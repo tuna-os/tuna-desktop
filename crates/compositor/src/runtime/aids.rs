@@ -62,6 +62,7 @@ impl Runtime {
     }
 
     pub(super) fn reset_input_aid_ownership(&mut self) {
+        self.dnd_escape_held = false;
         let now = self.input_aids.now_ms();
         let effects = self.input_aids.engine.reset_ownership(now);
         self.apply_aid_effects(effects);

@@ -5,6 +5,7 @@ Usage: tuna-scroll-capture.py niri|tuna OUT_DIR
 Tuna Desktop requires TUNA_COMPOSITOR_STATE; niri requires NIRI_SOCKET.
 """
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import socket
 import sys
 import time
 from PIL import ImageGrab
+from tuna_strip_endpoint import endpoint, wait_endpoint, capture_bracket
 
 backend, output = sys.argv[1:]
 out = Path(output)
@@ -54,20 +56,53 @@ else:
         return json.loads(Path(os.environ['TUNA_COMPOSITOR_STATE']).read_text())
 
 def capture(name):
+    endpoint_stage = backend != 'niri' and name in ('01-strip-rest', '02-strip-preset', 'view-000', 'view-800')
+    width = 826 if name in ('02-strip-preset', 'view-000') else 616
+    before = None
+    before_started = time.monotonic()
+    if endpoint_stage:
+        before = state()
+        if not endpoint(before, width):
+            raise RuntimeError('scheduled endpoint pre-grab state was not canonically settled')
     start = time.monotonic()
-    image = ImageGrab.grab(xdisplay=os.environ['DISPLAY']).convert('RGB')
+    image = ImageGrab.grab(xdisplay=os.environ['DISPLAY'])
     sampled = time.monotonic()
+    # Query immediately after the grab, before PNG encoding or file writes.
+    observed = state()
+    after_sampled = time.monotonic()
+    if endpoint_stage:
+        capture_bracket(before, observed, width)
     if image.size != (1280, 800):
         raise RuntimeError(f'inexact capture dimensions: {image.size}')
-    image.save(out / (name + '.png'))
-    (out / (name + '.json')).write_text(json.dumps(state(), indent=2))
+    image = image.convert('RGB')
+    image_path = out / (name + '.png')
+    image.save(image_path)
+    if endpoint_stage:
+        # Encoding cannot change the already captured state bracket.
+        (out / (name + '.capture-state.json')).write_text(json.dumps({
+            'before': before, 'after': observed, 'width': width, 'stage': name,
+            'png_sha256': hashlib.sha256(image_path.read_bytes()).hexdigest(),
+            'before_started': before_started, 'capture_started': start,
+            'grab_finished': sampled, 'after_sampled': after_sampled,
+            'scope': 'immediate state bracket of image grab; not a presentation timestamp'
+        }, indent=2))
+    (out / (name + '.json')).write_text(json.dumps(observed, indent=2))
     green = [x for x in range(image.width) if image.getpixel((x, 150)) == (0, 160, 64)]
     return {'capture_started': start, 'sampled': sampled,
             'green_right': max(green) + 1 if green else None}
 
+if backend != 'niri':
+    wait_endpoint(state, 616, deadline=time.monotonic() + 1)
 capture('01-strip-rest')
+before_preset = state() if backend != 'niri' else None
 press('r')
-time.sleep(1)
+if backend == 'niri':
+    time.sleep(1)
+else:
+    # XTest delivery is asynchronous. Require the expected width, the same
+    # focused client, a new rendered frame and canonical spring retirement.
+    wait_endpoint(state, 826, deadline=time.monotonic() + 1,
+                  baseline=before_preset['rendered_frames'], focused=before_preset['focused'])
 capture('02-strip-preset')
 samples = []
 # Capture each delay in a separate repeatable transition. PNG compression and

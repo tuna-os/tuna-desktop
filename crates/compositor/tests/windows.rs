@@ -2244,6 +2244,59 @@ fn strip_view_springs_to_target_while_geometry_jumps() {
 }
 
 #[test]
+fn strip_terminal_frame_is_exact_without_another_input_or_tick() {
+    let mut f = three_windows();
+    assert!(f.manager.set_scroll(&mut f.comp.state, true));
+    assert!(!f.manager.strip_animating());
+    // Entering scroll mode already lands on C. Moving to A must create
+    // a real target change before measuring or disabling its animation.
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    assert_ne!(f.manager.strip_view(), f.manager.strip_offset());
+    assert!(f.manager.strip_animating());
+    let mut observed_terminal = false;
+    for _ in 0..60 {
+        let old_view = f.manager.strip_view();
+        let old_running = f.manager.strip_animating();
+        f.manager.step_strip_view(1.0 / 60.0);
+        if old_running && !f.manager.strip_animating() {
+            // This is the one final frame. A pre-render publication preserves
+            // old_view; the post-render publication must expose the exact snap.
+            assert_ne!(old_view, f.manager.strip_offset());
+            assert_eq!(f.manager.strip_view(), f.manager.strip_offset());
+            assert_eq!(
+                f.manager.render_geometry(f.id_a),
+                f.manager.geometry(f.id_a)
+            );
+            observed_terminal = true;
+            break;
+        }
+    }
+    assert!(
+        observed_terminal,
+        "actual manager must expose its terminal frame"
+    );
+    // No extra input, fake tick, or unrelated wake completes this observation.
+    assert!(!f.manager.strip_animating());
+    assert_eq!(f.manager.strip_view(), f.manager.strip_offset());
+}
+
+#[test]
+fn strip_off_policy_lands_without_waiting_for_a_motion_timer() {
+    let mut f = three_windows();
+    assert!(f.manager.set_scroll(&mut f.comp.state, true));
+    assert!(!f.manager.strip_animating());
+    // Entering scroll mode already lands on C. Moving to A must create
+    // a real target change before measuring or disabling its animation.
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    assert_ne!(f.manager.strip_view(), f.manager.strip_offset());
+    assert!(f.manager.strip_animating());
+    f.manager.set_motion_allowed(false);
+    assert_eq!(f.manager.strip_view(), f.manager.strip_offset());
+    assert!(!f.manager.step_strip_view(0.0));
+    assert!(!f.manager.strip_animating());
+}
+
+#[test]
 fn scroll_axis_ignored_without_overflow() {
     let mut comp = TestCompositor::new();
     let mut manager = comp.window_manager();

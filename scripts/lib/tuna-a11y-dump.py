@@ -20,17 +20,22 @@ import time
 import pyatspi
 
 
-def bounds(acc):
+def bounds(acc, strict=False):
     # Wayland cannot expose global surface origins. Window coordinates
     # retain widget allocation; callers add the compositor-known origin.
     try:
         rect = acc.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
         return [rect.x, rect.y, rect.width, rect.height]
+    except NotImplementedError:
+        # Accessible applications/text nodes need not implement Component.
+        return None
     except Exception:
+        if strict:
+            raise
         return None
 
 
-def walk(acc, depth, out):
+def walk(acc, depth, out, strict=False):
     try:
         out.append({
             "role": acc.getRoleName(),
@@ -42,12 +47,12 @@ def walk(acc, depth, out):
             or acc.getState().contains(pyatspi.STATE_PRESSED),
             "selected": acc.getState().contains(pyatspi.STATE_SELECTED),
             "focused": acc.getState().contains(pyatspi.STATE_FOCUSED),
-            "bounds": bounds(acc),
+            "bounds": bounds(acc, strict),
         })
         for i in range(acc.childCount):
             child = acc.getChildAtIndex(i)
             if child is not None:
-                walk(child, depth + 1, out)
+                walk(child, depth + 1, out, strict)
     except Exception as exc:  # a node can die mid-walk; keep the rest
         out.append({"role": "error", "name": str(exc), "depth": depth, "showing": False})
 
@@ -90,6 +95,9 @@ def set_value(acc, target, value):
 def main():
     args = sys.argv[1:]
     expected_pid = None
+    strict = "--strict" in args
+    if strict:
+        args.remove("--strict")
     if "--pid" in args:
         i = args.index("--pid")
         expected_pid = int(args[i + 1])
@@ -125,7 +133,7 @@ def main():
                         return 1
                     time.sleep(1.5)
                 nodes = []
-                walk(app, 0, nodes)
+                walk(app, 0, nodes, strict)
                 if expected_pid is not None:
                     nodes[0]["process_id"] = app.get_process_id()
                 with open(path, "w") as fh:

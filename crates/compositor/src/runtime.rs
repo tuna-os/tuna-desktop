@@ -643,6 +643,7 @@ pub struct Runtime {
     wellbeing_effects: crate::wellbeing_effects::Effects,
     /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
     input_aids: aids::RuntimeAids,
+    dnd_escape_held: bool,
     /// PipeWire, connected on the first screen cast (#61).
     pipewire: Option<crate::screencast::PipeWire>,
     /// Running screen casts.
@@ -1137,6 +1138,7 @@ impl Runtime {
             input_settings: Default::default(),
             wellbeing_effects: Default::default(),
             input_aids: aids::RuntimeAids::default(),
+            dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name),
             pipewire: None,
             casts: Vec::new(),
@@ -1484,6 +1486,27 @@ impl Runtime {
             // Activity cancels the idle shield; the wake event belongs to
             // that shield, not the previously focused application.
             return;
+        }
+        if let ManagerInput::Key {
+            keycode: ESCAPE_KEYCODE,
+            pressed,
+            ..
+        } = &input
+        {
+            if self.dnd_escape_held {
+                // Repeats and the matching release belong to the cancelled drag.
+                self.dnd_escape_held = *pressed;
+                self.manager.discard_key_input(&mut self.state, &input);
+                return;
+            }
+            if *pressed
+                && self.state.client_dnd_active()
+                && self.state.cancel_client_dnd(input_time(&input) as u32)
+            {
+                self.dnd_escape_held = true;
+                self.manager.discard_key_input(&mut self.state, &input);
+                return;
+            }
         }
         // Three-finger swipes are the shell's (GNOME 51): consumed here,
         // acted on at the end. Other swipes reach the client.
@@ -2010,6 +2033,11 @@ impl Runtime {
         );
         // Live libinput device configuration (#343): beside the macro,
         // which is already at its recursion limit.
+        // Keep this unlocked drag observation outside the large scene macro.
+        doc["client_dnd_active"] =
+            serde_json::Value::Bool(!self.is_locked() && self.state.client_dnd_active());
+        // Canonical view AND column spring state, outside the large scene macro.
+        doc["strip_animating"] = serde_json::Value::Bool(self.manager.strip_animating());
         doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
         let doc = doc.to_string();
         if doc == self.state_last {
@@ -4035,7 +4063,18 @@ impl Runtime {
         self.publish_state();
         self.publish_cast_outputs();
         self.publish_overview_previews();
+        let strip_was_animating = self.manager.strip_animating();
         self.render()?;
+        // Rendering advances the strip's springs. Publish the terminal frame
+        // before the motion scheduler goes idle; the pre-render snapshot can
+        // otherwise retain the previous frame's residual indefinitely. With
+        // motion disabled, publish the instant frame's actual render count too.
+        let strip_lands_immediately = self.manager.session_mode()
+            == crate::windows::SessionMode::Scroll
+            && !self.input_settings.motion.allows_motion();
+        if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
+            self.publish_state();
+        }
         self.screencast_tick();
         #[cfg(feature = "drm")]
         if matches!(self.backend, Backend::Drm(_)) {
