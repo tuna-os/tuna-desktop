@@ -32,7 +32,14 @@ fn pam_unlock_accepts_the_right_password_and_nothing_else() {
     }
     let dir = tempfile::tempdir().unwrap();
     let passdb = dir.path().join("passdb");
-    std::fs::write(&passdb, "tunauser:right-password:tuna-lock-test\n").unwrap();
+    let own_user = tuna_compositor::unlock::session_user().expect("kernel session account");
+    std::fs::write(
+        &passdb,
+        format!(
+            "tunauser:right-password:tuna-lock-test\n{own_user}:right-password:tuna-lock-test\n"
+        ),
+    )
+    .unwrap();
     let services = dir.path().join("services");
     std::fs::create_dir(&services).unwrap();
     std::fs::write(
@@ -70,14 +77,38 @@ fn child() {
         "tunauser",
         "right-password"
     ));
-    // Through the unlock seam the lock screen uses.
-    let mut client = PamClient::new(service);
+    // The private helper permits ONLY the kernel session owner. Keep the raw
+    // controlled matrix checks above, and use that owner for the live facade.
+    let own_user = tuna_compositor::unlock::session_user().expect("kernel session account");
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tuna-compositor"));
+    let backend = tuna_compositor::pam_backend::Backend::with_trusted_factory(
+        move |identity, service, user, budget| {
+            tuna_compositor::pam_helper::Supervisor::spawn(
+                &executable,
+                identity,
+                service,
+                user,
+                budget,
+            )
+        },
+    )
+    .unwrap();
+    let mut client = PamClient::with_backend(service, backend.clone());
     assert_eq!(
-        attempt_unlock(&mut client, "tunauser", "right-password"),
+        attempt_unlock(&mut client, &own_user, "right-password"),
         UnlockOutcome::Unlocked
     );
     assert_eq!(
-        attempt_unlock(&mut client, "tunauser", "nope"),
+        attempt_unlock(&mut client, &own_user, "nope"),
         UnlockOutcome::Denied
     );
+    assert_ne!(
+        own_user, "tunauser",
+        "foreign-user negative fixture must be distinct"
+    );
+    assert_eq!(
+        attempt_unlock(&mut client, "tunauser", "right-password"),
+        UnlockOutcome::Denied
+    );
+    backend.shutdown();
 }

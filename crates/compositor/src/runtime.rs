@@ -58,7 +58,6 @@ use crate::windows::{
     translate_input, ManagerInput, TriggerAction, TriggerState, WindowManager, ESCAPE_KEYCODE,
 };
 use crate::xwayland::XWaylandSupervisor;
-use tuna_greeter::client::GreeterClient;
 
 use crate::{ClientState, State};
 
@@ -583,6 +582,18 @@ struct PendingScreenshotReply {
     saved: Option<std::path::PathBuf>,
 }
 
+enum UnlockEvent {
+    Pending,
+    Finished(bool),
+}
+struct UnlockWorker {
+    attempt: crate::auth_owner::Attempt,
+    worker: std::thread::JoinHandle<crate::pam_backend::Verification>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    phase: Arc<std::sync::atomic::AtomicU8>,
+    denied: bool,
+}
+
 pub struct Runtime {
     display: Display<State>,
     state: State,
@@ -702,9 +713,11 @@ pub struct Runtime {
     /// `last_stamp + anchor.elapsed()`.
     idle_since: Instant,
     /// Lock-screen password checks report back here.
-    unlock_results: calloop::channel::Sender<(u64, u64, bool)>,
+    unlock_results: calloop::channel::Sender<(crate::auth_owner::Attempt, UnlockEvent)>,
     /// A password check is running.
-    unlock_inflight: bool,
+    unlock_slot: crate::auth_owner::Slot,
+    unlock_worker: Option<UnlockWorker>,
+    unlock_quarantined: Option<crate::auth_owner::Attempt>,
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
@@ -733,6 +746,13 @@ pub fn control_socket_path(socket_name: &str) -> Option<std::path::PathBuf> {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        if let Some(worker) = &self.unlock_worker {
+            worker
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // Shutdown requests cancellation; it never certifies retirement.
+        crate::pam_backend::Backend::shutdown_live();
         #[cfg(feature = "xwayland")]
         {
             // Event sources can retain loop handles after dispatch stops.
@@ -1062,12 +1082,16 @@ impl Runtime {
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
 
         // Lock-screen password checks finish here, between frames.
-        let (unlock_results, unlock_source) = calloop::channel::channel::<(u64, u64, bool)>();
+        let (unlock_results, unlock_source) =
+            calloop::channel::channel::<(crate::auth_owner::Attempt, UnlockEvent)>();
         event_loop
             .handle()
             .insert_source(unlock_source, |event, _, rt: &mut Runtime| {
-                if let calloop::channel::Event::Msg((request, generation, ok)) = event {
-                    rt.finish_unlock(request, generation, ok);
+                if let calloop::channel::Event::Msg((attempt, event)) = event {
+                    match event {
+                        UnlockEvent::Pending => rt.deny_pending_unlock(attempt),
+                        UnlockEvent::Finished(ok) => rt.finish_unlock(attempt, ok),
+                    }
                 }
             })
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
@@ -1153,7 +1177,9 @@ impl Runtime {
             introspect,
             idle_since: Instant::now(),
             unlock_results,
-            unlock_inflight: false,
+            unlock_slot: crate::auth_owner::Slot::default(),
+            unlock_worker: None,
+            unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idle_monitor: crate::idle_monitor::start(),
             exit: false,
@@ -1328,6 +1354,8 @@ impl Runtime {
     /// snapshots), overview dismissed, and the exclusive lock surface
     /// up with an empty list — no window titles while locked.
     fn engage_lock(&mut self) {
+        // Track lifecycle separately: idle check_timeout has already locked its flag.
+        self.unlock_slot.note_lock(&self.unlock_generation);
         #[cfg(feature = "drm")]
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
@@ -1351,58 +1379,215 @@ impl Runtime {
     /// silent; auth is never invented. Returns whether the session is
     /// unlocked afterwards.
     pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
-        let now_ms = self.lock_now_ms();
-        // Under greetd, its daemon checks the password; under any other
-        // login manager (GDM on Marlin), PAM does (#62). Both fail closed.
-        if let Some(path) = crate::unlock::greetd_socket_path() {
-            let Ok(mut client) = GreeterClient::connect(&path) else {
-                return false;
-            };
-            return crate::unlock::unlock_session(
-                &mut self.lock,
-                &self.control,
-                &mut self.overlay,
-                now_ms,
-                user,
-                password,
-                &mut client,
-            );
+        use crate::pam_backend::{Initial, Verification};
+        if !self.is_locked() {
+            return true;
         }
-        let mut client = crate::pam::PamClient::new(crate::pam::service());
-        crate::unlock::unlock_session(
-            &mut self.lock,
-            &self.control,
-            &mut self.overlay,
-            now_ms,
-            user,
-            password,
-            &mut client,
-        )
+        self.unlock_slot.note_lock(&self.unlock_generation);
+        let epoch = self
+            .unlock_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let Some(attempt) = self.unlock_slot.begin(None, epoch) else {
+            return false;
+        };
+        // A configured greetd path never falls back to PAM.
+        if let Some(path) = crate::unlock::greetd_socket_path() {
+            let ok = crate::unlock::verify_greetd(&path, user, password);
+            return self.unlock_slot.retire(attempt)
+                && ok
+                && self.apply_verified_unlock(attempt.epoch);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticket = crate::pam_backend::Backend::live()
+            .ok_or(Verification::RejectedBeforeSpawn)
+            .and_then(|backend| {
+                backend.begin(
+                    crate::pam::service(),
+                    user.to_owned(),
+                    tuna_shell_control::Secret(password.to_owned()),
+                    cancel.clone(),
+                )
+            });
+        match ticket {
+            Ok(mut ticket) => match ticket.initial() {
+                Initial::Finished(result) => {
+                    if !result.may_retire() {
+                        self.unlock_quarantined = Some(attempt);
+                        return false;
+                    }
+                    self.unlock_slot.retire(attempt)
+                        && result.authenticated()
+                        && self.apply_verified_unlock(attempt.epoch)
+                }
+                Initial::Pending => {
+                    // The public caller gets denial now; no later result can grant it.
+                    self.start_unlock_worker(attempt, cancel, true, move |_| {
+                        ticket.wait_retired(|| {})
+                    });
+                    false
+                }
+            },
+            Err(result) => {
+                if result.may_retire() {
+                    self.unlock_slot.retire(attempt);
+                } else {
+                    self.unlock_quarantined = Some(attempt);
+                }
+                false
+            }
+        }
     }
 
-    /// A lock-screen password check finished: a verified password
-    /// clears the lock (the shell then destroys its lock surfaces), and
-    /// the shell hears the result either way.
-    fn finish_unlock(&mut self, request: u64, generation: u64, ok: bool) {
-        self.unlock_inflight = false;
-        let applied = ok
-            && generation
-                == self
-                    .unlock_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
+    fn start_unlock_worker(
+        &mut self,
+        attempt: crate::auth_owner::Attempt,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        denied: bool,
+        verify: impl FnOnce(Box<dyn FnMut() + Send>) -> crate::pam_backend::Verification
+            + Send
+            + 'static,
+    ) {
+        let reply = self.unlock_results.clone();
+        let wake = self.wake.clone();
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(u8::from(denied)));
+        let worker_phase = phase.clone();
+        let pending_reply = reply.clone();
+        let pending_phase = phase.clone();
+        let worker = std::thread::Builder::new()
+            .name("tuna-unlock".into())
+            .spawn(move || {
+                let _completion = wake.completion();
+                let result = verify(Box::new(move || {
+                    pending_phase.store(1, std::sync::atomic::Ordering::Release);
+                    let _ = pending_reply.send((attempt, UnlockEvent::Pending));
+                }));
+                worker_phase.store(2, std::sync::atomic::Ordering::Release);
+                let _ = reply.send((attempt, UnlockEvent::Finished(result.authenticated())));
+                result
+            });
+        match worker {
+            Ok(worker) => {
+                self.unlock_worker = Some(UnlockWorker {
+                    attempt,
+                    worker,
+                    cancel,
+                    phase,
+                    denied,
+                })
+            }
+            Err(_) => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                // A public pending ticket may already own a helper: no fabricated reap.
+                if denied {
+                    self.unlock_quarantined = Some(attempt);
+                } else {
+                    self.unlock_slot.retire(attempt);
+                }
+                if let Some(origin) = attempt.origin {
+                    self.control.finish_unlock(origin, false);
+                }
+            }
+        }
+    }
+
+    fn deny_pending_unlock(&mut self, attempt: crate::auth_owner::Attempt) {
+        if !self.unlock_slot.matches(attempt) {
+            return;
+        }
+        let Some(worker) = self
+            .unlock_worker
+            .as_mut()
+            .filter(|worker| worker.attempt == attempt)
+        else {
+            return;
+        };
+        if worker.denied {
+            return;
+        }
+        worker.denied = true;
+        if let Some(origin) = attempt.origin {
+            self.control.finish_unlock(origin, false);
+        }
+    }
+
+    fn apply_verified_unlock(&mut self, epoch: u64) -> bool {
+        if !self.is_locked() || !self.unlock_slot.grant(&self.unlock_generation, epoch) {
+            return false;
+        }
+        self.reset_input_aid_ownership();
+        self.lock.unlock(self.lock_now_ms());
+        self.control.set_locked(false);
+        self.state.set_shortcut_inhibition_locked(false);
+        self.overlay.hide();
+        true
+    }
+
+    /// Actual helper retirement is required in addition to the joined wrapper.
+    /// A poisoned owner denies permanently; it cannot release this slot.
+    fn finish_unlock(&mut self, attempt: crate::auth_owner::Attempt, reported_ok: bool) {
+        if !self.unlock_slot.matches(attempt) {
+            return;
+        }
+        let Some(worker) = self.unlock_worker.as_ref() else {
+            return;
+        };
+        if worker.attempt != attempt || !worker.worker.is_finished() {
+            return;
+        }
+        let worker = self.unlock_worker.take().expect("matched owned worker");
+        let denied = worker.denied;
+        let joined = worker.worker.join();
+        let joined_ok = joined.is_ok();
+        let result = joined.unwrap_or(crate::pam_backend::Verification::Unretired);
+        let backend_accepted = result.authenticated();
+        let ok = backend_accepted && reported_ok && !denied;
+        let live = attempt
+            .origin
+            .is_some_and(|origin| self.control.origin_pending_live(origin));
+        if !result.may_retire() {
+            self.unlock_quarantined = Some(attempt);
+            if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+                eprintln!(
+                    "tuna-compositor: lock authentication unretired {}",
+                    serde_json::json!({
+                        "pid":std::process::id(), "joined_ok":joined_ok,
+                        "attempt_serial":attempt.serial,"attempt_epoch":attempt.epoch,
+                        "current_epoch":self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                        "origin_live":live,"locked_after":self.is_locked()
+                    })
+                );
+            }
+            if !denied {
+                if let Some(origin) = attempt.origin {
+                    self.control.finish_unlock(origin, false);
+                }
+            }
+            return;
+        }
+        if !self.unlock_slot.retire(attempt) {
+            return;
+        }
+        let applied = ok && live && self.apply_verified_unlock(attempt.epoch);
         if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             eprintln!(
-                "tuna-compositor: lock authentication finished accepted={ok} applied={applied}"
+                "tuna-compositor: lock authentication retired {}",
+                serde_json::json!({
+                    "pid": std::process::id(), "joined_ok": joined_ok,
+                    "backend_accepted": backend_accepted, "reported_ok": reported_ok,
+                    "applied": applied, "attempt_serial": attempt.serial,
+                    "attempt_epoch": attempt.epoch,
+                    "current_epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                    "origin": attempt.origin.map(|origin| serde_json::json!({
+                        "connection": origin.connection, "request": origin.request })),
+                    "origin_live": live, "locked_after": self.is_locked()
+                })
             );
         }
-        if applied && self.is_locked() {
-            self.reset_input_aid_ownership();
-            self.lock.unlock(self.lock_now_ms());
-            self.control.set_locked(false);
-            self.state.set_shortcut_inhibition_locked(false);
-            self.overlay.hide();
+        if !denied {
+            if let Some(origin) = attempt.origin {
+                self.control.finish_unlock(origin, applied);
+            }
         }
-        self.control.finish_unlock(request, applied);
     }
 
     /// Route one backend input event: consumed by the lock surface while
@@ -2028,6 +2213,19 @@ impl Runtime {
             [pos.x, pos.y]
         }));
         doc["input_aids"] = self.input_aids_summary();
+        // Owned proof diagnostics only: no credentials, prompts or typed input.
+        doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+            serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
+                "backend_unretired": self.unlock_quarantined.is_some(),
+                "epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                "attempt": self.unlock_worker.as_ref().map(|worker| worker.attempt).or(self.unlock_quarantined).map(|attempt| serde_json::json!({
+                    "serial": attempt.serial, "epoch": attempt.epoch,
+                    "origin": attempt.origin.map(|origin| serde_json::json!({
+                        "connection": origin.connection, "request": origin.request }))
+                })) })
+        } else {
+            serde_json::Value::Null
+        };
         doc["pointer_fullscreen_blocked"] = serde_json::json!(
             (!self.is_locked()).then(|| self.manager.fullscreen_at(self.manager.pointer_pos()))
         );
@@ -3580,6 +3778,10 @@ impl Runtime {
         let mut schedule = crate::idle_schedule::Schedule::default();
         let system_now = crate::state::system_millis();
         if self.child_watch_failed
+            || self
+                .unlock_worker
+                .as_ref()
+                .is_some_and(|worker| worker.phase.load(std::sync::atomic::Ordering::Acquire) != 1)
             || self.control.needs_continuation(self.manager.model())
             || self
                 .idle_blank_signal
@@ -3713,6 +3915,13 @@ impl Runtime {
     }
 
     fn tick(&mut self) -> Result<bool, RuntimeError> {
+        let completed = self
+            .unlock_worker
+            .as_ref()
+            .and_then(|worker| worker.worker.is_finished().then_some(worker.attempt));
+        if let Some(attempt) = completed {
+            self.finish_unlock(attempt, true);
+        }
         if let Some(signal) = self.idle_blank_signal.as_mut() {
             self.blank = crate::lock::IdleBlank::parse(signal.text());
         }
@@ -3870,10 +4079,7 @@ impl Runtime {
         // flag flipped without the idle machine, so mirror it locally,
         // dismiss the overview, and raise the exclusive surface.
         if self.control.is_locked() && !self.lock.is_locked() {
-            self.lock.lock();
-            self.cursor.on_lock();
-            self.control.set_overview(false);
-            self.overlay.show(Vec::new());
+            self.engage_lock();
         }
         // ext-session-lock-v1: only the supervised shell may lock, and
         // locking through the protocol engages the compositor's own
@@ -3900,24 +4106,31 @@ impl Runtime {
         }
         // A lock-screen password: verified off the loop (PAM may stall
         // for seconds on a failure), one attempt at a time.
-        if let Some((request, password)) = outcome.unlock {
-            if self.unlock_inflight || !self.is_locked() {
-                let unlocked = !self.is_locked();
-                self.control.finish_unlock(request, unlocked);
-            } else {
-                self.unlock_inflight = true;
-                if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
-                    eprintln!("tuna-compositor: lock authentication started");
-                }
-                let reply = self.unlock_results.clone();
-                let generation = self
-                    .unlock_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
-                std::thread::spawn(move || {
-                    let ok = crate::unlock::session_user()
-                        .is_some_and(|user| crate::unlock::verify(&user, &password.0));
-                    let _ = reply.send((request, generation, ok));
+        if let Some((origin, password)) = outcome.unlock {
+            let password = crate::pam_backend::Credential::from_schema(password);
+            let epoch = self
+                .unlock_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let attempt = self
+                .is_locked()
+                .then(|| self.unlock_slot.begin(Some(origin), epoch))
+                .flatten();
+            if let Some(attempt) = attempt {
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let backend_cancel = cancel.clone();
+                self.start_unlock_worker(attempt, cancel, false, move |pending| {
+                    match crate::unlock::session_user() {
+                        Some(user) => crate::unlock::verify_owned_credential(
+                            &user,
+                            password,
+                            backend_cancel,
+                            pending,
+                        ),
+                        None => crate::pam_backend::Verification::RejectedBeforeSpawn,
+                    }
                 });
+            } else {
+                self.control.finish_unlock(origin, false);
             }
         }
         self.idle_monitor.tick();
@@ -5948,6 +6161,57 @@ fn send_frame_callbacks(
 /// `WAYLAND_DISPLAY` is set, so setting it first would point winit at our
 /// own not-yet-existing socket.
 pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
+    run_loop(session, |_| None)
+}
+
+/// Narrow, trusted Rust-only CI driver. The normal binary supplies no probe.
+/// No credential challenge, UI/configuration or IPC entry point is added.
+pub struct AuthOwnerProbe<'a> {
+    runtime: &'a mut Runtime,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct AuthOwnerStatus {
+    pub locked: bool,
+    pub epoch: u64,
+    pub outer_pending: bool,
+}
+impl AuthOwnerProbe<'_> {
+    pub fn status(&self) -> AuthOwnerStatus {
+        AuthOwnerStatus {
+            locked: self.runtime.is_locked(),
+            epoch: self
+                .runtime
+                .unlock_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            outer_pending: self.runtime.unlock_worker.is_some(),
+        }
+    }
+    /// Controlled epoch injection, not an observation of logind or S3.
+    pub fn invalidate_epoch(&mut self) -> bool {
+        crate::auth_owner::advance_epoch(&self.runtime.unlock_generation)
+    }
+    pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
+        self.runtime.try_unlock(user, password)
+    }
+    pub fn request_exit(&mut self) {
+        self.runtime.exit = true;
+        self.runtime.wake.signal();
+    }
+}
+
+/// Runs the identical runtime, input, IPC and owned-worker loop on the caller's
+/// main thread. A deadline belongs solely to the trusted probe caller.
+pub fn run_auth_owner_probe(
+    session: &NestedSession,
+    probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
+) -> Result<RunStats, RuntimeError> {
+    run_loop(session, probe)
+}
+
+fn run_loop(
+    session: &NestedSession,
+    mut probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
+) -> Result<RunStats, RuntimeError> {
     let (mut runtime, mut event_loop) = Runtime::launch(session)?;
     let prev_env = apply_nested_env(&session.socket_name);
     #[cfg(feature = "drm")]
@@ -6024,9 +6288,16 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
             }
         }
         let ticked = dispatched.and_then(|_| runtime.tick());
+        let probe_delay = probe(&mut AuthOwnerProbe {
+            runtime: &mut runtime,
+        });
         match ticked {
             Ok(true) => {
                 wait = runtime.next_wait();
+                if let Some(delay) = probe_delay {
+                    let delay = delay.clamp(Duration::from_millis(1), Duration::from_millis(100));
+                    wait = Some(wait.map_or(delay, |runtime_delay| runtime_delay.min(delay)));
+                }
                 continue;
             }
             done => {

@@ -135,7 +135,7 @@ impl LockUi {
         }
         self.pending.set(None);
         if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
-            eprintln!("tuna-shell-gtk: lock command result applied={applied}");
+            eprintln!("tuna-shell-gtk: lock command result applied={applied} request_id={id}");
         }
         for screen in self.screens.borrow().iter() {
             screen.entry.set_sensitive(true);

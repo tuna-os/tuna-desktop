@@ -914,5 +914,69 @@ class TourRecorderTests(unittest.TestCase):
         self.assertIn('qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core', workflow)
 
 
+
+class SleepAuthRetirementTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshot = {'state': {'locked': True, 'auth_owner': {
+            'outer_pending': True, 'epoch': 7,
+            'attempt': {'serial': 9, 'epoch': 7, 'origin': {'connection': 4, 'request': 12}}}},
+            'processes': [{'executable': 'tuna-compositor', 'pid': 600, 'start_ticks': 1500}]}
+        self.expected = lane.sleep_auth_attempt(self.snapshot)
+        self.event = {'pid': 600, 'joined_ok': True, 'backend_accepted': True, 'reported_ok': True,
+                      'applied': False, 'attempt_serial': 9, 'attempt_epoch': 7, 'current_epoch': 8,
+                      'origin': {'connection': 4, 'request': 12}, 'origin_live': True, 'locked_after': True}
+        self.denial = 'tuna-shell-gtk: lock command result applied=false request_id=12'
+
+    def trace(self, event=None, denial=None):
+        return ('journal tuna-compositor: lock authentication retired '
+                + json.dumps(self.event if event is None else event) + '\n'
+                + (self.denial if denial is None else denial) + '\n')
+
+    def test_exact_pending_attempt_accepted_join_stale_epoch_and_shell_denial(self):
+        self.assertEqual(lane.stale_sleep_auth_retirement(self.trace(), self.expected, 8), self.event)
+        self.assertEqual(self.expected['start_ticks'], 1500)
+
+    def test_wrong_password_panic_unreported_applied_dead_origin_or_unlocked_refused(self):
+        for key, value in [('backend_accepted', False), ('joined_ok', False), ('reported_ok', False),
+                           ('applied', True), ('origin_live', False), ('locked_after', False)]:
+            with self.subTest(key=key):
+                self.assertIsNone(lane.stale_sleep_auth_retirement(self.trace({**self.event, key: value}), self.expected, 8))
+
+    def test_same_epoch_wrong_current_epoch_and_unrelated_attempt_refused(self):
+        for event, current in [({**self.event, 'current_epoch': 7}, 7), (self.event, 9),
+                               ({**self.event, 'attempt_serial': 10}, 8),
+                               ({**self.event, 'pid': 601}, 8),
+                               ({**self.event, 'origin': {'connection': 5, 'request': 12}}, 8),
+                               ({**self.event, 'origin': {'connection': 4, 'request': 13}}, 8)]:
+            self.assertIsNone(lane.stale_sleep_auth_retirement(self.trace(event), self.expected, current))
+
+    def test_missing_malformed_wrong_type_extra_fields_and_duplicate_retirement_refused(self):
+        for trace in ['', self.denial, 'tuna-compositor: lock authentication retired {broken',
+                      self.trace({k: v for k, v in self.event.items() if k != 'backend_accepted'}),
+                      self.trace({**self.event, 'backend_accepted': 1}),
+                      self.trace({**self.event, 'attempt_serial': True}),
+                      self.trace({**self.event, 'origin': None}),
+                      self.trace({**self.event, 'extra': True}), self.trace() + self.trace(),
+                      'lock authentication finished accepted=true applied=false\n' + self.denial]:
+            self.assertIsNone(lane.stale_sleep_auth_retirement(trace, self.expected, 8))
+
+    def test_shell_missing_wrong_request_or_success_refused(self):
+        for denial in ['', self.denial.replace('12', '13'), self.denial.replace('false', 'true'),
+                       'tuna-shell-gtk: lock command result applied=false']:
+            self.assertIsNone(lane.stale_sleep_auth_retirement(self.trace(denial=denial), self.expected, 8))
+
+    def test_pre_sleep_snapshot_missing_not_pending_or_bad_identity_refused(self):
+        import copy
+        snapshots = []
+        for field, value in [('attempt', None), ('outer_pending', False), ('epoch', True), ('epoch', 8)]:
+            changed = copy.deepcopy(self.snapshot); changed['state']['auth_owner'][field] = value; snapshots.append(changed)
+        for field, value in [('serial', True), ('epoch', 0), ('origin', None)]:
+            changed = copy.deepcopy(self.snapshot); changed['state']['auth_owner']['attempt'][field] = value; snapshots.append(changed)
+        changed = copy.deepcopy(self.snapshot); changed['processes'] *= 2; snapshots.append(changed)
+        changed = copy.deepcopy(self.snapshot); changed['state']['locked'] = False; snapshots.append(changed)
+        for snapshot in snapshots:
+            with self.assertRaises(ValueError):
+                lane.sleep_auth_attempt(snapshot)
+
 if __name__ == "__main__":
     unittest.main()

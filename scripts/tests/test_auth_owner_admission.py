@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Actual CI admission code, synthetic file fixtures; no runtime qualification."""
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = (ROOT / 'scripts/tuna-auth-owner-ci-proof').read_text()
+BLOCKS = [part.split('\nPY\n', 1)[0] for part in SCRIPT.split("<<'PY'\n")[1:]]
+
+
+class Admission(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.out = Path(self.temp.name)
+        self.test = self.out / 'test-bin'
+        self.bin = self.out / 'compositor-bin'
+        self.test.write_bytes(b'admitted-test')
+        self.bin.write_bytes(b'admitted-compositor')
+        self.probe = self.out / 'probe-bin'
+        self.probe.write_bytes(b'admitted-probe')
+        self.probe_rows = [self.artifact('native-auth-owner-probe', 'example', self.probe, False)]
+        (self.out / 'source.txt').write_text('candidate-sha\n')
+        (self.out / 'root.txt').write_text(str(ROOT)+'\n')
+        (self.out / 'metadata.json').write_text(json.dumps({'packages': [{
+            'name': 'tuna-compositor', 'id': 'exact-compositor-package',
+            'manifest_path': str(ROOT / 'crates/compositor/Cargo.toml')}]}))
+        self.rows = [self.artifact('auth_owner_runtime', 'test', self.test, True),
+                     self.artifact('tuna-compositor', 'bin', self.bin, False)]
+
+    @staticmethod
+    def artifact(name, kind, path, test):
+        return {'reason': 'compiler-artifact', 'package_id': 'exact-compositor-package',
+                'target': {'name': name, 'kind': [kind], 'src_path': str(ROOT / (
+                    'crates/compositor/tests/auth_owner_runtime.rs' if name == 'auth_owner_runtime'
+                    else 'crates/compositor/examples/native-auth-owner-probe.rs' if name == 'native-auth-owner-probe'
+                    else 'crates/compositor/src/main.rs'))},
+                'profile': {'test': test}, 'executable': str(path)}
+
+    def execute(self, block):
+        before = sys.argv
+        try:
+            sys.argv = ['proof-admission', str(self.out)]
+            exec(compile(block, '<actual-auth-admission>', 'exec'), {})
+        finally:
+            sys.argv = before
+
+    def admit(self):
+        (self.out / 'build.json').write_text('\n'.join(map(json.dumps, self.rows)) + '\n')
+        (self.out / 'probe-build.json').write_text('\n'.join(map(json.dumps, self.probe_rows)))
+        self.execute(BLOCKS[0])
+        r = json.loads((self.out / 'binary-receipt.json').read_text())
+        (self.out / 'runtime').mkdir(exist_ok=True)
+        (self.out / 'runtime/success.json').write_text(json.dumps({
+            'late_closed_origin_success_denied': True, 'fresh_origin_success': True}))
+        (self.out / 'test.log').write_text('auth owner compositor sha256: ' + r['executables'][str(self.bin)] + '\n')
+        (self.out/'runtime-epoch').mkdir(exist_ok=True)
+        (self.out/'runtime-epoch/success.json').write_text(json.dumps({k:True for k in ['late_epoch_success_denied','busy_public_sync_denied','fresh_origin_success','public_sync_success']}))
+        (self.out/'test-epoch.log').write_text('auth owner probe sha256: '+r['executables'][str(self.probe)]+'\n')
+        (self.out/'runtime-pam').mkdir(exist_ok=True)
+        (self.out/'runtime-pam/success.json').write_text(json.dumps({
+            'late_closed_origin_success_denied': True, 'fresh_origin_success': True,
+            'held_self_path_replaced': True, 'compositor_sha256': r['executables'][str(self.bin)]}))
+        (self.out/'test-pam.log').write_text('auth owner pam sha256: '+r['executables'][str(self.bin)]+'\n')
+        return r
+
+    def test_exact_roles_and_unchanged_files_admitted(self):
+        r = self.admit()
+        self.assertEqual(r['compositor'], str(self.bin))
+        self.assertEqual(r['test'], str(self.test))
+        self.execute(BLOCKS[1])
+
+    def test_false_test_kind_profile_package_and_source_are_refused(self):
+        import copy
+        original = copy.deepcopy(self.rows)
+        for target in [0, 1]:
+            for field, wrong in [('kind', ['example']), ('profile', not original[target]['profile']['test']),
+                                 ('package', 'wrong-package'), ('source', str(ROOT/'crates/greeter/src/main.rs'))]:
+                self.rows = copy.deepcopy(original)
+                if field == 'kind': self.rows[target]['target']['kind'] = wrong
+                elif field == 'profile': self.rows[target]['profile']['test'] = wrong
+                elif field == 'package': self.rows[target]['package_id'] = wrong
+                else: self.rows[target]['target']['src_path'] = wrong
+                with self.subTest(role=target, field=field), self.assertRaises(AssertionError): self.admit()
+
+    def test_duplicate_identical_matching_artifact_is_refused(self):
+        self.rows.append(dict(self.rows[0]))
+        with self.assertRaises(AssertionError): self.admit()
+
+    def test_missing_compositor_is_refused(self):
+        self.rows.pop(1)
+        with self.assertRaises(AssertionError): self.admit()
+
+    def test_final_admission_reuses_exact_matcher(self):
+        self.admit()
+        rows = self.rows
+        rows[0]['target']['src_path'] = str(ROOT/'crates/greeter/src/main.rs')
+        (self.out/'build.json').write_text('\n'.join(map(json.dumps, rows))+'\n')
+        with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+
+    def test_probe_wrong_kind_package_profile_source_or_missing_refused(self):
+        import copy
+        original = copy.deepcopy(self.probe_rows)
+        for field in ['kind', 'package_id', 'profile', 'src_path', 'missing', 'duplicate']:
+            self.probe_rows = copy.deepcopy(original)
+            if field == 'kind': self.probe_rows[0]['target']['kind'] = ['bin']
+            elif field == 'package_id': self.probe_rows[0]['package_id'] = 'wrong'
+            elif field == 'profile': self.probe_rows[0]['profile']['test'] = True
+            elif field == 'src_path': self.probe_rows[0]['target']['src_path'] = str(ROOT/'crates/compositor/src/main.rs')
+            elif field == 'missing': self.probe_rows = []
+            else: self.probe_rows.append(copy.deepcopy(original[0]))
+            with self.subTest(field=field), self.assertRaises(AssertionError): self.admit()
+
+    def test_missing_test_is_refused(self):
+        self.rows.pop(0)
+        with self.assertRaises(AssertionError): self.admit()
+
+    def test_two_distinct_compositor_paths_refused(self):
+        self.rows.append(self.artifact('tuna-compositor', 'bin', self.out / 'other', False))
+        with self.assertRaises(AssertionError): self.admit()
+
+    def test_test_profile_binary_cannot_replace_normal_compositor(self):
+        self.rows[1]['profile']['test'] = True
+        with self.assertRaises(AssertionError): self.admit()
+
+    def test_binary_mutation_after_admission_refused(self):
+        self.admit()
+        self.bin.write_bytes(b'changed')
+        with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+
+    def test_actual_compositor_hash_cannot_be_test_hash(self):
+        r = self.admit()
+        (self.out / 'test.log').write_text('auth owner compositor sha256: ' + r['executables'][str(self.test)] + '\n')
+        with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+
+    def test_runtime_requirement_and_negative_receipt_remain_strict(self):
+        self.admit()
+        (self.out / 'runtime/success.json').write_text(json.dumps({
+            'late_closed_origin_success_denied': False, 'fresh_origin_success': True}))
+        with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+        self.assertIn('TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1', SCRIPT)
+        self.assertIn('timeout --kill-after=3s 45s', SCRIPT)
+        self.assertIn('1 passed; 0 failed; 0 ignored;', SCRIPT)
+
+
+    def test_actual_pam_receipt_false_or_wrong_image_refused(self):
+        for field, wrong in [('late_closed_origin_success_denied', False), ('fresh_origin_success', False),
+                             ('held_self_path_replaced', False), ('compositor_sha256', '0'*64)]:
+            self.admit()
+            path = self.out/'runtime-pam/success.json'
+            receipt = json.loads(path.read_text()); receipt[field] = wrong
+            path.write_text(json.dumps(receipt))
+            with self.subTest(field=field), self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+
+    def test_actual_pam_receipt_missing_or_duplicate_source_refused(self):
+        self.admit()
+        (self.out/'runtime-pam/success.json').unlink()
+        with self.assertRaises(FileNotFoundError): self.execute(BLOCKS[1])
+        self.admit()
+        path = self.out/'test-pam.log'; path.write_text(path.read_text()*2)
+        with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+
+if __name__ == '__main__':
+    unittest.main()

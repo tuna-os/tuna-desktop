@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Source integration guards; actual PAM execution is a separate CI Rust test."""
+from pathlib import Path
+import unittest
+import re
+ROOT = Path(__file__).resolve().parents[2]
+
+class SourceContracts(unittest.TestCase):
+    def test_fixed_helper_entry_precedes_any_desktop_initialization(self):
+        main = (ROOT / 'crates/compositor/src/main.rs').read_text().split('fn main() -> ExitCode {', 1)[1]
+        self.assertLess(main.index('pam_helper::entry()'), main.index('legacy::import_env'))
+        self.assertLess(main.index('pam_helper::entry()'), main.index('NestedSession::default_for_pid'))
+        self.assertIn('std::env::args_os().count() != 2', main)
+
+    def test_helper_is_authentication_only_and_live_factory_is_held_self(self):
+        helper = (ROOT / 'crates/compositor/src/pam_helper.rs').read_text()
+        for symbol in ('pam_authenticate', 'pam_acct_mgmt', 'pam_end', 'pam_get_item'):
+            self.assertIn(symbol, helper)
+        for symbol in ('pam_open_session', 'pam_setcred', 'StartSession'):
+            self.assertNotIn(symbol, helper)
+        backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
+        self.assertIn('SelfImage::capture()', backend)
+        self.assertIn('image.spawn(identity, service, user, budget)', backend)
+        self.assertIn('File::open("/proc/self/exe")', helper)
+        self.assertIn('self.file.as_raw_fd()', helper)
+        self.assertIn('_source_image: source_image', helper)
+        self.assertNotIn('std::env::', backend)
+        pam = (ROOT / 'crates/compositor/src/pam.rs').read_text()
+        self.assertNotIn('std::thread::Builder', pam)
+        self.assertIn('crate::pam_backend::Backend::live()', pam)
+        runtime = (ROOT / 'crates/compositor/src/runtime.rs').read_text()
+        self.assertIn('if !result.may_retire()', runtime)
+        self.assertIn('self.unlock_quarantined = Some(attempt)', runtime)
+        self.assertIn('let ok = backend_accepted && reported_ok && !denied', runtime)
+        self.assertIn('worker.phase.load', runtime)
+        self.assertIn('ticket.wait_retired', runtime)
+        self.assertIn('verify_owned', (ROOT / 'crates/compositor/src/unlock.rs').read_text())
+
+    def test_owned_credential_wrap_precedes_early_denials_and_moves_answer(self):
+        backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
+        self.assertIn('impl Drop for Credential', backend)
+        self.assertIn('crate::pam_helper::wipe(self.text.as_mut_vec())', backend)
+        self.assertIn('AnswerText::new(std::mem::take(&mut self.text))', backend)
+        self.assertIn('Credential::from_schema(password)', backend)
+        pam = (ROOT / 'crates/compositor/src/pam.rs').read_text()
+        self.assertIn('text.map(crate::pam_backend::Credential::from_string)', pam)
+        self.assertIn('begin_credential', pam)
+        runtime = (ROOT / 'crates/compositor/src/runtime.rs').read_text()
+        begin = runtime.index('if let Some((origin, password)) = outcome.unlock')
+        self.assertLess(runtime.index('Credential::from_schema(password)', begin), runtime.index('self.unlock_slot.begin', begin))
+
+    def test_private_framing_retirement_and_redaction_contracts(self):
+        helper = (ROOT / 'crates/compositor/src/pam_helper.rs').read_text()
+        for token in ('deny_unknown_fields', 'FRAME_LIMIT', 'TEXT_LIMIT', 'MESSAGE_LIMIT',
+                      'checked_duration_since', 'pidfd_open', 'Retirement::Quarantined',
+                      'group_has_no_live_members', 'same_user', 'RLIMIT_CORE', '<redacted>'):
+            self.assertIn(token, helper)
+        self.assertNotIn('.env(', helper)
+
+    def test_raw_negative_transport_is_bounded_before_body_allocation(self):
+        test = (ROOT / 'crates/compositor/tests/pam_helper.rs').read_text()
+        self.assertIn('fn raw_read<T: Read + AsRawFd>', test)
+        self.assertIn('checked_duration_since(Instant::now())', test)
+        self.assertIn('(1..=65536).contains(&count)', test)
+        self.assertNotIn('output.read_exact(', test)
+        self.assertNotIn('stderr.take().unwrap().read_to_string', test)
+        self.assertIn('struct RawChild', test)
+        self.assertIn('helper outlived its creating thread', test)
+
+    def test_actual_ci_fixture_binds_binary_and_is_not_a_model_only_test(self):
+        test = (ROOT / 'crates/compositor/tests/pam_helper.rs').read_text()
+        fixture = (ROOT / 'crates/compositor/tests/fixtures/pam_conversation.c').read_text()
+        self.assertIn('CARGO_BIN_EXE_tuna-compositor', test)
+        self.assertIn('TUNA_REQUIRE_PAM_WRAPPER', test)
+        self.assertIn('LD_PRELOAD', test)
+        for case in ('hang', 'teardown', 'crash', 'cancel', 'oversized-header', 'stale-generation', 'dribble', 'userchange', 'child'):
+            self.assertIn('"' + case + '"', test)
+        for token in ('PAM_PROMPT_ECHO_ON', 'PAM_PROMPT_ECHO_OFF', 'PAM_TEXT_INFO', 'PAM_ERROR_MSG', 'pam_set_data', 'fork()'):
+            self.assertIn(token, fixture)
+        ci = (ROOT / '.github/workflows/ci.yml').read_text()
+        gtk = re.search(r'(?ms)^  gtk-shell:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)', ci)
+        self.assertIsNotNone(gtk)
+        self.assertIn('libpam-wrapper libpam0g-dev', gtk.group(1))
+        for name in ('ci.yml', 'measured-coverage.yml'):
+            self.assertIn('libpam0g-dev', (ROOT / '.github/workflows' / name).read_text())
+
+if __name__ == '__main__': unittest.main()

@@ -48,6 +48,7 @@ use smithay::{
 
 pub mod animation;
 pub mod animation_clock;
+mod auth_owner;
 mod bell;
 pub mod capture_security;
 mod constraint_motion;
@@ -80,6 +81,8 @@ mod output_constraints;
 pub mod overlay;
 pub mod overview;
 pub mod pam;
+pub mod pam_backend;
+pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;
 pub mod popup;

@@ -26,7 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # smithay links system libxkbcommon via the xkbcommon crate;
       # the greeter UI needs GTK4/libadwaita dev files.
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev pkg-config libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev libpam-wrapper zstd
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev pkg-config libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev libpam-wrapper libpam0g-dev zstd
       # The GTK shell (ADR 0006) links gtk4-layer-shell, which Ubuntu
       # 24.04 does not package.
       - run: sudo apt-get install -y meson ninja-build libwayland-dev wayland-protocols && scripts/ci-install-gtk4-layer-shell
@@ -50,11 +50,13 @@ jobs:
       - run: python3 scripts/lib/tuna-a11y-dump-tests.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_comparison.py
+      - run: python3 scripts/lib/pam-helper-source-tests.py
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
       - run: /usr/bin/python3 scripts/lib/media-completion-barrier-tests.py
       - run: /usr/bin/python3 scripts/lib/media-completion-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/media-completion-fixture-tests.py
+      - run: python3 scripts/tests/test_auth_owner_admission.py
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
@@ -84,6 +86,25 @@ jobs:
       - run: cargo test --workspace
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
+      - name: Prove private PAM helper conversations and retirement
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/private-pam-helper-proof"
+          git rev-parse HEAD > "$RUNNER_TEMP/private-pam-helper-proof/source.txt"
+          sha256sum crates/compositor/src/pam_helper.rs crates/compositor/src/main.rs crates/compositor/tests/pam_helper.rs crates/compositor/tests/fixtures/pam_conversation.c > "$RUNNER_TEMP/private-pam-helper-proof/source-sha256.txt"
+          cargo test --locked -p tuna-compositor --test pam_helper -- --exact private_pam_helper_actual_binary_conversation_and_retirement --nocapture 2>&1 | tee "$RUNNER_TEMP/private-pam-helper-proof/test.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/private-pam-helper-proof/test.log"
+          grep -Eq '^private PAM helper executable sha256: [a-f0-9]{64}$' "$RUNNER_TEMP/private-pam-helper-proof/test.log"
+        env:
+          TUNA_REQUIRE_PAM_WRAPPER: "1"
+      - name: Retain private PAM helper proof
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: private-pam-helper-proof
+          path: ${{ runner.temp }}/private-pam-helper-proof/
+          if-no-files-found: warn
+          retention-days: 14
       - name: Shortcut inhibition consent proof
         run: scripts/tuna-shortcut-proof
       # Every listed test just passed: the parity-ledger job resolves
@@ -373,11 +394,19 @@ jobs:
               sudo sed -i 's|https\?://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
             fi
           done
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libsecret-tools gnome-keyring fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libsecret-tools gnome-keyring fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk
       - run: scripts/ci-install-gtk4-layer-shell
       - run: shellcheck -x scripts/tuna-gtk-shell-proof scripts/tuna-walkthrough scripts/tuna-gtk-accessibility-proof scripts/lib/tuna-fade-match
       # docs/walkthrough.md must match its manifest (docs/walkthrough.tsv).
       - run: scripts/tuna-walkthrough check
+      - name: Prove password origin and epoch ownership in the actual nested runtime
+        run: scripts/tuna-auth-owner-ci-proof "$RUNNER_TEMP/auth-owner-proof"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: auth-owner-runtime-proof
+          path: ${{ runner.temp }}/auth-owner-proof/
+          retention-days: 14
       # Freeze source before live proofs create checkout-local artifacts.
       - name: Check native minimize freeze identity and failure handling
         run: |
