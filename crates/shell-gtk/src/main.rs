@@ -2688,6 +2688,12 @@ fn build(app: &adw::Application) {
                 }
             }
             let locked = shell.control.as_ref().is_some_and(|c| c.locked());
+            let auth_generation = shell.control.as_ref().map(|c| c.connection_generation());
+            let authoritative_lock = shell
+                .control
+                .as_ref()
+                .filter(|c| !c.needs_snapshot())
+                .map(|c| c.locked());
             render_pills(&mut shell);
             if let Some(control) = shell.control.as_ref() {
                 switcher_ui.sync(control.model());
@@ -2711,7 +2717,10 @@ fn build(app: &adw::Application) {
                 notify.release_focus();
                 release_panel_focus(&panel_focus_window, &panel_focus_held);
             }
-            lock_ui.sync(locked);
+            lock_ui.sync_connection_generation(auth_generation);
+            if let Some(locked) = authoritative_lock {
+                lock_ui.sync(locked);
+            }
             screensaver.sync(locked);
             if locked {
                 shortcut_consent.dismiss();

@@ -1243,6 +1243,83 @@ pub fn encode_frame(msg: &Message) -> Vec<u8> {
     }
 }
 
+/// Owned credential frame. Drop wipes this encoder's sole allocation; this is
+/// not a claim about caller/GTK/decoded/kernel copies or generic encode_frame.
+pub struct SensitiveFrame(Vec<u8>);
+impl SensitiveFrame {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+    fn wipe(&mut self) {
+        wipe_auth_bytes(&mut self.0);
+    }
+}
+impl Drop for SensitiveFrame {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+impl std::fmt::Debug for SensitiveFrame {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("SensitiveFrame(<redacted>)")
+    }
+}
+struct OwnedUnlock(Message);
+impl OwnedUnlock {
+    fn wipe(&mut self) {
+        if let Message::Command {
+            kind: CommandKind::Unlock { password },
+            ..
+        } = &mut self.0
+        {
+            // SAFETY: exclusively owned string bytes become valid UTF-8 NULs.
+            unsafe {
+                wipe_auth_bytes(password.0.as_mut_vec());
+            }
+        }
+    }
+}
+impl Drop for OwnedUnlock {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+fn wipe_auth_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+}
+/// Encode the unchanged Unlock wire shape with one wiped buffer, no growth
+/// scratch or copied frame. Ownership includes input on errors/early denial.
+pub fn encode_unlock_frame(id: u64, password: Secret) -> Result<SensitiveFrame, ControlError> {
+    let message = OwnedUnlock(Message::Command {
+        id,
+        kind: CommandKind::Unlock { password },
+    });
+    let Message::Command {
+        kind: CommandKind::Unlock { password },
+        ..
+    } = &message.0
+    else {
+        unreachable!()
+    };
+    if password.0.len() > MAX_FRAME_BYTES {
+        return Err(ControlError::Unexpected(
+            "authentication frame exceeds bound".into(),
+        ));
+    }
+    let cap = password.0.len().saturating_add(64).min(MAX_FRAME_BYTES);
+    let mut frame = SensitiveFrame(vec![0u8; cap + 4]);
+    let used = postcard::to_slice(&message.0, &mut frame.0[4..])
+        .map_err(|_| ControlError::Unexpected("authentication frame encoding refused".into()))?
+        .len();
+    frame.0[..4].copy_from_slice(&(used as u32).to_le_bytes());
+    frame.0.truncate(used + 4);
+    Ok(frame)
+}
+
 /// Decode one length-prefixed frame into a message.
 ///
 /// Checks run in wire order: prefix present, declared length within
@@ -2253,5 +2330,55 @@ mod tests {
         let token3 = ActivationToken::new("other".to_owned());
         assert_eq!(token1, token2);
         assert_ne!(token1, token3);
+    }
+}
+
+#[cfg(test)]
+mod sensitive_frame_tests {
+    use super::*;
+    #[test]
+    fn dedicated_unlock_encoder_is_legacy_wire_equivalent() {
+        for text in [
+            String::new(),
+            "owned-test-password".into(),
+            "語".repeat(4096),
+        ] {
+            let expected = encode_frame(&Message::Command {
+                id: u64::MAX,
+                kind: CommandKind::Unlock {
+                    password: Secret(text.clone()),
+                },
+            });
+            let frame = encode_unlock_frame(u64::MAX, Secret(text)).unwrap();
+            assert_eq!(frame.as_bytes(), expected);
+        }
+    }
+    #[test]
+    fn sensitive_frame_and_input_drop_wipe_their_owned_buffers() {
+        let mut message = OwnedUnlock(Message::Command {
+            id: 1,
+            kind: CommandKind::Unlock {
+                password: Secret("owned-test-password".into()),
+            },
+        });
+        message.wipe();
+        let Message::Command {
+            kind: CommandKind::Unlock { password },
+            ..
+        } = &message.0
+        else {
+            panic!()
+        };
+        assert!(password.0.as_bytes().iter().all(|b| *b == 0));
+        let mut frame = encode_unlock_frame(1, Secret("owned-test-password".into())).unwrap();
+        frame.wipe();
+        assert!(frame.as_bytes().iter().all(|b| *b == 0));
+        // Calls the SAME wipe method used by Drop; never inspect freed memory.
+        assert!(!format!("{frame:?}").contains("owned-test-password"));
+    }
+    #[test]
+    fn oversize_input_and_body_overhead_fail_closed_without_panic() {
+        assert!(encode_unlock_frame(1, Secret("p".repeat(MAX_FRAME_BYTES + 1))).is_err());
+        assert!(encode_unlock_frame(u64::MAX, Secret("p".repeat(MAX_FRAME_BYTES))).is_err());
     }
 }
