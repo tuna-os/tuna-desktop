@@ -59,6 +59,7 @@ pub mod cursor;
 mod cursor_svg;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub mod fprintd;
 pub mod frame_timing;
 pub mod idle_monitor;
 mod idle_schedule;

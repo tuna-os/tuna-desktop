@@ -10,6 +10,12 @@
 //! the session locked with no window content leaked anywhere.
 //!
 //! All code here is original.
+//!
+//! Fingerprint lock-state application has no synchronous helper: the live
+//! path resolves on a runtime worker thread (see #366), so only the
+//! password half is exercised at this level. The fingerprint outcome seam
+//! itself is covered by unit tests at
+//! [`attempt_fprint_unlock`](tuna_compositor::unlock::attempt_fprint_unlock).
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

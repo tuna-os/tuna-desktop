@@ -1,0 +1,187 @@
+#!/usr/bin/python3
+"""CI-only exact built fingerprint phase receipts, without live UI/hardware claims."""
+import argparse
+import ctypes
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+sys.dont_write_bytecode = True
+CHILD_TIMEOUT = 200
+ROOT = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location("contract", ROOT / "scripts/lib/fprint_phase_contract.py")
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+
+def bounded_command(argv, path, deadline, *, limit=1024*1024, env=None):
+    """Linux single-owner command retirement, including orphaned descendants.
+
+    Require one thread and no preexisting children. A temporary subreaper scope
+    owns adopted descendants. Keep the session leader unreaped until group kill
+    so its PID cannot be reused. Adopted children are killed via pidfds and reaped.
+    Cleanup has a separate five-second budget; unconfirmed retirement fails closed.
+    Subreaper ownership lasts only while this process lives, not after CLI exit.
+    Spawn/kernel I/O stalls are not hard real-time guarantees.
+    """
+    def children():
+        return [int(value) for value in Path('/proc/self/task/'+str(os.getpid())+'/children').read_text().split()]
+    if len(list(Path('/proc/self/task').iterdir()))!=1 or children():
+        raise ValueError('command supervisor requires exclusive single-thread child ownership')
+    if deadline-time.monotonic()<=0:raise TimeoutError('absolute phase deadline')
+    libc=ctypes.CDLL(None,use_errno=True)
+    prior=ctypes.c_int()
+    if libc.prctl(37,ctypes.byref(prior),0,0,0)!=0 or libc.prctl(36,1,0,0,0)!=0:
+        raise OSError('command subreaper setup failed')
+    proc=None;lingered=False;retired=False;primary=None;timed_out=False;exit_status=None
+    try:
+        with path.open('wb') as f:
+            proc=subprocess.Popen(argv,stdin=subprocess.DEVNULL,
+                                  stdout=f,stderr=subprocess.STDOUT,start_new_session=True,env=env)
+            while True:
+                # WNOWAIT preserves the owned leader PID until group retirement.
+                status=os.waitid(os.P_PID,proc.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+                if status is not None:break
+                if time.monotonic()>=deadline or f.tell()>limit:
+                    timed_out=True
+                    raise TimeoutError('phase child bound')
+                time.sleep(.02)
+            exit_status = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+            if exit_status != 0 or f.tell()>limit:
+                raise RuntimeError('phase child failed')
+    except BaseException as error:
+        primary=error
+    finally:
+        if proc is not None:
+            # The unreaped owned leader reserves the PGID even after exit.
+            # Always kill the group: a successful leader can leave writers alive.
+            try:
+                os.killpg(proc.pid,signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cleanup_deadline=time.monotonic()+5
+            while time.monotonic()<cleanup_deadline:
+                direct=children()
+                if not direct:
+                    retired=True;break
+                for pid in direct:
+                    if pid!=proc.pid:lingered=True
+                    try:
+                        fd=os.pidfd_open(pid)
+                    except ProcessLookupError:
+                        continue
+                    try:
+                        # Direct children cannot be stolen/reused without our
+                        # reaping; pidfd also binds the actual kernel process.
+                        signal.pidfd_send_signal(fd,signal.SIGKILL)
+                    finally:
+                        os.close(fd)
+                while True:
+                    try:pid,status=os.waitpid(-1,os.WNOHANG)
+                    except ChildProcessError:break
+                    if pid==0:break
+                    if pid==proc.pid:proc.returncode=os.waitstatus_to_exitcode(status)
+                time.sleep(.01)
+            if not retired and not children():retired=True
+        else:
+            retired=not children()
+        if retired:
+            if libc.prctl(36,prior.value,0,0,0)!=0:
+                raise OSError('command subreaper restore failed')
+        else:
+            # Keep ownership while this process lives; an ensuing CLI exit is not
+            # physical retirement or persistent quarantine proof.
+            primary=RuntimeError('command retirement unconfirmed; phase wrapper must abort')
+    return {'pid':proc.pid if proc is not None else None,
+            'exit':124 if timed_out else exit_status, 'owned_cleanup':retired,
+            'adopted_descendants_observed':lingered,
+            'command_error':str(primary) if primary is not None else None,
+            'ownership_method':'exclusive-single-thread-subreaper-held-leader-pidfd'}
+
+
+def verify_unchanged(admission):
+    if contract.source_tuple(ROOT) != admission["source"]:
+        raise ValueError("source changed")
+    for r in admission["files"].values():
+        if any(contract.digest(r[k]) != r["sha256"] for k in ("cargo_executable", "admitted_executable")):
+            raise ValueError("executable changed")
+
+
+def run_filter(work, admission, number, filter_name, phases):
+    verify_unchanged(admission)
+    nonce = uuid.uuid4().hex
+    home = work / f"home-{number}"
+    home.mkdir(mode=0o700)
+    for directory in ("config", "data", "cache"): (home / directory).mkdir(mode=0o700)
+    env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+               XDG_DATA_HOME=str(home / "data"), XDG_CACHE_HOME=str(home / "cache"),
+               TUNA_FPRINT_PHASE_NONCE=nonce, TUNA_FPRINT_PHASE_OWNER=nonce,
+               PYTHONDONTWRITEBYTECODE="1")
+    for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "AT_SPI_BUS_ADDRESS"):
+        env.pop(name, None)
+    path = work / f"output-{number}.txt"
+    argv = [admission["files"]["tuna_compositor"]["admitted_executable"],
+            filter_name, "--exact", "--nocapture", "--test-threads=1"]
+    lifecycle = bounded_command(argv, path, time.monotonic() + CHILD_TIMEOUT, env=env)
+    receipt = {"filter": filter_name, "nonce": nonce, "argv": argv,
+               "output_sha256": contract.digest(path), **lifecycle}
+    (work / f"child-{number}.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    verify_unchanged(admission)
+    if (receipt["exit"] != 0 or not receipt["owned_cleanup"]
+            or receipt["adopted_descendants_observed"] or receipt["command_error"] is not None):
+        raise ValueError("child failed/timed out/left descendants or retirement unproven")
+    if path.stat().st_size > 1024 * 1024: raise ValueError("phase output exceeds budget")
+    return contract.phase_vectors(path.read_text(), nonce, receipt["pid"], phases)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--artifacts", type=Path, required=True)
+    args = p.parse_args()
+    work = args.artifacts.resolve()
+    work.mkdir(parents=True, exist_ok=False)
+    ci = contract.current_identity(ROOT)
+    source = contract.source_tuple(ROOT)
+    (work / "api-admission.json").write_text(json.dumps(ci, indent=2) + "\n")
+    target = work / "target"
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target), CARGO_PROFILE_DEV_DEBUG="0", CARGO_INCREMENTAL="0")
+    messages = []
+    for i, command in enumerate((
+        ["cargo","test","--locked","-p","tuna-compositor","--lib","--no-run","--message-format=json"],
+        ["cargo","build","--locked","-p","tuna-compositor","--bin","tuna-compositor","--message-format=json"],
+    )):
+        if shutil.disk_usage(work).free < 3 * 1024**3: raise ValueError("insufficient reserved build capacity")
+        log = work / f"cargo-{i}.json"
+        with log.open("w") as out: subprocess.run(command,cwd=ROOT,env=env,stdout=out,check=True,timeout=1800)
+        if log.stat().st_size > 32 * 1024**2: raise ValueError("Cargo JSON budget exceeded")
+        messages.extend(json.loads(line) for line in log.read_text().splitlines())
+    files = contract.select_artifacts(messages, ROOT, target)
+    bins = work / "bin"
+    bins.mkdir()
+    for name, record in files.items():
+        copied = bins / name
+        shutil.copy2(record["cargo_executable"],copied)
+        record["admitted_executable"] = str(copied)
+    admission = {"ci":ci,"source":source,"files":files,
+                 "build_env":{k:env.get(k) for k in ("CARGO_TARGET_DIR","CARGO_PROFILE_DEV_DEBUG","CARGO_INCREMENTAL","RUSTFLAGS")},
+                 "scope":"test foundation only; compositor bin compiled/admitted, not executed; driver exit unobserved"}
+    (work / "build-admission.json").write_text(json.dumps(admission,indent=2)+"\n")
+    vectors = {}
+    for i, (name, phases) in enumerate((
+        ("saturated_send_parks_close_until_fd_shutdown", ("A1","A2")),
+        ("frozen_peer_leaves_attempt_output_pending_and_bounded", ("B",)),
+    )):
+        vectors.update(run_filter(work,admission,i,"fprintd::tests::"+name,phases))
+    (work / "measured-phases.json").write_text(json.dumps(vectors,indent=2)+"\n")
+    contract.positive(vectors)
+    verify_unchanged(admission)
+    (work / "qualification.json").write_text(json.dumps({"pending_output_qualified":True,"driver_exit":"unobserved","live_ui":False,"hardware":False})+"\n")
+
+
+if __name__ == "__main__":
+    main()
