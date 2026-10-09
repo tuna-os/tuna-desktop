@@ -3573,7 +3573,7 @@ impl Runtime {
         }
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
-        self.configure_input_aids(&settings.keyboard_aids);
+        self.configure_input_aids(&settings.keyboard_aids, &settings.pointer_aids);
         self.cursor
             .set_theme(&settings.cursor_theme, settings.cursor_size);
         self.cursor.set_locate_pointer(settings.locate_pointer);
@@ -4051,6 +4051,9 @@ impl Runtime {
         }
         if let Some((x, y)) = outcome.screenshot_pointer {
             self.move_screenshot_pointer(x, y);
+        }
+        if let Some(click) = outcome.dwell_click {
+            self.set_dwell_click_type(click);
         }
         if let Some(enabled) = outcome.screen_reader {
             #[cfg(feature = "drm")]

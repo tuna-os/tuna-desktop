@@ -1,18 +1,23 @@
-//! The runtime's side of GNOME's keyboard accessibility aids (#350):
-//! backend input passes through [`InputAids`] before the lock screen,
+//! The runtime's side of GNOME's accessibility input aids (#350):
+//! backend input passes through the keyboard aids ([`InputAids`]) and
+//! then the pointer aids ([`PointerAids`]) before the lock screen,
 //! keybindings or any client sees it, and what comes out is routed as if
 //! the backend had sent it.
 
 use std::time::Instant;
 
+use tuna_shell_control::Message;
+
 use crate::input_aids::{AidEffect, InputAids};
+use crate::pointer_aids::{PointerAids, PointerEffect};
 use crate::windows::ManagerInput;
 
 use super::Runtime;
 
-/// The aids' engine and the clock it runs on.
+/// The aids' engines and the clock they run on.
 pub(super) struct RuntimeAids {
     engine: InputAids,
+    pointer: PointerAids,
     epoch: Instant,
 }
 
@@ -20,6 +25,7 @@ impl Default for RuntimeAids {
     fn default() -> Self {
         Self {
             engine: InputAids::new(),
+            pointer: PointerAids::new(),
             epoch: Instant::now(),
         }
     }
@@ -33,15 +39,23 @@ impl RuntimeAids {
             .try_into()
             .unwrap_or(u64::MAX)
     }
+
+    fn active(&self) -> bool {
+        self.engine.active() || self.pointer.active()
+    }
 }
 
 impl Runtime {
     /// One event from the hardware or nested backend, filtered by the
     /// aids first. Remote-desktop input does not come this way: GNOME's
-    /// aids serve the person at the keyboard.
+    /// aids serve the person at the keyboard and pointer.
     pub(super) fn on_backend_input(&mut self, input: ManagerInput) {
-        if !self.input_aids.engine.active() {
+        if !self.input_aids.active() {
             self.on_manager_input(input);
+            return;
+        }
+        if !self.input_aids.engine.active() {
+            self.route_pointer_aids(input);
             return;
         }
         let now = self.input_aids.now_ms();
@@ -77,21 +91,39 @@ impl Runtime {
     }
 
     /// The aids' timers (Slow Keys, the Shift-hold shortcut, Mouse Keys
-    /// motion), run every tick.
+    /// motion, hover and secondary clicks), run every tick.
     pub(super) fn poll_input_aids(&mut self) {
-        if !self.input_aids.engine.active() {
+        if !self.input_aids.active() {
             return;
         }
         let now = self.input_aids.now_ms();
         let effects = self.input_aids.engine.poll(now);
         self.apply_aid_effects(effects);
+        if self.input_aids.pointer.active() {
+            let pointer = self.manager.pointer_pos();
+            let effects = self.input_aids.pointer.poll(now, pointer);
+            self.apply_pointer_effects(effects);
+        }
     }
 
-    /// GNOME's `org.gnome.desktop.a11y.keyboard`, live from the shell.
-    pub(super) fn configure_input_aids(&mut self, settings: &tuna_shell_control::KeyboardAids) {
+    /// GNOME's `org.gnome.desktop.a11y.keyboard` and `.mouse`, live from
+    /// the shell.
+    pub(super) fn configure_input_aids(
+        &mut self,
+        keyboard: &tuna_shell_control::KeyboardAids,
+        pointer: &tuna_shell_control::PointerAids,
+    ) {
         let now = self.input_aids.now_ms();
-        let effects = self.input_aids.engine.configure(settings, now);
+        let effects = self.input_aids.engine.configure(keyboard, now);
         self.apply_aid_effects(effects);
+        let effects = self.input_aids.pointer.configure(pointer, now);
+        self.apply_pointer_effects(effects);
+    }
+
+    /// The hover-click chooser picked the next dwell's click.
+    pub(super) fn set_dwell_click_type(&mut self, click: tuna_shell_control::DwellClick) {
+        let effects = self.input_aids.pointer.set_click_type(click);
+        self.apply_pointer_effects(effects);
     }
 
     /// The aids for the state file; nothing while locked.
@@ -99,7 +131,9 @@ impl Runtime {
         if self.is_locked() {
             return serde_json::Value::Null;
         }
-        self.input_aids.engine.summary()
+        let mut summary = self.input_aids.engine.summary();
+        summary["pointer"] = self.input_aids.pointer.summary();
+        summary
     }
 
     fn apply_aid_effects(&mut self, effects: Vec<AidEffect>) {
@@ -109,7 +143,7 @@ impl Runtime {
                     let before = matches!(input, ManagerInput::Key { .. })
                         .then(|| self.manager.keyboard_led_state())
                         .flatten();
-                    self.on_manager_input(input);
+                    self.route_pointer_aids(input);
                     let after = self.manager.keyboard_led_state();
                     let changed = matches!((before, after), (Some(a), Some(b)) if a != b);
                     // Smithay updates the seat XKB state synchronously before
@@ -120,7 +154,7 @@ impl Runtime {
                 AidEffect::PointerMove { dx, dy, time } => {
                     let pos = self.manager.pointer_pos();
                     let pos = self.clamp_to_outputs(pos.x + dx, pos.y + dy);
-                    self.on_manager_input(ManagerInput::Motion {
+                    self.route_pointer_aids(ManagerInput::Motion {
                         pos: pos.into(),
                         time,
                     });
@@ -129,10 +163,55 @@ impl Runtime {
                 AidEffect::Toggled { aid, enabled } => {
                     eprintln!("tuna-compositor: keyboard aid {aid:?} switched enabled={enabled}");
                     self.control
-                        .queue_message(tuna_shell_control::Message::KeyboardAidToggled {
-                            aid,
-                            enabled,
-                        });
+                        .queue_message(Message::KeyboardAidToggled { aid, enabled });
+                }
+            }
+        }
+    }
+
+    /// Pointer events pass the pointer aids on their way in.
+    fn route_pointer_aids(&mut self, input: ManagerInput) {
+        let pointer_event = matches!(
+            input,
+            ManagerInput::Motion { .. } | ManagerInput::Button { .. }
+        );
+        if !pointer_event || !self.input_aids.pointer.active() {
+            self.on_manager_input(input);
+            return;
+        }
+        let now = self.input_aids.now_ms();
+        let effects = self.input_aids.pointer.process(input, now);
+        self.apply_pointer_effects(effects);
+    }
+
+    fn apply_pointer_effects(&mut self, effects: Vec<PointerEffect>) {
+        for effect in effects {
+            match effect {
+                PointerEffect::Input(input) => self.on_manager_input(input),
+                PointerEffect::TimeoutStarted {
+                    kind,
+                    duration_ms,
+                    pos,
+                } => self.control.queue_message(Message::PointerTimeout {
+                    kind,
+                    duration_ms: Some(duration_ms),
+                    clicked: false,
+                    x: pos.x.round() as i32,
+                    y: pos.y.round() as i32,
+                }),
+                PointerEffect::TimeoutStopped { kind, clicked } => {
+                    let pos = self.manager.pointer_pos();
+                    self.control.queue_message(Message::PointerTimeout {
+                        kind,
+                        duration_ms: None,
+                        clicked,
+                        x: pos.x.round() as i32,
+                        y: pos.y.round() as i32,
+                    });
+                }
+                PointerEffect::ClickType(click) => {
+                    self.control
+                        .queue_message(Message::DwellClickType { click });
                 }
             }
         }

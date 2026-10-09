@@ -49,3 +49,12 @@ and strict trailing-byte rejection remain intact. Both booleans are required;
 postcard rejects values other than 0/1. The authenticated shell sends the full
 pair initially and whenever wellbeing state changes. The compositor owns the
 three-second entry animation and immediate exit; the cursor is excluded.
+
+## Pointer accessibility aids (0.36)
+
+`InputSettings::pointer_aids` appends GNOME 51's `org.gnome.desktop.a11y.mouse`
+(simulated secondary click, hover click and its gesture directions) after the
+0.34 keyboard aids. `CommandKind::SetDwellClickType` carries the hover-click
+chooser's pick; the compositor reports `Message::DwellClickType` and
+`Message::PointerTimeout` (the pie timer). All are appended; both peers ship
+together because the postcard body is positional.
