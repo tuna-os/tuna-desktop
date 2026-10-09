@@ -285,7 +285,11 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
     orca_observations = []
     def await_orca(enabled):
-        deadline = time.monotonic() + 20
+        # Returns on the reader's own signal: the credential-verified bus owner
+        # appearing, or the stopped child's owner vanishing. Like GNOME's
+        # autostart, the compositor no longer abandons a cold Orca after 10 s,
+        # so this bound only catches a wedged session.
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             actual = agent.run("orca-read")
             orca_observations.append(actual)
@@ -295,7 +299,6 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
                              and actual["state"] == "disabled"))):
                 return actual
             time.sleep(0.2)
-        raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca")
     def await_reaped(identity):
         # The bus name is released while the stopped instance is still
         # exiting; starting the next Orca first loses the restart name race
@@ -307,6 +310,10 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
                 return
             time.sleep(0.2)
         raise RuntimeError("stopped Orca instance did not exit before restart")
+        last = orca_observations[-1] if orca_observations else {}
+        raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca "
+                           f"(enabled={enabled}, last state={last.get('state')!r}, "
+                           f"pid={last.get('pid')}, owner={'set' if last.get('owner') else 'none'})")
     try:
         first_orca = None
         stopped_identity = None
