@@ -161,9 +161,10 @@ impl ProtocolVersion {
     /// `0.29` appends private screenshot selection pointer movement.
     /// `0.30` appends live sound/bell and attached-modal brightness preferences.
     /// `0.31` appends workspace and edge-tiling preferences.
+    /// `0.32` appends cursor theme, size and locate-pointer preferences.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 31,
+        minor: 32,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -833,6 +834,17 @@ pub struct InputSettings {
     pub attach_modal_dialogs: bool,
     #[serde(default)]
     pub workspace_policy: WorkspacePolicy,
+    /// `org.gnome.desktop.interface cursor-theme`: the Xcursor theme the
+    /// compositor draws its own and requested-shape cursors from.
+    #[serde(default)]
+    pub cursor_theme: String,
+    /// `org.gnome.desktop.interface cursor-size`, in logical pixels.
+    #[serde(default)]
+    pub cursor_size: u32,
+    /// `org.gnome.desktop.interface locate-pointer`: a lone Ctrl tap
+    /// shows ripples around the pointer.
+    #[serde(default)]
+    pub locate_pointer: bool,
 }
 
 fn default_attach_modal_dialogs() -> bool {
@@ -863,6 +875,9 @@ impl Default for InputSettings {
             bell: BellPolicy::default(),
             attach_modal_dialogs: true,
             workspace_policy: WorkspacePolicy::default(),
+            cursor_theme: "Adwaita".into(),
+            cursor_size: 24,
+            locate_pointer: false,
         }
     }
 }
@@ -1204,6 +1219,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             check_title(&settings.xkb_layout)?;
             check_title(&settings.xkb_variant)?;
             check_title(&settings.xkb_options)?;
+            check_title(&settings.cursor_theme)?;
         }
         Message::Command {
             kind: CommandKind::SetSwitcherThumbnails { thumbnails },
@@ -1367,8 +1383,39 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_31() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 31));
+    fn current_version_is_0_32() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 32));
+    }
+
+    #[test]
+    fn cursor_settings_survive_the_positional_control_wire() {
+        for (theme, size, locate_pointer) in [("Adwaita", 24, false), ("DMZ-White", 48, true)] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(InputSettings {
+                    cursor_theme: theme.into(),
+                    cursor_size: size,
+                    locate_pointer,
+                    right_to_left: true,
+                    ..InputSettings::default()
+                }),
+            });
+        }
+    }
+
+    #[test]
+    fn oversized_cursor_theme_names_are_rejected() {
+        let frame = encode_frame(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(InputSettings {
+                cursor_theme: "x".repeat(MAX_TITLE_LEN + 1),
+                ..InputSettings::default()
+            }),
+        });
+        assert!(matches!(
+            decode_frame(&frame),
+            Err(DecodeError::TitleTooLong { .. })
+        ));
     }
 
     #[test]
