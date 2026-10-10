@@ -49,13 +49,14 @@ mod shortcut_consent;
 mod sound_feedback;
 mod switcher;
 mod tray;
+mod ui_wake;
 mod wifi;
 mod window_menu;
 mod wired;
 mod ws_dots;
 mod ws_popup;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -1041,6 +1042,7 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
 }
 
 fn build(app: &adw::Application) {
+    let ui_wake = Rc::new(ui_wake::UiWake::default());
     accessibility::start_focus_policy();
     let provider = gtk::CssProvider::new();
     // Shell CSS has GNOME's baseline face/size, but follows the user's font live.
@@ -1360,7 +1362,7 @@ fn build(app: &adw::Application) {
                 .collect()
         }
     };
-    let apps = live_apps::LiveApps::new();
+    let apps = live_apps::LiveApps::new(ui_wake.clone());
     let dash_apps = favorites.clone();
     let overview_ui = overview::OverviewUi::new(
         app.upcast_ref(),
@@ -1368,7 +1370,7 @@ fn build(app: &adw::Application) {
         favorites,
         Rc::new(ShellActions(shell.clone())),
     );
-    let switcher_ui = switcher::SwitcherUi::new(app.upcast_ref(), apps.clone());
+    let switcher_ui = switcher::SwitcherUi::new(app.upcast_ref(), apps.clone(), ui_wake.clone());
     // Keep both switcher policies live, including while a popup is open.
     {
         let app_settings = settings("org.gnome.shell.app-switcher");
@@ -1377,6 +1379,7 @@ fn build(app: &adw::Application) {
             let shell = shell.clone();
             let app_settings = app_settings.clone();
             let window_settings = window_settings.clone();
+            let ui_wake = ui_wake.clone();
             Rc::new(move || {
                 let defaults = tuna_shell_host::model::SwitcherWorkspacePolicy::default();
                 let read = |settings: &Option<gio::Settings>, fallback| {
@@ -1404,6 +1407,7 @@ fn build(app: &adw::Application) {
                         },
                     );
                 }
+                ui_wake.request();
             })
         };
         apply();
@@ -2212,7 +2216,16 @@ fn build(app: &adw::Application) {
         let shell_rc = shell.clone();
         let activities_button = activities.clone();
         let last_frames: RefCell<Vec<tuna_shell_control::SwitcherThumbnail>> = RefCell::default();
-        glib::timeout_add_local(Duration::from_millis(16), move || {
+        let last_locked = Cell::new(
+            shell
+                .borrow()
+                .control
+                .as_ref()
+                .is_some_and(|control| control.locked()),
+        );
+        let dispatcher = Rc::downgrade(&ui_wake);
+        ui_wake.install(move || {
+            let Some(wake) = dispatcher.upgrade() else { return };
             let mut shell = shell.borrow_mut();
             let mut results = Vec::new();
             let mut accelerators = Vec::new();
@@ -2220,7 +2233,14 @@ fn build(app: &adw::Application) {
             let mut consent = None;
             let mut popups = Vec::new();
             if let Some(control) = shell.control.as_mut() {
-                loop {
+                // OUT wakes flush the accepted queue before polling inbound
+                // messages; WouldBlock is retained for the next OUT readiness.
+                if let Err(error) = control.flush_pending() {
+                    if !is_would_block(&error) {
+                        eprintln!("tuna-shell-gtk: control write error: {error}");
+                    }
+                }
+                for index in 0..128 {
                     match control.poll() {
                         Ok(Handled::Gap { .. }) => {
                             let _ = control.request_snapshot();
@@ -2250,16 +2270,24 @@ fn build(app: &adw::Application) {
                         Err(e) if is_would_block(&e) => break,
                         Err(e) => {
                             eprintln!("tuna-shell-gtk: control error: {e}");
+                            shell.control = None;
                             break;
                         }
                     }
+                    if index == 127 {
+                        // read_frame can already hold more complete frames even
+                        // when the kernel socket is no longer readable.
+                        wake.request();
+                    }
                 }
             }
-            let locked = shell.control.as_ref().is_some_and(|c| c.locked());
+            let locked = shell.control.as_ref().map(|c| c.locked()).unwrap_or_else(|| last_locked.get());
+            last_locked.set(locked);
             render_pills(&mut shell);
             if let Some(control) = shell.control.as_ref() {
                 switcher_ui.sync(control.model());
             }
+            wake.at(shell.control.as_ref().and_then(|_| switcher_ui.popup_deadline()));
             // The switcher's window thumbnails: the compositor draws the
             // windows into the frames, sent whenever they move.
             let frames = switcher_ui.thumbnail_frames();
@@ -2348,10 +2376,77 @@ fn build(app: &adw::Application) {
                 };
                 chrome.update(previews, hovered, &lookup);
             }
-            glib::ControlFlow::Continue
         });
     }
 
+    // The duplicated descriptor is owned by GSocket for the source's entire
+    // lifetime. Retire after the last drain on EOF/error, before descriptor
+    // reuse could turn this into a watch on an unrelated connection.
+    use std::os::fd::AsFd;
+    let socket = shell.borrow().control.as_ref().map(|control| {
+        gio::Socket::from_fd(
+            control
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("duplicate control fd"),
+        )
+        .expect("watch control socket")
+    });
+    if let Some(socket) = socket {
+        // Only register OUT while an accepted frame is pending. A permanently
+        // writable source would replace the old timer with a busy loop.
+        let output_active = Rc::new(Cell::new(false));
+        let output_socket = socket.clone();
+        let output_wake = Rc::downgrade(&ui_wake);
+        let output_shell = Rc::downgrade(&shell);
+        if let Some(control) = shell.borrow_mut().control.as_mut() {
+            control.set_write_waker(move || {
+                if output_active.replace(true) {
+                    return;
+                }
+                let active = output_active.clone();
+                let weak_wake = output_wake.clone();
+                let weak_shell = output_shell.clone();
+                ui_wake::watch_socket_conditions(
+                    &output_socket,
+                    glib::IOCondition::OUT | glib::IOCondition::HUP | glib::IOCondition::ERR,
+                    move |condition| {
+                        let keep = if let (Some(wake), Some(shell)) =
+                            (weak_wake.upgrade(), weak_shell.upgrade())
+                        {
+                            wake.dispatch();
+                            if condition.contains(glib::IOCondition::ERR) {
+                                shell.borrow_mut().control = None;
+                            }
+                            let pending = shell
+                                .borrow()
+                                .control
+                                .as_ref()
+                                .is_some_and(|control| control.has_pending_write());
+                            pending
+                        } else {
+                            false
+                        };
+                        if !keep {
+                            active.set(false);
+                        }
+                        keep
+                    },
+                );
+            });
+        }
+        let wake = ui_wake.clone();
+        let shell = shell.clone();
+        ui_wake::watch_socket(&socket, move |condition| {
+            wake.dispatch();
+            // ERR is terminal even if a nonblocking read returned WouldBlock.
+            // HUP drains all complete buffered frames before read_frame sees EOF.
+            if condition.contains(glib::IOCondition::ERR) {
+                shell.borrow_mut().control = None;
+            }
+            shell.borrow().control.is_some()
+        });
+    }
     window.present();
 }
 

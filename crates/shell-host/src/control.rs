@@ -9,8 +9,9 @@
 //!
 //! Transport behavior mirrors the server side: the stream is put in
 //! nonblocking mode at construction and `WouldBlock` is always surfaced
-//! to the caller (as [`ControlError::Io`]), never hidden behind a retry
-//! loop, so the panel event loop stays responsive.
+//! to inbound callers (as [`ControlError::Io`]), never hidden behind a retry
+//! loop. Outbound frames are accepted into a bounded queue, preserving partial
+//! write offsets; an on-demand writable source flushes them without idle polls.
 //!
 //! Resnapshot rule (ADR 0002): the protocol has no dedicated
 //! snapshot-request opcode, so re-sending `Hello` via
@@ -30,6 +31,7 @@
 //! wiring, not transport.
 
 use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 
 use tuna_shell_control::{
@@ -153,6 +155,9 @@ pub enum Handled {
 pub struct ControlClient {
     stream: UnixStream,
     read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+    write_offset: usize,
+    write_waker: Option<Box<dyn Fn()>>,
     model: ShellModel,
     revision: Option<u64>,
     needs_snapshot: bool,
@@ -175,6 +180,12 @@ pub struct ControlClient {
     overview_previews: (Vec<tuna_shell_control::PreviewInfo>, Option<u64>),
 }
 
+impl AsFd for ControlClient {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
 impl ControlClient {
     /// Connect to the compositor's control socket and wrap the stream.
     /// Sends nothing: call [`hello`](Self::hello) first, then await the
@@ -192,6 +203,9 @@ impl ControlClient {
         Ok(Self {
             stream,
             read_buf: Vec::new(),
+            write_buf: Vec::new(),
+            write_offset: 0,
+            write_waker: None,
             model: ShellModel::new(),
             revision: None,
             needs_snapshot: true,
@@ -610,6 +624,12 @@ impl ControlClient {
     /// Read one frame and apply it, surfacing `WouldBlock` when no
     /// complete frame is available yet.
     pub fn poll(&mut self) -> Result<Handled, ControlError> {
+        // Legacy callers that use polling can still make queued-output
+        // progress; readiness-driven callers also flush on their OUT source.
+        match self.flush_pending() {
+            Err(ControlError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+            result => result?,
+        }
         let msg = self.read_frame()?;
         self.handle_message(msg)
     }
@@ -805,11 +825,62 @@ impl ControlClient {
         }
     }
 
-    /// Encode and write one frame. `WouldBlock` propagates to the caller.
+    /// Install the event loop's on-demand writable-source registration.
+    /// The callback runs synchronously and must not reborrow this client.
+    pub fn set_write_waker(&mut self, wake: impl Fn() + 'static) {
+        self.write_waker = Some(Box::new(wake));
+        if self.has_pending_write() {
+            self.write_waker.as_ref().unwrap()();
+        }
+    }
+
+    pub fn has_pending_write(&self) -> bool {
+        self.write_offset < self.write_buf.len()
+    }
+
+    /// Flush accepted frames, preserving the exact offset on backpressure.
+    /// Unlike write_all, a partial nonblocking write must never be retried
+    /// from the frame prefix. The event loop calls this on writable readiness.
+    pub fn flush_pending(&mut self) -> Result<(), ControlError> {
+        while self.has_pending_write() {
+            match self.stream.write(&self.write_buf[self.write_offset..]) {
+                Ok(0) => {
+                    return Err(
+                        io::Error::new(io::ErrorKind::WriteZero, "control write closed").into(),
+                    )
+                }
+                Ok(count) => self.write_offset += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.write_buf.clear();
+        self.write_offset = 0;
+        Ok(())
+    }
+
+    /// Accept a complete frame into a bounded output queue. A full queue
+    /// returns WouldBlock before accepting any bytes of the new frame.
+    /// Already accepted frames retain their order and exact partial offsets.
     fn write_message(&mut self, msg: &Message) -> Result<(), ControlError> {
         let frame = tuna_shell_control::encode_frame(msg);
-        self.stream.write_all(&frame)?;
-        Ok(())
+        if self.write_offset != 0 {
+            self.write_buf.drain(..self.write_offset);
+            self.write_offset = 0;
+        }
+        if frame.len().saturating_add(self.write_buf.len()) > MAX_FRAME_BYTES + 4 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
+        }
+        self.write_buf.extend_from_slice(&frame);
+        match self.flush_pending() {
+            Err(ControlError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(wake) = self.write_waker.as_ref() {
+                    wake();
+                }
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     /// Read one complete frame, buffering partial reads. Returns
@@ -990,6 +1061,82 @@ mod tests {
         let (ours, peer) = UnixStream::pair().expect("socketpair");
         let client = ControlClient::new(ours).expect("nonblocking client");
         (client, peer)
+    }
+
+    #[test]
+    fn backpressure_retains_exact_partial_frame_and_rejects_queue_overflow_atomically() {
+        let (mut client, mut peer) = pair();
+        peer.set_nonblocking(true).unwrap();
+        rustix::net::sockopt::set_socket_send_buffer_size(&client, 4096).unwrap();
+        let wakes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let pending = wakes.clone();
+        client.set_write_waker(move || pending.set(pending.get() + 1));
+        let message = Message::Environment {
+            vars: vec![("LARGE".into(), "x".repeat(900_000))],
+        };
+        let expected = encode_frame(&message);
+        client.write_message(&message).unwrap();
+        assert!(client.has_pending_write());
+        assert!(
+            client.write_offset > 0,
+            "exercise an actual partial socket write"
+        );
+        assert_eq!(wakes.get(), 1);
+        assert!(
+            matches!(client.write_message(&message), Err(ControlError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        let mut received = Vec::new();
+        for _ in 0..1000 {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match peer.read(&mut chunk) {
+                    Ok(count) if count > 0 => received.extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    result => panic!("unexpected peer read: {result:?}"),
+                }
+            }
+            match client.flush_pending() {
+                Ok(()) => {}
+                Err(ControlError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => panic!("unexpected pending flush: {result:?}"),
+            }
+            if received.len() == expected.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            received, expected,
+            "no duplicated prefix, omitted bytes, or overflow frame"
+        );
+        assert!(!client.has_pending_write());
+        let next = Message::Hello {
+            version: CURRENT_VERSION,
+        };
+        client.write_message(&next).unwrap();
+        assert_eq!(server_read(&mut peer), next);
+    }
+
+    #[test]
+    fn bounded_drains_continue_through_prefetched_frames_without_kernel_readiness() {
+        let (mut client, mut peer) = pair();
+        let frame = encode_frame(&Message::Hello {
+            version: CURRENT_VERSION,
+        });
+        peer.write_all(&frame.repeat(300)).unwrap();
+        for _ in 0..128 {
+            assert_eq!(client.poll().unwrap(), Handled::Hello);
+        }
+        // read_frame has already prefetched all bytes: readiness alone cannot
+        // tell the UI loop to continue a bounded drain.
+        assert!(!client.read_buf.is_empty());
+        for _ in 128..300 {
+            assert_eq!(client.poll().unwrap(), Handled::Hello);
+        }
+        assert!(
+            matches!(client.poll(), Err(ControlError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        drop(peer);
+        assert!(matches!(client.poll(), Err(ControlError::Unexpected(_))));
     }
 
     /// Blocking one-frame read for the in-test fake server.

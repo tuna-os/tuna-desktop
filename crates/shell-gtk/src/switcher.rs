@@ -41,6 +41,17 @@ struct Thumbs {
 /// GNOME pops the thumbnails up this long after an app with several
 /// windows is selected (`THUMBNAIL_POPUP_TIME`).
 const THUMBNAIL_POPUP: Duration = Duration::from_millis(500);
+
+fn thumbnail_popup_deadline(
+    since: Option<Instant>,
+    windows: usize,
+    focused: bool,
+    now: Instant,
+) -> Option<Instant> {
+    since
+        .map(|since| since + THUMBNAIL_POPUP)
+        .filter(|deadline| windows > 1 && !focused && *deadline > now)
+}
 /// A thumbnail frame's width and largest height (`THUMBNAIL_DEFAULT_SIZE`).
 const THUMBNAIL_SIZE: i32 = 256;
 /// Between the app list and the thumbnails (`.switcher-popup` spacing).
@@ -228,12 +239,17 @@ pub struct SwitcherUi {
     window_frames: RefCell<Vec<(u64, gtk::Box)>>,
     /// When the selected app was selected (for the popup delay).
     selected_since: Cell<Option<(u64, Instant)>>,
+    popup_deadline: Cell<Option<Instant>>,
     /// The tiles by representative window, to place the thumbnails.
     tiles: RefCell<Vec<(u64, gtk::Box)>>,
 }
 
 impl SwitcherUi {
-    pub fn new(app: &gtk::Application, apps: Rc<LiveApps>) -> Rc<Self> {
+    pub fn new(
+        app: &gtk::Application,
+        apps: Rc<LiveApps>,
+        wake: Rc<crate::ui_wake::UiWake>,
+    ) -> Rc<Self> {
         let window = gtk::ApplicationWindow::new(app);
         window.add_css_class("tuna-switcher");
         window.init_layer_shell();
@@ -276,6 +292,22 @@ impl SwitcherUi {
         thumbs_scroller.set_child(Some(&thumbs_row));
         thumbs_list.append(&thumbs_scroller);
         thumbs_window.set_child(Some(&thumbs_list));
+        // Observe actual GTK paint completion without requesting frames.
+        // Geometry is read by a coalesced idle after allocation/paint, rather
+        // than guessed from the model or sampled on a permanent tick source.
+        for window in [&window, &thumbs_window] {
+            let wake = wake.clone();
+            window.connect_realize(move |window| {
+                if let Some(clock) = window.frame_clock() {
+                    let wake = wake.clone();
+                    clock.connect_after_paint(move |_| wake.request());
+                }
+            });
+        }
+        let geometry_wake = wake.clone();
+        thumbs_scroller
+            .hadjustment()
+            .connect_value_changed(move |_| geometry_wake.request());
         Rc::new(Self {
             window,
             row,
@@ -294,6 +326,7 @@ impl SwitcherUi {
             frames: Default::default(),
             window_frames: Default::default(),
             selected_since: Cell::new(None),
+            popup_deadline: Cell::new(None),
             tiles: Default::default(),
         })
     }
@@ -348,14 +381,19 @@ impl SwitcherUi {
         self.sync_thumbnails(model, &now);
     }
 
+    pub fn popup_deadline(&self) -> Option<Instant> {
+        self.popup_deadline.get()
+    }
+
     /// GNOME's thumbnails: shown while they hold the focus, or once an
     /// app with several windows has been selected for half a second.
     fn sync_thumbnails(&self, model: &ShellModel, now: &Shown) {
+        let selected_at = Instant::now();
         let app = now.selected;
         let since = match (self.selected_since.get(), app) {
             (Some((id, t)), Some(a)) if id == a => Some(t),
             (_, Some(a)) => {
-                let t = Instant::now();
+                let t = selected_at;
                 self.selected_since.set(Some((a, t)));
                 Some(t)
             }
@@ -378,7 +416,14 @@ impl SwitcherUi {
             })
             .unwrap_or_default();
         let focused = model.switcher_window();
-        let popped = windows.len() > 1 && since.is_some_and(|t| t.elapsed() >= THUMBNAIL_POPUP);
+        let popped = windows.len() > 1
+            && since.is_some_and(|t| selected_at.saturating_duration_since(t) >= THUMBNAIL_POPUP);
+        self.popup_deadline.set(thumbnail_popup_deadline(
+            since,
+            windows.len(),
+            focused.is_some(),
+            selected_at,
+        ));
         let wanted = if focused.is_some() || popped {
             Thumbs { windows, focused }
         } else {
@@ -864,5 +909,51 @@ mod tests {
         assert_eq!(scroll_ms(off), 0.0);
         // GNOME_SHELL_SLOWDOWN_FACTOR stretches them.
         assert_eq!(fade_ms(MotionPolicy::new(MotionLevel::Full, 2.0)), 200.0);
+    }
+}
+
+#[cfg(test)]
+mod popup_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn popup_waits_half_a_second_and_cancels_on_close_focus_or_single_window() {
+        let selected = Instant::now();
+        assert_eq!(
+            thumbnail_popup_deadline(Some(selected), 2, false, selected),
+            Some(selected + Duration::from_millis(500))
+        );
+        assert_eq!(
+            thumbnail_popup_deadline(
+                Some(selected),
+                2,
+                false,
+                selected + Duration::from_millis(499)
+            ),
+            Some(selected + Duration::from_millis(500))
+        );
+        assert_eq!(
+            thumbnail_popup_deadline(
+                Some(selected),
+                2,
+                false,
+                selected + Duration::from_millis(500)
+            ),
+            None
+        );
+        assert_eq!(thumbnail_popup_deadline(None, 2, false, selected), None);
+        assert_eq!(
+            thumbnail_popup_deadline(Some(selected), 1, false, selected),
+            None
+        );
+        assert_eq!(
+            thumbnail_popup_deadline(Some(selected), 2, true, selected),
+            None
+        );
+        let next_selection = selected + Duration::from_millis(300);
+        assert_eq!(
+            thumbnail_popup_deadline(Some(next_selection), 2, false, next_selection),
+            Some(selected + Duration::from_millis(800))
+        );
     }
 }

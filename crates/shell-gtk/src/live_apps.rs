@@ -17,16 +17,24 @@ pub struct LiveApps {
 }
 
 impl LiveApps {
-    pub fn new() -> Rc<Self> {
+    pub fn new(wake: Rc<crate::ui_wake::UiWake>) -> Rc<Self> {
+        Self::with_dirs(default_app_dirs(), wake)
+    }
+
+    fn with_dirs(dirs: Vec<std::path::PathBuf>, wake: Rc<crate::ui_wake::UiWake>) -> Rc<Self> {
         let stale = Rc::new(Cell::new(false));
-        let monitors = default_app_dirs()
+        let monitors = dirs
             .into_iter()
             .filter_map(|dir| {
                 let monitor = gio::File::for_path(&dir)
                     .monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>)
                     .ok()?;
                 let stale = stale.clone();
-                monitor.connect_changed(move |_, _, _, _| stale.set(true));
+                let wake = wake.clone();
+                monitor.connect_changed(move |_, _, _, _| {
+                    stale.set(true);
+                    wake.request();
+                });
                 Some(monitor)
             })
             .collect();
@@ -46,5 +54,48 @@ impl LiveApps {
             }
         }
         self.inner.borrow()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn native_directory_monitor_invalidates_cache_and_wakes_without_a_poll_timer() {
+        let context = glib::MainContext::default();
+        let _owner = context.acquire().unwrap();
+        let wake = Rc::new(crate::ui_wake::UiWake::default());
+        let changes = Rc::new(Cell::new(0));
+        let changed = changes.clone();
+        wake.install(move || changed.set(changed.get() + 1));
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(changes.get(), 1);
+        let directory = tempfile::tempdir().unwrap();
+        let apps = LiveApps::with_dirs(vec![directory.path().to_owned()], wake);
+        assert_eq!(apps._monitors.len(), 1);
+        assert!(!apps.stale.get());
+        std::fs::write(
+            directory.path().join("new-app.desktop"),
+            "[Desktop Entry]\nName=Test\n",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while changes.get() == 1 && Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            changes.get() > 1,
+            "real file notification must schedule UI work"
+        );
+        assert!(apps.stale.get());
+        drop(apps.get());
+        assert!(!apps.stale.get(), "next cache read refreshes it");
     }
 }
