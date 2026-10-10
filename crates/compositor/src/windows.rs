@@ -756,9 +756,22 @@ impl WindowManager {
         if self.workspace_slide.running() {
             return self.sliding_entries();
         }
-        self.visible_entries()
-            .into_iter()
-            .map(|(id, window, geometry)| (id, window, self.shifted(id, geometry)))
+        let visible: HashSet<_> = self.visible_entries().into_iter().map(|e| e.0).collect();
+        let active = self.model.active_workspace();
+        self.stacking
+            .iter()
+            .copied()
+            .filter_map(|id| {
+                let w = self.windows.get(&id)?;
+                let animating = self.window_lifecycle.is_minimizing(id)
+                    && (w.sticky
+                        || self
+                            .model
+                            .window(id)
+                            .is_some_and(|entry| entry.workspace == active));
+                (visible.contains(&id) || animating)
+                    .then(|| (id, w.surface.clone(), self.shifted(id, w.geometry)))
+            })
             .collect()
     }
 

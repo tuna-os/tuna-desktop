@@ -42,9 +42,9 @@ pub fn frame(effect: Effect, progress: f64, policy: MotionPolicy, monitor_sized:
             0.0
         },
         alpha: match effect {
-            Effect::Minimize => (1.0 - ease) as f32,
+            Effect::Minimize => ((255.0 * (1.0 - ease)) as u8) as f32 / 255.0,
             Effect::Unminimize if motion => 1.0,
-            Effect::Unminimize => ease as f32,
+            Effect::Unminimize => ((255.0 * ease) as u8) as f32 / 255.0,
         },
     }
 }
@@ -152,13 +152,25 @@ mod tests {
         );
         let f = frame(Effect::Minimize, 0.5, p, false);
         assert_eq!(f.icon_weight, 0.96875);
-        assert_eq!(f.alpha, 0.03125);
+        assert_eq!(f.alpha, 7.0 / 255.0);
         assert_eq!(
             frame(Effect::Minimize, 1.0, p, false),
             Frame {
                 icon_weight: 1.0,
                 alpha: 0.0
             }
+        );
+    }
+    #[test]
+    fn clutter_guint_opacity_truncates_quarter_expo_samples() {
+        let policy = MotionPolicy::default();
+        assert_eq!(
+            frame(Effect::Minimize, 0.25, policy, false).alpha,
+            45.0 / 255.0
+        );
+        assert_eq!(
+            frame(Effect::Unminimize, 0.25, policy, true).alpha,
+            209.0 / 255.0
         );
     }
     #[test]
@@ -197,14 +209,14 @@ mod tests {
                 frame(Effect::Minimize, 0.5, p, monitor),
                 Frame {
                     icon_weight: 0.0,
-                    alpha: 0.03125
+                    alpha: 7.0 / 255.0
                 }
             );
             assert_eq!(
                 frame(Effect::Unminimize, 0.5, p, monitor),
                 Frame {
                     icon_weight: 0.0,
-                    alpha: 0.96875
+                    alpha: 247.0 / 255.0
                 }
             );
         }

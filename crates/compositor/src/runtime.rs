@@ -4891,6 +4891,25 @@ fn scene_elements(
             if split_from.is_none() && split.is_some_and(|s| *s == *surface) {
                 split_from = Some(elements.len());
             }
+            let buffer_size =
+                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+            let buffer_geometry = Rectangle::new(
+                crate::popup::surface_origin(&surface, geometry.loc),
+                buffer_size,
+            );
+            if let Some((r, fade)) = manager
+                .window_lifecycle()
+                .minimizing_frame(id, buffer_geometry.to_f64())
+            {
+                let scale = (
+                    r.size.w / f64::from(buffer_size.w),
+                    r.size.h / f64::from(buffer_size.h),
+                );
+                let origin = view.physical(r.loc.x, r.loc.y);
+                elements.extend(render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(renderer, &surface, origin, view.scale, fade, Kind::Unspecified).into_iter().map(|e| smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e, origin, scale)));
+                owners.resize(elements.len(), Some(id));
+                continue;
+            }
             if let Some((mut frame, snapshot)) = manager.size_changes().frame(id) {
                 // A workspace switch carries the transition along with its
                 // window: the live frame and the snapshot above it.
