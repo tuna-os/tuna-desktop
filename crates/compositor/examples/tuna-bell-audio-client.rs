@@ -25,7 +25,10 @@ fn main() {
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(2) {
         bell.tick(std::time::Instant::now());
-        assert_eq!(bell.player_pid().is_some(), bell.player_deadline().is_some());
+        assert_eq!(
+            bell.player_pid().is_some(),
+            bell.player_deadline().is_some()
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(bell.rings, 1);
