@@ -5,7 +5,9 @@ preferences. Disabling overamplification queues a backend clamp, including
 when volume was amplified before the shell started. Backend writes are
 serialized; the slider updates mute state and reads the backend back before
 feedback. Quiet keys, unchanged/muted output, disabled event sounds, and an
-unknown or Running default sink suppress feedback.
+unknown default sink suppress feedback. A Running default sink suppresses
+feedback unless the shell's current feedback player actually has a Running
+output stream actively linked to that sink.
 
 The compositor consumes live audible/visual bell policy through the shell
 control protocol. Bell audio stays silent before the first trusted policy.
@@ -90,9 +92,52 @@ main returns for volume and system-bell events. That probe modifies the
 diagnostic process environment and provides lifecycle evidence; it is not a
 performance measurement or proof that previous silent attempts succeeded.
 
-The passive recorder defaults to 100 ms latency. An isolated experiment with
-an explicit 256-sample latency captured the cold volume event, but the effect
-on repeatability and all suppression cases still requires verification.
+The passive recorder defaults to 100 ms latency. An explicit 256-sample
+experiment captured cold volume events, but a subsequent playing case failed
+the unchanged sine-continuity assertion. Offline analysis of that capture
+found a phase discontinuity exactly matching 256 missing samples at 48 kHz.
+The analysis is retained in `/tmp/tuna-v1-playing-phase-analysis.json`; it
+does not turn that failed run into a pass.
+
+A scratch diagnostic using 1024 samples passed all nine cases on both the
+original bundle (`/tmp/tuna-v1-sound-buffer1024-1`) and the new feedback bundle
+(`/tmp/tuna-v1-sound-feedback-b02-buffer1024-1`). The new run's playing
+residual was 3.573564211029281, below the unchanged limit of 5, and cleanup
+passed. This is limited diagnostic evidence, not established repeatability
+or a recorder latency measurement.
+
+## Owned feedback build
+
+Clean source `b02bc9f0c2c23c81731831e7c3704f4c68a1d510` completed a fresh
+workspace-package build under the shared guard. Schema tests passed 52 unit
+and 29 integration tests; compositor tests passed 351 with one ignored;
+host tests passed 327; GTK tests passed 126 with two ignored. Strict
+all-target Clippy and the union build of three desktop binaries and three
+native examples passed. All seven frozen executable hashes were checked
+against `/tmp/tuna-v1-feedback-replacement-binaries-b02bc9f0/manifest.json`.
+
+The new bundle passed the nine-case delivered diagnostic above. A separate
+replacement check sends a second real volume key only after observing the
+first owned player's Running stream and active sink link, then requires a
+different feedback PID. Its first attempt failed in the fixture's parser:
+`pw-dump` returned consecutive event arrays during stream creation, and
+`json.loads` rejected the extra array. The failed receipt and successful
+cleanup are retained at `/tmp/tuna-v1-sound-feedback-b02-replacement-1`.
+The corrected scratch parser folds complete arrays and still rejects
+malformed JSON; the replacement behavior remains unqualified until that
+runtime check succeeds.
+
+The second replacement attempt lost the shipped 67 ms player before the
+fixture's process inspection. The third used an explicitly selected custom
+two-second sound theme so the original player could be inspected while its
+stream was Running. Its replacement case observed a new player and volume
+0.52, but the complete ten-case run failed later on playing continuity:
+residual 8.641056208623368 exceeded 5 even at 1024 samples. The receipt at
+`/tmp/tuna-v1-sound-feedback-b02-replacement-3` retains that failure and
+successful cleanup. Consequently neither recorder buffer size is qualified
+as repeatable, and this run is not an aggregate audio pass. A separate
+three-second-theme overlap diagnostic is being checked against the old
+bundle to distinguish the policy change from natural playback completion.
 
 ## Open qualification and behavior gaps
 
@@ -104,8 +149,8 @@ must have a Running output stream linked actively to the current default
 sink. Unknown state and unrelated playback remain suppressive. This follows
 [GNOME 51's media-key feedback policy](https://github.com/GNOME/gnome-settings-daemon/blob/51.0/plugins/media-keys/gsd-media-keys-manager.c),
 which checks its own event playback before treating sink Running as external
-playback. The candidate requires fresh Cargo and repeated native key proofs;
-the existing frozen bundle predates it.
+playback. The fresh build and first nine-case delivered proof passed;
+replacement and repeated native key proofs remain open.
 Slider feedback uses the shared debounce rather than GNOME's drag-end
 specific behavior. These gaps prevent a full sound parity claim. No audio
 receipt establishes a performance win over GNOME.

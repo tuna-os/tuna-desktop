@@ -45,5 +45,28 @@ class FrozenSoundIdentityTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.validate(delivered=True)
 
+class PipeWireGraphTests(unittest.TestCase):
+    def test_consecutive_arrays_replace_complete_node_state(self):
+        events = '[{"id": 7, "info": {"state": "idle"}}]\n[{"id": 7, "info": {"state": "running"}}]'
+        self.assertEqual(proof.pipewire_graph(events), [{'id': 7, 'info': {'state': 'running'}}])
+
+    def test_removal_and_unrelated_nodes(self):
+        events = '[{"id": 7}, {"id": 8}] [{"id": 7, "info": null}]'
+        self.assertEqual(proof.pipewire_graph(events), [{'id': 8}])
+
+    def test_whitespace_and_empty_batches(self):
+        self.assertEqual(proof.pipewire_graph(' \n[]\n[] '), [])
+
+    def test_malformed_or_incomplete_json_rejected(self):
+        for events in ('[] broken', '[{"id": 7}', '[{"id": 7}] ['):
+            with self.subTest(events=events), self.assertRaises(json.JSONDecodeError):
+                proof.pipewire_graph(events)
+
+    def test_invalid_batch_and_identity_rejected(self):
+        for events in ('{}', '[null]', '[{"id": true}]', '[{"id": "7"}]'):
+            with self.subTest(events=events), self.assertRaises(AssertionError):
+                proof.pipewire_graph(events)
+
+
 if __name__ == '__main__':
     unittest.main()

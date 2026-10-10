@@ -121,6 +121,27 @@ def validate_identity(identity_path, revision, volume_client, bell_client, deliv
     return identity, binaries
 
 
+def pipewire_graph(text):
+    """Fold consecutive complete pw-dump arrays; reject malformed input."""
+    decoder = json.JSONDecoder()
+    objects = {}
+    offset = 0
+    while offset < len(text):
+        while offset < len(text) and text[offset].isspace():
+            offset += 1
+        if offset == len(text):
+            break
+        batch, offset = decoder.raw_decode(text, offset)
+        assert isinstance(batch, list), 'PipeWire event must be an array'
+        for item in batch:
+            assert isinstance(item, dict) and type(item.get('id')) is int
+            if 'info' in item and item['info'] is None:
+                objects.pop(item['id'], None)
+            else:
+                objects[item['id']] = item
+    return list(objects.values())
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--volume-client', type=Path, required=True)
@@ -238,7 +259,7 @@ def main():
         wait_until(lambda: (run(['pactl', 'set-default-sink', 'tuna-sound-proof'], env),
                             run(['pactl', 'get-default-sink'], env) == 'tuna-sound-proof')[1])
         wait_until(lambda: 'tuna-sound-proof' in run(['wpctl', 'inspect', '@DEFAULT_AUDIO_SINK@'], env))
-        graph = json.loads(run(['pw-dump'], env))
+        graph = pipewire_graph(run(['pw-dump'], env))
         assert not any(o.get('info', {}).get('props', {}).get('device.api') in ('alsa', 'bluez5')
                        for o in graph), 'hardware monitor escaped isolation'
         (artifacts / 'initial-graph.json').write_text(json.dumps(graph, indent=2))
@@ -330,23 +351,23 @@ def main():
             time.sleep(.5)
             wait_until(lambda: any(o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof'
                                   and o['info'].get('state') in ('idle', 'suspended')
-                                  for o in json.loads(run(['pw-dump'], env))))
+                                  for o in pipewire_graph(run(['pw-dump'], env))))
             player = None
             if case == 'playing':
                 player = spawn(['pw-play', '--target', 'tuna-sound-proof', str(tone)], 'playing-tone')
                 wait_until(lambda: any(o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof'
                                       and o['info'].get('state') == 'running'
-                                      for o in json.loads(run(['pw-dump'], env))))
+                                      for o in pipewire_graph(run(['pw-dump'], env))))
             audio = artifacts / (case + '.wav')
             recorder = spawn(['pw-record', '--target', 'tuna-sound-proof', '--rate', '48000', '--channels', '2',
                               '--format', 's16', '--latency', '256', '-P', 'stream.capture.sink=true node.passive=true node.name=tuna-sound-proof-recorder', str(audio)], case + '-record')
             def recorder_linked():
-                graph = json.loads(run(['pw-dump'], env))
+                graph = pipewire_graph(run(['pw-dump'], env))
                 nodes = {o['id'] for o in graph if o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof-recorder'}
                 return any(o.get('info', {}).get('input-node-id') in nodes for o in graph)
             wait_until(recorder_linked)
             time.sleep(.2)
-            graph_before = json.loads(run(['pw-dump'], env))
+            graph_before = pipewire_graph(run(['pw-dump'], env))
             sink_before = [o for o in graph_before if o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof']
             report['active_case'] = {'name': case, 'sink_before_command': sink_before,
                                      'command_started_monotonic': time.monotonic()}
