@@ -187,6 +187,25 @@ class OrcaReadFailure(unittest.TestCase):
                     actor.run("orca-read")
 
 
+class OrcaObservationRetry(unittest.TestCase):
+    def test_transient_guest_read_failure_is_retried_until_state_arrives(self):
+        actual = {"enabled": True, "ready": True, "state": "active", "pid": 57, "owner": ":1.7"}
+        agent = SimpleNamespace(run=unittest.mock.Mock(side_effect=[RuntimeError("bus not ready"), actual]))
+        observations = []
+        with patch.object(lane.time, "monotonic", side_effect=[0, 0, 1]), patch.object(lane.time, "sleep"):
+            self.assertIs(lane.wait_for_orca_state(agent, True, observations), actual)
+        self.assertEqual(agent.run.call_count, 2)
+        self.assertEqual(observations, [actual])
+
+    def test_repeated_guest_read_failure_still_times_out(self):
+        agent = SimpleNamespace(run=unittest.mock.Mock(side_effect=RuntimeError("bus not ready")))
+        observations = []
+        with patch.object(lane.time, "monotonic", side_effect=[0, 0, 21]), patch.object(lane.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "last observation error: RuntimeError"):
+                lane.wait_for_orca_state(agent, True, observations)
+        self.assertEqual(observations, [])
+
+
 class ConstraintProofCleanup(unittest.TestCase):
     def test_original_error_survives_all_independent_cleanup_failures(self):
         calls = []

@@ -199,6 +199,31 @@ def media_volume_ok(text, lifecycle_dir):
     return False, f"virtual HDA output: up/down/mute/unmute {observed}"
 
 
+def wait_for_orca_state(agent, enabled, observations, timeout=20):
+    """Poll a guest Orca observation, retrying transient guest-agent failures."""
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            actual = agent.run("orca-read")
+        except RuntimeError as error:
+            # The user bus or Orca's name can be briefly unavailable while
+            # the preference consumer starts or stops the service. Keep the
+            # observation inside the bounded wait instead of aborting early.
+            last_error = type(error).__name__
+            time.sleep(0.2)
+            continue
+        observations.append(actual)
+        if (actual["enabled"] is enabled
+                and ((enabled and actual["ready"] and actual["state"] == "active")
+                     or (not enabled and actual["pid"] == 0 and actual["owner"] is None
+                         and actual["state"] == "disabled"))):
+            return actual
+        time.sleep(0.2)
+    suffix = f" (last observation error: {last_error})" if last_error else ""
+    raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca" + suffix)
+
+
 def run_lifecycle(qmp, agent, out, serial_path, record):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
     evidence = os.path.join(out, "lifecycle")
@@ -363,17 +388,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
     orca_observations = []
     def await_orca(enabled):
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            actual = agent.run("orca-read")
-            orca_observations.append(actual)
-            if (actual["enabled"] is enabled
-                    and ((enabled and actual["ready"] and actual["state"] == "active")
-                         or (not enabled and actual["pid"] == 0 and actual["owner"] is None
-                             and actual["state"] == "disabled"))):
-                return actual
-            time.sleep(0.2)
-        raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca")
+        return wait_for_orca_state(agent, enabled, orca_observations)
     if older_guest:
         # The predating shell never manages Orca from this key, so the live
         # start/stop proof cannot run; no Orca probe is attempted either.
