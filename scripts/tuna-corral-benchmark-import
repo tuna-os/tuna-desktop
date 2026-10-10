@@ -116,7 +116,11 @@ try:
   receipt['raw_readback']=readback_prefix(a.context,a.namespace,disk_name,receipt['pvc_uid'],a.node,18*1024**3,manifest['raw_sha256'],a.out)
  receipt['upload_completed']=True;receipt['phase']='uploaded';receipt['node_peak_qualified']=False
  if a.start:
-  subprocess.run(['corral','--backend','kubevirt','--context',a.context,'start',name],check=True,timeout=120,stdout=(a.out/'start.log').open('wb'),stderr=subprocess.STDOUT)
+  start_deadline=time.monotonic()+120
+  with corral_ssh.projected_kubeconfig(a.context,deadline=start_deadline) as env:
+   remaining=start_deadline-time.monotonic()
+   if remaining<=0:raise TimeoutError('owned VM start context deadline')
+   subprocess.run(['corral','--backend','kubevirt','--context',a.context,'start',name],env=env,check=True,timeout=remaining,stdout=(a.out/'start.log').open('wb'),stderr=subprocess.STDOUT)
   receipt['start_succeeded']=True
  receipt['completed']=True;receipt['phase']='complete';receipt['owned_resources_retained']=True
 except BaseException as error:

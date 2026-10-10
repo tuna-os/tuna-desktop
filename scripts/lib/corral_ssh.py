@@ -1,5 +1,5 @@
 """Bind fixture client keys and measured guest host keys; never predict host keys."""
-import contextlib,hashlib,json,os,re,subprocess,tempfile
+import contextlib,hashlib,json,os,re,subprocess,tempfile,time
 from pathlib import Path
 HOST_KEYS='''import pathlib,json,subprocess
 boot=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
@@ -42,11 +42,13 @@ def host_receipt(value,known_hosts,boot_id):
 
 
 @contextlib.contextmanager
-def projected_kubeconfig(context):
+def projected_kubeconfig(context,deadline=None):
     # KubeVirt1.8.2 LocalClientCmd generates a ProxyCommand without --context.
     # Give the entire child process tree a private one-context credential file;
     # never write credentials into evidence/artifact directories or global config.
-    raw=subprocess.check_output(['kubectl','--context',context,'config','view','--minify','--flatten','--raw','-o','json'],timeout=30)
+    timeout=30 if deadline is None else min(30,deadline-time.monotonic())
+    if timeout<=0:raise TimeoutError('private context projection deadline')
+    raw=subprocess.check_output(['kubectl','--context',context,'config','view','--minify','--flatten','--raw','-o','json'],timeout=timeout)
     if len(raw)>1024*1024:raise ValueError('projected Kubernetes config exceeds bound')
     value=json.loads(raw)
     contexts=value.get('contexts',[]);clusters=value.get('clusters',[])

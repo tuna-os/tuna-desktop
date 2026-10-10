@@ -3,6 +3,11 @@ from unittest.mock import patch
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'lib'))
 import corral_ssh as m
 class Tests(unittest.TestCase):
+ def test_projection_api_inherits_deadline(self):
+  with patch.object(m.time,'monotonic',return_value=20),patch.object(m.subprocess,'check_output') as call:
+   with self.assertRaises(TimeoutError):
+    with m.projected_kubeconfig('selected',deadline=19):self.fail('expired')
+   call.assert_not_called()
  def test_private_context_projection_replaces_ambient_and_is_deleted(self):
   config={'current-context':'selected','contexts':[{'name':'selected','context':{'cluster':'c'}}],'clusters':[{'name':'c','cluster':{'server':'https://example.invalid'}}],'users':[{'name':'u','user':{'token':'synthetic-private-test-token'}}]}
   for fails in (False,True):

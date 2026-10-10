@@ -138,9 +138,12 @@ class Session:
 
     def remote(self,command,timeout=130):
         from corral_ssh import projected_kubeconfig
-        with projected_kubeconfig(self.context) as env:
+        deadline=time.monotonic()+timeout
+        with projected_kubeconfig(self.context,deadline=deadline) as env:
             self.metadata['ssh_kubernetes_context']={'explicit_context':self.context,'child_ambient_context_isolated':True,'credential_file_retained':False}
-            return bounded_run([*self.ssh,'--command',command,'vm/'+self.name],timeout,env=env)
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise TimeoutError('SSH acquisition deadline')
+            return bounded_run([*self.ssh,'--command',command,'vm/'+self.name],remaining,env=env)
 
     def python(self,source,argument=None):
         command=('python3 -c ' if self.user=='root' else 'sudo -n python3 -c ')+shlex.quote(source)
