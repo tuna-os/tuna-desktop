@@ -30,3 +30,17 @@ it again after archive extraction. These checks establish data integrity,
 not native rendered pixels or installed-image parity. The package-factory
 recipe must update its source archive and vendor pins to the final published
 v1 source before an actual package can include this new tree.
+
+
+## Native pixel assertions
+
+The GTK runtime journey now captures the actual X host framebuffer for the
+24px and48px legacy and scalable cursor cases, checking the complete colored
+rectangle, its dimensions and its hotspot against the physical pointer.
+A distinct SVG color proves it replaced the inherited legacy image; a client
+cursor surface and requested crosshair are also checked. The checker retries
+actual framebuffer captures for at most10 seconds to allow the presentation
+acknowledgment, and writes PNG plus pixel receipt for each case. It rejects
+cropped, displaced and incorrectly colored fixtures in four focused tests.
+These assertions await a successful native CI journey; they do not cover
+animated-frame pixels, fractional-output pixels or physical GPU measurements.

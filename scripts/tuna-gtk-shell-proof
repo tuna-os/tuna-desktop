@@ -2706,7 +2706,7 @@ def xcursor(sizes):
     for side in sizes:
         toc += struct.pack("<III", 0xFFFD0002, side, at)
         chunk = struct.pack("<IIIIIIIII", 36, 0xFFFD0002, side, 1, side, side, 1, 1, 0)
-        chunk += struct.pack("<I", 0xFF202020) * (side * side)
+        chunk += struct.pack("<I", 0xFFB51D5B if side == 24 else 0xFF19AD7D) * (side * side)
         chunks += chunk
         at += len(chunk)
     return header + toc + chunks
@@ -2719,6 +2719,18 @@ os.makedirs(os.path.join(root, "TunaProofBase", "cursors"), exist_ok=True)
 for name in ("default", "crosshair"):
     with open(os.path.join(root, "TunaProofBase", "cursors", name), "wb") as f:
         f.write(xcursor([24, 48]))
+# The scalable format used by GNOME51, with a nonzero hotspot. This
+# deliberately differs from the inherited legacy cursor to prove precedence.
+import json
+scalable = os.path.join(root, "TunaProofSvg", "cursors_scalable", "default")
+os.makedirs(scalable, exist_ok=True)
+with open(os.path.join(root, "TunaProofSvg", "index.theme"), "w") as f:
+    f.write("[Icon Theme]\nName=TunaProofSvg\nInherits=TunaProofBase\n")
+with open(os.path.join(scalable, "default.svg"), "w") as f:
+    f.write('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#315fc7"/></svg>')
+with open(os.path.join(scalable, "metadata.json"), "w") as f:
+    json.dump([{"filename": "default.svg", "nominal_size": 24,
+                "hotspot_x": 4, "hotspot_y": 6}], f)
 PYEOF
 cursor_theme_before="$(gsettings get org.gnome.desktop.interface cursor-theme)"
 cursor_size_before="$(gsettings get org.gnome.desktop.interface cursor-size)"
@@ -2750,10 +2762,27 @@ gsettings set org.gnome.desktop.interface cursor-size 24
 cstate '.cursor.theme == "TunaProof" and .cursor.size == 24 and .cursor.kind == "named" and .cursor.name == "default" and .cursor.source == "client" and .cursor.image_theme == "TunaProofBase" and .cursor.image == [24, 24] and .cursor.logical == [24, 24]' "theme cursor at 24px" ||
     fail G-CURSOR-SIZE "cursor-theme TunaProof at size 24 did not draw the inherited 24px image"
 cp "$CSTATE" "$ARTIFACTS/cursor-size-24.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-size-24.png" 24 1 1 181,29,91 ||
+    fail G-CURSOR-SIZE "the actual 24px legacy cursor pixels or hotspot differ"
 gsettings set org.gnome.desktop.interface cursor-size 48
 cstate '.cursor.size == 48 and .cursor.image_theme == "TunaProofBase" and .cursor.image == [48, 48] and .cursor.logical == [48, 48]' "theme cursor at 48px" ||
     fail G-CURSOR-SIZE "cursor-size 48 did not redraw the cursor from the 48px image live"
 cp "$CSTATE" "$ARTIFACTS/cursor-size-48.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-size-48.png" 48 1 1 25,173,125 ||
+    fail G-CURSOR-SIZE "the actual 48px legacy cursor pixels or hotspot differ"
+# A live theme change must replace the buffer with GNOME51 SVG data,
+# preserving its hotspot while rasterizing the requested physical size.
+gsettings set org.gnome.desktop.interface cursor-theme TunaProofSvg
+cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [48,48]' "48px scalable cursor" ||
+    fail G-CURSOR-SIZE "the scalable theme did not replace the legacy image"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-svg-48.png" 48 8 12 49,95,199 ||
+    fail G-CURSOR-SIZE "the actual 48px SVG pixels or scaled hotspot differ"
+gsettings set org.gnome.desktop.interface cursor-size 24
+cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [24,24]' "24px scalable cursor" ||
+    fail G-CURSOR-SIZE "the scalable theme did not resize live"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-svg-24.png" 24 4 6 49,95,199 ||
+    fail G-CURSOR-SIZE "the actual 24px SVG pixels or hotspot differ"
+gsettings set org.gnome.desktop.interface cursor-theme TunaProof
 pass G-CURSOR-SIZE "live cursor-theme (inherited) and cursor-size: 24px then 48px images drawn at 24 and 48 logical px"
 
 gsettings set org.gnome.desktop.interface cursor-size 24
@@ -2761,6 +2790,8 @@ cursor_probe shape crosshair G-CURSOR-SHAPE
 cstate '.cursor.kind == "named" and .cursor.name == "crosshair" and .cursor.source == "client" and .cursor.file == "crosshair" and .cursor.image_theme == "TunaProofBase" and .cursor.image == [24, 24]' "crosshair shape" ||
     fail G-CURSOR-SHAPE "a wp_cursor_shape_v1 crosshair request did not draw the theme's crosshair"
 cp "$CSTATE" "$ARTIFACTS/cursor-shape-crosshair.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-shape-crosshair.png" 24 1 1 181,29,91 ||
+    fail G-CURSOR-SHAPE "the requested shape has incorrect actual legacy pixels"
 # A shape the theme chain lacks still shows: from libXcursor's default
 # and GNOME's Adwaita fallbacks when installed, else the theme's arrow.
 cursor_probe shape wait G-CURSOR-SHAPE
@@ -2770,6 +2801,8 @@ cursor_probe surface 32 G-CURSOR-SHAPE
 cstate '.cursor.kind == "surface" and .cursor.image == [32, 32] and .cursor.logical == [32, 32]' "client cursor surface" ||
     fail G-CURSOR-SHAPE "a client's 32px cursor surface was not drawn at its size"
 cp "$CSTATE" "$ARTIFACTS/cursor-surface.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-surface.png" 32 0 0 224,27,36 ||
+    fail G-CURSOR-SHAPE "the client surface has incorrect actual pixels"
 kill "$CURSOR_PID" 2>/dev/null || true
 wait "$CURSOR_PID" 2>/dev/null || true
 CURSOR_PID=""
