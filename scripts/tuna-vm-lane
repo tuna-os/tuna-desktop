@@ -389,6 +389,18 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     orca_observations = []
     def await_orca(enabled):
         return wait_for_orca_state(agent, enabled, orca_observations)
+    def await_reaped(identity):
+        # The bus name is released while the stopped instance is still
+        # exiting; starting the next Orca first loses the restart name race
+        # on cold VMs (#543). Wait for the old process itself to die.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            departed = agent.run("orca-departed", *identity)
+            if not departed["original_alive"]:
+                return
+            time.sleep(0.2)
+        raise RuntimeError("stopped Orca instance did not exit before restart")
+
     if older_guest:
         # The predating shell never manages Orca from this key, so the live
         # start/stop proof cannot run; no Orca probe is attempted either.
@@ -399,7 +411,11 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     else:
         try:
             first_orca = None
+            stopped_identity = None
             for enabled in (False, True, False, True, False):
+                if enabled and stopped_identity is not None:
+                    await_reaped(stopped_identity)
+                    stopped_identity = None
                 agent.run("orca-on" if enabled else "orca-off")
                 actual = await_orca(enabled)
                 if enabled:
@@ -407,12 +423,11 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
                     if first_orca == identity:
                         raise RuntimeError("Orca retained the stopped process identity")
                     first_orca = identity
+                    stopped_identity = identity
             record("V-ORCA-ACTIVATION", True,
                    "live GNOME key starts/stops genuine distribution Orca; bus PID/UID, package hash, compositor parent and display verified")
         finally:
-            agent.run("orca-reset")
-            with open(os.path.join(evidence, "orca-activation.json"), "w") as stream:
-                json.dump(orca_observations, stream, indent=2)
+            finish_orca_activation(agent, evidence, orca_observations)
 
     # Real GNOME sound preference and virtual HDA/PipeWire data, not OSD state.
     amplified_observations = []
@@ -1393,6 +1408,30 @@ def restore_corner_mouse(qmp, original):
     if response != "" or len(current) != 1 or any(current[0].get(key) != original[key] for key in ("name", "index", "absolute")):
         raise RuntimeError("original QMP mouse handler was not restored")
     return {"original": original, "before": before, "after": after}
+
+
+def finish_orca_activation(agent, evidence, observations):
+    """Keep the activation failure and observations when reset also fails."""
+    primary = sys.exc_info()[1]
+    cleanup_errors = []
+    try:
+        agent.run("orca-reset")
+    except Exception as error:
+        # Transport errors may contain guest output. Retain only fixed action
+        # and exception class here; activation observations have their own
+        # bounded, privacy-checked receipt schema.
+        cleanup_errors.append({"action": "orca-reset", "exception_type": type(error).__name__})
+    try:
+        with open(os.path.join(evidence, "orca-activation.json"), "w") as stream:
+            json.dump(observations, stream, indent=2)
+        with open(os.path.join(evidence, "orca-activation-cleanup.json"), "w") as stream:
+            json.dump({"primary_error_type": type(primary).__name__ if primary else None,
+                       "cleanup_errors": cleanup_errors}, stream, indent=2)
+    except Exception as error:
+        cleanup_errors.append({"action": "orca-evidence-retention", "exception_type": type(error).__name__})
+        log("Orca activation evidence retention failed")
+    if primary is None and cleanup_errors:
+        raise RuntimeError("Orca activation cleanup failed: " + json.dumps(cleanup_errors))
 
 
 def finish_constraint_proof(agent, qmp, original_mouse, evidence, report):
