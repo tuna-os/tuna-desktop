@@ -324,3 +324,35 @@ def admit_imported_disk(export_dir, receipt_path, context, namespace, vm_name, r
         raise ValueError('uploaded disk is not attached to owned VM')
     return {'fixture_image_id':fixture,'manifest_sha256':manifest_sha,'disk_sha256':digest,
             'vm_uid':receipt['vm_uid'],'pvc_uid':receipt['pvc_uid'],'datavolume_uid':receipt['datavolume_uid']}
+
+
+def readback_prefix(context,namespace,pvc_name,pvc_uid,node,byte_count,expected_sha,out):
+    """Hash the actual uploaded raw prefix from a new owned read-only reader pod."""
+    import uuid
+    if type(byte_count) is not int or byte_count<=0 or byte_count%(1024*1024) or not re.fullmatch(r'[0-9a-f]{64}',expected_sha):
+        raise ValueError('bounded MiB raw prefix and exact SHA required')
+    claim=kubectl(context,'get','pvc',pvc_name,'-n',namespace,'-o','json')
+    if claim['metadata']['uid']!=pvc_uid or claim['status'].get('phase')!='Bound':raise ValueError('readback PVC identity/phase differs')
+    name='tuna-perf-readback-'+uuid.uuid4().hex[:10];out=Path(out)
+    owner={'apiVersion':'v1','kind':'PersistentVolumeClaim','name':pvc_name,'uid':pvc_uid,'controller':False}
+    command=f'set -eu; set -o pipefail; test "$(stat -c%s /data/disk.img)" -ge {byte_count}; dd if=/data/disk.img bs=1048576 count={byte_count//(1024*1024)} 2>/dev/null | sha256sum; stat -c "size=%s blocks=%b" /data/disk.img'
+    pod={'apiVersion':'v1','kind':'Pod','metadata':{'name':name,'namespace':namespace,'ownerReferences':[owner]},'spec':{'restartPolicy':'Never','automountServiceAccountToken':False,'nodeSelector':{'kubernetes.io/hostname':node},'securityContext':{'seccompProfile':{'type':'RuntimeDefault'},'runAsUser':107,'runAsGroup':107,'runAsNonRoot':True},'containers':[{'name':'reader','image':'alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b','command':['sh','-c',command],'securityContext':{'allowPrivilegeEscalation':False,'capabilities':{'drop':['ALL']}},'resources':{'requests':{'cpu':'20m','memory':'32Mi'},'limits':{'memory':'128Mi'}},'volumeMounts':[{'name':'disk','mountPath':'/data','readOnly':True}]}],'volumes':[{'name':'disk','persistentVolumeClaim':{'claimName':pvc_name,'readOnly':True}}]}}
+    path=out/'readback-pod-create.json';path.write_text(json.dumps(pod))
+    import corral_owned
+    owned=[]
+    try:
+        actual=corral_owned.create(context,namespace,'pod',pod,path,uuid.uuid4().hex,lambda *x:owned.append(x));uid=actual['metadata']['uid']
+        deadline=time.monotonic()+180
+        while time.monotonic()<deadline:
+            actual=kubectl(context,'get','pod',name,'-n',namespace,'-o','json')
+            if actual['metadata']['uid']!=uid:raise ValueError('readback pod replaced')
+            if actual['status'].get('phase') in ('Succeeded','Failed'):break
+            time.sleep(.5)
+        else:raise TimeoutError('owned readback deadline')
+        logs=subprocess.check_output(['kubectl','--context',context,'logs',name,'-n',namespace],timeout=20).decode()
+        (out/'readback.log').write_text(logs)
+        if actual['status'].get('phase')!='Succeeded' or logs.split()[0]!=expected_sha:raise ValueError('actual stored raw prefix differs')
+        receipt={'pod_uid':uid,'pvc_uid':pvc_uid,'node':node,'prefix_bytes':byte_count,'sha256':expected_sha,'matched':True}
+        (out/'raw-readback.json').write_text(json.dumps(receipt,indent=2));return receipt
+    finally:
+        if owned:corral_owned.cleanup(context,namespace,owned,timeout=60)

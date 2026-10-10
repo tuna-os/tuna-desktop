@@ -11,6 +11,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
 from corral_artifact import download,disk_plan
 from corral_perf import kubectl,capacity_receipt,node_name
 from corral_session import owned_listener
+import corral_owned
 p=argparse.ArgumentParser(description=__doc__)
 for name in ('context','node','source-sha','profile'):p.add_argument('--'+name,required=True)
 p.add_argument('--run-id',type=int,required=True);p.add_argument('--artifact-id',type=int,required=True)
@@ -23,10 +24,11 @@ receipt={'schema':1,'completed':False,'context':a.context,'namespace':a.namespac
 owned=[];proxy=None;upload=None
 
 def record(filename,value):(a.out/filename).write_text(json.dumps(value,indent=2))
+nonce=uuid.uuid4().hex
+def register(kind,name,uid):
+ owned.append((kind,name,uid));record('owned-objects.json',owned)
 def create(kind,obj):
- path=a.out/(kind+'-create.json');record(path.name,obj)
- result=json.loads(subprocess.check_output(['kubectl','--context',a.context,'create','-f',str(path),'-o','json'],timeout=45))
- owned.append((kind,result['metadata']['name'],result['metadata']['uid']));record('owned-objects.json',owned);return result
+ return corral_owned.create(a.context,a.namespace,kind,obj,a.out/(kind+'-create.json'),nonce,register)
 try:
  receipt['phase']='authenticated-export-download';record('import-receipt.json',receipt)
  export,manifest,acquisition=download(a.run_id,a.artifact_id,a.source_sha,a.profile,a.out/'original')
@@ -60,11 +62,16 @@ try:
   time.sleep(.1)
  if not port or not owned_listener(proxy.pid,port):raise ValueError('owned API uploadproxy tunnel unavailable')
  receipt['phase']='original-upload';record('import-receipt.json',receipt)
- log=(a.out/'upload.log').open('wb');upload=subprocess.Popen(['virtctl','--context',a.context,'image-upload','dv',disk_name,'-n',a.namespace,'--no-create','--image-path',str(export/'disk.qcow2'),'--uploadproxy-url',f'https://127.0.0.1:{port}','--insecure','--wait-secs','120','--retry','0'],stdout=log,stderr=log,start_new_session=True)
+ log=(a.out/'upload.log').open('wb');upload=subprocess.Popen(['virtctl','--context',a.context,'image-upload','dv',disk_name,'-n',a.namespace,'--no-create','--image-path',str(export/'disk.qcow2'),'--uploadproxy-url',f'https://127.0.0.1:{port}','--insecure','--wait-secs','120','--retry','1'],stdout=log,stderr=log,start_new_session=True)
  deadline=time.monotonic()+1800
  while upload.poll() is None and time.monotonic()<deadline:
   current_node=kubectl(a.context,'get','node',a.node,'-o','json')
-  if current_node['metadata']['uid']!=node['metadata']['uid'] or any(c.get('type')=='DiskPressure' and c.get('status')!='False' for c in current_node['status'].get('conditions',[])):raise ValueError('node identity/pressure changed during upload')
+  conditions={c['type']:c.get('status') for c in current_node['status'].get('conditions',[])}
+  if current_node['metadata']['uid']!=node['metadata']['uid'] or conditions.get('Ready')!='True' or conditions.get('DiskPressure')!='False':raise ValueError('node identity/readiness/pressure changed during upload')
+  current_stats=kubectl(a.context,'get','--raw','/api/v1/nodes/'+a.node+'/proxy/stats/summary')
+  pressure=capacity_receipt(current_node,current_stats,estimated_peak_bytes=1024**3)
+  if not pressure['ready_for_disk_admission']:raise ValueError('runtime filesystem safety reserve exhausted')
+  record('upload-capacity.json',pressure)
   pods=kubectl(a.context,'get','pods','-n',a.namespace,'-o','json')['items']
   owned_pods=[q for q in pods if any(o.get('uid')==receipt['pvc_uid'] for o in q['metadata'].get('ownerReferences',[]))]
   if any(q['spec'].get('nodeName') not in (None,a.node) for q in owned_pods):raise ValueError('upload scheduled on another node')
@@ -74,11 +81,14 @@ try:
  dv=kubectl(a.context,'get','dv',disk_name,'-n',a.namespace,'-o','json');claim=kubectl(a.context,'get','pvc',disk_name,'-n',a.namespace,'-o','json')
  if dv['metadata']['uid']!=receipt['datavolume_uid'] or claim['metadata']['uid']!=receipt['pvc_uid'] or dv['status'].get('phase')!='Succeeded' or claim['status'].get('phase')!='Bound':raise ValueError('original upload completion/identity unavailable')
  record('datavolume-completed.json',dv);record('pvc-completed.json',claim)
+ record('pv-completed.json',corral_owned.placement(a.context,a.namespace,claim,a.node))
  with (export/'disk.qcow2').open('rb') as stream:
   if hashlib.file_digest(stream,'sha256').hexdigest()!=receipt['disk_sha256']:raise ValueError('original upload bytes changed')
- receipt['completed']=True;receipt['phase']='complete';receipt['node_peak_qualified']=False
+ receipt['upload_completed']=True;receipt['phase']='uploaded';receipt['node_peak_qualified']=False
  if a.start:
   subprocess.run(['corral','--backend','kubevirt','--context',a.context,'start',name],check=True,timeout=120,stdout=(a.out/'start.log').open('wb'),stderr=subprocess.STDOUT)
+  receipt['start_succeeded']=True
+ receipt['completed']=True;receipt['phase']='complete';receipt['owned_resources_retained']=True
 except BaseException as error:
  receipt['error_type']=type(error).__name__;receipt['error']=str(error)[:4096]
  raise
@@ -90,11 +100,12 @@ finally:
    try:process.wait(timeout=5)
    except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
  if not receipt['completed']:
-  # Reverse dependent resources; verify exact original UID before each delete.
-  for kind,obj_name,uid in reversed(owned):
-   current=kubectl(a.context,'get',kind,obj_name,'-n',a.namespace,'-o','json')
-   if current['metadata']['uid']!=uid:raise ValueError('refusing cleanup of replaced resource')
-   subprocess.run(['kubectl','--context',a.context,'delete',kind,obj_name,'-n',a.namespace,'--wait=false'],check=True,timeout=30,stdout=subprocess.DEVNULL)
-  receipt['owned_cleanup_requested']=True
+  try:
+   receipt['cleanup']=corral_owned.cleanup(a.context,a.namespace,owned)
+   receipt['owned_resources_retained']=False
+  except Exception as cleanup_error:
+   receipt['cleanup_error']=str(cleanup_error)[:4096]
+   record('import-receipt.json',receipt)
+   raise
  record('import-receipt.json',receipt)
 print(json.dumps(receipt,indent=2))

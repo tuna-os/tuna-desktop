@@ -3,6 +3,10 @@ sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'lib'))
 import corral_artifact as m
 class Tests(unittest.TestCase):
  def run_receipt(self):return {'status':'completed','conclusion':'success','event':'workflow_dispatch','head_sha':'a'*40,'head_repository':{'full_name':m.REPO},'repository':{'full_name':m.REPO},'path':'.github/workflows/performance-baseline.yml'}
+ def test_upload_attempt_not_zero(self):
+  scripts=pathlib.Path(__file__).resolve().parents[1]
+  for filename in ('tuna-corral-benchmark-import','tuna-corral-raw-upload-probe'):
+   source=(scripts/filename).read_text();self.assertIn("'--retry','1'",source);self.assertNotIn("'--retry','0'",source)
  def test_original_run(self):m.original_run(self.run_receipt(),'a'*40,'.github/workflows/performance-baseline.yml')
  def test_wrong_identity_fails(self):
   for field,value in [('conclusion','failure'),('event','push'),('head_sha','b'*40),('path','.github/workflows/ci.yml'),('head_repository',{'full_name':'someone/fork'})]:
