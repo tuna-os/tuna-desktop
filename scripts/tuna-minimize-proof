@@ -79,7 +79,8 @@ freeze_manifest=json.loads((a.bin_dir / "manifest.json").read_text())
 assert manifest["source_revision"]==manifest["binary_source_revision"]==freeze_manifest["source_commit"]
 assert not manifest["source_dirty"],"proof must use clean source"
 for name,record in binaries.items(): assert record["sha256"]==freeze_manifest["sha256"][name]
-manifest["cargo_lock_sha256"]=freeze_manifest["cargo_lock_sha256"]
+manifest["cargo_lock_sha256"] = digest(root / "Cargo.lock")
+assert manifest["cargo_lock_sha256"] == digest(a.bin_dir / "Cargo.lock") == freeze_manifest["cargo_lock_sha256"]
 (art / "manifest.json").write_text(json.dumps(manifest,indent=2))
 processes = []
 logs = []
