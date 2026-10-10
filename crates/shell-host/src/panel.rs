@@ -7054,7 +7054,7 @@ mod tests {
             {
                 let guard = center.lock().expect("center lock");
                 assert_eq!(guard.history().len(), MAX_HISTORY, "history capped");
-                assert_eq!(guard.unread_count(), MAX_BANNERS, "unread capped");
+                assert_eq!(guard.unread_count(), MAX_HISTORY, "unseen history capped");
                 let rows = banner_key_rows(&guard);
                 assert_eq!(
                     rows.len(),
@@ -7070,11 +7070,14 @@ mod tests {
                 // No mutation between builds: the key is stable.
                 assert_eq!(rows, banner_key_rows(&guard), "paint rows stable at rest");
             }
-            // One slow tick picks up the capped marker (not 10k).
+            // One slow tick picks up capped unseen history (not 10k).
             host.tiles_refreshed = Some(std::time::Instant::now());
             host.update_panel_status();
             let key = host.panel_paint_key.clone().expect("tick records key");
-            assert_eq!(key.unread, MAX_BANNERS, "marker shows the capped queue");
+            assert_eq!(
+                key.unread, MAX_HISTORY,
+                "marker shows capped unseen history"
+            );
         }
 
         /// Restart rehydrates the unread list: save the queue, rebuild

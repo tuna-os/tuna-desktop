@@ -270,20 +270,22 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| application-children | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| show-banners | Honored | Live Do Not Disturb policy |
-| show-in-lock-screen | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
+| application-children | Honored | Registers canonical installed desktop identities when wire notifications arrive |
+| show-banners | Honored | Master banner admission and live Do Not Disturb policy; enabled critical messages bypass banner suppression |
+| show-in-lock-screen | Honored | Live master gate on the lock-safe unseen message projection |
 ## org.gnome.desktop.notifications.application
 
 | Key | Status | Reason |
 |---|---|---|
-| application-id | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| details-in-lock-screen | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| enable | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| enable-sound-alerts | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| force-expanded | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| show-banners | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| show-in-lock-screen | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
+| application-id | Honored | Registers the installed desktop identity for the relocatable application settings path |
+| details-in-lock-screen | Honored | Live summary/body redaction before constructing lock widgets; client critical urgency grants no privacy exception |
+| enable | Honored | Live source admission, visible history, lock projection and action gate |
+| enable-sound-alerts | Honored | Newly shown banners dispatch sender sound hints only with app sound alerts and global event sounds enabled; LOW and hidden messages are silent |
+| force-expanded | Honored | Banner body expansion with live policy changes |
+| show-banners | Honored | Master AND application admission before a banner takes a queue slot; enabled critical exception |
+| show-in-lock-screen | Honored | Master AND application gate on read-only lock source groups |
+
+Application policy requires a resolvable installed desktop-entry hint. Unknown identities use global banner/lock controls with lock details disabled. Desktop-file changes invalidate the live identity cache. These consumer dispositions do not constitute a complete GNOME parity or hardware qualification result.
 ## org.gnome.desktop.peripherals.keyboard
 
 | Key | Status | Reason |

@@ -21,7 +21,8 @@
 //! or version-skewed files load as empty — fail-closed, never a
 //! startup error.
 
-use std::collections::{HashSet, VecDeque};
+use crate::notification_policy::{NotificationPolicy, PolicyReader};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -105,9 +106,27 @@ pub struct Notification {
     pub expanded: bool,
     /// Action keys already invoked (replay guard).
     consumed: HashSet<String>,
+    /// A banner was seen or explicitly dismissed/invoked.
+    acknowledged: bool,
+    sound: NotificationSound,
+}
+
+/// Sender-supplied sound hints; a missing hint is silent. Debug is deliberately
+/// absent because a file path may reveal private data.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct NotificationSound {
+    pub name: String,
+    pub file: String,
 }
 
 impl Notification {
+    pub fn sound(&self) -> &NotificationSound {
+        &self.sound
+    }
+    pub fn acknowledged(&self) -> bool {
+        self.acknowledged
+    }
+
     /// Summary line (the banner paints this).
     pub fn summary(&self) -> &str {
         &self.title
@@ -173,6 +192,8 @@ pub enum NotificationError {
     UnknownAction,
     /// This action key was already invoked (replay).
     ActionReplayed,
+    /// Session lock or disabled source prevents application actions.
+    PolicyDenied,
 }
 
 impl std::fmt::Display for NotificationError {
@@ -180,6 +201,7 @@ impl std::fmt::Display for NotificationError {
         match self {
             Self::UnknownNotification => write!(f, "unknown notification"),
             Self::UnknownAction => write!(f, "unknown action"),
+            Self::PolicyDenied => write!(f, "notification action unavailable"),
             Self::ActionReplayed => write!(f, "action already invoked"),
         }
     }
@@ -256,6 +278,14 @@ fn decode_notification(item: &serde_json::Value) -> Option<Notification> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         consumed,
+        sound: NotificationSound {
+            name: text("sound_name"),
+            file: text("sound_file"),
+        },
+        acknowledged: item
+            .get("acknowledged")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     })
 }
 
@@ -265,8 +295,37 @@ pub fn state_dir() -> Option<PathBuf> {
     crate::xdg::state_home().map(|base| base.join(STATE_DIR_NAME))
 }
 
+#[derive(Default)]
+pub struct NotificationSource {
+    pub icon: String,
+    pub desktop_entry: String,
+    pub policy: NotificationPolicy,
+    pub sound: NotificationSound,
+}
+/// Lock-safe projection. With details disabled it contains no summary/body text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LockNotificationGroup {
+    pub key: String,
+    pub app: String,
+    pub desktop_entry: String,
+    pub icon: String,
+    pub count: usize,
+    pub critical: bool,
+    pub details: Vec<(String, String)>,
+}
+
+#[derive(Default)]
+struct NotificationSenders(HashMap<u32, String>);
+impl std::fmt::Debug for NotificationSenders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationSenders")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
 /// Local notification store: banner queue, history, DND gate.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct NotificationCenter {
     next_id: u64,
     /// Banner-visible ids, oldest first.
@@ -279,6 +338,26 @@ pub struct NotificationCenter {
     /// Set by [`NotificationCenter::load`], so a restored center
     /// keeps persisting to the file it came from.
     queue_path: Option<PathBuf>,
+    policies: HashMap<String, NotificationPolicy>,
+    policy_generation: u64,
+    revision: u64,
+    locked: bool,
+    senders: NotificationSenders,
+    policies_loaded: bool,
+    policy_reader_revision: u64,
+    policy_history_revision: u64,
+}
+
+impl std::fmt::Debug for NotificationCenter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationCenter")
+            .field("next_id", &self.next_id)
+            .field("banners", &self.banners)
+            .field("history_count", &self.history.len())
+            .field("source_count", &self.policies.len())
+            .field("locked", &self.locked)
+            .finish()
+    }
 }
 
 impl NotificationCenter {
@@ -352,7 +431,13 @@ impl NotificationCenter {
         let mut banners = VecDeque::new();
         if let Some(ids) = doc.get("banners").and_then(|v| v.as_array()) {
             for id in ids.iter().filter_map(serde_json::Value::as_u64) {
-                if live.contains(&id) && !banners.contains(&id) {
+                if live.contains(&id)
+                    && !banners.contains(&id)
+                    && center
+                        .history
+                        .iter()
+                        .any(|n| n.id == id && n.urgency != Urgency::Low)
+                {
                     banners.push_back(id);
                 }
             }
@@ -390,6 +475,9 @@ impl NotificationCenter {
                     "urgency": n.urgency.as_str(),
                     "expanded": n.expanded,
                     "consumed": n.consumed.iter().collect::<Vec<_>>(),
+                    "acknowledged": n.acknowledged,
+                    "sound_name": n.sound.name,
+                    "sound_file": n.sound.file,
                 })
             })
             .collect();
@@ -430,13 +518,130 @@ impl NotificationCenter {
         }
     }
 
+    pub fn policy_for(&self, source: &str) -> NotificationPolicy {
+        self.policies.get(source).copied().unwrap_or_default()
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn policy_generation(&self) -> u64 {
+        self.policy_generation
+    }
+    pub fn locked(&self) -> bool {
+        self.locked
+    }
+    /// Replaced from authenticated private compositor inventory; never from
+    /// notification hints or application-provided PID values.
+    pub fn set_senders(&mut self, entries: impl IntoIterator<Item = (u32, String)>) {
+        self.senders.0 = entries.into_iter().filter(|(pid, _)| *pid != 0).collect();
+    }
+    pub fn sender_app(&self, pid: u32) -> Option<&str> {
+        self.senders.0.get(&pid).map(String::as_str)
+    }
+
+    pub fn set_locked(&mut self, locked: bool) {
+        self.locked = locked;
+    }
+    pub fn set_policy(&mut self, source: &str, policy: NotificationPolicy) {
+        if self.policies.get(source) == Some(&policy) {
+            return;
+        }
+        self.policies.insert(source.to_owned(), policy);
+        self.policy_generation = self.policy_generation.wrapping_add(1);
+        self.banners.retain(|id| {
+            self.history.iter().find(|n| n.id == *id).is_some_and(|n| {
+                let p = self
+                    .policies
+                    .get(n.desktop_entry())
+                    .copied()
+                    .unwrap_or_default();
+                p.enable
+                    && n.urgency != Urgency::Low
+                    && (p.show_banners || n.urgency == Urgency::Critical)
+            })
+        });
+    }
+    pub fn refresh_policies(&mut self, reader: &mut PolicyReader) {
+        if self.policies_loaded
+            && self.policy_reader_revision == reader.revision()
+            && self.policy_history_revision == self.revision
+        {
+            return;
+        }
+        let sources: HashSet<String> = self
+            .history
+            .iter()
+            .map(|n| n.desktop_entry.clone())
+            .collect();
+        self.policies.retain(|source, _| sources.contains(source));
+        reader.retain_sources(&sources);
+        for source in sources {
+            self.set_policy(&source, reader.read(&source, false));
+        }
+        self.policies_loaded = true;
+        self.policy_reader_revision = reader.revision();
+        self.policy_history_revision = self.revision;
+    }
+    pub fn visible_history(&self) -> Vec<&Notification> {
+        self.history
+            .iter()
+            .filter(|n| self.policy_for(n.desktop_entry()).enable)
+            .collect()
+    }
+    pub fn acknowledge(&mut self, id: u64) {
+        if let Some(n) = self.history.iter_mut().find(|n| n.id == id) {
+            if !n.acknowledged {
+                n.acknowledged = true;
+                self.persist();
+            }
+        }
+    }
+    /// Private app messages never use GNOME's privileged SYSTEM privacy exception.
+    pub fn lock_notifications(&self) -> Vec<LockNotificationGroup> {
+        let mut groups: Vec<LockNotificationGroup> = Vec::new();
+        for n in self.history.iter().rev().filter(|n| !n.acknowledged) {
+            let policy = self.policy_for(n.desktop_entry());
+            if !policy.enable || !policy.show_in_lock_screen {
+                continue;
+            }
+            let key = if n.desktop_entry.is_empty() {
+                format!("generic:{}", n.app)
+            } else {
+                n.desktop_entry.clone()
+            };
+            let index = groups.iter().position(|g| g.key == key).unwrap_or_else(|| {
+                groups.push(LockNotificationGroup {
+                    key: key.clone(),
+                    app: n.app.clone(),
+                    desktop_entry: n.desktop_entry.clone(),
+                    icon: n.icon.clone(),
+                    count: 0,
+                    critical: false,
+                    details: Vec::new(),
+                });
+                groups.len() - 1
+            });
+            let group = &mut groups[index];
+            group.count += 1;
+            group.critical |= n.urgency == Urgency::Critical;
+            if policy.details_in_lock_screen {
+                group.details.push((n.title.clone(), n.body.clone()));
+            }
+        }
+        groups
+    }
+
     /// Record where a notification came from: its `app_icon` and
     /// `desktop-entry` hint, which pick the icon and name its header
     /// shows. Unknown ids are ignored.
     pub fn set_source(&mut self, id: u64, icon: &str, desktop_entry: &str) {
         if let Some(entry) = self.history.iter_mut().find(|n| n.id == id) {
             entry.icon = icon.to_owned();
-            entry.desktop_entry = desktop_entry.trim_end_matches(".desktop").to_owned();
+            entry.desktop_entry = desktop_entry
+                .strip_suffix(".desktop")
+                .unwrap_or(desktop_entry)
+                .to_owned();
+            self.revision = self.revision.wrapping_add(1);
             self.persist();
         }
     }
@@ -467,12 +672,13 @@ impl NotificationCenter {
         &self.history
     }
 
-    /// How many notifications are unread: the banner-visible queue
-    /// length. Dismissing a banner or invoking its action reads it
-    /// (history keeps the entry); DND-gated arrivals never queue,
-    /// so they never count.
+    /// GNOME's unseen count includes enabled unacknowledged history, including
+    /// LOW and DND-gated arrivals. Showing, dismissing, or invoking reads it.
     pub fn unread_count(&self) -> usize {
-        self.banners.len()
+        self.history
+            .iter()
+            .filter(|n| !n.acknowledged && self.policy_for(n.desktop_entry()).enable)
+            .count()
     }
 
     /// File a notification (freedesktop `Notify` shape). Returns the
@@ -487,6 +693,37 @@ impl NotificationCenter {
         urgency: Urgency,
         replaces_id: Option<u64>,
     ) -> u64 {
+        self.notify_with_source(
+            app,
+            title,
+            body,
+            actions,
+            urgency,
+            replaces_id,
+            NotificationSource::default(),
+        )
+    }
+
+    /// Source identity and policy are applied before any banner slot is used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn notify_with_source(
+        &mut self,
+        app: &str,
+        title: &str,
+        body: &str,
+        actions: Vec<NotificationAction>,
+        urgency: Urgency,
+        replaces_id: Option<u64>,
+        mut source: NotificationSource,
+    ) -> u64 {
+        if let Some(old) = replaces_id.and_then(|id| self.history.iter().find(|n| n.id == id)) {
+            if old.desktop_entry != source.desktop_entry {
+                source.desktop_entry = old.desktop_entry.clone();
+                source.policy = self.policy_for(&source.desktop_entry);
+            }
+        }
+        self.set_policy(&source.desktop_entry, source.policy);
+        self.revision = self.revision.wrapping_add(1);
         let id = if let Some(replaces) = replaces_id {
             if let Some(entry) = self.history.iter_mut().find(|n| n.id == replaces) {
                 entry.app = app.to_owned();
@@ -495,21 +732,26 @@ impl NotificationCenter {
                 entry.actions = actions;
                 entry.urgency = urgency;
                 entry.received = now_secs();
-                entry.expanded = false;
+                entry.expanded = source.policy.force_expanded || urgency == Urgency::Critical;
+                entry.icon = source.icon.clone();
+                entry.desktop_entry = source.desktop_entry.clone();
+                entry.acknowledged = false;
+                entry.sound = source.sound.clone();
                 entry.consumed.clear();
                 self.queue_banner(replaces, urgency);
                 self.persist();
                 return replaces;
             }
-            self.alloc_fresh(app, title, body, actions, urgency)
+            self.alloc_fresh(app, title, body, actions, urgency, &source)
         } else {
-            self.alloc_fresh(app, title, body, actions, urgency)
+            self.alloc_fresh(app, title, body, actions, urgency, &source)
         };
         self.persist();
         id
     }
 
     /// Append a fresh entry, pruning history and queueing its banner.
+    #[allow(clippy::too_many_arguments)]
     fn alloc_fresh(
         &mut self,
         app: &str,
@@ -517,26 +759,36 @@ impl NotificationCenter {
         body: &str,
         actions: Vec<NotificationAction>,
         urgency: Urgency,
+        source: &NotificationSource,
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         self.history.push_back(Notification {
             id,
-            icon: String::new(),
-            desktop_entry: String::new(),
+            icon: source.icon.clone(),
+            desktop_entry: source.desktop_entry.clone(),
             received: now_secs(),
             app: app.to_owned(),
             title: title.to_owned(),
             body: body.to_owned(),
             actions,
             urgency,
-            expanded: false,
+            expanded: source.policy.force_expanded || urgency == Urgency::Critical,
             consumed: HashSet::new(),
+            acknowledged: false,
+            sound: source.sound.clone(),
         });
         while self.history.len() > MAX_HISTORY {
-            let dropped = self.history.pop_front().map(|n| n.id);
+            let dropped = self.history.pop_front();
             if let Some(dropped) = dropped {
-                self.banners.retain(|b| *b != dropped);
+                self.banners.retain(|b| *b != dropped.id);
+                if !self
+                    .history
+                    .iter()
+                    .any(|n| n.desktop_entry == dropped.desktop_entry)
+                {
+                    self.policies.remove(&dropped.desktop_entry);
+                }
             }
         }
         self.queue_banner(id, urgency);
@@ -546,7 +798,17 @@ impl NotificationCenter {
     /// Queue a banner unless the DND gate holds (critical always
     /// breaks through) or the id is already queued.
     fn queue_banner(&mut self, id: u64, urgency: Urgency) {
-        if self.dnd && urgency != Urgency::Critical {
+        let policy = self
+            .history
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| self.policy_for(n.desktop_entry()))
+            .unwrap_or_default();
+        if urgency == Urgency::Low
+            || !policy.enable
+            || ((self.dnd || !policy.show_banners) && urgency != Urgency::Critical)
+        {
+            self.banners.retain(|queued| *queued != id);
             return;
         }
         if !self.banners.contains(&id) {
@@ -563,6 +825,9 @@ impl NotificationCenter {
             return Err(NotificationError::UnknownNotification);
         }
         self.banners.retain(|b| *b != id);
+        if let Some(entry) = self.history.iter_mut().find(|n| n.id == id) {
+            entry.acknowledged = true;
+        }
         self.persist();
         Ok(())
     }
@@ -573,6 +838,7 @@ impl NotificationCenter {
             return Err(NotificationError::UnknownNotification);
         };
         entry.expanded = expanded;
+        self.revision = self.revision.wrapping_add(1);
         self.persist();
         Ok(())
     }
@@ -582,6 +848,15 @@ impl NotificationCenter {
     /// [`NotificationError::ActionReplayed`], like an activation-token
     /// replay. Invoking dismisses the banner (history keeps the entry).
     pub fn invoke_action(&mut self, id: u64, action: &str) -> Result<(), NotificationError> {
+        if self.locked
+            || self
+                .history
+                .iter()
+                .find(|n| n.id == id)
+                .is_some_and(|n| !self.policy_for(n.desktop_entry()).enable)
+        {
+            return Err(NotificationError::PolicyDenied);
+        }
         let Some(entry) = self.history.iter_mut().find(|n| n.id == id) else {
             return Err(NotificationError::UnknownNotification);
         };
@@ -591,6 +866,7 @@ impl NotificationCenter {
         if !entry.consumed.insert(action.to_owned()) {
             return Err(NotificationError::ActionReplayed);
         }
+        entry.acknowledged = true;
         self.banners.retain(|b| *b != id);
         self.persist();
         Ok(())
@@ -636,7 +912,7 @@ mod tests {
         assert_eq!(c.history().len(), 2);
         assert_eq!(
             c.banners().iter().map(|n| n.id).collect::<Vec<_>>(),
-            vec![a, b]
+            vec![a]
         );
     }
 
@@ -674,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_count_tracks_the_banner_queue() {
+    fn unread_count_tracks_unacknowledged_history() {
         let mut c = center();
         assert_eq!(c.unread_count(), 0);
         let a = c.notify("app", "t", "b", vec![], Urgency::Normal, None);
@@ -685,14 +961,14 @@ mod tests {
         c.dismiss(a).unwrap();
         assert_eq!(c.unread_count(), 1);
         assert_eq!(c.history().len(), 2);
-        // DND-gated arrivals never queue, so they never read as unread.
+        // DND-gated arrivals still count as unseen history.
         c.set_dnd(true);
         c.notify("app", "t", "b", vec![], Urgency::Normal, None);
-        assert_eq!(c.unread_count(), 1);
+        assert_eq!(c.unread_count(), 2);
         assert_eq!(c.history().len(), 3);
         // Critical breaks through DND and counts again.
         c.notify("app", "t", "b", vec![], Urgency::Critical, None);
-        assert_eq!(c.unread_count(), 2);
+        assert_eq!(c.unread_count(), 3);
     }
 
     #[test]
@@ -755,7 +1031,7 @@ mod tests {
             "new",
             "b2",
             vec![action("x")],
-            Urgency::Low,
+            Urgency::Normal,
             Some(id),
         );
         assert_eq!(same, id);
@@ -1018,5 +1294,235 @@ mod tests {
         c.set_dnd(true);
         // No banner, action, dismiss, or DND path selects anything.
         assert_eq!(model.selected(), Some(1));
+    }
+    fn file_policy(
+        c: &mut NotificationCenter,
+        source: &str,
+        policy: NotificationPolicy,
+        urgency: Urgency,
+    ) -> u64 {
+        c.notify_with_source(
+            "fixture app",
+            "PRIVATE title",
+            "PRIVATE body",
+            vec![action("open")],
+            urgency,
+            None,
+            NotificationSource {
+                desktop_entry: source.to_owned(),
+                icon: String::new(),
+                policy,
+                sound: NotificationSound::default(),
+            },
+        )
+    }
+    #[test]
+    fn source_policy_snapshots_remain_bounded_with_distinct_source_floods() {
+        let mut c = center();
+        for i in 0..1_000 {
+            file_policy(
+                &mut c,
+                &format!("source-{i}"),
+                NotificationPolicy::default(),
+                Urgency::Normal,
+            );
+        }
+        assert_eq!(c.history.len(), MAX_HISTORY);
+        assert_eq!(c.policies.len(), MAX_HISTORY);
+        assert!(!c.policies.contains_key("source-0"));
+    }
+    #[test]
+    fn hidden_sources_never_consume_banner_capacity_and_critical_cannot_bypass_disable() {
+        let mut c = center();
+        let disabled = NotificationPolicy {
+            enable: false,
+            ..Default::default()
+        };
+        let held = NotificationPolicy {
+            show_banners: false,
+            ..Default::default()
+        };
+        let visible = file_policy(
+            &mut c,
+            "visible",
+            NotificationPolicy::default(),
+            Urgency::Normal,
+        );
+        for _ in 0..MAX_BANNERS + 4 {
+            file_policy(&mut c, "disabled", disabled, Urgency::Critical);
+            file_policy(&mut c, "held", held, Urgency::Normal);
+        }
+        assert_eq!(
+            c.banners().iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![visible]
+        );
+        let critical = file_policy(&mut c, "held", held, Urgency::Critical);
+        assert!(c.banners().iter().any(|n| n.id == critical));
+        assert!(c
+            .visible_history()
+            .iter()
+            .all(|n| n.desktop_entry() != "disabled"));
+    }
+    #[test]
+    fn live_disable_removes_queued_source_and_reenable_does_not_replay_banners() {
+        let mut c = center();
+        file_policy(
+            &mut c,
+            "alpha",
+            NotificationPolicy::default(),
+            Urgency::Critical,
+        );
+        c.set_policy(
+            "alpha",
+            NotificationPolicy {
+                enable: false,
+                ..Default::default()
+            },
+        );
+        assert!(c.banners().is_empty());
+        assert!(c.visible_history().is_empty());
+        c.set_policy("alpha", NotificationPolicy::default());
+        assert!(c.banners().is_empty());
+        assert_eq!(c.visible_history().len(), 1);
+    }
+    #[test]
+    fn replacements_keep_original_policy_and_refresh_content_revision() {
+        let mut c = center();
+        let disabled = NotificationPolicy {
+            enable: false,
+            ..Default::default()
+        };
+        let id = file_policy(&mut c, "alpha", disabled, Urgency::Normal);
+        let revision = c.revision();
+        let same = c.notify_with_source(
+            "other",
+            "new",
+            "body",
+            Vec::new(),
+            Urgency::Critical,
+            Some(id),
+            NotificationSource::default(),
+        );
+        assert_eq!(same, id);
+        assert_eq!(c.history()[0].desktop_entry(), "alpha");
+        assert!(c.banners().is_empty());
+        assert!(c.revision() > revision);
+    }
+    #[test]
+    fn lock_projection_never_copies_details_without_permission_even_for_critical() {
+        let mut c = center();
+        let hidden = NotificationPolicy {
+            show_in_lock_screen: false,
+            ..Default::default()
+        };
+        let summary = NotificationPolicy {
+            show_in_lock_screen: true,
+            ..Default::default()
+        };
+        let details = NotificationPolicy {
+            show_in_lock_screen: true,
+            details_in_lock_screen: true,
+            ..Default::default()
+        };
+        file_policy(&mut c, "hidden", hidden, Urgency::Critical);
+        let id = file_policy(&mut c, "summary", summary, Urgency::Critical);
+        file_policy(&mut c, "summary", summary, Urgency::Normal);
+        file_policy(&mut c, "details", details, Urgency::Normal);
+        let groups = c.lock_notifications();
+        assert_eq!(groups.len(), 2);
+        let redacted = groups.iter().find(|g| g.key == "summary").unwrap();
+        assert_eq!(redacted.count, 2);
+        assert!(redacted.details.is_empty());
+        assert!(redacted.critical);
+        assert_eq!(
+            groups
+                .iter()
+                .find(|g| g.key == "details")
+                .unwrap()
+                .details
+                .len(),
+            1
+        );
+        c.set_locked(true);
+        assert_eq!(
+            c.invoke_action(id, "open"),
+            Err(NotificationError::PolicyDenied)
+        );
+        c.set_locked(false);
+        c.set_policy(
+            "summary",
+            NotificationPolicy {
+                enable: false,
+                ..summary
+            },
+        );
+        assert_eq!(
+            c.invoke_action(id, "open"),
+            Err(NotificationError::PolicyDenied)
+        );
+        c.set_policy("details", hidden);
+        assert!(c.lock_notifications().is_empty());
+    }
+    #[test]
+    fn acknowledgment_and_policy_reload_keep_lock_privacy_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let mut c = center();
+        let policy = NotificationPolicy {
+            show_in_lock_screen: true,
+            details_in_lock_screen: true,
+            ..Default::default()
+        };
+        let seen = file_policy(&mut c, "alpha", policy, Urgency::Normal);
+        c.acknowledge(seen);
+        file_policy(&mut c, "alpha", policy, Urgency::Normal);
+        c.save(&path).unwrap();
+        let mut restored = NotificationCenter::load(&path);
+        // Before system policy reload, missing policy is lock-private.
+        assert!(restored.lock_notifications().is_empty());
+        restored.set_policy(
+            "alpha",
+            NotificationPolicy {
+                details_in_lock_screen: false,
+                ..policy
+            },
+        );
+        assert_eq!(restored.lock_notifications()[0].count, 1);
+        assert!(restored.lock_notifications()[0].details.is_empty());
+    }
+    #[test]
+    fn low_arrivals_and_replacements_remain_history_only() {
+        let mut c = center();
+        let id = c.notify("app", "first", "body", vec![], Urgency::Normal, None);
+        assert_eq!(c.banners().len(), 1);
+        assert_eq!(
+            c.notify("app", "low", "body", vec![], Urgency::Low, Some(id)),
+            id
+        );
+        assert!(c.banners().is_empty());
+        assert_eq!(c.history().len(), 1);
+        assert!(!c.history()[0].acknowledged());
+    }
+    #[test]
+    fn sender_inventory_replaces_old_process_associations_and_redacts_debug() {
+        let mut c = center();
+        c.set_senders([(4321, "org.Private.App".to_owned())]);
+        assert_eq!(c.sender_app(4321), Some("org.Private.App"));
+        let debug = format!("{c:?}");
+        assert!(!debug.contains("org.Private.App"));
+        assert!(!debug.contains("4321"));
+        c.set_senders([]);
+        assert_eq!(c.sender_app(4321), None);
+    }
+    #[test]
+    fn policy_source_identifiers_are_redacted_in_center_debug() {
+        let mut c = center();
+        file_policy(
+            &mut c,
+            "org.Private.PolicySource",
+            NotificationPolicy::default(),
+            Urgency::Normal,
+        );
+        assert!(!format!("{c:?}").contains("org.Private.PolicySource"));
     }
 }

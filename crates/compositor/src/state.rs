@@ -32,6 +32,9 @@ pub const MAX_TITLE_LEN: usize = 256;
 /// One mapped window as tracked by the compositor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowEntry {
+    /// Native kernel peer PID or XRes server-reported X11 owner PID.
+    /// Never the shared Xwayland process or client-provided _NET_WM_PID.
+    pub client_pid: Option<u32>,
     pub icon: Option<String>,
     /// Generational id: drawn from a session-monotonic counter, never reused.
     pub id: u64,
@@ -373,6 +376,7 @@ impl StateModel {
         self.register_workspace(workspace);
         let window = WindowEntry {
             on_all_workspaces: false,
+            client_pid: None,
             icon: None,
             id,
             title: cap_title(title),
@@ -547,6 +551,16 @@ impl StateModel {
             .filter(|(r, _)| *r > rev)
             .cloned()
             .collect())
+    }
+
+    pub fn set_client_pid(&mut self, id: u64, pid: Option<u32>) {
+        if let Some(window) = self.windows.get_mut(&id) {
+            if window.client_pid != pid {
+                window.client_pid = pid;
+                let window = window.clone();
+                self.commit(StateChange::WindowUpdated { window });
+            }
+        }
     }
 
     pub fn set_icon(&mut self, id: u64, icon: Option<String>) {

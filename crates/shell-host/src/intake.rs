@@ -18,7 +18,11 @@ use std::sync::{Arc, Mutex};
 
 use zbus::object_server::SignalEmitter;
 
-use crate::notifications::{NotificationAction, NotificationCenter, NotificationError, Urgency};
+use crate::notification_policy::PolicyReader;
+use crate::notifications::{
+    NotificationAction, NotificationCenter, NotificationError, NotificationSound,
+    NotificationSource, Urgency,
+};
 
 /// Well-known notifications name (freedesktop Desktop Notifications).
 pub const NOTIFICATIONS_NAME: &str = "org.freedesktop.Notifications";
@@ -49,9 +53,26 @@ fn urgency_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Urgency 
         .and_then(|hint| u8::try_from(hint).ok());
     match level {
         Some(0) => Urgency::Low,
-        Some(2..=u8::MAX) => Urgency::Critical,
+        Some(2) => Urgency::Critical,
         _ => Urgency::Normal,
     }
+}
+
+/// GNOME's tracked-PID, desktop hint, then app-name lookup order. Keep an
+/// unknown hint as generic source identity; it cannot gain per-app privileges.
+fn resolve_source(
+    tracked: Option<&str>,
+    hint: &str,
+    app: &str,
+    installed: impl Fn(&str) -> bool,
+) -> String {
+    for candidate in tracked.into_iter().chain([hint, app]) {
+        let candidate = candidate.strip_suffix(".desktop").unwrap_or(candidate);
+        if !candidate.is_empty() && installed(candidate) {
+            return candidate.to_owned();
+        }
+    }
+    hint.strip_suffix(".desktop").unwrap_or(hint).to_owned()
 }
 
 /// The `org.freedesktop.Notifications` object: wire calls become
@@ -69,7 +90,7 @@ impl Notifications {
     /// id the app uses to replace or close it). A poisoned center
     /// reads as id zero, which no real notification carries.
     #[allow(clippy::too_many_arguments)]
-    fn notify(
+    async fn notify(
         &self,
         app_name: String,
         replaces_id: u32,
@@ -79,25 +100,72 @@ impl Notifications {
         actions: Vec<String>,
         hints: HashMap<String, zbus::zvariant::OwnedValue>,
         _expire_timeout: i32,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> u32 {
         let replaces = (replaces_id != 0).then_some(replaces_id as u64);
         let desktop_entry = hints
             .get("desktop-entry")
             .and_then(|v| String::try_from(v.clone()).ok())
             .unwrap_or_default();
+        // Resolve the caller from the bus daemon, never a sender-provided hint.
+        let pid = if let Some(sender) = header.sender() {
+            match zbus::fdo::DBusProxy::new(connection).await {
+                Ok(proxy) => proxy
+                    .get_connection_unix_process_id(sender.clone().into())
+                    .await
+                    .ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let tracked = self
+            .center
+            .lock()
+            .ok()
+            .and_then(|center| pid.and_then(|pid| center.sender_app(pid).map(str::to_owned)));
+        let installed =
+            |id: &str| gio_unix::DesktopAppInfo::new(&format!("{id}.desktop")).is_some();
+        let resolved = resolve_source(tracked.as_deref(), &desktop_entry, &app_name, installed);
+        let source_id = {
+            let Ok(center) = self.center.lock() else {
+                return 0;
+            };
+            replaces
+                .and_then(|id| center.history().iter().find(|n| n.id == id))
+                .map(|n| n.desktop_entry().to_owned())
+                .unwrap_or(resolved)
+        };
+        // Desktop/settings I/O must not hold the queue mutex GTK uses to draw.
+        // The store rechecks replacement identity under the admission lock.
+        let policy = PolicyReader::new().read(&source_id, true);
         self.center
             .lock()
             .map(|mut center| {
-                let id = center.notify(
+                center.notify_with_source(
                     &app_name,
                     &summary,
                     &body,
                     pair_actions(&actions),
                     urgency_hint(&hints),
                     replaces,
-                );
-                center.set_source(id, &app_icon, &desktop_entry);
-                id
+                    NotificationSource {
+                        icon: app_icon.clone(),
+                        desktop_entry: source_id,
+                        policy,
+                        sound: NotificationSound {
+                            name: hints
+                                .get("sound-name")
+                                .and_then(|v| String::try_from(v.clone()).ok())
+                                .unwrap_or_default(),
+                            file: hints
+                                .get("sound-file")
+                                .and_then(|v| String::try_from(v.clone()).ok())
+                                .unwrap_or_default(),
+                        },
+                    },
+                )
             })
             .unwrap_or(0) as u32
     }
@@ -113,7 +181,11 @@ impl Notifications {
 
     /// Server capabilities: banner actions plus queue persistence.
     fn get_capabilities(&self) -> Vec<String> {
-        vec!["actions".to_owned(), "persistence".to_owned()]
+        vec![
+            "actions".to_owned(),
+            "persistence".to_owned(),
+            "sound".to_owned(),
+        ]
     }
 
     /// Banner press fired an action key (emitted by
@@ -311,6 +383,28 @@ mod tests {
     }
 
     #[test]
+    fn verified_pid_identity_precedes_conflicting_hint_and_name_fallback() {
+        let installed = |id: &str| matches!(id, "org.Alpha" | "org.Beta");
+        assert_eq!(
+            resolve_source(Some("org.Alpha"), "org.Beta", "org.Beta", installed),
+            "org.Alpha"
+        );
+        assert_eq!(
+            resolve_source(Some("unknown"), "org.Beta.desktop", "org.Alpha", installed),
+            "org.Beta"
+        );
+        assert_eq!(
+            resolve_source(None, "unknown", "org.Alpha.desktop", installed),
+            "org.Alpha"
+        );
+        assert_eq!(
+            resolve_source(None, "unknown", "unknown-name", installed),
+            "unknown"
+        );
+        assert_eq!(resolve_source(None, "", "unknown-name", installed), "");
+    }
+
+    #[test]
     fn urgency_hint_maps_the_byte_and_defaults_to_normal() {
         use zbus::zvariant::{OwnedValue, Value};
 
@@ -325,7 +419,7 @@ mod tests {
         assert_eq!(hinted(0), Urgency::Low);
         assert_eq!(hinted(1), Urgency::Normal);
         assert_eq!(hinted(2), Urgency::Critical);
-        assert_eq!(hinted(9), Urgency::Critical);
+        assert_eq!(hinted(9), Urgency::Normal);
         assert_eq!(urgency_hint(&HashMap::new()), Urgency::Normal);
         let mut mistyped = HashMap::new();
         mistyped.insert("urgency".to_owned(), OwnedValue::from(true));
@@ -344,6 +438,28 @@ mod tests {
 
         use super::super::{NotificationBus, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH};
         use crate::notifications::{NotificationCenter, NotificationError};
+
+        // GLib caches its default backend process-wide. Isolate each live wire
+        // fixture before any Settings object exists, rather than modifying the
+        // developer's preferences or changing process environment in parallel.
+        fn isolated_settings_fixture(name: &str) -> bool {
+            if std::env::var_os("TUNA_NOTIFICATION_SETTINGS_FIXTURE").is_some() {
+                return false;
+            }
+            let result =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        &format!("intake::tests::live_bus::{name}"),
+                        "--nocapture",
+                    ])
+                    .env("GSETTINGS_BACKEND", "memory")
+                    .env("TUNA_NOTIFICATION_SETTINGS_FIXTURE", "1")
+                    .status()
+                    .expect("isolated notification fixture starts");
+            assert!(result.success(), "isolated notification fixture passes");
+            true
+        }
 
         /// Private bus daemon plus its address, or `None` when no
         /// daemon is usable (the caller skips the test).
@@ -459,6 +575,11 @@ mod tests {
 
         #[test]
         fn stub_notify_shows_a_banner_and_close_notification_dismisses_it() {
+            if isolated_settings_fixture(
+                "stub_notify_shows_a_banner_and_close_notification_dismisses_it",
+            ) {
+                return;
+            }
             let Some((address, mut daemon)) = private_bus() else {
                 eprintln!("SKIP live notification test: no usable dbus-daemon on PATH");
                 return;
@@ -482,7 +603,14 @@ mod tests {
             let caps: Vec<String> = proxy
                 .call::<&str, _, Vec<String>>("GetCapabilities", &())
                 .expect("stub GetCapabilities reaches the intake");
-            assert_eq!(caps, vec!["actions".to_owned(), "persistence".to_owned()]);
+            assert_eq!(
+                caps,
+                vec![
+                    "actions".to_owned(),
+                    "persistence".to_owned(),
+                    "sound".to_owned()
+                ]
+            );
 
             let id = stub_notify(&proxy, vec!["default".to_owned(), "Open".to_owned()]);
             assert_ne!(id, 0, "intake returns a live notification id");
@@ -519,6 +647,11 @@ mod tests {
 
         #[test]
         fn default_action_press_fires_the_stub_callback_exactly_once() {
+            if isolated_settings_fixture(
+                "default_action_press_fires_the_stub_callback_exactly_once",
+            ) {
+                return;
+            }
             let Some((address, mut daemon)) = private_bus() else {
                 eprintln!("SKIP live notification test: no usable dbus-daemon on PATH");
                 return;
@@ -569,6 +702,9 @@ mod tests {
 
         #[test]
         fn close_press_tells_the_stub_its_notification_closed() {
+            if isolated_settings_fixture("close_press_tells_the_stub_its_notification_closed") {
+                return;
+            }
             let Some((address, mut daemon)) = private_bus() else {
                 eprintln!("SKIP live notification test: no usable dbus-daemon on PATH");
                 return;

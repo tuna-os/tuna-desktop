@@ -163,9 +163,10 @@ impl ProtocolVersion {
     /// `0.31` appends workspace/edge-tiling preferences and trusted dash icon targets.
     /// `0.32` appends cursor theme, size and locate-pointer preferences.
     /// `0.33` appends the configurable locate-pointer keysym name.
+    /// `0.34` appends authenticated window peer PID for notification sender matching.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 33,
+        minor: 34,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -210,6 +211,9 @@ pub struct WindowInfo {
     /// Sticky windows and windows outside the primary monitor's workspace set.
     #[serde(default)]
     pub on_all_workspaces: bool,
+    /// Native kernel peer PID or XRes server-reported X11 owner PID.
+    /// Private shell transport, redacted while locked; never _NET_WM_PID.
+    pub client_pid: Option<u32>,
 }
 
 /// Workspace state owned by the compositor and mirrored to the shell.
@@ -1317,6 +1321,7 @@ mod tests {
     fn sample_window(id: WindowId) -> WindowInfo {
         WindowInfo {
             on_all_workspaces: false,
+            client_pid: Some(4321),
             icon: None,
             id,
             title: format!("Terminal {id}"),
@@ -1423,8 +1428,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_33() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 33));
+    fn current_version_is_0_34() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 34));
     }
 
     #[test]

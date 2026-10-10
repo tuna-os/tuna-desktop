@@ -1,0 +1,471 @@
+#!/usr/bin/python3
+"""Nested GTK/DBus notification policy proof. Run with dbus-run-session.
+Requires immutable matched binaries, Xvfb, PAM wrapper and private AT-SPI.
+This proves local consumers and player dispatch, not audible output or a GNOME hardware comparison.
+"""
+import argparse, pwd, hashlib, importlib.util, json, os, select, shutil, signal, subprocess, time
+from pathlib import Path
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument('--bin-dir', type=Path, required=True)
+p.add_argument('--artifacts', type=Path, required=True)
+p.add_argument('--display', default=':96')
+p.add_argument('--real-audio', action='store_true', help='require private recorded digital sound cases')
+a = p.parse_args()
+root = Path(__file__).resolve().parent.parent
+art = a.artifacts.resolve(); art.mkdir(parents=True, exist_ok=True)
+runtime = art/'runtime'
+state = art/'state.json'
+env = dict(os.environ, DISPLAY=a.display, XDG_RUNTIME_DIR=str(runtime),
+ XDG_CONFIG_HOME=str(art/'config'), XDG_STATE_HOME=str(art/'state'), XDG_DATA_HOME=str(art/'data'),
+ TUNA_COMPOSITOR_STATE=str(state), TUNA_XWAYLAND='1', LIBGL_ALWAYS_SOFTWARE='1',
+ GSK_RENDERER='cairo', GTK_A11Y='atspi', ADW_DISABLE_PORTAL='1', GSETTINGS_BACKEND='keyfile')
+def sha(path):
+ with open(path,'rb') as f: return hashlib.file_digest(f,'sha256').hexdigest()
+manifest = dict(source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
+ source_dirty=bool(subprocess.check_output(['git','status','--porcelain'],cwd=root,text=True).strip()),
+ backend='winit/Xvfb/software', gnome_comparison=False, diagnostic_only=False, proof_sha256=sha(__file__),
+ binaries={n:dict(path=str(a.bin_dir.resolve()/n),sha256=sha(a.bin_dir/n)) for n in ('tuna-compositor','tuna-shell-gtk','tuna-shell-gtk-tests')})
+receipt=json.loads((a.bin_dir/'manifest.json').read_text())
+assert not receipt['source_dirty'] and not manifest['source_dirty'], 'proof requires committed clean source'
+proof_revision=manifest['source_revision']
+binary_revision=receipt['source_revision']
+changes=subprocess.check_output(['git','diff','--name-only',binary_revision,proof_revision],cwd=root,text=True).splitlines()
+assert set(changes)<= {'scripts/tuna-notification-policy-proof','docs/notification-policy-proof.md'}, 'production binary/source mismatch'
+subprocess.run(['git','diff','--exit-code',binary_revision,proof_revision,'--','crates','Cargo.toml','Cargo.lock'],cwd=root,check=True)
+manifest['source_revision']=binary_revision
+manifest['proof_revision']=proof_revision
+manifest['proof_only_changes']=changes
+manifest['production_source_equal']=True
+for name,record in manifest['binaries'].items():
+ assert receipt['binary_sha256'][name]==record['sha256'], 'frozen binary digest mismatch'
+manifest['binary_receipt']=receipt
+manifest['accessibility_bounds']='window-relative (Wayland has no global surface origin)'
+manifest['gtk_version']=subprocess.check_output(['pkg-config','--modversion','gtk4'],text=True).strip()
+assert not runtime.exists(), 'refusing an existing proof runtime'
+processes=[]; logs=[]; owned=[]; assertions=[]; accessibility=None; success=False; runtime_created=False; audio=None
+def interrupted(signum, _frame):
+ raise SystemExit(128+signum)
+signal.signal(signal.SIGTERM,interrupted)
+session=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+def spawn(args,name,extra=None):
+ log=(art/(name+'.log')).open('w'); logs.append(log)
+ proc=subprocess.Popen(args,env=env|(extra or {}),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+ processes.append(proc); return proc
+def call(bus,dest,path,iface,method,args=None,flags=Gio.DBusCallFlags.NONE,timeout=3000):
+ return bus.call_sync(dest,path,iface,method,args,None,flags,timeout,None).unpack()
+def wait(check,label,seconds=15):
+ end=time.monotonic()+seconds
+ while time.monotonic()<end:
+  try:
+   result=check()
+   if result: assertions.append(label); return result
+  except (GLib.Error,OSError,ValueError,KeyError): pass
+  time.sleep(.1)
+ if accessibility is not None:
+  (art/('failure-'+label+'.json')).write_text(json.dumps(tree()))
+  shot('failure-'+label)
+ raise AssertionError('timed out '+label)
+def snapshot(): return json.loads(state.read_text())
+def setpref(schema,key,value):
+ subprocess.run(['gsettings','set',schema,key,value],env=env,check=True)
+ time.sleep(.2)
+MASTER='org.gnome.desktop.notifications'
+def app_schema(app): return 'org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/org-tuna-notify'+app.lower()+'/'
+def notify(app,title,critical=False,replaces=0,body=None,low=False,sound=None,app_name=None):
+ hints={'urgency':GLib.Variant('y',0 if low else 2 if critical else 1)}
+ if sound: hints.update({k:GLib.Variant('s',v) for k,v in sound.items()})
+ if app: hints['desktop-entry']=GLib.Variant('s','org.tuna.Notify'+app)
+ return call(session,'org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','Notify',
+  GLib.Variant('(susssasa{sv}i)',(app_name or 'TunaPolicy'+(app or 'Unknown'),replaces,'',title,body or 'PRIVATE_BODY_'+title,['open','Open'],hints,0)))[0]
+def close(n): call(session,'org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','CloseNotification',GLib.Variant('(u)',(n,)))
+nodes={}
+def tree():
+ nodes.clear()
+ # Bulk GetChildren avoids GTK 4.14's stale GetChildAtIndex path.
+ names=[]; seen=set(); pending=[('org.a11y.atspi.Registry','/org/a11y/atspi/accessible/root')]
+ while pending:
+  dest,path=pending.pop()
+  if (dest,path) in seen or path=='/org/a11y/atspi/null': continue
+  seen.add((dest,path))
+  try:
+   # AT-SPI registry 2.52 returns () for GetAll; the individual Name
+   # property is implemented by both registry roots and GTK contexts.
+   name=call(accessibility,dest,path,'org.freedesktop.DBus.Properties','Get',GLib.Variant('(ss)',('org.a11y.atspi.Accessible','Name')))[0]
+   names.append(name); nodes.setdefault(name,[]).append((dest,path))
+   pending.extend(call(accessibility,dest,path,'org.a11y.atspi.Accessible','GetChildren')[0])
+  except GLib.Error as e:
+   if 'NoSuchObject' not in str(e) and 'UnknownObject' not in str(e): raise
+ return names
+def has(text): return any(text in n for n in tree())
+def absent(text): return not has(text)
+def height(text):
+ tree()
+ return max(call(accessibility,dest,path,'org.a11y.atspi.Component','GetExtents',GLib.Variant('(u)',(1,)))[0][3] for dest,path in nodes[text])
+def bounds(text):
+ tree()
+ return [call(accessibility,dest,path,'org.a11y.atspi.Component','GetExtents',GLib.Variant('(u)',(1,)))[0] for dest,path in nodes.get(text,[])]
+def shot(label):
+ time.sleep(.2); subprocess.run(['scrot',str(art/(label+'.png'))],env=env,check=True)
+def lock():
+ call(session,'org.gnome.ScreenSaver','/org/gnome/ScreenSaver','org.gnome.ScreenSaver','SetActive',GLib.Variant('(b)',(True,)),timeout=10000)
+ wait(lambda:snapshot()['locked'],'actual-lock'); time.sleep(.5)
+def unlock():
+ subprocess.run(['xdotool','key','Escape'],env=env,check=True); time.sleep(.2)
+ subprocess.run(['xdotool','key','space'],env=env,check=True); time.sleep(.3)
+ # The printable curtain key starts the password, including this space.
+ subprocess.run(['xdotool','key','ctrl+a','BackSpace'],env=env,check=True)
+ subprocess.run(['xdotool','type','--clearmodifiers',password],env=env,check=True)
+ subprocess.run(['xdotool','key','Return'],env=env,check=True)
+ wait(lambda:not snapshot()['locked'],'authenticated-unlock')
+try:
+ runtime.mkdir(mode=0o700); runtime_created=True; os.chmod(runtime,0o700)
+ for app in ('Alpha','Beta'):
+  folder=art/'data/applications'; folder.mkdir(parents=True,exist_ok=True)
+  (folder/('org.tuna.Notify'+app+'.desktop')).write_text('[Desktop Entry]\nType=Application\nName=TunaPolicy'+app+'\nExec=/usr/bin/true\nIcon=dialog-information\n')
+ pam=art/'pam/services'; pam.mkdir(parents=True)
+ password='tuna-policy-'+str(os.getpid())
+ passdb=art/'pam/passdb'; passdb.write_text(pwd.getpwuid(os.getuid()).pw_name+':'+password+':tuna-lock\n'); os.chmod(passdb,0o600)
+ matrix='/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so'; wrapper='/usr/lib/x86_64-linux-gnu/libpam_wrapper.so'
+ (pam/'tuna-lock').write_text(f'auth required {matrix} passdb={passdb}\naccount required {matrix} passdb={passdb}\n')
+ # Capture the actual bounded player process arguments. This validates
+ # dispatch and suppression, not hardware/audible playback quality.
+ player_dir=art/'players'; player_dir.mkdir()
+ sound_log=art/'sound-dispatch.jsonl'
+ player_body='#!/usr/bin/python3\nimport json,os,sys\nwith open(os.environ["TUNA_SOUND_DISPATCH"],"a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n'
+ if a.real_audio: player_body+='os.execv("/usr/bin/canberra-gtk-play",["/usr/bin/canberra-gtk-play"]+sys.argv[1:])\n'
+ (player_dir/'canberra-gtk-play').write_text(player_body)
+ (player_dir/'canberra-gtk-play').chmod(0o700)
+ env['PATH']=str(player_dir)+':'+env['PATH']; env['TUNA_SOUND_DISPATCH']=str(sound_log)
+ def sounds(): return [json.loads(line) for line in sound_log.read_text().splitlines()] if sound_log.exists() else []
+ manifest['pam_fixture']={'wrapper_sha256':sha(wrapper),'matrix_sha256':sha(matrix)}
+ launcher=spawn(['/usr/libexec/at-spi-bus-launcher','--launch-immediately'],'atspi')
+ address=wait(lambda:call(session,'org.a11y.Bus','/org/a11y/bus','org.a11y.Bus','GetAddress',flags=Gio.DBusCallFlags.NO_AUTO_START)[0],'private-a11y')
+ assert str(runtime) in address
+ env['AT_SPI_BUS_ADDRESS']=address
+ os.environ['AT_SPI_BUS_ADDRESS']=address
+ os.environ['XDG_RUNTIME_DIR']=str(runtime)
+ accessibility=Gio.DBusConnection.new_for_address_sync(address,Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT|Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,None,None)
+ assert not Path('/tmp/.X11-unix/X'+a.display.lstrip(':')).exists()
+ spawn(['Xvfb',a.display,'-screen','0','1280x800x24'],'xvfb')
+ wait(lambda:subprocess.run(['xdotool','getdisplaygeometry'],env=env,capture_output=True).returncode==0,'private-display')
+ call(accessibility,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','UpdateActivationEnvironment',GLib.Variant('(a{ss})',({'AT_SPI_BUS_ADDRESS':address,'XDG_RUNTIME_DIR':str(runtime)},)))
+ call(accessibility,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','StartServiceByName',GLib.Variant('(su)',('org.a11y.atspi.Registry',0)))
+ for name in ('org.freedesktop.DBus','org.a11y.atspi.Registry'):
+  pid=call(accessibility,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','GetConnectionUnixProcessID',GLib.Variant('(s)',(name,)))[0]
+  owned.append((name,pid,os.pidfd_open(pid)))
+ manifest['session_isolation']=dict(runtime=str(runtime),mode=oct(runtime.stat().st_mode&0o777),session_bus=env.get('DBUS_SESSION_BUS_ADDRESS'),accessibility_bus=address,owned_services=[dict(name=n,pid=pid) for n,pid,_ in owned])
+ widget_test=spawn([str(a.bin_dir.resolve()/'tuna-shell-gtk-tests'),'lock::tests::notification_viewport_restores_after_parent_is_hidden','--ignored','--exact','--test-threads=1'],'lock-viewport-widget-test',dict(GDK_BACKEND='x11'))
+ assert widget_test.wait(timeout=15)==0, 'GTK viewport visibility regression failed'
+ assertions.append('gtk-viewport-restores-after-parent-hidden')
+ if a.real_audio:
+  helper_path=root/'scripts/lib/tuna-notification-audio-proof.py'
+  spec=importlib.util.spec_from_file_location('notification_audio',helper_path)
+  helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
+  audio=helper.AudioProof(art,runtime,env,spawn,manifest)
+ setpref(MASTER,'show-banners','true'); setpref(MASTER,'show-in-lock-screen','true')
+ if audio: setpref('org.gnome.desktop.sound','theme-name',"'freedesktop'")
+ for app in ('Alpha','Beta'):
+  for key in ('enable','show-banners','show-in-lock-screen'): setpref(app_schema(app),key,'true')
+  setpref(app_schema(app),'details-in-lock-screen','false')
+ comp=spawn([str(a.bin_dir.resolve()/'tuna-compositor'),'--backend','winit','--socket','notification-proof','--shell-bin',str(a.bin_dir.resolve()/'tuna-shell-gtk')],'compositor',dict(LD_PRELOAD=wrapper,PAM_WRAPPER='1',PAM_WRAPPER_SERVICE_DIR=str(pam)))
+ wait(lambda:any(l['namespace']=='tuna-panel' for l in snapshot()['layers']),'shell-ready')
+ wid=wait(lambda:subprocess.check_output(['xdotool','search','--pid',str(comp.pid),'--name','Smithay'],env=env,text=True).strip().splitlines()[0],'host-window')
+ subprocess.run(['xdotool','windowfocus',wid],env=env,check=True)
+ setpref('org.gnome.desktop.sound','event-sounds','true')
+ setpref(app_schema('Beta'),'enable-sound-alerts','true')
+ if audio: audio.begin('positive-name-priority')
+ sounded=notify('Beta','SOUND_POSITIVE',sound={'sound-name':'message-new-instant','sound-file':'/tmp/unused.wav'})
+ wait(lambda:has('SOUND_POSITIVE') and len(sounds())==1,'actual-notification-player-dispatched')
+ assert '--id' in sounds()[0] and 'message-new-instant' in sounds()[0] and '--file' not in sounds()[0]
+ assert 'SOUND_POSITIVE' not in str(sounds()), 'private content passed to sound player'
+ if audio: audio.finish(True)
+ close(sounded)
+ setpref(app_schema('Beta'),'enable-sound-alerts','false')
+ if audio: audio.begin('app-sound-disabled')
+ muted=notify('Beta','SOUND_APP_DISABLED',sound={'sound-name':'message-new-instant'})
+ wait(lambda:has('SOUND_APP_DISABLED'),'silent-app-banner-positive-control'); time.sleep(.5)
+ assert len(sounds())==1
+ if audio: audio.finish(False)
+ close(muted)
+ setpref(app_schema('Beta'),'enable-sound-alerts','true')
+ setpref('org.gnome.desktop.sound','event-sounds','false')
+ if audio: audio.begin('global-event-sounds-disabled')
+ muted=notify('Beta','SOUND_GLOBAL_DISABLED',sound={'sound-name':'message-new-instant'})
+ wait(lambda:has('SOUND_GLOBAL_DISABLED'),'silent-global-banner-positive-control'); time.sleep(.5)
+ assert len(sounds())==1
+ if audio: audio.finish(False)
+ close(muted)
+ setpref('org.gnome.desktop.sound','event-sounds','true')
+ if audio: audio.begin('low-urgency-suppressed')
+ low_id=notify('Beta','LOW_HISTORY_ONLY',low=True,sound={'sound-name':'message-new-instant'})
+ time.sleep(.5)
+ assert absent('LOW_HISTORY_ONLY') and len(sounds())==1
+ if audio: audio.finish(False)
+ queue_file=art/'state/tuna-shell/notifications.json'
+ low_store=json.loads(queue_file.read_text())
+ assert low_id not in low_store['banners'] and any(n['id']==low_id for n in low_store['notifications'])
+ assertions.append('low-retains-history-without-banner-or-sound')
+ fallback=notify(None,'APP_NAME_FALLBACK',app_name='org.tuna.NotifyBeta.desktop')
+ wait(lambda:has('APP_NAME_FALLBACK'),'installed-app-name-fallback-shown')
+ assert next(n for n in json.loads(queue_file.read_text())['notifications'] if n['id']==fallback)['desktop_entry']=='org.tuna.NotifyBeta'
+ assertions.append('app-name-fallback-policy-identity'); close(fallback)
+ # One native Wayland client owns both its window and its DBus connection.
+ # A conflicting Beta hint must not bypass disabled Alpha policy.
+ sender_trigger=art/'sender-trigger'; sender_reply=art/'sender-reply'
+ sender_script=art/'sender-fixture.py'
+ sender_script.write_text("""import gi,os,json
+from pathlib import Path
+gi.require_version('Gtk','4.0')
+from gi.repository import Gtk,Gio,GLib
+app=Gtk.Application(application_id='org.tuna.NotifyAlpha',flags=Gio.ApplicationFlags.NON_UNIQUE)
+def activate(app):
+ win=Gtk.ApplicationWindow(application=app,title='Notification sender fixture');win.set_default_size(200,100);win.present()
+ bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+ def send():
+  trigger=Path(os.environ['TUNA_SENDER_TRIGGER'])
+  if trigger.exists():
+   title=trigger.read_text();trigger.unlink()
+   args=GLib.Variant('(susssasa{sv}i)',('lying Beta',0,'',title,'fixture body',[],{'desktop-entry':GLib.Variant('s','org.tuna.NotifyBeta')},0))
+   result=bus.call_sync('org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','Notify',args,None,Gio.DBusCallFlags.NONE,3000,None).unpack()[0]
+   Path(os.environ['TUNA_SENDER_REPLY']).write_text(json.dumps({'id':result,'pid':os.getpid()}))
+  return True
+ GLib.timeout_add(100,send)
+app.connect('activate',activate);app.run([])
+""")
+ sender=spawn(['/usr/bin/python3',str(sender_script)],'sender-fixture',dict(GDK_BACKEND='wayland',WAYLAND_DISPLAY='notification-proof',TUNA_SENDER_TRIGGER=str(sender_trigger),TUNA_SENDER_REPLY=str(sender_reply)))
+ wait(lambda:any(w.get('app_id')=='org.tuna.NotifyAlpha' for w in snapshot()['windows']),'native-sender-window-tracked')
+ time.sleep(.5)
+ setpref(app_schema('Alpha'),'enable','false')
+ sender_trigger.write_text('PID_DISABLED_ALPHA')
+ result=wait(lambda:json.loads(sender_reply.read_text()),'dbus-sender-response')
+ assert result['pid']==sender.pid
+ wait(lambda:any(n['id']==result['id'] and n['desktop_entry']=='org.tuna.NotifyAlpha' for n in json.loads(queue_file.read_text())['notifications']),'verified-pid-precedes-conflicting-hint')
+ assert absent('PID_DISABLED_ALPHA'), 'conflicting hint bypassed source policy'
+ setpref(app_schema('Alpha'),'enable','true')
+ sender_reply.unlink(); sender_trigger.write_text('PID_ENABLED_ALPHA')
+ wait(lambda:sender_reply.exists() and has('PID_ENABLED_ALPHA'),'verified-source-positive-control')
+ close(json.loads(sender_reply.read_text())['id']); sender.terminate();sender.wait(timeout=5)
+ # X11 application ownership comes from XRes, never _NET_WM_PID. Install a
+ # spoofed property before mapping so a cached property read cannot pass.
+ xdisplay=wait(lambda:snapshot().get('x11_display'),'reserved-x11-display')
+ xscript=art/'x11-sender-fixture.py'
+ xscript.write_text("""import gi,os,json,subprocess
+from pathlib import Path
+gi.require_version('Gtk','3.0');gi.require_version('GdkX11','3.0')
+from gi.repository import Gtk,GdkX11,Gio,GLib
+appid=os.environ['TUNA_X11_APP']
+GLib.set_prgname(appid)
+app=Gtk.Application(application_id=appid,flags=Gio.ApplicationFlags.NON_UNIQUE)
+def activate(app):
+ win=Gtk.ApplicationWindow(application=app,title='X11 notification sender fixture')
+ win.set_wmclass(appid,appid);win.set_default_size(200,100);win.realize()
+ xid=win.get_window().get_xid()
+ reported=int(os.environ.get('TUNA_X11_SPOOF_PID',os.getpid()))
+ subprocess.run(['xprop','-id',str(xid),'-f','_NET_WM_PID','32c','-set','_NET_WM_PID',str(reported)],check=True,timeout=5)
+ win.show_all()
+ Path(os.environ['TUNA_X11_READY']).write_text(json.dumps({'xid':xid,'pid':os.getpid(),'reported_pid':reported}))
+ bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+ def send():
+  trigger=Path(os.environ['TUNA_SENDER_TRIGGER'])
+  if trigger.exists():
+   title=trigger.read_text();trigger.unlink()
+   args=GLib.Variant('(susssasa{sv}i)',('lying sender name',0,'',title,'fixture body',[],{'desktop-entry':GLib.Variant('s',os.environ['TUNA_SENDER_HINT'])},0))
+   result=bus.call_sync('org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','Notify',args,None,Gio.DBusCallFlags.NONE,3000,None).unpack()[0]
+   Path(os.environ['TUNA_SENDER_REPLY']).write_text(json.dumps({'id':result,'pid':os.getpid()}))
+  return True
+ GLib.timeout_add(100,send)
+app.connect('activate',activate);app.run([])
+""")
+ xclients={}
+ for app in ('Beta','Alpha'):
+  trigger=art/(app+'-x11-trigger'); reply=art/(app+'-x11-reply'); ready=art/(app+'-x11-ready')
+  extra=dict(GDK_BACKEND='x11',DISPLAY=xdisplay,TUNA_X11_APP='org.tuna.Notify'+app,TUNA_X11_READY=str(ready),TUNA_SENDER_TRIGGER=str(trigger),TUNA_SENDER_REPLY=str(reply),TUNA_SENDER_HINT='org.tuna.Notify'+('Beta' if app=='Alpha' else 'Alpha'))
+  if app=='Alpha': extra['TUNA_X11_SPOOF_PID']=str(xclients['Beta'][0].pid)
+  client=spawn(['/usr/bin/python3',str(xscript)],app+'-x11-sender',extra)
+  info=wait(lambda:json.loads(ready.read_text()),app+'-x11-ready')
+  assert info['pid']==client.pid
+  wait(lambda:any(w.get('app_id')=='org.tuna.Notify'+app for w in snapshot()['windows']),app+'-x11-window-tracked')
+  xclients[app]=(client,trigger,reply,info)
+ # Give the bounded off-thread owner lookup a chance to reach the shell.
+ time.sleep(2)
+ alpha,trigger,reply,info=xclients['Alpha']
+ assert info['reported_pid']==xclients['Beta'][0].pid and info['reported_pid']!=alpha.pid
+ prop=subprocess.check_output(['xprop','-id',str(info['xid']),'_NET_WM_PID'],env=env|dict(DISPLAY=xdisplay),text=True)
+ assert int(prop.split('=')[1].strip())==info['reported_pid']
+ setpref(app_schema('Alpha'),'enable','false')
+ trigger.write_text('X11_SPOOF_NEGATIVE')
+ result=wait(lambda:json.loads(reply.read_text()),'x11-spoof-sender-response')
+ assert result['pid']==alpha.pid
+ wait(lambda:any(n['id']==result['id'] and n['desktop_entry']=='org.tuna.NotifyAlpha' for n in json.loads(queue_file.read_text())['notifications']),'xres-owner-precedes-spoofed-property-and-hint')
+ assert absent('X11_SPOOF_NEGATIVE'), 'spoofed property bypassed disabled owner policy'
+ beta,btrigger,breply,_=xclients['Beta']
+ btrigger.write_text('X11_OWNER_POSITIVE')
+ wait(lambda:breply.exists() and has('X11_OWNER_POSITIVE'),'xres-valid-sender-positive-control')
+ bresult=json.loads(breply.read_text());assert bresult['pid']==beta.pid
+ assert next(n for n in json.loads(queue_file.read_text())['notifications'] if n['id']==bresult['id'])['desktop_entry']=='org.tuna.NotifyBeta'
+ close(bresult['id'])
+ setpref(app_schema('Alpha'),'enable','true');reply.unlink();trigger.write_text('X11_SPOOFED_OWNER_ENABLED')
+ wait(lambda:reply.exists() and has('X11_SPOOFED_OWNER_ENABLED'),'xres-spoofed-owner-enable-positive-control')
+ close(json.loads(reply.read_text())['id'])
+ manifest['x11_identity']=dict(window_pid_source='XRes LOCAL_CLIENT_PID (X server owner)',sender_pid_source='org.freedesktop.DBus.GetConnectionUnixProcessID',spoofed_property='_NET_WM_PID set before map',kernel_authenticated_x11_window=False)
+ for client,_,_,_ in xclients.values(): client.terminate();client.wait(timeout=5)
+ wait(lambda:all(w.get('app_id') not in ('org.tuna.NotifyAlpha','org.tuna.NotifyBeta') for w in snapshot()['windows']),'x11-senders-unmapped')
+ setpref(app_schema('Alpha'),'show-banners','false')
+ for i in range(5): notify('Alpha','HIDDEN_NORMAL_'+str(i))
+ control=notify('Beta','VISIBLE_CONTROL')
+ wait(lambda:has('VISIBLE_CONTROL') and absent('HIDDEN_NORMAL_'),'hidden-admission-does-not-starve')
+ assert subprocess.check_output(['gsettings','get',app_schema('Beta'),'application-id'],env=env,text=True).strip()=="'org.tuna.NotifyBeta.desktop'"
+ assert 'org-tuna-notifybeta' in subprocess.check_output(['gsettings','get',MASTER,'application-children'],env=env,text=True)
+ assertions.append('canonical-source-metadata-registered')
+ shot('01-admission'); close(control)
+ longbody='PRIVATE_EXPAND '+('A deliberately long body to verify the actual expanded banner layout. '*12)
+ expanded=notify('Beta','EXPANSION_CONTROL',body=longbody)
+ wait(lambda:has(longbody),'collapsed-banner-present')
+ collapsed_height=height(longbody)
+ setpref(app_schema('Beta'),'force-expanded','true')
+ wait(lambda:height(longbody)>collapsed_height,'live-force-expanded-real-layout')
+ shot('01b-expanded'); close(expanded)
+ setpref(app_schema('Beta'),'force-expanded','false')
+ critical=notify('Alpha','CRITICAL_EXCEPTION',True)
+ wait(lambda:has('CRITICAL_EXCEPTION'),'critical-bypasses-banner-toggle')
+ setpref(app_schema('Alpha'),'enable','false')
+ wait(lambda:absent('CRITICAL_EXCEPTION'),'live-disable-removes-critical')
+ notify('Alpha','DISABLED_CRITICAL',True)
+ wait(lambda:absent('DISABLED_CRITICAL'),'disabled-critical-denied')
+ setpref(app_schema('Alpha'),'enable','true')
+ setpref(MASTER,'show-banners','false')
+ held=notify('Beta','MASTER_CRITICAL',True)
+ wait(lambda:has('MASTER_CRITICAL'),'master-critical-exception'); close(held)
+ lock()
+ setpref(MASTER,'show-banners','true')
+ normal=notify('Beta','LOCKED_NORMAL')
+ queue_file=art/'state/tuna-shell/notifications.json'
+ wait(lambda:normal in json.loads(queue_file.read_text())['banners'],'normal-admitted-behind-lock')
+ wait(lambda:has('TunaPolicyBeta') and absent('LOCKED_NORMAL'),'normal-lock-redacted')
+ frames_before=snapshot()['rendered_frames']
+ held_at=time.monotonic()
+ time.sleep(6)
+ manifest['locked_hold_frames']=dict(elapsed_seconds=time.monotonic()-held_at,rendered_frames=snapshot()['rendered_frames']-frames_before,paired_benchmark=False)
+ stored=json.loads(queue_file.read_text())
+ assert normal in stored['banners'] and not next(n for n in stored['notifications'] if n['id']==normal)['acknowledged']
+ wait(lambda:has('TunaPolicyBeta'),'unseen-normal-survives-banner-timeout')
+ setpref(MASTER,'show-banners','false')
+ secret=notify('Alpha','SECRET_LOCK_TITLE',True)
+ second=notify('Alpha','SECRET_SECOND',True)
+ wait(lambda:has('TunaPolicyAlpha') and absent('SECRET_LOCK_TITLE') and absent('PRIVATE_BODY_'),'redacted-lock-critical')
+ assert absent('Open'), 'app action exposed while locked'
+ assertions.append('lock-widgets-have-no-app-actions')
+ shot('02-redacted-lock')
+ setpref(app_schema('Alpha'),'details-in-lock-screen','true')
+ wait(lambda:has('SECRET_LOCK_TITLE') and has('PRIVATE_BODY_SECRET_LOCK_TITLE'),'live-lock-details-positive-control')
+ shot('03-detailed-lock')
+ subprocess.run(['xdotool','windowsize',wid,'1280','480'],env=env,check=True)
+ subprocess.run(['xdotool','key','space'],env=env,check=True); time.sleep(.3)
+ subprocess.run(['xdotool','type','--clearmodifiers','wrong-proof-password'],env=env,check=True)
+ subprocess.run(['xdotool','key','Return'],env=env,check=True)
+ failed="Sorry, that didn't work. Please try again."
+ wait(lambda:has(failed),'short-output-auth-error')
+ time.sleep(.5)
+ auth=[r for r in bounds(failed) if r[3]>0 and r[1]>=0]
+ assert auth, 'authentication error not allocated'
+ bottom=max(r[1]+r[3] for r in auth)
+ for rect in bounds('Lock Screen Notifications'):
+  if rect[3]>0 and rect[1]>=0:
+   assert rect[1]>=bottom and rect[1]+rect[3]<=480, 'notification viewport overlaps authentication'
+ assertions.append('short-output-notification-viewport-keeps-auth-clear')
+ shot('03b-short-auth-error')
+ subprocess.run(['xdotool','windowsize',wid,'1280','800'],env=env,check=True)
+ wait(lambda:has('SECRET_LOCK_TITLE'),'large-output-details-restored')
+ setpref(app_schema('Alpha'),'details-in-lock-screen','false')
+ wait(lambda:absent('SECRET_LOCK_TITLE') and absent('PRIVATE_BODY_'),'live-details-redaction')
+ setpref(app_schema('Alpha'),'show-in-lock-screen','false')
+ wait(lambda:absent('TunaPolicyAlpha'),'app-lock-hidden')
+ setpref(app_schema('Alpha'),'show-in-lock-screen','true')
+ notify(None,'UNKNOWN_SECRET',True)
+ wait(lambda:has('TunaPolicyUnknown') and absent('UNKNOWN_SECRET'),'generic-lock-redacted')
+ # A retained generic identity becomes governed by its installed app policy.
+ notify('Gamma','INSTALL_SECRET',True)
+ wait(lambda:has('TunaPolicyGamma') and absent('INSTALL_SECRET'),'unknown-app-generic-policy')
+ setpref(app_schema('Gamma'),'enable','false')
+ (folder/'org.tuna.NotifyGamma.desktop').write_text('[Desktop Entry]\nType=Application\nName=TunaPolicyGamma\nExec=/usr/bin/true\n')
+ wait(lambda:absent('TunaPolicyGamma'),'installed-app-monitor-policy-transition')
+ setpref(MASTER,'show-in-lock-screen','false')
+ wait(lambda:absent('TunaPolicyAlpha') and absent('TunaPolicyUnknown'),'master-lock-hidden')
+ setpref(MASTER,'show-in-lock-screen','true')
+ wait(lambda:has('TunaPolicyAlpha'),'master-lock-restored')
+ shot('04-restored-redacted-lock')
+ unlock()
+ wait(lambda:has('SECRET_SECOND'),'unlocked-content-restored')
+ shot('05-unlocked')
+ # Restart the actual supervised shell. The same settings and persisted history survive.
+ children=Path(f'/proc/{comp.pid}/task/{comp.pid}/children').read_text().split()
+ child=next(int(pid) for pid in children if Path(f'/proc/{pid}/exe').resolve()==(a.bin_dir.resolve()/'tuna-shell-gtk'))
+ fd=os.pidfd_open(child); signal.pidfd_send_signal(fd,signal.SIGTERM); os.close(fd)
+ wait(lambda:child not in [int(x) for x in Path(f'/proc/{comp.pid}/task/{comp.pid}/children').read_text().split()],'old-shell-exited')
+ wait(lambda:any(l['namespace']=='tuna-panel' for l in snapshot()['layers']),'restarted-shell-ready')
+ time.sleep(1)
+ lock(); notify('Alpha','RESTART_SECRET',True)
+ wait(lambda:has('TunaPolicyAlpha') and absent('RESTART_SECRET') and absent('PRIVATE_BODY_'),'restart-policy-and-privacy-persist')
+ shot('06-restart-redacted'); unlock()
+ if audio:
+  setpref('org.gnome.desktop.sound','event-sounds','true')
+  for key in ('enable','show-banners','enable-sound-alerts'): setpref(app_schema('Beta'),key,'true')
+  setpref(MASTER,'show-banners','true')
+  def audio_case(case,hints,expected,visible=True,critical=False,media=False,retain=False):
+   title='AUDIO_'+case.upper().replace('-','_')
+   audio.begin(case)
+   ident=notify('Beta',title,critical,sound=hints)
+   wait(lambda:has(title) if visible else absent(title),'audio-banner-'+case)
+   audio.finish(expected,media)
+   assertions.append('recorded-audio-'+case)
+   if not retain: close(ident)
+   return ident
+  audio_case('local-file',{'sound-file':str(audio.file)},True)
+  audio_case('local-file-uri',{'sound-file':audio.file.as_uri()},True)
+  audio_case('no-hint-silent',None,False)
+  audio_case('remote-uri-rejected',{'sound-file':'https://example.invalid/event.wav'},False)
+  setpref(MASTER,'show-banners','false')
+  audio_case('hidden-normal-silent',{'sound-name':'message-new-instant'},False,visible=False)
+  audio_case('hidden-critical-positive',{'sound-name':'message-new-instant'},True,critical=True)
+  setpref(MASTER,'show-banners','true')
+  setpref(app_schema('Beta'),'enable','false')
+  retained=audio_case('disabled-critical-silent',{'sound-name':'message-new-instant'},False,visible=False,critical=True,retain=True)
+  audio.begin('reenable-history-no-replay')
+  setpref(app_schema('Beta'),'enable','true')
+  audio.finish(False);close(retained)
+  assertions.append('recorded-audio-reenable-history-no-replay')
+  lock()
+  audio_case('locked-critical-silent',{'sound-name':'message-new-instant'},False,visible=False,critical=True)
+  unlock()
+  audio.start_media()
+  audio_case('playing-media-baseline',None,False,media=True)
+  audio_case('playing-media-event-overlay',{'sound-name':'message-new-instant'},True,media=True)
+  audio_case('playing-media-remains-after-event',None,False,media=True)
+ assert comp.poll() is None
+ success=True
+finally:
+ # Complete owned cleanup even if cancellation sends another signal.
+ signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ signal.signal(signal.SIGINT,signal.SIG_IGN)
+ for proc in reversed(processes):
+  if proc.poll() is None:
+   os.killpg(proc.pid,signal.SIGTERM)
+   try: proc.wait(timeout=5)
+   except subprocess.TimeoutExpired: os.killpg(proc.pid,signal.SIGKILL); proc.wait()
+ stopped=True
+ for name,pid,fd in reversed(owned):
+  poll=select.poll(); poll.register(fd,select.POLLIN)
+  if not poll.poll(0): signal.pidfd_send_signal(fd,signal.SIGTERM)
+  if not poll.poll(3000): signal.pidfd_send_signal(fd,signal.SIGKILL)
+  stopped=stopped and bool(poll.poll(3000)); os.close(fd)
+ for log in logs: log.close()
+ if runtime_created: shutil.rmtree(runtime)
+ audio_stopped=audio.exited() if audio else True
+ manifest['cleanup']=dict(owned_accessibility_exit_verified=stopped,owned_audio_exit_verified=audio_stopped,runtime_removed=not runtime.exists())
+ manifest['assertions']=assertions; manifest['passed']=success and stopped and audio_stopped
+ (art/'manifest.json').write_text(json.dumps(manifest,indent=2))
+ assert stopped and audio_stopped and not runtime.exists(), 'private session cleanup failed'
+print('PASS: notification policy/privacy local runtime' if success else 'FAIL')

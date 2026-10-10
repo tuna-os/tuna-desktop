@@ -2227,6 +2227,7 @@ fn build(app: &adw::Application) {
         let shell_rc = shell.clone();
         let activities_button = activities.clone();
         let last_frames: RefCell<Vec<tuna_shell_control::SwitcherThumbnail>> = RefCell::default();
+        let last_sender_revision = Cell::new(None);
         let last_locked = Cell::new(
             shell
                 .borrow()
@@ -2294,6 +2295,12 @@ fn build(app: &adw::Application) {
             }
             let locked = shell.control.as_ref().map(|c| c.locked()).unwrap_or_else(|| last_locked.get());
             last_locked.set(locked);
+            if let Some(control) = shell.control.as_ref() {
+                let revision = (control.revision(), locked);
+                if last_sender_revision.replace(Some(revision)) != Some(revision) {
+                    notify.sync_senders(control.model());
+                }
+            }
             render_pills(&mut shell);
             if let Some(control) = shell.control.as_ref() {
                 switcher_ui.sync(control.model());
@@ -2321,6 +2328,8 @@ fn build(app: &adw::Application) {
             if locked {
                 notify.release_focus();
             }
+            notify.set_locked(locked);
+            lock_ui.sync_notifications(notify.lock_notifications());
             lock_ui.sync(locked);
             screensaver.sync(locked);
             if locked {

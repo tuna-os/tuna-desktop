@@ -457,6 +457,7 @@ fn stalled_client_gets_backpressure_and_server_still_serves() {
             .windows()
             .map(|w| tuna_shell_control::WindowInfo {
                 on_all_workspaces: w.on_all_workspaces,
+                client_pid: w.client_pid,
                 icon: None,
                 id: w.id,
                 title: w.title.clone(),

@@ -20,6 +20,7 @@ use gtk4::prelude::*;
 use gtk4_session_lock as session_lock;
 
 use crate::logic;
+use tuna_shell_host::notifications::LockNotificationGroup;
 
 /// GNOME's wrong-password message (authPrompt.js).
 const FAILED: &str = "Sorry, that didn't work. Please try again.";
@@ -34,6 +35,7 @@ struct Screen {
     date: gtk::Label,
     entry: gtk::PasswordEntry,
     message: gtk::Label,
+    notifications: gtk::Box,
 }
 
 pub struct LockUi {
@@ -41,6 +43,7 @@ pub struct LockUi {
     instance: session_lock::Instance,
     send: SendUnlock,
     screens: RefCell<Vec<Screen>>,
+    notifications: RefCell<Vec<LockNotificationGroup>>,
     /// A lock was asked of the compositor and not yet released.
     requested: Cell<bool>,
     /// The password check in flight, by request id.
@@ -59,6 +62,7 @@ impl LockUi {
             instance: session_lock::Instance::new(),
             send,
             screens: RefCell::new(Vec::new()),
+            notifications: RefCell::new(Vec::new()),
             requested: Cell::new(false),
             pending: Cell::new(None),
             clock_format,
@@ -99,6 +103,12 @@ impl LockUi {
     pub fn sync(self: &Rc<Self>, locked: bool) {
         if locked && !self.requested.get() {
             self.requested.set(true);
+            if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+                eprintln!(
+                    "tuna-shell-gtk: lock starting notification-groups={}",
+                    self.notifications.borrow().len()
+                );
+            }
             if !self.instance.lock() {
                 eprintln!("tuna-shell-gtk: session lock unavailable");
                 return;
@@ -125,6 +135,24 @@ impl LockUi {
             self.requested.set(false);
             self.instance.unlock();
         }
+    }
+
+    /// Receive only the host's already-filtered, lock-safe projection.
+    pub fn sync_notifications(&self, notifications: Vec<LockNotificationGroup>) {
+        if *self.notifications.borrow() == notifications {
+            return;
+        }
+        if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+            eprintln!(
+                "tuna-shell-gtk: lock notification-groups={} screens={}",
+                notifications.len(),
+                self.screens.borrow().len()
+            );
+        }
+        for screen in self.screens.borrow().iter() {
+            render_notifications(&screen.notifications, &notifications);
+        }
+        *self.notifications.borrow_mut() = notifications;
     }
 
     /// A command result arrived: the answer to our password, if it is
@@ -294,22 +322,63 @@ impl LockUi {
         overlay.set_child(Some(&stack));
         bar.set_valign(gtk::Align::Start);
         overlay.add_overlay(&bar);
+        let notifications = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        notifications.add_css_class("unlock-dialog-notifications-container");
+        notifications.set_halign(gtk::Align::Center);
+        notifications.set_valign(gtk::Align::End);
+        notifications.set_width_request(420);
+        render_notifications(&notifications, &self.notifications.borrow());
+        let notification_scroll = gtk::ScrolledWindow::new();
+        notification_scroll.update_property(&[gtk::accessible::Property::Label(
+            "Lock Screen Notifications",
+        )]);
+        notification_scroll.set_child(Some(&notifications));
+        notification_scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+        notification_scroll.set_min_content_height(0);
+        notification_scroll.set_max_content_height(240);
+        notification_scroll.set_propagate_natural_height(true);
+        notification_scroll.set_halign(gtk::Align::Center);
+        notification_scroll.set_valign(gtk::Align::End);
+        notification_scroll.set_margin_bottom(24);
+        overlay.add_overlay(&notification_scroll);
         window.set_child(Some(&overlay));
 
         // Vertical placement: GNOME puts the stack a third of the way
         // down (UnlockDialogLayout), which lands the 1280x800 clock at
         // y 275 and the prompt at y 205.
         {
-            let (clock_box, prompt) = (clock_box.clone(), prompt.clone());
-            let last = Cell::new(-1);
+            let (clock_box, prompt, notification_scroll, notifications) = (
+                clock_box.clone(),
+                prompt.clone(),
+                notification_scroll.clone(),
+                notifications.clone(),
+            );
+            let last = Cell::new((-1, -1));
             window.add_tick_callback(move |w, _| {
                 let height = w.height();
-                if height != last.get() {
-                    last.set(height);
-                    let (clock_top, prompt_top) = logic::lock_offsets(height);
+                let (clock_top, prompt_top) = logic::lock_offsets(height);
+                let clock_height =
+                    clock_box.measure(gtk::Orientation::Vertical, -1).1 - clock_box.margin_top();
+                let prompt_height =
+                    prompt.measure(gtk::Orientation::Vertical, -1).1 - prompt.margin_top();
+                let auth_bottom = (clock_top + clock_height).max(prompt_top + prompt_height);
+                if (height, auth_bottom) != last.get() {
+                    last.set((height, auth_bottom));
+                    if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+                        eprintln!("tuna-shell-gtk: lock allocation height={height} clock-height={clock_height} prompt-height={prompt_height} auth-bottom={auth_bottom} notification-space={}", height - auth_bottom - 48);
+                    }
                     clock_box.set_margin_top(clock_top);
                     prompt.set_margin_top(prompt_top);
+                    // Keep authentication unobstructed on short outputs and
+                    // when a PAM message increases the prompt's height.
+                    notification_scroll
+                        .set_max_content_height((height - auth_bottom - 48).clamp(0, 240));
                 }
+                update_notification_visibility(
+                    &notification_scroll,
+                    &notifications,
+                    height - auth_bottom - 48,
+                );
                 glib::ControlFlow::Continue
             });
         }
@@ -457,14 +526,119 @@ impl LockUi {
             date,
             entry,
             message,
+            notifications,
         });
         window
     }
+}
+
+fn update_notification_visibility(
+    scroll: &gtk::ScrolledWindow,
+    notifications: &gtk::Box,
+    available_height: i32,
+) {
+    // Read the child's own visibility flag. is_visible() includes ancestors:
+    // once the initial zero-height allocation hides this scroller, that would
+    // prevent every subsequent allocation from showing it again.
+    scroll.set_visible(available_height > 0 && notifications.get_visible());
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
         // Never leave a typed password behind in a dead window.
         self.entry.set_text("");
+    }
+}
+
+/// Deliberately noninteractive: application actions require an unlocked session.
+pub(crate) fn render_notifications(container: &gtk::Box, groups: &[LockNotificationGroup]) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+    for group in groups {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.add_css_class("unlock-dialog-notification-source");
+        if group.critical {
+            row.add_css_class("critical");
+        }
+        let app = (!group.desktop_entry.is_empty())
+            .then(|| gio_unix::DesktopAppInfo::new(&format!("{}.desktop", group.desktop_entry)))
+            .flatten();
+        let icon = gtk::Image::new();
+        icon.set_pixel_size(32);
+        if let Some(gicon) = app.as_ref().and_then(|a| a.icon()) {
+            icon.set_from_gicon(&gicon);
+        } else {
+            icon.set_icon_name(Some("application-x-executable-symbolic"));
+        }
+        row.append(&icon);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        text.set_hexpand(true);
+        let name = app
+            .map(|a| a.display_name().to_string())
+            .unwrap_or_else(|| group.app.clone());
+        let label = gtk::Label::new(Some(&name.replace('\n', " ")));
+        label.add_css_class("unlock-dialog-notification-label");
+        label.set_xalign(0.0);
+        text.append(&label);
+        if group.details.is_empty() {
+            if group.count > 1 {
+                let count = gtk::Label::new(Some(&group.count.to_string()));
+                count.set_xalign(0.0);
+                text.append(&count);
+            }
+        } else {
+            for (title, body) in &group.details {
+                let detail = gtk::Label::new(Some(&format!(
+                    "{} {}",
+                    title.replace('\n', " "),
+                    body.replace('\n', " ")
+                )));
+                detail.set_xalign(0.0);
+                detail.set_wrap(true);
+                detail.set_max_width_chars(48);
+                detail.add_css_class("unlock-dialog-notification-count-text");
+                text.append(&detail);
+            }
+        }
+        row.append(&text);
+        container.append(&row);
+    }
+    container.set_visible(!groups.is_empty());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated GTK display; exercised by the notification policy proof"]
+    fn notification_viewport_restores_after_parent_is_hidden() {
+        gtk::init().expect("private GTK display");
+        let notifications = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        notifications.append(&gtk::Label::new(Some("unread notification")));
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_child(Some(&notifications));
+
+        update_notification_visibility(&scroll, &notifications, -411);
+        assert!(!scroll.get_visible());
+        assert!(notifications.get_visible());
+        assert!(!notifications.is_visible());
+        update_notification_visibility(&scroll, &notifications, 184);
+        assert!(scroll.get_visible());
+
+        // A short output hides the viewport without losing its unread content.
+        update_notification_visibility(&scroll, &notifications, 0);
+        assert!(!scroll.get_visible());
+        update_notification_visibility(&scroll, &notifications, 184);
+        assert!(scroll.get_visible());
+
+        // Policy removal still hides it even when the output has room.
+        notifications.set_visible(false);
+        update_notification_visibility(&scroll, &notifications, 184);
+        assert!(!scroll.get_visible());
+        notifications.set_visible(true);
+        update_notification_visibility(&scroll, &notifications, 184);
+        assert!(scroll.get_visible());
     }
 }
