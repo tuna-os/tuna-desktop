@@ -119,6 +119,32 @@ impl AudioState {
             })
     }
 
+    /// The owned feedback player must actually be running and linked to
+    /// the current default sink; an alive player or a different output
+    /// does not establish playback on this sink.
+    pub fn default_sink_has_running_process(&self, pid: u32) -> bool {
+        let Some(name) = self.default_name("default.audio.sink") else {
+            return false;
+        };
+        let Some((&sink, _)) = self.objects.iter().find(|(_, object)| {
+            object["info"]["props"]["media.class"] == "Audio/Sink"
+                && object["info"]["props"]["node.name"] == name
+        }) else {
+            return false;
+        };
+        self.objects.iter().any(|(&stream, object)| {
+            object["info"]["state"] == "running"
+                && object["info"]["props"]["media.class"] == "Stream/Output/Audio"
+                && number(&object["info"]["props"]["application.process.id"])
+                    == Some(u64::from(pid))
+                && self.objects.values().any(|link| {
+                    number(&link["info"]["output-node-id"]) == Some(stream)
+                        && number(&link["info"]["input-node-id"]) == Some(sink)
+                        && link["info"]["state"] == "active"
+                })
+        })
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let default_sink = self.default_name("default.audio.sink");
         let default_source = self.default_name("default.audio.source");
@@ -292,6 +318,41 @@ mod tests {
         assert_eq!(state.snapshot().sink_running, None);
         feed(&mut state, json!([{"id":2,"info":null}]));
         assert_eq!(state.snapshot().sink_running, None);
+    }
+
+    #[test]
+    fn feedback_player_requires_running_stream_on_default_sink() {
+        let mut state = AudioState::default();
+        feed(
+            &mut state,
+            json!([
+                {"id":20,"type":"PipeWire:Interface:Metadata","props":{"metadata.name":"default"},"metadata":[{"subject":0,"key":"default.audio.sink","value":{"name":"main"}}]},
+                {"id":2,"info":{"props":{"media.class":"Audio/Sink","node.name":"main"}}},
+                {"id":3,"info":{"props":{"media.class":"Audio/Sink","node.name":"other"}}},
+                {"id":4,"info":{"state":"running","props":{"media.class":"Stream/Output/Audio","application.process.id":"42"}}},
+                {"id":5,"info":{"state":"active","output-node-id":4,"input-node-id":2}}
+            ]),
+        );
+        assert!(state.default_sink_has_running_process(42));
+        assert!(!state.default_sink_has_running_process(43));
+        feed(
+            &mut state,
+            json!([{"id":5,"info":{"state":"active","output-node-id":4,"input-node-id":3}}]),
+        );
+        assert!(!state.default_sink_has_running_process(42));
+        feed(
+            &mut state,
+            json!([{"id":5,"info":{"state":"paused","output-node-id":4,"input-node-id":2}}]),
+        );
+        assert!(!state.default_sink_has_running_process(42));
+        feed(
+            &mut state,
+            json!([{"id":5,"info":{"state":"active","output-node-id":4,"input-node-id":2}},
+            {"id":4,"info":{"state":"idle","props":{"media.class":"Stream/Output/Audio","application.process.id":42}}}]),
+        );
+        assert!(!state.default_sink_has_running_process(42));
+        feed(&mut state, json!([{"id":4,"info":null}]));
+        assert!(!state.default_sink_has_running_process(42));
     }
 
     #[test]

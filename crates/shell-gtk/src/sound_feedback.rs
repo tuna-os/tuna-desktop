@@ -8,6 +8,7 @@ use gtk4::{gio, glib};
 
 thread_local! {
     static RUNNING: Cell<Option<bool>> = const { Cell::new(None) };
+    static OWN_PLAYING: Cell<bool> = const { Cell::new(false) };
     static PLAYER: RefCell<Option<gio::Subprocess>> = const { RefCell::new(None) };
     static PENDING: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
     static SETTINGS: Option<gio::Settings> = {
@@ -21,6 +22,7 @@ thread_local! {
                     PLAYER.with_borrow_mut(|player| {
                         if let Some(player) = player.take() { player.force_exit(); }
                     });
+                    OWN_PLAYING.set(false);
                 }
             });
         }
@@ -33,8 +35,28 @@ pub fn set_sink_running(running: Option<bool>) {
     RUNNING.set(running);
 }
 
-fn allowed(enabled: bool, quiet: bool, changed: bool, muted: bool, running: Option<bool>) -> bool {
-    enabled && !quiet && changed && !muted && running == Some(false)
+pub fn feedback_process_id() -> Option<u32> {
+    PLAYER.with_borrow(|player| player.as_ref()?.identifier()?.parse().ok())
+}
+
+pub fn set_own_playing(playing: bool) {
+    OWN_PLAYING.set(playing);
+}
+
+fn allowed(
+    enabled: bool,
+    quiet: bool,
+    changed: bool,
+    muted: bool,
+    running: Option<bool>,
+    own_playing: bool,
+) -> bool {
+    enabled
+        && !quiet
+        && changed
+        && !muted
+        && running.is_some()
+        && (running == Some(false) || own_playing)
 }
 
 /// Debounce repeated slider/key input, replacing the previous feedback rather
@@ -46,7 +68,14 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
         }
     });
     let enabled = SETTINGS.with(|s| s.as_ref().is_some_and(|s| s.boolean("event-sounds")));
-    if !allowed(enabled, quiet, changed, muted, RUNNING.get()) {
+    if !allowed(
+        enabled,
+        quiet,
+        changed,
+        muted,
+        RUNNING.get(),
+        OWN_PLAYING.get(),
+    ) {
         return;
     }
     PENDING.with_borrow_mut(|pending| {
@@ -64,6 +93,7 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
                     changed,
                     muted,
                     RUNNING.get(),
+                    OWN_PLAYING.get(),
                 ) {
                     return;
                 }
@@ -72,6 +102,7 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
                         old.force_exit();
                     }
                 });
+                OWN_PLAYING.set(false);
                 let theme = format!("canberra.xdg-theme.name={}", settings.string("theme-name"));
                 let launcher = gio::SubprocessLauncher::new(
                     gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE,
@@ -117,6 +148,7 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
                     PLAYER.with_borrow_mut(|current| {
                         if current.as_ref() == Some(&completed) {
                             current.take();
+                            OWN_PLAYING.set(false);
                         }
                     });
                 });
@@ -130,12 +162,15 @@ mod tests {
     use super::*;
     #[test]
     fn feedback_requires_enabled_changed_audible_idle_sink() {
-        assert!(allowed(true, false, true, false, Some(false)));
-        assert!(!allowed(false, false, true, false, Some(false)));
-        assert!(!allowed(true, true, true, false, Some(false)));
-        assert!(!allowed(true, false, false, false, Some(false)));
-        assert!(!allowed(true, false, true, true, Some(false)));
-        assert!(!allowed(true, false, true, false, Some(true)));
-        assert!(!allowed(true, false, true, false, None));
+        assert!(allowed(true, false, true, false, Some(false), false));
+        assert!(!allowed(false, false, true, false, Some(false), false));
+        assert!(!allowed(true, true, true, false, Some(false), false));
+        assert!(!allowed(true, false, false, false, Some(false), false));
+        assert!(!allowed(true, false, true, true, Some(false), false));
+        assert!(allowed(true, false, true, false, Some(true), true));
+        assert!(!allowed(true, false, true, false, None, true));
+        assert!(!allowed(true, true, true, false, Some(true), true));
+        assert!(!allowed(true, false, true, false, Some(true), false));
+        assert!(!allowed(true, false, true, false, None, false));
     }
 }

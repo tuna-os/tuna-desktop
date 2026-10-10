@@ -752,6 +752,10 @@ impl AudioUi {
 
     fn update(self: &Rc<Self>, snapshot: crate::audio_state::Snapshot) {
         crate::sound_feedback::set_sink_running(snapshot.sink_running);
+        crate::sound_feedback::set_own_playing(
+            crate::sound_feedback::feedback_process_id()
+                .is_some_and(|pid| self.state.borrow().default_sink_has_running_process(pid)),
+        );
         if *self.last.borrow() == snapshot {
             return;
         }

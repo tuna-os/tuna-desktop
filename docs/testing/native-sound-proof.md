@@ -99,8 +99,13 @@ on repeatability and all suppression cases still requires verification.
 The private fixture does not qualify physical audio devices, hardware keys,
 visual bell pixels, Xwayland bells, notification/input-click sounds, or full
 GNOME Settings mixer/profile and alert-selection paths. Feedback currently
-suppresses when any default-sink playback is Running, including this shell's
-own current player; GNOME's media-key consumer exempts its own feedback.
+has a candidate exemption for its owned feedback player: the real player
+must have a Running output stream linked actively to the current default
+sink. Unknown state and unrelated playback remain suppressive. This follows
+[GNOME 51's media-key feedback policy](https://github.com/GNOME/gnome-settings-daemon/blob/51.0/plugins/media-keys/gsd-media-keys-manager.c),
+which checks its own event playback before treating sink Running as external
+playback. The candidate requires fresh Cargo and repeated native key proofs;
+the existing frozen bundle predates it.
 Slider feedback uses the shared debounce rather than GNOME's drag-end
 specific behavior. These gaps prevent a full sound parity claim. No audio
 receipt establishes a performance win over GNOME.
