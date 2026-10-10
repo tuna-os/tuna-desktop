@@ -108,9 +108,25 @@ pub struct Notification {
     consumed: HashSet<String>,
     /// A banner was seen or explicitly dismissed/invoked.
     acknowledged: bool,
+    sound: NotificationSound,
+}
+
+/// Sender-supplied sound hints; a missing hint is silent. Debug is deliberately
+/// absent because a file path may reveal private data.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct NotificationSound {
+    pub name: String,
+    pub file: String,
 }
 
 impl Notification {
+    pub fn sound(&self) -> &NotificationSound {
+        &self.sound
+    }
+    pub fn acknowledged(&self) -> bool {
+        self.acknowledged
+    }
+
     /// Summary line (the banner paints this).
     pub fn summary(&self) -> &str {
         &self.title
@@ -262,6 +278,10 @@ fn decode_notification(item: &serde_json::Value) -> Option<Notification> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         consumed,
+        sound: NotificationSound {
+            name: text("sound_name"),
+            file: text("sound_file"),
+        },
         acknowledged: item
             .get("acknowledged")
             .and_then(|v| v.as_bool())
@@ -280,6 +300,7 @@ pub struct NotificationSource {
     pub icon: String,
     pub desktop_entry: String,
     pub policy: NotificationPolicy,
+    pub sound: NotificationSound,
 }
 /// Lock-safe projection. With details disabled it contains no summary/body text.
 #[derive(Clone, PartialEq, Eq)]
@@ -291,6 +312,16 @@ pub struct LockNotificationGroup {
     pub count: usize,
     pub critical: bool,
     pub details: Vec<(String, String)>,
+}
+
+#[derive(Default)]
+struct NotificationSenders(HashMap<u32, String>);
+impl std::fmt::Debug for NotificationSenders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationSenders")
+            .field("count", &self.0.len())
+            .finish()
+    }
 }
 
 /// Local notification store: banner queue, history, DND gate.
@@ -311,6 +342,7 @@ pub struct NotificationCenter {
     policy_generation: u64,
     revision: u64,
     locked: bool,
+    senders: NotificationSenders,
     policies_loaded: bool,
     policy_reader_revision: u64,
     policy_history_revision: u64,
@@ -387,7 +419,13 @@ impl NotificationCenter {
         let mut banners = VecDeque::new();
         if let Some(ids) = doc.get("banners").and_then(|v| v.as_array()) {
             for id in ids.iter().filter_map(serde_json::Value::as_u64) {
-                if live.contains(&id) && !banners.contains(&id) {
+                if live.contains(&id)
+                    && !banners.contains(&id)
+                    && center
+                        .history
+                        .iter()
+                        .any(|n| n.id == id && n.urgency != Urgency::Low)
+                {
                     banners.push_back(id);
                 }
             }
@@ -426,6 +464,8 @@ impl NotificationCenter {
                     "expanded": n.expanded,
                     "consumed": n.consumed.iter().collect::<Vec<_>>(),
                     "acknowledged": n.acknowledged,
+                    "sound_name": n.sound.name,
+                    "sound_file": n.sound.file,
                 })
             })
             .collect();
@@ -478,6 +518,15 @@ impl NotificationCenter {
     pub fn locked(&self) -> bool {
         self.locked
     }
+    /// Replaced from authenticated private compositor inventory; never from
+    /// notification hints or application-provided PID values.
+    pub fn set_senders(&mut self, entries: impl IntoIterator<Item = (u32, String)>) {
+        self.senders.0 = entries.into_iter().filter(|(pid, _)| *pid != 0).collect();
+    }
+    pub fn sender_app(&self, pid: u32) -> Option<&str> {
+        self.senders.0.get(&pid).map(String::as_str)
+    }
+
     pub fn set_locked(&mut self, locked: bool) {
         self.locked = locked;
     }
@@ -494,7 +543,9 @@ impl NotificationCenter {
                     .get(n.desktop_entry())
                     .copied()
                     .unwrap_or_default();
-                p.enable && (p.show_banners || n.urgency == Urgency::Critical)
+                p.enable
+                    && n.urgency != Urgency::Low
+                    && (p.show_banners || n.urgency == Urgency::Critical)
             })
         });
     }
@@ -672,6 +723,7 @@ impl NotificationCenter {
                 entry.icon = source.icon.clone();
                 entry.desktop_entry = source.desktop_entry.clone();
                 entry.acknowledged = false;
+                entry.sound = source.sound.clone();
                 entry.consumed.clear();
                 self.queue_banner(replaces, urgency);
                 self.persist();
@@ -711,6 +763,7 @@ impl NotificationCenter {
             expanded: source.policy.force_expanded || urgency == Urgency::Critical,
             consumed: HashSet::new(),
             acknowledged: false,
+            sound: source.sound.clone(),
         });
         while self.history.len() > MAX_HISTORY {
             let dropped = self.history.pop_front();
@@ -738,7 +791,11 @@ impl NotificationCenter {
             .find(|n| n.id == id)
             .map(|n| self.policy_for(n.desktop_entry()))
             .unwrap_or_default();
-        if !policy.enable || ((self.dnd || !policy.show_banners) && urgency != Urgency::Critical) {
+        if urgency == Urgency::Low
+            || !policy.enable
+            || ((self.dnd || !policy.show_banners) && urgency != Urgency::Critical)
+        {
+            self.banners.retain(|queued| *queued != id);
             return;
         }
         if !self.banners.contains(&id) {
@@ -842,7 +899,7 @@ mod tests {
         assert_eq!(c.history().len(), 2);
         assert_eq!(
             c.banners().iter().map(|n| n.id).collect::<Vec<_>>(),
-            vec![a, b]
+            vec![a]
         );
     }
 
@@ -1242,6 +1299,7 @@ mod tests {
                 desktop_entry: source.to_owned(),
                 icon: String::new(),
                 policy,
+                sound: NotificationSound::default(),
             },
         )
     }
@@ -1418,5 +1476,29 @@ mod tests {
         );
         assert_eq!(restored.lock_notifications()[0].count, 1);
         assert!(restored.lock_notifications()[0].details.is_empty());
+    }
+    #[test]
+    fn low_arrivals_and_replacements_remain_history_only() {
+        let mut c = center();
+        let id = c.notify("app", "first", "body", vec![], Urgency::Normal, None);
+        assert_eq!(c.banners().len(), 1);
+        assert_eq!(
+            c.notify("app", "low", "body", vec![], Urgency::Low, Some(id)),
+            id
+        );
+        assert!(c.banners().is_empty());
+        assert_eq!(c.history().len(), 1);
+        assert!(!c.history()[0].acknowledged());
+    }
+    #[test]
+    fn sender_inventory_replaces_old_process_associations_and_redacts_debug() {
+        let mut c = center();
+        c.set_senders([(4321, "org.Private.App".to_owned())]);
+        assert_eq!(c.sender_app(4321), Some("org.Private.App"));
+        let debug = format!("{c:?}");
+        assert!(!debug.contains("org.Private.App"));
+        assert!(!debug.contains("4321"));
+        c.set_senders([]);
+        assert_eq!(c.sender_app(4321), None);
     }
 }

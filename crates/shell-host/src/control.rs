@@ -906,6 +906,7 @@ fn snapshot_view(windows: &[WindowInfo], workspaces: &[WorkspaceInfo]) -> Snapsh
                     .with_workspace(u32::try_from(w.workspace).unwrap_or(u32::MAX))
                     .with_app_id(w.app_id.clone())
                     .with_icon(w.icon.clone())
+                    .with_client_pid(w.client_pid)
             })
             .collect(),
         workspaces: workspaces
@@ -1002,6 +1003,7 @@ mod tests {
 
     fn window(id: WindowId, title: &str, workspace: WorkspaceId, focused: bool) -> WindowInfo {
         WindowInfo {
+            client_pid: None,
             icon: None,
             id,
             title: title.to_owned(),

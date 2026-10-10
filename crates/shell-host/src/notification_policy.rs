@@ -14,6 +14,7 @@ static REGISTRATION: Mutex<()> = Mutex::new(());
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationPolicy {
     pub enable: bool,
+    pub enable_sound: bool,
     pub show_banners: bool,
     pub force_expanded: bool,
     pub show_in_lock_screen: bool,
@@ -23,6 +24,7 @@ impl Default for NotificationPolicy {
     fn default() -> Self {
         Self {
             enable: true,
+            enable_sound: true,
             show_banners: true,
             force_expanded: false,
             show_in_lock_screen: false,
@@ -121,6 +123,7 @@ impl PolicyReader {
             if matches!(
                 key,
                 "enable"
+                    | "enable-sound-alerts"
                     | "show-banners"
                     | "force-expanded"
                     | "show-in-lock-screen"
@@ -178,6 +181,7 @@ impl PolicyReader {
         }
         NotificationPolicy {
             enable: boolean(app, "enable", true),
+            enable_sound: boolean(app, "enable-sound-alerts", true),
             show_banners: boolean(self.master.as_ref(), "show-banners", true)
                 && boolean(app, "show-banners", true),
             force_expanded: boolean(app, "force-expanded", false),

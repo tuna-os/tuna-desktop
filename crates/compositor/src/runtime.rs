@@ -3200,6 +3200,28 @@ impl Runtime {
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        // Only native authenticated peers identify notification senders. X11's
+        // shared Wayland peer is Xwayland and cannot identify an application.
+        let peers: Vec<_> = self
+            .manager
+            .model()
+            .windows()
+            .filter(|window| window.client_pid.is_none() && !self.manager.is_x11(window.id))
+            .map(|window| {
+                let pid = if self.manager.is_x11(window.id) {
+                    None
+                } else {
+                    self.manager
+                        .surface_of(window.id)
+                        .and_then(|surface| self.state.authenticated_client_pid(&surface))
+                };
+                (window.id, pid)
+            })
+            .collect();
+        for (id, pid) in peers {
+            self.manager.model_mut().set_client_pid(id, pid);
+        }
+
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
         // connect and accidentally activate XWayland before a real client.

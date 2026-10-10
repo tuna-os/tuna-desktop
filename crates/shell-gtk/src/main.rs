@@ -2116,6 +2116,7 @@ fn build(app: &adw::Application) {
         let shell_rc = shell.clone();
         let activities_button = activities.clone();
         let last_frames: RefCell<Vec<tuna_shell_control::SwitcherThumbnail>> = RefCell::default();
+        let last_sender_revision = std::cell::Cell::new(None);
         glib::timeout_add_local(Duration::from_millis(16), move || {
             let mut shell = shell.borrow_mut();
             let mut results = Vec::new();
@@ -2160,6 +2161,12 @@ fn build(app: &adw::Application) {
                 }
             }
             let locked = shell.control.as_ref().is_some_and(|c| c.locked());
+            if let Some(control) = shell.control.as_ref() {
+                let revision = (control.revision(), locked);
+                if last_sender_revision.replace(Some(revision)) != Some(revision) {
+                    notify.sync_senders(control.model());
+                }
+            }
             render_pills(&mut shell);
             if let Some(control) = shell.control.as_ref() {
                 switcher_ui.sync(control.model());

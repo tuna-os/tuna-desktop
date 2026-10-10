@@ -866,6 +866,7 @@ fn window_to_wire(
     mint: &dyn Fn(Option<&str>) -> String,
 ) -> tuna_shell_control::WindowInfo {
     tuna_shell_control::WindowInfo {
+        client_pid: w.client_pid,
         icon: w.icon.clone(),
         id: w.id,
         title: w.title.clone(),

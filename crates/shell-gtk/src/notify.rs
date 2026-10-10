@@ -420,6 +420,7 @@ impl NotifyUi {
                 NotificationSource {
                     icon: icon.to_owned(),
                     desktop_entry: String::new(),
+                    sound: Default::default(),
                     policy,
                 },
             );
@@ -428,6 +429,17 @@ impl NotifyUi {
     }
 
     /// Hide and retire unlocked message widgets before lock surfaces are mapped.
+    pub fn sync_senders(&self, model: &tuna_shell_host::model::ShellModel) {
+        if let Ok(mut center) = self.center.lock() {
+            center.set_senders(
+                model
+                    .windows()
+                    .iter()
+                    .filter_map(|w| Some((w.client_pid?, w.app_id.clone()?))),
+            );
+        }
+    }
+
     pub fn set_locked(self: &Rc<Self>, locked: bool) {
         if let Ok(mut center) = self.center.lock() {
             if center.locked() == locked {
@@ -579,6 +591,10 @@ impl NotifyUi {
         }
         let banners = if locked { Vec::new() } else { center.banners() };
         for n in banners {
+            if !n.acknowledged() && center.policy_for(n.desktop_entry()).enable_sound {
+                crate::sound_feedback::notification(n.sound());
+            }
+
             let expanded = n.expanded
                 || center.policy_for(n.desktop_entry()).force_expanded
                 || n.urgency == Urgency::Critical;

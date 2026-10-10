@@ -280,7 +280,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | application-id | Honored | Registers the installed desktop identity for the relocatable application settings path |
 | details-in-lock-screen | Honored | Live summary/body redaction before constructing lock widgets; client critical urgency grants no privacy exception |
 | enable | Honored | Live source admission, visible history, lock projection and action gate |
-| enable-sound-alerts | Ignored | Notification sound playback has no consumer; system bell support is separate |
+| enable-sound-alerts | Honored | Newly shown banners dispatch sender sound hints only with app sound alerts and global event sounds enabled; LOW and hidden messages are silent |
 | force-expanded | Honored | Banner body expansion with live policy changes |
 | show-banners | Honored | Master AND application admission before a banner takes a queue slot; enabled critical exception |
 | show-in-lock-screen | Honored | Master AND application gate on read-only lock source groups |

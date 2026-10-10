@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """Nested GTK/DBus notification policy proof. Run with dbus-run-session.
 Requires immutable matched binaries, Xvfb, PAM wrapper and private AT-SPI.
-This proves local consumers, not sound support or a GNOME hardware comparison.
+This proves local consumers and player dispatch, not audible output or a GNOME hardware comparison.
 """
 import argparse, pwd, hashlib, json, os, select, shutil, signal, subprocess, time
 from pathlib import Path
@@ -58,11 +58,12 @@ def setpref(schema,key,value):
  time.sleep(.2)
 MASTER='org.gnome.desktop.notifications'
 def app_schema(app): return 'org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/org-tuna-notify'+app.lower()+'/'
-def notify(app,title,critical=False,replaces=0,body=None):
- hints={'urgency':GLib.Variant('y',2 if critical else 1)}
+def notify(app,title,critical=False,replaces=0,body=None,low=False,sound=None,app_name=None):
+ hints={'urgency':GLib.Variant('y',0 if low else 2 if critical else 1)}
+ if sound: hints.update({k:GLib.Variant('s',v) for k,v in sound.items()})
  if app: hints['desktop-entry']=GLib.Variant('s','org.tuna.Notify'+app)
  return call(session,'org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','Notify',
-  GLib.Variant('(susssasa{sv}i)',('TunaPolicy'+(app or 'Unknown'),replaces,'',title,body or 'PRIVATE_BODY_'+title,['open','Open'],hints,0)))[0]
+  GLib.Variant('(susssasa{sv}i)',(app_name or 'TunaPolicy'+(app or 'Unknown'),replaces,'',title,body or 'PRIVATE_BODY_'+title,['open','Open'],hints,0)))[0]
 def close(n): call(session,'org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','CloseNotification',GLib.Variant('(u)',(n,)))
 nodes={}
 def tree():
@@ -109,6 +110,14 @@ try:
  passdb=art/'pam/passdb'; passdb.write_text(pwd.getpwuid(os.getuid()).pw_name+':'+password+':tuna-lock\n'); os.chmod(passdb,0o600)
  matrix='/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so'; wrapper='/usr/lib/x86_64-linux-gnu/libpam_wrapper.so'
  (pam/'tuna-lock').write_text(f'auth required {matrix} passdb={passdb}\naccount required {matrix} passdb={passdb}\n')
+ # Capture the actual bounded player process arguments. This validates
+ # dispatch and suppression, not hardware/audible playback quality.
+ player_dir=art/'players'; player_dir.mkdir()
+ sound_log=art/'sound-dispatch.jsonl'
+ (player_dir/'canberra-gtk-play').write_text('#!/usr/bin/python3\nimport json,os,sys\nwith open(os.environ["TUNA_SOUND_DISPATCH"],"a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n')
+ (player_dir/'canberra-gtk-play').chmod(0o700)
+ env['PATH']=str(player_dir)+':'+env['PATH']; env['TUNA_SOUND_DISPATCH']=str(sound_log)
+ def sounds(): return [json.loads(line) for line in sound_log.read_text().splitlines()] if sound_log.exists() else []
  manifest['pam_fixture']={'wrapper_sha256':sha(wrapper),'matrix_sha256':sha(matrix)}
  launcher=spawn(['/usr/libexec/at-spi-bus-launcher','--launch-immediately'],'atspi')
  address=wait(lambda:call(session,'org.a11y.Bus','/org/a11y/bus','org.a11y.Bus','GetAddress',flags=Gio.DBusCallFlags.NO_AUTO_START)[0],'private-a11y')
@@ -134,6 +143,70 @@ try:
  wait(lambda:any(l['namespace']=='tuna-panel' for l in snapshot()['layers']),'shell-ready')
  wid=wait(lambda:subprocess.check_output(['xdotool','search','--pid',str(comp.pid),'--name','Smithay'],env=env,text=True).strip().splitlines()[0],'host-window')
  subprocess.run(['xdotool','windowfocus',wid],env=env,check=True)
+ setpref('org.gnome.desktop.sound','event-sounds','true')
+ setpref(app_schema('Beta'),'enable-sound-alerts','true')
+ sounded=notify('Beta','SOUND_POSITIVE',sound={'sound-name':'message-new-instant','sound-file':'/tmp/unused.wav'})
+ wait(lambda:has('SOUND_POSITIVE') and len(sounds())==1,'actual-notification-player-dispatched')
+ assert '--id' in sounds()[0] and 'message-new-instant' in sounds()[0] and '--file' not in sounds()[0]
+ assert 'SOUND_POSITIVE' not in str(sounds()), 'private content passed to sound player'
+ close(sounded)
+ setpref(app_schema('Beta'),'enable-sound-alerts','false')
+ muted=notify('Beta','SOUND_APP_DISABLED',sound={'sound-name':'message-new-instant'})
+ wait(lambda:has('SOUND_APP_DISABLED'),'silent-app-banner-positive-control'); time.sleep(.5)
+ assert len(sounds())==1; close(muted)
+ setpref(app_schema('Beta'),'enable-sound-alerts','true')
+ setpref('org.gnome.desktop.sound','event-sounds','false')
+ muted=notify('Beta','SOUND_GLOBAL_DISABLED',sound={'sound-name':'message-new-instant'})
+ wait(lambda:has('SOUND_GLOBAL_DISABLED'),'silent-global-banner-positive-control'); time.sleep(.5)
+ assert len(sounds())==1; close(muted)
+ setpref('org.gnome.desktop.sound','event-sounds','true')
+ low_id=notify('Beta','LOW_HISTORY_ONLY',low=True,sound={'sound-name':'message-new-instant'})
+ time.sleep(.5)
+ assert absent('LOW_HISTORY_ONLY') and len(sounds())==1
+ queue_file=art/'state/tuna-shell/notifications.json'
+ low_store=json.loads(queue_file.read_text())
+ assert low_id not in low_store['banners'] and any(n['id']==low_id for n in low_store['notifications'])
+ assertions.append('low-retains-history-without-banner-or-sound')
+ fallback=notify(None,'APP_NAME_FALLBACK',app_name='org.tuna.NotifyBeta.desktop')
+ wait(lambda:has('APP_NAME_FALLBACK'),'installed-app-name-fallback-shown')
+ assert next(n for n in json.loads(queue_file.read_text())['notifications'] if n['id']==fallback)['desktop_entry']=='org.tuna.NotifyBeta'
+ assertions.append('app-name-fallback-policy-identity'); close(fallback)
+ # One native Wayland client owns both its window and its DBus connection.
+ # A conflicting Beta hint must not bypass disabled Alpha policy.
+ sender_trigger=art/'sender-trigger'; sender_reply=art/'sender-reply'
+ sender_script=art/'sender-fixture.py'
+ sender_script.write_text("""import gi,os,json
+from pathlib import Path
+gi.require_version('Gtk','4.0')
+from gi.repository import Gtk,Gio,GLib
+app=Gtk.Application(application_id='org.tuna.NotifyAlpha',flags=Gio.ApplicationFlags.NON_UNIQUE)
+def activate(app):
+ win=Gtk.ApplicationWindow(application=app,title='Notification sender fixture');win.set_default_size(200,100);win.present()
+ bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+ def send():
+  trigger=Path(os.environ['TUNA_SENDER_TRIGGER'])
+  if trigger.exists():
+   title=trigger.read_text();trigger.unlink()
+   args=GLib.Variant('(susssasa{sv}i)',('lying Beta',0,'',title,'fixture body',[],{'desktop-entry':GLib.Variant('s','org.tuna.NotifyBeta')},0))
+   result=bus.call_sync('org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','Notify',args,None,Gio.DBusCallFlags.NONE,3000,None).unpack()[0]
+   Path(os.environ['TUNA_SENDER_REPLY']).write_text(json.dumps({'id':result,'pid':os.getpid()}))
+  return True
+ GLib.timeout_add(100,send)
+app.connect('activate',activate);app.run([])
+""")
+ sender=spawn(['/usr/bin/python3',str(sender_script)],'sender-fixture',dict(GDK_BACKEND='wayland',WAYLAND_DISPLAY='notification-proof',TUNA_SENDER_TRIGGER=str(sender_trigger),TUNA_SENDER_REPLY=str(sender_reply)))
+ wait(lambda:any(w.get('app_id')=='org.tuna.NotifyAlpha' for w in snapshot()['windows']),'native-sender-window-tracked')
+ time.sleep(.5)
+ setpref(app_schema('Alpha'),'enable','false')
+ sender_trigger.write_text('PID_DISABLED_ALPHA')
+ result=wait(lambda:json.loads(sender_reply.read_text()),'dbus-sender-response')
+ assert result['pid']==sender.pid
+ wait(lambda:any(n['id']==result['id'] and n['desktop_entry']=='org.tuna.NotifyAlpha' for n in json.loads(queue_file.read_text())['notifications']),'verified-pid-precedes-conflicting-hint')
+ assert absent('PID_DISABLED_ALPHA'), 'conflicting hint bypassed source policy'
+ setpref(app_schema('Alpha'),'enable','true')
+ sender_reply.unlink(); sender_trigger.write_text('PID_ENABLED_ALPHA')
+ wait(lambda:sender_reply.exists() and has('PID_ENABLED_ALPHA'),'verified-source-positive-control')
+ close(json.loads(sender_reply.read_text())['id']); sender.terminate();sender.wait(timeout=5)
  setpref(app_schema('Alpha'),'show-banners','false')
  for i in range(5): notify('Alpha','HIDDEN_NORMAL_'+str(i))
  control=notify('Beta','VISIBLE_CONTROL')

@@ -160,9 +160,10 @@ impl ProtocolVersion {
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
     /// `0.30` appends live sound/bell and attached-modal brightness preferences.
+    /// `0.31` adds authenticated window peer PID for private sender matching.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 30,
+        minor: 31,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -204,6 +205,8 @@ pub struct WindowInfo {
     pub activation_token: String,
     /// Compositor-owned PNG cache path or sanitized theme icon name.
     pub icon: Option<String>,
+    /// Authenticated native peer PID; private shell transport, redacted while locked.
+    pub client_pid: Option<u32>,
 }
 
 /// Workspace state owned by the compositor and mirrored to the shell.
@@ -1233,6 +1236,7 @@ mod tests {
 
     fn sample_window(id: WindowId) -> WindowInfo {
         WindowInfo {
+            client_pid: Some(4321),
             icon: None,
             id,
             title: format!("Terminal {id}"),
@@ -1306,8 +1310,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_30() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 30));
+    fn current_version_is_0_31() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 31));
     }
 
     #[test]

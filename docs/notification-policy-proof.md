@@ -42,11 +42,17 @@ verified during cleanup.
 
 ## Qualification limits
 
-Notification sound playback and `enable-sound-alerts` remain unsupported.
-Source policy resolution covers installed desktop-entry hints; tracked sender
-PID/application-name fallback is not implemented. Existing low-urgency banner
-behavior is not GNOME's low-urgency suppression. The local proof uses an Xvfb
-nested backend and a PAM fixture; it does not certify physical outputs, host PAM,
-GTK variants not actually run, or a paired GNOME performance/visual comparison.
-P-NT-03 must remain partial until all baseline cases and remaining consumers are
-qualified. No parity result is inferred from unit tests or inventory labels.
+Notification sounds follow sender sound-name/file hints, per-app sound alerts
+and global event sounds; no hint means silence. Actual shown banners trigger
+playback once per arrival/update. Bounded notification players operate separately
+from volume feedback and can overlay media. LOW notifications retain history and
+lock summaries without banner or sound. Private authenticated native peer PIDs
+are matched to the DBus sender before desktop-entry and installed app-name
+fallbacks. X11's shared Xwayland peer cannot authenticate the application PID, so
+those notifications use the installed hint/name fallback.
+
+The local proof captures actual player dispatch arguments; it does not certify
+audible output, sound device behavior, physical outputs, host PAM, GTK variants
+not actually run, or a paired GNOME performance/visual comparison. P-NT-03 must
+remain partial until all actual baseline cases are qualified. No parity result
+is inferred from unit tests or inventory labels.

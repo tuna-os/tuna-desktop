@@ -20,7 +20,8 @@ use zbus::object_server::SignalEmitter;
 
 use crate::notification_policy::PolicyReader;
 use crate::notifications::{
-    NotificationAction, NotificationCenter, NotificationError, NotificationSource, Urgency,
+    NotificationAction, NotificationCenter, NotificationError, NotificationSound,
+    NotificationSource, Urgency,
 };
 
 /// Well-known notifications name (freedesktop Desktop Notifications).
@@ -57,6 +58,23 @@ fn urgency_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Urgency 
     }
 }
 
+/// GNOME's tracked-PID, desktop hint, then app-name lookup order. Keep an
+/// unknown hint as generic source identity; it cannot gain per-app privileges.
+fn resolve_source(
+    tracked: Option<&str>,
+    hint: &str,
+    app: &str,
+    installed: impl Fn(&str) -> bool,
+) -> String {
+    for candidate in tracked.into_iter().chain([hint, app]) {
+        let candidate = candidate.strip_suffix(".desktop").unwrap_or(candidate);
+        if !candidate.is_empty() && installed(candidate) {
+            return candidate.to_owned();
+        }
+    }
+    hint.strip_suffix(".desktop").unwrap_or(hint).to_owned()
+}
+
 /// The `org.freedesktop.Notifications` object: wire calls become
 /// center mutations. Banner-side presses never arrive here as method
 /// calls — they go through [`NotificationBus`], which mutates and
@@ -72,7 +90,7 @@ impl Notifications {
     /// id the app uses to replace or close it). A poisoned center
     /// reads as id zero, which no real notification carries.
     #[allow(clippy::too_many_arguments)]
-    fn notify(
+    async fn notify(
         &self,
         app_name: String,
         replaces_id: u32,
@@ -82,12 +100,34 @@ impl Notifications {
         actions: Vec<String>,
         hints: HashMap<String, zbus::zvariant::OwnedValue>,
         _expire_timeout: i32,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> u32 {
         let replaces = (replaces_id != 0).then_some(replaces_id as u64);
         let desktop_entry = hints
             .get("desktop-entry")
             .and_then(|v| String::try_from(v.clone()).ok())
             .unwrap_or_default();
+        // Resolve the caller from the bus daemon, never a sender-provided hint.
+        let pid = if let Some(sender) = header.sender() {
+            match zbus::fdo::DBusProxy::new(connection).await {
+                Ok(proxy) => proxy
+                    .get_connection_unix_process_id(sender.clone().into())
+                    .await
+                    .ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let tracked = self
+            .center
+            .lock()
+            .ok()
+            .and_then(|center| pid.and_then(|pid| center.sender_app(pid).map(str::to_owned)));
+        let installed =
+            |id: &str| gio_unix::DesktopAppInfo::new(&format!("{id}.desktop")).is_some();
+        let resolved = resolve_source(tracked.as_deref(), &desktop_entry, &app_name, installed);
         let source_id = {
             let Ok(center) = self.center.lock() else {
                 return 0;
@@ -95,12 +135,7 @@ impl Notifications {
             replaces
                 .and_then(|id| center.history().iter().find(|n| n.id == id))
                 .map(|n| n.desktop_entry().to_owned())
-                .unwrap_or_else(|| {
-                    desktop_entry
-                        .strip_suffix(".desktop")
-                        .unwrap_or(&desktop_entry)
-                        .to_owned()
-                })
+                .unwrap_or(resolved)
         };
         // Desktop/settings I/O must not hold the queue mutex GTK uses to draw.
         // The store rechecks replacement identity under the admission lock.
@@ -119,6 +154,16 @@ impl Notifications {
                         icon: app_icon.clone(),
                         desktop_entry: source_id,
                         policy,
+                        sound: NotificationSound {
+                            name: hints
+                                .get("sound-name")
+                                .and_then(|v| String::try_from(v.clone()).ok())
+                                .unwrap_or_default(),
+                            file: hints
+                                .get("sound-file")
+                                .and_then(|v| String::try_from(v.clone()).ok())
+                                .unwrap_or_default(),
+                        },
                     },
                 )
             })
@@ -331,6 +376,28 @@ mod tests {
             ]
         );
         assert!(pair_actions(&[]).is_empty());
+    }
+
+    #[test]
+    fn verified_pid_identity_precedes_conflicting_hint_and_name_fallback() {
+        let installed = |id: &str| matches!(id, "org.Alpha" | "org.Beta");
+        assert_eq!(
+            resolve_source(Some("org.Alpha"), "org.Beta", "org.Beta", installed),
+            "org.Alpha"
+        );
+        assert_eq!(
+            resolve_source(Some("unknown"), "org.Beta.desktop", "org.Alpha", installed),
+            "org.Beta"
+        );
+        assert_eq!(
+            resolve_source(None, "unknown", "org.Alpha.desktop", installed),
+            "org.Alpha"
+        );
+        assert_eq!(
+            resolve_source(None, "unknown", "unknown-name", installed),
+            "unknown"
+        );
+        assert_eq!(resolve_source(None, "", "unknown-name", installed), "");
     }
 
     #[test]
