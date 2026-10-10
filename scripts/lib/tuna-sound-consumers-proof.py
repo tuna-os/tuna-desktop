@@ -273,7 +273,12 @@ def main():
             run(['xdotool', 'windowfocus', '--sync', window], env)
             run(['xdotool', 'mousemove', '--window', window, '400', '300'], env)
             wait_until(lambda: (runtime / 'tuna-sound-delivered').exists())
-            wait_until(lambda: run(['gdbus', 'call', '--session', '--dest', 'org.gnome.Shell', '--object-path', '/org/gnome/Shell', '--method', 'org.freedesktop.DBus.Peer.Ping'], env))
+            def shell_service_ready():
+                assert core.poll() is None, 'compositor exited before shell readiness'
+                return run(['gdbus', 'call', '--session', '--dest', 'org.gnome.Shell', '--object-path', '/org/gnome/Shell', '--method', 'org.freedesktop.DBus.Peer.Ping'], env)
+            # Match the existing native GTK rendering fixture's readiness
+            # bound. This precondition is separate from event observation.
+            wait_until(shell_service_ready, seconds=25)
             owner = run(['gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
                          '--object-path', '/org/freedesktop/DBus', '--method',
                          'org.freedesktop.DBus.GetConnectionUnixProcessID', 'org.gnome.Shell'], env)
@@ -334,7 +339,7 @@ def main():
                                       for o in json.loads(run(['pw-dump'], env))))
             audio = artifacts / (case + '.wav')
             recorder = spawn(['pw-record', '--target', 'tuna-sound-proof', '--rate', '48000', '--channels', '2',
-                              '--format', 's16', '-P', 'stream.capture.sink=true node.passive=true node.name=tuna-sound-proof-recorder', str(audio)], case + '-record')
+                              '--format', 's16', '--latency', '256', '-P', 'stream.capture.sink=true node.passive=true node.name=tuna-sound-proof-recorder', str(audio)], case + '-record')
             def recorder_linked():
                 graph = json.loads(run(['pw-dump'], env))
                 nodes = {o['id'] for o in graph if o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof-recorder'}
@@ -373,6 +378,7 @@ def main():
             observed = measure(audio)
             observed['backend'] = run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'], env)
             observed['sink_before_command'] = sink_before
+            observed['recorder_latency_samples'] = 256
             observed['observation_seconds'] = time.monotonic() - report['active_case']['command_started_monotonic']
             if case in ('up', 'bell-audible'):
                 assert observed['frames'] > 1000 and observed['peak'] > 20, (case, observed)
