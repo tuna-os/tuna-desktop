@@ -35,7 +35,12 @@ workspace-switch animation caused only by renumbering.
 
 The isolated state module has 30 passing tests; the isolated lease tracker has
 five passing tests. These checks do not qualify the production integration.
-The clean `3004c2db04504e88045bb802e573a79ce736c069` build passed 54 schema unit tests, 29 schema integration tests, 376 compositor tests (one ignored), 332 host tests, and 125 GTK tests (two ignored), plus strict all-target Clippy. All seven frozen binary hashes were verified against its manifest. Native topology runtime checks are still pending: the first harness found the instrumented state omitted the workspace list, so it could not establish the count. A subsequent diagnostic field exports the actual state-model workspace list; it requires a new frozen build before rerunning the proof. Startup sequence and
+The clean `3004c2db04504e88045bb802e573a79ce736c069` build passed 54 schema unit tests, 29 schema integration tests, 376 compositor tests (one ignored), 332 host tests, and 125 GTK tests (two ignored), plus strict all-target Clippy. All seven frozen binary hashes were verified against its manifest. The first native harness found the instrumented state omitted the workspace list, so it could not establish the count. The initial diagnostic field then exceeded the JSON macro's recursion limit; a separate postconstruction assignment corrected that build failure.
+
+Clean source `d484e374b1d611b20c7574b0db78e5c53e63b5d5` passed a fresh build with the same test counts, strict all-target Clippy, and the union native build. All seven binary hashes were independently checked against `/tmp/tuna-v1-workspace-runtime-binaries-d484e374/manifest.json`.
+The actual GTK/compositor proof at `/tmp/tuna-v1-workspace-topology-proof-d484-1` completed successfully: empty fixed counts 4, 36, 1, and 6; a live change to dynamic mode compacted to workspace IDs 0 and 1; and the active workspace stayed valid. Source and frozen-binary revisions matched. The owned runtime was removed and both verified accessibility processes stopped, with no cleanup query errors. The receipt records explicit settings-schema fixtures where installed schemas were absent. This does not qualify an installed GNOME Settings panel, window movement, multiple outputs, startup sequences, or lease expiry.
+
+Startup sequence and
 explicit keep-alive methods exist in the tracker, but their event producers are
 not connected yet. The idle scheduler must also consume the exported earliest
 lease deadline when this candidate is integrated. Multi-output overview and the
