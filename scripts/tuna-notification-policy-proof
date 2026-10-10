@@ -25,11 +25,19 @@ def sha(path):
  with open(path,'rb') as f: return hashlib.file_digest(f,'sha256').hexdigest()
 manifest = dict(source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
  source_dirty=bool(subprocess.check_output(['git','status','--porcelain'],cwd=root,text=True).strip()),
- backend='winit/Xvfb/software', gnome_comparison=False, proof_sha256=sha(__file__),
+ backend='winit/Xvfb/software', gnome_comparison=False, diagnostic_only=False, proof_sha256=sha(__file__),
  binaries={n:dict(path=str(a.bin_dir.resolve()/n),sha256=sha(a.bin_dir/n)) for n in ('tuna-compositor','tuna-shell-gtk','tuna-shell-gtk-tests')})
 receipt=json.loads((a.bin_dir/'manifest.json').read_text())
 assert not receipt['source_dirty'] and not manifest['source_dirty'], 'proof requires committed clean source'
-assert receipt['source_revision']==manifest['source_revision'], 'binary/source revision mismatch'
+proof_revision=manifest['source_revision']
+binary_revision=receipt['source_revision']
+changes=subprocess.check_output(['git','diff','--name-only',binary_revision,proof_revision],cwd=root,text=True).splitlines()
+assert set(changes)<= {'scripts/tuna-notification-policy-proof','docs/notification-policy-proof.md'}, 'production binary/source mismatch'
+subprocess.run(['git','diff','--exit-code',binary_revision,proof_revision,'--','crates','Cargo.toml','Cargo.lock'],cwd=root,check=True)
+manifest['source_revision']=binary_revision
+manifest['proof_revision']=proof_revision
+manifest['proof_only_changes']=changes
+manifest['production_source_equal']=True
 for name,record in manifest['binaries'].items():
  assert receipt['binary_sha256'][name]==record['sha256'], 'frozen binary digest mismatch'
 manifest['binary_receipt']=receipt
@@ -42,8 +50,8 @@ def spawn(args,name,extra=None):
  log=(art/(name+'.log')).open('w'); logs.append(log)
  proc=subprocess.Popen(args,env=env|(extra or {}),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
  processes.append(proc); return proc
-def call(bus,dest,path,iface,method,args=None,flags=Gio.DBusCallFlags.NONE):
- return bus.call_sync(dest,path,iface,method,args,None,flags,3000,None).unpack()
+def call(bus,dest,path,iface,method,args=None,flags=Gio.DBusCallFlags.NONE,timeout=3000):
+ return bus.call_sync(dest,path,iface,method,args,None,flags,timeout,None).unpack()
 def wait(check,label,seconds=15):
  end=time.monotonic()+seconds
  while time.monotonic()<end:
@@ -98,11 +106,13 @@ def bounds(text):
 def shot(label):
  time.sleep(.2); subprocess.run(['scrot',str(art/(label+'.png'))],env=env,check=True)
 def lock():
- call(session,'org.gnome.ScreenSaver','/org/gnome/ScreenSaver','org.gnome.ScreenSaver','SetActive',GLib.Variant('(b)',(True,)))
+ call(session,'org.gnome.ScreenSaver','/org/gnome/ScreenSaver','org.gnome.ScreenSaver','SetActive',GLib.Variant('(b)',(True,)),timeout=10000)
  wait(lambda:snapshot()['locked'],'actual-lock'); time.sleep(.5)
 def unlock():
  subprocess.run(['xdotool','key','Escape'],env=env,check=True); time.sleep(.2)
  subprocess.run(['xdotool','key','space'],env=env,check=True); time.sleep(.3)
+ # The printable curtain key starts the password, including this space.
+ subprocess.run(['xdotool','key','ctrl+a','BackSpace'],env=env,check=True)
  subprocess.run(['xdotool','type','--clearmodifiers',password],env=env,check=True)
  subprocess.run(['xdotool','key','Return'],env=env,check=True)
  wait(lambda:not snapshot()['locked'],'authenticated-unlock')

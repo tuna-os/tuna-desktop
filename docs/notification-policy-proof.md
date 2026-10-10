@@ -34,6 +34,13 @@ The immutable bundle also contains `tuna-shell-gtk-tests`; the proof verifies it
 hash and runs the real GTK viewport visibility regression on the private display.
 This covers an initially zero-height lock window, a short output, policy removal,
 and restoration without treating a hidden parent as absent notification content.
+For a proof-only correction, the receipt retains the actual compiled revision
+and records the separate proof revision/hash. It explicitly verifies production
+Rust, Cargo and crate contents are identical, and refuses every other changed
+path except this proof script and this document. No new compiled revision is
+inferred from a script correction. Authentication fixtures clear the printable
+space that opens the curtain before typing the known fixture password; real
+wrong-password failure and successful unlock are both required.
 It checks hidden admission versus the queue cap, source registration, live
 expansion geometry, critical and disabled-source controls, normal messages held
 past banner timeout, real lock/unlock, lock detail redaction and positive
