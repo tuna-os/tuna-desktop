@@ -29,15 +29,16 @@ def run(argv, env, timeout=8):
 
 def wait_until(check, seconds=8):
     end = time.monotonic() + seconds
+    last_error = None
     while time.monotonic() < end:
         try:
             result = check()
             if result:
                 return result
-        except (OSError, subprocess.SubprocessError):
-            pass
+        except (OSError, subprocess.SubprocessError) as error:
+            last_error = getattr(error, 'output', None) or str(error)
         time.sleep(.05)
-    raise RuntimeError('private service readiness timed out')
+    raise RuntimeError('private service readiness timed out: ' + str(last_error))
 
 
 def stop(process):
@@ -191,8 +192,16 @@ def main():
         spawn(['Xvfb', '-displayfd', str(display_write), '-screen', '0', '1280x800x24', '-nolisten', 'tcp', '-noreset'],
               'xvfb', pass_fds=(display_write,))
         os.close(display_write)
-        assert select.select([display_read], [], [], 8)[0], 'private display unavailable'
-        env['DISPLAY'] = ':' + os.read(display_read, 32).decode().strip()
+        display_number = b''
+        display_deadline = time.monotonic() + 8
+        while not display_number.endswith(b'\n'):
+            assert select.select([display_read], [], [], max(0, display_deadline - time.monotonic()))[0], 'private display unavailable'
+            chunk = os.read(display_read, 32)
+            assert chunk, 'private display closed before readiness'
+            display_number += chunk
+            assert len(display_number) <= 32
+        assert display_number.strip().isdigit()
+        env['DISPLAY'] = ':' + display_number.decode().strip()
         os.close(display_read)
         spawn(['pipewire'], 'pipewire')
         wait_until((runtime / 'pipewire-0').exists)
@@ -352,6 +361,14 @@ def main():
         report['failure'] = {'type': type(error).__name__, 'message': str(error)}
         if isinstance(error, subprocess.CalledProcessError):
             report['failure']['command_output'] = error.output
+        report['failure']['private_audio_diagnostics'] = {}
+        for label, command in [('pulse-info', ['pactl', 'info']),
+                               ('pulse-sinks', ['pactl', 'list', 'short', 'sinks']),
+                               ('pipewire-graph', ['pw-dump'])]:
+            try:
+                report['failure']['private_audio_diagnostics'][label] = run(command, env)
+            except (OSError, subprocess.SubprocessError) as diagnostic_error:
+                report['failure']['private_audio_diagnostics'][label] = str(diagnostic_error)
         raise
     finally:
         for child in reversed(children):

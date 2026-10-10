@@ -65,7 +65,13 @@ try:
     bus=runtime/'bus';spawn(['dbus-daemon','--session','--nofork','--address=unix:path='+str(bus)],'bus');wait(bus.exists,'bus')
     env['DBUS_SESSION_BUS_ADDRESS']='unix:path='+str(bus);env['DBUS_SYSTEM_BUS_ADDRESS']=env['DBUS_SESSION_BUS_ADDRESS']
     r,w=os.pipe();spawn(['Xvfb','-displayfd',str(w),'-screen','0','1280x800x24','-nolisten','tcp','-noreset'],'xvfb',pass_fds=(w,));os.close(w)
-    assert select.select([r],[],[],8)[0];env['DISPLAY']=':'+os.read(r,32).decode().strip();os.close(r)
+    display_number=b'';display_deadline=time.monotonic()+8
+    while not display_number.endswith(b'\n'):
+        assert select.select([r],[],[],max(0,display_deadline-time.monotonic()))[0], 'private display readiness timeout'
+        chunk=os.read(r,32);assert chunk, 'private display closed before readiness'
+        display_number+=chunk;assert len(display_number)<=32
+    assert display_number.strip().isdigit()
+    env['DISPLAY']=':'+display_number.decode().strip();os.close(r)
     core=spawn([str(bundle/'tuna-compositor'),'--backend','winit','--width','1280','--height','800','--socket','tuna-flash-proof','--shell-bin',str(client_script)],'compositor')
     ready=wait(lambda:read(art/'client-ready.json'),'supervised fixture');client_pid=ready['pid'];fds.append((client_pid,os.pidfd_open(client_pid)))
     window=wait(lambda:run(['xdotool','search','--pid',str(core.pid),'--name','Smithay']),'window');assert len(window.splitlines())==1
