@@ -91,6 +91,16 @@ pub fn transform_from_smithay(transform: smithay::utils::Transform) -> u32 {
     }
 }
 
+/// The GL frame transform for an output transform: the damage tracker
+/// holds the output (surface-rotation) transform and Smithay inverts
+/// it for rendering (`OutputDamageTracker::render_output` in the
+/// vendored `third-party/smithay/src/backend/renderer/damage/mod.rs`
+/// renders with the inverted transform), so the manual repaint path
+/// must render inverted too. Self-inverse for 0, 2, 4 and 6.
+pub fn render_transform(transform: u32) -> smithay::utils::Transform {
+    smithay_transform(transform).invert()
+}
+
 /// Logical size of a physical area at `scale` under `transform`
 /// (rounded, never zero; 90°/270° exchange width and height).
 pub fn logical_extent(width: i32, height: i32, scale: f64, transform: u32) -> (i32, i32) {
@@ -103,22 +113,46 @@ pub fn logical_extent(width: i32, height: i32, scale: f64, transform: u32) -> (i
 }
 
 /// Map a point in an unrotated `width`×`height` frame to the frame the
-/// transform produces (touch/input coordinate hook; windows.rs calls
-/// this once rotation-aware touch mapping lands there).
+/// transform produces, in pixel indices. This is Smithay
+/// `Transform::transform_point_in` (vendored
+/// `third-party/smithay/src/utils/geometry.rs`) adjusted from its
+/// logical-edge convention to pixel centers: each `area - point` edge
+/// becomes `size - 1 - point`. Directions built on it: [`touch_point`]
+/// maps panel pixels back to logical, and the scanout/capture remaps
+/// use Smithay's continuous rect mapping for the same direction
+/// (`native_repaint` and `mutter`).
+///
+/// Inputs clamp to the frame first, so `i32` extremes and zero or
+/// negative sizes can neither panic nor wrap: every result lands
+/// inside the produced frame.
 pub fn transform_point(width: i32, height: i32, transform: u32, x: i32, y: i32) -> (i32, i32) {
     let (w, h) = (width.max(1), height.max(1));
-    // Flipped variants compose a vertical flip with the rotation.
-    let (x, y) = if matches!(transform, 4..=7) {
-        (x, h - 1 - y)
-    } else {
-        (x, y)
-    };
+    let (x, y) = (x.clamp(0, w - 1), y.clamp(0, h - 1));
     match transform {
-        1 | 5 => (h - 1 - y, x),
-        2 | 6 => (w - 1 - x, h - 1 - y),
-        3 | 7 => (y, w - 1 - x),
-        _ => (x.clamp(0, w - 1), y.clamp(0, h - 1)),
+        1 => (h - 1 - y, x),
+        2 => (w - 1 - x, h - 1 - y),
+        3 => (y, w - 1 - x),
+        4 => (w - 1 - x, y),
+        5 => (y, x),
+        6 => (x, h - 1 - y),
+        7 => (h - 1 - y, w - 1 - x),
+        _ => (x, y),
     }
+}
+
+/// A panel-native touch/absolute-pointer pixel to the logical pixel
+/// shown under it: buffer space back to logical space, which inverts
+/// the transform (Smithay `Point<Buffer>::to_logical` inverts the
+/// same way). The hardware input path remaps primary-output touch
+/// through this; unknown transforms stay identity.
+pub fn touch_point(width: i32, height: i32, transform: u32, x: i32, y: i32) -> (i32, i32) {
+    transform_point(
+        width,
+        height,
+        transform_from_smithay(smithay_transform(transform).invert()),
+        x,
+        y,
+    )
 }
 
 /// iio-sensor-proxy accelerometer orientation (mutter 51.0
@@ -420,8 +454,8 @@ mod tests {
         assert_eq!(transform_point(4, 2, 1, 0, 0), (1, 0));
         assert_eq!(transform_point(4, 2, 2, 0, 0), (3, 1));
         assert_eq!(transform_point(4, 2, 3, 0, 0), (0, 3));
-        // 180° and the vertical flip are involutions.
-        for t in [2u32, 4] {
+        // 180° and the single-axis flips are involutions.
+        for t in [2u32, 4, 6] {
             for x in 0..4 {
                 for y in 0..2 {
                     let (x2, y2) = transform_point(4, 2, t, x, y);
@@ -443,6 +477,146 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn flipped_transforms_match_smithay_pixel_centers() {
+        // Smithay `transform_point_in` on a 4x2 frame, adjusted to
+        // pixel centers: Flipped mirrors x (not y), Flipped180
+        // mirrors y (not x). Each is pinned at three points so a
+        // wrong-axis regression fails loudly.
+        assert_eq!(transform_point(4, 2, 4, 0, 0), (3, 0));
+        assert_eq!(transform_point(4, 2, 4, 3, 1), (0, 1));
+        assert_eq!(transform_point(4, 2, 4, 1, 0), (2, 0));
+        assert_eq!(transform_point(4, 2, 5, 0, 0), (0, 0));
+        assert_eq!(transform_point(4, 2, 5, 3, 1), (1, 3));
+        assert_eq!(transform_point(4, 2, 5, 1, 0), (0, 1));
+        assert_eq!(transform_point(4, 2, 6, 0, 0), (0, 1));
+        assert_eq!(transform_point(4, 2, 6, 3, 1), (3, 0));
+        assert_eq!(transform_point(4, 2, 6, 3, 0), (3, 1));
+        assert_eq!(transform_point(4, 2, 7, 0, 0), (1, 3));
+        assert_eq!(transform_point(4, 2, 7, 3, 1), (0, 0));
+        assert_eq!(transform_point(4, 2, 7, 1, 0), (1, 2));
+        // The plain rotations, for the same strictness.
+        assert_eq!(transform_point(4, 2, 1, 3, 1), (0, 3));
+        assert_eq!(transform_point(4, 2, 2, 1, 0), (2, 1));
+        assert_eq!(transform_point(4, 2, 3, 3, 1), (1, 0));
+        // Unknown transforms stay a clamped identity.
+        assert_eq!(transform_point(4, 2, 9, 7, -3), (3, 0));
+    }
+
+    #[test]
+    fn transform_point_matches_smithay_on_every_pixel() {
+        // Strict correspondence with the vendored Smithay
+        // `transform_point_in`: pixel centers map in doubled space
+        // (`2x+1`), where Smithay's logical-edge formulas apply
+        // exactly, and `(result - 1) / 2` maps back.
+        for &(w, h) in &[(4, 2), (2, 4), (1, 1), (5, 3), (3, 5)] {
+            for t in 0..=7u32 {
+                let smithay = smithay_transform(t);
+                for x in 0..w {
+                    for y in 0..h {
+                        let doubled = smithay::utils::Point::<i64, smithay::utils::Logical>::from(
+                            (2 * i64::from(x) + 1, 2 * i64::from(y) + 1),
+                        );
+                        let area = smithay::utils::Size::<i64, smithay::utils::Logical>::from((
+                            2 * i64::from(w),
+                            2 * i64::from(h),
+                        ));
+                        let mapped = smithay.transform_point_in(doubled, &area);
+                        let expected = (((mapped.x - 1) / 2) as i32, ((mapped.y - 1) / 2) as i32);
+                        assert_eq!(
+                            transform_point(w, h, t, x, y),
+                            expected,
+                            "t={t} ({x},{y}) on {w}x{h}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_point_never_panics_or_wraps_on_extremes() {
+        // `i32` extremes, zero and negative sizes, every transform
+        // including unknown ones: clamping keeps every subtraction
+        // in range, so the test completing is the overflow proof,
+        // and every result lands inside the produced frame.
+        let extremes = [i32::MIN, -1, 0, 1, 2, 4, 1080, 1920, i32::MAX];
+        for &w in &extremes {
+            for &h in &extremes {
+                for t in 0..=9u32 {
+                    let (cw, ch) = (w.max(1), h.max(1));
+                    let (fw, fh) = if transform_swaps_dimensions(t) {
+                        (ch, cw)
+                    } else {
+                        (cw, ch)
+                    };
+                    for &x in &extremes {
+                        for &y in &extremes {
+                            let (mx, my) = transform_point(w, h, t, x, y);
+                            assert!(
+                                mx >= 0 && mx < fw && my >= 0 && my < fh,
+                                "t={t} ({x},{y}) on {w}x{h} -> ({mx},{my})"
+                            );
+                            let (tx, ty) = touch_point(w, h, t, x, y);
+                            assert!(
+                                tx >= 0 && tx < fw && ty >= 0 && ty < fh,
+                                "touch t={t} ({x},{y}) on {w}x{h} -> ({tx},{ty})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn touch_points_invert_the_panel_to_logical() {
+        // Panel pixel back to the logical pixel shown there: the
+        // inverse mapping, pinned per transform on a 4x2 panel.
+        assert_eq!(touch_point(4, 2, 0, 3, 1), (3, 1));
+        assert_eq!(touch_point(4, 2, 1, 3, 0), (0, 0));
+        assert_eq!(touch_point(4, 2, 2, 3, 1), (0, 0));
+        assert_eq!(touch_point(4, 2, 3, 3, 0), (1, 3));
+        assert_eq!(touch_point(4, 2, 4, 3, 0), (0, 0));
+        assert_eq!(touch_point(4, 2, 5, 3, 1), (0, 0));
+        assert_eq!(touch_point(4, 2, 6, 3, 0), (3, 1));
+        assert_eq!(touch_point(4, 2, 7, 3, 1), (1, 3));
+        assert_eq!(touch_point(4, 2, 9, 7, -3), (3, 0));
+        // Touch is exactly the inverted-wire forward map, everywhere.
+        for t in 0..=7u32 {
+            let inverted = transform_from_smithay(smithay_transform(t).invert());
+            for x in 0..4 {
+                for y in 0..2 {
+                    assert_eq!(
+                        touch_point(4, 2, t, x, y),
+                        transform_point(4, 2, inverted, x, y),
+                        "t={t} ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_transforms_follow_smithay_damage_tracker() {
+        // The frame renders inverted, exactly as Smithay's
+        // `render_output` inverts the tracker's output transform.
+        use smithay::utils::Transform as T;
+        for (wire, frame) in [
+            (0, T::Normal),
+            (1, T::_270),
+            (2, T::_180),
+            (3, T::_90),
+            (4, T::Flipped),
+            (5, T::Flipped270),
+            (6, T::Flipped180),
+            (7, T::Flipped90),
+        ] {
+            assert_eq!(render_transform(wire), frame, "wire={wire}");
+        }
+        assert_eq!(render_transform(9), T::Normal);
     }
 
     #[test]
