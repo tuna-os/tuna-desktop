@@ -7,11 +7,25 @@ import subprocess
 import tempfile
 import unittest
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT/'scripts/lib/ci-gtk-wake-proof.py'
 
 
 class PreflightTests(unittest.TestCase):
+    def test_required_native_proof_flags_belong_to_the_proof_step(self):
+        workflow = yaml.safe_load((ROOT/'.github/workflows/ci.yml').read_text())
+        steps = workflow['jobs']['gtk-shell']['steps']
+        proof = [step for step in steps if step.get('run') ==
+                 'scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts']
+        self.assertEqual(len(proof), 1)
+        for name in ('TUNA_REQUIRE_PAM_WRAPPER', 'TUNA_REQUIRE_IBUS', 'TUNA_REQUIRE_WAYLAND_INFO'):
+            self.assertEqual(proof[0]['env'].get(name), '1')
+        collection = next(step for step in steps if step.get('name') ==
+                          "Collect this run's minimize receipts with GTK proof evidence")
+        self.assertNotIn('env', collection)
+
     def test_artifacts_inside_checkout_rejected_before_build(self):
         artifacts = ROOT/'target'/'rejected-gtk-wake-receipts'
         self.assertFalse(artifacts.exists())
