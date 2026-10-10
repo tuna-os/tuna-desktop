@@ -1009,7 +1009,7 @@ fn audio(w: &Rc<Widgets>) {
                     .borrow()
                     .sink
                     .is_some_and(|(old, _)| (old - value).abs() > 0.01);
-                let muted = ui.last.borrow().sink.is_none_or(|(_, muted)| muted);
+                let muted = value <= 0.0;
                 crate::media_keys::wpctl(
                     &[
                         "set-volume",
@@ -1025,7 +1025,26 @@ fn audio(w: &Rc<Widgets>) {
                     ],
                     move |result| {
                         if node == SINK && result.is_some() {
-                            crate::sound_feedback::volume(false, changed, muted);
+                            crate::media_keys::wpctl(
+                                &["set-mute", SINK, if muted { "1" } else { "0" }],
+                                move |result| {
+                                    if result.is_some() {
+                                        crate::media_keys::wpctl(
+                                            &["get-volume", SINK],
+                                            move |result| {
+                                                if let Some((_, muted)) = result
+                                                    .as_deref()
+                                                    .and_then(crate::media_keys::parse_volume)
+                                                {
+                                                    crate::sound_feedback::volume(
+                                                        false, changed, muted,
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    }
+                                },
+                            );
                         }
                     },
                 );

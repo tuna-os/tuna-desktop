@@ -27,7 +27,7 @@ pub enum VolumeKey {
     Mute,
 }
 
-fn parse_volume(output: &str) -> Option<(f64, bool)> {
+pub(crate) fn parse_volume(output: &str) -> Option<(f64, bool)> {
     let mut words = output.split_whitespace();
     if words.next()? != "Volume:" {
         return None;
