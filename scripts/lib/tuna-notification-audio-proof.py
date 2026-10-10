@@ -26,6 +26,10 @@ class AudioProof:
     def __init__(self, artifacts, runtime, env, spawn, manifest):
         self.artifacts = artifacts
         self.env = env
+        # The capture graph is private PipeWire-Pulse. Pin libcanberra to the
+        # matching Pulse backend instead of allowing an ALSA fallback to fail
+        # silently when the runner has no physical device.
+        self.env['CANBERRA_DRIVER'] = 'pulse'
         self.spawn = spawn
         self.manifest = manifest
         self.active = None
