@@ -2005,11 +2005,12 @@ mod tests {
     #[test]
     fn fixed_workspace_layout_has_exact_slots_and_no_insertion_placeholder() {
         let windows = [win(1, 3, 10, 30, 300, 200)];
-        for mut layout in [
-            layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false),
-            app_grid_layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false),
-        ] {
-            assert_eq!(layout.thumbnails.len(), 4);
+        let overview = layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false);
+        assert_eq!(overview.thumbnails.len(), 4);
+        let app_grid = app_grid_layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false);
+        assert_eq!(app_grid.cards.len(), 4);
+        assert!(app_grid.thumbnails.is_empty());
+        for mut layout in [overview, app_grid] {
             assert!(layout.cards.iter().all(|card| card.workspace < 4));
             show_placeholder(&mut layout, 4);
             assert!(layout.placeholder.is_none());
