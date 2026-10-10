@@ -1017,6 +1017,7 @@ fn apply_command(
         | CommandKind::WindowAction { .. }
         | CommandKind::ShortcutConsent { .. }
         | CommandKind::SwitchInputSource { .. }
+        | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetSwitcherThumbnails { .. }
         | CommandKind::SetSwitcherKeys { .. }
         | CommandKind::MoveScreenshotPointer { .. }
