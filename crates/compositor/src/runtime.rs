@@ -3380,6 +3380,9 @@ impl Runtime {
                 schedule.at(self.x11_icon_reader.next_deadline());
             }
         }
+        if let Some(deadline) = self.manager.workspace_lease_deadline() {
+            schedule.at(deadline);
+        }
         if let Some(deadline) = self.idle_monitor.next_deadline() {
             schedule.at(deadline);
         }

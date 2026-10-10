@@ -80,6 +80,43 @@ impl WorkspaceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leases_wake_an_idle_scheduler_even_when_animation_time_is_manual() {
+        let now = Instant::now();
+        let mut tracker = WorkspaceTracker::default();
+        tracker.keep_alive(1, Duration::from_secs(2), now);
+        tracker.window_removed(2, true, now);
+        let deadline = tracker.next_deadline().unwrap();
+        assert_eq!(deadline, now + Duration::from_secs(1));
+        let mut schedule = crate::idle_schedule::Schedule::default();
+        schedule.motion(true, true);
+        schedule.at(deadline);
+        let wait = schedule.wait().expect("real workspace leases need a timer");
+        assert!(wait > Duration::ZERO);
+        assert!(wait <= Duration::from_secs(1));
+        tracker.protected_workspaces(now + Duration::from_secs(1));
+        assert_eq!(tracker.next_deadline(), Some(now + Duration::from_secs(2)));
+        tracker.protected_workspaces(now + Duration::from_secs(2));
+        assert_eq!(tracker.next_deadline(), None);
+    }
+
+    #[test]
+    fn expired_leases_request_reconciliation_once_then_allow_idle_blocking() {
+        let now = Instant::now();
+        let mut tracker = WorkspaceTracker::default();
+        tracker.keep_alive(1, Duration::ZERO, now);
+        let mut due = crate::idle_schedule::Schedule::default();
+        due.at(tracker.next_deadline().unwrap());
+        assert_eq!(due.wait(), Some(Duration::ZERO));
+        assert!(tracker.protected_workspaces(now).is_empty());
+        assert_eq!(tracker.next_deadline(), None);
+        let mut idle = crate::idle_schedule::Schedule::default();
+        if let Some(deadline) = tracker.next_deadline() {
+            idle.at(deadline);
+        }
+        assert_eq!(idle.wait(), None);
+    }
     #[test]
     fn dialog_grace_expires_at_one_second_and_has_no_past_due_deadline() {
         let now = Instant::now();
@@ -91,11 +128,9 @@ mod tests {
             tracker.protected_workspaces(now + Duration::from_millis(999)),
             [2]
         );
-        assert!(
-            tracker
-                .protected_workspaces(now + Duration::from_secs(1))
-                .is_empty()
-        );
+        assert!(tracker
+            .protected_workspaces(now + Duration::from_secs(1))
+            .is_empty());
         assert_eq!(tracker.next_deadline(), None);
     }
     #[test]
@@ -118,11 +153,9 @@ mod tests {
             tracker.protected_workspaces(now + Duration::from_secs(1)),
             [2]
         );
-        assert!(
-            tracker
-                .protected_workspaces(now + Duration::from_millis(1500))
-                .is_empty()
-        );
+        assert!(tracker
+            .protected_workspaces(now + Duration::from_millis(1500))
+            .is_empty());
     }
     #[test]
     fn startup_sequences_keep_workspace_until_each_identity_finishes() {
