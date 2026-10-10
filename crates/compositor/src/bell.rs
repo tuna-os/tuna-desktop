@@ -10,6 +10,7 @@ pub const BELL_SOUND: &str = "bell-window-system";
 pub(crate) struct Bell {
     pub rings: u64,
     policy: BellPolicy,
+    policy_ready: bool,
     last_visual: Option<Instant>,
     visual: Option<(Instant, u8, Option<WlSurface>)>,
     player: Option<(std::process::Child, Instant)>,
@@ -23,10 +24,11 @@ fn flashes(last: Option<Instant>, now: Instant) -> u8 {
     }
 }
 
-/// Two 50 ms quad-in legs per pulse: transparent -> 192/255 -> transparent.
+/// A 50 ms quad-in leg followed by `repeats` alternating legs.
+/// Mutter stops and removes the overlay after the final leg, including a peak.
 fn opacity(elapsed: Duration, pulses: u8) -> f32 {
     let ms = elapsed.as_secs_f32() * 1000.0;
-    if ms >= f32::from(pulses) * 100.0 {
+    if ms >= (f32::from(pulses) + 1.0) * 50.0 {
         return 0.0;
     }
     let leg = ms % 100.0;
@@ -47,12 +49,13 @@ impl Bell {
             self.stop_player();
         }
         self.policy = policy;
+        self.policy_ready = true;
     }
     pub fn ring(&mut self, surface: Option<WlSurface>) {
         self.rings = self.rings.saturating_add(1);
         let now = Instant::now();
         self.tick(now);
-        if self.policy.visual {
+        if self.policy_ready && self.policy.visual {
             let pulses = flashes(self.last_visual, now);
             if pulses > 0 {
                 self.last_visual = Some(now);
@@ -63,8 +66,7 @@ impl Bell {
                 ));
             }
         }
-        if !self.policy.audible
-            || !self.policy.event_sounds
+        if !self.audible_enabled()
             || self.player.is_some()
             || std::env::var_os("TUNA_BELL").is_some_and(|v| v == "0")
         {
@@ -114,7 +116,8 @@ impl Bell {
             }
         }
         if self.visual.as_ref().is_some_and(|(start, pulses, _)| {
-            now.saturating_duration_since(*start) >= Duration::from_millis(u64::from(*pulses) * 100)
+            now.saturating_duration_since(*start)
+                >= Duration::from_millis((u64::from(*pulses) + 1) * 50)
         }) {
             self.visual = None;
         }
@@ -128,6 +131,9 @@ impl Bell {
     }
     pub fn clear_visual(&mut self) {
         self.visual = None;
+    }
+    fn audible_enabled(&self) -> bool {
+        self.policy_ready && self.policy.audible && self.policy.event_sounds
     }
     fn stop_player(&mut self) {
         if let Some((mut child, _)) = self.player.take() {
@@ -159,9 +165,39 @@ mod tests {
         assert_eq!(opacity(Duration::ZERO, 2), 0.0);
         assert_eq!(opacity(Duration::from_millis(50), 2), 192.0 / 255.0);
         assert_eq!(opacity(Duration::from_millis(100), 2), 0.0);
-        assert_eq!(opacity(Duration::from_millis(150), 2), 192.0 / 255.0);
+        assert_eq!(
+            opacity(Duration::from_millis(25), 2),
+            (192.0 / 255.0) * 0.25
+        );
+        assert_eq!(
+            opacity(Duration::from_millis(125), 2),
+            (192.0 / 255.0) * 0.25
+        );
+        assert_eq!(opacity(Duration::from_millis(150), 2), 0.0);
         assert_eq!(opacity(Duration::from_millis(200), 2), 0.0);
         assert_eq!(opacity(Duration::from_millis(100), 1), 0.0);
+    }
+    #[test]
+    fn first_bell_is_silent_until_trusted_policy_arrives() {
+        let mut bell = Bell::default();
+        assert!(!bell.audible_enabled());
+        bell.ring(None);
+        assert!(bell.player.is_none());
+        assert!(bell.visual(Instant::now()).is_none());
+        assert_eq!(bell.rings, 1);
+        bell.set_policy(BellPolicy {
+            visual: true,
+            ..Default::default()
+        });
+        assert!(bell.audible_enabled());
+        bell.set_policy(BellPolicy {
+            audible: false,
+            visual: true,
+            ..Default::default()
+        });
+        bell.ring(None);
+        assert!(bell.visual(Instant::now()).is_some());
+        assert!(bell.player.is_none());
     }
     #[test]
     fn disabling_visual_policy_cancels_inflight_flash() {
