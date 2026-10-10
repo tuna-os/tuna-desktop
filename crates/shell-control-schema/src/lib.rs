@@ -833,6 +833,12 @@ pub struct InputSettings {
     pub attach_modal_dialogs: bool,
     #[serde(default)]
     pub workspace_policy: WorkspacePolicy,
+    /// `orientation-lock` from `org.gnome.settings-daemon.peripherals.touchscreen`
+    /// (#345): the shell reads the key, the compositor stops sensor-driven
+    /// rotation while set. Appended last: the postcard body is positional.
+    /// UNION: this field addition needs the Wave2 minor version bump.
+    #[serde(default)]
+    pub orientation_lock: bool,
 }
 
 fn default_attach_modal_dialogs() -> bool {
@@ -863,6 +869,8 @@ impl Default for InputSettings {
             bell: BellPolicy::default(),
             attach_modal_dialogs: true,
             workspace_policy: WorkspacePolicy::default(),
+            // GNOME default: convertibles auto-rotate out of the box.
+            orientation_lock: false,
         }
     }
 }

@@ -70,6 +70,7 @@ pub mod mutter;
 mod native_repaint;
 mod occlusion;
 pub mod orca;
+pub mod orientation;
 pub mod overlay;
 pub mod overview;
 pub mod pam;

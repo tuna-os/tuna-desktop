@@ -69,6 +69,8 @@ pub(crate) struct FrameSignature {
     pub size: (i32, i32),
     pub location: (i32, i32),
     pub scale: f64,
+    /// DisplayConfig transform (#345): rotation invalidates damage history.
+    pub transform: u32,
     pub locked: bool,
     pub background: Color32F,
     pub blank_alpha: f32,
@@ -87,6 +89,7 @@ impl FrameSignature {
         self.size == old.size
             && self.location == old.location
             && self.scale == old.scale
+            && self.transform == old.transform
             && self.locked == old.locked
             && self.background == old.background
             && self.blank_alpha == old.blank_alpha
@@ -184,6 +187,7 @@ mod tests {
             size: (1280, 800),
             location: (0, 0),
             scale: 1.0,
+            transform: 0,
             locked: false,
             background: Color32F::BLACK,
             blank_alpha: 0.0,
@@ -200,6 +204,14 @@ mod tests {
         let before = scene();
         let mut after = before.clone();
         after.effects = vec![0.7f32.to_bits()];
+        assert!(needs_repaint(Some(&before), &after, false));
+        assert!(!after.same_global_drawing(&before));
+    }
+    #[test]
+    fn rotation_change_repaints_and_resets_damage() {
+        let before = scene();
+        let mut after = before.clone();
+        after.transform = 1;
         assert!(needs_repaint(Some(&before), &after, false));
         assert!(!after.same_global_drawing(&before));
     }
