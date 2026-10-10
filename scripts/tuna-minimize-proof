@@ -365,7 +365,7 @@ try:
     wait(lambda d:any(f["window"]==wid for f in d["window_lifecycle"]["opening"]),"family-parent-animation-start")
     move(3975)
     action("dialog",20)
-    dialog=wait(lambda d:len(d["windows"])==2,"family-dialog-map")
+    dialog=wait(lambda d:len(d["windows"])==2 and any(f["window"]!=wid for f in d["window_lifecycle"]["opening"]),"family-dialog-map")
     child=next(w for w in dialog["windows"] if w["id"]!=wid)
     child_id=child["id"]; cx,cy,cw,ch=child["rect"]
     child_point=(round(cx+cw*.7),round(cy+ch*.8))
