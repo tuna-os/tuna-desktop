@@ -1403,12 +1403,14 @@ impl Runtime {
             let matches_key = if let ManagerInput::Key { keycode, .. } = &input {
                 self.state.seat.get_keyboard().is_some_and(|keyboard| {
                     keyboard.with_xkb_state(&mut self.state, |context| {
+                        let xkb = context.xkb().lock().unwrap();
                         self.cursor.locate.matches_keysym(
-                            context
-                                .keysym_handle(keycode.saturating_add(8).into())
-                                .raw_syms()
-                                .into_iter()
-                                .map(|symbol| symbol.raw()),
+                            xkb.raw_syms_for_key_in_layout(
+                                keycode.saturating_add(8).into(),
+                                xkb.active_layout(),
+                            )
+                            .iter()
+                            .map(|symbol| symbol.raw()),
                         )
                     })
                 })
