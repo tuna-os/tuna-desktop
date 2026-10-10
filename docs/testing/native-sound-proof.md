@@ -192,9 +192,14 @@ The original diagnostic path remains available explicitly as
 `--audio-fixture pw-tools`; there is no automatic fallback. The integrated
 default completed its own nine-case run at
 `/tmp/tuna-v1-sound-feedback-b02-memory-tool-1`, with verified running helper
-identities and owned cleanup. Its result is independent of the earlier
-scratch diagnostics; repeat qualification of the integrated tool remains
-pending.
+identities and owned cleanup. The unchanged integrated tool also passed all
+nine cases at `/tmp/tuna-v1-sound-feedback-b02-memory-tool-2`. Playing sine
+residuals were 4.966181511597964 and 3.5829795994198195, respectively, below
+the unchanged limit of 5. Both runs verified the delivered b02bc9f0 native
+executables, recorded the source and running bytes of the memory helpers,
+reported zero helper invalid-buffer, overflow, and error counters, and
+completed owned cleanup. These repeat results are independent of the earlier
+scratch diagnostics and qualify only this private null-sink fixture.
 
 ## Open qualification and behavior gaps
 
@@ -207,7 +212,10 @@ sink. Unknown state and unrelated playback remain suppressive. This follows
 [GNOME 51's media-key feedback policy](https://github.com/GNOME/gnome-settings-daemon/blob/51.0/plugins/media-keys/gsd-media-keys-manager.c),
 which checks its own event playback before treating sink Running as external
 playback. The fresh build and first nine-case delivered proof passed;
-replacement and repeated native key proofs remain open.
+the separate two-case owned-overlap proof also passed with an observed Running
+owned stream and a replacement player PID. Its old-bundle negative control
+failed to start that replacement. Repeated nine-case native key proofs passed
+as described above; physical-device and full sound-policy proofs remain open.
 Slider feedback uses the shared debounce rather than GNOME's drag-end
 specific behavior. These gaps prevent a full sound parity claim. No audio
 receipt establishes a performance win over GNOME.
