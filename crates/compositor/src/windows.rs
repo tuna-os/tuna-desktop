@@ -1905,6 +1905,9 @@ impl WindowManager {
     }
 
     fn remember_focus(&mut self, id: u64) {
+        if self.focus_history.first() == Some(&id) {
+            return;
+        }
         self.focus_history.retain(|other| *other != id);
         self.focus_history.insert(0, id);
     }
