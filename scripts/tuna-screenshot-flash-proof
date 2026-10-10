@@ -1,0 +1,140 @@
+#!/usr/bin/python3
+"""Actual nested screenshot feedback and caller boundary; no GNOME win claim.
+
+The screenshot caller is a supervised proof fixture, not the GTK UI.
+Production admission still authenticates its exact supervised PID. Output
+pixels come from Xvfb; saved PNG comes from production offscreen capture.
+"""
+import argparse,hashlib,json,os,select,signal,subprocess,time
+from pathlib import Path
+from PIL import Image
+p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--bundle',type=Path,required=True);p.add_argument('--artifacts',type=Path,required=True)
+a=p.parse_args();bundle=a.bundle.resolve();art=a.artifacts.resolve()
+client_script=Path(__file__).resolve().parent/'lib'/'tuna-screenshot-flash-client.py'
+manifest=json.loads((bundle/'manifest.json').read_text())
+assert manifest['source_dirty'] is False, 'dirty frozen source'
+import re
+assert re.fullmatch(r'[0-9a-f]{40}', manifest['source_revision']), 'invalid source identity'
+for name in ('tuna-compositor','tuna-shell-gtk','tuna-shell-host'):
+    assert hashlib.sha256((bundle/name).read_bytes()).hexdigest()==manifest['binary_sha256'][name]
+art.mkdir(mode=0o700)
+runtime=art/'runtime';runtime.mkdir(mode=0o700)
+clock=art/'clock';clock.write_text('0\n');state=art/'state.json'
+env=os.environ.copy()
+for key in ('DISPLAY','WAYLAND_DISPLAY','WAYLAND_SOCKET','DBUS_SESSION_BUS_ADDRESS','AT_SPI_BUS_ADDRESS'):
+    env.pop(key,None)
+env.update(XDG_RUNTIME_DIR=str(runtime),XDG_CONFIG_HOME=str(art/'config'),XDG_DATA_HOME=str(art/'data'),GSETTINGS_BACKEND='keyfile',LIBGL_ALWAYS_SOFTWARE='1',TUNA_XWAYLAND='0',TUNA_COMPOSITOR_STATE=str(state),TUNA_ANIMATION_CLOCK=str(clock),TUNA_FLASH_PROOF_ARTIFACTS=str(art))
+children=[];fds=[];logs=[];success=False;receipt={'scope':__doc__,'source_revision':manifest['source_revision'],'manifest_sha256':hashlib.sha256((bundle/'manifest.json').read_bytes()).hexdigest(),'cases':{},'cleanup':{}}
+def spawn(argv,name,**kw):
+    log=(art/(name+'.log')).open('wb');logs.append(log)
+    proc=subprocess.Popen(argv,env=env,stdout=log,stderr=log,start_new_session=True,**kw);children.append(proc);fds.append((proc.pid,os.pidfd_open(proc.pid)));return proc
+def wait(check,label,seconds=12):
+    end=time.monotonic()+seconds
+    while time.monotonic()<end:
+        try:
+            result=check()
+            if result:return result
+        except (OSError,ValueError,KeyError,subprocess.SubprocessError):pass
+        time.sleep(.02)
+    raise AssertionError('timed out: '+label)
+def read(path):return json.loads(path.read_text())
+def run(args):return subprocess.check_output(args,env=env,text=True,stderr=subprocess.STDOUT,timeout=5).strip()
+def advance(ms):
+    tmp=clock.with_suffix('.tmp');tmp.write_text(str(ms)+'\n');tmp.replace(clock)
+    wait(lambda:read(state).get('animation_clock_ms')==ms,'clock '+str(ms))
+    time.sleep(.07)
+def capture(name):
+    path=art/(name+'.png');run(['scrot',str(path)]);return Image.open(path).convert('RGB')
+def pixel(image,x=400,y=300):return list(image.getpixel((x,y)))
+id=0
+def request(method,signature,args):
+    global id
+    id+=1;tmp=art/'request.tmp';tmp.write_text(json.dumps({'id':id,'method':method,'signature':signature,'args':args}));tmp.replace(art/'request.json')
+    wait(lambda:read(art/'started.json')['id']==id,'request start');return id
+def response(number):
+    def ready():
+        value=read(art/'response.json')
+        return value if value['id']==number else False
+    return wait(ready,'reply')
+try:
+    bus=runtime/'bus';spawn(['dbus-daemon','--session','--nofork','--address=unix:path='+str(bus)],'bus');wait(bus.exists,'bus')
+    env['DBUS_SESSION_BUS_ADDRESS']='unix:path='+str(bus);env['DBUS_SYSTEM_BUS_ADDRESS']=env['DBUS_SESSION_BUS_ADDRESS']
+    r,w=os.pipe();spawn(['Xvfb','-displayfd',str(w),'-screen','0','1280x800x24','-nolisten','tcp','-noreset'],'xvfb',pass_fds=(w,));os.close(w)
+    assert select.select([r],[],[],8)[0];env['DISPLAY']=':'+os.read(r,32).decode().strip();os.close(r)
+    core=spawn([str(bundle/'tuna-compositor'),'--backend','winit','--width','1280','--height','800','--socket','tuna-flash-proof','--shell-bin',str(client_script)],'compositor')
+    ready=wait(lambda:read(art/'client-ready.json'),'supervised fixture');client_pid=ready['pid'];fds.append((client_pid,os.pidfd_open(client_pid)))
+    window=wait(lambda:run(['xdotool','search','--pid',str(core.pid),'--name','Smithay']),'window');assert len(window.splitlines())==1
+    run(['xdotool','windowfocus','--sync',window]);run(['xdotool','mousemove','--window',window,'1200','750'])
+    wait(lambda:read(state).get('animation_clock_ms')==0,'ready state');time.sleep(.5)
+    assert Path('/proc',str(core.pid),'exe').resolve()==bundle/'tuna-compositor'
+    receipt['running_compositor']={'pid':core.pid,'sha256':hashlib.sha256(Path('/proc',str(core.pid),'exe').read_bytes()).hexdigest()}
+    assert receipt['running_compositor']['sha256']==manifest['binary_sha256']['tuna-compositor'], 'running compositor bytes differ'
+    receipt['supervised_fixture']={'pid':client_pid,'source_sha256':hashlib.sha256(client_script.read_bytes()).hexdigest()}
+    baseline=capture('00-baseline');base=pixel(baseline);assert max(base)<230,'baseline cannot distinguish flash'
+    # Untrusted caller gets no authority even on the private bus.
+    untrusted=subprocess.run(['gdbus','call','--session','--dest','org.gnome.Shell.Screenshot','--object-path','/org/gnome/Shell/Screenshot','--method','org.gnome.Shell.Screenshot.FlashArea','0','0','1280','800'],env=env,capture_output=True,text=True,timeout=5)
+    assert untrusted.returncode!=0 and 'AccessDenied' in untrusted.stderr
+    assert pixel(capture('01-untrusted'))==base
+    receipt['cases']['untrusted']={'denied':True,'pixel':base}
+    number=request('Screenshot','(bbs)',[False,False,str(art/'no-flash.png')]);answer=response(number);assert answer['answer'][0]
+    assert pixel(capture('02-no-flash'))==base
+    receipt['cases']['flash-false']=answer
+    number=request('Screenshot','(bbs)',[False,True,str(art/'flash.png')]);wait((art/'flash.png').exists,'saved PNG')
+    start=pixel(capture('03-start'));assert min(start)>245,start
+    saved=Image.open(art/'flash.png').convert('RGB');assert pixel(saved)==base,{'saved':pixel(saved),'baseline':base}
+    # Saved pixels exist but the flashing method has not returned yet.
+    assert read(art/'response.json')['id']!=number,'reply preceded flash completion'
+    advance(250);half=pixel(capture('04-half'))
+    expected=[round(b*.75+255*.25) for b in base];assert all(abs(x-y)<=4 for x,y in zip(half,expected)),(half,expected)
+    assert read(art/'response.json')['id']!=number
+    advance(500);answer=response(number);end=pixel(capture('05-end'));assert end==base,(end,base)
+    receipt['cases']['flash-true']={'start':start,'half':half,'expected_half':expected,'end':end,'saved':pixel(saved),'reply':answer}
+    number=request('Screenshot','(bbs)',[False,True,str(art/'no-flash.png'/'failed.png')]);answer=response(number);assert not answer['answer'][0]
+    assert pixel(capture('06-failed'))==base
+    receipt['cases']['failed-capture']=answer
+    number=request('FlashArea','(iiii)',[200,200,500,300]);answer=response(number);assert 'answer' in answer
+    area=capture('07-area-start');assert min(pixel(area))>245
+    assert pixel(area,100,300)==pixel(baseline,100,300)
+    advance(1000);assert pixel(capture('08-area-end'))==base
+    receipt['cases']['area']={'reply':answer,'inside':pixel(area),'outside':pixel(area,100,300)}
+    number=request('FlashArea','(iiii)',[0,0,-1,20]);answer=response(number);assert 'error' in answer
+    assert pixel(capture('09-invalid'))==base;receipt['cases']['invalid-area']=answer
+    assert core.poll() is None, 'original compositor exited'
+    assert hashlib.sha256(Path('/proc',str(core.pid),'exe').read_bytes()).hexdigest()==manifest['binary_sha256']['tuna-compositor']
+    assert not select.select([fds[-1][1]],[],[],0)[0], 'original supervised fixture exited'
+    receipt['running_identity_verified_after_cases']=True
+    success=True
+finally:
+    # Pin exact children/fixture before signalling; assertions only after exits.
+    for pid,fd in reversed(fds):
+        if not select.select([fd],[],[],0)[0]:
+            try:signal.pidfd_send_signal(fd,signal.SIGTERM)
+            except ProcessLookupError:pass
+    for pid,fd in fds:
+        if not select.select([fd],[],[],3)[0]:signal.pidfd_send_signal(fd,signal.SIGKILL)
+        assert select.select([fd],[],[],3)[0],str(pid)+' survived';os.close(fd)
+    for proc in children:proc.wait(timeout=3)
+    # Detect and retire bus activation within only our private runtime.
+    marker=('XDG_RUNTIME_DIR='+str(runtime)).encode();remaining=[]
+    for path in Path('/proc').iterdir():
+        if not path.name.isdecimal() or int(path.name)==os.getpid():continue
+        try:
+            if marker not in (path/'environ').read_bytes().split(b'\0'):continue
+            fd=os.pidfd_open(int(path.name))
+            if marker not in (path/'environ').read_bytes().split(b'\0'):os.close(fd);continue
+            remaining.append((int(path.name),fd));signal.pidfd_send_signal(fd,signal.SIGTERM)
+        except OSError:pass
+    for pid,fd in remaining:
+        if not select.select([fd],[],[],2)[0]:signal.pidfd_send_signal(fd,signal.SIGKILL)
+        assert select.select([fd],[],[],2)[0];os.close(fd)
+    for log in logs:log.close()
+    # Daemons have exited; private runtime contains only disposable endpoints.
+    import shutil
+    shutil.rmtree(runtime)
+    receipt['cleanup']={'owned_processes_exited':True,'private_activated_pids':[pid for pid,_ in remaining],'runtime_removed':not runtime.exists()}
+    receipt['passed']=success
+    (art/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+if success:
+    (art/'assertions.txt').write_text('nested screenshot flash pixels, saved PNG isolation, reply timing, bounded area, failed capture, caller denial, owned cleanup\n')
+    print(json.dumps(receipt))

@@ -13,6 +13,7 @@
 //! The compositor runs one supervised shell; select this one with
 //! `TUNA_SHELL_BIN=tuna-shell-gtk` while it grows to parity.
 
+mod accessibility;
 mod audio_state;
 mod background_settings;
 mod bt_menu;
@@ -45,6 +46,7 @@ mod screenshot_ui;
 mod services;
 mod shell_dbus;
 mod shortcut_consent;
+mod sound_feedback;
 mod switcher;
 mod tray;
 mod wifi;
@@ -1028,6 +1030,7 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
 }
 
 fn build(app: &adw::Application) {
+    accessibility::start_focus_policy();
     let provider = gtk::CssProvider::new();
     // Shell CSS has GNOME's baseline face/size, but follows the user's font live.
     let apply_font = {
@@ -1287,6 +1290,7 @@ fn build(app: &adw::Application) {
     let end = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     end.append(&screencast::indicator(&recorder));
     end.append(&tray::tray());
+    end.append(&accessibility::menu());
     end.append(&system);
     bar.set_end_widget(Some(&end));
     window.set_child(Some(&bar));
@@ -1661,8 +1665,18 @@ fn build(app: &adw::Application) {
                             );
                         }
                     }
-                    Action::VolumeUp { precise } | Action::VolumeDown { precise } => {
-                        let up = matches!(action, Action::VolumeUp { .. });
+                    Action::VolumeUp { .. }
+                    | Action::VolumeDown { .. }
+                    | Action::VolumeUpQuiet
+                    | Action::VolumeDownQuiet => {
+                        let up = matches!(action, Action::VolumeUp { .. } | Action::VolumeUpQuiet);
+                        let precise = matches!(
+                            action,
+                            Action::VolumeUp { precise: true }
+                                | Action::VolumeDown { precise: true }
+                        );
+                        let quiet =
+                            matches!(action, Action::VolumeUpQuiet | Action::VolumeDownQuiet);
                         let step = if precise {
                             2.0
                         } else {
@@ -1676,13 +1690,15 @@ fn build(app: &adw::Application) {
                             },
                             step,
                             false,
+                            quiet,
                         );
                     }
-                    Action::VolumeMute | Action::MicrophoneMute => {
+                    Action::VolumeMute | Action::VolumeMuteQuiet | Action::MicrophoneMute => {
                         media_keys.change(
                             media_keys::VolumeKey::Mute,
                             0.0,
                             action == Action::MicrophoneMute,
+                            action == Action::VolumeMuteQuiet,
                         );
                     }
                     Action::BrightnessUp
@@ -1902,6 +1918,9 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.peripherals.mouse",
             INTERFACE_SCHEMA,
             A11Y_INTERFACE_SCHEMA,
+            "org.gnome.desktop.wm.preferences",
+            "org.gnome.desktop.sound",
+            "org.gnome.mutter",
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -1951,7 +1970,24 @@ fn build(app: &adw::Application) {
                 }
                 out.right_to_left = gtk::Widget::default_direction() == gtk::TextDirection::Rtl;
                 out.motion = motion::from_settings(all[4].as_ref(), all[5].as_ref());
+                if let Some(mutter) = all[8].as_ref() {
+                    if mutter
+                        .settings_schema()
+                        .is_some_and(|schema| schema.has_key("attach-modal-dialogs"))
+                    {
+                        out.attach_modal_dialogs = mutter.boolean("attach-modal-dialogs");
+                    }
+                }
                 motion::set(out.motion);
+                if let Some(wm) = all[6].as_ref() {
+                    out.bell.audible = wm.boolean("audible-bell");
+                    out.bell.visual = wm.boolean("visual-bell");
+                    out.bell.frame_flash = wm.string("visual-bell-type") == "frame-flash";
+                }
+                if let Some(sound) = all[7].as_ref() {
+                    out.bell.event_sounds = sound.boolean("event-sounds");
+                    out.bell.theme = sound.string("theme-name").to_string();
+                }
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }

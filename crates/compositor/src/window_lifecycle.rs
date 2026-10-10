@@ -149,6 +149,7 @@ struct Cached {
     kind: Kind,
     parent: Option<u64>,
     resizing: bool,
+    brightness: f32,
     order: usize,
     elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
 }
@@ -355,6 +356,7 @@ pub fn step_frame(
                     kind,
                     parent: manager.transient_parent(*id),
                     resizing: manager.size_changes().frame(*id).is_some(),
+                    brightness: manager.modal_dim().multiplier(*id),
                     order: index,
                     elements,
                 },
@@ -477,6 +479,11 @@ fn copy_frame(
         (f64::from(cached.geometry.size.h) * cached.scale).round() as i32,
     )
         .into();
+    let dim_program = if cached.brightness < 1.0 {
+        Some(crate::modal_dim::program(renderer)?)
+    } else {
+        None
+    };
     let mut texture: smithay::backend::renderer::gles::GlesTexture = renderer
         .create_buffer(Fourcc::Abgr8888, (size.w, size.h).into())
         .ok()?;
@@ -487,7 +494,17 @@ fn copy_frame(
         frame
             .clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &[all])
             .ok()?;
+        if let Some(program) = dim_program {
+            frame.override_default_tex_program(
+                program,
+                vec![smithay::backend::renderer::gles::Uniform::new(
+                    "brightness",
+                    cached.brightness,
+                )],
+            );
+        }
         draw_render_elements(&mut frame, cached.scale, &cached.elements, &[all]).ok()?;
+        frame.clear_tex_program_override();
         let _ = frame.finish().ok()?;
     }
     Some(texture)

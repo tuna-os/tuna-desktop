@@ -27,6 +27,8 @@ pub struct Snapshot {
     pub recording: bool,
     pub source: Option<(f64, bool)>,
     pub sink: Option<(f64, bool)>,
+    /// None until the default node reports a recognized playback state.
+    pub sink_running: Option<bool>,
     pub outputs: Vec<Output>,
 }
 
@@ -148,6 +150,11 @@ impl AudioState {
             }
             if is_default_sink {
                 snapshot.sink = node_level(object);
+                snapshot.sink_running = match object["info"]["state"].as_str() {
+                    Some("running") => Some(true),
+                    Some("idle" | "suspended") => Some(false),
+                    _ => None,
+                };
             }
             let name = props["node.description"]
                 .as_str()
@@ -261,6 +268,32 @@ mod tests {
             .feed(&vec![b' '; MAX_PENDING + 1])
             .is_err());
     }
+    #[test]
+    fn playback_state_is_default_sink_scoped_and_unknown_is_conservative() {
+        let mut state = AudioState::default();
+        feed(
+            &mut state,
+            json!([
+                {"id":20,"type":"PipeWire:Interface:Metadata","props":{"metadata.name":"default"},"metadata":[{"subject":0,"key":"default.audio.sink","value":{"name":"main"}}]},
+                {"id":1,"info":{"state":"running","props":{"media.class":"Audio/Sink","node.name":"other"}}},
+                {"id":2,"info":{"state":"idle","props":{"media.class":"Audio/Sink","node.name":"main"}}}
+            ]),
+        );
+        assert_eq!(state.snapshot().sink_running, Some(false));
+        feed(
+            &mut state,
+            json!([{"id":2,"info":{"state":"running","props":{"media.class":"Audio/Sink","node.name":"main"}}}]),
+        );
+        assert_eq!(state.snapshot().sink_running, Some(true));
+        feed(
+            &mut state,
+            json!([{"id":2,"info":{"state":"error","props":{"media.class":"Audio/Sink","node.name":"main"}}}]),
+        );
+        assert_eq!(state.snapshot().sink_running, None);
+        feed(&mut state, json!([{"id":2,"info":null}]));
+        assert_eq!(state.snapshot().sink_running, None);
+    }
+
     #[test]
     fn ports_share_a_sink_but_switch_distinct_routes_and_metadata_is_incremental() {
         let mut s = AudioState::default();

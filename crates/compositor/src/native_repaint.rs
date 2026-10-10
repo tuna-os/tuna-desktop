@@ -65,6 +65,7 @@ impl Element for ElementSignature {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FrameSignature {
+    pub effects: Vec<u32>,
     pub size: (i32, i32),
     pub location: (i32, i32),
     pub scale: f64,
@@ -92,6 +93,7 @@ impl FrameSignature {
             && self.accent == old.accent
             && self.pointer == old.pointer
             && self.decor == old.decor
+            && self.effects == old.effects
             && self.above == old.above
             && self.groups.len() == old.groups.len()
             && self.groups.iter().zip(&old.groups).all(|(new, old)| {
@@ -178,6 +180,7 @@ mod tests {
 
     fn scene() -> FrameSignature {
         FrameSignature {
+            effects: Vec::new(),
             size: (1280, 800),
             location: (0, 0),
             scale: 1.0,
@@ -192,6 +195,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parent_brightness_change_invalidates_native_repaint_and_damage_layout() {
+        let before = scene();
+        let mut after = before.clone();
+        after.effects = vec![0.7f32.to_bits()];
+        assert!(needs_repaint(Some(&before), &after, false));
+        assert!(!after.same_global_drawing(&before));
+    }
     #[test]
     fn unchanged_scene_sleeps_but_first_frame_and_timing_requests_render() {
         let next = scene();

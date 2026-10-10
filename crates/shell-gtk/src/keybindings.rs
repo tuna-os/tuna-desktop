@@ -44,6 +44,9 @@ pub enum Action {
         precise: bool,
     },
     VolumeMute,
+    VolumeUpQuiet,
+    VolumeDownQuiet,
+    VolumeMuteQuiet,
     MicrophoneMute,
     BrightnessUp,
     BrightnessDown,
@@ -301,7 +304,7 @@ fn specs() -> Vec<Spec> {
         ("mic-mute", Action::MicrophoneMute, vec!["XF86AudioMicMute"]),
         (
             "volume-up-quiet",
-            Action::VolumeUp { precise: false },
+            Action::VolumeUpQuiet,
             vec![
                 "<Alt>XF86AudioRaiseVolume",
                 "<Alt><Ctrl>XF86AudioRaiseVolume",
@@ -309,7 +312,7 @@ fn specs() -> Vec<Spec> {
         ),
         (
             "volume-down-quiet",
-            Action::VolumeDown { precise: false },
+            Action::VolumeDownQuiet,
             vec![
                 "<Alt>XF86AudioLowerVolume",
                 "<Alt><Ctrl>XF86AudioLowerVolume",
@@ -317,7 +320,7 @@ fn specs() -> Vec<Spec> {
         ),
         (
             "volume-mute-quiet",
-            Action::VolumeMute,
+            Action::VolumeMuteQuiet,
             vec!["<Alt>XF86AudioMute"],
         ),
         (
@@ -693,16 +696,23 @@ mod tests {
         assert_eq!(find(Action::LockScreen), ["<Super>l"]);
         assert_eq!(
             find(Action::VolumeUp { precise: false }),
+            ["XF86AudioRaiseVolume", "<Ctrl>XF86AudioRaiseVolume",]
+        );
+        assert_eq!(find(Action::VolumeMute), ["XF86AudioMute"]);
+        assert_eq!(find(Action::VolumeMuteQuiet), ["<Alt>XF86AudioMute"]);
+        assert_eq!(
+            find(Action::VolumeUpQuiet),
             [
-                "XF86AudioRaiseVolume",
-                "<Ctrl>XF86AudioRaiseVolume",
                 "<Alt>XF86AudioRaiseVolume",
                 "<Alt><Ctrl>XF86AudioRaiseVolume"
             ]
         );
         assert_eq!(
-            find(Action::VolumeMute),
-            ["XF86AudioMute", "<Alt>XF86AudioMute"]
+            find(Action::VolumeDownQuiet),
+            [
+                "<Alt>XF86AudioLowerVolume",
+                "<Alt><Ctrl>XF86AudioLowerVolume"
+            ]
         );
         assert_eq!(find(Action::MicrophoneMute), ["XF86AudioMicMute"]);
         assert_eq!(volume_step(None), 6.0);

@@ -316,6 +316,7 @@ pub struct WindowManager {
     /// queue here and the runtime draws them.
     size_changes: crate::size_change::SizeChanges<crate::size_change::Snapshot>,
     window_lifecycle: crate::window_lifecycle::Lifecycle,
+    modal_dim: crate::modal_dim::ModalDim,
 }
 
 impl WindowManager {
@@ -378,6 +379,7 @@ impl WindowManager {
             exclusive_held: None,
             size_changes: Default::default(),
             window_lifecycle: Default::default(),
+            modal_dim: Default::default(),
         }
     }
 
@@ -667,6 +669,34 @@ impl WindowManager {
         }
     }
 
+    pub fn modal_dim(&self) -> &crate::modal_dim::ModalDim {
+        &self.modal_dim
+    }
+    pub fn step_modal_dim(
+        &mut self,
+        now: std::time::Duration,
+        policy: tuna_shell_control::motion::MotionPolicy,
+        animate: bool,
+        enabled: bool,
+    ) {
+        let alive = self.windows.keys().copied().collect();
+        let parents = self
+            .windows
+            .iter()
+            .filter_map(|(id, w)| match w.surface.underlying_surface() {
+                WindowSurface::Wayland(top)
+                    if !w.minimized
+                        && read_modal(top)
+                        && committed_size(top.wl_surface()).is_some() =>
+                {
+                    self.transient_parent(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        self.modal_dim.set_enabled(enabled);
+        self.modal_dim.step(&alive, &parents, now, policy, animate);
+    }
     pub fn window_lifecycle(&self) -> &crate::window_lifecycle::Lifecycle {
         &self.window_lifecycle
     }

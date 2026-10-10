@@ -48,9 +48,11 @@ use smithay::{
 
 pub mod animation;
 pub mod animation_clock;
+mod bell;
 pub mod capture_security;
 mod constraint_motion;
 pub mod control;
+mod control_readiness;
 pub mod corner_pressure;
 #[cfg(feature = "drm")]
 pub mod drm;
@@ -78,6 +80,7 @@ mod runtime_signal;
 mod sandbox_identity;
 pub mod screencast;
 pub mod screenshot;
+pub mod screenshot_flash;
 pub mod session_lock;
 pub mod session_services;
 pub mod size_change;
@@ -90,6 +93,7 @@ pub mod unlock;
 pub mod wallpaper;
 pub mod window_icons;
 pub mod window_lifecycle;
+pub mod modal_dim;
 pub mod windows;
 pub mod workspace_slide;
 #[cfg(feature = "xwayland")]
