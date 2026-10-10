@@ -202,13 +202,13 @@ try:
         time.sleep(.7)
         keys("keyup","Alt_L")
         return wait(lambda d:wid not in d["minimized"] and d["window_lifecycle"]["restoring"],"restore-start")
-    def check_pixel(image,rect,alpha):
+    def check_pixel(image,rect,alpha,brightness=1.0):
         x,y,w,h=rect
         point=(round(x+w*.7),round(y+h*.8))
         before=(52,101,164)
         bg=baseline.getpixel(point)
         actual=image.getpixel(point)
-        expected=tuple(before[i]*alpha+bg[i]*(1-alpha) for i in range(3))
+        expected=tuple(before[i]*brightness*alpha+bg[i]*(1-alpha) for i in range(3))
         assert all(abs(actual[i]-expected[i])<=4 for i in range(3)),(point,actual,expected,rect,alpha)
     # Missing icon geometry goes to the leading corner of this actual output.
     action("minimize",1)
@@ -360,6 +360,12 @@ try:
     action("minimize",21)
     start=wait(lambda d:wid in d["minimized"],"family-parent-minimize")
     assert child_id not in start["minimized"] and start["focused"] is None
+    move(4175)
+    dimmed=wait(lambda d:d["window_lifecycle"]["minimizing"] and any(p["parent"]==wid for p in d["modal_dim"]["parents"]),"family-dimmed-parent-minimize-quarter")
+    effect=next(f for f in dimmed["window_lifecycle"]["minimizing"] if f["window"]==wid)
+    brightness=next(p["multiplier"] for p in dimmed["modal_dim"]["parents"] if p["parent"]==wid)
+    assert brightness < 1.0
+    check_pixel(screenshot("16-family-parent-minimize-dim"),effect["rect"],effect["alpha"],brightness)
     move(4475)
     hidden=screenshot("16-family-inherited-hidden")
     assert hidden.getpixel(child_point)==baseline.getpixel(child_point)
@@ -405,6 +411,17 @@ try:
     assert screenshot("20-family-hidden-child-close").getpixel(child_point)==baseline.getpixel(child_point)
     action("close",28); client.wait(timeout=10)
     wait(lambda d:not d["windows"],"family-clean")
+    command.unlink(missing_ok=True)
+    client=spawn([str(frozen / "tuna-modal-dim-client")],"deadline-client",{"WAYLAND_DISPLAY":"lifecycle-proof"})
+    wid=wait(lambda d:len(d["windows"])==1,"deadline-parent-map")["windows"][0]["id"]
+    move(6725)
+    action("minimize",30)
+    wait(lambda d:d["window_lifecycle"]["minimizing"],"deadline-minimize-start")
+    move(7125)
+    wait(lambda d:not d["window_lifecycle"]["minimizing"],"deadline-minimize-complete")
+    action("close",31);client.wait(timeout=10)
+    ended=wait(lambda d:not d["windows"],"death-after-minimize-deadline")
+    assert not ended["window_lifecycle"]["destroying"] and ended["window_lifecycle"]["retained_destroy_bytes"]==0
     assert compositor.poll() is None
     success=True
 finally:
@@ -460,5 +477,5 @@ finally:
 
 require_owned_cleanup(manifest["owned_cleanup"])
 if success:
-    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-CLEANUP pass private session owned process cleanup\n")
+    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-CLEANUP pass private session owned process cleanup\n")
     print(f"native minimize proof passed: {art}")

@@ -116,6 +116,9 @@ fn interrupted_close(mapping: bool, resizing: bool) -> Option<&'static str> {
         None
     }
 }
+fn hidden_dead_actor(minimizing: bool, was_minimized: bool) -> bool {
+    !minimizing && was_minimized
+}
 fn snapshot_allowed(count: usize, retained: u64, pixels: u64) -> bool {
     count < 32 && retained.saturating_add(pixels) <= 16 * 1024 * 1024
 }
@@ -707,6 +710,10 @@ pub fn step_frame(
         let old = life.cache.remove(&id).expect("cached id");
         let min_run = life.minimizing.remove(&id);
         let minimizing = min_run.is_some();
+        if hidden_dead_actor(minimizing, life.minimized.contains(&id)) {
+            life.record(id, "destroy", old.kind, "minimized-hidden");
+            continue;
+        }
         if min_run
             .is_some_and(|run| now.saturating_sub(run.start) >= crate::minimize::duration(policy))
         {
@@ -865,6 +872,12 @@ mod tests {
     use tuna_shell_control::motion::MotionLevel;
     fn policy(level: MotionLevel) -> MotionPolicy {
         MotionPolicy::new(level, 1.0)
+    }
+    #[test]
+    fn hidden_actor_death_after_minimize_deadline_does_not_restart_destroy() {
+        assert!(hidden_dead_actor(false, true));
+        assert!(!hidden_dead_actor(true, true));
+        assert!(!hidden_dead_actor(false, false));
     }
     #[test]
     fn live_minimize_frame_uses_latest_buffer_geometry_and_owns_no_snapshot() {
