@@ -33,11 +33,13 @@ def node_name(value):
     return value
 
 
-def kubectl(context, *args):
+def kubectl(context, *args, deadline=None):
     if not context or context.startswith('-'):
         raise ValueError('explicit Kubernetes context required')
+    timeout=30 if deadline is None else min(30,deadline-time.monotonic())
+    if timeout<=0:raise TimeoutError('Kubernetes acquisition deadline')
     result = subprocess.run(['kubectl', '--context', context, *args],
-                            capture_output=True, timeout=30, check=True)
+                            capture_output=True, timeout=timeout, check=True)
     if len(result.stdout) > 8*1024*1024:
         raise ValueError('cluster response exceeds bound')
     return json.loads(result.stdout)

@@ -31,8 +31,8 @@ node. Corral `--cloud-init` takes literal YAML, not a pathname. Keep private key
 and unredacted cloud-init out of artifacts. Use an owned SSH known_hosts file,
 API tunnel, strict host verification, and bind VM/VMI UID before/after operations.
 
-The paired measurement runner is not yet ported: transport plumbing and admission
-are preparation only. It must retain the original twenty-action pairing, stock
+The paired measurement runner is ported but has not acquired a Marlin comparison.
+It retains the original twenty-action pairing, stock
 and instrumented provenance, guest helper acquisition failure receipts, native
 presentation completion gates, same image/kernel/resources and repeated alternating
 sessions. Do not relabel local QEMU hardware metadata as KubeVirt. GPU device and
@@ -60,8 +60,8 @@ The upload receipt schema1 contains `completed:true`, `context`, `namespace`,
 `vm_name`, `vm_uid`, `pvc_name`, `pvc_uid`, `datavolume_name`, `datavolume_uid`,
 `disk_sha256` and `manifest_sha256`. These must describe the actual original
 owned upload action. Current successful CDI/PVC/VM state is checked too; it does
-not retroactively prove old disk bytes. The source-owned upload procedure still
-needs implementation and actual export/import qualification.
+not retroactively prove old disk bytes. The source-owned upload procedure is implemented; actual exported Marlin import
+and guest qualification remain pending.
 
 The six boots use one persistent fixture disk; they are not six new disk installs.
 Do not call these fresh disks or assume user state never persists across sessions.
@@ -81,8 +81,11 @@ named halted VM and owned CDI DataVolume are created; existing resources are nev
 adopted or overwritten. Upload uses an exact-context authenticated Kubernetes
 port-forward to CDI, an owned localhost listener and actual `virtctl image-upload`.
 The original upload receipt is written only after real successful CDI completion.
-Failure cleanup checks exact original resource UIDs and requests dependent deletion.
-The optional `--start` runs Corral only after upload completion. Actual guest boot,
+Failure cleanup sends server-side UID deletion preconditions, recovers ambiguous
+creates by unpredictable ownership nonce, and verifies recorded dependent PVC/pod
+UIDs are absent within a finite deadline.
+The optional `--start` runs Corral only after upload completion; a failed start
+keeps `completed:false` and performs owned cleanup. Actual guest boot,
 SSH, installed critical bytes and native receipts still require qualification.
 
 The current importer reserves the full20Gi target plus20Gi scratch, transfer,
@@ -95,3 +98,43 @@ CDI1.66.1's raw data source selects direct target transfer, while its controller
 still creates a scratch PVC. The actual first64Mi/1Gi diagnostic timed out with
 zero target/scratch data and remains a failure; it does not justify a smaller
 production import reservation. No shared CDI deployment or network was changed.
+
+
+## Backend-bound direct RAW import
+
+`--method raw-upload --raw-probe ORIGINAL_PROBE_DIR --raw-probe-sha BUNDLE_SHA`
+requires the source-owned completed 64Mi diagnostic, its actual matched stored
+prefix, frozen script/helpers, exact node UID, CDI1.66.1, uploadserver image digest,
+upload client bytes, and directory-only local-path provisioner configuration.
+The bundle SHA binds the receipt, uploader observations and frozen source bytes.
+The corrected diagnostic uses one actual upload attempt (`virtctl --retry 1`);
+retry zero performs no POST in virtctl1.8.2. The original failed probe stays failed.
+The later source-bound probe completed, matched stored bytes and cleaned resources.
+This is transport evidence, not an18Gi image or boot qualification.
+
+The RAW path first verifies standalone18Gi QCOW format, locally converts sparse
+RAW within checked headroom, then matches its full bytes to the original export's
+`raw_sha256`. It reserves the full20Gi target even if allocation is sparse.
+CDI still creates a nominal20Gi scratch PVC; its proven RAW branch does not use
+scratch data, so this exact backend admits1Gi physical scratch metadata plus1Gi
+runtime layers and512Mi guest writes:22.5Gi total. Any changed backend refuses this
+method. This bound is based on the direct-transfer source path and tiny actual
+probe; it remains an estimate until the full image import is measured.
+
+During actual upload, exact uploader digest, owned upload/scratch identities and
+exclusive target/scratch PV affinity are required; scratch allocation and remaining
+filesystem reserve are checked. Missing observations cannot qualify completion.
+Before starting the VM, a new restricted read-only pod hashes the entire original
+18Gi RAW prefix on the target PVC. The receipt distinguishes compressed transfer
+SHA from uploaded RAW SHA and actual stored-byte readback. GPU, total power, full
+image boot, guest SSH and paired performance remain independent open gates.
+
+
+The importer retains the exact exported public key SHA/fingerprint and public-key-
+only SSH policy. The paired runner binds `--key` to the exact original public file
+(`--public-key`, default `KEY.pub`) and exported root account before connecting.
+Each real SSH session measures guest host public-key fingerprints after boot,
+checks they match the owned strictly checked known_hosts evidence, and stores
+that identity with the exact boot ID in `corral-session.json`/measurement metadata.
+First connection uses TOFU over the authenticated Kubernetes API tunnel; per-VM
+host keys are generated on first boot and are never predicted by the exporter.

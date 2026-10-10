@@ -27,6 +27,17 @@ class Tests(unittest.TestCase):
    result=m.cleanup('ctx','ns',[('vm','new','v'),('dv','disk','d')])
   self.assertEqual(delete.call_count,2);self.assertTrue(result['all_owned_resources_absent'])
  def test_cleanup_pending_is_not_success(self):
-  with patch.object(m,'delete'),patch.object(m.time,'monotonic',side_effect=[0,0,2]),patch.object(m.time,'sleep'),patch.object(m.subprocess,'check_output',return_value=b'{"items":[{"metadata":{"name":"scratch","uid":"s","ownerReferences":[{"uid":"d"}]}}]}'):
+  with patch.object(m,'delete'),patch.object(m.time,'monotonic',side_effect=[0,0,0,0,0,0,0,2]),patch.object(m.time,'sleep'),patch.object(m.subprocess,'check_output',return_value=b'{"items":[{"metadata":{"name":"scratch","uid":"s","ownerReferences":[{"uid":"d"}]}}]}'):
    with self.assertRaises(TimeoutError):m.cleanup('ctx','ns',[('dv','disk','d')],timeout=1)
+ def test_recorded_orphan_scratch_is_not_lost(self):
+  # Its upload pod has already been GC'd; direct recorded UID still finds it.
+  data=json.dumps({'items':[{'metadata':{'name':'scratch','uid':'s'}}]}).encode()
+  with patch.object(m,'delete'),patch.object(m.time,'monotonic',side_effect=[0,0,0,0,0,0,0,0,2]),patch.object(m.time,'sleep'),patch.object(m.subprocess,'check_output',return_value=data):
+   with self.assertRaises(TimeoutError):m.cleanup('ctx','ns',[('pvc','scratch','s')],timeout=1)
+ def test_placement_rejects_other_node_or_claim_uid(self):
+  claim={'metadata':{'uid':'p'},'spec':{'volumeName':'pv'}}
+  for uid,node in [('other','node'),('p','other')]:
+   pv={'spec':{'claimRef':{'uid':uid,'namespace':'ns'},'nodeAffinity':{'required':{'nodeSelectorTerms':[{'matchExpressions':[{'key':'kubernetes.io/hostname','operator':'In','values':[node]}]}]}}}}
+   with patch.object(m.subprocess,'check_output',return_value=json.dumps(pv).encode()):
+    with self.assertRaises(ValueError):m.placement('ctx','ns',claim,'node')
 if __name__=='__main__':unittest.main()

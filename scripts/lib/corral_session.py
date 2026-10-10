@@ -108,6 +108,8 @@ class Session:
         if not any('devices.kubevirt.io/kvm' in c.get('resources',{}).get('limits',{}) for c in self.launcher()['spec']['containers']):
             raise ValueError('launcher does not request advertised KVM device')
         self.check_boot(self.remote('cat /proc/sys/kernel/random/boot_id').decode().strip())
+        from corral_ssh import HOST_KEYS,host_receipt
+        self.metadata['ssh_host_identity']=host_receipt(self.python(HOST_KEYS),known_hosts,self.boot_id)
         self.out.joinpath('corral-session.json').write_text(json.dumps(self.metadata,indent=2))
 
     def objects(self):
@@ -291,7 +293,10 @@ def admit_imported_disk(export_dir, receipt_path, context, namespace, vm_name, r
     disk=directory/'disk.qcow2'
     with disk.open('rb') as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
     if digest!=manifest.get('disk_sha256') or receipt.get('disk_sha256')!=digest:
-        raise ValueError('original/imported qcow2 bytes differ')
+        raise ValueError('original transfer qcow2 bytes differ')
+    if receipt.get('method')=='raw-upload':
+        readback=receipt.get('raw_readback',{})
+        if receipt.get('uploaded_raw_sha256')!=manifest.get('raw_sha256') or readback.get('sha256')!=manifest.get('raw_sha256') or readback.get('matched') is not True or readback.get('prefix_bytes')!=18*1024**3 or readback.get('pvc_uid')!=receipt.get('pvc_uid'):raise ValueError('actual imported raw byte proof differs')
     manifest_sha=hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     if receipt.get('manifest_sha256')!=manifest_sha or receipt.get('schema')!=1 or receipt.get('completed') is not True:
         raise ValueError('original completed upload receipt required')
@@ -344,12 +349,12 @@ def readback_prefix(context,namespace,pvc_name,pvc_uid,node,byte_count,expected_
         actual=corral_owned.create(context,namespace,'pod',pod,path,uuid.uuid4().hex,lambda *x:owned.append(x));uid=actual['metadata']['uid']
         deadline=time.monotonic()+180
         while time.monotonic()<deadline:
-            actual=kubectl(context,'get','pod',name,'-n',namespace,'-o','json')
+            actual=kubectl(context,'get','pod',name,'-n',namespace,'-o','json',deadline=deadline)
             if actual['metadata']['uid']!=uid:raise ValueError('readback pod replaced')
             if actual['status'].get('phase') in ('Succeeded','Failed'):break
             time.sleep(.5)
         else:raise TimeoutError('owned readback deadline')
-        logs=subprocess.check_output(['kubectl','--context',context,'logs',name,'-n',namespace],timeout=20).decode()
+        logs=subprocess.check_output(['kubectl','--context',context,'logs',name,'-n',namespace],timeout=min(20,max(.01,deadline-time.monotonic()))).decode()
         (out/'readback.log').write_text(logs)
         if actual['status'].get('phase')!='Succeeded' or logs.split()[0]!=expected_sha:raise ValueError('actual stored raw prefix differs')
         receipt={'pod_uid':uid,'pvc_uid':pvc_uid,'node':node,'prefix_bytes':byte_count,'sha256':expected_sha,'matched':True}

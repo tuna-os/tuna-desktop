@@ -20,10 +20,13 @@ def original_run(run,source,path):
         raise ValueError('original repository/workflow identity differs')
 
 
-def disk_plan(manifest, *, method='qcow2-upload'):
+def disk_plan(manifest, *, method='qcow2-upload', raw_proof=None):
     storage=manifest['storage']
     if storage.get('virtual_bytes')!=18*GIB or not 0<storage.get('transfer_bytes',0)<=2*GIB or manifest.get('requested_pvc')!='20Gi' or manifest.get('firmware')!='uefi':
         raise ValueError('bounded18Gi/20Gi UEFI export required')
+    if method=='raw-upload':
+        if not raw_proof or raw_proof.get('full_image_import_qualified') is not False or not re.fullmatch('[0-9a-f]{64}',raw_proof.get('original_probe_receipt_sha256','')):raise ValueError('backend-bound original RAW probe required')
+        return {'method':method,'target_pvc_bytes':20*GIB,'scratch_pvc_bytes':20*GIB,'scratch_physical_metadata_allowance_bytes':GIB,'runtime_layer_allowance_bytes':GIB,'guest_write_allowance_bytes':GIB//2,'estimated_peak_bytes':22*GIB+GIB//2,'raw_method_proof':raw_proof,'full_image_import_qualified':False,'performance_qualified':False}
     if method!='qcow2-upload':raise ValueError('raw optimization requires separately qualified actual method')
     # Reserve full target AND scratch capacity until a measured/source-proven
     # method supports a smaller physical bound. Mapped estimates are not enough.

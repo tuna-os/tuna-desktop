@@ -2,6 +2,8 @@ import sys,struct,unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'lib'))
 import corral_perf as m
+from unittest.mock import patch
+import subprocess
 class Stream:
  def __init__(self,data):self.data=bytearray(data);self.sent=bytearray()
  def settimeout(self,value):pass
@@ -11,6 +13,14 @@ class Stream:
 def update(x,w,raw):return b'\x00\x00\x00\x01'+struct.pack('>HHHHi',x,0,w,1,0)+raw
 def stream(data):return Stream(b'RFB 003.008\n\x01\x01'+b'\x00'*4+struct.pack('>HH',2,1)+b'\x00'*20+data)
 class Tests(unittest.TestCase):
+ def test_api_call_inherits_remaining_deadline(self):
+  with patch.object(m.time,'monotonic',return_value=10),patch.object(m.subprocess,'run',return_value=subprocess.CompletedProcess([],0,stdout=b'{}')) as run:
+   m.kubectl('ctx','get','pods',deadline=12)
+  self.assertEqual(run.call_args.kwargs['timeout'],2)
+  with patch.object(m.time,'monotonic',return_value=13),patch.object(m.subprocess,'run') as run:
+   with self.assertRaises(TimeoutError):m.kubectl('ctx','get','pods',deadline=12)
+  run.assert_not_called()
+
  def test_quantities(self):
   for value,count in [('1k',1000),('2',2),('0',0),('1.5k',1500)]:self.assertEqual(m.resource_count(value),count)
   for value in ['-1','0.1','1Gi','bad']:

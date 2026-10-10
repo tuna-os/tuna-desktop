@@ -13,17 +13,22 @@ import time
 sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
 from corral_session import Session,admit_imported_disk
 from corral_perf import kubectl,verify_identity
+from corral_ssh import client_key
 
 p=argparse.ArgumentParser(description=__doc__)
 for name in ('context','vm','key','known-hosts','reference-image','tuna-payload','tuna-selection','export-dir','import-receipt','out'):
  p.add_argument('--'+name,required=True)
-p.add_argument('--namespace',default='corral-vms');p.add_argument('--user',default='tuna-bench')
+p.add_argument('--public-key');p.add_argument('--namespace',default='corral-vms');p.add_argument('--user',default='root')
 p.add_argument('--profile',choices=('stock','diagnostic'),required=True)
 p.add_argument('--meta',action='append',default=[])
 a=p.parse_args();root=Path(a.out).resolve();root.mkdir(parents=True,exist_ok=False)
 inputs={name:hashlib.sha256(Path(getattr(a,name.replace('-','_'))).read_bytes()).hexdigest() for name in ('reference-image','tuna-payload','tuna-selection')}
 original=None;domain=None;node_uid=None;boots=[];case=0;stage='setup';active=None
 try:
+ stage='ssh-key-binding'
+ manifest=json.loads((Path(a.export_dir)/'manifest.json').read_text())
+ ssh_key=client_key(manifest,a.key,a.public_key or a.key+'.pub',a.user)
+ (root/'ssh-key-binding.json').write_text(json.dumps(ssh_key,indent=2))
  stage='import-admission'
  imported=admit_imported_disk(a.export_dir,a.import_receipt,a.context,a.namespace,a.vm,a.reference_image,a.tuna_payload,a.tuna_selection)
  (root/'import-admission.json').write_text(json.dumps(imported,indent=2))
