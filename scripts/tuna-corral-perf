@@ -1,0 +1,29 @@
+#!/usr/bin/python3
+"""Read-only Corral/KubeVirt benchmark admission; no CI runner provisioning."""
+import argparse
+import json
+from pathlib import Path
+import sys
+sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
+from corral_perf import capacity_receipt, kubectl, node_name
+
+p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--context',required=True)
+p.add_argument('--node',required=True)
+p.add_argument('--estimated-peak-bytes',type=int,default=0)
+p.add_argument('--out',type=Path,required=True)
+a=p.parse_args()
+try:
+    node_name(a.node)
+    node=kubectl(a.context,'get','node',a.node,'-o','json')
+    stats=kubectl(a.context,'get','--raw','/api/v1/nodes/'+a.node+'/proxy/stats/summary')
+    receipt=capacity_receipt(node,stats,estimated_peak_bytes=a.estimated_peak_bytes)
+except Exception as error:
+    receipt={'schema':1,'ready_for_disk_admission':False,
+             'reasons':['preflight-acquisition-failed'], 'error_type':type(error).__name__,
+             'performance_qualified':False}
+receipt.update(context=a.context,backend='corral-kubevirt')
+a.out.parent.mkdir(parents=True,exist_ok=True)
+a.out.write_text(json.dumps(receipt,indent=2)+'\n')
+print(json.dumps(receipt,indent=2))
+raise SystemExit(0 if receipt['ready_for_disk_admission'] else 1)

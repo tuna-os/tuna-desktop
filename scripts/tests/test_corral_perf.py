@@ -1,0 +1,37 @@
+import sys,struct,unittest
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'lib'))
+import corral_perf as m
+class Stream:
+ def __init__(self,data):self.data=bytearray(data);self.sent=bytearray()
+ def settimeout(self,value):pass
+ def recv(self,n):result=bytes(self.data[:n]);del self.data[:n];return result
+ def sendall(self,data):self.sent.extend(data)
+ def close(self):pass
+def update(x,w,raw):return b'\x00\x00\x00\x01'+struct.pack('>HHHHi',x,0,w,1,0)+raw
+def stream(data):return Stream(b'RFB 003.008\n\x01\x01'+b'\x00'*4+struct.pack('>HH',2,1)+b'\x00'*20+data)
+class Tests(unittest.TestCase):
+ def test_quantities(self):
+  for value,count in [('1k',1000),('2',2),('0',0),('1.5k',1500)]:self.assertEqual(m.resource_count(value),count)
+  for value in ['-1','0.1','1Gi','bad']:
+   with self.assertRaises(ValueError):m.resource_count(value)
+ def test_names(self):
+  m.node_name('ip-10-20-1-12')
+  for name in ['--raw','../pods','a/b','']:
+   with self.assertRaises(ValueError):m.node_name(name)
+ def test_capacity(self):
+  node={'metadata':{'name':'node','uid':'uid'},'status':{'conditions':[{'type':'Ready','status':'True'},{'type':'DiskPressure','status':'False'}],'allocatable':{'devices.kubevirt.io/'+k:'1k' for k in ('kvm','tun','vhost-net')}}}
+  fs={'capacityBytes':100*m.GIB,'availableBytes':20*m.GIB};stats={'node':{'fs':fs,'runtime':{'imageFs':fs,'containerFs':fs}}}
+  r=m.capacity_receipt(node,stats,estimated_peak_bytes=4*m.GIB);self.assertTrue(r['ready_for_disk_admission']);self.assertFalse(r['performance_qualified']);self.assertFalse(r['gpu']['qualified']);self.assertFalse(r['total_power']['qualified'])
+  for peak in [0,5*m.GIB]:self.assertFalse(m.capacity_receipt(node,stats,estimated_peak_bytes=peak)['ready_for_disk_admission'])
+  node['spec']={'taints':[{'effect':'NoSchedule'}]};self.assertFalse(m.capacity_receipt(node,stats,estimated_peak_bytes=m.GIB)['ready_for_disk_admission'])
+  self.assertFalse(m.capacity_receipt(node,{},estimated_peak_bytes=m.GIB)['ready_for_disk_admission'])
+ def test_pixels_keys(self):
+  s=stream(update(0,2,b'abcdefgh'));r=m.Rfb(s);self.assertEqual(r.snapshot(),(2,1,b'abcdefgh'));r.keys(0xffeb,32)
+  self.assertEqual(s.sent[-32:],b''.join(struct.pack('>BBHI',4,d,0,k) for d,k in [(1,0xffeb),(1,32),(0,32),(0,0xffeb)]))
+ def test_partial(self):
+  with self.assertRaises(EOFError):m.Rfb(stream(update(0,1,b'abcd'))).snapshot()
+ def test_disjoint(self):self.assertEqual(m.Rfb(stream(update(0,1,b'abcd')+update(1,1,b'efgh'))).snapshot()[2],b'abcdefgh')
+ def test_bounds(self):
+  with self.assertRaises(ValueError):m.Rfb(stream(update(2,1,b'abcd'))).snapshot()
+if __name__=='__main__':unittest.main()
