@@ -1,0 +1,18 @@
+=== proof w2-362-netloc (final, temp mod-registration still in main.rs for test build) ===
+a445af2e5f08397a0c7d970c19fe9782d96e4dd4
+
+=== cargo test -p tuna-shell-gtk --bin tuna-shell-gtk ===
+test location::tests::accuracy_round_trips_like_gnome ... ok
+test location::tests::authorization_matches_the_authorizer ... ok
+test location::tests::indicator_shows_only_while_in_use ... ok
+test location::tests::ceiling_is_none_while_disabled ... ok
+test location::tests::store_rows_parse_and_write_back ... ok
+test wwan::tests::cellular_icons_follow_wireless_thresholds ... ok
+test wwan::tests::gsm_apn_comes_from_the_gsm_section ... ok
+test wwan::tests::modem_states_label_like_mm_docs ... ok
+test wwan::tests::sim_locks_ask_for_pin_or_puk ... ok
+test wwan::tests::toggle_hides_without_modems_and_names_the_operator ... ok
+test result: ok. 136 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+=== clippy: non-dead-code lints in new files (empty = none) ===
+(end)
