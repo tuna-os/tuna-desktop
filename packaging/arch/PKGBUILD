@@ -106,6 +106,9 @@ package() {
         "$pkgdir/usr/share/wayland-sessions/tuna.desktop"
     install -Dm0644 "$root/share/systemd/user/tuna-session.target" \
         "$pkgdir/usr/lib/systemd/user/tuna-session.target"
+    # Private GNOME51 scalable cursor fallback; no system Adwaita file conflicts.
+    install -d "$pkgdir/usr/share/tuna-desktop/icons"
+    cp -a "$root/share/tuna-desktop/icons/." "$pkgdir/usr/share/tuna-desktop/icons/"
     # Lock-screen PAM service (#62): unlock under GDM, where no greetd runs.
     install -Dm0644 "$root/share/pam.d/tuna-lock" "$pkgdir/etc/pam.d/tuna-lock"
     # One release of compatibility with the former name (#505): the old

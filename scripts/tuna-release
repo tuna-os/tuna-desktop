@@ -82,6 +82,9 @@ mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin" "$STAGE/usr/share/wayland-sessions" "$
 for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-greeter; do
     install -m0755 "target/release/$bin" "$STAGE/usr/bin/$bin"
 done
+install -d "$STAGE/usr/share/tuna-desktop/icons"
+cp -a share/tuna-desktop/icons/. "$STAGE/usr/share/tuna-desktop/icons/"
+python3 scripts/tuna-cursor-assets-check "$STAGE/usr/share/tuna-desktop/icons/Adwaita"
 install -m0644 share/wayland-sessions/tuna.desktop \
     "$STAGE/usr/share/wayland-sessions/tuna.desktop"
 install -Dm0644 share/systemd/user/tuna-session.target \

@@ -50,6 +50,8 @@ VERSION="$(dpkg-deb -f "$PKG" Version)"
 DIR="$(mktemp -d)"
 trap 'rm -rf "$DIR"' EXIT INT TERM
 dpkg-deb -x "$PKG" "$DIR"
+python3 "$ROOT/scripts/tuna-cursor-assets-check" "$DIR/usr/share/tuna-desktop/icons/Adwaita" \
+    || fail "bundled cursor assets rejected"
 for path in usr/share/wayland-sessions/tuna.desktop usr/lib/systemd/user/tuna-session.target etc/pam.d/tuna-lock; do
     [ -f "$DIR/$path" ] && [ ! -L "$DIR/$path" ] || fail "invalid required file $path"
 done

@@ -13,3 +13,20 @@ The SVG candidate uses GNOME Shell51/KDE `cursors_scalable/<shape>/metadata.json
 Primary source: [GNOME Shell51 st-cursor.c](https://github.com/GNOME/gnome-shell/blob/51.0/src/st/st-cursor.c), [default metadata](https://github.com/GNOME/gnome-shell/blob/51.0/data/cursor-theme/icons/Adwaita/cursors_scalable/default/metadata.json), [default SVG](https://github.com/GNOME/gnome-shell/blob/51.0/data/cursor-theme/icons/Adwaita/cursors_scalable/default/default.svg). SVG support is registered by Shell as the Mutter cursor extension; examining only Mutter’s default Xcursor backend misses it.
 
 SVG and animated Xcursor behavior still needs the full build and actual native pixel proof. Multi-output/fractional scaling and physical hardware need separate qualification. The prior implementation and linked proof names are source candidates rather than release evidence.
+
+
+## Bundled GNOME51 assets
+
+The private fallback theme under `/usr/share/tuna-desktop/icons/Adwaita`
+contains the unmodified GNOME Shell51.0 cursor assets from upstream revision
+`2177bdf9624b2d285de7c1d34274073d3769d6b8`: 151 SVG frames, 35 shape
+metadata files, and two directory aliases. Embedded MIT attribution to Jakub
+Steiner is preserved, with upstream repository licensing and per-file hashes.
+User and system theme lookup remains ahead of this fallback.
+
+Both the Debian release script and Arch recipe stage this tree. CI verifies
+its manifest and rejection regressions; the Debian package checker verifies
+it again after archive extraction. These checks establish data integrity,
+not native rendered pixels or installed-image parity. The package-factory
+recipe must update its source archive and vendor pins to the final published
+v1 source before an actual package can include this new tree.

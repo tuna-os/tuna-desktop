@@ -49,6 +49,10 @@ jobs:
       - run: python3 scripts/lib/native-constraint-tests.py
       - run: python3 scripts/lib/tuna-pipewire-dump-tests.py
       - run: scripts/tuna-settings-inventory-check
+      - name: Verify bundled cursor assets and rejection checks
+        run: |
+          scripts/tuna-cursor-assets-check share/tuna-desktop/icons/Adwaita
+          python3 scripts/lib/cursor-assets-tests.py
       - run: cargo fmt --all -- --check
       - name: Check bounded EIS transport regression tests
         run: |

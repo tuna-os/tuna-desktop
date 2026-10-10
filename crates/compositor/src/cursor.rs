@@ -79,6 +79,9 @@ pub fn search_path(var: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
         );
         dirs.push(PathBuf::from("/usr/share/pixmaps"));
     }
+    // GNOME Shell embeds Adwaita SVG cursors; Tuna ships its own private
+    // copy so the default survives removing the GNOME session package.
+    dirs.push(PathBuf::from("/usr/share/tuna-desktop/icons"));
     let mut seen = HashSet::new();
     dirs.retain(|d| seen.insert(d.clone()));
     dirs
@@ -1313,7 +1316,11 @@ mod tests {
         ]));
         assert_eq!(
             dirs,
-            [PathBuf::from("/home/u/.icons"), PathBuf::from("/opt/icons")]
+            [
+                PathBuf::from("/home/u/.icons"),
+                PathBuf::from("/opt/icons"),
+                PathBuf::from("/usr/share/tuna-desktop/icons")
+            ]
         );
         let dirs = search_path(env(&[
             ("HOME", "/home/u"),
@@ -1326,7 +1333,8 @@ mod tests {
                 "/home/u/.icons",
                 "/run/host/share/icons",
                 "/usr/share/icons",
-                "/usr/share/pixmaps"
+                "/usr/share/pixmaps",
+                "/usr/share/tuna-desktop/icons"
             ]
             .map(PathBuf::from)
         );
