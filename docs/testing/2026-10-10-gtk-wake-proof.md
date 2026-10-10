@@ -61,3 +61,34 @@ builds. The existing local queued immutable b883 build remains independent of
 the weak signal ownership followup. Native policy/cache reconciling has focused
 source tests; complete installed Settings, multiple output, all input/device
 paths, physical paired GNOME CPU/GPU/power qualification remain separate.
+
+## CI integration
+
+The source-owned wrapper rebuilds all workspace-owned packages from the clean
+current checkout, retains third-party cache, then freezes matched executables
+outside the checkout. It refuses stale artifact directories, dirty source and
+an incorrect GITHUB_SHA. Failure result/logs survive build or native errors.
+
+Add `strace` to the existing GTK native job's runtime dependencies. In a clean
+checkout, before other untracked artifacts are generated, use:
+
+```yaml
+- name: GTK event wake preflight regressions
+  run: /usr/bin/python3 scripts/lib/ci-gtk-wake-proof-tests.py
+- name: Exact source native GTK event wake qualification
+  run: /usr/bin/python3 scripts/lib/ci-gtk-wake-proof.py --artifacts "$RUNNER_TEMP/gtk-wake-artifacts" --display :108
+  env:
+    CARGO_PROFILE_DEV_DEBUG: "0"
+- uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+  if: always()
+  with:
+    name: gtk-event-wake-proof
+    path: ${{ runner.temp }}/gtk-wake-artifacts/
+    retention-days: 14
+```
+
+The wrapper always invokes its own clean/build. It cannot attach the current
+revision to an arbitrary supplied binary directory. The native runner supports
+frozen older bundles as explicit diagnostics with separate source identities;
+CI qualification uses the newly built current-source bundle only. Source-owned
+full tests/Clippy remain the existing CI jobs' responsibility.
