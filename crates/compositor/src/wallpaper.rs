@@ -205,7 +205,17 @@ impl Wallpaper {
                     .iter()
                     .any(|(uri, _)| uri == &item.uri)
             })
-            .map(|item| item.observed + std::time::Duration::from_secs(1))
+            .map(|item| {
+                let deadline = item.observed + std::time::Duration::from_secs(1);
+                let now = std::time::Instant::now();
+                // An unsupported render size must not spin on a deadline that
+                // refresh could not service. Retain bounded active retry.
+                if deadline <= now {
+                    now + crate::idle_schedule::ACTIVE_INTERVAL
+                } else {
+                    deadline
+                }
+            })
             .min()
     }
 
@@ -571,6 +581,7 @@ impl Wallpaper {
         if area == 0 || area > MAX_WALLPAPER_AREA {
             return None;
         }
+        self.current_uris.clear();
         self.refresh_stage = Some("drop-open");
         let text = if let Some(signal) = self.drop_signal.as_mut() {
             signal.text().to_owned()
@@ -583,11 +594,6 @@ impl Wallpaper {
         self.color = lines.next().and_then(parse_color);
         self.accent = lines.next().and_then(parse_color);
         let lock_uri = lines.next().unwrap_or_default().trim();
-        self.current_uris = [uri.as_str(), lock_uri]
-            .into_iter()
-            .filter(|uri| !uri.is_empty())
-            .map(str::to_owned)
-            .collect();
         let settings = if let Some(line) = lines.next() {
             // Present but malformed/version-mismatched metadata is an error,
             // never an apparent successful legacy zoom rendering.
@@ -1086,6 +1092,22 @@ fn cache_path(path: &std::path::Path, w: u32, h: u32) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn malformed_current_wallpaper_policy_retires_old_maintenance_eligibility() {
+        let _serial = RUNTIME_DIR_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _runtime = RuntimeDirGuard::point_at(dir.path());
+        std::fs::write(wallpaper_drop_path(), "old\n\n\n\n{not-valid-json}").unwrap();
+        let mut wallpaper = Wallpaper::new();
+        wallpaper.current_uris.push("old".into());
+        wallpaper.identities.push(IdentitySnapshot {
+            uri: "old".into(),
+            value: None,
+            observed: std::time::Instant::now() - std::time::Duration::from_secs(3),
+        });
+        assert!(wallpaper.refresh((8, 8).into(), test_geometry()).is_none());
+        assert_eq!(wallpaper.maintenance_deadline(), None);
+    }
+    #[test]
     fn maintenance_deadlines_exclude_old_uri_and_inflight_identity_work() {
         let now = std::time::Instant::now();
         let mut wallpaper = super::Wallpaper::new();
@@ -1096,9 +1118,9 @@ mod tests {
         });
         assert_eq!(wallpaper.maintenance_deadline(), None);
         wallpaper.current_uris.push("old".into());
-        assert_eq!(
-            wallpaper.maintenance_deadline(),
-            Some(now - std::time::Duration::from_secs(2))
+        assert!(
+            wallpaper.maintenance_deadline().unwrap() > now,
+            "past due maintenance retains a bounded retry, never a zero spin"
         );
         let (_send, receive) = std::sync::mpsc::channel();
         wallpaper.identity_pending.push(("old".into(), receive));

@@ -1878,7 +1878,7 @@ impl Runtime {
         // its expansion remains below the compiler's default recursion limit.
         // These values keep the same flat JSON fields and suppress lock input.
         doc["native_relative_motion_count"] = serde_json::json!((!self.is_locked())
-            .then(|| match &self.backend {
+            .then_some(match &self.backend {
                 #[cfg(feature = "drm")]
                 Backend::Drm(drm) => Some(drm.relative_motion_events()),
                 Backend::Winit(_) => None::<u64>,
@@ -2451,6 +2451,8 @@ impl Runtime {
         fourcc: smithay::backend::allocator::Fourcc,
     ) -> Option<(i32, i32, Vec<u8>)> {
         use smithay::backend::renderer::{ExportMem, Offscreen};
+        #[cfg(not(feature = "drm"))]
+        let _ = connector;
         if self.is_locked() {
             return None;
         }
@@ -2776,6 +2778,8 @@ impl Runtime {
             let frame = match &target {
                 CastTarget::Window(id) => self.render_window_pixels(*id, Some(size), xrgb),
                 CastTarget::Monitor(connector) => {
+                    #[cfg(not(feature = "drm"))]
+                    let _ = connector;
                     let output = match &self.backend {
                         Backend::Winit(_) => None,
                         #[cfg(feature = "drm")]
