@@ -86,6 +86,21 @@ class DiskTests(unittest.TestCase):
         self.assertIn("!inputs.export_only && steps.shared_payload.outcome", source)
         self.assertIn('compression-level: 0', source)
 
+    def test_export_probes_and_install_use_inspected_image_id(self):
+        import ast
+        source = (Path(__file__).resolve().parents[2]/'scripts/tuna-benchmark-disk-export').read_text()
+        tree = ast.parse(source)
+        main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
+        assignments = [n for n in ast.walk(main) if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == 'image' for t in n.targets)]
+        self.assertEqual(len(assignments), 2)
+        pinned = assignments[1]
+        self.assertEqual(ast.unparse(pinned.value), "receipt['fixture_image_id']")
+        for command in ast.walk(main):
+            if isinstance(command, ast.List) and command.lineno > pinned.lineno:
+                self.assertNotIn('localhost/marlin-corral-benchmark:export',
+                                 [e.value for e in command.elts if isinstance(e, ast.Constant)])
+
 
 if __name__ == '__main__':
     unittest.main()

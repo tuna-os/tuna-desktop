@@ -69,6 +69,10 @@ def main():
              '--build-arg', 'PAIRED_SESSION=true', '--build-arg', 'CORRAL_SSH=true',
              '--secret', f'id=benchmark-ssh-key,src={public_key}', '-t', image, '.'], 'fixture-build')
         receipt['fixture_image_id'] = output(['sudo', 'podman', 'inspect', image, '--format', '{{.Id}}']).strip()
+        require(re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', receipt['fixture_image_id']),
+                'fixture inspection must return an immutable image ID')
+        # All remaining probes and installation use the exact inspected image.
+        image = receipt['fixture_image_id']
         receipt['shared_image_id'] = (ROOT/f'shared-image-id-{args.profile}').read_text().strip()
         receipt['coherent_image_id'] = (ROOT/'perf-artifacts/coherent-image-id').read_text().strip()
         receipt['base_digest'] = (ROOT/'base-digest').read_text().strip()
