@@ -149,6 +149,7 @@ pub fn watch_socket_conditions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gio::prelude::*;
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
@@ -250,6 +251,55 @@ mod tests {
         );
         assert!(shutdown_wake.callback.borrow().is_none());
         assert!(shutdown_wake.timer.borrow().is_none());
+
+        // Exercise the production lifetime contract with a real application
+        // signal: local build scope ends, application owns wake, shutdown
+        // breaks callbacks/UI references and destroys both transport sources.
+        let application = gio::Application::new(None, gio::ApplicationFlags::NON_UNIQUE);
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let socket = gio::Socket::from_fd(stream.as_fd().try_clone_to_owned().unwrap()).unwrap();
+        let input = watch_socket(&socket, |_| true);
+        let output = watch_socket(&socket, |_| true);
+        let retained_ui = Rc::new(());
+        let weak_ui = Rc::downgrade(&retained_ui);
+        let lifetime_calls = Rc::new(Cell::new(0));
+        let weak_wake = {
+            let wake = Rc::new(UiWake::default());
+            let owner = wake.clone();
+            application.connect_shutdown(move |_| owner.shutdown());
+            let calls = lifetime_calls.clone();
+            wake.install(move || {
+                let _ui = &retained_ui;
+                calls.set(calls.get() + 1);
+            });
+            wake.own_input_source(input.clone());
+            wake.own_output_source(output.clone());
+            Rc::downgrade(&wake)
+        };
+        assert!(
+            weak_wake.upgrade().is_some(),
+            "application owns wake after build scope ends"
+        );
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(lifetime_calls.get(), 1);
+        application.emit_by_name::<()>("shutdown", &[]);
+        assert!(input.is_destroyed() && output.is_destroyed());
+        assert!(
+            weak_ui.upgrade().is_none(),
+            "shutdown releases UI callback captures"
+        );
+        let wake = weak_wake.upgrade().unwrap();
+        assert!(wake.input_source.borrow().is_none());
+        assert!(wake.output_source.borrow().is_none());
+        assert!(wake.callback.borrow().is_none());
+        drop(wake);
+        drop(application);
+        assert!(
+            weak_wake.upgrade().is_none(),
+            "application cleanup releases dispatcher"
+        );
 
         // All bytes fit in the first kernel read. A128-frame drain stops
         // before the malformed prefetched frame; its decode error occurs in
