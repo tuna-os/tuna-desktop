@@ -260,6 +260,10 @@ mod tests {
         assert!(emit_to("forged\nMESSAGE=other", &destination).is_err());
         assert!(emit_to("nul\0record", &destination).is_err());
         drop(receiver);
+        // A bound Unix datagram pathname survives closing the receiver. Remove
+        // its filesystem entry so this assertion checks a genuinely absent
+        // endpoint rather than relying on sendto behavior for an unbound inode.
+        std::fs::remove_file(&destination).unwrap();
         assert!(emit_to(&message, &destination).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
