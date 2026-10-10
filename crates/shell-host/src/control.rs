@@ -1152,8 +1152,12 @@ mod tests {
         assert!(
             matches!(client.poll(), Err(ControlError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
         );
+        // Signal EOF on the stream explicitly rather than relying on the last
+        // descriptor reference closing while other tests launch subprocesses.
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let eof = client.poll();
+        assert!(matches!(eof, Err(ControlError::Unexpected(_))), "{eof:?}");
         drop(peer);
-        assert!(matches!(client.poll(), Err(ControlError::Unexpected(_))));
     }
 
     /// Blocking one-frame read for the in-test fake server.
