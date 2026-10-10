@@ -89,11 +89,16 @@ class Lifetime(unittest.TestCase):
                 handoff.attach(child)
                 scope = {'original': original, 'primary': None, 'vm': child, 'agent': Agent(),
                          'handoff': handoff, 'gnome_trace_active': False,
-                         'args': types.SimpleNamespace(desktop='gnome', gnome_profile='diagnostic'),
+                         'args': types.SimpleNamespace(desktop='gnome', gnome_profile='diagnostic', corral_vm=None),
+                         'out': Path(directory), 'json': json, 'corral': None,
                          'cleanup_owned_vm': life.cleanup_owned_vm, 'sys': sys}
                 with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(RuntimeError) as raised:
                     exec(compile(actual, 'actual-worker-finally', 'exec'), scope)
                 self.assertIs(raised.exception, original)
+                failure=json.loads((Path(directory)/'acquisition-failure.json').read_text())
+                self.assertEqual(failure['error_type'],'RuntimeError')
+                self.assertEqual(failure['message'],str(original))
+                self.assertFalse(failure['performance_qualified'])
                 self.assertIsNotNone(child.returncode)
                 self.assertEqual(life.read_receipt(handoff.path, private=True)['state'], 'reaped')
                 self.assertNotIn('private', err.getvalue())
