@@ -48,8 +48,14 @@ def advance(ms):
     tmp=clock.with_suffix('.tmp');tmp.write_text(str(ms)+'\n');tmp.replace(clock)
     wait(lambda:clock_reached(read(state),clock_base,ms),'clock '+str(ms))
     time.sleep(.07)
+capture_counts={}
 def capture(name):
-    path=art/(name+'.png');run(['scrot',str(path)]);return Image.open(path).convert('RGB')
+    # scrot preserves existing files by choosing a numbered name. Always
+    # request a fresh path, so polling reads this capture, not the first one.
+    count=capture_counts.get(name,0);capture_counts[name]=count+1
+    path=art/(name+('' if count==0 else '-'+str(count).zfill(4))+'.png')
+    assert not path.exists(), 'capture path already exists'
+    run(['scrot',str(path)]);return Image.open(path).convert('RGB')
 def pixel(image,x=400,y=300):return list(image.getpixel((x,y)))
 id=0
 def request(method,signature,args):
