@@ -161,6 +161,21 @@ struct Shown {
     policy_generation: u64,
 }
 
+/// Publish only after the store guard and widget borrows have been released.
+/// The consumer schedules work; it must not retain this UI or its store.
+type ChangeCallback = Rc<dyn Fn()>;
+
+fn publish_shown(shown: &RefCell<Shown>, now: Shown, changed: &RefCell<Option<ChangeCallback>>) {
+    if *shown.borrow() == now {
+        return;
+    }
+    *shown.borrow_mut() = now;
+    let callback = changed.borrow().clone();
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
 /// Notification surfaces and their store.
 pub struct NotifyUi {
     center: Arc<Mutex<NotificationCenter>>,
@@ -182,6 +197,7 @@ pub struct NotifyUi {
     expanded: RefCell<HashSet<String>>,
     group_widgets: RefCell<HashMap<String, Rc<crate::group_animation::Group>>>,
     shown: RefCell<Shown>,
+    changed: RefCell<Option<ChangeCallback>>,
     last_bus_try: RefCell<Option<Instant>>,
 }
 
@@ -379,6 +395,7 @@ impl NotifyUi {
                 banners: vec![u64::MAX],
                 ..Default::default()
             }),
+            changed: RefCell::new(None),
             last_bus_try: RefCell::new(None),
         });
         {
@@ -403,6 +420,11 @@ impl NotifyUi {
         }
         ui.refresh();
         ui
+    }
+
+    /// Wake external consumers, including lock-screen rows, on store/policy changes.
+    pub fn on_changed(&self, changed: Rc<dyn Fn()>) {
+        *self.changed.borrow_mut() = Some(changed);
     }
 
     /// Post the shell's own notification under a GNOME source name and
@@ -704,7 +726,7 @@ impl NotifyUi {
             center.acknowledge(id);
         }
         drop(center);
-        *self.shown.borrow_mut() = now;
+        publish_shown(&self.shown, now, &self.changed);
     }
 
     /// Close notifications from the list (and any banner they hold).
@@ -884,5 +906,96 @@ mod timer_tests {
         // No idle monitor: the user counts as active.
         let mut t = BannerTimer::new(t0, None);
         assert!(t.expired(t0 + s(4), None));
+    }
+}
+
+#[cfg(test)]
+mod refresh_signal_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn locked_store_and_policy_changes_wake_once_without_visible_cards() {
+        let shown = RefCell::new(Shown {
+            locked: true,
+            ..Default::default()
+        });
+        let count = Rc::new(Cell::new(0));
+        let seen = count.clone();
+        let changed: RefCell<Option<ChangeCallback>> = RefCell::new(Some(Rc::new(move || {
+            seen.set(seen.get() + 1);
+        })));
+        publish_shown(
+            &shown,
+            Shown {
+                locked: true,
+                ..Default::default()
+            },
+            &changed,
+        );
+        assert_eq!(count.get(), 0);
+        publish_shown(
+            &shown,
+            Shown {
+                locked: true,
+                revision: 1,
+                ..Default::default()
+            },
+            &changed,
+        );
+        assert_eq!(count.get(), 1);
+        publish_shown(
+            &shown,
+            Shown {
+                locked: true,
+                revision: 1,
+                policy_generation: 1,
+                ..Default::default()
+            },
+            &changed,
+        );
+        assert_eq!(count.get(), 2);
+        publish_shown(
+            &shown,
+            Shown {
+                locked: true,
+                revision: 1,
+                policy_generation: 1,
+                ..Default::default()
+            },
+            &changed,
+        );
+        assert_eq!(
+            count.get(),
+            2,
+            "idempotent refresh must not form a wake loop"
+        );
+    }
+
+    #[test]
+    fn changed_callback_can_borrow_store_and_replace_its_binding() {
+        let center = Arc::new(Mutex::new(NotificationCenter::default()));
+        let shown = RefCell::new(Shown::default());
+        let changed: Rc<RefCell<Option<ChangeCallback>>> = Rc::new(RefCell::new(None));
+        let binding = changed.clone();
+        let store = center.clone();
+        *changed.borrow_mut() = Some(Rc::new(move || {
+            assert!(
+                store.try_lock().is_ok(),
+                "consumer must run outside the store guard"
+            );
+            binding.borrow_mut().take();
+        }));
+        let guard = center.lock().unwrap();
+        drop(guard);
+        publish_shown(
+            &shown,
+            Shown {
+                revision: 1,
+                ..Default::default()
+            },
+            &changed,
+        );
+        assert!(changed.borrow().is_none());
     }
 }

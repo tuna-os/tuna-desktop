@@ -1204,6 +1204,14 @@ fn build(app: &adw::Application) {
 
     let notify = notify::NotifyUi::new(app.upcast_ref());
     {
+        let wake = Rc::downgrade(&ui_wake);
+        notify.on_changed(Rc::new(move || {
+            if let Some(wake) = wake.upgrade() {
+                wake.request();
+            }
+        }));
+    }
+    {
         let notify = notify.clone();
         glib::timeout_add_local(Duration::from_millis(250), move || {
             notify.tick();
