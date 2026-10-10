@@ -2436,8 +2436,6 @@ impl Runtime {
         }
     }
 
-    /// The desktop clear: GNOME's `primary-color` once the shell has
-    /// published it, else a dark neutral.
     /// Resolve only currently rendered target windows. A destroyed/hidden
     /// explicit target does not redirect a frame flash to another window.
     fn bell_frame(&mut self) -> Option<(f32, Option<(u64, Rectangle<i32, Logical>)>)> {
@@ -2463,6 +2461,8 @@ impl Runtime {
         Some((alpha, target))
     }
 
+    /// The desktop clear: GNOME's `primary-color` once the shell has
+    /// published it, else a dark neutral.
     fn desktop_color(&self) -> Color32F {
         match self.wallpaper.color() {
             Some([r, g, b]) => Color32F::new(r, g, b, 1.0),
