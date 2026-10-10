@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
 import io
@@ -183,6 +184,8 @@ class PackagePolicy(unittest.TestCase):
         self.tools.mkdir()
         self.stage = self.dir / 'stage'
         self.stage.mkdir()
+        shutil.copytree(ROOT / 'share/tuna-desktop/icons',
+                        self.stage / 'usr/share/tuna-desktop/icons', symlinks=True)
         for name in M.BINS:
             p = self.stage / 'usr/bin' / name
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -221,6 +224,11 @@ esac''')
 
     def test_positive_controlled_tool_policy(self):
         self.assertEqual(self.check(), 0)
+
+    def test_packaged_cursor_svg_tampering_rejected(self):
+        cursor = next((self.stage / 'usr/share/tuna-desktop/icons/Adwaita').rglob('*.svg'))
+        cursor.write_text('corrupt')
+        self.assertNotEqual(self.check(), 0)
 
     def test_compatibility_names_required(self):
         # tuna-rename: keep-begin
@@ -307,6 +315,11 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
+            shutil.copytree(ROOT / 'share/tuna-desktop/icons',
+                            root / 'share/tuna-desktop/icons', symlinks=True)
+            (root / 'scripts').mkdir()
+            shutil.copy2(ROOT / 'scripts/tuna-cursor-assets-check',
+                         root / 'scripts/tuna-cursor-assets-check')
             output = root / 'control'
             result = subprocess.run(['sh', str(ROOT / 'scripts/tuna-release'), '--allow-dirty', '--out', str(root/'out')], cwd=root, env=dict(os.environ, PATH=str(tools)+':'+os.environ['PATH'], OUTPUT=str(output)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             return result.returncode, output.read_text() if output.exists() else None
