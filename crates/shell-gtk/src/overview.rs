@@ -303,25 +303,29 @@ impl OverviewUi {
             let dash = ui.borrow().dash.clone();
             let weak = Rc::downgrade(&ui);
             dash.connect_map(move |dash| {
-                let Some(ui) = weak.upgrade() else {
-                    return;
-                };
-                if let Some((surface, handler)) = ui.borrow_mut().dash_layout.take() {
-                    surface.disconnect(handler);
-                }
-                if let Some(surface) = dash.surface() {
-                    let weak = Rc::downgrade(&ui);
-                    let handler = surface.connect_layout(move |_, _, _| {
-                        let weak = weak.clone();
-                        gtk::glib::idle_add_local_once(move || {
-                            if let Some(ui) = weak.upgrade() {
-                                Self::publish_dash_icons(&ui);
-                            }
+                let weak = weak.clone();
+                let dash = dash.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Some((surface, handler)) = ui.borrow_mut().dash_layout.take() {
+                        surface.disconnect(handler);
+                    }
+                    if let Some(surface) = dash.surface() {
+                        let weak = Rc::downgrade(&ui);
+                        let handler = surface.connect_layout(move |_, _, _| {
+                            let weak = weak.clone();
+                            gtk::glib::idle_add_local_once(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    Self::publish_dash_icons(&ui);
+                                }
+                            });
                         });
-                    });
-                    ui.borrow_mut().dash_layout = Some((surface, handler));
-                }
-                Self::publish_dash_icons(&ui);
+                        ui.borrow_mut().dash_layout = Some((surface, handler));
+                    }
+                    Self::publish_dash_icons(&ui);
+                });
             });
         }
         // An app dragged out of a folder's dialog leaves the folder.
