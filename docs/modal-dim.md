@@ -44,6 +44,11 @@ It checks normal transient exclusion, 500/250 ms pixels, two-modal overlap,
 transparent pixels, the actual GTK reduced/off settings bridge, parent removal
 and verified owned cleanup.
 
+Temporary deviation (owner: Tuna Desktop v1 implementation): the compositor
+currently treats GNOME's `attach-modal-dialogs` preference as enabled and does
+not honor a live false value. This default-case implementation must not be
+reported as matching GNOME when that preference is disabled.
+
 This implements the native normal scene. Paired GNOME captures, native GPU/DRM,
 X11 modal classification, overview preview dimming, live attach-modal-dialogs
 preference, color-management precision, nested modal stacks and performance
