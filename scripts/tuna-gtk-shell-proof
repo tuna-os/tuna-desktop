@@ -3723,7 +3723,9 @@ xdotool key super+Page_Down
 sleep 0.3
 scrot "$ARTIFACTS/24f-workspace-popup.png" >/dev/null
 # shellcheck disable=SC2046
-set -- $(px "$ARTIFACTS/24f-workspace-popup.png" $((WIDTH / 2 - 20)) $((HEIGHT - 59 - 28)))
+# Sample the pill body between its page dots; sampling the left dot's
+# antialiased edge made a visible pill fail the dark-surface threshold.
+set -- $(px "$ARTIFACTS/24f-workspace-popup.png" $((WIDTH / 2)) $((HEIGHT - 59 - 28)))
 xdotool key super+Page_Up
 if [ "${1:-0}" -ge 70 ] || [ "${2:-0}" -ge 70 ] || [ "${3:-0}" -ge 75 ]; then
     fail G-WS-POPUP "no switcher pill above the bottom edge (pixel ${1:-?} ${2:-?} ${3:-?})"
