@@ -36,6 +36,21 @@ class Tests(unittest.TestCase):
   for peak in [0,5*m.GIB]:self.assertFalse(m.capacity_receipt(node,stats,estimated_peak_bytes=peak)['ready_for_disk_admission'])
   node['spec']={'taints':[{'effect':'NoSchedule'}]};self.assertFalse(m.capacity_receipt(node,stats,estimated_peak_bytes=m.GIB)['ready_for_disk_admission'])
   self.assertFalse(m.capacity_receipt(node,{},estimated_peak_bytes=m.GIB)['ready_for_disk_admission'])
+ def test_pinned_container_disk_default_preserves_exact_sources(self):
+  import copy
+  volumes=[{'name':'disk','containerDisk':{'image':'repo@sha256:'+'a'*64}},{'name':'cloud','cloudInitNoCloud':{'userData':'synthetic exact bytes'}}]
+  vm={'metadata':{'name':'vm','namespace':'ns','uid':'vm-uid'},'spec':{'template':{'spec':{'volumes':copy.deepcopy(volumes)}}}}
+  vmi={'metadata':{'name':'vm','namespace':'ns','uid':'vmi-uid','ownerReferences':[{'kind':'VirtualMachine','uid':'vm-uid','controller':True}]},'status':{'phase':'Running','nodeName':'node'},'spec':{'volumes':copy.deepcopy(volumes)}}
+  vmi['spec']['volumes'][0]['containerDisk']['imagePullPolicy']='IfNotPresent'
+  identity=m.vm_identity(vm,vmi);self.assertEqual(m.verify_identity(identity,vm,vmi),identity)
+  for field,value in [('image','repo@sha256:'+'b'*64),('imagePullPolicy','Always'),('imagePullPolicy','Never')]:
+   old=vmi['spec']['volumes'][0]['containerDisk'].copy();vmi['spec']['volumes'][0]['containerDisk'][field]=value
+   with self.assertRaises(ValueError):m.vm_identity(vm,vmi)
+   vmi['spec']['volumes'][0]['containerDisk']=old
+  vmi['spec']['volumes'][1]['cloudInitNoCloud']['userData']='different bytes'
+  with self.assertRaises(ValueError):m.vm_identity(vm,vmi)
+  vmi['spec']['volumes'][1]=copy.deepcopy(volumes[1]);vm['spec']['template']['spec']['volumes'][0]['containerDisk']['imagePullPolicy']='Never'
+  with self.assertRaises(ValueError):m.vm_identity(vm,vmi)
  def test_identity_replacement_and_migration(self):
   vm={'metadata':{'name':'vm','namespace':'ns','uid':'vm-uid'},'spec':{'template':{'spec':{'volumes':[]}}}}
   vmi={'metadata':{'name':'vm','namespace':'ns','uid':'vmi-uid','ownerReferences':[{'kind':'VirtualMachine','uid':'vm-uid','controller':True}]},'status':{'phase':'Running','nodeName':'node'},'spec':{'volumes':[]}}

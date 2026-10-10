@@ -203,6 +203,18 @@ class Rfb:
         self.stream.close()
 
 
+def normalized_volumes(volumes):
+    # KubeVirt1.8.2 defaults.go setDefaultPullPoliciesOnContainerDisks.
+    # Only the digest-pinned default is accepted; all source bytes and explicit
+    # policies remain exact. Keep authoritative actual volume bytes in the hash.
+    result=json.loads(json.dumps(volumes))
+    for volume in result:
+        disk=volume.get('containerDisk')
+        if disk and re.fullmatch(r'.+@sha256:[0-9a-f]{64}',disk.get('image','')) and 'imagePullPolicy' not in disk:
+            disk['imagePullPolicy']='IfNotPresent'
+    return result
+
+
 def vm_identity(vm, vmi):
     """Bind a session to the actual server objects, node and container image."""
     metadata = vm['metadata']
@@ -218,7 +230,7 @@ def vm_identity(vm, vmi):
         raise ValueError('guest is not running on an identified node')
     declared = vm['spec']['template']['spec']['volumes']
     actual = vmi['spec']['volumes']
-    if declared != actual:
+    if normalized_volumes(declared) != normalized_volumes(actual):
         raise ValueError('VM/VMI storage sources differ')
     storage_digest = hashlib.sha256(json.dumps(actual,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     return {'namespace': metadata['namespace'], 'name': metadata['name'],
