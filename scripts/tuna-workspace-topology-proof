@@ -51,8 +51,11 @@ def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream,"sha256").hexdigest()
 binaries = {}
+bundle_manifest = json.loads((a.bin_dir / "manifest.json").read_text())
+assert bundle_manifest["source_dirty"] is False, "frozen source is dirty"
 for name in ("tuna-compositor","tuna-shell-gtk","tuna-modal-dim-client"):
     source = a.bin_dir.resolve() / name
+    assert digest(source) == bundle_manifest["binary_sha256"][name], "frozen binary differs: " + name
     dest = frozen / name
     shutil.copy2(source,dest)
     binaries[name] = {"source_path":str(source),"sha256":digest(dest)}
@@ -60,7 +63,7 @@ manifest = {
     "source_revision":subprocess.check_output(["git","rev-parse","HEAD"],cwd=root,text=True).strip(),
     "source_dirty":bool(subprocess.check_output(["git","status","--porcelain"],cwd=root,text=True).strip()),
     "binaries":binaries,
-    "binary_source_revision":(a.bin_dir / "SOURCE_COMMIT").read_text().strip(),
+    "binary_source_revision":bundle_manifest["source_revision"],
     "proof_sha256":digest(Path(__file__).resolve()),
     "client_sha256":digest(root / "crates/compositor/examples/tuna-modal-dim-client.rs"),
     "backend":"winit/Xvfb/llvmpipe", "gnome_comparison":False,
