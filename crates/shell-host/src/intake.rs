@@ -181,7 +181,11 @@ impl Notifications {
 
     /// Server capabilities: banner actions plus queue persistence.
     fn get_capabilities(&self) -> Vec<String> {
-        vec!["actions".to_owned(), "persistence".to_owned(), "sound".to_owned()]
+        vec![
+            "actions".to_owned(),
+            "persistence".to_owned(),
+            "sound".to_owned(),
+        ]
     }
 
     /// Banner press fired an action key (emitted by
@@ -599,7 +603,14 @@ mod tests {
             let caps: Vec<String> = proxy
                 .call::<&str, _, Vec<String>>("GetCapabilities", &())
                 .expect("stub GetCapabilities reaches the intake");
-            assert_eq!(caps, vec!["actions".to_owned(), "persistence".to_owned(), "sound".to_owned()]);
+            assert_eq!(
+                caps,
+                vec![
+                    "actions".to_owned(),
+                    "persistence".to_owned(),
+                    "sound".to_owned()
+                ]
+            );
 
             let id = stub_notify(&proxy, vec!["default".to_owned(), "Open".to_owned()]);
             assert_ne!(id, 0, "intake returns a live notification id");
