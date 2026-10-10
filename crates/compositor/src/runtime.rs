@@ -3560,7 +3560,8 @@ impl Runtime {
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
-        self.manager.step_modal_dim(now,self.input_settings.motion,allowed);
+        self.manager
+            .step_modal_dim(now, self.input_settings.motion, allowed);
         crate::window_lifecycle::step_frame(
             &mut self.manager,
             renderer,
@@ -3797,7 +3798,13 @@ impl Runtime {
                         pointer: (!locked && blank_alpha < 1.0).then_some((pointer.x, pointer.y)),
                         decor: decor.clone(),
                         above: elements.above,
-                        effects: elements.brightness.iter().copied().chain(elements.snapshots.iter().map(|s|s.2)).map(f32::to_bits).collect(),
+                        effects: elements
+                            .brightness
+                            .iter()
+                            .copied()
+                            .chain(elements.snapshots.iter().map(|s| s.2))
+                            .map(f32::to_bits)
+                            .collect(),
                         groups: vec![
                             elements
                                 .flashes
@@ -4202,7 +4209,7 @@ impl Scene {
             flashes: Vec::new(),
             bell: Vec::new(),
             snapshots: Vec::new(),
-            brightness: vec![1.0;above],
+            brightness: vec![1.0; above],
             dim_program: None,
             owners: vec![None; above],
         }
@@ -4554,7 +4561,9 @@ fn scene_elements(
                 }
                 snapshots.extend(
                     crate::size_change::snapshot_element(renderer, snapshot, &frame, view)
-                        .map(|element| (elements.len(), element, manager.modal_dim().multiplier(id))),
+                        .map(|element| {
+                            (elements.len(), element, manager.modal_dim().multiplier(id))
+                        }),
                 );
                 owners.resize(elements.len(), Some(id));
                 continue;
@@ -4632,12 +4641,20 @@ fn scene_elements(
     let above = elements.len() - split_from.unwrap_or(0);
     let total = elements.len();
     owners.resize(total, None);
-    let snapshots: Vec<(usize,SnapshotElement,f32)> = snapshots
+    let snapshots: Vec<(usize, SnapshotElement, f32)> = snapshots
         .into_iter()
         .map(|(index, element, brightness)| (total - index, element, brightness))
         .collect();
-    let brightness: Vec<f32> = owners.iter().map(|id| id.map_or(1.0, |id| manager.modal_dim().multiplier(id))).collect();
-    let dim_program = if brightness.iter().any(|v| *v < 1.0) || snapshots.iter().any(|s| s.2 < 1.0) { crate::modal_dim::program(renderer) } else { None };
+    let brightness: Vec<f32> = owners
+        .iter()
+        .map(|id| id.map_or(1.0, |id| manager.modal_dim().multiplier(id)))
+        .collect();
+    let dim_program =
+        if brightness.iter().any(|v| *v < 1.0) || snapshots.iter().any(|s| s.2 < 1.0) {
+            crate::modal_dim::program(renderer)
+        } else {
+            None
+        };
     Scene {
         elements: crate::layer::front_to_back(elements),
         brightness: crate::layer::front_to_back(brightness),
@@ -4907,9 +4924,21 @@ fn draw_slots(
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
         let visible = std::slice::from_ref(visible);
-        let brightness = match *slot { SceneSlot::Element(index)=>scene.brightness[index], SceneSlot::Snapshot(k)=>scene.snapshots[k].2, SceneSlot::Bell(_)=>1.0 };
+        let brightness = match *slot {
+            SceneSlot::Element(index) => scene.brightness[index],
+            SceneSlot::Snapshot(k) => scene.snapshots[k].2,
+            SceneSlot::Bell(_) => 1.0,
+        };
         if brightness < 1.0 {
-            if let Some(program) = &scene.dim_program { frame.override_default_tex_program(program.clone(),vec![smithay::backend::renderer::gles::Uniform::new("brightness",brightness)]); }
+            if let Some(program) = &scene.dim_program {
+                frame.override_default_tex_program(
+                    program.clone(),
+                    vec![smithay::backend::renderer::gles::Uniform::new(
+                        "brightness",
+                        brightness,
+                    )],
+                );
+            }
         }
         let result = match *slot {
             SceneSlot::Element(index) => draw_planned::<GlesRenderer, _>(
