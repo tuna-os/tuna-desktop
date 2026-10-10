@@ -1834,9 +1834,9 @@ impl Runtime {
         let output = Rectangle::new((0, 0).into(), size);
         let model = self.manager.model();
         let layout = if self.overview_app_grid {
-            crate::overview::app_grid_layout
+            crate::overview::app_grid_layout_with_policy
         } else {
-            crate::overview::layout
+            crate::overview::layout_with_policy
         };
         layout(
             output,
@@ -1844,6 +1844,7 @@ impl Runtime {
             model.workspaces(),
             model.active_workspace(),
             &self.manager.overview_windows(),
+            model.fixed_workspace_count().is_none(),
         )
     }
 
@@ -3016,6 +3017,8 @@ impl Runtime {
     fn apply_input_settings(&mut self, settings: tuna_shell_control::InputSettings) {
         self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
+            .apply_workspace_policy(&mut self.state, settings.workspace_policy);
+        self.manager
             .apply_keyboard_settings(&mut self.state, &settings);
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
@@ -3306,7 +3309,7 @@ impl Runtime {
                     above: self.manager.is_above(window),
                     sticky: self.manager.is_sticky(window),
                     workspace_left: self.manager.workspace_left_of(window),
-                    workspace_right: true,
+                    workspace_right: self.manager.workspace_right_of(window),
                 });
         }
         if !self.control.overview_open() {

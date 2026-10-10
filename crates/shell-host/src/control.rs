@@ -217,6 +217,10 @@ impl ControlClient {
         self.model.set_app_resolver(resolve);
     }
 
+    pub fn set_switcher_workspace_policy(&mut self, policy: crate::model::SwitcherWorkspacePolicy) {
+        self.model.set_switcher_workspace_policy(policy);
+    }
+
     /// Revision of the last applied snapshot or delta (`None` before the
     /// first snapshot).
     pub fn revision(&self) -> Option<u64> {
@@ -399,10 +403,13 @@ impl ControlClient {
         settings: tuna_shell_control::InputSettings,
     ) -> Result<u64, ControlError> {
         let id = self.alloc_request_id();
+        let fixed_count =
+            (!settings.workspace_policy.dynamic).then_some(settings.workspace_policy.fixed_count);
         self.write_message(&Message::Command {
             id,
             kind: CommandKind::SetInputSettings(settings),
         })?;
+        self.model.set_fixed_workspace_count(fixed_count);
         Ok(id)
     }
 
@@ -905,6 +912,7 @@ fn snapshot_view(windows: &[WindowInfo], workspaces: &[WorkspaceInfo]) -> Snapsh
                 WindowEntry::new(w.id, w.title.clone(), w.focused)
                     .with_workspace(u32::try_from(w.workspace).unwrap_or(u32::MAX))
                     .with_app_id(w.app_id.clone())
+                    .with_all_workspaces(w.on_all_workspaces)
                     .with_icon(w.icon.clone())
             })
             .collect(),
@@ -1002,6 +1010,7 @@ mod tests {
 
     fn window(id: WindowId, title: &str, workspace: WorkspaceId, focused: bool) -> WindowInfo {
         WindowInfo {
+            on_all_workspaces: false,
             icon: None,
             id,
             title: title.to_owned(),

@@ -160,9 +160,10 @@ impl ProtocolVersion {
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
     /// `0.30` appends live sound/bell and attached-modal brightness preferences.
+    /// `0.31` appends workspace and edge-tiling preferences.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 30,
+        minor: 31,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -204,6 +205,9 @@ pub struct WindowInfo {
     pub activation_token: String,
     /// Compositor-owned PNG cache path or sanitized theme icon name.
     pub icon: Option<String>,
+    /// Sticky windows and windows outside the primary monitor's workspace set.
+    #[serde(default)]
+    pub on_all_workspaces: bool,
 }
 
 /// Workspace state owned by the compositor and mirrored to the shell.
@@ -766,6 +770,26 @@ impl Default for BellPolicy {
     }
 }
 
+/// GNOME Shell's workspace and edge-tiling preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePolicy {
+    pub dynamic: bool,
+    pub fixed_count: u32,
+    pub only_on_primary: bool,
+    pub edge_tiling: bool,
+}
+
+impl Default for WorkspacePolicy {
+    fn default() -> Self {
+        Self {
+            dynamic: true,
+            fixed_count: 4,
+            only_on_primary: true,
+            edge_tiling: true,
+        }
+    }
+}
+
 /// GNOME input and bell preferences, flattened for the compositor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSettings {
@@ -807,6 +831,8 @@ pub struct InputSettings {
     /// Enable the attached-modal parent brightness effect (Mutter preference).
     #[serde(default = "default_attach_modal_dialogs")]
     pub attach_modal_dialogs: bool,
+    #[serde(default)]
+    pub workspace_policy: WorkspacePolicy,
 }
 
 fn default_attach_modal_dialogs() -> bool {
@@ -836,6 +862,7 @@ impl Default for InputSettings {
             right_to_left: false,
             bell: BellPolicy::default(),
             attach_modal_dialogs: true,
+            workspace_policy: WorkspacePolicy::default(),
         }
     }
 }
@@ -1233,6 +1260,7 @@ mod tests {
 
     fn sample_window(id: WindowId) -> WindowInfo {
         WindowInfo {
+            on_all_workspaces: false,
             icon: None,
             id,
             title: format!("Terminal {id}"),
@@ -1282,6 +1310,39 @@ mod tests {
     }
 
     #[test]
+    fn multitasking_preferences_survive_positional_wire() {
+        for fixed_count in [1, 4, 36] {
+            for enabled in [false, true] {
+                roundtrip(&Message::Command {
+                    id: 90,
+                    kind: CommandKind::SetInputSettings(InputSettings {
+                        workspace_policy: WorkspacePolicy {
+                            dynamic: enabled,
+                            fixed_count,
+                            only_on_primary: !enabled,
+                            edge_tiling: enabled,
+                        },
+                        ..Default::default()
+                    }),
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn all_workspace_window_state_survives_delta_wire() {
+        for enabled in [false, true] {
+            let mut window = sample_window(7);
+            window.on_all_workspaces = enabled;
+            roundtrip(&Message::Changes {
+                from_revision: 1,
+                to_revision: 2,
+                ops: vec![StateOp::WindowOpened(window)],
+            });
+        }
+    }
+
+    #[test]
     fn attach_modal_dialogs_survives_positional_control_wire() {
         for enabled in [true, false] {
             let settings = InputSettings {
@@ -1306,8 +1367,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_30() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 30));
+    fn current_version_is_0_31() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 31));
     }
 
     #[test]

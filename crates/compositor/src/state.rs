@@ -46,6 +46,7 @@ pub struct WindowEntry {
     pub active: bool,
     /// Keyboard-focus flag; mirrors [`StateModel::focused`].
     pub focused: bool,
+    pub on_all_workspaces: bool,
 }
 
 /// A single state transition, tagged with the post-mutation revision.
@@ -62,6 +63,8 @@ pub enum StateChange {
     /// Active workspace switched; empty non-active workspaces were
     /// pruned from the list at the same revision.
     ActiveWorkspaceChanged { previous: u32, active: u32 },
+    /// Workspace topology changed; incremental peers must take a snapshot.
+    WorkspacesChanged,
 }
 
 /// Full copy of the model at one revision, for snapshot-on-reconnect.
@@ -100,6 +103,7 @@ pub struct WindowUpdate {
     pub workspace: Option<u32>,
     /// Replace the active hint.
     pub active: Option<bool>,
+    pub on_all_workspaces: Option<bool>,
 }
 
 /// Compositor-owned revisioned window/workspace/focus model.
@@ -108,6 +112,7 @@ pub struct StateModel {
     revision: u64,
     windows: BTreeMap<u64, WindowEntry>,
     workspaces: Vec<u32>,
+    fixed_workspace_count: Option<u32>,
     active: u32,
     focused: Option<u64>,
     next_id: u64,
@@ -121,6 +126,7 @@ impl Default for StateModel {
             revision: 0,
             windows: BTreeMap::new(),
             workspaces: vec![0],
+            fixed_workspace_count: None,
             active: 0,
             focused: None,
             next_id: 1,
@@ -155,6 +161,52 @@ impl StateModel {
         &self.workspaces
     }
 
+    /// Fixed workspace count, or None for dynamic workspaces.
+    pub fn fixed_workspace_count(&self) -> Option<u32> {
+        self.fixed_workspace_count
+    }
+
+    pub fn workspace_allowed(&self, workspace: u32) -> bool {
+        self.fixed_workspace_count
+            .is_none_or(|count| workspace < count)
+    }
+
+    /// Apply a live fixed-count preference. Windows from removed workspaces
+    /// move to the last remaining one; IDs and window contents are preserved.
+    pub fn set_fixed_workspace_count(&mut self, count: Option<u32>) -> bool {
+        let count = count.map(|count| count.clamp(1, 36));
+        if self.fixed_workspace_count == count {
+            return false;
+        }
+        self.fixed_workspace_count = count;
+        if let Some(count) = count {
+            let last = count - 1;
+            let moved: Vec<_> = self
+                .windows
+                .values()
+                .filter(|window| window.workspace > last)
+                .map(|window| window.id)
+                .collect();
+            for id in moved {
+                self.update(
+                    id,
+                    WindowUpdate {
+                        workspace: Some(last),
+                        ..Default::default()
+                    },
+                );
+            }
+            if self.active > last {
+                self.set_active_workspace(last);
+            }
+            self.workspaces = (0..count).collect();
+        } else {
+            self.prune_workspaces();
+        }
+        self.commit(StateChange::WorkspacesChanged);
+        true
+    }
+
     /// Focused window id, if any.
     pub fn focused(&self) -> Option<u64> {
         self.focused
@@ -170,6 +222,9 @@ impl StateModel {
     /// re-selecting the active workspace returns true without a bump.
     /// Appends `ActiveWorkspaceChanged`.
     pub fn set_active_workspace(&mut self, workspace: u32) -> bool {
+        if !self.workspace_allowed(workspace) {
+            return false;
+        }
         if self.active == workspace {
             return true;
         }
@@ -187,6 +242,10 @@ impl StateModel {
     /// Drop workspace ids with no windows except the active one. The
     /// list converges through snapshots; removals carry no delta op.
     fn prune_workspaces(&mut self) {
+        if let Some(count) = self.fixed_workspace_count {
+            self.workspaces = (0..count).collect();
+            return;
+        }
         self.workspaces
             .retain(|id| *id == self.active || self.windows.values().any(|w| w.workspace == *id));
     }
@@ -202,9 +261,13 @@ impl StateModel {
     /// is registered in the workspace list if new. Bumps the revision and
     /// appends `WindowInserted`.
     pub fn insert(&mut self, title: &str, app_id: Option<&str>, workspace: u32) -> u64 {
+        let workspace = self
+            .fixed_workspace_count
+            .map_or(workspace, |count| workspace.min(count - 1));
         let id = self.next_id();
         self.register_workspace(workspace);
         let window = WindowEntry {
+            on_all_workspaces: false,
             icon: None,
             id,
             title: cap_title(title),
@@ -242,6 +305,12 @@ impl StateModel {
     /// when the id is unknown. A workspace move registers the workspace if
     /// new. Appends `WindowUpdated`.
     pub fn update(&mut self, id: u64, patch: WindowUpdate) -> bool {
+        if patch
+            .workspace
+            .is_some_and(|workspace| !self.workspace_allowed(workspace))
+        {
+            return false;
+        }
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
@@ -257,6 +326,9 @@ impl StateModel {
         if let Some(active) = patch.active {
             window.active = active;
         }
+        if let Some(on_all_workspaces) = patch.on_all_workspaces {
+            window.on_all_workspaces = on_all_workspaces;
+        }
         let window = window.clone();
         if let Some(workspace) = patch.workspace {
             self.register_workspace(workspace);
@@ -269,7 +341,8 @@ impl StateModel {
     /// Insert a workspace before `at`, shifting later windows and the active
     /// workspace, then place the dragged window in the new slot.
     pub fn insert_workspace_and_move(&mut self, id: u64, at: u32) -> bool {
-        if !self.windows.contains_key(&id)
+        if self.fixed_workspace_count.is_some()
+            || !self.windows.contains_key(&id)
             || self.workspaces.iter().any(|&w| w >= at && w == u32::MAX)
         {
             return false;
@@ -959,5 +1032,92 @@ mod tests {
         assert_eq!(m.workspaces(), &[0, 3]);
         assert!(m.remove(a));
         assert_eq!(m.workspaces(), &[0]);
+    }
+}
+
+#[cfg(test)]
+mod fixed_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_workspaces_keep_empty_slots_and_reject_out_of_range_commands() {
+        let mut model = StateModel::new();
+        assert!(model.set_fixed_workspace_count(Some(4)));
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+        assert!(model.set_active_workspace(3));
+        let revision = model.revision();
+        assert!(!model.set_active_workspace(4));
+        assert_eq!(model.revision(), revision);
+        assert!(model.set_active_workspace(0));
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn shrinking_fixed_workspaces_preserves_window_ids_titles_and_focus() {
+        let mut model = StateModel::new();
+        model.set_fixed_workspace_count(Some(6));
+        let first = model.insert("First", Some("org.tuna.First"), 5);
+        let second = model.insert("Second", Some("org.tuna.Second"), 4);
+        model.set_active_workspace(5);
+        model.set_focused(Some(first));
+        assert!(model.set_fixed_workspace_count(Some(2)));
+        assert_eq!(model.active_workspace(), 1);
+        assert_eq!(model.workspaces(), &[0, 1]);
+        assert_eq!(model.focused(), Some(first));
+        assert_eq!(model.window(first).unwrap().title, "First");
+        assert_eq!(model.window(second).unwrap().title, "Second");
+        assert!(model.windows().all(|window| window.workspace == 1));
+        assert!(matches!(
+            model.changes.back().unwrap().1,
+            StateChange::WorkspacesChanged
+        ));
+    }
+
+    #[test]
+    fn fixed_workspace_moves_cannot_expand_topology_or_partially_edit_a_window() {
+        let mut model = StateModel::new();
+        model.set_fixed_workspace_count(Some(2));
+        let window = model.insert("Original", None, 0);
+        let revision = model.revision();
+        assert!(!model.update(
+            window,
+            WindowUpdate {
+                title: Some("Changed".into()),
+                workspace: Some(2),
+                ..Default::default()
+            }
+        ));
+        assert_eq!(model.revision(), revision);
+        assert_eq!(model.window(window).unwrap().title, "Original");
+        assert!(!model.insert_workspace_and_move(window, 1));
+        assert_eq!(model.workspaces(), &[0, 1]);
+    }
+
+    #[test]
+    fn removing_last_window_preserves_fixed_slots_and_dynamic_reenable_prunes_them() {
+        let mut model = StateModel::new();
+        model.set_fixed_workspace_count(Some(4));
+        let window = model.insert("Window", None, 2);
+        model.remove(window);
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+        model.set_fixed_workspace_count(None);
+        assert_eq!(model.workspaces(), &[0]);
+        assert!(model.set_active_workspace(5));
+        assert_eq!(model.active_workspace(), 5);
+    }
+
+    #[test]
+    fn fixed_count_clamps_to_schema_range_and_insertion_uses_last_valid_slot() {
+        let mut model = StateModel::new();
+        model.set_fixed_workspace_count(Some(0));
+        assert_eq!(model.fixed_workspace_count(), Some(1));
+        let window = model.insert("Window", None, u32::MAX);
+        assert_eq!(model.window(window).unwrap().workspace, 0);
+        model.set_fixed_workspace_count(Some(u32::MAX));
+        assert_eq!(model.fixed_workspace_count(), Some(36));
+        assert_eq!(model.workspaces().len(), 36);
+        let revision = model.revision();
+        assert!(!model.set_fixed_workspace_count(Some(36)));
+        assert_eq!(model.revision(), revision);
     }
 }

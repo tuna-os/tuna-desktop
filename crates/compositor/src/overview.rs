@@ -94,6 +94,7 @@ pub struct OverviewLayout {
     pub thumbnails: Vec<WorkspaceCard>,
     /// The new-workspace drop slot, visible only during a window drag.
     pub placeholder: Option<(u32, Rectangle<i32, Logical>)>,
+    pub allow_workspace_insertion: bool,
 }
 
 /// GNOME shows the thumbnails strip once dynamic workspaces number more
@@ -270,6 +271,9 @@ pub fn insertion_target(layout: &OverviewLayout, pos: Point<f64, Logical>) -> Op
 /// Spread the thumbnails around a new-workspace slot, keeping their
 /// miniature windows aligned with their cards.
 pub fn show_placeholder(layout: &mut OverviewLayout, at: u32) {
+    if !layout.allow_workspace_insertion {
+        return;
+    }
     let Some(first) = layout.thumbnails.first() else {
         return;
     };
@@ -519,6 +523,7 @@ pub fn blend(from: &OverviewLayout, to: &OverviewLayout, p: f64) -> OverviewLayo
     let mut out = OverviewLayout {
         hovered: to.hovered,
         placeholder: to.placeholder,
+        allow_workspace_insertion: to.allow_workspace_insertion,
         ..Default::default()
     };
     for c in &to.cards {
@@ -1218,6 +1223,7 @@ pub fn transition(
         lerp_rect(start, card.rect, p)
     };
     let mut out = OverviewLayout {
+        allow_workspace_insertion: layout.allow_workspace_insertion,
         cards: layout
             .cards
             .iter()
@@ -1596,8 +1602,26 @@ pub fn layout(
     active: u32,
     windows: &[OverviewWindow],
 ) -> OverviewLayout {
-    let mut out = OverviewLayout::default();
-    let workspaces = shown_workspaces(workspaces, windows);
+    layout_with_policy(output, work_top, workspaces, active, windows, true)
+}
+
+pub fn layout_with_policy(
+    output: Rectangle<i32, Logical>,
+    work_top: i32,
+    workspaces: &[u32],
+    active: u32,
+    windows: &[OverviewWindow],
+    dynamic: bool,
+) -> OverviewLayout {
+    let mut out = OverviewLayout {
+        allow_workspace_insertion: dynamic,
+        ..Default::default()
+    };
+    let workspaces = if dynamic {
+        shown_workspaces(workspaces, windows)
+    } else {
+        workspaces.to_vec()
+    };
     let index = workspaces.iter().position(|w| *w == active).unwrap_or(0);
     let neighbors = [
         (index.checked_sub(1), -1),
@@ -1868,8 +1892,26 @@ pub fn app_grid_layout(
     active: u32,
     windows: &[OverviewWindow],
 ) -> OverviewLayout {
-    let mut out = OverviewLayout::default();
-    let shown = shown_workspaces(workspaces, windows);
+    app_grid_layout_with_policy(output, work_top, workspaces, active, windows, true)
+}
+
+pub fn app_grid_layout_with_policy(
+    output: Rectangle<i32, Logical>,
+    work_top: i32,
+    workspaces: &[u32],
+    active: u32,
+    windows: &[OverviewWindow],
+    dynamic: bool,
+) -> OverviewLayout {
+    let mut out = OverviewLayout {
+        allow_workspace_insertion: dynamic,
+        ..Default::default()
+    };
+    let shown = if dynamic {
+        shown_workspaces(workspaces, windows)
+    } else {
+        workspaces.to_vec()
+    };
     let work_h = (output.size.h - work_top).max(1);
     let w = (f64::from(output.size.w) * THUMBNAIL_SCALE).round();
     let h = (f64::from(work_h) * THUMBNAIL_SCALE).round();
@@ -1959,6 +2001,24 @@ pub fn hit(layout: &OverviewLayout, pos: Point<f64, Logical>) -> OverviewHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_workspace_layout_has_exact_slots_and_no_insertion_placeholder() {
+        let windows = [win(1, 3, 10, 30, 300, 200)];
+        for mut layout in [
+            layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false),
+            app_grid_layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false),
+        ] {
+            assert_eq!(layout.thumbnails.len(), 4);
+            assert!(layout.cards.iter().all(|card| card.workspace < 4));
+            show_placeholder(&mut layout, 4);
+            assert!(layout.placeholder.is_none());
+            assert!(!transition(&layout, 0.5, output(), &windows).allow_workspace_insertion);
+        }
+        let single = layout_with_policy(output(), 24, &[0], 0, &[], false);
+        assert_eq!(single.cards.len(), 1);
+        assert!(single.thumbnails.is_empty());
+    }
 
     const FULL: MotionPolicy = MotionPolicy {
         level: tuna_shell_control::motion::MotionLevel::Full,

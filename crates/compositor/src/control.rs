@@ -498,6 +498,13 @@ impl<'a> Session<'a> {
         }
         match model.changes_since(self.last_revision) {
             Ok(entries) => {
+                if entries
+                    .iter()
+                    .any(|(_, change)| matches!(change, StateChange::WorkspacesChanged))
+                {
+                    let revision = self.send_snapshot(model)?;
+                    return Ok(Emitted::Snapshot { revision });
+                }
                 let ops: Vec<StateOp> = entries
                     .iter()
                     .filter_map(|(_, c)| state_op(c, &*self.minter))
@@ -866,6 +873,7 @@ fn window_to_wire(
     mint: &dyn Fn(Option<&str>) -> String,
 ) -> tuna_shell_control::WindowInfo {
     tuna_shell_control::WindowInfo {
+        on_all_workspaces: w.on_all_workspaces,
         icon: w.icon.clone(),
         id: w.id,
         title: w.title.clone(),
@@ -890,7 +898,7 @@ fn state_op(change: &StateChange, mint: &dyn Fn(Option<&str>) -> String) -> Opti
             Some(StateOp::WindowOpened(window_to_wire(window, mint)))
         }
         StateChange::FocusChanged { focused: Some(id) } => Some(StateOp::WindowFocused { id: *id }),
-        StateChange::FocusChanged { focused: None } => None,
+        StateChange::FocusChanged { focused: None } | StateChange::WorkspacesChanged => None,
         // Active is exclusive shell-side (applying active:true clears
         // the rest), so one op carries the switch.
         StateChange::ActiveWorkspaceChanged { active, .. } => {
@@ -951,8 +959,16 @@ fn apply_command(
                     None,
                 );
             };
-            model.set_active_workspace(workspace);
-            (CommandStatus::Applied, None)
+            if model.set_active_workspace(workspace) {
+                (CommandStatus::Applied, None)
+            } else {
+                (
+                    CommandStatus::Denied {
+                        reason: "workspace outside fixed range".to_owned(),
+                    },
+                    None,
+                )
+            }
         }
         CommandKind::ToggleOverview => {
             // Flip the hub-shared intent; the hub broadcasts the new
