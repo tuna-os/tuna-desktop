@@ -21,3 +21,28 @@ Before hashing the final raw disk or converting to qcow2, composefs exports mate
 `manifest.json` records `esp_repair` with exact source image ID, kernel version, protected critical receipt hash, owned loop/partition/container/mount identities, target, member sizes and before/source/after SHA256s. `esp-repair.log` records command execution. Unmount and loop/container cleanup are attempted on failures; loop backing ownership is checked again before detaching. Failure to clean resources is fatal and retains the raw backing/scratch rather than unlinking a mounted or attached image. This is a disk byte repair, not boot qualification.
 
 Focused fake-command tests cover ambiguous discovery, baseline mismatch, copy/hash/sync/mount failures and fatal cleanup errors. A bounded 64 MiB synthetic FAT/loop probe also exercised real kernel mount/copy/sync/unmount/detach operations and source hash equality; its source bytes were synthetic, not a GNOME image. Actual composefs image boot and SSH access still require CI export and the authorized Corral guest run.
+
+
+## Owned command deadlines
+
+The disk exporter and ESP repair use new process sessions with finite command
+limits: fixture build and disk install 1,800 seconds each, compression 900 seconds,
+check/baseline 180 seconds, and queries/ESP operations 60 seconds. Resource removal,
+unmount and detach are limited to 30 seconds. Queries allow at most 4 MiB of output;
+long build/install phases allow 64 MiB. Temporary output files avoid pipe deadlocks.
+Each command records its deadline, elapsed time, output bound and leader reaping in
+`manifest.json` (ESP commands under `esp_repair`). TERM is followed by KILL and a
+bounded leader reap and Linux process-state check for executing group descendants; privileged children use an owned group signal through noninteractive
+sudo. These are command deadlines plus bounded shutdown, not image performance
+measurements.
+
+Every Podman run has a UUID name assigned before launch. Explicit bounded removal
+and absence checks cover containers/conmon that outlive the CLI. A timed out build
+uses `--force-rm`, but this does not prove all Buildah working containers disappeared;
+its cleanup is reported uncertain and scratch is retained. Successful install
+cleanup reconciles exact raw backing loops, refuses mounted or replaced backing,
+and confirms no matching loop remains before unlinking. An ambiguous ESP loop
+allocation response is reconciled the same way. Failed process/container/mount/loop
+cleanup is fatal and retains backing; no foreign container or loop is adopted.
+Focused tests use fake commands and tiny owned process groups, with no image build,
+import or native boot qualification.

@@ -6,13 +6,12 @@ import os
 import re
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT/'scripts/lib'))
 from tuna_benchmark_disk import digest, provenance, require, storage_receipt, VIRTUAL_BYTES
-from tuna_benchmark_esp import repair as repair_esp
+from tuna_benchmark_esp import repair as repair_esp, Commands, retire_backing
 
 
 def main():
@@ -35,17 +34,27 @@ def main():
     if args.profile == 'stock':
         profile_root /= 'stock'
 
+    commands = Commands(artifacts/'commands.log')
+    install_attempted = False
+    phase_deadlines = {'fixture-build': 1800, 'pinned-baseline': 180,
+                       'disk-install': 1800, 'disk-convert': 900, 'disk-check': 180}
+    receipt['phase_deadlines_seconds'] = phase_deadlines | {'query': 60, 'cleanup': 30}
+
     def run(command, phase):
         receipt['phase'] = phase
-        with (artifacts/(phase+'.log')).open('w') as log:
-            subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
+        previous_log = commands.log
+        commands.log = artifacts/(phase+'.log')
+        try:
+            commands.call(command, timeout=phase_deadlines[phase], max_output=64*1024*1024)
+        finally:
+            commands.log = previous_log
 
     def output(command):
-        return subprocess.check_output(command, text=True)
+        return commands.call(command, timeout=60)[1]
 
     try:
         source = output(['git', 'rev-parse', 'HEAD']).strip()
-        subprocess.run(['git', 'diff', '--quiet', 'HEAD'], check=True)
+        commands.call(['git', 'diff', '--quiet', 'HEAD'])
         if os.environ.get('GITHUB_SHA'):
             require(source == os.environ['GITHUB_SHA'], 'checkout/CI source mismatch')
         selection = json.loads((ROOT/'perf-artifacts/package-selection.json').read_text())
@@ -64,7 +73,7 @@ def main():
                           'boot_access_qualified': False}
         image = 'localhost/marlin-corral-benchmark:export'
         shared = f'localhost/marlin-tuna-preview:{args.profile}'
-        run(['sudo', 'podman', 'build', '-f', 'packaging/marlin/perf/Containerfile',
+        run(['sudo', 'podman', 'build', '--force-rm', '-f', 'packaging/marlin/perf/Containerfile',
              '--build-arg', f'BASE_IMAGE={shared}', '--build-arg', 'DESKTOP=gnome',
              '--build-arg', 'PAIRED_SESSION=true', '--build-arg', 'CORRAL_SSH=true',
              '--secret', f'id=benchmark-ssh-key,src={public_key}', '-t', image, '.'], 'fixture-build')
@@ -106,11 +115,12 @@ def main():
                           ['--composefs-backend', '--filesystem', 'ext4']], 'bootc probe flags')
         with raw.open('xb') as stream:
             stream.truncate(VIRTUAL_BYTES)
+        install_attempted = True
         run(['sudo', 'podman', 'run', '--rm', '--privileged', '--pid=host', '--security-opt',
              'label=type:unconfined_t', '-v', '/dev:/dev', '-v', '/var/lib/containers:/var/lib/containers',
              '-v', f'{args.scratch.resolve()}:/output', receipt['fixture_image_id'], 'bootc', 'install', 'to-disk',
              '--via-loopback', '--generic-image', '--wipe', *flags, '/output/disk.raw'], 'disk-install')
-        subprocess.run(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(raw)], check=True)
+        commands.call(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(raw)])
         receipt['esp_repair'] = {'required': '--composefs-backend' in flags}
         if receipt['esp_repair']['required']:
             repair_esp(raw, receipt['fixture_image_id'], args.scratch,
@@ -143,15 +153,23 @@ def main():
         result_code = 1
     finally:
         try:
+            commands.cleanup_containers()
+            require(not commands.process_cleanup_uncertain,
+                    'retaining scratch: owned privileged process cleanup unconfirmed')
+            require(not commands.interrupted_build,
+                    'retaining scratch: interrupted Buildah working-container cleanup unconfirmed')
             require(receipt.get('esp_repair', {}).get('owned_resources_removed', True),
                     'retaining raw backing/scratch after unsafe ESP resource cleanup')
+            if install_attempted:
+                retire_backing(commands, raw.resolve())
             raw.unlink(missing_ok=True)
             args.scratch.rmdir()
             receipt['owned_scratch_removed'] = True
-        except (OSError, ValueError) as error:
+        except Exception as error:
             receipt.update(owned_scratch_removed=False, export_succeeded=False,
                            cleanup_error=str(error))
             disk.unlink(missing_ok=True)
+        receipt['command_deadlines'] = commands.events
         (artifacts/'manifest.json').write_text(json.dumps(receipt, indent=2)+'\n')
         if not receipt['owned_scratch_removed']:
             result_code = 1

@@ -6,7 +6,7 @@ import shutil
 import tempfile
 import unittest
 from tuna_benchmark_disk import digest
-from tuna_benchmark_esp import critical_hashes, fat_partition, repair
+from tuna_benchmark_esp import Commands, critical_hashes, fat_partition, repair, retire_backing
 
 
 class FakeCommands:
@@ -25,6 +25,7 @@ class FakeCommands:
                 (target/'vmlinuz').write_bytes(bytes(20));(target/'initrd').write_bytes(bytes(30))
         if self.failure==operation or (self.failure=='copy-esp' and operation=='cp') or (self.failure=='detach' and '--detach' in args):
             raise RuntimeError('injected '+operation+' failure')
+        if operation=='podman' and args[2]=='container':return 1,''
         if operation=='podman' and args[2]=='run':
             if 'printf' in args[-1]: return 0,self.versions
         if operation=='podman' and args[2]=='cp':
@@ -115,8 +116,139 @@ class EspTests(unittest.TestCase):
     def test_export_repairs_before_raw_hash_and_conversion_and_refuses_unsafe_unlink(self):
         source=Path(__file__).resolve().parents[1].joinpath('tuna-benchmark-disk-export').read_text()
         self.assertLess(source.index('repair_esp(raw,'),source.index("receipt['raw_sha256'] = digest(raw)"))
-        self.assertLess(source.index("receipt['raw_sha256'] = digest(raw)"),source.index("'disk-convert'"))
+        self.assertLess(source.index("receipt['raw_sha256'] = digest(raw)"),source.index("'disk-convert')"))
         self.assertIn("get('owned_resources_removed', True)",source)
+
+
+class DeadlineTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='tuna-deadline-test-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.commands = Commands(self.root/'commands.log')
+
+    def test_success_and_nonzero_status_are_reaped(self):
+        import sys
+        self.assertEqual(self.commands.call([sys.executable,'-c','print("receipt")']), (0,'receipt'))
+        self.assertTrue(self.commands.events[-1]['leader_reaped'])
+        with self.assertRaisesRegex(RuntimeError,'command failed'):
+            self.commands.call([sys.executable,'-c','raise SystemExit(7)'])
+
+    def test_real_timeout_kills_owned_parent_and_child(self):
+        import os, sys, time
+        pidfile = self.root/'child.pid'
+        program = ('import os,signal,time,pathlib; '
+                   'signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+                   'child=os.fork(); '
+                   f'pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())) if child==0 else None; '
+                   'time.sleep(30)')
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError,'deadline exceeded'):
+            self.commands.call([sys.executable,'-c',program],timeout=1)
+        self.assertLess(time.monotonic()-started,9)
+        self.assertTrue(self.commands.events[-1]['leader_reaped'])
+        child = int(pidfile.read_text())
+        path = Path('/proc')/str(child)/'stat'
+        deadline = time.monotonic()+1
+        def stopped():
+            try: return path.read_text().split()[2] == 'Z'
+            except FileNotFoundError: return True
+        while not stopped() and time.monotonic()<deadline:
+            time.sleep(.02)
+        self.assertTrue(stopped())
+
+    def test_privileged_timeout_reaps_owned_sudo_group(self):
+        import shutil, subprocess, time
+        if not shutil.which('sudo'):
+            self.skipTest('sudo unavailable')
+        probe = subprocess.run(['sudo','-n','true'], timeout=3, capture_output=True)
+        if probe.returncode:
+            self.skipTest('noninteractive sudo unavailable')
+        pidfile = self.root/'root-child.pid'
+        program = ('import os,signal,time,pathlib; '
+                   'signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+                   'child=os.fork(); '
+                   f'pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())) if child==0 else None; '
+                   'time.sleep(30)')
+        with self.assertRaisesRegex(RuntimeError,'deadline exceeded'):
+            self.commands.call(['sudo','-n','/usr/bin/python3','-c',program],timeout=1)
+        self.assertFalse(self.commands.process_cleanup_uncertain)
+        child = int(pidfile.read_text())
+        deadline = time.monotonic()+1
+        while True:
+            try: state = (Path('/proc')/str(child)/'stat').read_text().split()[2]
+            except FileNotFoundError: state = 'Z'
+            if state == 'Z' or time.monotonic() >= deadline: break
+            time.sleep(.02)
+        self.assertEqual(state,'Z')
+        self.assertTrue(self.commands.events[-1]['leader_reaped'])
+
+    def test_run_name_is_recorded_before_process_launch(self):
+        from unittest.mock import patch
+        class Process:
+            pid = 99999999
+            returncode = 0
+            def poll(self):return 0
+            def wait(self,timeout):return 0
+        def launch(args, **kwargs):
+            self.assertIn('--name',args)
+            self.assertIn(args[args.index('--name')+1], self.commands.containers)
+            return Process()
+        with patch('tuna_benchmark_esp.subprocess.Popen',side_effect=launch), patch.object(self.commands,'_signal'):
+            self.commands.call(['sudo','podman','run','--rm','sha256:'+'a'*64,'true'])
+        self.assertEqual(len(self.commands.containers),1)
+
+    def test_output_bound_terminates_real_writer(self):
+        import sys
+        with self.assertRaisesRegex(RuntimeError,'output bound exceeded'):
+            self.commands.call([sys.executable,'-c','import os,time; os.write(1,b"x"*8192); time.sleep(30)'],
+                               timeout=2,max_output=1024)
+        self.assertLess((self.root/'commands.log').stat().st_size,2048)
+        self.assertTrue(self.commands.events[-1]['leader_reaped'])
+
+    def test_unconfirmed_process_cleanup_is_recorded_and_fatal(self):
+        import sys
+        from unittest.mock import patch
+        with patch.object(self.commands,'_verify_group_stopped',side_effect=RuntimeError('injected uncertain group')):
+            with self.assertRaisesRegex(RuntimeError,'injected uncertain group'):
+                self.commands.call([sys.executable,'-c','print("done")'])
+        self.assertTrue(self.commands.process_cleanup_uncertain)
+        self.assertFalse(self.commands.events[-1]['group_execution_stopped'])
+        self.assertIn('cleanup_error',self.commands.events[-1])
+
+    def test_cleanup_tries_every_named_container_and_checks_absence(self):
+        commands = self.commands
+        commands.containers = ['tuna-owned-one','tuna-owned-two']
+        calls = []
+        def fake(args, **kwargs):
+            calls.append(args)
+            if args[-1]=='tuna-owned-one': raise RuntimeError('injected cleanup deadline')
+            return (1,'') if 'exists' in args else (0,'')
+        commands.call = fake
+        with self.assertRaisesRegex(RuntimeError,'owned run cleanup failed'):
+            commands.cleanup_containers()
+        self.assertTrue(any(args[-1]=='tuna-owned-two' and 'exists' in args for args in calls))
+
+    def test_backing_cleanup_refuses_mounted_or_replaced_loop(self):
+        class Fake:
+            def __init__(self, mounted, replaced):self.calls=[];self.mounted=mounted;self.replaced=replaced
+            def call(self,args):
+                self.calls.append(args)
+                if 'lsblk' in args:
+                    return 0,json.dumps({'blockdevices':[{'mountpoints':['/owned/mount'] if self.mounted else []}]})
+                return 0,json.dumps({'loopdevices':[{'name':'/dev/loop77','back-file':'/foreign' if self.replaced and args[-1]=='/dev/loop77' else '/owned/disk.raw'}]})
+        for mounted,replaced in [(True,False),(False,True)]:
+            fake=Fake(mounted,replaced)
+            with self.assertRaises(ValueError):retire_backing(fake,Path('/owned/disk.raw'))
+            self.assertFalse(any('--detach' in args for args in fake.calls))
+
+    def test_exporter_uses_finite_phases_and_retains_uncertain_backing(self):
+        source=Path(__file__).resolve().parents[1].joinpath('tuna-benchmark-disk-export').read_text()
+        self.assertNotIn('subprocess.run',source)
+        self.assertNotIn('subprocess.check_output',source)
+        self.assertIn('commands.interrupted_build',source)
+        self.assertIn('commands.process_cleanup_uncertain',source)
+        self.assertLess(source.index('retire_backing(commands,'),source.index('raw.unlink('))
 
 
 if __name__=='__main__':unittest.main()
