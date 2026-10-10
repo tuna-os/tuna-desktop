@@ -495,11 +495,9 @@ impl OverviewUi {
             if attempt < 2 {
                 return gtk::glib::ControlFlow::Continue;
             }
-            let monitor = dash
-                .surface()
-                .and_then(|surface| {
-                    gtk::prelude::WidgetExt::display(dash).monitor_at_surface(&surface)
-                });
+            let monitor = dash.surface().and_then(|surface| {
+                gtk::prelude::WidgetExt::display(dash).monitor_at_surface(&surface)
+            });
             let Some(monitor) = monitor else {
                 if attempt < 30 {
                     return gtk::glib::ControlFlow::Continue;
