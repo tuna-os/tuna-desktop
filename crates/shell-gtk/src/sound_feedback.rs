@@ -10,9 +10,26 @@ thread_local! {
     static RUNNING: Cell<Option<bool>> = const { Cell::new(None) };
     static PLAYER: RefCell<Option<gio::Subprocess>> = const { RefCell::new(None) };
     static PENDING: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
+    static SETTINGS: Option<gio::Settings> = {
+        let settings = crate::media_keys::sound_settings();
+        if let Some(settings) = settings.as_ref() {
+            settings.connect_changed(Some("event-sounds"), |settings, _| {
+                if !settings.boolean("event-sounds") {
+                    PENDING.with_borrow_mut(|pending| {
+                        if let Some(id) = pending.take() { id.remove(); }
+                    });
+                    PLAYER.with_borrow_mut(|player| {
+                        if let Some(player) = player.take() { player.force_exit(); }
+                    });
+                }
+            });
+        }
+        settings
+    };
 }
 
 pub fn set_sink_running(running: Option<bool>) {
+    SETTINGS.with(|_| ());
     RUNNING.set(running);
 }
 
@@ -28,7 +45,7 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
             id.remove();
         }
     });
-    let enabled = crate::media_keys::sound_settings().is_some_and(|s| s.boolean("event-sounds"));
+    let enabled = SETTINGS.with(|s| s.as_ref().is_some_and(|s| s.boolean("event-sounds")));
     if !allowed(enabled, quiet, changed, muted, RUNNING.get()) {
         return;
     }
@@ -37,7 +54,7 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
             std::time::Duration::from_millis(30),
             move || {
                 PENDING.with_borrow_mut(|pending| pending.take());
-                let Some(settings) = crate::media_keys::sound_settings() else {
+                let Some(settings) = SETTINGS.with(Clone::clone) else {
                     return;
                 };
                 // Recheck live policy/playback after the debounce interval.
