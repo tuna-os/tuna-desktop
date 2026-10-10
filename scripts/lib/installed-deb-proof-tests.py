@@ -17,6 +17,13 @@ spec = importlib.util.spec_from_file_location('installed', ROOT / 'scripts/lib/i
 M = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(M)
 
+def copy_cursor_fixture(destination):
+    shutil.copytree(ROOT / 'share/tuna-desktop/icons', destination, symlinks=True)
+    # Model a packaged data tree; a shared developer checkout can be 0664.
+    for file in destination.rglob('*'):
+        if file.is_file() and not file.is_symlink():
+            file.chmod(0o644)
+
 
 class InstalledPolicy(unittest.TestCase):
     def process_case(self, inode=20, replacement=None, changed_field=None):
@@ -184,8 +191,7 @@ class PackagePolicy(unittest.TestCase):
         self.tools.mkdir()
         self.stage = self.dir / 'stage'
         self.stage.mkdir()
-        shutil.copytree(ROOT / 'share/tuna-desktop/icons',
-                        self.stage / 'usr/share/tuna-desktop/icons', symlinks=True)
+        copy_cursor_fixture(self.stage / 'usr/share/tuna-desktop/icons')
         for name in M.BINS:
             p = self.stage / 'usr/bin' / name
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -315,8 +321,7 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
-            shutil.copytree(ROOT / 'share/tuna-desktop/icons',
-                            root / 'share/tuna-desktop/icons', symlinks=True)
+            copy_cursor_fixture(root / 'share/tuna-desktop/icons')
             (root / 'scripts').mkdir()
             shutil.copy2(ROOT / 'scripts/tuna-cursor-assets-check',
                          root / 'scripts/tuna-cursor-assets-check')
