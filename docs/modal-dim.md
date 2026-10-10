@@ -45,8 +45,9 @@ transparent pixels, the actual GTK reduced/off settings bridge, parent removal
 live attach-modal settings disable/enable and verified owned cleanup.
 
 The GTK settings bridge watches `org.gnome.mutter attach-modal-dialogs` live.
-Disabling it removes parent dimming immediately; enabling it with an attached
-modal present starts the normal entering fade. A missing schema uses GNOME's
+Disabling it removes parent dimming immediately. Logical brightness transitions
+continue independently, matching GNOME's `_syncEnabled` gate; enabling it reveals
+the current logical brightness without restarting the fade. A missing schema uses GNOME's
 enabled default. The proof records fixture schemas when this host lacks GNOME
 51 settings; this does not qualify installed-image schema delivery. This setting
 controls brightness here; modal placement and focus policy remain separate.

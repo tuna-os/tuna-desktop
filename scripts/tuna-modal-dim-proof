@@ -230,10 +230,10 @@ try:
     move(1950)
     wait(lambda d:not d["modal_dim"]["running"] and factor(d)<.7,"dim-before-parent-close-full")
     subprocess.run(["gsettings","set","org.gnome.mutter","attach-modal-dialogs","false"],env=env,check=True)
-    wait(lambda d:not d["modal_dim"]["enabled"] and not d["modal_dim"]["parents"],"live-preference-disabled")
+    wait(lambda d:not d["modal_dim"]["enabled"] and factor(d) == 1.0,"live-preference-disabled")
     pixel_factor(screenshot("09-preference-off"),1.0)
     subprocess.run(["gsettings","set","org.gnome.mutter","attach-modal-dialogs","true"],env=env,check=True)
-    wait(lambda d:d["modal_dim"]["enabled"] and d["modal_dim"]["running"],"live-preference-reenabled")
+    wait(lambda d:d["modal_dim"]["enabled"] and not d["modal_dim"]["running"] and factor(d)<.7,"live-preference-reenabled")
     move(2450)
     wait(lambda d:not d["modal_dim"]["running"] and factor(d)<.7,"live-preference-dim-complete")
     pixel_factor(screenshot("10-preference-on"),88/127)
@@ -298,5 +298,5 @@ finally:
 
 require_owned_cleanup(manifest["owned_cleanup"])
 if success:
-    (art / "assertions.txt").write_text("MD-NATIVE pass explicit xdg-dialog modal; nonmodal transient excluded\nMD-DIM pass 500ms quad RGB-only dim; transparent pixels unchanged\nMD-OVERLAP pass two modal children; first close preserves dim\nMD-UNDIM pass 250ms quad restoration\nMD-MOTION pass actual GTK reduced/off settings bridge\nMD-PREFERENCE pass live GTK attach-modal-dialogs disable restores RGB immediately; enable fades again\nMD-DEATH pass parent destruction clears state and retained close texture keeps dim\nMD-CLEANUP pass verified private session cleanup\n")
+    (art / "assertions.txt").write_text("MD-NATIVE pass explicit xdg-dialog modal; nonmodal transient excluded\nMD-DIM pass 500ms quad RGB-only dim; transparent pixels unchanged\nMD-OVERLAP pass two modal children; first close preserves dim\nMD-UNDIM pass 250ms quad restoration\nMD-MOTION pass actual GTK reduced/off settings bridge\nMD-PREFERENCE pass live GTK attach-modal-dialogs disable restores RGB immediately; enable restores logical dim without restart\nMD-DEATH pass parent destruction clears state and retained close texture keeps dim\nMD-CLEANUP pass verified private session cleanup\n")
     print(f"native modal dim proof passed: {art}")

@@ -56,7 +56,7 @@ impl ModalDim {
             t.advance(now);
         }
         for id in alive {
-            let target = self.enabled && parents.contains(id);
+            let target = parents.contains(id);
             let old = self.entries.get(id);
             if old.is_none() && !target {
                 continue;
@@ -64,7 +64,7 @@ impl ModalDim {
             let changed = old.is_none_or(|t| t.target != target);
             if changed {
                 let from = old.map_or(1.0, |t| t.value);
-                let duration = if self.enabled && animate && policy.allows_fades() {
+                let duration = if animate && policy.allows_fades() {
                     Duration::from_secs_f64(
                         policy.adjust_ms(if target { 500.0 } else { 250.0 }) / 1000.0,
                     )
@@ -80,7 +80,7 @@ impl ModalDim {
                 };
                 t.advance(now);
                 self.entries.insert(*id, t);
-            } else if !self.enabled || !animate || !policy.allows_fades() {
+            } else if !animate || !policy.allows_fades() {
                 let t = self.entries.get_mut(id).unwrap();
                 t.duration = Duration::ZERO;
                 t.advance(now);
@@ -89,15 +89,21 @@ impl ModalDim {
         self.entries.retain(|_, t| t.target || t.value < 1.0);
     }
     pub fn multiplier(&self, id: u64) -> f32 {
-        self.entries.get(&id).map_or(1.0, |t| t.value)
+        if self.enabled {
+            self.entries.get(&id).map_or(1.0, |t| t.value)
+        } else {
+            1.0
+        }
     }
     pub fn running(&self) -> bool {
-        self.entries
-            .values()
-            .any(|t| t.value != if t.target { DIM_MULTIPLIER } else { 1.0 })
+        self.enabled
+            && self
+                .entries
+                .values()
+                .any(|t| t.value != if t.target { DIM_MULTIPLIER } else { 1.0 })
     }
     pub fn to_json(&self) -> serde_json::Value {
-        let mut entries:Vec<_> = self.entries.iter().map(|(id,t)|serde_json::json!({"parent":id,"dimmed":t.target,"multiplier":t.value,"duration_ms":t.duration.as_millis()})).collect();
+        let mut entries:Vec<_> = self.entries.iter().map(|(id,t)|serde_json::json!({"parent":id,"dimmed":t.target,"multiplier":self.multiplier(*id),"logical_multiplier":t.value,"duration_ms":t.duration.as_millis()})).collect();
         entries.sort_by_key(|v| v["parent"].as_u64());
         serde_json::json!({"enabled":self.enabled,"parents":entries,"running":self.running(),"target_multiplier":DIM_MULTIPLIER})
     }
@@ -158,23 +164,31 @@ mod tests {
         MotionPolicy::new(level, 1.0)
     }
     #[test]
-    fn live_attach_preference_disables_immediately_and_reenables_fade() {
+    fn live_attach_preference_gates_effect_without_restarting_logical_fade() {
         let mut dim = ModalDim::default();
         let alive = HashSet::from([1]);
         let parents = alive.clone();
         let policy = MotionPolicy::default();
         dim.step(&alive, &parents, Duration::ZERO, policy, true);
-        dim.step(&alive, &parents, Duration::from_millis(500), policy, true);
-        assert_eq!(dim.multiplier(1), DIM_MULTIPLIER);
+        dim.step(&alive, &parents, Duration::from_millis(250), policy, true);
+        assert!(dim.running());
         dim.set_enabled(false);
-        dim.step(&alive, &parents, Duration::from_millis(500), policy, true);
         assert_eq!(dim.multiplier(1), 1.0);
         assert!(!dim.running());
-        dim.set_enabled(true);
+        // GNOME gates the effect, independently of its logical transition.
         dim.step(&alive, &parents, Duration::from_millis(500), policy, true);
-        assert!(dim.running());
-        dim.step(&alive, &parents, Duration::from_millis(1000), policy, true);
+        assert_eq!(dim.multiplier(1), 1.0);
+        dim.set_enabled(true);
+        assert!(!dim.running());
         assert_eq!(dim.multiplier(1), DIM_MULTIPLIER);
+        dim.step(
+            &alive,
+            &HashSet::new(),
+            Duration::from_millis(500),
+            policy,
+            true,
+        );
+        assert!(dim.running());
     }
     #[test]
     fn parent_dims_500ms_and_undims_250ms_quad() {
