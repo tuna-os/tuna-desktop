@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import shutil
 from pathlib import Path
 import select
 import signal
@@ -129,6 +130,7 @@ def main():
     parser.add_argument('--identity', type=Path, required=True)
     parser.add_argument('--delivered', action='store_true', help='exercise frozen GTK/compositor through genuine nested keys and Wayland bell requests')
     parser.add_argument('--trace-processes', action='store_true', help='diagnose owned GTK audio subprocesses; not a performance run')
+    parser.add_argument('--diagnose-player', action='store_true', help='log real canberra invocations and stderr through an exec wrapper; not a performance run')
     args = parser.parse_args()
     identity, binaries = validate_identity(args.identity, args.source_revision, args.volume_client, args.bell_client, args.delivered)
     artifacts = args.artifacts.resolve()
@@ -151,6 +153,24 @@ def main():
     for key in ('WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'AT_SPI_BUS_ADDRESS',
                 'PIPEWIRE_REMOTE', 'WIREPLUMBER_CONFIG_DIR', 'WIREPLUMBER_CONFIG_PATH'):
         env.pop(key, None)
+    player_diagnostic = None
+    if args.diagnose_player:
+        player_path = shutil.which('canberra-gtk-play', path=env.get('PATH'))
+        assert player_path, 'canberra player unavailable'
+        real_player = Path(player_path).resolve()
+        diagnostic_bin = artifacts / 'diagnostic-bin'
+        diagnostic_bin.mkdir(mode=0o700)
+        wrapper = diagnostic_bin / 'canberra-gtk-play'
+        player_log = artifacts / 'canberra-player.log'
+        wrapper.write_text('#!/usr/bin/python3\nimport os,sys,time\n'
+                           + 'fd=os.open(' + repr(str(player_log)) + ',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)\n'
+                           + 'os.write(fd,(repr((time.monotonic(),os.getpid(),sys.argv))+"\\n").encode())\n'
+                           + 'os.dup2(fd,2);os.close(fd)\n'
+                           + 'os.execv(' + repr(str(real_player)) + ',[' + repr(str(real_player)) + ']+sys.argv[1:])\n')
+        wrapper.chmod(0o700)
+        env['PATH'] = str(diagnostic_bin) + os.pathsep + env.get('PATH', '')
+        player_diagnostic = {'real_player': str(real_player), 'real_player_sha256': hashlib.sha256(real_player.read_bytes()).hexdigest(),
+                             'exec_wrapper_sha256': hashlib.sha256(wrapper.read_bytes()).hexdigest(), 'log': str(player_log)}
     assert '0.4.' in run(['wireplumber', '--version'], env), 'fixture supports WirePlumber0.4 only'
     children = []
     logs = []
@@ -170,6 +190,7 @@ def main():
               'player': {'path': '/usr/bin/canberra-gtk-play', 'sha256': hashlib.sha256(Path('/usr/bin/canberra-gtk-play').read_bytes()).hexdigest()},
               'binaries': {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in binaries}}
+    report['player_diagnostic'] = player_diagnostic
     try:
         bus_socket = runtime / 'bus'
         spawn(['dbus-daemon', '--session', '--nofork', '--address=unix:path=' + str(bus_socket)], 'bus')
