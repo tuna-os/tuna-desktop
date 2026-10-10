@@ -17,7 +17,7 @@
 //!   [`StateModel::changes_since`]; a [`RevisionGap`] signals the shell must
 //!   take a fresh snapshot (ADR 0002: snapshot-on-reconnect, gaps resnapshot).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Maximum retained change-log entries; older entries are pruned.
 ///
@@ -169,6 +169,96 @@ impl StateModel {
     pub fn workspace_allowed(&self, workspace: u32) -> bool {
         self.fixed_workspace_count
             .is_none_or(|count| workspace < count)
+    }
+
+    /// GNOME's before-redraw dynamic workspace compaction. `keep_alive`
+    /// includes live startup sequences and short-lived dialog grace slots.
+    /// Preserve the active workspace and the empty slot after the last occupied
+    /// one, remove other empty slots from the end, and keep at least two.
+    pub fn reconcile_dynamic_workspaces(&mut self, keep_alive: &[u32]) -> bool {
+        if self.fixed_workspace_count.is_some() {
+            return false;
+        }
+        let occupied: BTreeSet<u64> = self
+            .windows
+            .values()
+            .filter(|window| !window.on_all_workspaces)
+            .map(|window| u64::from(window.workspace))
+            .chain(keep_alive.iter().map(|workspace| u64::from(*workspace)))
+            .collect();
+        let mut slots: Vec<u64> = self
+            .workspaces
+            .iter()
+            .copied()
+            .map(u64::from)
+            .chain(occupied.iter().copied())
+            .chain([u64::from(self.active)])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if slots.last().is_some_and(|last| occupied.contains(last)) {
+            slots.push(slots.last().copied().unwrap_or(0) + 1);
+        }
+        while slots.len() < 2 {
+            slots.push(slots.last().copied().unwrap_or(0) + 1);
+        }
+        let trailing = occupied
+            .iter()
+            .next_back()
+            .and_then(|last| slots.iter().position(|slot| slot == last))
+            .map_or(0, |index| index + 1);
+        let protected_empty = slots[trailing];
+        for index in (0..slots.len()).rev() {
+            if slots.len() == 2 {
+                break;
+            }
+            let slot = slots[index];
+            if slot != u64::from(self.active)
+                && slot != protected_empty
+                && !occupied.contains(&slot)
+            {
+                slots.remove(index);
+            }
+        }
+        let new_active = slots
+            .iter()
+            .position(|slot| *slot == u64::from(self.active))
+            .unwrap() as u32;
+        let moves: Vec<_> = self
+            .windows
+            .values()
+            .filter_map(|window| {
+                let workspace = slots
+                    .iter()
+                    .position(|slot| *slot == u64::from(window.workspace))
+                    .map_or(new_active, |index| index as u32);
+                (workspace != window.workspace).then_some((window.id, workspace))
+            })
+            .collect();
+        let workspaces: Vec<u32> = (0..slots.len() as u32).collect();
+        if moves.is_empty() && self.active == new_active && self.workspaces == workspaces {
+            return false;
+        }
+        for (id, workspace) in moves {
+            self.update(
+                id,
+                WindowUpdate {
+                    workspace: Some(workspace),
+                    ..Default::default()
+                },
+            );
+        }
+        if self.active != new_active {
+            let previous = self.active;
+            self.active = new_active;
+            self.commit(StateChange::ActiveWorkspaceChanged {
+                previous,
+                active: new_active,
+            });
+        }
+        self.workspaces = workspaces;
+        self.commit(StateChange::WorkspacesChanged);
+        true
     }
 
     /// Apply a live fixed-count preference. Windows from removed workspaces
@@ -1119,5 +1209,131 @@ mod fixed_workspace_tests {
         let revision = model.revision();
         assert!(!model.set_fixed_workspace_count(Some(36)));
         assert_eq!(model.revision(), revision);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn idle_has_two_slots_and_reconciliation_is_idempotent() {
+        let mut model = StateModel::new();
+        assert!(model.reconcile_dynamic_workspaces(&[]));
+        assert_eq!(model.workspaces(), &[0, 1]);
+        let revision = model.revision();
+        assert!(!model.reconcile_dynamic_workspaces(&[]));
+        assert_eq!(model.revision(), revision);
+    }
+
+    #[test]
+    fn occupying_last_slot_adds_one_empty_tail() {
+        let mut model = StateModel::new();
+        model.reconcile_dynamic_workspaces(&[]);
+        model.insert("First", None, 0);
+        assert!(!model.reconcile_dynamic_workspaces(&[]));
+        model.insert("Second", None, 1);
+        assert!(model.reconcile_dynamic_workspaces(&[]));
+        assert_eq!(model.workspaces(), &[0, 1, 2]);
+        assert!(!model.reconcile_dynamic_workspaces(&[]));
+    }
+
+    #[test]
+    fn gaps_compact_without_changing_window_identity_contents_or_focus() {
+        let mut model = StateModel::new();
+        let first = model.insert("First", Some("org.tuna.First"), 0);
+        let last = model.insert("Last", Some("org.tuna.Last"), 4);
+        model.set_focused(Some(last));
+        model.set_active_workspace(4);
+        assert!(model.reconcile_dynamic_workspaces(&[]));
+        assert_eq!(model.workspaces(), &[0, 1, 2]);
+        assert_eq!(model.active_workspace(), 1);
+        assert_eq!(model.focused(), Some(last));
+        assert_eq!(model.window(first).unwrap().workspace, 0);
+        let window = model.window(last).unwrap();
+        assert_eq!(window.workspace, 1);
+        assert_eq!(window.title, "Last");
+        assert_eq!(window.app_id.as_deref(), Some("org.tuna.Last"));
+        assert!(matches!(
+            model.changes.back().unwrap().1,
+            StateChange::WorkspacesChanged
+        ));
+    }
+
+    #[test]
+    fn active_empty_slot_remains_between_occupied_slots() {
+        let mut model = StateModel::new();
+        model.insert("First", None, 0);
+        model.insert("Last", None, 4);
+        model.set_active_workspace(2);
+        model.reconcile_dynamic_workspaces(&[]);
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+        assert_eq!(model.active_workspace(), 1);
+    }
+
+    #[test]
+    fn empty_slots_after_active_and_trailing_slot_are_removed() {
+        let mut model = StateModel::new();
+        model.insert("First", None, 0);
+        model.workspaces = (0..7).collect();
+        model.set_active_workspace(5);
+        // set_active_workspace eagerly prunes legacy slots; exercise the tracker topology.
+        model.workspaces = (0..7).collect();
+        model.reconcile_dynamic_workspaces(&[]);
+        assert_eq!(model.workspaces(), &[0, 1, 2]);
+        assert_eq!(model.active_workspace(), 2);
+    }
+
+    #[test]
+    fn keep_alive_preserves_empty_startup_and_dialog_slots_until_released() {
+        let mut model = StateModel::new();
+        model.insert("First", None, 0);
+        model.reconcile_dynamic_workspaces(&[1, 2]);
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+        assert!(!model.reconcile_dynamic_workspaces(&[1, 2]));
+        assert!(model.reconcile_dynamic_workspaces(&[]));
+        assert_eq!(model.workspaces(), &[0, 1]);
+    }
+
+    #[test]
+    fn all_workspace_windows_do_not_keep_empty_slots_alive() {
+        let mut model = StateModel::new();
+        let sticky = model.insert("Sticky", None, 4);
+        model.update(
+            sticky,
+            WindowUpdate {
+                on_all_workspaces: Some(true),
+                ..Default::default()
+            },
+        );
+        model.reconcile_dynamic_workspaces(&[]);
+        assert_eq!(model.workspaces(), &[0, 1]);
+        // The retained second empty slot becomes index 1; sticky home does not
+        // count as occupied and does not force a third slot.
+        assert_eq!(model.window(sticky).unwrap().workspace, 1);
+        assert!(model.window(sticky).unwrap().on_all_workspaces);
+        assert!(!model.reconcile_dynamic_workspaces(&[]));
+    }
+
+    #[test]
+    fn fixed_policy_never_compacts_or_adds_dynamic_slots() {
+        let mut model = StateModel::new();
+        model.set_fixed_workspace_count(Some(4));
+        let revision = model.revision();
+        assert!(!model.reconcile_dynamic_workspaces(&[100]));
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+        assert_eq!(model.revision(), revision);
+    }
+
+    #[test]
+    fn maximum_external_workspace_id_compacts_without_overflow() {
+        let mut model = StateModel::new();
+        let window = model.insert("Far", None, u32::MAX);
+        model.set_active_workspace(u32::MAX);
+        model.reconcile_dynamic_workspaces(&[]);
+        assert_eq!(model.workspaces(), &[0, 1]);
+        assert_eq!(model.active_workspace(), 0);
+        assert_eq!(model.window(window).unwrap().workspace, 0);
+        assert!(!model.reconcile_dynamic_workspaces(&[]));
     }
 }
