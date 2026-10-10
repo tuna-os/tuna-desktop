@@ -2,6 +2,11 @@
 //! sink. Protocol delivery/visual presentation are separate qualifications.
 #[path = "../src/bell.rs"]
 mod bell;
+// Bell deadlines use the same scheduler constant as production. The
+// remaining scheduler methods are unused by this standalone audio fixture.
+#[allow(dead_code)]
+#[path = "../src/idle_schedule.rs"]
+mod idle_schedule;
 
 fn main() {
     let mode = std::env::args().nth(1).expect("mode required");
