@@ -564,6 +564,7 @@ pub struct Runtime {
     /// snapshots; the shell never owns it.
     lock: SessionLock,
     blank: crate::lock::IdleBlank,
+    screenshot_flashes: crate::screenshot_flash::Flashes,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -920,6 +921,7 @@ impl Runtime {
                         calloop::channel::Event::Msg(Request::Shot {
                             filename,
                             window,
+                            flash,
                             reply,
                         }) => {
                             let saved = if window {
@@ -927,10 +929,31 @@ impl Runtime {
                             } else {
                                 rt.capture(&filename)
                             };
+                            if flash && saved.is_some() {
+                                rt.start_screenshot_flash(window);
+                            }
                             let _ = reply.send(saved);
                         }
                         calloop::channel::Event::Msg(Request::Windows { directory, reply }) => {
                             let _ = reply.send(rt.capture_selector_windows(&directory));
+                        }
+                        calloop::channel::Event::Msg(Request::Flash { area, reply }) => {
+                            let valid = !rt.is_locked()
+                                && rt.state.outputs.iter().any(|out| {
+                                    let [x, y, width, height] = area;
+                                    width > 0
+                                        && height > 0
+                                        && x >= out.loc.0
+                                        && y >= out.loc.1
+                                        && i64::from(x) + i64::from(width)
+                                            <= i64::from(out.loc.0) + i64::from(out.size.w)
+                                        && i64::from(y) + i64::from(height)
+                                            <= i64::from(out.loc.1) + i64::from(out.size.h)
+                                });
+                            if valid {
+                                rt.start_flash_area(area);
+                            }
+                            let _ = reply.send(valid);
                         }
                         calloop::channel::Event::Closed => {}
                     }
@@ -963,6 +986,7 @@ impl Runtime {
             triggers: TriggerState::default(),
             lock: SessionLock::new(idle_timeout_ms()),
             blank: crate::lock::IdleBlank::default(),
+            screenshot_flashes: Default::default(),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
             #[cfg(feature = "xwayland")]
@@ -2119,6 +2143,40 @@ impl Runtime {
     /// Render the primary output's current scene offscreen and save it
     /// as a PNG (`requested` when absolute, else GNOME's default path).
     /// Never while locked: nothing behind the lock may leave the session.
+    fn start_screenshot_flash(&mut self, window: bool) {
+        if self.is_locked() || !self.input_settings.motion.allows_fades() {
+            return;
+        }
+        let area = if window {
+            self.manager
+                .model()
+                .focused()
+                .and_then(|id| self.manager.geometry(id))
+        } else {
+            self.state.primary_output_name().and_then(|name| {
+                self.state
+                    .outputs
+                    .iter()
+                    .find(|output| output.name == name)
+                    .map(|output| Rectangle::<i32, Logical>::new(output.loc.into(), output.size))
+            })
+        };
+        if let Some(area) = area {
+            self.start_flash_area([area.loc.x, area.loc.y, area.size.w, area.size.h]);
+        }
+    }
+
+    fn start_flash_area(&mut self, area: [i32; 4]) {
+        if self.is_locked() || !self.input_settings.motion.allows_fades() {
+            return;
+        }
+        self.screenshot_flashes.trigger(
+            area,
+            self.animation_clock.now(),
+            Duration::from_secs_f64(self.input_settings.motion.adjust_ms(500.0) / 1000.0),
+        );
+    }
+
     pub fn capture(&mut self, requested: &std::path::Path) -> Option<std::path::PathBuf> {
         if self.is_locked() {
             return None;
@@ -3411,6 +3469,11 @@ impl Runtime {
         self.step_workspace_slide();
         self.step_size_changes();
         let now = self.animation_clock.now();
+        if locked || !self.input_settings.motion.allows_fades() {
+            self.screenshot_flashes.clear();
+        }
+        self.screenshot_flashes.expire(now);
+        let flashes = self.screenshot_flashes.samples(now);
         let allowed = crate::window_lifecycle::effects_allowed(
             self.control.overview_open(),
             self.shell_swipe.is_some(),
@@ -3509,6 +3572,7 @@ impl Runtime {
                         view,
                         self.manager.pointer_pos(),
                     ));
+                    elements.flashes = screenshot_flash_elements(&flashes, view);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
                     let paper = backdrop(
@@ -3630,6 +3694,7 @@ impl Runtime {
                         view,
                         self.manager.pointer_pos(),
                     ));
+                    elements.flashes = screenshot_flash_elements(&flashes, view);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
                     let paper = backdrop(
@@ -3654,6 +3719,11 @@ impl Runtime {
                         decor: decor.clone(),
                         above: elements.above,
                         groups: vec![
+                            elements
+                                .flashes
+                                .iter()
+                                .map(|e| ElementSignature::capture(e, 1.0))
+                                .collect(),
                             paper
                                 .iter()
                                 .map(|e| ElementSignature::capture(e, 1.0))
@@ -4005,6 +4075,8 @@ struct Scene {
     tile: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
     /// Window thumbnails over everything (the Alt+Tab switcher's).
     top: Vec<PreviewElement>,
+    /// Capture feedback is painted only on outputs, never into saved pixels.
+    flashes: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
     /// Old-frame snapshots of size-change transitions (#496), each
     /// drawn in front of `elements[index..]`, in physical pixels.
     snapshots: Vec<(usize, SnapshotElement)>,
@@ -4036,10 +4108,47 @@ impl Scene {
             above,
             tile: Vec::new(),
             top: Vec::new(),
+            flashes: Vec::new(),
             snapshots: Vec::new(),
             owners: vec![None; above],
         }
     }
+}
+
+/// The flash uses premultiplied white, with changing commit metadata so native
+/// damage includes every fade frame and the frame that removes the feedback.
+fn screenshot_flash_elements(
+    flashes: &[([i32; 4], f32)],
+    view: View,
+) -> Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement> {
+    use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Id, Kind};
+    thread_local! {
+        static IDS: [Id; crate::screenshot_flash::MAX_FLASHES] = std::array::from_fn(|_| Id::new());
+    }
+    IDS.with(|ids| {
+        flashes
+            .iter()
+            .zip(ids.iter())
+            .map(|(sample, id)| {
+                let ([x, y, width, height], alpha) = *sample;
+                let start = view.physical(f64::from(x), f64::from(y));
+                let end = view.physical(
+                    f64::from(x) + f64::from(width),
+                    f64::from(y) + f64::from(height),
+                );
+                SolidColorRenderElement::new(
+                    id.clone(),
+                    Rectangle::new(
+                        start.into(),
+                        ((end.0 - start.0).max(1), (end.1 - start.1).max(1)).into(),
+                    ),
+                    alpha.to_bits() as usize,
+                    Color32F::new(alpha, alpha, alpha, alpha),
+                    Kind::Unspecified,
+                )
+            })
+            .collect()
+    })
 }
 
 /// GNOME's tile preview (`.tile-preview`: the accent at half opacity
@@ -4381,6 +4490,7 @@ fn scene_elements(
         above,
         tile: Vec::new(),
         top: Vec::new(),
+        flashes: Vec::new(),
         snapshots,
         owners: crate::layer::front_to_back(owners),
     }
@@ -4504,6 +4614,7 @@ fn draw_scene(
         )
     });
     let shield_plan = occlusion.plan(1.0, shield.as_slice());
+    let flash_plan = occlusion.plan(1.0, &scene.flashes);
     let top_plan = occlusion.plan(scale, &scene.top);
     // Beneath the tile preview, the preview (blended), then the
     // dragged window and the layers over it, each half with the
@@ -4540,6 +4651,7 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.tile, &tile_plan).map_err(error)?;
     draw_slots(frame, scale, scene, &over, &over_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.flashes, &flash_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, visible) in over
