@@ -3504,6 +3504,12 @@ impl Runtime {
                 index += 1;
             }
         }
+        self.manager.reconcile_dynamic_workspaces(
+            self.overview_drag.is_some(),
+            now,
+            self.state.primary_size().w,
+            self.input_settings.motion,
+        );
         self.publish_state();
         self.publish_cast_outputs();
         self.publish_overview_previews();

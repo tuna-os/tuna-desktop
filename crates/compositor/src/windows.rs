@@ -318,6 +318,7 @@ pub struct WindowManager {
     window_lifecycle: crate::window_lifecycle::Lifecycle,
     workspace_policy: tuna_shell_control::WorkspacePolicy,
     workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
+    workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
     modal_dim: crate::modal_dim::ModalDim,
 }
 
@@ -447,6 +448,7 @@ impl WindowManager {
             window_lifecycle: Default::default(),
             workspace_policy: Default::default(),
             workspace_outputs: Vec::new(),
+            workspace_tracker: Default::default(),
             modal_dim: Default::default(),
         }
     }
@@ -831,6 +833,47 @@ impl WindowManager {
             .and_then(|(id, _)| self.model.window(*id))
             .and_then(|entry| self.workspace_slide.frame_placement(entry.workspace))
             .map_or(1.0, |placement| placement.alpha)
+    }
+
+    /// Reconcile topology once before redraw, after window/client requests.
+    /// An interactive drag keeps its destination indices stable until release.
+    pub fn reconcile_dynamic_workspaces(
+        &mut self,
+        overview_dragging: bool,
+        animation_now: std::time::Duration,
+        output_width: i32,
+        motion: tuna_shell_control::motion::MotionPolicy,
+    ) {
+        let keep_alive = self
+            .workspace_tracker
+            .protected_workspaces(std::time::Instant::now());
+        if self.grab.is_some() || overview_dragging {
+            return;
+        }
+        let previous_active = self.model.active_workspace();
+        if let Some(indices) = self
+            .model
+            .reconcile_dynamic_workspaces_with_remap(&keep_alive)
+        {
+            self.workspace_tracker.remap(&indices);
+            let active = self.model.active_workspace();
+            if active != previous_active {
+                // This is the same workspace after renumbering, not a user switch.
+                self.workspace_slide.observe(
+                    active,
+                    self.model.workspaces(),
+                    output_width,
+                    motion,
+                    true,
+                    animation_now,
+                );
+                self.last_active_workspace = Some(active);
+            }
+        }
+    }
+
+    pub fn workspace_lease_deadline(&self) -> Option<std::time::Instant> {
+        self.workspace_tracker.next_deadline()
     }
 
     /// The workspace switch motion (stepped by the runtime).
@@ -1534,6 +1577,27 @@ impl WindowManager {
     /// to the topmost remaining window, if any. In scroll mode the
     /// remaining columns close ranks behind it.
     fn unmap(&mut self, state: &mut State, id: u64) {
+        if let Some(entry) = self.model.window(id) {
+            let dialog_or_splash = self.windows.get(&id).is_some_and(|window| {
+                match window.surface.underlying_surface() {
+                    WindowSurface::Wayland(top) => {
+                        read_modal(top)
+                            || self.transient_parent(id).is_some()
+                            || state.closed_toplevel_parents.contains_key(top.wl_surface())
+                    }
+                    #[cfg(feature = "xwayland")]
+                    WindowSurface::X11(surface) => matches!(
+                        surface.window_type(),
+                        Some(WmWindowType::Dialog | WmWindowType::Splash)
+                    ),
+                }
+            });
+            self.workspace_tracker.window_removed(
+                entry.workspace,
+                dialog_or_splash,
+                std::time::Instant::now(),
+            );
+        }
         let return_parent = self
             .windows
             .get(&id)

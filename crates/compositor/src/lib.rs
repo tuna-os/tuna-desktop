@@ -96,6 +96,7 @@ pub mod window_icons;
 pub mod window_lifecycle;
 pub mod windows;
 pub mod workspace_policy;
+pub mod workspace_tracker;
 pub mod workspace_slide;
 #[cfg(feature = "xwayland")]
 mod x11_icons;

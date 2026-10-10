@@ -176,8 +176,18 @@ impl StateModel {
     /// Preserve the active workspace and the empty slot after the last occupied
     /// one, remove other empty slots from the end, and keep at least two.
     pub fn reconcile_dynamic_workspaces(&mut self, keep_alive: &[u32]) -> bool {
+        self.reconcile_dynamic_workspaces_with_remap(keep_alive)
+            .is_some()
+    }
+
+    /// The retained old-to-new indices let the runtime move workspace leases
+    /// together with the workspace object they protect.
+    pub fn reconcile_dynamic_workspaces_with_remap(
+        &mut self,
+        keep_alive: &[u32],
+    ) -> Option<Vec<(u32, u32)>> {
         if self.fixed_workspace_count.is_some() {
-            return false;
+            return None;
         }
         let occupied: BTreeSet<u64> = self
             .windows
@@ -237,8 +247,13 @@ impl StateModel {
             .collect();
         let workspaces: Vec<u32> = (0..slots.len() as u32).collect();
         if moves.is_empty() && self.active == new_active && self.workspaces == workspaces {
-            return false;
+            return None;
         }
+        let remap = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, old)| u32::try_from(*old).ok().map(|old| (old, index as u32)))
+            .collect();
         for (id, workspace) in moves {
             self.update(
                 id,
@@ -258,7 +273,7 @@ impl StateModel {
         }
         self.workspaces = workspaces;
         self.commit(StateChange::WorkspacesChanged);
-        true
+        Some(remap)
     }
 
     /// Apply a live fixed-count preference. Windows from removed workspaces
@@ -1313,6 +1328,22 @@ mod dynamic_workspace_tests {
         assert_eq!(model.window(sticky).unwrap().workspace, 1);
         assert!(model.window(sticky).unwrap().on_all_workspaces);
         assert!(!model.reconcile_dynamic_workspaces(&[]));
+    }
+
+    #[test]
+    fn remap_preserves_external_lease_identity_when_preceding_empty_slot_is_removed() {
+        let mut model = StateModel::new();
+        model.insert("First", None, 0);
+        model.set_active_workspace(3);
+        let remap = model.reconcile_dynamic_workspaces_with_remap(&[4]).unwrap();
+        assert_eq!(remap, [(0, 0), (3, 1), (4, 2), (5, 3)]);
+        assert_eq!(model.active_workspace(), 1);
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+        assert!(
+            model
+                .reconcile_dynamic_workspaces_with_remap(&[2])
+                .is_none()
+        );
     }
 
     #[test]

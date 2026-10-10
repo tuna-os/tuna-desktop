@@ -21,3 +21,22 @@ GNOME 51 source references:
 - https://github.com/GNOME/gnome-shell/blob/51.0/data/00_org.gnome.shell.gschema.override
 - https://github.com/GNOME/gnome-shell/blob/51.0/data/org.gnome.shell.gschema.xml.in
 - https://github.com/GNOME/gsettings-desktop-schemas/blob/51.0/schemas/org.gnome.desktop.wm.preferences.gschema.xml.in
+
+
+## Dynamic workspace tracker candidate
+
+The runtime now schedules topology reconciliation before publishing/rendering,
+after client window requests, and pauses it during pointer or overview drags.
+A real-time tracker holds a workspace for one second after a native dialog/modal
+or X11 dialog/splash is removed, following
+[GNOME Shell 51 WorkspaceTracker](https://github.com/GNOME/gnome-shell/blob/51.0/js/ui/windowManager.js).
+Compaction carries protected workspace indices forward and suppresses a spurious
+workspace-switch animation caused only by renumbering.
+
+The isolated state module has 30 passing tests; the isolated lease tracker has
+five passing tests. These checks do not qualify the production integration.
+Full Cargo checks and native runtime proofs are pending. Startup sequence and
+explicit keep-alive methods exist in the tracker, but their event producers are
+not connected yet. The idle scheduler must also consume the exported earliest
+lease deadline when this candidate is integrated. Multi-output overview and the
+remaining GNOME multitasking requirements remain open.
