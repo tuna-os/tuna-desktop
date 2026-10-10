@@ -48,8 +48,10 @@ python3 scripts/lib/tuna-sound-consumers-proof.py \
 ```
 
 The fixture currently requires WirePlumber 0.4, private PipeWire/Pulse and
-D-Bus daemons, Xvfb, wpctl/pactl/pw-record/pw-play, and a C compiler with
-Wayland client/scanner/protocol development files. It disables hardware
+D-Bus daemons, Xvfb, wpctl/pactl, and a C compiler with pkg-config,
+PipeWire and Wayland client/scanner/protocol development files. The
+`--audio-fixture pw-tools` diagnostic additionally uses pw-record/pw-play.
+It disables hardware
 monitors, rejects discovered ALSA/BlueZ devices, and uses a null sink with a
 passive recording stream. Xvfb must use `-noreset`: resetting after the last
 client disconnects otherwise rewrites its closed display-number pipe and
@@ -156,7 +158,7 @@ passed against the updated bundle at
 `/tmp/tuna-v1-sound-feedback-b02-owned-tool-1`. The default mode still requires
 all nine original cases and their original assertions.
 `--recorder-latency-samples` allows an explicit bounded capture setting;
-the default remains 256, and no setting has yet established repeatability.
+the pw-tools path has not established repeatability.
 
 The failed 1024-sample playing capture also has an offline phase analysis at
 `/tmp/tuna-v1-playing-buffer1024-analysis.json`: neighboring stable blocks
@@ -169,6 +171,30 @@ invalid and overflow buffers, and owned cleanup passed. This rejects the
 hypothesis that recorder file I/O alone explains the discontinuity; it does
 not establish whether the remaining loss is upstream playback, the graph,
 or capture scheduling. The experimental recorder remains outside the repo.
+
+Two subsequent full nine-case diagnostics used both a memory-fed tone player
+and memory recorder, retaining real PipeWire streams and the same generated
+tone bytes. Both completed with unchanged peak, sine-continuity, backend,
+source-identity, and cleanup assertions:
+`/tmp/tuna-v1-sound-feedback-b02-memory-both-1` and
+`/tmp/tuna-v1-sound-feedback-b02-memory-both-2`. Playing residuals were
+3.5817598326003 and 3.571930605143872. Recorder invalid/overflow/error counters
+and player invalid/error counters were zero. These results support the
+revised fixture on this host; they do not identify a single cause for the
+old fixture's discontinuities or qualify physical audio or performance.
+
+The reusable proof now defaults to the source-owned memory helpers and
+1024 samples. It stages their source, compiles with strict C warnings,
+records source/binary hashes and the PipeWire development version, checks
+the running executable bytes, and rejects helper errors, overflow, or
+frame-count mismatches. File I/O happens outside the process callbacks.
+The original diagnostic path remains available explicitly as
+`--audio-fixture pw-tools`; there is no automatic fallback. The integrated
+default completed its own nine-case run at
+`/tmp/tuna-v1-sound-feedback-b02-memory-tool-1`, with verified running helper
+identities and owned cleanup. Its result is independent of the earlier
+scratch diagnostics; repeat qualification of the integrated tool remains
+pending.
 
 ## Open qualification and behavior gaps
 

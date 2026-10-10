@@ -89,6 +89,9 @@ class ProofOptionsTests(unittest.TestCase):
             with self.subTest(latency=latency):
                 self.reject(['--recorder-latency-samples', latency])
 
+    def test_unknown_audio_fixture_rejected(self):
+        self.reject(['--audio-fixture', 'automatic-fallback'])
+
 
 if __name__ == '__main__':
     unittest.main()

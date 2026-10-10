@@ -15,6 +15,7 @@ import math
 import os
 import re
 import shutil
+import shlex
 from pathlib import Path
 import select
 import signal
@@ -153,7 +154,8 @@ def main():
     parser.add_argument('--trace-processes', action='store_true', help='diagnose owned GTK audio subprocesses; not a performance run')
     parser.add_argument('--diagnose-player', action='store_true', help='log real canberra invocations and stderr through an exec wrapper; not a performance run')
     parser.add_argument('--owned-overlap-only', action='store_true', help='two-case owned feedback diagnostic with a selected three-second theme; does not qualify the nine-case sound suite')
-    parser.add_argument('--recorder-latency-samples', type=int, default=256, help='requested passive capture quantum in samples (1..8192); not an input latency measurement')
+    parser.add_argument('--recorder-latency-samples', type=int, default=1024, help='requested passive capture quantum in samples (1..8192); not an input latency measurement')
+    parser.add_argument('--audio-fixture', choices=('memory', 'pw-tools'), default='memory', help='memory-fed native fixtures by default; pw-tools retains the original diagnostic path')
     args = parser.parse_args()
     if not 1 <= args.recorder_latency_samples <= 8192:
         parser.error('recorder latency samples must be in 1..8192')
@@ -218,7 +220,24 @@ def main():
               'binaries': {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in binaries}}
     report['player_diagnostic'] = player_diagnostic
+    memory_audio = {}
     try:
+        if args.audio_fixture == 'memory':
+            flags = shlex.split(run(['pkg-config', '--cflags', '--libs', 'libpipewire-0.3'], env))
+            report['memory_audio_fixture'] = {'pipewire_version': run(['pkg-config', '--modversion', 'libpipewire-0.3'], env), 'helpers': {}}
+            for kind in ('player', 'recorder'):
+                source = Path(__file__).with_name('tuna-audio-proof-' + kind + '.c')
+                staged = artifacts / source.name
+                staged.write_bytes(source.read_bytes())
+                executable = artifacts / ('tuna-audio-proof-' + kind)
+                compiler = spawn(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-O2', str(staged), '-o', str(executable)] + flags, kind + '-build')
+                compiler.wait(timeout=30)
+                assert compiler.returncode == 0, ('fixture compile', kind, compiler.returncode)
+                memory_audio[kind] = executable
+                report['memory_audio_fixture']['helpers'][kind] = {
+                    'source_path': str(source), 'source_sha256': hashlib.sha256(staged.read_bytes()).hexdigest(),
+                    'binary_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
+                }
         bus_socket = runtime / 'bus'
         spawn(['dbus-daemon', '--session', '--nofork', '--address=unix:path=' + str(bus_socket)], 'bus')
         wait_until(bus_socket.exists)
@@ -380,18 +399,30 @@ def main():
                                   for o in pipewire_graph(run(['pw-dump'], env))))
             player = None
             if case == 'playing':
-                player = spawn(['pw-play', '--target', 'tuna-sound-proof', str(tone)], 'playing-tone')
+                player_args = [str(memory_audio['player']), 'tuna-sound-proof', str(tone)] if memory_audio else ['pw-play', '--target', 'tuna-sound-proof', str(tone)]
+                player = spawn(player_args, 'playing-tone')
                 wait_until(lambda: any(o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof'
                                       and o['info'].get('state') == 'running'
                                       for o in pipewire_graph(run(['pw-dump'], env))))
             audio = artifacts / (case + '.wav')
-            recorder = spawn(['pw-record', '--target', 'tuna-sound-proof', '--rate', '48000', '--channels', '2',
+            if memory_audio:
+                recorder = spawn([str(memory_audio['recorder']), 'tuna-sound-proof', str(audio), str(args.recorder_latency_samples)], case + '-record')
+            else:
+                recorder = spawn(['pw-record', '--target', 'tuna-sound-proof', '--rate', '48000', '--channels', '2',
                               '--format', 's16', '--latency', str(args.recorder_latency_samples), '-P', 'stream.capture.sink=true node.passive=true node.name=tuna-sound-proof-recorder', str(audio)], case + '-record')
             def recorder_linked():
                 graph = pipewire_graph(run(['pw-dump'], env))
                 nodes = {o['id'] for o in graph if o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof-recorder'}
                 return any(o.get('info', {}).get('input-node-id') in nodes for o in graph)
             wait_until(recorder_linked)
+            if memory_audio:
+                for kind, child in [('recorder', recorder), ('player', player)]:
+                    if child is None:
+                        continue
+                    assert child.poll() is None, ('fixture exited early', kind)
+                    executable = Path('/proc', str(child.pid), 'exe')
+                    assert executable.resolve() == memory_audio[kind]
+                    assert hashlib.sha256(executable.read_bytes()).hexdigest() == report['memory_audio_fixture']['helpers'][kind]['binary_sha256']
             time.sleep(.2)
             graph_before = pipewire_graph(run(['pw-dump'], env))
             sink_before = [o for o in graph_before if o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof']
@@ -464,7 +495,19 @@ def main():
                 stop(recorder)
                 if player is not None:
                     stop(player)
+            if memory_audio:
+                assert recorder.returncode == 0, ('memory recorder exit', recorder.returncode)
+                capture_receipt = json.loads((artifacts / (case + '-record.log')).read_text().splitlines()[-1])
+                assert capture_receipt['errors'] == capture_receipt['invalid_buffers'] == capture_receipt['overflow_buffers'] == 0
+                if player is not None:
+                    assert player.returncode == 0, ('memory player exit', player.returncode)
+                    player_receipt = json.loads((artifacts / 'playing-tone.log').read_text().splitlines()[-1])
+                    assert player_receipt['errors'] == player_receipt['invalid_buffers'] == 0
+                    report['memory_player_receipt'] = player_receipt
             observed = measure(audio)
+            if memory_audio:
+                assert observed['frames'] == capture_receipt['frames']
+                observed['capture_receipt'] = capture_receipt
             observed['backend'] = run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'], env)
             observed['sink_before_command'] = sink_before
             observed['recorder_latency_samples'] = args.recorder_latency_samples
