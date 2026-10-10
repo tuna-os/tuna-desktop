@@ -1667,7 +1667,6 @@ impl Runtime {
             "touchpad_left_handed": self.input_settings.touchpad_left_handed,
             "locked": self.is_locked(),
             "active_workspace": model.active_workspace(),
-            "workspaces": model.workspaces(),
             "focused": focused,
             "focused_app_id": focused.and_then(app_of),
             "focused_rect": focused
@@ -1749,6 +1748,7 @@ impl Runtime {
                 .collect::<Vec<_>>(),
         });
         // Overdraw per output for the last drawn frame (#503).
+        doc["workspaces"] = serde_json::json!(model.workspaces());
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
         doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
