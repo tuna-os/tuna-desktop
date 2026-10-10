@@ -66,7 +66,11 @@ pub enum CastTarget {
 /// Where a `RecordArea` rectangle (global logical pixels) lands: the
 /// output holding its top-left corner, and the area in that output's
 /// physical pixels, clipped to it. `None` when no output holds it or
-/// nothing of it is left.
+/// nothing of it is left. Rotation-aware end to end (#345):
+/// hit-testing uses the rotated logical extent and the physical rect
+/// is the logical rect transformed into buffer pixels through
+/// Smithay's `to_buffer`, the same logical-to-buffer mapping the
+/// renderer uses for the scanout.
 pub fn area_on_output(
     outputs: &[OutputSnapshot],
     (x, y, width, height): (i32, i32, i32, i32),
@@ -75,21 +79,45 @@ pub fn area_on_output(
         return None;
     }
     let extent = |o: &OutputSnapshot| {
-        let (w, h) = crate::orientation::logical_extent(o.width, o.height, o.scale, o.transform);
-        (w, h)
+        crate::orientation::logical_extent(o.width, o.height, o.scale, o.transform)
     };
     let output = outputs.iter().find(|o| {
         let (w, h) = extent(o);
         x >= o.x && y >= o.y && x < o.x + w && y < o.y + h
     })?;
-    // Hit-testing above is rotation-aware; the physical remap below still
-    // assumes an unrotated scanout. Rotated RecordArea remap is open (#345).
-    let px = |v: i32| (f64::from(v) * output.scale).round() as i32;
-    let (left, top) = (px(x - output.x), px(y - output.y));
-    let right = px(x - output.x + width).min(output.width);
-    let bottom = px(y - output.y + height).min(output.height);
-    (right > left && bottom > top)
-        .then(|| (output.clone(), (left, top, right - left, bottom - top)))
+    let (lw, lh) = extent(output);
+    let rect = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::new(
+        (
+            f64::from(x.saturating_sub(output.x)),
+            f64::from(y.saturating_sub(output.y)),
+        )
+            .into(),
+        (f64::from(width), f64::from(height)).into(),
+    );
+    let area =
+        smithay::utils::Size::<f64, smithay::utils::Logical>::from((f64::from(lw), f64::from(lh)));
+    let mapped = rect.to_buffer(
+        output.scale,
+        crate::orientation::smithay_transform(output.transform),
+        &area,
+    );
+    let (left, top) = (
+        (mapped.loc.x.round() as i32).max(0),
+        (mapped.loc.y.round() as i32).max(0),
+    );
+    let right = ((mapped.loc.x + mapped.size.w).round() as i32).min(output.width);
+    let bottom = ((mapped.loc.y + mapped.size.h).round() as i32).min(output.height);
+    (right > left && bottom > top).then(|| {
+        (
+            output.clone(),
+            (
+                left,
+                top,
+                right.saturating_sub(left),
+                bottom.saturating_sub(top),
+            ),
+        )
+    })
 }
 
 /// A window as the D-Bus side describes it (Introspect, RecordWindow).
@@ -1159,5 +1187,35 @@ mod tests {
         // Past the unrotated height but inside the rotated one; the area
         // still fits the physical remap below the fold.
         assert!(area_on_output(&outputs, (100, 1000, 50, 50)).is_some());
+    }
+
+    #[test]
+    fn record_areas_remap_into_rotated_scanouts() {
+        // A 90° 1920x1080 panel: logical 1080x1920, buffer 1920x1080.
+        // Logical top-left lands at buffer top-right (rotated).
+        let mut portrait = snapshot("eDP-1");
+        portrait.transform = 1;
+        let outputs = [portrait];
+        let (_, area) = area_on_output(&outputs, (0, 0, 100, 50)).unwrap();
+        assert_eq!(area, (1870, 0, 50, 100));
+        // 180° lands at buffer bottom-right; the flip mirrors x only.
+        let mut upside = snapshot("eDP-1");
+        upside.transform = 2;
+        let (_, area) = area_on_output(&[upside], (0, 0, 100, 50)).unwrap();
+        assert_eq!(area, (1820, 1030, 100, 50));
+        let mut flipped = snapshot("eDP-1");
+        flipped.transform = 4;
+        let (_, area) = area_on_output(&[flipped], (0, 0, 100, 50)).unwrap();
+        assert_eq!(area, (1820, 0, 100, 50));
+        // Rotation composes with scale: a 90° panel at scale 2 shows
+        // 540x960 logical pixels.
+        let mut small = snapshot("eDP-1");
+        small.transform = 1;
+        small.scale = 2.0;
+        let (_, area) = area_on_output(&[small], (0, 0, 100, 50)).unwrap();
+        assert_eq!(area, (1820, 0, 100, 200));
+        // An area overhanging the logical edge clips to the buffer.
+        let (_, area) = area_on_output(&outputs, (1000, 1900, 200, 100)).unwrap();
+        assert_eq!(area, (0, 1000, 20, 80));
     }
 }

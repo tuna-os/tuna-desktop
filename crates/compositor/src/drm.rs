@@ -690,7 +690,30 @@ impl DrmBackend {
                 )
             }
             other => {
-                let inputs = crate::windows::translate_input(other, self.primary_size());
+                let mut inputs = crate::windows::translate_input(other, self.primary_size());
+                // Rotation (#345): absolute devices report panel-native
+                // pixels; remap them into the rotated logical frame the
+                // manager works in. Touch and absolute pointers arrive
+                // as Motion here; relative motion has its own arm.
+                if let Some(primary) = self.outputs.first() {
+                    if primary.transform != 0 {
+                        let (w, h) = (primary.size.w, primary.size.h);
+                        let transform = primary.transform;
+                        for input in &mut inputs {
+                            if let ManagerInput::Motion { pos, .. } = input {
+                                let (x, y) = crate::orientation::touch_point(
+                                    w,
+                                    h,
+                                    transform,
+                                    pos.x.round() as i32,
+                                    pos.y.round() as i32,
+                                );
+                                pos.x = f64::from(x);
+                                pos.y = f64::from(y);
+                            }
+                        }
+                    }
+                }
                 for input in &inputs {
                     if let ManagerInput::Motion { pos, .. } = input {
                         self.corner_pressure.observe_position(*pos);
