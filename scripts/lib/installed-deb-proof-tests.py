@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -192,6 +193,9 @@ class PackagePolicy(unittest.TestCase):
             p = self.stage / name
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('fixture\n')
+        shutil.copytree(ROOT / 'share/tuna-desktop/icons/Adwaita',
+                        self.stage / 'usr/share/tuna-desktop/icons/Adwaita',
+                        symlinks=True)
         self.env = dict(os.environ, PATH=str(self.tools) + ':' + os.environ['PATH'], FIXTURE=str(self.stage))
         self.tool('dpkg-deb', '''case "$1" in
 -c) find "$FIXTURE" -type f | while read -r path; do echo "-rwxr-xr-x $path"; done ;;
@@ -307,6 +311,11 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
+            shutil.copytree(ROOT / 'share/tuna-desktop/icons',
+                            root / 'share/tuna-desktop/icons', symlinks=True)
+            checker = root / 'scripts/tuna-cursor-assets-check'
+            checker.parent.mkdir(parents=True, exist_ok=True)
+            checker.symlink_to(ROOT / 'scripts/tuna-cursor-assets-check')
             output = root / 'control'
             result = subprocess.run(['sh', str(ROOT / 'scripts/tuna-release'), '--allow-dirty', '--out', str(root/'out')], cwd=root, env=dict(os.environ, PATH=str(tools)+':'+os.environ['PATH'], OUTPUT=str(output)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             return result.returncode, output.read_text() if output.exists() else None
