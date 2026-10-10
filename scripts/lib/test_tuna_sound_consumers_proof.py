@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from contextlib import redirect_stderr
+import io
 
 spec = importlib.util.spec_from_file_location('sound_proof', Path(__file__).with_name('tuna-sound-consumers-proof.py'))
 proof = importlib.util.module_from_spec(spec)
@@ -66,6 +69,25 @@ class PipeWireGraphTests(unittest.TestCase):
         for events in ('{}', '[null]', '[{"id": true}]', '[{"id": "7"}]'):
             with self.subTest(events=events), self.assertRaises(AssertionError):
                 proof.pipewire_graph(events)
+
+
+class ProofOptionsTests(unittest.TestCase):
+    def reject(self, extra):
+        argv = ['sound-proof', '--volume-client', 'unused', '--bell-client', 'unused',
+                '--artifacts', 'unused', '--source-revision', 'unused', '--identity', 'unused'] + extra
+        with patch('sys.argv', argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            proof.main()
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_overlap_requires_delivery_and_player_diagnostics(self):
+        for flags in ([], ['--delivered'], ['--diagnose-player']):
+            with self.subTest(flags=flags):
+                self.reject(['--owned-overlap-only'] + flags)
+
+    def test_capture_latency_is_bounded_before_starting_services(self):
+        for latency in ('-1', '0', '8193'):
+            with self.subTest(latency=latency):
+                self.reject(['--recorder-latency-samples', latency])
 
 
 if __name__ == '__main__':

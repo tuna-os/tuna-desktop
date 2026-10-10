@@ -136,8 +136,39 @@ residual 8.641056208623368 exceeded 5 even at 1024 samples. The receipt at
 `/tmp/tuna-v1-sound-feedback-b02-replacement-3` retains that failure and
 successful cleanup. Consequently neither recorder buffer size is qualified
 as repeatable, and this run is not an aggregate audio pass. A separate
-three-second-theme overlap diagnostic is being checked against the old
-bundle to distinguish the policy change from natural playback completion.
+three-second-theme overlap diagnostic checks the old bundle to distinguish
+the policy change from natural playback completion; its results follow.
+
+That matched comparison completed: the updated bundle passed the two-case
+overlap diagnostic at `/tmp/tuna-v1-sound-feedback-b02-overlap-1`; the old
+bundle failed exactly when waiting for the second feedback PID at
+`/tmp/tuna-v1-sound-feedback-old-overlap-control-1`. Both observed the first
+real player's Running output stream and active link before the second key,
+and both verified owned cleanup. The old receipt remains a failed run; it
+is a negative control for this policy change. This comparison does not
+qualify the full nine-case suite.
+
+The reusable proof now exposes `--owned-overlap-only`, requiring
+`--delivered --diagnose-player`, and reports its two-case scope explicitly.
+It uses a selected custom three-second sound theme because the shipped
+67 ms sound ends too quickly for the graph inspection. The new tool itself
+passed against the updated bundle at
+`/tmp/tuna-v1-sound-feedback-b02-owned-tool-1`. The default mode still requires
+all nine original cases and their original assertions.
+`--recorder-latency-samples` allows an explicit bounded capture setting;
+the default remains 256, and no setting has yet established repeatability.
+
+The failed 1024-sample playing capture also has an offline phase analysis at
+`/tmp/tuna-v1-playing-buffer1024-analysis.json`: neighboring stable blocks
+have equal amplitude and a phase jump matching one 1024-sample quantum.
+A separate memory-recorder experiment removed disk I/O from its PipeWire
+process callback and wrote the WAV only after disconnecting. The run at
+`/tmp/tuna-v1-sound-feedback-b02-memory-capture-3` still failed the unchanged
+continuity gate (residual 8.042682078299364). Its own counters reported zero
+invalid and overflow buffers, and owned cleanup passed. This rejects the
+hypothesis that recorder file I/O alone explains the discontinuity; it does
+not establish whether the remaining loss is upstream playback, the graph,
+or capture scheduling. The experimental recorder remains outside the repo.
 
 ## Open qualification and behavior gaps
 

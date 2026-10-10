@@ -152,7 +152,13 @@ def main():
     parser.add_argument('--delivered', action='store_true', help='exercise frozen GTK/compositor through genuine nested keys and Wayland bell requests')
     parser.add_argument('--trace-processes', action='store_true', help='diagnose owned GTK audio subprocesses; not a performance run')
     parser.add_argument('--diagnose-player', action='store_true', help='log real canberra invocations and stderr through an exec wrapper; not a performance run')
+    parser.add_argument('--owned-overlap-only', action='store_true', help='two-case owned feedback diagnostic with a selected three-second theme; does not qualify the nine-case sound suite')
+    parser.add_argument('--recorder-latency-samples', type=int, default=256, help='requested passive capture quantum in samples (1..8192); not an input latency measurement')
     args = parser.parse_args()
+    if not 1 <= args.recorder_latency_samples <= 8192:
+        parser.error('recorder latency samples must be in 1..8192')
+    if args.owned_overlap_only and not (args.delivered and args.diagnose_player):
+        parser.error('owned overlap requires --delivered and --diagnose-player')
     identity, binaries = validate_identity(args.identity, args.source_revision, args.volume_client, args.bell_client, args.delivered)
     artifacts = args.artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=False)
@@ -336,10 +342,30 @@ def main():
             stream.writeframes(samples.tobytes())
         report['playing_fixture'] = {'sha256': hashlib.sha256(tone.read_bytes()).hexdigest(),
                                      'frequency_hz': 440, 'sample_peak': 160}
+        if args.owned_overlap_only:
+            # The shipped feedback asset lasts only 67 ms. Use a documented
+            # selected custom theme for the overlap case, preserving the real
+            # libcanberra player, graph ownership, and production cancellation.
+            theme_dir = Path(env['XDG_DATA_HOME']) / 'sounds' / 'tuna-owned-feedback-proof'
+            (theme_dir / 'stereo').mkdir(parents=True)
+            (theme_dir / 'index.theme').write_text('[Sound Theme]\nName=Tuna owned feedback proof\nInherits=freedesktop\nDirectories=stereo\n\n[stereo]\nOutputProfile=stereo\n')
+            feedback_asset = theme_dir / 'stereo' / 'audio-volume-change.wav'
+            with wave.open(str(feedback_asset), 'wb') as stream:
+                stream.setnchannels(2); stream.setsampwidth(2); stream.setframerate(48000)
+                values = array.array('h')
+                for i in range(48000 * 3):
+                    value = round(1600 * math.sin(2 * math.pi * 440 * i / 48000))
+                    values.extend((value, value))
+                stream.writeframes(values.tobytes())
+            report['replacement_fixture'] = {'theme': 'tuna-owned-feedback-proof', 'duration_seconds': 3,
+                                             'asset_sha256': hashlib.sha256(feedback_asset.read_bytes()).hexdigest()}
+            report['scope'] = 'two-case owned-feedback overlap diagnostic; custom three-second theme; no full sound qualification'
         # Positive cases qualify the same backend used by suppression cases.
-        for case in ('up', 'quiet', 'event-disabled', 'muted', 'clamp', 'playing',
-                     'bell-audible', 'bell-silent', 'bell-event-disabled'):
+        cases = ('up', 'replacement') if args.owned_overlap_only else ('up', 'quiet', 'event-disabled', 'muted', 'clamp', 'playing', 'bell-audible', 'bell-silent', 'bell-event-disabled')
+        for case in cases:
             if args.delivered:
+                if args.owned_overlap_only:
+                    run(['gsettings', 'set', 'org.gnome.desktop.sound', 'theme-name', 'tuna-owned-feedback-proof' if case == 'replacement' else 'freedesktop'], env)
                 run(['gsettings', 'set', 'org.gnome.desktop.sound', 'event-sounds', 'false' if case in ('event-disabled', 'bell-event-disabled') else 'true'], env)
                 run(['gsettings', 'set', 'org.gnome.desktop.wm.preferences', 'audible-bell', 'false' if case == 'bell-silent' else 'true'], env)
                 run(['gsettings', 'set', 'org.gnome.desktop.sound', 'allow-volume-above-100-percent', 'true' if case == 'clamp' else 'false'], env)
@@ -360,7 +386,7 @@ def main():
                                       for o in pipewire_graph(run(['pw-dump'], env))))
             audio = artifacts / (case + '.wav')
             recorder = spawn(['pw-record', '--target', 'tuna-sound-proof', '--rate', '48000', '--channels', '2',
-                              '--format', 's16', '--latency', '256', '-P', 'stream.capture.sink=true node.passive=true node.name=tuna-sound-proof-recorder', str(audio)], case + '-record')
+                              '--format', 's16', '--latency', str(args.recorder_latency_samples), '-P', 'stream.capture.sink=true node.passive=true node.name=tuna-sound-proof-recorder', str(audio)], case + '-record')
             def recorder_linked():
                 graph = pipewire_graph(run(['pw-dump'], env))
                 nodes = {o['id'] for o in graph if o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof-recorder'}
@@ -386,6 +412,48 @@ def main():
                 command = [str(args.volume_client.resolve()), case]
             try:
                 (artifacts / (case + '-client.log')).write_text(run(command, env, timeout=10))
+                if case == 'replacement':
+                    assert args.delivered and args.diagnose_player
+                    def own_feedback_graph():
+                        entries = []
+                        if player_log.exists():
+                            for line in player_log.read_text().splitlines():
+                                try:
+                                    entry = ast.literal_eval(line)
+                                    if 'audio-volume-change' in entry[2] and entry[0] >= report['active_case']['command_started_monotonic']:
+                                        entries.append(entry)
+                                except (ValueError, SyntaxError):
+                                    pass
+                        if not entries:
+                            return False
+                        first_pid = entries[0][1]
+                        graph = pipewire_graph(run(['pw-dump'], env))
+                        sinks = {o['id'] for o in graph if o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof'}
+                        streams = {o['id'] for o in graph if o.get('info', {}).get('state') == 'running'
+                                   and o.get('info', {}).get('props', {}).get('media.class') == 'Stream/Output/Audio'
+                                   and str(o.get('info', {}).get('props', {}).get('application.process.id')) == str(first_pid)}
+                        linked = [o for o in graph if o.get('info', {}).get('output-node-id') in streams
+                                  and o.get('info', {}).get('input-node-id') in sinks and o.get('info', {}).get('state') == 'active']
+                        if not linked:
+                            return False
+                        return {'first_pid': first_pid, 'streams': sorted(streams), 'links': linked, 'running_nodes': [o for o in graph if o['id'] in streams | sinks], 'observed_monotonic': time.monotonic()}
+                    owned = wait_until(own_feedback_graph, seconds=3)
+                    report['replacement_observed'] = owned
+                    time.sleep(.04)
+                    assert Path('/proc', str(owned['first_pid']), 'exe').resolve() == real_player
+                    assert run(['xdotool', 'getwindowfocus'], env) == window
+                    run(command, env, timeout=10)
+                    def replacement_started():
+                        for line in player_log.read_text().splitlines():
+                            try:
+                                entry = ast.literal_eval(line)
+                                if 'audio-volume-change' in entry[2] and entry[1] != owned['first_pid'] and entry[0] > owned['observed_monotonic']:
+                                    return {'second_pid': entry[1], 'started_monotonic': entry[0]}
+                            except (ValueError, SyntaxError):
+                                pass
+                        return False
+                    replacement = wait_until(replacement_started, seconds=3)
+                    report['replacement'] = {**owned, **replacement, 'second_key': command}
                 if args.delivered:
                     # Production players have a five-second deadline. Keep
                     # the passive recorder linked through that whole lifetime,
@@ -399,9 +467,9 @@ def main():
             observed = measure(audio)
             observed['backend'] = run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'], env)
             observed['sink_before_command'] = sink_before
-            observed['recorder_latency_samples'] = 256
+            observed['recorder_latency_samples'] = args.recorder_latency_samples
             observed['observation_seconds'] = time.monotonic() - report['active_case']['command_started_monotonic']
-            if case in ('up', 'bell-audible'):
+            if case in ('up', 'replacement', 'bell-audible'):
                 assert observed['frames'] > 1000 and observed['peak'] > 20, (case, observed)
             elif case == 'playing':
                 # Volume0.46 scales the160-unit fixture to <20 units on this
@@ -411,7 +479,7 @@ def main():
             else:
                 assert observed['peak'] == 0, (case, observed)
             if args.delivered and not case.startswith('bell-') and case != 'clamp':
-                assert abs(float(observed['backend'].split()[1]) - (.34 if case == 'muted' else .46)) < .01, (case, observed)
+                assert abs(float(observed['backend'].split()[1]) - (.34 if case == 'muted' else (.52 if case == 'replacement' else .46))) < .01, (case, observed)
             if case == 'clamp':
                 assert float(observed['backend'].split()[1]) <= 1.0, observed
             report['cases'][case] = observed
@@ -440,7 +508,7 @@ def main():
             log.close()
         report['retired_bus_helpers'] = retire_private_processes(runtime)
         report['cleanup'] = all(child.poll() is not None for child in children)
-        report['passed'] = report['passed'] and report['cleanup'] and len(report['cases']) == 9
+        report['passed'] = report['passed'] and report['cleanup'] and len(report['cases']) == (2 if args.owned_overlap_only else 9)
         (artifacts / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
     assert report['passed']
     print(json.dumps(report))
