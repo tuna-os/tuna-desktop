@@ -70,7 +70,6 @@ const FRAME_BUDGET: Duration = Duration::from_millis(16);
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
 /// client epoll set; a duplicate keeps calloop's source lifetime independent.
-#[cfg(any(feature = "drm", test))]
 fn display_readiness_source(
     display: &Display<State>,
 ) -> std::io::Result<calloop::generic::Generic<std::os::fd::OwnedFd>> {
@@ -582,6 +581,7 @@ pub struct Runtime {
     blank: crate::lock::IdleBlank,
     screenshot_flashes: crate::screenshot_flash::Flashes,
     screenshot_replies: Vec<PendingScreenshotReply>,
+    idle_blank_signal: Option<crate::runtime_signal::CachedSignal>,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -825,6 +825,18 @@ impl Runtime {
             .ok_or_else(|| RuntimeError::Socket("XDG_RUNTIME_DIR is unset".to_owned()))?;
         let control = ControlHub::bind(control_path.clone(), tokens, crate::SEAT_NAME)
             .map_err(|e| RuntimeError::Socket(e.to_string()))?;
+        event_loop
+            .handle()
+            .insert_source(
+                control
+                    .readiness_source()
+                    .map_err(|e| RuntimeError::Loop(e.to_string()))?,
+                |_, fd, _: &mut Runtime| {
+                    crate::control_readiness::drain(fd)?;
+                    Ok(calloop::PostAction::Continue)
+                },
+            )
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let shell_policy = RestartPolicy::default();
         let mut shell = ShellDriver::new(
             shell_policy,
@@ -848,8 +860,9 @@ impl Runtime {
                 Backend::Winit(Box::new(backend))
             }
         };
-        #[cfg(feature = "drm")]
-        if matches!(backend, Backend::Drm(_)) {
+        {
+            // Accepted clients also wake the nested backend, independently of
+            // host window input. Keep the existing 16 ms safety cap.
             event_loop
                 .handle()
                 .insert_source(
@@ -1020,6 +1033,11 @@ impl Runtime {
             blank: crate::lock::IdleBlank::default(),
             screenshot_flashes: Default::default(),
             screenshot_replies: Vec::new(),
+            idle_blank_signal: std::env::var_os("XDG_RUNTIME_DIR").map(|dir| {
+                crate::runtime_signal::CachedSignal::new(
+                    std::path::PathBuf::from(dir).join("tuna-idle-blank"),
+                )
+            }),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
             #[cfg(feature = "xwayland")]
@@ -1073,6 +1091,29 @@ impl Runtime {
             #[cfg(feature = "drm")]
             performance_trace: crate::performance_trace::Trace::from_env(),
         };
+        if let Some(signal) = runtime.idle_blank_signal.as_mut() {
+            runtime.blank = crate::lock::IdleBlank::parse(signal.text());
+            match signal.source() {
+                Ok(Some(source)) => {
+                    runtime
+                        .loop_handle
+                        .insert_source(source, |_, _, rt: &mut Runtime| {
+                            let Some(signal) = rt.idle_blank_signal.as_mut() else {
+                                return Ok(calloop::PostAction::Remove);
+                            };
+                            let valid = signal.refresh();
+                            rt.blank = crate::lock::IdleBlank::parse(signal.text());
+                            Ok(if valid {
+                                calloop::PostAction::Continue
+                            } else {
+                                calloop::PostAction::Remove
+                            })
+                        })
+                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                }
+                Ok(None) | Err(_) => signal.disable(),
+            }
+        }
         runtime.animation_clock =
             crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
         let started = runtime.animation_clock.now();
@@ -1083,7 +1124,9 @@ impl Runtime {
         #[cfg(feature = "xwayland")]
         if session.xwayland {
             if let Err(error) = runtime.prepare_x11(None) {
-                eprintln!("tuna-compositor: xwayland: socket preparation failed: {error}; native session continues");
+                eprintln!(
+                    "tuna-compositor: xwayland: socket preparation failed: {error}; native session continues"
+                );
             }
         }
         // GNOME Shell greets a login with the overview.
@@ -3147,11 +3190,8 @@ impl Runtime {
     }
 
     fn tick(&mut self) -> Result<bool, RuntimeError> {
-        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let text =
-                crate::runtime_signal::read(&std::path::PathBuf::from(dir).join("tuna-idle-blank"))
-                    .unwrap_or_default();
-            self.blank = crate::lock::IdleBlank::parse(&text);
+        if let Some(signal) = self.idle_blank_signal.as_mut() {
+            self.blank = crate::lock::IdleBlank::parse(signal.text());
         }
         self.display
             .dispatch_clients(&mut self.state)

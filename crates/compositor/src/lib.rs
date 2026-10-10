@@ -52,6 +52,7 @@ mod bell;
 pub mod capture_security;
 mod constraint_motion;
 pub mod control;
+mod control_readiness;
 pub mod corner_pressure;
 #[cfg(feature = "drm")]
 pub mod drm;

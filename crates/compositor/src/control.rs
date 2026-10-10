@@ -1117,6 +1117,7 @@ pub fn is_private_dir(dir: &std::path::Path) -> bool {
 /// only mutates the model.
 pub struct ControlHub {
     listener: UnixListener,
+    readiness: crate::control_readiness::ControlReadiness,
     socket_path: std::path::PathBuf,
     sessions: Vec<Session<'static>>,
     /// Peers accepted in an earlier round: their `Hello` is due now.
@@ -1201,8 +1202,10 @@ impl ControlHub {
         let listener = UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let readiness = crate::control_readiness::ControlReadiness::new(&listener)?;
         Ok(Self {
             listener,
+            readiness,
             socket_path,
             sessions: Vec::new(),
             pending: Vec::new(),
@@ -1366,6 +1369,12 @@ impl ControlHub {
         std::mem::take(&mut session.closed)
     }
 
+    pub(crate) fn readiness_source(
+        &self,
+    ) -> std::io::Result<calloop::generic::Generic<std::os::fd::OwnedFd>> {
+        self.readiness.source()
+    }
+
     /// One nonblocking round: accept waiting peers, advance pending
     /// handshakes, catch live sessions up, and apply one command frame
     /// per session. Returns the model ids of windows the shell activated
@@ -1381,7 +1390,10 @@ impl ControlHub {
                 self.refused += 1;
                 continue;
             }
-            let _ = stream.set_nonblocking(true);
+            if stream.set_nonblocking(true).is_err() || self.readiness.add(&stream).is_err() {
+                self.refused += 1;
+                continue;
+            }
             self.fresh.push(stream);
             self.fresh_peers.push(cred);
         }
@@ -1610,5 +1622,78 @@ impl Drop for ControlHub {
     /// (which also removes it first).
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn hub_listener_hello_commands_and_peer_eviction_use_real_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let mut hub = ControlHub::bind(
+            path.clone(),
+            std::rc::Rc::new(TokenStore::new()),
+            crate::SEAT_NAME,
+        )
+        .unwrap();
+        let mut model = StateModel::new();
+        let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+        event_loop
+            .handle()
+            .insert_source(hub.readiness_source().unwrap(), |_, fd, wakes| {
+                crate::control_readiness::drain(fd).unwrap();
+                *wakes += 1;
+                Ok(calloop::PostAction::Continue)
+            })
+            .unwrap();
+        let mut wakes = 0;
+        let mut client = UnixStream::connect(&path).unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 1, "listener must wake before a periodic tick");
+        hub.poll(&mut model);
+        client
+            .write_all(&encode_frame(&Message::Hello {
+                version: CURRENT_VERSION,
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 2, "accepted peer must wake for its Hello");
+        hub.poll(&mut model);
+        assert_eq!(hub.sessions.len(), 1);
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 2, "drained control must not spin");
+        client
+            .write_all(&encode_frame(&Message::Command {
+                id: 1,
+                kind: CommandKind::ToggleOverview,
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 3);
+        hub.poll(&mut model);
+        assert!(hub.overview_open());
+        hub.set_peer_gate(PeerGate::Closed);
+        hub.poll(&mut model);
+        assert!(hub.sessions.is_empty());
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 3, "evicted socket interest must retire");
+        assert!(
+            client.write_all(b"evicted").is_err(),
+            "readiness source must not retain a duplicate peer socket"
+        );
     }
 }
