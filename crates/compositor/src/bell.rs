@@ -41,6 +41,20 @@ fn opacity(elapsed: Duration, pulses: u8) -> f32 {
 }
 
 impl Bell {
+    pub(crate) fn player_pid(&self) -> Option<u32> {
+        self.player.as_ref().map(|(child, _)| child.id())
+    }
+    pub(crate) fn player_deadline(&self) -> Option<Instant> {
+        self.player.as_ref().map(|(_, start)| {
+            let deadline = *start + Duration::from_secs(5);
+            if deadline <= Instant::now() {
+                Instant::now() + crate::idle_schedule::ACTIVE_INTERVAL
+            } else {
+                deadline
+            }
+        })
+    }
+
     pub fn set_policy(&mut self, policy: BellPolicy) {
         if !policy.visual {
             self.visual = None;

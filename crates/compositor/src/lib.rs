@@ -53,6 +53,10 @@ pub mod capture_security;
 mod constraint_motion;
 pub mod control;
 mod control_readiness;
+mod wake;
+mod idle_schedule;
+mod process_wake;
+mod shutdown_wake;
 pub mod corner_pressure;
 #[cfg(feature = "drm")]
 pub mod drm;

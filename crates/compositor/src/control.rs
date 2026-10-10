@@ -88,6 +88,14 @@ pub struct ControlConn {
 }
 
 impl ControlConn {
+    fn buffered_work(&self) -> bool {
+        let Some(header) = self.rbuf.get(..4) else {
+            return false;
+        };
+        let len = u32::from_le_bytes(header.try_into().expect("four byte header")) as usize;
+        len > MAX_FRAME_BYTES || self.rbuf.len() >= 4 + len
+    }
+
     /// Wrap a connected stream and put it in nonblocking mode.
     pub fn new(stream: UnixStream) -> Result<Self, ControlError> {
         stream.set_nonblocking(true)?;
@@ -1266,6 +1274,22 @@ impl ControlHub {
     }
 
     /// Accepted peers still waiting for their handshake round.
+    pub(crate) fn needs_continuation(&self, model: &StateModel) -> bool {
+        !self.fresh.is_empty()
+            || !self.pending.is_empty()
+            || self.sessions.iter().any(|session| {
+                session.conn.buffered_work()
+                    || session.last_revision != model.revision()
+                    || session.locked_sent != self.locked.get()
+            })
+            || self.overview.get() != self.overview_sent
+            || self.outputs != self.outputs_sent
+            || self.environment != self.environment_sent
+            || self.previews != self.previews_sent
+            || !self.switcher_queue.is_empty()
+            || !self.menu_queue.is_empty()
+            || !self.accelerator_queue.is_empty()
+    }
     pub fn pending_count(&self) -> usize {
         self.pending.len() + self.fresh.len()
     }
@@ -1648,6 +1672,22 @@ mod readiness_tests {
     use std::time::Duration;
 
     #[test]
+    fn buffered_complete_frames_require_continuation_but_partial_frames_wait_for_io() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut conn = ControlConn::new(stream).unwrap();
+        conn.rbuf = vec![1, 0, 0];
+        assert!(!conn.buffered_work());
+        conn.rbuf = vec![2, 0, 0, 0, 1];
+        assert!(!conn.buffered_work());
+        conn.rbuf.push(2);
+        assert!(conn.buffered_work());
+        conn.rbuf = (MAX_FRAME_BYTES as u32 + 1).to_le_bytes().to_vec();
+        assert!(
+            conn.buffered_work(),
+            "invalid buffered header must be rejected without another socket edge"
+        );
+    }
+    #[test]
     fn hub_listener_hello_commands_and_peer_eviction_use_real_readiness() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1675,6 +1715,10 @@ mod readiness_tests {
             .unwrap();
         assert_eq!(wakes, 1, "listener must wake before a periodic tick");
         hub.poll(&mut model);
+        assert!(
+            hub.needs_continuation(&model),
+            "accepted Hello phase needs a bounded continuation"
+        );
         client
             .write_all(&encode_frame(&Message::Hello {
                 version: CURRENT_VERSION,

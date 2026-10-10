@@ -17,6 +17,9 @@ pub struct Flashes {
 }
 
 impl Flashes {
+    pub(crate) fn running(&self) -> bool {
+        !self.entries.is_empty()
+    }
     pub fn trigger(&mut self, area: [i32; 4], now: Duration, duration: Duration) {
         self.expire(now);
         if area[2] <= 0 || area[3] <= 0 || duration.is_zero() {

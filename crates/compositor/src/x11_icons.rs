@@ -12,19 +12,25 @@ const MAX_WORDS: u32 = 1_048_576;
 type Request = (u32, Vec<(u32, u64)>);
 type Reply = (u32, Vec<(u32, u64, Option<Raster>)>);
 pub struct Reader {
+    wake: crate::wake::Wake,
     requests: SyncSender<Request>,
     replies: Receiver<Reply>,
     last: Instant,
 }
 impl Reader {
     pub fn new() -> Self {
+        let wake = crate::wake::Wake::default();
+        let worker_wake = wake.clone();
         let (requests, rx) = mpsc::sync_channel::<Request>(1);
         let (tx, replies) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("tuna-x11-icons".into())
             .spawn(move || {
+                let _lifetime = worker_wake.completion();
+                let tx = tx;
                 let mut connection = None;
                 while let Ok((display, windows)) = rx.recv() {
+                    let _completion = worker_wake.completion();
                     if connection.as_ref().is_none_or(|(d, _, _)| *d != display) {
                         connection =
                             smithay::reexports::x11rb::connect(Some(&format!(":{display}")))
@@ -65,10 +71,17 @@ impl Reader {
             })
             .expect("X11 icon worker");
         Self {
+            wake,
             requests,
             replies,
             last: Instant::now() - Duration::from_secs(1),
         }
+    }
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
+    pub(crate) fn next_deadline(&self) -> Instant {
+        self.last + Duration::from_millis(500)
     }
     pub fn poll(
         &mut self,
@@ -81,9 +94,10 @@ impl Reader {
                 result = r;
             }
         }
-        if self.last.elapsed() >= Duration::from_millis(500)
-            && self.requests.try_send((display, windows)).is_ok()
-        {
+        if self.last.elapsed() >= Duration::from_millis(500) {
+            let _ = self.requests.try_send((display, windows));
+            // A full or closed bounded queue must not leave an expired deadline.
+            // Replies independently wake the loop; the next probe remains bounded.
             self.last = Instant::now();
         }
         result

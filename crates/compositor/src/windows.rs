@@ -3066,7 +3066,12 @@ impl WindowManager {
 
     /// Whether the strip view is still moving toward its target.
     pub fn strip_animating(&self) -> bool {
-        self.mode == SessionMode::Scroll && self.strip_shown != self.strip_offset
+        self.mode == SessionMode::Scroll
+            && (self.strip_shown != self.strip_offset
+                || self
+                    .column_animations
+                    .values()
+                    .any(crate::animation::ColumnSpring::running))
     }
 
     /// Jump the drawn view onto the target (no animation).

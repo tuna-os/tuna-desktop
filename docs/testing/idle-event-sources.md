@@ -1,42 +1,63 @@
-# Compositor idle wake plumbing
+# Compositor idle wake scheduling
 
-The compositor retains its 16 ms dispatch timeout. This change establishes
-wake sources and removes repetitive idle-blank file reads; it does not yet
-make the compositor block indefinitely at idle or demonstrate a CPU win.
+The compositor waits for the earliest real obligation or a registered event.
+An idle session can block without the former unconditional 16 ms tick.
+Active animations, refresh protocol obligations, buffered control work and
+failed watches retain the existing 16 ms service cap. This is source behavior,
+not evidence of a measured CPU, GPU, power or GNOME performance advantage.
 
-ControlHub keeps a Linux epoll set for its listener and each admitted accepted
-stream. A duplicated epoll descriptor wakes calloop; no accepted stream is
-duplicated by the watcher. Closing the original stream automatically removes
-its interest, including failed handshakes and peer-gate eviction. Edge
-notifications are drained in bounded batches; parsing, peer policy and the
-one-command-per-session behavior remain in ControlHub::poll. The periodic
-safety tick still processes handshake phases and already-buffered commands.
-Do not widen the timeout without accounting for those tasks.
+## Sources and deadlines
 
-The Wayland display's accepted-client epoll descriptor now wakes nested and
-native sessions. The listening socket alone reports new connections, not
-requests on existing clients.
+| Obligation | Wake or deadline |
+| --- | --- |
+| Native and nested Wayland clients | Listening socket and accepted-client display epoll descriptor |
+| Shell control | Hub epoll listener/accepted sockets; bounded continuation for handshake phases, complete buffered frames, dirty broadcasts and model changes |
+| Owned shell, Orca, IBus/XIM, bell player | Owned unreaped-child pidfds; readable source removes itself; failed observation or deferred reap retains active fallback |
+| Sleep monitor | Coalesced ping after publishing lock/wake flags; unlock generation invalidates before the lock flag |
+| Orca observation, IBus address probe, wallpaper identity/decode/card, X11 icons | Coalesced worker result/disconnect ping; result sender retires before final completion ping, including unwind |
+| IdleMonitor D-Bus | Registration/removal ping and earliest unfired idle interval; active watches wait for real input |
+| Shell/IME/Orca/Xwayland restart | Existing retry deadline and attempt budget, no timer for exhausted/disabled supervision |
+| Wallpaper source identity | Existing one-second observation interval for the current source, excluded while its worker is pending |
+| X11 icons | Existing 500 ms probe interval while XWM is ready, bounded full-queue retry |
+| Lock and idle blank | Actual idle threshold; 16 ms only during blank fade; held inhibitors suppress deadlines and their removal resets the input clock anchor |
+| Overview, strip/column, workspace, size change, window lifecycle, tile preview, screenshot flash/reply | Active motion cap on real animation time; held workspace swipe waits for input; manual proof time waits for its file source |
+| Bell visuals/player timeout | Real-time visual service and existing five-second player limit, independent of a manual animation clock |
+| Cast | Existing 33 ms streaming cadence; failed/no-buffer capture uses active bounded retry; PipeWire and revocation sources already wake calloop |
+| Frame callbacks, FIFO/commit timer obligations | Existing refresh service cap, with release still performed only by the existing drawn-frame / KMS pageflip paths |
+| KMS presentation | Registered DRM pageflip source; pending output scanout is never fabricated or overwritten by this scheduler |
+| Shutdown | signal-hook nonblocking self-pipe plus atomic flag; handlers unregister with their runtime |
 
-The idle-blank signal is initially read after installing a parent-directory
-inotify watch. Target-file edits, atomic rename, deletion, recreation and
-metadata changes invalidate the cache. Queue overflow forces a conservative
-rescan. Directory removal/move, watch loss and read errors remove the loop
-source and restore the prior per-tick fallback. Watch creation failure also
-retains fallback. Reads still reject symlinks, special files, oversize and
-invalid UTF-8 signals. An invalid cache is parsed with the existing disabled
-blanking fallback. The wire schema and writer contract do not change.
+Client keyboard repeats remain governed by wl_keyboard.repeat_info. The
+scheduler does not invent a compositor repeat timer or release a presentation
+barrier merely because wall time passed. Hidden/pending protocol obligations
+can conservatively retain refresh service rather than being treated as an
+unconditionally idle scene.
 
-## Before relaxing idle dispatch
+## File watches and fallback
 
-Further work must provide wakeable sleep/Orca/wallpaper worker completion,
-idle-watch registration and child-exit observation, and schedule actual lock,
-blank fade, animation, screencast, restart and protocol deadlines. Shutdown
-signals must interrupt the loop. GTK control reconciliation needs socket
-readiness plus bounded allocation/animation follow-ups so switcher thumbnail
-geometry remains correct after GTK layout and during scrolling. A simple
-no-message early return or a larger fixed timeout is insufficient.
+Idle-blank, wallpaper, and instrumented animation-clock/swipe files use
+parent-directory inotify watches. Target edits, atomic rename, deletion,
+recreation and metadata changes rescan the cache. Overflow rescans; directory
+move/removal, watch loss, read errors, or the bounded callback cap retire the
+source and restore active polling. The callback cap deliberately invalidates
+the cache because a prefetched later watch-loss event cannot safely be lost.
 
-Qualification needs stable exact-source binaries, delivered input/control
-and timer regression proofs, and a matched native paired CPU benchmark.
-Nested wake tests cannot establish a physical GPU/power or GNOME performance
-advantage.
+Reads reject symlinks, special files, oversize and invalid UTF-8. Small proof
+and idle signals keep their 4096-byte limit; wallpaper retains its existing
+16 KiB contract. The wire schema and writer contracts do not change.
+
+## Qualification
+
+Focused source tests cover deadline ordering/manual time/inhibition removal,
+worker completion and failure publication order, real child pidfd exit/removal,
+signal wake/drain, control buffered frames/phases, IdleMonitor registration,
+wallpaper identity eligibility, and watch rename/delete/loss/flood fallback.
+They do not establish runtime rendering or performance equivalence.
+
+Run the compositor library suite and strict Clippy for both supported feature
+sets, then build and freeze exact-source binaries under the shared build guard.
+Re-run matched native delivered input/control, manual animation clock, lock/
+blank/inhibitor, screenshot feedback, casts, sleep/auth generation and shell
+restart proofs. GTK retains its separate allocation/reconciliation polling;
+this batch makes no GTK idle optimization claim. Finally run a matched native
+paired CPU/power benchmark with valid counters and presentation receipts.

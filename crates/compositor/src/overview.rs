@@ -806,6 +806,19 @@ impl Default for OverviewMotion {
 }
 
 impl OverviewMotion {
+    pub(crate) fn animating(&self) -> bool {
+        !self.progress.done()
+            || !self.search.done()
+            || !self.drag_shrink.done()
+            || self.hover.iter().any(|(_, tween)| !tween.done())
+            || self
+                .morph
+                .as_ref()
+                .is_some_and(|(_, tween, _)| !tween.done())
+            || self.revert.as_ref().is_some_and(|(_, tween)| !tween.done())
+            || self.pending.is_some()
+    }
+
     /// The drawn transition: 0 the desktop, 1 the overview.
     pub fn progress(&self) -> f64 {
         self.progress.value()

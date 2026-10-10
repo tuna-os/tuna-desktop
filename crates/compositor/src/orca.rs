@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tuna_shell_control::ScreenReaderState as State;
 
 pub struct Reader {
+    wake: crate::wake::Wake,
     display: String,
     enabled: bool,
     child: Option<Child>,
@@ -22,6 +23,7 @@ impl Reader {
     pub fn new(display: &str) -> Self {
         Self {
             display: display.into(),
+            wake: Default::default(),
             enabled: false,
             child: None,
             observed: None,
@@ -30,6 +32,12 @@ impl Reader {
             attempts: 0,
             next_start: Instant::now(),
         }
+    }
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        (self.enabled && self.child.is_none() && self.attempts < 3).then_some(self.next_start)
     }
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
@@ -113,22 +121,26 @@ impl Reader {
                 Ok(None) => observed_running = true,
             }
         }
-        if let Some(receiver) = &self.observed {
-            if let Ok((pid, state, reason)) = receiver.try_recv() {
-                if self.pid() == Some(pid) {
-                    if state == State::Active {
-                        self.state = state;
-                    } else {
-                        if diagnostics_visible {
-                            eprintln!(
-                                "TUNA_ORCA_DIAGNOSTIC stage={} pid={} attempt={} observed_running={}",
-                                reason, pid, self.attempts, observed_running
-                            );
-                        }
-                        self.stop();
-                        self.state = state;
-                        self.attempts = 3;
+        let observation = self.observed.as_ref().map(|receiver| receiver.try_recv());
+        if matches!(observation, Some(Err(mpsc::TryRecvError::Disconnected))) {
+            self.stop();
+            self.state = State::Unavailable;
+            self.attempts = 3;
+        }
+        if let Some(Ok((pid, state, reason))) = observation {
+            if self.pid() == Some(pid) {
+                if state == State::Active {
+                    self.state = state;
+                } else {
+                    if diagnostics_visible {
+                        eprintln!(
+                            "TUNA_ORCA_DIAGNOSTIC stage={} pid={} attempt={} observed_running={}",
+                            reason, pid, self.attempts, observed_running
+                        );
                     }
+                    self.stop();
+                    self.state = state;
+                    self.attempts = 3;
                 }
             }
         }
@@ -159,12 +171,19 @@ impl Reader {
                     self.child = Some(child);
                     self.state = State::Starting;
                     self.observed = Some(receiver);
-                    std::thread::spawn(move || loop {
-                        let (state, reason) = observe_orca_name(pid);
-                        if sender.send((pid, state, reason)).is_err() || state != State::Active {
-                            break;
+                    let wake = self.wake.clone();
+                    std::thread::spawn(move || {
+                        let _completion = wake.completion();
+                        let sender = sender;
+                        loop {
+                            let (state, reason) = observe_orca_name(pid);
+                            let sent = sender.send((pid, state, reason));
+                            wake.signal();
+                            if sent.is_err() || state != State::Active {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_secs(1));
                         }
-                        std::thread::sleep(Duration::from_secs(1));
                     });
                 }
                 Err(error) => {
@@ -392,5 +411,23 @@ mod tests {
         assert!(other.try_wait().unwrap().is_none());
         other.kill().unwrap();
         other.wait().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    #[test]
+    fn broken_observer_stops_bounded_retry_and_never_leaves_a_stale_deadline() {
+        let mut reader = Reader::new("isolated-test");
+        let (send, receive) = mpsc::channel();
+        drop(send);
+        reader.observed = Some(receive);
+        reader.enabled = true;
+        reader.attempts = 1;
+        assert_eq!(reader.poll(false), Some(State::Unavailable));
+        assert_eq!(reader.attempts, 3);
+        assert_eq!(reader.next_deadline(), None);
+        assert!(reader.observed.is_none());
     }
 }

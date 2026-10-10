@@ -9,12 +9,15 @@ use std::path::Path;
 const MAX_BYTES: u64 = 4096;
 
 pub(crate) fn read(path: &Path) -> io::Result<String> {
+    read_bounded(path, MAX_BYTES)
+}
+pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+    if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime signal must be a small regular file",
@@ -23,8 +26,8 @@ pub(crate) fn read(path: &Path) -> io::Result<String> {
     // The file can grow after metadata inspection. Limit the descriptor read
     // too, with one extra byte to detect overflow rather than accept a prefix.
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_BYTES {
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime signal exceeds its size limit",
@@ -37,6 +40,21 @@ pub(crate) fn read(path: &Path) -> io::Result<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_bounded_wallpaper_signal_preserves_sixteen_kib_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallpaper");
+        std::fs::write(&path, vec![b'x'; 16 * 1024]).unwrap();
+        let mut signal = CachedSignal::new_bounded(path.clone(), 16 * 1024);
+        assert_eq!(signal.text().len(), 16 * 1024);
+        assert!(
+            read(&path).is_err(),
+            "small proof signal limit remains unchanged"
+        );
+        std::fs::write(&path, vec![b'x'; 16 * 1024 + 1]).unwrap();
+        signal.refresh();
+        assert_eq!(signal.text(), "");
+    }
     #[test]
     fn regular_runtime_signals_follow_atomic_policy_replacement() {
         let dir = tempfile::tempdir().unwrap();
@@ -92,7 +110,9 @@ mod tests {
 
 /// Cache a small signal behind a directory watch so atomic replacement stays
 /// observable. Watch failure retains the previous per-tick read behavior.
+#[derive(Debug)]
 pub(crate) struct CachedSignal {
+    max_bytes: u64,
     path: std::path::PathBuf,
     watch: Option<std::os::fd::OwnedFd>,
     valid: bool,
@@ -100,6 +120,12 @@ pub(crate) struct CachedSignal {
 }
 impl CachedSignal {
     pub fn new(path: std::path::PathBuf) -> Self {
+        Self::new_bounded(path, MAX_BYTES)
+    }
+    pub fn watched(&self) -> bool {
+        self.valid
+    }
+    pub fn new_bounded(path: std::path::PathBuf, max_bytes: u64) -> Self {
         use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
         // Install before initial read so changes racing startup remain queued.
         let watch = path.parent().and_then(|parent| {
@@ -121,8 +147,9 @@ impl CachedSignal {
             Some(fd)
         });
         let valid = watch.is_some();
-        let value = read(&path).unwrap_or_default();
+        let value = read_bounded(&path, max_bytes).unwrap_or_default();
         Self {
+            max_bytes,
             path,
             watch,
             valid,
@@ -149,7 +176,7 @@ impl CachedSignal {
     }
     pub fn text(&mut self) -> &str {
         if !self.valid {
-            self.value = read(&self.path).unwrap_or_default();
+            self.value = read_bounded(&self.path, self.max_bytes).unwrap_or_default();
         }
         &self.value
     }
@@ -194,7 +221,7 @@ impl CachedSignal {
             }
         }
         if dirty {
-            self.value = read(&self.path).unwrap_or_default();
+            self.value = read_bounded(&self.path, self.max_bytes).unwrap_or_default();
         }
         self.valid
     }

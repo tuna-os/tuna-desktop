@@ -25,6 +25,7 @@ const RESTART_DELAY_MS: u64 = 2_000;
 
 /// The supervised bridge process.
 pub struct ImeBridge {
+    wake: crate::wake::Wake,
     bin: PathBuf,
     wayland_display: String,
     child: Option<Child>,
@@ -39,6 +40,31 @@ pub struct ImeBridge {
 }
 
 impl ImeBridge {
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
+    pub(crate) fn child_pids(&self) -> Vec<u32> {
+        [&self.child, &self.xim, &self.retired_xim]
+            .into_iter()
+            .filter_map(|child| child.as_ref().map(Child::id))
+            .collect()
+    }
+    pub(crate) fn next_delay(&self, now: u64) -> Option<Duration> {
+        let native = (self.child.is_none() && self.starts <= MAX_RESTARTS)
+            .then_some(self.next_ms.saturating_sub(now));
+        let xim = (self.x11_display.is_some()
+            && self.xim.is_none()
+            && self.retired_xim.is_none()
+            && self.xim_address_probe.is_none()
+            && self.xim_starts <= MAX_RESTARTS)
+            .then_some(self.xim_next_ms.saturating_sub(now));
+        native
+            .into_iter()
+            .chain(xim)
+            .min()
+            .map(Duration::from_millis)
+    }
+
     /// The bridge to run for this session, if any: `TUNA_IBUS=0` turns
     /// it off; otherwise it runs when IBus is installed (`ibus-daemon`
     /// on `PATH`) and the bridge binary is found (`TUNA_IBUS_BRIDGE_BIN`,
@@ -75,6 +101,7 @@ impl ImeBridge {
             xim_address_probe: None,
             xim_starts: 0,
             xim_next_ms: 0,
+            wake: Default::default(),
         })
     }
 
@@ -165,7 +192,10 @@ impl ImeBridge {
                 PathBuf::from("/usr/lib64/ibus/ibus-x11"),
             ])
             .find(|path| path.is_file());
-        let Some(bin) = bin else { return };
+        let Some(bin) = bin else {
+            self.xim_next_ms = now_ms + RESTART_DELAY_MS;
+            return;
+        };
         // A single worker owns the private address lookup and its pipe. The
         // compositor tick only receives a bounded result without waiting.
         let Some(probe) = &self.xim_address_probe else {
@@ -179,10 +209,14 @@ impl ImeBridge {
             let (send, receive) = mpsc::sync_channel(1);
             self.xim_starts += 1;
             self.xim_next_ms = now_ms + RESTART_DELAY_MS;
+            let completion = self.wake.completion();
             if std::thread::Builder::new()
                 .name("tuna-xim-address".into())
                 .stack_size(256 * 1024)
                 .spawn(move || {
+                    let _completion = completion;
+                    // Drop the result sender before the completion wake, including unwind.
+                    let send = send;
                     let _ = send.send(bounded_address_probe(command));
                 })
                 .is_ok()
@@ -445,6 +479,7 @@ mod tests {
             xim_address_probe: None,
             xim_starts: MAX_RESTARTS + 1,
             xim_next_ms: 456,
+            wake: Default::default(),
         };
         bridge.set_ready_x11_display(Some(5));
         assert_eq!(bridge.xim.as_ref().unwrap().id(), pid);
