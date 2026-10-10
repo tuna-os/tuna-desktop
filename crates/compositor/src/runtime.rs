@@ -88,6 +88,26 @@ mod display_readiness_tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
+    fn modal_parent_fades_need_real_timer_work_but_not_manual_clock_ticks() {
+        let mut dim = crate::modal_dim::ModalDim::default();
+        let alive = std::collections::HashSet::from([1]);
+        let policy = tuna_shell_control::motion::MotionPolicy::default();
+        dim.step(&alive, &alive, Duration::ZERO, policy, true);
+        assert!(dim.running());
+        let mut schedule = crate::idle_schedule::Schedule::default();
+        schedule.motion(false, dim.running());
+        assert_eq!(schedule.wait(), Some(FRAME_BUDGET));
+        let mut manual = crate::idle_schedule::Schedule::default();
+        manual.motion(true, dim.running());
+        assert_eq!(manual.wait(), None);
+        dim.step(&alive, &alive, Duration::from_secs(1), policy, true);
+        assert!(!dim.running());
+        let mut settled = crate::idle_schedule::Schedule::default();
+        settled.motion(false, dim.running());
+        assert_eq!(settled.wait(), None);
+    }
+
+    #[test]
     fn accepted_wayland_requests_wake_the_loop_and_drained_clients_do_not_spin() {
         let mut compositor = crate::TestCompositor::new();
         let (server, mut client) = UnixStream::pair().unwrap();
@@ -3380,6 +3400,7 @@ impl Runtime {
                     && !self.manager.workspace_slide().following())
                 || self.manager.size_changes().in_flight()
                 || self.manager.window_lifecycle().running()
+                || self.manager.modal_dim().running()
                 || self.screenshot_flashes.running()
                 || !self.screenshot_replies.is_empty()
                 || self.tile_animation.as_ref().is_some_and(|(_, _, start)| {
