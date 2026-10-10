@@ -390,7 +390,7 @@ impl Wallpaper {
                         output.h,
                         started.elapsed().as_millis()
                     );
-                    let _ = send.send(pixels);
+                    let _ = result_sender.send(pixels);
                 });
             if spawned.is_ok() {
                 self.pending.push(Pending {
