@@ -42,14 +42,16 @@ cache, clear every workspace package before switching checkouts. The proof
 records binary hashes, source identity, state samples and actual screenshots.
 It checks normal transient exclusion, 500/250 ms pixels, two-modal overlap,
 transparent pixels, the actual GTK reduced/off settings bridge, parent removal
-and verified owned cleanup.
+live attach-modal settings disable/enable and verified owned cleanup.
 
-Temporary deviation (owner: Tuna Desktop v1 implementation): the compositor
-currently treats GNOME's `attach-modal-dialogs` preference as enabled and does
-not honor a live false value. This default-case implementation must not be
-reported as matching GNOME when that preference is disabled.
+The GTK settings bridge watches `org.gnome.mutter attach-modal-dialogs` live.
+Disabling it removes parent dimming immediately; enabling it with an attached
+modal present starts the normal entering fade. A missing schema uses GNOME's
+enabled default. The proof records fixture schemas when this host lacks GNOME
+51 settings; this does not qualify installed-image schema delivery. This setting
+controls brightness here; modal placement and focus policy remain separate.
 
 This implements the native normal scene. Paired GNOME captures, native GPU/DRM,
-X11 modal classification, overview preview dimming, live attach-modal-dialogs
-preference, color-management precision, nested modal stacks and performance
+X11 modal classification, overview preview dimming, installed settings delivery,
+color-management precision, nested modal stacks and performance
 remain unqualified. The ledger therefore remains partial.

@@ -26,11 +26,22 @@ impl Transition {
         self.value = self.from + (to - self.from) * (1.0 - (1.0 - p).powi(2));
     }
 }
-#[derive(Default)]
 pub struct ModalDim {
+    enabled: bool,
     entries: HashMap<u64, Transition>,
 }
+impl Default for ModalDim {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            entries: HashMap::new(),
+        }
+    }
+}
 impl ModalDim {
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
     /// Desired membership is a set, so additional dialogs never restart a fade.
     pub fn step(
         &mut self,
@@ -45,7 +56,7 @@ impl ModalDim {
             t.advance(now);
         }
         for id in alive {
-            let target = parents.contains(id);
+            let target = self.enabled && parents.contains(id);
             let old = self.entries.get(id);
             if old.is_none() && !target {
                 continue;
@@ -53,7 +64,7 @@ impl ModalDim {
             let changed = old.is_none_or(|t| t.target != target);
             if changed {
                 let from = old.map_or(1.0, |t| t.value);
-                let duration = if animate && policy.allows_fades() {
+                let duration = if self.enabled && animate && policy.allows_fades() {
                     Duration::from_secs_f64(
                         policy.adjust_ms(if target { 500.0 } else { 250.0 }) / 1000.0,
                     )
@@ -69,7 +80,7 @@ impl ModalDim {
                 };
                 t.advance(now);
                 self.entries.insert(*id, t);
-            } else if !animate || !policy.allows_fades() {
+            } else if !self.enabled || !animate || !policy.allows_fades() {
                 let t = self.entries.get_mut(id).unwrap();
                 t.duration = Duration::ZERO;
                 t.advance(now);
@@ -88,7 +99,7 @@ impl ModalDim {
     pub fn to_json(&self) -> serde_json::Value {
         let mut entries:Vec<_> = self.entries.iter().map(|(id,t)|serde_json::json!({"parent":id,"dimmed":t.target,"multiplier":t.value,"duration_ms":t.duration.as_millis()})).collect();
         entries.sort_by_key(|v| v["parent"].as_u64());
-        serde_json::json!({"parents":entries,"running":self.running(),"target_multiplier":DIM_MULTIPLIER})
+        serde_json::json!({"enabled":self.enabled,"parents":entries,"running":self.running(),"target_multiplier":DIM_MULTIPLIER})
     }
 }
 
@@ -145,6 +156,25 @@ mod tests {
     use tuna_shell_control::motion::MotionLevel;
     fn p(level: MotionLevel) -> MotionPolicy {
         MotionPolicy::new(level, 1.0)
+    }
+    #[test]
+    fn live_attach_preference_disables_immediately_and_reenables_fade() {
+        let mut dim = ModalDim::default();
+        let alive = HashSet::from([1]);
+        let parents = alive.clone();
+        let policy = MotionPolicy::default();
+        dim.step(&alive, &parents, Duration::ZERO, policy, true);
+        dim.step(&alive, &parents, Duration::from_millis(500), policy, true);
+        assert_eq!(dim.multiplier(1), DIM_MULTIPLIER);
+        dim.set_enabled(false);
+        dim.step(&alive, &parents, Duration::from_millis(500), policy, true);
+        assert_eq!(dim.multiplier(1), 1.0);
+        assert!(!dim.running());
+        dim.set_enabled(true);
+        dim.step(&alive, &parents, Duration::from_millis(500), policy, true);
+        assert!(dim.running());
+        dim.step(&alive, &parents, Duration::from_millis(1000), policy, true);
+        assert_eq!(dim.multiplier(1), DIM_MULTIPLIER);
     }
     #[test]
     fn parent_dims_500ms_and_undims_250ms_quad() {

@@ -3560,8 +3560,12 @@ impl Runtime {
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
-        self.manager
-            .step_modal_dim(now, self.input_settings.motion, allowed);
+        self.manager.step_modal_dim(
+            now,
+            self.input_settings.motion,
+            allowed,
+            self.input_settings.attach_modal_dialogs,
+        );
         crate::window_lifecycle::step_frame(
             &mut self.manager,
             renderer,

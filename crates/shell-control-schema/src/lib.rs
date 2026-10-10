@@ -159,9 +159,10 @@ impl ProtocolVersion {
     /// GNOME's three-state motion policy plus its slow-down factor.
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
+    /// `0.30` appends the live attached-modal brightness preference.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 29,
+        minor: 30,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -803,6 +804,13 @@ pub struct InputSettings {
     pub right_to_left: bool,
     #[serde(default)]
     pub bell: BellPolicy,
+    /// Enable the attached-modal parent brightness effect (Mutter preference).
+    #[serde(default = "default_attach_modal_dialogs")]
+    pub attach_modal_dialogs: bool,
+}
+
+fn default_attach_modal_dialogs() -> bool {
+    true
 }
 
 impl Default for InputSettings {
@@ -827,6 +835,7 @@ impl Default for InputSettings {
             touchpad_left_handed: false,
             right_to_left: false,
             bell: BellPolicy::default(),
+            attach_modal_dialogs: true,
         }
     }
 }
@@ -1253,6 +1262,20 @@ mod tests {
     }
 
     #[test]
+    fn attach_modal_dialogs_survives_positional_control_wire() {
+        for enabled in [true, false] {
+            let settings = InputSettings {
+                attach_modal_dialogs: enabled,
+                ..Default::default()
+            };
+            let mut buffer = [0u8; 256];
+            let body = postcard::to_slice(&settings, &mut buffer).unwrap();
+            let decoded: InputSettings = postcard::from_bytes(body).unwrap();
+            assert_eq!(decoded, settings);
+        }
+        assert!(InputSettings::default().attach_modal_dialogs);
+    }
+    #[test]
     fn secrets_never_reach_debug_output() {
         let kind = CommandKind::Unlock {
             password: Secret("hunter2".into()),
@@ -1263,8 +1286,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_29() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 29));
+    fn current_version_is_0_30() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 30));
     }
 
     #[test]

@@ -56,6 +56,7 @@ manifest = {
     "source_revision":subprocess.check_output(["git","rev-parse","HEAD"],cwd=root,text=True).strip(),
     "source_dirty":bool(subprocess.check_output(["git","status","--porcelain"],cwd=root,text=True).strip()),
     "binaries":binaries,
+    "binary_source_revision":(a.bin_dir / "SOURCE_COMMIT").read_text().strip(),
     "proof_sha256":digest(Path(__file__).resolve()),
     "client_sha256":digest(root / "crates/compositor/examples/tuna-modal-dim-client.rs"),
     "backend":"winit/Xvfb/llvmpipe", "gnome_comparison":False,
@@ -138,12 +139,21 @@ try:
         if subprocess.run(["xdotool", "getdisplaygeometry"], env=env, capture_output=True).returncode == 0:
             break
         time.sleep(.05)
-    if subprocess.run(["gsettings", "range", "org.gnome.desktop.a11y.interface", "reduced-motion"],env=env,capture_output=True).returncode:
-        schemas = art / "schemas"
-        schemas.mkdir(exist_ok=True)
-        shutil.copy(root / "tests/settings/gnome51-a11y-interface.gschema.xml",schemas)
-        subprocess.run(["glib-compile-schemas",str(schemas)],check=True)
+    fixture_keys = []
+    schemas = art / "schemas"
+    for schema, key, fixture in (
+        ("org.gnome.desktop.a11y.interface", "reduced-motion", "gnome51-a11y-interface.gschema.xml"),
+        ("org.gnome.mutter", "attach-modal-dialogs", "gnome51-mutter.gschema.xml"),
+    ):
+        if subprocess.run(["gsettings", "range", schema, key], env=env, capture_output=True).returncode:
+            schemas.mkdir(exist_ok=True)
+            shutil.copy(root / "tests/settings" / fixture, schemas)
+            fixture_keys.append(f"{schema}:{key}")
+    if fixture_keys:
+        subprocess.run(["glib-compile-schemas", str(schemas)], check=True)
         env["GSETTINGS_SCHEMA_DIR"] = str(schemas)
+    manifest["settings_fixture_keys"] = fixture_keys
+    subprocess.run(["gsettings", "set", "org.gnome.mutter", "attach-modal-dialogs", "true"], env=env, check=True)
     subprocess.run(["gsettings","set","org.gnome.desktop.a11y.interface","reduced-motion","no-preference"],env=env,check=True)
     subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "enable-animations", "true"], env=env, check=True)
     compositor = spawn([str(frozen / "tuna-compositor"), "--socket", "lifecycle-proof", "--shell-bin", str(frozen / "tuna-shell-gtk")], "compositor")
@@ -219,11 +229,19 @@ try:
     wait(lambda d:len(d["modal_dim"]["parents"]) == 1,"dim-before-parent-close")
     move(1950)
     wait(lambda d:not d["modal_dim"]["running"] and factor(d)<.7,"dim-before-parent-close-full")
+    subprocess.run(["gsettings","set","org.gnome.mutter","attach-modal-dialogs","false"],env=env,check=True)
+    wait(lambda d:not d["modal_dim"]["enabled"] and not d["modal_dim"]["parents"],"live-preference-disabled")
+    pixel_factor(screenshot("09-preference-off"),1.0)
+    subprocess.run(["gsettings","set","org.gnome.mutter","attach-modal-dialogs","true"],env=env,check=True)
+    wait(lambda d:d["modal_dim"]["enabled"] and d["modal_dim"]["running"],"live-preference-reenabled")
+    move(2450)
+    wait(lambda d:not d["modal_dim"]["running"] and factor(d)<.7,"live-preference-dim-complete")
+    pixel_factor(screenshot("10-preference-on"),88/127)
     action("close",9)
     client.wait(timeout=10)
     wait(lambda d:not d["windows"] and not d["modal_dim"]["parents"] and len(d["window_lifecycle"]["destroying"]) == 1,"parent-death-clears-state")
-    pixel_factor(screenshot("09-closed-parent-retains-dim"),88/127)
-    move(2100)
+    pixel_factor(screenshot("11-closed-parent-retains-dim"),88/127)
+    move(2600)
     wait(lambda d:not d["window_lifecycle"]["destroying"],"parent-death-clean")
     assert compositor.poll() is None
     success = True
@@ -280,5 +298,5 @@ finally:
 
 require_owned_cleanup(manifest["owned_cleanup"])
 if success:
-    (art / "assertions.txt").write_text("MD-NATIVE pass explicit xdg-dialog modal; nonmodal transient excluded\nMD-DIM pass 500ms quad RGB-only dim; transparent pixels unchanged\nMD-OVERLAP pass two modal children; first close preserves dim\nMD-UNDIM pass 250ms quad restoration\nMD-MOTION pass actual GTK reduced/off settings bridge\nMD-DEATH pass parent destruction clears state and retained close texture keeps dim\nMD-CLEANUP pass verified private session cleanup\n")
+    (art / "assertions.txt").write_text("MD-NATIVE pass explicit xdg-dialog modal; nonmodal transient excluded\nMD-DIM pass 500ms quad RGB-only dim; transparent pixels unchanged\nMD-OVERLAP pass two modal children; first close preserves dim\nMD-UNDIM pass 250ms quad restoration\nMD-MOTION pass actual GTK reduced/off settings bridge\nMD-PREFERENCE pass live GTK attach-modal-dialogs disable restores RGB immediately; enable fades again\nMD-DEATH pass parent destruction clears state and retained close texture keeps dim\nMD-CLEANUP pass verified private session cleanup\n")
     print(f"native modal dim proof passed: {art}")

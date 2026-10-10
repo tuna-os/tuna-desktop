@@ -1920,6 +1920,7 @@ fn build(app: &adw::Application) {
             A11Y_INTERFACE_SCHEMA,
             "org.gnome.desktop.wm.preferences",
             "org.gnome.desktop.sound",
+            "org.gnome.mutter",
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -1969,6 +1970,14 @@ fn build(app: &adw::Application) {
                 }
                 out.right_to_left = gtk::Widget::default_direction() == gtk::TextDirection::Rtl;
                 out.motion = motion::from_settings(all[4].as_ref(), all[5].as_ref());
+                if let Some(mutter) = all[8].as_ref() {
+                    if mutter
+                        .settings_schema()
+                        .is_some_and(|schema| schema.has_key("attach-modal-dialogs"))
+                    {
+                        out.attach_modal_dialogs = mutter.boolean("attach-modal-dialogs");
+                    }
+                }
                 motion::set(out.motion);
                 if let Some(wm) = all[6].as_ref() {
                     out.bell.audible = wm.boolean("audible-bell");

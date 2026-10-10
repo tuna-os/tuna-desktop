@@ -677,6 +677,7 @@ impl WindowManager {
         now: std::time::Duration,
         policy: tuna_shell_control::motion::MotionPolicy,
         animate: bool,
+        enabled: bool,
     ) {
         let alive = self.windows.keys().copied().collect();
         let parents = self
@@ -693,6 +694,7 @@ impl WindowManager {
                 _ => None,
             })
             .collect();
+        self.modal_dim.set_enabled(enabled);
         self.modal_dim.step(&alive, &parents, now, policy, animate);
     }
     pub fn window_lifecycle(&self) -> &crate::window_lifecycle::Lifecycle {
