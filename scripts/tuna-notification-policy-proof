@@ -332,7 +332,9 @@ app.connect('activate',activate);app.run([])
   appid='org.tuna.IdentityFixture'
   client=spawn(['/usr/bin/python3',str(xscript)],label+'-sender',dict(GDK_BACKEND='x11',DISPLAY=xdisplay,TUNA_X11_APP=appid,TUNA_X11_CLASS=class_name,TUNA_X11_INSTANCE=instance,TUNA_X11_READY=str(ready),TUNA_SENDER_TRIGGER=str(trigger),TUNA_SENDER_REPLY=str(reply),TUNA_SENDER_HINT=hint))
   info=wait(lambda:json.loads(ready.read_text()),label+'-sender-ready');assert info['pid']==client.pid
-  wait(lambda:any(w.get('title')=='X11 notification sender fixture '+appid and w.get('app_id')==class_name for w in snapshot()['windows']),label+'-window-tracked')
+  # The compositor's state snapshot intentionally omits window titles. Match
+  # this exact X11 window by XID and verify its derived desktop identity.
+  wait(lambda:any(w.get('x11_window_id')==info['xid'] and w.get('app_id')==class_name for w in snapshot()['windows']),label+'-window-tracked')
   time.sleep(2)
   policy_schema='org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/'+expected.lower().replace('.','-')+'/'
   setpref(policy_schema,'enable','false');trigger.write_text('IDENTITY_DISABLED_'+label)
