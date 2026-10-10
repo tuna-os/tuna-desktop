@@ -134,6 +134,57 @@ pub fn attempt_unlock(client: &mut impl UnlockClient, user: &str, password: &str
     UnlockOutcome::Denied
 }
 
+/// The fingerprint seam [`attempt_fprint_unlock`] drives.
+/// [`crate::fprintd::Fprintd`] is the production implementation; tests
+/// stub here (no reader on CI).
+pub trait FprintVerifier {
+    /// One bounded verification for `user`.
+    fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome;
+}
+
+impl FprintVerifier for crate::fprintd::Fprintd {
+    fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome {
+        crate::fprintd::Fprintd::verify_user(self, user)
+    }
+}
+
+/// One fingerprint attempt for `user`: only a daemon-reported match
+/// unlocks. No-match, no device, no enrolled prints, cancellation,
+/// timeout and errors all collapse to [`UnlockOutcome::Denied`] with no
+/// detail, exactly like the password path.
+pub fn attempt_fprint_unlock(verifier: &mut impl FprintVerifier, user: &str) -> UnlockOutcome {
+    match verifier.verify(user) {
+        crate::fprintd::VerifyOutcome::Matched => UnlockOutcome::Unlocked,
+        _ => UnlockOutcome::Denied,
+    }
+}
+
+/// Truthful fingerprint capability for `user` (reader present plus
+/// enrollment), for the lock screen to decide whether to offer a
+/// fingerprint attempt. Unavailable on any failure, including no
+/// daemon. Blocking (D-Bus round trips), so the runtime calls it on a
+/// worker thread, like [`verify`].
+pub fn fprint_capability(user: &str) -> crate::fprintd::Capability {
+    crate::fprintd::Fprintd::connect()
+        .map(|client| client.capability(user))
+        .unwrap_or_else(crate::fprintd::Capability::unavailable)
+}
+
+/// One live fingerprint verification for `user` through fprintd,
+/// without touching any lock state. `false` on every non-match,
+/// including no daemon, no reader, and no enrolled prints. Blocking
+/// (the user may take the whole [`crate::fprintd::VERIFY_TIMEOUT`]),
+/// so the runtime calls it on a worker thread.
+pub fn verify_fingerprint(user: &str) -> bool {
+    let Some(client) = crate::fprintd::Fprintd::connect() else {
+        return false;
+    };
+    matches!(
+        client.verify_user(user),
+        crate::fprintd::VerifyOutcome::Matched
+    )
+}
+
 /// Verify `password` for `user` the way [`unlock_session`] does, without
 /// touching any lock state: greetd's daemon when one runs, else PAM's
 /// `tuna-lock` service (GDM sessions). Blocking (PAM may delay a
@@ -337,6 +388,67 @@ mod tests {
         );
         // Info carries no question: acknowledged empty, unprompted.
         assert_eq!(stub.answers, vec![None]);
+    }
+
+    /// Scripted fingerprint stub: canned outcome, recording the user.
+    struct FprintStub {
+        outcome: crate::fprintd::VerifyOutcome,
+        users: Vec<String>,
+    }
+
+    impl FprintStub {
+        fn new(outcome: crate::fprintd::VerifyOutcome) -> Self {
+            Self {
+                outcome,
+                users: Vec::new(),
+            }
+        }
+    }
+
+    impl FprintVerifier for FprintStub {
+        fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome {
+            self.users.push(user.to_string());
+            self.outcome
+        }
+    }
+
+    #[test]
+    fn fingerprint_match_unlocks_for_that_user() {
+        let mut stub = FprintStub::new(crate::fprintd::VerifyOutcome::Matched);
+        assert_eq!(
+            attempt_fprint_unlock(&mut stub, "ada"),
+            UnlockOutcome::Unlocked
+        );
+        assert_eq!(stub.users, vec!["ada".to_string()]);
+    }
+
+    #[test]
+    fn every_fingerprint_non_match_denies_silently() {
+        use crate::fprintd::VerifyOutcome::*;
+        for outcome in [NoMatch, NoDevice, NotEnrolled, Cancelled, TimedOut, Error] {
+            let mut stub = FprintStub::new(outcome);
+            assert_eq!(
+                attempt_fprint_unlock(&mut stub, "ada"),
+                UnlockOutcome::Denied,
+                "unlocked on {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_capability_is_unavailable_when_disabled() {
+        let _guard = crate::fprintd::test_serialize_env().lock().unwrap();
+        let prior = std::env::var_os(crate::fprintd::DISABLE_ENV);
+        unsafe { std::env::set_var(crate::fprintd::DISABLE_ENV, "1") };
+        let capability = fprint_capability("ada");
+        assert!(!capability.offered());
+        assert!(!verify_fingerprint("ada"));
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var(crate::fprintd::DISABLE_ENV, value),
+                None => std::env::remove_var(crate::fprintd::DISABLE_ENV),
+            }
+        }
     }
 
     #[test]

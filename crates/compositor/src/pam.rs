@@ -82,8 +82,24 @@ impl Drop for Secrets {
     }
 }
 
+/// True when a PAM message's text asks for a fingerprint rather than
+/// a typed secret (#366). A null or undecodable message is not one:
+/// the historical single-password behavior answers those unchanged.
+unsafe fn message_asks_fingerprint(message: *const PamMessage) -> bool {
+    let text = (*message).msg;
+    if text.is_null() {
+        return false;
+    }
+    let text = std::ffi::CStr::from_ptr(text).to_string_lossy();
+    tuna_greeter::model::is_fingerprint_prompt(&text)
+}
+
 /// The PAM conversation: the password for hidden prompts, the user name
-/// for visible ones, nothing for messages. Anything else fails it.
+/// for visible ones, nothing for messages. Anything else fails it — as
+/// does a hidden prompt that asks for a fingerprint (#366): distinct
+/// credentials are never answered with the password, so a fprintd-backed
+/// stack falls through to its own device flow instead of consuming the
+/// password as a fingerprint answer.
 unsafe extern "C" fn conversation(
     count: c_int,
     messages: *mut *const PamMessage,
@@ -107,7 +123,13 @@ unsafe extern "C" fn conversation(
             return PAM_CONV_ERR;
         }
         let reply = match (*message).msg_style {
-            PAM_PROMPT_ECHO_OFF => libc::strdup(secrets.password.as_ptr()),
+            PAM_PROMPT_ECHO_OFF => {
+                if message_asks_fingerprint(message) {
+                    free_responses(out, i);
+                    return PAM_CONV_ERR;
+                }
+                libc::strdup(secrets.password.as_ptr())
+            }
             PAM_PROMPT_ECHO_ON => libc::strdup(secrets.user.as_ptr()),
             PAM_ERROR_MSG | PAM_TEXT_INFO => std::ptr::null_mut(),
             _ => {
@@ -254,5 +276,94 @@ impl crate::unlock::UnlockClient for PamClient {
     fn cancel(&mut self) -> Result<(), CodecError> {
         self.user = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// Drive [`conversation`] with one message, returning the status and
+    /// (on success) the first reply text. Frees the C responses.
+    fn run_once(style: c_int, text: Option<&str>) -> (c_int, Option<String>) {
+        let user = CString::new("ada").unwrap();
+        let password = CString::new("s3cret").unwrap();
+        let secrets = Box::new(Secrets { user, password });
+        let prompt = text.map(|t| CString::new(t).unwrap());
+        let message = PamMessage {
+            msg_style: style,
+            msg: prompt.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+        };
+        let mut messages = [&message as *const PamMessage];
+        let mut out: *mut PamResponse = std::ptr::null_mut();
+        let rc = unsafe {
+            conversation(
+                1,
+                messages.as_mut_ptr(),
+                &mut out,
+                &*secrets as *const Secrets as *mut c_void,
+            )
+        };
+        let reply = if rc == PAM_SUCCESS && !out.is_null() {
+            let resp = unsafe { (*out).resp };
+            let text = if resp.is_null() {
+                None
+            } else {
+                Some(
+                    unsafe { std::ffi::CStr::from_ptr(resp) }
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            };
+            unsafe { free_responses(out, 1) };
+            text
+        } else {
+            None
+        };
+        (rc, reply)
+    }
+
+    #[test]
+    fn password_prompt_still_gets_the_password() {
+        let (rc, reply) = run_once(PAM_PROMPT_ECHO_OFF, Some("Password:"));
+        assert_eq!(rc, PAM_SUCCESS);
+        assert_eq!(reply.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn username_prompt_still_gets_the_user() {
+        let (rc, reply) = run_once(PAM_PROMPT_ECHO_ON, Some("Login:"));
+        assert_eq!(rc, PAM_SUCCESS);
+        assert_eq!(reply.as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn fingerprint_prompt_fails_instead_of_consuming_the_password() {
+        for text in [
+            "Place your finger on the fingerprint reader",
+            "Swipe your finger across the fingerprint reader",
+            "Swipe your finger again",
+        ] {
+            let (rc, reply) = run_once(PAM_PROMPT_ECHO_OFF, Some(text));
+            assert_eq!(rc, PAM_CONV_ERR, "answered a fingerprint prompt: {text}");
+            assert_eq!(reply, None);
+        }
+    }
+
+    #[test]
+    fn null_message_text_keeps_historical_behavior() {
+        let (rc, reply) = run_once(PAM_PROMPT_ECHO_OFF, None);
+        assert_eq!(rc, PAM_SUCCESS);
+        assert_eq!(reply.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn info_and_error_messages_stay_unanswered() {
+        for style in [PAM_TEXT_INFO, PAM_ERROR_MSG] {
+            let (rc, reply) = run_once(style, Some("Place your finger on the fingerprint reader"));
+            assert_eq!(rc, PAM_SUCCESS);
+            assert_eq!(reply, None);
+        }
     }
 }

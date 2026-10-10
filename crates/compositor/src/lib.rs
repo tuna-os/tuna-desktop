@@ -56,6 +56,7 @@ mod control_readiness;
 pub mod corner_pressure;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub mod fprintd;
 pub mod frame_timing;
 pub mod idle_monitor;
 mod idle_schedule;
