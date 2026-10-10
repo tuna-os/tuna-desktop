@@ -341,6 +341,10 @@ def main():
                 return any(o.get('info', {}).get('input-node-id') in nodes for o in graph)
             wait_until(recorder_linked)
             time.sleep(.2)
+            graph_before = json.loads(run(['pw-dump'], env))
+            sink_before = [o for o in graph_before if o.get('info', {}).get('props', {}).get('node.name') == 'tuna-sound-proof']
+            report['active_case'] = {'name': case, 'sink_before_command': sink_before,
+                                     'command_started_monotonic': time.monotonic()}
             if args.delivered:
                 if case.startswith('bell-'):
                     command = [str(bell_request)]
@@ -357,13 +361,19 @@ def main():
             try:
                 (artifacts / (case + '-client.log')).write_text(run(command, env, timeout=10))
                 if args.delivered:
-                    time.sleep(2)
+                    # Production players have a five-second deadline. Keep
+                    # the passive recorder linked through that whole lifetime,
+                    # including cold GTK/player initialization under load.
+                    # This is an audibility check, not an input latency claim.
+                    time.sleep(6)
             finally:
                 stop(recorder)
                 if player is not None:
                     stop(player)
             observed = measure(audio)
             observed['backend'] = run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'], env)
+            observed['sink_before_command'] = sink_before
+            observed['observation_seconds'] = time.monotonic() - report['active_case']['command_started_monotonic']
             if case in ('up', 'bell-audible'):
                 assert observed['frames'] > 1000 and observed['peak'] > 20, (case, observed)
             elif case == 'playing':
@@ -382,6 +392,7 @@ def main():
                 observed['command'] = command
                 observed['desktop_identity'] = desktop_identity()
         report['passed'] = True
+        report.pop('active_case', None)
     except BaseException as error:
         report['failure'] = {'type': type(error).__name__, 'message': str(error)}
         if isinstance(error, subprocess.CalledProcessError):
