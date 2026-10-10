@@ -707,6 +707,12 @@ pub fn step_frame(
         let old = life.cache.remove(&id).expect("cached id");
         let min_run = life.minimizing.remove(&id);
         let minimizing = min_run.is_some();
+        if min_run
+            .is_some_and(|run| now.saturating_sub(run.start) >= crate::minimize::duration(policy))
+        {
+            life.record(id, "minimize", old.kind, "completed");
+            continue;
+        }
         let effect = if minimizing { "minimize" } else { "destroy" };
         let mapping = life.opening.remove(&id).is_some();
         // Raw cached elements exclude active map/resize transforms. A safe
