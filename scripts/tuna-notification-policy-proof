@@ -33,6 +33,7 @@ assert receipt['source_revision']==manifest['source_revision'], 'binary/source r
 for name,record in manifest['binaries'].items():
  assert receipt['binary_sha256'][name]==record['sha256'], 'frozen binary digest mismatch'
 manifest['binary_receipt']=receipt
+manifest['accessibility_bounds']='window-relative (Wayland has no global surface origin)'
 manifest['gtk_version']=subprocess.check_output(['pkg-config','--modversion','gtk4'],text=True).strip()
 assert not runtime.exists(), 'refusing an existing proof runtime'
 processes=[]; logs=[]; owned=[]; assertions=[]; accessibility=None; success=False; runtime_created=False
@@ -51,6 +52,9 @@ def wait(check,label,seconds=15):
    if result: assertions.append(label); return result
   except (GLib.Error,OSError,ValueError,KeyError): pass
   time.sleep(.1)
+ if accessibility is not None:
+  (art/('failure-'+label+'.json')).write_text(json.dumps(tree()))
+  shot('failure-'+label)
  raise AssertionError('timed out '+label)
 def snapshot(): return json.loads(state.read_text())
 def setpref(schema,key,value):
@@ -75,8 +79,10 @@ def tree():
   if (dest,path) in seen or path=='/org/a11y/atspi/null': continue
   seen.add((dest,path))
   try:
-   props=call(accessibility,dest,path,'org.freedesktop.DBus.Properties','GetAll',GLib.Variant('(s)',('org.a11y.atspi.Accessible',)))[0]
-   name=props.get('Name',''); names.append(name); nodes.setdefault(name,[]).append((dest,path))
+   # AT-SPI registry 2.52 returns () for GetAll; the individual Name
+   # property is implemented by both registry roots and GTK contexts.
+   name=call(accessibility,dest,path,'org.freedesktop.DBus.Properties','Get',GLib.Variant('(ss)',('org.a11y.atspi.Accessible','Name')))[0]
+   names.append(name); nodes.setdefault(name,[]).append((dest,path))
    pending.extend(call(accessibility,dest,path,'org.a11y.atspi.Accessible','GetChildren')[0])
   except GLib.Error as e:
    if 'NoSuchObject' not in str(e) and 'UnknownObject' not in str(e): raise
@@ -85,10 +91,10 @@ def has(text): return any(text in n for n in tree())
 def absent(text): return not has(text)
 def height(text):
  tree()
- return max(call(accessibility,dest,path,'org.a11y.atspi.Component','GetExtents',GLib.Variant('(u)',(0,)))[0][3] for dest,path in nodes[text])
+ return max(call(accessibility,dest,path,'org.a11y.atspi.Component','GetExtents',GLib.Variant('(u)',(1,)))[0][3] for dest,path in nodes[text])
 def bounds(text):
  tree()
- return [call(accessibility,dest,path,'org.a11y.atspi.Component','GetExtents',GLib.Variant('(u)',(0,)))[0] for dest,path in nodes.get(text,[])]
+ return [call(accessibility,dest,path,'org.a11y.atspi.Component','GetExtents',GLib.Variant('(u)',(1,)))[0] for dest,path in nodes.get(text,[])]
 def shot(label):
  time.sleep(.2); subprocess.run(['scrot',str(art/(label+'.png'))],env=env,check=True)
 def lock():

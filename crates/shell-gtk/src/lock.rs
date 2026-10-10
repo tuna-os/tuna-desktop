@@ -103,6 +103,12 @@ impl LockUi {
     pub fn sync(self: &Rc<Self>, locked: bool) {
         if locked && !self.requested.get() {
             self.requested.set(true);
+            if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+                eprintln!(
+                    "tuna-shell-gtk: lock starting notification-groups={}",
+                    self.notifications.borrow().len()
+                );
+            }
             if !self.instance.lock() {
                 eprintln!("tuna-shell-gtk: session lock unavailable");
                 return;
@@ -135,6 +141,13 @@ impl LockUi {
     pub fn sync_notifications(&self, notifications: Vec<LockNotificationGroup>) {
         if *self.notifications.borrow() == notifications {
             return;
+        }
+        if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+            eprintln!(
+                "tuna-shell-gtk: lock notification-groups={} screens={}",
+                notifications.len(),
+                self.screens.borrow().len()
+            );
         }
         for screen in self.screens.borrow().iter() {
             render_notifications(&screen.notifications, &notifications);
@@ -351,6 +364,9 @@ impl LockUi {
                 let auth_bottom = (clock_top + clock_height).max(prompt_top + prompt_height);
                 if (height, auth_bottom) != last.get() {
                     last.set((height, auth_bottom));
+                    if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+                        eprintln!("tuna-shell-gtk: lock allocation height={height} clock-height={clock_height} prompt-height={prompt_height} auth-bottom={auth_bottom} notification-space={}", height - auth_bottom - 48);
+                    }
                     clock_box.set_margin_top(clock_top);
                     prompt.set_margin_top(prompt_top);
                     // Keep authentication unobstructed on short outputs and
