@@ -4935,19 +4935,21 @@ fn scene_elements(
                 owners.resize(elements.len(), Some(id));
                 continue;
             }
+            let buffer_size =
+                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+            let buffer_geometry = Rectangle::new(
+                crate::popup::surface_origin(&surface, geometry.loc),
+                buffer_size,
+            );
             if let Some((r, fade)) = manager
                 .window_lifecycle()
-                .restoring_frame(id, geometry.to_f64())
+                .restoring_frame(id, buffer_geometry.to_f64())
             {
-                let geo = crate::popup::window_geometry_loc(&surface);
                 let scale = (
-                    r.size.w / f64::from(geometry.size.w),
-                    r.size.h / f64::from(geometry.size.h),
+                    r.size.w / f64::from(buffer_size.w),
+                    r.size.h / f64::from(buffer_size.h),
                 );
-                let origin = view.physical(
-                    r.loc.x - f64::from(geo.x) * scale.0,
-                    r.loc.y - f64::from(geo.y) * scale.1,
-                );
+                let origin = view.physical(r.loc.x, r.loc.y);
                 elements.extend(render_elements_from_surface_tree::<_,WaylandSurfaceRenderElement<_>>(renderer,&surface,origin,view.scale,fade*manager.render_alpha(&window),Kind::Unspecified).into_iter().map(|e|smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e,origin,scale)));
                 owners.resize(elements.len(), Some(id));
                 continue;

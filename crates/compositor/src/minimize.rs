@@ -62,6 +62,22 @@ pub fn fallback(
         (0.0, 0.0).into(),
     )
 }
+/// Bounds of both layers when a resize crossfade is interrupted.
+pub fn bounds(
+    a: crate::size_change::RectF,
+    b: crate::size_change::RectF,
+) -> crate::size_change::RectF {
+    let x = a.loc.x.min(b.loc.x);
+    let y = a.loc.y.min(b.loc.y);
+    smithay::utils::Rectangle::new(
+        (x, y).into(),
+        (
+            (a.loc.x + a.size.w).max(b.loc.x + b.size.w) - x,
+            (a.loc.y + a.size.h).max(b.loc.y + b.size.h) - y,
+        )
+            .into(),
+    )
+}
 pub fn geometry(
     normal: crate::size_change::RectF,
     icon: crate::size_change::RectF,

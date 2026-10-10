@@ -150,9 +150,18 @@ struct Cached {
     kind: Kind,
     parent: Option<u64>,
     resizing: bool,
+    resize_snapshot: Option<
+        smithay::backend::renderer::element::texture::TextureRenderElement<
+            smithay::backend::renderer::gles::GlesTexture,
+        >,
+    >,
     brightness: f32,
     order: usize,
-    elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    elements: Vec<
+        smithay::backend::renderer::element::utils::RescaleRenderElement<
+            WaylandSurfaceRenderElement<GlesRenderer>,
+        >,
+    >,
 }
 #[derive(Clone, Copy)]
 struct MinRun {
@@ -409,53 +418,104 @@ pub fn step_frame(
             let geo = crate::popup::window_geometry_loc(&surface);
             let buffer_geometry =
                 Rect::new(crate::popup::surface_origin(&surface, geometry.loc), size);
-            let presentation = manager
+            let restoring = manager
                 .window_lifecycle()
-                .restoring_frame(*id, geometry.to_f64())
-                .or_else(|| {
-                    manager
-                        .window_lifecycle()
-                        .opening_frame(*id)
-                        .map(|f| (rect(*geometry, f), f.alpha))
-                });
-            let (presentation, fade) = if let Some((r, fade)) = presentation {
-                let sx = r.size.w / f64::from(geometry.size.w);
-                let sy = r.size.h / f64::from(geometry.size.h);
-                (
-                    Rectangle::new(
-                        (
-                            r.loc.x - f64::from(geo.x) * sx,
-                            r.loc.y - f64::from(geo.y) * sy,
-                        )
-                            .into(),
-                        (f64::from(size.w) * sx, f64::from(size.h) * sy).into(),
-                    ),
-                    fade,
-                )
-            } else {
-                (buffer_geometry.to_f64(), 1.0)
-            };
-            let origin: smithay::utils::Point<i32, smithay::utils::Physical> = (0, 0).into();
-            let elements = render_elements_from_surface_tree(
-                renderer,
-                &surface,
-                origin,
-                scale,
-                fade,
-                RenderKind::Unspecified,
+                .restoring_frame(*id, buffer_geometry.to_f64());
+            let mapped = manager.window_lifecycle().opening_frame(*id);
+            let (
+                mut capture_geometry,
+                mut presentation,
+                mut fade,
+                mut live_scale,
+                mut live_visible,
+            ) = (
+                buffer_geometry,
+                buffer_geometry.to_f64(),
+                1.0,
+                (1.0, 1.0),
+                true,
             );
-            if elements.is_empty() {
+            if let Some((r, alpha)) = restoring {
+                presentation = r;
+                fade = alpha;
+            } else if let Some(f) = mapped {
+                let r = rect(*geometry, f);
+                presentation = Rectangle::new(
+                    (
+                        r.loc.x - f64::from(geo.x) * f.scale.0,
+                        r.loc.y - f64::from(geo.y) * f.scale.1,
+                    )
+                        .into(),
+                    (f64::from(size.w) * f.scale.0, f64::from(size.h) * f.scale.1).into(),
+                );
+                fade = f.alpha;
+            }
+            let resizing = manager.size_changes().frame(*id);
+            let mut resize_snapshot = None;
+            let mut origin = (0, 0).into();
+            if let Some((f, snapshot)) = resizing {
+                live_scale = f.live_scale;
+                live_visible = f.live_visible;
+                fade = 1.0;
+                let live = Rectangle::new(
+                    (
+                        f.live.loc.x - f64::from(geo.x) * live_scale.0,
+                        f.live.loc.y - f64::from(geo.y) * live_scale.1,
+                    )
+                        .into(),
+                    (
+                        f64::from(size.w) * live_scale.0,
+                        f64::from(size.h) * live_scale.1,
+                    )
+                        .into(),
+                );
+                let bounds = if live_visible {
+                    crate::minimize::bounds(live, f.snapshot)
+                } else {
+                    f.snapshot
+                };
+                capture_geometry = bounds.to_i32_up();
+                presentation = capture_geometry.to_f64();
+                let view = crate::runtime::View {
+                    offset: (capture_geometry.loc.x, capture_geometry.loc.y),
+                    scale,
+                };
+                origin = view.physical(live.loc.x, live.loc.y);
+                resize_snapshot =
+                    crate::size_change::snapshot_element(renderer, snapshot, &f, view);
+            }
+            let elements: Vec<_> = if live_visible {
+                render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<GlesRenderer>>(
+                    renderer,
+                    &surface,
+                    origin,
+                    scale,
+                    fade,
+                    RenderKind::Unspecified,
+                )
+                .into_iter()
+                .map(|e| {
+                    smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(
+                        e, origin, live_scale,
+                    )
+                })
+                .collect()
+            } else {
+                Vec::new()
+            };
+            if elements.is_empty() && resize_snapshot.is_none() {
                 continue;
             }
             shown.push((
                 *id,
                 Cached {
-                    geometry: buffer_geometry,
+                    geometry: capture_geometry,
                     presentation,
                     scale,
                     kind,
                     parent: manager.transient_parent(*id),
-                    resizing: manager.size_changes().frame(*id).is_some(),
+                    resizing: resizing.is_some(),
+                    resize_snapshot,
                     brightness: manager.modal_dim().multiplier(*id),
                     order: index,
                     elements,
@@ -534,7 +594,8 @@ pub fn step_frame(
         let mapping = life.opening.remove(&id).is_some();
         // Raw cached elements exclude active map/resize transforms. A safe
         // immediate close is preferable to an opaque full-size frozen jump.
-        if let Some(reason) = interrupted_close(mapping && !minimizing, old.resizing) {
+        if let Some(reason) = interrupted_close(mapping && !minimizing, old.resizing && !minimizing)
+        {
             life.record(id, effect, old.kind, reason);
             continue;
         }
@@ -660,6 +721,9 @@ fn copy_frame(
             );
         }
         draw_render_elements(&mut frame, cached.scale, &cached.elements, &[all]).ok()?;
+        if let Some(snapshot) = &cached.resize_snapshot {
+            draw_render_elements(&mut frame, 1.0, std::slice::from_ref(snapshot), &[all]).ok()?;
+        }
         frame.clear_tex_program_override();
         let _ = frame.finish().ok()?;
     }
