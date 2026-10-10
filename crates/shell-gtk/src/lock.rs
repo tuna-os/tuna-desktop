@@ -374,8 +374,11 @@ impl LockUi {
                     notification_scroll
                         .set_max_content_height((height - auth_bottom - 48).clamp(0, 240));
                 }
-                notification_scroll
-                    .set_visible(height - auth_bottom - 48 > 0 && notifications.is_visible());
+                update_notification_visibility(
+                    &notification_scroll,
+                    &notifications,
+                    height - auth_bottom - 48,
+                );
                 glib::ControlFlow::Continue
             });
         }
@@ -529,6 +532,17 @@ impl LockUi {
     }
 }
 
+fn update_notification_visibility(
+    scroll: &gtk::ScrolledWindow,
+    notifications: &gtk::Box,
+    available_height: i32,
+) {
+    // Read the child's own visibility flag. is_visible() includes ancestors:
+    // once the initial zero-height allocation hides this scroller, that would
+    // prevent every subsequent allocation from showing it again.
+    scroll.set_visible(available_height > 0 && notifications.get_visible());
+}
+
 impl Drop for Screen {
     fn drop(&mut self) {
         // Never leave a typed password behind in a dead window.
@@ -591,4 +605,40 @@ pub(crate) fn render_notifications(container: &gtk::Box, groups: &[LockNotificat
         container.append(&row);
     }
     container.set_visible(!groups.is_empty());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated GTK display; exercised by the notification policy proof"]
+    fn notification_viewport_restores_after_parent_is_hidden() {
+        gtk::init().expect("private GTK display");
+        let notifications = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        notifications.append(&gtk::Label::new(Some("unread notification")));
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_child(Some(&notifications));
+
+        update_notification_visibility(&scroll, &notifications, -411);
+        assert!(!scroll.get_visible());
+        assert!(notifications.get_visible());
+        assert!(!notifications.is_visible());
+        update_notification_visibility(&scroll, &notifications, 184);
+        assert!(scroll.get_visible());
+
+        // A short output hides the viewport without losing its unread content.
+        update_notification_visibility(&scroll, &notifications, 0);
+        assert!(!scroll.get_visible());
+        update_notification_visibility(&scroll, &notifications, 184);
+        assert!(scroll.get_visible());
+
+        // Policy removal still hides it even when the output has room.
+        notifications.set_visible(false);
+        update_notification_visibility(&scroll, &notifications, 184);
+        assert!(!scroll.get_visible());
+        notifications.set_visible(true);
+        update_notification_visibility(&scroll, &notifications, 184);
+        assert!(scroll.get_visible());
+    }
 }

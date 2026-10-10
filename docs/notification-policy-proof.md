@@ -30,6 +30,10 @@ dbus-run-session -- /usr/bin/python3 scripts/tuna-notification-policy-proof \
 The proof refuses dirty source, mismatched binary/source revisions or hashes,
 existing proof runtimes, and occupied displays. It runs the actual compositor,
 GTK shell, notification service, private settings backend and PAM fixture.
+The immutable bundle also contains `tuna-shell-gtk-tests`; the proof verifies its
+hash and runs the real GTK viewport visibility regression on the private display.
+This covers an initially zero-height lock window, a short output, policy removal,
+and restoration without treating a hidden parent as absent notification content.
 It checks hidden admission versus the queue cap, source registration, live
 expansion geometry, critical and disabled-source controls, normal messages held
 past banner timeout, real lock/unlock, lock detail redaction and positive

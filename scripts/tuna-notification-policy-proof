@@ -26,7 +26,7 @@ def sha(path):
 manifest = dict(source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
  source_dirty=bool(subprocess.check_output(['git','status','--porcelain'],cwd=root,text=True).strip()),
  backend='winit/Xvfb/software', gnome_comparison=False, proof_sha256=sha(__file__),
- binaries={n:dict(path=str(a.bin_dir.resolve()/n),sha256=sha(a.bin_dir/n)) for n in ('tuna-compositor','tuna-shell-gtk')})
+ binaries={n:dict(path=str(a.bin_dir.resolve()/n),sha256=sha(a.bin_dir/n)) for n in ('tuna-compositor','tuna-shell-gtk','tuna-shell-gtk-tests')})
 receipt=json.loads((a.bin_dir/'manifest.json').read_text())
 assert not receipt['source_dirty'] and not manifest['source_dirty'], 'proof requires committed clean source'
 assert receipt['source_revision']==manifest['source_revision'], 'binary/source revision mismatch'
@@ -141,6 +141,9 @@ try:
   pid=call(accessibility,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','GetConnectionUnixProcessID',GLib.Variant('(s)',(name,)))[0]
   owned.append((name,pid,os.pidfd_open(pid)))
  manifest['session_isolation']=dict(runtime=str(runtime),mode=oct(runtime.stat().st_mode&0o777),session_bus=env.get('DBUS_SESSION_BUS_ADDRESS'),accessibility_bus=address,owned_services=[dict(name=n,pid=pid) for n,pid,_ in owned])
+ widget_test=spawn([str(a.bin_dir.resolve()/'tuna-shell-gtk-tests'),'lock::tests::notification_viewport_restores_after_parent_is_hidden','--ignored','--exact','--test-threads=1'],'lock-viewport-widget-test',dict(GDK_BACKEND='x11'))
+ assert widget_test.wait(timeout=15)==0, 'GTK viewport visibility regression failed'
+ assertions.append('gtk-viewport-restores-after-parent-hidden')
  setpref(MASTER,'show-banners','true'); setpref(MASTER,'show-in-lock-screen','true')
  for app in ('Alpha','Beta'):
   for key in ('enable','show-banners','show-in-lock-screen'): setpref(app_schema(app),key,'true')
