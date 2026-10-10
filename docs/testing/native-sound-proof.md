@@ -68,6 +68,32 @@ capture path. Failure of any positive or identity check rejects the run.
 Without `--delivered`, the examples execute production source consumer
 modules directly. That scope does not qualify protocol or key delivery.
 
+## Diagnostics from the combined v1 bundle
+
+The clean `0a7b68a6b4c0168f536b2a9eb46c61373d1a8dc2` bundle has passing
+nine-case delivered receipts and retained intermittent positive failures.
+It is not yet qualified as repeatable. In attempts 8 and 9, the actual volume
+changed to 0.46, the sink was suspended immediately before input, and the
+real player was invoked, but the passive recorder captured silence.
+Attempt 9 observed the full five-second player deadline plus one second;
+extending the observation window alone did not resolve the failure.
+
+`--diagnose-player` records the resolved player and exec-wrapper hashes,
+invocation time and arguments, and real stderr. The wrapper replaces itself
+with the real player, retaining the production parent-death signal and alarm.
+The receipt also retains the pre-input sink state and observation duration.
+
+A separate diagnostic run in
+`/tmp/tuna-v1-sound-combined-0a7-lifecycle-2` passed all nine cases. An additional
+library probe recorded successful libcanberra callbacks and successful player
+main returns for volume and system-bell events. That probe modifies the
+diagnostic process environment and provides lifecycle evidence; it is not a
+performance measurement or proof that previous silent attempts succeeded.
+
+The passive recorder defaults to 100 ms latency. An isolated experiment with
+an explicit 256-sample latency captured the cold volume event, but the effect
+on repeatability and all suppression cases still requires verification.
+
 ## Open qualification and behavior gaps
 
 The private fixture does not qualify physical audio devices, hardware keys,
