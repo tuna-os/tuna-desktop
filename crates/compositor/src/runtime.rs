@@ -546,6 +546,12 @@ struct RemoteHeld {
     buttons: std::collections::HashSet<u32>,
 }
 
+struct PendingScreenshotReply {
+    deadline: Duration,
+    reply: std::sync::mpsc::Sender<Option<std::path::PathBuf>>,
+    saved: Option<std::path::PathBuf>,
+}
+
 pub struct Runtime {
     display: Display<State>,
     state: State,
@@ -565,6 +571,7 @@ pub struct Runtime {
     lock: SessionLock,
     blank: crate::lock::IdleBlank,
     screenshot_flashes: crate::screenshot_flash::Flashes,
+    screenshot_replies: Vec<PendingScreenshotReply>,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -924,15 +931,30 @@ impl Runtime {
                             flash,
                             reply,
                         }) => {
+                            if flash
+                                && rt.screenshot_replies.len()
+                                    == crate::screenshot_flash::MAX_FLASHES
+                            {
+                                let _ = reply.send(None);
+                                return;
+                            }
                             let saved = if window {
                                 rt.capture_window(&filename)
                             } else {
                                 rt.capture(&filename)
                             };
-                            if flash && saved.is_some() {
-                                rt.start_screenshot_flash(window);
+                            let deadline = (flash && saved.is_some())
+                                .then(|| rt.start_screenshot_flash(window))
+                                .flatten();
+                            if let Some(deadline) = deadline {
+                                rt.screenshot_replies.push(PendingScreenshotReply {
+                                    deadline,
+                                    reply,
+                                    saved,
+                                });
+                            } else {
+                                let _ = reply.send(saved);
                             }
-                            let _ = reply.send(saved);
                         }
                         calloop::channel::Event::Msg(Request::Windows { directory, reply }) => {
                             let _ = reply.send(rt.capture_selector_windows(&directory));
@@ -951,7 +973,7 @@ impl Runtime {
                                             <= i64::from(out.loc.1) + i64::from(out.size.h)
                                 });
                             if valid {
-                                rt.start_flash_area(area);
+                                let _ = rt.start_flash_area(area);
                             }
                             let _ = reply.send(valid);
                         }
@@ -987,6 +1009,7 @@ impl Runtime {
             lock: SessionLock::new(idle_timeout_ms()),
             blank: crate::lock::IdleBlank::default(),
             screenshot_flashes: Default::default(),
+            screenshot_replies: Vec::new(),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
             #[cfg(feature = "xwayland")]
@@ -2140,12 +2163,9 @@ impl Runtime {
         }
     }
 
-    /// Render the primary output's current scene offscreen and save it
-    /// as a PNG (`requested` when absolute, else GNOME's default path).
-    /// Never while locked: nothing behind the lock may leave the session.
-    fn start_screenshot_flash(&mut self, window: bool) {
+    fn start_screenshot_flash(&mut self, window: bool) -> Option<Duration> {
         if self.is_locked() || !self.input_settings.motion.allows_fades() {
-            return;
+            return None;
         }
         let area = if window {
             self.manager
@@ -2161,22 +2181,25 @@ impl Runtime {
                     .map(|output| Rectangle::<i32, Logical>::new(output.loc.into(), output.size))
             })
         };
-        if let Some(area) = area {
-            self.start_flash_area([area.loc.x, area.loc.y, area.size.w, area.size.h]);
-        }
+        area.and_then(|area| {
+            self.start_flash_area([area.loc.x, area.loc.y, area.size.w, area.size.h])
+        })
     }
 
-    fn start_flash_area(&mut self, area: [i32; 4]) {
+    fn start_flash_area(&mut self, area: [i32; 4]) -> Option<Duration> {
         if self.is_locked() || !self.input_settings.motion.allows_fades() {
-            return;
+            return None;
         }
-        self.screenshot_flashes.trigger(
-            area,
-            self.animation_clock.now(),
-            Duration::from_secs_f64(self.input_settings.motion.adjust_ms(500.0) / 1000.0),
-        );
+        let now = self.animation_clock.now();
+        let duration =
+            Duration::from_secs_f64(self.input_settings.motion.adjust_ms(500.0) / 1000.0);
+        self.screenshot_flashes.trigger(area, now, duration);
+        now.checked_add(duration)
     }
 
+    /// Render the primary output's current scene offscreen and save it
+    /// as a PNG (`requested` when absolute, else GNOME's default path).
+    /// Never while locked: nothing behind the lock may leave the session.
     pub fn capture(&mut self, requested: &std::path::Path) -> Option<std::path::PathBuf> {
         if self.is_locked() {
             return None;
@@ -3386,6 +3409,19 @@ impl Runtime {
         self.stats.shell_restarts = self.shell.restarts_used();
         self.proof_swipe_input();
         self.animation_clock.poll();
+        // GNOME completes a flashing screenshot reply when its feedback ends.
+        // Locking or disabling animations also ends pending feedback promptly.
+        let now = self.animation_clock.now();
+        let ended = self.is_locked() || !self.input_settings.motion.allows_fades();
+        let mut index = 0;
+        while index < self.screenshot_replies.len() {
+            if ended || now >= self.screenshot_replies[index].deadline {
+                let pending = self.screenshot_replies.swap_remove(index);
+                let _ = pending.reply.send(pending.saved);
+            } else {
+                index += 1;
+            }
+        }
         self.publish_state();
         self.publish_cast_outputs();
         self.publish_overview_previews();
