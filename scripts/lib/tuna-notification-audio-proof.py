@@ -71,12 +71,27 @@ class AudioProof:
         except RuntimeError as error:
             sinks = helpers.run(['pactl', 'list', 'short', 'sinks'], env)
             raise RuntimeError(f'{error}; pactl sinks: {sinks!r}') from error
+        graph = self.graph()
+        sink_ids = [str(o['id']) for o in graph
+                    if o.get('info', {}).get('props', {}).get('node.name')
+                    == 'tuna-notification-audio'
+                    and o.get('info', {}).get('props', {}).get('media.class')
+                    == 'Audio/Sink']
+        if len(sink_ids) != 1:
+            raise RuntimeError(
+                'expected one PipeWire Audio/Sink named tuna-notification-audio; '
+                f'found IDs {sink_ids!r}')
         try:
-            helpers.run(['pactl', 'set-default-sink', 'tuna-notification-audio'], env)
-        except subprocess.CalledProcessError as error:
+            helpers.run(['wpctl', 'set-default', sink_ids[0]], env)
+            selected = helpers.run(['wpctl', 'inspect', '@DEFAULT_AUDIO_SINK@'], env)
+            if 'node.name = "tuna-notification-audio"' not in selected:
+                raise RuntimeError(
+                    f'WirePlumber default sink did not resolve to the private sink: {selected!r}')
+        except (subprocess.CalledProcessError, RuntimeError) as error:
             sinks = helpers.run(['pactl', 'list', 'short', 'sinks'], env)
             raise RuntimeError(
-                f'pactl set-default-sink failed: {error.output!r}; sinks: {sinks!r}') from error
+                f'WirePlumber could not select the private default sink: {error}; '
+                f'pactl sinks: {sinks!r}') from error
         helpers.run(['pactl', 'set-sink-volume', 'tuna-notification-audio', '100%'], env)
         graph = self.graph()
         assert not any(o.get('info', {}).get('props', {}).get('device.api')
