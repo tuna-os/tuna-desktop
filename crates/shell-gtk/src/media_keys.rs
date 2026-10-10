@@ -228,10 +228,20 @@ fn next_command() {
 fn run_wpctl(args: &[&str], done: impl FnOnce(Option<String>) + 'static) {
     let mut argv = vec![std::ffi::OsStr::new("wpctl")];
     argv.extend(args.iter().map(std::ffi::OsStr::new));
-    let Ok(process) = gio::Subprocess::newv(
-        &argv,
+    let launcher = gio::SubprocessLauncher::new(
         gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_SILENCE,
-    ) else {
+    );
+    let parent = std::process::id() as libc::pid_t;
+    launcher.set_child_setup(move || unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+            || libc::getppid() != parent
+        {
+            libc::_exit(127);
+        }
+        libc::signal(libc::SIGALRM, libc::SIG_DFL);
+        libc::alarm(5);
+    });
+    let Ok(process) = launcher.spawn(&argv) else {
         done(None);
         return;
     };

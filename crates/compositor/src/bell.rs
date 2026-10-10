@@ -1,5 +1,6 @@
 //! Native xdg bell consumers with live policy and bounded player lifetime.
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 use tuna_shell_control::BellPolicy;
 
@@ -73,7 +74,21 @@ impl Bell {
             "canberra.xdg-theme.name={}",
             self.policy.theme.chars().take(256).collect::<String>()
         );
-        self.player = std::process::Command::new("canberra-gtk-play")
+        let mut command = std::process::Command::new("canberra-gtk-play");
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+                    || libc::getppid() != parent
+                {
+                    libc::_exit(127);
+                }
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                libc::alarm(5);
+                Ok(())
+            });
+        }
+        self.player = command
             .args([
                 "--id",
                 BELL_SOUND,
