@@ -153,7 +153,7 @@ pub struct OverviewUi {
     dash_signature: Vec<(u64, Option<String>, Option<String>)>,
     dash_icons: Vec<(Vec<u64>, gtk::Image)>,
     dash_layout: Option<(gtk::gdk::Surface, gtk::glib::SignalHandlerId)>,
-    icon_publication_pending: bool,
+    icon_publication_pending: Rc<std::cell::Cell<bool>>,
     published_icons: Vec<tuna_shell_control::WindowIconGeometry>,
     grid: gtk::ApplicationWindow,
     apps: Rc<LiveApps>,
@@ -286,7 +286,7 @@ impl OverviewUi {
             dash_signature: Vec::new(),
             dash_icons: Vec::new(),
             dash_layout: None,
-            icon_publication_pending: false,
+            icon_publication_pending: Rc::new(std::cell::Cell::new(false)),
             published_icons: Vec::new(),
             grid,
             apps,
@@ -467,25 +467,32 @@ impl OverviewUi {
 
     /// One bounded layout observer per rebuild; steady state has no frame callback.
     fn publish_dash_icons(ui: &Rc<RefCell<Self>>) {
-        let mut me = ui.borrow_mut();
-        if me.icon_publication_pending {
+        let me = ui.borrow();
+        if me.icon_publication_pending.replace(true) {
             return;
         }
-        me.icon_publication_pending = true;
+        let pending = me.icon_publication_pending.clone();
         let dash = me.dash.clone();
         drop(me);
         let weak = Rc::downgrade(ui);
-        let mut attempts = 0;
+        let attempts = std::cell::Cell::new(0usize);
         dash.add_tick_callback(move |dash, _| {
-            attempts += 1;
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
             let Some(ui) = weak.upgrade() else {
+                pending.set(false);
                 return gtk::glib::ControlFlow::Break;
             };
             let Ok(mut me) = ui.try_borrow_mut() else {
-                return gtk::glib::ControlFlow::Continue;
+                return if attempt < 30 {
+                    gtk::glib::ControlFlow::Continue
+                } else {
+                    pending.set(false);
+                    gtk::glib::ControlFlow::Break
+                };
             };
             // Tick precedes allocation; allow a completed frame before sampling.
-            if attempts < 2 {
+            if attempt < 2 {
                 return gtk::glib::ControlFlow::Continue;
             }
             let monitor = dash
@@ -494,10 +501,10 @@ impl OverviewUi {
                     gtk::prelude::WidgetExt::display(dash).monitor_at_surface(&surface)
                 });
             let Some(monitor) = monitor else {
-                if attempts < 30 {
+                if attempt < 30 {
                     return gtk::glib::ControlFlow::Continue;
                 }
-                me.icon_publication_pending = false;
+                pending.set(false);
                 return gtk::glib::ControlFlow::Break;
             };
             let monitor = monitor.geometry();
@@ -526,7 +533,7 @@ impl OverviewUi {
                 me.actions.set_window_icon_geometries(geometries.clone());
                 me.published_icons = geometries;
             }
-            me.icon_publication_pending = false;
+            pending.set(false);
             gtk::glib::ControlFlow::Break
         });
     }
