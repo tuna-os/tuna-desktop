@@ -1,5 +1,5 @@
 """Bind fixture client keys and measured guest host keys; never predict host keys."""
-import hashlib,json,re,subprocess
+import contextlib,hashlib,json,os,re,subprocess,tempfile
 from pathlib import Path
 HOST_KEYS='''import pathlib,json,subprocess
 boot=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
@@ -39,3 +39,21 @@ def host_receipt(value,known_hosts,boot_id):
  matched=sorted(fingerprints & {k['fingerprint'] for k in keys})
  if not matched:raise ValueError('authenticated SSH known_hosts does not match measured guest host key')
  return {'measured_after_boot':True,'boot_id':boot_id,'guest_public_host_keys':keys,'matched_known_hosts_fingerprints':matched,'owned_known_hosts_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'transport':'Kubernetes API tunnel; initial TOFU accept-new; existing keys strictly checked'}
+
+
+@contextlib.contextmanager
+def projected_kubeconfig(context):
+    # KubeVirt1.8.2 LocalClientCmd generates a ProxyCommand without --context.
+    # Give the entire child process tree a private one-context credential file;
+    # never write credentials into evidence/artifact directories or global config.
+    raw=subprocess.check_output(['kubectl','--context',context,'config','view','--minify','--flatten','--raw','-o','json'],timeout=30)
+    if len(raw)>1024*1024:raise ValueError('projected Kubernetes config exceeds bound')
+    value=json.loads(raw)
+    contexts=value.get('contexts',[]);clusters=value.get('clusters',[])
+    if value.get('current-context')!=context or len(contexts)!=1 or contexts[0].get('name')!=context or len(clusters)!=1 or contexts[0].get('context',{}).get('cluster')!=clusters[0].get('name'):raise ValueError('private Kubernetes context projection differs')
+    with tempfile.TemporaryDirectory(prefix='tuna-corral-ssh-',dir='/tmp') as directory:
+        path=Path(directory)/'kubeconfig'
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'wb') as stream:stream.write(raw)
+        env=dict(os.environ);env['KUBECONFIG']=str(path)
+        yield env

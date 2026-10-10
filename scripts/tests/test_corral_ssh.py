@@ -1,7 +1,25 @@
-import hashlib,pathlib,subprocess,sys,tempfile,unittest
+import hashlib,json,os,pathlib,subprocess,sys,tempfile,unittest
+from unittest.mock import patch
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'lib'))
 import corral_ssh as m
 class Tests(unittest.TestCase):
+ def test_private_context_projection_replaces_ambient_and_is_deleted(self):
+  config={'current-context':'selected','contexts':[{'name':'selected','context':{'cluster':'c'}}],'clusters':[{'name':'c','cluster':{'server':'https://example.invalid'}}],'users':[{'name':'u','user':{'token':'synthetic-private-test-token'}}]}
+  for fails in (False,True):
+   with patch.object(m.subprocess,'check_output',return_value=json.dumps(config).encode()) as call,patch.dict(os.environ,{'KUBECONFIG':'ambient-other-context'}):
+    try:
+     with m.projected_kubeconfig('selected') as env:
+      path=pathlib.Path(env['KUBECONFIG']);self.assertNotEqual(str(path),os.environ['KUBECONFIG']);self.assertEqual(path.stat().st_mode&0o777,0o600);self.assertEqual(json.loads(path.read_text())['current-context'],'selected')
+      self.assertEqual(path.parent.stat().st_mode&0o777,0o700)
+      if fails:raise RuntimeError('controlled SSH failure')
+    except RuntimeError:
+     if not fails:raise
+    self.assertFalse(path.exists());self.assertEqual(os.environ['KUBECONFIG'],'ambient-other-context')
+   self.assertIn('selected',call.call_args.args[0])
+ def test_projection_rejects_other_context(self):
+  with patch.object(m.subprocess,'check_output',return_value=b'{"current-context":"ambient","contexts":[],"clusters":[]}'):
+   with self.assertRaises(ValueError):
+    with m.projected_kubeconfig('selected'):self.fail('must refuse')
  def setup(self,d):
   key=pathlib.Path(d)/'key';subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(key)],check=True)
   pub=pathlib.Path(str(key)+'.pub');fp=subprocess.check_output(['ssh-keygen','-lf',str(pub)]).decode().split()[1]

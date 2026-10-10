@@ -138,3 +138,13 @@ checks they match the owned strictly checked known_hosts evidence, and stores
 that identity with the exact boot ID in `corral-session.json`/measurement metadata.
 First connection uses TOFU over the authenticated Kubernetes API tunnel; per-VM
 host keys are generated on first boot and are never predicted by the exporter.
+
+
+virtctl1.8.2 parses `--known-hosts` but does not pass it into its native SSH client.
+The adapter therefore also sets native UserKnownHostsFile explicitly and disables
+GlobalKnownHostsFile; changing the default shared host store is never a repair.
+Its generated ProxyCommand also omits context. Every SSH child receives a private
+minified single-context KUBECONFIG under a0700 temporary directory, mode0600,
+outside evidence/artifact paths. It is deleted after the child completes/fails;
+the ambient kubeconfig/current context is unchanged. Credentials are not retained
+in measurement receipts, which record explicit context isolation only.

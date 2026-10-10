@@ -63,9 +63,9 @@ print(json.dumps({'boot_id':boot,'messages':rows}))
 '''
 
 
-def bounded_run(command, timeout):
+def bounded_run(command, timeout, env=None):
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        process = subprocess.Popen(command,stdout=stdout,stderr=stderr,start_new_session=True)
+        process = subprocess.Popen(command,stdout=stdout,stderr=stderr,start_new_session=True,env=env)
         try:
             deadline=time.monotonic()+timeout
             while process.poll() is None:
@@ -137,7 +137,10 @@ class Session:
         return result
 
     def remote(self,command,timeout=130):
-        return bounded_run([*self.ssh,'--command',command,'vm/'+self.name],timeout)
+        from corral_ssh import projected_kubeconfig
+        with projected_kubeconfig(self.context) as env:
+            self.metadata['ssh_kubernetes_context']={'explicit_context':self.context,'child_ambient_context_isolated':True,'credential_file_retained':False}
+            return bounded_run([*self.ssh,'--command',command,'vm/'+self.name],timeout,env=env)
 
     def python(self,source,argument=None):
         command=('python3 -c ' if self.user=='root' else 'sudo -n python3 -c ')+shlex.quote(source)
