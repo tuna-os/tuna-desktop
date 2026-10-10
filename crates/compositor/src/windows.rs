@@ -229,6 +229,9 @@ pub struct WindowManager {
     x11_index: HashMap<u32, u64>,
     /// Model ids bottom-to-top; focus raises to the top.
     stacking: Vec<u64>,
+    // Explicit activation history is independent of raising transient families.
+    // GNOME workspace.c focus_ancestor_or_mru_window uses MRU after detach.
+    focus_history: Vec<u64>,
     cascade: i32,
     keyboard: Option<KeyboardHandle<State>>,
     pointer: Option<PointerHandle<State>>,
@@ -407,6 +410,7 @@ impl WindowManager {
             #[cfg(feature = "xwayland")]
             x11_index: HashMap::new(),
             stacking: Vec::new(),
+            focus_history: Vec::new(),
             cascade: 0,
             keyboard,
             pointer,
@@ -1719,6 +1723,7 @@ impl WindowManager {
             }
         }
         self.stacking.retain(|other| *other != id);
+        self.focus_history.retain(|other| *other != id);
         self.model.remove(id);
         for window in self.windows.values_mut() {
             if window.x11_parent == Some(id) {
@@ -1733,6 +1738,12 @@ impl WindowManager {
         let fallback = return_parent
             .filter(|id| visible.contains(id))
             .or_else(|| self.model.focused().filter(|id| visible.contains(id)))
+            .or_else(|| {
+                self.focus_history
+                    .iter()
+                    .copied()
+                    .find(|id| visible.contains(id))
+            })
             .or_else(|| {
                 self.stacking
                     .iter()
@@ -1876,6 +1887,7 @@ impl WindowManager {
         let id = id.map(|id| self.activation_target(id));
         self.pre_overview_focus = id;
         if let Some(id) = id {
+            self.remember_focus(id);
             if self.mode == SessionMode::Gnome {
                 self.raise_family(id);
             }
@@ -1892,12 +1904,20 @@ impl WindowManager {
         }
     }
 
+    fn remember_focus(&mut self, id: u64) {
+        self.focus_history.retain(|other| *other != id);
+        self.focus_history.insert(0, id);
+    }
+
     fn apply_focus(&mut self, state: &mut State, id: Option<u64>) {
         // GNOME attaches modal dialogs to their parent: the parent
         // cannot take focus from its dialog (xdg-dialog, #89).
         let id = id.map(|id| self.activation_target(id));
         let previous = self.model.focused();
         self.model.set_focused(id);
+        if let Some(id) = id {
+            self.remember_focus(id);
+        }
         // Shell activation may set model focus before this manager runs.
         // Compare the last applied activation too, so Alt+Tab follows the
         // selected column while ordinary reassertion preserves wheel panning.
