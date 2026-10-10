@@ -164,9 +164,10 @@ impl ProtocolVersion {
     /// `0.32` appends cursor theme, size and locate-pointer preferences.
     /// `0.33` appends the configurable locate-pointer keysym name.
     /// `0.34` appends authenticated window peer PID for notification sender matching.
+    /// `0.35` appends private X11 instance metadata for desktop matching.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 34,
+        minor: 35,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -214,6 +215,10 @@ pub struct WindowInfo {
     /// Native kernel peer PID or XRes server-reported X11 owner PID.
     /// Private shell transport, redacted while locked; never _NET_WM_PID.
     pub client_pid: Option<u32>,
+    /// Untrusted X11 WM_CLASS instance, private and absent while locked.
+    /// Appended positional field; both peers upgrade together.
+    #[serde(default)]
+    pub x11_instance: Option<String>,
 }
 
 /// Workspace state owned by the compositor and mirrored to the shell.
@@ -1322,6 +1327,7 @@ mod tests {
         WindowInfo {
             on_all_workspaces: false,
             client_pid: Some(4321),
+            x11_instance: Some("terminal-instance".to_owned()),
             icon: None,
             id,
             title: format!("Terminal {id}"),
@@ -1428,8 +1434,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_34() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 34));
+    fn current_version_is_0_35() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 35));
     }
 
     #[test]

@@ -99,6 +99,20 @@ uses installed hint/name fallback. The real X11 fixture sets another mapped
 sender's PID property before mapping, then requires disabled-source rejection
 and positive controls for both actual senders.
 
+Tracked windows additionally supply private, length-bounded X11 instance
+metadata. The host resolves exact StartupWMClass instance before class, then
+desktop basenames in original case before ASCII lowercase/space-to-dash forms,
+with GNOME's vendor-prefix order. Duplicate StartupWMClass entries use GNOME's
+cache-scan exact/visible replacement rules. Desktop discovery occurs at intake
+outside the notification-center lock and caches only owned strings/flags; the
+live AppInfoMonitor invalidates that catalog without scanning on the GTK thread.
+Notification desktop hints and app-name fallback remain exact installed IDs.
+The canonical proof adds separate real X11 instance/class, exact-case and
+canonical vendor controls plus exact installed app-name controls. These new
+cases remain unqualified until the corresponding exact-source CI receipt passes.
+Sandbox/GTK application properties, startup sequences and window-group or
+transient associations remain further tracked-identity requirements.
+
 The default local proof captures actual player dispatch arguments. `--real-audio`
 also requires recorded digital output. Neither mode certifies
 audible output, sound device behavior, physical outputs, host PAM, GTK variants

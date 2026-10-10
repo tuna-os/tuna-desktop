@@ -124,7 +124,10 @@ impl Notifications {
             .center
             .lock()
             .ok()
-            .and_then(|center| pid.and_then(|pid| center.sender_app(pid).map(str::to_owned)));
+            .and_then(|center| pid.and_then(|pid| center.sender_identity(pid).cloned()));
+        let tracked = tracked
+            .as_ref()
+            .and_then(crate::application_identity::resolve_tracked);
         let installed =
             |id: &str| gio_unix::DesktopAppInfo::new(&format!("{id}.desktop")).is_some();
         let resolved = resolve_source(tracked.as_deref(), &desktop_entry, &app_name, installed);

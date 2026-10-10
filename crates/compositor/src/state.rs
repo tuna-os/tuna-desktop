@@ -35,6 +35,7 @@ pub struct WindowEntry {
     /// Native kernel peer PID or XRes server-reported X11 owner PID.
     /// Never the shared Xwayland process or client-provided _NET_WM_PID.
     pub client_pid: Option<u32>,
+    pub x11_instance: Option<String>,
     pub icon: Option<String>,
     /// Generational id: drawn from a session-monotonic counter, never reused.
     pub id: u64,
@@ -377,6 +378,7 @@ impl StateModel {
         let window = WindowEntry {
             on_all_workspaces: false,
             client_pid: None,
+            x11_instance: None,
             icon: None,
             id,
             title: cap_title(title),
@@ -551,6 +553,17 @@ impl StateModel {
             .filter(|(r, _)| *r > rev)
             .cloned()
             .collect())
+    }
+
+    pub fn set_x11_instance(&mut self, id: u64, instance: Option<String>) {
+        let instance = instance.map(|s| cap_title(&s));
+        if let Some(window) = self.windows.get_mut(&id) {
+            if window.x11_instance != instance {
+                window.x11_instance = instance;
+                let window = window.clone();
+                self.commit(StateChange::WindowUpdated { window });
+            }
+        }
     }
 
     pub fn set_client_pid(&mut self, id: u64, pid: Option<u32>) {
@@ -1151,6 +1164,24 @@ mod tests {
         assert_eq!(m.workspaces(), &[0, 3]);
         assert!(m.remove(a));
         assert_eq!(m.workspaces(), &[0]);
+    }
+
+    #[test]
+    fn private_x11_instance_is_bounded_revisioned_and_clearable() {
+        let mut model = StateModel::new();
+        let id = model.insert("window", Some("Class"), 0);
+        assert!(model.window(id).unwrap().x11_instance.is_none());
+        let before = model.revision();
+        model.set_x11_instance(id, Some("λ".repeat(MAX_TITLE_LEN)));
+        let value = model.window(id).unwrap().x11_instance.clone();
+        assert!(value.as_ref().unwrap().len() <= MAX_TITLE_LEN);
+        assert!(model.revision() > before);
+        let unchanged = model.revision();
+        model.set_x11_instance(id, value);
+        assert_eq!(model.revision(), unchanged);
+        model.set_x11_instance(id, None);
+        assert!(model.window(id).unwrap().x11_instance.is_none());
+        assert!(model.revision() > unchanged);
     }
 }
 

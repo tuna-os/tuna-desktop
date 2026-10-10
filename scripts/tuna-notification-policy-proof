@@ -260,8 +260,8 @@ appid=os.environ['TUNA_X11_APP']
 GLib.set_prgname(appid)
 app=Gtk.Application(application_id=appid,flags=Gio.ApplicationFlags.NON_UNIQUE)
 def activate(app):
- win=Gtk.ApplicationWindow(application=app,title='X11 notification sender fixture')
- win.set_wmclass(appid,appid);win.set_default_size(200,100);win.realize()
+ win=Gtk.ApplicationWindow(application=app,title='X11 notification sender fixture '+appid)
+ win.set_wmclass(os.environ.get('TUNA_X11_INSTANCE',appid),os.environ.get('TUNA_X11_CLASS',appid));win.set_default_size(200,100);win.realize()
  xid=win.get_window().get_xid()
  reported=int(os.environ.get('TUNA_X11_SPOOF_PID',os.getpid()))
  subprocess.run(['xprop','-id',str(xid),'-f','_NET_WM_PID','32c','-set','_NET_WM_PID',str(reported)],check=True,timeout=5)
@@ -313,6 +313,45 @@ app.connect('activate',activate);app.run([])
  manifest['x11_identity']=dict(window_pid_source='XRes LOCAL_CLIENT_PID (X server owner)',sender_pid_source='org.freedesktop.DBus.GetConnectionUnixProcessID',spoofed_property='_NET_WM_PID set before map',kernel_authenticated_x11_window=False)
  for client,_,_,_ in xclients.values(): client.terminate();client.wait(timeout=5)
  wait(lambda:all(w.get('app_id') not in ('org.tuna.NotifyAlpha','org.tuna.NotifyBeta') for w in snapshot()['windows']),'x11-senders-unmapped')
+ # Installed source lookup also consumes GNOME's tracked-window heuristics.
+ identity_folder=art/'data/applications'
+ for ident,name,startup in (
+  ('org.tuna.NotifyAlpha','TunaPolicyAlpha','SharedBrowserClass'),
+  ('org.tuna.NotifyBeta','TunaPolicyBeta','ShortcutInstance'),
+  ('Exact.MixedCase','IdentityExact',''),
+  ('gnome-fedora-editor','IdentityVendor','')):
+  (identity_folder/(ident+'.desktop')).write_text('[Desktop Entry]\nType=Application\nName='+name+'\nExec=/usr/bin/true\nStartupWMClass='+startup+'\n')
+ time.sleep(2)
+ identity_cases=(
+  ('startup-instance','SharedBrowserClass','ShortcutInstance','org.tuna.NotifyBeta','org.tuna.NotifyAlpha'),
+  ('startup-class','SharedBrowserClass','UnmatchedInstance','org.tuna.NotifyAlpha','org.tuna.NotifyBeta'),
+  ('exact-instance','MissingClass','Exact.MixedCase','Exact.MixedCase','org.tuna.NotifyAlpha'),
+  ('canonical-vendor','MissingClass','Fedora Editor','gnome-fedora-editor','org.tuna.NotifyAlpha'))
+ for label,class_name,instance,expected,hint in identity_cases:
+  trigger=art/(label+'-trigger');reply=art/(label+'-reply');ready=art/(label+'-ready')
+  appid='org.tuna.IdentityFixture'
+  client=spawn(['/usr/bin/python3',str(xscript)],label+'-sender',dict(GDK_BACKEND='x11',DISPLAY=xdisplay,TUNA_X11_APP=appid,TUNA_X11_CLASS=class_name,TUNA_X11_INSTANCE=instance,TUNA_X11_READY=str(ready),TUNA_SENDER_TRIGGER=str(trigger),TUNA_SENDER_REPLY=str(reply),TUNA_SENDER_HINT=hint))
+  info=wait(lambda:json.loads(ready.read_text()),label+'-sender-ready');assert info['pid']==client.pid
+  wait(lambda:any(w.get('title')=='X11 notification sender fixture '+appid and w.get('app_id')==class_name for w in snapshot()['windows']),label+'-window-tracked')
+  time.sleep(2)
+  policy_schema='org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/'+expected.lower().replace('.','-')+'/'
+  setpref(policy_schema,'enable','false');trigger.write_text('IDENTITY_DISABLED_'+label)
+  result=wait(lambda:json.loads(reply.read_text()),label+'-disabled-response')
+  wait(lambda:any(n['id']==result['id'] and n['desktop_entry']==expected for n in json.loads(queue_file.read_text())['notifications']),label+'-installed-source-matched')
+  assert absent('IDENTITY_DISABLED_'+label), 'tracked identity bypassed disabled policy'
+  close(result['id']);reply.unlink();setpref(policy_schema,'enable','true')
+  trigger.write_text('IDENTITY_ENABLED_'+label)
+  wait(lambda:reply.exists() and has('IDENTITY_ENABLED_'+label),label+'-source-enabled-positive')
+  close(json.loads(reply.read_text())['id']);client.terminate();client.wait(timeout=5)
+  wait(lambda:all(w.get('title')!='X11 notification sender fixture '+appid for w in snapshot()['windows']),label+'-sender-unmapped')
+ # The notification's app-name fallback is exact, with no tracked sender.
+ setpref(app_schema('Alpha'),'enable','false')
+ named=notify(None,'INSTALLED_APP_NAME_DISABLED',app_name='org.tuna.NotifyAlpha')
+ wait(lambda:any(n['id']==named and n['desktop_entry']=='org.tuna.NotifyAlpha' for n in json.loads(queue_file.read_text())['notifications']),'exact-installed-app-name-source')
+ assert absent('INSTALLED_APP_NAME_DISABLED');close(named)
+ setpref(app_schema('Alpha'),'enable','true')
+ named=notify(None,'INSTALLED_APP_NAME_ENABLED',app_name='org.tuna.NotifyAlpha')
+ wait(lambda:has('INSTALLED_APP_NAME_ENABLED'),'exact-installed-app-name-positive');close(named)
  setpref(app_schema('Alpha'),'show-banners','false')
  for i in range(5): notify('Alpha','HIDDEN_NORMAL_'+str(i))
  control=notify('Beta','VISIBLE_CONTROL')

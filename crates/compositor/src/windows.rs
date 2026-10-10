@@ -1480,6 +1480,7 @@ impl WindowManager {
         let window = Window::new_x11_window(surface.clone());
         let id = self.insert_managed(&title, app_id.as_deref());
         self.x11_index.insert(surface.window_id(), id);
+        self.model.set_x11_instance(id, Some(surface.instance()));
         eprintln!("tuna-compositor: X11 window {id} mapped ({title})");
         // GNOME placement at the size the client asked for.
         let asked = surface.geometry().size;
@@ -1568,6 +1569,7 @@ impl WindowManager {
                             window.surface.x11_surface().map(|surface| {
                                 (
                                     model,
+                                    surface.instance(),
                                     map_x11_identity(
                                         &surface.title(),
                                         &surface.class(),
@@ -1577,7 +1579,8 @@ impl WindowManager {
                             })
                         })
                     });
-                    if let Some((model, (title, app_id))) = pair {
+                    if let Some((model, instance, (title, app_id))) = pair {
+                        self.model.set_x11_instance(model, Some(instance));
                         self.model.update(
                             model,
                             WindowUpdate {

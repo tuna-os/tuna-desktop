@@ -100,6 +100,7 @@ impl PolicyReader {
         let revision = self.revision.clone();
         let callback = changed.clone();
         self.app_monitor.connect_changed(move |_| {
+            crate::application_identity::installed_changed();
             app_revision.set(app_revision.get().wrapping_add(1));
             revision.set(revision.get().wrapping_add(1));
             callback();

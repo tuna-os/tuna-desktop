@@ -315,7 +315,7 @@ pub struct LockNotificationGroup {
 }
 
 #[derive(Default)]
-struct NotificationSenders(HashMap<u32, String>);
+struct NotificationSenders(HashMap<u32, crate::application_identity::WindowIdentity>);
 impl std::fmt::Debug for NotificationSenders {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NotificationSenders")
@@ -532,11 +532,17 @@ impl NotificationCenter {
     }
     /// Replaced from authenticated private compositor inventory; never from
     /// notification hints or application-provided PID values.
-    pub fn set_senders(&mut self, entries: impl IntoIterator<Item = (u32, String)>) {
+    pub fn set_senders(
+        &mut self,
+        entries: impl IntoIterator<Item = (u32, crate::application_identity::WindowIdentity)>,
+    ) {
         self.senders.0 = entries.into_iter().filter(|(pid, _)| *pid != 0).collect();
     }
-    pub fn sender_app(&self, pid: u32) -> Option<&str> {
-        self.senders.0.get(&pid).map(String::as_str)
+    pub fn sender_identity(
+        &self,
+        pid: u32,
+    ) -> Option<&crate::application_identity::WindowIdentity> {
+        self.senders.0.get(&pid)
     }
 
     pub fn set_locked(&mut self, locked: bool) {
@@ -1506,13 +1512,24 @@ mod tests {
     #[test]
     fn sender_inventory_replaces_old_process_associations_and_redacts_debug() {
         let mut c = center();
-        c.set_senders([(4321, "org.Private.App".to_owned())]);
-        assert_eq!(c.sender_app(4321), Some("org.Private.App"));
+        c.set_senders([(
+            4321,
+            crate::application_identity::WindowIdentity {
+                class: "org.Private.App".to_owned(),
+                instance: Some("private-instance".into()),
+            },
+        )]);
+        assert_eq!(
+            c.sender_identity(4321)
+                .map(|identity| identity.class.as_str()),
+            Some("org.Private.App")
+        );
         let debug = format!("{c:?}");
         assert!(!debug.contains("org.Private.App"));
+        assert!(!debug.contains("private-instance"));
         assert!(!debug.contains("4321"));
         c.set_senders([]);
-        assert_eq!(c.sender_app(4321), None);
+        assert!(c.sender_identity(4321).is_none());
     }
     #[test]
     fn policy_source_identifiers_are_redacted_in_center_debug() {

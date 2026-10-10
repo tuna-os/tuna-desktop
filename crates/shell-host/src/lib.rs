@@ -11,6 +11,7 @@
 //! - [`control`] — shell-side control-protocol client (Hello, snapshot,
 //!   ordered changes with gap resnapshot, token activation commands).
 
+pub mod application_identity;
 pub mod apps;
 pub mod control;
 pub mod dock;

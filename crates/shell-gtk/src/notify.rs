@@ -453,12 +453,15 @@ impl NotifyUi {
     /// Hide and retire unlocked message widgets before lock surfaces are mapped.
     pub fn sync_senders(&self, model: &tuna_shell_host::model::ShellModel) {
         if let Ok(mut center) = self.center.lock() {
-            center.set_senders(
-                model
-                    .windows()
-                    .iter()
-                    .filter_map(|w| Some((w.client_pid?, w.app_id.clone()?))),
-            );
+            center.set_senders(model.windows().iter().filter_map(|w| {
+                Some((
+                    w.client_pid?,
+                    tuna_shell_host::application_identity::WindowIdentity {
+                        class: w.app_id.clone().unwrap_or_default(),
+                        instance: w.x11_instance.clone(),
+                    },
+                ))
+            }));
         }
     }
 

@@ -22,6 +22,7 @@
 pub struct WindowEntry {
     /// Native kernel peer PID or XRes server-reported owner, from private control.
     pub client_pid: Option<u32>,
+    pub x11_instance: Option<String>,
     pub icon: Option<String>,
     /// Compositor-issued opaque window id.
     pub id: u64,
@@ -43,6 +44,7 @@ impl WindowEntry {
     pub fn new(id: u64, title: impl Into<String>, active: bool) -> Self {
         Self {
             client_pid: None,
+            x11_instance: None,
             icon: None,
             on_all_workspaces: false,
             id,
@@ -55,6 +57,10 @@ impl WindowEntry {
 
     pub fn with_client_pid(mut self, pid: Option<u32>) -> Self {
         self.client_pid = pid;
+        self
+    }
+    pub fn with_x11_instance(mut self, instance: Option<String>) -> Self {
+        self.x11_instance = instance;
         self
     }
 
