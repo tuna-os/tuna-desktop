@@ -232,31 +232,72 @@ impl CursorImage {
     }
 }
 
-/// The image of an Xcursor file nearest `wanted` (the first frame of
-/// an animated cursor).
-pub fn decode(bytes: &[u8], wanted: u32) -> Option<CursorImage> {
+/// All animation frames of the nearest nominal Xcursor size, in file order.
+/// Every frame keeps its own dimensions, hotspot, pixels and delay.
+pub fn decode_frames(bytes: &[u8], wanted: u32) -> Option<Vec<(CursorImage, u32)>> {
     let images = xcursor::parser::parse_xcursor(bytes)?;
     let nearest = images
         .iter()
-        .map(|i| i.size)
-        .min_by_key(|s| (s.abs_diff(wanted), *s))?;
-    let image = images.into_iter().find(|i| i.size == nearest)?;
-    let len = (image.width as usize) * (image.height as usize) * 4;
-    if image.width == 0 || image.height == 0 || image.pixels_rgba.len() < len {
-        return None;
+        .map(|image| image.size)
+        .min_by_key(|size| (size.abs_diff(wanted), *size))?;
+    let mut frames = Vec::new();
+    let mut total_bytes = 0usize;
+    for image in images.into_iter().filter(|image| image.size == nearest) {
+        let len = (image.width as usize)
+            .checked_mul(image.height as usize)?
+            .checked_mul(4)?;
+        total_bytes = total_bytes.checked_add(len)?;
+        if image.width == 0
+            || image.height == 0
+            || image.width > 4096
+            || image.height > 4096
+            || image.pixels_rgba.len() < len
+            || total_bytes > 64 * 1024 * 1024
+            || frames.len() >= 1024
+        {
+            return None;
+        }
+        frames.push((
+            CursorImage {
+                nominal: image.size.max(1),
+                width: image.width,
+                height: image.height,
+                hotspot: (
+                    image.xhot.min(image.width - 1),
+                    image.yhot.min(image.height - 1),
+                ),
+                pixels: image.pixels_rgba[..len].to_vec(),
+            },
+            image.delay,
+        ));
     }
-    Some(CursorImage {
-        nominal: image.size.max(1),
-        width: image.width,
-        height: image.height,
-        hotspot: (
-            image.xhot.min(image.width - 1),
-            image.yhot.min(image.height - 1),
-        ),
-        // Xcursor stores little-endian premultiplied ARGB words: the
-        // bytes are already DRM's ARGB8888.
-        pixels: image.pixels_rgba[..len].to_vec(),
-    })
+    (!frames.is_empty()).then_some(frames)
+}
+
+/// Compatibility helper for tests and static callers.
+pub fn decode(bytes: &[u8], wanted: u32) -> Option<CursorImage> {
+    decode_frames(bytes, wanted)?
+        .into_iter()
+        .next()
+        .map(|(image, _)| image)
+}
+
+/// Select the frame using individual delays, wrap at the total cycle, and
+/// avoid a zero-delay theme creating a busy loop. Static cursors stay on 0.
+pub fn animation_frame(delays: &[u32], elapsed: Duration) -> usize {
+    let cycle: u128 = delays.iter().map(|delay| u128::from((*delay).max(1))).sum();
+    if delays.len() < 2 || cycle == 0 {
+        return 0;
+    }
+    let mut position = elapsed.as_millis() % cycle;
+    for (index, delay) in delays.iter().enumerate() {
+        let delay = u128::from((*delay).max(1));
+        if position < delay {
+            return index;
+        }
+        position -= delay;
+    }
+    0
 }
 
 /// The built-in arrow for a theme size: black outline, white fill,
@@ -331,28 +372,45 @@ fn edge_distance(poly: &[(f64, f64)], (px, py): (f64, f64)) -> f64 {
     best
 }
 
-/// A loaded cursor ready to draw.
-struct Loaded {
+/// A decoded frame and its reusable renderer buffer.
+struct LoadedFrame {
     image: CursorImage,
     buffer: MemoryRenderBuffer,
-    /// Theme it came from, or `None` for the built-in arrow.
+}
+
+/// A loaded cursor ready to draw without allocating on every animation tick.
+struct Loaded {
+    frames: Vec<LoadedFrame>,
+    delays: Vec<u32>,
     theme: Option<String>,
     name: String,
 }
 
 impl Loaded {
     fn new(image: CursorImage, theme: Option<String>, name: String) -> Self {
-        let buffer = MemoryRenderBuffer::from_slice(
-            &image.pixels,
-            Fourcc::Argb8888,
-            (image.width as i32, image.height as i32),
-            1,
-            Transform::Normal,
-            None,
-        );
+        Self::from_frames(vec![(image, 0)], theme, name)
+    }
+
+    fn from_frames(frames: Vec<(CursorImage, u32)>, theme: Option<String>, name: String) -> Self {
+        let mut delays = Vec::with_capacity(frames.len());
+        let frames = frames
+            .into_iter()
+            .map(|(image, delay)| {
+                delays.push(delay);
+                let buffer = MemoryRenderBuffer::from_slice(
+                    &image.pixels,
+                    Fourcc::Argb8888,
+                    (image.width as i32, image.height as i32),
+                    1,
+                    Transform::Normal,
+                    None,
+                );
+                LoadedFrame { image, buffer }
+            })
+            .collect();
         Self {
-            image,
-            buffer,
+            frames,
+            delays,
             theme,
             name,
         }
@@ -379,6 +437,8 @@ struct Shown {
     /// Drawn size in logical pixels.
     logical: Option<(f64, f64)>,
     scale: f64,
+    animation_frame: usize,
+    animation_frames: usize,
 }
 
 /// Where the cursor image is coming from this frame.
@@ -432,6 +492,8 @@ pub struct Cursor {
     builtin: HashMap<u32, Loaded>,
     shown: Option<Shown>,
     pub locate: LocatePointer,
+    animation_icon: Option<CursorIcon>,
+    animation_started: Duration,
 }
 
 impl Default for Cursor {
@@ -451,6 +513,8 @@ impl Cursor {
             builtin: HashMap::new(),
             shown: None,
             locate: LocatePointer::default(),
+            animation_icon: None,
+            animation_started: Duration::ZERO,
         };
         cursor.set_theme(DEFAULT_THEME, DEFAULT_SIZE);
         cursor
@@ -469,6 +533,7 @@ impl Cursor {
         self.dirs = search_path(|k| std::env::var(k).ok());
         self.chain = theme_chain(&self.dirs, theme);
         self.cache.clear();
+        self.animation_icon = None;
         eprintln!(
             "tuna-compositor: cursor theme {:?} size {size} (themes {:?})",
             self.theme, self.chain
@@ -490,8 +555,8 @@ impl Cursor {
                 let loaded =
                     find_cursor(&self.dirs, &self.chain, &icon_names(icon)).and_then(|found| {
                         let bytes = std::fs::read(&found.path).ok()?;
-                        let image = decode(&bytes, wanted)?;
-                        Some(Loaded::new(image, Some(found.theme), found.name))
+                        let frames = decode_frames(&bytes, wanted)?;
+                        Some(Loaded::from_frames(frames, Some(found.theme), found.name))
                     });
                 self.cache.insert(key, loaded);
             }
@@ -538,29 +603,37 @@ impl Cursor {
             image: None,
             logical: None,
             scale,
+            animation_frame: 0,
+            animation_frames: 0,
         };
+        if !matches!(what, Pointer::Named(..)) {
+            self.animation_icon = None;
+        }
         match what {
             Pointer::Hidden => {}
             Pointer::Named(icon, source) => {
                 let size = self.size;
+                if self.animation_icon != Some(*icon) {
+                    self.animation_icon = Some(*icon);
+                    self.animation_started = now;
+                }
+                let elapsed = now.saturating_sub(self.animation_started);
                 let loaded = self.loaded(*icon, scale);
-                let ((w, h), (hx, hy)) = loaded.image.logical(size);
+                let index = animation_frame(&loaded.delays, elapsed);
+                let frame = &loaded.frames[index];
+                let ((w, h), (hx, hy)) = frame.image.logical(size);
                 let at = to_physical(pointer - Point::from((hx, hy)));
                 let physical = (
                     (w * scale).round().max(1.0) as i32,
                     (h * scale).round().max(1.0) as i32,
                 );
                 let src = Rectangle::from_size(
-                    (
-                        f64::from(loaded.image.width),
-                        f64::from(loaded.image.height),
-                    )
-                        .into(),
+                    (f64::from(frame.image.width), f64::from(frame.image.height)).into(),
                 );
                 if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
                     at,
-                    &loaded.buffer,
+                    &frame.buffer,
                     None,
                     Some(src),
                     Some(physical.into()),
@@ -574,9 +647,11 @@ impl Cursor {
                     source,
                     theme: Some(loaded.theme.clone().unwrap_or_else(|| "builtin".into())),
                     file: Some(loaded.name.clone()),
-                    image: Some((loaded.image.width, loaded.image.height)),
+                    image: Some((frame.image.width, frame.image.height)),
                     logical: Some((w, h)),
                     scale,
+                    animation_frame: index,
+                    animation_frames: loaded.frames.len(),
                 };
             }
             Pointer::Surface(surface) => {
@@ -606,6 +681,8 @@ impl Cursor {
                     image: size.map(|(_, buffer)| buffer),
                     logical: size.map(|(logical, _)| logical),
                     scale,
+                    animation_frame: 0,
+                    animation_frames: 0,
                 };
             }
         }
@@ -657,6 +734,10 @@ impl Cursor {
     /// frame must be repainted even without input.
     pub fn animating(&self, now: Duration) -> bool {
         self.locate.active(now)
+            || self
+                .shown
+                .as_ref()
+                .is_some_and(|shown| shown.animation_frames > 1)
     }
 
     /// The state-file record: settings, what the pointer shows, and
@@ -675,6 +756,8 @@ impl Cursor {
             "image": shown.and_then(|s| s.image).map(|(w, h)| [w, h]),
             "logical": shown.and_then(|s| s.logical).map(|(w, h)| [w, h]),
             "scale": shown.map(|s| s.scale),
+            "animation_frame": shown.map(|s| s.animation_frame),
+            "animation_frames": shown.map(|s| s.animation_frames),
             "locate_pointer": self.locate.snapshot(now),
         })
     }
@@ -1058,6 +1141,55 @@ pub fn ripple_disc(size: u32, accent: [f32; 3], glow: f64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animated_cursors_keep_each_frame_of_the_nearest_size() {
+        let mut bytes = xcursor_file(&[(24, 24), (48, 48), (24, 32)]);
+        let first = 16 + 12 * 3;
+        bytes[first + 32..first + 36].copy_from_slice(&30u32.to_le_bytes());
+        let third = first + 36 + 24 * 24 * 4 + 36 + 48 * 48 * 4;
+        bytes[third + 32..third + 36].copy_from_slice(&70u32.to_le_bytes());
+        let frames = decode_frames(&bytes, 25).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            (frames[0].0.width, frames[0].0.hotspot, frames[0].1),
+            (24, (6, 3), 30)
+        );
+        assert_eq!(
+            (frames[1].0.width, frames[1].0.hotspot, frames[1].1),
+            (32, (8, 4), 70)
+        );
+        assert_eq!(decode_frames(&bytes, 48).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cursor_animation_obeys_each_delay_and_wraps_at_exact_boundaries() {
+        for (millis, expected) in [
+            (0, 0),
+            (29, 0),
+            (30, 1),
+            (99, 1),
+            (100, 2),
+            (119, 2),
+            (120, 0),
+            (150, 1),
+        ] {
+            assert_eq!(
+                animation_frame(&[30, 70, 20], Duration::from_millis(millis)),
+                expected
+            );
+        }
+        assert_eq!(animation_frame(&[], Duration::MAX), 0);
+        assert_eq!(animation_frame(&[0], Duration::MAX), 0);
+    }
+
+    #[test]
+    fn zero_cursor_delays_are_bounded_and_large_times_do_not_overflow() {
+        assert_eq!(animation_frame(&[0, 0], Duration::from_millis(0)), 0);
+        assert_eq!(animation_frame(&[0, 0], Duration::from_millis(1)), 1);
+        assert_eq!(animation_frame(&[0, 0], Duration::from_millis(2)), 0);
+        assert!(animation_frame(&[u32::MAX, u32::MAX], Duration::MAX) < 2);
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
