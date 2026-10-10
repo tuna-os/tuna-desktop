@@ -29,4 +29,10 @@ fn main() {
     assert_eq!(bell.rings, 1);
     assert!(bell.visual(std::time::Instant::now()).is_none());
     bell.clear_visual();
+    // Scheduler introspection stays linked: the audio proof never
+    // schedules, but the example must keep compiling against the full
+    // `Bell` surface (and `ACTIVE_INTERVAL` through it) so a signature
+    // drift breaks loudly instead of rotting silently.
+    let _player = bell.player_pid();
+    let _deadline = bell.player_deadline();
 }
