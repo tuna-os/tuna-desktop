@@ -2,6 +2,7 @@
 ARG BASE_IMAGE=localhost/marlin-tuna-preview:perf
 FROM ${BASE_IMAGE}
 ARG DESKTOP
+ARG PAIRED_SESSION=false
 COPY packaging/marlin/vm-lane/custom.conf /etc/gdm/custom.conf
 COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
@@ -20,6 +21,7 @@ COPY scripts/lib/perf_trace_diagnostics.py /usr/libexec/perf_trace_diagnostics.p
 COPY scripts/lib/gnome_failed_capture.py /usr/libexec/gnome_failed_capture.py
 COPY packaging/marlin/perf/tuna-perf.service /usr/lib/systemd/system/tuna-perf.service
 RUN case "$DESKTOP" in gnome|tuna) ;; *) exit 1 ;; esac && \
+    case "$PAIRED_SESSION" in true|false) ;; *) exit 1 ;; esac && \
     /usr/libexec/tuna-pinned-baseline && \
     pacman -S --needed --noconfirm python python-gobject wayland-utils qemu-guest-agent gcc pkgconf wayland-protocols && \
     /usr/libexec/tuna-pinned-baseline && \
@@ -32,5 +34,5 @@ RUN case "$DESKTOP" in gnome|tuna) ;; *) exit 1 ;; esac && \
     sed -i "s/DefaultSession=tuna.desktop/DefaultSession=${DESKTOP}.desktop/" /etc/gdm/custom.conf && \
     sed -i "s/Session=tuna/Session=${DESKTOP}/" /usr/lib/tmpfiles.d/tuna-vm-lane.conf && \
     test -f "/usr/share/wayland-sessions/${DESKTOP}.desktop" && \
-    if [ "$DESKTOP" = tuna ]; then sed -i 's|^Exec=.*|Exec=/usr/libexec/tuna-perf-session|' /usr/share/wayland-sessions/tuna.desktop; fi && \
+    if [ "$DESKTOP" = tuna ] || [ "$PAIRED_SESSION" = true ]; then sed -i 's|^Exec=.*|Exec=/usr/libexec/tuna-perf-session|' /usr/share/wayland-sessions/tuna.desktop; fi && \
     systemctl enable tuna-perf.service qemu-guest-agent.service
