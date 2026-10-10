@@ -325,7 +325,7 @@ impl std::fmt::Debug for NotificationSenders {
 }
 
 /// Local notification store: banner queue, history, DND gate.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct NotificationCenter {
     next_id: u64,
     /// Banner-visible ids, oldest first.
@@ -346,6 +346,18 @@ pub struct NotificationCenter {
     policies_loaded: bool,
     policy_reader_revision: u64,
     policy_history_revision: u64,
+}
+
+impl std::fmt::Debug for NotificationCenter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationCenter")
+            .field("next_id", &self.next_id)
+            .field("banners", &self.banners)
+            .field("history_count", &self.history.len())
+            .field("source_count", &self.policies.len())
+            .field("locked", &self.locked)
+            .finish()
+    }
 }
 
 impl NotificationCenter {
@@ -1501,5 +1513,16 @@ mod tests {
         assert!(!debug.contains("4321"));
         c.set_senders([]);
         assert_eq!(c.sender_app(4321), None);
+    }
+    #[test]
+    fn policy_source_identifiers_are_redacted_in_center_debug() {
+        let mut c = center();
+        file_policy(
+            &mut c,
+            "org.Private.PolicySource",
+            NotificationPolicy::default(),
+            Urgency::Normal,
+        );
+        assert!(!format!("{c:?}").contains("org.Private.PolicySource"));
     }
 }
