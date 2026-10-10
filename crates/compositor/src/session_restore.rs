@@ -1,34 +1,44 @@
 //! Opt-in session save and restore (P-SY-08, #338).
 //!
-//! What GNOME 51 does: the desktop session can bring back the user's
-//! windows after logout and reboot when the user opts in. Tuna Desktop
-//! implements the capability in three layers:
+//! What GNOME 51 does — and pointedly does not do: upstream's
+//! `gsm-manager.c` hardcodes `RestoreSupported` to `FALSE` (`// TODO:
+//! For GNOME 50, we've disabled the save/restore feature`), so GNOME
+//! 50/51 advertises no restore support even though the
+//! `RegisterRestore` plumbing still exists behind the flag. Tuna
+//! Desktop goes further: when the user opts in, the session genuinely
+//! brings back their windows after logout and reboot, using the same
+//! D-Bus contract shapes GNOME defined (verified against the 51.0
+//! tag; see below). Tuna implements the capability in three layers:
 //!
 //! 1. **Saved state.** [`SavedSession`] is the on-disk snapshot: one
 //!    entry per restorable window with its application identity
 //!    (desktop id / app id), workspace, geometry and layout flags,
 //!    plus the active workspace. It lives at
 //!    [`session_file_path`] (`$XDG_STATE_HOME/tuna/session.json`).
-//!    Writes are atomic (temporary file plus rename) and the file is
-//!    created mode `0600`: window titles can name private documents.
+//!    Writes are atomic (unique temporary file plus rename, with a
+//!    directory fsync) and the file is created mode `0600`: window
+//!    titles can name private documents.
 //! 2. **Restore plan.** [`plan_restore`] turns a snapshot into launch
 //!    requests ([`LaunchRequest`]) for apps that are still installed
 //!    and did not crash, skipping the rest with an explicit
 //!    [`SkipReason`]. [`scan_autostart`] adds the XDG autostart
 //!    entries GNOME would launch at login, merged without duplicates
-//!    by [`merge_autostart`].
+//!    by [`merge_autostart`]. [`launch_desktop_id`] resolves each
+//!    request to an installed `.desktop` file and spawns it detached,
+//!    exactly as a user's own launch would.
 //! 3. **Session-manager contracts.** [`serve_session_manager`]
 //!    answers `org.gnome.SessionManager`'s `RestoreSupported`
-//!    property (what GNOME Settings' multitasking panel checks) plus
-//!    the `RegisterRestore` / `DeletedInstanceIds` /
-//!    `UnregisterRestore` methods, with the exact signatures and
-//!    restore-reason codes from gnome-session's interface definition
-//!    (verified against the `main` branch XML; see below). The facade
-//!    stays off the bus when a real session manager owns the name.
-//!    The `xdg_session_manager_v1` Wayland global is *not* advertised
-//!    here: Smithay 0.7 has no such global (see `docs/protocols.md`),
-//!    so the wire protocol waits on a Smithay upgrade; the stable
-//!    per-window session token it would carry is [`session_id_for`].
+//!    property truthfully from the user's opt-in preference (what
+//!    GNOME Settings' multitasking panel checks) plus the
+//!    `RegisterRestore` / `DeletedInstanceIds` / `UnregisterRestore`
+//!    methods, with the exact signatures, restore-reason codes and
+//!    instance lifecycle from gnome-session 51.0's interface and
+//!    implementation (see below). The facade stays off the bus when a
+//!    real session manager owns the name. The `xdg_session_manager_v1`
+//!    Wayland global is *not* advertised here: Smithay 0.7 has no such
+//!    global (see `docs/protocols.md`), so the wire protocol waits on
+//!    a Smithay upgrade; the stable per-window session token it would
+//!    carry is [`session_id_for`].
 //!
 //! ## Secrets policy
 //!
@@ -50,61 +60,83 @@
 //! data is touched. Saving while disabled is a no-op
 //! ([`save_if_enabled`]).
 //!
-//! ## Runtime hook points (union-time wiring, not yet called)
+//! ## Production entry points
 //!
-//! - Login: `load_from(session_file_path())` → on
-//!   `LoadOutcome::Loaded`, `plan_restore` with the installed-app set
-//!   and the previous session's crash set, then hand each
-//!   [`LaunchRequest`] to the launcher and place the window via
-//!   `WindowManager::{set_maximized, set_fullscreen, minimize}` plus
-//!   the model workspace move.
-//! - Logout / shutdown: collect one [`WindowRow`] per mapped toplevel
-//!   (`StateModel` for app id, title, workspace; `WindowManager` for
-//!   geometry and layout flags; `protocols::toplevel_tag` for the
-//!   tag), [`collect`] them, and [`save_if_enabled`]. The natural
-//!   call site is beside `session_services`' shutdown path.
+//! - Startup: [`startup_session_manager`] serves the facade on the
+//!   session bus and hands back the live [`RestoreSupported`] flag
+//!   the shell's preference UI drives.
+//! - Login: [`login_restore_plan`] loads the snapshot, plans the
+//!   restore against [`installed_apps`] and the previous session's
+//!   crash set, merges [`scan_autostart`], and queues
+//!   [`PendingPlacements`]; [`launch_plan`] runs each
+//!   [`LaunchRequest`] through the launcher ([`launch_desktop_id`]).
+//! - Map: as each relaunched window maps, the compositor pops its
+//!   placement with `PendingPlacements::take_for` (matched by app id
+//!   and toplevel tag) and applies it with
+//!   [`apply_restored_placement`].
+//! - Logout / shutdown: [`logout_save`] collects one [`WindowRow`]
+//!   per mapped toplevel (`StateModel` for app id, title, workspace;
+//!   `WindowManager` for geometry and layout flags;
+//!   `protocols::toplevel_tag` for the tag) and saves it when the user
+//!   opted in.
 //! - Crash sets: the supervisor's per-app crash record feeds
 //!   `plan_restore`'s `crashed` argument so a crashing app is not
 //!   relaunched into a loop; the entry stays in the file for the next
-//!   clean login.
+//!   clean login. Within a session, the facade's `NameOwnerChanged`
+//!   watch marks vanished bus names crashed the same way.
 //! - Corrupt or version-newer files are ignored ([`IgnoreReason`]) and
 //!   can be quarantined aside with [`quarantine_at`] for diagnosis;
 //!   they never block login.
 //!
-//! ## GNOME comparison (verified 2026-10-10)
+//! ## GNOME comparison (verified against the 51.0 tag)
 //!
-//! Interface shape verified against gnome-session `main`
-//! (`gnome-session/org.gnome.SessionManager.xml` on GNOME GitLab):
-//! `RestoreSupported` is a read-only boolean property ("Communicates
-//!   whether the session supports the save/restore mechanism");
-//! `RegisterRestore(app_id, dbus_name)` returns `(reason,
-//!   instance_id, cleanup_ids)`; `DeletedInstanceIds(app_id, ids)`
-//!   and `UnregisterRestore(app_id, instance_id)` manage instance
-//!   lifetime. Upstream documents these as a private interface
-//!   between gnome-session and xdg-desktop-portal — apps talk to the
-//!   portal, which forwards here. Restore reasons: 0 = restore
-//!   nothing, 1 = normal launch (restore reasonable state), 2 =
-//!   post-crash restore (restore carefully), 3 = normal restore after
-//!   logout/shutdown (restore everything).
+//! Contract shapes verified against gnome-session 51.0
+//! (`org.gnome.SessionManager.xml`, `gsm-manager.c` and
+//! `gsm-session-save.c`): `RestoreSupported` is a read-only boolean
+//! property ("Communicates whether the session supports the
+//! save/restore mechanism"); `RegisterRestore(app_id, dbus_name)`
+//! returns `(reason, instance_id, cleanup_ids)`; `DeletedInstanceIds`
+//! `(app_id, ids)` and `UnregisterRestore(app_id, instance_id)`
+//! manage instance lifetime. Upstream documents these as a private
+//! interface between gnome-session and xdg-desktop-portal — apps talk
+//! to the portal, which forwards here. Restore reasons (the XML's
+//! documented meanings, matching [`reason`]): 0 = restore nothing, 1
+//! = normal launch (restore reasonable state), 2 = post-crash
+//! restore (restore carefully), 3 = normal restore after
+//! logout/shutdown (restore everything).
 //!
-//! Open at union time: confirm the `main`-branch XML still matches
-//! the GNOME 51.0 tag; full `org.gnome.SessionManager` parity
-//! (logout, inhibit, client registration, signals) is out of scope
-//! for P-SY-08. Tuna restores only when the user opts in; GNOME's own
-//! default (no automatic window reopen) is likewise off.
+//! Two deliberate divergences from upstream. First, gnome-session
+//! hardcodes `RestoreSupported` to `FALSE` ("For GNOME 50, we've
+//! disabled the save/restore feature"), so GNOME 50/51 never
+//! restores; Tuna answers the property truthfully from the user's
+//! opt-in preference and genuinely restores — real restoration is
+//! required here, not descoped. Second, upstream persists instance
+//! state as a GVariant vardict (`version`, `dirty`, `instances`) at
+//! `$XDG_STATE_HOME/gnome-session@<id>.state`; Tuna's snapshot is
+//! JSON at [`session_file_path`] and carries no instance tokens (see
+//! the secrets policy), so instance continuity lives in the
+//! [`RestoreRegistry`] for the session. The instance lifecycle
+//! otherwise mirrors `gsm-session-save.c`: register reuses a prior
+//! instance id, cleanup ids are discarded ids only (never live
+//! ones), an empty `dbus_name` falls back to the caller's bus name,
+//! an unknown unregister is `NotRegistered`, and a
+//! `NameOwnerChanged` watch marks vanished names crashed.
+//!
+//! Full `org.gnome.SessionManager` parity (logout, inhibit, client
+//! registration, signals) is out of scope for P-SY-08.
 //!
 //! Autostart honours `Hidden=`, `OnlyShowIn=` / `NotShowIn=`,
 //! `TryExec=` and `X-GNOME-Autostart-enabled=` per the XDG autostart
 //! spec and GNOME's desktop-file handling.
 
-use std::collections::{HashMap, HashSet};
-use std::io;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, OnceLock,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +154,11 @@ pub const MAX_WORKSPACE: u32 = 63;
 
 /// Largest window dimension (either axis) accepted from a snapshot.
 pub const MAX_DIMENSION: i32 = 16384;
+
+/// Largest snapshot file accepted from disk. Reads are bounded to
+/// this size *before* parsing so a hostile or ever-growing file
+/// cannot balloon memory.
+pub const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 
 /// D-Bus name whose `RestoreSupported` property Settings checks.
 pub const SESSION_MANAGER_NAME: &str = "org.gnome.SessionManager";
@@ -192,13 +229,17 @@ impl WindowPlacement {
     /// Validate a snapshot-supplied placement; `None` means the entry
     /// is stale or corrupt and must be skipped, not guessed at.
     pub fn validated(self) -> Option<Self> {
+        // Saturating absolute value: `i32::MIN.abs()` panics in debug
+        // builds, and a hostile snapshot may carry exactly that.
+        // `saturating_abs` maps it to `i32::MAX`, which the bound
+        // below rejects.
         if self.workspace > MAX_WORKSPACE
             || self.width <= 0
             || self.height <= 0
             || self.width > MAX_DIMENSION
             || self.height > MAX_DIMENSION
-            || self.x.abs() > MAX_DIMENSION * 4
-            || self.y.abs() > MAX_DIMENSION * 4
+            || self.x.saturating_abs() > MAX_DIMENSION * 4
+            || self.y.saturating_abs() > MAX_DIMENSION * 4
         {
             return None;
         }
@@ -522,27 +563,56 @@ pub fn saved_state_has_no_secrets(session: &SavedSession) -> bool {
         .unwrap_or(false)
 }
 
-/// Write `session` to `path` atomically (temporary file in the same
-/// directory plus rename) with mode `0600`. Parent directories are
-/// created as needed.
+/// Process-wide counter so concurrent saves never share a
+/// temporary file name, even within the same nanosecond.
+static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A temporary sibling of `path` unique to this process and call:
+/// pid plus clock plus counter, created with `O_EXCL`, so two
+/// sessions saving at once cannot truncate each other's file.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let n = SAVE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!(".session.{}.{nanos:x}.{n}.tmp", std::process::id());
+    path.parent().unwrap_or_else(|| Path::new(".")).join(name)
+}
+
+/// Write `session` to `path` atomically (unique temporary file in
+/// the same directory plus rename, with a directory fsync so the
+/// rename survives a crash) with mode `0600`. Parent directories are
+/// created as needed. Parallel-session safe: each save uses its own
+/// temporary file, so a concurrent save can only win or lose the
+/// final rename, never interleave bytes.
 pub fn save_to(path: &Path, session: &SavedSession) -> io::Result<()> {
     let json = serialize(session).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    {
+    let tmp = unique_tmp_path(path);
+    let saved = (|| -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
-        std::fs::remove_file(&tmp).ok();
+        opts.write(true).create_new(true).mode(0o600);
         let mut file = opts.open(&tmp)?;
         use std::io::Write;
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        // Persist the rename itself: without a directory fsync a
+        // power cut can lose it even though the file was synced.
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if saved.is_err() {
+        std::fs::remove_file(&tmp).ok();
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    saved
 }
 
 /// Write `session` to `path` when `prefs` opts in; otherwise a no-op.
@@ -563,13 +633,31 @@ pub fn save_if_enabled(
 /// [`LoadOutcome::Absent`]; corrupt, wrong-shape and newer-version
 /// files are [`LoadOutcome::Ignored`] — login never fails on them.
 /// Oversized window lists are truncated to [`MAX_SAVED_WINDOWS`].
+/// The read itself is bounded to [`MAX_SNAPSHOT_BYTES`]: the size is
+/// checked up front *and* the stream is capped, so a file that grows
+/// mid-read (or a device like `/dev/zero`) cannot balloon memory —
+/// the old code read the whole file first and measured after.
 pub fn load_from(path: &Path) -> LoadOutcome {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return LoadOutcome::Absent,
         Err(e) => return LoadOutcome::Ignored(IgnoreReason::Corrupt(e.to_string())),
     };
-    if bytes.len() > 1024 * 1024 {
+    // Fast path: reject an obviously oversized file without reading
+    // it. This alone is not enough — the size can change, and some
+    // files (fifos, devices) report no useful size — so the read
+    // below is capped as well.
+    if file
+        .metadata()
+        .is_ok_and(|meta| meta.len() > MAX_SNAPSHOT_BYTES)
+    {
+        return LoadOutcome::Ignored(IgnoreReason::Corrupt("snapshot over 1 MiB".into()));
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = file.take(MAX_SNAPSHOT_BYTES + 1).read_to_end(&mut bytes) {
+        return LoadOutcome::Ignored(IgnoreReason::Corrupt(e.to_string()));
+    }
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
         return LoadOutcome::Ignored(IgnoreReason::Corrupt("snapshot over 1 MiB".into()));
     }
     let mut session: SavedSession = match serde_json::from_slice(&bytes) {
@@ -744,11 +832,28 @@ fn shown_in_session(keys: &HashMap<String, String>) -> bool {
     !excluded
 }
 
+/// Whether an autostart `.desktop` file is launchable at all: it
+/// names an application (`Type=Application`, required) with
+/// something to run (`Exec=`, required and non-empty). Files that
+/// fail this are config-only — a bare `[Desktop Entry]` stub, a
+/// `Type=Link` bookmark — and must neither launch nor shadow a
+/// same-stem system entry (see [`scan_autostart`]).
+fn autostart_is_launchable(keys: &HashMap<String, String>) -> bool {
+    keys.get("Type").is_some_and(|t| t == "Application")
+        && keys.get("Exec").is_some_and(|exec| !exec.trim().is_empty())
+}
+
 /// Scan `dirs` (user dir first, so it shadows system entries by
 /// desktop id) for autostart entries, honouring `Hidden=true`,
 /// `OnlyShowIn=` / `NotShowIn=`, `TryExec=` and
 /// `X-GNOME-Autostart-enabled=false`, like GNOME's startup handling.
-/// Unparseable files are skipped; nothing is executed here.
+/// Only launchable entries are returned: a file without
+/// `Type=Application` or without `Exec=` is config-only and is
+/// skipped *without* retaining its stem, so a launchable system
+/// entry with the same name still loads. (An explicit disable —
+/// `Hidden=true` or `X-GNOME-Autostart-enabled=false` — still
+/// shadows, even when the stub carries no `Exec=`.) Unparseable
+/// files are skipped; nothing is executed here.
 pub fn scan_autostart(dirs: &[PathBuf]) -> Vec<AutostartEntry> {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -771,25 +876,34 @@ pub fn scan_autostart(dirs: &[PathBuf]) -> Vec<AutostartEntry> {
             let Some(desktop_id) = normalize_desktop_id(stem) else {
                 continue;
             };
-            if !seen.insert(desktop_id.clone()) {
+            if seen.contains(&desktop_id) {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&file) else {
+                // An unreadable file still shadows by name (XDG
+                // filename shadowing): only config-only *content*
+                // releases the stem.
+                seen.insert(desktop_id);
                 continue;
             };
             let keys = desktop_entry_keys(&text);
+            // Explicit disables shadow first, before the
+            // launchability check: a `Hidden=true` stub is exactly
+            // how a user turns a system autostart entry off.
             if keys
                 .get("Hidden")
                 .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+                || keys
+                    .get("X-GNOME-Autostart-enabled")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("false"))
             {
+                seen.insert(desktop_id);
                 continue;
             }
-            if keys
-                .get("X-GNOME-Autostart-enabled")
-                .is_some_and(|v| v.eq_ignore_ascii_case("false"))
-            {
+            if !autostart_is_launchable(&keys) {
                 continue;
             }
+            seen.insert(desktop_id.clone());
             if !shown_in_session(&keys) {
                 continue;
             }
@@ -798,10 +912,6 @@ pub fn scan_autostart(dirs: &[PathBuf]) -> Vec<AutostartEntry> {
                     continue;
                 }
             }
-            // Only launchable entries: GNOME requires Type=Application.
-            if keys.get("Type").is_some_and(|t| t != "Application") {
-                continue;
-            }
             entries.push(AutostartEntry { desktop_id });
         }
     }
@@ -809,10 +919,21 @@ pub fn scan_autostart(dirs: &[PathBuf]) -> Vec<AutostartEntry> {
 }
 
 /// Default autostart directories: user config first, then system dirs.
+/// The user dir honours `$XDG_CONFIG_HOME` (absolute paths only;
+/// anything else falls back to `~/.config`, per the base-directory
+/// spec), then `$XDG_CONFIG_DIRS` or `/etc/xdg`.
 pub fn default_autostart_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join(".config/autostart"));
+    let user_config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(".config"))
+        });
+    if let Some(config) = user_config {
+        dirs.push(config.join("autostart"));
     }
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_DIRS") {
         for dir in std::env::split_paths(&xdg) {
@@ -884,10 +1005,40 @@ pub mod reason {
     pub const NORMAL_RESTORE: u32 = 3;
 }
 
+/// One registered app instance: the id persists in the registry
+/// for the session, the bus name is kept for crash monitoring (like
+/// `gsm-session-save.c`'s `SavedAppInstance`, minus the watch id —
+/// the single `NameOwnerChanged` subscription in
+/// [`serve_session_manager`] feeds every record through
+/// [`RestoreRegistry::note_name_owner_changed`]).
+#[derive(Debug, Clone)]
+struct InstanceRecord {
+    /// Instance id handed to the app; reused across re-registration.
+    id: String,
+    /// The app's bus name while it runs; `None` once it exits or
+    /// crashes, which is what makes the id reusable.
+    dbus_name: Option<String>,
+    /// The bus name vanished without an unregister: a crash.
+    crashed: bool,
+}
+
+/// One app's instance bookkeeping, mirroring `SavedApp` in
+/// `gsm-session-save.c`: live instances, ids the app should delete,
+/// and the id the next registration reuses.
+#[derive(Debug, Default)]
+struct AppRecord {
+    instances: Vec<InstanceRecord>,
+    discarded: Vec<String>,
+    next_id: Option<String>,
+}
+
 /// Live instance registry behind the `RegisterRestore` family.
 /// Tracks which apps asked for restore, what instance ids they hold,
 /// and which ids are stale and should be deleted — the bookkeeping
-/// gnome-session does between the portal and the apps.
+/// gnome-session does between the portal and the apps. Instance ids
+/// persist in the registry for the session and are reused across
+/// re-registration; cleanup ids are discarded ids only, never
+/// currently-live instance ids.
 #[derive(Debug)]
 pub struct RestoreRegistry {
     supported: RestoreSupported,
@@ -895,8 +1046,8 @@ pub struct RestoreRegistry {
     saved: HashSet<String>,
     /// Desktop ids that crashed last session.
     crashed: HashSet<String>,
-    /// Instance ids currently issued per desktop id.
-    live: HashMap<String, Vec<String>>,
+    /// Instance bookkeeping per desktop id.
+    apps: HashMap<String, AppRecord>,
     /// Per-session token baked into issued instance ids so they can
     /// never collide with another session manager's ids.
     token: String,
@@ -914,7 +1065,7 @@ impl RestoreRegistry {
             supported,
             saved,
             crashed,
-            live: HashMap::new(),
+            apps: HashMap::new(),
             token: Self::session_token(),
             next_instance: 0,
         }
@@ -959,6 +1110,35 @@ impl RestoreRegistry {
         }
     }
 
+    /// Crash-monitor hook for the facade's `NameOwnerChanged`
+    /// subscription: when `name` loses its owner (`new_owner` empty),
+    /// every live instance registered under it is marked crashed and
+    /// its bus name cleared, exactly like `gsm-session-save.c`'s
+    /// `on_instance_vanished`. Returns how many instances were marked.
+    /// A re-registering app then reuses its prior instance id with a
+    /// crash reason instead of minting a fresh one.
+    pub fn note_name_owner_changed(&mut self, name: &str, new_owner: &str) -> usize {
+        if name.is_empty() || !new_owner.is_empty() {
+            return 0;
+        }
+        let mut marked = 0;
+        let mut crashed_apps = Vec::new();
+        for (desktop_id, app) in self.apps.iter_mut() {
+            for instance in app.instances.iter_mut() {
+                if instance.dbus_name.as_deref() == Some(name) {
+                    instance.dbus_name = None;
+                    instance.crashed = true;
+                    crashed_apps.push(desktop_id.clone());
+                    marked += 1;
+                }
+            }
+        }
+        for desktop_id in crashed_apps {
+            self.crashed.insert(desktop_id);
+        }
+        marked
+    }
+
     /// The restore reason one app gets: crashed beats saved (a
     /// crashing app must restore carefully even when a snapshot names
     /// it), saved beats unknown, disabled restores nothing.
@@ -975,60 +1155,137 @@ impl RestoreRegistry {
         reason::NORMAL_LAUNCH
     }
 
-    /// Register one app for restore: mint a fresh instance id and
-    /// report previously issued ids for the app as cleanup ids (they
-    /// belong to older registrations the app should delete). Empty
-    /// app ids and bus names are rejected; the D-Bus name is recorded
-    /// for crash monitoring but not trusted for anything else.
+    /// A fresh instance id for `desktop_id`: the session token plus
+    /// a per-registry counter, so ids never collide across sessions
+    /// or managers (the XML's no-collision promise). Preferring a
+    /// cleanly-exited instance's leftover id (GNOME's `next_id`) is
+    /// the caller's job — see [`RestoreRegistry::register_with_sender`].
+    fn fresh_instance_id(token: &str, n: u64, desktop_id: &str) -> String {
+        let app_part = session_id_for(desktop_id, None);
+        let app_part = app_part.trim_start_matches("tuna-");
+        format!("tuna-{token}-{app_part}-{n}")
+    }
+
+    /// Register one app for restore: reuse a prior instance id when
+    /// one is not currently running, otherwise mint one, and report
+    /// the app's discarded ids for cleanup. Cleanup ids are only
+    /// ever discarded ids — a currently-live instance id is never
+    /// sent for cleanup. An empty `dbus_name` falls back to `sender`
+    /// (the D-Bus caller, like `gsm-manager.c`); empty app ids, and
+    /// an empty bus name with no sender, are rejected. The bus name
+    /// is kept for crash monitoring but not trusted for anything else.
+    pub fn register_with_sender(
+        &mut self,
+        app_id: &str,
+        dbus_name: &str,
+        sender: Option<&str>,
+    ) -> Result<(u32, String, Vec<String>), String> {
+        let desktop_id = normalize_desktop_id(app_id)
+            .ok_or_else(|| "RegisterRestore needs a non-empty app id".to_owned())?;
+        let bus_name = (!dbus_name.is_empty())
+            .then(|| dbus_name.to_owned())
+            .or_else(|| sender.filter(|s| !s.is_empty()).map(str::to_owned))
+            .ok_or_else(|| "RegisterRestore needs the app's bus name".to_owned())?;
+        let reason = self.reason_for(&desktop_id);
+        // Reuse a prior instance id when one is not running (GNOME's
+        // "check if the instance is running" scan): a cleanly-exited
+        // or crashed instance keeps its id, so the app's saved state
+        // stays addressable under the same id.
+        if let Some(app) = self.apps.get_mut(&desktop_id) {
+            if let Some(instance) = app.instances.iter_mut().find(|i| i.dbus_name.is_none()) {
+                instance.dbus_name = Some(bus_name);
+                instance.crashed = false;
+                let id = instance.id.clone();
+                let cleanup_ids = app.discarded.clone();
+                return Ok((reason, id, cleanup_ids));
+            }
+        }
+        // No reusable instance: prefer the id a cleanly-exited
+        // instance left behind (GNOME's `next_id`), else mint fresh.
+        let leftover = self
+            .apps
+            .get_mut(&desktop_id)
+            .and_then(|app| app.next_id.take());
+        let instance_id = match leftover {
+            Some(reuse) => reuse,
+            None => {
+                self.next_instance += 1;
+                let n = self.next_instance;
+                Self::fresh_instance_id(&self.token, n, &desktop_id)
+            }
+        };
+        let app = self.apps.entry(desktop_id).or_default();
+        let cleanup_ids = app.discarded.clone();
+        app.instances.push(InstanceRecord {
+            id: instance_id.clone(),
+            dbus_name: Some(bus_name),
+            crashed: false,
+        });
+        Ok((reason, instance_id, cleanup_ids))
+    }
+
+    /// Register one app for restore without a D-Bus caller to fall
+    /// back to: an empty `dbus_name` is rejected. See
+    /// [`RestoreRegistry::register_with_sender`].
     pub fn register(
         &mut self,
         app_id: &str,
         dbus_name: &str,
     ) -> Result<(u32, String, Vec<String>), String> {
-        let desktop_id = normalize_desktop_id(app_id)
-            .ok_or_else(|| "RegisterRestore needs a non-empty app id".to_owned())?;
-        if dbus_name.is_empty() {
-            return Err("RegisterRestore needs the app's bus name".to_owned());
-        }
-        self.next_instance += 1;
-        let app_part = session_id_for(&desktop_id, None);
-        let app_part = app_part.trim_start_matches("tuna-");
-        let instance_id = format!("tuna-{}-{app_part}-{}", self.token, self.next_instance);
-        let reason = self.reason_for(&desktop_id);
-        let cleanup_ids = self.live.get(&desktop_id).cloned().unwrap_or_default();
-        self.live
-            .entry(desktop_id)
-            .or_default()
-            .push(instance_id.clone());
-        Ok((reason, instance_id, cleanup_ids))
+        self.register_with_sender(app_id, dbus_name, None)
     }
 
-    /// Forget instance ids the app confirms it deleted. Unknown ids
-    /// are ignored; the return is how many were actually held.
+    /// Forget discarded ids the app confirms it deleted. Live ids
+    /// are never forgotten here (they were never sent for cleanup);
+    /// unknown ids are ignored. The return is how many discarded ids
+    /// were actually held.
     pub fn deleted(&mut self, app_id: &str, ids: &[String]) -> usize {
         let Some(desktop_id) = normalize_desktop_id(app_id) else {
             return 0;
         };
-        let Some(live) = self.live.get_mut(&desktop_id) else {
+        let Some(app) = self.apps.get_mut(&desktop_id) else {
             return 0;
         };
-        let before = live.len();
-        live.retain(|id| !ids.contains(id));
-        before - live.len()
+        let before = app.discarded.len();
+        app.discarded.retain(|id| !ids.contains(id));
+        before - app.discarded.len()
     }
 
-    /// Drop one registration when the app exits cleanly.
+    /// Drop one registration when the app exits cleanly. The id moves
+    /// to the discard path (GNOME's `saved_app_discard_instance`):
+    /// the next registration reuses it, and any id it displaces is
+    /// reported for cleanup. Unknown apps and ids return false; the
+    /// D-Bus layer reports those as `NotRegistered`.
     pub fn unregister(&mut self, app_id: &str, instance_id: &str) -> bool {
         let Some(desktop_id) = normalize_desktop_id(app_id) else {
             return false;
         };
-        let Some(live) = self.live.get_mut(&desktop_id) else {
+        let Some(app) = self.apps.get_mut(&desktop_id) else {
             return false;
         };
-        let before = live.len();
-        live.retain(|id| id != instance_id);
-        before != live.len()
+        let Some(pos) = app.instances.iter().position(|i| i.id == instance_id) else {
+            return false;
+        };
+        app.instances.remove(pos);
+        if let Some(previous) = app.next_id.replace(instance_id.to_owned()) {
+            app.discarded.push(previous);
+        }
+        true
     }
+}
+
+/// D-Bus errors for the restore facade, named like upstream's
+/// `GSM_MANAGER_ERROR` domain.
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.gnome.SessionManager.Error")]
+enum RestoreDbusError {
+    /// `gsm_manager_unregister_restore` answers an unknown instance
+    /// with `GSM_MANAGER_ERROR_NOT_REGISTERED` ("Provided instance
+    /// not found"); so do we.
+    NotRegistered(String),
+    /// The registry lock was poisoned: an internal failure, never a
+    /// client error.
+    Internal(String),
 }
 
 struct SessionManagerNode {
@@ -1049,46 +1306,114 @@ impl SessionManagerNode {
     }
 
     /// Register the caller for save/restore: returns the restore
-    /// reason, a fresh instance id, and stale instance ids the app
-    /// should delete. Signature and semantics match gnome-session.
+    /// reason, an instance id (reused across the app's restarts when
+    /// possible), and discarded instance ids the app should delete.
+    /// An empty `dbus_name` falls back to the caller's bus name,
+    /// like `gsm-manager.c`. Signature and semantics match
+    /// gnome-session.
     fn register_restore(
         &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
         app_id: &str,
         dbus_name: &str,
     ) -> zbus::fdo::Result<(u32, String, Vec<String>)> {
+        let sender = hdr.sender().map(|s| s.to_string());
         self.registry
             .lock()
             .map_err(|_| zbus::fdo::Error::Failed("restore registry poisoned".into()))?
-            .register(app_id, dbus_name)
+            .register_with_sender(app_id, dbus_name, sender.as_deref())
             .map_err(zbus::fdo::Error::InvalidArgs)
     }
 
-    /// The app deleted these instance ids; forget them for good.
+    /// The app deleted these discarded instance ids; forget them for
+    /// good.
     fn deleted_instance_ids(&self, app_id: &str, ids: Vec<String>) {
         if let Ok(mut registry) = self.registry.lock() {
             registry.deleted(app_id, &ids);
         }
     }
 
-    /// The app exited cleanly; drop its registration.
-    fn unregister_restore(&self, app_id: &str, instance_id: &str) {
-        if let Ok(mut registry) = self.registry.lock() {
-            registry.unregister(app_id, instance_id);
+    /// The app exited cleanly; drop its registration. An unknown app
+    /// or instance id is `NotRegistered`, like upstream.
+    fn unregister_restore(&self, app_id: &str, instance_id: &str) -> Result<(), RestoreDbusError> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| RestoreDbusError::Internal("restore registry poisoned".into()))?;
+        if registry.unregister(app_id, instance_id) {
+            Ok(())
+        } else {
+            Err(RestoreDbusError::NotRegistered(
+                "Provided instance not found".into(),
+            ))
         }
     }
 }
 
+/// Subscribe to `NameOwnerChanged` and feed owner losses into the
+/// registry's crash monitor for the life of the connection (like
+/// `gsm-session-save.c`'s per-instance `g_bus_watch_name`, but with
+/// one subscription for every record). A failed subscription degrades
+/// to no crash monitoring — the facade keeps serving — and is logged.
+fn watch_names_for_crash(
+    conn: &zbus::blocking::Connection,
+    registry: &Arc<std::sync::Mutex<RestoreRegistry>>,
+) {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")
+        .and_then(|b| b.interface("org.freedesktop.DBus"))
+        .and_then(|b| b.member("NameOwnerChanged"))
+        .and_then(|b| b.path("/org/freedesktop/DBus"))
+        .map(|b| b.build());
+    let rule = match rule {
+        Ok(rule) => rule,
+        Err(e) => {
+            eprintln!("tuna-compositor: session manager: no crash watch ({e}); serving anyway");
+            loop {
+                std::thread::park();
+            }
+        }
+    };
+    let iter = match zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(32)) {
+        Ok(iter) => iter,
+        Err(e) => {
+            eprintln!("tuna-compositor: session manager: no crash watch ({e}); serving anyway");
+            loop {
+                std::thread::park();
+            }
+        }
+    };
+    for msg in iter {
+        let Ok(msg) = msg else {
+            continue;
+        };
+        let Ok((name, _old_owner, new_owner)) =
+            msg.body().deserialize::<(String, String, String)>()
+        else {
+            continue;
+        };
+        if let Ok(mut registry) = registry.lock() {
+            registry.note_name_owner_changed(&name, &new_owner);
+        }
+    }
+    eprintln!("tuna-compositor: session manager: bus gone, facade down");
+}
+
 /// Serve the session-manager restore facade on the session bus from a
-/// thread. When a real session manager owns the name (a nested run
+/// thread, with a `NameOwnerChanged` crash watch over the registered
+/// bus names. When a real session manager owns the name (a nested run
 /// inside GNOME), the service stays off, like the Mutter facade.
-/// Hook: the runtime calls this once at startup with its live flag.
+/// Hook: the runtime calls this once at startup with its live flag
+/// (see [`startup_session_manager`).
 /// Hardening note (union time): upstream treats `RegisterRestore` as
 /// a private portal interface; a caller-identity check against
 /// `org.freedesktop.portal.Desktop` belongs here before trusting
 /// `dbus_name` for crash monitoring.
 pub fn serve_session_manager(supported: RestoreSupported) {
+    let registry = Arc::new(std::sync::Mutex::new(RestoreRegistry::from_disk(supported)));
     let node = SessionManagerNode {
-        registry: Arc::new(std::sync::Mutex::new(RestoreRegistry::from_disk(supported))),
+        registry: registry.clone(),
     };
     let _ = std::thread::Builder::new()
         .name("tuna-session-manager".into())
@@ -1113,17 +1438,598 @@ pub fn serve_session_manager(supported: RestoreSupported) {
                     return;
                 }
             }
-            // The facade is property-only; park the thread on the
-            // connection until the process exits.
-            loop {
-                std::thread::park();
-            }
+            watch_names_for_crash(&conn, &registry);
         });
+}
+
+/// Startup entry point: create the live opt-in flag (off until the
+/// shell's preference UI turns it on), serve the restore facade, and
+/// hand the flag back. The runtime calls this once at startup; the
+/// shell pushes its persisted preference into the flag.
+pub fn startup_session_manager() -> RestoreSupported {
+    let supported: RestoreSupported = Arc::new(AtomicBool::new(false));
+    serve_session_manager(supported.clone());
+    supported
+}
+
+/// Directories searched for installed applications:
+/// `$XDG_DATA_HOME/applications` (absolute only, else
+/// `~/.local/share/applications`), then each
+/// `$XDG_DATA_DIRS/applications` (default
+/// `/usr/local/share:/usr/share`), per the base-directory spec.
+pub fn application_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let user_data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(".local/share"))
+        });
+    if let Some(data) = user_data {
+        dirs.push(data.join("applications"));
+    }
+    match std::env::var_os("XDG_DATA_DIRS") {
+        Some(list) => {
+            for dir in std::env::split_paths(&list) {
+                dirs.push(dir.join("applications"));
+            }
+        }
+        None => {
+            dirs.push(PathBuf::from("/usr/local/share/applications"));
+            dirs.push(PathBuf::from("/usr/share/applications"));
+        }
+    }
+    dirs
+}
+
+/// Resolve a desktop id to its installed `.desktop` file, or `None`
+/// when no application dir carries it. Ids containing path
+/// separators are rejected outright (desktop ids are bare names —
+/// never trust a snapshot into a path traversal).
+pub fn resolve_desktop_file(desktop_id: &str) -> Option<PathBuf> {
+    let id = normalize_desktop_id(desktop_id)?;
+    if id.contains('/') || id.contains('\0') {
+        return None;
+    }
+    let file_name = format!("{id}.desktop");
+    application_dirs()
+        .iter()
+        .map(|dir| dir.join(&file_name))
+        .find(|path| path.is_file())
+}
+
+/// Desktop ids installed anywhere in [`application_dirs`]: the
+/// `installed` set [`login_restore_plan`] plans against. The scan is
+/// capped so a hostile applications directory cannot balloon memory.
+pub fn installed_apps() -> HashSet<String> {
+    const MAX_APPS: usize = 4096;
+    let mut apps = HashSet::new();
+    for dir in application_dirs() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.filter_map(|e| e.ok()) {
+            if apps.len() >= MAX_APPS {
+                return apps;
+            }
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "desktop") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if let Some(id) = normalize_desktop_id(stem) {
+                if !id.contains('/') {
+                    apps.insert(id);
+                }
+            }
+        }
+    }
+    apps
+}
+
+/// Expand an `Exec=` line into argv, per the Desktop Entry Spec.
+/// Quoting and backslash escapes are honoured (single quotes are
+/// *not* special in `Exec=`, unlike a shell); field codes expand as:
+/// `%f %F %u %U` dropped (a restore launch opens no files),
+/// deprecated `%d %D %n %N %v %m` dropped, `%i` becomes
+/// `--icon <Icon>`, `%c` the entry name, `%k` the desktop file path,
+/// `%%` a literal `%`. Unknown codes are dropped.
+fn expand_exec(exec: &str, name: &str, icon: Option<&str>, desktop_path: &Path) -> Vec<String> {
+    // Tokenize on unquoted whitespace first.
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut in_quotes = false;
+    let mut chars = exec.chars();
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            match ch {
+                '"' => in_quotes = false,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                _ => current.push(ch),
+            }
+        } else {
+            match ch {
+                '"' => {
+                    in_quotes = true;
+                    in_token = true;
+                }
+                '\\' => {
+                    in_token = true;
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                _ if ch.is_whitespace() => {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut current));
+                        in_token = false;
+                    }
+                }
+                _ => {
+                    in_token = true;
+                    current.push(ch);
+                }
+            }
+        }
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    // Then expand field codes per token.
+    let mut argv = Vec::new();
+    for token in tokens {
+        if token == "%i" {
+            if let Some(icon) = icon.filter(|i| !i.is_empty()) {
+                argv.push("--icon".to_owned());
+                argv.push(icon.to_owned());
+            }
+            continue;
+        }
+        let mut expanded = String::new();
+        let mut chars = token.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '%' {
+                expanded.push(ch);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => expanded.push('%'),
+                Some('c') => expanded.push_str(name),
+                Some('k') => expanded.push_str(&desktop_path.to_string_lossy()),
+                Some('i') => {
+                    if let Some(icon) = icon {
+                        expanded.push_str(icon);
+                    }
+                }
+                // %f %F %u %U, deprecated codes, and unknown codes:
+                // dropped (a restore launch carries no files).
+                Some(_) | None => {}
+            }
+        }
+        if !expanded.is_empty() {
+            argv.push(expanded);
+        }
+    }
+    argv
+}
+
+/// Queue of launched restore children awaiting reaping, drained by
+/// one background thread so relaunched apps never linger as zombies.
+/// (A `SIGCHLD`/`SA_NOCLDWAIT` shortcut is out of the question: the
+/// supervisor owns `waitpid` for the shell child and must keep it.)
+fn reaper() -> &'static std::sync::mpsc::Sender<std::process::Child> {
+    static REAPER: OnceLock<std::sync::mpsc::Sender<std::process::Child>> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<std::process::Child>();
+        let _ = std::thread::Builder::new()
+            .name("tuna-restore-reaper".into())
+            .spawn(move || {
+                let mut kids = Vec::new();
+                loop {
+                    while let Ok(kid) = rx.try_recv() {
+                        kids.push(kid);
+                    }
+                    kids.retain_mut(|kid| matches!(kid.try_wait(), Ok(None)));
+                    match rx.recv_timeout(Duration::from_secs(1)) {
+                        Ok(kid) => kids.push(kid),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            });
+        tx
+    })
+}
+
+/// Launch one installed application by desktop id: resolve the id to
+/// its `.desktop` file at restore time (like `gsm-util`'s
+/// `GDesktopAppInfo` launch, and like the user's own launch), honour
+/// `TryExec=` and refuse `Hidden` / non-`Application` / terminal
+/// entries, then spawn detached in its own session with no stdio
+/// inheritance. The child is handed to the reaper so it never
+/// zombifies.
+pub fn launch_desktop_id(desktop_id: &str) -> io::Result<()> {
+    let path = resolve_desktop_file(desktop_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{desktop_id}: no such installed application"),
+        )
+    })?;
+    let text = std::fs::read_to_string(&path)?;
+    let keys = desktop_entry_keys(&text);
+    if keys
+        .get("Hidden")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{desktop_id}: entry is Hidden"),
+        ));
+    }
+    if !keys.get("Type").is_some_and(|t| t == "Application") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{desktop_id}: not a Type=Application entry"),
+        ));
+    }
+    let exec = keys
+        .get("Exec")
+        .filter(|e| !e.trim().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{desktop_id}: entry has no Exec="),
+            )
+        })?;
+    if let Some(try_exec) = keys.get("TryExec") {
+        let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        if !try_exec_ok(try_exec, &path_dirs) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{desktop_id}: TryExec target is missing"),
+            ));
+        }
+    }
+    if keys
+        .get("Terminal")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{desktop_id}: terminal apps need a terminal emulator"),
+        ));
+    }
+    let name = keys.get("Name").map(String::as_str).unwrap_or(desktop_id);
+    let argv = expand_exec(exec, name, keys.get("Icon").map(String::as_str), &path);
+    if argv.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{desktop_id}: Exec= expands to nothing"),
+        ));
+    }
+    let mut command = std::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(dir) = keys.get("Path").filter(|d| Path::new(d).is_dir()) {
+        command.current_dir(dir);
+    }
+    // Detach into a new session so the app outlives restore-time
+    // bookkeeping and never takes our signals. A freshly forked
+    // child cannot be a process-group leader, so `setsid` cannot
+    // fail here — but report it honestly if it ever does.
+    // SAFETY: `setsid` is async-signal-safe; nothing else runs
+    // between fork and exec.
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    // The reaper lives for the process; a failed handoff leaks one
+    // zombie at worst, never the launch itself.
+    let _ = reaper().send(child);
+    Ok(())
+}
+
+/// One restore launch and what came of it. A failed launch never
+/// aborts the plan: the runtime logs it and carries on.
+#[derive(Debug)]
+pub struct LaunchAttempt {
+    /// Desktop id that was launched.
+    pub desktop_id: String,
+    /// The launch came from XDG autostart rather than the snapshot.
+    pub from_autostart: bool,
+    /// The launcher's verdict.
+    pub result: io::Result<()>,
+}
+
+/// Run every [`RestoreEntry::Launch`] in a plan through `launcher`
+/// (production passes [`launch_desktop_id`); skipped entries produce
+/// no attempt. Launches run in plan order: autostart first, then the
+/// snapshot in saved order.
+pub fn launch_plan(
+    entries: &[RestoreEntry],
+    launcher: &dyn Fn(&LaunchRequest) -> io::Result<()>,
+) -> Vec<LaunchAttempt> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            RestoreEntry::Launch(req) => Some(LaunchAttempt {
+                desktop_id: req.desktop_id.clone(),
+                from_autostart: req.from_autostart,
+                result: launcher(req),
+            }),
+            RestoreEntry::Skipped { .. } => None,
+        })
+        .collect()
+}
+
+/// Logout/shutdown entry point: collect the live rows into a snapshot
+/// and save it at [`session_file_path`] when `prefs` opts in. The
+/// runtime calls this on its shutdown path with one [`WindowRow`] per
+/// mapped toplevel.
+pub fn logout_save(
+    rows: impl IntoIterator<Item = WindowRow>,
+    active_workspace: u32,
+    prefs: RestorePrefs,
+) -> io::Result<SaveOutcome> {
+    save_if_enabled(
+        &session_file_path(),
+        prefs,
+        &collect(rows, active_workspace),
+    )
+}
+
+/// One login's restore work: the merged launch entries plus the
+/// placement queue for windows as they map.
+#[derive(Debug)]
+pub struct LoginRestore {
+    /// What to launch and what to skip, with reasons.
+    pub entries: Vec<RestoreEntry>,
+    /// Workspace that was active at save time (0 without a snapshot).
+    pub active_workspace: u32,
+    /// Queued placements for mapping windows (see
+    /// [`PendingPlacements`]).
+    pub placements: PendingPlacements,
+}
+
+/// Login entry point: load the snapshot at [`session_file_path`],
+/// plan the restore against [`installed_apps`] and the previous
+/// session's crash set (`crashed`), merge [`scan_autostart`], and
+/// queue the launch entries' placements. The snapshot restores only
+/// when `prefs` opts in; autostart launches at every login whatever
+/// the preference, like GNOME.
+pub fn login_restore_plan(prefs: RestorePrefs, crashed: &HashSet<String>) -> LoginRestore {
+    let installed = installed_apps();
+    let (snapshot, active_workspace) = match load_from(&session_file_path()) {
+        LoadOutcome::Loaded(session) => {
+            let active = session.active_workspace.min(MAX_WORKSPACE);
+            (Some(session), active)
+        }
+        LoadOutcome::Absent | LoadOutcome::Ignored(_) => (None, 0),
+    };
+    let plan = match (prefs.enabled, snapshot) {
+        (true, Some(session)) => plan_restore(&session, &|id| installed.contains(id), crashed),
+        _ => Vec::new(),
+    };
+    let autostart = scan_autostart(&default_autostart_dirs());
+    let entries = merge_autostart(plan, &autostart, active_workspace);
+    let mut placements = PendingPlacements::new();
+    placements.push_all(&entries);
+    LoginRestore {
+        entries,
+        active_workspace,
+        placements,
+    }
+}
+
+/// Placements waiting for relaunched windows to map, queued by
+/// [`login_restore_plan`]. The compositor pops each mapped window's
+/// placement with [`PendingPlacements::take_for`] and applies it with
+/// [`apply_restored_placement`].
+#[derive(Debug, Clone)]
+struct PendingPlacement {
+    desktop_id: String,
+    app_id: Option<String>,
+    tag: Option<String>,
+    placement: WindowPlacement,
+}
+
+/// FIFO queue matching mapped windows back to their saved placement.
+#[derive(Debug, Default)]
+pub struct PendingPlacements {
+    queue: VecDeque<PendingPlacement>,
+}
+
+impl PendingPlacements {
+    /// Empty queue.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue every launch entry's placement, in plan order.
+    pub fn push_all(&mut self, entries: &[RestoreEntry]) {
+        for entry in entries {
+            if let RestoreEntry::Launch(req) = entry {
+                self.queue.push_back(PendingPlacement {
+                    desktop_id: req.desktop_id.clone(),
+                    app_id: req.app_id.clone(),
+                    tag: req.tag.clone(),
+                    placement: req.placement,
+                });
+            }
+        }
+    }
+
+    /// Queued placements.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Whether any placement is still queued.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Pop the placement for a mapping window: an exact toplevel-tag
+    /// match wins (tags disambiguate an app's several windows), else
+    /// the first app-id match (falling back to the desktop id, since
+    /// clients often set the app id to it), FIFO. Returns `None` for
+    /// windows no restore launched — they place normally.
+    pub fn take_for(&mut self, app_id: Option<&str>, tag: Option<&str>) -> Option<WindowPlacement> {
+        if let Some(tag) = tag.map(str::trim).filter(|t| !t.is_empty()) {
+            if let Some(pos) = self
+                .queue
+                .iter()
+                .position(|p| p.tag.as_deref().is_some_and(|t| t == tag))
+            {
+                return self.queue.remove(pos).map(|p| p.placement);
+            }
+        }
+        if let Some(app) = app_id.map(str::trim).filter(|a| !a.is_empty()) {
+            let normalized = normalize_desktop_id(app);
+            if let Some(pos) = self.queue.iter().position(|p| {
+                p.app_id.as_deref() == Some(app)
+                    || p.desktop_id == app
+                    || normalized.as_deref().is_some_and(|n| p.desktop_id == n)
+            }) {
+                return self.queue.remove(pos).map(|p| p.placement);
+            }
+        }
+        None
+    }
+}
+
+/// What [`apply_restored_placement`] managed to apply. Steps report
+/// false for unknown ids (the window closed mid-restore) rather than
+/// failing the whole restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedPlacement {
+    /// The window moved to its saved workspace.
+    pub workspace: bool,
+    /// Floating size and position were applied.
+    pub geometry: bool,
+    /// Maximize / fullscreen / minimize were applied.
+    pub layout: bool,
+}
+
+/// Map-time entry point: apply a saved [`WindowPlacement`] to a just
+/// mapped window. Workspace first, then floating geometry (resize
+/// plus a delta move from the current position — there is no absolute
+/// setter, and the delta from
+/// [`WindowManager::geometry`](crate::windows::WindowManager::geometry)
+/// is exact),
+/// then layout flags last so maximize/fullscreen stash the floating
+/// geometry they cover, exactly as a user's own toggles would.
+/// (`sticky` has no `WindowManager` setter — only `is_sticky` — so it
+/// cannot be restored yet; see the union patch notes.)
+pub fn apply_restored_placement(
+    manager: &mut crate::windows::WindowManager,
+    state: &mut crate::State,
+    id: u64,
+    placement: &WindowPlacement,
+) -> AppliedPlacement {
+    let workspace = manager.move_to_workspace(state, id, placement.workspace.min(MAX_WORKSPACE));
+    let geometry = match manager.geometry(id) {
+        Some(geo) => {
+            let resized = manager.resize_window(id, placement.width, placement.height);
+            let moved = manager.move_window(
+                id,
+                placement.x.saturating_sub(geo.loc.x),
+                placement.y.saturating_sub(geo.loc.y),
+            );
+            resized && moved
+        }
+        None => false,
+    };
+    let mut layout = true;
+    if placement.fullscreen {
+        layout &= manager.set_fullscreen(state, id, true);
+    } else if placement.maximized {
+        layout &= manager.set_maximized(state, id, true);
+    }
+    if placement.minimized {
+        layout &= manager.minimize(state, id);
+    }
+    AppliedPlacement {
+        workspace,
+        geometry,
+        layout,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    /// Serializes tests that mutate process-global XDG variables and
+    /// restores every variable it touched on drop. The harness runs
+    /// tests on threads in one process, so unsynchronized `set_var`
+    /// in one test can leak into another test's reads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let lock = ENV_LOCK.lock().expect("env lock");
+            let mut saved = Vec::new();
+            for (key, value) in vars {
+                saved.push((*key, std::env::var_os(key)));
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { _lock: lock, saved }
+        }
+
+        /// Isolated XDG world: state/config/data all under `root`,
+        /// system dirs emptied so the host cannot leak in.
+        fn isolated(root: &Path) -> Self {
+            let root = root.to_string_lossy().into_owned();
+            Self::set(&[
+                ("XDG_STATE_HOME", Some(&format!("{root}/state"))),
+                ("XDG_CONFIG_HOME", Some(&format!("{root}/config"))),
+                ("XDG_CONFIG_DIRS", Some("")),
+                ("XDG_DATA_HOME", Some(&format!("{root}/data"))),
+                ("XDG_DATA_DIRS", Some("")),
+            ])
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     fn placement(workspace: u32) -> WindowPlacement {
         WindowPlacement {
@@ -1513,17 +2419,10 @@ mod tests {
     #[test]
     fn snapshot_file_defaults_under_state_home() {
         let home = tempfile::tempdir().expect("temp dir");
-        let prior = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_STATE_HOME", home.path().join("state"));
-        let path = session_file_path();
-        match prior {
-            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        assert_eq!(
-            path,
-            home.path().join("state").join("tuna").join("session.json")
-        );
+        let state = home.path().join("state");
+        let state_str = state.to_string_lossy().into_owned();
+        let _guard = EnvGuard::set(&[("XDG_STATE_HOME", Some(&state_str))]);
+        assert_eq!(session_file_path(), state.join("tuna").join("session.json"));
     }
 
     #[test]
@@ -1581,25 +2480,165 @@ mod tests {
     }
 
     #[test]
-    fn reregistration_reports_stale_ids_for_cleanup() {
+    fn live_ids_are_never_sent_for_cleanup() {
+        let mut reg = registry_with(&[], &[], true);
+        let (_, first, cleanup) = reg
+            .register("org.gnome.TextEditor", ":1.7")
+            .expect("register");
+        assert!(cleanup.is_empty(), "first registration has no cleanup");
+        // A second live instance mints a fresh id and reports no
+        // cleanup: the first instance is still running, so its id
+        // must not be deleted.
+        let (_, second, cleanup) = reg
+            .register("org.gnome.TextEditor", ":1.9")
+            .expect("register");
+        assert_ne!(first, second, "concurrent instances hold distinct ids");
+        assert!(
+            cleanup.is_empty(),
+            "live instance ids are never cleanup ids, got {cleanup:?}"
+        );
+        // `deleted` cannot forget a live id either: it only forgets
+        // discarded ids the registry actually sent for cleanup.
+        assert_eq!(
+            reg.deleted("org.gnome.TextEditor", std::slice::from_ref(&first)),
+            0
+        );
+        assert_eq!(
+            reg.deleted("org.gnome.TextEditor", std::slice::from_ref(&second)),
+            0
+        );
+        assert_eq!(
+            reg.deleted(
+                "org.gnome.TextEditor",
+                std::slice::from_ref(&"bogus".to_owned())
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn clean_exit_recycles_ids_through_the_discard_path() {
         let mut reg = registry_with(&[], &[], true);
         let (_, first, _) = reg
             .register("org.gnome.TextEditor", ":1.7")
             .expect("register");
         let (_, second, cleanup) = reg
-            .register("org.gnome.TextEditor", ":1.7")
+            .register("org.gnome.TextEditor", ":1.9")
             .expect("register");
-        assert_ne!(first, second, "each registration mints a fresh id");
+        assert_ne!(first, second);
+        assert!(cleanup.is_empty());
+        // Clean exits drop the live registrations. The first id is
+        // parked for reuse; the second displaces it to cleanup.
+        assert!(reg.unregister("org.gnome.TextEditor", &first));
+        assert!(!reg.unregister("org.gnome.TextEditor", &first));
+        assert!(!reg.unregister("org.gnome.TextEditor", "bogus"));
+        assert!(!reg.unregister("org.gnome.Missing", &first));
+        assert!(reg.unregister("org.gnome.TextEditor", &second));
+        // The next registration reuses the parked id and reports the
+        // displaced one — and only that one — for cleanup.
+        let (_, reused, cleanup) = reg
+            .register("org.gnome.TextEditor", ":1.11")
+            .expect("register");
+        assert_eq!(reused, second, "prior instance id is reused");
         assert_eq!(cleanup, [first.as_str()]);
-        // The app deletes the stale id; unknown ids are ignored.
+        // The app deletes the discarded id; it is forgotten for good,
+        // while the live id still cannot be forgotten.
         assert_eq!(
-            reg.deleted("org.gnome.TextEditor", &[first.clone(), "bogus".into()]),
+            reg.deleted("org.gnome.TextEditor", std::slice::from_ref(&first)),
             1
         );
-        // Clean exit drops the live registration.
-        assert!(reg.unregister("org.gnome.TextEditor", &second));
-        assert!(!reg.unregister("org.gnome.TextEditor", &second));
-        assert!(!reg.unregister("org.gnome.TextEditor", "bogus"));
+        assert_eq!(
+            reg.deleted("org.gnome.TextEditor", std::slice::from_ref(&first)),
+            0
+        );
+        assert_eq!(
+            reg.deleted("org.gnome.TextEditor", std::slice::from_ref(&reused)),
+            0
+        );
+        // A lone clean exit parks its id with no cleanup at all.
+        assert!(reg.unregister("org.gnome.TextEditor", &reused));
+        let (_, again, cleanup) = reg
+            .register("org.gnome.TextEditor", ":1.12")
+            .expect("register");
+        assert_eq!(again, second);
+        assert!(cleanup.is_empty());
+    }
+
+    #[test]
+    fn vanished_bus_names_crash_their_instances() {
+        let mut reg = registry_with(&["org.gnome.TextEditor"], &[], true);
+        let (_, first, _) = reg
+            .register("org.gnome.TextEditor", ":1.7")
+            .expect("register");
+        // Gaining an owner, or an unrelated name, marks nothing.
+        assert_eq!(reg.note_name_owner_changed(":1.7", ":1.7"), 0);
+        assert_eq!(reg.note_name_owner_changed(":1.99", ""), 0);
+        assert_eq!(reg.note_name_owner_changed("", ""), 0);
+        // Losing the owner marks the instance crashed and frees the
+        // id for reuse with a crash reason.
+        assert_eq!(reg.note_name_owner_changed(":1.7", ""), 1);
+        assert_eq!(reg.note_name_owner_changed(":1.7", ""), 0);
+        let (reason, reused, _) = reg
+            .register("org.gnome.TextEditor", ":1.20")
+            .expect("register");
+        assert_eq!(reused, first, "crashed instance keeps its id");
+        assert_eq!(reason, reason::CRASH_RESTORE);
+    }
+
+    #[test]
+    fn empty_dbus_name_falls_back_to_the_sender() {
+        let mut reg = registry_with(&[], &[], true);
+        let (_, id, _) = reg
+            .register_with_sender("org.gnome.TextEditor", "", Some(":1.42"))
+            .expect("sender fallback");
+        assert!(id.starts_with("tuna-"));
+        // The sender's name is what crash monitoring watches.
+        assert_eq!(reg.note_name_owner_changed(":1.42", ""), 1);
+        // An explicit bus name still wins over the sender.
+        let (_, _, _) = reg
+            .register_with_sender("org.gnome.TextEditor", ":1.7", Some(":1.99"))
+            .expect("register");
+        assert_eq!(reg.note_name_owner_changed(":1.7", ""), 1);
+        assert_eq!(reg.note_name_owner_changed(":1.99", ""), 0);
+        // No name anywhere is still rejected.
+        assert!(reg
+            .register_with_sender("org.gnome.TextEditor", "", None)
+            .is_err());
+        assert!(reg
+            .register_with_sender("org.gnome.TextEditor", "", Some(""))
+            .is_err());
+    }
+
+    #[test]
+    fn unknown_unregister_is_not_registered() {
+        use zbus::DBusError as _;
+        let mut reg = registry_with(&[], &[], true);
+        assert!(!reg.unregister("org.gnome.TextEditor", "tuna-nope"));
+        let (_, id, _) = reg
+            .register("org.gnome.TextEditor", ":1.7")
+            .expect("register");
+        assert!(!reg.unregister("org.gnome.TextEditor", "tuna-nope"));
+        assert!(reg.unregister("org.gnome.TextEditor", &id));
+        assert!(!reg.unregister("org.gnome.TextEditor", &id));
+        // The wire error matches upstream's
+        // `GSM_MANAGER_ERROR_NOT_REGISTERED` domain and name.
+        let err = RestoreDbusError::NotRegistered("Provided instance not found".into());
+        assert_eq!(
+            err.name().as_str(),
+            "org.gnome.SessionManager.Error.NotRegistered"
+        );
+        assert!(err.description().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[test]
+    fn gnome_51_contract_shapes_are_pinned() {
+        // Restore reasons from the 51.0 `org.gnome.SessionManager.xml`
+        // itemized list (0 = restore nothing, 1 = normal launch, 2 =
+        // post-crash restore, 3 = normal restore).
+        assert_eq!(reason::NO_RESTORE, 0);
+        assert_eq!(reason::NORMAL_LAUNCH, 1);
+        assert_eq!(reason::CRASH_RESTORE, 2);
+        assert_eq!(reason::NORMAL_RESTORE, 3);
     }
 
     #[test]
@@ -1626,5 +2665,437 @@ mod tests {
             .register("org.gnome.TextEditor", ":1.7")
             .expect("register");
         assert_eq!(reason, reason::NORMAL_LAUNCH);
+    }
+
+    #[test]
+    fn extreme_coordinates_reject_without_panicking() {
+        // `i32::MIN.abs()` panics in debug builds; a hostile snapshot
+        // may carry exactly that.
+        for (x, y) in [
+            (i32::MIN, 0),
+            (0, i32::MIN),
+            (i32::MIN, i32::MIN),
+            (i32::MAX, i32::MAX),
+        ] {
+            let mut bad = placement(0);
+            bad.x = x;
+            bad.y = y;
+            assert!(
+                bad.validated().is_none(),
+                "({x}, {y}) must be rejected, not panic"
+            );
+        }
+        // Boundary survivors still validate.
+        let mut edge = placement(0);
+        edge.x = MAX_DIMENSION * 4;
+        edge.y = -(MAX_DIMENSION * 4);
+        assert!(edge.validated().is_some());
+        // And collect drops hostile rows at save time.
+        let mut hostile = row("org.gnome.TextEditor", 0);
+        hostile.placement.x = i32::MIN;
+        assert!(collect([hostile], 0).windows.is_empty());
+    }
+
+    #[test]
+    fn reads_are_bounded_before_the_size_check() {
+        // `/dev/zero` reports a zero size but streams forever: without
+        // the capped read, `load_from` would never return. With it,
+        // the read stops just past the limit and the file is corrupt.
+        assert!(matches!(
+            load_from(Path::new("/dev/zero")),
+            LoadOutcome::Ignored(IgnoreReason::Corrupt(_))
+        ));
+        // One byte past the cap is rejected even when the metadata
+        // fast path cannot see it coming (covered by the same take).
+        let (_dir, path) = tmp_file("session.json");
+        std::fs::write(&path, vec![b'x'; MAX_SNAPSHOT_BYTES as usize + 1]).unwrap();
+        assert!(matches!(
+            load_from(&path),
+            LoadOutcome::Ignored(IgnoreReason::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn autostart_dirs_honor_xdg_config_home() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let custom = root.path().join("custom-config");
+        let custom_str = custom.to_string_lossy().into_owned();
+        let home_str = root.path().to_string_lossy().into_owned();
+        let _guard = EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", Some(&custom_str)),
+            ("HOME", Some(&home_str)),
+            ("XDG_CONFIG_DIRS", None),
+        ]);
+        let dirs = default_autostart_dirs();
+        assert_eq!(dirs[0], custom.join("autostart"));
+        assert_eq!(dirs[1], PathBuf::from("/etc/xdg/autostart"));
+        drop(_guard);
+        // A relative XDG_CONFIG_HOME is ignored per the spec.
+        let _guard = EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", Some("relative/path")),
+            ("HOME", Some(&home_str)),
+            ("XDG_CONFIG_DIRS", None),
+        ]);
+        let dirs = default_autostart_dirs();
+        assert_eq!(dirs[0], root.path().join(".config/autostart"));
+    }
+
+    #[test]
+    fn autostart_rejects_unlaunchable_entries_without_shadowing() {
+        let user = tempfile::tempdir().expect("temp dir");
+        let system = tempfile::tempdir().expect("temp dir");
+        // Config-only user entries: no Type, no Exec.
+        std::fs::write(
+            user.path().join("notype.desktop"),
+            "[Desktop Entry]\nName=NoType\nExec=/bin/true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user.path().join("noexec.desktop"),
+            "[Desktop Entry]\nType=Application\nName=NoExec\n",
+        )
+        .unwrap();
+        // Same stems, launchable, in the system dir.
+        for stem in ["notype", "noexec"] {
+            std::fs::write(
+                system.path().join(format!("{stem}.desktop")),
+                "[Desktop Entry]\nType=Application\nName=S\nExec=/bin/true\n",
+            )
+            .unwrap();
+        }
+        // A Hidden stub with no Exec is still a disable, not a
+        // config-only entry: it shadows the system file.
+        std::fs::write(
+            user.path().join("disabled.desktop"),
+            "[Desktop Entry]\nHidden=true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            system.path().join("disabled.desktop"),
+            "[Desktop Entry]\nType=Application\nName=S\nExec=/bin/true\n",
+        )
+        .unwrap();
+        let ids: Vec<String> =
+            scan_autostart(&[user.path().to_path_buf(), system.path().to_path_buf()])
+                .into_iter()
+                .map(|e| e.desktop_id)
+                .collect();
+        assert_eq!(ids, ["noexec", "notype"]);
+    }
+
+    #[test]
+    fn parallel_saves_never_interleave_or_litter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.json");
+        let sessions: Vec<SavedSession> = (0..8)
+            .map(|ws| collect([row("org.gnome.TextEditor", ws)], ws))
+            .collect();
+        std::thread::scope(|s| {
+            for session in &sessions {
+                s.spawn(|| {
+                    for _ in 0..8 {
+                        save_to(&path, session).expect("parallel save");
+                    }
+                });
+            }
+        });
+        // The winner is one whole snapshot, never interleaved bytes.
+        match load_from(&path) {
+            LoadOutcome::Loaded(back) => {
+                assert!(sessions.contains(&back));
+            }
+            other => panic!("parallel saves must leave a valid snapshot, got {other:?}"),
+        }
+        // No temporary file is left behind, fixed-name or unique.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n != "session.json")
+            .collect();
+        assert!(leftovers.is_empty(), "tmp litter: {leftovers:?}");
+        // And the survivor still carries the private mode.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn exec_expansion_follows_the_desktop_spec() {
+        let desktop = PathBuf::from("/apps/demo.desktop");
+        // Quoting, escapes, and single quotes (not special in Exec=).
+        assert_eq!(
+            expand_exec(r#"app "two words" it\'s \\"#, "Demo", None, &desktop),
+            ["app", "two words", "it's", "\\"]
+        );
+        // File codes drop; %% survives; %c/%k expand.
+        assert_eq!(
+            expand_exec("app %f %F %u %U 100%% %c %k", "Demo", None, &desktop),
+            ["app", "100%", "Demo", "/apps/demo.desktop"]
+        );
+        // Standalone %i becomes --icon plus the value; without an
+        // Icon key it vanishes.
+        assert_eq!(
+            expand_exec("app %i", "Demo", Some("demo-icon"), &desktop),
+            ["app", "--icon", "demo-icon"]
+        );
+        assert_eq!(expand_exec("app %i", "Demo", None, &desktop), ["app"]);
+        // Deprecated and unknown codes drop.
+        assert_eq!(
+            expand_exec("app %d %v %m %q", "Demo", None, &desktop),
+            ["app"]
+        );
+    }
+
+    /// Fake installed application under an isolated XDG world; the
+    /// guard must outlive every resolve/launch call.
+    fn fake_app_world(desktop_id: &str, body: &str) -> (tempfile::TempDir, EnvGuard) {
+        let root = tempfile::tempdir().expect("temp dir");
+        let apps = root.path().join("data/applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(apps.join(format!("{desktop_id}.desktop")), body).unwrap();
+        let guard = EnvGuard::isolated(root.path());
+        (root, guard)
+    }
+
+    #[test]
+    fn launcher_resolves_spawns_and_refuses() {
+        let (_root, _guard) = fake_app_world(
+            "com.example.Marker",
+            "[Desktop Entry]\nType=Application\nName=Marker\nExec=/bin/true\n",
+        );
+        assert!(installed_apps().contains("com.example.Marker"));
+        assert!(resolve_desktop_file("com.example.Marker").is_some());
+        launch_desktop_id("com.example.Marker").expect("launch installed app");
+        // Unknown apps, traversal ids, and refusal cases fail cleanly.
+        assert_eq!(
+            launch_desktop_id("com.example.Gone").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(resolve_desktop_file("../evil").is_none());
+        assert!(resolve_desktop_file("a/b").is_none());
+        drop(_guard);
+        let (_root, _guard) = fake_app_world(
+            "com.example.Terminal",
+            "[Desktop Entry]\nType=Application\nName=T\nExec=/bin/true\nTerminal=true\n",
+        );
+        assert_eq!(
+            launch_desktop_id("com.example.Terminal")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        drop(_guard);
+        let (_root, _guard) = fake_app_world(
+            "com.example.NoExec",
+            "[Desktop Entry]\nType=Application\nName=N\n",
+        );
+        assert_eq!(
+            launch_desktop_id("com.example.NoExec").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(_guard);
+        let (_root, _guard) = fake_app_world(
+            "com.example.TryExec",
+            "[Desktop Entry]\nType=Application\nName=T\nExec=/bin/true\nTryExec=/definitely/missing/tuna-restore-probe\n",
+        );
+        assert_eq!(
+            launch_desktop_id("com.example.TryExec").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn launcher_runs_the_child_detached() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let marker = dir.path().join("launched");
+        let marker_str = marker.to_string_lossy().into_owned();
+        let (_root, _guard) = fake_app_world(
+            "com.example.Spawn",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=S\nExec=/bin/sh -c \"echo ok > '{marker_str}'\"\n"
+            ),
+        );
+        launch_desktop_id("com.example.Spawn").expect("spawn marker");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(&marker).unwrap_or_default() != "ok\n" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawned child never wrote its marker"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn launch_plan_runs_launches_in_order_and_survives_failure() {
+        let session = collect(
+            [row("org.gnome.TextEditor", 0), row("com.example.Gone", 0)],
+            0,
+        );
+        let plan = plan_restore(&session, &|id| id != "com.example.Gone", &HashSet::new());
+        let merged = merge_autostart(
+            plan,
+            &[AutostartEntry {
+                desktop_id: "org.gnome.Calculator".into(),
+            }],
+            0,
+        );
+        let seen = std::sync::Mutex::new(Vec::new());
+        let attempts = launch_plan(&merged, &|req| {
+            seen.lock().unwrap().push(req.desktop_id.clone());
+            if req.desktop_id == "org.gnome.TextEditor" {
+                Err(io::Error::other("boom"))
+            } else {
+                Ok(())
+            }
+        });
+        // Autostart first, then the snapshot; the skipped app has no
+        // attempt; the failure does not abort the plan.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["org.gnome.Calculator", "org.gnome.TextEditor"]
+        );
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[0].result.is_ok());
+        assert!(attempts[0].from_autostart);
+        assert!(attempts[1].result.is_err());
+        assert!(!attempts[1].from_autostart);
+    }
+
+    #[test]
+    fn placement_queue_matches_tags_then_apps_fifo() {
+        let mut tagged = row("org.gnome.TextEditor", 1);
+        tagged.tag = Some("main".into());
+        tagged.app_id = Some("org.gnome.TextEditor".into());
+        let mut other = row("org.gnome.TextEditor", 2);
+        other.tag = Some("scratch".into());
+        other.app_id = Some("org.gnome.TextEditor".into());
+        let session = collect([tagged, other], 1);
+        let plan = plan_restore(&session, &|_| true, &HashSet::new());
+        let mut queue = PendingPlacements::new();
+        queue.push_all(&plan);
+        assert_eq!(queue.len(), 2);
+        // Exact tag match wins regardless of queue order.
+        assert_eq!(
+            queue
+                .take_for(Some("org.gnome.TextEditor"), Some("scratch"))
+                .expect("tag match")
+                .workspace,
+            2
+        );
+        // App id matches what remains; desktop-id fallback covers
+        // clients that set only the bare name.
+        assert_eq!(
+            queue
+                .take_for(Some("org.gnome.TextEditor"), None)
+                .expect("app match")
+                .workspace,
+            1
+        );
+        assert!(queue.is_empty());
+        assert!(queue.take_for(Some("org.gnome.TextEditor"), None).is_none());
+        // Unknown windows place normally.
+        let mut queue = PendingPlacements::new();
+        queue.push_all(&plan);
+        assert!(queue.take_for(Some("org.gnome.Maps"), None).is_none());
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn login_and_logout_entry_points_roundtrip() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let apps = root.path().join("data/applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(
+            apps.join("org.gnome.TextEditor.desktop"),
+            "[Desktop Entry]\nType=Application\nName=E\nExec=/bin/true\n",
+        )
+        .unwrap();
+        let autostart = root.path().join("config/autostart");
+        std::fs::create_dir_all(&autostart).unwrap();
+        std::fs::write(
+            autostart.join("org.gnome.Calculator.desktop"),
+            "[Desktop Entry]\nType=Application\nName=C\nExec=/bin/true\n",
+        )
+        .unwrap();
+        // The installed-app world needs its own .desktop too, or the
+        // login plan skips the snapshot entry as missing.
+        std::fs::write(
+            apps.join("org.gnome.Calculator.desktop"),
+            "[Desktop Entry]\nType=Application\nName=C\nExec=/bin/true\n",
+        )
+        .unwrap();
+        let _guard = EnvGuard::isolated(root.path());
+        // Logout saves the rows when opted in.
+        let outcome = logout_save([row("org.gnome.TextEditor", 1)], 1, RestorePrefs::enabled())
+            .expect("logout save");
+        assert_eq!(outcome, SaveOutcome::Saved);
+        // Login restores the snapshot plus autostart, with queued
+        // placements for both.
+        let login = login_restore_plan(RestorePrefs::enabled(), &HashSet::new());
+        assert_eq!(login.active_workspace, 1);
+        let launches: Vec<&LaunchRequest> = login
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                RestoreEntry::Launch(req) => Some(req),
+                RestoreEntry::Skipped { .. } => None,
+            })
+            .collect();
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[0].desktop_id, "org.gnome.Calculator");
+        assert!(launches[0].from_autostart);
+        assert_eq!(launches[1].desktop_id, "org.gnome.TextEditor");
+        assert_eq!(login.placements.len(), 2);
+        // Disabled: the snapshot stays closed but autostart still
+        // launches, like GNOME.
+        let login = login_restore_plan(RestorePrefs::default(), &HashSet::new());
+        let launches: Vec<&LaunchRequest> = login
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                RestoreEntry::Launch(req) => Some(req),
+                RestoreEntry::Skipped { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            launches
+                .iter()
+                .map(|r| r.desktop_id.as_str())
+                .collect::<Vec<_>>(),
+            ["org.gnome.Calculator"]
+        );
+        // And disabling at logout writes nothing.
+        std::fs::remove_file(session_file_path()).unwrap();
+        let outcome = logout_save([row("org.gnome.TextEditor", 1)], 1, RestorePrefs::default())
+            .expect("logout save");
+        assert_eq!(outcome, SaveOutcome::SkippedDisabled);
+        assert!(!session_file_path().exists());
+    }
+
+    #[test]
+    fn restore_applier_degrades_gracefully_for_unknown_windows() {
+        let display =
+            smithay::reexports::wayland_server::Display::<crate::State>::new().expect("display");
+        let mut state = crate::State::new(&display.handle());
+        let mut manager = crate::windows::WindowManager::new(&mut state);
+        let applied = apply_restored_placement(&mut manager, &mut state, 9999, &placement(1));
+        assert_eq!(
+            applied,
+            AppliedPlacement {
+                workspace: false,
+                geometry: false,
+                layout: true,
+            }
+        );
+        // Layout flags on an unknown window fail the layout step
+        // without panicking.
+        let mut max = placement(1);
+        max.maximized = true;
+        max.minimized = true;
+        let applied = apply_restored_placement(&mut manager, &mut state, 9999, &max);
+        assert!(!applied.workspace);
+        assert!(!applied.geometry);
+        assert!(!applied.layout);
     }
 }
