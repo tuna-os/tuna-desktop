@@ -395,7 +395,17 @@ pub fn step_frame(
                 .icon_geometry(*id)
                 .map(|r| r.to_f64())
                 .unwrap_or_else(|| crate::minimize::fallback(monitor, right_to_left));
-            Some((*id, (icon, geometry == monitor)))
+            Some((
+                *id,
+                (
+                    icon,
+                    crate::minimize::monitor_sized(
+                        manager.is_fullscreen(*id),
+                        geometry,
+                        state.desktop_size(),
+                    ),
+                ),
+            ))
         })
         .collect();
     let entries = manager.render_entries();

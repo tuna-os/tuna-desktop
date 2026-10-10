@@ -48,6 +48,15 @@ pub fn frame(effect: Effect, progress: f64, policy: MotionPolicy, monitor_sized:
         },
     }
 }
+/// Mutter 51: fullscreen or an exact whole-screen frame. A normal window
+/// matching only one monitor in a multi-monitor desktop still uses motion.
+pub fn monitor_sized(
+    fullscreen: bool,
+    frame: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+    screen: (i32, i32),
+) -> bool {
+    fullscreen || frame == smithay::utils::Rectangle::new((0, 0).into(), screen.into())
+}
 /// GNOME's missing-icon fallback is the monitor's upper leading corner.
 pub fn fallback(
     monitor: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
@@ -101,6 +110,24 @@ pub fn geometry(
 mod tests {
     use super::*;
     use tuna_shell_control::motion::MotionLevel;
+    #[test]
+    fn mutter_monitor_sized_excludes_normal_single_monitor_on_multi_output_desktop() {
+        let rect = smithay::utils::Rectangle::new((0, 0).into(), (1280, 800).into());
+        assert!(monitor_sized(true, rect, (2560, 800)));
+        assert!(monitor_sized(false, rect, (1280, 800)));
+        assert!(!monitor_sized(false, rect, (2560, 800)));
+    }
+    #[test]
+    fn resize_capture_bounds_preserve_both_layers_and_fractional_edges() {
+        let a = smithay::utils::Rectangle::new((-10.5, 20.25).into(), (500.0, 300.0).into());
+        let b = smithay::utils::Rectangle::new((10.0, -5.5).into(), (600.0, 450.0).into());
+        let r = bounds(a, b);
+        assert_eq!(r.loc, (-10.5, -5.5).into());
+        assert_eq!(r.size, (620.5, 450.0).into());
+        let integer: smithay::utils::Rectangle<i32, smithay::utils::Logical> = r.to_i32_up();
+        assert_eq!(integer.loc, (-11, -6).into());
+        assert_eq!(integer.size, (621, 451).into());
+    }
     #[test]
     fn icon_target_geometry_and_rtl_fallback_use_global_logical_monitor_bounds() {
         let monitor = smithay::utils::Rectangle::new((-1920, 100).into(), (1920, 1080).into());

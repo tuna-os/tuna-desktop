@@ -741,6 +741,11 @@ impl WindowManager {
         }
     }
 
+    pub fn is_fullscreen(&self, id: u64) -> bool {
+        self.windows
+            .get(&id)
+            .is_some_and(|w| w.layout == WindowLayout::Fullscreen)
+    }
     pub fn icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
         self.icon_geometries.get(&id).copied()
     }
