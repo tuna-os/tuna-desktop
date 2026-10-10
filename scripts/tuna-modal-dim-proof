@@ -89,7 +89,9 @@ def screenshot(name):
 def move(ms):
     temp = art / "clock.tmp"
     temp.write_text(str(ms))
+    before = json.loads(state.read_text())["rendered_frames"]
     temp.replace(clock)
+    wait(lambda d:d["animation_clock_ms"] >= clock_base + ms and d["rendered_frames"] >= before+2, f"clock-{ms}")
 def action(name, generation):
     temp = art / "command.tmp"
     temp.write_text(json.dumps(dict(action=name, generation=generation)))
@@ -146,9 +148,10 @@ try:
     subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "enable-animations", "true"], env=env, check=True)
     compositor = spawn([str(frozen / "tuna-compositor"), "--socket", "lifecycle-proof", "--shell-bin", str(frozen / "tuna-shell-gtk")], "compositor")
     wait(lambda d: d["animation_clock_manual"] and d["rendered_frames"] >= 5 and d["wallpaper_diagnostics"]["decode_result_count"] > 0 and any(layer["namespace"] == "tuna-panel" for layer in d["layers"]), "ready")
+    clock_base = json.loads(state.read_text())["animation_clock_ms"]
     baseline = screenshot("00-baseline")
     client = spawn([str(frozen / "tuna-modal-dim-client")], "client", {"WAYLAND_DISPLAY":"lifecycle-proof"})
-    wait(lambda d: len(d["windows"]) == 1, "parent-map")
+    wait(lambda d: len(d["windows"]) == 1 and bool(d["window_lifecycle"]["opening"]), "parent-map")
     move(150)
     ready = wait(lambda d:not d["window_lifecycle"]["opening"],"parent-landed")
     parent = ready["windows"][0]
@@ -165,7 +168,7 @@ try:
         assert all(abs(after[i]-before[i]*factor)<=2 for i in range(3)), (before,after,factor)
         assert image.getpixel(transparent) == baseline.getpixel(transparent), "dim shader changed transparent parent pixels"
     action("nonmodal",1)
-    wait(lambda d:len(d["windows"]) == 2,"nonmodal-mapped")
+    wait(lambda d:len(d["windows"]) == 2 and bool(d["window_lifecycle"]["opening"]),"nonmodal-mapped")
     move(250)
     wait(lambda d:not d["window_lifecycle"]["opening"],"nonmodal-landed")
     assert factor(json.loads(state.read_text())) == 1.0, "ordinary transient incorrectly dims parent"
@@ -179,7 +182,7 @@ try:
     full = wait(lambda d:not d["modal_dim"]["running"] and factor(d)<.7,"dim-full-500ms")
     pixel_factor(screenshot("03-dim-full"),factor(full))
     action("second-dialog",3)
-    wait(lambda d:len(d["windows"]) == 3,"overlapping-modals")
+    wait(lambda d:len(d["windows"]) == 3 and bool(d["window_lifecycle"]["opening"]),"overlapping-modals")
     assert abs(factor(json.loads(state.read_text()))-88/127)<1e-5
     move(850)
     wait(lambda d:not d["window_lifecycle"]["opening"],"second-landed")
