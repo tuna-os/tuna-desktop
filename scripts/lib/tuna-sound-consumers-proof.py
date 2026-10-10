@@ -128,6 +128,7 @@ def main():
     parser.add_argument('--source-revision', required=True)
     parser.add_argument('--identity', type=Path, required=True)
     parser.add_argument('--delivered', action='store_true', help='exercise frozen GTK/compositor through genuine nested keys and Wayland bell requests')
+    parser.add_argument('--trace-processes', action='store_true', help='diagnose owned GTK audio subprocesses; not a performance run')
     args = parser.parse_args()
     identity, binaries = validate_identity(args.identity, args.source_revision, args.volume_client, args.bell_client, args.delivered)
     artifacts = args.artifacts.resolve()
@@ -267,6 +268,9 @@ def main():
                     observed[name] = {'pid': pid, 'sha256': digest, 'exe': str(exe.resolve())}
                 return observed
             report['running_identity_start'] = desktop_identity()
+            if args.trace_processes:
+                spawn(['strace', '-f', '-e', 'trace=process', '-p', str(shell_pid),
+                       '-o', str(artifacts / 'gtk-process-trace.log')], 'gtk-process-tracer')
             time.sleep(2)
             env['WAYLAND_DISPLAY'] = 'tuna-sound-delivered'
             report['scope'] = 'delivered nested media keys and real Wayland bell requests on private null sink'

@@ -94,7 +94,7 @@ try:
     assert pixel(capture('02-no-flash'))==base
     receipt['cases']['flash-false']=answer
     number=request('Screenshot','(bbs)',[False,True,str(art/'flash.png')]);wait((art/'flash.png').exists,'saved PNG')
-    start=pixel(capture('03-start'));assert min(start)>245,start
+    start=wait(lambda: (value if min(value:=pixel(capture('03-start')))>245 else False),'visible flash start')
     saved=Image.open(art/'flash.png').convert('RGB');assert pixel(saved)==base,{'saved':pixel(saved),'baseline':base}
     # Saved pixels exist but the flashing method has not returned yet.
     assert read(art/'response.json')['id']!=number,'reply preceded flash completion'
@@ -107,7 +107,7 @@ try:
     assert pixel(capture('06-failed'))==base
     receipt['cases']['failed-capture']=answer
     number=request('FlashArea','(iiii)',[200,200,500,300]);answer=response(number);assert 'answer' in answer
-    area=capture('07-area-start');assert min(pixel(area))>245
+    area=wait(lambda: (value if min(pixel(value:=capture('07-area-start')))>245 else False),'visible area flash start')
     assert pixel(area,100,300)==pixel(baseline,100,300)
     advance(1000);assert pixel(capture('08-area-end'))==base
     receipt['cases']['area']={'reply':answer,'inside':pixel(area),'outside':pixel(area,100,300)}
