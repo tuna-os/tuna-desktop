@@ -2868,9 +2868,10 @@ locate_physical_key() {
     "$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" "--physical=$1" "$2" ||
         fail G-LOCATE-POINTER "physical key $1/$2 injection failed"
 }
-[ "$("$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --physical=37 probe)" = 0xffe3 ] &&
-[ "$("$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --physical=133 probe)" = 0xffeb ] ||
+if ! [ "$("$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --physical=37 probe)" = 0xffe3 ] ||
+   ! [ "$("$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --physical=133 probe)" = 0xffeb ]; then
     fail G-LOCATE-POINTER "host XKB physical Ctrl/Super fixture differs; refusing guessed keycodes"
+fi
 printf '{"host_left_ctrl":{"x_keycode":37,"evdev":29,"keysym":"Control_L"},"host_left_super":{"x_keycode":133,"evdev":125,"keysym":"Super_L"},"host_map_modified":false,"compositor_options":"ctrl:swap_lwin_lctl"}\n' >"$ARTIFACTS/locate-pointer-xkb-physical-identity.json"
 gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us')]"
 gsettings set org.gnome.desktop.input-sources xkb-options '[]'
