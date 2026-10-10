@@ -864,7 +864,10 @@ impl ControlClient {
                 }
                 Ok(count) => self.write_offset += count,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error.into()),
+                // Keep socket readiness in the same Io variant as read_frame.
+                // The shared legacy conversion maps WouldBlock to a distinct
+                // variant, which bypasses this client's writable-source handling.
+                Err(error) => return Err(ControlError::Io(error)),
             }
         }
         self.write_buf.clear();
@@ -882,7 +885,7 @@ impl ControlClient {
             self.write_offset = 0;
         }
         if frame.len().saturating_add(self.write_buf.len()) > MAX_FRAME_BYTES + 4 {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
+            return Err(ControlError::Io(io::Error::from(io::ErrorKind::WouldBlock)));
         }
         self.write_buf.extend_from_slice(&frame);
         match self.flush_pending() {
