@@ -92,6 +92,7 @@ pub mod unlock;
 pub mod wallpaper;
 pub mod window_icons;
 pub mod window_lifecycle;
+pub mod modal_dim;
 pub mod windows;
 pub mod workspace_slide;
 #[cfg(feature = "xwayland")]

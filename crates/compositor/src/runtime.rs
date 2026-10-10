@@ -1706,6 +1706,7 @@ impl Runtime {
         });
         // Overdraw per output for the last drawn frame (#503).
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
+        doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
             .frame_costs
             .iter()
@@ -3559,6 +3560,7 @@ impl Runtime {
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
+        self.manager.step_modal_dim(now,self.input_settings.motion,allowed);
         crate::window_lifecycle::step_frame(
             &mut self.manager,
             renderer,
@@ -3795,6 +3797,7 @@ impl Runtime {
                         pointer: (!locked && blank_alpha < 1.0).then_some((pointer.x, pointer.y)),
                         decor: decor.clone(),
                         above: elements.above,
+                        effects: elements.brightness.iter().copied().chain(elements.snapshots.iter().map(|s|s.2)).map(f32::to_bits).collect(),
                         groups: vec![
                             elements
                                 .flashes
@@ -3832,7 +3835,7 @@ impl Runtime {
                             elements
                                 .snapshots
                                 .iter()
-                                .map(|(_, e)| ElementSignature::capture(e, 1.0))
+                                .map(|(_, e, _)| ElementSignature::capture(e, 1.0))
                                 .collect(),
                         ],
                     };
@@ -4165,7 +4168,9 @@ struct Scene {
     )>,
     /// Old-frame snapshots of size-change transitions (#496), each
     /// drawn in front of `elements[index..]`, in physical pixels.
-    snapshots: Vec<(usize, SnapshotElement)>,
+    snapshots: Vec<(usize, SnapshotElement, f32)>,
+    brightness: Vec<f32>,
+    dim_program: Option<smithay::backend::renderer::gles::GlesTexProgram>,
     /// The window each of `elements` belongs to (popups included), for
     /// reporting which windows occlusion hid; `None` for layers.
     owners: Vec<Option<u64>>,
@@ -4197,6 +4202,8 @@ impl Scene {
             flashes: Vec::new(),
             bell: Vec::new(),
             snapshots: Vec::new(),
+            brightness: vec![1.0;above],
+            dim_program: None,
             owners: vec![None; above],
         }
     }
@@ -4499,7 +4506,7 @@ fn scene_elements(
                 manager
                     .window_lifecycle()
                     .element(ghost, renderer, view)
-                    .map(|e| (elements.len(), e)),
+                    .map(|e| (elements.len(), e, 1.0)),
             );
         }
         // Unassociated X11 windows contribute no surface yet and
@@ -4547,7 +4554,7 @@ fn scene_elements(
                 }
                 snapshots.extend(
                     crate::size_change::snapshot_element(renderer, snapshot, &frame, view)
-                        .map(|element| (elements.len(), element)),
+                        .map(|element| (elements.len(), element, manager.modal_dim().multiplier(id))),
                 );
                 owners.resize(elements.len(), Some(id));
                 continue;
@@ -4601,7 +4608,7 @@ fn scene_elements(
             manager
                 .window_lifecycle()
                 .element(ghost, renderer, view)
-                .map(|e| (elements.len(), e)),
+                .map(|e| (elements.len(), e, 1.0)),
         );
     }
     // Layer shell above windows: panel strip, then overview, each with
@@ -4625,12 +4632,16 @@ fn scene_elements(
     let above = elements.len() - split_from.unwrap_or(0);
     let total = elements.len();
     owners.resize(total, None);
-    let snapshots = snapshots
+    let snapshots: Vec<(usize,SnapshotElement,f32)> = snapshots
         .into_iter()
-        .map(|(index, element)| (total - index, element))
+        .map(|(index, element, brightness)| (total - index, element, brightness))
         .collect();
+    let brightness: Vec<f32> = owners.iter().map(|id| id.map_or(1.0, |id| manager.modal_dim().multiplier(id))).collect();
+    let dim_program = if brightness.iter().any(|v| *v < 1.0) || snapshots.iter().any(|s| s.2 < 1.0) { crate::modal_dim::program(renderer) } else { None };
     Scene {
         elements: crate::layer::front_to_back(elements),
+        brightness: crate::layer::front_to_back(brightness),
+        dim_program,
         above,
         tile: Vec::new(),
         top: Vec::new(),
@@ -4772,7 +4783,7 @@ fn draw_scene(
     // dragged window and the layers over it, each half with the
     // size-change snapshots among its elements (#496).
     let split = scene.above.min(scene.elements.len());
-    let snapshot_at: Vec<usize> = scene.snapshots.iter().map(|(index, _)| *index).collect();
+    let snapshot_at: Vec<usize> = scene.snapshots.iter().map(|(index, _, _)| *index).collect();
     let mut over = scene_slots(split, 0, false, &snapshot_at);
     let mut under = scene_slots(scene.elements.len() - split, split, true, &snapshot_at);
     insert_bell_slots(&mut over, scene);
@@ -4896,26 +4907,32 @@ fn draw_slots(
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
         let visible = std::slice::from_ref(visible);
-        match *slot {
+        let brightness = match *slot { SceneSlot::Element(index)=>scene.brightness[index], SceneSlot::Snapshot(k)=>scene.snapshots[k].2, SceneSlot::Bell(_)=>1.0 };
+        if brightness < 1.0 {
+            if let Some(program) = &scene.dim_program { frame.override_default_tex_program(program.clone(),vec![smithay::backend::renderer::gles::Uniform::new("brightness",brightness)]); }
+        }
+        let result = match *slot {
             SceneSlot::Element(index) => draw_planned::<GlesRenderer, _>(
                 frame,
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
-            )?,
+            ),
             SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
                 frame,
                 1.0,
                 std::slice::from_ref(&scene.bell[k].1),
                 visible,
-            )?,
+            ),
             SceneSlot::Snapshot(k) => draw_planned::<GlesRenderer, _>(
                 frame,
                 1.0,
                 std::slice::from_ref(&scene.snapshots[k].1),
                 visible,
-            )?,
-        }
+            ),
+        };
+        frame.clear_tex_program_override();
+        result?;
     }
     Ok(())
 }
