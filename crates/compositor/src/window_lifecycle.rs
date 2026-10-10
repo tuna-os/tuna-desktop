@@ -409,6 +409,52 @@ pub fn step_frame(
         })
         .collect();
     let entries = manager.render_entries();
+    // Register transitions before caching this frame. Cache geometry/alpha
+    // must describe the frame actually drawn below, including a map/restore's
+    // first frame, so immediate interruption cannot resurrect a full window.
+    let map_candidates: Vec<_> = entries
+        .iter()
+        .filter(|e| buffered.contains(&e.0))
+        .filter_map(|e| manager.lifecycle_kind(e.0).map(|kind| (e.0, kind)))
+        .collect();
+    {
+        let life = manager.window_lifecycle_mut();
+        life.now = now;
+        life.policy = policy;
+        if !allowed || !policy.allows_fades() {
+            life.suspend(ids);
+            life.minimized = minimized;
+            return;
+        }
+        let restored: Vec<_> = life
+            .minimized
+            .difference(&minimized)
+            .copied()
+            .filter(|id| ids.contains(id))
+            .collect();
+        for id in restored {
+            life.ghosts.retain(|g| g.id != id);
+            if let Some((icon, monitor_sized)) = targets.get(&id) {
+                life.restoring.insert(
+                    id,
+                    MinRun {
+                        start: now,
+                        icon: *icon,
+                        monitor_sized: *monitor_sized,
+                    },
+                );
+                if let Some(kind) = map_candidates.iter().find(|e| e.0 == id).map(|e| e.1) {
+                    life.record(id, "unminimize", kind, "started");
+                }
+            }
+        }
+        for (id, kind) in map_candidates {
+            if life.known.insert(id) {
+                life.opening.insert(id, Running { kind, start: now });
+                life.record(id, "map", kind, "started");
+            }
+        }
+    }
     let mut shown = Vec::new();
     if allowed && policy.allows_fades() {
         for (index, (id, window, geometry)) in entries.iter().enumerate() {
@@ -564,25 +610,6 @@ pub fn step_frame(
             "completed",
         );
     }
-    let restored: Vec<_> = life
-        .minimized
-        .difference(&minimized)
-        .copied()
-        .filter(|id| ids.contains(id))
-        .collect();
-    for id in restored {
-        life.ghosts.retain(|g| g.id != id);
-        if let Some((icon, monitor_sized)) = targets.get(&id) {
-            life.restoring.insert(
-                id,
-                MinRun {
-                    start: now,
-                    icon: *icon,
-                    monitor_sized: *monitor_sized,
-                },
-            );
-        }
-    }
     life.restoring.retain(|id, r| {
         ids.contains(id)
             && !minimized.contains(id)
@@ -673,16 +700,6 @@ pub fn step_frame(
     let visible: HashSet<_> = shown.iter().map(|e| e.0).collect();
     life.cache.retain(|id, _| visible.contains(id));
     for (id, cached) in shown {
-        if life.known.insert(id) {
-            life.opening.insert(
-                id,
-                Running {
-                    kind: cached.kind,
-                    start: now,
-                },
-            );
-            life.record(id, "map", cached.kind, "started");
-        }
         life.cache.insert(id, cached);
     }
     life.minimized = minimized;
