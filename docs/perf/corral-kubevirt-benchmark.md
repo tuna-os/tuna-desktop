@@ -69,3 +69,29 @@ SSH key/sshd provisioning must be part of the external test fixture and validate
 by actual boot. Fedora containerDisk preflight alone proves no Marlin SSH support.
 Budget the full20Gi PVC plus transfer, scratch and temporary allocation for the
 chosen import procedure, rather than admitting the optimistic mapped7Gi estimate.
+
+## Original artifact importer
+
+`scripts/tuna-corral-benchmark-import` requires explicit original workflow run,
+artifact ID and source SHA. GitHub API run metadata must identify a successful
+manual dispatch from the original repository/workflow. Original archive digest,
+finite ZIP members/expansion, disk bytes, manifest source/reference, package run
+and exporter evidence files are checked before cluster writes. A new randomly
+named halted VM and owned CDI DataVolume are created; existing resources are never
+adopted or overwritten. Upload uses an exact-context authenticated Kubernetes
+port-forward to CDI, an owned localhost listener and actual `virtctl image-upload`.
+The original upload receipt is written only after real successful CDI completion.
+Failure cleanup checks exact original resource UIDs and requests dependent deletion.
+The optional `--start` runs Corral only after upload completion. Actual guest boot,
+SSH, installed critical bytes and native receipts still require qualification.
+
+The current importer reserves the full20Gi target plus20Gi scratch, transfer,
+1Gi runtime layers and512Mi guest writes. It cannot proceed on a node with only
+32Gi conservative headroom. Do not lower this from a mapped-size estimate.
+
+The owned `tuna-corral-raw-upload-probe` diagnostic creates a small raw upload on
+an explicitly selected node, records uploader/scratch observations and cleans up.
+CDI1.66.1's raw data source selects direct target transfer, while its controller
+still creates a scratch PVC. The actual first64Mi/1Gi diagnostic timed out with
+zero target/scratch data and remains a failure; it does not justify a smaller
+production import reservation. No shared CDI deployment or network was changed.

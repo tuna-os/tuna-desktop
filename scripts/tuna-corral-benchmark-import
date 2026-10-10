@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Acquire an original CI export and upload it into new owned KubeVirt storage.
+
+No on-node image build. No existing VM/disk adoption or overwrite. The conservative
+qcow2 target+scratch reservation applies until another method is proven.
+"""
+import argparse,datetime,hashlib,json,os
+from pathlib import Path
+import re,signal,subprocess,sys,time,uuid
+sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
+from corral_artifact import download,disk_plan
+from corral_perf import kubectl,capacity_receipt,node_name
+from corral_session import owned_listener
+p=argparse.ArgumentParser(description=__doc__)
+for name in ('context','node','source-sha','profile'):p.add_argument('--'+name,required=True)
+p.add_argument('--run-id',type=int,required=True);p.add_argument('--artifact-id',type=int,required=True)
+p.add_argument('--namespace',default='corral-vms');p.add_argument('--out',type=Path,required=True)
+p.add_argument('--start',action='store_true');a=p.parse_args();node_name(a.node)
+if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}',a.namespace):p.error('invalid namespace')
+a.out.mkdir(parents=True,exist_ok=False);a.out.chmod(0o700)
+name='tuna-v1-bench-'+uuid.uuid4().hex[:12];disk_name=name+'-disk'
+receipt={'schema':1,'completed':False,'context':a.context,'namespace':a.namespace,'vm_name':name,'pvc_name':disk_name,'datavolume_name':disk_name,'performance_qualified':False}
+owned=[];proxy=None;upload=None
+
+def record(filename,value):(a.out/filename).write_text(json.dumps(value,indent=2))
+def create(kind,obj):
+ path=a.out/(kind+'-create.json');record(path.name,obj)
+ result=json.loads(subprocess.check_output(['kubectl','--context',a.context,'create','-f',str(path),'-o','json'],timeout=45))
+ owned.append((kind,result['metadata']['name'],result['metadata']['uid']));record('owned-objects.json',owned);return result
+try:
+ receipt['phase']='authenticated-export-download';record('import-receipt.json',receipt)
+ export,manifest,acquisition=download(a.run_id,a.artifact_id,a.source_sha,a.profile,a.out/'original')
+ plan=disk_plan(manifest);record('storage-plan.json',plan)
+ node=kubectl(a.context,'get','node',a.node,'-o','json');stats=kubectl(a.context,'get','--raw','/api/v1/nodes/'+a.node+'/proxy/stats/summary')
+ admission=capacity_receipt(node,stats,estimated_peak_bytes=plan['estimated_peak_bytes']);record('admission.json',admission)
+ if not admission['ready_for_disk_admission']:raise ValueError('full target+scratch storage admission refused')
+ receipt.update(disk_sha256=acquisition['disk_sha256'],manifest_sha256=acquisition['manifest_sha256'],original_export_run_id=a.run_id,original_export_artifact_id=a.artifact_id)
+ expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=2)).isoformat().replace('+00:00','Z')
+ vm={'apiVersion':'kubevirt.io/v1','kind':'VirtualMachine','metadata':{'name':name,'namespace':a.namespace,'labels':{'corral.dev/ephemeral':'true','tuna-perf-owned':name},'annotations':{'corral.dev/expires-at':expiry}},'spec':{'runStrategy':'Halted','template':{'metadata':{'labels':{'kubevirt.io/domain':name}},'spec':{'nodeSelector':{'kubernetes.io/hostname':a.node},'domain':{'cpu':{'cores':4,'model':'host-passthrough'},'resources':{'requests':{'memory':'6Gi'}},'firmware':{'bootloader':{'efi':{'secureBoot':False}}},'devices':{'disks':[{'name':'rootdisk','disk':{'bus':'virtio'}}],'interfaces':[{'name':'default','masquerade':{}}]}},'networks':[{'name':'default','pod':{}}],'volumes':[{'name':'rootdisk','persistentVolumeClaim':{'claimName':disk_name}}]}}}}
+ actual=create('vm',vm);receipt['vm_uid']=actual['metadata']['uid']
+ owner={'apiVersion':'kubevirt.io/v1','kind':'VirtualMachine','name':name,'uid':receipt['vm_uid'],'controller':True,'blockOwnerDeletion':True}
+ dv={'apiVersion':'cdi.kubevirt.io/v1beta1','kind':'DataVolume','metadata':{'name':disk_name,'namespace':a.namespace,'labels':{'tuna-perf-owned':name},'ownerReferences':[owner]},'spec':{'source':{'upload':{}},'pvc':{'accessModes':['ReadWriteOnce'],'volumeMode':'Filesystem','storageClassName':'local-path','resources':{'requests':{'storage':'20Gi'}}}}}
+ actual=create('dv',dv);receipt['datavolume_uid']=actual['metadata']['uid']
+ receipt['phase']='owned-pvc-node-binding';record('import-receipt.json',receipt)
+ deadline=time.monotonic()+60
+ while time.monotonic()<deadline:
+  result=subprocess.run(['kubectl','--context',a.context,'get','pvc',disk_name,'-n',a.namespace,'-o','json'],capture_output=True,timeout=15)
+  if result.returncode==0:claim=json.loads(result.stdout);break
+  time.sleep(.25)
+ else:raise TimeoutError('owned CDI PVC unavailable')
+ if not any(o.get('uid')==receipt['datavolume_uid'] for o in claim['metadata'].get('ownerReferences',[])):raise ValueError('CDI PVC ownership differs')
+ receipt['pvc_uid']=claim['metadata']['uid']
+ operations=[{'op':'test','path':'/metadata/uid','value':receipt['pvc_uid']},{'op':'add','path':'/metadata/annotations/volume.kubernetes.io~1selected-node','value':a.node}]
+ subprocess.run(['kubectl','--context',a.context,'patch','pvc',disk_name,'-n',a.namespace,'--type=json','-p',json.dumps(operations)],check=True,timeout=30,stdout=subprocess.DEVNULL)
+ log=(a.out/'proxy.log').open('wb');proxy=subprocess.Popen(['kubectl','--context',a.context,'-n','cdi','port-forward','--address','127.0.0.1','svc/cdi-uploadproxy',':443'],stdout=log,stderr=log,start_new_session=True)
+ deadline=time.monotonic()+20;port=None
+ while time.monotonic()<deadline and proxy.poll() is None:
+  match=re.search(r'Forwarding from 127\.0\.0\.1:(\d+) ->',(a.out/'proxy.log').read_text())
+  if match:port=int(match[1]);break
+  time.sleep(.1)
+ if not port or not owned_listener(proxy.pid,port):raise ValueError('owned API uploadproxy tunnel unavailable')
+ receipt['phase']='original-upload';record('import-receipt.json',receipt)
+ log=(a.out/'upload.log').open('wb');upload=subprocess.Popen(['virtctl','--context',a.context,'image-upload','dv',disk_name,'-n',a.namespace,'--no-create','--image-path',str(export/'disk.qcow2'),'--uploadproxy-url',f'https://127.0.0.1:{port}','--insecure','--wait-secs','120','--retry','0'],stdout=log,stderr=log,start_new_session=True)
+ deadline=time.monotonic()+1800
+ while upload.poll() is None and time.monotonic()<deadline:
+  current_node=kubectl(a.context,'get','node',a.node,'-o','json')
+  if current_node['metadata']['uid']!=node['metadata']['uid'] or any(c.get('type')=='DiskPressure' and c.get('status')!='False' for c in current_node['status'].get('conditions',[])):raise ValueError('node identity/pressure changed during upload')
+  pods=kubectl(a.context,'get','pods','-n',a.namespace,'-o','json')['items']
+  owned_pods=[q for q in pods if any(o.get('uid')==receipt['pvc_uid'] for o in q['metadata'].get('ownerReferences',[]))]
+  if any(q['spec'].get('nodeName') not in (None,a.node) for q in owned_pods):raise ValueError('upload scheduled on another node')
+  record('upload-pods.json',owned_pods);time.sleep(2)
+ if upload.poll() is None:raise TimeoutError('original upload deadline')
+ if upload.returncode:raise RuntimeError('original upload failed; inspect upload.log')
+ dv=kubectl(a.context,'get','dv',disk_name,'-n',a.namespace,'-o','json');claim=kubectl(a.context,'get','pvc',disk_name,'-n',a.namespace,'-o','json')
+ if dv['metadata']['uid']!=receipt['datavolume_uid'] or claim['metadata']['uid']!=receipt['pvc_uid'] or dv['status'].get('phase')!='Succeeded' or claim['status'].get('phase')!='Bound':raise ValueError('original upload completion/identity unavailable')
+ record('datavolume-completed.json',dv);record('pvc-completed.json',claim)
+ with (export/'disk.qcow2').open('rb') as stream:
+  if hashlib.file_digest(stream,'sha256').hexdigest()!=receipt['disk_sha256']:raise ValueError('original upload bytes changed')
+ receipt['completed']=True;receipt['phase']='complete';receipt['node_peak_qualified']=False
+ if a.start:
+  subprocess.run(['corral','--backend','kubevirt','--context',a.context,'start',name],check=True,timeout=120,stdout=(a.out/'start.log').open('wb'),stderr=subprocess.STDOUT)
+except BaseException as error:
+ receipt['error_type']=type(error).__name__;receipt['error']=str(error)[:4096]
+ raise
+finally:
+ record('import-receipt.json',receipt)
+ for process in (upload,proxy):
+  if process and process.poll() is None:
+   os.killpg(process.pid,signal.SIGTERM)
+   try:process.wait(timeout=5)
+   except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
+ if not receipt['completed']:
+  # Reverse dependent resources; verify exact original UID before each delete.
+  for kind,obj_name,uid in reversed(owned):
+   current=kubectl(a.context,'get',kind,obj_name,'-n',a.namespace,'-o','json')
+   if current['metadata']['uid']!=uid:raise ValueError('refusing cleanup of replaced resource')
+   subprocess.run(['kubectl','--context',a.context,'delete',kind,obj_name,'-n',a.namespace,'--wait=false'],check=True,timeout=30,stdout=subprocess.DEVNULL)
+  receipt['owned_cleanup_requested']=True
+ record('import-receipt.json',receipt)
+print(json.dumps(receipt,indent=2))
