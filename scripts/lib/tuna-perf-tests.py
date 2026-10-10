@@ -732,6 +732,100 @@ class Accounting(unittest.TestCase):
             result = guest.sample(1000, root)
             self.assertEqual(result["unreadable"], [{"pid":1,"error":"FileNotFoundError"}])
 
+    def test_transient_process_lookup_retries_before_accepting_valid_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.process(root, 1, 0, 1000, 10, 55)
+            original = Path.read_text
+            reads = []
+            def read_text(candidate, *args, **kwargs):
+                if candidate == path / "smaps_rollup":
+                    reads.append(candidate)
+                    if len(reads) < 3:
+                        raise ProcessLookupError("transient mm read")
+                return original(candidate, *args, **kwargs)
+            with patch.object(Path, "read_text", read_text), patch.object(guest.time, "sleep") as sleep:
+                result = guest.sample(1000, root)
+            self.assertEqual(len(reads), 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(result["unreadable"], [])
+            self.assertEqual(result["pss_kib"], 10)
+            self.assertEqual(result["process_count"], 1)
+
+    def test_persistent_process_lookup_on_live_identity_remains_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.process(root, 1, 0, 1000, 10, 55)
+            original = Path.read_text
+            reads = []
+            def read_text(candidate, *args, **kwargs):
+                if candidate == path / "smaps_rollup":
+                    reads.append(candidate)
+                    raise ProcessLookupError("persistent mm read")
+                return original(candidate, *args, **kwargs)
+            with patch.object(Path, "read_text", read_text), patch.object(guest.time, "sleep") as sleep:
+                result = guest.sample(1000, root)
+            self.assertEqual(len(reads), 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(result["unreadable"], [{"pid": 1, "error": "ProcessLookupError"}])
+            self.assertEqual(result["process_count"], 0)
+
+    def test_permission_error_is_not_retried_or_replaced_with_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.process(root, 1, 0, 1000, 10, 55)
+            original = Path.read_text
+            reads = []
+            def read_text(candidate, *args, **kwargs):
+                if candidate == path / "smaps_rollup":
+                    reads.append(candidate)
+                    raise PermissionError("denied")
+                return original(candidate, *args, **kwargs)
+            with patch.object(Path, "read_text", read_text), patch.object(guest.time, "sleep") as sleep:
+                result = guest.sample(1000, root)
+            self.assertEqual(len(reads), 1)
+            sleep.assert_not_called()
+            self.assertEqual(result["unreadable"], [{"pid": 1, "error": "PermissionError"}])
+
+    def test_exit_after_process_lookup_error_remains_a_departed_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.process(root, 1, 0, 1000, 10, 55)
+            original = Path.read_text
+            reads = []
+            def read_text(candidate, *args, **kwargs):
+                if candidate == path / "smaps_rollup" and not reads:
+                    reads.append(candidate)
+                    (path / "status").unlink()
+                    (path / "smaps_rollup").unlink()
+                    raise ProcessLookupError("exited")
+                return original(candidate, *args, **kwargs)
+            with patch.object(Path, "read_text", read_text), patch.object(guest.time, "sleep"):
+                result = guest.sample(1000, root)
+            self.assertEqual(result["unreadable"], [])
+            self.assertEqual(result["process_count"], 0)
+
+    def test_pid_reuse_during_process_lookup_retry_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.process(root, 1, 0, 1000, 10, 55)
+            original = Path.read_text
+            reads = []
+            def read_text(candidate, *args, **kwargs):
+                if candidate == path / "smaps_rollup":
+                    reads.append(candidate)
+                    if len(reads) == 1:
+                        fields = (path / "stat").read_text().rsplit(") ", 1)
+                        body = fields[1].split()
+                        body[19] = "99"
+                        (path / "stat").write_text(fields[0] + ") " + " ".join(body))
+                        raise ProcessLookupError("identity changed")
+                return original(candidate, *args, **kwargs)
+            with patch.object(Path, "read_text", read_text), patch.object(guest.time, "sleep"):
+                result = guest.sample(1000, root)
+            self.assertEqual(result["unreadable"], [{"pid": 1, "error": "ProcessIdentityChanged"}])
+            self.assertEqual(result["process_count"], 0)
+
     def test_drm_duplicate_handles_and_shared_process_clients_are_counted_once(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
