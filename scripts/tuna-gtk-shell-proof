@@ -546,6 +546,16 @@ if ! gsettings range org.gnome.desktop.a11y.interface reduced-motion >/dev/null 
     GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
     export GSETTINGS_SCHEMA_DIR
 fi
+# Use installed Mutter XML, extending only the missing GNOME locate key.
+# Preserve workspace/modal keys and their defaults/ranges; absent original
+# schemas are fatal rather than a reduced replacement that hides regressions.
+"$PY" "$ROOT/scripts/lib/tuna-locate-schema.py" "$ARTIFACTS/schemas"
+if [ -f "$ARTIFACTS/schemas/org.tuna.fixture-mutter.gschema.xml" ]; then
+    glib-compile-schemas --strict "$ARTIFACTS/schemas"
+    GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
+    export GSETTINGS_SCHEMA_DIR
+fi
+"$PY" "$ROOT/scripts/lib/tuna-locate-schema.py" "$ARTIFACTS/schemas" --verify
 gsettings set org.gnome.desktop.a11y.interface reduced-motion 'no-preference'
 if ! gsettings range org.gnome.desktop.calendar week-start-day >/dev/null 2>&1; then
     mkdir -p "$ARTIFACTS/schemas"
@@ -2792,31 +2802,56 @@ gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme_before"
 gsettings set org.gnome.desktop.interface cursor-size "$cursor_size_before"
 pass G-CURSOR-SHAPE "cursor-shape crosshair drawn from the theme, a missing shape falls back, a 32px client surface draws at 32px"
 
-# GNOME's locate-pointer: a lone Ctrl tap ripples at the pointer, only
-# while the key is on (Mutter's locate-pointer-key, Control_L).
+# Live Mutter settings choose a keysym, not a hardcoded left Ctrl keycode.
 xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+locate_key_before="$(gsettings get org.gnome.mutter locate-pointer-key)"
+locate_enabled_before="$(gsettings get org.gnome.desktop.interface locate-pointer)"
+gsettings set org.gnome.mutter locate-pointer-key 'Control_R'
 gsettings set org.gnome.desktop.interface locate-pointer false
-cstate '.cursor.locate_pointer.enabled | not' "locate-pointer off" ||
-    fail G-LOCATE-POINTER "locate-pointer false did not reach the compositor"
+cstate '.cursor.locate_pointer.enabled == false and .cursor.locate_pointer.key == "Control_R" and .cursor.locate_pointer.key_valid' "configured right Ctrl, disabled" ||
+    fail G-LOCATE-POINTER "live locate enable/key settings did not reach compositor"
 locate_before="$(jq '.cursor.locate_pointer.count' "$CSTATE")"
 locate_frames="$(jq '.cursor.locate_pointer.frames' "$CSTATE")"
-xdotool key Control_L
-sleep 1.5
-jq -e ".cursor.locate_pointer.count == $locate_before and .cursor.locate_pointer.frames == $locate_frames" "$CSTATE" >/dev/null ||
-    fail G-LOCATE-POINTER "a Ctrl tap rippled with locate-pointer off"
+locate_no_ripple() {
+    sleep 0.25
+    cstate ".cursor.locate_pointer.count == $locate_before and .cursor.locate_pointer.frames == $locate_frames and (.cursor.locate_pointer.active | not)" "$1" ||
+        fail G-LOCATE-POINTER "$1 triggered configured locate ripples"
+    cp "$CSTATE" "$ARTIFACTS/locate-pointer-$2.json"
+}
+xdotool key Control_R
+locate_no_ripple "disabled right Ctrl" disabled
 gsettings set org.gnome.desktop.interface locate-pointer true
-cstate '.cursor.locate_pointer.enabled' "locate-pointer on" ||
-    fail G-LOCATE-POINTER "locate-pointer true did not reach the compositor"
+cstate '.cursor.locate_pointer.enabled and .cursor.locate_pointer.key == "Control_R"' "configured locate enabled" ||
+    fail G-LOCATE-POINTER "locate-pointer true did not reach compositor"
 xdotool key Control_L
-cstate ".cursor.locate_pointer.count == $((locate_before + 1)) and .cursor.locate_pointer.active and .cursor.locate_pointer.frames > $locate_frames" "ripples" 3 ||
-    fail G-LOCATE-POINTER "a Ctrl tap with locate-pointer on drew no ripples"
+locate_no_ripple "unconfigured left Ctrl" left-negative
+xdotool key Control_R
+cstate ".cursor.locate_pointer.count == $((locate_before + 1)) and .cursor.locate_pointer.active and .cursor.locate_pointer.frames > $locate_frames" "configured right Ctrl ripples" 3 ||
+    fail G-LOCATE-POINTER "configured right Ctrl produced no rendered ripples"
 cp "$CSTATE" "$ARTIFACTS/locate-pointer.json"
 jq -e ".cursor.locate_pointer.at == [$((WIDTH / 2)), $((HEIGHT / 2))]" "$CSTATE" >/dev/null ||
-    fail G-LOCATE-POINTER "the ripples did not center on the pointer: $(jq -c '.cursor.locate_pointer' "$CSTATE")"
+    fail G-LOCATE-POINTER "ripples were not centered on the pointer"
 cstate '.cursor.locate_pointer.active | not' "ripples finished" 5 ||
-    fail G-LOCATE-POINTER "the ripples did not finish"
-gsettings set org.gnome.desktop.interface locate-pointer false
-pass G-LOCATE-POINTER "a Ctrl tap ripples at the pointer with locate-pointer on, nothing with it off"
+    fail G-LOCATE-POINTER "ripples did not finish"
+locate_before="$(jq '.cursor.locate_pointer.count' "$CSTATE")"
+locate_frames="$(jq '.cursor.locate_pointer.frames' "$CSTATE")"
+xdotool keydown Control_R key Shift_L keyup Control_R
+locate_no_ripple "modifier chord cancellation" chord-cancel
+xdotool keydown Control_R click 1 keyup Control_R
+locate_no_ripple "button cancellation" button-cancel
+for invalid_locate_key in '' 'TunaUnknownLocateKeysym'; do
+    gsettings set org.gnome.mutter locate-pointer-key "'$invalid_locate_key'"
+    cstate ".cursor.locate_pointer.key == \"$invalid_locate_key\" and (.cursor.locate_pointer.key_valid | not)" "invalid locate keysym disabled" ||
+        fail G-LOCATE-POINTER "empty/unknown locate key was not disabled"
+    xdotool key Control_R
+    locate_no_ripple "invalid locate key" "invalid-${invalid_locate_key:-empty}"
+done
+gsettings set org.gnome.mutter locate-pointer-key "$locate_key_before"
+gsettings set org.gnome.desktop.interface locate-pointer "$locate_enabled_before"
+locate_key_restored="$(gsettings get org.gnome.mutter locate-pointer-key | "$PY" -c 'import ast,json,sys; print(json.dumps(ast.literal_eval(sys.stdin.read())))')"
+cstate ".cursor.locate_pointer.key == $locate_key_restored and .cursor.locate_pointer.enabled == $locate_enabled_before" "locate settings restored" ||
+    fail G-LOCATE-POINTER "locate settings did not restore"
+pass G-LOCATE-POINTER "live Control_R ripples; left Ctrl, disabled/invalid keys and modifier/button cancellation do not"
 
 # A genuine GTK fullscreen request blocks accidental corner opening, while
 # deliberate Super access remains available and unfullscreen restores it.

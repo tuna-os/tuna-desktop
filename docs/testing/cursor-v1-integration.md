@@ -1,6 +1,6 @@
 # Cursor v1 integration qualification
 
-The v1 cursor lane imports the existing Xcursor/client-surface/shape/locate-pointer implementation onto the combined audio, workspace and idle scheduler source. It preserves sound and modal preferences plus workspace policy and appends cursor preferences in private protocol 0.34 (including the appended authenticated notification sender PID). The compositor and shell must be built together. The idle scheduler retains active animation service while locate-pointer ripples are running.
+The v1 cursor lane imports the existing Xcursor/client-surface/shape/locate-pointer implementation onto the combined audio, workspace and idle scheduler source. It preserves sound and modal preferences plus workspace policy and appends cursor preferences in private protocol 0.35 (including authenticated notification sender PID and X11 instance metadata). The compositor and shell must be built together. The idle scheduler retains active animation service while locate-pointer ripples are running.
 
 No fresh native build or runtime result is claimed for this lane yet. The imported proof checks must run against frozen exact-source executables and include actual captured pixels, owned session isolation and cleanup. Existing state-file-only assertions are insufficient for the full capability.
 
