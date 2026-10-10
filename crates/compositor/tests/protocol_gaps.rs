@@ -842,3 +842,70 @@ fn parented_dialogs_remain_centered_on_left_and_upper_outputs() {
         }
     }
 }
+
+#[test]
+fn minimized_parent_hides_transients_and_child_activation_restores_ancestors() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "parent-minimize");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let (child_surface, child) = window(&mut peer, "child-minimize");
+    child.set_parent(Some(&parent));
+    child_surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "parent-minimize");
+    let child_id = id_of(&manager, "child-minimize");
+    manager.focus(&mut comp.state, Some(child_id));
+    assert!(manager.minimize(&mut comp.state, parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert!(!manager.is_minimized(child_id));
+    assert_eq!(manager.model().focused(), None);
+    manager.focus(&mut comp.state, Some(child_id));
+    assert!(!manager.is_minimized(parent_id));
+    assert_eq!(manager.visible_windows().len(), 2);
+    assert_eq!(manager.model().focused(), Some(child_id));
+}
+
+#[test]
+fn restoring_parent_preserves_independent_child_minimize() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "independent-parent");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let (surface, child) = window(&mut peer, "independent-child");
+    child.set_parent(Some(&parent));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "independent-parent");
+    let child_id = id_of(&manager, "independent-child");
+    manager.minimize(&mut comp.state, child_id);
+    manager.minimize(&mut comp.state, parent_id);
+    manager.focus(&mut comp.state, Some(parent_id));
+    assert!(!manager.is_minimized(parent_id));
+    assert!(manager.is_minimized(child_id));
+    assert_eq!(manager.visible_windows().len(), 1);
+    assert_eq!(manager.model().focused(), Some(parent_id));
+}
+
+#[test]
+fn child_mapping_and_closing_cannot_restore_hidden_parent() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "hidden-parent");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "hidden-parent");
+    manager.minimize(&mut comp.state, parent_id);
+    let (surface, child) = window(&mut peer, "hidden-new-child");
+    child.set_parent(Some(&parent));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(manager.is_minimized(parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert_eq!(manager.model().focused(), None);
+    child.destroy();
+    surface.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(manager.is_minimized(parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert_eq!(manager.model().focused(), None);
+}

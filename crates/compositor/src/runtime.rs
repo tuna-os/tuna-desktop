@@ -2429,11 +2429,12 @@ impl Runtime {
         let model = self.manager.model();
         let active = model.active_workspace();
         let focused = model.focused();
+        let hidden = self.manager.hidden_by_minimize();
         let mut windows: Vec<(u64, Rectangle<i32, Logical>)> = self
             .manager
             .overview_windows()
             .into_iter()
-            .filter(|w| w.workspace == active && !self.manager.is_minimized(w.id))
+            .filter(|w| w.workspace == active && !hidden.contains(&w.id))
             .map(|w| (w.id, w.geometry))
             .collect();
         // GNOME sorts by stable sequence: creation order (Tuna Desktop ids rise).
