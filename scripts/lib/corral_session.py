@@ -84,6 +84,16 @@ def bounded_run(command, timeout):
                 os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
 
 
+def ssh_args(context,namespace,user,key,known_hosts):
+    known=str(Path(known_hosts).resolve())
+    return ['virtctl','--context',context,'ssh','--namespace',namespace,'--username',user,
+            '--identity-file',str(Path(key).resolve()),'--known-hosts',known,
+            '--local-ssh-opts=-o UserKnownHostsFile='+known,
+            '--local-ssh-opts=-o GlobalKnownHostsFile=/dev/null',
+            '--local-ssh-opts=-o StrictHostKeyChecking=accept-new','--local-ssh-opts=-o BatchMode=yes',
+            '--local-ssh-opts=-o ConnectTimeout=10']
+
+
 class Session:
     def __init__(self,context,namespace,name,user,key,known_hosts,out):
         for value in (namespace,name):
@@ -94,10 +104,7 @@ class Session:
         self.out=Path(out);self.boot_id=None;self.counter=0;self.responses={};self.proxy=None;self.display=None
         self.identity=vm_identity(*self.objects())
         if self.identity['migration_state'] is not None:raise ValueError('migrating guest rejected')
-        self.ssh=['virtctl','--context',context,'ssh','--namespace',namespace,'--username',user,
-                  '--identity-file',str(Path(key).resolve()),'--known-hosts',str(Path(known_hosts).resolve()),
-                  '--local-ssh-opts=-o StrictHostKeyChecking=accept-new','--local-ssh-opts=-o BatchMode=yes',
-                  '--local-ssh-opts=-o ConnectTimeout=10']
+        self.ssh=ssh_args(context,namespace,user,key,known_hosts)
         self.metadata={ 'backend':'corral-kubevirt','identity':self.identity,
           'gpu':{'status':'unsupported','qualified':False},'total_power':{'status':'unsupported','qualified':False},
           'cpu_hardware_scope':'AWS virtual node/guest; no physical-host counters',

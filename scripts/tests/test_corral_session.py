@@ -4,6 +4,14 @@ sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'lib'))
 import corral_session as m
 
 class Tests(unittest.TestCase):
+ def test_native_ssh_argv_explicitly_isolates_host_stores(self):
+  with tempfile.TemporaryDirectory() as d:
+   known=pathlib.Path(d)/'owned_hosts';key=pathlib.Path(d)/'key';args=m.ssh_args('ctx','ns','root',key,known)
+   self.assertEqual(args[args.index('--known-hosts')+1],str(known))
+   self.assertIn('--local-ssh-opts=-o UserKnownHostsFile='+str(known),args)
+   self.assertIn('--local-ssh-opts=-o GlobalKnownHostsFile=/dev/null',args)
+   self.assertIn('--local-ssh-opts=-o StrictHostKeyChecking=accept-new',args)
+   self.assertNotIn('--local-ssh-opts=-o StrictHostKeyChecking=no',args)
  def test_launcher_matches_actual_vmi_owner_and_node(self):
   s=m.Session.__new__(m.Session);s.context='ctx';s.namespace='ns';s.name='vm';s.identity={'vmi_uid':'instance','node':'node'}
   pod={'metadata':{'name':'launcher','ownerReferences':[{'uid':'instance','kind':'VirtualMachineInstance','controller':True}]},'spec':{'nodeName':'node'}}
