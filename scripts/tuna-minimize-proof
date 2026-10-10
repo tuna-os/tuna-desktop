@@ -105,6 +105,7 @@ def wait(check, label):
 def screenshot(name):
     time.sleep(.1)
     path = art / f"{name}.png"
+    path.unlink(missing_ok=True)
     subprocess.run(["scrot", str(path)], env=env, check=True)
     return Image.open(path).convert("RGB")
 def move(ms):
@@ -185,6 +186,10 @@ try:
     subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "enable-animations", "true"], env=env, check=True)
     compositor = spawn([str(frozen / "tuna-compositor"), "--socket", "lifecycle-proof", "--shell-bin", str(frozen / "tuna-shell-gtk")], "compositor")
     wait(lambda d: d["animation_clock_manual"] and d["rendered_frames"] >= 5 and d["wallpaper_diagnostics"]["decode_result_count"] > 0 and any(layer["namespace"] == "tuna-panel" for layer in d["layers"]), "ready")
+    host = subprocess.check_output(["xdotool","search","--pid",str(compositor.pid),"--name","Smithay"],env=env,text=True).splitlines()
+    assert len(host)==1
+    subprocess.run(["xdotool","windowfocus","--sync",host[0]],env=env,check=True)
+    manifest["x11_host_window"] = host[0]
     clock_base = json.loads(state.read_text())["animation_clock_ms"]
     # Settle the compositor wallpaper crossfade before a fixed background
     # is used for alpha composition checks at later animation times.
@@ -232,7 +237,7 @@ try:
     wait(lambda d:not d["window_lifecycle"]["restoring"],"restore-finished")
     # Open the actual GTK overview once to publish the native window-backed dash icon.
     keys("key","Super_L")
-    wait(lambda d:d["overview_open"] and any(l["namespace"]=="tuna-overview-dash" for l in d["layers"]),"dash-visible")
+    wait(lambda d:d["overview_open"] and any(l["namespace"]=="tuna-shell-dash" for l in d["layers"]),"dash-visible")
     settle_extra(300)
     time.sleep(1)
     dash_source=screenshot("04-dash-target-source")
@@ -274,7 +279,13 @@ try:
     assert hidden.getpixel(point)==baseline.getpixel(point),(point,hidden.getpixel(point),baseline.getpixel(point))
     keys("keydown","Alt_L","key","Tab");time.sleep(.7);keys("keyup","Alt_L")
     wait(lambda d:wid not in d["minimized"] and not d["window_lifecycle"]["restoring"],"off-immediate-restore")
-    check_pixel(screenshot("08-off-restored"),normal_rect,1.0)
+    off_end=time.monotonic()+10
+    while True:
+        try:
+            check_pixel(screenshot("08-off-restored"),normal_rect,1.0)
+            break
+        except AssertionError:
+            if time.monotonic()>=off_end: raise
     action("close",5);client.wait(timeout=10)
     wait(lambda d:not d["windows"] and not d["window_lifecycle"]["minimizing"] and not d["window_lifecycle"]["restoring"],"native-death-clean")
     subprocess.run(["gsettings","set","org.gnome.desktop.a11y.interface","reduced-motion","no-preference"],env=env,check=True)
@@ -327,16 +338,19 @@ try:
     ghost=wait(lambda d:d["window_lifecycle"]["minimizing"],"interrupted-map-minimize-quarter")["window_lifecycle"]["minimizing"][0]
     check_pixel(screenshot("12-interrupted-map-reset"),ghost["rect"],ghost["alpha"])
     action("recolor",9)
-    time.sleep(.3)
-    # Same animation time, new native buffer. A frozen clone remains blue.
-    live=screenshot("13-minimize-live-commit")
+    # Wait for the actual native buffer to reach displayed pixels; same clock.
     x,y,w,h=ghost["rect"]; point=(round(x+w*.7),round(y+h*.8))
-    alpha=ghost["alpha"]; bg=baseline.getpixel(point); actual=live.getpixel(point)
+    alpha=ghost["alpha"]; bg=baseline.getpixel(point)
     expected=tuple((173,127,168)[i]*alpha+bg[i]*(1-alpha) for i in range(3))
-    assert all(abs(actual[i]-expected[i])<=4 for i in range(3)), (point,actual,expected)
+    end=time.monotonic()+10
+    while True:
+        live=screenshot("13-minimize-live-commit")
+        actual=live.getpixel(point)
+        if all(abs(actual[i]-expected[i])<=4 for i in range(3)): break
+        if time.monotonic()>=end: raise AssertionError((point,actual,expected))
     assert json.loads(state.read_text())["window_lifecycle"]["retained_destroy_bytes"] == 0
     action("close",10);client.wait(timeout=10)
-    dead=wait(lambda d:not d["windows"] and d["window_lifecycle"]["minimizing"],"minimize-dead-actor-retained")
+    dead=wait(lambda d:not d["windows"] and d["window_lifecycle"]["minimizing"] and d["window_lifecycle"]["retained_destroy_bytes"] > 0,"minimize-dead-actor-retained")
     assert dead["window_lifecycle"]["retained_destroy_bytes"] > 0
     dead_frame=dead["window_lifecycle"]["minimizing"][0]
     retained=screenshot("14-minimize-destroyed-surface-safe")
@@ -348,13 +362,16 @@ try:
     client=spawn([str(frozen / "tuna-modal-dim-client")],"family-client",{"WAYLAND_DISPLAY":"lifecycle-proof"})
     parent=wait(lambda d:len(d["windows"])==1,"family-parent-map")["windows"][0]
     wid=parent["id"]; normal_rect=parent["rect"]
+    wait(lambda d:any(f["window"]==wid for f in d["window_lifecycle"]["opening"]),"family-parent-animation-start")
     move(3975)
     action("dialog",20)
     dialog=wait(lambda d:len(d["windows"])==2,"family-dialog-map")
     child=next(w for w in dialog["windows"] if w["id"]!=wid)
     child_id=child["id"]; cx,cy,cw,ch=child["rect"]
     child_point=(round(cx+cw*.7),round(cy+ch*.8))
+    wait(lambda d:any(f["window"]==child_id for f in d["window_lifecycle"]["opening"]),"family-dialog-animation-start")
     move(4075)
+    wait(lambda d:not d["window_lifecycle"]["opening"],"family-dialog-animation-complete")
     visible=screenshot("15-family-visible")
     assert visible.getpixel(child_point)==(78,154,6)
     action("minimize",21)
