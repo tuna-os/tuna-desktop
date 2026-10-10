@@ -20,7 +20,8 @@ not evidence of a measured CPU, GPU, power or GNOME performance advantage.
 | Wallpaper source identity | Existing one-second observation interval for the current source, excluded while its worker is pending |
 | X11 icons | Existing 500 ms probe interval while XWM is ready, bounded full-queue retry |
 | Lock and idle blank | Actual idle threshold; 16 ms only during blank fade; held inhibitors suppress deadlines and their removal resets the input clock anchor |
-| Overview, strip/column, workspace, size change, window lifecycle, tile preview, screenshot flash/reply | Active motion cap on real animation time; held workspace swipe waits for input; manual proof time waits for its file source |
+| Overview, strip/column, workspace, size change, window lifecycle, modal parent brightness, tile preview, screenshot flash/reply | Active motion cap on real animation time; held workspace swipe waits for input; manual proof time waits for its file source |
+| Workspace grace and explicit leases | Earliest real monotonic expiry; leases retire before drag-paused reconciliation; startup identities wait for producer events |
 | Bell visuals/player timeout | Real-time visual service and existing five-second player limit, independent of a manual animation clock |
 | Cast | Existing 33 ms streaming cadence; failed/no-buffer capture uses active bounded retry; PipeWire and revocation sources already wake calloop |
 | Frame callbacks, FIFO/commit timer obligations | Existing refresh service cap, with release still performed only by the existing drawn-frame / KMS pageflip paths |
@@ -53,6 +54,10 @@ worker completion and failure publication order, real child pidfd exit/removal,
 signal wake/drain, control buffered frames/phases, IdleMonitor registration,
 wallpaper identity eligibility, and watch rename/delete/loss/flood fallback.
 They do not establish runtime rendering or performance equivalence.
+Workspace deadline tests additionally cover earliest dialog/explicit expiry,
+manual animation-clock independence and expired-lease retirement. Startup and
+explicit lease APIs still need their genuine producer connections; a timer
+hook does not claim that missing integration.
 
 Run the compositor library suite and strict Clippy for both supported feature
 sets, then build and freeze exact-source binaries under the shared build guard.
