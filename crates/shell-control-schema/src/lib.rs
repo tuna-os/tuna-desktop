@@ -1227,7 +1227,11 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
     }
 
     fn check_window(w: &WindowInfo) -> Result<(), DecodeError> {
-        check_title(&w.title)
+        check_title(&w.title)?;
+        if let Some(instance) = w.x11_instance.as_deref() {
+            check_title(instance)?;
+        }
+        Ok(())
     }
 
     match msg {
@@ -1431,6 +1435,37 @@ mod tests {
         let shown = format!("{kind:?}");
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(shown.contains("redacted"));
+    }
+
+    #[test]
+    fn x11_instance_metadata_is_bounded_in_snapshots_and_deltas() {
+        let mut window = sample_window(1);
+        window.x11_instance = Some("x".repeat(MAX_TITLE_LEN + 1));
+        for message in [
+            Message::Snapshot {
+                revision: 1,
+                windows: vec![window.clone()],
+                workspaces: vec![],
+                locked: false,
+            },
+            Message::Changes {
+                from_revision: 1,
+                to_revision: 2,
+                ops: vec![StateOp::WindowOpened(window.clone())],
+            },
+        ] {
+            assert!(matches!(
+                decode_frame(&encode_frame(&message)),
+                Err(DecodeError::TitleTooLong { .. })
+            ));
+        }
+        window.x11_instance = Some("x".repeat(MAX_TITLE_LEN));
+        roundtrip(&Message::Snapshot {
+            revision: 1,
+            windows: vec![window],
+            workspaces: vec![],
+            locked: false,
+        });
     }
 
     #[test]
