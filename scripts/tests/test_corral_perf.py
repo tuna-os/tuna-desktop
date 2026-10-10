@@ -26,6 +26,16 @@ class Tests(unittest.TestCase):
   for peak in [0,5*m.GIB]:self.assertFalse(m.capacity_receipt(node,stats,estimated_peak_bytes=peak)['ready_for_disk_admission'])
   node['spec']={'taints':[{'effect':'NoSchedule'}]};self.assertFalse(m.capacity_receipt(node,stats,estimated_peak_bytes=m.GIB)['ready_for_disk_admission'])
   self.assertFalse(m.capacity_receipt(node,{},estimated_peak_bytes=m.GIB)['ready_for_disk_admission'])
+ def test_identity_replacement_and_migration(self):
+  vm={'metadata':{'name':'vm','namespace':'ns','uid':'vm-uid'},'spec':{'template':{'spec':{'volumes':[]}}}}
+  vmi={'metadata':{'name':'vm','namespace':'ns','uid':'vmi-uid','ownerReferences':[{'kind':'VirtualMachine','uid':'vm-uid','controller':True}]},'status':{'phase':'Running','nodeName':'node'}}
+  identity=m.vm_identity(vm,vmi);self.assertEqual(m.verify_identity(identity,vm,vmi),identity)
+  vmi['metadata']['uid']='replacement'
+  with self.assertRaises(ValueError):m.verify_identity(identity,vm,vmi)
+  vmi['metadata']['uid']='vmi-uid';vmi['status']['migrationState']={}
+  with self.assertRaises(ValueError):m.verify_identity(identity,vm,vmi)
+  vmi['metadata']['ownerReferences']=[]
+  with self.assertRaises(ValueError):m.vm_identity(vm,vmi)
  def test_pixels_keys(self):
   s=stream(update(0,2,b'abcdefgh'));r=m.Rfb(s);self.assertEqual(r.snapshot(),(2,1,b'abcdefgh'));r.keys(0xffeb,32)
   self.assertEqual(s.sent[-32:],b''.join(struct.pack('>BBHI',4,d,0,k) for d,k in [(1,0xffeb),(1,32),(0,32),(0,0xffeb)]))
