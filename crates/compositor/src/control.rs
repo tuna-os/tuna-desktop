@@ -1629,6 +1629,7 @@ impl Drop for ControlHub {
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     #[test]
