@@ -162,9 +162,10 @@ impl ProtocolVersion {
     /// `0.30` appends live sound/bell and attached-modal brightness preferences.
     /// `0.31` appends workspace and edge-tiling preferences.
     /// `0.32` appends cursor theme, size and locate-pointer preferences.
+    /// `0.33` appends the configurable locate-pointer keysym name.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 32,
+        minor: 33,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -845,6 +846,13 @@ pub struct InputSettings {
     /// shows ripples around the pointer.
     #[serde(default)]
     pub locate_pointer: bool,
+    /// Mutter keysym name, resolved through the active keyboard map.
+    #[serde(default = "default_locate_pointer_key")]
+    pub locate_pointer_key: String,
+}
+
+fn default_locate_pointer_key() -> String {
+    "Control_L".into()
 }
 
 fn default_attach_modal_dialogs() -> bool {
@@ -878,6 +886,7 @@ impl Default for InputSettings {
             cursor_theme: "Adwaita".into(),
             cursor_size: 24,
             locate_pointer: false,
+            locate_pointer_key: default_locate_pointer_key(),
         }
     }
 }
@@ -1220,6 +1229,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             check_title(&settings.xkb_variant)?;
             check_title(&settings.xkb_options)?;
             check_title(&settings.cursor_theme)?;
+            check_title(&settings.locate_pointer_key)?;
         }
         Message::Command {
             kind: CommandKind::SetSwitcherThumbnails { thumbnails },
@@ -1383,8 +1393,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_32() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 32));
+    fn current_version_is_0_33() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 33));
     }
 
     #[test]
@@ -1401,6 +1411,31 @@ mod tests {
                 }),
             });
         }
+    }
+
+    #[test]
+    fn locate_key_defaults_roundtrips_and_bounds() {
+        assert_eq!(InputSettings::default().locate_pointer_key, "Control_L");
+        for name in ["Control_L", "Control_R", "Super_L", "", "NoSuchKeysym"] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(InputSettings {
+                    locate_pointer_key: name.into(),
+                    ..InputSettings::default()
+                }),
+            });
+        }
+        let frame = encode_frame(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(InputSettings {
+                locate_pointer_key: "x".repeat(MAX_TITLE_LEN + 1),
+                ..InputSettings::default()
+            }),
+        });
+        assert!(matches!(
+            decode_frame(&frame),
+            Err(DecodeError::TitleTooLong { .. })
+        ));
     }
 
     #[test]

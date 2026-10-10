@@ -28,6 +28,7 @@ use smithay::backend::renderer::element::surface::{
 };
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::input::keyboard::xkb;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
@@ -849,6 +850,7 @@ pub fn grab_icon(resize_edges: Option<u32>) -> CursorIcon {
 
 /// evdev `KEY_LEFTCTRL`: Mutter's default `locate-pointer-key` is
 /// `Control_L`.
+#[cfg(test)]
 pub const LOCATE_POINTER_KEYCODE: u32 = 29;
 
 /// `ripples.js`: each ring's `(delay, duration, start scale, start
@@ -893,7 +895,9 @@ fn ripples_end_ms() -> f64 {
 pub struct LocatePointer {
     enabled: bool,
     held: HashSet<u32>,
-    armed: bool,
+    armed: Option<u32>,
+    key_name: String,
+    keysym: Option<u32>,
     /// Where and when the ripples started.
     playing: Option<(Point<f64, Logical>, Duration)>,
     /// Ripples started this session, for the proofs.
@@ -904,10 +908,43 @@ pub struct LocatePointer {
 }
 
 impl LocatePointer {
+    pub fn set_key(&mut self, name: &str) {
+        if self.key_name == name {
+            return;
+        }
+        self.key_name = name.into();
+        // xkbcommon's helper panics on embedded NUL; an invalid setting
+        // disables the binding rather than inventing another key.
+        self.keysym = if name.is_empty() || name.contains('\0') {
+            None
+        } else {
+            let symbol = xkb::keysym_from_name(name, 0).raw();
+            (symbol != 0).then_some(symbol)
+        };
+        self.reset_keys();
+    }
+
+    pub fn matches_keysym(&self, symbols: impl IntoIterator<Item = u32>) -> bool {
+        self.keysym
+            .is_some_and(|wanted| symbols.into_iter().any(|symbol| symbol == wanted))
+    }
+
+    #[cfg(test)]
+    fn feed(&mut self, input: &ManagerInput, pointer: Point<f64, Logical>, now: Duration) -> bool {
+        let matches_key = matches!(
+            input,
+            ManagerInput::Key {
+                keycode: LOCATE_POINTER_KEYCODE,
+                ..
+            }
+        );
+        self.feed_matched(input, matches_key, pointer, now)
+    }
+
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
-            self.armed = false;
+            self.armed = None;
             self.playing = None;
         }
     }
@@ -917,9 +954,10 @@ impl LocatePointer {
     }
 
     /// Feed one input event; returns whether the ripples started.
-    pub fn feed(
+    pub fn feed_matched(
         &mut self,
         input: &ManagerInput,
+        matches_key: bool,
         pointer: Point<f64, Logical>,
         now: Duration,
     ) -> bool {
@@ -929,13 +967,15 @@ impl LocatePointer {
             } => {
                 if pressed {
                     let alone = self.held.is_empty();
-                    self.held.insert(keycode);
-                    self.armed = keycode == LOCATE_POINTER_KEYCODE && alone;
+                    if !self.held.insert(keycode) {
+                        return false; // Repeated press keeps an existing lone tap armed.
+                    }
+                    self.armed = (matches_key && alone).then_some(keycode);
                     false
                 } else {
                     self.held.remove(&keycode);
-                    let fire = self.armed && keycode == LOCATE_POINTER_KEYCODE;
-                    self.armed = false;
+                    let fire = self.armed == Some(keycode);
+                    self.armed = None;
                     if fire && self.enabled {
                         self.playing = Some((pointer, now));
                         self.count += 1;
@@ -947,7 +987,7 @@ impl LocatePointer {
             ManagerInput::Button { .. }
             | ManagerInput::Axis { .. }
             | ManagerInput::SwipeBegin { .. } => {
-                self.armed = false;
+                self.armed = None;
                 false
             }
             _ => false,
@@ -957,7 +997,7 @@ impl LocatePointer {
     /// Forget held keys a lock or grab swallowed.
     pub fn reset_keys(&mut self) {
         self.held.clear();
-        self.armed = false;
+        self.armed = None;
     }
 
     fn elapsed_ms(&self, now: Duration) -> Option<f64> {
@@ -1040,6 +1080,8 @@ impl LocatePointer {
     fn snapshot(&self, now: Duration) -> serde_json::Value {
         serde_json::json!({
             "enabled": self.enabled,
+            "key": self.key_name,
+            "key_valid": self.keysym.is_some(),
             "count": self.count,
             "frames": self.frames,
             "active": self.active(now),
@@ -1449,6 +1491,83 @@ mod tests {
         // Right Ctrl is not Mutter's default key.
         locate.feed(&key(97, true), at, now);
         assert!(!locate.feed(&key(97, false), at, now));
+    }
+
+    #[test]
+    fn configured_locate_keys_and_invalid_names() {
+        let mut locate = LocatePointer::default();
+        locate.set_key("Control_L");
+        assert!(locate.matches_keysym([0xffe3]));
+        assert!(!locate.matches_keysym([0xffe4]));
+        locate.set_key("Control_R");
+        assert!(locate.matches_keysym([0xffe4]));
+        assert!(!locate.matches_keysym([0xffe3]));
+        for name in ["", "NotARealKeysym", "Control_L\0"] {
+            locate.set_key(name);
+            assert!(!locate.matches_keysym([0, 0xffe3, 0xffe4]));
+        }
+    }
+
+    #[test]
+    fn locate_resolves_control_through_real_swapped_caps_keymap() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let mut locate = LocatePointer::default();
+        locate.set_key("Control_L");
+        for (options, left_control, caps_lock) in [
+            (None, true, false),
+            (Some("ctrl:swapcaps".into()), false, true),
+        ] {
+            let keymap = xkb::Keymap::new_from_names(
+                &context,
+                "",
+                "",
+                "us",
+                "",
+                options,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .expect("system XKB us keymap");
+            let state = xkb::State::new(&keymap);
+            let matches = |evdev: u32| {
+                let code = (evdev + 8).into();
+                locate.matches_keysym(
+                    keymap
+                        .key_get_syms_by_level(code, state.key_get_layout(code), 0)
+                        .iter()
+                        .map(|symbol| symbol.raw()),
+                )
+            };
+            assert_eq!(matches(29), left_control);
+            assert_eq!(matches(58), caps_lock);
+        }
+    }
+
+    #[test]
+    fn locate_matches_remapped_physical_keys_and_repeat_preserves_tap() {
+        let key = |keycode, pressed| ManagerInput::Key {
+            keycode,
+            pressed,
+            time: 0,
+        };
+        let mut locate = LocatePointer::default();
+        locate.set_enabled(true);
+        let point = (10.0, 20.0).into();
+        let now = Duration::ZERO;
+        // XKB has mapped Control_L to Caps Lock's evdev position.
+        assert!(!locate.feed_matched(&key(58, true), true, point, now));
+        assert!(!locate.feed_matched(&key(58, true), true, point, now));
+        assert!(locate.feed_matched(&key(58, false), true, point, now));
+        // A non-matching physical left Ctrl never triggers.
+        locate.feed_matched(&key(29, true), false, point, now);
+        assert!(!locate.feed_matched(&key(29, false), false, point, now));
+        // Releasing a different physical key cannot fire an armed tap.
+        locate.feed_matched(&key(58, true), true, point, now);
+        assert!(!locate.feed_matched(&key(97, false), true, point, now));
+        assert!(!locate.feed_matched(&key(58, false), true, point, now));
+        locate.feed_matched(&key(58, true), true, point, now);
+        locate.set_key("Control_R");
+        assert!(!locate.feed_matched(&key(58, false), true, point, now));
+        assert_eq!(locate.count, 1);
     }
 
     #[test]

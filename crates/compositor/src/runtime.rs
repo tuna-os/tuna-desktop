@@ -1400,9 +1400,24 @@ impl Runtime {
             // GNOME's locate-pointer: a lone Ctrl tap; the key still
             // reaches the client (#342).
             let now = self.animation_clock.now();
+            let matches_key = if let ManagerInput::Key { keycode, .. } = &input {
+                self.state.seat.get_keyboard().is_some_and(|keyboard| {
+                    keyboard.with_xkb_state(&mut self.state, |context| {
+                        self.cursor.locate.matches_keysym(
+                            context
+                                .keysym_handle(keycode.saturating_add(8).into())
+                                .raw_syms()
+                                .into_iter()
+                                .map(|symbol| symbol.raw()),
+                        )
+                    })
+                })
+            } else {
+                false
+            };
             self.cursor
                 .locate
-                .feed(&input, self.manager.pointer_pos(), now);
+                .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
         }
         if self.is_locked() {
             // Only the lock screen hears input; with none up (shell
@@ -3137,6 +3152,7 @@ impl Runtime {
         self.cursor
             .set_theme(&settings.cursor_theme, settings.cursor_size);
         self.cursor.set_locate_pointer(settings.locate_pointer);
+        self.cursor.locate.set_key(&settings.locate_pointer_key);
         // Introspect's AnimationsEnabled is GNOME's enable-animations
         // (St): reduced motion keeps it true, as in GNOME 51.
         self.introspect

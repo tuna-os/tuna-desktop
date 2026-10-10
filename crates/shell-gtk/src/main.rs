@@ -2057,6 +2057,10 @@ fn build(app: &adw::Application) {
                 }
                 if let Some(mutter) = all[8].as_ref() {
                     if let Some(schema) = mutter.settings_schema() {
+                        if schema.has_key("locate-pointer-key") {
+                            out.locate_pointer_key =
+                                mutter.string("locate-pointer-key").to_string();
+                        }
                         if schema.has_key("dynamic-workspaces") {
                             out.workspace_policy.dynamic = mutter.boolean("dynamic-workspaces");
                         }
