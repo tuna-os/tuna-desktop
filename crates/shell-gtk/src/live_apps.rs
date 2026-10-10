@@ -66,6 +66,7 @@ mod tests {
 
     #[test]
     fn native_directory_monitor_invalidates_cache_and_wakes_without_a_poll_timer() {
+        let _serial = crate::ui_wake::test_default_context_lock();
         let context = glib::MainContext::default();
         let _owner = context.acquire().unwrap();
         let wake = Rc::new(crate::ui_wake::UiWake::default());

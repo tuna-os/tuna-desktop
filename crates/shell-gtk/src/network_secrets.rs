@@ -484,6 +484,7 @@ mod tests {
     use super::*;
     #[test]
     fn helper_output_is_bounded_and_the_process_is_reaped() {
+        let _serial = crate::ui_wake::test_default_context_lock();
         let context = glib::MainContext::default();
         context
             .with_thread_default(|| {

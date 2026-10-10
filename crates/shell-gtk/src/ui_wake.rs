@@ -147,6 +147,14 @@ pub fn watch_socket_conditions(
     source
 }
 
+/// Tests sharing GLib's process-wide default context must serialize before
+/// acquiring it. Keep the guard until all local sources and owners are dropped.
+#[cfg(test)]
+pub(crate) fn test_default_context_lock() -> std::sync::MutexGuard<'static, ()> {
+    static CONTEXT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CONTEXT_TESTS.lock().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +168,7 @@ mod tests {
     // compositor or installed services are needed for scheduling semantics.
     #[test]
     fn coalescing_deadline_cancellation_socket_drain_and_hup_retirement() {
+        let _serial = test_default_context_lock();
         let context = glib::MainContext::default();
         let _owner = context.acquire().unwrap();
         let wake = Rc::new(UiWake::default());

@@ -282,6 +282,7 @@ mod tests {
     #[test]
     #[ignore = "requires private graphical/session/accessibility buses and focus schema fixture"]
     fn live_menu_and_focus_settings() {
+        let _serial = crate::ui_wake::test_default_context_lock();
         gtk::init().unwrap();
         assert_eq!(std::env::var("GSETTINGS_BACKEND").as_deref(), Ok("memory"));
         let drain = |seconds: f64| {

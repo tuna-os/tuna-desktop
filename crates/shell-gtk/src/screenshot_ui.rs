@@ -1074,6 +1074,7 @@ mod tests {
     #[test]
     #[ignore = "requires a supervised GTK test process inside a Wayland layer-shell session"]
     fn external_close_and_destroy_retire_the_screenshot_window() {
+        let _serial = crate::ui_wake::test_default_context_lock();
         let _control = crate::attach_control().expect("supervised shell control handshake");
         gtk::init().expect("GTK display");
         let app = gtk::Application::builder()
