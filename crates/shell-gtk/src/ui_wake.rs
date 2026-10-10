@@ -21,7 +21,8 @@ impl UiWake {
         if let Some((_, timer)) = self.timer.borrow_mut().take() {
             timer.remove();
         }
-        self.callback.borrow_mut().take();
+        let callback = self.callback.borrow_mut().take();
+        drop(callback); // Drop UI captures after releasing the callback borrow.
     }
 
     pub fn install(self: &Rc<Self>, callback: impl Fn() + 'static) {
@@ -251,6 +252,22 @@ mod tests {
         );
         assert!(shutdown_wake.callback.borrow().is_none());
         assert!(shutdown_wake.timer.borrow().is_none());
+
+        struct RequestOnDrop(std::rc::Weak<UiWake>);
+        impl Drop for RequestOnDrop {
+            fn drop(&mut self) {
+                if let Some(wake) = self.0.upgrade() {
+                    wake.request();
+                }
+            }
+        }
+        let reentrant = Rc::new(UiWake::default());
+        let ui_capture = RequestOnDrop(Rc::downgrade(&reentrant));
+        reentrant.install(move || {
+            let _ui = &ui_capture;
+        });
+        reentrant.shutdown(); // UI destructors may emit local notifications.
+        assert!(!reentrant.pending.get());
 
         // Exercise the production lifetime contract with a real application
         // signal: local build scope ends, application owns wake, shutdown
