@@ -25,7 +25,8 @@ env=os.environ.copy()
 for key in ('DISPLAY','WAYLAND_DISPLAY','WAYLAND_SOCKET','DBUS_SESSION_BUS_ADDRESS','AT_SPI_BUS_ADDRESS'):
     env.pop(key,None)
 env.update(XDG_RUNTIME_DIR=str(runtime),XDG_CONFIG_HOME=str(art/'config'),XDG_DATA_HOME=str(art/'data'),GSETTINGS_BACKEND='keyfile',LIBGL_ALWAYS_SOFTWARE='1',TUNA_XWAYLAND='0',TUNA_COMPOSITOR_STATE=str(state),TUNA_ANIMATION_CLOCK=str(clock),TUNA_FLASH_PROOF_ARTIFACTS=str(art))
-children=[];fds=[];logs=[];success=False;receipt={'scope':__doc__,'source_revision':manifest['source_revision'],'manifest_sha256':hashlib.sha256((bundle/'manifest.json').read_bytes()).hexdigest(),'cases':{},'cleanup':{}}
+clock_base=0
+children=[];fds=[];logs=[];success=False;receipt={'scope':__doc__,'source_revision':manifest['source_revision'],'manifest_sha256':hashlib.sha256((bundle/'manifest.json').read_bytes()).hexdigest(),'proof_script_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'cases':{},'cleanup':{}}
 def spawn(argv,name,**kw):
     log=(art/(name+'.log')).open('wb');logs.append(log)
     proc=subprocess.Popen(argv,env=env,stdout=log,stderr=log,start_new_session=True,**kw);children.append(proc);fds.append((proc.pid,os.pidfd_open(proc.pid)));return proc
@@ -40,9 +41,12 @@ def wait(check,label,seconds=12):
     raise AssertionError('timed out: '+label)
 def read(path):return json.loads(path.read_text())
 def run(args):return subprocess.check_output(args,env=env,text=True,stderr=subprocess.STDOUT,timeout=5).strip()
+def clock_reached(document, base, offset):
+    value=document.get('animation_clock_ms')
+    return document.get('animation_clock_manual') is True and type(value) is int and value==base+offset
 def advance(ms):
     tmp=clock.with_suffix('.tmp');tmp.write_text(str(ms)+'\n');tmp.replace(clock)
-    wait(lambda:read(state).get('animation_clock_ms')==ms,'clock '+str(ms))
+    wait(lambda:clock_reached(read(state),clock_base,ms),'clock '+str(ms))
     time.sleep(.07)
 def capture(name):
     path=art/(name+'.png');run(['scrot',str(path)]);return Image.open(path).convert('RGB')
@@ -66,7 +70,10 @@ try:
     ready=wait(lambda:read(art/'client-ready.json'),'supervised fixture');client_pid=ready['pid'];fds.append((client_pid,os.pidfd_open(client_pid)))
     window=wait(lambda:run(['xdotool','search','--pid',str(core.pid),'--name','Smithay']),'window');assert len(window.splitlines())==1
     run(['xdotool','windowfocus','--sync',window]);run(['xdotool','mousemove','--window',window,'1200','750'])
-    wait(lambda:read(state).get('animation_clock_ms')==0,'ready state');time.sleep(.5)
+    ready_state=wait(lambda:read(state) if read(state).get('animation_clock_manual') is True else False,'ready state')
+    clock_base=ready_state['animation_clock_ms'];assert type(clock_base) is int
+    receipt['animation_clock_base_ms']=clock_base
+    time.sleep(.5)
     assert Path('/proc',str(core.pid),'exe').resolve()==bundle/'tuna-compositor'
     receipt['running_compositor']={'pid':core.pid,'sha256':hashlib.sha256(Path('/proc',str(core.pid),'exe').read_bytes()).hexdigest()}
     assert receipt['running_compositor']['sha256']==manifest['binary_sha256']['tuna-compositor'], 'running compositor bytes differ'

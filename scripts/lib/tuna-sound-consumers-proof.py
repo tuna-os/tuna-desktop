@@ -162,7 +162,7 @@ def main():
         return child
 
     report = {'scope': 'native source audio consumers on private null sink',
-              'source_revision': args.source_revision, 'cases': {},
+              'source_revision': args.source_revision, 'cases': {}, 'passed': False,
               'proof_script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'frozen_identity_sha256': hashlib.sha256(args.identity.read_bytes()).hexdigest(),
               'player': {'path': '/usr/bin/canberra-gtk-play', 'sha256': hashlib.sha256(Path('/usr/bin/canberra-gtk-play').read_bytes()).hexdigest()},
@@ -202,7 +202,10 @@ def main():
         run(['pactl', 'load-module', 'module-null-sink', 'sink_name=tuna-sound-proof',
              'rate=48000', 'channels=2'], env)
         wait_until(lambda: 'tuna-sound-proof' in run(['pactl', 'list', 'short', 'sinks'], env))
-        run(['pactl', 'set-default-sink', 'tuna-sound-proof'], env)
+        # The node may appear before Pulse publishes a selectable sink.
+        # Retry only this private graph readiness step and verify the selection.
+        wait_until(lambda: (run(['pactl', 'set-default-sink', 'tuna-sound-proof'], env),
+                            run(['pactl', 'get-default-sink'], env) == 'tuna-sound-proof')[1])
         wait_until(lambda: 'tuna-sound-proof' in run(['wpctl', 'inspect', '@DEFAULT_AUDIO_SINK@'], env))
         graph = json.loads(run(['pw-dump'], env))
         assert not any(o.get('info', {}).get('props', {}).get('device.api') in ('alsa', 'bluez5')
@@ -344,6 +347,12 @@ def main():
             if args.delivered:
                 observed['command'] = command
                 observed['desktop_identity'] = desktop_identity()
+        report['passed'] = True
+    except BaseException as error:
+        report['failure'] = {'type': type(error).__name__, 'message': str(error)}
+        if isinstance(error, subprocess.CalledProcessError):
+            report['failure']['command_output'] = error.output
+        raise
     finally:
         for child in reversed(children):
             stop(child)
@@ -351,8 +360,9 @@ def main():
             log.close()
         report['retired_bus_helpers'] = retire_private_processes(runtime)
         report['cleanup'] = all(child.poll() is not None for child in children)
-    assert report['cleanup'] and len(report['cases']) == 9
-    (artifacts / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
+        report['passed'] = report['passed'] and report['cleanup'] and len(report['cases']) == 9
+        (artifacts / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
+    assert report['passed']
     print(json.dumps(report))
 
 
