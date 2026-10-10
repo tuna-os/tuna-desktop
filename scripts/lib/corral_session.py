@@ -116,9 +116,9 @@ class Session:
         return tuple(kubectl(self.context,'get',kind,self.name,'-n',self.namespace,'-o','json') for kind in ('vm','vmi'))
 
     def launcher(self):
-        pods=kubectl(self.context,'get','pods','-n',self.namespace,'-l','kubevirt.io/domain='+self.name,'-o','json')['items']
-        owned=[p for p in pods if any(o.get('uid')==self.identity['vmi_uid'] for o in p['metadata'].get('ownerReferences',[])) and not p['metadata'].get('deletionTimestamp')]
-        if len(owned)!=1:raise ValueError('exact owned launcher required')
+        pods=kubectl(self.context,'get','pods','-n',self.namespace,'-l','kubevirt.io/created-by='+self.identity['vmi_uid'],'-o','json')['items']
+        owned=[p for p in pods if any(o.get('uid')==self.identity['vmi_uid'] and o.get('kind')=='VirtualMachineInstance' and o.get('controller') is True for o in p['metadata'].get('ownerReferences',[])) and not p['metadata'].get('deletionTimestamp')]
+        if len(owned)!=1 or owned[0]['spec'].get('nodeName')!=self.identity['node']:raise ValueError('exact owned launcher on identified node required')
         return owned[0]
 
     def verify(self):

@@ -4,6 +4,18 @@ sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'lib'))
 import corral_session as m
 
 class Tests(unittest.TestCase):
+ def test_launcher_matches_actual_vmi_owner_and_node(self):
+  s=m.Session.__new__(m.Session);s.context='ctx';s.namespace='ns';s.name='vm';s.identity={'vmi_uid':'instance','node':'node'}
+  pod={'metadata':{'name':'launcher','ownerReferences':[{'uid':'instance','kind':'VirtualMachineInstance','controller':True}]},'spec':{'nodeName':'node'}}
+  with patch.object(m,'kubectl',return_value={'items':[pod]}) as call:
+   self.assertEqual(s.launcher(),pod)
+  self.assertIn('kubevirt.io/created-by=instance',call.call_args.args)
+  for kind,controller,uid,node in [('VirtualMachine',True,'instance','node'),('VirtualMachineInstance',False,'instance','node'),('VirtualMachineInstance',True,'replacement','node'),('VirtualMachineInstance',True,'instance','other')]:
+   foreign={'metadata':{'ownerReferences':[{'uid':uid,'kind':kind,'controller':controller}]},'spec':{'nodeName':node}}
+   with patch.object(m,'kubectl',return_value={'items':[foreign]}):
+    with self.assertRaises(ValueError):s.launcher()
+  with patch.object(m,'kubectl',return_value={'items':[pod,pod]}):
+   with self.assertRaises(ValueError):s.launcher()
  def test_boot_attribution(self):
   s=m.Session.__new__(m.Session);s.boot_id=None;s.metadata={}
   boot='01234567-0123-0123-0123-012345678901';s.check_boot(boot);s.check_boot(boot)
