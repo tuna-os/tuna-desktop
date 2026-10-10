@@ -2471,8 +2471,6 @@ impl Runtime {
         fourcc: smithay::backend::allocator::Fourcc,
     ) -> Option<(i32, i32, Vec<u8>)> {
         use smithay::backend::renderer::{ExportMem, Offscreen};
-        #[cfg(not(feature = "drm"))]
-        let _ = connector;
         if self.is_locked() {
             return None;
         }
@@ -2620,6 +2618,8 @@ impl Runtime {
         fourcc: smithay::backend::allocator::Fourcc,
     ) -> Option<(i32, i32, Vec<u8>)> {
         use smithay::backend::renderer::{ExportMem, Offscreen};
+        #[cfg(not(feature = "drm"))]
+        let _ = connector;
         if self.is_locked() {
             return None;
         }
