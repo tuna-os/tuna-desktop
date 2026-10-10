@@ -163,7 +163,9 @@ impl CachedSignal {
         let mut reader = Reader::new(fd, &mut buffer);
         let mut dirty = false;
         // Bound one callback even if another same-user writer floods events.
-        // Conservative rescan after the cap covers unread events in this batch.
+        // Reader may prefetch events past the cap. Retire the watch at that
+        // boundary because a lost watch-invalidating event could otherwise
+        // leave a permanently stale cache. The 16 ms fallback remains bounded.
         for index in 0..256 {
             match reader.next() {
                 Ok(event) => {
@@ -179,6 +181,7 @@ impl CachedSignal {
                     self.valid &= valid;
                     if index == 255 {
                         dirty = true;
+                        self.valid = false;
                     }
                 }
                 Err(rustix::io::Errno::WOULDBLOCK) => break,
@@ -315,6 +318,36 @@ mod cache_tests {
         std::os::unix::fs::symlink(target, path).unwrap();
         signal.refresh();
         assert_eq!(signal.text(), "");
+    }
+    #[test]
+    fn event_flood_and_late_directory_move_force_bounded_polling_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let watched = dir.path().join("watched");
+        std::fs::create_dir(&watched).unwrap();
+        let path = watched.join("policy");
+        std::fs::write(&path, "initial").unwrap();
+        let mut signal = CachedSignal::new(path.clone());
+        // Long distinct names yield >256 events and multiple read batches.
+        // The move event can be prefetched beyond the callback's event cap.
+        for index in 0..100 {
+            std::fs::write(
+                watched.join(format!("unrelated-long-name-{}-{index}", "x".repeat(64))),
+                "flood",
+            )
+            .unwrap();
+        }
+        std::fs::rename(&watched, dir.path().join("moved")).unwrap();
+        assert!(
+            !signal.refresh(),
+            "cap must retire possibly invalid prefetched watch"
+        );
+        std::fs::create_dir(&watched).unwrap();
+        std::fs::write(&path, "new directory").unwrap();
+        assert_eq!(
+            signal.text(),
+            "new directory",
+            "lost invalidation must not strand cache"
+        );
     }
     #[test]
     fn watch_creation_failure_keeps_live_polling_fallback() {
