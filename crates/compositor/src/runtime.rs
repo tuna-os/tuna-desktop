@@ -4306,7 +4306,7 @@ fn screenshot_flash_elements(
                 SolidColorRenderElement::new(
                     id.clone(),
                     Rectangle::new(
-                        start.into(),
+                        start,
                         ((end.x - start.x).max(1), (end.y - start.y).max(1)).into(),
                     ),
                     alpha.to_bits() as usize,
