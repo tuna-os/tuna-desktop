@@ -4227,7 +4227,7 @@ fn screenshot_flash_elements(
                     id.clone(),
                     Rectangle::new(
                         start.into(),
-                        ((end.0 - start.0).max(1), (end.1 - start.1).max(1)).into(),
+                        ((end.x - start.x).max(1), (end.y - start.y).max(1)).into(),
                     ),
                     alpha.to_bits() as usize,
                     Color32F::new(alpha, alpha, alpha, alpha),
