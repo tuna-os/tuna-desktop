@@ -39,6 +39,10 @@ on:
         description: Exact main or explicitly dispatched candidate package source SHA
         required: false
         type: string
+      benchmark_ssh_public_key:
+        description: One Ed25519 public key for the owned Corral benchmark guest
+        required: false
+        type: string
       export_only:
         description: Build/export the selected disk without running local QEMU measurements
         required: false
@@ -66,8 +70,10 @@ jobs:
           if [[ "$EXPORT_DISK" == stock || "$EXPORT_DISK" == diagnostic ]]; then
             [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo 'disk export requires exact candidate_commit' >&2; exit 2; }
           fi
+      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y python3-yaml
       - run: python3 scripts/lib/tuna-perf-tests.py
       - run: python3 scripts/lib/tuna-benchmark-disk-tests.py
+      - run: /usr/bin/python3 scripts/lib/tuna-corral-ssh-export-tests.py
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
       - run: python3 scripts/lib/tuna-perf-repeatability-tests.py
       - run: python3 scripts/lib/tuna-perf-vm-lifetime-tests.py
@@ -205,7 +211,15 @@ jobs:
         if: ${{ inputs.export_disk == 'stock' || inputs.export_disk == 'diagnostic' }}
         env:
           EXPORT_DISK: ${{ inputs.export_disk }}
-        run: scripts/tuna-benchmark-disk-export --profile "$EXPORT_DISK"
+          BENCHMARK_SSH_PUBLIC_KEY: ${{ inputs.benchmark_ssh_public_key }}
+        run: |
+          python3 - <<'PYKEY'
+          import os
+          from pathlib import Path
+          os.umask(0o077)
+          Path('/mnt/perf/benchmark-ssh-key.pub').write_text(os.environ['BENCHMARK_SSH_PUBLIC_KEY'].strip() + '\n')
+          PYKEY
+          scripts/tuna-benchmark-disk-export --profile "$EXPORT_DISK" --ssh-public-key-file /mnt/perf/benchmark-ssh-key.pub
       - name: Upload compact benchmark disk and provenance
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: ${{ always() && (inputs.export_disk == 'stock' || inputs.export_disk == 'diagnostic') }}

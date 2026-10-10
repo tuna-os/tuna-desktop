@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ from tuna_benchmark_disk import digest, provenance, require, storage_receipt, VI
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--profile', choices=['stock', 'diagnostic'], required=True)
+    p.add_argument('--ssh-public-key-file', type=Path, required=True)
     p.add_argument('--artifacts', type=Path, default=Path('benchmark-disk'))
     p.add_argument('--scratch', type=Path, default=Path('/mnt/perf/benchmark-export'))
     args = p.parse_args()
@@ -49,11 +51,22 @@ def main():
         payload = json.loads((ROOT/'perf-artifacts/package-payload.json').read_text())
         reference = json.loads((profile_root/'reference-image.json').read_text())
         receipt.update(provenance(source, selection, payload, reference, args.profile))
+        public_key = args.ssh_public_key_file.resolve()
+        key_text = public_key.read_text().strip()
+        require(re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/]+={0,2}(?: [^\r\n]*)?', key_text) is not None,
+                'benchmark requires one plain Ed25519 public key')
+        fingerprint = output(['ssh-keygen', '-lf', str(public_key)]).split()[1]
+        require(fingerprint.startswith('SHA256:'), 'public key fingerprint missing')
+        receipt['ssh'] = {'user': 'root', 'public_key_sha256': digest(public_key),
+                          'public_key_fingerprint': fingerprint, 'password_authentication': False,
+                          'authorized_keys_path': '/etc/ssh/authorized_keys/root',
+                          'boot_access_qualified': False}
         image = 'localhost/marlin-corral-benchmark:export'
         shared = f'localhost/marlin-tuna-preview:{args.profile}'
         run(['sudo', 'podman', 'build', '-f', 'packaging/marlin/perf/Containerfile',
              '--build-arg', f'BASE_IMAGE={shared}', '--build-arg', 'DESKTOP=gnome',
-             '--build-arg', 'PAIRED_SESSION=true', '-t', image, '.'], 'fixture-build')
+             '--build-arg', 'PAIRED_SESSION=true', '--build-arg', 'CORRAL_SSH=true',
+             '--secret', f'id=benchmark-ssh-key,src={public_key}', '-t', image, '.'], 'fixture-build')
         receipt['fixture_image_id'] = output(['sudo', 'podman', 'inspect', image, '--format', '{{.Id}}']).strip()
         receipt['shared_image_id'] = (ROOT/f'shared-image-id-{args.profile}').read_text().strip()
         receipt['coherent_image_id'] = (ROOT/'perf-artifacts/coherent-image-id').read_text().strip()

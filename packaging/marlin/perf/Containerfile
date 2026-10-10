@@ -3,6 +3,8 @@ ARG BASE_IMAGE=localhost/marlin-tuna-preview:perf
 FROM ${BASE_IMAGE}
 ARG DESKTOP
 ARG PAIRED_SESSION=false
+ARG CORRAL_SSH=false
+COPY packaging/marlin/perf/tuna-corral-ssh-setup /usr/libexec/tuna-corral-ssh-setup
 COPY packaging/marlin/vm-lane/custom.conf /etc/gdm/custom.conf
 COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
@@ -36,3 +38,10 @@ RUN case "$DESKTOP" in gnome|tuna) ;; *) exit 1 ;; esac && \
     test -f "/usr/share/wayland-sessions/${DESKTOP}.desktop" && \
     if [ "$DESKTOP" = tuna ] || [ "$PAIRED_SESSION" = true ]; then sed -i 's|^Exec=.*|Exec=/usr/libexec/tuna-perf-session|' /usr/share/wayland-sessions/tuna.desktop; fi && \
     systemctl enable tuna-perf.service qemu-guest-agent.service
+
+RUN --mount=type=secret,id=benchmark-ssh-key \
+    case "$CORRAL_SSH" in \
+      false) ;; \
+      true) /usr/libexec/tuna-corral-ssh-setup /run/secrets/benchmark-ssh-key ;; \
+      *) exit 1 ;; \
+    esac
