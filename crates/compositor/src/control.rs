@@ -1634,6 +1634,7 @@ mod readiness_tests {
     #[test]
     fn hub_listener_hello_commands_and_peer_eviction_use_real_readiness() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("control.sock");
         let mut hub = ControlHub::bind(
             path.clone(),
