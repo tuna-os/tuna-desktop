@@ -290,6 +290,16 @@ jobs:
           name: gtk-event-wake-proof
           path: ${{ runner.temp }}/gtk-wake-artifacts/
           retention-days: 14
+      - name: Prove native minimize pixels and attached modal families
+        run: |
+          dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$RUNNER_TEMP/gtk-wake-artifacts/frozen" --artifacts "$RUNNER_TEMP/minimize-artifacts/ltr" --display :109
+          dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$RUNNER_TEMP/gtk-wake-artifacts/frozen" --artifacts "$RUNNER_TEMP/minimize-artifacts/rtl" --display :110 --rtl
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-minimize-proof
+          path: ${{ runner.temp }}/minimize-artifacts/
+          retention-days: 14
       - name: Prove live accessibility widgets and focus timers
         run: |
           cargo test -p tuna-shell-gtk --bin tuna-shell-gtk --no-run --message-format=json > "$RUNNER_TEMP/tuna-gtk-a11y-build.json"
@@ -308,6 +318,11 @@ jobs:
       # G-WAYLAND-INFO; all required so no stage can silently skip.
       - run: python3 scripts/lib/cursor-pixels-tests.py
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
+      - name: Collect this run's minimize receipts with GTK proof evidence
+        run: |
+          mkdir -p gtk-shell-artifacts/minimize
+          cp "$RUNNER_TEMP/minimize-artifacts/ltr/assertions.txt" gtk-shell-artifacts/minimize/ltr-assertions.txt
+          cp "$RUNNER_TEMP/minimize-artifacts/rtl/assertions.txt" gtk-shell-artifacts/minimize/rtl-assertions.txt
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
           TUNA_REQUIRE_IBUS: "1"
@@ -632,6 +647,8 @@ jobs:
           --assertions ledger-in/journey/assertions.txt
           --assertions ledger-in/gtk-shell/assertions.txt
           --assertions ledger-in/gtk-shell/scale/assertions.txt
+          --assertions ledger-in/gtk-shell/minimize/ltr-assertions.txt
+          --assertions ledger-in/gtk-shell/minimize/rtl-assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
 

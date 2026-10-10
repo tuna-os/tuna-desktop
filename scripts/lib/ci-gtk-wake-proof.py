@@ -76,6 +76,9 @@ def main():
         manifest = {'source_revision': source_revision, 'source_dirty': False,
                     'cargo_lock_sha256': digest(frozen/'Cargo.lock'),
                     'binary_sha256': {name: digest(frozen/name) for name in names}}
+        # Shared immutable bundle vocabulary used by the minimize proof.
+        manifest['source_commit'] = source_revision
+        manifest['sha256'] = manifest['binary_sha256']
         (frozen/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
         (frozen/'SOURCE_COMMIT').write_text(source_revision+'\n')
         (frozen/'SHA256SUMS').write_text(''.join(manifest['binary_sha256'][name]+'  '+name+'\n' for name in names))
