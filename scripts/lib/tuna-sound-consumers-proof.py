@@ -81,7 +81,13 @@ def main():
     parser.add_argument('--bell-client', type=Path, required=True)
     parser.add_argument('--artifacts', type=Path, required=True)
     parser.add_argument('--source-revision', required=True)
+    parser.add_argument('--identity', type=Path, required=True)
     args = parser.parse_args()
+    identity = json.loads(args.identity.read_text())
+    assert identity['source_revision'] == args.source_revision, 'frozen source identity mismatch'
+    for binary in (args.volume_client, args.bell_client):
+        assert binary.resolve().parent == args.identity.resolve().parent, 'client outside frozen bundle'
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == identity['binary_sha256'][binary.name], 'frozen client byte mismatch'
     artifacts = args.artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=False)
     runtime = artifacts / 'runtime'
@@ -116,6 +122,8 @@ def main():
 
     report = {'scope': 'native source audio consumers on private null sink',
               'source_revision': args.source_revision, 'cases': {},
+              'frozen_identity_sha256': hashlib.sha256(args.identity.read_bytes()).hexdigest(),
+              'player': {'path': '/usr/bin/canberra-gtk-play', 'sha256': hashlib.sha256(Path('/usr/bin/canberra-gtk-play').read_bytes()).hexdigest()},
               'binaries': {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in (args.volume_client, args.bell_client)}}
     try:
