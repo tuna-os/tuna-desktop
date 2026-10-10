@@ -27,7 +27,7 @@ impl Reader {
             .name("tuna-x11-icons".into())
             .spawn(move || {
                 let _lifetime = worker_wake.completion();
-                let tx = tx;
+                let reply_sender = tx;
                 let mut connection = None;
                 while let Ok((display, windows)) = rx.recv() {
                     let _completion = worker_wake.completion();
@@ -63,7 +63,7 @@ impl Reader {
                         })
                         .collect();
                     let failed = conn.flush().is_err();
-                    let _ = tx.try_send((display, result));
+                    let _ = reply_sender.try_send((display, result));
                     if failed {
                         connection = None;
                     }

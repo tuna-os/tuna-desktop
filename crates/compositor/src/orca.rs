@@ -174,10 +174,10 @@ impl Reader {
                     let wake = self.wake.clone();
                     std::thread::spawn(move || {
                         let _completion = wake.completion();
-                        let sender = sender;
+                        let observations = sender;
                         loop {
                             let (state, reason) = observe_orca_name(pid);
-                            let sent = sender.send((pid, state, reason));
+                            let sent = observations.send((pid, state, reason));
                             wake.signal();
                             if sent.is_err() || state != State::Active {
                                 break;

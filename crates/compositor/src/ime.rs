@@ -216,8 +216,8 @@ impl ImeBridge {
                 .spawn(move || {
                     let _completion = completion;
                     // Drop the result sender before the completion wake, including unwind.
-                    let send = send;
-                    let _ = send.send(bounded_address_probe(command));
+                    let result_sender = send;
+                    let _ = result_sender.send(bounded_address_probe(command));
                 })
                 .is_ok()
             {

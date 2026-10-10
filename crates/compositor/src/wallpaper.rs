@@ -331,8 +331,8 @@ impl Wallpaper {
                 .spawn(move || {
                     let _completion = completion;
                     // Drop the result sender before the completion wake, including unwind.
-                    let send = send;
-                    let _ = send.send(FileIdentity::for_uri(&path));
+                    let result_sender = send;
+                    let _ = result_sender.send(FileIdentity::for_uri(&path));
                 })
                 .is_ok()
             {
@@ -376,7 +376,7 @@ impl Wallpaper {
                 .spawn(move || {
                     let _completion = completion;
                     // Drop the result sender before the completion wake, including unwind.
-                    let send = send;
+                    let result_sender = send;
                     let started = std::time::Instant::now();
                     let pixels = load_static_wallpaper(&job, settings, geometry, identity);
                     eprintln!(
@@ -787,7 +787,7 @@ impl Wallpaper {
             .spawn(move || {
                 let _completion = completion;
                 // Drop the result sender before the completion wake, including unwind.
-                let send = send;
+                let result_sender = send;
                 let scale = rendered.w as f32 / output.w as f32;
                 let card = tuna_wallpaper::card(
                     full.as_deref()
@@ -804,7 +804,7 @@ impl Wallpaper {
                         alpha: 0.2,
                     },
                 );
-                let _ = send.send(card);
+                let _ = result_sender.send(card);
             })
             .is_ok()
         {
