@@ -1,0 +1,111 @@
+#!/usr/bin/python3
+"""Build matching notification proof binaries in one isolated CI checkout."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import time
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument('--artifacts', type=Path, required=True)
+a = p.parse_args()
+root = Path(__file__).resolve().parent.parent
+art = a.artifacts.resolve()
+assert not art.is_relative_to(root), 'place proof artifacts outside the clean checkout'
+art.mkdir(parents=True, exist_ok=True)
+env = dict(os.environ)
+commands = []
+receipt = {'passed': False, 'commands': commands, 'started_unix': time.time(),
+           'execution_environment': 'isolated GitHub Actions checkout',
+           'physical_audio_proof': False, 'gnome_comparison': False}
+
+def interrupted(signum, _frame):
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGTERM, interrupted)
+
+def child(args, log, output):
+    process = subprocess.Popen(args, cwd=root, env=env, stdout=output,
+                               stderr=log, start_new_session=True)
+    try:
+        status = process.wait()
+    except BaseException:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        raise
+    if status:
+        raise subprocess.CalledProcessError(status, args)
+
+def git(*args):
+    return subprocess.check_output(['git', *args], cwd=root, text=True).strip()
+
+def run(args, stdout=None):
+    commands.append(args)
+    print('RUN', *args, flush=True)
+    with (art/'build.log').open('a') as log:
+        if stdout is None:
+            child(args, log, log)
+        else:
+            with stdout.open('w') as output:
+                child(args, log, output)
+
+def sha(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+try:
+    receipt['source_revision'] = git('rev-parse', 'HEAD')
+    receipt['source_dirty'] = bool(git('status', '--porcelain'))
+    receipt['cargo_environment'] = {name: env.get(name) for name in (
+        'CARGO_TARGET_DIR', 'CARGO_BUILD_JOBS', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG')}
+    assert not receipt['source_dirty'], 'proof requires committed clean source'
+    metadata = json.loads(subprocess.check_output(
+        ['cargo', 'metadata', '--no-deps', '--format-version=1'], cwd=root, env=env))
+    members = set(metadata['workspace_members'])
+    packages = [entry['name'] for entry in metadata['packages'] if entry['id'] in members]
+    run(['cargo', 'clean', *[arg for name in packages for arg in ('-p', name)]])
+    run(['cargo', 'build', '-p', 'tuna-compositor', '-p', 'tuna-shell-gtk',
+         '-p', 'tuna-shell-host', '--bins'])
+    test_messages = art/'gtk-test-build.jsonl'
+    run(['cargo', 'test', '-p', 'tuna-shell-gtk', '--bin', 'tuna-shell-gtk',
+         '--no-run', '--message-format=json'], stdout=test_messages)
+    messages = [json.loads(line) for line in test_messages.read_text().splitlines()]
+    executables = [m['executable'] for m in messages
+                   if m.get('reason') == 'compiler-artifact'
+                   and m.get('profile', {}).get('test')
+                   and m.get('target', {}).get('name') == 'tuna-shell-gtk'
+                   and m.get('executable')]
+    assert len(executables) == 1, 'expected exactly one GTK test executable'
+    assert git('rev-parse', 'HEAD') == receipt['source_revision']
+    assert not git('status', '--porcelain'), 'source changed while building'
+    target = Path(metadata['target_directory'])/'debug'
+    bundle = art/'bin'
+    bundle.mkdir()
+    hashes = {}
+    for name in ('tuna-compositor', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-shell-gtk-tests'):
+        origin = Path(executables[0]) if name == 'tuna-shell-gtk-tests' else target/name
+        destination = bundle/name
+        shutil.copy2(origin, destination)
+        hashes[name] = sha(destination)
+    binary_receipt = {'source_revision': receipt['source_revision'], 'source_dirty': False,
+                      'binary_sha256': hashes, 'workspace_cleaned': True,
+                      'execution_environment': receipt['execution_environment'],
+                      'cargo_environment': receipt['cargo_environment']}
+    (bundle/'manifest.json').write_text(json.dumps(binary_receipt, indent=2))
+    receipt['binary_receipt'] = binary_receipt
+    run(['/usr/bin/dbus-run-session', '--', '/usr/bin/python3',
+         str(root/'scripts/tuna-notification-policy-proof'), '--bin-dir', str(bundle),
+         '--artifacts', str(art/'runtime-proof'), '--display', ':96', '--real-audio'])
+    receipt['passed'] = True
+finally:
+    receipt['finished_unix'] = time.time()
+    (art/'ci-manifest.json').write_text(json.dumps(receipt, indent=2))

@@ -51,6 +51,36 @@ Accessibility queries use bulk children enumeration; query errors refuse proof.
 Owned accessibility service pidfds are retained and exit/runtime removal are
 verified during cleanup.
 
+## CI qualification
+
+The GTK CI job runs `scripts/ci-notification-proof` from one clean checkout.
+It cleans every workspace package, builds the compositor, GTK shell and host,
+and captures the exact GTK test executable from Cargo's JSON output. Copied
+binaries receive a source revision and SHA256 manifest before the runtime proof
+starts. Artifacts live outside the checkout so source cleanliness remains
+meaningful. Build commands, Cargo environment overrides, logs and a CI receipt
+are retained even when a build or proof fails; the workflow always uploads them.
+
+CI requires `--real-audio`. The proof launches private PipeWire, Pulse and
+WirePlumber services using its private runtime and disables physical device
+discovery. This configuration currently requires WirePlumber 0.4; unsupported
+versions fail explicitly. The actual libcanberra player feeds a private null
+sink recorded at 48 kHz. Every capture must contain real frames. Cases cover
+theme-name priority, local file and file URI fallback, absent or remote hints,
+app and global suppression, LOW, hidden normal and critical controls, disabled
+sources, history reenable, locked delivery, and event sounds over playing media.
+Media recordings check the carrier and residual event energy before and after
+playback. Audio service exits and accessibility daemon/registry exits are
+verified before removing the runtime. Cancellation also enters owned cleanup.
+These are digital output checks; they do not qualify physical speakers.
+
+The exact source `32f75039` passed strict Clippy, 353 compositor, 338 host,
+81 protocol and 126 GTK tests (with one compositor and three GTK tests ignored).
+Its matching immutable binaries passed 57 canonical local runtime assertions,
+including XRes positive/spoof-negative cases and the real ignored GTK viewport
+regression. The new CI/audio cases require their own successful CI receipt;
+the earlier result does not qualify those additions.
+
 ## Qualification limits
 
 Notification sounds follow sender sound-name/file hints, per-app sound alerts
@@ -69,7 +99,8 @@ uses installed hint/name fallback. The real X11 fixture sets another mapped
 sender's PID property before mapping, then requires disabled-source rejection
 and positive controls for both actual senders.
 
-The local proof captures actual player dispatch arguments; it does not certify
+The default local proof captures actual player dispatch arguments. `--real-audio`
+also requires recorded digital output. Neither mode certifies
 audible output, sound device behavior, physical outputs, host PAM, GTK variants
 not actually run, or a paired GNOME performance/visual comparison. P-NT-03 must
 remain partial until all actual baseline cases are qualified. No parity result
