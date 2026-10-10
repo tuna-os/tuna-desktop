@@ -19,4 +19,6 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(bell.rings, 1);
+    assert!(bell.visual(std::time::Instant::now()).is_none());
+    bell.clear_visual();
 }

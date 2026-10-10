@@ -2438,7 +2438,7 @@ impl Runtime {
 
     /// Resolve only currently rendered target windows. A destroyed/hidden
     /// explicit target does not redirect a frame flash to another window.
-    fn bell_frame(&mut self) -> Option<(f32, Option<(u64, Rectangle<i32, Logical>)>)> {
+    fn bell_frame(&mut self) -> Option<BellFrame> {
         let now = Instant::now();
         self.state.protocols.bell.tick(now);
         if self.is_locked() {
@@ -4255,12 +4255,9 @@ fn insert_bell_slot(slots: &mut Vec<SceneSlot>, at: usize, k: usize) {
     }
 }
 
-fn install_bell(
-    scene: &mut Scene,
-    view: View,
-    bell: Option<(f32, Option<(u64, Rectangle<i32, Logical>)>)>,
-    desktop: [i32; 4],
-) {
+type BellFrame = (f32, Option<(u64, Rectangle<i32, Logical>)>);
+
+fn install_bell(scene: &mut Scene, view: View, bell: Option<BellFrame>, desktop: [i32; 4]) {
     use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Id};
     let Some((alpha, target)) = bell.filter(|(alpha, _)| *alpha > 0.0) else {
         return;
