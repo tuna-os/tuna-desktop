@@ -53,7 +53,7 @@ fn urgency_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Urgency 
         .and_then(|hint| u8::try_from(hint).ok());
     match level {
         Some(0) => Urgency::Low,
-        Some(2..=u8::MAX) => Urgency::Critical,
+        Some(2) => Urgency::Critical,
         _ => Urgency::Normal,
     }
 }
@@ -181,7 +181,7 @@ impl Notifications {
 
     /// Server capabilities: banner actions plus queue persistence.
     fn get_capabilities(&self) -> Vec<String> {
-        vec!["actions".to_owned(), "persistence".to_owned()]
+        vec!["actions".to_owned(), "persistence".to_owned(), "sound".to_owned()]
     }
 
     /// Banner press fired an action key (emitted by
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(hinted(0), Urgency::Low);
         assert_eq!(hinted(1), Urgency::Normal);
         assert_eq!(hinted(2), Urgency::Critical);
-        assert_eq!(hinted(9), Urgency::Critical);
+        assert_eq!(hinted(9), Urgency::Normal);
         assert_eq!(urgency_hint(&HashMap::new()), Urgency::Normal);
         let mut mistyped = HashMap::new();
         mistyped.insert("urgency".to_owned(), OwnedValue::from(true));
@@ -599,7 +599,7 @@ mod tests {
             let caps: Vec<String> = proxy
                 .call::<&str, _, Vec<String>>("GetCapabilities", &())
                 .expect("stub GetCapabilities reaches the intake");
-            assert_eq!(caps, vec!["actions".to_owned(), "persistence".to_owned()]);
+            assert_eq!(caps, vec!["actions".to_owned(), "persistence".to_owned(), "sound".to_owned()]);
 
             let id = stub_notify(&proxy, vec!["default".to_owned(), "Open".to_owned()]);
             assert_ne!(id, 0, "intake returns a live notification id");
