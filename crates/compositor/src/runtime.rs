@@ -3227,11 +3227,36 @@ impl Runtime {
         // connect and accidentally activate XWayland before a real client.
         if let Some(display) = self.x11_display.filter(|_| self.state.xwm.is_some()) {
             let windows = self.manager.x11_icon_identities();
-            for (xid, id, raster) in self.x11_icon_reader.poll(display, windows.clone()) {
-                if windows.contains(&(xid, id)) {
-                    let icon =
-                        raster.and_then(|r| self.state.window_icons.cache(format!("x11:{id}"), r));
-                    self.manager.model_mut().set_icon(id, icon);
+            let requests = windows
+                .iter()
+                .map(|&(xid, id)| {
+                    let unknown_pid = self
+                        .manager
+                        .model()
+                        .window(id)
+                        .is_some_and(|window| window.client_pid.is_none());
+                    (xid, id, unknown_pid)
+                })
+                .collect();
+            for reply in self.x11_icon_reader.poll(display, requests) {
+                // The model ID is the mapping generation. Ignore late replies
+                // after unmap or XID reuse instead of assigning an old owner.
+                if reply.is_current(&windows) {
+                    let pid = reply.client_pid_if_unknown(
+                        self.manager
+                            .model()
+                            .window(reply.id)
+                            .and_then(|w| w.client_pid),
+                    );
+                    let icon = reply.icon.and_then(|r| {
+                        self.state
+                            .window_icons
+                            .cache(format!("x11:{}", reply.id), r)
+                    });
+                    self.manager.model_mut().set_icon(reply.id, icon);
+                    if let Some(pid) = pid {
+                        self.manager.model_mut().set_client_pid(reply.id, Some(pid));
+                    }
                 }
             }
         }

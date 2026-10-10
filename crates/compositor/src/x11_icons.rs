@@ -1,16 +1,34 @@
-//! X11 property IO stays on a worker; only compositor-mapped identities are queried.
+//! X11 property and XRes IO stays on a worker; only mapped identities are queried.
 use crate::window_icons::Raster;
 use smithay::reexports::x11rb::{
     connection::Connection,
-    protocol::xproto::{AtomEnum, ConnectionExt, ImageFormat, ImageOrder, VisualClass},
+    protocol::{
+        res::{self, ClientIdMask, ClientIdSpec, ClientIdValue},
+        xproto::{AtomEnum, ConnectionExt, ImageFormat, ImageOrder, VisualClass},
+    },
 };
 use std::{
     sync::mpsc::{self, Receiver, SyncSender},
     time::{Duration, Instant},
 };
 const MAX_WORDS: u32 = 1_048_576;
-type Request = (u32, Vec<(u32, u64)>);
-type Reply = (u32, Vec<(u32, u64, Option<Raster>)>);
+type Request = (u32, Vec<(u32, u64, bool)>);
+type Reply = (u32, Vec<WindowReply>);
+pub struct WindowReply {
+    pub xid: u32,
+    pub id: u64,
+    pub icon: Option<Raster>,
+    /// X server owner PID from XRes, never the client-supplied _NET_WM_PID.
+    pub client_pid: Option<u32>,
+}
+impl WindowReply {
+    pub fn is_current(&self, windows: &[(u32, u64)]) -> bool {
+        windows.contains(&(self.xid, self.id))
+    }
+    pub fn client_pid_if_unknown(&self, known: Option<u32>) -> Option<u32> {
+        known.is_none().then_some(self.client_pid).flatten()
+    }
+}
 pub struct Reader {
     requests: SyncSender<Request>,
     replies: Receiver<Reply>,
@@ -45,7 +63,7 @@ impl Reader {
                     let result = windows
                         .into_iter()
                         .take(512)
-                        .map(|(xid, id)| {
+                        .map(|(xid, id, query_pid)| {
                             let raster = conn
                                 .get_property(false, xid, *atom, AtomEnum::CARDINAL, 0, MAX_WORDS)
                                 .ok()
@@ -53,7 +71,27 @@ impl Reader {
                                 .filter(|p| p.bytes_after == 0 && p.format == 32)
                                 .and_then(|p| parse(&p.value32()?.collect::<Vec<_>>()))
                                 .or_else(|| wm_hints(conn, xid));
-                            (xid, id, raster)
+                            let client_pid = query_pid
+                                .then(|| {
+                                    res::query_client_ids(
+                                        conn,
+                                        &[ClientIdSpec {
+                                            client: xid,
+                                            mask: ClientIdMask::LOCAL_CLIENT_PID,
+                                        }],
+                                    )
+                                    .ok()?
+                                    .reply()
+                                    .ok()
+                                    .and_then(|reply| local_client_pid(&reply.ids))
+                                })
+                                .flatten();
+                            WindowReply {
+                                xid,
+                                id,
+                                icon: raster,
+                                client_pid,
+                            }
                         })
                         .collect();
                     let failed = conn.flush().is_err();
@@ -70,11 +108,7 @@ impl Reader {
             last: Instant::now() - Duration::from_secs(1),
         }
     }
-    pub fn poll(
-        &mut self,
-        display: u32,
-        windows: Vec<(u32, u64)>,
-    ) -> Vec<(u32, u64, Option<Raster>)> {
+    pub fn poll(&mut self, display: u32, windows: Vec<(u32, u64, bool)>) -> Vec<WindowReply> {
         let mut result = Vec::new();
         while let Ok((d, r)) = self.replies.try_recv() {
             if d == display {
@@ -88,6 +122,14 @@ impl Reader {
         }
         result
     }
+}
+fn local_client_pid(values: &[ClientIdValue]) -> Option<u32> {
+    let [value] = values else { return None };
+    let [pid] = value.value.as_slice() else {
+        return None;
+    };
+    (u32::from(value.spec.mask) & u32::from(ClientIdMask::LOCAL_CLIENT_PID) != 0 && *pid != 0)
+        .then_some(*pid)
 }
 fn wm_hints(conn: &impl Connection, xid: u32) -> Option<Raster> {
     let reply = conn
@@ -266,6 +308,51 @@ fn parse(words: &[u32]) -> Option<Raster> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn xres_pid_requires_one_nonzero_local_owner_value() {
+        let value = |mask, words| ClientIdValue {
+            spec: ClientIdSpec { client: 17, mask },
+            value: words,
+        };
+        assert_eq!(
+            local_client_pid(&[value(ClientIdMask::LOCAL_CLIENT_PID, vec![4321])]),
+            Some(4321)
+        );
+        assert_eq!(local_client_pid(&[]), None);
+        for words in [vec![], vec![0], vec![4321, 1234]] {
+            assert_eq!(
+                local_client_pid(&[value(ClientIdMask::LOCAL_CLIENT_PID, words)]),
+                None
+            );
+        }
+        assert_eq!(
+            local_client_pid(&[value(ClientIdMask::CLIENT_XID, vec![4321])]),
+            None
+        );
+        assert_eq!(
+            local_client_pid(&[
+                value(ClientIdMask::LOCAL_CLIENT_PID, vec![4321]),
+                value(ClientIdMask::LOCAL_CLIENT_PID, vec![1234]),
+            ]),
+            None
+        );
+    }
+    #[test]
+    fn late_xres_owner_reply_is_rejected_after_unmap_or_xid_reuse() {
+        let reply = WindowReply {
+            xid: 17,
+            id: 42,
+            icon: None,
+            client_pid: Some(4321),
+        };
+        assert!(reply.is_current(&[(17, 42)]));
+        assert!(!reply.is_current(&[]));
+        assert!(!reply.is_current(&[(17, 43)]));
+        assert!(!reply.is_current(&[(18, 42)]));
+        assert_eq!(reply.client_pid_if_unknown(None), Some(4321));
+        assert_eq!(reply.client_pid_if_unknown(Some(4321)), None);
+        assert_eq!(reply.client_pid_if_unknown(Some(1234)), None);
+    }
     #[test]
     fn true_color_masks_are_contiguous_and_scaled() {
         assert!(mask_valid(0xff0000));

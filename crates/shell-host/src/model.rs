@@ -20,6 +20,7 @@
 /// `workspace` scopes overview rendering to the active workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowEntry {
+    /// Native kernel peer PID or XRes server-reported owner, from private control.
     pub client_pid: Option<u32>,
     pub icon: Option<String>,
     /// Compositor-issued opaque window id.

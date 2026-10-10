@@ -59,8 +59,15 @@ playback once per arrival/update. Bounded notification players operate separatel
 from volume feedback and can overlay media. LOW notifications retain history and
 lock summaries without banner or sound. Private authenticated native peer PIDs
 are matched to the DBus sender before desktop-entry and installed app-name
-fallbacks. X11's shared Xwayland peer cannot authenticate the application PID, so
-those notifications use the installed hint/name fallback.
+fallbacks. X11 owners use the X server's XRes `LOCAL_CLIENT_PID`, queried on the
+existing bounded property worker. This is server-reported ownership, not a
+kernel-authenticated X11 window credential. The shared Xwayland Wayland peer and
+client-provided `_NET_WM_PID` never establish the owner. Lookup stays unknown
+until its asynchronous reply; replies are checked against the mapped XID and
+session-monotonic window ID and never overwrite a known PID. Unknown ownership
+uses installed hint/name fallback. The real X11 fixture sets another mapped
+sender's PID property before mapping, then requires disabled-source rejection
+and positive controls for both actual senders.
 
 The local proof captures actual player dispatch arguments; it does not certify
 audible output, sound device behavior, physical outputs, host PAM, GTK variants

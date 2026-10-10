@@ -19,7 +19,7 @@ runtime = art/'runtime'
 state = art/'state.json'
 env = dict(os.environ, DISPLAY=a.display, XDG_RUNTIME_DIR=str(runtime),
  XDG_CONFIG_HOME=str(art/'config'), XDG_STATE_HOME=str(art/'state'), XDG_DATA_HOME=str(art/'data'),
- TUNA_COMPOSITOR_STATE=str(state), TUNA_XWAYLAND='0', LIBGL_ALWAYS_SOFTWARE='1',
+ TUNA_COMPOSITOR_STATE=str(state), TUNA_XWAYLAND='1', LIBGL_ALWAYS_SOFTWARE='1',
  GSK_RENDERER='cairo', GTK_A11Y='atspi', ADW_DISABLE_PORTAL='1', GSETTINGS_BACKEND='keyfile')
 def sha(path):
  with open(path,'rb') as f: return hashlib.file_digest(f,'sha256').hexdigest()
@@ -226,6 +226,71 @@ app.connect('activate',activate);app.run([])
  sender_reply.unlink(); sender_trigger.write_text('PID_ENABLED_ALPHA')
  wait(lambda:sender_reply.exists() and has('PID_ENABLED_ALPHA'),'verified-source-positive-control')
  close(json.loads(sender_reply.read_text())['id']); sender.terminate();sender.wait(timeout=5)
+ # X11 application ownership comes from XRes, never _NET_WM_PID. Install a
+ # spoofed property before mapping so a cached property read cannot pass.
+ xdisplay=wait(lambda:snapshot().get('x11_display'),'reserved-x11-display')
+ xscript=art/'x11-sender-fixture.py'
+ xscript.write_text("""import gi,os,json,subprocess
+from pathlib import Path
+gi.require_version('Gtk','3.0');gi.require_version('GdkX11','3.0')
+from gi.repository import Gtk,GdkX11,Gio,GLib
+appid=os.environ['TUNA_X11_APP']
+GLib.set_prgname(appid)
+app=Gtk.Application(application_id=appid,flags=Gio.ApplicationFlags.NON_UNIQUE)
+def activate(app):
+ win=Gtk.ApplicationWindow(application=app,title='X11 notification sender fixture')
+ win.set_wmclass(appid,appid);win.set_default_size(200,100);win.realize()
+ xid=win.get_window().get_xid()
+ reported=int(os.environ.get('TUNA_X11_SPOOF_PID',os.getpid()))
+ subprocess.run(['xprop','-id',str(xid),'-f','_NET_WM_PID','32c','-set','_NET_WM_PID',str(reported)],check=True,timeout=5)
+ win.show_all()
+ Path(os.environ['TUNA_X11_READY']).write_text(json.dumps({'xid':xid,'pid':os.getpid(),'reported_pid':reported}))
+ bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+ def send():
+  trigger=Path(os.environ['TUNA_SENDER_TRIGGER'])
+  if trigger.exists():
+   title=trigger.read_text();trigger.unlink()
+   args=GLib.Variant('(susssasa{sv}i)',('lying sender name',0,'',title,'fixture body',[],{'desktop-entry':GLib.Variant('s',os.environ['TUNA_SENDER_HINT'])},0))
+   result=bus.call_sync('org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','Notify',args,None,Gio.DBusCallFlags.NONE,3000,None).unpack()[0]
+   Path(os.environ['TUNA_SENDER_REPLY']).write_text(json.dumps({'id':result,'pid':os.getpid()}))
+  return True
+ GLib.timeout_add(100,send)
+app.connect('activate',activate);app.run([])
+""")
+ xclients={}
+ for app in ('Beta','Alpha'):
+  trigger=art/(app+'-x11-trigger'); reply=art/(app+'-x11-reply'); ready=art/(app+'-x11-ready')
+  extra=dict(GDK_BACKEND='x11',DISPLAY=xdisplay,TUNA_X11_APP='org.tuna.Notify'+app,TUNA_X11_READY=str(ready),TUNA_SENDER_TRIGGER=str(trigger),TUNA_SENDER_REPLY=str(reply),TUNA_SENDER_HINT='org.tuna.Notify'+('Beta' if app=='Alpha' else 'Alpha'))
+  if app=='Alpha': extra['TUNA_X11_SPOOF_PID']=str(xclients['Beta'][0].pid)
+  client=spawn(['/usr/bin/python3',str(xscript)],app+'-x11-sender',extra)
+  info=wait(lambda:json.loads(ready.read_text()),app+'-x11-ready')
+  assert info['pid']==client.pid
+  wait(lambda:any(w.get('app_id')=='org.tuna.Notify'+app for w in snapshot()['windows']),app+'-x11-window-tracked')
+  xclients[app]=(client,trigger,reply,info)
+ # Give the bounded off-thread owner lookup a chance to reach the shell.
+ time.sleep(2)
+ alpha,trigger,reply,info=xclients['Alpha']
+ assert info['reported_pid']==xclients['Beta'][0].pid and info['reported_pid']!=alpha.pid
+ prop=subprocess.check_output(['xprop','-id',str(info['xid']),'_NET_WM_PID'],env=env|dict(DISPLAY=xdisplay),text=True)
+ assert int(prop.split('=')[1].strip())==info['reported_pid']
+ setpref(app_schema('Alpha'),'enable','false')
+ trigger.write_text('X11_SPOOF_NEGATIVE')
+ result=wait(lambda:json.loads(reply.read_text()),'x11-spoof-sender-response')
+ assert result['pid']==alpha.pid
+ wait(lambda:any(n['id']==result['id'] and n['desktop_entry']=='org.tuna.NotifyAlpha' for n in json.loads(queue_file.read_text())['notifications']),'xres-owner-precedes-spoofed-property-and-hint')
+ assert absent('X11_SPOOF_NEGATIVE'), 'spoofed property bypassed disabled owner policy'
+ beta,btrigger,breply,_=xclients['Beta']
+ btrigger.write_text('X11_OWNER_POSITIVE')
+ wait(lambda:breply.exists() and has('X11_OWNER_POSITIVE'),'xres-valid-sender-positive-control')
+ bresult=json.loads(breply.read_text());assert bresult['pid']==beta.pid
+ assert next(n for n in json.loads(queue_file.read_text())['notifications'] if n['id']==bresult['id'])['desktop_entry']=='org.tuna.NotifyBeta'
+ close(bresult['id'])
+ setpref(app_schema('Alpha'),'enable','true');reply.unlink();trigger.write_text('X11_SPOOFED_OWNER_ENABLED')
+ wait(lambda:reply.exists() and has('X11_SPOOFED_OWNER_ENABLED'),'xres-spoofed-owner-enable-positive-control')
+ close(json.loads(reply.read_text())['id'])
+ manifest['x11_identity']=dict(window_pid_source='XRes LOCAL_CLIENT_PID (X server owner)',sender_pid_source='org.freedesktop.DBus.GetConnectionUnixProcessID',spoofed_property='_NET_WM_PID set before map',kernel_authenticated_x11_window=False)
+ for client,_,_,_ in xclients.values(): client.terminate();client.wait(timeout=5)
+ wait(lambda:all(w.get('app_id') not in ('org.tuna.NotifyAlpha','org.tuna.NotifyBeta') for w in snapshot()['windows']),'x11-senders-unmapped')
  setpref(app_schema('Alpha'),'show-banners','false')
  for i in range(5): notify('Alpha','HIDDEN_NORMAL_'+str(i))
  control=notify('Beta','VISIBLE_CONTROL')

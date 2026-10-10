@@ -32,7 +32,8 @@ pub const MAX_TITLE_LEN: usize = 256;
 /// One mapped window as tracked by the compositor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowEntry {
-    /// Authenticated Wayland peer PID; never the shared Xwayland process.
+    /// Native kernel peer PID or XRes server-reported X11 owner PID.
+    /// Never the shared Xwayland process or client-provided _NET_WM_PID.
     pub client_pid: Option<u32>,
     pub icon: Option<String>,
     /// Generational id: drawn from a session-monotonic counter, never reused.

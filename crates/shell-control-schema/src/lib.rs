@@ -205,7 +205,8 @@ pub struct WindowInfo {
     pub activation_token: String,
     /// Compositor-owned PNG cache path or sanitized theme icon name.
     pub icon: Option<String>,
-    /// Authenticated native peer PID; private shell transport, redacted while locked.
+    /// Native kernel peer PID or XRes server-reported X11 owner PID.
+    /// Private shell transport, redacted while locked; never _NET_WM_PID.
     pub client_pid: Option<u32>,
 }
 
