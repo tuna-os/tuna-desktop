@@ -12,7 +12,7 @@ class ArchAudioDependencies(unittest.TestCase):
                     if 'apt-get' in step.get('run', '') and
                     'gnome-session-canberra' in step['run']]
         self.assertEqual(len(installs), 1)
-        for dependency in ('pipewire', 'pipewire-pulse', 'wireplumber',
+        for dependency in ('bubblewrap', 'pipewire', 'pipewire-pulse', 'wireplumber',
                            'pulseaudio-utils', 'sound-theme-freedesktop'):
             self.assertIn(dependency, installs[0].split())
 
