@@ -59,6 +59,7 @@ mod process_wake;
 mod shutdown_wake;
 pub mod corner_pressure;
 pub mod cursor;
+mod cursor_svg;
 #[cfg(feature = "drm")]
 pub mod drm;
 pub mod frame_timing;

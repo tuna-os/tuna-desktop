@@ -19,6 +19,8 @@ png = "0.18"
 # GNOME's cursor themes (#342): Xcursor files, parsed only; theme
 # lookup and inheritance are our own (src/cursor.rs).
 xcursor = "0.3"
+# GNOME51/KDE scalable cursor metadata and physical-scale rasterization.
+resvg.workspace = true
 # Screen sharing (#61): org.gnome.Mutter.ScreenCast streams over PipeWire,
 # niri's shape. Needs libpipewire-0.3 (and libclang to build).
 pipewire = { version = "0.10", features = ["v0_3_33"] }

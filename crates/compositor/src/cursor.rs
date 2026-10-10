@@ -1,4 +1,4 @@
-//! The compositor's own pointer (#342), as GNOME 51 draws it: Xcursor
+//! The compositor's own pointer (#342): GNOME51/KDE SVG and Xcursor
 //! themes from `org.gnome.desktop.interface cursor-theme` and
 //! `cursor-size`, crisp at every output scale; `wp_cursor_shape_v1`
 //! shapes drawn from that theme; client cursor surfaces; the move and
@@ -210,13 +210,13 @@ pub fn clamp_size(size: u32) -> u32 {
 }
 
 /// One decoded cursor image, premultiplied ARGB8888.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CursorImage {
-    /// The Xcursor nominal size this image was made for.
+    /// Nominal raster size: Xcursor image size or SVG physical raster size.
     pub nominal: u32,
     pub width: u32,
     pub height: u32,
-    pub hotspot: (u32, u32),
+    pub hotspot: (f64, f64),
     pub pixels: Vec<u8>,
 }
 
@@ -228,7 +228,7 @@ impl CursorImage {
         let k = f64::from(clamp_size(size)) / f64::from(self.nominal.max(1));
         (
             (f64::from(self.width) * k, f64::from(self.height) * k),
-            (f64::from(self.hotspot.0) * k, f64::from(self.hotspot.1) * k),
+            (self.hotspot.0 * k, self.hotspot.1 * k),
         )
     }
 }
@@ -264,8 +264,8 @@ pub fn decode_frames(bytes: &[u8], wanted: u32) -> Option<Vec<(CursorImage, u32)
                 width: image.width,
                 height: image.height,
                 hotspot: (
-                    image.xhot.min(image.width - 1),
-                    image.yhot.min(image.height - 1),
+                    f64::from(image.xhot.min(image.width - 1)),
+                    f64::from(image.yhot.min(image.height - 1)),
                 ),
                 pixels: image.pixels_rgba[..len].to_vec(),
             },
@@ -337,7 +337,7 @@ pub fn builtin_arrow(nominal: u32) -> CursorImage {
         nominal,
         width: w,
         height: h,
-        hotspot: (tip, tip),
+        hotspot: (f64::from(tip), f64::from(tip)),
         pixels,
     }
 }
@@ -550,15 +550,24 @@ impl Cursor {
     /// else the theme's default arrow, else the built-in one.
     fn loaded(&mut self, icon: CursorIcon, scale: f64) -> &Loaded {
         let wanted = load_size(self.size, scale);
+        let raster_size = crate::cursor_svg::raster_size(self.size, scale);
         for icon in [icon, CursorIcon::Default] {
-            let key = (wanted, icon);
+            let key = (raster_size, icon);
             if !self.cache.contains_key(&key) {
-                let loaded =
+                let loaded = crate::cursor_svg::find_frames(
+                    &self.dirs,
+                    &self.chain,
+                    &icon_names(icon),
+                    raster_size,
+                )
+                .map(|(found, frames)| Loaded::from_frames(frames, Some(found.theme), found.name))
+                .or_else(|| {
                     find_cursor(&self.dirs, &self.chain, &icon_names(icon)).and_then(|found| {
                         let bytes = std::fs::read(&found.path).ok()?;
                         let frames = decode_frames(&bytes, wanted)?;
                         Some(Loaded::from_frames(frames, Some(found.theme), found.name))
-                    });
+                    })
+                });
                 self.cache.insert(key, loaded);
             }
             if self.cache.get(&key).is_some_and(Option::is_some) {
@@ -1195,11 +1204,11 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(
             (frames[0].0.width, frames[0].0.hotspot, frames[0].1),
-            (24, (6, 3), 30)
+            (24, (6.0, 3.0), 30)
         );
         assert_eq!(
             (frames[1].0.width, frames[1].0.hotspot, frames[1].1),
-            (32, (8, 4), 70)
+            (32, (8.0, 4.0), 70)
         );
         assert_eq!(decode_frames(&bytes, 48).unwrap().len(), 1);
     }
@@ -1366,7 +1375,7 @@ mod tests {
         );
         let arrow = builtin_arrow(48);
         assert_eq!((arrow.width, arrow.height, arrow.nominal), (48, 48, 48));
-        assert_eq!(arrow.hotspot, (2, 2));
+        assert_eq!(arrow.hotspot, (2.0, 2.0));
         let px = |x: u32, y: u32| arrow.pixels[((y * 48 + x) * 4) as usize..][..4].to_vec();
         assert_eq!(px(2, 2), [0, 0, 0, 255], "the tip is outline");
         assert_eq!(px(8, 20), [255, 255, 255, 255], "the body is filled");
@@ -1380,7 +1389,7 @@ mod tests {
         assert_eq!(decode(&bytes, 30).unwrap().width, 32);
         assert_eq!(decode(&bytes, 96).unwrap().width, 48);
         let image = decode(&bytes, 48).unwrap();
-        assert_eq!((image.nominal, image.hotspot), (48, (12, 6)));
+        assert_eq!((image.nominal, image.hotspot), (48, (12.0, 6.0)));
         assert_eq!(&image.pixels[..4], &[0x30, 0x20, 0x10, 0xff]);
         assert!(decode(b"not a cursor", 24).is_none());
     }
@@ -1397,7 +1406,7 @@ mod tests {
             nominal,
             width: side,
             height: side,
-            hotspot: (side / 4, side / 8),
+            hotspot: (f64::from(side / 4), f64::from(side / 8)),
             pixels: Vec::new(),
         };
         // 200%: the 48px image draws 24 logical, 48 physical: 1:1 crisp.
