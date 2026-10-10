@@ -9,3 +9,9 @@ Feedback is a separate output scene pass, above normal content and below the idl
 ## Verification scope
 
 Three independent state tests passed: 1.0/0.25/absent at 0/250/500 ms, zero-duration and invalid geometry rejection, and bounded concurrent feedback with immediate clearing. This is not a runtime pixel receipt. The source still requires the guarded compositor build, actual authenticated D-Bus requests, output pixel measurements, false/failed/locked negative cases, and paired GNOME/native hardware qualification before this part of P-AN-10 can pass.
+
+## Focused runtime proof
+
+`scripts/tuna-screenshot-flash-proof --bundle <frozen-bundle> --artifacts <new-directory>` checks production D-Bus admission through a supervised proof caller and actual nested output pixels. It covers a white flash at start, out-quad midpoint, completion, saved-PNG isolation, delayed Screenshot replies, failed capture, FlashArea bounds, and unauthorized callers. Invalid frozen identities fail before private services start. A receipt records the exact source and running compositor bytes, then verifies owned process exits and runtime removal before writing assertions.
+
+This fixture does not exercise the GTK screenshot UI, hardware scanout, cursor inclusion, locked/motion-off sessions, or a paired GNOME comparison. Those remain separate qualification work. The new combined source must pass its build and runtime proof before any success is claimed.

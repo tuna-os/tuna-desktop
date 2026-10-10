@@ -4604,10 +4604,9 @@ fn scene_elements(
                     );
                 }
                 snapshots.extend(
-                    crate::size_change::snapshot_element(renderer, snapshot, &frame, view)
-                        .map(|element| {
-                            (elements.len(), element, manager.modal_dim().multiplier(id))
-                        }),
+                    crate::size_change::snapshot_element(renderer, snapshot, &frame, view).map(
+                        |element| (elements.len(), element, manager.modal_dim().multiplier(id)),
+                    ),
                 );
                 owners.resize(elements.len(), Some(id));
                 continue;
@@ -4693,12 +4692,12 @@ fn scene_elements(
         .iter()
         .map(|id| id.map_or(1.0, |id| manager.modal_dim().multiplier(id)))
         .collect();
-    let dim_program =
-        if brightness.iter().any(|v| *v < 1.0) || snapshots.iter().any(|s| s.2 < 1.0) {
-            crate::modal_dim::program(renderer)
-        } else {
-            None
-        };
+    let dim_program = if brightness.iter().any(|v| *v < 1.0) || snapshots.iter().any(|s| s.2 < 1.0)
+    {
+        crate::modal_dim::program(renderer)
+    } else {
+        None
+    };
     Scene {
         elements: crate::layer::front_to_back(elements),
         brightness: crate::layer::front_to_back(brightness),

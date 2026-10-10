@@ -159,7 +159,7 @@ impl ProtocolVersion {
     /// GNOME's three-state motion policy plus its slow-down factor.
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
-    /// `0.30` appends the live attached-modal brightness preference.
+    /// `0.30` appends live sound/bell and attached-modal brightness preferences.
     pub const CURRENT: Self = Self {
         major: 0,
         minor: 30,
@@ -1259,6 +1259,26 @@ mod tests {
         let frame = encode_frame(msg);
         let back = decode_frame(&frame).expect("roundtrip must decode");
         assert_eq!(&back, msg);
+    }
+
+    #[test]
+    fn combined_bell_and_modal_preferences_survive_positional_wire() {
+        for attach in [false, true] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(InputSettings {
+                    attach_modal_dialogs: attach,
+                    bell: BellPolicy {
+                        audible: false,
+                        visual: true,
+                        frame_flash: true,
+                        event_sounds: false,
+                        theme: "custom".into(),
+                    },
+                    ..Default::default()
+                }),
+            });
+        }
     }
 
     #[test]
