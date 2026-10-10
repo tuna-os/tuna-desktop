@@ -8,6 +8,7 @@ sounds, visual presentation, Xwayland bells, or a GNOME performance win.
 """
 import argparse
 import array
+import ast
 import hashlib
 import json
 import math
@@ -145,7 +146,7 @@ def main():
                XDG_CONFIG_HOME=str(config), GSETTINGS_BACKEND='memory',
                PULSE_SERVER='unix:' + str(runtime / 'pulse/native'), CANBERRA_DRIVER='pulse')
     # Never use an inherited host display/session endpoint.
-    for key in ('WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'DISPLAY', 'DBUS_SESSION_BUS_ADDRESS',
+    for key in ('WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'AT_SPI_BUS_ADDRESS',
                 'PIPEWIRE_REMOTE', 'WIREPLUMBER_CONFIG_DIR', 'WIREPLUMBER_CONFIG_PATH'):
         env.pop(key, None)
     assert '0.4.' in run(['wireplumber', '--version'], env), 'fixture supports WirePlumber0.4 only'
@@ -173,6 +174,19 @@ def main():
         wait_until(bus_socket.exists)
         env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=' + str(bus_socket)
         env['DBUS_SYSTEM_BUS_ADDRESS'] = env['DBUS_SESSION_BUS_ADDRESS']
+        spawn(['/usr/libexec/at-spi-bus-launcher', '--launch-immediately'], 'accessibility-launcher')
+        wait_until(lambda: run(['gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+                              '--object-path', '/org/freedesktop/DBus', '--method',
+                              'org.freedesktop.DBus.GetNameOwner', 'org.a11y.Bus'], env))
+        address, = ast.literal_eval(run(['gdbus', 'call', '--session', '--dest', 'org.a11y.Bus',
+                                        '--object-path', '/org/a11y/bus', '--method',
+                                        'org.a11y.Bus.GetAddress'], env))
+        assert str(runtime) in address, 'accessibility bus escaped private runtime'
+        env['AT_SPI_BUS_ADDRESS'] = address
+        report['session_isolation'] = {
+            'runtime_directory': str(runtime), 'runtime_mode': oct(runtime.stat().st_mode & 0o777),
+            'session_bus': env['DBUS_SESSION_BUS_ADDRESS'], 'accessibility_bus': address,
+        }
         display_read, display_write = os.pipe()
         spawn(['Xvfb', '-displayfd', str(display_write), '-screen', '0', '1280x800x24', '-nolisten', 'tcp', '-noreset'],
               'xvfb', pass_fds=(display_write,))
