@@ -15,6 +15,15 @@ pub struct UiWake {
 }
 
 impl UiWake {
+    pub fn shutdown(&self) {
+        self.pending.set(false);
+        self.retire_transport();
+        if let Some((_, timer)) = self.timer.borrow_mut().take() {
+            timer.remove();
+        }
+        self.callback.borrow_mut().take();
+    }
+
     pub fn install(self: &Rc<Self>, callback: impl Fn() + 'static) {
         *self.callback.borrow_mut() = Some(Rc::new(callback));
         self.pending.set(false);
@@ -96,10 +105,7 @@ impl UiWake {
 
 impl Drop for UiWake {
     fn drop(&mut self) {
-        self.retire_transport();
-        if let Some((_, timer)) = self.timer.get_mut().take() {
-            timer.remove();
-        }
+        self.shutdown();
     }
 }
 
@@ -226,6 +232,24 @@ mod tests {
             context.iteration(false);
         }
         assert_eq!(reads.get(), 2, "HUP source stays retired");
+
+        let shutdown_wake = Rc::new(UiWake::default());
+        let after_shutdown = Rc::new(Cell::new(0));
+        let observed = after_shutdown.clone();
+        shutdown_wake.install(move || observed.set(observed.get() + 1));
+        shutdown_wake.at(Some(Instant::now() + Duration::from_millis(10)));
+        shutdown_wake.shutdown();
+        std::thread::sleep(Duration::from_millis(20));
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(
+            after_shutdown.get(),
+            0,
+            "shutdown cancels queued UI and deadlines"
+        );
+        assert!(shutdown_wake.callback.borrow().is_none());
+        assert!(shutdown_wake.timer.borrow().is_none());
 
         // All bytes fit in the first kernel read. A128-frame drain stops
         // before the malformed prefetched frame; its decode error occurs in

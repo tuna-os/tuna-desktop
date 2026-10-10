@@ -1043,6 +1043,10 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
 
 fn build(app: &adw::Application) {
     let ui_wake = Rc::new(ui_wake::UiWake::default());
+    // The application owns the dispatcher until shutdown. Local signals hold
+    // Weak references, so a UI/cache callback cannot create a lifetime cycle.
+    let owned_wake = ui_wake.clone();
+    app.connect_shutdown(move |_| owned_wake.shutdown());
     accessibility::start_focus_policy();
     let provider = gtk::CssProvider::new();
     // Shell CSS has GNOME's baseline face/size, but follows the user's font live.
