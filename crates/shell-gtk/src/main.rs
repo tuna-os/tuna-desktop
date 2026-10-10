@@ -2302,7 +2302,11 @@ fn build(app: &adw::Application) {
                 .control
                 .as_ref()
                 .is_some_and(|c| c.model().is_overview_open());
+            let disconnected = shell.control.is_none();
             drop(shell);
+            if disconnected {
+                wake.retire_transport();
+            }
             if locked {
                 notify.release_focus();
             }
@@ -2404,10 +2408,14 @@ fn build(app: &adw::Application) {
                 if output_active.replace(true) {
                     return;
                 }
+                let Some(owner) = output_wake.upgrade() else {
+                    output_active.set(false);
+                    return;
+                };
                 let active = output_active.clone();
                 let weak_wake = output_wake.clone();
                 let weak_shell = output_shell.clone();
-                ui_wake::watch_socket_conditions(
+                let source = ui_wake::watch_socket_conditions(
                     &output_socket,
                     glib::IOCondition::OUT | glib::IOCondition::HUP | glib::IOCondition::ERR,
                     move |condition| {
@@ -2417,6 +2425,7 @@ fn build(app: &adw::Application) {
                             wake.dispatch();
                             if condition.contains(glib::IOCondition::ERR) {
                                 shell.borrow_mut().control = None;
+                                wake.retire_transport();
                             }
                             let pending = shell
                                 .borrow()
@@ -2429,23 +2438,33 @@ fn build(app: &adw::Application) {
                         };
                         if !keep {
                             active.set(false);
+                            if let Some(wake) = weak_wake.upgrade() {
+                                wake.retire_output_source();
+                            }
                         }
                         keep
                     },
                 );
+                owner.own_output_source(source);
             });
         }
-        let wake = ui_wake.clone();
-        let shell = shell.clone();
-        ui_wake::watch_socket(&socket, move |condition| {
+        let weak_wake = Rc::downgrade(&ui_wake);
+        let weak_shell = Rc::downgrade(&shell);
+        let source = ui_wake::watch_socket(&socket, move |condition| {
+            let (Some(wake), Some(shell)) = (weak_wake.upgrade(), weak_shell.upgrade()) else {
+                return false;
+            };
             wake.dispatch();
             // ERR is terminal even if a nonblocking read returned WouldBlock.
             // HUP drains all complete buffered frames before read_frame sees EOF.
             if condition.contains(glib::IOCondition::ERR) {
                 shell.borrow_mut().control = None;
+                wake.retire_transport();
             }
-            shell.borrow().control.is_some()
+            let connected = shell.borrow().control.is_some();
+            connected
         });
+        ui_wake.own_input_source(source);
     }
     window.present();
 }

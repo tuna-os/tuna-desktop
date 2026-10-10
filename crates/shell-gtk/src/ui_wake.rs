@@ -10,6 +10,8 @@ pub struct UiWake {
     pending: Cell<bool>,
     callback: RefCell<Option<Rc<dyn Fn()>>>,
     timer: RefCell<Option<(Instant, glib::SourceId)>>,
+    input_source: RefCell<Option<glib::Source>>,
+    output_source: RefCell<Option<glib::Source>>,
 }
 
 impl UiWake {
@@ -41,6 +43,34 @@ impl UiWake {
         }
     }
 
+    pub fn own_input_source(&self, source: glib::Source) {
+        if let Some(old) = self.input_source.replace(Some(source)) {
+            old.destroy();
+        }
+    }
+
+    pub fn own_output_source(&self, source: glib::Source) {
+        if let Some(old) = self.output_source.replace(Some(source)) {
+            old.destroy();
+        }
+    }
+
+    pub fn retire_output_source(&self) {
+        if let Some(source) = self.output_source.borrow_mut().take() {
+            source.destroy();
+        }
+    }
+
+    /// Terminal failures may occur in a buffered continuation after kernel IN
+    /// has cleared. Explicitly destroy both sources: waiting for another HUP
+    /// would retain the duplicated endpoint and leave the peer connected.
+    pub fn retire_transport(&self) {
+        if let Some(source) = self.input_source.borrow_mut().take() {
+            source.destroy();
+        }
+        self.retire_output_source();
+    }
+
     pub fn at(self: &Rc<Self>, deadline: Option<Instant>) {
         if self.timer.borrow().as_ref().map(|(at, _)| *at) == deadline {
             return;
@@ -66,6 +96,7 @@ impl UiWake {
 
 impl Drop for UiWake {
     fn drop(&mut self) {
+        self.retire_transport();
         if let Some((_, timer)) = self.timer.get_mut().take() {
             timer.remove();
         }
@@ -195,5 +226,78 @@ mod tests {
             context.iteration(false);
         }
         assert_eq!(reads.get(), 2, "HUP source stays retired");
+
+        // All bytes fit in the first kernel read. A128-frame drain stops
+        // before the malformed prefetched frame; its decode error occurs in
+        // the idle continuation with no further IN/HUP event from the peer.
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let socket = gio::Socket::from_fd(stream.as_fd().try_clone_to_owned().unwrap()).unwrap();
+        let client = tuna_shell_host::control::ControlClient::new(stream).unwrap();
+        let client = Rc::new(RefCell::new(Some(client)));
+        let wake = Rc::new(UiWake::default());
+        let weak_wake = Rc::downgrade(&wake);
+        let dispatcher_client = client.clone();
+        let handled = Rc::new(Cell::new(0));
+        let handled_callback = handled.clone();
+        wake.install(move || {
+            let wake = weak_wake.upgrade().unwrap();
+            let mut client = dispatcher_client.borrow_mut();
+            for index in 0..128 {
+                let result = client.as_mut().unwrap().poll();
+                match result {
+                    Ok(_) => handled_callback.set(handled_callback.get() + 1),
+                    Err(tuna_shell_host::control::ControlError::Io(error))
+                        if error.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        break
+                    }
+                    Err(tuna_shell_host::control::ControlError::Decode(_)) => {
+                        *client = None;
+                        wake.retire_transport();
+                        break;
+                    }
+                    result => panic!("unexpected decode test result: {result:?}"),
+                }
+                if index == 127 {
+                    wake.request();
+                }
+            }
+        });
+        // Consume the initialization dispatch before publishing test bytes.
+        while context.pending() {
+            context.iteration(false);
+        }
+        let weak_wake = Rc::downgrade(&wake);
+        let callback_client = client.clone();
+        let source = watch_socket(&socket, move |_| {
+            weak_wake.upgrade().unwrap().dispatch();
+            callback_client.borrow().is_some()
+        });
+        wake.own_input_source(source.clone());
+        let hello = tuna_shell_control::encode_frame(&tuna_shell_control::Message::Hello {
+            version: tuna_shell_control::CURRENT_VERSION,
+        });
+        let mut bytes = hello.repeat(128);
+        bytes.extend_from_slice(&[1, 0, 0, 0, 255]);
+        peer.write_all(&bytes).unwrap();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(handled.get(), 128);
+        assert!(client.borrow().is_none());
+        assert!(
+            source.is_destroyed(),
+            "buffered decode failure must retire the quiet input source"
+        );
+        assert!(wake.input_source.borrow().is_none());
+        drop(source);
+        drop(socket);
+        let mut byte = [0];
+        assert_eq!(
+            peer.read(&mut byte).unwrap(),
+            0,
+            "duplicated endpoint must close without requiring peer HUP"
+        );
     }
 }
