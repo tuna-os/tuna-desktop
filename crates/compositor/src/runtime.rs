@@ -4177,10 +4177,17 @@ impl Runtime {
                     install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
+                    // Rotation (#345): the tracker holds the output
+                    // transform while Smithay renders inverted (see
+                    // `orientation::render_transform`); layout, damage
+                    // and the wallpaper all work in the pre-transform
+                    // frame, whose physical size swaps at 90°/270°.
+                    let output_transform = crate::orientation::smithay_transform(out.transform);
+                    let logical = output_transform.transform_size(size);
                     let paper = backdrop(
                         &mut self.wallpaper,
                         renderer,
-                        background_geometry(size, view, desktop),
+                        background_geometry(logical, view, desktop),
                         view,
                         show_paper,
                         cards,
@@ -4278,10 +4285,9 @@ impl Runtime {
                     if reset {
                         out.damage_tracker = None;
                     }
-                    // Rotation (#345): damage history and rendering follow
-                    // the output transform; a transform change resets the
-                    // tracker through the signature above.
-                    let output_transform = crate::orientation::smithay_transform(out.transform);
+                    // A transform change resets the tracker through the
+                    // signature above; the tracker holds the output
+                    // transform while the frame renders inverted.
                     let tracker = out.damage_tracker.get_or_insert_with(|| {
                         smithay::backend::renderer::damage::OutputDamageTracker::new(
                             size,
@@ -4301,7 +4307,11 @@ impl Runtime {
                             .bind(&mut dmabuf)
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let mut frame = renderer
-                            .render(&mut target, size, output_transform)
+                            .render(
+                                &mut target,
+                                size,
+                                crate::orientation::render_transform(out.transform),
+                            )
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let drew = draw_scene(
                             &mut frame,
@@ -4349,7 +4359,11 @@ impl Runtime {
                     let feedback = crate::frame_timing::take_feedback(&mine, &out.output);
                     if let Err(e) = out.surface.queue_buffer(
                         Some(sync),
-                        Some(crate::native_repaint::scanout_damage(&damage)),
+                        Some(crate::native_repaint::scanout_damage_rotated(
+                            &damage,
+                            output_transform,
+                            (logical.w, logical.h),
+                        )),
                         feedback,
                     ) {
                         eprintln!("tuna-compositor: drm: queue_buffer {}: {e}", out.name);

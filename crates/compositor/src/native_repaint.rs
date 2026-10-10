@@ -167,6 +167,28 @@ pub(crate) fn scanout_damage(
     repainted.to_vec()
 }
 
+/// KMS damage clips in scanout-buffer pixels (#345): `repainted`
+/// damage from [`damage_region`] is in pre-transform output space,
+/// which matches the buffer only when unrotated. Under rotation each
+/// rect maps into the buffer through the output transform (Smithay
+/// `Transform::transform_rect_in`, the logical-to-buffer direction
+/// also used for `RecordArea` capture); unrotated outputs pass
+/// through exactly as [`scanout_damage`] does.
+pub(crate) fn scanout_damage_rotated(
+    repainted: &[Rectangle<i32, Physical>],
+    transform: Transform,
+    logical: (i32, i32),
+) -> Vec<Rectangle<i32, Physical>> {
+    if transform == Transform::Normal {
+        return scanout_damage(repainted);
+    }
+    let area = smithay::utils::Size::<i32, smithay::utils::Physical>::from(logical);
+    repainted
+        .iter()
+        .map(|rect| transform.transform_rect_in(*rect, &area))
+        .collect()
+}
+
 /// Timing requests need an actual submitted frame even without pixel damage.
 pub(crate) fn needs_repaint(
     previous: Option<&FrameSignature>,
@@ -399,6 +421,40 @@ mod tests {
             7,
             7
         ));
+    }
+
+    #[test]
+    fn rotated_scanout_damage_maps_into_buffer_pixels() {
+        // A 90° 4x2 panel tracks damage in its 2x4 logical frame; the
+        // KMS clips must name 4x2 buffer pixels instead.
+        let r = |x, y, w, h| Rectangle::<i32, Physical>::new((x, y).into(), (w, h).into());
+        let full = vec![r(0, 0, 2, 4)];
+        assert_eq!(
+            scanout_damage_rotated(&full, Transform::_90, (2, 4)),
+            vec![r(0, 0, 4, 2)]
+        );
+        // A logical corner rect rotates with the content it covers.
+        let corner = vec![r(0, 0, 1, 1)];
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::_90, (2, 4)),
+            vec![r(3, 0, 1, 1)]
+        );
+        // 180° and the flip map to their own buffer corners.
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::_180, (4, 2)),
+            vec![r(3, 1, 1, 1)]
+        );
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::Flipped, (4, 2)),
+            vec![r(3, 0, 1, 1)]
+        );
+        // Unrotated outputs pass damage through untouched, and empty
+        // damage stays empty under any transform.
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::Normal, (4, 2)),
+            corner
+        );
+        assert!(scanout_damage_rotated(&[], Transform::_90, (2, 4)).is_empty());
     }
 
     #[test]
