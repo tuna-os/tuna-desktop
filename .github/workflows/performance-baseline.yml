@@ -5,6 +5,8 @@ on:
       - .github/workflows/performance-baseline.yml
       - scripts/tuna-vm-perf
       - scripts/tuna-benchmark-disk-export
+      - scripts/lib/tuna_benchmark_esp.py
+      - scripts/lib/tuna-benchmark-esp-tests.py
       - scripts/lib/tuna_benchmark_disk.py
       - scripts/lib/tuna-benchmark-disk-tests.py
       - scripts/tuna-perf-profile-pairs
@@ -73,6 +75,7 @@ jobs:
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y python3-yaml
       - run: python3 scripts/lib/tuna-perf-tests.py
       - run: python3 scripts/lib/tuna-benchmark-disk-tests.py
+      - run: python3 scripts/lib/tuna-benchmark-esp-tests.py
       - run: /usr/bin/python3 scripts/lib/tuna-corral-ssh-export-tests.py
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
       - run: python3 scripts/lib/tuna-perf-repeatability-tests.py

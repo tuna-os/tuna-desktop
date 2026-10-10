@@ -12,6 +12,7 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT/'scripts/lib'))
 from tuna_benchmark_disk import digest, provenance, require, storage_receipt, VIRTUAL_BYTES
+from tuna_benchmark_esp import repair as repair_esp
 
 
 def main():
@@ -91,6 +92,7 @@ def main():
         receipt['qemu_version'] = output(['qemu-img', '--version']).splitlines()[0]
         receipt['exporter_source_sha256'] = {name: digest(ROOT/name) for name in [
             'scripts/tuna-benchmark-disk-export', 'scripts/lib/tuna_benchmark_disk.py',
+            'scripts/lib/tuna_benchmark_esp.py',
             'packaging/marlin/perf/Containerfile.baseline', 'packaging/marlin/perf/Containerfile',
             'packaging/marlin/Containerfile']}
         receipt['gnome_version'] = output(['sudo', 'podman', 'run', '--rm', image, 'gnome-shell', '--version']).strip()
@@ -102,9 +104,14 @@ def main():
             stream.truncate(VIRTUAL_BYTES)
         run(['sudo', 'podman', 'run', '--rm', '--privileged', '--pid=host', '--security-opt',
              'label=type:unconfined_t', '-v', '/dev:/dev', '-v', '/var/lib/containers:/var/lib/containers',
-             '-v', f'{args.scratch.resolve()}:/output', image, 'bootc', 'install', 'to-disk',
+             '-v', f'{args.scratch.resolve()}:/output', receipt['fixture_image_id'], 'bootc', 'install', 'to-disk',
              '--via-loopback', '--generic-image', '--wipe', *flags, '/output/disk.raw'], 'disk-install')
         subprocess.run(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(raw)], check=True)
+        receipt['esp_repair'] = {'required': '--composefs-backend' in flags}
+        if receipt['esp_repair']['required']:
+            repair_esp(raw, receipt['fixture_image_id'], args.scratch,
+                       profile_root/'baseline-critical.sha256', receipt['esp_repair'],
+                       artifacts/'esp-repair.log')
         receipt['raw_sha256'] = digest(raw)
         run(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', '-c', str(raw), str(disk)], 'disk-convert')
         run(['qemu-img', 'check', '-f', 'qcow2', str(disk)], 'disk-check')
@@ -132,10 +139,12 @@ def main():
         result_code = 1
     finally:
         try:
+            require(receipt.get('esp_repair', {}).get('owned_resources_removed', True),
+                    'retaining raw backing/scratch after unsafe ESP resource cleanup')
             raw.unlink(missing_ok=True)
             args.scratch.rmdir()
             receipt['owned_scratch_removed'] = True
-        except OSError as error:
+        except (OSError, ValueError) as error:
             receipt.update(owned_scratch_removed=False, export_succeeded=False,
                            cleanup_error=str(error))
             disk.unlink(missing_ok=True)
