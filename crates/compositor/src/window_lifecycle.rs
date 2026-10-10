@@ -749,7 +749,13 @@ fn copy_frame(
         }
         draw_render_elements(&mut frame, cached.scale, &cached.elements, &[all]).ok()?;
         if let Some(snapshot) = &cached.resize_snapshot {
-            draw_render_elements(&mut frame, 1.0, std::slice::from_ref(snapshot), &[all]).ok()?;
+            draw_render_elements::<GlesRenderer, _, _>(
+                &mut frame,
+                1.0,
+                std::slice::from_ref(snapshot),
+                &[all],
+            )
+            .ok()?;
         }
         frame.clear_tex_program_override();
         let _ = frame.finish().ok()?;
