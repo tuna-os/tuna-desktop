@@ -7054,7 +7054,7 @@ mod tests {
             {
                 let guard = center.lock().expect("center lock");
                 assert_eq!(guard.history().len(), MAX_HISTORY, "history capped");
-                assert_eq!(guard.unread_count(), MAX_BANNERS, "unread capped");
+                assert_eq!(guard.unread_count(), MAX_HISTORY, "unseen history capped");
                 let rows = banner_key_rows(&guard);
                 assert_eq!(
                     rows.len(),

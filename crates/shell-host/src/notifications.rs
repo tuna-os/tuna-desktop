@@ -660,12 +660,13 @@ impl NotificationCenter {
         &self.history
     }
 
-    /// How many notifications are unread: the banner-visible queue
-    /// length. Dismissing a banner or invoking its action reads it
-    /// (history keeps the entry); DND-gated arrivals never queue,
-    /// so they never count.
+    /// GNOME's unseen count includes enabled unacknowledged history, including
+    /// LOW and DND-gated arrivals. Showing, dismissing, or invoking reads it.
     pub fn unread_count(&self) -> usize {
-        self.banners.len()
+        self.history
+            .iter()
+            .filter(|n| !n.acknowledged && self.policy_for(n.desktop_entry()).enable)
+            .count()
     }
 
     /// File a notification (freedesktop `Notify` shape). Returns the
@@ -937,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_count_tracks_the_banner_queue() {
+    fn unread_count_tracks_unacknowledged_history() {
         let mut c = center();
         assert_eq!(c.unread_count(), 0);
         let a = c.notify("app", "t", "b", vec![], Urgency::Normal, None);
@@ -948,14 +949,14 @@ mod tests {
         c.dismiss(a).unwrap();
         assert_eq!(c.unread_count(), 1);
         assert_eq!(c.history().len(), 2);
-        // DND-gated arrivals never queue, so they never read as unread.
+        // DND-gated arrivals still count as unseen history.
         c.set_dnd(true);
         c.notify("app", "t", "b", vec![], Urgency::Normal, None);
-        assert_eq!(c.unread_count(), 1);
+        assert_eq!(c.unread_count(), 2);
         assert_eq!(c.history().len(), 3);
         // Critical breaks through DND and counts again.
         c.notify("app", "t", "b", vec![], Urgency::Critical, None);
-        assert_eq!(c.unread_count(), 2);
+        assert_eq!(c.unread_count(), 3);
     }
 
     #[test]
@@ -1018,7 +1019,7 @@ mod tests {
             "new",
             "b2",
             vec![action("x")],
-            Urgency::Low,
+            Urgency::Normal,
             Some(id),
         );
         assert_eq!(same, id);
