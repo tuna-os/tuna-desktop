@@ -4319,9 +4319,9 @@ impl WindowManager {
         &mut self,
         state: &mut State,
         settings: &tuna_shell_control::InputSettings,
-    ) {
+    ) -> bool {
         let Some(keyboard) = self.keyboard.clone() else {
-            return;
+            return false;
         };
         let config = XkbConfig {
             layout: &settings.xkb_layout,
@@ -4329,12 +4329,16 @@ impl WindowManager {
             options: (!settings.xkb_options.is_empty()).then(|| settings.xkb_options.clone()),
             ..XkbConfig::default()
         };
-        if let Err(e) = keyboard.set_xkb_config(state, config) {
-            eprintln!(
-                "tuna-compositor: keymap {}({}) refused: {e:?}",
-                settings.xkb_layout, settings.xkb_variant
-            );
-        }
+        let applied = match keyboard.set_xkb_config(state, config) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "tuna-compositor: keymap {}({}) refused: {e:?}",
+                    settings.xkb_layout, settings.xkb_variant
+                );
+                false
+            }
+        };
         let rate = if settings.repeat && settings.repeat_interval_ms > 0 {
             (1000 / settings.repeat_interval_ms).max(1) as i32
         } else {
@@ -4342,6 +4346,7 @@ impl WindowManager {
         };
         keyboard.change_repeat_info(rate, settings.repeat_delay_ms as i32);
         self.repeat = (rate, settings.repeat_delay_ms as i32);
+        applied
     }
 
     /// The next input source (GNOME's Super+Space).

@@ -325,6 +325,7 @@ OCCLUSION_PIDS=""
 CURSOR_PID=""
 IME_PIDS=""
 cleanup() {
+    if [ "${LOCATE_RESTORE_ACTIVE:-0}" = 1 ]; then locate_restore_settings || true; fi
     if [ -n "$ICON_PID" ]; then kill "$ICON_PID" 2>/dev/null || true; fi
     if [ -n "$HINTS_PID" ]; then kill "$HINTS_PID" 2>/dev/null || true; fi
     if [ -n "$INHIBITOR_PID" ]; then kill "$INHIBITOR_PID" 2>/dev/null || true; fi
@@ -2806,6 +2807,21 @@ pass G-CURSOR-SHAPE "cursor-shape crosshair drawn from the theme, a missing shap
 xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
 locate_key_before="$(gsettings get org.gnome.mutter locate-pointer-key)"
 locate_enabled_before="$(gsettings get org.gnome.desktop.interface locate-pointer)"
+locate_sources_before="$(gsettings get org.gnome.desktop.input-sources sources)"
+locate_options_before="$(gsettings get org.gnome.desktop.input-sources xkb-options)"
+locate_map_before="$(jq -c '.cursor.locate_pointer.keymap' "$CSTATE")"
+LOCATE_RESTORE_ACTIVE=1
+locate_restore_settings() {
+    # Also runs from EXIT/INT/TERM before this private display/bus is stopped.
+    gsettings set org.gnome.desktop.interface locate-pointer false
+    "$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --physical=37 release || true
+    "$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --physical=133 release || true
+    gsettings set org.gnome.desktop.input-sources sources "$locate_sources_before"
+    gsettings set org.gnome.desktop.input-sources xkb-options "$locate_options_before"
+    gsettings set org.gnome.mutter locate-pointer-key "$locate_key_before"
+    gsettings set org.gnome.desktop.interface locate-pointer "$locate_enabled_before"
+    LOCATE_RESTORE_ACTIVE=0
+}
 gsettings set org.gnome.mutter locate-pointer-key 'Control_R'
 gsettings set org.gnome.desktop.interface locate-pointer false
 cstate '.cursor.locate_pointer.enabled == false and .cursor.locate_pointer.key == "Control_R" and .cursor.locate_pointer.key_valid' "configured right Ctrl, disabled" ||
@@ -2846,12 +2862,63 @@ for invalid_locate_key in '' 'TunaUnknownLocateKeysym'; do
     xdotool key Control_R
     locate_no_ripple "invalid locate key" "invalid-${invalid_locate_key:-empty}"
 done
-gsettings set org.gnome.mutter locate-pointer-key "$locate_key_before"
-gsettings set org.gnome.desktop.interface locate-pointer "$locate_enabled_before"
+# Change only the compositor's XKB map. Inject the same physical XTEST
+# keycodes before/after; never let xdotool resolve the remapped keysym.
+locate_physical_key() {
+    "$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" "--physical=$1" "$2" ||
+        fail G-LOCATE-POINTER "physical key $1/$2 injection failed"
+}
+[ "$("$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --physical=37 probe)" = 0xffe3 ] &&
+[ "$("$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --physical=133 probe)" = 0xffeb ] ||
+    fail G-LOCATE-POINTER "host XKB physical Ctrl/Super fixture differs; refusing guessed keycodes"
+printf '{"host_left_ctrl":{"x_keycode":37,"evdev":29,"keysym":"Control_L"},"host_left_super":{"x_keycode":133,"evdev":125,"keysym":"Super_L"},"host_map_modified":false,"compositor_options":"ctrl:swap_lwin_lctl"}\n' >"$ARTIFACTS/locate-pointer-xkb-physical-identity.json"
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us')]"
+gsettings set org.gnome.desktop.input-sources xkb-options '[]'
+gsettings set org.gnome.mutter locate-pointer-key 'Control_L'
+cstate '.cursor.locate_pointer.key == "Control_L" and .cursor.locate_pointer.keymap == ["us", "", ""]' "unmodified US locate map" ||
+    fail G-LOCATE-POINTER "unmodified US map was not successfully applied"
+locate_physical_key 37 tap
+cstate ".cursor.locate_pointer.count == $((locate_before + 1)) and .cursor.locate_pointer.active and .cursor.locate_pointer.frames > $locate_frames" "physical Ctrl baseline" 3 ||
+    fail G-LOCATE-POINTER "physical Ctrl baseline did not ripple"
+cp "$CSTATE" "$ARTIFACTS/locate-pointer-xkb-baseline.json"
+cstate '.cursor.locate_pointer.active | not' "baseline ripples finished" 5 || fail G-LOCATE-POINTER "baseline ripples did not finish"
+locate_before="$(jq '.cursor.locate_pointer.count' "$CSTATE")"
+locate_frames="$(jq '.cursor.locate_pointer.frames' "$CSTATE")"
+# Hold through repeat delay and successful map replacement. Its eventual
+# release belongs to the new map and must not finish the old armed tap.
+locate_physical_key 37 press
+sleep 0.8
+gsettings set org.gnome.desktop.input-sources xkb-options "['ctrl:swap_lwin_lctl']"
+cstate '.cursor.locate_pointer.keymap == ["us", "", "ctrl:swap_lwin_lctl"]' "live swapped Ctrl/Super map" ||
+    fail G-LOCATE-POINTER "live XKB option did not successfully apply"
+locate_physical_key 37 release
+locate_no_ripple "held Ctrl cancelled across keymap change" xkb-held-cancel
+locate_physical_key 37 tap
+locate_no_ripple "old physical Ctrl now resolves Super" xkb-ctrl-negative
+locate_physical_key 133 tap
+cstate ".cursor.locate_pointer.count == $((locate_before + 1)) and .cursor.locate_pointer.active and .cursor.locate_pointer.frames > $locate_frames" "physical Super now resolves configured Ctrl" 3 ||
+    fail G-LOCATE-POINTER "configured locate keysym did not follow active XKB remap"
+cp "$CSTATE" "$ARTIFACTS/locate-pointer-xkb-swapped-positive.json"
+cstate '.cursor.locate_pointer.active | not' "remapped ripples finished" 5 || fail G-LOCATE-POINTER "remapped ripples did not finish"
+# The existing physical Super overview shortcut can also act on this tap;
+# close its UI before continuing, without changing the locate assertion.
+xdotool key Escape
+cstate '.overview_open | not' "remap overview dismissed" || fail G-LOCATE-POINTER "remap overview did not close"
+locate_before="$(jq '.cursor.locate_pointer.count' "$CSTATE")"
+locate_frames="$(jq '.cursor.locate_pointer.frames' "$CSTATE")"
+locate_physical_key 133 press
+gsettings set org.gnome.desktop.interface locate-pointer false
+cstate '.cursor.locate_pointer.enabled | not' "held remapped key disabled" || fail G-LOCATE-POINTER "held disable not published"
+gsettings set org.gnome.desktop.interface locate-pointer true
+cstate '.cursor.locate_pointer.enabled' "held remapped key reenabled" || fail G-LOCATE-POINTER "held reenable not published"
+locate_physical_key 133 release
+locate_no_ripple "disable/reenable cancels held tap" xkb-disabled-held-cancel
+xdotool key Escape
+locate_restore_settings
 locate_key_restored="$(gsettings get org.gnome.mutter locate-pointer-key | "$PY" -c 'import ast,json,sys; print(json.dumps(ast.literal_eval(sys.stdin.read())))')"
-cstate ".cursor.locate_pointer.key == $locate_key_restored and .cursor.locate_pointer.enabled == $locate_enabled_before" "locate settings restored" ||
+cstate ".cursor.locate_pointer.key == $locate_key_restored and .cursor.locate_pointer.enabled == $locate_enabled_before and .cursor.locate_pointer.keymap == $locate_map_before" "locate settings restored" ||
     fail G-LOCATE-POINTER "locate settings did not restore"
-pass G-LOCATE-POINTER "live Control_R ripples; left Ctrl, disabled/invalid keys and modifier/button cancellation do not"
+pass G-LOCATE-POINTER "live configured Ctrl follows active physical Ctrl/Super remap; disabled/invalid/chord/button/held-map and held-disable cases do not ripple"
 
 # A genuine GTK fullscreen request blocks accidental corner opening, while
 # deliberate Super access remains available and unfullscreen restores it.

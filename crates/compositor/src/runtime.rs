@@ -3148,8 +3148,16 @@ impl Runtime {
         self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
             .apply_workspace_policy(&mut self.state, settings.workspace_policy);
-        self.manager
-            .apply_keyboard_settings(&mut self.state, &settings);
+        if self
+            .manager
+            .apply_keyboard_settings(&mut self.state, &settings)
+        {
+            self.cursor.locate.keymap_applied(
+                &settings.xkb_layout,
+                &settings.xkb_variant,
+                &settings.xkb_options,
+            );
+        }
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
         self.cursor

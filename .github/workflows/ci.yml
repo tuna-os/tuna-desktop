@@ -327,6 +327,7 @@ jobs:
           scripts/tuna-gtk-accessibility-proof gtk-shell-artifacts/a11y/bin/gtk-tests "$(git rev-parse HEAD)" gtk-shell-artifacts/a11y
       # pam_wrapper backs G-UNLOCK, IBus G-IME and wayland-utils
       # G-WAYLAND-INFO; all required so no stage can silently skip.
+      - run: python3 scripts/lib/xkeycode-tap-tests.py
       - run: python3 scripts/lib/tuna-locate-schema-tests.py
       - run: python3 scripts/lib/cursor-proof-theme-tests.py
       - run: python3 scripts/lib/cursor-pixels-tests.py

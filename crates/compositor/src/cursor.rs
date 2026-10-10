@@ -910,6 +910,8 @@ pub struct LocatePointer {
     armed: Option<u32>,
     key_name: String,
     keysym: Option<u32>,
+    /// Only successful map applications update this identity.
+    keymap: Option<[String; 3]>,
     /// Where and when the ripples started.
     playing: Option<(Point<f64, Logical>, Duration)>,
     /// Ripples started this session, for the proofs.
@@ -920,6 +922,16 @@ pub struct LocatePointer {
 }
 
 impl LocatePointer {
+    /// A held tap belongs to the map under which it was armed. Unrelated
+    /// settings and failed map applications must not pretend it changed.
+    pub fn keymap_applied(&mut self, layout: &str, variant: &str, options: &str) {
+        let next = [layout.to_owned(), variant.to_owned(), options.to_owned()];
+        if self.keymap.as_ref() != Some(&next) {
+            self.reset_keys();
+            self.keymap = Some(next);
+        }
+    }
+
     pub fn set_key(&mut self, name: &str) {
         if self.key_name == name {
             return;
@@ -1094,6 +1106,7 @@ impl LocatePointer {
             "enabled": self.enabled,
             "key": self.key_name,
             "key_valid": self.keysym.is_some(),
+            "keymap": self.keymap,
             "count": self.count,
             "frames": self.frames,
             "active": self.active(now),
@@ -1508,6 +1521,44 @@ mod tests {
         // Right Ctrl is not Mutter's default key.
         locate.feed(&key(97, true), at, now);
         assert!(!locate.feed(&key(97, false), at, now));
+    }
+
+    #[test]
+    fn locate_map_change_cancels_held_tap_and_repeat() {
+        let at = Point::from((10.0, 20.0));
+        let now = Duration::from_secs(1);
+        let key = |pressed| ManagerInput::Key {
+            keycode: 29,
+            pressed,
+            time: 0,
+        };
+        let mut locate = LocatePointer::default();
+        locate.set_enabled(true);
+        locate.keymap_applied("us", "", "");
+        assert!(!locate.feed_matched(&key(true), true, at, now));
+        assert!(!locate.feed_matched(&key(true), true, at, now));
+        locate.keymap_applied("us", "", "ctrl:swap_lwin_lctl");
+        assert!(!locate.feed_matched(&key(false), false, at, now));
+        assert_eq!(locate.count, 0);
+        assert!(!locate.feed_matched(&key(true), true, at, now));
+        assert!(locate.feed_matched(&key(false), true, at, now));
+    }
+
+    #[test]
+    fn locate_unchanged_successful_map_preserves_held_tap() {
+        let at = Point::from((10.0, 20.0));
+        let now = Duration::from_secs(1);
+        let key = |pressed| ManagerInput::Key {
+            keycode: 29,
+            pressed,
+            time: 0,
+        };
+        let mut locate = LocatePointer::default();
+        locate.set_enabled(true);
+        locate.keymap_applied("us", "", "");
+        assert!(!locate.feed_matched(&key(true), true, at, now));
+        locate.keymap_applied("us", "", "");
+        assert!(locate.feed_matched(&key(false), true, at, now));
     }
 
     #[test]
