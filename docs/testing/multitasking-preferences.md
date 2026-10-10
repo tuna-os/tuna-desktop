@@ -35,7 +35,7 @@ workspace-switch animation caused only by renumbering.
 
 The isolated state module has 30 passing tests; the isolated lease tracker has
 five passing tests. These checks do not qualify the production integration.
-Full Cargo checks and native runtime proofs are pending. Startup sequence and
+The clean `3004c2db04504e88045bb802e573a79ce736c069` build passed 54 schema unit tests, 29 schema integration tests, 376 compositor tests (one ignored), 332 host tests, and 125 GTK tests (two ignored), plus strict all-target Clippy. All seven frozen binary hashes were verified against its manifest. Native topology runtime checks are still pending: the first harness found the instrumented state omitted the workspace list, so it could not establish the count. A subsequent diagnostic field exports the actual state-model workspace list; it requires a new frozen build before rerunning the proof. Startup sequence and
 explicit keep-alive methods exist in the tracker, but their event producers are
 not connected yet. The idle scheduler must also consume the exported earliest
 lease deadline when this candidate is integrated. Multi-output overview and the

@@ -1667,6 +1667,7 @@ impl Runtime {
             "touchpad_left_handed": self.input_settings.touchpad_left_handed,
             "locked": self.is_locked(),
             "active_workspace": model.active_workspace(),
+            "workspaces": model.workspaces(),
             "focused": focused,
             "focused_app_id": focused.and_then(app_of),
             "focused_rect": focused
