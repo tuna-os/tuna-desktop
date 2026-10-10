@@ -30,10 +30,12 @@ impl LiveApps {
                     .monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>)
                     .ok()?;
                 let stale = stale.clone();
-                let wake = wake.clone();
+                let wake = Rc::downgrade(&wake);
                 monitor.connect_changed(move |_, _, _, _| {
                     stale.set(true);
-                    wake.request();
+                    if let Some(wake) = wake.upgrade() {
+                        wake.request();
+                    }
                 });
                 Some(monitor)
             })
@@ -75,7 +77,7 @@ mod tests {
         }
         assert_eq!(changes.get(), 1);
         let directory = tempfile::tempdir().unwrap();
-        let apps = LiveApps::with_dirs(vec![directory.path().to_owned()], wake);
+        let apps = LiveApps::with_dirs(vec![directory.path().to_owned()], wake.clone());
         assert_eq!(apps._monitors.len(), 1);
         assert!(!apps.stale.get());
         std::fs::write(
@@ -97,5 +99,18 @@ mod tests {
         assert!(apps.stale.get());
         drop(apps.get());
         assert!(!apps.stale.get(), "next cache read refreshes it");
+        // The production dispatcher owns the cache/UI. Signal callbacks must
+        // not retain the dispatcher in the opposite direction.
+        let weak = Rc::downgrade(&wake);
+        let retained_cache = apps.clone();
+        wake.install(move || drop(retained_cache.get()));
+        drop(wake);
+        assert!(
+            weak.upgrade().is_none(),
+            "file monitors must not form a dispatcher/cache cycle"
+        );
+        while context.pending() {
+            context.iteration(false);
+        }
     }
 }

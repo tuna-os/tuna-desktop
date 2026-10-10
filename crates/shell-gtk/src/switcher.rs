@@ -296,18 +296,26 @@ impl SwitcherUi {
         // Geometry is read by a coalesced idle after allocation/paint, rather
         // than guessed from the model or sampled on a permanent tick source.
         for window in [&window, &thumbs_window] {
-            let wake = wake.clone();
+            let wake = Rc::downgrade(&wake);
             window.connect_realize(move |window| {
                 if let Some(clock) = window.frame_clock() {
                     let wake = wake.clone();
-                    clock.connect_after_paint(move |_| wake.request());
+                    clock.connect_after_paint(move |_| {
+                        if let Some(wake) = wake.upgrade() {
+                            wake.request();
+                        }
+                    });
                 }
             });
         }
-        let geometry_wake = wake.clone();
+        let geometry_wake = Rc::downgrade(&wake);
         thumbs_scroller
             .hadjustment()
-            .connect_value_changed(move |_| geometry_wake.request());
+            .connect_value_changed(move |_| {
+                if let Some(wake) = geometry_wake.upgrade() {
+                    wake.request();
+                }
+            });
         Rc::new(Self {
             window,
             row,

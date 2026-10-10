@@ -1379,7 +1379,7 @@ fn build(app: &adw::Application) {
             let shell = shell.clone();
             let app_settings = app_settings.clone();
             let window_settings = window_settings.clone();
-            let ui_wake = ui_wake.clone();
+            let ui_wake = Rc::downgrade(&ui_wake);
             Rc::new(move || {
                 let defaults = tuna_shell_host::model::SwitcherWorkspacePolicy::default();
                 let read = |settings: &Option<gio::Settings>, fallback| {
@@ -1407,7 +1407,9 @@ fn build(app: &adw::Application) {
                         },
                     );
                 }
-                ui_wake.request();
+                if let Some(ui_wake) = ui_wake.upgrade() {
+                    ui_wake.request();
+                }
             })
         };
         apply();
