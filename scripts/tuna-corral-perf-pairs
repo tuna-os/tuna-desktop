@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Three alternating matched pairs on one explicitly owned imported KubeVirt VM.
+
+This runs measurements; it never provisions a CI runner or builds/imports images.
+"""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
+from corral_session import Session,admit_imported_disk
+from corral_perf import kubectl,verify_identity
+
+p=argparse.ArgumentParser(description=__doc__)
+for name in ('context','vm','key','known-hosts','reference-image','tuna-payload','tuna-selection','export-dir','import-receipt','out'):
+ p.add_argument('--'+name,required=True)
+p.add_argument('--namespace',default='corral-vms');p.add_argument('--user',default='tuna-bench')
+p.add_argument('--profile',choices=('stock','diagnostic'),required=True)
+p.add_argument('--meta',action='append',default=[])
+a=p.parse_args();root=Path(a.out).resolve();root.mkdir(parents=True,exist_ok=False)
+inputs={name:hashlib.sha256(Path(getattr(a,name.replace('-','_'))).read_bytes()).hexdigest() for name in ('reference-image','tuna-payload','tuna-selection')}
+original=None;domain=None;node_uid=None;boots=[];case=0;stage='setup';active=None
+try:
+ stage='import-admission'
+ imported=admit_imported_disk(a.export_dir,a.import_receipt,a.context,a.namespace,a.vm,a.reference_image,a.tuna_payload,a.tuna_selection)
+ (root/'import-admission.json').write_text(json.dumps(imported,indent=2))
+ if json.loads((Path(a.export_dir)/'manifest.json').read_text()).get('gnome_profile')!=a.profile:raise ValueError('exported profile differs')
+ for repeat,order in enumerate((('gnome','tuna'),('tuna','gnome'),('gnome','tuna')),1):
+  for desktop in order:
+   case+=1;out=root/f'{repeat}-{desktop}';setup=root/f'{repeat}-{desktop}-setup';setup.mkdir()
+   stage='select-session';active=Session(a.context,a.namespace,a.vm,a.user,a.key,a.known_hosts,setup)
+   if original is None:
+    original=active.identity
+    if original['vm_uid']!=imported['vm_uid']:raise ValueError('uploaded VM replaced')
+    domain=active.metadata['guest_domain'];node_uid=active.metadata['node_uid']
+   elif active.identity!=original or active.metadata['guest_domain']!=domain or active.metadata['node_uid']!=node_uid:raise ValueError('paired VM identity/resource substrate changed')
+   selection=active.select(desktop);active.close();active=None
+   (setup/'selection.json').write_text(json.dumps(selection,indent=2))
+   stage='wait-fresh-boot';deadline=time.monotonic()+240
+   while time.monotonic()<deadline:
+    try:
+     candidate=Session(a.context,a.namespace,a.vm,a.user,a.key,a.known_hosts,setup)
+     if candidate.identity!=original or candidate.metadata['guest_domain']!=domain or candidate.metadata['node_uid']!=node_uid:raise ValueError('paired VM replaced or migrated')
+     if candidate.boot_id!=selection['previous_boot_id']:
+      active=candidate;break
+     candidate.close()
+    except (RuntimeError,ValueError,subprocess.SubprocessError):pass
+    time.sleep(3)
+   else:raise TimeoutError('selected fresh guest boot unavailable')
+   if active.boot_id in boots:raise ValueError('fresh boot reused across paired acquisitions')
+   boots.append(active.boot_id);active.close();active=None
+   stage='measurement'
+   if admit_imported_disk(a.export_dir,a.import_receipt,a.context,a.namespace,a.vm,a.reference_image,a.tuna_payload,a.tuna_selection)!=imported:raise ValueError('disk import provenance changed')
+   command=[str(Path(__file__).resolve().parent/'tuna-vm-perf'),'--corral-vm',a.vm,'--corral-context',a.context,
+    '--corral-namespace',a.namespace,'--corral-user',a.user,'--corral-key',a.key,'--corral-known-hosts',a.known_hosts,
+    '--desktop',desktop,'--gnome-profile',a.profile,'--reference-image',a.reference_image,
+    '--tuna-payload',a.tuna_payload,'--tuna-selection',a.tuna_selection,'--out',str(out)]
+   for meta in [*a.meta,f'acquisition_repeat={repeat}',f'acquisition_order={"-".join(order)}',f'gnome_profile={a.profile}',f'fixture_image_id={imported["fixture_image_id"]}']:
+    command+=['--meta',meta]
+   subprocess.run(command,check=True,timeout=1000)
+   report=json.loads((out/'report.json').read_text());session=report['corral_session']
+   if session['identity']!=original or session['guest_domain']!=domain or session['node_uid']!=node_uid or session['boot_id']!=boots[-1]:raise ValueError('runner used another guest identity/boot')
+   if len(json.loads((out/'observations.json').read_text()))!=20:raise ValueError('twenty real input observations required')
+   current={name:hashlib.sha256(Path(getattr(a,name.replace('-','_'))).read_bytes()).hexdigest() for name in inputs}
+   if current!=inputs:raise ValueError('original host provenance receipts changed')
+ stage='complete'
+finally:
+ if active:active.close()
+ (root/'acquisition-status.json').write_text(json.dumps({'schema':1,'backend':'corral-kubevirt','profile':a.profile,
+  'stage':stage,'completed_cases':case if stage=='complete' else case-1,'all_six_commands_succeeded':stage=='complete',
+  'identity':original,'boot_ids':boots,'host_receipt_sha256':inputs,
+  'gpu_qualified':False,'total_power_qualified':False,'performance_qualified':False},indent=2))

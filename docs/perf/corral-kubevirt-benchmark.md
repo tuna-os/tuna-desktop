@@ -38,3 +38,34 @@ presentation completion gates, same image/kernel/resources and repeated alternat
 sessions. Do not relabel local QEMU hardware metadata as KubeVirt. GPU device and
 host total-power counters are currently unavailable on the selected AWS node;
 these cannot count as a performance win.
+
+## Paired transport runner
+
+`scripts/tuna-vm-perf --corral-vm NAME` uses actual API-tunneled RFB key events,
+full requested raw framebuffer coverage, and fixed SSH guest phases. Phase children
+have their own guest `timeout` supervisor as well as host acquisition limits.
+Sampler journal records must match the exact boot ID and `tuna-perf.service`.
+VM/VMI/storage source hashes, node UID, resources, boot ID and actual selected
+compositor executable identity are retained and checked. The host is the observer,
+not the AWS hypervisor. Existing native completion and GNOME reference validators
+remain in force. RFB first response is still only a broad visible-response bound.
+
+`scripts/tuna-corral-perf-pairs` selects GNOME/Tuna three times in alternating
+order, reboots before each acquisition, requires six distinct fresh boot IDs and
+twenty actual input observations per case. Session selection writes only mutable
+GDM/AccountsService/tmpfiles overrides; it does not modify the protected image.
+It requires `--export-dir` from an authenticated original CI download, original
+reference/package/selection receipts, and an original successful upload receipt.
+The upload receipt schema1 contains `completed:true`, `context`, `namespace`,
+`vm_name`, `vm_uid`, `pvc_name`, `pvc_uid`, `datavolume_name`, `datavolume_uid`,
+`disk_sha256` and `manifest_sha256`. These must describe the actual original
+owned upload action. Current successful CDI/PVC/VM state is checked too; it does
+not retroactively prove old disk bytes. The source-owned upload procedure still
+needs implementation and actual export/import qualification.
+
+The six boots use one persistent fixture disk; they are not six new disk installs.
+Do not call these fresh disks or assume user state never persists across sessions.
+SSH key/sshd provisioning must be part of the external test fixture and validated
+by actual boot. Fedora containerDisk preflight alone proves no Marlin SSH support.
+Budget the full20Gi PVC plus transfer, scratch and temporary allocation for the
+chosen import procedure, rather than admitting the optimistic mapped7Gi estimate.

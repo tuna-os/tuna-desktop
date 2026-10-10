@@ -4,6 +4,7 @@ Neither readiness nor a captured framebuffer qualifies performance. Callers must
 retain paired image/source identities and the existing native receipt gates.
 """
 import json
+import hashlib
 from decimal import Decimal
 import re
 import socket
@@ -213,9 +214,14 @@ def vm_identity(vm, vmi):
     status = vmi.get('status', {})
     if status.get('phase') != 'Running' or not status.get('nodeName'):
         raise ValueError('guest is not running on an identified node')
+    declared = vm['spec']['template']['spec']['volumes']
+    actual = vmi['spec']['volumes']
+    if declared != actual:
+        raise ValueError('VM/VMI storage sources differ')
+    storage_digest = hashlib.sha256(json.dumps(actual,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     return {'namespace': metadata['namespace'], 'name': metadata['name'],
             'vm_uid': metadata['uid'], 'vmi_uid': instance['uid'],
-            'node': status['nodeName'], 'migration_state': status.get('migrationState'),
+            'storage_sha256': storage_digest, 'node': status['nodeName'], 'migration_state': status.get('migrationState'),
             'container_disks': [volume['containerDisk']['image'] for volume in
                                 vm['spec']['template']['spec']['volumes'] if 'containerDisk' in volume]}
 
