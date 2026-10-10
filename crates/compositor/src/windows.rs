@@ -768,7 +768,7 @@ impl WindowManager {
             .filter_map(|id| {
                 let w = self.windows.get(&id)?;
                 let animating = self.window_lifecycle.is_minimizing(id)
-                    && (w.sticky
+                    && (self.on_all_workspaces(id)
                         || self
                             .model
                             .window(id)
