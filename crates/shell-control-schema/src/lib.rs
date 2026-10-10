@@ -1405,7 +1405,7 @@ mod tests {
         assert!(ProtocolVersion::new(0, 27).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 28).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 29).is_compatible_with(&ours));
-        assert!(!ProtocolVersion::new(0, 30).is_compatible_with(&ours));
+        assert!(!ProtocolVersion::new(ours.major, ours.minor + 1).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 4).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 0).is_compatible_with(&ours));
     }
