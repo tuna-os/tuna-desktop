@@ -58,7 +58,25 @@ class AudioProof:
         helpers.wait_until(lambda: helpers.run(['pactl', 'info'], env))
         helpers.run(['pactl', 'load-module', 'module-null-sink',
                      'sink_name=tuna-notification-audio', 'rate=48000', 'channels=2'], env)
-        helpers.run(['pactl', 'set-default-sink', 'tuna-notification-audio'], env)
+        # PipeWire-Pulse acknowledges module loading before the new sink is
+        # always visible to subsequent pactl commands. Wait for the exact
+        # named sink instead of racing set-default-sink against registration.
+        def sink_ready():
+            sinks = helpers.run(['pactl', 'list', 'short', 'sinks'], env)
+            return any(line.split()[1:2] == ['tuna-notification-audio']
+                       for line in sinks.splitlines())
+
+        try:
+            helpers.wait_until(sink_ready, seconds=8)
+        except RuntimeError as error:
+            sinks = helpers.run(['pactl', 'list', 'short', 'sinks'], env)
+            raise RuntimeError(f'{error}; pactl sinks: {sinks!r}') from error
+        try:
+            helpers.run(['pactl', 'set-default-sink', 'tuna-notification-audio'], env)
+        except subprocess.CalledProcessError as error:
+            sinks = helpers.run(['pactl', 'list', 'short', 'sinks'], env)
+            raise RuntimeError(
+                f'pactl set-default-sink failed: {error.output!r}; sinks: {sinks!r}') from error
         helpers.run(['pactl', 'set-sink-volume', 'tuna-notification-audio', '100%'], env)
         graph = self.graph()
         assert not any(o.get('info', {}).get('props', {}).get('device.api')
