@@ -743,8 +743,29 @@ pub struct PreviewInfo {
     pub height: i32,
 }
 
-/// GNOME's input settings (`org.gnome.desktop.input-sources` and
-/// `org.gnome.desktop.peripherals.*`), flattened for the compositor.
+/// GNOME sound and window-manager bell preferences, consumed by the compositor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BellPolicy {
+    pub audible: bool,
+    pub visual: bool,
+    pub frame_flash: bool,
+    pub event_sounds: bool,
+    pub theme: String,
+}
+impl Default for BellPolicy {
+    fn default() -> Self {
+        Self {
+            audible: true,
+            visual: false,
+            frame_flash: false,
+            event_sounds: true,
+            theme: "freedesktop".into(),
+        }
+    }
+}
+
+/// GNOME input and bell preferences, flattened for the compositor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSettings {
     /// xkb layouts, comma separated, in input-source order (`us,de`).
@@ -780,6 +801,8 @@ pub struct InputSettings {
     /// GTK shell default text direction; corners and Activities follow it.
     #[serde(default)]
     pub right_to_left: bool,
+    #[serde(default)]
+    pub bell: BellPolicy,
 }
 
 impl Default for InputSettings {
@@ -803,6 +826,7 @@ impl Default for InputSettings {
             mouse_left_handed: false,
             touchpad_left_handed: false,
             right_to_left: false,
+            bell: BellPolicy::default(),
         }
     }
 }
@@ -1260,6 +1284,23 @@ mod tests {
         ] {
             roundtrip(&Message::ScreenReader { state });
         }
+    }
+
+    #[test]
+    fn live_bell_policy_survives_the_positional_control_wire() {
+        roundtrip(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(InputSettings {
+                bell: BellPolicy {
+                    audible: false,
+                    visual: true,
+                    frame_flash: true,
+                    event_sounds: false,
+                    theme: "custom".into(),
+                },
+                ..InputSettings::default()
+            }),
+        });
     }
 
     #[test]

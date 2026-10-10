@@ -398,6 +398,16 @@ mod scene_slot_tests {
     use super::{scene_slots, SceneSlot::*};
 
     #[test]
+    fn frame_bell_stays_under_higher_windows_and_only_in_its_slice() {
+        let mut over = scene_slots(2, 0, false, &[0]);
+        super::insert_bell_slot(&mut over, 1, 0);
+        assert_eq!(over, [Snapshot(0), Element(0), Bell(0), Element(1)]);
+        let mut under = scene_slots(2, 2, true, &[]);
+        super::insert_bell_slot(&mut under, 1, 0);
+        assert_eq!(under, [Element(2), Element(3)]);
+    }
+
+    #[test]
     fn snapshots_draw_in_front_of_the_elements_at_and_after_their_index() {
         // Five elements split at 2: snapshot 0 sits at index 1 (over half),
         // snapshot 1 at the boundary 2 (under half's end only), snapshots
@@ -2428,6 +2438,31 @@ impl Runtime {
 
     /// The desktop clear: GNOME's `primary-color` once the shell has
     /// published it, else a dark neutral.
+    /// Resolve only currently rendered target windows. A destroyed/hidden
+    /// explicit target does not redirect a frame flash to another window.
+    fn bell_frame(&mut self) -> Option<(f32, Option<(u64, Rectangle<i32, Logical>)>)> {
+        let now = Instant::now();
+        self.state.protocols.bell.tick(now);
+        if self.is_locked() {
+            self.state.protocols.bell.clear_visual();
+            return None;
+        }
+        let (alpha, surface) = self.state.protocols.bell.visual(now)?;
+        let target = if let Some(surface) = surface {
+            Some(
+                self.manager
+                    .render_entries()
+                    .into_iter()
+                    .find_map(|(id, _, geo)| {
+                        (self.manager.surface_of(id).as_ref() == Some(surface)).then_some((id, geo))
+                    })?,
+            )
+        } else {
+            None
+        };
+        Some((alpha, target))
+    }
+
     fn desktop_color(&self) -> Color32F {
         match self.wallpaper.color() {
             Some([r, g, b]) => Color32F::new(r, g, b, 1.0),
@@ -2467,6 +2502,7 @@ impl Runtime {
             self.desktop_color()
         };
         let desktop = self.background_desktop();
+        let bell = self.bell_frame();
         let (renderer, size, view) = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = backend.window_size();
@@ -2527,6 +2563,7 @@ impl Runtime {
             view,
             self.manager.pointer_pos(),
         ));
+        install_bell(&mut elements, view, bell, desktop);
         let decor = decor_for_output(&decor_global, view);
         let previews = preview_elements(renderer, &self.manager, view, cards);
         let paper = backdrop(
@@ -2933,6 +2970,7 @@ impl Runtime {
     /// Apply GNOME's input settings (#60): the seat's keymap and key
     /// repeat, libinput pointer devices (hardware), the hot corner.
     fn apply_input_settings(&mut self, settings: tuna_shell_control::InputSettings) {
+        self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
             .apply_keyboard_settings(&mut self.state, &settings);
         self.triggers.set_hot_corner(settings.hot_corners);
@@ -3554,6 +3592,7 @@ impl Runtime {
         #[cfg(feature = "drm")]
         let timing_roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
         let desktop = self.background_desktop();
+        let bell = self.bell_frame();
         // Window clones (overview, switcher) and casts show windows the
         // scene hides: their frame callbacks keep full rate then.
         let clones_shown =
@@ -3609,6 +3648,7 @@ impl Runtime {
                         self.manager.pointer_pos(),
                     ));
                     elements.flashes = screenshot_flash_elements(&flashes, view);
+                    install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
                     let paper = backdrop(
@@ -3731,6 +3771,7 @@ impl Runtime {
                         self.manager.pointer_pos(),
                     ));
                     elements.flashes = screenshot_flash_elements(&flashes, view);
+                    install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
                     let paper = backdrop(
@@ -3782,6 +3823,11 @@ impl Runtime {
                                 .top
                                 .iter()
                                 .map(|e| ElementSignature::capture(e, view.scale))
+                                .collect(),
+                            elements
+                                .bell
+                                .iter()
+                                .map(|(_, e)| ElementSignature::capture(e, 1.0))
                                 .collect(),
                             elements
                                 .snapshots
@@ -4113,6 +4159,10 @@ struct Scene {
     top: Vec<PreviewElement>,
     /// Capture feedback is painted only on outputs, never into saved pixels.
     flashes: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
+    bell: Vec<(
+        Option<usize>,
+        smithay::backend::renderer::element::solid::SolidColorRenderElement,
+    )>,
     /// Old-frame snapshots of size-change transitions (#496), each
     /// drawn in front of `elements[index..]`, in physical pixels.
     snapshots: Vec<(usize, SnapshotElement)>,
@@ -4145,6 +4195,7 @@ impl Scene {
             tile: Vec::new(),
             top: Vec::new(),
             flashes: Vec::new(),
+            bell: Vec::new(),
             snapshots: Vec::new(),
             owners: vec![None; above],
         }
@@ -4185,6 +4236,66 @@ fn screenshot_flash_elements(
             })
             .collect()
     })
+}
+
+/// A frame bell sits above its own window and below every higher layer/window.
+fn insert_bell_slots(slots: &mut Vec<SceneSlot>, scene: &Scene) {
+    for (k, (at, _)) in scene.bell.iter().enumerate() {
+        let Some(at) = at else { continue };
+        insert_bell_slot(slots, *at, k);
+    }
+}
+
+fn insert_bell_slot(slots: &mut Vec<SceneSlot>, at: usize, k: usize) {
+    if let Some(index) = slots
+        .iter()
+        .position(|slot| *slot == SceneSlot::Element(at))
+    {
+        slots.insert(index, SceneSlot::Bell(k));
+    }
+}
+
+fn install_bell(
+    scene: &mut Scene,
+    view: View,
+    bell: Option<(f32, Option<(u64, Rectangle<i32, Logical>)>)>,
+    desktop: [i32; 4],
+) {
+    use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Id};
+    let Some((alpha, target)) = bell.filter(|(alpha, _)| *alpha > 0.0) else {
+        return;
+    };
+    let (at, rect) = match target {
+        Some((id, geo)) => {
+            let Some(at) = scene.owners.iter().position(|owner| *owner == Some(id)) else {
+                return;
+            };
+            (Some(at), geo)
+        }
+        None => (
+            None,
+            Rectangle::new(
+                (desktop[0], desktop[1]).into(),
+                (desktop[2], desktop[3]).into(),
+            ),
+        ),
+    };
+    let origin = view.physical(f64::from(rect.loc.x), f64::from(rect.loc.y));
+    let end = view.physical(
+        f64::from(rect.loc.x + rect.size.w),
+        f64::from(rect.loc.y + rect.size.h),
+    );
+    thread_local! { static BELL_ID: Id = Id::new(); }
+    scene.bell.push((
+        at,
+        SolidColorRenderElement::new(
+            BELL_ID.with(Clone::clone),
+            Rectangle::new(origin, (end.x - origin.x, end.y - origin.y).into()),
+            0usize,
+            Color32F::new(0.0, 0.0, 0.0, alpha),
+            Kind::Unspecified,
+        ),
+    ));
 }
 
 /// GNOME's tile preview (`.tile-preview`: the accent at half opacity
@@ -4527,6 +4638,7 @@ fn scene_elements(
         tile: Vec::new(),
         top: Vec::new(),
         flashes: Vec::new(),
+        bell: Vec::new(),
         snapshots,
         owners: crate::layer::front_to_back(owners),
     }
@@ -4651,14 +4763,23 @@ fn draw_scene(
     });
     let shield_plan = occlusion.plan(1.0, shield.as_slice());
     let flash_plan = occlusion.plan(1.0, &scene.flashes);
+    let fullscreen_bell: Vec<_> = scene
+        .bell
+        .iter()
+        .filter(|(at, _)| at.is_none())
+        .map(|(_, e)| e.clone())
+        .collect();
+    let bell_plan = occlusion.plan(1.0, &fullscreen_bell);
     let top_plan = occlusion.plan(scale, &scene.top);
     // Beneath the tile preview, the preview (blended), then the
     // dragged window and the layers over it, each half with the
     // size-change snapshots among its elements (#496).
     let split = scene.above.min(scene.elements.len());
     let snapshot_at: Vec<usize> = scene.snapshots.iter().map(|(index, _)| *index).collect();
-    let over = scene_slots(split, 0, false, &snapshot_at);
-    let under = scene_slots(scene.elements.len() - split, split, true, &snapshot_at);
+    let mut over = scene_slots(split, 0, false, &snapshot_at);
+    let mut under = scene_slots(scene.elements.len() - split, split, true, &snapshot_at);
+    insert_bell_slots(&mut over, scene);
+    insert_bell_slots(&mut under, scene);
     let over_plan = plan_slots(&mut occlusion, scale, scene, &over);
     let tile_plan = occlusion.plan(1.0, &scene.tile);
     let under_plan = plan_slots(&mut occlusion, scale, scene, &under);
@@ -4687,6 +4808,7 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.tile, &tile_plan).map_err(error)?;
     draw_slots(frame, scale, scene, &over, &over_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.flashes, &flash_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
@@ -4712,6 +4834,7 @@ fn draw_scene(
 enum SceneSlot {
     Element(usize),
     Snapshot(usize),
+    Bell(usize),
 }
 
 /// The scene's `[base..base + len]` elements front to back, with the
@@ -4756,6 +4879,9 @@ fn plan_slots(
             SceneSlot::Element(index) => occlusion
                 .plan(scale, std::slice::from_ref(&scene.elements[index]))
                 .remove(0),
+            SceneSlot::Bell(k) => occlusion
+                .plan(1.0, std::slice::from_ref(&scene.bell[k].1))
+                .remove(0),
             SceneSlot::Snapshot(k) => occlusion
                 .plan(1.0, std::slice::from_ref(&scene.snapshots[k].1))
                 .remove(0),
@@ -4778,6 +4904,12 @@ fn draw_slots(
                 frame,
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
+                visible,
+            )?,
+            SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
+                frame,
+                1.0,
+                std::slice::from_ref(&scene.bell[k].1),
                 visible,
             )?,
             SceneSlot::Snapshot(k) => draw_planned::<GlesRenderer, _>(

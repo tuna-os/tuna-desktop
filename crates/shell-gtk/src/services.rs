@@ -751,6 +751,7 @@ impl AudioUi {
     }
 
     fn update(self: &Rc<Self>, snapshot: crate::audio_state::Snapshot) {
+        crate::sound_feedback::set_sink_running(snapshot.sink_running);
         if *self.last.borrow() == snapshot {
             return;
         }
@@ -1002,7 +1003,14 @@ fn audio(w: &Rc<Widgets>) {
         let ui = ui.clone();
         slider.connect_value_changed(move |s| {
             if !ui.syncing.get() {
-                wpctl(
+                let value = s.value();
+                let changed = ui
+                    .last
+                    .borrow()
+                    .sink
+                    .is_some_and(|(old, _)| (old - value).abs() > 0.01);
+                let muted = ui.last.borrow().sink.is_none_or(|(_, muted)| muted);
+                crate::media_keys::wpctl(
                     &[
                         "set-volume",
                         node,
@@ -1015,7 +1023,11 @@ fn audio(w: &Rc<Widgets>) {
                             logic::wpctl_volume_arg(s.value())
                         },
                     ],
-                    |_| {},
+                    move |result| {
+                        if node == SINK && result.is_some() {
+                            crate::sound_feedback::volume(false, changed, muted);
+                        }
+                    },
                 );
             }
         });
