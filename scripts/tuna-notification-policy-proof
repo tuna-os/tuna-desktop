@@ -1,0 +1,254 @@
+#!/usr/bin/python3
+"""Nested GTK/DBus notification policy proof. Run with dbus-run-session.
+Requires immutable matched binaries, Xvfb, PAM wrapper and private AT-SPI.
+This proves local consumers, not sound support or a GNOME hardware comparison.
+"""
+import argparse, pwd, hashlib, json, os, select, shutil, signal, subprocess, time
+from pathlib import Path
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument('--bin-dir', type=Path, required=True)
+p.add_argument('--artifacts', type=Path, required=True)
+p.add_argument('--display', default=':96')
+a = p.parse_args()
+root = Path(__file__).resolve().parent.parent
+art = a.artifacts.resolve(); art.mkdir(parents=True, exist_ok=True)
+runtime = art/'runtime'
+state = art/'state.json'
+env = dict(os.environ, DISPLAY=a.display, XDG_RUNTIME_DIR=str(runtime),
+ XDG_CONFIG_HOME=str(art/'config'), XDG_STATE_HOME=str(art/'state'), XDG_DATA_HOME=str(art/'data'),
+ TUNA_COMPOSITOR_STATE=str(state), TUNA_XWAYLAND='0', LIBGL_ALWAYS_SOFTWARE='1',
+ GSK_RENDERER='cairo', GTK_A11Y='atspi', ADW_DISABLE_PORTAL='1', GSETTINGS_BACKEND='keyfile')
+def sha(path):
+ with open(path,'rb') as f: return hashlib.file_digest(f,'sha256').hexdigest()
+manifest = dict(source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
+ source_dirty=bool(subprocess.check_output(['git','status','--porcelain'],cwd=root,text=True).strip()),
+ backend='winit/Xvfb/software', gnome_comparison=False, proof_sha256=sha(__file__),
+ binaries={n:dict(path=str(a.bin_dir.resolve()/n),sha256=sha(a.bin_dir/n)) for n in ('tuna-compositor','tuna-shell-gtk')})
+receipt=json.loads((a.bin_dir/'manifest.json').read_text())
+assert not receipt['source_dirty'] and not manifest['source_dirty'], 'proof requires committed clean source'
+assert receipt['source_revision']==manifest['source_revision'], 'binary/source revision mismatch'
+for name,record in manifest['binaries'].items():
+ assert receipt['binary_sha256'][name]==record['sha256'], 'frozen binary digest mismatch'
+manifest['binary_receipt']=receipt
+manifest['gtk_version']=subprocess.check_output(['pkg-config','--modversion','gtk4'],text=True).strip()
+assert not runtime.exists(), 'refusing an existing proof runtime'
+processes=[]; logs=[]; owned=[]; assertions=[]; accessibility=None; success=False; runtime_created=False
+session=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+def spawn(args,name,extra=None):
+ log=(art/(name+'.log')).open('w'); logs.append(log)
+ proc=subprocess.Popen(args,env=env|(extra or {}),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+ processes.append(proc); return proc
+def call(bus,dest,path,iface,method,args=None,flags=Gio.DBusCallFlags.NONE):
+ return bus.call_sync(dest,path,iface,method,args,None,flags,3000,None).unpack()
+def wait(check,label,seconds=15):
+ end=time.monotonic()+seconds
+ while time.monotonic()<end:
+  try:
+   result=check()
+   if result: assertions.append(label); return result
+  except (GLib.Error,OSError,ValueError,KeyError): pass
+  time.sleep(.1)
+ raise AssertionError('timed out '+label)
+def snapshot(): return json.loads(state.read_text())
+def setpref(schema,key,value):
+ subprocess.run(['gsettings','set',schema,key,value],env=env,check=True)
+ time.sleep(.2)
+MASTER='org.gnome.desktop.notifications'
+def app_schema(app): return 'org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/org-tuna-notify'+app.lower()+'/'
+def notify(app,title,critical=False,replaces=0,body=None):
+ hints={'urgency':GLib.Variant('y',2 if critical else 1)}
+ if app: hints['desktop-entry']=GLib.Variant('s','org.tuna.Notify'+app)
+ return call(session,'org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','Notify',
+  GLib.Variant('(susssasa{sv}i)',('TunaPolicy'+(app or 'Unknown'),replaces,'',title,body or 'PRIVATE_BODY_'+title,['open','Open'],hints,0)))[0]
+def close(n): call(session,'org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','CloseNotification',GLib.Variant('(u)',(n,)))
+nodes={}
+def tree():
+ nodes.clear()
+ # Bulk GetChildren avoids GTK 4.14's stale GetChildAtIndex path.
+ names=[]; seen=set(); pending=[('org.a11y.atspi.Registry','/org/a11y/atspi/accessible/root')]
+ while pending:
+  dest,path=pending.pop()
+  if (dest,path) in seen or path=='/org/a11y/atspi/null': continue
+  seen.add((dest,path))
+  try:
+   props=call(accessibility,dest,path,'org.freedesktop.DBus.Properties','GetAll',GLib.Variant('(s)',('org.a11y.atspi.Accessible',)))[0]
+   name=props.get('Name',''); names.append(name); nodes.setdefault(name,[]).append((dest,path))
+   pending.extend(call(accessibility,dest,path,'org.a11y.atspi.Accessible','GetChildren')[0])
+  except GLib.Error as e:
+   if 'NoSuchObject' not in str(e) and 'UnknownObject' not in str(e): raise
+ return names
+def has(text): return any(text in n for n in tree())
+def absent(text): return not has(text)
+def height(text):
+ tree()
+ return max(call(accessibility,dest,path,'org.a11y.atspi.Component','GetExtents',GLib.Variant('(u)',(0,)))[0][3] for dest,path in nodes[text])
+def bounds(text):
+ tree()
+ return [call(accessibility,dest,path,'org.a11y.atspi.Component','GetExtents',GLib.Variant('(u)',(0,)))[0] for dest,path in nodes.get(text,[])]
+def shot(label):
+ time.sleep(.2); subprocess.run(['scrot',str(art/(label+'.png'))],env=env,check=True)
+def lock():
+ call(session,'org.gnome.ScreenSaver','/org/gnome/ScreenSaver','org.gnome.ScreenSaver','SetActive',GLib.Variant('(b)',(True,)))
+ wait(lambda:snapshot()['locked'],'actual-lock'); time.sleep(.5)
+def unlock():
+ subprocess.run(['xdotool','key','Escape'],env=env,check=True); time.sleep(.2)
+ subprocess.run(['xdotool','key','space'],env=env,check=True); time.sleep(.3)
+ subprocess.run(['xdotool','type','--clearmodifiers',password],env=env,check=True)
+ subprocess.run(['xdotool','key','Return'],env=env,check=True)
+ wait(lambda:not snapshot()['locked'],'authenticated-unlock')
+try:
+ runtime.mkdir(mode=0o700); runtime_created=True; os.chmod(runtime,0o700)
+ for app in ('Alpha','Beta'):
+  folder=art/'data/applications'; folder.mkdir(parents=True,exist_ok=True)
+  (folder/('org.tuna.Notify'+app+'.desktop')).write_text('[Desktop Entry]\nType=Application\nName=TunaPolicy'+app+'\nExec=/usr/bin/true\nIcon=dialog-information\n')
+ pam=art/'pam/services'; pam.mkdir(parents=True)
+ password='tuna-policy-'+str(os.getpid())
+ passdb=art/'pam/passdb'; passdb.write_text(pwd.getpwuid(os.getuid()).pw_name+':'+password+':tuna-lock\n'); os.chmod(passdb,0o600)
+ matrix='/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so'; wrapper='/usr/lib/x86_64-linux-gnu/libpam_wrapper.so'
+ (pam/'tuna-lock').write_text(f'auth required {matrix} passdb={passdb}\naccount required {matrix} passdb={passdb}\n')
+ manifest['pam_fixture']={'wrapper_sha256':sha(wrapper),'matrix_sha256':sha(matrix)}
+ launcher=spawn(['/usr/libexec/at-spi-bus-launcher','--launch-immediately'],'atspi')
+ address=wait(lambda:call(session,'org.a11y.Bus','/org/a11y/bus','org.a11y.Bus','GetAddress',flags=Gio.DBusCallFlags.NO_AUTO_START)[0],'private-a11y')
+ assert str(runtime) in address
+ env['AT_SPI_BUS_ADDRESS']=address
+ os.environ['AT_SPI_BUS_ADDRESS']=address
+ os.environ['XDG_RUNTIME_DIR']=str(runtime)
+ accessibility=Gio.DBusConnection.new_for_address_sync(address,Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT|Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,None,None)
+ assert not Path('/tmp/.X11-unix/X'+a.display.lstrip(':')).exists()
+ spawn(['Xvfb',a.display,'-screen','0','1280x800x24'],'xvfb')
+ wait(lambda:subprocess.run(['xdotool','getdisplaygeometry'],env=env,capture_output=True).returncode==0,'private-display')
+ call(accessibility,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','UpdateActivationEnvironment',GLib.Variant('(a{ss})',({'AT_SPI_BUS_ADDRESS':address,'XDG_RUNTIME_DIR':str(runtime)},)))
+ call(accessibility,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','StartServiceByName',GLib.Variant('(su)',('org.a11y.atspi.Registry',0)))
+ for name in ('org.freedesktop.DBus','org.a11y.atspi.Registry'):
+  pid=call(accessibility,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','GetConnectionUnixProcessID',GLib.Variant('(s)',(name,)))[0]
+  owned.append((name,pid,os.pidfd_open(pid)))
+ manifest['session_isolation']=dict(runtime=str(runtime),mode=oct(runtime.stat().st_mode&0o777),session_bus=env.get('DBUS_SESSION_BUS_ADDRESS'),accessibility_bus=address,owned_services=[dict(name=n,pid=pid) for n,pid,_ in owned])
+ setpref(MASTER,'show-banners','true'); setpref(MASTER,'show-in-lock-screen','true')
+ for app in ('Alpha','Beta'):
+  for key in ('enable','show-banners','show-in-lock-screen'): setpref(app_schema(app),key,'true')
+  setpref(app_schema(app),'details-in-lock-screen','false')
+ comp=spawn([str(a.bin_dir.resolve()/'tuna-compositor'),'--backend','winit','--socket','notification-proof','--shell-bin',str(a.bin_dir.resolve()/'tuna-shell-gtk')],'compositor',dict(LD_PRELOAD=wrapper,PAM_WRAPPER='1',PAM_WRAPPER_SERVICE_DIR=str(pam)))
+ wait(lambda:any(l['namespace']=='tuna-panel' for l in snapshot()['layers']),'shell-ready')
+ wid=wait(lambda:subprocess.check_output(['xdotool','search','--pid',str(comp.pid),'--name','Smithay'],env=env,text=True).strip().splitlines()[0],'host-window')
+ subprocess.run(['xdotool','windowfocus',wid],env=env,check=True)
+ setpref(app_schema('Alpha'),'show-banners','false')
+ for i in range(5): notify('Alpha','HIDDEN_NORMAL_'+str(i))
+ control=notify('Beta','VISIBLE_CONTROL')
+ wait(lambda:has('VISIBLE_CONTROL') and absent('HIDDEN_NORMAL_'),'hidden-admission-does-not-starve')
+ assert subprocess.check_output(['gsettings','get',app_schema('Beta'),'application-id'],env=env,text=True).strip()=="'org.tuna.NotifyBeta.desktop'"
+ assert 'org-tuna-notifybeta' in subprocess.check_output(['gsettings','get',MASTER,'application-children'],env=env,text=True)
+ assertions.append('canonical-source-metadata-registered')
+ shot('01-admission'); close(control)
+ longbody='PRIVATE_EXPAND '+('A deliberately long body to verify the actual expanded banner layout. '*12)
+ expanded=notify('Beta','EXPANSION_CONTROL',body=longbody)
+ wait(lambda:has(longbody),'collapsed-banner-present')
+ collapsed_height=height(longbody)
+ setpref(app_schema('Beta'),'force-expanded','true')
+ wait(lambda:height(longbody)>collapsed_height,'live-force-expanded-real-layout')
+ shot('01b-expanded'); close(expanded)
+ setpref(app_schema('Beta'),'force-expanded','false')
+ critical=notify('Alpha','CRITICAL_EXCEPTION',True)
+ wait(lambda:has('CRITICAL_EXCEPTION'),'critical-bypasses-banner-toggle')
+ setpref(app_schema('Alpha'),'enable','false')
+ wait(lambda:absent('CRITICAL_EXCEPTION'),'live-disable-removes-critical')
+ notify('Alpha','DISABLED_CRITICAL',True)
+ wait(lambda:absent('DISABLED_CRITICAL'),'disabled-critical-denied')
+ setpref(app_schema('Alpha'),'enable','true')
+ setpref(MASTER,'show-banners','false')
+ held=notify('Beta','MASTER_CRITICAL',True)
+ wait(lambda:has('MASTER_CRITICAL'),'master-critical-exception'); close(held)
+ lock()
+ setpref(MASTER,'show-banners','true')
+ normal=notify('Beta','LOCKED_NORMAL')
+ queue_file=art/'state/tuna-shell/notifications.json'
+ wait(lambda:normal in json.loads(queue_file.read_text())['banners'],'normal-admitted-behind-lock')
+ wait(lambda:has('TunaPolicyBeta') and absent('LOCKED_NORMAL'),'normal-lock-redacted')
+ frames_before=snapshot()['rendered_frames']
+ held_at=time.monotonic()
+ time.sleep(6)
+ manifest['locked_hold_frames']=dict(elapsed_seconds=time.monotonic()-held_at,rendered_frames=snapshot()['rendered_frames']-frames_before,paired_benchmark=False)
+ stored=json.loads(queue_file.read_text())
+ assert normal in stored['banners'] and not next(n for n in stored['notifications'] if n['id']==normal)['acknowledged']
+ wait(lambda:has('TunaPolicyBeta'),'unseen-normal-survives-banner-timeout')
+ setpref(MASTER,'show-banners','false')
+ secret=notify('Alpha','SECRET_LOCK_TITLE',True)
+ second=notify('Alpha','SECRET_SECOND',True)
+ wait(lambda:has('TunaPolicyAlpha') and absent('SECRET_LOCK_TITLE') and absent('PRIVATE_BODY_'),'redacted-lock-critical')
+ assert absent('Open'), 'app action exposed while locked'
+ assertions.append('lock-widgets-have-no-app-actions')
+ shot('02-redacted-lock')
+ setpref(app_schema('Alpha'),'details-in-lock-screen','true')
+ wait(lambda:has('SECRET_LOCK_TITLE') and has('PRIVATE_BODY_SECRET_LOCK_TITLE'),'live-lock-details-positive-control')
+ shot('03-detailed-lock')
+ subprocess.run(['xdotool','windowsize',wid,'1280','480'],env=env,check=True)
+ subprocess.run(['xdotool','key','space'],env=env,check=True); time.sleep(.3)
+ subprocess.run(['xdotool','type','--clearmodifiers','wrong-proof-password'],env=env,check=True)
+ subprocess.run(['xdotool','key','Return'],env=env,check=True)
+ failed="Sorry, that didn't work. Please try again."
+ wait(lambda:has(failed),'short-output-auth-error')
+ time.sleep(.5)
+ auth=[r for r in bounds(failed) if r[3]>0 and r[1]>=0]
+ assert auth, 'authentication error not allocated'
+ bottom=max(r[1]+r[3] for r in auth)
+ for rect in bounds('Lock Screen Notifications'):
+  if rect[3]>0 and rect[1]>=0:
+   assert rect[1]>=bottom and rect[1]+rect[3]<=480, 'notification viewport overlaps authentication'
+ assertions.append('short-output-notification-viewport-keeps-auth-clear')
+ shot('03b-short-auth-error')
+ subprocess.run(['xdotool','windowsize',wid,'1280','800'],env=env,check=True)
+ wait(lambda:has('SECRET_LOCK_TITLE'),'large-output-details-restored')
+ setpref(app_schema('Alpha'),'details-in-lock-screen','false')
+ wait(lambda:absent('SECRET_LOCK_TITLE') and absent('PRIVATE_BODY_'),'live-details-redaction')
+ setpref(app_schema('Alpha'),'show-in-lock-screen','false')
+ wait(lambda:absent('TunaPolicyAlpha'),'app-lock-hidden')
+ setpref(app_schema('Alpha'),'show-in-lock-screen','true')
+ notify(None,'UNKNOWN_SECRET',True)
+ wait(lambda:has('TunaPolicyUnknown') and absent('UNKNOWN_SECRET'),'generic-lock-redacted')
+ # A retained generic identity becomes governed by its installed app policy.
+ notify('Gamma','INSTALL_SECRET',True)
+ wait(lambda:has('TunaPolicyGamma') and absent('INSTALL_SECRET'),'unknown-app-generic-policy')
+ setpref(app_schema('Gamma'),'enable','false')
+ (folder/'org.tuna.NotifyGamma.desktop').write_text('[Desktop Entry]\nType=Application\nName=TunaPolicyGamma\nExec=/usr/bin/true\n')
+ wait(lambda:absent('TunaPolicyGamma'),'installed-app-monitor-policy-transition')
+ setpref(MASTER,'show-in-lock-screen','false')
+ wait(lambda:absent('TunaPolicyAlpha') and absent('TunaPolicyUnknown'),'master-lock-hidden')
+ setpref(MASTER,'show-in-lock-screen','true')
+ wait(lambda:has('TunaPolicyAlpha'),'master-lock-restored')
+ shot('04-restored-redacted-lock')
+ unlock()
+ wait(lambda:has('SECRET_SECOND'),'unlocked-content-restored')
+ shot('05-unlocked')
+ # Restart the actual supervised shell. The same settings and persisted history survive.
+ children=Path(f'/proc/{comp.pid}/task/{comp.pid}/children').read_text().split()
+ child=next(int(pid) for pid in children if Path(f'/proc/{pid}/exe').resolve()==(a.bin_dir.resolve()/'tuna-shell-gtk'))
+ fd=os.pidfd_open(child); signal.pidfd_send_signal(fd,signal.SIGTERM); os.close(fd)
+ wait(lambda:child not in [int(x) for x in Path(f'/proc/{comp.pid}/task/{comp.pid}/children').read_text().split()],'old-shell-exited')
+ wait(lambda:any(l['namespace']=='tuna-panel' for l in snapshot()['layers']),'restarted-shell-ready')
+ time.sleep(1)
+ lock(); notify('Alpha','RESTART_SECRET',True)
+ wait(lambda:has('TunaPolicyAlpha') and absent('RESTART_SECRET') and absent('PRIVATE_BODY_'),'restart-policy-and-privacy-persist')
+ shot('06-restart-redacted'); unlock()
+ assert comp.poll() is None
+ success=True
+finally:
+ for proc in reversed(processes):
+  if proc.poll() is None:
+   os.killpg(proc.pid,signal.SIGTERM)
+   try: proc.wait(timeout=5)
+   except subprocess.TimeoutExpired: os.killpg(proc.pid,signal.SIGKILL); proc.wait()
+ stopped=True
+ for name,pid,fd in reversed(owned):
+  poll=select.poll(); poll.register(fd,select.POLLIN)
+  if not poll.poll(0): signal.pidfd_send_signal(fd,signal.SIGTERM)
+  if not poll.poll(3000): signal.pidfd_send_signal(fd,signal.SIGKILL)
+  stopped=stopped and bool(poll.poll(3000)); os.close(fd)
+ for log in logs: log.close()
+ if runtime_created: shutil.rmtree(runtime)
+ manifest['cleanup']=dict(owned_accessibility_exit_verified=stopped,runtime_removed=not runtime.exists())
+ manifest['assertions']=assertions; manifest['passed']=success and stopped
+ (art/'manifest.json').write_text(json.dumps(manifest,indent=2))
+ assert stopped and not runtime.exists(), 'private session cleanup failed'
+print('PASS: notification policy/privacy local runtime' if success else 'FAIL')

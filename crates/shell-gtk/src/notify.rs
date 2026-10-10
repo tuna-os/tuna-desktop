@@ -20,7 +20,10 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::intake::NotificationBus;
-use tuna_shell_host::notifications::{Notification, NotificationCenter, Urgency};
+use tuna_shell_host::notification_policy::PolicyReader;
+use tuna_shell_host::notifications::{
+    LockNotificationGroup, Notification, NotificationCenter, NotificationSource, Urgency,
+};
 
 /// How long a normal or low banner stays up (GNOME: about 4 s).
 pub const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
@@ -153,11 +156,15 @@ struct Shown {
     history: Vec<u64>,
     expanded: Vec<String>,
     dnd: bool,
+    locked: bool,
+    revision: u64,
+    policy_generation: u64,
 }
 
 /// Notification surfaces and their store.
 pub struct NotifyUi {
     center: Arc<Mutex<NotificationCenter>>,
+    policies: RefCell<PolicyReader>,
     bus: RefCell<NotificationBus>,
     banner_window: gtk::ApplicationWindow,
     banner_box: gtk::Box,
@@ -183,6 +190,10 @@ pub struct NotifyUi {
 /// and close button, then the title and body. Returns the card and its
 /// close button.
 fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
+    card_with_expansion(n, true)
+}
+
+fn card_with_expansion(n: &Notification, expanded: bool) -> (gtk::Box, gtk::Button) {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("message");
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -227,7 +238,13 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
         let body = gtk::Label::new(Some(n.body()));
         body.add_css_class("message-body");
         body.set_xalign(0.0);
-        body.set_wrap(true);
+        body.set_wrap(expanded);
+        body.set_lines(if expanded { -1 } else { 1 });
+        body.set_ellipsize(if expanded {
+            gtk::pango::EllipsizeMode::None
+        } else {
+            gtk::pango::EllipsizeMode::End
+        });
         body.set_max_width_chars(48);
         content.append(&body);
     }
@@ -346,6 +363,7 @@ impl NotifyUi {
 
         let ui = Rc::new(Self {
             center,
+            policies: RefCell::new(PolicyReader::new()),
             bus: RefCell::new(bus),
             banner_window,
             banner_box,
@@ -372,6 +390,17 @@ impl NotifyUi {
                 me.refresh();
             });
         }
+        {
+            let weak = Rc::downgrade(&ui);
+            ui.policies.borrow_mut().on_changed(Rc::new(move || {
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.refresh();
+                    }
+                });
+            }));
+        }
         ui.refresh();
         ui
     }
@@ -380,10 +409,51 @@ impl NotifyUi {
     /// icon (screenshots: "Screenshot", `screenshot-recorded-symbolic`).
     pub fn post(self: &Rc<Self>, app: &str, icon: &str, summary: &str, body: &str) {
         if let Ok(mut center) = self.center.lock() {
-            let id = center.notify(app, summary, body, Vec::new(), Urgency::Normal, None);
-            center.set_source(id, icon, "");
+            let policy = self.policies.borrow_mut().read("", false);
+            center.notify_with_source(
+                app,
+                summary,
+                body,
+                Vec::new(),
+                Urgency::Normal,
+                None,
+                NotificationSource {
+                    icon: icon.to_owned(),
+                    desktop_entry: String::new(),
+                    policy,
+                },
+            );
         }
         self.refresh();
+    }
+
+    /// Hide and retire unlocked message widgets before lock surfaces are mapped.
+    pub fn set_locked(self: &Rc<Self>, locked: bool) {
+        if let Ok(mut center) = self.center.lock() {
+            if center.locked() == locked {
+                return;
+            }
+            center.set_locked(locked);
+        }
+        if locked {
+            self.release_focus();
+        }
+        // Time only banners that can actually be shown. Unlock starts a fresh
+        // display interval rather than expiring unseen lock-screen messages.
+        self.first_seen.borrow_mut().clear();
+        self.refresh();
+    }
+    pub fn lock_notifications(&self) -> Vec<LockNotificationGroup> {
+        self.center
+            .lock()
+            .map(|c| {
+                if c.locked() {
+                    c.lock_notifications()
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default()
     }
 
     /// The calendar popover's notification pane.
@@ -440,8 +510,11 @@ impl NotifyUi {
             };
             let mut seen = self.first_seen.borrow_mut();
             let now = Instant::now();
-            let live: Vec<(u64, Urgency)> =
-                center.banners().iter().map(|n| (n.id, n.urgency)).collect();
+            let live: Vec<(u64, Urgency)> = if center.locked() {
+                Vec::new()
+            } else {
+                center.banners().iter().map(|n| (n.id, n.urgency)).collect()
+            };
             seen.retain(|id, _| live.iter().any(|(l, _)| l == id));
             let timed: Vec<u64> = live
                 .iter()
@@ -466,10 +539,17 @@ impl NotifyUi {
     }
 
     fn refresh(self: &Rc<Self>) {
-        let Ok(center) = self.center.lock() else {
+        let Ok(mut center) = self.center.lock() else {
             return;
         };
-        let groups = group_ids(center.history().iter().rev().map(|n| (n.id, group_key(n))));
+        center.refresh_policies(&mut self.policies.borrow_mut());
+        let locked = center.locked();
+        let history = if locked {
+            Vec::new()
+        } else {
+            center.visible_history()
+        };
+        let groups = group_ids(history.iter().rev().map(|n| (n.id, group_key(n))));
         // A group that falls back to one card (or goes) forgets it was
         // expanded.
         self.expanded
@@ -478,10 +558,17 @@ impl NotifyUi {
         let mut expanded: Vec<String> = self.expanded.borrow().iter().cloned().collect();
         expanded.sort();
         let now = Shown {
-            banners: center.banners().iter().map(|n| n.id).collect(),
-            history: center.history().iter().rev().map(|n| n.id).collect(),
+            banners: if locked {
+                Vec::new()
+            } else {
+                center.banners().iter().map(|n| n.id).collect()
+            },
+            history: history.iter().rev().map(|n| n.id).collect(),
             expanded,
             dnd: center.dnd(),
+            locked,
+            revision: center.revision(),
+            policy_generation: center.policy_generation(),
         };
         if *self.shown.borrow() == now {
             return;
@@ -490,8 +577,27 @@ impl NotifyUi {
         while let Some(child) = self.banner_box.first_child() {
             self.banner_box.remove(&child);
         }
-        for n in center.banners() {
-            let (c, close) = card(n);
+        let banners = if locked { Vec::new() } else { center.banners() };
+        for n in banners {
+            let expanded = n.expanded
+                || center.policy_for(n.desktop_entry()).force_expanded
+                || n.urgency == Urgency::Critical;
+            let (c, close) = card_with_expansion(n, expanded);
+            let motion = gtk::EventControllerMotion::new();
+            if !expanded {
+                let (weak, id) = (Rc::downgrade(self), n.id);
+                motion.connect_enter(move |_, _, _| {
+                    if let Some(ui) = weak.upgrade() {
+                        if let Ok(mut center) = ui.center.lock() {
+                            if !center.locked() {
+                                let _ = center.expand(id, true);
+                            }
+                        }
+                        ui.refresh();
+                    }
+                });
+            }
+            c.add_controller(motion);
             c.add_css_class("banner");
             let has_default = n.actions().iter().any(|a| a.id == "default");
             if n.actions().iter().any(|a| a.id != "default") {
@@ -541,8 +647,7 @@ impl NotifyUi {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
-        let by_id: HashMap<u64, &Notification> =
-            center.history().iter().map(|n| (n.id, n)).collect();
+        let by_id: HashMap<u64, &Notification> = history.iter().map(|n| (n.id, *n)).collect();
         for (key, ids) in &groups {
             let members: Vec<&Notification> =
                 ids.iter().filter_map(|id| by_id.get(id).copied()).collect();
@@ -575,6 +680,13 @@ impl NotifyUi {
         self.empty.set_visible(!any);
         self.clear.set_visible(!self.clear_bound.get() || any);
         self.clear.set_sensitive(any);
+        // Shown banners become acknowledged, as in GNOME's message tray.
+        // Locked arrivals stay unseen until unlock displays their banner.
+        let acknowledged = now.banners.clone();
+        drop(history);
+        for id in acknowledged {
+            center.acknowledge(id);
+        }
         drop(center);
         *self.shown.borrow_mut() = now;
     }

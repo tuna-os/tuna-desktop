@@ -18,7 +18,10 @@ use std::sync::{Arc, Mutex};
 
 use zbus::object_server::SignalEmitter;
 
-use crate::notifications::{NotificationAction, NotificationCenter, NotificationError, Urgency};
+use crate::notification_policy::PolicyReader;
+use crate::notifications::{
+    NotificationAction, NotificationCenter, NotificationError, NotificationSource, Urgency,
+};
 
 /// Well-known notifications name (freedesktop Desktop Notifications).
 pub const NOTIFICATIONS_NAME: &str = "org.freedesktop.Notifications";
@@ -85,19 +88,39 @@ impl Notifications {
             .get("desktop-entry")
             .and_then(|v| String::try_from(v.clone()).ok())
             .unwrap_or_default();
+        let source_id = {
+            let Ok(center) = self.center.lock() else {
+                return 0;
+            };
+            replaces
+                .and_then(|id| center.history().iter().find(|n| n.id == id))
+                .map(|n| n.desktop_entry().to_owned())
+                .unwrap_or_else(|| {
+                    desktop_entry
+                        .strip_suffix(".desktop")
+                        .unwrap_or(&desktop_entry)
+                        .to_owned()
+                })
+        };
+        // Desktop/settings I/O must not hold the queue mutex GTK uses to draw.
+        // The store rechecks replacement identity under the admission lock.
+        let policy = PolicyReader::new().read(&source_id, true);
         self.center
             .lock()
             .map(|mut center| {
-                let id = center.notify(
+                center.notify_with_source(
                     &app_name,
                     &summary,
                     &body,
                     pair_actions(&actions),
                     urgency_hint(&hints),
                     replaces,
-                );
-                center.set_source(id, &app_icon, &desktop_entry);
-                id
+                    NotificationSource {
+                        icon: app_icon.clone(),
+                        desktop_entry: source_id,
+                        policy,
+                    },
+                )
             })
             .unwrap_or(0) as u32
     }
@@ -345,6 +368,28 @@ mod tests {
         use super::super::{NotificationBus, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH};
         use crate::notifications::{NotificationCenter, NotificationError};
 
+        // GLib caches its default backend process-wide. Isolate each live wire
+        // fixture before any Settings object exists, rather than modifying the
+        // developer's preferences or changing process environment in parallel.
+        fn isolated_settings_fixture(name: &str) -> bool {
+            if std::env::var_os("TUNA_NOTIFICATION_SETTINGS_FIXTURE").is_some() {
+                return false;
+            }
+            let result =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        &format!("intake::tests::live_bus::{name}"),
+                        "--nocapture",
+                    ])
+                    .env("GSETTINGS_BACKEND", "memory")
+                    .env("TUNA_NOTIFICATION_SETTINGS_FIXTURE", "1")
+                    .status()
+                    .expect("isolated notification fixture starts");
+            assert!(result.success(), "isolated notification fixture passes");
+            true
+        }
+
         /// Private bus daemon plus its address, or `None` when no
         /// daemon is usable (the caller skips the test).
         fn private_bus() -> Option<(String, std::process::Child)> {
@@ -459,6 +504,11 @@ mod tests {
 
         #[test]
         fn stub_notify_shows_a_banner_and_close_notification_dismisses_it() {
+            if isolated_settings_fixture(
+                "stub_notify_shows_a_banner_and_close_notification_dismisses_it",
+            ) {
+                return;
+            }
             let Some((address, mut daemon)) = private_bus() else {
                 eprintln!("SKIP live notification test: no usable dbus-daemon on PATH");
                 return;
@@ -519,6 +569,11 @@ mod tests {
 
         #[test]
         fn default_action_press_fires_the_stub_callback_exactly_once() {
+            if isolated_settings_fixture(
+                "default_action_press_fires_the_stub_callback_exactly_once",
+            ) {
+                return;
+            }
             let Some((address, mut daemon)) = private_bus() else {
                 eprintln!("SKIP live notification test: no usable dbus-daemon on PATH");
                 return;
@@ -569,6 +624,9 @@ mod tests {
 
         #[test]
         fn close_press_tells_the_stub_its_notification_closed() {
+            if isolated_settings_fixture("close_press_tells_the_stub_its_notification_closed") {
+                return;
+            }
             let Some((address, mut daemon)) = private_bus() else {
                 eprintln!("SKIP live notification test: no usable dbus-daemon on PATH");
                 return;

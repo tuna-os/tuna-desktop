@@ -2143,9 +2143,8 @@ fn build(app: &adw::Application) {
                 .as_ref()
                 .is_some_and(|c| c.model().is_overview_open());
             drop(shell);
-            if locked {
-                notify.release_focus();
-            }
+            notify.set_locked(locked);
+            lock_ui.sync_notifications(notify.lock_notifications());
             lock_ui.sync(locked);
             screensaver.sync(locked);
             if locked {

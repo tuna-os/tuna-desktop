@@ -1597,3 +1597,14 @@ window.tuna-ibus-candidates button.candidate-page-button-previous {
 window.tuna-ibus-candidates button.candidate-page-button-next {
   border-radius: 0 8px 8px 0;
 }
+
+/* Lock messages contain only the policy-approved projection. */
+.unlock-dialog-notification-source {
+  background-color: rgba(30, 30, 34, 0.88);
+  color: #ffffff;
+  padding: 12px;
+  border-radius: 12px;
+}
+.unlock-dialog-notification-source.critical { border: 1px solid #ffbe6f; }
+.unlock-dialog-notification-label { font-weight: bold; }
+.unlock-dialog-notification-count-text { color: #dddddd; }

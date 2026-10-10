@@ -17,6 +17,7 @@ gtk4-layer-shell.workspace = true
 gtk4-session-lock.workspace = true
 glib.workspace = true
 gio.workspace = true
+gio-unix.workspace = true
 jiff.workspace = true
 libc = "0.2"
 serde_json.workspace = true
