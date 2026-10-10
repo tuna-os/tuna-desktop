@@ -160,7 +160,7 @@ impl ProtocolVersion {
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
     /// `0.30` appends live sound/bell and attached-modal brightness preferences.
-    /// `0.31` appends workspace and edge-tiling preferences.
+    /// `0.31` appends workspace/edge-tiling preferences and trusted dash icon targets.
     /// `0.32` appends cursor theme, size and locate-pointer preferences.
     /// `0.33` appends the configurable locate-pointer keysym name.
     pub const CURRENT: Self = Self {
@@ -388,7 +388,20 @@ pub enum CommandKind {
     /// local to the mapped exclusive screenshot overlay in logical pixels,
     /// never global input.
     MoveScreenshotPointer { x: i32, y: i32 },
+    /// Trusted shell dash icon bounds in global logical coordinates. Full replacement.
+    SetWindowIconGeometries { geometries: Vec<WindowIconGeometry> },
 }
+
+/// A running window's dash icon target; empty replacement selects monitor fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowIconGeometry {
+    pub window: u64,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+pub const MAX_WINDOW_ICON_GEOMETRIES: usize = 256;
 
 /// Screen Reader process lifecycle, not proof of spoken usability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1232,6 +1245,23 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             check_title(&settings.locate_pointer_key)?;
         }
         Message::Command {
+            kind: CommandKind::SetWindowIconGeometries { geometries },
+            ..
+        } if geometries.len() > MAX_WINDOW_ICON_GEOMETRIES
+            || geometries.iter().any(|g| {
+                g.width <= 0
+                    || g.height <= 0
+                    || g.width > 16384
+                    || g.height > 16384
+                    || g.x.checked_add(g.width).is_none()
+                    || g.y.checked_add(g.height).is_none()
+            }) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
+        Message::Command {
             kind: CommandKind::SetSwitcherThumbnails { thumbnails },
             ..
         } if thumbnails.len() > MAX_SWITCHER_THUMBNAILS => {
@@ -1451,6 +1481,37 @@ mod tests {
             decode_frame(&frame),
             Err(DecodeError::TitleTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn dash_icon_targets_roundtrip_and_reject_oversize_invalid_bounds() {
+        let icon = WindowIconGeometry {
+            window: 4,
+            x: -900,
+            y: 700,
+            width: 64,
+            height: 64,
+        };
+        roundtrip(&Message::Command {
+            id: 77,
+            kind: CommandKind::SetWindowIconGeometries {
+                geometries: vec![icon],
+            },
+        });
+        for geometries in [
+            vec![icon; MAX_WINDOW_ICON_GEOMETRIES + 1],
+            vec![WindowIconGeometry { width: 0, ..icon }],
+            vec![WindowIconGeometry {
+                x: i32::MAX,
+                ..icon
+            }],
+        ] {
+            let bytes = encode_frame(&Message::Command {
+                id: 77,
+                kind: CommandKind::SetWindowIconGeometries { geometries },
+            });
+            assert!(decode_frame(&bytes).is_err());
+        }
     }
 
     #[test]

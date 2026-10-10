@@ -3542,6 +3542,19 @@ impl Runtime {
         if let Some(active) = outcome.overview_app_grid {
             self.overview_app_grid = active;
         }
+        if let Some(geometries) = outcome.icon_geometries {
+            self.manager.set_icon_geometries(
+                geometries
+                    .into_iter()
+                    .map(|g| {
+                        (
+                            g.window,
+                            Rectangle::new((g.x, g.y).into(), (g.width, g.height).into()),
+                        )
+                    })
+                    .collect(),
+            );
+        }
         if let Some(settings) = outcome.input_settings {
             self.apply_input_settings(settings);
         }
@@ -3906,6 +3919,7 @@ impl Runtime {
             now,
             self.input_settings.motion,
             allowed,
+            self.input_settings.right_to_left,
         );
         let overview = (show_content && !overlay_visible && drawn).then(|| self.overview_layout());
         // While search shows results, the workspace view steps aside.
@@ -4918,6 +4932,23 @@ fn scene_elements(
                         |element| (elements.len(), element, manager.modal_dim().multiplier(id)),
                     ),
                 );
+                owners.resize(elements.len(), Some(id));
+                continue;
+            }
+            if let Some((r, fade)) = manager
+                .window_lifecycle()
+                .restoring_frame(id, geometry.to_f64())
+            {
+                let geo = crate::popup::window_geometry_loc(&surface);
+                let scale = (
+                    r.size.w / f64::from(geometry.size.w),
+                    r.size.h / f64::from(geometry.size.h),
+                );
+                let origin = view.physical(
+                    r.loc.x - f64::from(geo.x) * scale.0,
+                    r.loc.y - f64::from(geo.y) * scale.1,
+                );
+                elements.extend(render_elements_from_surface_tree::<_,WaylandSurfaceRenderElement<_>>(renderer,&surface,origin,view.scale,fade*manager.render_alpha(&window),Kind::Unspecified).into_iter().map(|e|smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e,origin,scale)));
                 owners.resize(elements.len(), Some(id));
                 continue;
             }

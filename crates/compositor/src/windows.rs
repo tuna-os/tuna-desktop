@@ -320,6 +320,7 @@ pub struct WindowManager {
     workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
     workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
     modal_dim: crate::modal_dim::ModalDim,
+    icon_geometries: HashMap<u64, Rectangle<i32, Logical>>,
 }
 
 impl WindowManager {
@@ -450,6 +451,7 @@ impl WindowManager {
             workspace_outputs: Vec::new(),
             workspace_tracker: Default::default(),
             modal_dim: Default::default(),
+            icon_geometries: Default::default(),
         }
     }
 
@@ -737,6 +739,17 @@ impl WindowManager {
                 _ => None,
             },
         }
+    }
+
+    pub fn icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
+        self.icon_geometries.get(&id).copied()
+    }
+    /// Replace trusted shell-published global logical dash icon bounds.
+    pub fn set_icon_geometries(&mut self, geometries: Vec<(u64, Rectangle<i32, Logical>)>) {
+        self.icon_geometries = geometries
+            .into_iter()
+            .filter(|(id, r)| self.windows.contains_key(id) && r.size.w > 0 && r.size.h > 0)
+            .collect();
     }
 
     pub fn modal_dim(&self) -> &crate::modal_dim::ModalDim {

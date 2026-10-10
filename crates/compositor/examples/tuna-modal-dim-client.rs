@@ -98,7 +98,14 @@ wayland_client::delegate_noop!(Peer: ignore xdg_dialog_v1::XdgDialogV1);
 impl Peer {
     fn create(&mut self, q: &QueueHandle<Self>, index: usize, modal: bool) {
         let parent = index == 0;
-        let (width, height) = if parent { (500, 350) } else { (220, 100) };
+        let fullscreen = parent && std::env::var_os("TUNA_PROOF_FULLSCREEN").is_some();
+        let (width, height) = if fullscreen {
+            (1280, 800)
+        } else if parent {
+            (500, 350)
+        } else {
+            (220, 100)
+        };
         let mut file = tempfile::tempfile().unwrap();
         let mut bytes = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height {
@@ -135,6 +142,9 @@ impl Peer {
         let top = xdg.get_toplevel(q, ());
         top.set_app_id("tuna-modal-dim-proof".into());
         top.set_title(format!("Modal dim {index}"));
+        if fullscreen {
+            top.set_fullscreen(None);
+        }
         if !parent {
             top.set_parent(Some(&self.windows[0].as_ref().unwrap().top));
         }
@@ -196,6 +206,11 @@ fn main() {
                 if next != generation {
                     generation = next;
                     match value["action"].as_str().unwrap_or("") {
+                        "minimize" => peer.windows[0].as_ref().unwrap().top.set_minimized(),
+                        "new" => {
+                            peer.close(0);
+                            peer.create(&q, 0, false);
+                        }
                         "dialog" => peer.create(&q, 1, true),
                         "second-dialog" => peer.create(&q, 2, true),
                         "nonmodal" => peer.create(&q, 1, false),

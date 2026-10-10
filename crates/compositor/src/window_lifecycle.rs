@@ -145,6 +145,7 @@ fn retire<T>(items: &mut Vec<T>, expired: impl Fn(&T) -> bool) -> Vec<T> {
 }
 struct Cached {
     geometry: Rect,
+    presentation: RectF,
     scale: f64,
     kind: Kind,
     parent: Option<u64>,
@@ -152,6 +153,12 @@ struct Cached {
     brightness: f32,
     order: usize,
     elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+}
+#[derive(Clone, Copy)]
+struct MinRun {
+    start: Duration,
+    icon: RectF,
+    monitor_sized: bool,
 }
 struct Running {
     kind: Kind,
@@ -162,10 +169,11 @@ pub struct Ghost {
     pub before: Option<u64>,
     order: usize,
     parent: Option<u64>,
-    geometry: Rect,
+    geometry: RectF,
     snapshot: Snapshot,
     pixels: u64,
     running: Running,
+    minimizing: Option<MinRun>,
 }
 #[derive(Default)]
 pub struct Lifecycle {
@@ -173,6 +181,8 @@ pub struct Lifecycle {
     cache: HashMap<u64, Cached>,
     stack: Vec<u64>,
     opening: HashMap<u64, Running>,
+    minimized: HashSet<u64>,
+    restoring: HashMap<u64, MinRun>,
     ghosts: Vec<Ghost>,
     history: VecDeque<serde_json::Value>,
     now: Duration,
@@ -181,13 +191,14 @@ pub struct Lifecycle {
 impl Lifecycle {
     fn suspend(&mut self, ids: HashSet<u64>) {
         self.opening.clear();
+        self.restoring.clear();
         self.ghosts.clear();
         self.cache.clear();
         self.stack.clear();
         self.known = ids;
     }
     pub fn running(&self) -> bool {
-        !self.opening.is_empty() || !self.ghosts.is_empty()
+        !self.opening.is_empty() || !self.ghosts.is_empty() || !self.restoring.is_empty()
     }
 
     pub fn opening_frame(&self, id: u64) -> Option<Frame> {
@@ -202,6 +213,25 @@ impl Lifecycle {
                 1.0
             },
             self.policy,
+        ))
+    }
+    pub fn restoring_frame(&self, id: u64, normal: RectF) -> Option<(RectF, f32)> {
+        let run = self.restoring.get(&id)?;
+        let d = crate::minimize::duration(self.policy).as_secs_f64();
+        let progress = if d > 0.0 {
+            self.now.saturating_sub(run.start).as_secs_f64() / d
+        } else {
+            1.0
+        };
+        let f = crate::minimize::frame(
+            crate::minimize::Effect::Unminimize,
+            progress,
+            self.policy,
+            run.monitor_sized,
+        );
+        Some((
+            crate::minimize::geometry(normal, run.icon, f.icon_weight),
+            f.alpha,
         ))
     }
     pub fn ghosts(&self) -> impl Iterator<Item = &Ghost> {
@@ -231,7 +261,26 @@ impl Lifecycle {
         >,
     > {
         let f = self.destroy_frame(ghost);
-        let geometry = rect(ghost.geometry, f);
+        let (geometry, alpha) = if let Some(run) = ghost.minimizing {
+            let d = crate::minimize::duration(self.policy).as_secs_f64();
+            let progress = if d > 0.0 {
+                self.now.saturating_sub(run.start).as_secs_f64() / d
+            } else {
+                1.0
+            };
+            let f = crate::minimize::frame(
+                crate::minimize::Effect::Minimize,
+                progress,
+                self.policy,
+                run.monitor_sized,
+            );
+            (
+                crate::minimize::geometry(ghost.geometry, run.icon, f.icon_weight),
+                f.alpha,
+            )
+        } else {
+            (rect(ghost.geometry.to_i32_round(), f), f.alpha)
+        };
         crate::size_change::snapshot_element(
             renderer,
             &ghost.snapshot,
@@ -240,13 +289,13 @@ impl Lifecycle {
                 live_scale: f.scale,
                 live_visible: false,
                 snapshot: geometry,
-                snapshot_alpha: f.alpha,
+                snapshot_alpha: alpha,
             },
             view,
         )
     }
     fn record(&mut self, id: u64, effect: &str, kind: Kind, outcome: &str) {
-        self.history.push_back(serde_json::json!({"window":id,"effect":effect,"kind":format!("{kind:?}"),"outcome":outcome,"at_ms":self.now.as_millis(),"duration_ms":duration(kind,self.policy).as_millis()}));
+        self.history.push_back(serde_json::json!({"window":id,"effect":effect,"kind":format!("{kind:?}"),"outcome":outcome,"at_ms":self.now.as_millis(),"duration_ms":if effect=="minimize" || effect=="unminimize" {crate::minimize::duration(self.policy).as_millis()} else {duration(kind,self.policy).as_millis()}}));
         while self.history.len() > 32 {
             self.history.pop_front();
         }
@@ -272,6 +321,7 @@ impl Lifecycle {
         let destroying: Vec<_> = self
             .ghosts
             .iter()
+            .filter(|g| g.minimizing.is_none())
             .map(|g| {
                 serde_json::json!({
                     "window": g.id, "kind": format!("{:?}",g.running.kind),
@@ -281,11 +331,18 @@ impl Lifecycle {
                 })
             })
             .collect();
+        let minimizing:Vec<_>=self.ghosts.iter().filter_map(|g|g.minimizing.map(|r| {
+            let progress=self.now.saturating_sub(r.start).as_secs_f64()/crate::minimize::duration(self.policy).as_secs_f64();
+            let f=crate::minimize::frame(crate::minimize::Effect::Minimize,progress,self.policy,r.monitor_sized);
+            let rect=crate::minimize::geometry(g.geometry,r.icon,f.icon_weight);
+            serde_json::json!({"window":g.id,"icon":[r.icon.loc.x,r.icon.loc.y,r.icon.size.w,r.icon.size.h],"rect":[rect.loc.x,rect.loc.y,rect.size.w,rect.size.h],"alpha":f.alpha,"monitor_sized":r.monitor_sized,"duration_ms":crate::minimize::duration(self.policy).as_millis()})
+        })).collect();
+        let restoring:Vec<_>=self.restoring.iter().map(|(id,r)|serde_json::json!({"window":id,"elapsed_ms":self.now.saturating_sub(r.start).as_millis(),"duration_ms":crate::minimize::duration(self.policy).as_millis(),"icon":[r.icon.loc.x,r.icon.loc.y,r.icon.size.w,r.icon.size.h],"monitor_sized":r.monitor_sized})).collect();
         serde_json::json!({
             "retained_destroy_bytes": self.ghosts.iter().map(|g|g.pixels*4).sum::<u64>(),
             "snapshot_budget_bytes": 64*1024*1024,
             "snapshot_effect_limit": 32,
-            "opening": opening, "destroying": destroying, "history": self.history,
+            "opening": opening, "destroying": destroying, "minimizing":minimizing,"restoring":restoring,"history": self.history,
         })
     }
 }
@@ -297,6 +354,7 @@ pub fn step_frame(
     now: Duration,
     policy: MotionPolicy,
     allowed: bool,
+    right_to_left: bool,
 ) {
     use smithay::backend::renderer::element::{
         surface::render_elements_from_surface_tree, Kind as RenderKind,
@@ -312,6 +370,23 @@ pub fn step_frame(
                 .as_ref()
                 .and_then(crate::windows::committed_size)
                 .is_some_and(|size| size.w > 0 && size.h > 0)
+        })
+        .collect();
+    let minimized: HashSet<u64> = ids
+        .iter()
+        .copied()
+        .filter(|id| manager.is_minimized(*id))
+        .collect();
+    let targets: HashMap<u64, (RectF, bool)> = ids
+        .iter()
+        .filter_map(|id| {
+            let geometry = manager.geometry(*id)?;
+            let monitor = state.monitor_geometry(geometry);
+            let icon = manager
+                .icon_geometry(*id)
+                .map(|r| r.to_f64())
+                .unwrap_or_else(|| crate::minimize::fallback(monitor, right_to_left));
+            Some((*id, (icon, geometry == monitor)))
         })
         .collect();
     let entries = manager.render_entries();
@@ -332,17 +407,41 @@ pub fn step_frame(
             }
             let scale = state.scale_for(*geometry).fractional_scale();
             let geo = crate::popup::window_geometry_loc(&surface);
-            let origin: smithay::utils::Point<i32, smithay::utils::Physical> = (
-                (-f64::from(geo.x) * scale).round() as i32,
-                (-f64::from(geo.y) * scale).round() as i32,
-            )
-                .into();
+            let buffer_geometry =
+                Rect::new(crate::popup::surface_origin(&surface, geometry.loc), size);
+            let presentation = manager
+                .window_lifecycle()
+                .restoring_frame(*id, geometry.to_f64())
+                .or_else(|| {
+                    manager
+                        .window_lifecycle()
+                        .opening_frame(*id)
+                        .map(|f| (rect(*geometry, f), f.alpha))
+                });
+            let (presentation, fade) = if let Some((r, fade)) = presentation {
+                let sx = r.size.w / f64::from(geometry.size.w);
+                let sy = r.size.h / f64::from(geometry.size.h);
+                (
+                    Rectangle::new(
+                        (
+                            r.loc.x - f64::from(geo.x) * sx,
+                            r.loc.y - f64::from(geo.y) * sy,
+                        )
+                            .into(),
+                        (f64::from(size.w) * sx, f64::from(size.h) * sy).into(),
+                    ),
+                    fade,
+                )
+            } else {
+                (buffer_geometry.to_f64(), 1.0)
+            };
+            let origin: smithay::utils::Point<i32, smithay::utils::Physical> = (0, 0).into();
             let elements = render_elements_from_surface_tree(
                 renderer,
                 &surface,
                 origin,
                 scale,
-                1.0,
+                fade,
                 RenderKind::Unspecified,
             );
             if elements.is_empty() {
@@ -351,7 +450,8 @@ pub fn step_frame(
             shown.push((
                 *id,
                 Cached {
-                    geometry: Rect::new(geometry.loc, size),
+                    geometry: buffer_geometry,
+                    presentation,
                     scale,
                     kind,
                     parent: manager.transient_parent(*id),
@@ -368,31 +468,74 @@ pub fn step_frame(
     life.policy = policy;
     if !allowed || !policy.allows_fades() {
         life.suspend(ids);
+        life.minimized = minimized;
         return;
     }
     // Release expired textures before admitting new snapshots to the budget.
     let finished = retire(&mut life.ghosts, |g| {
-        now.saturating_sub(g.running.start) >= duration(g.running.kind, policy)
+        now.saturating_sub(g.running.start)
+            >= if g.minimizing.is_some() {
+                crate::minimize::duration(policy)
+            } else {
+                duration(g.running.kind, policy)
+            }
+            || (g.minimizing.is_some() && !ids.contains(&g.id))
             || g.parent.is_some_and(|p| !ids.contains(&p))
     });
     for g in finished {
-        life.record(g.id, "destroy", g.running.kind, "completed");
+        life.record(
+            g.id,
+            if g.minimizing.is_some() {
+                "minimize"
+            } else {
+                "destroy"
+            },
+            g.running.kind,
+            "completed",
+        );
     }
+    let restored: Vec<_> = life
+        .minimized
+        .difference(&minimized)
+        .copied()
+        .filter(|id| ids.contains(id))
+        .collect();
+    for id in restored {
+        life.ghosts.retain(|g| g.id != id);
+        if let Some((icon, monitor_sized)) = targets.get(&id) {
+            life.restoring.insert(
+                id,
+                MinRun {
+                    start: now,
+                    icon: *icon,
+                    monitor_sized: *monitor_sized,
+                },
+            );
+        }
+    }
+    life.restoring.retain(|id, r| {
+        ids.contains(id)
+            && !minimized.contains(id)
+            && now.saturating_sub(r.start) < crate::minimize::duration(policy)
+    });
+    let newly_minimized: HashSet<_> = minimized.difference(&life.minimized).copied().collect();
     let visible_ids = entries.iter().map(|e| e.0).collect();
     let next = successors(&life.stack, &visible_ids);
     let gone: Vec<_> = life
         .cache
         .keys()
         .copied()
-        .filter(|id| !ids.contains(id))
+        .filter(|id| !ids.contains(id) || newly_minimized.contains(id))
         .collect();
     for id in gone {
         let old = life.cache.remove(&id).expect("cached id");
+        let minimizing = newly_minimized.contains(&id);
+        let effect = if minimizing { "minimize" } else { "destroy" };
         let mapping = life.opening.remove(&id).is_some();
         // Raw cached elements exclude active map/resize transforms. A safe
         // immediate close is preferable to an opaque full-size frozen jump.
-        if let Some(reason) = interrupted_close(mapping, old.resizing) {
-            life.record(id, "destroy", old.kind, reason);
+        if let Some(reason) = interrupted_close(mapping && !minimizing, old.resizing) {
+            life.record(id, effect, old.kind, reason);
             continue;
         }
         if old.parent.is_some_and(|parent| !ids.contains(&parent)) {
@@ -406,17 +549,21 @@ pub fn step_frame(
             life.ghosts.iter().map(|g| g.pixels).sum(),
             pixels,
         ) {
-            life.record(id, "destroy", old.kind, "snapshot-budget");
+            life.record(id, effect, old.kind, "snapshot-budget");
             continue;
         }
         if let Some(texture) = copy_frame(renderer, &old) {
-            life.record(id, "destroy", old.kind, "started");
+            life.record(id, effect, old.kind, "started");
             life.ghosts.push(Ghost {
                 id,
                 before: next.get(old.order).copied().flatten(),
                 order: old.order,
                 parent: old.parent,
-                geometry: old.geometry,
+                geometry: if minimizing {
+                    old.presentation
+                } else {
+                    old.geometry.to_f64()
+                },
                 pixels,
                 snapshot: Snapshot {
                     texture,
@@ -426,9 +573,17 @@ pub fn step_frame(
                     kind: old.kind,
                     start: now,
                 },
+                minimizing: minimizing.then(|| {
+                    let (icon, monitor_sized) = targets[&id];
+                    MinRun {
+                        start: now,
+                        icon,
+                        monitor_sized,
+                    }
+                }),
             });
         } else {
-            life.record(id, "destroy", old.kind, "snapshot-failed");
+            life.record(id, effect, old.kind, "snapshot-failed");
         }
     }
     life.ghosts.sort_by_key(|g| g.order);
@@ -459,6 +614,7 @@ pub fn step_frame(
         }
         life.cache.insert(id, cached);
     }
+    life.minimized = minimized;
     life.stack = entries.iter().map(|e| e.0).collect();
     // A first commit on a hidden workspace is a map too: showing that
     // workspace later must not replay a fresh-window effect.

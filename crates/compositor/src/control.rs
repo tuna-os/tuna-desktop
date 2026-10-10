@@ -274,6 +274,7 @@ pub struct Session<'a> {
     unlock_pending: Option<u64>,
     /// Latest `SetInputSettings` from the shell, drained by the hub.
     input_settings: Option<tuna_shell_control::InputSettings>,
+    icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     screen_reader: Option<bool>,
     screenshot_pointer: Option<(i32, i32)>,
     /// Input-source switches the shell asked for (`true` backward).
@@ -348,6 +349,7 @@ impl<'a> Session<'a> {
             unlock_request: None,
             unlock_pending: None,
             input_settings: None,
+            icon_geometries: None,
             screen_reader: None,
             screenshot_pointer: None,
             input_source_switches: Vec::new(),
@@ -636,6 +638,17 @@ impl<'a> Session<'a> {
             } => {
                 // Session-level settings for the runtime (seat, libinput).
                 self.input_settings = Some(settings);
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::SetWindowIconGeometries { geometries },
+            } => {
+                self.icon_geometries = Some(geometries);
                 self.conn.write_frame(&Message::CommandResult {
                     id,
                     status: CommandStatus::Applied,
@@ -1043,6 +1056,7 @@ pub struct PollOutcome {
     pub unlock: Option<(u64, tuna_shell_control::Secret)>,
     /// GNOME input settings the shell sent, if any.
     pub input_settings: Option<tuna_shell_control::InputSettings>,
+    pub icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     pub screen_reader: Option<bool>,
     pub screenshot_pointer: Option<(i32, i32)>,
     /// Accelerator grabs the shell sent, if they changed.
@@ -1494,6 +1508,9 @@ impl ControlHub {
                     }
                     if let Some(request) = session.unlock_request.take() {
                         outcome.unlock = Some(request);
+                    }
+                    if let Some(geometries) = session.icon_geometries.take() {
+                        outcome.icon_geometries = Some(geometries);
                     }
                     if let Some(settings) = session.input_settings.take() {
                         outcome.input_settings = Some(settings);
