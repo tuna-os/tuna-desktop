@@ -49,6 +49,10 @@ pub(crate) fn drain(fd: impl AsFd) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "control_readiness_test_peer.rs"]
+pub(crate) mod test_peer;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
@@ -90,9 +94,7 @@ mod tests {
             .dispatch(Some(Duration::ZERO), &mut count)
             .unwrap();
         assert_eq!(count, 2, "closed original fd must remove interest");
-        assert!(
-            sender.write_all(b"after close").is_err(),
-            "watch must not hold the peer alive"
-        );
+        test_peer::wait_for_peer_close(&mut sender, Duration::from_secs(1))
+            .expect("watch must not hold the peer alive");
     }
 }

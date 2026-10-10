@@ -1753,9 +1753,13 @@ mod readiness_tests {
             .dispatch(Some(Duration::ZERO), &mut wakes)
             .unwrap();
         assert_eq!(wakes, 3, "evicted socket interest must retire");
-        assert!(
-            client.write_all(b"evicted").is_err(),
-            "readiness source must not retain a duplicate peer socket"
-        );
+        // Concurrent forked test children may briefly inherit the peer until
+        // exec closes it. Still reject a persistent duplicate: WouldBlock is
+        // never closure, and queued replies are drained before checking EOF.
+        crate::control_readiness::test_peer::wait_for_peer_close(
+            &mut client,
+            Duration::from_secs(1),
+        )
+        .expect("readiness source must not retain a duplicate peer socket");
     }
 }
