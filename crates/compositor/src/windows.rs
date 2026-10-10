@@ -682,13 +682,15 @@ impl WindowManager {
         let parents = self
             .windows
             .iter()
-            .filter_map(|(id, w)| {
-                let WindowSurface::Wayland(top) = w.surface.underlying_surface() else {
-                    return None;
-                };
-                (!w.minimized && read_modal(top) && committed_size(top.wl_surface()).is_some())
-                    .then(|| self.transient_parent(*id))
-                    .flatten()
+            .filter_map(|(id, w)| match w.surface.underlying_surface() {
+                WindowSurface::Wayland(top)
+                    if !w.minimized
+                        && read_modal(top)
+                        && committed_size(top.wl_surface()).is_some() =>
+                {
+                    self.transient_parent(*id)
+                }
+                _ => None,
             })
             .collect();
         self.modal_dim.step(&alive, &parents, now, policy, animate);
