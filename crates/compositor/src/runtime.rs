@@ -3421,6 +3421,7 @@ impl Runtime {
                 || self.manager.size_changes().in_flight()
                 || self.manager.window_lifecycle().running()
                 || self.manager.modal_dim().running()
+                || self.cursor.animating(self.animation_clock.now())
                 || self.screenshot_flashes.running()
                 || !self.screenshot_replies.is_empty()
                 || self.tile_animation.as_ref().is_some_and(|(_, _, start)| {
