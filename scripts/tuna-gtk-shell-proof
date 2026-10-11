@@ -99,6 +99,11 @@
 #                  the key fires AcceleratorActivated, and ShowOSD shows
 #   G-KEYBINDINGS  GNOME Shell's keys: Super+S quick settings, Super+V the
 #                  date menu, Super+A the app grid (and back)
+#   G-PANEL-FOCUS  Ctrl+Alt+Tab focuses the top bar (switch-panels):
+#                  Activities takes focus, Tab walks to the clock and
+#                  the system menu, Enter opens quick settings, Escape
+#                  unwinds and returns focus to the client; the
+#                  backward chord starts on the last control
 #   G-KEY-BRIGHTNESS the brightness key steps the backlight through logind
 #   G-SCREENSHOT-UI  Print opens the screenshot UI; Screen + Capture saves
 #   G-SCREENSHOT-UI-WINDOW Window shows GNOME's window selector, the
@@ -365,6 +370,14 @@ fail() {
 
 showing() {
     jq -e --arg n "$2" 'any(.[]; .name == $n and .showing)' "$1" >/dev/null
+}
+
+hidden() {
+    jq -e --arg n "$2" 'any(.[]; .name == $n and .showing) | not' "$1" >/dev/null
+}
+
+focused() {
+    jq -e --arg n "$2" 'any(.[]; .name == $n and .focused)' "$1" >/dev/null
 }
 
 cstate() {
@@ -3084,6 +3097,71 @@ cstate '.overview_open | not' "closed" || fail G-KEYBINDINGS "Super+A again did 
 # The shell hides its overview surfaces on its next frame: let it.
 sleep 1
 pass G-KEYBINDINGS "Super+S, Super+V and Super+A open GNOME's menus and the app grid"
+# Ctrl+Alt+Tab (switch-panels) moves keyboard focus into the top bar:
+# first control forward, last control backward; Tab walks the strip,
+# Enter opens the focused menu, Escape unwinds, and a final Escape
+# returns focus to the client (NORMAL chords pause while held).
+xdotool key ctrl+alt+Tab
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-focus.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+focused "$ARTIFACTS/a11y-panel-focus.json" "Activities" ||
+    fail G-PANEL-FOCUS "Ctrl+Alt+Tab did not focus Activities"
+scrot "$ARTIFACTS/panel-focus.png" >/dev/null
+xdotool key Tab
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-tab.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+focused "$ARTIFACTS/a11y-panel-tab.json" "Date and Time" ||
+    fail G-PANEL-FOCUS "Tab did not move panel focus to the clock"
+for _ in $(seq 1 6); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-walk.json" 20 ||
+        fail G-PANEL-FOCUS "accessibility dump failed"
+    focused "$ARTIFACTS/a11y-panel-walk.json" "System" && break
+    xdotool key Tab
+    sleep 1
+done
+focused "$ARTIFACTS/a11y-panel-walk.json" "System" ||
+    fail G-PANEL-FOCUS "Tab did not reach the system menu"
+xdotool key Return
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-open.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+showing "$ARTIFACTS/a11y-panel-open.json" "Dark Style" ||
+    fail G-PANEL-FOCUS "Enter did not open quick settings from the bar"
+xdotool key Escape
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-unwind.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-panel-unwind.json" "Dark Style" ||
+    fail G-PANEL-FOCUS "Escape did not close the keyboard-opened menu"
+focused "$ARTIFACTS/a11y-panel-unwind.json" "System" ||
+    fail G-PANEL-FOCUS "Escape did not keep focus on the system button"
+xdotool key super+s
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-held.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-panel-held.json" "Dark Style" ||
+    fail G-PANEL-FOCUS "a NORMAL chord fired while the bar held the keyboard"
+xdotool key Escape
+sleep 1
+xdotool key shift+ctrl+alt+Tab
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-backward.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+focused "$ARTIFACTS/a11y-panel-backward.json" "System" ||
+    fail G-PANEL-FOCUS "the backward chord did not focus the last control"
+xdotool key Escape
+sleep 1
+xdotool key super+v
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-returned.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+showing "$ARTIFACTS/a11y-panel-returned.json" "Previous month" ||
+    fail G-PANEL-FOCUS "NORMAL chords stayed paused after the final Escape"
+xdotool key Escape
+sleep 1
+pass G-PANEL-FOCUS "Ctrl+Alt+Tab walks the bar, Enter opens menus, Escape unwinds and returns focus"
 # Both directions are rebound, then walk every overview state.
 gsettings set org.gnome.shell.keybindings shift-overview-up "['<Super>F8']"
 gsettings set org.gnome.shell.keybindings shift-overview-down "['<Super>F7']"
