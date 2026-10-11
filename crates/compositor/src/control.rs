@@ -1451,6 +1451,14 @@ impl ControlHub {
             if self.gate.admits(self.session_peers[i], uid) {
                 i += 1;
             } else {
+                // Diagnostic probe (#329).
+                match self.session_peers[i] {
+                    Some(cred) => eprintln!(
+                        "tuna-settings-probe: hub-session-evict gate pid={} uid={}",
+                        cred.pid, cred.uid
+                    ),
+                    None => eprintln!("tuna-settings-probe: hub-session-evict gate pid=unknown"),
+                }
                 self.sessions.swap_remove(i);
                 self.session_peers.swap_remove(i);
             }
@@ -1532,6 +1540,14 @@ impl ControlHub {
             if alive {
                 i += 1;
             } else {
+                // Diagnostic probe (#329).
+                match self.session_peers[i] {
+                    Some(cred) => eprintln!(
+                        "tuna-settings-probe: hub-session-evict dead pid={} uid={}",
+                        cred.pid, cred.uid
+                    ),
+                    None => eprintln!("tuna-settings-probe: hub-session-evict dead pid=unknown"),
+                }
                 self.sessions.swap_remove(i);
                 self.session_peers.swap_remove(i);
             }
@@ -1669,6 +1685,14 @@ impl ControlHub {
                     let _ = session.send_window_menu(&Message::PointerOutput {
                         name: self.pointer_output.clone(),
                     });
+                }
+                // Diagnostic probe (#329).
+                match peer {
+                    Some(cred) => eprintln!(
+                        "tuna-settings-probe: hub-session-accept pid={} uid={}",
+                        cred.pid, cred.uid
+                    ),
+                    None => eprintln!("tuna-settings-probe: hub-session-accept pid=unknown"),
                 }
                 self.sessions.push(session);
                 self.session_peers.push(peer);

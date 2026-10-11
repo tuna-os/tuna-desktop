@@ -2081,7 +2081,9 @@ fn build(app: &adw::Application) {
                         "tuna-settings-probe: send mouse_left_handed={} hot_corners={}",
                         out.mouse_left_handed, out.hot_corners
                     );
-                    let _ = control.set_input_settings(out);
+                    if let Err(error) = control.set_input_settings(out) {
+                        eprintln!("tuna-settings-probe: send-error {error:?}");
+                    }
                 }
             })
         };
