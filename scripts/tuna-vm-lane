@@ -143,7 +143,9 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
             json.dump(state, stream, indent=2)
         return state
 
-    def await_state(predicate, timeout=15, label=None):
+    # Tour-boot runners are heavily loaded (video capture + probes + guests);
+    # every stage ack gets a 30s budget. Assertions unchanged (#329).
+    def await_state(predicate, timeout=30, label=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             state = inventory(label) if label else agent.run("inventory")
