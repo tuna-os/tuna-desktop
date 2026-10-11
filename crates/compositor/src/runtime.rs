@@ -1682,6 +1682,16 @@ impl Runtime {
         crate::xwayland::on_xwayland_event(self, event);
     }
 
+    /// Live libinput device configuration (#343): empty off hardware,
+    /// where there is no libinput context.
+    fn input_device_states(&self) -> Vec<serde_json::Value> {
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &self.backend {
+            return drm.input_device_states();
+        }
+        Vec::new()
+    }
+
     /// Write the compositor-side state snapshot when it changed
     /// (`TUNA_COMPOSITOR_STATE`, journeys only; #65). App ids and ids,
     /// never titles.
@@ -1925,6 +1935,9 @@ impl Runtime {
         doc["pointer_fullscreen_blocked"] = serde_json::json!(
             (!self.is_locked()).then(|| self.manager.fullscreen_at(self.manager.pointer_pos()))
         );
+        // Live libinput device configuration (#343): beside the macro,
+        // which is already at its recursion limit.
+        doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
         let doc = doc.to_string();
         if doc == self.state_last {
             return;
