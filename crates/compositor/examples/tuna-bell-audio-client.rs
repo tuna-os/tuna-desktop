@@ -8,14 +8,6 @@ mod bell;
 #[path = "../src/idle_schedule.rs"]
 mod idle_schedule;
 
-// The example crate root stands in for the compositor crate root, so
-// `bell.rs`' `crate::idle_schedule::ACTIVE_INTERVAL` resolves here.
-// Value mirrors `src/idle_schedule.rs` (read-only: that module is
-// owned elsewhere and must not be changed for this example).
-mod idle_schedule {
-    pub const ACTIVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
-}
-
 fn main() {
     let mode = std::env::args().nth(1).expect("mode required");
     assert!(["audible", "silent", "event-disabled"].contains(&mode.as_str()));
