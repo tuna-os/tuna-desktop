@@ -24,6 +24,7 @@ pub mod icons;
 pub mod intake;
 pub mod introspect;
 pub mod keyboard;
+pub mod lockdown;
 pub mod model;
 pub mod notifications;
 pub mod overview;
