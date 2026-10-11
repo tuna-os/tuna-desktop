@@ -1780,8 +1780,17 @@ for step in $(seq 1 6); do
 done
 sleep 0.25
 xdotool mousemove --window "$WID" $((WIDTH - 6)) 330
-sleep 0.6
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-short-target.json" 20 || fail G-GRID-SHORT-PAGES "target page dump failed"
+# The carousel page turn lags on loaded runners: a fixed sleep can dump
+# while AAA Move Two is still offscreen, and grid_point (unlike
+# grid_shown) returns those offscreen bounds, so the drop lands before
+# the turn completes. Poll for the visible target instead, bounded.
+short_turned=0
+for _ in $(seq 1 20); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-short-target.json" 20 >/dev/null 2>&1 || { sleep 0.5; continue; }
+    if grid_shown "$ARTIFACTS/a11y-grid-short-target.json" "AAA Move Two"; then short_turned=1; break; fi
+    sleep 0.5
+done
+[ "$short_turned" = 1 ] || fail G-GRID-SHORT-PAGES "second page did not turn within 10s while holding at the edge"
 grid_coordinates="$(grid_point "$ARTIFACTS/a11y-grid-short-target.json" "AAA Move Two" 4)" || fail G-GRID-SHORT-PAGES "target edge bounds missing"
 read -r target_x target_y <<EOF
 $grid_coordinates
