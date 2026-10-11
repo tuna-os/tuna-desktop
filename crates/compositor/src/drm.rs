@@ -751,6 +751,39 @@ impl DrmBackend {
         }
     }
 
+    /// Live libinput state for every tracked device (#343): names and
+    /// capability kinds plus the configuration libinput itself reports
+    /// back, with per-option availability, so proofs assert applied
+    /// device state rather than the settings echo and unsupported
+    /// options are visible instead of silently ignored. No input
+    /// content, only configuration.
+    pub fn input_device_states(&self) -> Vec<serde_json::Value> {
+        self.devices
+            .iter()
+            .map(|device| {
+                let kind = match pointer_kind(device) {
+                    PointerKind::Touchpad => "touchpad",
+                    PointerKind::Pointer => "pointer",
+                    PointerKind::Other => "other",
+                };
+                serde_json::json!({
+                    "name": device.name(),
+                    "kind": kind,
+                    "tap_fingers": device.config_tap_finger_count(),
+                    "left_handed": device.config_left_handed(),
+                    "handed_available": device.config_left_handed_is_available(),
+                    "tap_enabled": device.config_tap_enabled(),
+                    "natural_scroll": device.config_scroll_natural_scroll_enabled(),
+                    "natural_available": device.config_scroll_has_natural_scroll(),
+                    "accel_speed": device.config_accel_speed(),
+                    "accel_available": device.config_accel_is_available(),
+                    "dwt_enabled": device.config_dwt_enabled(),
+                    "dwt_available": device.config_dwt_is_available(),
+                })
+            })
+            .collect()
+    }
+
     /// Move the drawn cursor to where the window manager put the pointer.
     pub fn set_pointer(&mut self, pos: Point<f64, Logical>) {
         if pos != self.pointer {
@@ -823,6 +856,68 @@ mod wake_event_tests {
     }
 }
 
+/// Which GNOME settings family a libinput device takes (#343): touchpads
+/// take the touchpad keys, every other pointer (mice, trackballs,
+/// pointing sticks) the mouse keys, as Mutter maps POINTER minus
+/// TOUCHPAD onto the mouse schema. Known gap: Mutter gives pointing
+/// sticks their own speed, which needs a wire field (#343 follow-up).
+/// Keyboards and tablets take none of these keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerKind {
+    Touchpad,
+    Pointer,
+    Other,
+}
+
+/// One device's libinput configuration, resolved from GNOME's settings
+/// for its [`PointerKind`]. `None` tap/disable-while-typing means the
+/// device family has no such key.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LibinputPolicy {
+    pub left_handed: bool,
+    pub tap_to_click: Option<bool>,
+    pub natural_scroll: bool,
+    pub speed: f64,
+    pub disable_while_typing: Option<bool>,
+}
+
+/// Classify a libinput device the way [`apply_libinput`] does.
+pub fn pointer_kind(device: &smithay::reexports::input::Device) -> PointerKind {
+    if device.config_tap_finger_count() > 0 {
+        PointerKind::Touchpad
+    } else if device.has_capability(smithay::reexports::input::DeviceCapability::Pointer) {
+        PointerKind::Pointer
+    } else {
+        PointerKind::Other
+    }
+}
+
+/// Resolve the libinput configuration for one device kind from GNOME's
+/// settings. `None` leaves the device alone. Speed is GNOME's -1..1.
+pub fn libinput_policy(
+    settings: &tuna_shell_control::InputSettings,
+    kind: PointerKind,
+) -> Option<LibinputPolicy> {
+    let speed = |milli: i32| f64::from(milli.clamp(-1000, 1000)) / 1000.0;
+    match kind {
+        PointerKind::Touchpad => Some(LibinputPolicy {
+            left_handed: settings.touchpad_left_handed,
+            tap_to_click: Some(settings.tap_to_click),
+            natural_scroll: settings.touchpad_natural_scroll,
+            speed: speed(settings.touchpad_speed_milli),
+            disable_while_typing: Some(settings.disable_while_typing),
+        }),
+        PointerKind::Pointer => Some(LibinputPolicy {
+            left_handed: settings.mouse_left_handed,
+            tap_to_click: None,
+            natural_scroll: settings.mouse_natural_scroll,
+            speed: speed(settings.mouse_speed_milli),
+            disable_while_typing: None,
+        }),
+        PointerKind::Other => None,
+    }
+}
+
 /// One device's libinput configuration from GNOME's settings, as Mutter
 /// applies them (niri's `apply_libinput_settings` shape): touchpads get
 /// tap-to-click, natural scroll, disable-while-typing and their speed;
@@ -831,18 +926,18 @@ fn apply_libinput(
     settings: &tuna_shell_control::InputSettings,
     device: &mut smithay::reexports::input::Device,
 ) {
-    let speed = |milli: i32| f64::from(milli.clamp(-1000, 1000)) / 1000.0;
-    if device.config_tap_finger_count() > 0 {
-        apply_handedness(device, settings.touchpad_left_handed);
-        let _ = device.config_tap_set_enabled(settings.tap_to_click);
-        let _ = device.config_scroll_set_natural_scroll_enabled(settings.touchpad_natural_scroll);
-        let _ = device.config_dwt_set_enabled(settings.disable_while_typing);
-        let _ = device.config_accel_set_speed(speed(settings.touchpad_speed_milli));
-    } else if device.has_capability(smithay::reexports::input::DeviceCapability::Pointer) {
-        apply_handedness(device, settings.mouse_left_handed);
-        let _ = device.config_scroll_set_natural_scroll_enabled(settings.mouse_natural_scroll);
-        let _ = device.config_accel_set_speed(speed(settings.mouse_speed_milli));
+    let Some(policy) = libinput_policy(settings, pointer_kind(device)) else {
+        return;
+    };
+    apply_handedness(device, policy.left_handed);
+    if let Some(tap) = policy.tap_to_click {
+        let _ = device.config_tap_set_enabled(tap);
     }
+    let _ = device.config_scroll_set_natural_scroll_enabled(policy.natural_scroll);
+    if let Some(dwt) = policy.disable_while_typing {
+        let _ = device.config_dwt_set_enabled(dwt);
+    }
+    let _ = device.config_accel_set_speed(policy.speed);
 }
 
 fn apply_handedness(device: &smithay::reexports::input::Device, left_handed: bool) {
@@ -939,5 +1034,69 @@ mod tests {
         let (outline, fill) = cursor_rects((1930.0, 5.0).into(), (1920, 0), 1.0);
         assert_eq!(outline[0].loc, (10, 5).into());
         assert!(!fill.is_empty());
+    }
+
+    /// Distinct touchpad and mouse settings, so a swapped family shows.
+    fn pointer_settings() -> tuna_shell_control::InputSettings {
+        tuna_shell_control::InputSettings {
+            tap_to_click: true,
+            touchpad_natural_scroll: true,
+            touchpad_speed_milli: -500,
+            disable_while_typing: false,
+            touchpad_left_handed: true,
+            mouse_natural_scroll: false,
+            mouse_speed_milli: 250,
+            mouse_left_handed: false,
+            ..tuna_shell_control::InputSettings::default()
+        }
+    }
+
+    #[test]
+    fn touchpad_policy_carries_the_touchpad_keys() {
+        let policy = libinput_policy(&pointer_settings(), PointerKind::Touchpad).unwrap();
+        assert!(policy.left_handed);
+        assert_eq!(policy.tap_to_click, Some(true));
+        assert!(policy.natural_scroll);
+        assert_eq!(policy.speed, -0.5);
+        assert_eq!(policy.disable_while_typing, Some(false));
+    }
+
+    #[test]
+    fn pointer_policy_carries_the_mouse_keys() {
+        // Mice, trackballs and pointing sticks all take the mouse
+        // keys, as Mutter maps POINTER minus TOUCHPAD (#343).
+        let policy = libinput_policy(&pointer_settings(), PointerKind::Pointer).unwrap();
+        assert!(!policy.left_handed);
+        assert_eq!(policy.tap_to_click, None);
+        assert!(!policy.natural_scroll);
+        assert_eq!(policy.speed, 0.25);
+        assert_eq!(policy.disable_while_typing, None);
+    }
+
+    #[test]
+    fn other_devices_are_left_alone() {
+        assert_eq!(
+            libinput_policy(&pointer_settings(), PointerKind::Other),
+            None
+        );
+    }
+
+    #[test]
+    fn pointer_speed_clamps_to_gnomes_range() {
+        let mut settings = pointer_settings();
+        settings.mouse_speed_milli = 5000;
+        settings.touchpad_speed_milli = -5000;
+        assert_eq!(
+            libinput_policy(&settings, PointerKind::Pointer)
+                .unwrap()
+                .speed,
+            1.0
+        );
+        assert_eq!(
+            libinput_policy(&settings, PointerKind::Touchpad)
+                .unwrap()
+                .speed,
+            -1.0
+        );
     }
 }

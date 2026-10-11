@@ -855,7 +855,9 @@ impl Default for InputSettings {
             repeat: true,
             repeat_delay_ms: 500,
             repeat_interval_ms: 30,
-            tap_to_click: false,
+            // GNOME 51.0 enables touchpad tap by default
+            // (org.gnome.desktop.peripherals.touchpad tap-to-click).
+            tap_to_click: true,
             touchpad_natural_scroll: true,
             touchpad_speed_milli: 0,
             disable_while_typing: true,
