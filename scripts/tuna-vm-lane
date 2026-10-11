@@ -299,6 +299,11 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
                              and actual["state"] == "disabled"))):
                 return actual
             time.sleep(0.2)
+        last = orca_observations[-1] if orca_observations else {}
+        raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca "
+                           f"(enabled={enabled}, last state={last.get('state')!r}, "
+                           f"pid={last.get('pid')}, owner={'set' if last.get('owner') else 'none'})")
+
     def await_reaped(identity):
         # The bus name is released while the stopped instance is still
         # exiting; starting the next Orca first loses the restart name race
@@ -310,10 +315,6 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
                 return
             time.sleep(0.2)
         raise RuntimeError("stopped Orca instance did not exit before restart")
-        last = orca_observations[-1] if orca_observations else {}
-        raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca "
-                           f"(enabled={enabled}, last state={last.get('state')!r}, "
-                           f"pid={last.get('pid')}, owner={'set' if last.get('owner') else 'none'})")
     try:
         first_orca = None
         stopped_identity = None
