@@ -93,7 +93,7 @@ class WallpaperCheckTests(unittest.TestCase):
 
     def test_file_identity_and_decoded_buffer(self):
         ok, report = gates.check_wallpaper(
-            self.state("FileIdentity { path: \"/tmp/x\" }", (True, 1024)),
+            self.state("Some(FileIdentity { path: \"/tmp/x\" })", (True, 1024)),
             self.URI, identity="file", decoded=True)
         self.assertTrue(ok, report)
 
@@ -123,13 +123,13 @@ class WallpaperCheckTests(unittest.TestCase):
 
     def test_missing_decode_fails(self):
         ok, _ = gates.check_wallpaper(
-            self.state("FileIdentity { path: \"/tmp/x\" }", None), self.URI,
+            self.state("Some(FileIdentity { path: \"/tmp/x\" })", None), self.URI,
             identity=None, decoded=True)
         self.assertFalse(ok)
 
     def test_empty_buffer_fails(self):
         ok, _ = gates.check_wallpaper(
-            self.state("FileIdentity { path: \"/tmp/x\" }", (False, None)),
+            self.state("Some(FileIdentity { path: \"/tmp/x\" })", (False, None)),
             self.URI, identity=None, decoded=True)
         self.assertFalse(ok)
 
