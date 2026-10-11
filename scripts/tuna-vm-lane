@@ -146,7 +146,8 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
             if predicate(state):
                 return state
             time.sleep(0.2)
-        raise RuntimeError("lifecycle state did not arrive within its deadline")
+        where = f" ({label})" if label else ""
+        raise RuntimeError(f"lifecycle state did not arrive within its deadline{where}")
 
     def frame(label):
         qmp.frame(os.path.join(evidence, f"{label}.png"))
@@ -199,7 +200,8 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     # proposed size may also exceed GTK's initial 400x240 buffer: click inside
     # that buffer, then require the real client to observe keyboard activation.
     for require_active in (False, True):
-        deadline = time.monotonic() + 15
+        # Loaded tour-boot runners need more than 15s for first map/activate (#329).
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             readiness = agent.run("input-ready")
             with open(os.path.join(evidence, "input-ready.json"), "w") as stream:
@@ -239,14 +241,17 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
         for swapped in (False, True, False):
             if not agent.run("mouse-handedness", str(swapped).lower())["stored"]:
                 raise RuntimeError("GNOME primary-button setting did not persist")
+            # Live swap ack can exceed 15s on a loaded tour boot (#329); the
+            # assertion is unchanged, only the bounded wait.
             await_state(lambda value: value["state"]["mouse_left_handed"] is swapped,
-                        label=f"mouse-handedness-{str(swapped).lower()}")
+                        timeout=30, label=f"mouse-handedness-{str(swapped).lower()}")
             for physical, logical in (("left", "3" if swapped else "1"),
                                       ("right", "1" if swapped else "3"),
                                       ("middle", "2")):
                 before_click = agent.run("input-buttons")
                 qmp.click(click_x, click_y, button=physical)
-                deadline = time.monotonic() + 2
+                # Click delivery can exceed 2s on a loaded tour boot (#329).
+                deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
                     after_click = agent.run("input-buttons")
                     if after_click["buttons"] != before_click["buttons"]:
