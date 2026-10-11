@@ -75,6 +75,17 @@
 #                  enable-hot-corners the hot corner (#60)
 #   G-SETTINGS-IDLE GNOME's idle-delay and lock-enabled keys set the
 #                  compositor's idle lock live (#63)
+#   G-SET-WALLPAPER GNOME Settings' picture-uri write reaches the
+#                  compositor live: drop file, file identity, decoded
+#                  pixels and a visible repaint, with file-replacement
+#                  refresh, an ignored invalid URI and revert (#594)
+#   G-SET-CLOCK  clock-format and clock-show-date reach the panel
+#                  clock live, an invalid format is rejected or falls
+#                  back without a crash, and revert restores (#594)
+#   G-SET-FONTS  document/monospace fonts reach GTK apps live through
+#                  the apps' own Gio.Settings reads with a visible
+#                  repaint, a bogus family falls back without a crash,
+#                  and revert restores (#594)
 #   G-SCREENSHOT   org.gnome.Shell.Screenshot saves the screen as a PNG
 #                  the right way up (#61)
 #   G-SCREENSHOT-BUTTON the quick-settings button saves one under
@@ -314,6 +325,7 @@ HINTS_PID=""
 PERMISSIONS_PID=""
 INHIBITOR_PID=""
 SCROLL_PROBE_PID=""
+SET_FONTS_PID=""
 HOT_CORNER_PID=""
 OCCLUSION_PIDS=""
 IME_PIDS=""
@@ -323,6 +335,7 @@ cleanup() {
     if [ -n "$INHIBITOR_PID" ]; then kill "$INHIBITOR_PID" 2>/dev/null || true; fi
     if [ -n "$PERMISSIONS_PID" ]; then kill "$PERMISSIONS_PID" 2>/dev/null || true; fi
     if [ -n "$SCROLL_PROBE_PID" ]; then kill "$SCROLL_PROBE_PID" 2>/dev/null || true; fi
+    if [ -n "$SET_FONTS_PID" ]; then kill "$SET_FONTS_PID" 2>/dev/null || true; fi
     if [ -n "$HOT_CORNER_PID" ]; then kill "$HOT_CORNER_PID" 2>/dev/null || true; fi
     # shellcheck disable=SC2086
     if [ -n "$OCCLUSION_PIDS" ]; then kill $OCCLUSION_PIDS 2>/dev/null || true; fi
@@ -2663,6 +2676,269 @@ gsettings set org.gnome.desktop.interface font-name "$original_font"
 gsettings set org.gnome.desktop.interface text-scaling-factor "$original_scale"
 sleep 1
 pass G-SETTINGS-FONT "font-name family/size/style and text-scaling-factor change the running panel"
+
+# P-ST-01 (#594): GNOME Settings' wallpaper write reaches the running
+# desktop live. The shell publishes the drop file, the compositor
+# records the file's identity and decoded pixels, and the desktop
+# visibly repaints. Re-setting the same URI is idempotent (no
+# restart); replacing the file refreshes without a URI change; an
+# invalid URI is ignored without a crash. Restart persistence is
+# covered by cargo:wallpaper_survives_session_restart.
+set_wallpaper_before_uri=$(gsettings get org.gnome.desktop.background picture-uri)
+set_wallpaper_before_dark=$(gsettings get org.gnome.desktop.background picture-uri-dark)
+set_wallpaper_before_options=$(gsettings get org.gnome.desktop.background picture-options)
+set_wallpaper_green="$ARTIFACTS/set-wallpaper-green.png"
+ffmpeg -loglevel error -y -f lavfi -i color=c=0x00ff00:s=64x64 -frames:v 1 -threads 1 "$set_wallpaper_green"
+set_wallpaper_uri=$("$PY" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' "$set_wallpaper_green")
+printf '%s\n' "$set_wallpaper_uri" >"$ARTIFACTS/set-wallpaper-uri.txt"
+gsettings set org.gnome.desktop.background picture-options zoom
+gsettings set org.gnome.desktop.background picture-uri "$set_wallpaper_uri"
+gsettings set org.gnome.desktop.background picture-uri-dark "$set_wallpaper_uri"
+set_wallpaper_end=$(($(date +%s) + 15))
+while :; do
+    set_wallpaper_drop_first=$(sed -n '1p' "$XDG_RUNTIME_DIR/tuna-wallpaper" 2>/dev/null || true)
+    [ "$set_wallpaper_drop_first" = "$set_wallpaper_uri" ] && break
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "shell did not publish $set_wallpaper_uri to the wallpaper drop file (got '$set_wallpaper_drop_first')"
+    sleep 0.3
+done
+set_wallpaper_end=$(($(date +%s) + 20))
+while :; do
+    "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" wallpaper-check "$CSTATE" \
+        --uri "$set_wallpaper_uri" --identity file --decoded \
+        >"$ARTIFACTS/set-wallpaper-check.txt" 2>&1 && break
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "compositor never tracked the wallpaper: $(cat "$ARTIFACTS/set-wallpaper-check.txt")"
+    sleep 0.3
+done
+set_wallpaper_sample=$("$PY" "$ROOT/scripts/lib/tuna-set-gates.py" desktop-pixel "$CSTATE" --width "$WIDTH" --height "$HEIGHT") ||
+    fail G-SET-WALLPAPER "no desktop pixel outside every window to sample"
+# shellcheck disable=SC2086
+set -- $set_wallpaper_sample
+set_wallpaper_x=$1
+set_wallpaper_y=$2
+set_wallpaper_end=$(($(date +%s) + 15))
+while :; do
+    scrot -o "$ARTIFACTS/set-wallpaper-shot-green.png" >/dev/null
+    set_wallpaper_rgb=$(px "$ARTIFACTS/set-wallpaper-shot-green.png" "$set_wallpaper_x" "$set_wallpaper_y")
+    # shellcheck disable=SC2086
+    set -- $set_wallpaper_rgb
+    if [ "${1:-255}" -lt 20 ] && [ "${2:-0}" -gt 220 ] && [ "${3:-255}" -lt 20 ]; then break; fi
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "wallpaper write did not paint green at $set_wallpaper_x,$set_wallpaper_y: $set_wallpaper_rgb"
+    sleep 0.3
+done
+# Idempotent: writing the same URI again changes nothing observable.
+gsettings set org.gnome.desktop.background picture-uri "$set_wallpaper_uri"
+sleep 1
+[ "$(sed -n '1p' "$XDG_RUNTIME_DIR/tuna-wallpaper")" = "$set_wallpaper_uri" ] ||
+    fail G-SET-WALLPAPER "re-setting the same wallpaper URI moved the drop file"
+scrot -o "$ARTIFACTS/set-wallpaper-shot-green-again.png" >/dev/null
+set_wallpaper_rgb=$(px "$ARTIFACTS/set-wallpaper-shot-green-again.png" "$set_wallpaper_x" "$set_wallpaper_y")
+# shellcheck disable=SC2086
+set -- $set_wallpaper_rgb
+if [ "${1:-255}" -ge 20 ] || [ "${2:-0}" -le 220 ] || [ "${3:-255}" -ge 20 ]; then
+    fail G-SET-WALLPAPER "re-setting the same wallpaper URI lost the green desktop: $set_wallpaper_rgb"
+fi
+# Refresh: replacing the file repaints without a URI change.
+ffmpeg -loglevel error -y -f lavfi -i color=c=0xff00ff:s=64x64 -frames:v 1 -threads 1 "$set_wallpaper_green"
+set_wallpaper_end=$(($(date +%s) + 20))
+while :; do
+    scrot -o "$ARTIFACTS/set-wallpaper-shot-magenta.png" >/dev/null
+    set_wallpaper_rgb=$(px "$ARTIFACTS/set-wallpaper-shot-magenta.png" "$set_wallpaper_x" "$set_wallpaper_y")
+    # shellcheck disable=SC2086
+    set -- $set_wallpaper_rgb
+    if [ "${1:-0}" -gt 220 ] && [ "${2:-255}" -lt 20 ] && [ "${3:-0}" -gt 220 ]; then break; fi
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "replacing the wallpaper file did not repaint magenta: $set_wallpaper_rgb"
+    sleep 0.3
+done
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" wallpaper-check "$CSTATE" \
+    --uri "$set_wallpaper_uri" --identity file --decoded ||
+    fail G-SET-WALLPAPER "compositor lost the replaced wallpaper"
+# Negative control: a non-file URI is ignored as an image (identity
+# None, solid fallback) without crashing the shell or compositor.
+gsettings set org.gnome.desktop.background picture-uri 'http://example.invalid/set-wallpaper.png'
+gsettings set org.gnome.desktop.background picture-uri-dark 'http://example.invalid/set-wallpaper.png'
+sleep 2
+kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail G-SET-WALLPAPER "invalid wallpaper URI killed the compositor"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-wallpaper-invalid.json" 20 ||
+    fail G-SET-WALLPAPER "shell stopped answering after an invalid wallpaper URI"
+set_wallpaper_end=$(($(date +%s) + 15))
+while :; do
+    "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" wallpaper-check "$CSTATE" \
+        --uri 'http://example.invalid/set-wallpaper.png' --identity none \
+        >"$ARTIFACTS/set-wallpaper-invalid-check.txt" 2>&1 && break
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "invalid URI was not ignored: $(cat "$ARTIFACTS/set-wallpaper-invalid-check.txt")"
+    sleep 0.3
+done
+scrot -o "$ARTIFACTS/set-wallpaper-shot-invalid.png" >/dev/null
+set_wallpaper_rgb=$(px "$ARTIFACTS/set-wallpaper-shot-invalid.png" "$set_wallpaper_x" "$set_wallpaper_y")
+# shellcheck disable=SC2086
+set -- $set_wallpaper_rgb
+if [ "${1:-0}" -gt 220 ] && [ "${2:-255}" -lt 20 ] && [ "${3:-0}" -gt 220 ]; then
+    fail G-SET-WALLPAPER "invalid wallpaper URI kept the magenta image: $set_wallpaper_rgb"
+fi
+gsettings set org.gnome.desktop.background picture-uri "$set_wallpaper_before_uri"
+gsettings set org.gnome.desktop.background picture-uri-dark "$set_wallpaper_before_dark"
+gsettings set org.gnome.desktop.background picture-options "$set_wallpaper_before_options"
+# The shell publishes the dark URI under the dark style, nothing when
+# picture-options is "none": expect exactly what it must publish. The
+# pre-proof file may not exist on the runner, so the revert asserts the
+# shell's publication (already proved end to end above), not a decode.
+set_wallpaper_scheme=$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null || echo "'default'")
+set_wallpaper_before_bare=$(printf '%s' "$set_wallpaper_before_uri" | sed "s/^'//; s/'$//")
+set_wallpaper_before_dark_bare=$(printf '%s' "$set_wallpaper_before_dark" | sed "s/^'//; s/'$//")
+set_wallpaper_expect_revert="$set_wallpaper_before_bare"
+if [ "$set_wallpaper_scheme" = "'prefer-dark'" ] && [ -n "$set_wallpaper_before_dark_bare" ]; then
+    set_wallpaper_expect_revert="$set_wallpaper_before_dark_bare"
+fi
+if [ "$set_wallpaper_before_options" = "'none'" ]; then
+    set_wallpaper_expect_revert=""
+fi
+set_wallpaper_end=$(($(date +%s) + 15))
+while :; do
+    set_wallpaper_drop_first=$(sed -n '1p' "$XDG_RUNTIME_DIR/tuna-wallpaper" 2>/dev/null || true)
+    [ "$set_wallpaper_drop_first" = "$set_wallpaper_expect_revert" ] && break
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "revert did not restore the drop file (got '$set_wallpaper_drop_first')"
+    sleep 0.3
+done
+sleep 1
+scrot -o "$ARTIFACTS/set-wallpaper-shot-reverted.png" >/dev/null
+cp "$CSTATE" "$ARTIFACTS/set-wallpaper-reverted-state.json"
+pass G-SET-WALLPAPER "picture-uri writes publish, identify, decode and visibly repaint; replacement refreshes, an invalid URI is ignored, and revert restores"
+
+# P-ST-01 (#594): clock-format and clock-show-date reach the panel clock
+# live. The shell re-reads them every second, so no restart is needed
+# and re-setting the same values is idempotent. Seconds are covered by
+# G-SETTINGS-CLOCK; the weekday key shares this date code path.
+set_clock_before_format=$(gsettings get org.gnome.desktop.interface clock-format)
+set_clock_before_date=$(gsettings get org.gnome.desktop.interface clock-show-date)
+set_clock_before_weekday=$(gsettings get org.gnome.desktop.interface clock-show-weekday)
+set_clock_before_seconds=$(gsettings get org.gnome.desktop.interface clock-show-seconds)
+gsettings set org.gnome.desktop.interface clock-show-weekday false
+gsettings set org.gnome.desktop.interface clock-show-date false
+gsettings set org.gnome.desktop.interface clock-show-seconds false
+gsettings set org.gnome.desktop.interface clock-format '12h'
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-12h.json" 20 ||
+    fail G-SET-CLOCK "accessibility dump failed"
+scrot "$ARTIFACTS/set-clock-12h.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-12h.json" --format 12h --date off ||
+    fail G-SET-CLOCK "clock-format 12h without date did not reach the panel clock"
+gsettings set org.gnome.desktop.interface clock-show-date true
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-date.json" 20 ||
+    fail G-SET-CLOCK "accessibility dump failed"
+scrot "$ARTIFACTS/set-clock-date.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-date.json" --format 12h --date on ||
+    fail G-SET-CLOCK "clock-show-date did not add the date to the panel clock"
+# Negative control: an invalid format is rejected by the schema (or
+# falls back to 24h where the schema allows it) without breaking the clock.
+if gsettings set org.gnome.desktop.interface clock-format 'bogus' 2>"$ARTIFACTS/set-clock-invalid.err"; then
+    sleep 2
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-invalid.json" 20 ||
+        fail G-SET-CLOCK "accessibility dump failed"
+    scrot "$ARTIFACTS/set-clock-invalid.png" >/dev/null
+    "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-invalid.json" --format 24h --date on ||
+        fail G-SET-CLOCK "invalid clock-format did not fall back to a 24h clock"
+else
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-invalid.json" 20 ||
+        fail G-SET-CLOCK "accessibility dump failed"
+    scrot "$ARTIFACTS/set-clock-invalid.png" >/dev/null
+    "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-invalid.json" --format 12h --date on ||
+        fail G-SET-CLOCK "rejected clock-format changed the panel clock"
+fi
+gsettings set org.gnome.desktop.interface clock-format "$set_clock_before_format"
+gsettings set org.gnome.desktop.interface clock-show-date "$set_clock_before_date"
+gsettings set org.gnome.desktop.interface clock-show-weekday "$set_clock_before_weekday"
+gsettings set org.gnome.desktop.interface clock-show-seconds "$set_clock_before_seconds"
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-reverted.json" 20 ||
+    fail G-SET-CLOCK "accessibility dump failed"
+scrot "$ARTIFACTS/set-clock-reverted.png" >/dev/null
+set_clock_expect_format=24h
+case "$set_clock_before_format" in *12h*) set_clock_expect_format=12h ;; esac
+set_clock_expect_date=off
+case "$set_clock_before_date" in *true*) set_clock_expect_date=on ;; esac
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-reverted.json" --format "$set_clock_expect_format" --date "$set_clock_expect_date" ||
+    fail G-SET-CLOCK "revert did not restore clock-format $set_clock_before_format / clock-show-date $set_clock_before_date"
+pass G-SET-CLOCK "clock-format and clock-show-date render live; an invalid format is rejected or falls back, and revert restores"
+
+# P-ST-01 (#594): document and monospace fonts reach GTK apps live
+# through the apps' own Gio.Settings reads, as gnome-terminal and
+# gedit read them (GTK offers no Gtk.Settings properties for these
+# keys; Tuna Desktop chrome keeps using font-name). No restart is
+# needed and re-setting the same values is idempotent.
+set_fonts_before_doc=$(gsettings get org.gnome.desktop.interface document-font-name)
+set_fonts_before_mono=$(gsettings get org.gnome.desktop.interface monospace-font-name)
+set_fonts_before_doc_bare=$(printf '%s' "$set_fonts_before_doc" | sed "s/^'//; s/'$//")
+set_fonts_before_mono_bare=$(printf '%s' "$set_fonts_before_mono" | sed "s/^'//; s/'$//")
+set_fonts_count="$(jq '.windows | length' "$CSTATE")"
+SET_FONTS_JSON="$ARTIFACTS/set-fonts-fixture.json"
+rm -f "$SET_FONTS_JSON"
+WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-set-font-fixture.py" "$SET_FONTS_JSON" >"$ARTIFACTS/set-fonts-fixture.log" 2>&1 &
+SET_FONTS_PID=$!
+cstate '.windows | any(.app_id == "tuna-set-fonts-fixture")' "fonts fixture mapped" ||
+    { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "GTK font fixture never mapped"; }
+sleep 1
+scrot "$ARTIFACTS/set-fonts-before.png" >/dev/null
+gsettings set org.gnome.desktop.interface document-font-name 'Serif 24'
+gsettings set org.gnome.desktop.interface monospace-font-name 'Monospace 24'
+set_fonts_end=$(($(date +%s) + 20))
+while :; do
+    if [ -s "$SET_FONTS_JSON" ]; then
+        "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" fonts-check "$SET_FONTS_JSON" \
+            --document 'Serif 24' --monospace 'Monospace 24' \
+            >"$ARTIFACTS/set-fonts-check.txt" 2>&1 && break
+    fi
+    [ "$(date +%s)" -ge "$set_fonts_end" ] && { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "GTK app never observed the font keys: $(cat "$ARTIFACTS/set-fonts-check.txt" 2>/dev/null || echo 'no fixture report')"; }
+    sleep 0.3
+done
+cp "$SET_FONTS_JSON" "$ARTIFACTS/set-fonts-after.json"
+sleep 1
+scrot "$ARTIFACTS/set-fonts-after.png" >/dev/null
+set_fonts_rect="$(jq -r '.windows[] | select(.app_id == "tuna-set-fonts-fixture") | .rect | join(" ")' "$CSTATE")"
+[ -n "$set_fonts_rect" ] ||
+    { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "font fixture window has no rectangle to sample"; }
+# shellcheck disable=SC2086
+set -- $set_fonts_rect
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" pixel-diff "$ARTIFACTS/set-fonts-before.png" "$ARTIFACTS/set-fonts-after.png" \
+    "$1" "$2" "$3" "$4" --min-fraction 0.02 ||
+    { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "document/monospace change did not visibly repaint the GTK fixture"; }
+# Idempotent: writing the same fonts again keeps the same app read.
+gsettings set org.gnome.desktop.interface document-font-name 'Serif 24'
+gsettings set org.gnome.desktop.interface monospace-font-name 'Monospace 24'
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" fonts-check "$SET_FONTS_JSON" \
+    --document 'Serif 24' --monospace 'Monospace 24' ||
+    { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "re-setting the same fonts lost the app's font read"; }
+# Negative control: a bogus family falls back in Pango without killing
+# the app or its font read.
+gsettings set org.gnome.desktop.interface document-font-name 'NoSuchFontXYZ 24'
+sleep 1
+kill -0 "$SET_FONTS_PID" 2>/dev/null || fail G-SET-FONTS "bogus document font killed the GTK fixture"
+cstate '.windows | any(.app_id == "tuna-set-fonts-fixture")' "fixture survives bogus font" ||
+    fail G-SET-FONTS "bogus document font unmapped the GTK fixture"
+scrot "$ARTIFACTS/set-fonts-invalid.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" fonts-check "$SET_FONTS_JSON" \
+    --document 'NoSuchFontXYZ 24' --monospace 'Monospace 24' ||
+    fail G-SET-FONTS "bogus document font broke the app's font read"
+gsettings set org.gnome.desktop.interface document-font-name "$set_fonts_before_doc"
+gsettings set org.gnome.desktop.interface monospace-font-name "$set_fonts_before_mono"
+set_fonts_end=$(($(date +%s) + 20))
+while :; do
+    if [ -s "$SET_FONTS_JSON" ]; then
+        "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" fonts-check "$SET_FONTS_JSON" \
+            --document "$set_fonts_before_doc_bare" --monospace "$set_fonts_before_mono_bare" \
+            >"$ARTIFACTS/set-fonts-revert-check.txt" 2>&1 && break
+    fi
+    [ "$(date +%s)" -ge "$set_fonts_end" ] && { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "revert never reached the GTK app: $(cat "$ARTIFACTS/set-fonts-revert-check.txt" 2>/dev/null || echo 'no fixture report')"; }
+    sleep 0.3
+done
+sleep 1
+scrot "$ARTIFACTS/set-fonts-reverted.png" >/dev/null
+kill "$SET_FONTS_PID" 2>/dev/null || true
+SET_FONTS_PID=""
+cstate ".windows | length == $set_fonts_count" "fonts fixture removed" ||
+    fail G-SET-FONTS "font fixture window did not unmap"
+pass G-SET-FONTS "document/monospace fonts reach GTK apps live with a visible repaint; a bogus family falls back, and revert restores"
 
 # GNOME's input settings (#60).
 gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us'), ('xkb', 'de')]"
