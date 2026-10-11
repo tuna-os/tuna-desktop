@@ -1485,6 +1485,12 @@ impl DragPager {
         let before = page > 0;
         let after = page + 1 < self.carousel.n_pages();
         let dragging = self.dragging.get();
+        if std::env::var_os("TUNA_GRID_TRACE").is_some() {
+            eprintln!(
+                "tuna-grid: pager sync page={page} pages={} dragging={dragging} before={before} after={after}",
+                self.carousel.n_pages()
+            );
+        }
         self.previous.set_visible(before && !dragging);
         self.next.set_visible(after && !dragging);
         self.previous_hint.set_visible(before && dragging);
@@ -1599,6 +1605,13 @@ impl DragPager {
         if std::env::var_os("TUNA_GRID_TRACE").is_some() {
             eprintln!("tuna-shell-gtk: grid pager drag entered width={width}");
         }
+        // The Carousel also recognizes primary-button drags as page
+        // swipes. During a tile DnD that competes with the drag pager:
+        // the carousel can move to the neighboring page while the user
+        // is only dragging across tiles, changing which hint is shown.
+        // Touchpad/scroll navigation remains available outside a DnD;
+        // edge paging while dragging is owned by this pager below.
+        self.carousel.set_interactive(false);
         // A tenth of the grid each (PAGE_PREVIEW_RATIO / 2).
         let w = (f64::from(width) * 0.1) as i32;
         self.previous_hint.set_size_request(w, -1);
@@ -1613,6 +1626,7 @@ impl DragPager {
         }
         self.reset();
         self.dragging.set(false);
+        self.carousel.set_interactive(true);
         self.previous_hint.remove_css_class("dnd");
         self.next_hint.remove_css_class("dnd");
         self.sync(self.page());
