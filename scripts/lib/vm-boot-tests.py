@@ -501,5 +501,35 @@ class PciCapabilities(unittest.TestCase):
         self.assertTrue(self.probe(8, cycle=True)["no_soft_reset"])
 
 
+class UsbBusDiscovery(unittest.TestCase):
+    QTREE = """bus: main-system-bus
+  type System
+  dev: qemu-xhci, id ""
+    bus: usb-bus.0
+      type USB
+      dev: usb-tablet, id ""
+        port = "1"
+      dev: usb-kbd, id ""
+        port = "2"
+"""
+
+    def test_typed_usb_bus_wins(self):
+        self.assertEqual(lane.usb_bus_from_qtree(self.QTREE), "usb-bus.0")
+
+    def test_endpoint_devices_name_the_bus_without_a_type_line(self):
+        qtree = self.QTREE.replace("      type USB\n", "")
+        self.assertEqual(lane.usb_bus_from_qtree(qtree), "usb-bus.0")
+
+    def test_controllers_never_pose_as_endpoints(self):
+        qtree = ("bus: main-system-bus\n  type System\n"
+                 "  dev: usb-ehci, id \"\"\n    bus: usb-bus.0\n")
+        with self.assertRaises(RuntimeError):
+            lane.usb_bus_from_qtree(qtree)
+
+    def test_missing_usb_bus_raises(self):
+        with self.assertRaises(RuntimeError):
+            lane.usb_bus_from_qtree("bus: main-system-bus\n  type System\n")
+
+
 if __name__ == "__main__":
     unittest.main()
