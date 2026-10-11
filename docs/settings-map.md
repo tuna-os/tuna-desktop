@@ -51,6 +51,7 @@ GNOME 51 `org.gnome.desktop.a11y.interface reduced-motion` is read live and comb
 | org.gnome.desktop.app-folders (folder-children and each folder's name, apps, categories, excluded-apps, translate) | Honored | App-grid folders, read on each grid open. Proof G-APP-FOLDERS |
 | org.gnome.shell enabled-extensions | Ignored | GNOME Shell extensions are JavaScript. Tuna Desktop has its own extension point |
 | org.gnome.settings-daemon.plugins.color night-light-enabled | Honored (write only) | The Night Light tile writes it, but Tuna Desktop applies no colour temperature yet (#89 gamma control) |
+| org.gnome.settings-daemon.plugins.color night-light-temperature, night-light-schedule-automatic, night-light-schedule-from, night-light-schedule-to | Ignored | Named in the compositor's Night Light key inventory; the schedule model is pure and no reader or gamma control consumes these keys yet (#89, #339) |
 
 ## Displays
 

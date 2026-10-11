@@ -68,6 +68,7 @@ pub mod monitors;
 pub mod mutter;
 #[cfg(feature = "drm")]
 mod native_repaint;
+pub mod night_light;
 mod occlusion;
 pub mod orca;
 pub mod orientation;
