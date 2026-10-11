@@ -97,7 +97,7 @@ def check_wallpaper(state, uri, identity, decoded):
             known = [prefixed(item, "uri") for item in snapshots][:4]
             return False, f"no identity snapshot for {uri!r} (have {known})"
         seen = prefixed(match[0], "identity")
-        if identity == "file" and not seen.startswith("FileIdentity"):
+        if identity == "file" and not seen.startswith("Some(FileIdentity"):
             return False, f"identity for {uri!r} is {seen!r}, not a file"
         if identity == "none" and seen != "None":
             return False, f"identity for {uri!r} is {seen!r}, not ignored"
