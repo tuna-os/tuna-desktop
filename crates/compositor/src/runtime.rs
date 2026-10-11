@@ -70,7 +70,6 @@ const FRAME_BUDGET: Duration = Duration::from_millis(16);
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
 /// client epoll set; a duplicate keeps calloop's source lifetime independent.
-#[cfg(any(feature = "drm", test))]
 fn display_readiness_source(
     display: &Display<State>,
 ) -> std::io::Result<calloop::generic::Generic<std::os::fd::OwnedFd>> {
@@ -87,6 +86,26 @@ mod display_readiness_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn modal_parent_fades_need_real_timer_work_but_not_manual_clock_ticks() {
+        let mut dim = crate::modal_dim::ModalDim::default();
+        let alive = std::collections::HashSet::from([1]);
+        let policy = tuna_shell_control::motion::MotionPolicy::default();
+        dim.step(&alive, &alive, Duration::ZERO, policy, true);
+        assert!(dim.running());
+        let mut schedule = crate::idle_schedule::Schedule::default();
+        schedule.motion(false, dim.running());
+        assert_eq!(schedule.wait(), Some(FRAME_BUDGET));
+        let mut manual = crate::idle_schedule::Schedule::default();
+        manual.motion(true, dim.running());
+        assert_eq!(manual.wait(), None);
+        dim.step(&alive, &alive, Duration::from_secs(1), policy, true);
+        assert!(!dim.running());
+        let mut settled = crate::idle_schedule::Schedule::default();
+        settled.motion(false, dim.running());
+        assert_eq!(settled.wait(), None);
+    }
 
     #[test]
     fn accepted_wayland_requests_wake_the_loop_and_drained_clients_do_not_spin() {
@@ -398,6 +417,16 @@ mod scene_slot_tests {
     use super::{scene_slots, SceneSlot::*};
 
     #[test]
+    fn frame_bell_stays_under_higher_windows_and_only_in_its_slice() {
+        let mut over = scene_slots(2, 0, false, &[0]);
+        super::insert_bell_slot(&mut over, 1, 0);
+        assert_eq!(over, [Snapshot(0), Element(0), Bell(0), Element(1)]);
+        let mut under = scene_slots(2, 2, true, &[]);
+        super::insert_bell_slot(&mut under, 1, 0);
+        assert_eq!(under, [Element(2), Element(3)]);
+    }
+
+    #[test]
     fn snapshots_draw_in_front_of_the_elements_at_and_after_their_index() {
         // Five elements split at 2: snapshot 0 sits at index 1 (over half),
         // snapshot 1 at the boundary 2 (under half's end only), snapshots
@@ -546,6 +575,12 @@ struct RemoteHeld {
     buttons: std::collections::HashSet<u32>,
 }
 
+struct PendingScreenshotReply {
+    deadline: Duration,
+    reply: std::sync::mpsc::Sender<Option<std::path::PathBuf>>,
+    saved: Option<std::path::PathBuf>,
+}
+
 pub struct Runtime {
     display: Display<State>,
     state: State,
@@ -564,6 +599,15 @@ pub struct Runtime {
     /// snapshots; the shell never owns it.
     lock: SessionLock,
     blank: crate::lock::IdleBlank,
+    screenshot_flashes: crate::screenshot_flash::Flashes,
+    screenshot_replies: Vec<PendingScreenshotReply>,
+    idle_blank_signal: Option<crate::runtime_signal::CachedSignal>,
+    wake: crate::wake::Wake,
+    proof_signals: Vec<crate::runtime_signal::CachedSignal>,
+    child_sources: std::collections::HashMap<u32, calloop::RegistrationToken>,
+    child_watch_failed: bool,
+    exited_children: std::collections::HashSet<u32>,
+    was_inhibited: bool,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -807,6 +851,18 @@ impl Runtime {
             .ok_or_else(|| RuntimeError::Socket("XDG_RUNTIME_DIR is unset".to_owned()))?;
         let control = ControlHub::bind(control_path.clone(), tokens, crate::SEAT_NAME)
             .map_err(|e| RuntimeError::Socket(e.to_string()))?;
+        event_loop
+            .handle()
+            .insert_source(
+                control
+                    .readiness_source()
+                    .map_err(|e| RuntimeError::Loop(e.to_string()))?,
+                |_, fd, _: &mut Runtime| {
+                    crate::control_readiness::drain(fd)?;
+                    Ok(calloop::PostAction::Continue)
+                },
+            )
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let shell_policy = RestartPolicy::default();
         let mut shell = ShellDriver::new(
             shell_policy,
@@ -830,8 +886,9 @@ impl Runtime {
                 Backend::Winit(Box::new(backend))
             }
         };
-        #[cfg(feature = "drm")]
-        if matches!(backend, Backend::Drm(_)) {
+        {
+            // Accepted clients also wake the nested backend, independently of
+            // host window input. The scheduler separately accounts for active work.
             event_loop
                 .handle()
                 .insert_source(
@@ -920,17 +977,54 @@ impl Runtime {
                         calloop::channel::Event::Msg(Request::Shot {
                             filename,
                             window,
+                            flash,
                             reply,
                         }) => {
+                            if flash
+                                && rt.screenshot_replies.len()
+                                    == crate::screenshot_flash::MAX_FLASHES
+                            {
+                                let _ = reply.send(None);
+                                return;
+                            }
                             let saved = if window {
                                 rt.capture_window(&filename)
                             } else {
                                 rt.capture(&filename)
                             };
-                            let _ = reply.send(saved);
+                            let deadline = (flash && saved.is_some())
+                                .then(|| rt.start_screenshot_flash(window))
+                                .flatten();
+                            if let Some(deadline) = deadline {
+                                rt.screenshot_replies.push(PendingScreenshotReply {
+                                    deadline,
+                                    reply,
+                                    saved,
+                                });
+                            } else {
+                                let _ = reply.send(saved);
+                            }
                         }
                         calloop::channel::Event::Msg(Request::Windows { directory, reply }) => {
                             let _ = reply.send(rt.capture_selector_windows(&directory));
+                        }
+                        calloop::channel::Event::Msg(Request::Flash { area, reply }) => {
+                            let valid = !rt.is_locked()
+                                && rt.state.outputs.iter().any(|out| {
+                                    let [x, y, width, height] = area;
+                                    width > 0
+                                        && height > 0
+                                        && x >= out.loc.0
+                                        && y >= out.loc.1
+                                        && i64::from(x) + i64::from(width)
+                                            <= i64::from(out.loc.0) + i64::from(out.size.w)
+                                        && i64::from(y) + i64::from(height)
+                                            <= i64::from(out.loc.1) + i64::from(out.size.h)
+                                });
+                            if valid {
+                                let _ = rt.start_flash_area(area);
+                            }
+                            let _ = reply.send(valid);
                         }
                         calloop::channel::Event::Closed => {}
                     }
@@ -949,6 +1043,12 @@ impl Runtime {
             })
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
 
+        let (wake, wake_source) =
+            crate::wake::Wake::new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        event_loop
+            .handle()
+            .insert_source(wake_source, |_, _, _: &mut Runtime| {})
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let loop_handle = event_loop.handle();
         let mut runtime = Runtime {
             display,
@@ -963,6 +1063,19 @@ impl Runtime {
             triggers: TriggerState::default(),
             lock: SessionLock::new(idle_timeout_ms()),
             blank: crate::lock::IdleBlank::default(),
+            screenshot_flashes: Default::default(),
+            screenshot_replies: Vec::new(),
+            wake,
+            proof_signals: Vec::new(),
+            child_sources: Default::default(),
+            child_watch_failed: false,
+            exited_children: Default::default(),
+            was_inhibited: false,
+            idle_blank_signal: std::env::var_os("XDG_RUNTIME_DIR").map(|dir| {
+                crate::runtime_signal::CachedSignal::new(
+                    std::path::PathBuf::from(dir).join("tuna-idle-blank"),
+                )
+            }),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
             #[cfg(feature = "xwayland")]
@@ -1016,8 +1129,86 @@ impl Runtime {
             #[cfg(feature = "drm")]
             performance_trace: crate::performance_trace::Trace::from_env(),
         };
+        if let Some(signal) = runtime.idle_blank_signal.as_mut() {
+            runtime.blank = crate::lock::IdleBlank::parse(signal.text());
+            match signal.source() {
+                Ok(Some(source)) => {
+                    runtime
+                        .loop_handle
+                        .insert_source(source, |_, _, rt: &mut Runtime| {
+                            let Some(signal) = rt.idle_blank_signal.as_mut() else {
+                                return Ok(calloop::PostAction::Remove);
+                            };
+                            let valid = signal.refresh();
+                            rt.blank = crate::lock::IdleBlank::parse(signal.text());
+                            Ok(if valid {
+                                calloop::PostAction::Continue
+                            } else {
+                                calloop::PostAction::Remove
+                            })
+                        })
+                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                }
+                Ok(None) | Err(_) => signal.disable(),
+            }
+        }
         runtime.animation_clock =
             crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
+        runtime.wallpaper.set_wake(&runtime.wake);
+        runtime.orca.set_wake(&runtime.wake);
+        runtime.idle_monitor.set_wake(&runtime.wake);
+        if let Some(ime) = &runtime.ime {
+            ime.set_wake(&runtime.wake);
+        }
+        #[cfg(feature = "xwayland")]
+        runtime.x11_icon_reader.set_wake(&runtime.wake);
+        match runtime.wallpaper.install_drop_watch() {
+            Ok(Some(source)) => {
+                runtime
+                    .loop_handle
+                    .insert_source(source, |_, _, rt: &mut Runtime| {
+                        Ok(if rt.wallpaper.refresh_drop_watch() {
+                            calloop::PostAction::Continue
+                        } else {
+                            calloop::PostAction::Remove
+                        })
+                    })
+                    .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+            }
+            _ => runtime.wallpaper.disable_drop_watch(),
+        }
+        let mut proof_paths = Vec::new();
+        if let Some(path) = runtime.animation_clock.watch_path() {
+            proof_paths.push(path);
+        }
+        if runtime.state_path.is_some() {
+            if let Some(path) = std::env::var_os("TUNA_PROOF_SWIPE_INPUT")
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+            {
+                proof_paths.push(path);
+            }
+        }
+        for path in proof_paths {
+            let mut signal = crate::runtime_signal::CachedSignal::new(path);
+            let index = runtime.proof_signals.len();
+            match signal.source() {
+                Ok(Some(source)) => {
+                    runtime
+                        .loop_handle
+                        .insert_source(source, move |_, _, rt: &mut Runtime| {
+                            Ok(if rt.proof_signals[index].refresh() {
+                                calloop::PostAction::Continue
+                            } else {
+                                calloop::PostAction::Remove
+                            })
+                        })
+                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                }
+                _ => signal.disable(),
+            }
+            runtime.proof_signals.push(signal);
+        }
         let started = runtime.animation_clock.now();
         runtime.overview_progress_at = started;
         runtime.strip_view_at = started;
@@ -1026,7 +1217,9 @@ impl Runtime {
         #[cfg(feature = "xwayland")]
         if session.xwayland {
             if let Err(error) = runtime.prepare_x11(None) {
-                eprintln!("tuna-compositor: xwayland: socket preparation failed: {error}; native session continues");
+                eprintln!(
+                    "tuna-compositor: xwayland: socket preparation failed: {error}; native session continues"
+                );
             }
         }
         // GNOME Shell greets a login with the overview.
@@ -1648,7 +1841,9 @@ impl Runtime {
                 .collect::<Vec<_>>(),
         });
         // Overdraw per output for the last drawn frame (#503).
+        doc["workspaces"] = serde_json::json!(model.workspaces());
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
+        doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
             .frame_costs
             .iter()
@@ -1703,7 +1898,7 @@ impl Runtime {
         // its expansion remains below the compiler's default recursion limit.
         // These values keep the same flat JSON fields and suppress lock input.
         doc["native_relative_motion_count"] = serde_json::json!((!self.is_locked())
-            .then(|| match &self.backend {
+            .then_some(match &self.backend {
                 #[cfg(feature = "drm")]
                 Backend::Drm(drm) => Some(drm.relative_motion_events()),
                 Backend::Winit(_) => None::<u64>,
@@ -1733,9 +1928,9 @@ impl Runtime {
         let output = Rectangle::new((0, 0).into(), size);
         let model = self.manager.model();
         let layout = if self.overview_app_grid {
-            crate::overview::app_grid_layout
+            crate::overview::app_grid_layout_with_policy
         } else {
-            crate::overview::layout
+            crate::overview::layout_with_policy
         };
         layout(
             output,
@@ -1743,6 +1938,7 @@ impl Runtime {
             model.workspaces(),
             model.active_workspace(),
             &self.manager.overview_windows(),
+            model.fixed_workspace_count().is_none(),
         )
     }
 
@@ -2116,6 +2312,40 @@ impl Runtime {
         }
     }
 
+    fn start_screenshot_flash(&mut self, window: bool) -> Option<Duration> {
+        if self.is_locked() || !self.input_settings.motion.allows_fades() {
+            return None;
+        }
+        let area = if window {
+            self.manager
+                .model()
+                .focused()
+                .and_then(|id| self.manager.geometry(id))
+        } else {
+            self.state.primary_output_name().and_then(|name| {
+                self.state
+                    .outputs
+                    .iter()
+                    .find(|output| output.name == name)
+                    .map(|output| Rectangle::<i32, Logical>::new(output.loc.into(), output.size))
+            })
+        };
+        area.and_then(|area| {
+            self.start_flash_area([area.loc.x, area.loc.y, area.size.w, area.size.h])
+        })
+    }
+
+    fn start_flash_area(&mut self, area: [i32; 4]) -> Option<Duration> {
+        if self.is_locked() || !self.input_settings.motion.allows_fades() {
+            return None;
+        }
+        let now = self.animation_clock.now();
+        let duration =
+            Duration::from_secs_f64(self.input_settings.motion.adjust_ms(500.0) / 1000.0);
+        self.screenshot_flashes.trigger(area, now, duration);
+        now.checked_add(duration)
+    }
+
     /// Render the primary output's current scene offscreen and save it
     /// as a PNG (`requested` when absolute, else GNOME's default path).
     /// Never while locked: nothing behind the lock may leave the session.
@@ -2345,6 +2575,31 @@ impl Runtime {
         }
     }
 
+    /// Resolve only currently rendered target windows. A destroyed/hidden
+    /// explicit target does not redirect a frame flash to another window.
+    fn bell_frame(&mut self) -> Option<BellFrame> {
+        let now = Instant::now();
+        self.state.protocols.bell.tick(now);
+        if self.is_locked() {
+            self.state.protocols.bell.clear_visual();
+            return None;
+        }
+        let (alpha, surface) = self.state.protocols.bell.visual(now)?;
+        let target = if let Some(surface) = surface {
+            Some(
+                self.manager
+                    .render_entries()
+                    .into_iter()
+                    .find_map(|(id, _, geo)| {
+                        (self.manager.surface_of(id).as_ref() == Some(surface)).then_some((id, geo))
+                    })?,
+            )
+        } else {
+            None
+        };
+        Some((alpha, target))
+    }
+
     /// The desktop clear: GNOME's `primary-color` once the shell has
     /// published it, else a dark neutral.
     fn desktop_color(&self) -> Color32F {
@@ -2363,6 +2618,8 @@ impl Runtime {
         fourcc: smithay::backend::allocator::Fourcc,
     ) -> Option<(i32, i32, Vec<u8>)> {
         use smithay::backend::renderer::{ExportMem, Offscreen};
+        #[cfg(not(feature = "drm"))]
+        let _ = connector;
         if self.is_locked() {
             return None;
         }
@@ -2386,6 +2643,7 @@ impl Runtime {
             self.desktop_color()
         };
         let desktop = self.background_desktop();
+        let bell = self.bell_frame();
         let (renderer, size, view) = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = backend.window_size();
@@ -2446,6 +2704,7 @@ impl Runtime {
             view,
             self.manager.pointer_pos(),
         ));
+        install_bell(&mut elements, view, bell, desktop);
         let decor = decor_for_output(&decor_global, view);
         let previews = preview_elements(renderer, &self.manager, view, cards);
         let paper = backdrop(
@@ -2539,6 +2798,8 @@ impl Runtime {
             let frame = match &target {
                 CastTarget::Window(id) => self.render_window_pixels(*id, Some(size), xrgb),
                 CastTarget::Monitor(connector) => {
+                    #[cfg(not(feature = "drm"))]
+                    let _ = connector;
                     let output = match &self.backend {
                         Backend::Winit(_) => None,
                         #[cfg(feature = "drm")]
@@ -2852,6 +3113,9 @@ impl Runtime {
     /// Apply GNOME's input settings (#60): the seat's keymap and key
     /// repeat, libinput pointer devices (hardware), the hot corner.
     fn apply_input_settings(&mut self, settings: tuna_shell_control::InputSettings) {
+        self.state.protocols.bell.set_policy(settings.bell.clone());
+        self.manager
+            .apply_workspace_policy(&mut self.state, settings.workspace_policy);
         self.manager
             .apply_keyboard_settings(&mut self.state, &settings);
         self.triggers.set_hot_corner(settings.hot_corners);
@@ -3026,12 +3290,155 @@ impl Runtime {
         self.introspect.publish(windows);
     }
 
+    /// Watch only unreaped children owned by this runtime. Their pid cannot be
+    /// reused before try_wait consumes the exit; no arbitrary /proc selection.
+    fn sync_child_sources(&mut self) {
+        let mut pids: Vec<u32> = [
+            self.shell.child_pid(),
+            self.orca.pid(),
+            self.state.protocols.bell.player_pid(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if let Some(ime) = &self.ime {
+            pids.extend(ime.child_pids());
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        self.child_sources.retain(|pid, token| {
+            if pids.contains(pid) {
+                true
+            } else {
+                self.loop_handle.remove(*token);
+                false
+            }
+        });
+        self.exited_children.retain(|pid| pids.contains(pid));
+        self.child_watch_failed = !self.exited_children.is_empty();
+        for pid in pids {
+            if self.child_sources.contains_key(&pid) || self.exited_children.contains(&pid) {
+                continue;
+            }
+            let source = match crate::process_wake::source(pid) {
+                Ok(source) => source,
+                Err(_) => {
+                    self.child_watch_failed = true;
+                    continue;
+                }
+            };
+            match self
+                .loop_handle
+                .insert_source(source, move |_, _, rt: &mut Runtime| {
+                    rt.child_sources.remove(&pid);
+                    rt.exited_children.insert(pid);
+                    Ok(calloop::PostAction::Remove)
+                }) {
+                Ok(token) => {
+                    self.child_sources.insert(pid, token);
+                }
+                Err(_) => self.child_watch_failed = true,
+            }
+        }
+    }
+
+    /// Every deadline is an existing obligation. The previous active cap is
+    /// retained for motion, frame protocol service, and failed readiness.
+    fn next_wait(&self) -> Option<Duration> {
+        let mut schedule = crate::idle_schedule::Schedule::default();
+        let system_now = crate::state::system_millis();
+        if self.child_watch_failed
+            || self.control.needs_continuation(self.manager.model())
+            || self
+                .idle_blank_signal
+                .as_ref()
+                .is_some_and(|signal| !signal.watched())
+            || self.proof_signals.iter().any(|signal| !signal.watched())
+            || self.wallpaper.watch_fallback()
+        {
+            schedule.active();
+        }
+        if let Some(delay) = self.shell.next_delay_ms(system_now) {
+            schedule.after(Duration::from_millis(delay));
+        }
+        if let Some(deadline) = self.orca.next_deadline() {
+            schedule.at(deadline);
+        }
+        if !self.is_locked() {
+            if let Some(delay) = self.ime.as_ref().and_then(|ime| ime.next_delay(system_now)) {
+                schedule.after(delay);
+            }
+        }
+        #[cfg(feature = "xwayland")]
+        {
+            if !self.x11_failed {
+                if let Some(delay) = self.xwayland.next_delay_ms(system_now) {
+                    schedule.after(Duration::from_millis(delay));
+                }
+            }
+            if self.state.xwm.is_some() {
+                schedule.at(self.x11_icon_reader.next_deadline());
+            }
+        }
+        if let Some(deadline) = self.manager.workspace_lease_deadline() {
+            schedule.at(deadline);
+        }
+        if let Some(deadline) = self.idle_monitor.next_deadline() {
+            schedule.at(deadline);
+        }
+        if let Some(deadline) = self.wallpaper.maintenance_deadline() {
+            schedule.at(deadline);
+        }
+        schedule.idle(
+            self.lock.idle_ms(self.lock_now_ms()),
+            (!self.is_locked()).then_some(self.lock.timeout_ms()),
+            (self.blank.idle_ms, self.blank.fade_ms),
+            self.was_inhibited,
+        );
+        schedule.motion(
+            self.animation_clock.is_manual(),
+            self.overview_motion.animating()
+                || self.manager.strip_animating()
+                || (self.manager.workspace_slide().running()
+                    && !self.manager.workspace_slide().following())
+                || self.manager.size_changes().in_flight()
+                || self.manager.window_lifecycle().running()
+                || self.manager.modal_dim().running()
+                || self.screenshot_flashes.running()
+                || !self.screenshot_replies.is_empty()
+                || self.tile_animation.as_ref().is_some_and(|(_, _, start)| {
+                    self.animation_clock
+                        .now()
+                        .saturating_sub(*start)
+                        .as_secs_f64()
+                        < 0.2 * self.input_settings.motion.slowdown()
+                }),
+        );
+        if self.state.protocols.bell.visual(Instant::now()).is_some() {
+            schedule.active();
+        }
+        if let Some(deadline) = self.state.protocols.bell.player_deadline() {
+            schedule.at(deadline);
+        }
+        // Preserve refresh-cycle authority: these timers only request work;
+        // the existing drawn frame / KMS flip paths release protocol barriers.
+        let roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
+        if crate::frame_timing::pending_frame_work(&roots) {
+            schedule.active();
+        }
+        for cast in &self.casts {
+            if let Some(delay) = cast.next_delay() {
+                // A failed/no-buffer capture must not busy-loop on a past due
+                // timestamp. Keep the old active retry cap for that case.
+                schedule.after(if delay.is_zero() { FRAME_BUDGET } else { delay });
+            }
+        }
+        schedule.wait()
+    }
+
     fn tick(&mut self) -> Result<bool, RuntimeError> {
-        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let text =
-                crate::runtime_signal::read(&std::path::PathBuf::from(dir).join("tuna-idle-blank"))
-                    .unwrap_or_default();
-            self.blank = crate::lock::IdleBlank::parse(&text);
+        if let Some(signal) = self.idle_blank_signal.as_mut() {
+            self.blank = crate::lock::IdleBlank::parse(signal.text());
         }
         self.display
             .dispatch_clients(&mut self.state)
@@ -3078,6 +3485,9 @@ impl Runtime {
             .map(|output| output.name.clone());
         self.control.set_pointer_output(output);
         let outcome = self.control.poll(self.manager.model_mut());
+        for workspace in outcome.departed_workspaces.iter().copied() {
+            self.manager.keep_departed_workspace_alive(workspace);
+        }
         for id in outcome.activated {
             self.manager.focus(&mut self.state, Some(id));
         }
@@ -3146,7 +3556,7 @@ impl Runtime {
                     above: self.manager.is_above(window),
                     sticky: self.manager.is_sticky(window),
                     workspace_left: self.manager.workspace_left_of(window),
-                    workspace_right: true,
+                    workspace_right: self.manager.workspace_right_of(window),
                 });
         }
         if !self.control.overview_open() {
@@ -3213,11 +3623,14 @@ impl Runtime {
         self.idle_monitor.tick();
         // Idle timeout from input timestamps: lock the untouched session.
         // A live idle inhibitor (video, presentation) counts as activity.
-        if self.state.idle_inhibited() {
-            let now = self.lock_now_ms();
-            self.lock.note_input(now);
+        let inhibited = self.state.idle_inhibited();
+        if self
+            .lock
+            .inhibitor_activity(self.was_inhibited, inhibited, self.lock_now_ms())
+        {
             self.idle_since = Instant::now();
         }
+        self.was_inhibited = inhibited;
         if !self.is_locked() && self.lock.check_timeout(self.lock_now_ms()) {
             self.engage_lock();
         }
@@ -3328,6 +3741,25 @@ impl Runtime {
         self.stats.shell_restarts = self.shell.restarts_used();
         self.proof_swipe_input();
         self.animation_clock.poll();
+        // GNOME completes a flashing screenshot reply when its feedback ends.
+        // Locking or disabling animations also ends pending feedback promptly.
+        let now = self.animation_clock.now();
+        let ended = self.is_locked() || !self.input_settings.motion.allows_fades();
+        let mut index = 0;
+        while index < self.screenshot_replies.len() {
+            if ended || now >= self.screenshot_replies[index].deadline {
+                let pending = self.screenshot_replies.swap_remove(index);
+                let _ = pending.reply.send(pending.saved);
+            } else {
+                index += 1;
+            }
+        }
+        self.manager.reconcile_dynamic_workspaces(
+            self.overview_drag.is_some(),
+            now,
+            self.state.primary_size().w,
+            self.input_settings.motion,
+        );
         self.publish_state();
         self.publish_cast_outputs();
         self.publish_overview_previews();
@@ -3341,6 +3773,7 @@ impl Runtime {
                 .flush_clients()
                 .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         }
+        self.sync_child_sources();
         Ok(!self.exit)
     }
 
@@ -3411,6 +3844,11 @@ impl Runtime {
         self.step_workspace_slide();
         self.step_size_changes();
         let now = self.animation_clock.now();
+        if locked || !self.input_settings.motion.allows_fades() {
+            self.screenshot_flashes.clear();
+        }
+        self.screenshot_flashes.expire(now);
+        let flashes = self.screenshot_flashes.samples(now);
         let allowed = crate::window_lifecycle::effects_allowed(
             self.control.overview_open(),
             self.shell_swipe.is_some(),
@@ -3422,6 +3860,12 @@ impl Runtime {
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
+        self.manager.step_modal_dim(
+            now,
+            self.input_settings.motion,
+            allowed,
+            self.input_settings.attach_modal_dialogs,
+        );
         crate::window_lifecycle::step_frame(
             &mut self.manager,
             renderer,
@@ -3455,6 +3899,7 @@ impl Runtime {
         #[cfg(feature = "drm")]
         let timing_roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
         let desktop = self.background_desktop();
+        let bell = self.bell_frame();
         // Window clones (overview, switcher) and casts show windows the
         // scene hides: their frame callbacks keep full rate then.
         let clones_shown =
@@ -3509,6 +3954,8 @@ impl Runtime {
                         view,
                         self.manager.pointer_pos(),
                     ));
+                    elements.flashes = screenshot_flash_elements(&flashes, view);
+                    install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
                     let paper = backdrop(
@@ -3630,6 +4077,8 @@ impl Runtime {
                         view,
                         self.manager.pointer_pos(),
                     ));
+                    elements.flashes = screenshot_flash_elements(&flashes, view);
+                    install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
                     let paper = backdrop(
@@ -3653,7 +4102,19 @@ impl Runtime {
                         pointer: (!locked && blank_alpha < 1.0).then_some((pointer.x, pointer.y)),
                         decor: decor.clone(),
                         above: elements.above,
+                        effects: elements
+                            .brightness
+                            .iter()
+                            .copied()
+                            .chain(elements.snapshots.iter().map(|s| s.2))
+                            .map(f32::to_bits)
+                            .collect(),
                         groups: vec![
+                            elements
+                                .flashes
+                                .iter()
+                                .map(|e| ElementSignature::capture(e, 1.0))
+                                .collect(),
                             paper
                                 .iter()
                                 .map(|e| ElementSignature::capture(e, 1.0))
@@ -3678,9 +4139,14 @@ impl Runtime {
                                 .map(|e| ElementSignature::capture(e, view.scale))
                                 .collect(),
                             elements
-                                .snapshots
+                                .bell
                                 .iter()
                                 .map(|(_, e)| ElementSignature::capture(e, 1.0))
+                                .collect(),
+                            elements
+                                .snapshots
+                                .iter()
+                                .map(|(_, e, _)| ElementSignature::capture(e, 1.0))
                                 .collect(),
                         ],
                     };
@@ -4005,9 +4471,17 @@ struct Scene {
     tile: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
     /// Window thumbnails over everything (the Alt+Tab switcher's).
     top: Vec<PreviewElement>,
+    /// Capture feedback is painted only on outputs, never into saved pixels.
+    flashes: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
+    bell: Vec<(
+        Option<usize>,
+        smithay::backend::renderer::element::solid::SolidColorRenderElement,
+    )>,
     /// Old-frame snapshots of size-change transitions (#496), each
     /// drawn in front of `elements[index..]`, in physical pixels.
-    snapshots: Vec<(usize, SnapshotElement)>,
+    snapshots: Vec<(usize, SnapshotElement, f32)>,
+    brightness: Vec<f32>,
+    dim_program: Option<smithay::backend::renderer::gles::GlesTexProgram>,
     /// The window each of `elements` belongs to (popups included), for
     /// reporting which windows occlusion hid; `None` for layers.
     owners: Vec<Option<u64>>,
@@ -4036,10 +4510,107 @@ impl Scene {
             above,
             tile: Vec::new(),
             top: Vec::new(),
+            flashes: Vec::new(),
+            bell: Vec::new(),
             snapshots: Vec::new(),
+            brightness: vec![1.0; above],
+            dim_program: None,
             owners: vec![None; above],
         }
     }
+}
+
+/// The flash uses premultiplied white, with changing commit metadata so native
+/// damage includes every fade frame and the frame that removes the feedback.
+fn screenshot_flash_elements(
+    flashes: &[([i32; 4], f32)],
+    view: View,
+) -> Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement> {
+    use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Id, Kind};
+    thread_local! {
+        static IDS: [Id; crate::screenshot_flash::MAX_FLASHES] = std::array::from_fn(|_| Id::new());
+    }
+    IDS.with(|ids| {
+        flashes
+            .iter()
+            .zip(ids.iter())
+            .map(|(sample, id)| {
+                let ([x, y, width, height], alpha) = *sample;
+                let start = view.physical(f64::from(x), f64::from(y));
+                let end = view.physical(
+                    f64::from(x) + f64::from(width),
+                    f64::from(y) + f64::from(height),
+                );
+                SolidColorRenderElement::new(
+                    id.clone(),
+                    Rectangle::new(
+                        start,
+                        ((end.x - start.x).max(1), (end.y - start.y).max(1)).into(),
+                    ),
+                    alpha.to_bits() as usize,
+                    Color32F::new(alpha, alpha, alpha, alpha),
+                    Kind::Unspecified,
+                )
+            })
+            .collect()
+    })
+}
+
+/// A frame bell sits above its own window and below every higher layer/window.
+fn insert_bell_slots(slots: &mut Vec<SceneSlot>, scene: &Scene) {
+    for (k, (at, _)) in scene.bell.iter().enumerate() {
+        let Some(at) = at else { continue };
+        insert_bell_slot(slots, *at, k);
+    }
+}
+
+fn insert_bell_slot(slots: &mut Vec<SceneSlot>, at: usize, k: usize) {
+    if let Some(index) = slots
+        .iter()
+        .position(|slot| *slot == SceneSlot::Element(at))
+    {
+        slots.insert(index, SceneSlot::Bell(k));
+    }
+}
+
+type BellFrame = (f32, Option<(u64, Rectangle<i32, Logical>)>);
+
+fn install_bell(scene: &mut Scene, view: View, bell: Option<BellFrame>, desktop: [i32; 4]) {
+    use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Id};
+    let Some((alpha, target)) = bell.filter(|(alpha, _)| *alpha > 0.0) else {
+        return;
+    };
+    let (at, rect) = match target {
+        Some((id, geo)) => {
+            let Some(at) = scene.owners.iter().position(|owner| *owner == Some(id)) else {
+                return;
+            };
+            (Some(at), geo)
+        }
+        None => (
+            None,
+            Rectangle::new(
+                (desktop[0], desktop[1]).into(),
+                (desktop[2], desktop[3]).into(),
+            ),
+        ),
+    };
+    let origin = view.physical(f64::from(rect.loc.x), f64::from(rect.loc.y));
+    let end = view.physical(
+        f64::from(rect.loc.x + rect.size.w),
+        f64::from(rect.loc.y + rect.size.h),
+    );
+    thread_local! { static BELL_ID: Id = Id::new(); }
+    scene.bell.push((
+        at,
+        SolidColorRenderElement::new(
+            BELL_ID.with(Clone::clone),
+            Rectangle::new(origin, (end.x - origin.x, end.y - origin.y).into()),
+            0usize,
+            Color32F::new(0.0, 0.0, 0.0, alpha),
+            Kind::Unspecified,
+        ),
+    ));
 }
 
 /// GNOME's tile preview (`.tile-preview`: the accent at half opacity
@@ -4246,7 +4817,7 @@ fn scene_elements(
                 manager
                     .window_lifecycle()
                     .element(ghost, renderer, view)
-                    .map(|e| (elements.len(), e)),
+                    .map(|e| (elements.len(), e, 1.0)),
             );
         }
         // Unassociated X11 windows contribute no surface yet and
@@ -4293,8 +4864,9 @@ fn scene_elements(
                     );
                 }
                 snapshots.extend(
-                    crate::size_change::snapshot_element(renderer, snapshot, &frame, view)
-                        .map(|element| (elements.len(), element)),
+                    crate::size_change::snapshot_element(renderer, snapshot, &frame, view).map(
+                        |element| (elements.len(), element, manager.modal_dim().multiplier(id)),
+                    ),
                 );
                 owners.resize(elements.len(), Some(id));
                 continue;
@@ -4348,7 +4920,7 @@ fn scene_elements(
             manager
                 .window_lifecycle()
                 .element(ghost, renderer, view)
-                .map(|e| (elements.len(), e)),
+                .map(|e| (elements.len(), e, 1.0)),
         );
     }
     // Layer shell above windows: panel strip, then overview, each with
@@ -4372,15 +4944,29 @@ fn scene_elements(
     let above = elements.len() - split_from.unwrap_or(0);
     let total = elements.len();
     owners.resize(total, None);
-    let snapshots = snapshots
+    let snapshots: Vec<(usize, SnapshotElement, f32)> = snapshots
         .into_iter()
-        .map(|(index, element)| (total - index, element))
+        .map(|(index, element, brightness)| (total - index, element, brightness))
         .collect();
+    let brightness: Vec<f32> = owners
+        .iter()
+        .map(|id| id.map_or(1.0, |id| manager.modal_dim().multiplier(id)))
+        .collect();
+    let dim_program = if brightness.iter().any(|v| *v < 1.0) || snapshots.iter().any(|s| s.2 < 1.0)
+    {
+        crate::modal_dim::program(renderer)
+    } else {
+        None
+    };
     Scene {
         elements: crate::layer::front_to_back(elements),
+        brightness: crate::layer::front_to_back(brightness),
+        dim_program,
         above,
         tile: Vec::new(),
         top: Vec::new(),
+        flashes: Vec::new(),
+        bell: Vec::new(),
         snapshots,
         owners: crate::layer::front_to_back(owners),
     }
@@ -4504,14 +5090,24 @@ fn draw_scene(
         )
     });
     let shield_plan = occlusion.plan(1.0, shield.as_slice());
+    let flash_plan = occlusion.plan(1.0, &scene.flashes);
+    let fullscreen_bell: Vec<_> = scene
+        .bell
+        .iter()
+        .filter(|(at, _)| at.is_none())
+        .map(|(_, e)| e.clone())
+        .collect();
+    let bell_plan = occlusion.plan(1.0, &fullscreen_bell);
     let top_plan = occlusion.plan(scale, &scene.top);
     // Beneath the tile preview, the preview (blended), then the
     // dragged window and the layers over it, each half with the
     // size-change snapshots among its elements (#496).
     let split = scene.above.min(scene.elements.len());
-    let snapshot_at: Vec<usize> = scene.snapshots.iter().map(|(index, _)| *index).collect();
-    let over = scene_slots(split, 0, false, &snapshot_at);
-    let under = scene_slots(scene.elements.len() - split, split, true, &snapshot_at);
+    let snapshot_at: Vec<usize> = scene.snapshots.iter().map(|(index, _, _)| *index).collect();
+    let mut over = scene_slots(split, 0, false, &snapshot_at);
+    let mut under = scene_slots(scene.elements.len() - split, split, true, &snapshot_at);
+    insert_bell_slots(&mut over, scene);
+    insert_bell_slots(&mut under, scene);
     let over_plan = plan_slots(&mut occlusion, scale, scene, &over);
     let tile_plan = occlusion.plan(1.0, &scene.tile);
     let under_plan = plan_slots(&mut occlusion, scale, scene, &under);
@@ -4540,6 +5136,8 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.tile, &tile_plan).map_err(error)?;
     draw_slots(frame, scale, scene, &over, &over_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.flashes, &flash_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, visible) in over
@@ -4564,6 +5162,7 @@ fn draw_scene(
 enum SceneSlot {
     Element(usize),
     Snapshot(usize),
+    Bell(usize),
 }
 
 /// The scene's `[base..base + len]` elements front to back, with the
@@ -4608,6 +5207,9 @@ fn plan_slots(
             SceneSlot::Element(index) => occlusion
                 .plan(scale, std::slice::from_ref(&scene.elements[index]))
                 .remove(0),
+            SceneSlot::Bell(k) => occlusion
+                .plan(1.0, std::slice::from_ref(&scene.bell[k].1))
+                .remove(0),
             SceneSlot::Snapshot(k) => occlusion
                 .plan(1.0, std::slice::from_ref(&scene.snapshots[k].1))
                 .remove(0),
@@ -4625,20 +5227,44 @@ fn draw_slots(
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
         let visible = std::slice::from_ref(visible);
-        match *slot {
+        let brightness = match *slot {
+            SceneSlot::Element(index) => scene.brightness[index],
+            SceneSlot::Snapshot(k) => scene.snapshots[k].2,
+            SceneSlot::Bell(_) => 1.0,
+        };
+        if brightness < 1.0 {
+            if let Some(program) = &scene.dim_program {
+                frame.override_default_tex_program(
+                    program.clone(),
+                    vec![smithay::backend::renderer::gles::Uniform::new(
+                        "brightness",
+                        brightness,
+                    )],
+                );
+            }
+        }
+        let result = match *slot {
             SceneSlot::Element(index) => draw_planned::<GlesRenderer, _>(
                 frame,
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
-            )?,
+            ),
+            SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
+                frame,
+                1.0,
+                std::slice::from_ref(&scene.bell[k].1),
+                visible,
+            ),
             SceneSlot::Snapshot(k) => draw_planned::<GlesRenderer, _>(
                 frame,
                 1.0,
                 std::slice::from_ref(&scene.snapshots[k].1),
                 visible,
-            )?,
-        }
+            ),
+        };
+        frame.clear_tex_program_override();
+        result?;
     }
     Ok(())
 }
@@ -4829,23 +5455,46 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
     } else {
         None
     };
+    #[cfg(feature = "drm")]
+    if let Some(monitor) = &sleep_monitor {
+        monitor.set_wake(&runtime.wake);
+    }
     // Graceful shutdown on SIGTERM/SIGINT: ending the loop drops the
     // runtime, whose supervisor kills the shell child (ADR 0003 kill
     // on exit). Without this a signal would bypass `Drop` and orphan
     // the shell on a dead socket. The flag write is the only work done
     // in the handler; the loop observes it below.
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
-        signal_hook::flag::register(signal, std::sync::Arc::clone(&shutdown))
-            .map_err(|e| RuntimeError::Loop(format!("signal handler failed: {e}")))?;
-    }
+    let (signal_source, _signal_handlers) = crate::shutdown_wake::source(
+        &[signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT],
+        &shutdown,
+    )
+    .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+    event_loop
+        .handle()
+        .insert_source(signal_source, |_, stream, rt: &mut Runtime| {
+            use std::io::Read;
+            let mut stream = &**stream;
+            let mut bytes = [0; 64];
+            loop {
+                match stream.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(_) => rt.exit = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            Ok(calloop::PostAction::Continue)
+        })
+        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+    let mut wait = Some(Duration::ZERO);
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             restore_env(prev_env);
             return Ok(runtime.stats);
         }
         let dispatched = event_loop
-            .dispatch(Some(FRAME_BUDGET), &mut runtime)
+            .dispatch(wait, &mut runtime)
             .map_err(|e| RuntimeError::Loop(e.to_string()));
         #[cfg(feature = "drm")]
         if let Some(monitor) = &sleep_monitor {
@@ -4863,7 +5512,10 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
         }
         let ticked = dispatched.and_then(|_| runtime.tick());
         match ticked {
-            Ok(true) => continue,
+            Ok(true) => {
+                wait = runtime.next_wait();
+                continue;
+            }
             done => {
                 restore_env(prev_env);
                 return done.map(|_| runtime.stats);

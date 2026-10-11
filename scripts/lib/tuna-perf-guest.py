@@ -129,6 +129,21 @@ def unique_drm_clients(rows):
     return list(clients.values())
 
 
+def read_smaps_rollup(path):
+    """Bound a transient ESRCH while a process changes or releases its mm.
+
+    The caller still rechecks uid/start time and rejects a persistent read
+    failure. Permission, malformed-data and missing-file errors are not retried.
+    """
+    for attempt in range(3):
+        try:
+            return (path / "smaps_rollup").read_text()
+        except ProcessLookupError:
+            if attempt == 2:
+                raise
+            time.sleep(0.0005)
+
+
 def sample(uid, proc=Path("/proc"), observer=None):
     processes, errors = {}, []
     for path in proc.iterdir():
@@ -152,7 +167,7 @@ def sample(uid, proc=Path("/proc"), observer=None):
             continue
         path = proc / str(pid)
         try:
-            memory = dict(line.split(":", 1) for line in (path / "smaps_rollup").read_text().splitlines() if ":" in line)
+            memory = dict(line.split(":", 1) for line in read_smaps_rollup(path).splitlines() if ":" in line)
             row.update(pss_kib=int(memory["Pss"].split()[0]), rss_kib=int(memory["Rss"].split()[0]),
                        fds=len(list((path / "fd").iterdir())))
             row["drm_clients"], row["drm_errors"] = drm_clients(path)

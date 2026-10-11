@@ -88,6 +88,14 @@ pub struct ControlConn {
 }
 
 impl ControlConn {
+    fn buffered_work(&self) -> bool {
+        let Some(header) = self.rbuf.get(..4) else {
+            return false;
+        };
+        let len = u32::from_le_bytes(header.try_into().expect("four byte header")) as usize;
+        len > MAX_FRAME_BYTES || self.rbuf.len() >= 4 + len
+    }
+
     /// Wrap a connected stream and put it in nonblocking mode.
     pub fn new(stream: UnixStream) -> Result<Self, ControlError> {
         stream.set_nonblocking(true)?;
@@ -498,6 +506,13 @@ impl<'a> Session<'a> {
         }
         match model.changes_since(self.last_revision) {
             Ok(entries) => {
+                if entries
+                    .iter()
+                    .any(|(_, change)| matches!(change, StateChange::WorkspacesChanged))
+                {
+                    let revision = self.send_snapshot(model)?;
+                    return Ok(Emitted::Snapshot { revision });
+                }
                 let ops: Vec<StateOp> = entries
                     .iter()
                     .filter_map(|(_, c)| state_op(c, &*self.minter))
@@ -866,6 +881,7 @@ fn window_to_wire(
     mint: &dyn Fn(Option<&str>) -> String,
 ) -> tuna_shell_control::WindowInfo {
     tuna_shell_control::WindowInfo {
+        on_all_workspaces: w.on_all_workspaces,
         icon: w.icon.clone(),
         id: w.id,
         title: w.title.clone(),
@@ -890,7 +906,7 @@ fn state_op(change: &StateChange, mint: &dyn Fn(Option<&str>) -> String) -> Opti
             Some(StateOp::WindowOpened(window_to_wire(window, mint)))
         }
         StateChange::FocusChanged { focused: Some(id) } => Some(StateOp::WindowFocused { id: *id }),
-        StateChange::FocusChanged { focused: None } => None,
+        StateChange::FocusChanged { focused: None } | StateChange::WorkspacesChanged => None,
         // Active is exclusive shell-side (applying active:true clears
         // the rest), so one op carries the switch.
         StateChange::ActiveWorkspaceChanged { active, .. } => {
@@ -951,8 +967,16 @@ fn apply_command(
                     None,
                 );
             };
-            model.set_active_workspace(workspace);
-            (CommandStatus::Applied, None)
+            if model.set_active_workspace(workspace) {
+                (CommandStatus::Applied, None)
+            } else {
+                (
+                    CommandStatus::Denied {
+                        reason: "workspace outside fixed range".to_owned(),
+                    },
+                    None,
+                )
+            }
         }
         CommandKind::ToggleOverview => {
             // Flip the hub-shared intent; the hub broadcasts the new
@@ -1009,6 +1033,9 @@ pub struct PollOutcome {
     pub activated: Vec<u64>,
     /// Windows to ask to close.
     pub closed: Vec<u64>,
+    /// Workspaces left by shell focus commands; the window manager keeps
+    /// these alive through the next dynamic-workspace reconciliation.
+    pub departed_workspaces: Vec<u32>,
     /// Idle-lock timeout the shell asked for (`0` never), if any.
     pub idle_timeout: Option<u64>,
     /// Whether overview search is showing results, if the shell said.
@@ -1117,6 +1144,7 @@ pub fn is_private_dir(dir: &std::path::Path) -> bool {
 /// only mutates the model.
 pub struct ControlHub {
     listener: UnixListener,
+    readiness: crate::control_readiness::ControlReadiness,
     socket_path: std::path::PathBuf,
     sessions: Vec<Session<'static>>,
     /// Peers accepted in an earlier round: their `Hello` is due now.
@@ -1201,8 +1229,10 @@ impl ControlHub {
         let listener = UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let readiness = crate::control_readiness::ControlReadiness::new(&listener)?;
         Ok(Self {
             listener,
+            readiness,
             socket_path,
             sessions: Vec::new(),
             pending: Vec::new(),
@@ -1247,6 +1277,22 @@ impl ControlHub {
     }
 
     /// Accepted peers still waiting for their handshake round.
+    pub(crate) fn needs_continuation(&self, model: &StateModel) -> bool {
+        !self.fresh.is_empty()
+            || !self.pending.is_empty()
+            || self.sessions.iter().any(|session| {
+                session.conn.buffered_work()
+                    || session.last_revision != model.revision()
+                    || session.locked_sent != self.locked.get()
+            })
+            || self.overview.get() != self.overview_sent
+            || self.outputs != self.outputs_sent
+            || self.environment != self.environment_sent
+            || self.previews != self.previews_sent
+            || !self.switcher_queue.is_empty()
+            || !self.menu_queue.is_empty()
+            || !self.accelerator_queue.is_empty()
+    }
     pub fn pending_count(&self) -> usize {
         self.pending.len() + self.fresh.len()
     }
@@ -1366,6 +1412,12 @@ impl ControlHub {
         std::mem::take(&mut session.closed)
     }
 
+    pub(crate) fn readiness_source(
+        &self,
+    ) -> std::io::Result<calloop::generic::Generic<std::os::fd::OwnedFd>> {
+        self.readiness.source()
+    }
+
     /// One nonblocking round: accept waiting peers, advance pending
     /// handshakes, catch live sessions up, and apply one command frame
     /// per session. Returns the model ids of windows the shell activated
@@ -1381,7 +1433,10 @@ impl ControlHub {
                 self.refused += 1;
                 continue;
             }
-            let _ = stream.set_nonblocking(true);
+            if stream.set_nonblocking(true).is_err() || self.readiness.add(&stream).is_err() {
+                self.refused += 1;
+                continue;
+            }
             self.fresh.push(stream);
             self.fresh_peers.push(cred);
         }
@@ -1404,6 +1459,7 @@ impl ControlHub {
             let alive = {
                 let session = &mut self.sessions[i];
                 let before = model.focused();
+                let workspace_before = model.active_workspace();
                 let deltas_ok = session.emit_deltas(model).is_ok();
                 let cmd_ok = match session.handle_next(model) {
                     Ok(_) => true,
@@ -1411,6 +1467,12 @@ impl ControlHub {
                     Err(_) => false,
                 };
                 if deltas_ok && cmd_ok {
+                    if model.active_workspace() != workspace_before {
+                        // FocusWorkspace changes the model directly; preserve
+                        // every departed slot so rapid commands cannot be
+                        // compacted into a snap-back.
+                        outcome.departed_workspaces.push(workspace_before);
+                    }
                     if model.focused() != before {
                         outcome.activated.extend(model.focused());
                     }
@@ -1610,5 +1672,117 @@ impl Drop for ControlHub {
     /// (which also removes it first).
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    #[test]
+    fn buffered_complete_frames_require_continuation_but_partial_frames_wait_for_io() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut conn = ControlConn::new(stream).unwrap();
+        conn.rbuf = vec![1, 0, 0];
+        assert!(!conn.buffered_work());
+        conn.rbuf = vec![2, 0, 0, 0, 1];
+        assert!(!conn.buffered_work());
+        conn.rbuf.push(2);
+        assert!(conn.buffered_work());
+        conn.rbuf = (MAX_FRAME_BYTES as u32 + 1).to_le_bytes().to_vec();
+        assert!(
+            conn.buffered_work(),
+            "invalid buffered header must be rejected without another socket edge"
+        );
+    }
+    #[test]
+    fn hub_listener_hello_commands_and_peer_eviction_use_real_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("control.sock");
+        let mut hub = ControlHub::bind(
+            path.clone(),
+            std::rc::Rc::new(TokenStore::new()),
+            crate::SEAT_NAME,
+        )
+        .unwrap();
+        let mut model = StateModel::new();
+        let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+        event_loop
+            .handle()
+            .insert_source(hub.readiness_source().unwrap(), |_, fd, wakes| {
+                crate::control_readiness::drain(fd).unwrap();
+                *wakes += 1;
+                Ok(calloop::PostAction::Continue)
+            })
+            .unwrap();
+        let mut wakes = 0;
+        let mut client = UnixStream::connect(&path).unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 1, "listener must wake before a periodic tick");
+        hub.poll(&mut model);
+        assert!(
+            hub.needs_continuation(&model),
+            "accepted Hello phase needs a bounded continuation"
+        );
+        client
+            .write_all(&encode_frame(&Message::Hello {
+                version: CURRENT_VERSION,
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 2, "accepted peer must wake for its Hello");
+        hub.poll(&mut model);
+        assert_eq!(hub.sessions.len(), 1);
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 2, "drained control must not spin");
+        client
+            .write_all(&encode_frame(&Message::Command {
+                id: 1,
+                kind: CommandKind::ToggleOverview,
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 3);
+        hub.poll(&mut model);
+        assert!(hub.overview_open());
+        client
+            .write_all(&encode_frame(&Message::Command {
+                id: 2,
+                kind: CommandKind::FocusWorkspace { workspace: 1 },
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 4);
+        let outcome = hub.poll(&mut model);
+        assert_eq!(model.active_workspace(), 1);
+        assert_eq!(outcome.departed_workspaces, [0]);
+        hub.set_peer_gate(PeerGate::Closed);
+        hub.poll(&mut model);
+        assert!(hub.sessions.is_empty());
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 4, "evicted socket interest must retire");
+        // Concurrent forked test children may briefly inherit the peer until
+        // exec closes it. Still reject a persistent duplicate: WouldBlock is
+        // never closure, and queued replies are drained before checking EOF.
+        crate::control_readiness::test_peer::wait_for_peer_close(
+            &mut client,
+            Duration::from_secs(1),
+        )
+        .expect("readiness source must not retain a duplicate peer socket");
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! The shell publishes the Settings wallpaper URI out-of-band: it
 //! writes the URI to [`wallpaper_drop_path`] in the runtime dir, and
-//! the compositor re-reads that file on every frame. An optional second
+//! the compositor watches its directory for changes. An optional second
 //! line carries GNOME's `primary-color` (`#rrggbb`), the colour shown
 //! when there is no picture or it cannot be read, as in GNOME. No
 //! wallpaper state crosses the control protocol by design. Any
@@ -127,6 +127,9 @@ const MAX_CARDS: usize = 4;
 /// together, so extra outputs cannot grow memory without bound.
 #[derive(Debug, Default)]
 pub struct Wallpaper {
+    wake: crate::wake::Wake,
+    drop_signal: Option<crate::runtime_signal::CachedSignal>,
+    current_uris: Vec<String>,
     loaded: Vec<Loaded>,
     /// Journey-only observation of the last attempted refresh, not a paint claim.
     refresh_stage: Option<&'static str>,
@@ -189,6 +192,58 @@ struct IdentitySnapshot {
 }
 
 impl Wallpaper {
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
+    pub(crate) fn maintenance_deadline(&self) -> Option<std::time::Instant> {
+        self.identities
+            .iter()
+            .filter(|item| self.current_uris.contains(&item.uri))
+            .filter(|item| {
+                !self
+                    .identity_pending
+                    .iter()
+                    .any(|(uri, _)| uri == &item.uri)
+            })
+            .map(|item| {
+                let deadline = item.observed + std::time::Duration::from_secs(1);
+                let now = std::time::Instant::now();
+                // An unsupported render size must not spin on a deadline that
+                // refresh could not service. Retain bounded active retry.
+                if deadline <= now {
+                    now + crate::idle_schedule::ACTIVE_INTERVAL
+                } else {
+                    deadline
+                }
+            })
+            .min()
+    }
+
+    pub(crate) fn install_drop_watch(
+        &mut self,
+    ) -> std::io::Result<Option<calloop::generic::Generic<std::os::fd::OwnedFd>>> {
+        let signal =
+            crate::runtime_signal::CachedSignal::new_bounded(wallpaper_drop_path(), 16 * 1024);
+        let source = signal.source();
+        self.drop_signal = Some(signal);
+        source
+    }
+    pub(crate) fn refresh_drop_watch(&mut self) -> bool {
+        self.drop_signal
+            .as_mut()
+            .is_some_and(|signal| signal.refresh())
+    }
+    pub(crate) fn disable_drop_watch(&mut self) {
+        if let Some(signal) = self.drop_signal.as_mut() {
+            signal.disable();
+        }
+    }
+    pub(crate) fn watch_fallback(&self) -> bool {
+        self.drop_signal
+            .as_ref()
+            .is_none_or(|signal| !signal.watched())
+    }
+
     /// Empty wallpaper (solid clear until a drop file appears).
     pub fn new() -> Self {
         Self::default()
@@ -280,10 +335,14 @@ impl Wallpaper {
         {
             let (send, result) = std::sync::mpsc::channel();
             let path = uri.to_owned();
+            let completion = self.wake.completion();
             if std::thread::Builder::new()
                 .name("tuna-wallpaper-identity".into())
                 .spawn(move || {
-                    let _ = send.send(FileIdentity::for_uri(&path));
+                    let _completion = completion;
+                    // Drop the result sender before the completion wake, including unwind.
+                    let result_sender = send;
+                    let _ = result_sender.send(FileIdentity::for_uri(&path));
                 })
                 .is_ok()
             {
@@ -321,9 +380,13 @@ impl Wallpaper {
             }
             let (send, result) = std::sync::mpsc::channel();
             let job = uri.to_owned();
+            let completion = self.wake.completion();
             let spawned = std::thread::Builder::new()
                 .name("tuna-wallpaper".into())
                 .spawn(move || {
+                    let _completion = completion;
+                    // Drop the result sender before the completion wake, including unwind.
+                    let result_sender = send;
                     let started = std::time::Instant::now();
                     let pixels = load_static_wallpaper(&job, settings, geometry, identity);
                     eprintln!(
@@ -337,7 +400,7 @@ impl Wallpaper {
                         output.h,
                         started.elapsed().as_millis()
                     );
-                    let _ = send.send(pixels);
+                    let _ = result_sender.send(pixels);
                 });
             if spawned.is_ok() {
                 self.pending.push(Pending {
@@ -518,27 +581,13 @@ impl Wallpaper {
         if area == 0 || area > MAX_WALLPAPER_AREA {
             return None;
         }
+        self.current_uris.clear();
         self.refresh_stage = Some("drop-open");
-        let mut drop_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(wallpaper_drop_path())
-            .ok()?;
-        self.refresh_stage = Some("drop-metadata");
-        let meta = drop_file.metadata().ok()?;
-        if !meta.is_file() || meta.len() > 16 * 1024 {
-            return None;
-        }
-        self.refresh_stage = Some("drop-read-bounded-utf8");
-        let mut text = String::new();
-        drop_file
-            .by_ref()
-            .take(16 * 1024 + 1)
-            .read_to_string(&mut text)
-            .ok()?;
-        if text.len() > 16 * 1024 {
-            return None;
-        }
+        let text = if let Some(signal) = self.drop_signal.as_mut() {
+            signal.text().to_owned()
+        } else {
+            crate::runtime_signal::read_bounded(&wallpaper_drop_path(), 16 * 1024).ok()?
+        };
         self.refresh_stage = Some("drop-parse-metadata");
         let mut lines = text.lines();
         let mut uri = lines.next().unwrap_or_default().trim().to_owned();
@@ -570,12 +619,14 @@ impl Wallpaper {
         if lock && !lock_uri.is_empty() {
             uri = lock_uri.to_owned();
         }
+        self.current_uris = vec![uri.clone()];
         let identity = if settings.placement == tuna_shell_control::background::Placement::None {
             // GNOME NONE has no source file. In particular, an ignored lock
             // URI must not schedule a network/FUSE identity task or delay its
             // pure color/gradient. Empty URI also makes every downstream cache
             // and render worker independent of the unused file.
             uri.clear();
+            self.current_uris.clear();
             None
         } else {
             self.refresh_stage = Some("source-identity-pending");
@@ -736,9 +787,13 @@ impl Wallpaper {
             return None;
         }
         let (send, result) = std::sync::mpsc::channel();
+        let completion = self.wake.completion();
         if std::thread::Builder::new()
             .name("tuna-wallpaper-card".into())
             .spawn(move || {
+                let _completion = completion;
+                // Drop the result sender before the completion wake, including unwind.
+                let result_sender = send;
                 let scale = rendered.w as f32 / output.w as f32;
                 let card = tuna_wallpaper::card(
                     full.as_deref()
@@ -755,7 +810,7 @@ impl Wallpaper {
                         alpha: 0.2,
                     },
                 );
-                let _ = send.send(card);
+                let _ = result_sender.send(card);
             })
             .is_ok()
         {
@@ -1036,6 +1091,41 @@ fn cache_path(path: &std::path::Path, w: u32, h: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_current_wallpaper_policy_retires_old_maintenance_eligibility() {
+        let _serial = RUNTIME_DIR_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _runtime = RuntimeDirGuard::point_at(dir.path());
+        std::fs::write(wallpaper_drop_path(), "old\n\n\n\n{not-valid-json}").unwrap();
+        let mut wallpaper = Wallpaper::new();
+        wallpaper.current_uris.push("old".into());
+        wallpaper.identities.push(IdentitySnapshot {
+            uri: "old".into(),
+            value: None,
+            observed: std::time::Instant::now() - std::time::Duration::from_secs(3),
+        });
+        assert!(wallpaper.refresh((8, 8).into(), test_geometry()).is_none());
+        assert_eq!(wallpaper.maintenance_deadline(), None);
+    }
+    #[test]
+    fn maintenance_deadlines_exclude_old_uri_and_inflight_identity_work() {
+        let now = std::time::Instant::now();
+        let mut wallpaper = super::Wallpaper::new();
+        wallpaper.identities.push(super::IdentitySnapshot {
+            uri: "old".into(),
+            value: None,
+            observed: now - std::time::Duration::from_secs(3),
+        });
+        assert_eq!(wallpaper.maintenance_deadline(), None);
+        wallpaper.current_uris.push("old".into());
+        assert!(
+            wallpaper.maintenance_deadline().unwrap() > now,
+            "past due maintenance retains a bounded retry, never a zero spin"
+        );
+        let (_send, receive) = std::sync::mpsc::channel();
+        wallpaper.identity_pending.push(("old".into(), receive));
+        assert_eq!(wallpaper.maintenance_deadline(), None);
+    }
     use super::*;
     use std::sync::Mutex;
 

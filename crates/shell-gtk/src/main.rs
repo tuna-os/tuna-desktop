@@ -46,6 +46,7 @@ mod screenshot_ui;
 mod services;
 mod shell_dbus;
 mod shortcut_consent;
+mod sound_feedback;
 mod switcher;
 mod tray;
 mod wifi;
@@ -268,8 +269,19 @@ fn render_pills(shell: &mut Shell) {
     let wanted = match shell.control.as_ref() {
         Some(control) => {
             let model = control.model();
-            let occupied: Vec<u32> = model.windows().iter().map(|w| w.workspace).collect();
-            logic::workspace_pills(model.workspaces(), model.active_workspace(), &occupied)
+            if let Some(count) = model.fixed_workspace_count() {
+                (0..count)
+                    .map(|workspace| workspace == model.active_workspace())
+                    .collect()
+            } else {
+                let occupied: Vec<u32> = model
+                    .windows()
+                    .iter()
+                    .filter(|w| !w.on_all_workspaces)
+                    .map(|w| w.workspace)
+                    .collect();
+                logic::workspace_pills(model.workspaces(), model.active_workspace(), &occupied)
+            }
         }
         None => vec![true],
     };
@@ -1357,6 +1369,50 @@ fn build(app: &adw::Application) {
         Rc::new(ShellActions(shell.clone())),
     );
     let switcher_ui = switcher::SwitcherUi::new(app.upcast_ref(), apps.clone());
+    // Keep both switcher policies live, including while a popup is open.
+    {
+        let app_settings = settings("org.gnome.shell.app-switcher");
+        let window_settings = settings("org.gnome.shell.window-switcher");
+        let apply: Rc<dyn Fn()> = {
+            let shell = shell.clone();
+            let app_settings = app_settings.clone();
+            let window_settings = window_settings.clone();
+            Rc::new(move || {
+                let defaults = tuna_shell_host::model::SwitcherWorkspacePolicy::default();
+                let read = |settings: &Option<gio::Settings>, fallback| {
+                    settings
+                        .as_ref()
+                        .filter(|settings| {
+                            settings
+                                .settings_schema()
+                                .is_some_and(|schema| schema.has_key("current-workspace-only"))
+                        })
+                        .map(|settings| settings.boolean("current-workspace-only"))
+                        .unwrap_or(fallback)
+                };
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    control.set_switcher_workspace_policy(
+                        tuna_shell_host::model::SwitcherWorkspacePolicy {
+                            applications_current_workspace_only: read(
+                                &app_settings,
+                                defaults.applications_current_workspace_only,
+                            ),
+                            windows_current_workspace_only: read(
+                                &window_settings,
+                                defaults.windows_current_workspace_only,
+                            ),
+                        },
+                    );
+                }
+            })
+        };
+        apply();
+        for settings in [app_settings, window_settings].into_iter().flatten() {
+            let apply = apply.clone();
+            settings.connect_changed(Some("current-workspace-only"), move |_, _| apply());
+            std::mem::forget(settings);
+        }
+    }
     // GNOME's WindowTracker: a window belongs to the desktop entry its
     // app id names (as the switcher finds its icon), shown in the grid
     // or not; a window no desktop file claims is an app of its own.
@@ -1626,12 +1682,27 @@ fn build(app: &adw::Application) {
                             return;
                         };
                         let model = control.model();
-                        let occupied: Vec<u32> =
-                            model.windows().iter().map(|w| w.workspace).collect();
+                        let occupied: Vec<u32> = model
+                            .windows()
+                            .iter()
+                            .filter(|w| !w.on_all_workspaces)
+                            .map(|w| w.workspace)
+                            .collect();
                         let Some(workspace) =
                             target.resolve(model.active_workspace(), model.workspaces(), &occupied)
                         else {
                             return;
+                        };
+                        let workspace = if let Some(count) = model.fixed_workspace_count() {
+                            if target == keybindings::Target::Last {
+                                count - 1
+                            } else if workspace >= count {
+                                return;
+                            } else {
+                                workspace
+                            }
+                        } else {
+                            workspace
                         };
                         let focused = model.windows().iter().find(|w| w.active).map(|w| w.id);
                         if matches!(action, Action::MoveToWorkspace(_)) {
@@ -1660,12 +1731,24 @@ fn build(app: &adw::Application) {
                                 .max();
                             workspace_popup_keys.display(
                                 workspace,
-                                tuna_shell_control::dynamic_workspace_count(occupied, workspace),
+                                control.model().fixed_workspace_count().unwrap_or_else(|| {
+                                    tuna_shell_control::dynamic_workspace_count(occupied, workspace)
+                                }),
                             );
                         }
                     }
-                    Action::VolumeUp { precise } | Action::VolumeDown { precise } => {
-                        let up = matches!(action, Action::VolumeUp { .. });
+                    Action::VolumeUp { .. }
+                    | Action::VolumeDown { .. }
+                    | Action::VolumeUpQuiet
+                    | Action::VolumeDownQuiet => {
+                        let up = matches!(action, Action::VolumeUp { .. } | Action::VolumeUpQuiet);
+                        let precise = matches!(
+                            action,
+                            Action::VolumeUp { precise: true }
+                                | Action::VolumeDown { precise: true }
+                        );
+                        let quiet =
+                            matches!(action, Action::VolumeUpQuiet | Action::VolumeDownQuiet);
                         let step = if precise {
                             2.0
                         } else {
@@ -1679,13 +1762,15 @@ fn build(app: &adw::Application) {
                             },
                             step,
                             false,
+                            quiet,
                         );
                     }
-                    Action::VolumeMute | Action::MicrophoneMute => {
+                    Action::VolumeMute | Action::VolumeMuteQuiet | Action::MicrophoneMute => {
                         media_keys.change(
                             media_keys::VolumeKey::Mute,
                             0.0,
                             action == Action::MicrophoneMute,
+                            action == Action::VolumeMuteQuiet,
                         );
                     }
                     Action::BrightnessUp
@@ -1905,6 +1990,9 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.peripherals.mouse",
             INTERFACE_SCHEMA,
             A11Y_INTERFACE_SCHEMA,
+            "org.gnome.desktop.wm.preferences",
+            "org.gnome.desktop.sound",
+            "org.gnome.mutter",
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -1954,7 +2042,39 @@ fn build(app: &adw::Application) {
                 }
                 out.right_to_left = gtk::Widget::default_direction() == gtk::TextDirection::Rtl;
                 out.motion = motion::from_settings(all[4].as_ref(), all[5].as_ref());
+                if let Some(mutter) = all[8].as_ref() {
+                    if mutter
+                        .settings_schema()
+                        .is_some_and(|schema| schema.has_key("attach-modal-dialogs"))
+                    {
+                        out.attach_modal_dialogs = mutter.boolean("attach-modal-dialogs");
+                    }
+                }
+                if let Some(mutter) = all[8].as_ref() {
+                    if let Some(schema) = mutter.settings_schema() {
+                        if schema.has_key("dynamic-workspaces") {
+                            out.workspace_policy.dynamic = mutter.boolean("dynamic-workspaces");
+                        }
+                        if schema.has_key("workspaces-only-on-primary") {
+                            out.workspace_policy.only_on_primary =
+                                mutter.boolean("workspaces-only-on-primary");
+                        }
+                        if schema.has_key("edge-tiling") {
+                            out.workspace_policy.edge_tiling = mutter.boolean("edge-tiling");
+                        }
+                    }
+                }
                 motion::set(out.motion);
+                if let Some(wm) = all[6].as_ref() {
+                    out.workspace_policy.fixed_count = wm.int("num-workspaces").clamp(1, 36) as u32;
+                    out.bell.audible = wm.boolean("audible-bell");
+                    out.bell.visual = wm.boolean("visual-bell");
+                    out.bell.frame_flash = wm.string("visual-bell-type") == "frame-flash";
+                }
+                if let Some(sound) = all[7].as_ref() {
+                    out.bell.event_sounds = sound.boolean("event-sounds");
+                    out.bell.theme = sound.string("theme-name").to_string();
+                }
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }

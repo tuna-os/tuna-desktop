@@ -233,6 +233,15 @@ pub struct Cast {
 }
 
 impl Cast {
+    pub(crate) fn next_delay(&self) -> Option<Duration> {
+        let inner = self.inner.borrow();
+        (inner.streaming && inner.size.is_some()).then(|| {
+            self.last_frame.map_or(Duration::ZERO, |last| {
+                FRAME_INTERVAL.saturating_sub(last.elapsed())
+            })
+        })
+    }
+
     /// Whether a frame is wanted now: streaming, negotiated, and at
     /// least [`FRAME_INTERVAL`] since the last one.
     pub fn wants_frame(&self) -> Option<(i32, i32)> {

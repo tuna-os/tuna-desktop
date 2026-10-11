@@ -15,6 +15,7 @@ struct Pending {
 }
 
 pub struct Monitor {
+    wake: crate::wake::Wake,
     connection: zbus::blocking::Connection,
     pending: Arc<Pending>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -39,11 +40,14 @@ impl Monitor {
             "org.freedesktop.login1.Manager",
         )?;
         let signals = proxy.receive_signal("PrepareForSleep")?;
+        let wake = crate::wake::Wake::default();
+        let worker_wake = wake.clone();
         let pending = Arc::new(Pending::default());
         let worker_pending = pending.clone();
         let worker = std::thread::Builder::new()
             .name("tuna-logind-sleep".into())
             .spawn(move || {
+                let _completion = worker_wake.completion();
                 let mut prepared = false;
                 for signal in signals {
                     let Ok((sleeping,)) = signal.body().deserialize::<(bool,)>() else {
@@ -55,13 +59,16 @@ impl Monitor {
                         generation.fetch_add(1, Ordering::AcqRel);
                         prepared = true;
                         worker_pending.lock.store(true, Ordering::Release);
+                        worker_wake.signal();
                     } else if prepared {
                         prepared = false;
                         worker_pending.wake.store(true, Ordering::Release);
+                        worker_wake.signal();
                     }
                 }
             })?;
         Ok(Self {
+            wake,
             connection,
             pending,
             worker: Some(worker),
@@ -69,6 +76,9 @@ impl Monitor {
     }
 
     /// Coalesce notifications; the caller locks before processing a wake.
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
     pub fn take(&self) -> (bool, bool) {
         (
             self.pending.lock.swap(false, Ordering::AcqRel),

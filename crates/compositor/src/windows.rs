@@ -316,9 +316,77 @@ pub struct WindowManager {
     /// queue here and the runtime draws them.
     size_changes: crate::size_change::SizeChanges<crate::size_change::Snapshot>,
     window_lifecycle: crate::window_lifecycle::Lifecycle,
+    workspace_policy: tuna_shell_control::WorkspacePolicy,
+    workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
+    workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
+    modal_dim: crate::modal_dim::ModalDim,
 }
 
 impl WindowManager {
+    fn on_all_workspaces(&self, id: u64) -> bool {
+        self.windows.get(&id).is_some_and(|window| {
+            window.sticky
+                || (self.workspace_policy.only_on_primary
+                    && crate::workspace_policy::on_secondary(
+                        (
+                            window.geometry.loc.x,
+                            window.geometry.loc.y,
+                            window.geometry.size.w,
+                            window.geometry.size.h,
+                        ),
+                        &self.workspace_outputs,
+                    ))
+        })
+    }
+
+    fn refresh_workspace_affinity(&mut self, state: &State) {
+        self.workspace_outputs = state
+            .hot_corner_outputs()
+            .into_iter()
+            .map(|(rect, primary)| crate::workspace_policy::OutputBounds {
+                x: rect.loc.x,
+                y: rect.loc.y,
+                width: rect.size.w,
+                height: rect.size.h,
+                primary,
+            })
+            .collect();
+        let changes: Vec<_> = self
+            .windows
+            .keys()
+            .copied()
+            .filter_map(|id| {
+                let on_all_workspaces = self.on_all_workspaces(id);
+                (self.model.window(id)?.on_all_workspaces != on_all_workspaces)
+                    .then_some((id, on_all_workspaces))
+            })
+            .collect();
+        for (id, on_all_workspaces) in changes {
+            self.model.update(
+                id,
+                crate::state::WindowUpdate {
+                    on_all_workspaces: Some(on_all_workspaces),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    pub fn apply_workspace_policy(
+        &mut self,
+        state: &mut State,
+        policy: tuna_shell_control::WorkspacePolicy,
+    ) {
+        self.workspace_policy = policy;
+        self.refresh_workspace_affinity(state);
+        if self
+            .model
+            .set_fixed_workspace_count((!policy.dynamic).then_some(policy.fixed_count))
+        {
+            self.focus_topmost(state, self.model.active_workspace());
+        }
+    }
+
     /// Last known pointer position, for position-less events (button
     /// presses) that need a location, e.g. the Activities-strip trigger.
     pub fn pointer_pos(&self) -> Point<f64, Logical> {
@@ -378,6 +446,10 @@ impl WindowManager {
             exclusive_held: None,
             size_changes: Default::default(),
             window_lifecycle: Default::default(),
+            workspace_policy: Default::default(),
+            workspace_outputs: Vec::new(),
+            workspace_tracker: Default::default(),
+            modal_dim: Default::default(),
         }
     }
 
@@ -414,7 +486,7 @@ impl WindowManager {
                 Some(crate::overview::OverviewWindow {
                     id: *id,
                     // A sticky window sits on whichever workspace shows.
-                    workspace: if window.sticky {
+                    workspace: if self.on_all_workspaces(*id) {
                         self.model.active_workspace()
                     } else {
                         entry.workspace
@@ -667,6 +739,34 @@ impl WindowManager {
         }
     }
 
+    pub fn modal_dim(&self) -> &crate::modal_dim::ModalDim {
+        &self.modal_dim
+    }
+    pub fn step_modal_dim(
+        &mut self,
+        now: std::time::Duration,
+        policy: tuna_shell_control::motion::MotionPolicy,
+        animate: bool,
+        enabled: bool,
+    ) {
+        let alive = self.windows.keys().copied().collect();
+        let parents = self
+            .windows
+            .iter()
+            .filter_map(|(id, w)| match w.surface.underlying_surface() {
+                WindowSurface::Wayland(top)
+                    if !w.minimized
+                        && read_modal(top)
+                        && committed_size(top.wl_surface()).is_some() =>
+                {
+                    self.transient_parent(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        self.modal_dim.set_enabled(enabled);
+        self.modal_dim.step(&alive, &parents, now, policy, animate);
+    }
     pub fn window_lifecycle(&self) -> &crate::window_lifecycle::Lifecycle {
         &self.window_lifecycle
     }
@@ -712,7 +812,7 @@ impl WindowManager {
             .filter_map(|id| {
                 let window = self.windows.get(id).filter(|w| !w.minimized)?;
                 let mut geometry = self.shifted(*id, window.geometry);
-                if !window.sticky {
+                if !self.on_all_workspaces(*id) {
                     let workspace = self.model.window(*id)?.workspace;
                     geometry.loc.x += self.workspace_slide.frame_placement(workspace)?.dx;
                 }
@@ -729,10 +829,51 @@ impl WindowManager {
         }
         self.windows
             .iter()
-            .find(|(_, w)| w.surface == *window && !w.sticky)
+            .find(|(id, w)| w.surface == *window && !self.on_all_workspaces(**id))
             .and_then(|(id, _)| self.model.window(*id))
             .and_then(|entry| self.workspace_slide.frame_placement(entry.workspace))
             .map_or(1.0, |placement| placement.alpha)
+    }
+
+    /// Reconcile topology once before redraw, after window/client requests.
+    /// An interactive drag keeps its destination indices stable until release.
+    pub fn reconcile_dynamic_workspaces(
+        &mut self,
+        overview_dragging: bool,
+        animation_now: std::time::Duration,
+        output_width: i32,
+        motion: tuna_shell_control::motion::MotionPolicy,
+    ) {
+        let keep_alive = self
+            .workspace_tracker
+            .protected_workspaces(std::time::Instant::now());
+        if self.grab.is_some() || overview_dragging {
+            return;
+        }
+        let previous_active = self.model.active_workspace();
+        if let Some(indices) = self
+            .model
+            .reconcile_dynamic_workspaces_with_remap(&keep_alive)
+        {
+            self.workspace_tracker.remap(&indices);
+            let active = self.model.active_workspace();
+            if active != previous_active {
+                // This is the same workspace after renumbering, not a user switch.
+                self.workspace_slide.observe(
+                    active,
+                    self.model.workspaces(),
+                    output_width,
+                    motion,
+                    true,
+                    animation_now,
+                );
+                self.last_active_workspace = Some(active);
+            }
+        }
+    }
+
+    pub fn workspace_lease_deadline(&self) -> Option<std::time::Instant> {
+        self.workspace_tracker.next_deadline()
     }
 
     /// The workspace switch motion (stepped by the runtime).
@@ -747,7 +888,7 @@ impl WindowManager {
     /// How far the workspace switch shifts `id` this frame (0 when no
     /// switch is drawn or the window is on every workspace).
     pub fn slide_dx(&self, id: u64) -> i32 {
-        if !self.workspace_slide.running() || self.windows.get(&id).is_none_or(|w| w.sticky) {
+        if !self.workspace_slide.running() || self.on_all_workspaces(id) {
             return 0;
         }
         self.model
@@ -786,7 +927,7 @@ impl WindowManager {
                 self.model
                     .window(*id)
                     .is_some_and(|entry| entry.workspace == active)
-                    || self.windows.get(id).is_some_and(|w| w.sticky)
+                    || self.on_all_workspaces(*id)
             })
             .filter_map(|id| {
                 self.windows
@@ -838,6 +979,7 @@ impl WindowManager {
     }
 
     pub fn reconcile(&mut self, state: &mut State) {
+        self.refresh_workspace_affinity(state);
         // Popups (#88): drop dead trees, and once the last grabbed popup
         // is gone hand keyboard focus back to the focused window.
         state.popups.cleanup();
@@ -903,16 +1045,19 @@ impl WindowManager {
             window.surface.on_commit();
         }
         self.place_committed(state);
+        self.refresh_workspace_affinity(state);
         // Focus tracks the active workspace: a model-level switch (e.g.
         // shell FocusWorkspace) that strands focus on a hidden window
         // refocuses the new topmost here, converging seat focus and
         // Activated states on the next tick.
         let active = self.model.active_workspace();
-        let stranded = self
-            .model
-            .focused()
-            .and_then(|id| self.model.window(id))
-            .is_some_and(|entry| entry.workspace != active);
+        let stranded = self.model.focused().is_some_and(|id| {
+            !self.on_all_workspaces(id)
+                && self
+                    .model
+                    .window(id)
+                    .is_some_and(|entry| entry.workspace != active)
+        });
         // Arriving on a workspace with nothing focused focuses its top
         // window, as GNOME does, whichever path switched (keys, shell).
         let arrived = self.last_active_workspace != Some(active) && self.model.focused().is_none();
@@ -1432,6 +1577,27 @@ impl WindowManager {
     /// to the topmost remaining window, if any. In scroll mode the
     /// remaining columns close ranks behind it.
     fn unmap(&mut self, state: &mut State, id: u64) {
+        if let Some(entry) = self.model.window(id) {
+            let dialog_or_splash = self.windows.get(&id).is_some_and(|window| {
+                match window.surface.underlying_surface() {
+                    WindowSurface::Wayland(top) => {
+                        read_modal(top)
+                            || self.transient_parent(id).is_some()
+                            || state.closed_toplevel_parents.contains_key(top.wl_surface())
+                    }
+                    #[cfg(feature = "xwayland")]
+                    WindowSurface::X11(surface) => matches!(
+                        surface.window_type(),
+                        Some(WmWindowType::Dialog | WmWindowType::Splash)
+                    ),
+                }
+            });
+            self.workspace_tracker.window_removed(
+                entry.workspace,
+                dialog_or_splash,
+                std::time::Instant::now(),
+            );
+        }
         let return_parent = self
             .windows
             .get(&id)
@@ -1896,6 +2062,9 @@ impl WindowManager {
             return;
         };
         if let PointerGrab::Move { id, .. } = grab {
+            if !self.workspace_policy.edge_tiling {
+                return;
+            }
             match snap_target(self.pointer_pos, state.primary_size().w) {
                 Some(Snap::Maximize) => {
                     self.set_maximized(state, id, true);
@@ -1912,6 +2081,9 @@ impl WindowManager {
     /// the dragged window and the area it would fill on release (the
     /// work area, or one half of it).
     pub fn tile_preview(&self, state: &State) -> Option<(u64, Rectangle<i32, Logical>)> {
+        if !self.workspace_policy.edge_tiling {
+            return None;
+        }
         let Some(PointerGrab::Move { id, .. }) = self.grab else {
             return None;
         };
@@ -1969,11 +2141,10 @@ impl WindowManager {
         let active = self.model.active_workspace();
         self.stacking.iter().rev().copied().find(|id| {
             self.model.window(*id).is_some_and(|entry| {
-                entry.workspace == active
-                    && self
-                        .windows
-                        .get(id)
-                        .is_some_and(|w| contains(w.geometry, pos))
+                (entry.workspace == active || self.on_all_workspaces(*id))
+                    && self.windows.get(id).is_some_and(|w| {
+                        !w.minimized && contains(self.shifted(*id, w.geometry), pos)
+                    })
             })
         })
     }
@@ -2523,6 +2694,7 @@ impl WindowManager {
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.sticky = !window.sticky;
                 }
+                self.refresh_workspace_affinity(state);
                 true
             }
             WindowAction::ToggleAbove => {
@@ -2553,16 +2725,33 @@ impl WindowManager {
     /// Whether the window has a workspace to its left (and always one
     /// to its right: GNOME's workspaces are dynamic).
     pub fn workspace_left_of(&self, id: u64) -> bool {
-        self.model.window(id).is_some_and(|e| e.workspace > 0)
+        !self.on_all_workspaces(id) && self.model.window(id).is_some_and(|e| e.workspace > 0)
+    }
+
+    pub fn workspace_right_of(&self, id: u64) -> bool {
+        !self.on_all_workspaces(id)
+            && self.model.window(id).is_some_and(|entry| {
+                entry
+                    .workspace
+                    .checked_add(1)
+                    .is_some_and(|next| self.model.workspace_allowed(next))
+            })
     }
 
     /// GNOME's popup for the active workspace: `(index, count)`.
     pub fn workspace_popup(&self) -> (u32, u32) {
         let active = self.model.active_workspace();
-        let occupied = self.model.windows().map(|w| w.workspace).max();
+        let occupied = self
+            .model
+            .windows()
+            .filter(|w| !w.on_all_workspaces)
+            .map(|w| w.workspace)
+            .max();
         (
             active,
-            tuna_shell_control::dynamic_workspace_count(occupied, active),
+            self.model
+                .fixed_workspace_count()
+                .unwrap_or_else(|| tuna_shell_control::dynamic_workspace_count(occupied, active)),
         )
     }
 
@@ -2877,7 +3066,12 @@ impl WindowManager {
 
     /// Whether the strip view is still moving toward its target.
     pub fn strip_animating(&self) -> bool {
-        self.mode == SessionMode::Scroll && self.strip_shown != self.strip_offset
+        self.mode == SessionMode::Scroll
+            && (self.strip_shown != self.strip_offset
+                || self
+                    .column_animations
+                    .values()
+                    .any(crate::animation::ColumnSpring::running))
     }
 
     /// Jump the drawn view onto the target (no animation).
@@ -3390,6 +3584,7 @@ impl WindowManager {
             return false;
         }
         if Some(id) == self.model.focused()
+            && !self.on_all_workspaces(id)
             && self
                 .model
                 .window(id)
@@ -3409,13 +3604,48 @@ impl WindowManager {
         true
     }
 
+    /// Grace lease for a workspace the user just switched away from:
+    /// one second, matching GNOME 51's dialog-removal grace in
+    /// [`crate::workspace_tracker`]. The shell converges in
+    /// milliseconds; the lease only has to survive the first post-
+    /// switch compaction tick, after which the kept pair is a stable
+    /// fixed point (see `single_trailing_pair_with_active_trailing`).
+    const DEPARTED_WORKSPACE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Switch the model's active workspace, granting the departed
+    /// workspace a grace lease so the tick's dynamic compaction keeps
+    /// it (and the switch) instead of pruning it and renumbering
+    /// active back onto the slot the user just left (J-WS-NEXT). No
+    /// lease on a no-op reselect: leasing the active workspace itself
+    /// would pad a phantom trailing slot.
+    fn activate_workspace(&mut self, workspace: u32) -> bool {
+        let previous = self.model.active_workspace();
+        if !self.model.set_active_workspace(workspace) {
+            return false;
+        }
+        if previous != workspace {
+            self.keep_departed_workspace_alive(previous);
+        }
+        true
+    }
+
+    /// Preserve a workspace which a model-level shell command just left.
+    /// This shares the transition policy with keyboard and move/follow paths.
+    pub fn keep_departed_workspace_alive(&mut self, workspace: u32) {
+        self.workspace_tracker.keep_alive(
+            workspace,
+            Self::DEPARTED_WORKSPACE_GRACE,
+            std::time::Instant::now(),
+        );
+    }
+
     /// Switch the active workspace, focusing its topmost window (or
     /// nothing when empty). Returns false for unknown ids.
     pub fn switch_workspace(&mut self, state: &mut State, workspace: u32) -> bool {
         if !self.model.workspaces().contains(&workspace) {
             return false;
         }
-        if !self.model.set_active_workspace(workspace) {
+        if !self.activate_workspace(workspace) {
             return false;
         }
         self.focus_topmost(state, workspace);
@@ -3448,7 +3678,7 @@ impl WindowManager {
         let Some(target) = target else {
             return false;
         };
-        if !self.model.set_active_workspace(target) {
+        if !self.activate_workspace(target) {
             return false;
         }
         self.focus_topmost(state, target);
@@ -3473,7 +3703,7 @@ impl WindowManager {
         if !self.move_to_workspace(state, id, target) {
             return false;
         }
-        if !self.model.set_active_workspace(target) {
+        if !self.activate_workspace(target) {
             return false;
         }
         self.apply_focus(state, Some(id));
@@ -3538,7 +3768,7 @@ impl WindowManager {
                 .model
                 .window(*id)
                 .is_some_and(|entry| entry.workspace == workspace)
-                || self.windows.get(id).is_some_and(|w| w.sticky))
+                || self.on_all_workspaces(*id))
                 && self.windows.get(id).is_some_and(|w| !w.minimized)
         });
         // In the overview a workspace switch moves the activated look

@@ -159,9 +159,11 @@ impl ProtocolVersion {
     /// GNOME's three-state motion policy plus its slow-down factor.
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
+    /// `0.30` appends live sound/bell and attached-modal brightness preferences.
+    /// `0.31` appends workspace and edge-tiling preferences.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 29,
+        minor: 31,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -203,6 +205,9 @@ pub struct WindowInfo {
     pub activation_token: String,
     /// Compositor-owned PNG cache path or sanitized theme icon name.
     pub icon: Option<String>,
+    /// Sticky windows and windows outside the primary monitor's workspace set.
+    #[serde(default)]
+    pub on_all_workspaces: bool,
 }
 
 /// Workspace state owned by the compositor and mirrored to the shell.
@@ -743,8 +748,49 @@ pub struct PreviewInfo {
     pub height: i32,
 }
 
-/// GNOME's input settings (`org.gnome.desktop.input-sources` and
-/// `org.gnome.desktop.peripherals.*`), flattened for the compositor.
+/// GNOME sound and window-manager bell preferences, consumed by the compositor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BellPolicy {
+    pub audible: bool,
+    pub visual: bool,
+    pub frame_flash: bool,
+    pub event_sounds: bool,
+    pub theme: String,
+}
+impl Default for BellPolicy {
+    fn default() -> Self {
+        Self {
+            audible: true,
+            visual: false,
+            frame_flash: false,
+            event_sounds: true,
+            theme: "freedesktop".into(),
+        }
+    }
+}
+
+/// GNOME Shell's workspace and edge-tiling preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePolicy {
+    pub dynamic: bool,
+    pub fixed_count: u32,
+    pub only_on_primary: bool,
+    pub edge_tiling: bool,
+}
+
+impl Default for WorkspacePolicy {
+    fn default() -> Self {
+        Self {
+            dynamic: true,
+            fixed_count: 4,
+            only_on_primary: true,
+            edge_tiling: true,
+        }
+    }
+}
+
+/// GNOME input and bell preferences, flattened for the compositor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSettings {
     /// xkb layouts, comma separated, in input-source order (`us,de`).
@@ -780,6 +826,17 @@ pub struct InputSettings {
     /// GTK shell default text direction; corners and Activities follow it.
     #[serde(default)]
     pub right_to_left: bool,
+    #[serde(default)]
+    pub bell: BellPolicy,
+    /// Enable the attached-modal parent brightness effect (Mutter preference).
+    #[serde(default = "default_attach_modal_dialogs")]
+    pub attach_modal_dialogs: bool,
+    #[serde(default)]
+    pub workspace_policy: WorkspacePolicy,
+}
+
+fn default_attach_modal_dialogs() -> bool {
+    true
 }
 
 impl Default for InputSettings {
@@ -803,6 +860,9 @@ impl Default for InputSettings {
             mouse_left_handed: false,
             touchpad_left_handed: false,
             right_to_left: false,
+            bell: BellPolicy::default(),
+            attach_modal_dialogs: true,
+            workspace_policy: WorkspacePolicy::default(),
         }
     }
 }
@@ -1200,6 +1260,7 @@ mod tests {
 
     fn sample_window(id: WindowId) -> WindowInfo {
         WindowInfo {
+            on_all_workspaces: false,
             icon: None,
             id,
             title: format!("Terminal {id}"),
@@ -1229,6 +1290,73 @@ mod tests {
     }
 
     #[test]
+    fn combined_bell_and_modal_preferences_survive_positional_wire() {
+        for attach in [false, true] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(InputSettings {
+                    attach_modal_dialogs: attach,
+                    bell: BellPolicy {
+                        audible: false,
+                        visual: true,
+                        frame_flash: true,
+                        event_sounds: false,
+                        theme: "custom".into(),
+                    },
+                    ..Default::default()
+                }),
+            });
+        }
+    }
+
+    #[test]
+    fn multitasking_preferences_survive_positional_wire() {
+        for fixed_count in [1, 4, 36] {
+            for enabled in [false, true] {
+                roundtrip(&Message::Command {
+                    id: 90,
+                    kind: CommandKind::SetInputSettings(InputSettings {
+                        workspace_policy: WorkspacePolicy {
+                            dynamic: enabled,
+                            fixed_count,
+                            only_on_primary: !enabled,
+                            edge_tiling: enabled,
+                        },
+                        ..Default::default()
+                    }),
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn all_workspace_window_state_survives_delta_wire() {
+        for enabled in [false, true] {
+            let mut window = sample_window(7);
+            window.on_all_workspaces = enabled;
+            roundtrip(&Message::Changes {
+                from_revision: 1,
+                to_revision: 2,
+                ops: vec![StateOp::WindowOpened(window)],
+            });
+        }
+    }
+
+    #[test]
+    fn attach_modal_dialogs_survives_positional_control_wire() {
+        for enabled in [true, false] {
+            let settings = InputSettings {
+                attach_modal_dialogs: enabled,
+                ..Default::default()
+            };
+            let mut buffer = [0u8; 256];
+            let body = postcard::to_slice(&settings, &mut buffer).unwrap();
+            let decoded: InputSettings = postcard::from_bytes(body).unwrap();
+            assert_eq!(decoded, settings);
+        }
+        assert!(InputSettings::default().attach_modal_dialogs);
+    }
+    #[test]
     fn secrets_never_reach_debug_output() {
         let kind = CommandKind::Unlock {
             password: Secret("hunter2".into()),
@@ -1239,8 +1367,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_29() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 29));
+    fn current_version_is_0_31() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 31));
     }
 
     #[test]
@@ -1260,6 +1388,23 @@ mod tests {
         ] {
             roundtrip(&Message::ScreenReader { state });
         }
+    }
+
+    #[test]
+    fn live_bell_policy_survives_the_positional_control_wire() {
+        roundtrip(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(InputSettings {
+                bell: BellPolicy {
+                    audible: false,
+                    visual: true,
+                    frame_flash: true,
+                    event_sounds: false,
+                    theme: "custom".into(),
+                },
+                ..InputSettings::default()
+            }),
+        });
     }
 
     #[test]
@@ -1341,7 +1486,7 @@ mod tests {
         assert!(ProtocolVersion::new(0, 27).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 28).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 29).is_compatible_with(&ours));
-        assert!(!ProtocolVersion::new(0, 30).is_compatible_with(&ours));
+        assert!(!ProtocolVersion::new(ours.major, ours.minor + 1).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 4).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 0).is_compatible_with(&ours));
     }

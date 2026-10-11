@@ -27,7 +27,7 @@ pub enum VolumeKey {
     Mute,
 }
 
-fn parse_volume(output: &str) -> Option<(f64, bool)> {
+pub(crate) fn parse_volume(output: &str) -> Option<(f64, bool)> {
     let mut words = output.split_whitespace();
     if words.next()? != "Volume:" {
         return None;
@@ -42,7 +42,7 @@ fn parse_volume(output: &str) -> Option<(f64, bool)> {
 /// zero mutes it. The ordinary range stops at 100 percent.
 fn adjusted(percent: f64, muted: bool, key: VolumeKey, step: f64, limit: f64) -> (f64, bool) {
     match key {
-        VolumeKey::Mute => (percent, !muted),
+        VolumeKey::Mute => (percent.clamp(0.0, limit), !muted),
         VolumeKey::Up => (
             (if muted && percent > 0.0 {
                 percent
@@ -63,26 +63,42 @@ type Osd = Rc<dyn Fn(f64, bool, bool)>;
 #[derive(Clone)]
 pub struct MediaKeys(Rc<Inner>);
 struct Inner {
-    queue: RefCell<VecDeque<(VolumeKey, f64, bool)>>,
+    queue: RefCell<VecDeque<(VolumeKey, f64, bool, bool)>>,
+    clamp_pending: Cell<bool>,
     busy: Cell<bool>,
     osd: Osd,
     sound: Option<gio::Settings>,
 }
 impl MediaKeys {
     pub fn new(osd: Osd) -> Self {
-        Self(Rc::new(Inner {
+        let this = Self(Rc::new(Inner {
             queue: RefCell::new(VecDeque::new()),
             busy: Cell::new(false),
+            clamp_pending: Cell::new(true),
             osd,
             sound: sound_settings(),
-        }))
+        }));
+        if let Some(settings) = this.0.sound.as_ref() {
+            let weak = Rc::downgrade(&this.0);
+            settings.connect_changed(Some(AMPLIFIED_KEY), move |_, _| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.clamp_pending.set(true);
+                    Self(inner).next();
+                }
+            });
+        }
+        this.next();
+        this
     }
-    pub fn change(&self, key: VolumeKey, step: f64, microphone: bool) {
+    pub fn change(&self, key: VolumeKey, step: f64, microphone: bool, quiet: bool) {
         // Bound repeated input while a missing audio service is timing out.
         if self.0.queue.borrow().len() >= 32 {
             return;
         }
-        self.0.queue.borrow_mut().push_back((key, step, microphone));
+        self.0
+            .queue
+            .borrow_mut()
+            .push_back((key, step, microphone, quiet));
         self.next();
     }
     fn finish(&self) {
@@ -93,7 +109,28 @@ impl MediaKeys {
         if self.0.busy.get() {
             return;
         }
-        let Some((key, step, microphone)) = self.0.queue.borrow_mut().pop_front() else {
+        if self.0.clamp_pending.replace(false) {
+            self.0.busy.set(true);
+            let this = self.clone();
+            wpctl(&["get-volume", "@DEFAULT_AUDIO_SINK@"], move |out| {
+                let Some((percent, _)) = out.as_deref().and_then(parse_volume) else {
+                    this.finish();
+                    return;
+                };
+                let limit = output_limit(this.0.sound.as_ref());
+                if percent > limit {
+                    let volume = format!("{:.4}", limit / 100.0);
+                    wpctl(
+                        &["set-volume", "@DEFAULT_AUDIO_SINK@", &volume],
+                        move |_| this.finish(),
+                    );
+                } else {
+                    this.finish();
+                }
+            });
+            return;
+        }
+        let Some((key, step, microphone, quiet)) = self.0.queue.borrow_mut().pop_front() else {
             return;
         };
         self.0.busy.set(true);
@@ -108,6 +145,7 @@ impl MediaKeys {
                 this.finish();
                 return;
             };
+            let before = (percent, muted);
             let (percent, muted) = adjusted(
                 percent,
                 muted,
@@ -135,6 +173,13 @@ impl MediaKeys {
                         wpctl(&["get-volume", target], move |out| {
                             if let Some((percent, muted)) = out.as_deref().and_then(parse_volume) {
                                 (this.0.osd)(percent, muted, microphone);
+                                if !microphone {
+                                    crate::sound_feedback::volume(
+                                        quiet,
+                                        before != (percent, muted),
+                                        muted,
+                                    );
+                                }
                             }
                             this.finish();
                         });
@@ -145,13 +190,58 @@ impl MediaKeys {
     }
 }
 
-fn wpctl(args: &[&str], done: impl FnOnce(Option<String>) + 'static) {
+type AudioCommand = (Vec<String>, Box<dyn FnOnce(Option<String>)>);
+thread_local! {
+    static COMMANDS: RefCell<VecDeque<AudioCommand>> = const { RefCell::new(VecDeque::new()) };
+    static COMMAND_BUSY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Serialize slider writes with key mutations and the live policy clamp: an
+/// older amplified slider write must finish before a policy clamp reads it.
+pub(crate) fn wpctl(args: &[&str], done: impl FnOnce(Option<String>) + 'static) {
+    if COMMANDS.with_borrow(|queue| queue.len() >= 128) {
+        done(None);
+        return;
+    }
+    COMMANDS.with_borrow_mut(|queue| {
+        queue.push_back((args.iter().map(|s| s.to_string()).collect(), Box::new(done)))
+    });
+    next_command();
+}
+
+fn next_command() {
+    if COMMAND_BUSY.get() {
+        return;
+    }
+    let Some((args, done)) = COMMANDS.with_borrow_mut(VecDeque::pop_front) else {
+        return;
+    };
+    COMMAND_BUSY.set(true);
+    let argv: Vec<_> = args.iter().map(String::as_str).collect();
+    run_wpctl(&argv, move |result| {
+        done(result);
+        COMMAND_BUSY.set(false);
+        next_command();
+    });
+}
+
+fn run_wpctl(args: &[&str], done: impl FnOnce(Option<String>) + 'static) {
     let mut argv = vec![std::ffi::OsStr::new("wpctl")];
     argv.extend(args.iter().map(std::ffi::OsStr::new));
-    let Ok(process) = gio::Subprocess::newv(
-        &argv,
+    let launcher = gio::SubprocessLauncher::new(
         gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_SILENCE,
-    ) else {
+    );
+    let parent = std::process::id() as libc::pid_t;
+    launcher.set_child_setup(move || unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+            || libc::getppid() != parent
+        {
+            libc::_exit(127);
+        }
+        libc::signal(libc::SIGALRM, libc::SIG_DFL);
+        libc::alarm(5);
+    });
+    let Ok(process) = launcher.spawn(&argv) else {
         done(None);
         return;
     };
@@ -205,6 +295,24 @@ mod tests {
             (100.0, false)
         );
         assert_eq!(output_limit(None), 100.0);
+    }
+
+    #[test]
+    fn unmute_cannot_bypass_disabled_amplification() {
+        assert_eq!(
+            adjusted(140.0, true, VolumeKey::Mute, 0.0, 100.0),
+            (100.0, false)
+        );
+        assert_eq!(
+            adjusted(
+                140.0,
+                true,
+                VolumeKey::Mute,
+                0.0,
+                crate::logic::volume_limit(true)
+            ),
+            (140.0, false)
+        );
     }
 
     #[test]
