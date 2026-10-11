@@ -2076,6 +2076,11 @@ fn build(app: &adw::Application) {
                     out.bell.theme = sound.string("theme-name").to_string();
                 }
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    // Diagnostic probe (#329): values only, no PII.
+                    eprintln!(
+                        "tuna-settings-probe: send mouse_left_handed={} hot_corners={}",
+                        out.mouse_left_handed, out.hot_corners
+                    );
                     let _ = control.set_input_settings(out);
                 }
             })

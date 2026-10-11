@@ -136,6 +136,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
     evidence = os.path.join(out, "lifecycle")
     os.makedirs(evidence, exist_ok=True)
+    ack_timing = []
 
     def inventory(label):
         state = agent.run("inventory")
@@ -145,12 +146,26 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
 
     def await_state(predicate, timeout=15, label=None):
         deadline = time.monotonic() + timeout
+        started = time.monotonic()
         while time.monotonic() < deadline:
             state = inventory(label) if label else agent.run("inventory")
             if predicate(state):
+                # Diagnostic probe (#329): per-stage ack timing sidecar.
+                if label is not None:
+                    ack_timing.append({"label": label,
+                                       "waited_s": round(time.monotonic() - started, 2),
+                                       "ok": True})
+                    with open(os.path.join(evidence, "settings-ack-timing.json"), "w") as stream:
+                        json.dump(ack_timing, stream, indent=2)
                 return state
             time.sleep(0.2)
         where = f" ({label})" if label else ""
+        if label is not None:
+            ack_timing.append({"label": label,
+                               "waited_s": round(time.monotonic() - started, 2),
+                               "ok": False})
+            with open(os.path.join(evidence, "settings-ack-timing.json"), "w") as stream:
+                json.dump(ack_timing, stream, indent=2)
         raise RuntimeError(f"lifecycle state did not arrive within its deadline{where}")
 
     def frame(label):

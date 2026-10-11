@@ -3606,6 +3606,11 @@ impl Runtime {
             self.overview_app_grid = active;
         }
         if let Some(settings) = outcome.input_settings {
+            // Diagnostic probe (#329).
+            eprintln!(
+                "tuna-settings-probe: apply mouse_left_handed={} hot_corners={}",
+                settings.mouse_left_handed, settings.hot_corners
+            );
             self.apply_input_settings(settings);
         }
         if let Some((x, y)) = outcome.screenshot_pointer {

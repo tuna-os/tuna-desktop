@@ -635,6 +635,11 @@ impl<'a> Session<'a> {
                 kind: CommandKind::SetInputSettings(settings),
             } => {
                 // Session-level settings for the runtime (seat, libinput).
+                // Diagnostic probe (#329).
+                eprintln!(
+                    "tuna-settings-probe: hub-recv mouse_left_handed={} hot_corners={}",
+                    settings.mouse_left_handed, settings.hot_corners
+                );
                 self.input_settings = Some(settings);
                 self.conn.write_frame(&Message::CommandResult {
                     id,
@@ -1506,6 +1511,11 @@ impl ControlHub {
                         outcome.unlock = Some(request);
                     }
                     if let Some(settings) = session.input_settings.take() {
+                        // Diagnostic probe (#329).
+                        eprintln!(
+                            "tuna-settings-probe: hub-drain mouse_left_handed={} hot_corners={}",
+                            settings.mouse_left_handed, settings.hot_corners
+                        );
                         outcome.input_settings = Some(settings);
                     }
                     if let Some(pos) = session.screenshot_pointer.take() {
