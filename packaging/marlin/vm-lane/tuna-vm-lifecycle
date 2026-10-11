@@ -611,6 +611,18 @@ def main():
             raise ValueError("mouse handedness must be true or false")
         call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "left-handed", value, user=True)
         result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "left-handed", user=True) == value}
+    elif action == "mouse-speed":
+        value = float(sys.argv[2])
+        if not -1.0 <= value <= 1.0:
+            raise ValueError("mouse speed must be within GNOME's -1..1")
+        call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "speed", str(value), user=True)
+        result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "speed", user=True) == str(value)}
+    elif action == "mouse-natural":
+        value = sys.argv[2]
+        if value not in ("true", "false"):
+            raise ValueError("mouse natural scroll must be true or false")
+        call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "natural-scroll", value, user=True)
+        result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "natural-scroll", user=True) == value}
     elif action in ("input-count", "input-ready", "input-buttons"):
         result = json.loads(pathlib.Path(RUNTIME, "tuna-vm-input.json").read_text())
         if pathlib.Path(f"/proc/{result['pid']}").stat().st_uid != OWNER.pw_uid:

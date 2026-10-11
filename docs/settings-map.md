@@ -77,8 +77,8 @@ GNOME 51 `org.gnome.desktop.a11y.interface reduced-motion` is read live and comb
 | org.gnome.desktop.wm.preferences audible-bell, visual-bell | Ignored | The bell always sounds (GNOME's default audible bell) and never flashes (xdg-system-bell, #89) |
 | org.gnome.mutter dynamic-workspaces, edge-tiling | Ignored | Always on, as GNOME's defaults |
 | org.gnome.desktop.peripherals.keyboard repeat, delay, repeat-interval | Honored | Seat key repeat, live. Proof G-SETTINGS-INPUT |
-| org.gnome.desktop.peripherals.touchpad tap-to-click, natural-scroll, speed, disable-while-typing | Honored | libinput on hardware sessions, live and on hotplug |
-| org.gnome.desktop.peripherals.mouse natural-scroll, speed | Honored | libinput on hardware sessions |
+| org.gnome.desktop.peripherals.touchpad tap-to-click, natural-scroll, speed, disable-while-typing, left-handed | Honored | libinput on hardware sessions, live and on hotplug; left/right/mouse enum resolved in the shell. Proofs V-MOUSE-HANDEDNESS, V-POINTER-LIVE, V-POINTER-HOTPLUG; physical touchpad qualification remains (#343) |
+| org.gnome.desktop.peripherals.mouse natural-scroll, speed, left-handed | Honored | libinput on hardware sessions, live and on hotplug. Proofs V-MOUSE-HANDEDNESS, V-POINTER-LIVE, V-POINTER-HOTPLUG (#343) |
 | org.gnome.settings-daemon.peripherals.touchscreen orientation-lock | Ignored | No GSettings reader yet: the compositor's `OrientationPolicy` honors `InputSettings.orientation_lock` and serves `PanelOrientationManaged` live, but nothing publishes the key (mutter 51 `CONF_SCHEMA`; #345 follow-up) |
 | org.gnome.desktop.input-sources sources, xkb-options | Honored | xkb sources become one keymap in order; Super+Space switches; IBus sources use the supervised bridge (#60). Proof G-SETTINGS-INPUT |
 | org.gnome.desktop.a11y.* | Partial / missing | Some keys reach GTK; zoom, screen keyboard, seat input aids and several modern preferences lack consumers. Spoken screen-reader acceptance remains unqualified; see the control-center audit |
