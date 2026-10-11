@@ -729,6 +729,47 @@ struct AudioUi {
     process: RefCell<Option<gio::Subprocess>>,
     stopping: Cell<bool>,
     sound: Option<gio::Settings>,
+    privacy: Option<gio::Settings>,
+    enforcer: RefCell<crate::privacy::Tracker>,
+    last_actions: RefCell<Vec<crate::privacy::Action>>,
+}
+
+/// Cap on enforcement subprocesses per graph event. Graphs are
+/// small; the cap only bounds pathological ones.
+const MAX_PRIVACY_ACTIONS: usize = 64;
+
+/// The privacy kill-switches, when the schema is installed. Missing
+/// schemas (or keys) read as no settings object, and enforcement
+/// then plans nothing — like an unreachable service.
+fn privacy_settings() -> Option<gio::Settings> {
+    let source = gio::SettingsSchemaSource::default()?;
+    source.lookup("org.gnome.desktop.privacy", true)?;
+    Some(gio::Settings::new("org.gnome.desktop.privacy"))
+}
+
+/// One kill-switch without a critical log when an older schema
+/// lacks the key.
+fn privacy_bool(settings: &gio::Settings, key: &str) -> bool {
+    if settings
+        .settings_schema()
+        .is_none_or(|schema| !schema.has_key(key))
+    {
+        return false;
+    }
+    settings.boolean(key)
+}
+
+/// Current kill-switch policy (all-allowed without settings).
+fn privacy_policy(settings: Option<&gio::Settings>) -> tuna_shell_host::settings::PrivacyPolicy {
+    use tuna_shell_host::settings::PrivacyPolicy;
+    let Some(settings) = settings else {
+        return PrivacyPolicy::default();
+    };
+    PrivacyPolicy {
+        camera_disabled: privacy_bool(settings, "disable-camera"),
+        microphone_disabled: privacy_bool(settings, "disable-microphone"),
+        sound_output_disabled: privacy_bool(settings, "disable-sound-output"),
+    }
 }
 
 impl AudioUi {
@@ -865,6 +906,41 @@ impl AudioUi {
         *self.last.borrow_mut() = snapshot;
     }
 
+    /// Enforce the privacy kill-switches against the latest graph:
+    /// mute what the policy requires, destroy camera nodes, and
+    /// unmute on explicit restore. Runs on every graph event and on
+    /// every settings change, so a bypass attempt (or a respawning
+    /// node) is answered within one event. Steps dispatch through
+    /// the bounded async helpers; only a changed step set is
+    /// logged, so a steady state stays silent.
+    fn enforce_privacy(self: &Rc<Self>) {
+        let policy = privacy_policy(self.privacy.as_ref());
+        let scan = self.state.borrow().privacy_scan(&policy);
+        let mut actions = self.enforcer.borrow_mut().plan(&scan);
+        if actions.len() > MAX_PRIVACY_ACTIONS {
+            eprintln!("tuna-shell-gtk: privacy enforcement capped at {MAX_PRIVACY_ACTIONS} steps");
+            actions.truncate(MAX_PRIVACY_ACTIONS);
+        }
+        if actions != *self.last_actions.borrow() {
+            if !actions.is_empty() {
+                eprintln!("tuna-shell-gtk: privacy enforcement {actions:?}");
+            }
+            *self.last_actions.borrow_mut() = actions.clone();
+        }
+        for action in &actions {
+            if let Some(argv) = crate::privacy::wpctl_args(action) {
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                wpctl(&refs, |_| {});
+            } else if let Some(argv) = crate::privacy::pw_cli_args(action) {
+                let full = std::iter::once("pw-cli".to_owned())
+                    .chain(argv)
+                    .collect::<Vec<_>>();
+                let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+                audio_command(&refs, |_| {});
+            }
+        }
+    }
+
     fn retry(self: &Rc<Self>) {
         if let Some(process) = self.process.borrow_mut().take() {
             process.force_exit();
@@ -940,6 +1016,7 @@ impl AudioUi {
                     Ok(true) => {
                         let snapshot = ui.state.borrow().snapshot();
                         ui.update(snapshot);
+                        ui.enforce_privacy();
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -993,7 +1070,18 @@ fn audio(w: &Rc<Widgets>) {
         process: RefCell::new(None),
         stopping: Cell::new(false),
         sound: crate::media_keys::sound_settings(),
+        privacy: privacy_settings(),
+        enforcer: RefCell::default(),
+        last_actions: RefCell::default(),
     });
+    if let Some(privacy) = ui.privacy.as_ref() {
+        let weak = Rc::downgrade(&ui);
+        privacy.connect_changed(None::<&str>, move |_, _| {
+            if let Some(ui) = weak.upgrade() {
+                ui.enforce_privacy();
+            }
+        });
+    }
     ui.refresh_volume_limit();
     if let Some(sound) = ui.sound.as_ref() {
         let weak = Rc::downgrade(&ui);

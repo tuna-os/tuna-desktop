@@ -8,6 +8,8 @@ Switcher follow-up: main `c387326d067a53b7b583aafb9e0206fba0fab59c` (2026-10-10)
 
 Orientation follow-up: w2-345 (#345). `orientation-lock` never lived under `org.gnome.desktop.peripherals.touchscreen`: mutter 51.0 reads it from `org.gnome.settings-daemon.peripherals.touchscreen` (`src/backends/meta-orientation-manager.c` `CONF_SCHEMA`), and the desktop touchscreen schema holds only `output`. The row and its pinned key are removed (429→428 keys); the settings-daemon key is tracked in [settings-map.md](settings-map.md).
 
+Privacy follow-up: w3-356-privacy (#356). The three `org.gnome.desktop.privacy` device kill-switches move to Honored with the enforcing services identified per key; retention, diagnostics, and reporting rows stay Ignored as external-service responsibilities. Mechanism, GNOME 51 comparison, and proof matrix are in [privacy-enforcement.md](privacy-enforcement.md).
+
 Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.14.5/gdk/wayland/gdkdisplay-wayland.c). Related shell, Mutter and settings-daemon keys are in [settings-map.md](settings-map.md).
 
 ## org.gnome.desktop.a11y
@@ -393,9 +395,9 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| disable-camera | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
-| disable-microphone | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
-| disable-sound-output | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
+| disable-camera | Honored | Shell host publishes the standard Lockdown+Access backend from this key, so xdg-desktop-portal denies new Camera sessions while set (live daemon proof); the GTK shell additionally destroys Video/Source nodes and camera-linked capture streams on the PipeWire graph, existing and newly appearing, and restores on explicit re-allow. See privacy-enforcement.md |
+| disable-microphone | Honored | GTK shell mutes every PipeWire Audio/Source while set and re-mutes bypass attempts; explicit restore unmutes only tracker-muted nodes. GNOME publishes this key to Lockdown with no enforcer; enforcement here is Tuna-defined. See privacy-enforcement.md |
+| disable-sound-output | Honored | GTK shell mutes every PipeWire Audio/Sink while set and re-mutes bypass attempts; explicit restore unmutes only tracker-muted nodes. GNOME publishes this key to Lockdown with no enforcer; enforcement here is Tuna-defined. See privacy-enforcement.md |
 | hide-identity | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
 | old-files-age | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
 | privacy-screen | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |

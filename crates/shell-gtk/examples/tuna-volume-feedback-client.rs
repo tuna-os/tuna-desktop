@@ -8,6 +8,8 @@ mod audio_state;
 mod logic;
 #[path = "../src/media_keys.rs"]
 mod media_keys;
+#[path = "../src/privacy.rs"]
+mod privacy;
 #[path = "../src/sound_feedback.rs"]
 mod sound_feedback;
 

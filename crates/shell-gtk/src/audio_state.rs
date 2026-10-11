@@ -1,6 +1,7 @@
 //! Bounded state from pw-dump's event stream. No GTK or daemon calls.
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use tuna_shell_host::settings::PrivacyPolicy;
 
 pub const MAX_PENDING: usize = 4 * 1024 * 1024;
 const MAX_OBJECTS: usize = 4096;
@@ -145,6 +146,64 @@ impl AudioState {
         })
     }
 
+    /// Fold the current graph against the privacy kill-switches:
+    /// which nodes must read muted, which camera nodes/streams must
+    /// not exist, and which nodes are muted right now. A video
+    /// capture stream counts as camera capture only while linked to
+    /// a `Video/Source` node — an unlinked stream captures nothing,
+    /// and a stream wired to anything else (a screen-share feed) is
+    /// never the camera's business.
+    pub fn privacy_scan(&self, policy: &PrivacyPolicy) -> crate::privacy::PrivacyScan {
+        let mut scan = crate::privacy::PrivacyScan {
+            mute_required: BTreeSet::new(),
+            destroy: Vec::new(),
+            muted_now: BTreeSet::new(),
+        };
+        for (&id, object) in &self.objects {
+            let props = &object["info"]["props"];
+            let class = props["media.class"].as_str().unwrap_or("");
+            let audio_required = if class == "Audio/Source" {
+                Some(policy.microphone_disabled)
+            } else if class == "Audio/Sink" {
+                Some(policy.sound_output_disabled)
+            } else {
+                None
+            };
+            if let Some(required) = audio_required {
+                if node_muted(object) {
+                    scan.muted_now.insert(id);
+                }
+                if required {
+                    scan.mute_required.insert(id);
+                }
+            } else if policy.camera_disabled
+                && (is_camera_node(class)
+                    || (class == "Stream/Input/Video" && self.video_stream_captures_camera(id)))
+            {
+                scan.destroy.push(id);
+            }
+        }
+        scan
+    }
+
+    /// A video capture stream captures the camera while a link feeds
+    /// it from a `Video/Source` node (data flows output node to
+    /// input node, as in
+    /// [`AudioState::default_sink_has_running_process`]).
+    fn video_stream_captures_camera(&self, stream: u64) -> bool {
+        self.objects.values().any(|object| {
+            let info = &object["info"];
+            let output = number(&info["output-node-id"]);
+            let input = number(&info["input-node-id"]);
+            input == Some(stream)
+                && output.is_some_and(|camera| {
+                    self.objects.get(&camera).is_some_and(|node| {
+                        is_camera_node(node["info"]["props"]["media.class"].as_str().unwrap_or(""))
+                    })
+                })
+        })
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let default_sink = self.default_name("default.audio.sink");
         let default_source = self.default_name("default.audio.source");
@@ -242,6 +301,20 @@ impl AudioState {
 
 fn property_bool(v: &Value) -> bool {
     v.as_bool().unwrap_or(v.as_str() == Some("true"))
+}
+/// A camera device node (`Video/Source`, plus any namespaced kind a
+/// provider may publish beneath it).
+fn is_camera_node(class: &str) -> bool {
+    class == "Video/Source" || class.starts_with("Video/Source/")
+}
+/// A node's mixer mute flag. Missing mixer state reads as unmuted,
+/// so an unknown node is muted (and re-muted) rather than trusted.
+fn node_muted(node: &Value) -> bool {
+    node["info"]["params"]["Props"]
+        .as_array()
+        .and_then(|params| params.first())
+        .and_then(|props| props["mute"].as_bool())
+        .unwrap_or(false)
 }
 fn number(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str()?.parse().ok())
@@ -385,5 +458,107 @@ mod tests {
         );
         assert_eq!(s.snapshot().source, a.source);
         assert!(s.snapshot().sink.is_none());
+    }
+
+    fn privacy_graph() -> AudioState {
+        let mut s = AudioState::default();
+        feed(
+            &mut s,
+            json!([
+                {"id":48,"info":{"props":{"media.class":"Audio/Sink","node.name":"analog"},"params":{"Props":[{"channelVolumes":[0.512],"mute":false}]}}},
+                {"id":49,"info":{"props":{"media.class":"Audio/Sink","node.name":"hdmi"},"params":{"Props":[{"channelVolumes":[0.512],"mute":true}]}}},
+                {"id":50,"info":{"props":{"media.class":"Audio/Source","node.name":"mic"},"params":{"Props":[{"channelVolumes":[0.125],"mute":false}]}}},
+                {"id":51,"info":{"props":{"media.class":"Audio/Source","node.name":"monitor"},"params":{"Props":[{"mute":true}]}}},
+                {"id":60,"info":{"state":"running","props":{"media.class":"Video/Source","node.name":"camera"}}},
+                {"id":61,"info":{"state":"running","props":{"media.class":"Stream/Input/Video","node.name":"capture"}}},
+                {"id":62,"info":{"state":"running","props":{"media.class":"Stream/Input/Video","node.name":"share-view"}}},
+                {"id":63,"info":{"state":"running","props":{"media.class":"Stream/Output/Video","node.name":"producer"}}},
+                {"id":64,"info":{"props":{"media.class":"Video/Source/Custom","node.name":"doorbell"}}},
+                {"id":70,"info":{"state":"active","output-node-id":60,"input-node-id":61}},
+                {"id":71,"info":{"state":"active","output-node-id":63,"input-node-id":62}}
+            ]),
+        );
+        s
+    }
+
+    #[test]
+    fn privacy_scan_is_empty_when_everything_is_allowed() {
+        let s = privacy_graph();
+        let scan = s.privacy_scan(&PrivacyPolicy::default());
+        assert!(scan.mute_required.is_empty());
+        assert!(scan.destroy.is_empty());
+        assert_eq!(scan.muted_now, BTreeSet::from([49, 51]));
+    }
+
+    #[test]
+    fn privacy_scan_requires_mute_on_every_unmuted_device() {
+        let s = privacy_graph();
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            microphone_disabled: true,
+            sound_output_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert_eq!(scan.mute_required, BTreeSet::from([48, 49, 50, 51]));
+        assert!(scan.destroy.is_empty());
+    }
+
+    #[test]
+    fn privacy_scan_destroys_cameras_but_not_screen_shares() {
+        let s = privacy_graph();
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            camera_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert!(scan.mute_required.is_empty());
+        // Both camera flavors plus the stream fed by the camera; the
+        // stream fed by the video producer and the producer itself
+        // are not camera capture.
+        assert_eq!(scan.destroy, vec![60, 61, 64]);
+    }
+
+    #[test]
+    fn privacy_scan_ignores_an_unlinked_capture_stream() {
+        let mut s = AudioState::default();
+        feed(
+            &mut s,
+            json!([
+                {"id":61,"info":{"state":"running","props":{"media.class":"Stream/Input/Video","node.name":"capture"}}}
+            ]),
+        );
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            camera_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert!(scan.destroy.is_empty());
+        // Linking it to a camera later makes it camera capture.
+        feed(
+            &mut s,
+            json!([
+                {"id":60,"info":{"state":"running","props":{"media.class":"Video/Source","node.name":"camera"}}},
+                {"id":70,"info":{"state":"active","output-node-id":60,"input-node-id":61}}
+            ]),
+        );
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            camera_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert_eq!(scan.destroy, vec![60, 61]);
+    }
+
+    #[test]
+    fn privacy_scan_treats_missing_mixer_state_as_unmuted() {
+        let mut s = AudioState::default();
+        feed(
+            &mut s,
+            json!([
+                {"id":50,"info":{"props":{"media.class":"Audio/Source","node.name":"mic"}}}
+            ]),
+        );
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            microphone_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert_eq!(scan.mute_required, BTreeSet::from([50]));
+        assert!(scan.muted_now.is_empty());
     }
 }

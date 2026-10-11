@@ -38,6 +38,7 @@ mod overview;
 mod polkit;
 mod power;
 mod preview_chrome;
+mod privacy;
 mod providers;
 mod screencast;
 mod screensaver;
