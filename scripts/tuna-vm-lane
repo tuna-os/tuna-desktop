@@ -61,7 +61,11 @@ _guest_loader.exec_module(guest_agent)
 
 WIDTH, HEIGHT = baseline.WIDTH, baseline.HEIGHT
 DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
-SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings: ")
+# The shell emits this as one eprintln!, but serial/journal interleaving
+# with the compositor's stderr can shear the payload off onto later
+# records, leaving a bare `tuna-shell-gtk: keybindings:` line. Match the
+# stable prefix so startup is still recognized (run 38102898073 r04).
+SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings:")
 EXHAUSTED = "shell supervision: BudgetExhausted"
 CARDS = os.path.join(HERE, "lib", "vm-tour-cards")
 TOUR_FPS = 2        # frames captured per second during the tour
