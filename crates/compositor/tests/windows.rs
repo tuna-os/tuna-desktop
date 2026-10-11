@@ -828,6 +828,206 @@ fn super_page_keys_switch_and_shift_moves_focused() {
     assert_eq!(f.manager.model().focused(), Some(f.id_b));
 }
 
+/// One schedule tick's dynamic-workspace compaction, as the runtime
+/// runs it every frame after input and the control poll.
+fn tick_compaction(manager: &mut WindowManager) {
+    manager.reconcile_dynamic_workspaces(
+        false,
+        std::time::Duration::ZERO,
+        1280,
+        tuna_shell_control::motion::MotionPolicy::default(),
+    );
+}
+
+#[test]
+fn super_page_down_sticks_after_the_tick_compaction_on_empty_workspaces() {
+    // J-WS-NEXT headless mirror: with both workspaces empty (the CI
+    // journey's topology), Super+PageDown must survive the tick's
+    // dynamic compaction instead of being renumbered back onto the
+    // workspace the user just left.
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    // The journey baseline: the first tick compacts the fresh model
+    // to the two-slot minimum, active 0.
+    tick_compaction(&mut manager);
+    assert_eq!(manager.model().workspaces(), &[0, 1]);
+    assert_eq!(manager.model().active_workspace(), 0);
+    // The journey chord.
+    press(&mut manager, &mut comp, SUPER_LEFT_KEYCODE);
+    press(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
+    release(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
+    release(&mut manager, &mut comp, SUPER_LEFT_KEYCODE);
+    assert_eq!(manager.model().active_workspace(), 1);
+    // The following ticks compact around the departed workspace's
+    // grace lease instead of renumbering active back to 0.
+    tick_compaction(&mut manager);
+    assert_eq!(manager.model().active_workspace(), 1);
+    assert_eq!(manager.model().workspaces(), &[0, 1]);
+    tick_compaction(&mut manager);
+    assert_eq!(manager.model().active_workspace(), 1);
+    assert_eq!(manager.model().workspaces(), &[0, 1]);
+}
+
+#[test]
+fn reselecting_the_active_workspace_adds_no_phantom_slot() {
+    // The departed-workspace grace lease fires on real switches only:
+    // reselection must grant nothing, or the lease on the active
+    // workspace itself would pad a phantom trailing slot on the next
+    // tick ([0, 1] active 1 would grow to [0, 1, 2]).
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    tick_compaction(&mut manager);
+    press(&mut manager, &mut comp, SUPER_LEFT_KEYCODE);
+    press(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
+    release(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
+    release(&mut manager, &mut comp, SUPER_LEFT_KEYCODE);
+    tick_compaction(&mut manager);
+    assert_eq!(manager.model().active_workspace(), 1);
+    assert!(manager.switch_workspace(&mut comp.state, 1));
+    tick_compaction(&mut manager);
+    tick_compaction(&mut manager);
+    assert_eq!(manager.model().active_workspace(), 1);
+    assert_eq!(manager.model().workspaces(), &[0, 1]);
+}
+
+#[test]
+fn shell_focus_workspace_keeps_the_departed_slot_through_compaction() {
+    // ControlHub changes the model before the runtime can notify the
+    // WindowManager. Preserve that departure through the same lease path
+    // used by keyboard switches.
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    tick_compaction(&mut manager);
+    assert!(manager.model_mut().set_active_workspace(1));
+    manager.keep_departed_workspace_alive(0);
+    tick_compaction(&mut manager);
+    assert_eq!(manager.model().active_workspace(), 1);
+    assert_eq!(manager.model().workspaces(), &[0, 1]);
+}
+
+#[test]
+fn rapid_workspace_switches_keep_the_complete_empty_path_for_retargeting() {
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    tick_compaction(&mut manager);
+
+    assert!(manager.switch_relative(&mut comp.state, 1));
+    assert!(manager.switch_relative(&mut comp.state, 1));
+    tick_compaction(&mut manager);
+
+    assert_eq!(manager.model().active_workspace(), 2);
+    assert_eq!(manager.model().workspaces(), &[0, 1, 2]);
+}
+
+/// A shell-side peer over a real socketpair: reads what the session
+/// emits without blocking (no sleeps; the server side already wrote).
+struct WireClient {
+    stream: UnixStream,
+    buf: Vec<u8>,
+}
+
+impl WireClient {
+    fn drain(&mut self) -> Vec<tuna_shell_control::Message> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("wire read: {e}"),
+            }
+        }
+        while self.buf.len() >= 4 {
+            let len = u32::from_le_bytes(self.buf[..4].try_into().unwrap()) as usize;
+            if self.buf.len() < 4 + len {
+                break;
+            }
+            let frame = self.buf[..4 + len].to_vec();
+            self.buf.drain(..4 + len);
+            out.push(tuna_shell_control::decode_frame(&frame).unwrap());
+        }
+        out
+    }
+}
+
+#[test]
+fn workspace_switch_reaches_the_shell_and_never_snaps_back_on_the_wire() {
+    // Journey-adjacent end to end for J-WS-NEXT: the real Super+PageDown
+    // chord, the runtime's real tick order (input, control emit,
+    // compaction, control emit), and the decoded wire the shell
+    // mirrors. Every frame after the switch must carry active 1; a
+    // single active-0 frame is the snap-back the journey catches.
+    use tuna_compositor::control::{ControlConn, Session};
+    use tuna_shell_control::{encode_frame, Message, CURRENT_VERSION};
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    tick_compaction(&mut manager);
+
+    let (server, client) = UnixStream::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    let mut peer = WireClient {
+        stream: client,
+        buf: Vec::new(),
+    };
+    let conn = ControlConn::new(server).unwrap();
+    {
+        use std::io::Write;
+        let mut hello = peer.stream.try_clone().unwrap();
+        hello
+            .write_all(&encode_frame(&Message::Hello {
+                version: CURRENT_VERSION,
+            }))
+            .unwrap();
+    }
+    let mut session = Session::handshake(conn, manager.model()).unwrap();
+    let mut frames = peer.drain();
+    assert!(matches!(frames.pop(), Some(Message::Snapshot { .. })));
+    assert!(matches!(frames.pop(), Some(Message::Hello { .. })));
+    assert!(frames.is_empty());
+
+    press(&mut manager, &mut comp, SUPER_LEFT_KEYCODE);
+    press(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
+    release(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
+    release(&mut manager, &mut comp, SUPER_LEFT_KEYCODE);
+
+    // Three ticks in runtime order; collect every emitted frame.
+    let mut wire = Vec::new();
+    for _ in 0..3 {
+        session.emit_deltas(manager.model()).unwrap();
+        wire.extend(peer.drain());
+        tick_compaction(&mut manager);
+    }
+    session.emit_deltas(manager.model()).unwrap();
+    wire.extend(peer.drain());
+
+    // The shell learns the switch (liveness) and never unlearns it.
+    let mut saw_active_one = false;
+    for msg in &wire {
+        match msg {
+            Message::Snapshot { workspaces, .. } => {
+                let active = workspaces.iter().find(|w| w.active).map(|w| w.id);
+                assert_eq!(active, Some(1), "snapshot must carry active 1: {msg:?}");
+                saw_active_one = true;
+            }
+            Message::Changes { ops, .. } => {
+                for op in ops {
+                    if let tuna_shell_control::StateOp::WorkspaceChanged(info) = op {
+                        if info.active {
+                            assert_eq!(info.id, 1, "delta must carry active 1: {msg:?}");
+                            saw_active_one = true;
+                        }
+                    }
+                }
+            }
+            other => panic!("unexpected wire message: {other:?}"),
+        }
+    }
+    assert!(saw_active_one, "no frame carried the switch: {wire:?}");
+    assert_eq!(manager.model().active_workspace(), 1);
+}
+
 #[test]
 fn super_tab_switches_applications_like_alt_tab() {
     // GNOME binds switch-applications to Super+Tab as well as Alt+Tab;

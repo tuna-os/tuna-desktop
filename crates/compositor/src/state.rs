@@ -1242,6 +1242,25 @@ mod dynamic_workspace_tests {
     }
 
     #[test]
+    fn single_trailing_pair_with_active_trailing() {
+        // The departed-workspace grace lease (J-WS-NEXT) only has to
+        // survive the first post-switch compaction: once the pair is
+        // kept, an all-empty [0, 1] with active trailing is a stable
+        // fixed point with or without the lease.
+        let mut model = StateModel::new();
+        model.reconcile_dynamic_workspaces(&[]);
+        model.set_active_workspace(1);
+        model.reconcile_dynamic_workspaces(&[0]);
+        assert_eq!(model.workspaces(), &[0, 1]);
+        assert_eq!(model.active_workspace(), 1);
+        let revision = model.revision();
+        assert!(!model.reconcile_dynamic_workspaces(&[0]));
+        assert!(!model.reconcile_dynamic_workspaces(&[]));
+        assert_eq!(model.revision(), revision);
+        assert_eq!(model.active_workspace(), 1);
+    }
+
+    #[test]
     fn occupying_last_slot_adds_one_empty_tail() {
         let mut model = StateModel::new();
         model.reconcile_dynamic_workspaces(&[]);

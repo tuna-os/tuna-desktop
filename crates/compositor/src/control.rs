@@ -1033,6 +1033,9 @@ pub struct PollOutcome {
     pub activated: Vec<u64>,
     /// Windows to ask to close.
     pub closed: Vec<u64>,
+    /// Workspaces left by shell focus commands; the window manager keeps
+    /// these alive through the next dynamic-workspace reconciliation.
+    pub departed_workspaces: Vec<u32>,
     /// Idle-lock timeout the shell asked for (`0` never), if any.
     pub idle_timeout: Option<u64>,
     /// Whether overview search is showing results, if the shell said.
@@ -1456,6 +1459,7 @@ impl ControlHub {
             let alive = {
                 let session = &mut self.sessions[i];
                 let before = model.focused();
+                let workspace_before = model.active_workspace();
                 let deltas_ok = session.emit_deltas(model).is_ok();
                 let cmd_ok = match session.handle_next(model) {
                     Ok(_) => true,
@@ -1463,6 +1467,12 @@ impl ControlHub {
                     Err(_) => false,
                 };
                 if deltas_ok && cmd_ok {
+                    if model.active_workspace() != workspace_before {
+                        // FocusWorkspace changes the model directly; preserve
+                        // every departed slot so rapid commands cannot be
+                        // compacted into a snap-back.
+                        outcome.departed_workspaces.push(workspace_before);
+                    }
                     if model.focused() != before {
                         outcome.activated.extend(model.focused());
                     }
@@ -1746,13 +1756,26 @@ mod readiness_tests {
         assert_eq!(wakes, 3);
         hub.poll(&mut model);
         assert!(hub.overview_open());
+        client
+            .write_all(&encode_frame(&Message::Command {
+                id: 2,
+                kind: CommandKind::FocusWorkspace { workspace: 1 },
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 4);
+        let outcome = hub.poll(&mut model);
+        assert_eq!(model.active_workspace(), 1);
+        assert_eq!(outcome.departed_workspaces, [0]);
         hub.set_peer_gate(PeerGate::Closed);
         hub.poll(&mut model);
         assert!(hub.sessions.is_empty());
         event_loop
             .dispatch(Some(Duration::ZERO), &mut wakes)
             .unwrap();
-        assert_eq!(wakes, 3, "evicted socket interest must retire");
+        assert_eq!(wakes, 4, "evicted socket interest must retire");
         // Concurrent forked test children may briefly inherit the peer until
         // exec closes it. Still reject a persistent duplicate: WouldBlock is
         // never closure, and queued replies are drained before checking EOF.

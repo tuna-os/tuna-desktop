@@ -3604,13 +3604,48 @@ impl WindowManager {
         true
     }
 
+    /// Grace lease for a workspace the user just switched away from:
+    /// one second, matching GNOME 51's dialog-removal grace in
+    /// [`crate::workspace_tracker`]. The shell converges in
+    /// milliseconds; the lease only has to survive the first post-
+    /// switch compaction tick, after which the kept pair is a stable
+    /// fixed point (see `single_trailing_pair_with_active_trailing`).
+    const DEPARTED_WORKSPACE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Switch the model's active workspace, granting the departed
+    /// workspace a grace lease so the tick's dynamic compaction keeps
+    /// it (and the switch) instead of pruning it and renumbering
+    /// active back onto the slot the user just left (J-WS-NEXT). No
+    /// lease on a no-op reselect: leasing the active workspace itself
+    /// would pad a phantom trailing slot.
+    fn activate_workspace(&mut self, workspace: u32) -> bool {
+        let previous = self.model.active_workspace();
+        if !self.model.set_active_workspace(workspace) {
+            return false;
+        }
+        if previous != workspace {
+            self.keep_departed_workspace_alive(previous);
+        }
+        true
+    }
+
+    /// Preserve a workspace which a model-level shell command just left.
+    /// This shares the transition policy with keyboard and move/follow paths.
+    pub fn keep_departed_workspace_alive(&mut self, workspace: u32) {
+        self.workspace_tracker.keep_alive(
+            workspace,
+            Self::DEPARTED_WORKSPACE_GRACE,
+            std::time::Instant::now(),
+        );
+    }
+
     /// Switch the active workspace, focusing its topmost window (or
     /// nothing when empty). Returns false for unknown ids.
     pub fn switch_workspace(&mut self, state: &mut State, workspace: u32) -> bool {
         if !self.model.workspaces().contains(&workspace) {
             return false;
         }
-        if !self.model.set_active_workspace(workspace) {
+        if !self.activate_workspace(workspace) {
             return false;
         }
         self.focus_topmost(state, workspace);
@@ -3643,7 +3678,7 @@ impl WindowManager {
         let Some(target) = target else {
             return false;
         };
-        if !self.model.set_active_workspace(target) {
+        if !self.activate_workspace(target) {
             return false;
         }
         self.focus_topmost(state, target);
@@ -3668,7 +3703,7 @@ impl WindowManager {
         if !self.move_to_workspace(state, id, target) {
             return false;
         }
-        if !self.model.set_active_workspace(target) {
+        if !self.activate_workspace(target) {
             return false;
         }
         self.apply_focus(state, Some(id));

@@ -3485,6 +3485,9 @@ impl Runtime {
             .map(|output| output.name.clone());
         self.control.set_pointer_output(output);
         let outcome = self.control.poll(self.manager.model_mut());
+        for workspace in outcome.departed_workspaces.iter().copied() {
+            self.manager.keep_departed_workspace_alive(workspace);
+        }
         for id in outcome.activated {
             self.manager.focus(&mut self.state, Some(id));
         }
