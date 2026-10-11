@@ -57,6 +57,17 @@ pub enum Action {
     FocusActiveNotification,
     ShiftOverviewUp,
     ShiftOverviewDown,
+    /// GNOME's Ctrl+Alt+Tab "Switch system controls"
+    /// (`switch-panels`): move keyboard focus into the top bar, where
+    /// Tab/arrows walk every control and Enter activates it. GNOME
+    /// 51 shows a group switcher first (ctrlAltTab.js); with one bar
+    /// the chord focuses it directly: the first control, or the last
+    /// when `backward` (`switch-panels-backward`). Tray icons, the
+    /// accessibility menu and the screencast stop button have no
+    /// other keyboard route.
+    FocusPanel {
+        backward: bool,
+    },
     /// Window-manager keys on the focused window or the workspaces.
     WindowMenu,
     ToggleMaximized,
@@ -402,6 +413,23 @@ fn specs() -> Vec<Spec> {
         },
         wm("begin-move", Action::BeginMove, vec!["<Alt>F7"]),
         wm("begin-resize", Action::BeginResize, vec!["<Alt>F8"]),
+        // GNOME binds these in NORMAL|OVERVIEW|LOCK|UNLOCK|LOGIN
+        // (windowManager.js `_startA11ySwitcher`); the lock screen
+        // shows no panel here, so NORMAL|OVERVIEW.
+        Spec {
+            schema: Schema::Wm,
+            key: "switch-panels".into(),
+            action: Action::FocusPanel { backward: false },
+            defaults: vec!["<Control><Alt>Tab"],
+            modes: NORMAL_OVERVIEW,
+        },
+        Spec {
+            schema: Schema::Wm,
+            key: "switch-panels-backward".into(),
+            action: Action::FocusPanel { backward: true },
+            defaults: vec!["<Shift><Control><Alt>Tab"],
+            modes: NORMAL_OVERVIEW,
+        },
         wm(
             "switch-to-workspace-1",
             Action::Workspace(Target::First),
@@ -726,6 +754,14 @@ mod tests {
         assert_eq!(find(Action::ShowScreenshotUi), ["Print"]);
         assert_eq!(find(Action::ShowScreenRecordingUi), ["<Ctrl><Shift><Alt>R"]);
         assert_eq!(find(Action::WindowMenu), ["<Alt>space"]);
+        assert_eq!(
+            find(Action::FocusPanel { backward: false }),
+            ["<Control><Alt>Tab"]
+        );
+        assert_eq!(
+            find(Action::FocusPanel { backward: true }),
+            ["<Shift><Control><Alt>Tab"]
+        );
         // GNOME 51's defaults for the keys the compositor used to own.
         assert_eq!(find(Action::Maximize), ["<Super>Up"]);
         assert_eq!(find(Action::Unmaximize), ["<Super>Down", "<Alt>F5"]);

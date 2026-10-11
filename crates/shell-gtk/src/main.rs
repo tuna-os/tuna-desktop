@@ -35,6 +35,7 @@ mod notify;
 mod orca;
 mod osd;
 mod overview;
+mod panel_focus;
 mod polkit;
 mod power;
 mod preview_chrome;
@@ -55,7 +56,7 @@ mod wired;
 mod ws_dots;
 mod ws_popup;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -263,6 +264,74 @@ fn panel_menu_button(
         }
     });
     button
+}
+
+/// The panel's live tray menu buttons, in strip order.
+fn tray_menu_buttons(tray: &gtk::Box) -> Vec<gtk::MenuButton> {
+    let mut buttons = Vec::new();
+    let mut child = tray.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(button) = widget.downcast::<gtk::MenuButton>() {
+            buttons.push(button);
+        }
+    }
+    buttons
+}
+
+/// Whether any panel menu (clock, system, accessibility, tray) is open.
+fn panel_menu_open(
+    clock: &gtk::MenuButton,
+    system: &gtk::MenuButton,
+    a11y: &gtk::MenuButton,
+    tray: &gtk::Box,
+) -> bool {
+    clock.is_active()
+        || system.is_active()
+        || a11y.is_active()
+        || tray_menu_buttons(tray).iter().any(|b| b.is_active())
+}
+
+/// Close every open panel menu; a button that owned one keeps focus.
+fn close_panel_menus(
+    clock: &gtk::MenuButton,
+    system: &gtk::MenuButton,
+    a11y: &gtk::MenuButton,
+    tray: &gtk::Box,
+) {
+    let mut buttons = vec![clock.clone(), system.clone(), a11y.clone()];
+    buttons.extend(tray_menu_buttons(tray));
+    for button in buttons {
+        if button.is_active() {
+            button.popdown();
+            button.grab_focus();
+        }
+    }
+}
+
+/// Give the panel's Ctrl+Alt+Tab keyboard back to the client.
+fn release_panel_focus(window: &gtk::ApplicationWindow, held: &Rc<Cell<bool>>) {
+    held.set(false);
+    window.set_keyboard_mode(KeyboardMode::OnDemand);
+}
+
+/// Ctrl+Alt+Tab (`switch-panels`): the panel takes exclusive keyboard
+/// and the first (forward) or last (backward) control takes GTK focus.
+fn focus_panel(
+    window: &gtk::ApplicationWindow,
+    activities: &gtk::Button,
+    system: &gtk::MenuButton,
+    held: &Rc<Cell<bool>>,
+    backward: bool,
+) {
+    window.set_keyboard_mode(KeyboardMode::Exclusive);
+    window.present();
+    window.set_focus_visible(true);
+    held.set(true);
+    match panel_focus::focus_end(backward) {
+        panel_focus::FocusEnd::First => activities.grab_focus(),
+        panel_focus::FocusEnd::Last => system.grab_focus(),
+    };
 }
 
 fn render_pills(shell: &mut Shell) {
@@ -1294,17 +1363,119 @@ fn build(app: &adw::Application) {
     };
     screencast::serve(recorder.clone());
 
+    // Ctrl+Alt+Tab panel focus (P-A11Y-02): `held` while the bar
+    // owns exclusive keyboard; `escaping` while our own Escape
+    // handling closes the menus (a close that keeps focus).
+    let panel_held: Rc<Cell<bool>> = Rc::default();
+    let panel_escaping: Rc<Cell<bool>> = Rc::default();
     let bar = gtk::CenterBox::new();
     bar.set_start_widget(Some(&activities));
     bar.set_center_widget(Some(&clock));
     // AppIndicator items sit left of the system indicators.
     let end = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     end.append(&screencast::indicator(&recorder));
-    end.append(&tray::tray());
-    end.append(&accessibility::menu());
+    let tray_box = {
+        let (window, held, escaping) = (window.clone(), panel_held.clone(), panel_escaping.clone());
+        tray::tray(Rc::new(move || {
+            if panel_focus::release_on_popdown(held.get(), escaping.get()) {
+                release_panel_focus(&window, &held);
+            }
+        }))
+    };
+    end.append(&tray_box);
+    let a11y = accessibility::menu();
+    end.append(&a11y);
     end.append(&system);
     bar.set_end_widget(Some(&end));
     window.set_child(Some(&bar));
+    // A panel menu closing any other way (item activation, outside
+    // click) returns focus to the client, as in GNOME. No-op unless
+    // Ctrl+Alt+Tab holds the bar.
+    for button in [&clock, &system, &a11y] {
+        if let Some(popover) = button.popover() {
+            let (window, held, escaping) =
+                (window.clone(), panel_held.clone(), panel_escaping.clone());
+            popover.connect_closed(move |_| {
+                if panel_focus::release_on_popdown(held.get(), escaping.get()) {
+                    release_panel_focus(&window, &held);
+                }
+            });
+        }
+    }
+    // Panel-focus keys: Escape unwinds the open panel menu, then
+    // returns focus to the client; Enter/Space on Activities toggles
+    // the overview (the pointer path stays the compositor's press
+    // region); Left/Right walk the bar while no menu owns the arrows.
+    {
+        let (window, bar, activities, clock, system, a11y, tray_box, held, escaping) = (
+            window.clone(),
+            bar.clone(),
+            activities.clone(),
+            clock.clone(),
+            system.clone(),
+            a11y.clone(),
+            tray_box.clone(),
+            panel_held.clone(),
+            panel_escaping.clone(),
+        );
+        let shell = shell.clone();
+        let keys = gtk::EventControllerKey::new();
+        // Capture: Escape must reach us before an open popover's own
+        // Escape handling, or the menu would close natively and the
+        // unwind would release focus instead of keeping the button.
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let window_keys = window.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            use gtk::gdk::Key;
+            if !held.get() {
+                return glib::Propagation::Proceed;
+            }
+            match key {
+                Key::Escape => {
+                    match panel_focus::escape(
+                        true,
+                        panel_menu_open(&clock, &system, &a11y, &tray_box),
+                    ) {
+                        panel_focus::EscapeOutcome::CloseMenus => {
+                            escaping.set(true);
+                            close_panel_menus(&clock, &system, &a11y, &tray_box);
+                            escaping.set(false);
+                            glib::Propagation::Stop
+                        }
+                        panel_focus::EscapeOutcome::Release => {
+                            release_panel_focus(&window_keys, &held);
+                            glib::Propagation::Stop
+                        }
+                        panel_focus::EscapeOutcome::Ignore => glib::Propagation::Proceed,
+                    }
+                }
+                Key::Return | Key::KP_Enter | Key::space
+                    if gtk::prelude::GtkWindowExt::focus(&window_keys).as_ref()
+                        == Some(activities.upcast_ref()) =>
+                {
+                    if let Some(control) = shell.borrow_mut().control.as_mut() {
+                        let _ = control.toggle_overview();
+                    }
+                    glib::Propagation::Stop
+                }
+                Key::Left | Key::Right
+                    if panel_focus::arrows_walk_bar(
+                        true,
+                        panel_menu_open(&clock, &system, &a11y, &tray_box),
+                    ) =>
+                {
+                    bar.child_focus(if key == Key::Left {
+                        gtk::DirectionType::TabBackward
+                    } else {
+                        gtk::DirectionType::TabForward
+                    });
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        window.add_controller(keys);
+    }
 
     // Clock: GNOME's panel text, refreshed every second.
     let interface = settings(INTERFACE_SCHEMA);
@@ -1542,6 +1713,8 @@ fn build(app: &adw::Application) {
             let (apps, notify, osd_ui) = (apps.clone(), notify.clone(), osd_ui.clone());
             let screenshot_ui = screenshot_ui.clone();
             let workspace_popup_keys = workspace_popup.clone();
+            let (panel_window_keys, activities_keys, panel_held_keys) =
+                (window.clone(), activities.clone(), panel_held.clone());
             Rc::new(move |action| {
                 use keybindings::Action;
                 let toggle = |button: &gtk::MenuButton| {
@@ -1586,6 +1759,15 @@ fn build(app: &adw::Application) {
                     }
                     Action::ToggleMessageTray => toggle(&clock),
                     Action::ToggleQuickSettings => toggle(&system),
+                    Action::FocusPanel { backward } => {
+                        focus_panel(
+                            &panel_window_keys,
+                            &activities_keys,
+                            &system,
+                            &panel_held_keys,
+                            backward,
+                        );
+                    }
                     Action::SwitchToApplication(n) => {
                         let Some(entry) = dash_entry(n) else { return };
                         // Its newest window when it runs, else a launch;
@@ -2188,6 +2370,9 @@ fn build(app: &adw::Application) {
         let overview_ui = overview_ui.clone();
         let switcher_ui = switcher_ui.clone();
         let panel_window = window.clone();
+        let panel_focus_window = window.clone();
+        let panel_focus_held = panel_held.clone();
+        let mut last_open = false;
         let chrome = {
             let shell = shell.clone();
             preview_chrome::PreviewChrome::new(
@@ -2268,6 +2453,7 @@ fn build(app: &adw::Application) {
             drop(shell);
             if locked {
                 notify.release_focus();
+                release_panel_focus(&panel_focus_window, &panel_focus_held);
             }
             lock_ui.sync(locked);
             screensaver.sync(locked);
@@ -2298,6 +2484,16 @@ fn build(app: &adw::Application) {
                 activities_button.remove_css_class("checked");
             }
             overview::OverviewUi::set_open(&overview_ui, open);
+            if open != last_open {
+                // Panel focus follows the overview: opening hands the
+                // keyboard over; closing releases a hold that never won
+                // it (the overview kept the keyboard), while a hold the
+                // bar actually won survives.
+                if open || !panel_focus_window.is_active() {
+                    release_panel_focus(&panel_focus_window, &panel_focus_held);
+                }
+                last_open = open;
+            }
             // GNOME's preview chrome over the compositor's previews.
             let shell = shell_rc.borrow();
             if let Some(control) = shell.control.as_ref() {

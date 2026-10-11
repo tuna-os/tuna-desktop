@@ -122,8 +122,9 @@ fn icon_for(item: &Item) -> gtk::Image {
 }
 
 /// The tray box for the panel's right side. Empty (and invisible)
-/// until an item registers.
-pub fn tray() -> gtk::Box {
+/// until an item registers. `on_popdown` runs whenever a tray popover
+/// closes, so keyboard panel focus can return to the client.
+pub fn tray(on_popdown: std::rc::Rc<dyn Fn()>) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     row.set_visible(false);
     let (to_worker, worker_rx) = mpsc::channel();
@@ -147,6 +148,10 @@ pub fn tray() -> gtk::Box {
                         let popover = gtk::Popover::new();
                         popover.add_css_class("tuna-shell-popover");
                         popover.set_has_arrow(false);
+                        {
+                            let on_popdown = on_popdown.clone();
+                            popover.connect_closed(move |_| on_popdown());
+                        }
                         let button = gtk::MenuButton::builder()
                             .child(&icon_for(item))
                             .popover(&popover)
