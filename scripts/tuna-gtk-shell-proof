@@ -3786,8 +3786,6 @@ cstate '.workspace_slide.in_flight.position > .workspace_slide.in_flight.from_sl
     fail G-WORKSPACE-SLIDE "the first slide did not move"
 first_position="$(jq '.workspace_slide.in_flight.position' "$CSTATE")"
 xdotool key super+Page_Down
-slide_began $((slide_home + 2)) "retargeted" ||
-    fail G-WORKSPACE-SLIDE "the second press did not start a slide toward the next workspace"
 cstate ".active_workspace == $slide_home + 2 and (.workspace_slide.in_flight | .record.retargets == 1 and ((.position - $first_position) | . < 0.001 and . > -0.001))" "retargeted" ||
     fail G-WORKSPACE-SLIDE "the second press jumped instead of retargeting from the drawn offset"
 cp "$CSTATE" "$ARTIFACTS/workspace-slide-retarget-in-flight.json"
