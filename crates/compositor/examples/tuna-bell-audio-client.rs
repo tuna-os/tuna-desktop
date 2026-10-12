@@ -1,15 +1,12 @@
 //! Scoped audio proof: production native bell consumer against a private null
 //! sink. Protocol delivery/visual presentation are separate qualifications.
+#![allow(dead_code)]
 #[path = "../src/bell.rs"]
 mod bell;
-
-// The example crate root stands in for the compositor crate root, so
-// `bell.rs`' `crate::idle_schedule::ACTIVE_INTERVAL` resolves here.
-// Value mirrors `src/idle_schedule.rs` (read-only: that module is
-// owned elsewhere and must not be changed for this example).
-mod idle_schedule {
-    pub const ACTIVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
-}
+// bell.rs reads `crate::idle_schedule::ACTIVE_INTERVAL`; declare the
+// self-contained module locally so the example root resolves it.
+#[path = "../src/idle_schedule.rs"]
+mod idle_schedule;
 
 fn main() {
     let mode = std::env::args().nth(1).expect("mode required");

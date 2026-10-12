@@ -642,6 +642,14 @@ pub struct Runtime {
     casts: Vec<crate::screencast::Cast>,
     /// Monitor list the Mutter D-Bus side serves.
     cast_outputs: crate::mutter::Outputs,
+    /// Orientation lock plus the latest accelerometer sample (#345).
+    orientation: crate::orientation::OrientationPolicy,
+    /// Flags shared with the Mutter D-Bus thread (managed property,
+    /// sensor inhibition).
+    orientation_share: std::sync::Arc<crate::orientation::OrientationShare>,
+    /// Configured transform per connector (Settings/monitors.xml):
+    /// the sensor overrides these live but never rewrites them.
+    manual_transforms: std::collections::HashMap<String, u32>,
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
@@ -946,6 +954,8 @@ impl Runtime {
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen
         // sharing through the stock GNOME portal.
         let cast_outputs: crate::mutter::Outputs = Default::default();
+        let orientation_share: std::sync::Arc<crate::orientation::OrientationShare> =
+            Default::default();
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
@@ -957,6 +967,7 @@ impl Runtime {
                     introspect.windows.clone(),
                     capture_authority.clone(),
                     display.handle(),
+                    orientation_share.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1110,6 +1121,9 @@ impl Runtime {
             pipewire: None,
             casts: Vec::new(),
             cast_outputs,
+            orientation: Default::default(),
+            orientation_share,
+            manual_transforms: Default::default(),
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
@@ -3033,6 +3047,14 @@ impl Runtime {
                 self.casts.retain(|cast| cast.session_id != session_id);
                 self.cast_grants.remove(&session_id);
             }
+            crate::mutter::ToLoop::SensorSample {
+                present,
+                orientation,
+            } => {
+                self.orientation.sensor_present = present;
+                self.orientation.sensor = orientation;
+                self.apply_orientation_policy();
+            }
             crate::mutter::ToLoop::ApplyMonitors {
                 configs,
                 persistent,
@@ -3133,12 +3155,67 @@ impl Runtime {
         if let Backend::Drm(drm) = &mut self.backend {
             drm.apply_input_settings(&settings);
         }
+        // Orientation lock (#345): stop sensor rotation live (and tell
+        // the sensor thread to release its claim, as mutter does).
+        if self.orientation.lock != settings.orientation_lock {
+            self.orientation.lock = settings.orientation_lock;
+            self.orientation_share
+                .set_inhibited(settings.orientation_lock);
+            self.apply_orientation_policy();
+        }
         self.input_settings = settings;
     }
 
+    /// Recompute sensor management and rotate unlocked built-in panels
+    /// to the accelerometer reading (live only: manual transforms in
+    /// monitors.xml are never rewritten). Called on every sensor
+    /// sample and every orientation-lock change.
+    fn apply_orientation_policy(&mut self) {
+        let entries = self.state.output_entries();
+        let has_builtin = entries
+            .iter()
+            .any(|(name, _, _, _)| crate::orientation::is_builtin_panel(name));
+        self.orientation_share
+            .set_managed(self.orientation.managed(has_builtin));
+        #[cfg(feature = "drm")]
+        {
+            let wants: Vec<(String, u32)> = entries
+                .iter()
+                .filter(|(name, _, _, _)| crate::orientation::is_builtin_panel(name))
+                .map(|(name, _, _, _)| {
+                    let manual = self.manual_transforms.get(name).copied().unwrap_or(0);
+                    (name.clone(), self.orientation.effective(name, manual))
+                })
+                .collect();
+            if let Backend::Drm(drm) = &mut self.backend {
+                for (name, want) in wants {
+                    let Some(out) = drm.outputs.iter_mut().find(|o| o.name == name) else {
+                        continue;
+                    };
+                    if out.transform == want {
+                        continue;
+                    }
+                    out.transform = want;
+                    out.output.change_current_state(
+                        None,
+                        Some(crate::orientation::smithay_transform(want)),
+                        None,
+                        None,
+                    );
+                    let (lw, lh) = out.logical_size();
+                    self.state
+                        .add_output(&name, Some(out.output.clone()), lw, lh);
+                    eprintln!("tuna-compositor: orientation: {name} rotated to transform {want}");
+                }
+            }
+        }
+    }
+
     /// Apply a display arrangement live (GNOME Settings' Displays
-    /// panel): each named output's scale and logical position. Layout,
-    /// rendering and the per-window client scale follow on the next frame.
+    /// panel): each named output's scale, logical position and rotation.
+    /// Layout, rendering and the per-window client scale follow on the
+    /// next frame. The sensor may immediately override a built-in
+    /// panel's rotation while orientation lock is off (#345).
     fn apply_monitors(&mut self, configs: &[crate::monitors::MonitorConfig]) {
         let scale_of = |s: f64| {
             if s == 1.0 {
@@ -3147,6 +3224,10 @@ impl Runtime {
                 Scale::Fractional(s)
             }
         };
+        for config in configs {
+            self.manual_transforms
+                .insert(config.connector.clone(), config.transform);
+        }
         match &mut self.backend {
             Backend::Winit(backend) => {
                 // One nested output: take the first arrangement entry.
@@ -3156,6 +3237,12 @@ impl Runtime {
                 self.scale = clamp_scale(config.scale);
                 if let Some(output) = self.state.primary_output() {
                     output.change_current_state(None, None, Some(scale_of(self.scale)), None);
+                }
+                if config.transform != 0 {
+                    eprintln!(
+                        "tuna-compositor: nested output cannot rotate; ignoring transform {}",
+                        config.transform
+                    );
                 }
                 let size = backend.window_size();
                 let (lw, lh) = logical_size(size.w, size.h, self.scale);
@@ -3170,16 +3257,22 @@ impl Runtime {
                     };
                     out.scale = clamp_scale(config.scale);
                     out.loc = (config.x, config.y);
+                    // The sensor wins on unlocked built-in panels; the
+                    // configured transform stays in manual_transforms.
+                    let transform = self.orientation.effective(&out.name, config.transform);
+                    out.transform = transform;
                     out.output.change_current_state(
                         None,
-                        None,
+                        Some(crate::orientation::smithay_transform(transform)),
                         Some(scale_of(out.scale)),
                         Some(out.loc.into()),
                     );
                     let (lw, lh) = out.logical_size();
-                    self.state
-                        .add_output(&out.name, Some(out.output.clone()), lw, lh);
-                    self.state.set_output_location(&out.name, out.loc);
+                    let output = out.output.clone();
+                    let name = out.name.clone();
+                    let loc = out.loc;
+                    self.state.add_output(&name, Some(output), lw, lh);
+                    self.state.set_output_location(&name, loc);
                 }
             }
         }
@@ -3244,6 +3337,9 @@ impl Runtime {
                     y: loc.1,
                     scale: output.current_scale().fractional_scale(),
                     primary,
+                    transform: crate::orientation::transform_from_smithay(
+                        output.current_transform(),
+                    ),
                 })
             })
             .collect();
@@ -4081,10 +4177,17 @@ impl Runtime {
                     install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
+                    // Rotation (#345): the tracker holds the output
+                    // transform while Smithay renders inverted (see
+                    // `orientation::render_transform`); layout, damage
+                    // and the wallpaper all work in the pre-transform
+                    // frame, whose physical size swaps at 90°/270°.
+                    let output_transform = crate::orientation::smithay_transform(out.transform);
+                    let logical = output_transform.transform_size(size);
                     let paper = backdrop(
                         &mut self.wallpaper,
                         renderer,
-                        background_geometry(size, view, desktop),
+                        background_geometry(logical, view, desktop),
                         view,
                         show_paper,
                         cards,
@@ -4095,6 +4198,7 @@ impl Runtime {
                         size: (size.w, size.h),
                         location: out.loc,
                         scale: out.scale,
+                        transform: out.transform,
                         locked,
                         background,
                         blank_alpha,
@@ -4181,11 +4285,14 @@ impl Runtime {
                     if reset {
                         out.damage_tracker = None;
                     }
+                    // A transform change resets the tracker through the
+                    // signature above; the tracker holds the output
+                    // transform while the frame renders inverted.
                     let tracker = out.damage_tracker.get_or_insert_with(|| {
                         smithay::backend::renderer::damage::OutputDamageTracker::new(
                             size,
                             1.0,
-                            Transform::Normal,
+                            output_transform,
                         )
                     });
                     let damage = crate::native_repaint::damage_region(
@@ -4200,7 +4307,11 @@ impl Runtime {
                             .bind(&mut dmabuf)
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let mut frame = renderer
-                            .render(&mut target, size, Transform::Normal)
+                            .render(
+                                &mut target,
+                                size,
+                                crate::orientation::render_transform(out.transform),
+                            )
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let drew = draw_scene(
                             &mut frame,
@@ -4248,7 +4359,11 @@ impl Runtime {
                     let feedback = crate::frame_timing::take_feedback(&mine, &out.output);
                     if let Err(e) = out.surface.queue_buffer(
                         Some(sync),
-                        Some(crate::native_repaint::scanout_damage(&damage)),
+                        Some(crate::native_repaint::scanout_damage_rotated(
+                            &damage,
+                            output_transform,
+                            (logical.w, logical.h),
+                        )),
                         feedback,
                     ) {
                         eprintln!("tuna-compositor: drm: queue_buffer {}: {e}", out.name);

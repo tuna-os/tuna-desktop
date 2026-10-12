@@ -43,6 +43,8 @@ pub struct OutputSnapshot {
     pub y: i32,
     pub scale: f64,
     pub primary: bool,
+    /// DisplayConfig transform (0-7, #345).
+    pub transform: u32,
 }
 
 /// The runtime keeps this current; D-Bus calls read it.
@@ -64,7 +66,11 @@ pub enum CastTarget {
 /// Where a `RecordArea` rectangle (global logical pixels) lands: the
 /// output holding its top-left corner, and the area in that output's
 /// physical pixels, clipped to it. `None` when no output holds it or
-/// nothing of it is left.
+/// nothing of it is left. Rotation-aware end to end (#345):
+/// hit-testing uses the rotated logical extent and the physical rect
+/// is the logical rect transformed into buffer pixels through
+/// Smithay's `to_buffer`, the same logical-to-buffer mapping the
+/// renderer uses for the scanout.
 pub fn area_on_output(
     outputs: &[OutputSnapshot],
     (x, y, width, height): (i32, i32, i32, i32),
@@ -72,17 +78,46 @@ pub fn area_on_output(
     if width <= 0 || height <= 0 {
         return None;
     }
+    let extent = |o: &OutputSnapshot| {
+        crate::orientation::logical_extent(o.width, o.height, o.scale, o.transform)
+    };
     let output = outputs.iter().find(|o| {
-        let w = (f64::from(o.width) / o.scale).round() as i32;
-        let h = (f64::from(o.height) / o.scale).round() as i32;
+        let (w, h) = extent(o);
         x >= o.x && y >= o.y && x < o.x + w && y < o.y + h
     })?;
-    let px = |v: i32| (f64::from(v) * output.scale).round() as i32;
-    let (left, top) = (px(x - output.x), px(y - output.y));
-    let right = px(x - output.x + width).min(output.width);
-    let bottom = px(y - output.y + height).min(output.height);
-    (right > left && bottom > top)
-        .then(|| (output.clone(), (left, top, right - left, bottom - top)))
+    let (lw, lh) = extent(output);
+    let rect = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::new(
+        (
+            f64::from(x.saturating_sub(output.x)),
+            f64::from(y.saturating_sub(output.y)),
+        )
+            .into(),
+        (f64::from(width), f64::from(height)).into(),
+    );
+    let area =
+        smithay::utils::Size::<f64, smithay::utils::Logical>::from((f64::from(lw), f64::from(lh)));
+    let mapped = rect.to_buffer(
+        output.scale,
+        crate::orientation::smithay_transform(output.transform),
+        &area,
+    );
+    let (left, top) = (
+        (mapped.loc.x.round() as i32).max(0),
+        (mapped.loc.y.round() as i32).max(0),
+    );
+    let right = ((mapped.loc.x + mapped.size.w).round() as i32).min(output.width);
+    let bottom = ((mapped.loc.y + mapped.size.h).round() as i32).min(output.height);
+    (right > left && bottom > top).then(|| {
+        (
+            output.clone(),
+            (
+                left,
+                top,
+                right.saturating_sub(left),
+                bottom.saturating_sub(top),
+            ),
+        )
+    })
 }
 
 /// A window as the D-Bus side describes it (Introspect, RecordWindow).
@@ -142,6 +177,12 @@ pub enum ToLoop {
     ApplyMonitors {
         configs: Vec<crate::monitors::MonitorConfig>,
         persistent: bool,
+    },
+    /// The accelerometer sample changed (iio-sensor-proxy, #345):
+    /// whether a sensor is present and its current orientation.
+    SensorSample {
+        present: bool,
+        orientation: Option<crate::orientation::SensorOrientation>,
     },
 }
 
@@ -274,10 +315,9 @@ struct LogicalMonitor {
 }
 
 /// GNOME's built-in panel test (Mutter's), for "Built-in display".
+/// (Shared with the orientation policy: [`crate::orientation::is_builtin_panel`].)
 fn is_laptop_panel(connector: &str) -> bool {
-    ["eDP-", "LVDS-", "DSI-"]
-        .iter()
-        .any(|p| connector.starts_with(p))
+    crate::orientation::is_builtin_panel(connector)
 }
 
 #[derive(Deserialize, Type)]
@@ -293,6 +333,7 @@ struct LogicalMonitorConfiguration {
 struct DisplayConfig {
     outputs: Outputs,
     to_loop: calloop::channel::Sender<ToLoop>,
+    orientation: std::sync::Arc<crate::orientation::OrientationShare>,
 }
 
 #[interface(name = "org.gnome.Mutter.DisplayConfig")]
@@ -353,7 +394,7 @@ impl DisplayConfig {
                 x: o.x,
                 y: o.y,
                 scale: o.scale,
-                transform: 0,
+                transform: o.transform,
                 is_primary: o.primary,
                 monitors: vec![names],
                 properties: HashMap::new(),
@@ -412,7 +453,7 @@ impl DisplayConfig {
 
     #[zbus(property)]
     fn panel_orientation_managed(&self) -> bool {
-        false
+        self.orientation.is_managed()
     }
 
     #[zbus(property)]
@@ -437,8 +478,11 @@ fn validate(
         if logical.monitors.len() > 1 {
             return Err(fdo::Error::Failed("mirroring is not supported yet".into()));
         }
-        if logical.transform != 0 {
-            return Err(fdo::Error::Failed("rotation is not supported yet".into()));
+        if !crate::orientation::transform_is_supported(logical.transform) {
+            return Err(fdo::Error::Failed(format!(
+                "transform {} is not a Mutter transform (0-7)",
+                logical.transform
+            )));
         }
         if !(1.0..=4.0).contains(&logical.scale) {
             return Err(fdo::Error::Failed(format!(
@@ -472,6 +516,7 @@ fn validate(
                 x: logical.x,
                 y: logical.y,
                 primary: logical.is_primary,
+                transform: logical.transform,
             });
         }
     }
@@ -867,6 +912,7 @@ pub fn start(
     windows: Windows,
     authority: crate::capture_security::Authority,
     display: smithay::reexports::wayland_server::DisplayHandle,
+    orientation: std::sync::Arc<crate::orientation::OrientationShare>,
 ) -> calloop::channel::Channel<ToLoop> {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _ = std::thread::Builder::new()
@@ -875,7 +921,11 @@ pub fn start(
             let display_config = DisplayConfig {
                 outputs: outputs.clone(),
                 to_loop: to_loop.clone(),
+                orientation: orientation.clone(),
             };
+            // Accelerometer for sensor-driven orientation (#345): polled
+            // with the admission scan, reported to the loop on change.
+            let mut sensor = crate::orientation::SensorPoller::new();
             let sessions: Sessions = Default::default();
             let remote: remote_desktop::RemoteSessions = Default::default();
             let next_id = Arc::new(AtomicU64::new(1));
@@ -985,6 +1035,12 @@ pub fn start(
                         sessions.retain(|(s, _)| s.id != session.id);
                     }
                 }
+                if let Some(sample) = sensor.poll(orientation.is_inhibited()) {
+                    let _ = to_loop.send(ToLoop::SensorSample {
+                        present: sample.present,
+                        orientation: sample.orientation,
+                    });
+                }
             }
         });
     from_dbus
@@ -1006,6 +1062,7 @@ mod tests {
             y: 0,
             scale: 1.0,
             primary: true,
+            transform: 0,
         }
     }
 
@@ -1102,5 +1159,63 @@ mod tests {
         assert!(is_laptop_panel("LVDS-1"));
         assert!(!is_laptop_panel("HDMI-A-1"));
         assert!(!is_laptop_panel("tuna-0"));
+    }
+
+    #[test]
+    fn display_rotation_validates_mutter_transforms() {
+        let outputs = [snapshot("eDP-1")];
+        for transform in 0..=7u32 {
+            let mut request = logical("eDP-1", 1.0);
+            request.transform = transform;
+            let ok = validate(&outputs, &[request]).unwrap();
+            assert_eq!(ok[0].transform, transform);
+        }
+        let mut request = logical("eDP-1", 1.0);
+        request.transform = 8;
+        assert!(validate(&outputs, &[request]).is_err(), "transform range");
+    }
+
+    #[test]
+    fn record_areas_hit_test_rotated_monitors() {
+        // A 90° panel shows a 1080x1920 logical frame.
+        let mut portrait = snapshot("eDP-1");
+        portrait.transform = 1;
+        let outputs = [portrait];
+        assert!(area_on_output(&outputs, (100, 100, 50, 50)).is_some());
+        // Past the swapped width (an unrotated 1920-wide frame would hit).
+        assert!(area_on_output(&outputs, (1500, 100, 50, 50)).is_none());
+        // Past the unrotated height but inside the rotated one; the area
+        // still fits the physical remap below the fold.
+        assert!(area_on_output(&outputs, (100, 1000, 50, 50)).is_some());
+    }
+
+    #[test]
+    fn record_areas_remap_into_rotated_scanouts() {
+        // A 90° 1920x1080 panel: logical 1080x1920, buffer 1920x1080.
+        // Logical top-left lands at buffer top-right (rotated).
+        let mut portrait = snapshot("eDP-1");
+        portrait.transform = 1;
+        let outputs = [portrait];
+        let (_, area) = area_on_output(&outputs, (0, 0, 100, 50)).unwrap();
+        assert_eq!(area, (1870, 0, 50, 100));
+        // 180° lands at buffer bottom-right; the flip mirrors x only.
+        let mut upside = snapshot("eDP-1");
+        upside.transform = 2;
+        let (_, area) = area_on_output(&[upside], (0, 0, 100, 50)).unwrap();
+        assert_eq!(area, (1820, 1030, 100, 50));
+        let mut flipped = snapshot("eDP-1");
+        flipped.transform = 4;
+        let (_, area) = area_on_output(&[flipped], (0, 0, 100, 50)).unwrap();
+        assert_eq!(area, (1820, 0, 100, 50));
+        // Rotation composes with scale: a 90° panel at scale 2 shows
+        // 540x960 logical pixels.
+        let mut small = snapshot("eDP-1");
+        small.transform = 1;
+        small.scale = 2.0;
+        let (_, area) = area_on_output(&[small], (0, 0, 100, 50)).unwrap();
+        assert_eq!(area, (1820, 0, 100, 200));
+        // An area overhanging the logical edge clips to the buffer.
+        let (_, area) = area_on_output(&outputs, (1000, 1900, 200, 100)).unwrap();
+        assert_eq!(area, (0, 1000, 20, 80));
     }
 }

@@ -78,6 +78,8 @@ pub struct DrmOutput {
     pub loc: (i32, i32),
     /// Output scale from monitors.xml (`TUNA_SCALE` without one), #59.
     pub scale: f64,
+    /// DisplayConfig transform (0-7) from monitors.xml or Settings, #345.
+    pub transform: u32,
     /// A frame is queued and its page flip has not completed yet.
     pub pending: bool,
     pub(crate) last_frame: Option<crate::native_repaint::FrameSignature>,
@@ -98,9 +100,10 @@ impl DrmOutput {
         );
     }
 
-    /// Size in logical pixels (mode size over scale).
+    /// Size in logical pixels (mode size over scale, swapped under
+    /// 90°/270° rotation).
     pub fn logical_size(&self) -> (i32, i32) {
-        crate::runtime::logical_size(self.size.w, self.size.h, self.scale)
+        crate::orientation::logical_extent(self.size.w, self.size.h, self.scale, self.transform)
     }
 }
 
@@ -320,6 +323,7 @@ impl DrmBackend {
                 size,
                 loc: (0, 0),
                 scale: 1.0,
+                transform: 0,
                 pending: false,
                 last_frame: None,
                 damage_tracker: None,
@@ -341,16 +345,24 @@ impl DrmBackend {
                 Some(config) => {
                     out.scale = crate::runtime::clamp_scale(config.scale);
                     out.loc = (config.x, config.y);
+                    out.transform = config.transform;
                 }
                 None => {
                     out.scale = fallback_scale;
                     out.loc = (next_x, 0);
                 }
             }
+            if !crate::orientation::transform_is_supported(out.transform) {
+                eprintln!(
+                    "tuna-compositor: drm: output {}: transform {} unsupported, staying normal",
+                    out.name, out.transform
+                );
+                out.transform = 0;
+            }
             next_x = next_x.max(out.loc.0 + out.logical_size().0);
             out.output.change_current_state(
                 None,
-                None,
+                Some(crate::orientation::smithay_transform(out.transform)),
                 Some(if out.scale == 1.0 {
                     smithay::output::Scale::Integer(1)
                 } else {
@@ -359,8 +371,8 @@ impl DrmBackend {
                 Some(out.loc.into()),
             );
             eprintln!(
-                "tuna-compositor: drm: output {} {}x{} at {},{} scale {}",
-                out.name, out.size.w, out.size.h, out.loc.0, out.loc.1, out.scale
+                "tuna-compositor: drm: output {} {}x{} at {},{} scale {} transform {}",
+                out.name, out.size.w, out.size.h, out.loc.0, out.loc.1, out.scale, out.transform
             );
         }
         // GNOME's primary monitor first: it carries the top bar.
@@ -678,7 +690,30 @@ impl DrmBackend {
                 )
             }
             other => {
-                let inputs = crate::windows::translate_input(other, self.primary_size());
+                let mut inputs = crate::windows::translate_input(other, self.primary_size());
+                // Rotation (#345): absolute devices report panel-native
+                // pixels; remap them into the rotated logical frame the
+                // manager works in. Touch and absolute pointers arrive
+                // as Motion here; relative motion has its own arm.
+                if let Some(primary) = self.outputs.first() {
+                    if primary.transform != 0 {
+                        let (w, h) = (primary.size.w, primary.size.h);
+                        let transform = primary.transform;
+                        for input in &mut inputs {
+                            if let ManagerInput::Motion { pos, .. } = input {
+                                let (x, y) = crate::orientation::touch_point(
+                                    w,
+                                    h,
+                                    transform,
+                                    pos.x.round() as i32,
+                                    pos.y.round() as i32,
+                                );
+                                pos.x = f64::from(x);
+                                pos.y = f64::from(y);
+                            }
+                        }
+                    }
+                }
                 for input in &inputs {
                     if let ManagerInput::Motion { pos, .. } = input {
                         self.corner_pressure.observe_position(*pos);
