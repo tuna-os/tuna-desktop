@@ -49,6 +49,7 @@ impl LoginWindow {
     pub fn shutdown(&self) {
         let state = self.state.borrow();
         state.closed.store(true, Ordering::Release);
+        state.widgets.answer.set_text("");
         let interrupt = state.interrupt.lock().expect("interrupt lock").take();
         if let Some(stream) = interrupt {
             let _ = stream.shutdown(Shutdown::Both);
@@ -247,7 +248,13 @@ pub fn build_login(
             let user = w.username.text().to_string();
             let answer = w.answer.text().to_string();
             let selected = state.sessions.get(w.sessions.selected() as usize).cloned();
-            state.controller.submit(&user, answer, selected.as_ref())
+            let effect = state.controller.submit(&user, answer, selected.as_ref());
+            // Clear only accepted submissions. Busy/refused activations retain
+            // the widget value; the owned command still carries the exact answer.
+            if matches!(&effect, Effect::Send(_)) {
+                state.widgets.answer.set_text("");
+            }
+            effect
         };
         apply(&state, effect);
     });
@@ -258,7 +265,11 @@ pub fn build_login(
     let weak = Rc::downgrade(&state);
     cancel.connect_clicked(move |_| {
         if let Some(state) = weak.upgrade() {
-            let effect = state.borrow_mut().controller.cancel();
+            let effect = {
+                let mut state = state.borrow_mut();
+                state.widgets.answer.set_text("");
+                state.controller.cancel()
+            };
             apply(&state, effect);
         }
     });
@@ -278,6 +289,7 @@ pub fn build_login(
         if let Some(state) = weak.upgrade() {
             let state = state.borrow();
             state.closed.store(true, Ordering::Release);
+            state.widgets.answer.set_text("");
             let interrupt = state.interrupt.lock().expect("interrupt lock").take();
             if let Some(stream) = interrupt {
                 let _ = stream.shutdown(Shutdown::Both);

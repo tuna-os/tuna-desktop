@@ -154,6 +154,25 @@ fn live_greetd_gtk_prompt_cancel_retry_and_handoff() {
     let progress = Rc::new(Cell::new(0));
     let result = progress.clone();
     app.connect_activate(move |app| {
+        let _hold = app.hold();
+        // Actual widget lifetime checks before the wire walkthrough. Detach
+        // the close fixture from this app so its close handler cannot quit it.
+        let shutdown = login::build_login(app, vec![], String::new());
+        let shutdown_widgets = shutdown.widgets();
+        shutdown_widgets.answer.set_text("shutdown-widget-fixture");
+        shutdown.shutdown();
+        assert!(shutdown_widgets.answer.text().is_empty());
+        shutdown_widgets.window.destroy();
+        drop(shutdown);
+        let close = login::build_login(app, vec![], String::new());
+        let close_widgets = close.widgets();
+        close_widgets.answer.set_text("close-widget-fixture");
+        close_widgets
+            .window
+            .set_application(None::<&gtk4::Application>);
+        close_widgets.window.close();
+        assert!(close_widgets.answer.text().is_empty());
+        drop(close);
         let window = login::build_login(
             app,
             vec![SessionEntry {
@@ -220,6 +239,16 @@ fn live_greetd_gtk_prompt_cancel_retry_and_handoff() {
                     assert!(!gtk4::prelude::EntryExt::is_visible(&widgets.answer));
                     capture("secret-entered");
                     widgets.submit.emit_clicked();
+                    assert!(
+                        widgets.answer.text().is_empty(),
+                        "clear before delayed reply"
+                    );
+                    // Programmatic activation while busy must not erase input
+                    // or send another answer. Peer still receives fixture-secret.
+                    widgets.answer.set_text("busy-refusal-fixture");
+                    widgets.submit.emit_clicked();
+                    assert_eq!(widgets.answer.text(), "busy-refusal-fixture");
+                    widgets.answer.set_text("");
                     stage.set(2);
                 }
                 2 if ready && notice == "Sign-in failed. Try again." => {
@@ -232,7 +261,12 @@ fn live_greetd_gtk_prompt_cancel_retry_and_handoff() {
                 3 if ready && prompt == "Cancel token:" => {
                     assert!(gtk4::prelude::EntryExt::is_visible(&widgets.answer));
                     capture("visible-cancel");
+                    widgets.answer.set_text("cancel-unsubmitted-fixture");
                     widgets.cancel.emit_clicked();
+                    assert!(
+                        widgets.answer.text().is_empty(),
+                        "cancel clears before reply"
+                    );
                     assert!(!widgets.cancel.is_sensitive());
                     stage.set(4);
                 }
@@ -324,5 +358,5 @@ fn live_greetd_gtk_prompt_cancel_retry_and_handoff() {
         "quit requires successful actual StartSession reply"
     );
     peer.join().unwrap();
-    std::fs::write(PathBuf::from(std::env::var_os("TUNA_GREETER_ARTIFACTS").unwrap()).join("assertions.txt"),"G-GREETER-GTK-PROMPTS PASS\nG-GREETER-CANCEL-RETRY PASS\nG-GREETER-START-REPLY PASS\nG-GREETER-WORKER-RESPONSIVE PASS\n").unwrap();
+    std::fs::write(PathBuf::from(std::env::var_os("TUNA_GREETER_ARTIFACTS").unwrap()).join("assertions.txt"),"G-GREETER-GTK-PROMPTS PASS\nG-GREETER-CANCEL-RETRY PASS\nG-GREETER-START-REPLY PASS\nG-GREETER-WORKER-RESPONSIVE PASS\nG-GREETER-SECRET-WIDGET-CLEAR PASS\n").unwrap();
 }
