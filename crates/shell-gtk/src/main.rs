@@ -1795,8 +1795,23 @@ fn build(app: &adw::Application) {
     // lends it the message list, the OSD countdown and the lock action.
     // Test builds compile the module for its unit tests but never start
     // the live runtime (it owns process timers and the real history file).
+    // Effect sends bind below, once protocol 0.35 lands (root owns the
+    // schema + compositor consumer; this lane makes no schema edit).
     #[cfg(not(test))]
     {
+        /// Forward one atomic effect pair toward the compositor.
+        ///
+        /// TODO(0.35): send `CommandKind::SetWellbeingEffects { grayscale,
+        /// fade }` through the shell control client here. Until the 0.35
+        /// schema lands, the pair is logged as a diagnostic so the wiring
+        /// (change detection + atomic sends + initial false/false) is
+        /// reviewable without inventing wire bytes.
+        fn send_wellbeing_effects(grayscale: bool, fade: bool) {
+            eprintln!(
+                "tuna-shell-gtk: wellbeing: effects grayscale={grayscale} fade={fade} (0.35 send pending)"
+            );
+        }
+
         let notices = notify.clone();
         let countdown_osd = osd_ui.clone();
         let lock_shell = shell.clone();
@@ -1833,6 +1848,9 @@ fn build(app: &adw::Application) {
                 }),
                 break_action: Rc::new(move |kind: wellbeing::BreakActionKind| {
                     break_push.borrow_mut().push(kind);
+                }),
+                effect_hook: Rc::new(move |grayscale: bool, fade: bool| {
+                    send_wellbeing_effects(grayscale, fade);
                 }),
                 show_countdown: Rc::new(move |label: String, progress: f64| {
                     eprintln!("tuna-shell-gtk: wellbeing: countdown {label}");

@@ -1814,6 +1814,10 @@ pub enum BreakActionKind {
 }
 /// Enqueue one user-chosen break action for the next tick.
 pub type BreakActionHook = Rc<dyn Fn(BreakActionKind)>;
+/// Send both effect bools atomically to the compositor (grayscale, fade).
+/// Bound to `CommandKind::SetWellbeingEffects` once protocol 0.35 lands;
+/// until then the binding is a marked TODO (no independent schema edit).
+pub type EffectHook = Rc<dyn Fn(bool, bool)>;
 
 /// Action keys and button labels for break notices. Keys are center action
 /// ids; labels are plain Header Case (GNOME 51 ships no verbatim strings
@@ -1854,10 +1858,23 @@ pub struct ShellHooks {
     pub on_notice_action: ActionRegisterHook,
     pub drop_notice_actions: ActionDropHook,
     pub break_action: BreakActionHook,
+    pub effect_hook: EffectHook,
 }
 
-/// Desired effect state. The compositor has no desaturate/brightness hook
-/// yet, so the runtime logs transitions and the proof gates read them back.
+/// Send the effect pair when it differs from the last send. Both bools go
+/// together on every send, so the compositor never observes a split
+/// grayscale/fade state. Pure over its inputs; the ticks own `sent`.
+pub fn maybe_send_effect(hooks: &ShellHooks, sent: &mut EffectState, effect: &EffectState) {
+    if *sent != *effect {
+        (hooks.effect_hook)(effect.grayscale, effect.fade);
+        *sent = *effect;
+    }
+}
+
+/// Desired effect state. The runtime sends the pair atomically through
+/// the effect hook on every change (protocol 0.35
+/// `SetWellbeingEffects`), and keeps logging transitions as diagnostics
+/// that proof gates read back until pixel proofs land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EffectState {
     pub grayscale: bool,
@@ -2040,6 +2057,7 @@ struct Runtime {
     countdown: Option<BreakType>,
     resident: Option<u64>,
     actions: Rc<RefCell<Vec<BreakActionKind>>>,
+    sent_effect: EffectState,
 }
 
 /// One screen-time poll: idle verdict from the compositor, history edges and
@@ -2061,7 +2079,9 @@ fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
         (r.hooks.clone(), r.effect, poll.events)
     };
     dispatch_screen_time(&hooks, &mut effect, &events);
-    rt.borrow_mut().effect = effect;
+    let mut r = rt.borrow_mut();
+    maybe_send_effect(&hooks, &mut r.sent_effect, &effect);
+    r.effect = effect;
 }
 
 /// One break poll, plus a countdown label refresh from the manager's due
@@ -2093,6 +2113,7 @@ fn break_tick(rt: &Rc<RefCell<Runtime>>) {
         }
     }
     let mut r = rt.borrow_mut();
+    maybe_send_effect(&hooks, &mut r.sent_effect, &effect);
     r.effect = effect;
     r.countdown = countdown;
     r.resident = resident;
@@ -2133,7 +2154,11 @@ pub fn start(
         countdown: None,
         resident: None,
         actions,
+        sent_effect: EffectState::default(),
     }));
+    // Baseline first: the compositor starts from neutral even if a limit
+    // is already reached (the first polls then send the actual pair).
+    (rt.borrow().hooks.effect_hook)(false, false);
     // The first polls run now so the startup edge, the limit state and any
     // due break apply immediately instead of a tick late.
     screen_tick(&rt);
@@ -2776,6 +2801,7 @@ mod tests {
         callbacks: Rc<RefCell<HashMap<(u64, String), Rc<dyn Fn()>>>>,
         dropped: Rc<RefCell<Vec<u64>>>,
         queued: Rc<RefCell<Vec<BreakActionKind>>>,
+        effect_sends: Rc<RefCell<Vec<(bool, bool)>>>,
     }
 
     fn recording_hooks(recorded: &Recorded) -> ShellHooks {
@@ -2789,6 +2815,7 @@ mod tests {
         let callbacks = recorded.callbacks.clone();
         let dropped = recorded.dropped.clone();
         let queued = recorded.queued.clone();
+        let effect_sends = recorded.effect_sends.clone();
         ShellHooks {
             post_notice: Rc::new(move |title, body| {
                 posts.borrow_mut().push((title, body));
@@ -2820,6 +2847,12 @@ mod tests {
             break_action: Rc::new(move |kind| {
                 queued.borrow_mut().push(kind);
             }),
+            effect_hook: {
+                let effect_sends = effect_sends.clone();
+                Rc::new(move |grayscale, fade| {
+                    effect_sends.borrow_mut().push((grayscale, fade));
+                })
+            },
         }
     }
 
@@ -2835,6 +2868,7 @@ mod tests {
             callbacks: Rc::new(RefCell::new(HashMap::new())),
             dropped: Rc::new(RefCell::new(Vec::new())),
             queued: Rc::new(RefCell::new(Vec::new())),
+            effect_sends: Rc::new(RefCell::new(Vec::new())),
         };
         let shell = recording_hooks(&hooks);
         (shell, hooks)
@@ -3085,6 +3119,58 @@ mod tests {
         assert!(service.skip_break(T0).is_empty());
         assert_eq!(service.manager.state(), BreakState::Disabled);
         assert_eq!(service.manager.next_break_due_time(T0), due_before);
+    }
+
+    #[test]
+    fn effect_pair_sends_atomically_only_on_change() {
+        let (hooks, seen) = recorded();
+        let mut sent = EffectState::default();
+        // Silence when unchanged.
+        maybe_send_effect(
+            &hooks,
+            &mut sent,
+            &EffectState {
+                grayscale: false,
+                fade: false,
+            },
+        );
+        assert!(seen.effect_sends.borrow().is_empty());
+        // Each change sends BOTH bools together, never a split pair.
+        maybe_send_effect(
+            &hooks,
+            &mut sent,
+            &EffectState {
+                grayscale: true,
+                fade: false,
+            },
+        );
+        maybe_send_effect(
+            &hooks,
+            &mut sent,
+            &EffectState {
+                grayscale: true,
+                fade: true,
+            },
+        );
+        maybe_send_effect(
+            &hooks,
+            &mut sent,
+            &EffectState {
+                grayscale: true,
+                fade: true,
+            },
+        );
+        assert_eq!(
+            seen.effect_sends.borrow().as_slice(),
+            &[(true, false), (true, true)]
+        );
+        assert_eq!(
+            sent,
+            EffectState {
+                grayscale: true,
+                fade: true
+            }
+        );
     }
 
     #[test]
