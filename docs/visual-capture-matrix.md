@@ -219,6 +219,24 @@ their ledger rows above:
   sharing panels on image).
 - fprint: P-LK-02 (`missing-product`).
 
+## Walkthrough freshness
+
+The checked-in `docs/walkthrough/` images predate this pipeline and are
+STALE until a refresh lands; `scripts/tuna-walkthrough freshness`
+reports all 46 as such (exit 1) when no per-frame manifest exists, and
+the `visual-capture` workflow's manifest job prints that report on
+every run as a visible, non-gating step. `scripts/tuna-walkthrough
+refresh` rebuilds images ONLY from exact successful artifacts (pinned
+run id, one attempt, all consumed stages ok, every frame labeled
+feature/baseline), writing `walkthrough/manifest.json` with each
+frame's hash, capture outcome and source IDs (head SHA, merge SHA,
+branch, package/image IDs). Map: `docs/walkthrough-visual.tsv`.
+Procedure and exact commands: `docs/visual-capture-refresh.md`.
+Behavioral coverage for the new subcommands lives in
+`scripts/lib/tuna-walkthrough-freshness-tests.py` (run by the
+visual-capture build job, not by any existing gate). The existing
+`tuna-walkthrough check` (markdown + existence) is unchanged.
+
 ## Known-blocker coverage
 
 - The tour's `T-app-grid`, `T-calendar`, `T-quick-settings` (wallpaper

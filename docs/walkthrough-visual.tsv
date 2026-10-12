@@ -1,0 +1,51 @@
+# id	stage	frame
+# Walkthrough id -> visual-capture stage and frame file inside that
+# stage's visual-<stage> artifact bundle. Read by
+# `scripts/tuna-walkthrough refresh`; every docs/walkthrough.tsv id must
+# have a row here (checked by scripts/lib/tuna-walkthrough-freshness-tests.py).
+panel	panel	panel-desktop.png
+calendar	calendar	calendar-menu.png
+tray	panel	panel-tray-menu.png
+quick-settings	quick-settings	qs-grid.png
+wifi-menu	quick-settings	qs-wifi-menu.png
+network-agent	quick-settings	qs-network-agent.png
+wired-menu	quick-settings	qs-wired-menu.png
+bluetooth-menu	quick-settings	qs-bluetooth-menu.png
+microphone	quick-settings	qs-microphone.png
+power-menu	quick-settings	qs-power-menu.png
+osd-volume	quick-settings	qs-osd-volume.png
+osd-brightness	quick-settings	qs-osd-brightness.png
+windows	windows	windows-three.png
+popover	windows	windows-popover.png
+tile-preview	windows	windows-tile-preview.png
+window-menu	windows	windows-menu.png
+x11	x11	x11-app.png
+scroll-strip	scroll	scroll-strip.png
+scroll-follow	scroll	scroll-follow.png
+scroll-presets	scroll	scroll-preset.png
+switcher	switcher	switcher-popup.png
+switcher-thumbnails	switcher	switcher-thumbnails.png
+overview	overview	overview-open.png
+workspaces	overview	overview-workspaces.png
+overview-drag	overview	overview-drag.png
+workspace-popup	overview	workspace-popup.png
+search	search-apps	search-results.png
+search-provider	search-apps	search-provider.png
+app-grid	search-apps	app-grid.png
+app-folder	search-apps	app-folder.png
+app-grid-pages	search-apps	app-grid-pages.png
+folder-made	search-apps	grid-folder-made.png
+grid-reorder	search-apps	grid-reordered.png
+banner	notifications	notify-banner.png
+notification-list	notifications	notify-list.png
+do-not-disturb	notifications	notify-dnd-list.png
+notification-group	notifications	notify-group.png
+notification-group-expanded	notifications	notify-group-expanded.png
+ime	input	ime-preedit.png
+ime-candidates	input	ime-candidates.png
+screenshot-ui	system	system-screenshot-ui.png
+polkit	system	system-polkit.png
+end-session	system	system-end-session.png
+lock	system	system-locked.png
+unlock	system	system-unlock-prompt.png
+scale	system	system-scale-125.png

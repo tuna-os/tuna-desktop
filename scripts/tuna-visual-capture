@@ -183,6 +183,14 @@ with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as handle:
     handle.write("\n")
 print("tuna-visual-capture: merged %d stages (%d ok) into %s/manifest.json"
       % (len(stages), ok, root))
+print("tuna-visual-capture: per-stage report (missing/failed/skipped are explicit)")
+for name in sorted(stages):
+    stage = stages[name]
+    print("  [%s] %s frames=%s" % (stage.get("status", "?"), name,
+                                   json.dumps(stage.get("frame_summary", {}), sort_keys=True)))
+    for step in stage.get("steps", []):
+        print("    %-8s %-16s %s" % (step.get("status", "?"), step.get("state", "?"),
+                                     (step.get("note") or "")[:120]))
 MERGE
     exit 0
 fi

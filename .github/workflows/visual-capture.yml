@@ -56,8 +56,9 @@ jobs:
           done
       - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols
       - run: scripts/ci-install-gtk4-layer-shell
-      - run: shellcheck -x scripts/tuna-visual-capture && python3 -m py_compile scripts/lib/tuna-visual-label.py
+      - run: shellcheck -x scripts/tuna-visual-capture scripts/tuna-walkthrough && python3 -m py_compile scripts/lib/tuna-visual-label.py
       - run: scripts/tuna-visual-capture --check-matrix
+      - run: python3 scripts/lib/tuna-walkthrough-freshness-tests.py
       - run: cargo build --manifest-path Cargo.toml -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host
       - run: |
           mkdir -p visual-bin
@@ -134,6 +135,10 @@ jobs:
           merge-multiple: false
       - run: mkdir -p visual-all && scripts/tuna-visual-capture --merge --artifacts visual-all
       - run: scripts/tuna-visual-capture --check-matrix
+      # Visible staleness report for the checked-in walkthrough images.
+      # Non-gating (|| true): freshness fails until a refresh lands, and
+      # must stay a report, never a silent absence or a gate change.
+      - run: scripts/tuna-walkthrough freshness --dest docs || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
