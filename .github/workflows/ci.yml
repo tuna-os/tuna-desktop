@@ -298,6 +298,14 @@ jobs:
           name: native-minimize-proof
           path: ${{ runner.temp }}/native-minimize/
           retention-days: 14
+      - name: Prove actual GTK greetd prompt, cancel, retry and handoff replies
+        run: scripts/tuna-greeter-proof "$RUNNER_TEMP/native-greeter"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-greeter-proof
+          path: ${{ runner.temp }}/native-greeter/
+          retention-days: 14
       - name: Check wellbeing proof admission
         run: /usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
       - name: Prove live wellbeing framebuffer and screenshot pixels

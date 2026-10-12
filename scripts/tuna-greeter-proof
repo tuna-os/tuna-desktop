@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Real GTK/greetd-wire fixture qualification, not PAM/installed-image admission.
+set -euo pipefail
+out=${1:?usage: tuna-greeter-proof ABSOLUTE-OWNED-ARTIFACTS}
+[[ $out == /* && ! -e $out ]] || { echo 'Artifacts must be a new absolute directory' >&2; exit 1; }
+[[ -z $(git status --porcelain --untracked-files=normal) ]] || { echo 'Greeter proof requires clean source' >&2; exit 1; }
+mkdir -m0700 "$out"
+export TUNA_GREETER_ARTIFACTS="$out"
+git rev-parse HEAD > "$out/SOURCE_COMMIT"
+# Test executable discovery comes from Cargo, never a stale glob.
+cargo test -p tuna-greeter --test gtk_login --no-run --message-format=json > "$out/build.jsonl" 2> "$out/build.log"
+python3 - "$out" <<'PY'
+import hashlib,json,pathlib,shutil,subprocess,sys
+out=pathlib.Path(sys.argv[1]); msgs=[json.loads(s) for s in (out/'build.jsonl').read_text().splitlines() if s.startswith('{')]
+exe=[m['executable'] for m in msgs if m.get('reason')=='compiler-artifact' and m.get('target',{}).get('name')=='gtk_login' and m.get('executable')]
+if len(exe)!=1: raise SystemExit('Expected one source-owned GTK walkthrough executable')
+shutil.copy2(exe[0],out/'gtk-login-tests')
+files=['Cargo.toml','Cargo.lock','crates/greeter/Cargo.toml','crates/greeter/src/model.rs','crates/greeter/src/session.rs','crates/greeter/src/main.rs','crates/greeter/src/login.rs','crates/greeter/src/controller.rs','crates/greeter/src/client.rs','crates/greeter/tests/gtk_login.rs','scripts/tuna-greeter-proof']
+receipt={'source_commit':(out/'SOURCE_COMMIT').read_text().strip(),'executable_sha256':hashlib.sha256((out/'gtk-login-tests').read_bytes()).hexdigest(),'source_sha256':{f:hashlib.sha256(pathlib.Path(f).read_bytes()).hexdigest() for f in files},'scope':'actual GTK widgets and real fake-greetd IPC; not installed PAM/session execution','runtime_passed':False}
+(out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+PY
+set +e
+timeout --kill-after=5s 90s dbus-run-session -- xvfb-run -a -s '-screen 0 1024x768x24 -nolisten tcp' \
+  env GDK_BACKEND=x11 GSK_RENDERER=cairo "$out/gtk-login-tests" \
+  --ignored --exact live_greetd_gtk_prompt_cancel_retry_and_handoff --test-threads=1 --nocapture \
+  > "$out/runtime.log" 2>&1
+proof_exit=$?
+set -e
+python3 - "$out" "$proof_exit" <<'PY'
+import hashlib,json,pathlib,subprocess,sys
+from PIL import Image
+out=pathlib.Path(sys.argv[1]);r=json.loads((out/'receipt.json').read_text());r['runtime_exit']=int(sys.argv[2]);r['runtime_passed']=False
+r['captures']={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in out.glob('*.png')}
+r['assertions_sha256']=hashlib.sha256((out/'assertions.txt').read_bytes()).hexdigest() if (out/'assertions.txt').is_file() else None
+try:
+    if r['runtime_exit']==0:
+        assert (out/'assertions.txt').is_file(), 'Missing runtime assertions'
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==r['source_commit'], 'Source changed during proof'
+        assert hashlib.sha256((out/'gtk-login-tests').read_bytes()).hexdigest()==r['executable_sha256'], 'Frozen executable changed'
+        assert all(hashlib.sha256(pathlib.Path(f).read_bytes()).hexdigest()==h for f,h in r['source_sha256'].items()), 'Source bytes changed'
+        required=['username','secret','secret-entered','failed','visible-cancel','cancelled','pending-cancelled','info','error-notice','multi-visible','launch-wait','start-rejected','transport-failure','handoff-wait']
+        for name in required:
+            with Image.open(out/(name+'.png')) as frame:
+                assert frame.size==(1024,768), 'Unexpected framebuffer dimensions'
+                assert len(frame.convert('RGB').resize((128,96)).getcolors(128*96) or [])>8, 'Empty/unrendered framebuffer'
+        r['runtime_passed']=True
+except (AssertionError,OSError) as error:
+    r['validation_error']=str(error)
+finally:
+    (out/'receipt.json').write_text(json.dumps(r,indent=2)+'\n')
+if r['runtime_exit']==0 and not r['runtime_passed']: raise SystemExit('Greeter proof validation failed')
+PY
+exit "$proof_exit"
