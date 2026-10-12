@@ -60,7 +60,14 @@ def main():
     args = parser.parse_args()
     if not args.present:
         raise RuntimeError("positive observed state is required")
+    # Write failure state before any process or AT-SPI call can block. The
+    # shell's hard timeout must never leave a missing artifact looking green.
+    output = Path(args.output)
+    output.write_text(json.dumps({"qualified": False, "phase": "identity-admission",
+        "pid": args.pid, "parent": args.parent, "present": args.present, "absent": args.absent}, indent=2))
     before = identity(args.pid, args.parent, args.binary)
+    output.write_text(json.dumps({"qualified": False, "phase": "awaiting-live-observation",
+        "identity": before, "present": args.present, "absent": args.absent}, indent=2))
     end = time.monotonic() + 5
     nodes, error = [], None
     while time.monotonic() < end:
