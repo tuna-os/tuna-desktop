@@ -70,3 +70,13 @@ damage, or fresh input. Native unit regressions bound cursor movement damage
 and exercise edge/rotated-output intersection admission. These need exact-head
 CI. The nested proof does not qualify installed DRM, hardware frame timing,
 physical multi-output rendering, or total GPU/power performance.
+
+Scheduler admission removes the client cursor from generic pending roots, then
+adds it back only when unlocked, not fully blanked, selected rather than
+overridden, and an individual mapped surface or subsurface intersects an
+available output. The geometry walk mirrors renderer rounding and skips
+unmapped parents. Refresh-cycle roots remain intact for real refreshes.
+Negative unit controls cover hidden/overridden requests, off-output trees with
+an empty gap across the display, and visible fractional-scale subsurfaces.
+These are source/unit controls awaiting CI; they do not measure an installed
+session idle loop or hardware power.

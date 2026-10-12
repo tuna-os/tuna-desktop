@@ -3603,7 +3603,49 @@ impl Runtime {
         }
         // Preserve refresh-cycle authority: these timers only request work;
         // the existing drawn frame / KMS flip paths release protocol barriers.
-        let roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
+        let mut roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
+        if let smithay::input::pointer::CursorImageStatus::Surface(surface) =
+            &self.state.cursor_image
+        {
+            roots.retain(|root| root != surface);
+            let what = if !self.is_locked() && self.blank_alpha() < 1.0 {
+                crate::cursor::Pointer::resolve(
+                    &self.state.cursor_image,
+                    self.manager.grab_cursor(),
+                    self.state.pointer_focused(),
+                )
+            } else {
+                crate::cursor::Pointer::Hidden
+            };
+            let visible = match &self.backend {
+                Backend::Winit(backend) => crate::cursor::surface_visible_on_output(
+                    &what,
+                    self.manager.pointer_pos(),
+                    (0, 0).into(),
+                    self.scale,
+                    Rectangle::from_size(backend.window_size()),
+                ),
+                #[cfg(feature = "drm")]
+                Backend::Drm(drm) => {
+                    drm.scanout_ready()
+                        && drm.outputs.iter().any(|output| {
+                            crate::cursor::surface_visible_on_output(
+                                &what,
+                                drm.pointer(),
+                                output.loc.into(),
+                                output.scale,
+                                Rectangle::from_size(
+                                    crate::orientation::smithay_transform(output.transform)
+                                        .transform_size(output.size),
+                                ),
+                            )
+                        })
+                }
+            };
+            if visible {
+                roots.push(surface.clone());
+            }
+        }
         if crate::frame_timing::pending_frame_work(&roots) {
             schedule.active();
         }
