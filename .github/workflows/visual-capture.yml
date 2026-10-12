@@ -60,6 +60,7 @@ jobs:
       - run: python3 scripts/lib/tuna-visual-validators-tests.py
       - run: python3 scripts/lib/tuna-visual-provenance-tests.py
       - run: python3 scripts/lib/tuna-visual-walkthrough-map-tests.py
+      - run: /usr/bin/python3 scripts/lib/tuna-scale-frame-tests.py
       - run: cargo build --manifest-path Cargo.toml -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host
       - run: |
           mkdir -p visual-bin

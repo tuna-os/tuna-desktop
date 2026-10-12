@@ -60,6 +60,12 @@ def build(loop):
     scroller = Gtk.ScrolledWindow(min_content_height=150)
     scroller.set_child(rows)
     box.append(scroller)
+    if os.environ.get("TUNA_TEST_BOUNDS_MARKER") == "1":
+        # Actual bottom-edge pixels for the scale workarea proof, not a crop.
+        marker = Gtk.Box()
+        marker.set_size_request(-1, 4)
+        marker.add_css_class("tuna-test")
+        box.append(marker)
     win.set_content(box)
     win.present()
     if request_path := os.environ.get("TUNA_TEST_REQUESTS"):

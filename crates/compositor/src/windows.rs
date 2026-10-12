@@ -323,6 +323,7 @@ pub struct WindowManager {
     window_lifecycle: crate::window_lifecycle::Lifecycle,
     workspace_policy: tuna_shell_control::WorkspacePolicy,
     workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
+    floating_workareas: Vec<(String, crate::output_constraints::Rect)>,
     workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
     modal_dim: crate::modal_dim::ModalDim,
     icon_geometries: HashMap<u64, Rectangle<i32, Logical>>,
@@ -343,6 +344,72 @@ impl WindowManager {
                         &self.workspace_outputs,
                     ))
         })
+    }
+
+    /// Output scale/mode changes alter logical workareas independently of client
+    /// requests. Preserve fitting windows that were fully visible, once per change.
+    fn reconcile_floating_workareas(&mut self, state: &State) {
+        if self.grab.is_some() {
+            return;
+        }
+        // The common idle tick must not allocate a fresh output-name cache.
+        if state.outputs.len() == self.floating_workareas.len()
+            && state
+                .outputs
+                .iter()
+                .zip(&self.floating_workareas)
+                .all(|(output, (name, area))| {
+                    output.name == *name
+                        && *area
+                            == (
+                                output.loc.0,
+                                output.loc.1.saturating_add(WORK_AREA_TOP),
+                                output.size.w,
+                                output.size.h.saturating_sub(WORK_AREA_TOP),
+                            )
+                })
+        {
+            return;
+        }
+        let current: Vec<_> = state
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.name.clone(),
+                    (
+                        output.loc.0,
+                        output.loc.1.saturating_add(WORK_AREA_TOP),
+                        output.size.w,
+                        output.size.h.saturating_sub(WORK_AREA_TOP),
+                    ),
+                )
+            })
+            .collect();
+        let mut moved = Vec::new();
+        for (&id, window) in &mut self.windows {
+            if window.layout != WindowLayout::Floating || window.unplaced {
+                continue;
+            }
+            let rect = (
+                window.geometry.loc.x,
+                window.geometry.loc.y,
+                window.geometry.size.w,
+                window.geometry.size.h,
+            );
+            if let Some((x, y, _, _)) = crate::output_constraints::reposition_on_output(
+                rect,
+                &self.floating_workareas,
+                &current,
+            ) {
+                window.geometry.loc = (x, y).into();
+                moved.push(id);
+            }
+        }
+        self.floating_workareas = current;
+        for id in moved {
+            self.configure(id, self.model.focused() == Some(id));
+        }
     }
 
     fn refresh_workspace_affinity(&mut self, state: &State) {
@@ -468,6 +535,7 @@ impl WindowManager {
             window_lifecycle: Default::default(),
             workspace_policy: Default::default(),
             workspace_outputs: Vec::new(),
+            floating_workareas: Vec::new(),
             workspace_tracker: Default::default(),
             modal_dim: Default::default(),
             icon_geometries: Default::default(),
@@ -1073,6 +1141,7 @@ impl WindowManager {
     }
 
     pub fn reconcile(&mut self, state: &mut State) {
+        self.reconcile_floating_workareas(state);
         self.refresh_workspace_affinity(state);
         // Popups (#88): drop dead trees, and once the last grabbed popup
         // is gone hand keyboard focus back to the focused window.

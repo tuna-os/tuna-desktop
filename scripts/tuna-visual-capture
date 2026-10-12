@@ -1655,7 +1655,7 @@ st_system_end_session() {
     close_all
 }
 st_system_lock() {
-    spawn_test_windows || state_fail "test windows never mapped"
+    TUNA_TEST_BOUNDS_MARKER=1 spawn_test_windows || state_fail "test windows never mapped"
     open_qs || state_fail "quick settings would not open"
     a11y a11y-suspend.json --press "Power Off Menu" >/dev/null 2>&1 || state_fail "could not press the power button"
     a11y a11y-suspend2.json --press "Suspend" >/dev/null 2>&1 || state_fail "could not press Suspend"
@@ -1700,6 +1700,23 @@ st_system_scale() {
     sleep 1
     shot system-scale-125 || state_fail "scrot failed"
     require_cstate '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' "layout at scale 1.25"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-test-gamma "$ARTIFACTS/a11y-gamma-scale.json" 20 \
+        >/dev/null 2>&1 || state_fail "Gamma accessibility bounds missing"
+    "$PY" "$ROOT/scripts/lib/tuna-scale-frame-proof.py" \
+        "$ARTIFACTS/system-scale-125.png" "$ARTIFACTS/system-scale-125.json" \
+        "$ARTIFACTS/a11y-gamma-scale.json" "$ARTIFACTS/system-scale-frame-proof.json" \
+        || state_fail "Gamma pixels or close button extend outside scaled output"
+    read -r sx sy <<EOF2
+$(jq -r '.close_physical_center | "\(.[0]) \(.[1])"' "$ARTIFACTS/system-scale-frame-proof.json")
+EOF2
+    xdo mousemove --window "$WID" "$sx" "$sy" click 1 || state_fail "scaled close click failed"
+    cstate_wait '(.windows | all(.app_id != "tuna-test-gamma")) and (.windows | any(.app_id == "tuna-test-alpha")) and (.windows | any(.app_id == "tuna-test-beta"))' 10 \
+        || state_fail "actual scaled close button did not close only Gamma"
+    shot system-scale-125-closed || state_fail "scaled close frame failed"
+    jq '.input_close_delivered = true | .gamma_unmapped = true | .other_fixture_windows_retained = true' \
+        "$ARTIFACTS/system-scale-frame-proof.json" >"$ARTIFACTS/system-scale-frame-proof.done.json" \
+        || state_fail "scaled close receipt failed"
+    mv "$ARTIFACTS/system-scale-frame-proof.done.json" "$ARTIFACTS/system-scale-frame-proof.json"
     bus call --session --dest org.gnome.Mutter.DisplayConfig \
         --object-path /org/gnome/Mutter/DisplayConfig \
         --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
