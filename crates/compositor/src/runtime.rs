@@ -1824,7 +1824,6 @@ impl Runtime {
         let x11_ready = false;
         let mut doc = serde_json::json!({
             "rendered_frames": self.stats.frames,
-            "wellbeing_effects": { "desaturation": self.wellbeing_effects.sample(self.animation_clock.now()).desaturation, "brightness": self.wellbeing_effects.sample(self.animation_clock.now()).brightness, "animating": self.wellbeing_effects.animating(self.animation_clock.now()) },
             "x11_display": self.x11_display.map(|d| format!(":{d}")),
             "capture_streams": self.casts.len(),
             "remote_input_sessions": self.remote_held.len(),
@@ -1923,6 +1922,16 @@ impl Runtime {
                     }))
                 })
                 .collect::<Vec<_>>(),
+        });
+        // Keep this nested object outside the large json! expansion so
+        // additions cannot exceed serde_json's default macro recursion bound.
+        // One clock/sample also makes the diagnostic tuple internally coherent.
+        let wellbeing_now = self.animation_clock.now();
+        let wellbeing_sample = self.wellbeing_effects.sample(wellbeing_now);
+        doc["wellbeing_effects"] = serde_json::json!({
+            "desaturation": wellbeing_sample.desaturation,
+            "brightness": wellbeing_sample.brightness,
+            "animating": self.wellbeing_effects.animating(wellbeing_now),
         });
         // Overdraw per output for the last drawn frame (#503).
         doc["workspaces"] = serde_json::json!(model.workspaces());
