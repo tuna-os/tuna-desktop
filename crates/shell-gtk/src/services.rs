@@ -261,6 +261,12 @@ pub struct Widgets {
     pub bt_menu: Rc<crate::bt_menu::BtMenu>,
     pub wired: Tile,
     pub bluetooth: Tile,
+    /// The mobile-broadband tile and its modem menu.
+    pub wwan: Tile,
+    pub wwan_menu: Rc<crate::wwan::WwanMenu>,
+    /// The location agent: the master-switch tile, the GeoClue2 agent
+    /// and the panel's in-use indicator.
+    pub location_agent: Rc<crate::location::LocationAgent>,
     pub power_mode: Tile,
     /// The Power Mode menu: its header icon and one item per profile
     /// (profile name, button, check ornament).
@@ -292,7 +298,7 @@ pub struct Widgets {
 /// Wire every service to its widgets. Missing buses leave the tiles
 /// hidden; nothing here blocks.
 pub fn attach(w: &Rc<Widgets>) {
-    for tile in [&w.wifi, &w.wired, &w.bluetooth, &w.power_mode] {
+    for tile in [&w.wifi, &w.wired, &w.bluetooth, &w.wwan, &w.power_mode] {
         tile.present(false);
     }
     // The system bus connection itself is asynchronous too.
@@ -304,6 +310,7 @@ pub fn attach(w: &Rc<Widgets>) {
             Ok(conn) => {
                 network(&conn, &w2);
                 bluetooth(&conn, &w2);
+                location(&conn, &w2);
                 power_profiles(&conn, &w2, 0);
                 brightness(&conn, &w2);
                 battery(&conn, &w2);
@@ -329,6 +336,9 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
                 let on = dict_bool(&props, "WirelessEnabled").unwrap_or(false);
                 // GNOME's subtitle is the connected network's name.
                 w1.wifi_menu.set_enabled(on);
+                // The WWAN tile shows the master modem switch.
+                w1.wwan_menu
+                    .set_enabled(dict_bool(&props, "WwanEnabled").unwrap_or(false));
             });
             // Which tiles exist depends on the devices present.
             let (w, conn) = (w.clone(), conn.clone());
@@ -376,6 +386,7 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
                             w.wifi.present(wifi);
                             w.wifi_menu.attach(&conn, wifi_device.borrow().clone());
                             w.wired_menu.attach(&conn);
+                            w.wwan_menu.attach(&conn);
                             // GNOME's primary network indicator: shown
                             // while the main connection is up.
                             w.panel_network.set_visible(wired && connected);
@@ -397,6 +408,7 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
             } else {
                 w.wifi.present(false);
                 w.wired_menu.detach();
+                w.wwan_menu.detach();
                 w.panel_network.set_visible(false);
             }
         });
@@ -406,6 +418,13 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
         w.wifi
             .on_user_toggle(move |on| nm.set("WirelessEnabled", on.to_variant()));
     }
+}
+
+/// Location services: export the GeoClue2 agent on the system bus and
+/// follow its `InUse`. The tile itself is GSettings-backed, so it
+/// stays operable with GeoClue absent.
+fn location(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
+    w.location_agent.attach(conn);
 }
 
 fn bluetooth(conn: &gio::DBusConnection, w: &Rc<Widgets>) {

@@ -163,9 +163,9 @@ pub fn wwan_toggle(devices: &[WwanDevice], wwan_enabled: bool) -> WwanToggle {
         visible: !devices.is_empty(),
         checked: wwan_enabled,
         subtitle: first.map(|d| d.subtitle()),
-        icon: first.map(|d| d.icon()).unwrap_or(
-            "network-cellular-signal-none-symbolic",
-        ),
+        icon: first
+            .map(|d| d.icon())
+            .unwrap_or("network-cellular-signal-none-symbolic"),
     }
 }
 
@@ -174,7 +174,10 @@ pub fn gsm_apn<'a>(
     mut sections: impl Iterator<Item = (&'a str, glib::VariantDict)>,
 ) -> Option<String> {
     let (_, gsm) = sections.find(|(name, _)| *name == "gsm")?;
-    gsm.lookup::<String>("apn").ok().flatten().filter(|apn| !apn.is_empty())
+    gsm.lookup::<String>("apn")
+        .ok()
+        .flatten()
+        .filter(|apn| !apn.is_empty())
 }
 
 /// The WWAN tile's menu and the state behind it.
@@ -210,7 +213,9 @@ impl WwanMenu {
         let this = Rc::downgrade(self);
         tile.on_user_toggle(move |on| {
             let Some(menu) = this.upgrade() else { return };
-            let Some(conn) = menu.conn.borrow().clone() else { return };
+            let Some(conn) = menu.conn.borrow().clone() else {
+                return;
+            };
             conn.call(
                 Some(NM),
                 NM_PATH,
@@ -277,6 +282,12 @@ impl WwanMenu {
         self.generation.set(self.generation.get() + 1);
         self.devices.borrow_mut().clear();
         self.render();
+    }
+
+    /// Re-read the modems now (the menu calls this when it opens, so
+    /// a freshly appeared modem lists without waiting for a signal).
+    pub fn refresh(self: &Rc<Self>) {
+        self.schedule_reload();
     }
 
     fn schedule_reload(self: &Rc<Self>) {
@@ -379,7 +390,9 @@ impl WwanMenu {
         let button = gtk::Button::builder().child(&line).build();
         button.add_css_class("qs-menu-item");
         button.add_css_class("nm-wwan-item");
-        button.update_property(&[gtk::accessible::Property::Label(&format!("{name}, {detail}"))]);
+        button.update_property(&[gtk::accessible::Property::Label(&format!(
+            "{name}, {detail}"
+        ))]);
         button.connect_clicked(|_| {
             let _ = std::process::Command::new("gnome-control-center")
                 .arg("network")
@@ -510,7 +523,8 @@ fn read_device(
                                         // `gsm_apn` borrows the names; collect first.
                                         let owned: Vec<(String, glib::VariantDict)> =
                                             sections.collect();
-                                        let refs = owned.iter().map(|(n, d)| (n.as_str(), d.clone()));
+                                        let refs =
+                                            owned.iter().map(|(n, d)| (n.as_str(), d.clone()));
                                         device.borrow_mut().apn = gsm_apn(refs);
                                     }
                                     finish.tick();
@@ -627,7 +641,10 @@ mod tests {
             cellular_signal_icon(60, true),
             "network-cellular-signal-good-symbolic"
         );
-        assert_eq!(cellular_signal_icon(45, true), "network-cellular-signal-ok-symbolic");
+        assert_eq!(
+            cellular_signal_icon(45, true),
+            "network-cellular-signal-ok-symbolic"
+        );
         assert_eq!(
             cellular_signal_icon(20, true),
             "network-cellular-signal-weak-symbolic"

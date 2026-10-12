@@ -21,6 +21,8 @@ use gio::prelude::*;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
+use crate::services::Tile;
+
 pub const LOCATION_SCHEMA: &str = "org.gnome.system.location";
 pub const ENABLED_KEY: &str = "enabled";
 pub const MAX_ACCURACY_KEY: &str = "max-accuracy-level";
@@ -192,6 +194,12 @@ pub fn indicator_icon(enabled: bool, in_use: bool) -> Option<&'static str> {
     (enabled && in_use).then_some("location-services-active-symbolic")
 }
 
+/// The Location tile's (visible, checked): hidden without its
+/// GSettings schema, checked with the master switch.
+pub fn tile_state(schema_present: bool, enabled: bool) -> (bool, bool) {
+    (schema_present, schema_present && enabled)
+}
+
 /// The authorization dialog: its app id, requested level, and the
 /// answer callback (the user's level, or `NONE`).
 pub type AuthorizePrompt = dyn Fn(String, u32, Rc<dyn Fn(u32)>);
@@ -201,6 +209,7 @@ pub type AuthorizePrompt = dyn Fn(String, u32, Rc<dyn Fn(u32)>);
 pub struct LocationAgent {
     settings: Option<gio::Settings>,
     indicator: RefCell<Option<gtk::Image>>,
+    tile: RefCell<Option<Tile>>,
     conn: RefCell<Option<gio::DBusConnection>>,
     session: RefCell<Option<gio::DBusConnection>>,
     in_use: Cell<bool>,
@@ -215,6 +224,7 @@ impl LocationAgent {
         let agent = Rc::new(Self {
             settings,
             indicator: RefCell::default(),
+            tile: RefCell::default(),
             conn: RefCell::default(),
             session: RefCell::default(),
             in_use: Cell::new(false),
@@ -242,6 +252,29 @@ impl LocationAgent {
     pub fn set_indicator(&self, indicator: gtk::Image) {
         *self.indicator.borrow_mut() = Some(indicator);
         self.sync_indicator();
+    }
+
+    /// The Location toggle: checked with the master switch, hidden
+    /// without its schema. A click flips the switch; writes from
+    /// elsewhere (Settings, the proof) update the tile the same way.
+    pub fn set_tile(self: &Rc<Self>, tile: Tile) {
+        let weak = Rc::downgrade(self);
+        tile.on_user_toggle(move |on| {
+            let Some(agent) = weak.upgrade() else { return };
+            agent.set_enabled(on);
+            // The tile shows GSettings' state, not the click.
+            agent.sync_tile();
+        });
+        *self.tile.borrow_mut() = Some(tile);
+        if let Some(settings) = self.settings.as_ref() {
+            let weak = Rc::downgrade(self);
+            settings.connect_changed(Some(ENABLED_KEY), move |_, _| {
+                if let Some(agent) = weak.upgrade() {
+                    agent.sync_tile();
+                }
+            });
+        }
+        self.sync_tile();
     }
 
     /// The authorization dialog: `respond` carries the user's level
@@ -299,25 +332,25 @@ impl LocationAgent {
         }
         let calls = self.clone();
         let props = self.clone();
-        if let Err(e) = conn
-            .register_object(AGENT_PATH, &info)
-            .method_call(move |_, _, _, _, method, params, invocation| match method {
-                "AuthorizeApp" => {
-                    let desktop_id: String = params.child_value(0).get().unwrap_or_default();
-                    let req: u32 = params.child_value(1).get().unwrap_or(ACC_NONE);
-                    calls.authorize_app(&desktop_id, req, invocation);
-                }
-                _ => invocation
-                    .return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method),
-            })
-            .property(move |_, _, _, _, name| {
-                if name == "MaxAccuracyLevel" {
-                    props.max_accuracy_level().to_variant()
-                } else {
-                    0u32.to_variant()
-                }
-            })
-            .build()
+        if let Err(e) =
+            conn.register_object(AGENT_PATH, &info)
+                .method_call(move |_, _, _, _, method, params, invocation| match method {
+                    "AuthorizeApp" => {
+                        let desktop_id: String = params.child_value(0).get().unwrap_or_default();
+                        let req: u32 = params.child_value(1).get().unwrap_or(ACC_NONE);
+                        calls.authorize_app(&desktop_id, req, invocation);
+                    }
+                    _ => invocation
+                        .return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method),
+                })
+                .property(move |_, _, _, _, name| {
+                    if name == "MaxAccuracyLevel" {
+                        props.max_accuracy_level().to_variant()
+                    } else {
+                        0u32.to_variant()
+                    }
+                })
+                .build()
         {
             eprintln!("tuna-shell-gtk: location agent object: {e}");
             return;
@@ -389,9 +422,7 @@ impl LocationAgent {
         lookup_permissions(self, move |perms| {
             // `None` is a missing store: authorize at the request. A
             // present store with no row for the app prompts instead.
-            let stored = perms
-                .as_ref()
-                .and_then(|p| stored_accuracy(p, &desktop_id));
+            let stored = perms.as_ref().and_then(|p| stored_accuracy(p, &desktop_id));
             let decision = authorize(req, max, stored, perms.is_none(), app_known);
             match decision {
                 AuthDecision::Answer { accuracy, save } => {
@@ -410,8 +441,7 @@ impl LocationAgent {
                             // The dialog answers later; its own reference.
                             // The hook is repeat-callable, so the first
                             // answer wins and later ones are dropped.
-                            let invocation2 =
-                                RefCell::new(Some(invocation.clone()));
+                            let invocation2 = RefCell::new(Some(invocation.clone()));
                             prompt(
                                 desktop_id,
                                 req,
@@ -419,9 +449,7 @@ impl LocationAgent {
                                     let accuracy = clamp_accuracy(level, max);
                                     this.save_permission(perms.as_ref(), &id, accuracy);
                                     if let Some(inv) = invocation2.borrow_mut().take() {
-                                        inv.return_value(Some(
-                                            &auth_reply(accuracy).to_variant(),
-                                        ));
+                                        inv.return_value(Some(&auth_reply(accuracy).to_variant()));
                                     }
                                 }),
                             );
@@ -451,10 +479,11 @@ impl LocationAgent {
             5000,
             None::<&gio::Cancellable>,
             move |reply| {
-                done(reply.ok().and_then(|v| {
-                    v.child_value(0)
-                        .get::<HashMap<String, Vec<String>>>()
-                }));
+                done(
+                    reply
+                        .ok()
+                        .and_then(|v| v.child_value(0).get::<HashMap<String, Vec<String>>>()),
+                );
             },
         );
     }
@@ -547,6 +576,15 @@ impl LocationAgent {
         }
     }
 
+    fn sync_tile(&self) {
+        let Some(tile) = self.tile.borrow().clone() else {
+            return;
+        };
+        let (visible, checked) = tile_state(self.settings.is_some(), self.enabled());
+        tile.present(visible);
+        tile.show_state(checked, None);
+    }
+
     /// Tell GeoClue the ceiling moved (GNOME's `_notifyMaxAccuracyLevel`).
     fn emit_max_accuracy(&self) {
         let Some(conn) = self.conn.borrow().clone() else {
@@ -558,7 +596,8 @@ impl LocationAgent {
             self.max_accuracy_level().to_variant(),
         );
         let args = (AGENT_IFACE, changed, Vec::<String>::new()).to_variant();
-        if let Err(e) = conn.emit_signal(None, AGENT_PATH, PROPS, "PropertiesChanged", Some(&args)) {
+        if let Err(e) = conn.emit_signal(None, AGENT_PATH, PROPS, "PropertiesChanged", Some(&args))
+        {
             eprintln!("tuna-shell-gtk: location agent signal: {e}");
         }
     }
@@ -592,7 +631,14 @@ mod tests {
         assert_eq!(accuracy_name(7), "NONE");
         // The numeric levels are GNOME's, not 0..=5.
         assert_eq!(
-            (ACC_NONE, ACC_COUNTRY, ACC_CITY, ACC_NEIGHBORHOOD, ACC_STREET, ACC_EXACT),
+            (
+                ACC_NONE,
+                ACC_COUNTRY,
+                ACC_CITY,
+                ACC_NEIGHBORHOOD,
+                ACC_STREET,
+                ACC_EXACT
+            ),
             (0, 1, 4, 5, 6, 8)
         );
     }
@@ -646,7 +692,10 @@ mod tests {
     #[test]
     fn store_rows_parse_and_write_back() {
         let perms = HashMap::from([
-            ("org.gnome.Maps".to_owned(), vec!["EXACT".to_owned(), "1700000000".to_owned()]),
+            (
+                "org.gnome.Maps".to_owned(),
+                vec!["EXACT".to_owned(), "1700000000".to_owned()],
+            ),
             ("org.gnome.Weather".to_owned(), vec!["CITY".to_owned()]),
             ("bad.app".to_owned(), vec!["BOGUS".to_owned()]),
         ]);
@@ -654,7 +703,10 @@ mod tests {
         assert_eq!(stored_accuracy(&perms, "missing.app"), None);
         // A garbled row denies rather than prompting again.
         assert_eq!(stored_accuracy(&perms, "bad.app"), Some(ACC_NONE));
-        assert_eq!(permission_entry(ACC_CITY, 42), vec!["CITY".to_owned(), "42".to_owned()]);
+        assert_eq!(
+            permission_entry(ACC_CITY, 42),
+            vec!["CITY".to_owned(), "42".to_owned()]
+        );
         let apps = parse_lookup(&perms);
         assert_eq!(apps.len(), 3);
         assert!(apps.windows(2).all(|w| w[0].desktop_id <= w[1].desktop_id));
@@ -662,6 +714,14 @@ mod tests {
         assert_eq!(apps[0].accuracy, ACC_NONE);
         assert_eq!(apps[1].seen, Some(1_700_000_000));
         assert_eq!(apps[2].seen, None);
+    }
+
+    #[test]
+    fn tile_hides_without_schema_and_mirrors_switch() {
+        assert_eq!(tile_state(false, false), (false, false));
+        assert_eq!(tile_state(false, true), (false, false));
+        assert_eq!(tile_state(true, false), (true, false));
+        assert_eq!(tile_state(true, true), (true, true));
     }
 
     #[test]
