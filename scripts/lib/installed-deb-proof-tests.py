@@ -299,7 +299,7 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('#!/bin/sh\necho "' + name + ' 0.1.0"\nexit ' + str(version_exit if name == 'tuna-shell-gtk' else 0) + '\n')
                 path.chmod(0o755)
-            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock'):
+            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf'):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
