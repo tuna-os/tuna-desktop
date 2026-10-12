@@ -344,11 +344,14 @@ impl NetworkAgent {
             entry.set_editable(field.key.is_some());
             entry.set_can_focus(field.key.is_some());
             entry.update_property(&[gtk::accessible::Property::Label(&field.label)]);
-            if field.password {
-                entry.set_icon_from_icon_name(
-                    gtk::EntryIconPosition::Secondary,
-                    Some("view-reveal-symbolic"),
-                );
+            // Administrative lockdown (#357): no reveal toggle while
+            // `disable-show-password` denies (live read per prompt, so
+            // lifting the policy restores the toggle on the next one).
+            if let Some(icon) = crate::lockdown::password_reveal_icon(
+                field.password,
+                &crate::lockdown::read().entry_visibility(),
+            ) {
+                entry.set_icon_from_icon_name(gtk::EntryIconPosition::Secondary, Some(icon));
                 entry.connect_icon_press(|e, _| {
                     e.set_visibility(!gtk::prelude::EntryExt::is_visible(e))
                 });

@@ -67,6 +67,14 @@ use crate::{ClientState, State};
 /// repaint replaces this provisional pacing in a later slice.
 const FRAME_BUDGET: Duration = Duration::from_millis(16);
 
+/// Administrative lockdown (#357): how often the tick re-reads the
+/// live `disable-lock-screen` key. One subprocess per interval at
+/// most, skipped without a session bus; the shell enforces its own
+/// surface immediately, so this backstop's short lag fails safe (an
+/// extra lock in the window still needs auth to unlock, and unlocks
+/// never come from policy).
+const LOCKDOWN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
 /// client epoll set; a duplicate keeps calloop's source lifetime independent.
@@ -608,6 +616,8 @@ pub struct Runtime {
     child_watch_failed: bool,
     exited_children: std::collections::HashSet<u32>,
     was_inhibited: bool,
+    /// Last live lockdown refresh (see [`LOCKDOWN_REFRESH_INTERVAL`]).
+    lockdown_refresh_at: Instant,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -1082,6 +1092,7 @@ impl Runtime {
             child_watch_failed: false,
             exited_children: Default::default(),
             was_inhibited: false,
+            lockdown_refresh_at: Instant::now(),
             idle_blank_signal: std::env::var_os("XDG_RUNTIME_DIR").map(|dir| {
                 crate::runtime_signal::CachedSignal::new(
                     std::path::PathBuf::from(dir).join("tuna-idle-blank"),
@@ -3659,6 +3670,12 @@ impl Runtime {
             self.overview_search = false;
             self.overview_app_grid = false;
         }
+        // Administrative lockdown (#357): follow the live key on a
+        // slow tick; the shell maps it onto its idle sender too.
+        if self.lockdown_refresh_at.elapsed() >= LOCKDOWN_REFRESH_INTERVAL {
+            self.control.refresh_lockdown();
+            self.lockdown_refresh_at = Instant::now();
+        }
         // GNOME's idle and lock settings, from the shell (#63).
         if let Some(ms) = outcome.idle_timeout {
             self.lock.set_timeout(if ms == 0 { u64::MAX } else { ms });
@@ -3680,14 +3697,19 @@ impl Runtime {
                 (pid, self.shell.child_pid()),
                 (Some(pid), Some(child)) if u32::try_from(pid).ok() == Some(child)
             );
-            if ours {
+            // Administrative lockdown (#357): a disabled lock screen
+            // refuses even our own shell's locker (no Wayland bypass).
+            let approved = ours && self.control.lock_screen_allowed();
+            if approved {
                 if !self.is_locked() {
                     self.engage_lock();
                 }
+            } else if ours {
+                eprintln!("tuna-compositor: session lock refused by administrator policy");
             } else {
                 eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
             }
-            self.state.resolve_lock_request(locker, ours);
+            self.state.resolve_lock_request(locker, approved);
         }
         // A lock client's unlock_and_destroy never unlocks by itself:
         // only a verified password clears the flag.
@@ -3728,7 +3750,14 @@ impl Runtime {
         }
         self.was_inhibited = inhibited;
         if !self.is_locked() && self.lock.check_timeout(self.lock_now_ms()) {
-            self.engage_lock();
+            // Administrative lockdown (#357): a disabled lock screen
+            // never engages on idle; restart the stretch instead so no
+            // surprise lock fires when the policy lifts.
+            if self.control.lock_screen_allowed() {
+                self.engage_lock();
+            } else {
+                self.lock.unlock(self.lock_now_ms());
+            }
         }
         // XIM is an X11 client itself: keep it off merely advertised sockets,
         // and retire the helper on server loss even while the session is locked.

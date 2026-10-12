@@ -1,9 +1,10 @@
 //! Lockdown admin UX integration tests (#357).
 //!
-//! The `lockdown` module is not yet registered in `main.rs` (union-time
-//! patch, see evidence), so this target includes it by path and proves
-//! the GSettings round trip plus real widget application. The module's
-//! own `#[cfg(test)]` suite compiles into this binary as well.
+//! The binary's `lockdown` module cannot be imported from an
+//! integration target, so this target includes it by path and proves
+//! the GSettings round trip, the spawn/reveal guards, and real widget
+//! application. The module's own `#[cfg(test)]` suite compiles into
+//! this binary as well.
 
 #[path = "../src/lockdown.rs"]
 mod lockdown;
@@ -52,6 +53,23 @@ fn policy_round_trips_through_memory_backend() {
     assert!(!visibility.run_command);
     assert!(!visibility.password_reveal);
     assert!(!visibility.url_handlers);
+    // The guards follow the same snapshot: denied handlers block the
+    // spawn and denied reveal yields no toggle.
+    let calls = std::cell::Cell::new(0);
+    assert!(!lockdown::spawn_settings_for_policy(
+        Some("wifi"),
+        &locked,
+        &|_: Option<&str>| {
+            calls.set(calls.get() + 1);
+            true
+        }
+    ));
+    assert_eq!(calls.get(), 0, "denied snapshot must not spawn");
+    assert_eq!(
+        lockdown::password_reveal_icon(true, &locked.entry_visibility()),
+        None,
+        "denied snapshot yields no reveal toggle"
+    );
     // Policy unlock restores every entry point.
     for key in [
         lockdown::KEY_DISABLE_COMMAND_LINE,
@@ -72,7 +90,18 @@ fn policy_round_trips_through_memory_backend() {
     ] {
         settings.set_boolean(key, false).unwrap();
     }
-    assert_eq!(read_from(&settings), LockdownPolicy::default());
+    let restored = read_from(&settings);
+    assert_eq!(restored, LockdownPolicy::default());
+    // Lifting the policy restores the spawn and the toggle.
+    assert!(lockdown::spawn_settings_for_policy(
+        Some("wifi"),
+        &restored,
+        &|_: Option<&str>| true
+    ));
+    assert_eq!(
+        lockdown::password_reveal_icon(true, &restored.entry_visibility()),
+        Some("view-reveal-symbolic")
+    );
 }
 
 /// Real widgets flip visibility under the policy. Needs a display;
@@ -108,4 +137,17 @@ fn widgets_apply_entry_visibility() {
     assert!(lock.is_visible());
     assert!(log_out.is_visible());
     assert!(user_switch.is_visible());
+    // The top Settings button hides while handlers deny.
+    let settings_btn = gtk::Button::with_label("Settings");
+    let handlers_locked = LockdownPolicy {
+        disable_application_handlers: true,
+        ..LockdownPolicy::default()
+    };
+    lockdown::apply_settings_visibility(&handlers_locked.entry_visibility(), &settings_btn);
+    assert!(!settings_btn.is_visible());
+    lockdown::apply_settings_visibility(
+        &LockdownPolicy::default().entry_visibility(),
+        &settings_btn,
+    );
+    assert!(settings_btn.is_visible());
 }

@@ -4,9 +4,11 @@
 //! allow/deny decision for every desktop entry point each key constrains.
 //! The compositor owns enforcement for session-scoped requests (lock);
 //! the shell owns its menus and dialogs; applications and system daemons
-//! own the rest. There is no I/O here: the shell reads GSettings (it
-//! owns the `gio` dependency) and ships a snapshot over the control
-//! channel; tests inject values through [`LockdownPolicy::from_reader`].
+//! own the rest. The shell reads all eleven keys live through `gio`
+//! and enforces its surface immediately; the compositor backstops the
+//! lock paths from its own live read of `disable-lock-screen` (see
+//! [`read_lock_screen_key`]), so no control-protocol change is needed.
+//! Tests inject values through [`LockdownPolicy::from_reader`].
 //!
 //! Key inventory (verified against the installed
 //! `gsettings-desktop-schemas` 46.1 `org.gnome.desktop.lockdown`
@@ -333,6 +335,47 @@ impl LockdownPolicy {
     }
 }
 
+/// Live value of `disable-lock-screen`, if GSettings answers. `None`
+/// keeps the caller's current value under the refresh rule: a missing
+/// `gsettings` binary, schema, key, or session bus never restricts by
+/// accident (same fail-safe as the shell's missing-schema path).
+///
+/// The compositor owns no `gio` dependency, so this shells out to the
+/// `gsettings` CLI. Call sites are rare by construction (hub startup
+/// plus a slow tick and lock transitions, never the frame path): one
+/// subprocess per refresh, skipped entirely without a session bus.
+pub fn read_lock_screen_key() -> Option<bool> {
+    if !session_bus_present() {
+        return None;
+    }
+    let output = std::process::Command::new("gsettings")
+        .args(["get", SCHEMA, KEY_DISABLE_LOCK_SCREEN])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_gsettings_bool(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Whether a session bus is plausibly reachable for a `gsettings` read.
+fn session_bus_present() -> bool {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+        return true;
+    }
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .is_some_and(|dir| std::path::Path::new(&dir).join("bus").exists())
+}
+
+/// Parse `gsettings get` boolean output (`true`/`false` plus newline).
+fn parse_gsettings_bool(text: &str) -> Option<bool> {
+    match text.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +483,23 @@ mod tests {
         assert!(policy.logout_allowed());
         assert!(policy.lock_screen_allowed());
         assert!(policy.command_line_allowed());
+    }
+
+    #[test]
+    fn gsettings_booleans_parse_and_garbage_yields_none() {
+        assert_eq!(parse_gsettings_bool("true\n"), Some(true));
+        assert_eq!(parse_gsettings_bool("false\n"), Some(false));
+        assert_eq!(parse_gsettings_bool("true"), Some(true));
+        assert_eq!(parse_gsettings_bool(""), None);
+        assert_eq!(parse_gsettings_bool("no such key\n"), None);
+        assert_eq!(parse_gsettings_bool("1"), None);
+    }
+
+    #[test]
+    fn live_lock_screen_read_is_deterministic_and_never_panics() {
+        // Passes with or without a session bus or schema: two reads
+        // agree, and an unreadable key reads absent (refresh rule).
+        assert_eq!(read_lock_screen_key(), read_lock_screen_key());
     }
 
     #[test]

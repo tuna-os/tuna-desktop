@@ -23,6 +23,7 @@ use tuna_compositor::control::{
     deny_all_tokens, ControlConn, ControlHub, Emitted, Handled, Session,
 };
 use tuna_compositor::lock::{content_visible, SessionLock};
+use tuna_compositor::lockdown::LockdownPolicy;
 use tuna_compositor::overlay::Overlay;
 use tuna_compositor::state::{StateModel, TokenStore};
 use tuna_compositor::SEAT_NAME;
@@ -328,6 +329,219 @@ fn lock_command_engages_and_unlock_restores() {
         windows.iter().any(|w| w.title == "Secrets"),
         "window opened while locked appears after unlock"
     );
+}
+
+/// Administrative lockdown (#357): `Lock` denies under a
+/// restrictive policy — the flag stays clear and no stripped snapshot
+/// follows — while the default policy applies (see the test above).
+#[test]
+fn lock_command_denied_under_lockdown_policy() {
+    let mut model = two_window_model();
+    let (server, mut client) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(TIMEOUT))
+        .and(client.set_write_timeout(Some(TIMEOUT)))
+        .unwrap();
+    let conn = ControlConn::new(server).unwrap();
+    let locked = Rc::new(Cell::new(false));
+    client_write(&mut client, &hello());
+    let mut session = Session::handshake_with(
+        conn,
+        &model,
+        deny_all_tokens,
+        Rc::new(|_| String::new()),
+        Rc::new(Cell::new(false)),
+        locked.clone(),
+    )
+    .unwrap();
+    assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+    assert_unlocked_with_titles(&client_read(&mut client));
+
+    // The administrator disables the lock screen; the hub pushes the
+    // policy onto the session (injected here, as the hub does live).
+    session.set_lockdown_policy(LockdownPolicy {
+        disable_lock_screen: true,
+        ..LockdownPolicy::default()
+    });
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 7,
+            kind: CommandKind::Lock,
+        },
+    );
+    let handled = session.handle_next(&mut model).unwrap();
+    assert!(
+        matches!(
+            handled,
+            Handled::CommandResult {
+                id: 7,
+                applied: false
+            }
+        ),
+        "Lock denies under policy, got {handled:?}"
+    );
+    let Message::CommandResult { id, status } = client_read(&mut client) else {
+        panic!("expected CommandResult for denied Lock");
+    };
+    assert_eq!(id, 7);
+    let CommandStatus::Denied { reason } = status else {
+        panic!("expected Denied, got {status:?}");
+    };
+    assert!(
+        reason.contains("administrator"),
+        "denial names the administrator, got {reason:?}"
+    );
+    assert!(!locked.get(), "denied Lock flips no flag");
+
+    // No lock transition, so no resnapshot: the session stays quiet.
+    let emitted = session.emit_deltas(&model).unwrap();
+    assert!(matches!(emitted, Emitted::Idle { .. }));
+}
+
+/// Lifting the policy restores the lock: denied while restricted,
+/// applied once allowed again.
+#[test]
+fn lockdown_policy_lift_restores_lock() {
+    let mut model = two_window_model();
+    let (server, mut client) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(TIMEOUT))
+        .and(client.set_write_timeout(Some(TIMEOUT)))
+        .unwrap();
+    let conn = ControlConn::new(server).unwrap();
+    let locked = Rc::new(Cell::new(false));
+    client_write(&mut client, &hello());
+    let mut session = Session::handshake_with(
+        conn,
+        &model,
+        deny_all_tokens,
+        Rc::new(|_| String::new()),
+        Rc::new(Cell::new(false)),
+        locked.clone(),
+    )
+    .unwrap();
+    assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+    assert_unlocked_with_titles(&client_read(&mut client));
+
+    session.set_lockdown_policy(LockdownPolicy {
+        disable_lock_screen: true,
+        ..LockdownPolicy::default()
+    });
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 1,
+            kind: CommandKind::Lock,
+        },
+    );
+    let handled = session.handle_next(&mut model).unwrap();
+    assert!(matches!(
+        handled,
+        Handled::CommandResult {
+            id: 1,
+            applied: false
+        }
+    ));
+    assert!(!locked.get());
+
+    session.set_lockdown_policy(LockdownPolicy::default());
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 2,
+            kind: CommandKind::Lock,
+        },
+    );
+    let handled = session.handle_next(&mut model).unwrap();
+    assert!(matches!(
+        handled,
+        Handled::CommandResult {
+            id: 2,
+            applied: true
+        }
+    ));
+    // Two results are queued (denied 1, applied 2); drain both in order.
+    let Message::CommandResult { id, status } = client_read(&mut client) else {
+        panic!("expected CommandResult for denied Lock");
+    };
+    assert_eq!(id, 1);
+    assert!(matches!(status, CommandStatus::Denied { .. }));
+    let Message::CommandResult { id, status } = client_read(&mut client) else {
+        panic!("expected CommandResult for restored Lock");
+    };
+    assert_eq!(id, 2);
+    assert_eq!(status, CommandStatus::Applied);
+    assert!(locked.get(), "lifted policy locks again");
+}
+
+/// End to end over a bound hub: the hub's policy reaches its live
+/// sessions, the shell's `Lock` denies under it, and lifting the
+/// policy restores the lock and its stripped snapshot.
+#[test]
+fn hub_lockdown_policy_reaches_sessions_and_restores() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = two_window_model();
+    assert!(hub.lock_screen_allowed(), "hub starts at GNOME defaults");
+
+    let mut client = connect(&path);
+    hub.poll(&mut model);
+    client_write(&mut client, &hello());
+    hub.poll(&mut model);
+    assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+    assert_unlocked_with_titles(&client_read(&mut client));
+    // Drain the handshake overview intent (see the idle test above).
+    assert!(matches!(
+        client_read(&mut client),
+        Message::Overview { open: false }
+    ));
+
+    // Restrict: the hub pushes the policy onto the live session, and
+    // the shell's Lock denies.
+    hub.set_lockdown_policy(LockdownPolicy {
+        disable_lock_screen: true,
+        ..LockdownPolicy::default()
+    });
+    assert!(!hub.lock_screen_allowed());
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 1,
+            kind: CommandKind::Lock,
+        },
+    );
+    hub.poll(&mut model);
+    let Message::CommandResult { id, status } = client_read(&mut client) else {
+        panic!("expected CommandResult for denied Lock");
+    };
+    assert_eq!(id, 1);
+    assert!(
+        matches!(status, CommandStatus::Denied { .. }),
+        "got {status:?}"
+    );
+    assert!(!hub.is_locked(), "denied Lock flips no flag");
+
+    // Lift: Lock applies again and the next poll strips the snapshot.
+    hub.set_lockdown_policy(LockdownPolicy::default());
+    assert!(hub.lock_screen_allowed());
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 2,
+            kind: CommandKind::Lock,
+        },
+    );
+    hub.poll(&mut model);
+    let Message::CommandResult { id, status } = client_read(&mut client) else {
+        panic!("expected CommandResult for restored Lock");
+    };
+    assert_eq!(id, 2);
+    assert_eq!(status, CommandStatus::Applied);
+    assert!(hub.is_locked());
+    hub.poll(&mut model);
+    assert_locked_without_content(&client_read(&mut client));
 }
 
 /// The lock surface reuses the Overlay shape with an empty list: no
