@@ -9,7 +9,7 @@ showing node named NAME, as a screen-reader user would, then dumps.
 With --set, sets the value of the first showing node named NAME that
 has one (a slider), the way assistive technology moves it.
 
-Each node: role, name, depth, showing, and window-relative bounds.
+Each node: role, name, description, depth, showing, and window-relative bounds.
 Waits up to TIMEOUT_S for the app
 to register on the accessibility bus. Exit 1 if it never appears.
 """
@@ -35,6 +35,7 @@ def walk(acc, depth, out):
         out.append({
             "role": acc.getRoleName(),
             "name": acc.name or "",
+            "description": getattr(acc, "description", None) or "",
             "depth": depth,
             "showing": acc.getState().contains(pyatspi.STATE_SHOWING),
             "checked": acc.getState().contains(pyatspi.STATE_CHECKED)

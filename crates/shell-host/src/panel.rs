@@ -8533,6 +8533,8 @@ mod tests {
                 icon_pixmap: Vec::new(),
                 attention_name: String::new(),
                 attention_pixmap: Vec::new(),
+                tooltip_title: String::new(),
+                tooltip_body: String::new(),
             }
         }
 

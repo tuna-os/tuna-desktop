@@ -174,8 +174,9 @@
 #   G-APP-DRAG  dragging an app's header bar moves the window (#58)
 #   G-TILE-PREVIEW dragging a window to the left edge shows GNOME's tile
 #               preview over the left half; dragging back drops it
-#   G-TRAY      an AppIndicator item shows in the panel and its menu
-#               row reaches the item (P-TR-01)
+#   G-TRAY      an AppIndicator item shows in the panel with its
+#               tooltip, its menu row reaches the item, and the row
+#               leaves the panel when the item exits (P-TR-01)
 #   G-SWITCHER-GROUP Alt+Above_Tab shows an app's windows as thumbnails
 #               inside the output and steps through them; W closes the
 #               focused one
@@ -1070,7 +1071,8 @@ pass A11Y-QS "quick-settings toggles, slider, and lock exposed"
 xdotool key Escape
 sleep 1
 
-# Tray (P-TR-01): an item registers, shows, and its menu fires.
+# Tray (P-TR-01): an item registers, shows with its tooltip, its
+# menu fires, and its row leaves the panel when it exits.
 TRAY_MARKER="$ARTIFACTS/tray-marker"
 rm -f "$TRAY_MARKER"
 "$PY" "$ROOT/scripts/lib/tuna-tray-item-stub.py" "$TRAY_MARKER" >"$ARTIFACTS/tray.log" 2>&1 &
@@ -1083,6 +1085,10 @@ for _ in $(seq 1 20); do
 done
 showing "$ARTIFACTS/a11y-tray.json" "Tuna Desktop Tray Probe" ||
     fail G-TRAY "the registered item never showed in the panel"
+jq -e --arg n "Tuna Desktop Tray Probe" \
+    'any(.[]; .name == $n and .showing and ((.description // "") | contains("Tray probe tip")))' \
+    "$ARTIFACTS/a11y-tray.json" >/dev/null ||
+    fail G-TRAY "the item showed without its tooltip"
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-tray-menu.json" 20 \
     --press "Tuna Desktop Tray Probe" || fail G-TRAY "could not open the item"
 scrot "$ARTIFACTS/03b-tray-menu.png" >/dev/null
@@ -1092,7 +1098,15 @@ end=$(($(date +%s) + 10))
 until [ -s "$TRAY_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q "^clicked 1" "$TRAY_MARKER" 2>/dev/null || fail G-TRAY "the menu row never reached the item"
 kill "$TRAY_PID" 2>/dev/null || true
-pass G-TRAY "an AppIndicator item shows and its menu row reaches it"
+for _ in $(seq 1 30); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-tray-gone.json" 20 >/dev/null 2>&1
+    showing "$ARTIFACTS/a11y-tray-gone.json" "Tuna Desktop Tray Probe" || break
+    sleep 0.5
+done
+if showing "$ARTIFACTS/a11y-tray-gone.json" "Tuna Desktop Tray Probe"; then
+    fail G-TRAY "the item stayed in the panel after it exited"
+fi
+pass G-TRAY "an AppIndicator item shows with its tooltip, fires its menu, and leaves on exit"
 xdotool key Escape
 sleep 1
 
