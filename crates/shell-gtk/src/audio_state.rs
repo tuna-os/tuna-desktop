@@ -155,6 +155,7 @@ impl AudioState {
     /// never the camera's business.
     pub fn privacy_scan(&self, policy: &PrivacyPolicy) -> crate::privacy::PrivacyScan {
         let mut scan = crate::privacy::PrivacyScan {
+            audio_present: BTreeSet::new(),
             mute_required: BTreeSet::new(),
             destroy: Vec::new(),
             muted_now: BTreeSet::new(),
@@ -170,6 +171,7 @@ impl AudioState {
                 None
             };
             if let Some(required) = audio_required {
+                scan.audio_present.insert(id);
                 if node_muted(object) {
                     scan.muted_now.insert(id);
                 }
