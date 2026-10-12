@@ -23,6 +23,7 @@ mod folder_dialog;
 mod folders;
 mod group_animation;
 mod ibus_panel;
+mod kbd_a11y;
 mod keybindings;
 mod live_apps;
 mod lock;
@@ -2304,6 +2305,7 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.wm.preferences",
             "org.gnome.desktop.sound",
             "org.gnome.mutter",
+            kbd_a11y::SCHEMA,
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -2386,6 +2388,7 @@ fn build(app: &adw::Application) {
                     out.bell.event_sounds = sound.boolean("event-sounds");
                     out.bell.theme = sound.string("theme-name").to_string();
                 }
+                out.keyboard_aids = kbd_a11y::read(all[9].as_ref());
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }
@@ -2492,6 +2495,7 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    let kbd_a11y_dialog = kbd_a11y::KbdA11yDialog::new(app.upcast_ref());
     // Compositor state: drain the control socket every frame.
     {
         let shell = shell.clone();
@@ -2524,6 +2528,7 @@ fn build(app: &adw::Application) {
             let mut menus = Vec::new();
             let mut consent = None;
             let mut popups = Vec::new();
+            let mut aid_switches = Vec::new();
             if let Some(control) = shell.control.as_mut() {
                 loop {
                     match control.poll() {
@@ -2532,6 +2537,9 @@ fn build(app: &adw::Application) {
                         }
                         Ok(Handled::WindowMenu(request)) => menus.push(request),
                         Ok(Handled::ShortcutConsent(request)) => consent = Some(request),
+                        Ok(Handled::KeyboardAidToggled { aid, enabled }) => {
+                            aid_switches.push((aid, enabled));
+                        }
                         Ok(Handled::ScreenReader(state)) => {
                             if matches!(
                                 state,
@@ -2599,6 +2607,12 @@ fn build(app: &adw::Application) {
             }
             for (index, count) in popups {
                 workspace_popup.display(index, count);
+            }
+            for (aid, enabled) in aid_switches {
+                kbd_a11y_dialog.switched(aid, enabled, locked);
+            }
+            if locked {
+                kbd_a11y_dialog.dismiss();
             }
             for (id, applied) in results {
                 lock_ui.command_result(id, applied);

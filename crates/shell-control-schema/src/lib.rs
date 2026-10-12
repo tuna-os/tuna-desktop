@@ -31,9 +31,9 @@ pub const MAX_TITLE_LEN: usize = 512;
 pub mod layer_namespaces;
 pub use layer_namespaces::{
     BANNER_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE,
-    GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, NETWORK_AGENT_NAMESPACE,
-    OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
-    SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
+    GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE,
+    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE, POLKIT_NAMESPACE,
+    PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
     SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
 };
 
@@ -162,9 +162,10 @@ impl ProtocolVersion {
     /// `0.30` appends live sound/bell and attached-modal brightness preferences.
     /// `0.31` appends workspace and edge-tiling preferences.
     /// `0.32` appends trusted dash icon targets for minimize/restore.
+    /// `0.34` appends keyboard accessibility aids and toggle notifications.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 32,
+        minor: 34,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -744,6 +745,19 @@ pub enum Message {
     PointerOutput { name: Option<String> },
     /// Actual compositor-owned Screen Reader child status.
     ScreenReader { state: ScreenReaderState },
+    /// A keyboard shortcut (Shift five times, Shift held eight seconds,
+    /// two modifiers at once) switched an aid; the shell saves the
+    /// setting and confirms it as GNOME does.
+    KeyboardAidToggled { aid: KeyboardAid, enabled: bool },
+}
+
+/// The keyboard aids GNOME lets the keyboard itself switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyboardAid {
+    /// `stickykeys-enable`.
+    StickyKeys,
+    /// `slowkeys-enable`.
+    SlowKeys,
 }
 
 /// GNOME's dynamic workspace count: one empty workspace always follows
@@ -854,6 +868,67 @@ pub struct InputSettings {
     /// UNION: this field addition needs the Wave2 minor version bump.
     #[serde(default)]
     pub orientation_lock: bool,
+    /// GNOME keyboard accessibility input aids.
+    #[serde(default)]
+    pub keyboard_aids: KeyboardAids,
+}
+
+/// GNOME's `org.gnome.desktop.a11y.keyboard`, flattened for the
+/// compositor's input pipeline. Delays are milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyboardAids {
+    /// `enable`: the keyboard may switch Sticky and Slow Keys.
+    pub shortcuts: bool,
+    /// `feature-state-change-beep`.
+    pub feature_beep: bool,
+    /// `stickykeys-enable`, `stickykeys-two-key-off`, `stickykeys-modifier-beep`.
+    pub sticky: bool,
+    pub sticky_two_key_off: bool,
+    pub sticky_beep: bool,
+    /// `slowkeys-enable`, `slowkeys-delay` and its three beeps.
+    pub slow: bool,
+    pub slow_delay_ms: u32,
+    pub slow_beep_press: bool,
+    pub slow_beep_accept: bool,
+    pub slow_beep_reject: bool,
+    /// `bouncekeys-enable`, `bouncekeys-delay`, `bouncekeys-beep-reject`.
+    pub bounce: bool,
+    pub bounce_delay_ms: u32,
+    pub bounce_beep_reject: bool,
+    /// `togglekeys-enable`.
+    pub toggle_beep: bool,
+    /// `mousekeys-enable`, `mousekeys-max-speed` (pixels per second),
+    /// `mousekeys-accel-time` and `mousekeys-init-delay`.
+    pub mouse: bool,
+    pub mouse_max_speed: u32,
+    pub mouse_accel_ms: u32,
+    pub mouse_init_delay_ms: u32,
+}
+
+impl Default for KeyboardAids {
+    /// GNOME 51's defaults: every aid off.
+    fn default() -> Self {
+        Self {
+            shortcuts: false,
+            feature_beep: false,
+            sticky: false,
+            sticky_two_key_off: false,
+            sticky_beep: false,
+            slow: false,
+            slow_delay_ms: 300,
+            slow_beep_press: false,
+            slow_beep_accept: false,
+            slow_beep_reject: false,
+            bounce: false,
+            bounce_delay_ms: 300,
+            bounce_beep_reject: false,
+            toggle_beep: false,
+            mouse: false,
+            mouse_max_speed: 10,
+            mouse_accel_ms: 300,
+            mouse_init_delay_ms: 300,
+        }
+    }
 }
 
 fn default_attach_modal_dialogs() -> bool {
@@ -888,6 +963,7 @@ impl Default for InputSettings {
             workspace_policy: WorkspacePolicy::default(),
             // GNOME default: convertibles auto-rotate out of the box.
             orientation_lock: false,
+            keyboard_aids: KeyboardAids::default(),
         }
     }
 }
@@ -1282,6 +1358,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::WorkspacePopup { .. }
         | Message::PointerOutput { .. }
         | Message::ScreenReader { .. }
+        | Message::KeyboardAidToggled { .. }
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }
         | Message::CommandResult { .. }
@@ -1414,8 +1491,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_32() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 32));
+    fn current_version_is_0_34() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 34));
     }
 
     #[test]
@@ -1552,6 +1629,34 @@ mod tests {
                     ..InputSettings::default()
                 }),
             });
+        }
+    }
+
+    #[test]
+    fn keyboard_aids_survive_the_positional_control_wire() {
+        roundtrip(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(InputSettings {
+                keyboard_aids: KeyboardAids {
+                    shortcuts: true,
+                    sticky: true,
+                    sticky_two_key_off: true,
+                    slow: true,
+                    slow_delay_ms: 450,
+                    bounce: true,
+                    bounce_delay_ms: 120,
+                    mouse: true,
+                    mouse_max_speed: 900,
+                    ..KeyboardAids::default()
+                },
+                right_to_left: true,
+                ..InputSettings::default()
+            }),
+        });
+        for aid in [KeyboardAid::StickyKeys, KeyboardAid::SlowKeys] {
+            for enabled in [false, true] {
+                roundtrip(&Message::KeyboardAidToggled { aid, enabled });
+            }
         }
     }
 

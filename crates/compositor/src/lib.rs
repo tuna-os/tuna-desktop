@@ -60,6 +60,7 @@ pub mod frame_timing;
 pub mod idle_monitor;
 mod idle_schedule;
 pub mod ime;
+pub mod input_aids;
 pub mod introspect;
 pub mod layer;
 pub mod lock;

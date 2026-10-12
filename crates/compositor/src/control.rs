@@ -805,6 +805,7 @@ impl<'a> Session<'a> {
             | Message::WorkspacePopup { .. }
             | Message::PointerOutput { .. }
             | Message::ScreenReader { .. }
+            | Message::KeyboardAidToggled { .. }
             | Message::ShortcutConsent { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
@@ -850,6 +851,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ScreenReader { .. } => "ScreenReader",
+        Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
     }
 }
 
