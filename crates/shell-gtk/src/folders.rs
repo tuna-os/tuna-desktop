@@ -418,43 +418,233 @@ pub fn rename(id: &str, name: &str) {
     gio::Settings::sync();
 }
 
-/// The user's folders from GSettings (none when the schema is missing).
-pub fn load() -> Vec<Folder> {
-    let Some(source) = gio::SettingsSchemaSource::default() else {
-        return Vec::new();
-    };
-    if source.lookup(SCHEMA, true).is_none() || source.lookup(FOLDER_SCHEMA, true).is_none() {
-        return Vec::new();
+/// Retained settings instances subscribe before reading each key. A short-lived
+/// reader can otherwise observe the backend cache before its change dispatch.
+/// Callbacks only mark a cell; the existing UI poll owns graph reconciliation.
+pub struct FolderWatch {
+    root: Option<gio::Settings>,
+    backend: Option<gio::SettingsBackend>,
+    children: std::cell::RefCell<std::collections::BTreeMap<String, gio::Settings>>,
+    dirty: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl Default for FolderWatch {
+    fn default() -> Self {
+        Self::new()
     }
-    let root = gio::Settings::new(SCHEMA);
-    root.strv("folder-children")
-        .iter()
-        .map(|id| {
-            let path = format!("/org/gnome/desktop/app-folders/folders/{id}/");
-            let s = gio::Settings::with_path(FOLDER_SCHEMA, &path);
-            let list = |key: &str| s.strv(key).iter().map(|v| v.to_string()).collect();
-            let raw = s.string("name").to_string();
-            let name = if s.boolean("translate") {
-                directory_name(&raw)
-            } else if raw.is_empty() {
-                id.to_string()
-            } else {
-                raw
-            };
-            Folder {
-                id: id.to_string(),
-                name,
-                apps: list("apps"),
-                categories: list("categories"),
-                excluded: list("excluded-apps"),
+}
+
+impl FolderWatch {
+    pub fn new() -> Self {
+        Self::with_backend(None)
+    }
+
+    fn with_backend(backend: Option<gio::SettingsBackend>) -> Self {
+        let dirty = std::rc::Rc::new(std::cell::Cell::new(false));
+        let root = schemas_present().then(|| {
+            let schema = gio::SettingsSchemaSource::default()
+                .unwrap()
+                .lookup(SCHEMA, true)
+                .unwrap();
+            gio::Settings::new_full(&schema, backend.as_ref(), None)
+        });
+        if let Some(root) = &root {
+            let weak = std::rc::Rc::downgrade(&dirty);
+            root.connect_changed(Some("folder-children"), move |_, _| {
+                if let Some(dirty) = weak.upgrade() {
+                    dirty.set(true);
+                }
+            });
+        }
+        let watch = Self {
+            root,
+            backend,
+            children: Default::default(),
+            dirty,
+        };
+        watch.reconcile();
+        watch
+    }
+
+    /// Refresh subscriptions even while the overview is closed or dragging.
+    pub fn reconcile(&self) {
+        let Some(root) = &self.root else { return };
+        let ids = root.strv("folder-children");
+        let mut children = self.children.borrow_mut();
+        children.retain(|id, _| ids.iter().any(|v| v.as_str() == id));
+        for id in ids.iter() {
+            // A relocatable path component must not escape the folder tree.
+            if id.is_empty() || id.contains('/') || children.contains_key(id.as_str()) {
+                continue;
             }
-        })
-        .collect()
+            let schema = gio::SettingsSchemaSource::default()
+                .unwrap()
+                .lookup(FOLDER_SCHEMA, true)
+                .unwrap();
+            let path = format!("/org/gnome/desktop/app-folders/folders/{id}/");
+            let settings = gio::Settings::new_full(&schema, self.backend.as_ref(), Some(&path));
+            let weak = std::rc::Rc::downgrade(&self.dirty);
+            settings.connect_changed(None, move |_, _| {
+                if let Some(dirty) = weak.upgrade() {
+                    dirty.set(true);
+                }
+            });
+            // GSettings emits changed only for keys read after connecting.
+            let _ = read_folder(id, &settings);
+            children.insert(id.to_string(), settings);
+        }
+    }
+
+    pub fn take_dirty_if(&self, open: bool, dragging: bool) -> bool {
+        open && !dragging && self.take_dirty()
+    }
+
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.replace(false)
+    }
+
+    pub fn load(&self) -> Vec<Folder> {
+        self.reconcile();
+        self.children
+            .borrow()
+            .iter()
+            .map(|(id, s)| read_folder(id, s))
+            .collect()
+    }
+}
+
+fn read_folder(id: &str, s: &gio::Settings) -> Folder {
+    let list = |key: &str| s.strv(key).iter().map(|v| v.to_string()).collect();
+    let raw = s.string("name").to_string();
+    let name = if s.boolean("translate") {
+        directory_name(&raw)
+    } else if raw.is_empty() {
+        id.to_owned()
+    } else {
+        raw
+    };
+    Folder {
+        id: id.to_owned(),
+        name,
+        apps: list("apps"),
+        categories: list("categories"),
+        excluded: list("excluded-apps"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dispatch_until(context: &glib::MainContext, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if ready() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder change not dispatched"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn closed_and_dragging_preserve_folder_refresh_until_ready() {
+        let watch = FolderWatch {
+            root: None,
+            backend: None,
+            children: Default::default(),
+            dirty: std::rc::Rc::new(std::cell::Cell::new(true)),
+        };
+        assert!(!watch.take_dirty_if(false, false));
+        assert!(!watch.take_dirty_if(true, true));
+        assert!(watch.take_dirty_if(true, false));
+        assert!(!watch.take_dirty_if(true, false));
+        assert!(watch.load().is_empty(), "missing schemas remain graceful");
+    }
+
+    #[test]
+    fn retained_folder_watch_memory_changes_and_subscription_removal() {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                assert!(
+                    schemas_present(),
+                    "folder schemas required for actual Gio regression"
+                );
+                let backend = gio::memory_settings_backend_new();
+                let watch = FolderWatch::with_backend(Some(backend.clone()));
+                let source = gio::SettingsSchemaSource::default().unwrap();
+                let root = gio::Settings::new_full(
+                    &source.lookup(SCHEMA, true).unwrap(),
+                    Some(&backend),
+                    None,
+                );
+                let child = gio::Settings::new_full(
+                    &source.lookup(FOLDER_SCHEMA, true).unwrap(),
+                    Some(&backend),
+                    Some("/org/gnome/desktop/app-folders/folders/Live/"),
+                );
+                assert!(watch.load().is_empty());
+                root.set_strv("folder-children", ["Live"]).unwrap();
+                dispatch_until(&context, || watch.dirty.get());
+                watch.reconcile();
+                watch.take_dirty();
+                child.set_string("name", "Changed").unwrap();
+                child.set_strv("apps", ["one.desktop"]).unwrap();
+                child.set_strv("categories", ["Utility"]).unwrap();
+                child.set_strv("excluded-apps", ["two.desktop"]).unwrap();
+                child.set_boolean("translate", false).unwrap();
+                dispatch_until(&context, || watch.dirty.get());
+                let folders = watch.load();
+                assert_eq!(folders[0].name, "Changed");
+                assert_eq!(folders[0].apps, ["one.desktop"]);
+                assert_eq!(folders[0].categories, ["Utility"]);
+                assert_eq!(folders[0].excluded, ["two.desktop"]);
+                root.set_strv("folder-children", [] as [&str; 0]).unwrap();
+                dispatch_until(&context, || watch.load().is_empty());
+                watch.take_dirty();
+                child.set_string("name", "Removed child").unwrap();
+                while context.pending() {
+                    context.iteration(false);
+                }
+                assert!(!watch.take_dirty(), "removed child must no longer notify");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn retained_folder_watch_keyfile_external_atomic_write() {
+        let context = glib::MainContext::new();
+        let dir =
+            std::env::temp_dir().join(format!("tuna-folder-watch-{}", glib::uuid_string_random()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings");
+        context.with_thread_default(|| {
+            assert!(schemas_present(), "folder schemas required for actual Gio regression");
+            let backend = gio::keyfile_settings_backend_new(path.to_str().unwrap(), "/", None);
+            let watch = FolderWatch::with_backend(Some(backend));
+            assert!(watch.load().is_empty());
+            let replacement = dir.join("replacement");
+            std::fs::write(&replacement, "[org/gnome/desktop/app-folders]\nfolder-children=['Live']\n[org/gnome/desktop/app-folders/folders/Live]\nname='External'\napps=['one.desktop']\n").unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+            dispatch_until(&context, || watch.dirty.get());
+            assert_eq!(watch.load()[0].name, "External");
+            watch.take_dirty();
+            std::fs::write(&replacement, "[org/gnome/desktop/app-folders]\nfolder-children=['Live']\n[org/gnome/desktop/app-folders/folders/Live]\nname='Renamed'\napps=['two.desktop']\n").unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+            dispatch_until(&context, || watch.dirty.get());
+            let folders = watch.load();
+            assert_eq!(folders[0].name, "Renamed");
+            assert_eq!(folders[0].apps, ["two.desktop"]);
+        }).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn folder_lists_change_like_gnome() {

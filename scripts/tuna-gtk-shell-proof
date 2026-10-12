@@ -1990,6 +1990,26 @@ showing "$ARTIFACTS/a11y-folders.json" "Probe Tools" ||
 if showing "$ARTIFACTS/a11y-folders.json" "Tuna Probe"; then
     fail G-APP-FOLDERS "a foldered app still shows loose in the grid"
 fi
+# Mutate root and child settings while the same app grid remains open.
+folder_watch_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)"
+case "$folder_watch_pid" in *[!0-9]*|'') fail G-APP-FOLDERS "GTK child PID is not unique" ;; esac
+folder_watch_observe() {
+    "$PY" "$ROOT/scripts/lib/gtk-folder-watch-proof.py" --pid "$folder_watch_pid" \
+        --parent "$COMPOSITOR_PID" --binary "$privacy_expected_shell" \
+        --output "$ARTIFACTS/folder-watch-$1.json" --present "$2" --absent "$3" || \
+        fail G-APP-FOLDERS "live settings change did not update the owned grid: $1"
+}
+gsettings set "$FOLDER" name 'Probe Tools Live'
+folder_watch_observe rename 'Probe Tools Live' 'Probe Tools'
+gsettings set "$FOLDER" apps "[]"
+folder_watch_observe child-remove 'Tuna Probe' 'Probe Tools Live'
+gsettings set "$FOLDER" apps "['tuna-probe.desktop']"
+folder_watch_observe child-readd 'Probe Tools Live' 'Tuna Probe'
+gsettings set org.gnome.desktop.app-folders folder-children "[]"
+folder_watch_observe remove 'Tuna Probe' 'Probe Tools Live'
+gsettings set "$FOLDER" name 'Probe Tools'
+gsettings set org.gnome.desktop.app-folders folder-children "['ProbeTools']"
+folder_watch_observe readd 'Probe Tools' 'Tuna Probe'
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-open.json" 20 --press "Probe Tools" ||
     fail G-APP-FOLDERS "could not open the folder"
 scrot "$ARTIFACTS/11b-app-folder.png" >/dev/null
