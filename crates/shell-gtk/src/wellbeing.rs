@@ -2839,9 +2839,12 @@ mod tests {
                 dismissals.borrow_mut().push(id);
                 true
             }),
-            on_notice_action: Rc::new(move |id, key, handler| {
-                registered.borrow_mut().push((id, key.clone()));
-                callbacks.borrow_mut().insert((id, key), handler);
+            on_notice_action: Rc::new({
+                let callbacks = callbacks.clone();
+                move |id, key, handler| {
+                    registered.borrow_mut().push((id, key.clone()));
+                    callbacks.borrow_mut().insert((id, key), handler);
+                }
             }),
             drop_notice_actions: {
                 let callbacks = callbacks.clone();
