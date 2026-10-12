@@ -390,6 +390,38 @@ jobs:
           assert result.returncode == 0, 'notification lifecycle proof failed'
           assert 'running 1 test' in output_text and '1 passed; 0 failed; 0 ignored;' in output_text, 'expected lifecycle test did not execute'
           PY
+      - name: Prove real GTK countdown OSD ownership and cancellation
+        run: |
+          /usr/bin/python3 - <<'PY'
+          import hashlib, json, os, pathlib, signal, subprocess
+          admission = json.loads(pathlib.Path('gtk-shell-artifacts/a11y/bin/build-admission.json').read_text())
+          expected = {'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'cargo_lock_sha256': hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest(), 'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT']}
+          if any(admission.get(key) != value for key, value in expected.items()):
+              raise RuntimeError('countdown proof requires this source, lock, run and attempt')
+          binary = pathlib.Path(admission['admitted_executable']).resolve()
+          if admission['executable_sha256'] != hashlib.sha256(binary.read_bytes()).hexdigest():
+              raise RuntimeError('countdown proof executable differs from Cargo admission')
+          artifacts = pathlib.Path('gtk-shell-artifacts/countdown')
+          artifacts.mkdir(parents=True, exist_ok=False)
+          argv = ['env', '-u', 'WAYLAND_DISPLAY', '-u', 'WAYLAND_SOCKET', 'dbus-run-session', '--', 'xvfb-run', '-a', 'env', 'GDK_BACKEND=x11', 'TUNA_REQUIRE_COUNTDOWN_OSD=1', str(binary), 'osd::gtk_countdown_tests::actual_gtk_stop_countdown_preserves_newer_osd_and_timers', '--exact', '--ignored', '--test-threads=1', '--nocapture']
+          with (artifacts / 'output.txt').open('w') as output:
+              child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+              try:
+                  exit_status = child.wait(timeout=30)
+              except subprocess.TimeoutExpired:
+                  exit_status = 124
+                  os.killpg(child.pid, signal.SIGTERM)
+                  try:
+                      child.wait(timeout=3)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(child.pid, signal.SIGKILL)
+                      child.wait(timeout=3)
+          text = (artifacts / 'output.txt').read_text()
+          unchanged = admission['executable_sha256'] == hashlib.sha256(binary.read_bytes()).hexdigest()
+          (artifacts / 'receipt.json').write_text(json.dumps({'build_admission': admission, 'argv': argv, 'exit_status': exit_status, 'executable_unchanged_after': unchanged, 'output_sha256': hashlib.sha256((artifacts / 'output.txt').read_bytes()).hexdigest(), 'scope': 'actual GTK production countdown hooks, widget visibility and GLib timers under private X11; Wayland layer-shell and installed DRM qualification pending'}, indent=2) + '\n')
+          if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or 'COUNTDOWN-OSD pass ' not in text:
+              raise RuntimeError('actual admitted countdown OSD test did not pass')
+          PY
       # pam_wrapper backs G-UNLOCK, IBus G-IME and wayland-utils
       # G-WAYLAND-INFO; all required so no stage can silently skip.
       - run: python3 scripts/lib/cursor-proof-theme-tests.py
