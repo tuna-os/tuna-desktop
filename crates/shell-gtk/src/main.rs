@@ -1510,15 +1510,10 @@ fn build(app: &adw::Application) {
         /// schema lands, the pair is logged as a diagnostic so the wiring
         /// (change detection + atomic sends + initial false/false) is
         /// reviewable without inventing wire bytes.
-        fn send_wellbeing_effects(grayscale: bool, fade: bool) {
-            eprintln!(
-                "tuna-shell-gtk: wellbeing: effects grayscale={grayscale} fade={fade} (0.35 send pending)"
-            );
-        }
-
         let notices = notify.clone();
         let countdown_osd = osd_ui.clone();
         let lock_shell = shell.clone();
+        let effect_shell = shell.clone();
         let action_notices = notify.clone();
         let dismiss_notices = notify.clone();
         let register_notices = notify.clone();
@@ -1553,8 +1548,19 @@ fn build(app: &adw::Application) {
                 break_action: Rc::new(move |kind: wellbeing::BreakActionKind| {
                     break_push.borrow_mut().push(kind);
                 }),
+                // Production 0.35 send: both bools go atomically on every
+                // changed EffectState (plus the initial false/false at
+                // startup) via the same control-client pattern as lock.
+                // Requires the reconciled schema variant
+                // `CommandKind::SetWellbeingEffects { grayscale, fade }`
+                // and `ControlClient::set_wellbeing_effects`; this
+                // commit is picked into the tree that carries both.
                 effect_hook: Rc::new(move |grayscale: bool, fade: bool| {
-                    send_wellbeing_effects(grayscale, fade);
+                    if let Some(control) = effect_shell.borrow_mut().control.as_mut() {
+                        if let Err(e) = control.set_wellbeing_effects(grayscale, fade) {
+                            eprintln!("tuna-shell-gtk: wellbeing: effects send failed: {e}");
+                        }
+                    }
                 }),
                 show_countdown: Rc::new(move |label: String, progress: f64| {
                     eprintln!("tuna-shell-gtk: wellbeing: countdown {label}");
