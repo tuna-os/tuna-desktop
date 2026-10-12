@@ -316,7 +316,7 @@ jobs:
         run: |
           cargo test -p tuna-shell-gtk --bin tuna-shell-gtk --no-run --message-format=json > "$RUNNER_TEMP/tuna-gtk-a11y-build.json"
           python3 - <<'PY'
-          import json, os, pathlib, shutil
+          import hashlib, json, os, pathlib, shutil, subprocess
           messages = [json.loads(line) for line in pathlib.Path(os.environ['RUNNER_TEMP'], 'tuna-gtk-a11y-build.json').read_text().splitlines()]
           binaries = [m['executable'] for m in messages if m.get('reason') == 'compiler-artifact' and m.get('profile', {}).get('test') and m.get('target', {}).get('name') == 'tuna-shell-gtk' and m.get('executable')]
           if len(binaries) != 1:
@@ -324,8 +324,39 @@ jobs:
           destination = pathlib.Path('gtk-shell-artifacts/a11y/bin/gtk-tests')
           destination.parent.mkdir(parents=True, exist_ok=True)
           shutil.copy2(binaries[0], destination)
+          receipt = destination.parent / 'build-admission.json'
+          receipt.write_text(json.dumps({
+              'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'cargo_lock_sha256': hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest(),
+              'cargo_executable': binaries[0],
+              'admitted_executable': str(destination),
+              'executable_sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+          }, indent=2) + '\n')
           PY
           scripts/tuna-gtk-accessibility-proof gtk-shell-artifacts/a11y/bin/gtk-tests "$(git rev-parse HEAD)" gtk-shell-artifacts/a11y
+      - name: Prove real GTK notification action retirement
+        run: |
+          /usr/bin/python3 scripts/tests/test_notify_callback_contract.py
+          /usr/bin/python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess
+          admission = json.loads(pathlib.Path('gtk-shell-artifacts/a11y/bin/build-admission.json').read_text())
+          assert admission['source_commit'] == subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert admission['cargo_lock_sha256'] == hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest()
+          binary = pathlib.Path(admission['admitted_executable']).resolve()
+          assert admission['executable_sha256'] == hashlib.sha256(binary.read_bytes()).hexdigest()
+          artifacts = pathlib.Path('gtk-shell-artifacts/notify')
+          artifacts.mkdir(parents=True, exist_ok=False)
+          argv = ['env', '-u', 'WAYLAND_DISPLAY', '-u', 'WAYLAND_SOCKET', 'dbus-run-session', '--', 'xvfb-run', '-a', 'env', 'GDK_BACKEND=x11', 'TUNA_REQUIRE_NOTIFY_UI=1', str(binary), 'notify::gtk_action_lifecycle_tests::actual_gtk_captured_actions_obey_resident_lifecycle', '--exact', '--ignored', '--test-threads=1', '--nocapture']
+          with (artifacts / 'output.txt').open('w') as output:
+              result = subprocess.run(argv, stdout=output, stderr=subprocess.STDOUT, check=False)
+          (artifacts / 'receipt.json').write_text(json.dumps({'build_admission': admission, 'argv': argv, 'exit_status': result.returncode, 'scope': 'real GTK callbacks and in-memory native notification center; installed pointer/layer-shell qualification pending'}, indent=2) + '\n')
+          output_text = (artifacts / 'output.txt').read_text()
+          print(output_text)
+          assert result.returncode == 0, 'notification lifecycle proof failed'
+          assert 'running 1 test' in output_text and '1 passed; 0 failed; 0 ignored;' in output_text, 'expected lifecycle test did not execute'
+          PY
       # pam_wrapper backs G-UNLOCK, IBus G-IME and wayland-utils
       # G-WAYLAND-INFO; all required so no stage can silently skip.
       - run: python3 scripts/lib/cursor-proof-theme-tests.py
