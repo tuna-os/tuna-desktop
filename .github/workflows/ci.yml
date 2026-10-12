@@ -298,6 +298,16 @@ jobs:
           name: native-minimize-proof
           path: ${{ runner.temp }}/native-minimize/
           retention-days: 14
+      - name: Check wellbeing proof admission
+        run: /usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
+      - name: Prove live wellbeing framebuffer and screenshot pixels
+        run: dbus-run-session -- /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-wellbeing-proof
+          path: ${{ runner.temp }}/native-wellbeing/
+          retention-days: 14
       - name: Bound native privacy executor proof
         run: cargo test -p tuna-shell-gtk --bin tuna-shell-gtk privacy::tests::live_pw::live_native_executor_mutes_restores_and_refuses_wrong_identity -- --exact --nocapture
         env:

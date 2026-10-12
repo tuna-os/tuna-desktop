@@ -10,7 +10,7 @@ if [[ -n $(git status --porcelain) ]]; then
   exit 2
 fi
 mkdir -p "$art"
-cargo build --locked -p tuna-compositor -p tuna-shell-gtk --bins --example tuna-modal-dim-client --message-format=json > "$art/build.json"
+cargo build --locked -p tuna-compositor -p tuna-shell-gtk --bins --example tuna-modal-dim-client --example tuna-wellbeing-proof-shell --message-format=json > "$art/build.json"
 python3 - "$root" "$art" <<'PY'
 import hashlib
 import json
