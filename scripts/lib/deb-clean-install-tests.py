@@ -61,6 +61,19 @@ sys.exit(int(os.environ['ENGINE_FAILURE']))
         self.assertIn('"$path" --version', body)
         self.assertNotIn('-dev', body)
 
+    def test_native_audio_runtime_is_a_hard_dependency_and_checked_without_recommends(self):
+        release = SCRIPT.with_name('tuna-release').read_text()
+        depends = next(line for line in release.splitlines() if line.startswith('Depends: '))
+        for package in ('gnome-session-canberra', 'libcanberra-pulse', 'sound-theme-freedesktop'):
+            self.assertIn(package, depends.split(': ', 1)[1].split(', '))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(self.log.read_text())[-1]
+        self.assertIn('command -v canberra-gtk-play', body)
+        self.assertIn('dpkg-query -L libcanberra-pulse', body)
+        self.assertIn('for event in bell audio-volume-change', body)
+        self.assertIn('/usr/share/sounds/freedesktop/stereo/$event.oga', body)
+
     def test_non_root_archive_never_reaches_container(self):
         self.env['BAD_OWNER'] = '1'
         result = self.run_check()
