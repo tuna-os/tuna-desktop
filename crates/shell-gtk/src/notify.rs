@@ -197,6 +197,14 @@ impl ActionDispatch {
         self.live.remove(&id);
     }
 
+    /// Release callbacks whose center entries were removed or history-pruned.
+    /// Banner absence is not removal: dismissed history still belongs to the center.
+    fn retain_history(&mut self, center: &NotificationCenter) {
+        let present: HashSet<u64> = center.history().iter().map(|n| n.id).collect();
+        self.handlers.retain(|(id, _), _| present.contains(id));
+        self.live.retain(|id| present.contains(id));
+    }
+
     /// Run one registered callback, then retire the whole resident so no
     /// sibling key can fire afterwards. False when unadmitted: unknown
     /// ids, retired residents, and unregistered keys never fire.
@@ -622,6 +630,10 @@ impl NotifyUi {
         let Ok(center) = self.center.lock() else {
             return;
         };
+        // Reconcile even when the visible view is unchanged. The center can
+        // remove/prune entries independently of this UI; stale widgets may
+        // still exist, but their local callbacks must no longer own state.
+        self.local_actions.borrow_mut().retain_history(&center);
         let groups = group_ids(center.history().iter().rev().map(|n| (n.id, group_key(n))));
         // A group that falls back to one card (or goes) forgets it was
         // expanded.
@@ -911,6 +923,62 @@ mod action_dispatch_tests {
     }
 
     #[test]
+    fn removed_history_releases_callbacks_without_invocation() {
+        let mut center = NotificationCenter::new();
+        let old = center.notify("old", "old", "", vec![], Urgency::Normal, None);
+        let other = center.notify("other", "other", "", vec![], Urgency::Normal, None);
+        let fired = Rc::new(Cell::new(false));
+        let weak = Rc::downgrade(&fired);
+        let mut dispatch = ActionDispatch::default();
+        dispatch.register(old, "take", counting(&fired));
+        dispatch.register(other, "take", Rc::new(|| {}));
+        drop(fired);
+        center.dismiss(old).unwrap();
+        dispatch.retain_history(&center);
+        assert!(
+            weak.upgrade().is_some(),
+            "banner absence must not mean history removal"
+        );
+        assert!(dispatch.live.contains(&old));
+        assert!(
+            !weak.upgrade().unwrap().get(),
+            "reconciliation must not invoke"
+        );
+        center.remove(old);
+        dispatch.retain_history(&center);
+        assert!(
+            weak.upgrade().is_none(),
+            "removed callback must release captured state"
+        );
+        assert!(!dispatch.live.contains(&old));
+        assert_eq!(dispatch.handlers.len(), 1);
+        assert!(!dispatch.dispatch(old, "take"));
+        center.clear_history();
+        dispatch.retain_history(&center);
+        assert!(dispatch.handlers.is_empty() && dispatch.live.is_empty());
+    }
+
+    #[test]
+    fn bounded_history_pruning_retires_only_missing_ids() {
+        let mut center = NotificationCenter::new();
+        let old = center.notify("old", "old", "", vec![], Urgency::Normal, None);
+        let fired = Rc::new(Cell::new(false));
+        let mut dispatch = ActionDispatch::default();
+        dispatch.register(old, "take", counting(&fired));
+        let mut last = old;
+        for _ in 0..tuna_shell_host::notifications::MAX_HISTORY {
+            last = center.notify("new", "new", "", vec![], Urgency::Normal, None);
+        }
+        dispatch.register(last, "take", counting(&fired));
+        dispatch.retain_history(&center);
+        assert!(!dispatch.live.contains(&old));
+        assert_eq!(dispatch.handlers.len(), 1);
+        assert!(!dispatch.dispatch(old, "take"));
+        assert!(!fired.get());
+        assert!(dispatch.live.contains(&last));
+    }
+
+    #[test]
     fn registered_keys_fire_and_unknown_keys_do_not() {
         let mut dispatch = ActionDispatch::default();
         let fired = Rc::new(Cell::new(false));
@@ -1125,9 +1193,13 @@ mod gtk_action_lifecycle_tests {
             "replacement",
             "timeout",
             "history-close",
+            "center-remove",
             "clear",
         ] {
             let (id, take, delay, fired) = post(&ui);
+            ui.refresh(); // Unchanged visible state must preserve admitted actions.
+            assert_eq!(ui.local_actions.borrow().handlers.len(), 2);
+            assert!(ui.local_actions.borrow().live.contains(&id));
             match terminal {
                 "user-close" => button(&ui.banner_box, "close").emit_clicked(),
                 "dismiss" => assert!(ui.dismiss_notification(id)),
@@ -1149,9 +1221,26 @@ mod gtk_action_lifecycle_tests {
                     assert!(!center.lock().unwrap().banners().iter().any(|n| n.id == id));
                 }
                 "history-close" => button(&ui.list, "close").emit_clicked(),
+                "center-remove" => {
+                    center.lock().unwrap().remove(id);
+                    ui.refresh();
+                }
                 "clear" => ui.clear.emit_clicked(),
                 _ => unreachable!(),
             }
+            assert!(
+                ui.local_actions.borrow().handlers.is_empty(),
+                "unused callbacks after {terminal}"
+            );
+            assert!(
+                ui.local_actions.borrow().live.is_empty(),
+                "unused admission after {terminal}"
+            );
+            assert_eq!(
+                Rc::strong_count(&fired),
+                1,
+                "callback capture not released after {terminal}"
+            );
             take.emit_clicked();
             delay.emit_clicked();
             assert_eq!(
@@ -1159,7 +1248,7 @@ mod gtk_action_lifecycle_tests {
                 0,
                 "captured old callbacks fired after {terminal}"
             );
-            if matches!(terminal, "clear" | "history-close") {
+            if matches!(terminal, "clear" | "history-close" | "center-remove") {
                 assert!(ui.bus.borrow().invoke_action(id as u32, "take").is_err());
             } else {
                 assert!(center.lock().unwrap().history().iter().any(|n| n.id == id));
