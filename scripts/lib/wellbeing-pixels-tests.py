@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 import importlib.util
+import sys
+
+# Helper imports must preserve the admitted source tree throughout the proof.
+sys.dont_write_bytecode = True
 from pathlib import Path
 import unittest
 from PIL import Image

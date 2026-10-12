@@ -15,7 +15,8 @@ class SourceCleanImports(unittest.TestCase):
             root = Path(scratch) / 'source'
             root.mkdir()
             for name in ['scripts/tuna-wellbeing-proof', 'scripts/lib/wellbeing-bundle.py',
-                         'scripts/lib/wellbeing-pixels.py', 'scripts/tests/test_wellbeing_bundle.py']:
+                         'scripts/lib/wellbeing-pixels.py', 'scripts/lib/wellbeing-pixels-tests.py',
+                         'scripts/tests/test_wellbeing_bundle.py']:
                 target = root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, target)
@@ -42,9 +43,13 @@ class SourceCleanImports(unittest.TestCase):
         self.check_import('scripts/tuna-wellbeing-proof')
 
     def test_unprotected_import_is_rejected_even_with_developer_global_ignores(self):
-        for entry in ['scripts/tuna-wellbeing-proof', 'scripts/tests/test_wellbeing_bundle.py']:
+        for entry in ['scripts/tuna-wellbeing-proof', 'scripts/tests/test_wellbeing_bundle.py',
+                      'scripts/lib/wellbeing-pixels-tests.py']:
             with self.subTest(entry=entry), self.assertRaisesRegex(AssertionError, 'actual import'):
                 self.check_import(entry, remove_guard=True)
+
+    def test_later_pixel_test_import_keeps_source_clean(self):
+        self.check_import('scripts/lib/wellbeing-pixels-tests.py')
 
     def test_preceding_admission_test_import_keeps_source_clean(self):
         self.check_import('scripts/tests/test_wellbeing_bundle.py')
