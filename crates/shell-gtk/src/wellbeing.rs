@@ -145,6 +145,9 @@ pub struct Transition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryError {
     /// The file does not exist; the caller should start with empty history.
+    // Reserved: loaders report a missing file as empty history, so nothing
+    // constructs this yet; kept for API completeness and tests.
+    #[allow(dead_code)]
     NotFound,
     /// The file exists but is unreadable or fails validation. The raw text is
     /// kept for logging; the file itself is left untouched.
@@ -277,6 +280,8 @@ impl HistoryStore {
         }
     }
 
+    // Inspection API for tests and diagnostics; the runtime holds the path.
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -429,6 +434,8 @@ pub fn active_time_today(
 /// When the daily limit was (or will be) reached, ported from
 /// `_calculateWellbeingDailyLimitReachedAtSecs`. Returns 0 while the limit is
 /// not reached yet today.
+// Reached only through `daily_limit_time` (pending D-Bus property surface).
+#[allow(dead_code)]
 pub fn limit_reached_at(
     transitions: &[Transition],
     now_secs: i64,
@@ -560,14 +567,20 @@ impl ScreenTimeTracker {
         }
     }
 
+    // Inspection API for tests and pending status surfaces.
+    #[allow(dead_code)]
     pub fn state(&self) -> TimeLimitsState {
         self.state
     }
 
+    // Inspection API for tests and pending status surfaces.
+    #[allow(dead_code)]
     pub fn user_state(&self) -> UserState {
         self.user_state
     }
 
+    // Inspection API for tests and pending status surfaces.
+    #[allow(dead_code)]
     pub fn settings(&self) -> ScreenTimeSettings {
         self.settings
     }
@@ -576,12 +589,16 @@ impl ScreenTimeTracker {
         self.settings = settings;
     }
 
+    // Inspection API for tests and pending status surfaces.
+    #[allow(dead_code)]
     pub fn store(&self) -> &HistoryStore {
         &self.store
     }
 
     /// Mirror of GNOME's `dailyLimitTime` (wellbeing branch): when the limit
     /// will be / was reached, or 0 while inactive, disabled, or unlimited.
+    // No D-Bus property surface reads this yet; exercised by tests.
+    #[allow(dead_code)]
     pub fn daily_limit_time(&self, now_secs: i64) -> i64 {
         match self.state {
             TimeLimitsState::Disabled => 0,
@@ -805,6 +822,8 @@ pub enum BreakType {
 }
 
 impl BreakType {
+    // Inspection API for tests; identifies breaks in selection round-trips.
+    #[allow(dead_code)]
     pub fn id(self) -> &'static str {
         match self {
             Self::Eyesight => "eyesight",
@@ -944,6 +963,8 @@ impl BreakManager {
     }
 
     /// End of the most recent break, or 0 while a break is in progress.
+    // No D-Bus property surface reads this yet; exercised by tests.
+    #[allow(dead_code)]
     pub fn last_break_end_time(&self) -> i64 {
         if self.state == BreakState::InBreak {
             return 0;
@@ -955,6 +976,8 @@ impl BreakManager {
         self.get_next_break_due(now).1
     }
 
+    // Inspection API for tests.
+    #[allow(dead_code)]
     pub fn config(&self, break_type: BreakType) -> Option<BreakTypeSettings> {
         self.configs.get(&break_type).copied()
     }
@@ -1120,6 +1143,8 @@ impl BreakManager {
     }
 
     /// Delay every currently due break by its `delay-seconds`.
+    // Pending notification actions (notify action support); used by tests.
+    #[allow(dead_code)]
     pub fn delay_break(&mut self, now: i64) {
         if self.state == BreakState::Disabled {
             return;
@@ -1134,6 +1159,8 @@ impl BreakManager {
     }
 
     /// Skip every currently due break (their intervals restart at `now`).
+    // Pending notification actions (notify action support); used by tests.
+    #[allow(dead_code)]
     pub fn skip_break(&mut self, now: i64) {
         if self.state == BreakState::Disabled {
             return;
@@ -1466,6 +1493,8 @@ impl BreakDispatcher {
     }
 
     /// The user pressed Take (or the notification action): lock or fade now.
+    // Pending notification actions (notify action support); used by tests.
+    #[allow(dead_code)]
     pub fn take_break(&mut self, manager: &BreakManager) -> Vec<BreakUiEvent> {
         let mut events = Vec::new();
         if let Some(t) = manager.current_break_type() {
@@ -1586,17 +1615,23 @@ impl BreakService {
         self.dispatcher.update(&self.manager, now)
     }
 
+    // Pending notification actions (notify action support); used by tests.
+    #[allow(dead_code)]
     pub fn delay_break(&mut self, now: i64) -> Vec<BreakUiEvent> {
         self.manager.delay_break(now);
         self.dispatcher.update(&self.manager, now)
     }
 
+    // Pending notification actions (notify action support); used by tests.
+    #[allow(dead_code)]
     pub fn skip_break(&mut self, now: i64) -> Vec<BreakUiEvent> {
         self.manager.skip_break(now);
         self.dispatcher.update(&self.manager, now)
     }
 
     /// The user chose Take: ask them to go idle (lock or fade, per toggles).
+    // Pending notification actions (notify action support); used by tests.
+    #[allow(dead_code)]
     pub fn take_break(&mut self) -> Vec<BreakUiEvent> {
         self.dispatcher.take_break(&self.manager)
     }
@@ -1790,8 +1825,13 @@ pub fn countdown_progress(due_in_secs: i64) -> f64 {
 
 fn log_effect(effect: EffectState) {
     eprintln!(
-        "tuna-shell-gtk: wellbeing: effect grayscale={} fade={} (desired; compositor hook pending)",
-        effect.grayscale, effect.fade
+        "tuna-shell-gtk: wellbeing: effect grayscale={} fade={} (gray fades {}s to {}; break fades {}s to {}; compositor hook pending)",
+        effect.grayscale,
+        effect.fade,
+        GRAYSCALE_FADE_SECONDS,
+        GRAYSCALE_SATURATION,
+        BREAK_FADE_SECONDS,
+        BREAK_BRIGHTNESS_FACTOR
     );
 }
 
@@ -1824,16 +1864,16 @@ pub fn dispatch_screen_time(
 }
 
 /// Deliver break events to the shell: notices to the message list, the
-/// countdown to the OSD, lock to the session. `countdown` tracks the live
-/// OSD countdown as (type, due wall time) so the tick can refresh its label;
-/// the OSD hides itself 1.5 s after the last show, so stopping needs no call.
-/// Dismissal only clears local state: posted entries are independent history
-/// items, and replacing the resident notice needs notify action support.
+/// countdown to the OSD, lock to the session. `countdown` marks the live
+/// OSD countdown so the tick can refresh its label from the manager's due
+/// time; the OSD hides itself 1.5 s after the last show, so stopping needs
+/// no call. Dismissal only clears local state: posted entries are
+/// independent history items, and replacing the resident notice needs
+/// notify action support.
 pub fn dispatch_break_ui(
     hooks: &ShellHooks,
     effect: &mut EffectState,
-    countdown: &mut Option<(BreakType, i64)>,
-    now: i64,
+    countdown: &mut Option<BreakType>,
     events: &[BreakUiEvent],
 ) {
     for event in events {
@@ -1849,7 +1889,7 @@ pub fn dispatch_break_ui(
                 break_type,
                 due_in_secs,
             } => {
-                *countdown = Some((*break_type, now + due_in_secs));
+                *countdown = Some(*break_type);
                 (hooks.show_countdown)(
                     countdown_text(*due_in_secs),
                     countdown_progress(*due_in_secs),
@@ -1920,7 +1960,7 @@ struct Runtime {
     break_parent: Option<gio::Settings>,
     break_children: Vec<(BreakType, gio::Settings)>,
     effect: EffectState,
-    countdown: Option<(BreakType, i64)>,
+    countdown: Option<BreakType>,
 }
 
 /// One screen-time poll: idle verdict from the compositor, history edges and
@@ -1936,10 +1976,8 @@ fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
         if let Err(e) = &poll.stored {
             eprintln!("tuna-shell-gtk: wellbeing: history store failed: {e}");
         }
-        if let Some(loaded) = &poll.loaded {
-            if let Err(e) = loaded {
-                eprintln!("tuna-shell-gtk: wellbeing: {e}");
-            }
+        if let Some(Err(e)) = &poll.loaded {
+            eprintln!("tuna-shell-gtk: wellbeing: {e}");
         }
         (r.hooks.clone(), r.effect, poll.events)
     };
@@ -1947,25 +1985,24 @@ fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
     rt.borrow_mut().effect = effect;
 }
 
-/// One break poll, plus a countdown label refresh from the stored due time
-/// (the dispatcher only announces the countdown's start and stop).
+/// One break poll, plus a countdown label refresh from the manager's due
+/// time (the dispatcher only announces the countdown's start and stop).
 #[cfg(not(test))]
 fn break_tick(rt: &Rc<RefCell<Runtime>>) {
     let now = wall_now();
-    let (hooks, mut effect, mut countdown, events, stored_due) = {
+    let (hooks, mut effect, mut countdown, events) = {
         let mut r = rt.borrow_mut();
         let idle_secs = idle_time().map(|d| d.as_secs() as i64).unwrap_or(0);
         let events = r.breaks.poll(now, idle_secs);
-        let stored_due = r.countdown.map(|(_, due)| due);
-        (r.hooks.clone(), r.effect, r.countdown, events, stored_due)
+        (r.hooks.clone(), r.effect, r.countdown, events)
     };
-    if let Some(due) = stored_due {
-        let due_in = due - now;
+    dispatch_break_ui(&hooks, &mut effect, &mut countdown, &events);
+    if countdown.is_some() {
+        let due_in = rt.borrow().breaks.manager.next_break_due_time(now) - now;
         if due_in > 0 {
             (hooks.show_countdown)(countdown_text(due_in), countdown_progress(due_in));
         }
     }
-    dispatch_break_ui(&hooks, &mut effect, &mut countdown, now, &events);
     let mut r = rt.borrow_mut();
     r.effect = effect;
     r.countdown = countdown;
@@ -2722,7 +2759,6 @@ mod tests {
             &hooks,
             &mut effect,
             &mut countdown,
-            T0,
             &[
                 BreakUiEvent::StateChanged(BreakState::BreakDue),
                 BreakUiEvent::Notify(due_notice(BreakType::Eyesight, 20, true)),
@@ -2740,7 +2776,7 @@ mod tests {
                     .to_string(),
             )]
         );
-        assert_eq!(countdown, Some((BreakType::Eyesight, T0 + 30)));
+        assert_eq!(countdown, Some(BreakType::Eyesight));
         assert_eq!(
             seen.countdowns.borrow().as_slice(),
             &[("Break in 30 seconds".to_string(), 0.5)]
@@ -2749,7 +2785,6 @@ mod tests {
             &hooks,
             &mut effect,
             &mut countdown,
-            T0 + 5,
             &[
                 BreakUiEvent::FadeScreen(true),
                 BreakUiEvent::LockScreen,
@@ -2764,6 +2799,30 @@ mod tests {
         assert_eq!(seen.locks.get(), 1);
         // Dismissal posts nothing: entries are independent history items.
         assert_eq!(seen.posts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn live_polls_use_gnome_cadence() {
+        assert_eq!(SCREEN_TIME_POLL, Duration::from_secs(30));
+        assert_eq!(BREAK_POLL, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn break_settings_update_applies_live() {
+        let mut manager = BreakManager::new();
+        manager.set_selected(&[(BreakType::Eyesight, BreakType::Eyesight.defaults())], T0);
+        assert_eq!(manager.next_break_due_time(T0), T0 + 1200);
+        let mut cfg = BreakType::Eyesight.defaults();
+        cfg.interval_secs = 60;
+        manager.set_break_settings(BreakType::Eyesight, cfg);
+        assert_eq!(
+            manager.config(BreakType::Eyesight).unwrap().interval_secs,
+            60
+        );
+        assert_eq!(manager.next_break_due_time(T0), T0 + 60);
+        // Unselected types stay ignored.
+        manager.set_break_settings(BreakType::Movement, BreakType::Movement.defaults());
+        assert!(manager.config(BreakType::Movement).is_none());
     }
 
     #[test]
@@ -2785,7 +2844,7 @@ mod tests {
         for now in [T0, T0 + 3600] {
             let events = service.poll(now, 0);
             assert!(events.is_empty());
-            dispatch_break_ui(&hooks, &mut effect, &mut countdown, now, &events);
+            dispatch_break_ui(&hooks, &mut effect, &mut countdown, &events);
         }
         assert_eq!(service.manager.state(), BreakState::Disabled);
         assert!(seen.posts.borrow().is_empty());
