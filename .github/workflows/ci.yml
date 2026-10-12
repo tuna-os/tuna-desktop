@@ -330,7 +330,9 @@ jobs:
           path: ${{ runner.temp }}/native-minimize/
           retention-days: 14
       - name: Check wellbeing proof admission
-        run: /usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
+        run: |
+          /usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
+          /usr/bin/python3 scripts/tests/test_wellbeing_bytecode_contract.py
       - name: Prove live wellbeing framebuffer and screenshot pixels
         run: dbus-run-session -- /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

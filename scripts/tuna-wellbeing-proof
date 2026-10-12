@@ -2,6 +2,11 @@
 """Source-matched native wellbeing pixels; synthetic supervised control, no GTK policy claim.
 Run in dbus-run-session with the same build.json/frozen bundle as native minimize.
 """
+import sys
+# Admission must observe a clean source tree; imports must not create pyc
+# files in this checkout (including before the admission check itself).
+sys.dont_write_bytecode = True
+
 import argparse
 import ctypes
 import importlib.util

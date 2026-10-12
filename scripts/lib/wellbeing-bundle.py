@@ -18,7 +18,8 @@ def admit(root, frozen, build_receipt, destination):
     assert destination != root and root not in destination.parents, 'artifacts must remain outside checkout'
     assert not destination.exists(), 'existing bundle cannot be overwritten'
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
-    assert not subprocess.check_output(['git', 'status', '--porcelain'], cwd=root, text=True).strip(), 'source must remain clean'
+    status = subprocess.check_output(['git', 'status', '--porcelain'], cwd=root, text=True).strip()
+    assert not status, f'source must remain clean: {status}'
     manifest = json.loads((frozen / 'manifest.json').read_text())
     assert manifest['source_commit'] == revision == (frozen / 'SOURCE_COMMIT').read_text().strip()
     assert manifest['cargo_lock_sha256'] == digest(root / 'Cargo.lock') == digest(frozen / 'Cargo.lock')

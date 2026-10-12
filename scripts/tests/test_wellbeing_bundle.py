@@ -1,4 +1,9 @@
 """Focused proof admission negatives; fake bytes never count as native runtime evidence."""
+import sys
+# Admission must observe a clean source tree; imports must not create pyc
+# files in this checkout (including before the admission check itself).
+sys.dont_write_bytecode = True
+
 import hashlib
 import importlib.util
 import json
