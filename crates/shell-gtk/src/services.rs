@@ -923,6 +923,12 @@ impl AudioUi {
     fn enforce_privacy(self: &Rc<Self>) {
         let policy = privacy_policy(self.privacy.as_ref());
         let scan = self.state.borrow().privacy_scan(&policy);
+        if !scan.authoritative {
+            // A retry cleared the cache or its initial dump is incomplete.
+            // Preserve both restore ownership and queued intent until the
+            // restarted monitor publishes a complete graph baseline.
+            return;
+        }
         let planned = self.enforcer.borrow_mut().plan(&scan);
         if planned != *self.last_actions.borrow() {
             if !planned.is_empty() {

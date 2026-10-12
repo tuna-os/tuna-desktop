@@ -12,6 +12,7 @@ pub struct AudioState {
     objects: BTreeMap<u64, Value>,
     pending: Vec<u8>,
     state_bytes: usize,
+    authoritative: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -101,6 +102,11 @@ impl AudioState {
                 }
             }
         }
+        if changed {
+            // The initial pw-dump array is complete only after JSON framing
+            // succeeds. A disconnected or partially read cache proves no removals.
+            self.authoritative = true;
+        }
         Ok(changed)
     }
 
@@ -155,6 +161,7 @@ impl AudioState {
     /// never the camera's business.
     pub fn privacy_scan(&self, policy: &PrivacyPolicy) -> crate::privacy::PrivacyScan {
         let mut scan = crate::privacy::PrivacyScan {
+            authoritative: self.authoritative,
             audio_present: BTreeSet::new(),
             mute_required: BTreeSet::new(),
             destroy: Vec::new(),
