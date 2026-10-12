@@ -220,7 +220,7 @@ class PackagePolicy(unittest.TestCase):
         self.tool('dpkg-deb', '''case "$1" in
 -c) find "$FIXTURE" -type f | while read -r path; do echo "-rwxr-xr-x $path"; done ;;
 -f) case "$3" in Version) echo 0.1.0 ;; Depends) echo 'libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas' ;; Replaces|Conflicts|Provides) echo roost ;; esac ;;  # tuna-rename: keep
--x) cp -R "$FIXTURE/." "$3/" ;;
+-x) cp -pR "$FIXTURE/." "$3/" ;;
 --ctrl-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./conffiles ;;
 --fsys-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./usr ./etc ;;
 esac''')
@@ -259,7 +259,15 @@ esac''')
         entry = next(item for item in manifest['entries'] if item['path'].endswith('.svg'))
         path = theme / entry['path']
         path.chmod(path.stat().st_mode | 0o020)
-        self.assertNotEqual(self.check(), 0)
+        # dpkg-deb extraction preserves archive modes. The mock must do the
+        # same under both the CI umask and a group-writable local checkout.
+        for mask in (0o022, 0o002):
+            with self.subTest(umask=oct(mask)):
+                previous = os.umask(mask)
+                try:
+                    self.assertNotEqual(self.check(), 0)
+                finally:
+                    os.umask(previous)
 
     def test_compatibility_names_required(self):
         # tuna-rename: keep-begin
