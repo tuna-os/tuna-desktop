@@ -6,6 +6,10 @@
 //! application. The module's own `#[cfg(test)]` suite compiles into
 //! this binary as well.
 
+// The live wrappers (`handlers_allowed`, `open_settings_panel`) run in the
+// binary, not here: this target pins their testable core instead of
+// spawning real processes, so the unused copies stay quiet.
+#[allow(dead_code)]
 #[path = "../src/lockdown.rs"]
 mod lockdown;
 
