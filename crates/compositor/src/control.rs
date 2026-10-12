@@ -43,6 +43,7 @@ use tuna_shell_control::{
     CURRENT_VERSION, MAX_FRAME_BYTES,
 };
 
+use crate::lockdown::{LockdownPolicy, RestrictedAction};
 use crate::state::{StateChange, StateModel, TokenStore, WindowEntry};
 
 /// Transport and protocol failures, shared with the shell-host endpoint.
@@ -274,6 +275,11 @@ pub struct Session<'a> {
     switcher_thumbnails: Option<Vec<tuna_shell_control::SwitcherThumbnail>>,
     /// The shell's switcher keys, until the runtime drains them.
     switcher_keys: Option<Vec<tuna_shell_control::SwitcherKey>>,
+    /// Administrative lockdown (#357): the hub's policy at accept,
+    /// refreshed onto every session by [`ControlHub::refresh_lockdown`].
+    /// `Lock` commands consult it; a restrictive key denies them with
+    /// the administrator's reason instead of engaging the lock.
+    lockdown: LockdownPolicy,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -345,6 +351,7 @@ impl<'a> Session<'a> {
             input_source_switches: Vec::new(),
             switcher_thumbnails: None,
             switcher_keys: None,
+            lockdown: LockdownPolicy::default(),
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -427,6 +434,18 @@ impl<'a> Session<'a> {
     /// The latest `SetIdleTimeout` the shell sent, once (#63).
     pub fn take_idle_timeout(&mut self) -> Option<u64> {
         self.idle_timeout.take()
+    }
+
+    /// Replace this session's lockdown policy (#357). The hub pushes
+    /// its live policy here on accept and refresh; tests inject a
+    /// restrictive policy to prove `Lock` denies under it.
+    pub fn set_lockdown_policy(&mut self, policy: LockdownPolicy) {
+        self.lockdown = policy;
+    }
+
+    /// This session's lockdown policy.
+    pub fn lockdown_policy(&self) -> LockdownPolicy {
+        self.lockdown
     }
 
     /// Window-menu actions the shell sent since the last call.
@@ -752,6 +771,37 @@ impl<'a> Session<'a> {
                     status: CommandStatus::Applied,
                 })?;
                 Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::Lock,
+            } => {
+                // Administrative lockdown (#357): a disabled lock
+                // screen denies the command instead of engaging the
+                // lock. Denying never weakens verification and never
+                // unlocks; it only refuses to lock.
+                if !self.lockdown.lock_screen_allowed() {
+                    let status = CommandStatus::Denied {
+                        reason: RestrictedAction::LockScreen.denial().to_owned(),
+                    };
+                    self.conn
+                        .write_frame(&Message::CommandResult { id, status })?;
+                    return Ok(Handled::CommandResult { id, applied: false });
+                }
+                let (status, closed) = apply_command(
+                    model,
+                    &self.validator,
+                    &self.overview,
+                    &self.locked,
+                    &CommandKind::Lock,
+                );
+                if let Some(window) = closed {
+                    self.closed.push(window);
+                }
+                let applied = matches!(status, CommandStatus::Applied);
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
             }
             Message::Command { id, kind } => {
                 let (status, closed) =
@@ -1137,6 +1187,11 @@ pub struct ControlHub {
     /// the runtime (idle timeout) or `Lock` commands, shared with every
     /// live session so snapshots carry it; the shell never owns it.
     locked: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Administrative lockdown (#357): read live at bind, refreshed by
+    /// [`ControlHub::refresh_lockdown`], pushed onto every session so
+    /// `Lock` commands deny under a restrictive key. Only the lock key
+    /// is live here; the shell owns the rest of the surface.
+    lockdown: LockdownPolicy,
     /// Alt-Tab drive events awaiting broadcast. Unlike the overview
     /// intent (level), steps are discrete events: each one is sent to
     /// every live session exactly once, retained until all sends land.
@@ -1201,6 +1256,16 @@ impl ControlHub {
         let listener = UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let readiness = crate::control_readiness::ControlReadiness::new(&listener)?;
+        // Administrative lockdown (#357): constructed from the live
+        // key at startup; unreadable reads GNOME defaults (allowed).
+        let lockdown = LockdownPolicy::from_reader(&|key| {
+            if key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN {
+                crate::lockdown::read_lock_screen_key()
+            } else {
+                None
+            }
+        });
         Ok(Self {
             listener,
             socket_path,
@@ -1210,6 +1275,7 @@ impl ControlHub {
             overview: std::rc::Rc::new(std::cell::Cell::new(false)),
             overview_sent: false,
             locked: std::rc::Rc::new(std::cell::Cell::new(false)),
+            lockdown,
             switcher_queue: Vec::new(),
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
@@ -1325,6 +1391,35 @@ impl ControlHub {
     /// Whether the session is locked (compositor-owned flag).
     pub fn is_locked(&self) -> bool {
         self.locked.get()
+    }
+
+    /// Whether the lock screen is currently allowed by policy (#357).
+    pub fn lock_screen_allowed(&self) -> bool {
+        self.lockdown.lock_screen_allowed()
+    }
+
+    /// Replace the hub's lockdown policy and push it onto every live
+    /// session; newcomers clone it at accept. Tests inject a
+    /// restrictive policy to prove the lock paths deny under it.
+    pub fn set_lockdown_policy(&mut self, policy: LockdownPolicy) {
+        self.lockdown = policy;
+        for session in &mut self.sessions {
+            session.set_lockdown_policy(policy);
+        }
+    }
+
+    /// Re-read the live `disable-lock-screen` key onto the hub and
+    /// every session. An unreadable key keeps the current value,
+    /// never resets. The runtime calls this on a slow tick (one
+    /// subprocess per call, skipped without a session bus).
+    pub fn refresh_lockdown(&mut self) {
+        if let Some(value) = crate::lockdown::read_lock_screen_key() {
+            self.lockdown
+                .refresh(&|key| (key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN).then_some(value));
+            for session in &mut self.sessions {
+                session.set_lockdown_policy(self.lockdown);
+            }
+        }
     }
 
     /// Set the session-lock flag; the next [`poll`](Self::poll) carries
@@ -1580,6 +1675,8 @@ impl ControlHub {
             if let Ok(mut session) =
                 Session::handshake_with(conn, model, validator, minter, overview, locked)
             {
+                // Newcomers join the hub's live lockdown policy (#357).
+                session.set_lockdown_policy(self.lockdown);
                 // Newcomers join mid-state: tell them the intent and the
                 // inventory now (best-effort; the poll broadcast covers
                 // the rest). An empty inventory means unknown — never

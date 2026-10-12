@@ -245,17 +245,17 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| disable-application-handlers | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-command-line | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-lock-screen | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-log-out | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-print-setup | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-printing | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-save-to-disk | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-show-password | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-user-switching | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| mount-removable-storage-devices-as-read-only | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| user-administration-disabled | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
+| disable-application-handlers | Honored | Shell-opened Settings/handlers blocked live while denied (#357) |
+| disable-command-line | Ignored | No run-command dialog ships, so nothing to restrict; visibility gate unit-tested for its landing |
+| disable-lock-screen | Honored | Shell hides and guards all lock paths; compositor denies Lock, idle and Wayland locks (#357) |
+| disable-log-out | Honored | Power menu Log Out row hidden live; nested sessions show no menu (#357) |
+| disable-print-setup | Ignored | App-owned: applications' Print Setup dialogs; the shell exposes no print path |
+| disable-printing | Ignored | App-owned: applications' Print dialogs; the shell exposes no print path |
+| disable-save-to-disk | Ignored | App-owned: applications' Save dialogs; shell-owned savers out of scope as in GNOME |
+| disable-show-password | Honored | Network secret reveal toggle omitted live while denied (#357) |
+| disable-user-switching | Ignored | No user-switch row ships, so nothing to restrict; visibility gate unit-tested for its landing |
+| mount-removable-storage-devices-as-read-only | Ignored | Daemon-owned: removable mounts (udisks2); Tuna ships no mount agent |
+| user-administration-disabled | Ignored | Daemon-owned: user administration (accountsservice/polkit); Tuna ships no Users panel |
 ## org.gnome.desktop.media-handling
 
 | Key | Status | Reason |
