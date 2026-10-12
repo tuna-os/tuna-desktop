@@ -20,8 +20,11 @@
 //!   the panel's own Blueprint sources (see
 //!   `tests/settings/gnome51-control-center-items.json`).
 //!
-//! CUPS I/O runs on short-lived worker threads with connect/read
-//! timeouts, so an absent or stuck daemon can never hang the shell; a
+//! CUPS I/O runs on worker threads with a 2s connect timeout and 5s
+//! per-read/per-write timeouts, so an absent or stuck daemon cannot
+//! block the UI thread. These timeouts bound each connect/read/write
+//! call, not the whole exchange: there is no global deadline, and a
+//! peer that keeps dribbling bytes can keep a worker past 5s. A
 //! missing daemon renders as GNOME's "No Print Service". Privileged
 //! writes are attempted as direct IPP and, when cupsd answers 401 or
 //! 403, surface as "Authentication Required": a cups-pk-helper
@@ -31,7 +34,7 @@ use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -115,7 +118,9 @@ const CUPS_SOCKETS: [&str; 2] = ["/run/cups/cups.sock", "/var/run/cups/cups.sock
 const CUPS_TCP_HOST: &str = "127.0.0.1";
 const CUPS_TCP_PORT: u16 = 631;
 
-/// Bounds so a stuck daemon cannot hang a worker thread for long.
+/// Per-call bounds (not a global deadline for the whole exchange,
+/// see the module docs): each connect fails after 2s and each
+/// read/write after 5s.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on an IPP response body (printers and jobs lists are small).
@@ -189,8 +194,8 @@ pub struct IppAttr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IppMessage {
     pub status: u16,
-    // Echoed from the request; asserted in tests, unread by the panel.
-    #[allow(dead_code)]
+    // Echoed from the request; `exchange` rejects replies whose id
+    // does not match the request it sent.
     pub request_id: u32,
     pub groups: Vec<(u8, Vec<IppAttr>)>,
 }
@@ -830,14 +835,16 @@ pub fn language_from(lang: &str) -> String {
     }
 }
 
-/// A CUPS client: endpoints to probe, the user and language tags, and
-/// a request-id counter. Cheap to clone for worker threads.
+/// A CUPS client: endpoints to probe, the user and language tags, a
+/// request-id counter and a count of replies discarded for carrying
+/// the wrong request id. Cheap to clone for worker threads.
 #[derive(Debug)]
 pub struct CupsClient {
     endpoints: Vec<Endpoint>,
     user: String,
     lang: String,
     next_id: AtomicU32,
+    id_mismatches: AtomicU64,
 }
 
 impl Clone for CupsClient {
@@ -847,6 +854,9 @@ impl Clone for CupsClient {
             user: self.user.clone(),
             lang: self.lang.clone(),
             next_id: AtomicU32::new(1),
+            // Per-client diagnostic: each worker clone counts its own
+            // exchanges, and surfaces mismatches as errors.
+            id_mismatches: AtomicU64::new(0),
         }
     }
 }
@@ -859,6 +869,7 @@ impl CupsClient {
             user: cups_user(),
             lang: natural_language(),
             next_id: AtomicU32::new(1),
+            id_mismatches: AtomicU64::new(0),
         }
     }
 
@@ -871,11 +882,19 @@ impl CupsClient {
             user: cups_user(),
             lang: natural_language(),
             next_id: AtomicU32::new(1),
+            id_mismatches: AtomicU64::new(0),
         }
     }
 
     fn request_id(&self) -> u32 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Replies discarded for a request-id mismatch on this client.
+    // Test probe; production surfaces each mismatch as an error.
+    #[allow(dead_code)]
+    pub fn id_mismatch_count(&self) -> u64 {
+        self.id_mismatches.load(Ordering::Relaxed)
     }
 
     /// The operation attributes every request carries: charset,
@@ -940,14 +959,16 @@ impl CupsClient {
     /// One IPP exchange: encode `groups` (operation group first),
     /// POST to `/` like libcups does, read and decode the response,
     /// and map failures to [`CupsError`]. `document`, when present, is
-    /// appended after the encoding.
+    /// appended after the encoding. A reply whose request id is not the
+    /// one just sent is discarded and counted, never applied.
     pub fn exchange(
         &self,
         op: u16,
         groups: Vec<(u8, Vec<OutAttr<'_>>)>,
         document: Option<&[u8]>,
     ) -> Result<IppMessage, CupsError> {
-        let mut body = encode_request(op, self.request_id(), &groups);
+        let sent_id = self.request_id();
+        let mut body = encode_request(op, sent_id, &groups);
         if let Some(doc) = document {
             body.extend_from_slice(doc);
         }
@@ -981,6 +1002,14 @@ impl CupsClient {
         }
         let message =
             decode_response(&reply).map_err(|e| CupsError::new(CupsErrorKind::Transport, e))?;
+        if message.request_id != sent_id {
+            self.id_mismatches.fetch_add(1, Ordering::Relaxed);
+            let got = message.request_id;
+            return Err(CupsError::new(
+                CupsErrorKind::Transport,
+                format!("print server mixed up replies (request {sent_id}, reply {got})"),
+            ));
+        }
         if message.status != STATUS_OK {
             return Err(status_error(message.status, &message));
         }
@@ -1729,6 +1758,90 @@ fn perform(client: &CupsClient, action: &Action) -> Result<Option<String>, CupsE
 /// query is in flight.
 const PUMP_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Maximum concurrent CUPS worker threads admitted per panel. Refresh
+/// and action workers share this budget: one refresh plus one action
+/// can overlap, and no more.
+pub const MAX_PANEL_WORKERS: usize = 2;
+
+/// Bounded admission for panel CUPS workers. GTK-free, so unit tests
+/// can prove the bound without a display; the panel owns one and
+/// admits every `refresh`/`run` through it. At most
+/// [`MAX_PANEL_WORKERS`] workers run at once: an excess refresh
+/// coalesces into a single pending refresh (run when a worker reports
+/// back), while an excess action is refused and counted.
+#[derive(Debug, Default)]
+pub struct WorkerGate {
+    inflight: usize,
+    pending_refresh: bool,
+    refused_actions: u64,
+}
+
+impl WorkerGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Admit a refresh worker. `true` means spawn; `false` means the
+    /// refresh coalesced into the pending one.
+    pub fn admit_refresh(&mut self) -> bool {
+        if self.inflight < MAX_PANEL_WORKERS {
+            self.inflight += 1;
+            true
+        } else {
+            self.pending_refresh = true;
+            false
+        }
+    }
+
+    /// Admit an action worker. `true` means spawn; `false` means the
+    /// action was refused and counted.
+    pub fn admit_action(&mut self) -> bool {
+        if self.inflight < MAX_PANEL_WORKERS {
+            self.inflight += 1;
+            true
+        } else {
+            self.refused_actions += 1;
+            false
+        }
+    }
+
+    /// Release one worker. `true` means a coalesced refresh is due:
+    /// the caller must launch exactly one refresh.
+    pub fn release(&mut self) -> bool {
+        self.inflight = self.inflight.saturating_sub(1);
+        if self.inflight < MAX_PANEL_WORKERS && self.pending_refresh {
+            self.pending_refresh = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Withdraw an admission whose thread never started.
+    pub fn cancel(&mut self) {
+        self.inflight = self.inflight.saturating_sub(1);
+    }
+
+    /// Workers currently admitted.
+    pub fn inflight(&self) -> usize {
+        self.inflight
+    }
+
+    /// Whether a coalesced refresh waits for a free slot.
+    // Test probe; production learns this from `release`.
+    #[allow(dead_code)]
+    pub fn has_pending(&self) -> bool {
+        self.pending_refresh
+    }
+
+    /// Excess actions refused since the gate was created.
+    // Test probe; production surfaces each refusal in the status line.
+    #[allow(dead_code)]
+    pub fn refused_actions(&self) -> u64 {
+        self.refused_actions
+    }
+}
+
 /// The printers panel: a header, a status line and one entry per
 /// printer. CUPS I/O runs on worker threads, which report back over an
 /// `mpsc` channel; a transient main-loop pump (alive only while a
@@ -1743,7 +1856,7 @@ pub struct PrintersPanel {
     generation: Cell<u64>,
     sender: mpsc::Sender<PanelUpdate>,
     receiver: mpsc::Receiver<PanelUpdate>,
-    inflight: Cell<usize>,
+    gate: RefCell<WorkerGate>,
     pumping: Cell<bool>,
 }
 
@@ -1790,7 +1903,7 @@ impl PrintersPanel {
             generation: Cell::new(0),
             sender,
             receiver,
-            inflight: Cell::new(0),
+            gate: RefCell::new(WorkerGate::new()),
             pumping: Cell::new(false),
         });
         {
@@ -1810,10 +1923,14 @@ impl PrintersPanel {
         self.root.clone()
     }
 
-    /// Re-read printers and jobs on a worker thread.
+    /// Re-read printers and jobs on a worker thread. Past the cap
+    /// the refresh coalesces into the pending one instead of spawning.
     pub fn refresh(self: &Rc<Self>) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
+        if !self.gate.borrow_mut().admit_refresh() {
+            return; // At cap: the pending refresh covers this one.
+        }
         let client = self.client.clone();
         let sender = self.sender.clone();
         if std::thread::Builder::new()
@@ -1824,15 +1941,20 @@ impl PrintersPanel {
             })
             .is_err()
         {
+            self.gate.borrow_mut().cancel();
             self.show_status("Could not start a print query thread");
             return;
         }
-        self.inflight.set(self.inflight.get() + 1);
         self.ensure_pump();
     }
 
-    /// Run `action` on a worker thread, then refresh.
+    /// Run `action` on a worker thread, then refresh. Past the cap the
+    /// action is refused (and counted) rather than queued.
     fn run(self: &Rc<Self>, action: Action) {
+        if !self.gate.borrow_mut().admit_action() {
+            self.show_status("Printer busy; try again shortly");
+            return;
+        }
         let client = self.client.clone();
         let sender = self.sender.clone();
         if std::thread::Builder::new()
@@ -1843,10 +1965,10 @@ impl PrintersPanel {
             })
             .is_err()
         {
+            self.gate.borrow_mut().cancel();
             self.show_status("Could not start a print action thread");
             return;
         }
-        self.inflight.set(self.inflight.get() + 1);
         self.ensure_pump();
     }
 
@@ -1864,7 +1986,7 @@ impl PrintersPanel {
             while let Ok(update) = panel.receiver.try_recv() {
                 panel.apply(update);
             }
-            if panel.inflight.get() == 0 {
+            if panel.gate.borrow().inflight() == 0 {
                 panel.pumping.set(false);
                 glib::ControlFlow::Break
             } else {
@@ -1879,11 +2001,15 @@ impl PrintersPanel {
     }
 
     fn apply(self: &Rc<Self>, update: PanelUpdate) {
-        self.inflight.set(self.inflight.get().saturating_sub(1));
+        let pending = self.gate.borrow_mut().release();
         match update {
             PanelUpdate::Snapshot { generation, result } => {
                 if generation != self.generation.get() {
-                    return; // A newer refresh already superseded this one.
+                    // A newer refresh already superseded this one.
+                    if pending {
+                        self.refresh();
+                    }
+                    return;
                 }
                 match result {
                     Ok(snapshot) => {
@@ -1900,15 +2026,24 @@ impl PrintersPanel {
                         self.show_status(&e.to_string());
                     }
                 }
+                if pending {
+                    self.refresh();
+                }
             }
             PanelUpdate::Action { result } => match result {
                 Ok(notice) => {
                     if let Some(text) = notice {
                         self.show_status(&text);
                     }
+                    // The post-action refresh subsumes any coalesced one.
                     self.refresh();
                 }
-                Err(e) => self.show_status(&e.to_string()),
+                Err(e) => {
+                    self.show_status(&e.to_string());
+                    if pending {
+                        self.refresh();
+                    }
+                }
             },
         }
     }
@@ -2793,10 +2928,10 @@ mod tests {
         out
     }
 
-    fn ok_printers_body() -> Vec<u8> {
+    fn ok_printers_body(id: u32) -> Vec<u8> {
         encode_request(
             STATUS_OK,
-            1,
+            id,
             &[
                 (TAG_OPERATION, op_group()),
                 (
@@ -2818,10 +2953,10 @@ mod tests {
         )
     }
 
-    fn ok_jobs_body() -> Vec<u8> {
+    fn ok_jobs_body(id: u32) -> Vec<u8> {
         encode_request(
             STATUS_OK,
-            2,
+            id,
             &[
                 (TAG_OPERATION, op_group()),
                 (
@@ -2900,7 +3035,7 @@ mod tests {
 
     #[test]
     fn client_lists_printers_over_http() {
-        let (endpoint, seen, server) = start_fake(vec![http_ok(&ok_printers_body())]);
+        let (endpoint, seen, server) = start_fake(vec![http_ok(&ok_printers_body(1))]);
         let client = CupsClient::single(endpoint);
         let printers = client.printers().expect("printers");
         assert_eq!(
@@ -2915,12 +3050,13 @@ mod tests {
 
     #[test]
     fn client_lists_jobs_and_cancels() {
-        let ok_empty = encode_request(STATUS_OK, 9, &[(TAG_OPERATION, op_group())]);
+        // Replies echo each exchange's request id (1..=4 on this client).
+        let empty = |id: u32| encode_request(STATUS_OK, id, &[(TAG_OPERATION, op_group())]);
         let (endpoint, seen, server) = start_fake(vec![
-            http_ok(&ok_jobs_body()),
-            http_ok(&ok_empty),
-            http_ok(&ok_jobs_body()),
-            http_ok(&ok_empty),
+            http_ok(&ok_jobs_body(1)),
+            http_ok(&empty(2)),
+            http_ok(&ok_jobs_body(3)),
+            http_ok(&empty(4)),
         ]);
         let client = CupsClient::single(endpoint);
         let jobs = client
@@ -2947,7 +3083,7 @@ mod tests {
     fn client_submits_document_after_encoding() {
         let ok_job = encode_request(
             STATUS_OK,
-            3,
+            1,
             &[
                 (TAG_OPERATION, op_group()),
                 (TAG_JOB, vec![OutAttr::int("job-id", TAG_INTEGER, 7)]),
@@ -2982,7 +3118,7 @@ mod tests {
 
         let forbidden = encode_request(
             STATUS_FORBIDDEN,
-            4,
+            1,
             &[(
                 TAG_OPERATION,
                 vec![OutAttr::text("status-message", TAG_TEXT, "no way")],
@@ -3011,7 +3147,7 @@ mod tests {
     fn server_default_reads_printer_name() {
         let body = encode_request(
             STATUS_OK,
-            5,
+            1,
             &[
                 (TAG_OPERATION, op_group()),
                 (
@@ -3027,6 +3163,82 @@ mod tests {
             request_op(&seen.recv().expect("request")),
             OP_CUPS_GET_DEFAULT
         );
+        server.join().expect("server ends");
+    }
+
+    #[test]
+    fn worker_gate_bounds_rapid_refresh_to_cap() {
+        // N rapid refresh invocations admit at most MAX_PANEL_WORKERS;
+        // the rest coalesce into one pending refresh.
+        let mut gate = WorkerGate::new();
+        let mut admitted = 0usize;
+        let mut peak = 0usize;
+        for _ in 0..32 {
+            if gate.admit_refresh() {
+                admitted += 1;
+            }
+            peak = peak.max(gate.inflight());
+        }
+        assert_eq!(admitted, MAX_PANEL_WORKERS);
+        assert_eq!(gate.inflight(), MAX_PANEL_WORKERS);
+        assert!(peak <= MAX_PANEL_WORKERS);
+        assert!(gate.has_pending());
+        // Draining one worker surfaces the coalesced refresh exactly
+        // once; further releases report nothing pending.
+        assert!(gate.release());
+        assert!(!gate.has_pending());
+        assert!(!gate.release());
+        assert_eq!(gate.inflight(), 0);
+    }
+
+    #[test]
+    fn worker_gate_refuses_excess_actions_and_counts() {
+        let mut gate = WorkerGate::new();
+        assert!(gate.admit_refresh());
+        assert!(gate.admit_action());
+        assert!(!gate.admit_action());
+        assert!(!gate.admit_action());
+        assert_eq!(gate.inflight(), MAX_PANEL_WORKERS);
+        assert_eq!(gate.refused_actions(), 2);
+        // A freed slot admits again without counting a refusal.
+        gate.release();
+        assert!(gate.admit_action());
+        assert_eq!(gate.refused_actions(), 2);
+        // Withdrawing an admission that never spawned frees its slot.
+        gate.cancel();
+        assert_eq!(gate.inflight(), MAX_PANEL_WORKERS - 1);
+    }
+
+    #[test]
+    fn client_rejects_reply_with_wrong_request_id() {
+        // A well-formed printers reply carrying another request's id is
+        // discarded (and counted); the correctly-echoed reply on the
+        // same client is accepted, without touching the count.
+        let ghost = encode_request(
+            STATUS_OK,
+            999,
+            &[
+                (TAG_OPERATION, op_group()),
+                (
+                    TAG_PRINTER,
+                    vec![OutAttr::text("printer-name", TAG_NAME, "Ghost")],
+                ),
+            ],
+        );
+        let (endpoint, _, server) =
+            start_fake(vec![http_ok(&ghost), http_ok(&ok_printers_body(2))]);
+        let client = CupsClient::single(endpoint);
+        let err = client.printers().expect_err("wrong id must be rejected");
+        assert_eq!(err.kind, CupsErrorKind::Transport);
+        assert!(
+            err.message.contains("999"),
+            "mismatch error names the reply id: {err}"
+        );
+        assert_eq!(client.id_mismatch_count(), 1);
+        let printers = client.printers().expect("correct id accepted");
+        assert_eq!(printers.len(), 2);
+        assert!(printers.iter().all(|p| p.name != "Ghost"));
+        assert_eq!(client.id_mismatch_count(), 1);
         server.join().expect("server ends");
     }
 }
