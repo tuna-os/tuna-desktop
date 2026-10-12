@@ -26,7 +26,7 @@
 //! hand stays muted), and video streams created after restore are
 //! no longer destroyed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,15 @@ pub enum Action {
         /// Node id from `pw-dump`.
         node: u64,
     },
+}
+
+impl Action {
+    /// The node this action targets (the dispatch queue's dedupe key).
+    pub fn node(&self) -> u64 {
+        match *self {
+            Action::SetMute { node, .. } | Action::DestroyNode { node } => node,
+        }
+    }
 }
 
 /// One graph scan folded against the policy: what must be muted,
@@ -87,6 +96,12 @@ pub fn pw_cli_args(action: &Action) -> Option<[String; 2]> {
 
 /// Enforcement state across scans: which nodes this tracker muted,
 /// so explicit restore unmutes exactly those.
+///
+/// Ownership is released only on observed completion: a tracked node
+/// stays tracked until a scan shows it no longer muted (or gone from
+/// the graph). A restore the caller defers, truncates, or fails to
+/// execute therefore re-plans on the next tick instead of being
+/// forgotten.
 #[derive(Debug, Default)]
 pub struct Tracker {
     muted_by_policy: BTreeSet<u64>,
@@ -95,8 +110,11 @@ pub struct Tracker {
 impl Tracker {
     /// Plan one round: mute what the policy requires, destroy what
     /// must not exist, and unmute tracked nodes the policy no longer
-    /// requires muted. A tracked node that is already unmuted (or
-    /// gone from the graph) is forgotten silently.
+    /// requires muted. A tracked node that is still muted keeps its
+    /// ownership — the unmute re-plans every round until the graph
+    /// observes it unmuted — while a tracked node that reads unmuted
+    /// (restored, whether by us or another party, or gone from the
+    /// graph) is forgotten silently.
     pub fn plan(&mut self, scan: &PrivacyScan) -> Vec<Action> {
         let mut actions = Vec::new();
         for id in scan.mute_required.difference(&scan.muted_now) {
@@ -115,12 +133,15 @@ impl Tracker {
             .copied()
             .collect();
         for id in stale {
-            self.muted_by_policy.remove(&id);
             if scan.muted_now.contains(&id) {
+                // Still muted: retain ownership so a deferred or
+                // failed unmute re-plans on the next tick.
                 actions.push(Action::SetMute {
                     node: id,
                     muted: false,
                 });
+            } else {
+                self.muted_by_policy.remove(&id);
             }
         }
         actions
@@ -130,6 +151,141 @@ impl Tracker {
     #[cfg(test)]
     fn tracked(&self) -> &BTreeSet<u64> {
         &self.muted_by_policy
+    }
+}
+
+/// Consecutive per-node failures before the queue stops scheduling
+/// proactive retry ticks for that node. Ownership stays with the
+/// [`Tracker`] (or the live scan, for destroys), so the next graph
+/// event or settings change retries — the bound only stops a
+/// persistently failing tool from self-perpetuating ticks.
+const MAX_ACTION_RETRIES: u32 = 3;
+
+/// Cap on dispatched-but-unreported actions. [`ActionQueue::take`]
+/// leaves work queued past this headroom instead of piling up
+/// subprocesses while a tool hangs; completions (or their timeouts)
+/// free it again.
+const MAX_INFLIGHT_ACTIONS: usize = 256;
+
+/// Cap on remembered per-node failure counts. Eviction only re-arms
+/// proactive retries (the safe direction); ownership is unaffected.
+const MAX_TRACKED_FAILURES: usize = 4096;
+
+/// Bounded per-tick dispatch buffer between [`Tracker::plan`] and the
+/// async executors.
+///
+/// Each tick offers the fresh plan and takes at most a budget of
+/// actions to dispatch; the rest stays queued and drains on later
+/// ticks instead of being dropped. The queue holds at most one action
+/// per node — a fresh action for a node supersedes its queued one,
+/// and queued actions for nodes with no fresh demand are dropped as
+/// achieved, moot, or superseded — so its length never exceeds one
+/// scan's demand. Dispatched actions are remembered until reported,
+/// so a re-plan never duplicates an identical in-flight command while
+/// still superseding it when the policy changes its mind.
+#[derive(Debug, Default)]
+pub struct ActionQueue {
+    queued: VecDeque<Action>,
+    inflight: BTreeMap<u64, Action>,
+    failures: BTreeMap<u64, u32>,
+}
+
+impl ActionQueue {
+    /// Reconcile fresh demand against retained work: fresh actions win
+    /// per node (replacing the queued one), queued actions for nodes
+    /// with no fresh demand are dropped, and fresh actions identical
+    /// to an in-flight command are skipped (the executor's report
+    /// settles those; queueing another copy would only pile up
+    /// duplicate subprocesses).
+    pub fn offer(&mut self, actions: Vec<Action>) {
+        let mut fresh = BTreeMap::new();
+        for action in actions {
+            if self.inflight.get(&action.node()) == Some(&action) {
+                continue;
+            }
+            fresh.insert(action.node(), action);
+        }
+        self.queued
+            .retain(|action| fresh.contains_key(&action.node()));
+        let inflight = &self.inflight;
+        self.failures
+            .retain(|node, _| fresh.contains_key(node) || inflight.contains_key(node));
+        for (node, action) in fresh {
+            if let Some(slot) = self.queued.iter_mut().find(|queued| queued.node() == node) {
+                *slot = action;
+            } else {
+                self.queued.push_back(action);
+            }
+        }
+    }
+
+    /// Take up to `limit` actions to dispatch this tick, oldest first.
+    /// Taken actions read as in-flight until [`ActionQueue::report`]
+    /// settles them; past the in-flight cap nothing is taken and the
+    /// work stays queued for a later tick.
+    pub fn take(&mut self, limit: usize) -> Vec<Action> {
+        let headroom = MAX_INFLIGHT_ACTIONS.saturating_sub(self.inflight.len());
+        let count = limit.min(headroom).min(self.queued.len());
+        let mut batch = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(action) = self.queued.pop_front() {
+                self.inflight.insert(action.node(), action);
+                batch.push(action);
+            }
+        }
+        batch
+    }
+
+    /// Report a dispatched action's outcome. Returns true when the
+    /// caller should schedule another drain tick: queued work remains,
+    /// or this failure still has proactive retries left. Past the
+    /// retry bound the work stays owned (the tracker re-plans it on
+    /// the next graph event or settings change) but no tick is
+    /// scheduled for it. A stale report — one whose action no longer
+    /// matches what is in flight for its node — never clears newer
+    /// intent, and success clears that node's failure count.
+    pub fn report(&mut self, action: &Action, success: bool) -> bool {
+        if self.inflight.get(&action.node()) == Some(action) {
+            self.inflight.remove(&action.node());
+        }
+        if success {
+            self.failures.remove(&action.node());
+        } else {
+            let count = self
+                .failures
+                .get(&action.node())
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            if !self.failures.contains_key(&action.node())
+                && self.failures.len() >= MAX_TRACKED_FAILURES
+            {
+                self.failures.pop_first();
+            }
+            self.failures.insert(action.node(), count);
+            if count <= MAX_ACTION_RETRIES {
+                return true;
+            }
+        }
+        !self.queued.is_empty()
+    }
+
+    /// Queued (undispatched) actions (tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.queued.len()
+    }
+
+    /// True when nothing is queued (in-flight commands settle through
+    /// their own reports, not through ticks).
+    pub fn is_empty(&self) -> bool {
+        self.queued.is_empty()
+    }
+
+    /// Nodes with remembered failure counts (tests).
+    #[cfg(test)]
+    fn failure_nodes(&self) -> usize {
+        self.failures.len()
     }
 }
 
@@ -271,15 +427,20 @@ mod tests {
         let mut tracker = Tracker::default();
         assert_eq!(tracker.plan(&scan(&[48], &[], &[])).len(), 1);
         assert!(tracker.plan(&scan(&[48], &[], &[48])).is_empty());
-        // Policy lifted: the tracked node is still muted, so it is
-        // unmuted; a node muted by hand (49) is not ours to touch.
-        assert_eq!(
-            tracker.plan(&scan(&[], &[], &[48, 49])),
-            vec![Action::SetMute {
-                node: 48,
-                muted: false
-            }]
-        );
+        // Policy lifted: the tracked node is still muted, so an
+        // unmute plans — and ownership is retained, so a deferred or
+        // failed restore re-plans on the next tick instead of being
+        // forgotten. A node muted by hand (49) is not ours to touch.
+        let unmute = vec![Action::SetMute {
+            node: 48,
+            muted: false,
+        }];
+        assert_eq!(tracker.plan(&scan(&[], &[], &[48, 49])), unmute);
+        assert_eq!(tracker.tracked(), &BTreeSet::from([48]));
+        assert_eq!(tracker.plan(&scan(&[], &[], &[48, 49])), unmute);
+        assert_eq!(tracker.tracked(), &BTreeSet::from([48]));
+        // Observed unmuted: forgotten silently.
+        assert!(tracker.plan(&scan(&[], &[], &[49])).is_empty());
         assert!(tracker.tracked().is_empty());
         assert!(tracker.plan(&scan(&[], &[], &[49])).is_empty());
     }
@@ -292,6 +453,418 @@ mod tests {
         // no unmute for a node that is gone.
         assert!(tracker.plan(&scan(&[], &[], &[])).is_empty());
         assert!(tracker.tracked().is_empty());
+    }
+
+    fn mute(node: u64) -> Action {
+        Action::SetMute { node, muted: true }
+    }
+
+    fn unmute(node: u64) -> Action {
+        Action::SetMute { node, muted: false }
+    }
+
+    #[test]
+    fn queue_coalesces_supersedes_and_drops_stale() {
+        let mut queue = ActionQueue::default();
+        // One slot per node no matter how often the same demand is
+        // offered: re-plans never grow the queue.
+        for _ in 0..1000 {
+            queue.offer(vec![mute(7)]);
+        }
+        assert_eq!(queue.len(), 1);
+        // Fresh intent supersedes queued intent for the same node.
+        queue.offer(vec![unmute(7)]);
+        assert_eq!(queue.take(64), vec![unmute(7)]);
+        assert!(queue.is_empty());
+        // Queued work for nodes with no fresh demand is dropped as
+        // achieved, moot, or superseded — never dispatched stale.
+        queue.offer(vec![mute(8), mute(9)]);
+        queue.offer(vec![mute(8)]);
+        assert_eq!(queue.len(), 1);
+        queue.offer(vec![]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn queue_skips_identical_inflight_but_supersedes_on_change() {
+        let mut queue = ActionQueue::default();
+        queue.offer(vec![mute(7), mute(8)]);
+        assert_eq!(queue.take(1), vec![mute(7)]);
+        // A re-plan while 7's mute flies: the duplicate is skipped,
+        // the still-queued demand coalesces.
+        queue.offer(vec![mute(7), mute(8)]);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.take(64), vec![mute(8)]);
+        // The policy changed its mind while 7's mute flies: the
+        // unmute supersedes instead of waiting behind it.
+        queue.offer(vec![unmute(7)]);
+        assert_eq!(queue.take(64), vec![unmute(7)]);
+        // A stale report never clears newer intent: 7's unmute is
+        // still in flight after its mute reports.
+        assert!(!queue.report(&mute(7), true));
+        queue.offer(vec![unmute(7), mute(9)]);
+        assert_eq!(queue.len(), 1);
+        assert!(queue.report(&unmute(7), true));
+        assert_eq!(queue.take(64), vec![mute(9)]);
+        assert!(!queue.report(&mute(9), true));
+    }
+
+    #[test]
+    fn queue_bounds_inflight_and_failure_memory() {
+        let mut queue = ActionQueue::default();
+        // Past the in-flight cap nothing is taken; the work stays
+        // queued for a later tick instead of piling up subprocesses.
+        queue.offer((0..600).map(mute).collect());
+        let batch = queue.take(600);
+        assert_eq!(batch.len(), super::MAX_INFLIGHT_ACTIONS);
+        assert_eq!(queue.len(), 600 - super::MAX_INFLIGHT_ACTIONS);
+        for action in &batch {
+            assert!(queue.report(action, true));
+        }
+        // Headroom refills as reports land: the backlog drains in
+        // bounded batches, nothing dropped.
+        let batch = queue.take(600);
+        assert_eq!(batch.len(), super::MAX_INFLIGHT_ACTIONS);
+        assert_eq!(queue.len(), 600 - 2 * super::MAX_INFLIGHT_ACTIONS);
+        for action in &batch {
+            assert!(queue.report(action, true));
+        }
+        let rest = queue.take(600);
+        assert_eq!(rest.len(), 600 - 2 * super::MAX_INFLIGHT_ACTIONS);
+        assert!(queue.is_empty());
+        for action in &rest {
+            assert!(!queue.report(action, true));
+        }
+        // Failure memory is capped; eviction only re-arms proactive
+        // retries, and success clears the count.
+        for id in 0..(super::MAX_TRACKED_FAILURES as u64 + 100) {
+            queue.report(&mute(100_000 + id), false);
+        }
+        assert_eq!(queue.failure_nodes(), super::MAX_TRACKED_FAILURES);
+        assert!(queue.report(&mute(7), false));
+        assert!(queue.report(&mute(7), false));
+        assert!(!queue.report(&mute(7), true));
+        assert!(queue.report(&mute(7), false));
+    }
+
+    /// Production-path restore cycles: a fake graph behind the real
+    /// [`AudioState`](crate::audio_state::AudioState) feed/scan, the
+    /// real [`Tracker`], and the real [`ActionQueue`], with a scripted
+    /// executor standing in for `wpctl`. Node JSON matches the
+    /// `pw-dump` shape the scanner parses.
+    mod restore_cycle {
+        use std::cell::RefCell;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use serde_json::json;
+        use tuna_shell_host::settings::PrivacyPolicy;
+
+        use super::{mute, unmute, Action, ActionQueue, Tracker};
+        use crate::audio_state::AudioState;
+
+        /// A fake PipeWire graph: node id → (media class, muted).
+        struct FakeGraph {
+            nodes: BTreeMap<u64, (&'static str, bool)>,
+            state: AudioState,
+        }
+
+        impl FakeGraph {
+            fn new(nodes: &[(u64, &'static str, bool)]) -> Self {
+                let mut graph = Self {
+                    nodes: nodes
+                        .iter()
+                        .map(|&(id, class, muted)| (id, (class, muted)))
+                        .collect(),
+                    state: AudioState::default(),
+                };
+                graph.publish();
+                graph
+            }
+
+            /// Feed the current graph as one `pw-dump` batch.
+            fn publish(&mut self) {
+                let batch: Vec<serde_json::Value> = self
+                    .nodes
+                    .iter()
+                    .map(|(&id, (class, muted))| {
+                        json!({"id": id,
+                            "info": {"props": {"media.class": class, "node.name": format!("node-{id}")},
+                            "params": {"Props": [{"mute": muted}]}}})
+                    })
+                    .collect();
+                self.state
+                    .feed(&serde_json::Value::Array(batch).to_string().into_bytes())
+                    .unwrap();
+            }
+
+            fn muted(&self, id: u64) -> bool {
+                self.nodes[&id].1
+            }
+
+            /// The scripted `wpctl`: apply the mute flag, unless this
+            /// action is scripted to fail.
+            fn execute(&mut self, action: &Action, fail: &dyn Fn(&Action) -> bool) -> bool {
+                if fail(action) {
+                    return false;
+                }
+                match *action {
+                    Action::SetMute { node, muted } => {
+                        if let Some(slot) = self.nodes.get_mut(&node) {
+                            slot.1 = muted;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Action::DestroyNode { node } => self.nodes.remove(&node).is_some(),
+                }
+            }
+        }
+
+        struct Rig {
+            graph: FakeGraph,
+            tracker: Tracker,
+            queue: ActionQueue,
+            dispatched: Vec<Action>,
+        }
+
+        impl Rig {
+            /// Run ticks until the tracker and queue settle or `rounds`
+            /// run out. Each tick mirrors `AudioUi::enforce_privacy`:
+            /// scan → plan → offer → take(`budget`) → execute →
+            /// report. Returns how often a report scheduled another
+            /// tick.
+            fn settle(
+                &mut self,
+                policy: &PrivacyPolicy,
+                budget: usize,
+                rounds: usize,
+                fail: &dyn Fn(&Action) -> bool,
+            ) -> usize {
+                let mut reticks = 0;
+                for _ in 0..rounds {
+                    let scan = self.graph.state.privacy_scan(policy);
+                    let planned = self.tracker.plan(&scan);
+                    let demanded = !planned.is_empty();
+                    self.queue.offer(planned);
+                    let batch = self.queue.take(budget);
+                    for action in &batch {
+                        let ok = self.graph.execute(action, fail);
+                        if self.queue.report(action, ok) {
+                            reticks += 1;
+                        }
+                        self.dispatched.push(*action);
+                    }
+                    self.graph.publish();
+                    if !demanded && batch.is_empty() && self.queue.is_empty() {
+                        return reticks;
+                    }
+                }
+                panic!("restore did not settle within {rounds} ticks");
+            }
+        }
+
+        fn denied() -> PrivacyPolicy {
+            PrivacyPolicy {
+                microphone_disabled: true,
+                sound_output_disabled: true,
+                ..PrivacyPolicy::default()
+            }
+        }
+
+        /// 100 policy devices plus 3 the user muted by hand.
+        fn big_graph() -> (Rig, BTreeSet<u64>, Vec<u64>) {
+            let mut nodes = Vec::new();
+            for i in 0..50 {
+                nodes.push((100 + i, "Audio/Sink", false));
+            }
+            for i in 0..50 {
+                nodes.push((200 + i, "Audio/Source", false));
+            }
+            let user_muted = vec![300, 301, 302];
+            for &id in &user_muted {
+                nodes.push((id, "Audio/Sink", true));
+            }
+            let policy: BTreeSet<u64> = nodes
+                .iter()
+                .filter(|(id, _, _)| !user_muted.contains(id))
+                .map(|(id, _, _)| *id)
+                .collect();
+            (
+                Rig {
+                    graph: FakeGraph::new(&nodes),
+                    tracker: Tracker::default(),
+                    queue: ActionQueue::default(),
+                    dispatched: Vec::new(),
+                },
+                policy,
+                user_muted,
+            )
+        }
+
+        #[test]
+        fn disable_beyond_per_tick_cap_restores_every_node() {
+            let (mut rig, policy, user_muted) = big_graph();
+            let allowed = PrivacyPolicy::default();
+
+            rig.settle(&denied(), 64, 50, &|_| false);
+            for &id in &policy {
+                assert!(rig.graph.muted(id), "policy node {id} muted while disabled");
+            }
+            for &id in &user_muted {
+                assert!(
+                    rig.graph.muted(id),
+                    "user mute {id} preserved while disabled"
+                );
+            }
+            // Exactly the policy nodes are owned: never a user mute.
+            assert_eq!(rig.tracker.tracked(), &policy);
+
+            // Lift: the first tick dispatches a bounded batch and
+            // retains ownership of everything it cannot dispatch yet.
+            let scan = rig.graph.state.privacy_scan(&allowed);
+            let planned = rig.tracker.plan(&scan);
+            let planned_nodes: BTreeSet<u64> = planned.iter().map(|action| action.node()).collect();
+            assert_eq!(planned_nodes, policy);
+            assert!(planned
+                .iter()
+                .all(|action| *action == unmute(action.node())));
+            rig.queue.offer(planned);
+            let batch = rig.queue.take(64);
+            assert_eq!(batch.len(), 64);
+            assert_eq!(rig.queue.len(), 36);
+            assert_eq!(rig.tracker.tracked(), &policy);
+            for action in &batch {
+                assert!(rig.graph.execute(action, &|_| false));
+                rig.queue.report(action, true);
+                rig.dispatched.push(*action);
+            }
+            rig.graph.publish();
+
+            // The remainder drains on later ticks: every policy node
+            // by identity, no user mute touched, nothing left owned.
+            rig.settle(&allowed, 64, 50, &|_| false);
+            for &id in &policy {
+                assert!(!rig.graph.muted(id), "policy node {id} restored");
+            }
+            for &id in &user_muted {
+                assert!(rig.graph.muted(id), "user mute {id} preserved");
+            }
+            assert!(rig.tracker.tracked().is_empty());
+            assert!(rig.queue.is_empty());
+            let touched: BTreeSet<u64> =
+                rig.dispatched.iter().map(|action| action.node()).collect();
+            assert!(touched.is_disjoint(&user_muted.into_iter().collect()));
+            assert!(policy.is_subset(&touched));
+        }
+
+        #[test]
+        fn failed_unmute_retries_then_recovers() {
+            let (mut rig, policy, user_muted) = big_graph();
+            rig.settle(&denied(), 64, 50, &|_| false);
+            assert_eq!(rig.tracker.tracked(), &policy);
+
+            // Two nodes fail their first two unmutes, then recover.
+            let attempts = RefCell::new(BTreeMap::new());
+            let flaky: BTreeSet<u64> = [100, 200].into_iter().collect();
+            let fail = |action: &Action| {
+                let mut attempts = attempts.borrow_mut();
+                let count = attempts.entry(action.node()).or_insert(0);
+                *count += 1;
+                flaky.contains(&action.node()) && *count <= 2
+            };
+            let reticks = rig.settle(&PrivacyPolicy::default(), 64, 50, &fail);
+            assert!(
+                reticks > 0,
+                "failures schedule retry ticks instead of stalling"
+            );
+            let attempts = attempts.borrow();
+            assert_eq!(attempts[&100], 3);
+            assert_eq!(attempts[&200], 3);
+            for &id in &policy {
+                assert!(!rig.graph.muted(id), "policy node {id} restored");
+            }
+            for &id in &user_muted {
+                assert!(rig.graph.muted(id), "user mute {id} preserved");
+            }
+            assert!(rig.tracker.tracked().is_empty());
+            assert!(rig.queue.is_empty());
+        }
+
+        #[test]
+        fn persistent_failure_backs_off_without_losing_ownership() {
+            let mut rig = Rig {
+                graph: FakeGraph::new(&[(100, "Audio/Sink", false), (300, "Audio/Sink", true)]),
+                tracker: Tracker::default(),
+                queue: ActionQueue::default(),
+                dispatched: Vec::new(),
+            };
+            rig.settle(&denied(), 64, 50, &|_| false);
+            assert_eq!(rig.tracker.tracked(), &BTreeSet::from([100]));
+
+            // The unmute always fails: proactive retries stop after
+            // the bound, but ownership is retained — every later
+            // external tick re-plans it.
+            for round in 1..=5 {
+                let scan = rig.graph.state.privacy_scan(&PrivacyPolicy::default());
+                let planned = rig.tracker.plan(&scan);
+                assert_eq!(
+                    planned,
+                    vec![unmute(100)],
+                    "round {round}: the stuck node re-plans"
+                );
+                rig.queue.offer(planned);
+                let batch = rig.queue.take(64);
+                assert_eq!(batch, vec![unmute(100)]);
+                for action in &batch {
+                    let ok = rig.graph.execute(action, &|_| true);
+                    assert!(!ok);
+                    assert_eq!(
+                        rig.queue.report(action, ok),
+                        round <= super::super::MAX_ACTION_RETRIES,
+                        "round {round}: a tick is scheduled only within the retry bound"
+                    );
+                }
+                rig.graph.publish();
+            }
+            assert_eq!(rig.tracker.tracked(), &BTreeSet::from([100]));
+            assert!(rig.queue.is_empty());
+
+            // Healing the executor restores it on the next tick, and
+            // the user's mute was never touched.
+            rig.settle(&PrivacyPolicy::default(), 64, 50, &|_| false);
+            assert!(!rig.graph.muted(100));
+            assert!(rig.graph.muted(300));
+            assert!(rig.tracker.tracked().is_empty());
+            assert!(rig.queue.is_empty());
+        }
+
+        #[test]
+        fn destroy_leg_survives_the_queue_unchanged() {
+            let (mut rig, _, _) = big_graph();
+            // Destroys are untracked by design, but they still flow
+            // through the queue in full: nothing truncated away.
+            let cameras: Vec<Action> = (0..100)
+                .map(|i| Action::DestroyNode { node: 1000 + i })
+                .collect();
+            rig.queue.offer(cameras.clone());
+            let mut drained = Vec::new();
+            while !rig.queue.is_empty() {
+                drained.extend(rig.queue.take(64));
+            }
+            assert_eq!(drained, cameras);
+            for action in &drained {
+                assert!(!rig.queue.report(action, true));
+            }
+            // And the mute helper stays honest about its own shape.
+            assert_eq!(
+                mute(7),
+                Action::SetMute {
+                    node: 7,
+                    muted: true
+                }
+            );
+        }
     }
 
     /// Live enforcer against a real headless PipeWire + WirePlumber:
