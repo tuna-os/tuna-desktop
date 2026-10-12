@@ -2750,15 +2750,23 @@ pass G-QS-BT-MENU "the Bluetooth menu lists paired devices as GNOME does and con
 # Clean Print Heads, Use Printer by Default, Clear All and Remove
 # Printer actions. The stub's call log proves live discovery and that
 # Cancel and Test Page reach the server.
+# Line-count marker: the panel queries at construction and the tile ticks,
+# so only queries AFTER the press prove the menu-open refresh (f118's
+# presence assertions passed vacuously on startup evidence).
+cups_mark=$(wc -l < "$TUNA_STUB_CUPS_LOG")
 qs_press "Printers Menu" printers-menu || fail G-QS-PRINTERS "could not open the Printers menu"
 sleep 2
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-printers-menu.json" 20 ||
     fail G-QS-PRINTERS "accessibility dump failed"
 scrot "$ARTIFACTS/15d-printers-menu.png" >/dev/null
-grep -q "^CUPS-Get-Printers" "$TUNA_STUB_CUPS_LOG" ||
+tail -n +"$((cups_mark + 1))" "$TUNA_STUB_CUPS_LOG" | grep -qE "^[0-9.]+ CUPS-Get-Printers$" ||
     fail G-QS-PRINTERS "opening the menu did not query CUPS for printers"
-grep -q "^Get-Jobs" "$TUNA_STUB_CUPS_LOG" ||
+tail -n +"$((cups_mark + 1))" "$TUNA_STUB_CUPS_LOG" | grep -qE "^[0-9.]+ Get-Jobs " ||
     fail G-QS-PRINTERS "opening the menu did not query CUPS for jobs"
+# Menu-lifetime split: if the menu did not stay open for the dump, say so
+# instead of misattributing bare-desktop evidence to row population.
+showing "$ARTIFACTS/a11y-qs-printers-menu.json" "Print Settings" ||
+    fail G-QS-PRINTERS "the Printers menu did not stay open for the dump (menu lifetime, not rows)"
 for name in "OfficeJet Pro (Default) — Ready — 1 Job" "LabelPrinter — Stopped" \
     "Print Settings" "1 Job"; do
     showing "$ARTIFACTS/a11y-qs-printers-menu.json" "$name" ||
@@ -2784,12 +2792,12 @@ jq -e 'any(.[]; .showing and (.name | contains("Out of paper")))' \
     "$ARTIFACTS/a11y-qs-printers-window.json" >/dev/null ||
     fail G-QS-PRINTERS "no Out of paper banner on the stopped printer"
 qs_press "Cancel" printers-cancel || fail G-QS-PRINTERS "could not press Cancel"
-for _ in $(seq 1 20); do grep -q "^Cancel-Job id=42" "$TUNA_STUB_CUPS_LOG" 2>/dev/null && break; sleep 0.5; done
-grep -q "^Cancel-Job id=42" "$TUNA_STUB_CUPS_LOG" ||
+for _ in $(seq 1 20); do grep -qE "^[0-9.]+ Cancel-Job id=42$" "$TUNA_STUB_CUPS_LOG" 2>/dev/null && break; sleep 0.5; done
+grep -qE "^[0-9.]+ Cancel-Job id=42$" "$TUNA_STUB_CUPS_LOG" ||
     fail G-QS-PRINTERS "Cancel did not reach CUPS as Cancel-Job 42"
 qs_press "Test Page" printers-test || fail G-QS-PRINTERS "could not press Test Page"
-for _ in $(seq 1 20); do grep -q "^Print-Job" "$TUNA_STUB_CUPS_LOG" 2>/dev/null && break; sleep 0.5; done
-grep -q "^Print-Job" "$TUNA_STUB_CUPS_LOG" ||
+for _ in $(seq 1 20); do grep -qE "^[0-9.]+ Print-Job " "$TUNA_STUB_CUPS_LOG" 2>/dev/null && break; sleep 0.5; done
+grep -qE "^[0-9.]+ Print-Job " "$TUNA_STUB_CUPS_LOG" ||
     fail G-QS-PRINTERS "Test Page did not reach CUPS as Print-Job"
 qs_press "Close" printers-close || fail G-QS-PRINTERS "could not close the queue window"
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-printers-closed.json" 20 ||
