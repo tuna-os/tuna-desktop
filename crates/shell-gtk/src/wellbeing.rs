@@ -2087,7 +2087,7 @@ fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
 #[cfg(not(test))]
 fn break_tick(rt: &Rc<RefCell<Runtime>>) {
     let now = wall_now();
-    let (hooks, mut effect, mut countdown, mut resident, mut events) = {
+    let (hooks, mut effect, mut countdown, mut resident, events) = {
         let mut r = rt.borrow_mut();
         let idle_secs = idle_time().map(|d| d.as_secs() as i64).unwrap_or(0);
         let mut events = r.breaks.poll(now, idle_secs);
@@ -2791,15 +2791,18 @@ mod tests {
         let _ = session_idle_delay();
     }
 
+    type ActionPost = (String, String, Vec<(String, String)>, u64);
+    type ActionCallbacks = HashMap<(u64, String), Rc<dyn Fn()>>;
+
     struct Recorded {
         posts: Rc<RefCell<Vec<(String, String)>>>,
         countdowns: Rc<RefCell<Vec<(String, f64)>>>,
         locks: Rc<Cell<u32>>,
-        action_posts: Rc<RefCell<Vec<(String, String, Vec<(String, String)>, u64)>>>,
+        action_posts: Rc<RefCell<Vec<ActionPost>>>,
         next_id: Rc<Cell<u64>>,
         dismissals: Rc<RefCell<Vec<u64>>>,
         registered: Rc<RefCell<Vec<(u64, String)>>>,
-        callbacks: Rc<RefCell<HashMap<(u64, String), Rc<dyn Fn()>>>>,
+        callbacks: Rc<RefCell<ActionCallbacks>>,
         dropped: Rc<RefCell<Vec<u64>>>,
         queued: Rc<RefCell<Vec<BreakActionKind>>>,
         effect_sends: Rc<RefCell<Vec<(bool, bool)>>>,
