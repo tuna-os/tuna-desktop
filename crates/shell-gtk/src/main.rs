@@ -1557,9 +1557,15 @@ fn build(app: &adw::Application) {
                 // commit is picked into the tree that carries both.
                 effect_hook: Rc::new(move |grayscale: bool, fade: bool| {
                     if let Some(control) = effect_shell.borrow_mut().control.as_mut() {
-                        if let Err(e) = control.set_wellbeing_effects(grayscale, fade) {
-                            eprintln!("tuna-shell-gtk: wellbeing: effects send failed: {e}");
+                        match control.set_wellbeing_effects(grayscale, fade) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                eprintln!("tuna-shell-gtk: wellbeing: effects send failed: {e}");
+                                false
+                            }
                         }
+                    } else {
+                        false
                     }
                 }),
                 show_countdown: Rc::new(move |label: String, progress: f64| {
