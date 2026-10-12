@@ -462,6 +462,49 @@ try:
     ended=wait(lambda d:not d["windows"],"death-after-minimize-deadline")
     assert not ended["window_lifecycle"]["destroying"] and ended["window_lifecycle"]["retained_destroy_bytes"]==0
     assert compositor.poll() is None
+    # Close a real native actor during its opaque full-motion restore. The
+    # retained destroy must start from the last rendered transform, including
+    # pixels outside that transform staying background (no full-size jump).
+    command.unlink(missing_ok=True)
+    client=spawn([str(frozen / "tuna-modal-dim-client")],"restore-close-client",{"WAYLAND_DISPLAY":"lifecycle-proof"})
+    mapped=wait(lambda d:len(d["windows"])==1 and d["window_lifecycle"]["opening"],"restore-close-map")
+    wid=mapped["windows"][0]["id"]
+    normal_rect=mapped["windows"][0]["rect"]
+    move(7275)
+    wait(lambda d:not d["window_lifecycle"]["opening"],"restore-close-map-complete")
+    action("minimize",32)
+    wait(lambda d:wid in d["minimized"] and d["window_lifecycle"]["minimizing"],"restore-close-minimize")
+    move(7675)
+    wait(lambda d:not d["window_lifecycle"]["minimizing"],"restore-close-minimize-complete")
+    restore()
+    move(7775)
+    restoring=wait(lambda d:any(r["window"]==wid for r in d["window_lifecycle"]["restoring"]),"restore-close-quarter")
+    icon=next(r for r in restoring["window_lifecycle"]["restoring"] if r["window"]==wid)["icon"]
+    weight=2**(-2.5)
+    shown=[normal_rect[i]+(icon[i]-normal_rect[i])*weight for i in range(4)]
+    before=screenshot("21-interrupted-restore-before")
+    check_pixel(before,shown,1.0)
+    x,y,w,h=normal_rect
+    outside=next((round(x+w*fx),round(y+h*fy))
+                 for fx,fy in ((.05,.95),(.95,.95),(.05,.05),(.95,.05))
+                 if not (shown[0]-4 <= x+w*fx <= shown[0]+shown[2]+4 and
+                         shown[1]-4 <= y+h*fy <= shown[1]+shown[3]+4))
+    assert before.getpixel(outside)==baseline.getpixel(outside),outside
+    action("close",33)
+    client.wait(timeout=10)
+    dead=wait(lambda d:not d["windows"] and any(g["window"]==wid for g in d["window_lifecycle"]["destroying"]),"restore-close-retained")
+    assert dead["window_lifecycle"]["retained_destroy_bytes"] > 0
+    assert any(h["window"]==wid and h["effect"]=="destroy" and h["outcome"]=="started-from-restore"
+               for h in dead["window_lifecycle"]["history"])
+    after=screenshot("22-interrupted-restore-retained")
+    check_pixel(after,shown,1.0)
+    assert after.getpixel(outside)==baseline.getpixel(outside),(outside,after.getpixel(outside))
+    region=(max(0,int(min(x,shown[0]))), max(0,int(min(y,shown[1]))),
+            min(before.width,int(max(x+w,shown[0]+shown[2]))+1),
+            min(before.height,int(max(y+h,shown[1]+shown[3]))+1))
+    assert after.crop(region).tobytes()==before.crop(region).tobytes(),"surface death changed the frozen restore presentation"
+    move(7925)
+    wait(lambda d:not d["window_lifecycle"]["destroying"] and d["window_lifecycle"]["retained_destroy_bytes"]==0,"restore-close-clean")
     success=True
 finally:
     owned_accessibility_pids = [manifest["session_isolation"]["accessibility_bus_pid"]] if "session_isolation" in manifest else []
@@ -516,5 +559,5 @@ finally:
 
 require_owned_cleanup(manifest["owned_cleanup"])
 if success:
-    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-FAMILY-DIM-HIDDEN pass independently minimized managed modal retains dim until actual unset-modal brightness control\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-CLEANUP pass private session owned process cleanup\n")
+    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-FAMILY-DIM-HIDDEN pass independently minimized managed modal retains dim until actual unset-modal brightness control\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-RESTORE-CLOSE pass actual frozen restore presentation survives native surface death without full-size jump\nMN-CLEANUP pass private session owned process cleanup\n")
     print(f"native minimize proof passed: {art}")

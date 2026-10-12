@@ -91,12 +91,15 @@ pub fn frame(kind: Kind, effect: Effect, progress: f64, policy: MotionPolicy) ->
     }
 }
 pub fn rect(geometry: Rect, frame: Frame) -> RectF {
-    let w = f64::from(geometry.size.w);
-    let h = f64::from(geometry.size.h);
+    rect_f(geometry.to_f64(), frame)
+}
+fn rect_f(geometry: RectF, frame: Frame) -> RectF {
+    let w = geometry.size.w;
+    let h = geometry.size.h;
     Rectangle::new(
         (
-            f64::from(geometry.loc.x) + w * (1.0 - frame.scale.0) * frame.pivot.0,
-            f64::from(geometry.loc.y) + h * (1.0 - frame.scale.1) * frame.pivot.1,
+            geometry.loc.x + w * (1.0 - frame.scale.0) * frame.pivot.0,
+            geometry.loc.y + h * (1.0 - frame.scale.1) * frame.pivot.1,
         )
             .into(),
         (w * frame.scale.0, h * frame.scale.1).into(),
@@ -114,6 +117,15 @@ fn interrupted_close(mapping: bool, resizing: bool) -> Option<&'static str> {
         Some("interrupted-size-change")
     } else {
         None
+    }
+}
+// A dead actor retains the presentation actually rendered during restore,
+// rather than jumping back to normal geometry before its destroy curve.
+fn retained_geometry(normal: Rect, presentation: RectF, transformed: bool) -> RectF {
+    if transformed {
+        presentation
+    } else {
+        normal.to_f64()
     }
 }
 fn hidden_dead_actor(minimizing: bool, was_minimized: bool) -> bool {
@@ -153,6 +165,7 @@ struct Cached {
     kind: Kind,
     parent: Option<u64>,
     resizing: bool,
+    restoring: bool,
     resize_snapshot: Option<
         smithay::backend::renderer::element::texture::TextureRenderElement<
             smithay::backend::renderer::gles::GlesTexture,
@@ -318,7 +331,7 @@ impl Lifecycle {
                 f.alpha,
             )
         } else {
-            (rect(ghost.geometry.to_i32_round(), f), f.alpha)
+            (rect_f(ghost.geometry, f), f.alpha)
         };
         crate::size_change::snapshot_element(
             renderer,
@@ -655,6 +668,7 @@ pub fn step_frame(
                     kind,
                     parent: manager.transient_parent(*id),
                     resizing: resizing.is_some(),
+                    restoring: restoring.is_some(),
                     resize_snapshot,
                     brightness: manager.modal_dim().multiplier(*id),
                     order: index,
@@ -749,17 +763,26 @@ pub fn step_frame(
             continue;
         }
         if let Some(texture) = copy_frame(renderer, &old) {
-            life.record(id, effect, old.kind, "started");
+            life.record(
+                id,
+                effect,
+                old.kind,
+                if old.restoring {
+                    "started-from-restore"
+                } else {
+                    "started"
+                },
+            );
             life.ghosts.push(Ghost {
                 id,
                 before: next.get(old.order).copied().flatten(),
                 order: old.order,
                 parent: old.parent,
-                geometry: if minimizing {
-                    old.presentation
-                } else {
-                    old.geometry.to_f64()
-                },
+                geometry: retained_geometry(
+                    old.geometry,
+                    old.presentation,
+                    minimizing || old.restoring,
+                ),
                 pixels,
                 snapshot: Snapshot {
                     texture,
@@ -872,6 +895,19 @@ mod tests {
     use tuna_shell_control::motion::MotionLevel;
     fn policy(level: MotionLevel) -> MotionPolicy {
         MotionPolicy::new(level, 1.0)
+    }
+    #[test]
+    fn destroyed_restore_keeps_last_rendered_geometry_without_changing_normal_close() {
+        let normal = Rect::new((100, 200).into(), (500, 350).into());
+        let shown = RectF::new((75.25, 160.5).into(), (420.75, 300.25).into());
+        assert_eq!(retained_geometry(normal, shown, true), shown);
+        assert_eq!(retained_geometry(normal, shown, false), normal.to_f64());
+        let start = frame(Kind::Normal, Effect::Destroy, 0.0, MotionPolicy::default());
+        assert_eq!(
+            rect_f(shown, start),
+            shown,
+            "retained fractional transform must not snap to integer geometry"
+        );
     }
     #[test]
     fn hidden_actor_death_after_minimize_deadline_does_not_restart_destroy() {
