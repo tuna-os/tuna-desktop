@@ -40,6 +40,28 @@ fn command(stream: &mut UnixStream, replies: &mpsc::Receiver<Message>, id: u64, 
         }
     }
 }
+fn observe(stream: &mut UnixStream, replies: &mpsc::Receiver<Message>) {
+    stream
+        .write_all(&encode_frame(&Message::Hello {
+            version: CURRENT_VERSION,
+        }))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut hello = false;
+    loop {
+        let message = replies
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("observation timed out");
+        match message {
+            Message::Hello { version } => {
+                assert_eq!(version, CURRENT_VERSION);
+                hello = true;
+            }
+            Message::Snapshot { locked: false, .. } if hello => break,
+            _ => {}
+        }
+    }
+}
 fn main() {
     let parent = unsafe { libc::getppid() };
     let path = PathBuf::from(std::env::var_os("TUNA_WELLBEING_COMMAND").unwrap());
@@ -105,6 +127,7 @@ fn main() {
             if next > generation {
                 assert_eq!(next, generation + 1, "proof generation skipped");
                 match value["action"].as_str().unwrap() {
+                    "observe" => observe(&mut stream, &replies),
                     "effects" => command(
                         &mut stream,
                         &replies,

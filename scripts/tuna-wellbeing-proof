@@ -103,11 +103,17 @@ def main():
         temp = clock.with_suffix('.tmp')
         temp.write_text(str(clock_value))
         temp.replace(clock)
+        # Read-only protocol resnapshots provide explicit render/readback
+        # boundaries; no repeated effect commands or fresh pointer input.
+        for _ in range(3):
+            action('observe')
         wait(lambda d: d['animation_clock_ms'] >= base + clock_value and d['rendered_frames'] >= before + 2, f'clock-{clock_value}')
     def keys(*argv):
         subprocess.run(['xdotool', *map(str, argv)], env=env, check=True, timeout=5)
     def capture(name):
         before = json.loads(state.read_text())['rendered_frames']
+        for _ in range(3):
+            action('observe')
         wait(lambda d: d['rendered_frames'] >= before + 2, name + '-presented')
         path = art / f'{name}-host.png'
         assert not path.exists()

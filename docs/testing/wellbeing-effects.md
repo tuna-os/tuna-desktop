@@ -101,7 +101,7 @@ source geometry and checked against actual chromatic producer pixels.
 
 Artifacts live outside the checkout in a fresh directory and include original
 freeze/build-receipt hashes, exact compositor/proof-peer/client identities,
-boot ID and process start ticks, per-image SHA receipts, passive frame admission
+boot ID and process start ticks, per-image SHA receipts, explicit read-only resnapshot frame barriers
 and cleanup status. The proof refuses existing displays, mismatched/stale/dirty
 source, ambiguous/missing examples and overwritten bundles. Child processes
 have parent-exit signals; an owned pidfd tracks the supervised peer. Source and
@@ -115,3 +115,8 @@ Retain the reconciled boxed InputSettings API before combined CI. This proof
 qualifies renderer behavior only when it runs successfully; GTK GSettings,
 usage timers, notifications, screen-cast transport, installed DRM and hardware
 acceptance remain separate.
+
+Read-only protocol resnapshots provide fixed render/readback boundaries before
+pixel capture and after clock changes. They do not resend effect commands,
+retry gestures, change fixture state, or qualify idle scheduling/performance.
+This keeps the renderer proof independent of incidental GTK timers.
