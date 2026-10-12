@@ -917,6 +917,7 @@ impl OverviewUi {
                         let actions = me.actions.clone();
                         let members: Vec<AppEntry> = members.iter().map(|e| (*e).clone()).collect();
                         let (id, name) = (folder.id.clone(), folder.name.clone());
+                        let dragging = me.grid_dragging.clone();
                         button.connect_clicked(move |_| {
                             let tiles = members
                                 .iter()
@@ -924,7 +925,11 @@ impl OverviewUi {
                                     let tile = app_button(entry, 96, true);
                                     tile.add_css_class("folder-tile");
                                     // Dragged out onto the shade, it leaves.
-                                    drag_source(&tile, format!("folder-app:{id}:{}", entry.app_id));
+                                    let source = drag_source(
+                                        &tile,
+                                        format!("folder-app:{id}:{}", entry.app_id),
+                                    );
+                                    guard_drag_source(&source, &dragging);
                                     let (entry, actions, dialog) =
                                         (entry.clone(), actions.clone(), dialog.clone());
                                     tile.connect_clicked(move |_| {
@@ -1449,10 +1454,7 @@ fn paged_grid(
                 let Some(source) = controllers.item(i).and_downcast::<gtk::DragSource>() else {
                     continue;
                 };
-                let active = dragging.clone();
-                source.connect_drag_begin(move |_, _| active.set(true));
-                let active = dragging.clone();
-                source.connect_drag_end(move |_, _, _| active.set(false));
+                guard_drag_source(&source, &dragging);
             }
         }
     }
@@ -1927,6 +1929,14 @@ fn step_page(carousel: &libadwaita::Carousel, step: i32) {
     let target = (current + step).clamp(0, carousel.n_pages() as i32 - 1);
     let page = carousel.nth_page(target as u32);
     carousel.scroll_to(&page, true);
+}
+
+/// Shared local-drag ownership includes tiles created in the folder dialog.
+fn guard_drag_source(source: &gtk::DragSource, dragging: &Rc<Cell<bool>>) {
+    let active = dragging.clone();
+    source.connect_drag_begin(move |_, _| active.set(true));
+    let active = dragging.clone();
+    source.connect_drag_end(move |_, _, _| active.set(false));
 }
 
 /// Make `widget` a drag source of `text`, the widget itself as the

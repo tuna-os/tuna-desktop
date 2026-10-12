@@ -424,6 +424,7 @@ pub fn rename(id: &str, name: &str) {
 pub struct FolderWatch {
     root: Option<gio::Settings>,
     backend: Option<gio::SettingsBackend>,
+    source: Option<gio::SettingsSchemaSource>,
     children: std::cell::RefCell<std::collections::BTreeMap<String, gio::Settings>>,
     dirty: std::rc::Rc<std::cell::Cell<bool>>,
 }
@@ -440,13 +441,18 @@ impl FolderWatch {
     }
 
     fn with_backend(backend: Option<gio::SettingsBackend>) -> Self {
+        Self::with_source(gio::SettingsSchemaSource::default(), backend)
+    }
+
+    fn with_source(
+        source: Option<gio::SettingsSchemaSource>,
+        backend: Option<gio::SettingsBackend>,
+    ) -> Self {
         let dirty = std::rc::Rc::new(std::cell::Cell::new(false));
-        let root = schemas_present().then(|| {
-            let schema = gio::SettingsSchemaSource::default()
-                .unwrap()
-                .lookup(SCHEMA, true)
-                .unwrap();
-            gio::Settings::new_full(&schema, backend.as_ref(), None)
+        let root = source.as_ref().and_then(|source| {
+            source.lookup(FOLDER_SCHEMA, true)?;
+            let schema = source.lookup(SCHEMA, true)?;
+            Some(gio::Settings::new_full(&schema, backend.as_ref(), None))
         });
         if let Some(root) = &root {
             let weak = std::rc::Rc::downgrade(&dirty);
@@ -459,6 +465,7 @@ impl FolderWatch {
         let watch = Self {
             root,
             backend,
+            source,
             children: Default::default(),
             dirty,
         };
@@ -477,7 +484,9 @@ impl FolderWatch {
             if id.is_empty() || id.contains('/') || children.contains_key(id.as_str()) {
                 continue;
             }
-            let schema = gio::SettingsSchemaSource::default()
+            let schema = self
+                .source
+                .as_ref()
                 .unwrap()
                 .lookup(FOLDER_SCHEMA, true)
                 .unwrap();
@@ -505,10 +514,13 @@ impl FolderWatch {
 
     pub fn load(&self) -> Vec<Folder> {
         self.reconcile();
-        self.children
-            .borrow()
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
+        let children = self.children.borrow();
+        root.strv("folder-children")
             .iter()
-            .map(|(id, s)| read_folder(id, s))
+            .filter_map(|id| children.get(id.as_str()).map(|s| read_folder(id, s)))
             .collect()
     }
 }
@@ -536,6 +548,49 @@ fn read_folder(id: &str, s: &gio::Settings) -> Folder {
 mod tests {
     use super::*;
 
+    struct TestSchemas {
+        source: gio::SettingsSchemaSource,
+        dir: PathBuf,
+    }
+
+    impl TestSchemas {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "tuna-folder-schemas-{}",
+                glib::uuid_string_random()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("folders.gschema.xml"),
+                r#"<schemalist>
+<schema id="org.gnome.desktop.app-folders" path="/org/gnome/desktop/app-folders/">
+<key name="folder-children" type="as"><default>[]</default></key></schema>
+<schema id="org.gnome.desktop.app-folders.folder">
+<key name="name" type="s"><default>''</default></key>
+<key name="translate" type="b"><default>false</default></key>
+<key name="apps" type="as"><default>[]</default></key>
+<key name="categories" type="as"><default>[]</default></key>
+<key name="excluded-apps" type="as"><default>[]</default></key>
+</schema></schemalist>"#,
+            )
+            .unwrap();
+            assert!(std::process::Command::new("glib-compile-schemas")
+                .arg("--strict")
+                .arg(&dir)
+                .status()
+                .unwrap()
+                .success());
+            let source = gio::SettingsSchemaSource::from_directory(&dir, None, false).unwrap();
+            Self { source, dir }
+        }
+    }
+
+    impl Drop for TestSchemas {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
     fn dispatch_until(context: &glib::MainContext, mut ready: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
@@ -558,6 +613,7 @@ mod tests {
         let watch = FolderWatch {
             root: None,
             backend: None,
+            source: None,
             children: Default::default(),
             dirty: std::rc::Rc::new(std::cell::Cell::new(true)),
         };
@@ -573,13 +629,10 @@ mod tests {
         let context = glib::MainContext::new();
         context
             .with_thread_default(|| {
-                assert!(
-                    schemas_present(),
-                    "folder schemas required for actual Gio regression"
-                );
+                let fixture = TestSchemas::new();
+                let source = fixture.source.clone();
                 let backend = gio::memory_settings_backend_new();
-                let watch = FolderWatch::with_backend(Some(backend.clone()));
-                let source = gio::SettingsSchemaSource::default().unwrap();
+                let watch = FolderWatch::with_source(Some(source.clone()), Some(backend.clone()));
                 let root = gio::Settings::new_full(
                     &source.lookup(SCHEMA, true).unwrap(),
                     Some(&backend),
@@ -619,6 +672,22 @@ mod tests {
     }
 
     #[test]
+    fn retained_folder_watch_preserves_root_priority_and_rejects_path_escape() {
+        let fixture = TestSchemas::new();
+        let backend = gio::memory_settings_backend_new();
+        let watch = FolderWatch::with_source(Some(fixture.source.clone()), Some(backend));
+        let root = watch.root.as_ref().unwrap();
+        root.set_strv("folder-children", ["Zebra", "Alpha", "escape/child", ""])
+            .unwrap();
+        let ids: Vec<_> = watch.load().into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, ["Zebra", "Alpha"]);
+        root.set_strv("folder-children", ["Alpha", "Zebra"])
+            .unwrap();
+        let ids: Vec<_> = watch.load().into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, ["Alpha", "Zebra"]);
+    }
+
+    #[test]
     fn retained_folder_watch_keyfile_external_atomic_write() {
         let context = glib::MainContext::new();
         let dir =
@@ -626,9 +695,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("settings");
         context.with_thread_default(|| {
-            assert!(schemas_present(), "folder schemas required for actual Gio regression");
+            let fixture = TestSchemas::new();
             let backend = gio::keyfile_settings_backend_new(path.to_str().unwrap(), "/", None);
-            let watch = FolderWatch::with_backend(Some(backend));
+            let watch = FolderWatch::with_source(Some(fixture.source.clone()), Some(backend));
             assert!(watch.load().is_empty());
             let replacement = dir.join("replacement");
             std::fs::write(&replacement, "[org/gnome/desktop/app-folders]\nfolder-children=['Live']\n[org/gnome/desktop/app-folders/folders/Live]\nname='External'\napps=['one.desktop']\n").unwrap();
