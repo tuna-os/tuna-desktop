@@ -49,7 +49,8 @@ impl LoginWindow {
     pub fn shutdown(&self) {
         let state = self.state.borrow();
         state.closed.store(true, Ordering::Release);
-        if let Some(stream) = state.interrupt.lock().expect("interrupt lock").take() {
+        let interrupt = state.interrupt.lock().expect("interrupt lock").take();
+        if let Some(stream) = interrupt {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
@@ -277,7 +278,8 @@ pub fn build_login(
         if let Some(state) = weak.upgrade() {
             let state = state.borrow();
             state.closed.store(true, Ordering::Release);
-            if let Some(stream) = state.interrupt.lock().expect("interrupt lock").take() {
+            let interrupt = state.interrupt.lock().expect("interrupt lock").take();
+            if let Some(stream) = interrupt {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         }

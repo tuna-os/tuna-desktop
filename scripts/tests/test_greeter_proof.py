@@ -14,6 +14,12 @@ class GreeterProof(unittest.TestCase):
         self.assertIn('connect_shutdown', main)
         self.assertNotIn('ui::build_ui', main)
 
+    def test_shutdown_takes_stream_before_tail_expression_or_socket_shutdown(self):
+        login = (ROOT / 'crates/greeter/src/login.rs').read_text()
+        self.assertNotIn('if let Some(stream) = state.interrupt.lock()', login)
+        self.assertEqual(login.count('let interrupt = state.interrupt.lock().expect("interrupt lock").take();'), 2)
+        self.assertEqual(login.count('if let Some(stream) = interrupt {'), 2)
+
     def test_ci_captures_failure_receipts_after_source_clean_freeze(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertLess(ci.index('scripts/tuna-minimize-ci-proof'), ci.index('scripts/tuna-greeter-proof'))
