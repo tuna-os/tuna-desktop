@@ -1328,6 +1328,7 @@ impl Runtime {
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
         self.lock.lock();
+        self.cursor.on_lock();
         self.control.set_locked(true);
         let remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
         for id in remote_ids {
@@ -1965,7 +1966,9 @@ impl Runtime {
         doc["animation_clock_ms"] =
             serde_json::json!(manual.then(|| self.animation_clock.now().as_millis() as u64));
         doc["overview_motion"] = self.overview_motion.diagnostics();
-        doc["cursor"] = self.cursor.snapshot(self.animation_clock.now());
+        doc["cursor"] = self
+            .cursor
+            .diagnostics(self.animation_clock.now(), self.is_locked());
         doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());
         doc["screen_reader_state"] = serde_json::json!(self.orca.state());
         // Keep backend-specific observations outside the large scene macro so
@@ -3764,6 +3767,7 @@ impl Runtime {
         // dismiss the overview, and raise the exclusive surface.
         if self.control.is_locked() && !self.lock.is_locked() {
             self.lock.lock();
+            self.cursor.on_lock();
             self.control.set_overview(false);
             self.overlay.show(Vec::new());
         }

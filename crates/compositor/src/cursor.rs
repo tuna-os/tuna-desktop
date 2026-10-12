@@ -914,6 +914,22 @@ impl Cursor {
                 .is_some_and(|shown| shown.animation_frames > 1)
     }
 
+    /// A lock is a privacy boundary, including a D-Bus lock without input.
+    /// Keep preference/theme caches, but discard activity and rendered history.
+    pub fn on_lock(&mut self) {
+        self.locate.on_lock();
+        self.shown = None;
+        self.animation_icon = None;
+    }
+
+    pub fn diagnostics(&self, now: Duration, locked: bool) -> serde_json::Value {
+        if locked {
+            serde_json::Value::Null
+        } else {
+            self.snapshot(now)
+        }
+    }
+
     /// The state-file record: settings, what the pointer shows, and
     /// locate-pointer.
     pub fn snapshot(&self, now: Duration) -> serde_json::Value {
@@ -1171,6 +1187,13 @@ impl LocatePointer {
     pub fn reset_keys(&mut self) {
         self.held.clear();
         self.armed = None;
+    }
+
+    pub fn on_lock(&mut self) {
+        self.reset_keys();
+        self.playing = None;
+        self.count = 0;
+        self.frames = 0;
     }
 
     fn elapsed_ms(&self, now: Duration) -> Option<f64> {
@@ -1759,6 +1782,40 @@ mod tests {
         // Right Ctrl is not Mutter's default key.
         locate.feed(&key(97, true), at, now);
         assert!(!locate.feed(&key(97, false), at, now));
+    }
+
+    #[test]
+    fn locking_during_a_ripple_clears_activity_and_redacts_all_cursor_history() {
+        let mut cursor = Cursor::new();
+        cursor.locate.set_enabled(true);
+        cursor.locate.set_key("Control_L");
+        let key = |pressed| ManagerInput::Key {
+            keycode: 29,
+            pressed,
+            time: 0,
+        };
+        let now = Duration::from_secs(1);
+        cursor.locate.feed(&key(true), (100.0, 50.0).into(), now);
+        assert!(cursor.locate.feed(&key(false), (100.0, 50.0).into(), now));
+        cursor.locate.frames = 3;
+        assert_eq!(
+            cursor.diagnostics(now, false)["locate_pointer"]["at"],
+            serde_json::json!([100.0, 50.0])
+        );
+        // Even before transition cleanup, publication fails closed.
+        assert!(cursor.diagnostics(now, true).is_null());
+        cursor.locate.feed(&key(true), (100.0, 50.0).into(), now);
+        cursor.on_lock();
+        assert!(!cursor.animating(now));
+        assert!(cursor.locate.held.is_empty());
+        assert!(cursor.locate.armed.is_none());
+        assert!(cursor.locate.playing.is_none());
+        assert!(cursor.shown.is_none());
+        assert_eq!((cursor.locate.count, cursor.locate.frames), (0, 0));
+        assert!(cursor.locate.enabled());
+        assert!(cursor.locate.matches_keysym([0xffe3]));
+        assert!(!cursor.locate.feed(&key(false), (100.0, 50.0).into(), now));
+        assert!(cursor.diagnostics(now, false)["locate_pointer"]["at"].is_null());
     }
 
     #[test]

@@ -5364,7 +5364,7 @@ end=$(($(date +%s) + 10))
 until grep -q Suspend "$POWER_LOG" 2>/dev/null || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q Suspend "$POWER_LOG" || fail G-SUSPEND-LOCK "logind never got Suspend"
 cstate '.locked' "locked" 10 || fail G-SUSPEND-LOCK "PrepareForSleep did not lock the session"
-cstate 'has("pointer_position") and has("pointer_fullscreen_blocked") and .pointer_position == null and .pointer_fullscreen_blocked == null' "locked pointer diagnostics redacted" ||
+cstate 'has("pointer_position") and has("pointer_fullscreen_blocked") and .pointer_position == null and .pointer_fullscreen_blocked == null and has("cursor") and .cursor == null' "locked pointer diagnostics redacted" ||
     fail G-POINTER-TRACE-PRIVATE "credential input retained pointer diagnostics"
 pass G-POINTER-TRACE-PRIVATE "actual locked scene omits pointer coordinates and fullscreen observations"
 "$PY" "$ROOT/scripts/lib/tuna-capture-security-client.py" >"$ARTIFACTS/capture-locked-denial.log" 2>&1 ||
@@ -5451,9 +5451,29 @@ if [ -n "$PAM_ON" ]; then
     grep -q 'ActiveChanged.*true' "$ARTIFACTS/screensaver-signals.log" || fail G-LOCK-KEY "no active signal"
     grep -q 'ActiveChanged.*false' "$ARTIFACTS/screensaver-signals.log" || fail G-LOCK-KEY "no inactive signal"
     pass G-LOCK-KEY "Super+L locks; PAM unlocks; ActiveChanged publishes both transitions"
+    # Freeze only the animation clock so a genuine rendered Ctrl ripple
+    # remains in flight until the real D-Bus lock. No synthetic frames/time.
+    anim_clock 20000
+    cstate '.animation_clock_manual and (.locked | not)' "locate privacy clock" ||
+        fail G-POINTER-TRACE-PRIVATE "could not freeze the unlocked animation clock"
+    gsettings set org.gnome.desktop.interface locate-pointer true
+    cstate '.cursor.locate_pointer.enabled' "locate privacy enabled" ||
+        fail G-POINTER-TRACE-PRIVATE "locate-pointer did not enable"
+    locate_lock_frames=$(jq '.cursor.locate_pointer.frames' "$CSTATE")
+    xdotool key Control_L
+    cstate ".cursor.locate_pointer.active and .cursor.locate_pointer.at != null and .cursor.locate_pointer.frames > $locate_lock_frames" "rendered ripple before D-Bus lock" ||
+        fail G-POINTER-TRACE-PRIVATE "no actual active rendered ripple before locking"
+    cp "$CSTATE" "$ARTIFACTS/locate-before-dbus-lock.json"
     gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/ScreenSaver \
         --method org.gnome.ScreenSaver.Lock >/dev/null || fail G-DBUS-LOCK "D-Bus Lock failed"
     cstate '.locked' "D-Bus locked" 5 || fail G-DBUS-LOCK "D-Bus Lock replied without locking"
+    cstate '.locked and .animation_clock_manual and has("cursor") and .cursor == null and .pointer_position == null and .pointer_fullscreen_blocked == null' "D-Bus lock redacts active ripple" ||
+        fail G-POINTER-TRACE-PRIVATE "D-Bus lock retained cursor activity or pointer coordinates"
+    cp "$CSTATE" "$ARTIFACTS/locate-dbus-locked-private.json"
+    rm -f "$TUNA_ANIMATION_CLOCK"
+    cstate '.locked and (.animation_clock_manual | not)' "locked real clock restored" ||
+        fail G-POINTER-TRACE-PRIVATE "animation proof clock remained active"
+
     # The first printable key lifts the curtain and becomes exactly one
     # password character. Do not click, clear, or replace the entry here:
     # PAM acceptance proves the wake key was neither lost nor inserted twice.
@@ -5466,6 +5486,12 @@ if [ -n "$PAM_ON" ]; then
     cstate '(.locked | not)' "first-printable lock wake authenticated through PAM" 15 ||
         fail G-LOCK-FIRST-PRINTABLE "first wake character was lost, duplicated, or could not authenticate"
     pass G-LOCK-FIRST-PRINTABLE "a printable wake key becomes exactly one password character and PAM unlocks"
+    cstate '(.locked | not) and (.cursor.locate_pointer.active | not) and .cursor.locate_pointer.at == null and .cursor.locate_pointer.count == 0 and .cursor.locate_pointer.frames == 0' "unlock retains no prior ripple" ||
+        fail G-POINTER-TRACE-PRIVATE "unlock resurrected pre-lock cursor activity/history"
+    cp "$CSTATE" "$ARTIFACTS/locate-after-dbus-unlock.json"
+    gsettings set org.gnome.desktop.interface locate-pointer false
+    pass G-POINTER-TRACE-PRIVATE "D-Bus lock during an actual rendered frozen-clock ripple redacts cursor diagnostics; unlock retains no activity/history"
+
     pass G-DBUS-LOCK "org.gnome.Shell exposes the screen-saver object and Lock waits for confirmation"
 
     # A short idle policy must fade, cancel on activity, then latch only
