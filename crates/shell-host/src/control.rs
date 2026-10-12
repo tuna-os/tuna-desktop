@@ -31,6 +31,7 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use tuna_shell_control::{
     ActivationToken, CommandKind, CommandStatus, DecodeError, ErrorKind, Message, OutputInfo,
@@ -170,6 +171,8 @@ pub struct ControlClient {
     /// Socket path for redial, kept by [`ControlClient::connect`]
     /// (`None` for a caller-supplied stream, which has no redial path).
     socket_path: Option<std::path::PathBuf>,
+    /// Bound idle redial attempts while the compositor is unavailable.
+    next_poll_reconnect: Option<Instant>,
     read_buf: Vec<u8>,
     model: ShellModel,
     revision: Option<u64>,
@@ -218,6 +221,7 @@ impl ControlClient {
         Ok(Self {
             stream,
             socket_path: None,
+            next_poll_reconnect: None,
             read_buf: Vec::new(),
             model: ShellModel::new(),
             revision: None,
@@ -635,10 +639,34 @@ impl ControlClient {
     }
 
     /// Read one frame and apply it, surfacing `WouldBlock` when no
-    /// complete frame is available yet.
+    /// complete frame is available yet. A closed connected peer triggers
+    /// a fresh Hello even when the user sends no command. Failed idle
+    /// redials are spaced by 250 ms; ordinary reads and sends never wait.
     pub fn poll(&mut self) -> Result<Handled, ControlError> {
-        let msg = self.read_frame()?;
-        self.handle_message(msg)
+        match self.read_frame() {
+            Ok(msg) => self.handle_message(msg),
+            Err(ControlError::Io(e))
+                if self.socket_path.is_some()
+                    && (is_dead_peer(&e) || e.kind() == io::ErrorKind::UnexpectedEof) =>
+            {
+                self.read_buf.clear();
+                self.revision = None;
+                self.needs_snapshot = true;
+                let now = Instant::now();
+                if self
+                    .next_poll_reconnect
+                    .is_some_and(|deadline| now < deadline)
+                {
+                    return Err(ControlError::WouldBlock);
+                }
+                self.next_poll_reconnect = Some(now + Duration::from_millis(250));
+                self.reconnect()?;
+                // The hub must have a turn to accept Hello and produce
+                // the snapshot. Do not spin or wait inside the UI tick.
+                Err(ControlError::WouldBlock)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Apply one already-decoded message to client state.
@@ -904,9 +932,11 @@ impl ControlClient {
             let mut chunk = [0u8; 8192];
             match self.stream.read(&mut chunk) {
                 Ok(0) => {
-                    return Err(ControlError::Unexpected(
-                        "control connection closed".to_owned(),
-                    ));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "control connection closed",
+                    )
+                    .into());
                 }
                 Ok(n) => self.read_buf.extend_from_slice(&chunk[..n]),
                 Err(e) => return Err(ControlError::Io(e)),
@@ -1678,7 +1708,6 @@ mod tests {
         // The hub evicts and closes our session (spec R6): the shell
         // sees EOF on its next poll, then EPIPE on its next send.
         drop(server1);
-        assert!(client.poll().is_err());
         let id = client.toggle_overview().expect("resend after reconnect");
 
         // The reconnect redials: Hello (the resync signal), then the
@@ -1726,5 +1755,91 @@ mod tests {
         std::fs::remove_file(&path).expect("remove socket");
         assert!(client.poll().is_err());
         assert!(client.toggle_overview().is_err());
+    }
+
+    #[test]
+    fn idle_evicted_session_reconnects_and_receives_fresh_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).expect("connect");
+        let (mut server1, _) = listener.accept().expect("accept one");
+        server_write(
+            &mut server1,
+            &Message::Snapshot {
+                revision: 7,
+                windows: vec![],
+                workspaces: vec![],
+                locked: false,
+            },
+        );
+        assert!(matches!(
+            client.poll(),
+            Ok(Handled::Snapshot { revision: 7 })
+        ));
+        // An incomplete old frame must not contaminate the new stream.
+        server1.write_all(&[10, 0, 0, 0, 1]).expect("partial frame");
+        drop(server1);
+        assert!(matches!(client.poll(), Err(ControlError::WouldBlock)));
+        assert!(client.needs_snapshot());
+        assert_eq!(client.revision(), None);
+
+        let (mut server2, _) = listener.accept().expect("idle reconnect");
+        assert_eq!(
+            server_read(&mut server2),
+            Message::Hello {
+                version: CURRENT_VERSION
+            }
+        );
+        server_write(
+            &mut server2,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        server_write(
+            &mut server2,
+            &Message::Snapshot {
+                revision: 12,
+                windows: vec![],
+                workspaces: vec![],
+                locked: true,
+            },
+        );
+        assert!(matches!(client.poll(), Ok(Handled::Hello)));
+        assert!(matches!(
+            client.poll(),
+            Ok(Handled::Snapshot { revision: 12 })
+        ));
+        assert!(!client.needs_snapshot());
+        assert!(client.locked());
+        assert_eq!(client.revision(), Some(12));
+        assert_eq!(client.next_request_id, INITIAL_REQUEST_ID);
+    }
+
+    #[test]
+    fn unavailable_hub_limits_idle_redials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        drop(server);
+        drop(listener);
+        std::fs::remove_file(&path).expect("remove socket");
+        assert!(matches!(client.poll(), Err(ControlError::Io(_))));
+        // Fix the deadline well into the future to make the cooldown
+        // assertion independent of a loaded test host's timing.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        client.next_poll_reconnect = Some(deadline);
+        assert!(matches!(client.poll(), Err(ControlError::WouldBlock)));
+        assert_eq!(client.next_poll_reconnect, Some(deadline));
+        assert!(client.needs_snapshot());
+    }
+
+    #[test]
+    fn supplied_stream_reports_eof_without_redial() {
+        let (mut client, peer) = pair();
+        drop(peer);
+        assert!(matches!(client.poll(), Err(ControlError::Io(e))
+            if e.kind() == io::ErrorKind::UnexpectedEof));
     }
 }
