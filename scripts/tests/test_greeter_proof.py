@@ -20,6 +20,16 @@ class GreeterProof(unittest.TestCase):
         self.assertEqual(login.count('let interrupt = state.interrupt.lock().expect("interrupt lock").take();'), 2)
         self.assertEqual(login.count('if let Some(stream) = interrupt {'), 2)
 
+    def test_standalone_greeter_declares_used_accessibility_api(self):
+        import tomllib
+        manifest = tomllib.loads((ROOT / 'crates/greeter/Cargo.toml').read_text())
+        gtk = manifest['dependencies']['gtk4']
+        self.assertIn('v4_10', gtk['features'])
+        self.assertTrue(gtk['optional'])
+        self.assertIn('dep:gtk4', manifest['features']['gtk-ui'])
+        self.assertIn('cargo test -p tuna-greeter --test gtk_login',
+                      (ROOT / 'scripts/tuna-greeter-proof').read_text())
+
     def test_ci_captures_failure_receipts_after_source_clean_freeze(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertLess(ci.index('scripts/tuna-minimize-ci-proof'), ci.index('scripts/tuna-greeter-proof'))
