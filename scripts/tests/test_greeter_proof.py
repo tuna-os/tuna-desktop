@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Source-owned wiring and fixture admission regressions; not a runtime claim."""
 import pathlib
+import subprocess
+import uuid
 import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -22,6 +24,16 @@ class GreeterProof(unittest.TestCase):
         self.assertIn("m.get('executable')", proof)
         self.assertIn('timeout --kill-after=5s 90s', proof)
         self.assertIn("r['runtime_passed']", proof)
+
+    def test_admission_rejects_checkout_artifacts_and_missing_execution(self):
+        proof = (ROOT / 'scripts/tuna-greeter-proof').read_text()
+        for marker in ['realpath -m', 'outside source checkout', "'crates/greeter/src/lib.rs'", "'crates/greeter/src/ui.rs'", "'1 passed; 0 failed; 0 ignored;'", "['git','diff','--quiet','HEAD']"]:
+            self.assertIn(marker, proof)
+        forbidden = ROOT / ('.greeter-proof-' + uuid.uuid4().hex)
+        result = subprocess.run([str(ROOT / 'scripts/tuna-greeter-proof'), str(forbidden)], cwd=ROOT, capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('outside source checkout', result.stderr)
+        self.assertFalse(forbidden.exists())
 
     def test_real_widgets_and_wire_negative_cases_remain(self):
         test = (ROOT / 'crates/greeter/tests/gtk_login.rs').read_text()
