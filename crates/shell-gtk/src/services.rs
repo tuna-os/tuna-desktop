@@ -732,10 +732,13 @@ struct AudioUi {
     privacy: Option<gio::Settings>,
     enforcer: RefCell<crate::privacy::Tracker>,
     last_actions: RefCell<Vec<crate::privacy::Action>>,
+    queue: RefCell<crate::privacy::ActionQueue>,
+    drain_pending: Cell<bool>,
 }
 
-/// Cap on enforcement subprocesses per graph event. Graphs are
-/// small; the cap only bounds pathological ones.
+/// Dispatch budget per enforcement tick. Graphs are small; on a
+/// pathological one the remainder stays queued and drains on later
+/// ticks instead of being dropped.
 const MAX_PRIVACY_ACTIONS: usize = 64;
 
 /// The privacy kill-switches, when the schema is installed. Missing
@@ -910,35 +913,75 @@ impl AudioUi {
     /// mute what the policy requires, destroy camera nodes, and
     /// unmute on explicit restore. Runs on every graph event and on
     /// every settings change, so a bypass attempt (or a respawning
-    /// node) is answered within one event. Steps dispatch through
-    /// the bounded async helpers; only a changed step set is
+    /// node) is answered within one event. Each tick dispatches at
+    /// most [`MAX_PRIVACY_ACTIONS`] steps through the bounded async
+    /// helpers; the rest stays queued and drains on later ticks, and
+    /// failed steps schedule a retry — the tracker retains restore
+    /// ownership until the graph observes the unmute, so deferred or
+    /// failed work is never forgotten. Only a changed step set is
     /// logged, so a steady state stays silent.
     fn enforce_privacy(self: &Rc<Self>) {
         let policy = privacy_policy(self.privacy.as_ref());
         let scan = self.state.borrow().privacy_scan(&policy);
-        let mut actions = self.enforcer.borrow_mut().plan(&scan);
-        if actions.len() > MAX_PRIVACY_ACTIONS {
-            eprintln!("tuna-shell-gtk: privacy enforcement capped at {MAX_PRIVACY_ACTIONS} steps");
-            actions.truncate(MAX_PRIVACY_ACTIONS);
-        }
-        if actions != *self.last_actions.borrow() {
-            if !actions.is_empty() {
-                eprintln!("tuna-shell-gtk: privacy enforcement {actions:?}");
+        let planned = self.enforcer.borrow_mut().plan(&scan);
+        if planned != *self.last_actions.borrow() {
+            if !planned.is_empty() {
+                eprintln!("tuna-shell-gtk: privacy enforcement {planned:?}");
             }
-            *self.last_actions.borrow_mut() = actions.clone();
+            *self.last_actions.borrow_mut() = planned.clone();
         }
-        for action in &actions {
-            if let Some(argv) = crate::privacy::wpctl_args(action) {
-                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                wpctl(&refs, |_| {});
-            } else if let Some(argv) = crate::privacy::pw_cli_args(action) {
-                let full = std::iter::once("pw-cli".to_owned())
+        let batch = {
+            let mut queue = self.queue.borrow_mut();
+            queue.offer(planned);
+            queue.take(MAX_PRIVACY_ACTIONS)
+        };
+        for action in batch {
+            // Both legs report exit status (not just "the tool ran"),
+            // so a failed step schedules a retry instead of stalling
+            // until the next graph event.
+            let argv = if let Some(argv) = crate::privacy::wpctl_args(&action) {
+                std::iter::once("wpctl".to_owned())
                     .chain(argv)
-                    .collect::<Vec<_>>();
-                let refs: Vec<&str> = full.iter().map(String::as_str).collect();
-                audio_command(&refs, |_| {});
-            }
+                    .collect::<Vec<_>>()
+            } else if let Some(argv) = crate::privacy::pw_cli_args(&action) {
+                std::iter::once("pw-cli".to_owned())
+                    .chain(argv)
+                    .collect::<Vec<_>>()
+            } else {
+                continue;
+            };
+            let weak = Rc::downgrade(self);
+            audio_command(
+                &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+                move |ok| {
+                    if let Some(ui) = weak.upgrade() {
+                        if ui.queue.borrow_mut().report(&action, ok) {
+                            ui.schedule_drain();
+                        }
+                    }
+                },
+            );
         }
+        if !self.queue.borrow().is_empty() {
+            self.schedule_drain();
+        }
+    }
+
+    /// Run enforcement again shortly, coalesced: at most one drain
+    /// tick is ever pending, and it re-plans from the live graph, so
+    /// queued work drains without depending on future graph events.
+    fn schedule_drain(self: &Rc<Self>) {
+        if self.drain_pending.get() {
+            return;
+        }
+        self.drain_pending.set(true);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.drain_pending.set(false);
+                ui.enforce_privacy();
+            }
+        });
     }
 
     fn retry(self: &Rc<Self>) {
@@ -1073,6 +1116,8 @@ fn audio(w: &Rc<Widgets>) {
         privacy: privacy_settings(),
         enforcer: RefCell::default(),
         last_actions: RefCell::default(),
+        queue: RefCell::default(),
+        drain_pending: Cell::new(false),
     });
     if let Some(privacy) = ui.privacy.as_ref() {
         let weak = Rc::downgrade(&ui);

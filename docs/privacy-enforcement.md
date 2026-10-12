@@ -103,7 +103,13 @@ what must not exist:
 
 Restore is explicit: flipping a key back unmutes exactly the
 nodes this shell muted (a node the user muted by hand stays
-muted), and video nodes created after restore survive.
+muted), and video nodes created after restore survive. Restore
+ownership is released only on observed completion — a node stays
+owned until the graph shows it unmuted (or gone) — so a restore
+deferred past the per-tick dispatch budget, or one whose command
+fails, re-plans on the next tick instead of being forgotten. Each
+tick dispatches at most 64 steps; the bounded queue drains the
+rest on later ticks, and failed steps schedule a bounded retry.
 
 Deliberate deltas from GNOME: Tuna kills existing camera nodes
 where GNOME denies new portal sessions only, and Tuna mutes
@@ -132,6 +138,13 @@ Committed tests (all in-repo, `cargo test -p tuna-shell-host
   screen-share/unlinked exclusion, and unknown-mixer distrust.
 - `privacy::tests::plan_*`: tracker mute/remute/restore/forget
   semantics and command lines.
+- `privacy::tests::queue_*` and `restore_cycle::*`: the bounded
+  dispatch queue (coalescing, in-flight dedupe, retry bound) and
+  production-path cycles through the real feed/scan/plan/queue: a
+  100-node disable drains past the 64-step budget to a full
+  restore, failed unmutes retry and recover, a persistently
+  failing unmute backs off without losing ownership, and
+  user-muted nodes keep their mute and identity throughout.
 - `privacy::tests::live_pw::*`: real headless PipeWire +
   WirePlumber + GStreamer app streams. The audio leg proves
   existing streams are silenced (not destroyed), a direct unmute
