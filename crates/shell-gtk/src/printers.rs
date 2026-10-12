@@ -617,6 +617,8 @@ pub fn parse_response_head(bytes: &[u8]) -> Result<(u16, usize, Option<usize>), 
 
 /// Read one HTTP response: head, then exactly Content-Length bytes
 /// (or up to [`MAX_BODY`] when the server closes without one).
+/// Test-only: production reads under an absolute deadline.
+#[cfg(test)]
 pub fn read_response(stream: &mut impl Read) -> Result<(u16, Vec<u8>), String> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
@@ -1137,10 +1139,7 @@ impl CupsClient {
                         Ok(Stream::Unix(s))
                     }),
                 Endpoint::Tcp(host, port) => {
-                    let budget = match remaining(deadline, connect_timeout) {
-                        Ok(b) => b,
-                        Err(e) => return Err(e),
-                    };
+                    let budget = remaining(deadline, connect_timeout)?;
                     format!("{host}:{port}")
                         .parse::<std::net::SocketAddr>()
                         .or_else(|_| {
@@ -1270,6 +1269,8 @@ impl CupsClient {
     }
 
     /// The printers the server knows, in server order.
+    /// Test-only: production lists via the snapshot budget.
+    #[cfg(test)]
     pub fn printers(&self) -> Result<Vec<Printer>, CupsError> {
         self.printers_with_budget(
             Instant::now() + EXCHANGE_TIMEOUT,
@@ -1313,17 +1314,6 @@ impl CupsClient {
         Ok(out)
     }
 
-    /// The default printer's name: the user's `~/.cups/lpoptions`
-    /// choice first (as libcups prefers it), else the server default.
-    pub fn default_name(&self) -> Option<String> {
-        self.default_name_with_budget(
-            Instant::now() + EXCHANGE_TIMEOUT,
-            CONNECT_TIMEOUT,
-            IO_TIMEOUT,
-            EXCHANGE_TIMEOUT,
-        )
-    }
-
     fn default_name_with_budget(
         &self,
         outer: Instant,
@@ -1343,6 +1333,8 @@ impl CupsClient {
     }
 
     /// The server-wide default via `CUPS-Get-Default`.
+    /// Test-only: production resolves via the snapshot budget.
+    #[cfg(test)]
     pub fn server_default_name(&self) -> Option<String> {
         self.server_default_name_with_budget(
             Instant::now() + EXCHANGE_TIMEOUT,
@@ -1401,6 +1393,8 @@ impl CupsClient {
 
     /// Active (`not-completed`) jobs on one printer, newest last like
     /// the jobs dialog lists them. `my_only` restricts to our user.
+    /// Test-only: production lists via the snapshot/action budget.
+    #[cfg(test)]
     pub fn jobs(&self, printer_uri: &str, my_only: bool) -> Result<Vec<PrintJob>, CupsError> {
         self.jobs_with_budget(
             printer_uri,
