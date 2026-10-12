@@ -161,32 +161,53 @@ struct Shown {
 /// External notices route through the bus to their sender; shell-own
 /// notices have no sender, so the shell registers a callback per
 /// (notice id, action key) instead. The banner path always runs the
-/// bus invoke first (replay guard + banner dismiss + signal) and only
-/// dispatches locally when that succeeds, so unregistered ids behave
-/// exactly as before. Pure and headless-testable; the UI owns one.
+/// bus invoke first (per-key replay guard + banner dismiss + signal)
+/// and only dispatches locally when that succeeds.
+///
+/// Admission is shell-owned: `live` holds the resident generation that
+/// may still fire. Center ids are monotonic and never reused, so
+/// dropping an id from `live` invalidates exactly that resident
+/// generation. The bus does NOT guard residency: `dismiss` removes only
+/// the banner while history keeps every unconsumed key invokable, so a
+/// second old key would still invoke after a first action or a banner
+/// close unless the shell retires the resident. Every terminal event
+/// therefore retires: a successful dispatch retires all sibling keys
+/// at once (first press wins), and banner close, body click, timeout
+/// expiry, list removal, and programmatic dismiss retire without
+/// firing. Unregistered ids behave exactly as before. Pure and
+/// headless-testable; the UI owns one.
 #[derive(Default)]
 struct ActionDispatch {
     handlers: HashMap<(u64, String), Rc<dyn Fn()>>,
+    live: HashSet<u64>,
 }
 
 impl ActionDispatch {
-    /// Register (or replace) one action callback.
+    /// Register (or replace) one action callback, admitting the resident.
     fn register(&mut self, id: u64, action: &str, handler: Rc<dyn Fn()>) {
         self.handlers.insert((id, action.to_owned()), handler);
+        self.live.insert(id);
     }
 
-    /// Forget one notice entirely (replacement/removal): its keys must
-    /// never fire again, even through a previously captured path.
+    /// Retire one resident generation entirely (action/dismiss/replace):
+    /// its keys must never fire again, even through a previously
+    /// captured path. History entries are untouched.
     fn drop_notice(&mut self, id: u64) {
         self.handlers.retain(|(known, _), _| *known != id);
+        self.live.remove(&id);
     }
 
-    /// Run one registered callback. False when unknown: denied keys,
-    /// closed/dropped notices, and replaced residents never fire.
-    fn dispatch(&self, id: u64, action: &str) -> bool {
+    /// Run one registered callback, then retire the whole resident so no
+    /// sibling key can fire afterwards. False when unadmitted: unknown
+    /// ids, retired residents, and unregistered keys never fire.
+    fn dispatch(&mut self, id: u64, action: &str) -> bool {
+        if !self.live.contains(&id) {
+            return false;
+        }
         match self.handlers.get(&(id, action.to_owned())) {
             Some(handler) => {
                 handler();
+                self.drop_notice(id);
                 true
             }
             None => false,
@@ -429,8 +450,9 @@ impl NotifyUi {
 
     /// Post the shell's own notification WITH invokable actions, returning
     /// the center id (None when the store is unreachable). The banner
-    /// renders one button per action; presses run the bus invoke first
-    /// (replay guard + dismiss) and then any locally registered handler.
+    /// renders one button per action; a press runs the bus invoke first
+    /// (per-key replay guard + banner dismiss + signal) and then the
+    /// local handler, retiring all sibling keys on success.
     pub fn post_with_actions(
         self: &Rc<Self>,
         app: &str,
@@ -469,7 +491,9 @@ impl NotifyUi {
     }
 
     /// Dismiss one banner by id (history keeps the entry); false when the
-    /// center no longer knows it.
+    /// center no longer knows it. Retires the resident's local callbacks:
+    /// history keeps unconsumed keys invokable, so without this an old
+    /// key could still dispatch after the user dismissed the banner.
     pub fn dismiss_notification(self: &Rc<Self>, id: u64) -> bool {
         let dismissed = self
             .center
@@ -477,16 +501,26 @@ impl NotifyUi {
             .map(|mut center| center.dismiss(id))
             .is_ok_and(|r| r.is_ok());
         if dismissed {
+            self.retire_local_actions(id);
             self.refresh();
         }
         dismissed
     }
 
-    /// Run one registered local callback; false when unknown. Only called
-    /// after a successful bus invoke, so replay/unknown/closed keys never
-    /// reach a handler (the center refuses them first).
+    /// Run one registered local callback; false when unadmitted. Only
+    /// called after a successful bus invoke (per-key replay guard). A
+    /// successful dispatch retires the whole resident, so sibling keys
+    /// captured before the press can never fire afterwards.
     fn dispatch_local_action(&self, id: u64, action: &str) -> bool {
-        self.local_actions.borrow().dispatch(id, action)
+        self.local_actions.borrow_mut().dispatch(id, action)
+    }
+
+    /// Retire one resident's local callbacks without firing (banner
+    /// close, body click, timeout expiry, list removal, programmatic
+    /// dismiss). History entries are untouched; unregistered ids are a
+    /// no-op, so external notices behave exactly as before.
+    fn retire_local_actions(&self, id: u64) {
+        self.local_actions.borrow_mut().drop_notice(id);
     }
 
     /// The calendar popover's notification pane.
@@ -564,6 +598,7 @@ impl NotifyUi {
         };
         for id in expired {
             let _ = self.bus.borrow().dismiss_banner(id as u32, REASON_EXPIRED);
+            self.retire_local_actions(id);
         }
         self.refresh();
     }
@@ -603,10 +638,13 @@ impl NotifyUi {
                     let button = gtk::Button::with_label(&action.label);
                     let (me, id, key) = (self.clone(), n.id, action.id.clone());
                     button.connect_clicked(move |_| {
-                        // Bus first: replay/unknown/closed keys fail here and
-                        // never reach a local handler. Local dispatch only
-                        // fires for registered shell-own (id, key) pairs, so
-                        // every unregistered notice behaves exactly as before.
+                        // Bus first: its per-key replay guard rejects
+                        // unknown/replayed keys. Local dispatch then fires
+                        // only for admitted shell-own (id, key) pairs and
+                        // retires the whole resident on success, so no
+                        // sibling key captured before the press can fire
+                        // afterwards. Unregistered notices behave exactly
+                        // as before.
                         if me.bus.borrow().invoke_action(id as u32, &key).is_ok() {
                             me.dispatch_local_action(id, &key);
                         }
@@ -620,6 +658,7 @@ impl NotifyUi {
                 let (me, id) = (self.clone(), n.id);
                 close.connect_clicked(move |_| {
                     let _ = me.bus.borrow().dismiss_banner(id as u32, REASON_DISMISSED);
+                    me.retire_local_actions(id);
                     me.refresh();
                 });
             }
@@ -634,6 +673,7 @@ impl NotifyUi {
                         bus.dismiss_banner(id as u32, REASON_DISMISSED)
                     };
                     drop(bus);
+                    me.retire_local_actions(id);
                     me.refresh();
                 });
             }
@@ -695,6 +735,7 @@ impl NotifyUi {
                 .bus
                 .borrow()
                 .dismiss_banner(id as u32, REASON_DISMISSED);
+            self.retire_local_actions(id);
             if let Ok(mut center) = self.center.lock() {
                 center.remove(id);
             }
@@ -904,6 +945,57 @@ mod action_dispatch_tests {
         assert!(dispatch.dispatch(7, "delay"));
         assert!(!first.get());
         assert!(second.get());
+    }
+
+    #[test]
+    fn first_action_retires_captured_sibling_keys() {
+        let mut dispatch = ActionDispatch::default();
+        let take = Rc::new(Cell::new(false));
+        let delay = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&take));
+        dispatch.register(7, "delay", counting(&delay));
+        // First press wins...
+        assert!(dispatch.dispatch(7, "take"));
+        assert!(take.get());
+        // ...then the sibling key captured before the press is dead, as
+        // is a replay of the fired key: the resident is retired.
+        assert!(!dispatch.dispatch(7, "delay"));
+        assert!(!dispatch.dispatch(7, "take"));
+        assert!(!delay.get());
+    }
+
+    #[test]
+    fn dismiss_retires_all_keys_but_keeps_other_residents() {
+        let mut dispatch = ActionDispatch::default();
+        let take = Rc::new(Cell::new(false));
+        let other = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&take));
+        dispatch.register(7, "skip", counting(&take));
+        dispatch.register(9, "take", counting(&other));
+        // Same call the banner-close, body-click, expiry, removal, and
+        // programmatic-dismiss paths make: retire without firing.
+        dispatch.drop_notice(7);
+        assert!(!dispatch.dispatch(7, "take"));
+        assert!(!dispatch.dispatch(7, "skip"));
+        assert!(!take.get());
+        // A different live resident is unaffected.
+        assert!(dispatch.dispatch(9, "take"));
+        assert!(other.get());
+    }
+
+    #[test]
+    fn retired_resident_never_readmits_without_register() {
+        let mut dispatch = ActionDispatch::default();
+        let fired = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&fired));
+        assert!(dispatch.dispatch(7, "take"));
+        // Retired by the dispatch above; no re-fire without a fresh post.
+        assert!(!dispatch.dispatch(7, "take"));
+        // A fresh post for the same id re-admits exactly its new keys.
+        dispatch.register(7, "take", counting(&fired));
+        fired.set(false);
+        assert!(dispatch.dispatch(7, "take"));
+        assert!(fired.get());
     }
 }
 
