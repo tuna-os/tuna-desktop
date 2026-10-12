@@ -18,6 +18,38 @@ lane = importlib.util.module_from_spec(spec)
 loader.exec_module(lane)
 
 
+class DeviceInventoryProjection(unittest.TestCase):
+    def inventory(self, state):
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        fn = next(n for n in ast.parse(source.read_text()).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "inventory")
+        def call(*args):
+            if args[1] == "list-sessions":
+                return "1 1000 tuna-test seat0 tty1"
+            return "Id=1\nVTNr=1\nUser=1000\nService=greetd\nType=wayland\nClass=user"
+        scope = {"json": json, "STATE": SimpleNamespace(read_text=lambda: json.dumps(state)),
+                 "pathlib": SimpleNamespace(Path=lambda _: SimpleNamespace(iterdir=lambda: [])),
+                 "OWNER": SimpleNamespace(pw_uid=1000),
+                 "os": SimpleNamespace(geteuid=lambda: 0), "call": call}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), scope)
+        return scope["inventory"]()
+
+    def state(self):
+        return dict.fromkeys(("locked", "windows", "focused", "active_workspace",
+                              "overview_open", "pointer_position", "native_relative_motion_count"))
+
+    def test_live_device_state_survives_guest_projection(self):
+        state = self.state()
+        state["input_devices"] = [{"kind": "pointer", "accel_available": True,
+                                   "accel_speed": 0.5, "natural_available": True,
+                                   "natural_scroll": False}]
+        self.assertEqual(self.inventory(state)["state"]["input_devices"], state["input_devices"])
+
+    def test_missing_device_snapshot_refused_instead_of_empty_default(self):
+        with self.assertRaisesRegex(KeyError, "input_devices"):
+            self.inventory(self.state())
+
+
 class OrcaUnreadyDiagnostic(unittest.TestCase):
     def run_probe(self, *, locked=False, changed=False, executable="/usr/bin/python3.14",
                   uid=1000, package="python", oversized=False, replaced=False):
