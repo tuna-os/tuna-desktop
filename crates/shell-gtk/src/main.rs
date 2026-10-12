@@ -53,6 +53,7 @@ mod shortcut_consent;
 mod sound_feedback;
 mod switcher;
 mod tray;
+mod wellbeing;
 mod wifi;
 mod window_menu;
 mod wired;
@@ -1789,6 +1790,41 @@ fn build(app: &adw::Application) {
             Rc::new(move || shell.borrow().control.as_ref().is_some_and(|c| c.locked()))
         },
     );
+    // Wellbeing (#354): screen-time history/limits and break reminders.
+    // The module owns its timers and settings watches; the shell only
+    // lends it the message list, the OSD countdown and the lock action.
+    // Test builds compile the module for its unit tests but never start
+    // the live runtime (it owns process timers and the real history file).
+    #[cfg(not(test))]
+    {
+        let notices = notify.clone();
+        let countdown_osd = osd_ui.clone();
+        let lock_shell = shell.clone();
+        wellbeing::start(
+            app.upcast_ref(),
+            wellbeing::ShellHooks {
+                post_notice: Rc::new(move |title: String, body: String| {
+                    notices.post("Wellbeing", "alarm-symbolic", &title, &body);
+                }),
+                show_countdown: Rc::new(move |label: String, progress: f64| {
+                    eprintln!("tuna-shell-gtk: wellbeing: countdown {label}");
+                    countdown_osd.show(&osd::OsdRequest {
+                        icon: Some("alarm-symbolic".into()),
+                        label: Some(label),
+                        level: Some(progress.clamp(0.0, 1.0)),
+                        max_level: Some(1.0),
+                    });
+                }),
+                lock: Rc::new(move || {
+                    if let Some(control) = lock_shell.borrow_mut().control.as_mut() {
+                        if let Err(e) = control.lock() {
+                            eprintln!("tuna-shell-gtk: wellbeing: lock failed: {e}");
+                        }
+                    }
+                }),
+            },
+        );
+    }
     let gnome_shell = shell_dbus::start(Rc::new(GnomeShellDbus {
         osd: osd_ui.clone(),
         overview: overview_ui.clone(),

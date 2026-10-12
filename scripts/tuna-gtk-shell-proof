@@ -101,6 +101,12 @@
 #                  the apps' own Gio.Settings reads with a visible
 #                  repaint, a bogus family falls back without a crash,
 #                  and revert restores (#594)
+#   G-WELLBEING-HISTORY the shell records GNOME-compatible
+#                  session-active history, deleted while disabled (#354)
+#   G-WELLBEING-LIMIT a spent daily limit posts its notice and
+#                  requests grayscale, live (#354)
+#   G-WELLBEING-BREAK a 10 s break shows the OSD countdown, the due
+#                  notice, and an idle take fades and sounds (#354)
 #   G-SCREENSHOT   org.gnome.Shell.Screenshot saves the screen as a PNG
 #                  the right way up (#61)
 #   G-SCREENSHOT-BUTTON the quick-settings button saves one under
@@ -585,6 +591,17 @@ gsettings set org.gnome.desktop.a11y.interface reduced-motion 'no-preference'
 if ! gsettings range org.gnome.desktop.calendar week-start-day >/dev/null 2>&1; then
     mkdir -p "$ARTIFACTS/schemas"
     cp "$ROOT/tests/settings/gnome51-calendar.gschema.xml" "$ARTIFACTS/schemas/"
+    glib-compile-schemas --strict "$ARTIFACTS/schemas"
+    GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
+    export GSETTINGS_SCHEMA_DIR
+fi
+# Wellbeing schemas for hosts without gsettings-desktop-schemas 51 (#354).
+# The shell reads them live from startup, so they must exist before the
+# nested session launches; after that the gates drive the real keys.
+if ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.desktop.screen-time-limits || \
+    ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.desktop.break-reminders; then
+    mkdir -p "$ARTIFACTS/schemas"
+    cp "$ROOT/tests/settings/gnome51-wellbeing.gschema.xml" "$ARTIFACTS/schemas/"
     glib-compile-schemas --strict "$ARTIFACTS/schemas"
     GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
     export GSETTINGS_SCHEMA_DIR
@@ -3762,6 +3779,129 @@ gsettings set org.gnome.desktop.session idle-delay 300
 cstate '.idle_timeout_ms == 310000' "idle 300" ||
     fail G-SETTINGS-IDLE "the idle lock did not follow back to 300 s"
 pass G-SETTINGS-IDLE "GNOME's idle-delay and lock-enabled set the idle lock live"
+
+# Wellbeing (#354): the live shell records session-active history where
+# GNOME Settings 51 reads it, with GNOME's field names and a startup edge
+# from this journey (not fabricated usage).
+HISTORY_FILE="$XDG_DATA_HOME/gnome-shell/session-active-history.json"
+[ -s "$HISTORY_FILE" ] || fail G-WELLBEING-HISTORY "no history file at $HISTORY_FILE"
+"$PY" - "$HISTORY_FILE" <<'PYHIST' || fail G-WELLBEING-HISTORY "history file failed validation"
+import json, sys, time
+transitions = json.load(open(sys.argv[1]))
+assert transitions, "history is empty"
+for t in transitions:
+    assert set(t) == {"oldState", "newState", "wallTimeSecs"}, t
+    assert t["oldState"] != t["newState"], t
+    assert t["wallTimeSecs"] <= time.time() + 60, t
+recent = [t for t in transitions if abs(t["wallTimeSecs"] - time.time()) < 7200]
+assert recent, "no startup edge from this journey"
+PYHIST
+cp "$HISTORY_FILE" "$ARTIFACTS/wellbeing-history.json"
+# Negative control: disabling recording deletes the file live through the
+# settings watch (not the 30 s tick); re-enabling records again.
+gsettings set org.gnome.desktop.screen-time-limits history-enabled false
+end=$(($(date +%s) + 15))
+while [ -f "$HISTORY_FILE" ] && [ "$(date +%s)" -le "$end" ]; do sleep 1; done
+[ ! -f "$HISTORY_FILE" ] || fail G-WELLBEING-HISTORY "history file survived history-enabled=false"
+gsettings reset org.gnome.desktop.screen-time-limits history-enabled
+end=$(($(date +%s) + 15))
+while [ ! -s "$HISTORY_FILE" ] && [ "$(date +%s)" -le "$end" ]; do sleep 1; done
+[ -s "$HISTORY_FILE" ] || fail G-WELLBEING-HISTORY "history did not resume after re-enabling"
+pass G-WELLBEING-HISTORY "the shell records GNOME-compatible session-active history, deleted while disabled"
+
+# A 10 s daily limit is long spent this journey: enabling it posts GNOME's
+# limit notice and records the grayscale request, live. Banners need DND
+# off; the journey's DND state is restored after the break gate.
+DND_BEFORE="$(gsettings get org.gnome.desktop.notifications show-banners)"
+gsettings set org.gnome.desktop.notifications show-banners true
+sleep 2
+gsettings set org.gnome.desktop.screen-time-limits daily-limit-seconds 10
+gsettings set org.gnome.desktop.screen-time-limits daily-limit-enabled true
+LIMIT_BANNER=""
+end=$(($(date +%s) + 20))
+while [ "$(date +%s)" -le "$end" ]; do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-limit.json" 20 >/dev/null 2>&1 || continue
+    if showing "$ARTIFACTS/a11y-wellbeing-limit.json" "Screen Time Limit Reached"; then LIMIT_BANNER=1; break; fi
+    sleep 2
+done
+[ -n "$LIMIT_BANNER" ] || fail G-WELLBEING-LIMIT "no Screen Time Limit Reached banner"
+scrot "$ARTIFACTS/25-wellbeing-limit.png" >/dev/null
+grep -q "wellbeing: effect grayscale=true" "$LOG" || fail G-WELLBEING-LIMIT "no grayscale request in the shell log"
+# Negative controls: grayscale off clears the request; the limit off
+# returns the tracker to Active without a second notice.
+gsettings set org.gnome.desktop.screen-time-limits grayscale false
+end=$(($(date +%s) + 15))
+until grep -q "wellbeing: effect grayscale=false" "$LOG" || [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+grep -q "wellbeing: effect grayscale=false" "$LOG" || fail G-WELLBEING-LIMIT "grayscale=false did not clear the request"
+limit_mark="$(wc -c <"$LOG")"
+gsettings reset org.gnome.desktop.screen-time-limits daily-limit-enabled
+gsettings reset org.gnome.desktop.screen-time-limits daily-limit-seconds
+gsettings reset org.gnome.desktop.screen-time-limits grayscale
+end=$(($(date +%s) + 15))
+until tail -c +"$((limit_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" || [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((limit_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" || fail G-WELLBEING-LIMIT "the tracker did not return to Active"
+pass G-WELLBEING-LIMIT "the spent daily limit posts its notice and requests grayscale live"
+
+# Break reminders with correct timing: a 10 s eyesight interval shows the
+# OSD countdown, then the due notice; an idle user takes the break (fade
+# request) and finishing it plays the complete sound.
+wb_mark="$(wc -c <"$LOG")"
+xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10
+gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 10
+gsettings set org.gnome.desktop.break-reminders.eyesight countdown true
+gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']"
+# Three keep-alives over 6 s: the user stays in the Active phase (idle
+# under 10 s) while the countdown shows and the break comes due. Due is
+# detected on a 2 s tick, so the last input lands 4-6 s before it: away
+# enough for the banner to wait (over 1 s), present enough to be due.
+sleep 2
+xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2))
+sleep 2
+xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+sleep 2
+xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2))
+scrot "$ARTIFACTS/26a-wellbeing-countdown.png" >/dev/null
+DUE_BANNER=""
+end=$(($(date +%s) + 20))
+while [ "$(date +%s)" -le "$end" ]; do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-break.json" 20 >/dev/null 2>&1 || continue
+    if showing "$ARTIFACTS/a11y-wellbeing-break.json" "Time for an Eyesight Break"; then DUE_BANNER=1; break; fi
+    sleep 2
+done
+[ -n "$DUE_BANNER" ] || fail G-WELLBEING-BREAK "no Time for an Eyesight Break banner"
+scrot "$ARTIFACTS/26b-wellbeing-due.png" >/dev/null
+tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: countdown Break in" || fail G-WELLBEING-BREAK "no countdown OSD for the upcoming break"
+# The idle user takes the 10 s break: InBreak fades, completion unfades
+# and sounds. Completion lands ~20 s after selection; sleep past it.
+sleep 20
+end=$(($(date +%s) + 15))
+until tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=true" || [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=true" || fail G-WELLBEING-BREAK "no fade request while the break was taken"
+tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: break complete sound" || fail G-WELLBEING-BREAK "no complete sound when the break finished"
+tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" || fail G-WELLBEING-BREAK "no unfade after the break finished"
+# Leave no trace for the later gates: deselect (Disabled), reset the keys,
+# clear the notices, let the banners expire, restore the journey's DND.
+gsettings reset org.gnome.desktop.break-reminders selected-breaks
+gsettings reset org.gnome.desktop.break-reminders.eyesight interval-seconds
+gsettings reset org.gnome.desktop.break-reminders.eyesight duration-seconds
+gsettings reset org.gnome.desktop.break-reminders.eyesight countdown
+open_calendar
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-cleared.json" 20 --press "Clear" ||
+    fail G-WELLBEING-BREAK "could not press Clear"
+xdotool key Escape
+xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+sleep 3
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-quiet.json" 20 ||
+    fail G-WELLBEING-BREAK "quiet dump failed"
+if showing "$ARTIFACTS/a11y-wellbeing-quiet.json" "Time for an Eyesight Break"; then
+    fail G-WELLBEING-BREAK "the due banner outlived Clear"
+fi
+if showing "$ARTIFACTS/a11y-wellbeing-quiet.json" "Screen Time Limit Reached"; then
+    fail G-WELLBEING-BREAK "the limit banner outlived Clear"
+fi
+gsettings set org.gnome.desktop.notifications show-banners "$DND_BEFORE"
+pass G-WELLBEING-BREAK "the 10 s break counts down, notifies due, and an idle take fades and sounds"
 
 # org.gnome.Shell for gnome-settings-daemon: a caller outside GNOME's
 # allowlist is refused; the media-keys daemon's grab takes the key away

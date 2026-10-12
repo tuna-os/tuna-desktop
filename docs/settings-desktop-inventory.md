@@ -127,35 +127,35 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| selected-breaks | Ignored | Tuna Desktop has no break reminder scheduler |
+| selected-breaks | Honored | Shell break scheduler; empty disables reminders |
 ## org.gnome.desktop.break-reminders.eyesight
 
 | Key | Status | Reason |
 |---|---|---|
-| countdown | Ignored | Tuna Desktop has no break reminder scheduler |
-| delay-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| duration-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| fade-screen | Ignored | Tuna Desktop has no break reminder scheduler |
-| interval-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| lock-screen | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify-overdue | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify-upcoming | Ignored | Tuna Desktop has no break reminder scheduler |
-| play-sound | Ignored | Tuna Desktop has no break reminder scheduler |
+| countdown | Honored | OSD countdown in the last 60 s before a break |
+| delay-seconds | Ignored | No notification action invokes delay yet (notify action support pending) |
+| duration-seconds | Honored | Break length for scheduling and idle-take detection |
+| fade-screen | Honored | Fade request logged; compositor hook pending |
+| interval-seconds | Honored | Time between breaks |
+| lock-screen | Honored | Locks the session when the break starts |
+| notify | Honored | Due/overdue notices posted; tray-only urgency not distinguished yet |
+| notify-overdue | Honored | Overdue notice 60 s after due |
+| notify-upcoming | Honored | Upcoming notice 2 min before due |
+| play-sound | Honored | Complete sound via canberra, event-sounds gated |
 ## org.gnome.desktop.break-reminders.movement
 
 | Key | Status | Reason |
 |---|---|---|
-| countdown | Ignored | Tuna Desktop has no break reminder scheduler |
-| delay-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| duration-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| fade-screen | Ignored | Tuna Desktop has no break reminder scheduler |
-| interval-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| lock-screen | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify-overdue | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify-upcoming | Ignored | Tuna Desktop has no break reminder scheduler |
-| play-sound | Ignored | Tuna Desktop has no break reminder scheduler |
+| countdown | Honored | OSD countdown in the last 60 s before a break |
+| delay-seconds | Ignored | No notification action invokes delay yet (notify action support pending) |
+| duration-seconds | Honored | Break length for scheduling and idle-take detection |
+| fade-screen | Honored | Fade request logged; compositor hook pending |
+| interval-seconds | Honored | Time between breaks |
+| lock-screen | Honored | Locks the session when the break starts |
+| notify | Honored | Due/overdue notices posted; tray-only urgency not distinguished yet |
+| notify-overdue | Honored | Overdue notice 60 s after due |
+| notify-upcoming | Honored | Upcoming notice 2 min before due |
+| play-sound | Honored | Complete sound via canberra, event-sounds gated |
 ## org.gnome.desktop.calendar
 
 | Key | Status | Reason |
@@ -455,10 +455,10 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| daily-limit-enabled | Ignored | Tuna Desktop has no screen-time tracking/enforcement service |
-| daily-limit-seconds | Ignored | Tuna Desktop has no screen-time tracking/enforcement service |
-| grayscale | Ignored | Tuna Desktop has no screen-time tracking/enforcement service |
-| history-enabled | Ignored | Tuna Desktop has no screen-time tracking/enforcement service |
+| daily-limit-enabled | Honored | Limit evaluated on the 30 s poll and on settings change |
+| daily-limit-seconds | Honored | Daily allowance in seconds |
+| grayscale | Honored | Grayscale request logged; compositor hook pending |
+| history-enabled | Honored | Recording on/off; off deletes the history file live |
 ## org.gnome.desktop.screensaver
 
 | Key | Status | Reason |
