@@ -293,16 +293,27 @@ fn panel_menu_open(
 }
 
 /// Close every open panel menu; a button that owned one keeps focus.
+/// Each popdown of a visible popover banks one guard credit before
+/// the popdown, so the matching `closed` signal keeps the hold
+/// whenever it lands (G-PANEL-FOCUS).
 fn close_panel_menus(
     clock: &gtk::MenuButton,
     system: &gtk::MenuButton,
     a11y: &gtk::MenuButton,
     tray: &gtk::Box,
+    guard: &Cell<panel_focus::EscapeGuard>,
 ) {
     let mut buttons = vec![clock.clone(), system.clone(), a11y.clone()];
     buttons.extend(tray_menu_buttons(tray));
     for button in buttons {
         if button.is_active() {
+            if let Some(popover) = button.popover() {
+                if popover.is_visible() {
+                    let mut state = guard.get();
+                    state.note_escape_close();
+                    guard.set(state);
+                }
+            }
             button.popdown();
             button.grab_focus();
         }
@@ -1370,10 +1381,11 @@ fn build(app: &adw::Application) {
     screencast::serve(recorder.clone());
 
     // Ctrl+Alt+Tab panel focus (P-A11Y-02): `held` while the bar
-    // owns exclusive keyboard; `escaping` while our own Escape
-    // handling closes the menus (a close that keeps focus).
+    // owns exclusive keyboard; `escape_guard` banks one credit per
+    // Escape popdown so the matching `closed` signal keeps focus
+    // whenever it lands (G-PANEL-FOCUS).
     let panel_held: Rc<Cell<bool>> = Rc::default();
-    let panel_escaping: Rc<Cell<bool>> = Rc::default();
+    let panel_escape_guard: Rc<Cell<panel_focus::EscapeGuard>> = Rc::default();
     let bar = gtk::CenterBox::new();
     bar.set_start_widget(Some(&activities));
     bar.set_center_widget(Some(&clock));
@@ -1381,12 +1393,22 @@ fn build(app: &adw::Application) {
     let end = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     end.append(&screencast::indicator(&recorder));
     let tray_box = {
-        let (window, held, escaping) = (window.clone(), panel_held.clone(), panel_escaping.clone());
-        tray::tray(Rc::new(move || {
-            if panel_focus::release_on_popdown(held.get(), escaping.get()) {
-                release_panel_focus(&window, &held);
-            }
-        }))
+        let (window, held, guard) = (
+            window.clone(),
+            panel_held.clone(),
+            panel_escape_guard.clone(),
+        );
+        tray::tray(
+            Rc::new(move || {
+                let mut state = guard.get();
+                let release = state.closed(held.get());
+                guard.set(state);
+                if release {
+                    release_panel_focus(&window, &held);
+                }
+            }),
+            panel_escape_guard.clone(),
+        )
     };
     end.append(&tray_box);
     let a11y = accessibility::menu();
@@ -1399,10 +1421,22 @@ fn build(app: &adw::Application) {
     // Ctrl+Alt+Tab holds the bar.
     for button in [&clock, &system, &a11y] {
         if let Some(popover) = button.popover() {
-            let (window, held, escaping) =
-                (window.clone(), panel_held.clone(), panel_escaping.clone());
+            let guard = panel_escape_guard.clone();
+            popover.connect_show(move |_| {
+                let mut state = guard.get();
+                state.note_shown();
+                guard.set(state);
+            });
+            let (window, held, guard) = (
+                window.clone(),
+                panel_held.clone(),
+                panel_escape_guard.clone(),
+            );
             popover.connect_closed(move |_| {
-                if panel_focus::release_on_popdown(held.get(), escaping.get()) {
+                let mut state = guard.get();
+                let release = state.closed(held.get());
+                guard.set(state);
+                if release {
                     release_panel_focus(&window, &held);
                 }
             });
@@ -1413,7 +1447,7 @@ fn build(app: &adw::Application) {
     // the overview (the pointer path stays the compositor's press
     // region); Left/Right walk the bar while no menu owns the arrows.
     {
-        let (window, bar, activities, clock, system, a11y, tray_box, held, escaping) = (
+        let (window, bar, activities, clock, system, a11y, tray_box, held, guard) = (
             window.clone(),
             bar.clone(),
             activities.clone(),
@@ -1422,7 +1456,7 @@ fn build(app: &adw::Application) {
             a11y.clone(),
             tray_box.clone(),
             panel_held.clone(),
-            panel_escaping.clone(),
+            panel_escape_guard.clone(),
         );
         let shell = shell.clone();
         let keys = gtk::EventControllerKey::new();
@@ -1443,13 +1477,12 @@ fn build(app: &adw::Application) {
                         panel_menu_open(&clock, &system, &a11y, &tray_box),
                     ) {
                         panel_focus::EscapeOutcome::CloseMenus => {
-                            escaping.set(true);
-                            close_panel_menus(&clock, &system, &a11y, &tray_box);
-                            escaping.set(false);
+                            close_panel_menus(&clock, &system, &a11y, &tray_box, &guard);
                             // Closing keeps panel focus by contract: the
-                            // hold is re-asserted unconditionally, healing
-                            // any close signal that outran the escaping
-                            // guard above (G-PANEL-FOCUS).
+                            // hold is re-asserted unconditionally (a no-op
+                            // when the guard already held it), so the bar
+                            // keeps exclusive keyboard on every path out
+                            // of this branch (G-PANEL-FOCUS).
                             assert_panel_hold(&window_keys, &held);
                             glib::Propagation::Stop
                         }
