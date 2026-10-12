@@ -1672,9 +1672,9 @@ impl DragPager {
             if last >= 0.0 && (last - x).abs() > DRAG_EDGE_PX {
                 self.reset();
             }
-        } else if self.overshoot.get() < 0.0 {
+        } else if let Some(step) = drag_edge_transition(self.overshoot.get(), x, width) {
             self.reset();
-            self.turn_and_repeat(if x <= DRAG_EDGE_PX { -1 } else { 1 });
+            self.turn_and_repeat(step);
             self.overshoot.set(x);
             return;
         } else {
@@ -1713,6 +1713,26 @@ impl DragPager {
             }
         });
         *self.initial.borrow_mut() = Some(id);
+    }
+}
+
+// Motion events may jump directly between edges. In that case the old
+// repeating timer must change direction even without an interior event.
+fn drag_edge_transition(previous: f64, x: f64, width: f64) -> Option<i32> {
+    let edge = |position: f64| {
+        if position <= DRAG_EDGE_PX {
+            Some(-1)
+        } else if position >= width - DRAG_EDGE_PX {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    let next = edge(x)?;
+    if previous < 0.0 || edge(previous) != Some(next) {
+        Some(next)
+    } else {
+        None
     }
 }
 
@@ -1770,4 +1790,29 @@ fn on_drop(
         true
     });
     widget.add_controller(target);
+}
+
+#[cfg(test)]
+mod drag_edge_tests {
+    use super::drag_edge_transition;
+
+    #[test]
+    fn direct_opposite_edge_motion_retargets_the_repeat() {
+        assert_eq!(drag_edge_transition(0.0, 1274.0, 1280.0), Some(1));
+        assert_eq!(drag_edge_transition(1274.0, 0.0, 1280.0), Some(-1));
+    }
+
+    #[test]
+    fn first_edge_starts_once_and_same_edge_keeps_its_timer() {
+        assert_eq!(drag_edge_transition(-1.0, 0.0, 1280.0), Some(-1));
+        assert_eq!(drag_edge_transition(-1.0, 1274.0, 1280.0), Some(1));
+        assert_eq!(drag_edge_transition(0.0, 6.0, 1280.0), None);
+        assert_eq!(drag_edge_transition(1274.0, 1279.0, 1280.0), None);
+    }
+
+    #[test]
+    fn interior_motion_does_not_start_edge_paging() {
+        assert_eq!(drag_edge_transition(-1.0, 640.0, 1280.0), None);
+        assert_eq!(drag_edge_transition(0.0, 640.0, 1280.0), None);
+    }
 }
