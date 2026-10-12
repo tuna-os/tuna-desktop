@@ -584,6 +584,10 @@ mod tests {
                 {"id":53,"info":{"props":{"media.class":"Stream/Output/Video","node.name":"meta-stream-source-source"}}},
                 {"id":54,"info":{"props":{"media.class":"Stream/Output/Video","node.name":"tuna-screen-cast"}}},
                 {"id":55,"info":{"props":{"media.class":"Video/Source","device.id":999}}},
+            {"id":56,"info":{"props":{"media.class":"Video/Source","device.id":80}}},
+            {"id":57,"info":{"props":{"media.class":"Video/Source","device.id":81}}},
+            {"id":80,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Video/Device","device.api":"libcamera"}}},
+            {"id":81,"type":"PipeWire:Interface:Device","info":{"props":{"media.class":"Audio/Device","device.api":"v4l2"}}},
                 {"id":60,"info":{"props":{"media.class":"Stream/Input/Video"}}},
                 {"id":61,"info":{"props":{"media.class":"Stream/Input/Video"}}},
                 {"id":62,"info":{"props":{"media.class":"Stream/Input/Video"}}},
@@ -597,7 +601,10 @@ mod tests {
             ..PrivacyPolicy::default()
         });
         assert_eq!(scan.destroy, vec![41, 42, 60]);
-        assert_eq!(scan.unclassified_video_sources, vec![50, 51, 52, 55]);
+        assert_eq!(
+            scan.unclassified_video_sources,
+            vec![50, 51, 52, 55, 56, 57]
+        );
     }
 
     #[test]
