@@ -1,33 +1,49 @@
 # Wellbeing (#354) grayscale/fade renderer protocol proposal (0.35)
 
-For root: concrete effect semantics + wire shape for the two #354 effects
-that are currently desired-state logs. Protocol 0.35 is reserved for
-wellbeing pending the single combined schema; this lane makes no schema
-edit. Constants below are the ported GNOME names already pinned in
-`crates/shell-gtk/src/wellbeing.rs`.
+For root: effect semantics corrected to actual GNOME 51 source (an
+earlier revision of this proposal invented 3 s restore fades — GNOME
+disables immediately on exit; only entry fades). Protocol 0.35 is
+reserved for wellbeing pending the single combined schema; this lane
+makes no schema edit. Root owns the final color/render consumer.
 
-## Required effect semantics (observable, gate-testable)
+Primary sources (GNOME/gnome-shell @ 51.0, `js/misc/`):
+- `timeLimitsManager.js`: `GRAYSCALE_FADE_TIME_SECONDS = 3` (L46),
+  `GRAYSCALE_SATURATION = 1.0` full desaturation (L47).
+- `breakManager.js`: `BRIGHTNESS_FADE_TIME_SECONDS = 3` (L44),
+  `BRIGHTNESS_FACTOR = 0.6` (L45).
 
-Grayscale (screen-time limit reached):
-- Trigger on, fade all outputs from full color to full desaturation over
-  3.0 s (`GRAYSCALE_FADE_SECONDS`), ending at desaturation factor 1.0
-  (`GRAYSCALE_SATURATION` = full desaturation).
-- Restore to full color over 3.0 s when the limit no longer applies
-  (new day boundary, limit disabled, or allowance restored).
-- Scope: every output. Interaction: nightlight (#339) also transforms
-  output color; proposed composition order is temperature, then
-  desaturation, then brightness (root/compositor to confirm).
+## Actual GNOME 51 semantics (cited)
 
-Break fade-screen (break taken):
-- Trigger on, fade all outputs to brightness multiplier 0.6
-  (`BREAK_BRIGHTNESS_FACTOR`) over 3.0 s (`BREAK_FADE_SECONDS`).
-- Restore to 1.0 over 3.0 s at break end, skip, or disable.
-- Scope: every output; same composition order as above.
+Grayscale (limit reached):
+- `Clutter.DesaturateEffect` named `desaturate`, attached once to
+  `Main.layoutManager.uiGroup`
+  (`timeLimitsManager.js` L1206-1210).
+- Entry (LIMIT_REACHED + grayscale on): set `factor = 0.0`, enable, ease
+  `@effects.desaturate.factor` to 1.0 over 3000 ms, `EASE_OUT_QUAD`
+  (L1254-1260).
+- Exit is IMMEDIATE, no fade: DISABLED removes the effect
+  (`_ensureDisabled`, L1215-1221); ACTIVE calls `set_enabled(false)`
+  (L1232). There is no restore animation in GNOME 51.
 
-Both effects are output-wide renderer state, not per-window: no app can
-observe or veto them, and screenshots capture the transformed frame
-(pixel proofs read back through the same frame path as the nightlight
-identity-control capture).
+Break fade (break taken):
+- `Clutter.BrightnessContrastEffect` named `brightness`, attached once
+  to `Main.layoutManager.uiGroup` (`breakManager.js` L749-751).
+- Entry (`_brightnessEffectOn`, L879-894): `set_brightness(127)`,
+  enable, ease `@effects.brightness.brightness` to
+  `Cogl.Color(127*0.6 each)` over 3000 ms, `EASE_OUT_QUAD`. Value range
+  is [0,255] with 127 as the no-change midpoint (comment at L878).
+- Exit is IMMEDIATE, no fade: DISABLED removes the effect (L757-763);
+  ACTIVE and IDLE call `set_enabled(false)` (L801, L835).
+
+Scope: both effects attach to the `uiGroup` actor. For Tuna the
+equivalent scene-graph scope applies with the cursor excluded (cursor
+exclusion to confirm with the compositor owner). Screenshots capture
+through the same frame path, so pixel proofs read the transformed
+frame.
+
+Composition with color temperature: temperature applies AFTER the UI
+effect in GNOME's output ordering (root-provided; pending
+compositor-owner review — this proposal does not assume the reverse).
 
 ## Proposed wire shape (0.35)
 
@@ -45,20 +61,17 @@ pub struct WellbeingEffects {
 }
 ```
 
-Alternative (not recommended): two dedicated `CommandKind` variants. A
-single struct keeps grayscale+fade atomic across one settings push and
-matches how motion/sound/brightness preferences already ride settings.
-
-Open for root: exact host struct to extend (pending 0.33/0.34 combined
-schema), per-output vs all-output scope confirmation, composition order
-with nightlight, and the GNOME 51 renderer component that owns the
-equivalent path (this proposal specifies observable behavior only and
-claims no verbatim GNOME internals).
+A single struct keeps grayscale+fade atomic across one settings push.
+The compositor implements GNOME's exact timing: 3 s `EASE_OUT_QUAD`
+entry from the neutral value, immediate disable on exit. Exact host
+struct choice is root's (pending 0.33/0.34 combined schema).
 
 ## Acceptance (not from logs)
 
-- Pixel ramp proofs: saturation/brightness move on trigger and restore
-  after, sampled from real frames (negative: no change when disabled).
+- Pixel proofs: entry ramps (3 s ease to full desaturation / 0.6
+  brightness) and immediate exits, sampled from real frames; negative
+  proofs (no change when disabled; no restore fade — exit must read
+  neutral at once, matching GNOME).
 - Gate split: effect-state diagnostics stay as diagnostics; acceptance
   requires the transformed pixels.
 - Inventory rows stay `Honored (partial)` until these proofs pass.
