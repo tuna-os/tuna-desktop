@@ -38,6 +38,8 @@ use std::time::Duration;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
+use crate::services::Tile;
+
 /// IPP version we speak. CUPS 2.x servers all accept 1.1; nothing here
 /// needs 2.0 features.
 const IPP_MAJOR: u8 = 1;
@@ -61,17 +63,21 @@ const TAG_NAME_WITH_LANGUAGE: u8 = 0x36;
 const TAG_END_COLLECTION: u8 = 0x37;
 const TAG_TEXT: u8 = 0x41;
 const TAG_NAME: u8 = 0x42;
-const TAG_KEYWORD: u8 = 0x43;
-const TAG_URI: u8 = 0x44;
-const TAG_CHARSET: u8 = 0x46;
-const TAG_LANGUAGE: u8 = 0x47;
-const TAG_MIME: u8 = 0x48;
+// 0x43 is IPP_TAG_RESERVED_STRING and 0x46 IPP_TAG_URISCHEME: no
+// request or response value uses either, so neither has a constant.
+const TAG_KEYWORD: u8 = 0x44;
+const TAG_URI: u8 = 0x45;
+const TAG_CHARSET: u8 = 0x47;
+const TAG_LANGUAGE: u8 = 0x48;
+const TAG_MIME: u8 = 0x49;
 
 /// Operations used (`cups/ipp.h` `ipp_op_t`). Note `CUPS-Set-Default`
 /// is `0x400A`, not `0x4001` (`CUPS-Get-Default`).
 const OP_PRINT_JOB: u16 = 0x0002;
 const OP_CANCEL_JOB: u16 = 0x0008;
 const OP_GET_JOBS: u16 = 0x000A;
+// Only `printer_details` sends this operation (see its note).
+#[allow(dead_code)]
 const OP_GET_PRINTER_ATTRIBUTES: u16 = 0x000B;
 const OP_PAUSE_PRINTER: u16 = 0x0010;
 const OP_RESUME_PRINTER: u16 = 0x0011;
@@ -171,6 +177,8 @@ pub enum IppValue {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IppAttr {
     pub name: String,
+    // Decoded wire fidelity; the model matches on names, never tags.
+    #[allow(dead_code)]
     pub tag: u8,
     pub values: Vec<IppValue>,
 }
@@ -181,12 +189,16 @@ pub struct IppAttr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IppMessage {
     pub status: u16,
+    // Echoed from the request; asserted in tests, unread by the panel.
+    #[allow(dead_code)]
     pub request_id: u32,
     pub groups: Vec<(u8, Vec<IppAttr>)>,
 }
 
 impl IppMessage {
     /// All attributes named `name` in groups tagged `group`.
+    // Test query helper; production iterates the groups directly.
+    #[allow(dead_code)]
     pub fn find<'a>(&'a self, group: u8, name: &str) -> Vec<&'a IppAttr> {
         self.groups
             .iter()
@@ -278,6 +290,8 @@ impl<'a> OutAttr<'a> {
         }
     }
 
+    // Encoder completeness; no request sends a boolean today.
+    #[allow(dead_code)]
     pub fn boolean(name: &'a str, value: bool) -> Self {
         Self {
             name,
@@ -849,6 +863,8 @@ impl CupsClient {
     }
 
     /// One explicit endpoint (tests and `$CUPS_SERVER` overrides).
+    // Test constructor; production resolves the system daemon.
+    #[allow(dead_code)]
     pub fn single(endpoint: Endpoint) -> Self {
         Self {
             endpoints: vec![endpoint],
@@ -1019,6 +1035,8 @@ impl CupsClient {
     }
 
     /// Fresh attributes for one printer, e.g. before an action.
+    // Reserved client query; actions use the listing's fresh state.
+    #[allow(dead_code)]
     pub fn printer_details(&self, name: &str) -> Result<Printer, CupsError> {
         let mut op = self.op_base();
         op.push(OutAttr::text("printer-uri", TAG_URI, &printer_uri(name)));
@@ -1130,6 +1148,8 @@ impl CupsClient {
 
     /// Whether the printer advertises a maintenance `command` in its
     /// `printer-commands` attribute.
+    // Reserved probe; the panel reads the listing's commands directly.
+    #[allow(dead_code)]
     pub fn supports_command(&self, name: &str, command: &str) -> bool {
         self.printer_details(name)
             .map(|p| p.commands.iter().any(|c| c == command))
@@ -1414,6 +1434,8 @@ pub fn error_banner(
 
 /// Whether GNOME's details dialog accepts `name`: printer names cannot
 /// contain SPACE, TAB, `#` or `/`.
+// The tested rename rule; the shell panel has no rename UI.
+#[allow(dead_code)]
 pub fn valid_printer_name(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(|c| matches!(c, ' ' | '\t' | '#' | '/'))
 }
@@ -1425,7 +1447,11 @@ pub fn valid_printer_name(name: &str) -> bool {
 pub struct Marker {
     pub name: String,
     pub level: i32,
+    // Decoded for model fidelity; the Ink Level row shows name and level.
+    #[allow(dead_code)]
     pub color: String,
+    // Decoded for model fidelity; the Ink Level row shows name and level.
+    #[allow(dead_code)]
     pub kind: String,
 }
 
@@ -1435,14 +1461,20 @@ pub struct Printer {
     pub name: String,
     pub uri: String,
     pub device_uri: String,
+    // CUPS's description string; the panel renders GNOME's rows.
+    #[allow(dead_code)]
     pub info: String,
     pub make_and_model: String,
     pub location: String,
     pub state: PrinterState,
+    // The server's detail; the Status row derives from state and reasons.
+    #[allow(dead_code)]
     pub state_message: String,
     pub reasons: Vec<String>,
     pub accepting_jobs: bool,
     pub is_default: bool,
+    // Queued count from the listing; the panel lists the jobs themselves.
+    #[allow(dead_code)]
     pub queued: i32,
     pub commands: Vec<String>,
     pub markers: Vec<Marker>,
@@ -1566,12 +1598,16 @@ impl Printer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrintJob {
     pub id: i32,
+    // The job's URI; actions address the printer URI plus the job id.
+    #[allow(dead_code)]
     pub uri: String,
     pub name: String,
     pub user: String,
     pub state: JobState,
     pub message: String,
     pub hold_until: Option<String>,
+    // Completed sheet count; the jobs list shows state, not progress.
+    #[allow(dead_code)]
     pub sheets_completed: i32,
 }
 
@@ -1933,6 +1969,8 @@ impl PrintersPanel {
             printer.name.clone()
         };
         let expander = gtk::Expander::builder().label(&title).build();
+        // The queue UI shows jobs and actions without an extra click.
+        expander.set_expanded(true);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
         body.set_margin_start(12);
 
@@ -2057,6 +2095,110 @@ impl PrintersPanel {
         expander.set_child(Some(&body));
         self.list.append(&expander);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Quick-settings tile
+// ---------------------------------------------------------------------------
+
+/// The tile drains poll results every tick but re-reads CUPS only every
+/// [`TILE_POLL_TICKS`] ticks, so the subtitle settles within a second of
+/// a state change without polling the daemon every second.
+const TILE_TICK: Duration = Duration::from_secs(1);
+const TILE_POLL_TICKS: u64 = 5;
+
+/// The tile's subtitle for one poll result: the active queue depth when
+/// jobs are running, else the printer (or its count), else the honest
+/// absence. Failures show the error's short label ("No Print Service",
+/// "Authentication Required", ...), matching the panel.
+pub fn tile_subtitle(result: &Result<Snapshot, CupsError>) -> String {
+    match result {
+        Err(e) => e.title().to_string(),
+        Ok(snapshot) => {
+            let jobs: usize = snapshot
+                .entries
+                .iter()
+                .map(|e| e.jobs.iter().filter(|j| j.state.is_active()).count())
+                .sum();
+            if jobs > 0 {
+                if jobs == 1 {
+                    "1 Job".to_string()
+                } else {
+                    format!("{jobs} Jobs")
+                }
+            } else {
+                match snapshot.entries.as_slice() {
+                    [] => "No Printers".to_string(),
+                    [entry] => entry.printer.name.clone(),
+                    entries => {
+                        let count = entries.len();
+                        format!("{count} Printers")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The tile's live CUPS state: re-reads the snapshot on worker threads
+/// and shows it as the subtitle. Kept alive by its own timeout for the
+/// shell's lifetime. Only the subtitle label is touched, never the
+/// toggle, so the menu's toggle sync cannot fight the poller.
+struct TileWatch {
+    tile: Tile,
+    client: CupsClient,
+    sender: mpsc::Sender<Result<Snapshot, CupsError>>,
+    receiver: mpsc::Receiver<Result<Snapshot, CupsError>>,
+    inflight: Cell<bool>,
+    ticks: Cell<u64>,
+}
+
+impl TileWatch {
+    fn tick(self: &Rc<Self>) {
+        while let Ok(result) = self.receiver.try_recv() {
+            self.inflight.set(false);
+            self.tile.subtitle.set_text(&tile_subtitle(&result));
+            self.tile.subtitle.set_visible(true);
+        }
+        let ticks = self.ticks.get() + 1;
+        self.ticks.set(ticks);
+        if self.inflight.get() || ticks % TILE_POLL_TICKS != 1 {
+            return;
+        }
+        self.inflight.set(true);
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        if std::thread::Builder::new()
+            .name("tuna-printers-tile".to_string())
+            .spawn(move || {
+                let _ = sender.send(client.snapshot());
+            })
+            .is_err()
+        {
+            self.inflight.set(false);
+        }
+    }
+}
+
+/// Track live CUPS state on the quick-settings tile (see
+/// [`tile_subtitle`]). CUPS I/O stays on worker threads with the
+/// module's connect/read timeouts, so an absent daemon only ever shows
+/// "No Print Service", never a hang.
+pub fn watch_tile(tile: Tile) {
+    let (sender, receiver) = mpsc::channel();
+    let watch = Rc::new(TileWatch {
+        tile,
+        client: CupsClient::system(),
+        sender,
+        receiver,
+        inflight: Cell::new(false),
+        ticks: Cell::new(0),
+    });
+    watch.tick();
+    glib::timeout_add_local(TILE_TICK, move || {
+        watch.tick();
+        glib::ControlFlow::Continue
+    });
 }
 
 #[cfg(test)]
@@ -2408,6 +2550,79 @@ mod tests {
         let custom = testprint_candidates(Some("/opt/cups"));
         assert_eq!(custom.len(), 2);
         assert_eq!(custom[0], PathBuf::from("/opt/cups/data/testprint"));
+    }
+
+    fn subtitle_job(state: i32) -> PrintJob {
+        PrintJob::from_attrs(&[
+            IppAttr {
+                name: "job-id".into(),
+                tag: TAG_INTEGER,
+                values: vec![IppValue::Integer(42)],
+            },
+            IppAttr {
+                name: "job-state".into(),
+                tag: TAG_ENUM,
+                values: vec![IppValue::Enum(state)],
+            },
+        ])
+        .expect("job")
+    }
+
+    fn subtitle_error(kind: CupsErrorKind) -> Result<Snapshot, CupsError> {
+        Err(CupsError {
+            kind,
+            message: String::new(),
+        })
+    }
+
+    #[test]
+    fn tile_subtitle_names_queue_printer_or_absence() {
+        assert_eq!(
+            tile_subtitle(&subtitle_error(CupsErrorKind::NoPrintService)),
+            "No Print Service"
+        );
+        assert_eq!(
+            tile_subtitle(&subtitle_error(CupsErrorKind::AuthRequired)),
+            "Authentication Required"
+        );
+        assert_eq!(tile_subtitle(&Ok(Snapshot::default())), "No Printers");
+        let office = Printer::from_attrs(&printer_attrs()).expect("printer");
+        let one = Snapshot {
+            entries: vec![PrinterEntry {
+                printer: office.clone(),
+                jobs: Vec::new(),
+            }],
+        };
+        assert_eq!(tile_subtitle(&Ok(one)), "Office");
+        let mut lab = office.clone();
+        lab.name = "Lab".to_string();
+        let two = Snapshot {
+            entries: vec![
+                PrinterEntry {
+                    printer: office.clone(),
+                    jobs: Vec::new(),
+                },
+                PrinterEntry {
+                    printer: lab,
+                    jobs: Vec::new(),
+                },
+            ],
+        };
+        assert_eq!(tile_subtitle(&Ok(two)), "2 Printers");
+        let queued = Snapshot {
+            entries: vec![PrinterEntry {
+                printer: office,
+                jobs: vec![subtitle_job(5)],
+            }],
+        };
+        assert_eq!(tile_subtitle(&Ok(queued)), "1 Job");
+        let done = Snapshot {
+            entries: vec![PrinterEntry {
+                printer: Printer::from_attrs(&printer_attrs()).expect("printer"),
+                jobs: vec![subtitle_job(9)],
+            }],
+        };
+        assert_eq!(tile_subtitle(&Ok(done)), "Office");
     }
 
     // -- Fake CUPS server ---------------------------------------------------
