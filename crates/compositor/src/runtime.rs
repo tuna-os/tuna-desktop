@@ -1436,11 +1436,18 @@ impl Runtime {
             let matches_key = if let ManagerInput::Key { keycode, .. } = &input {
                 self.state.seat.get_keyboard().is_some_and(|keyboard| {
                     keyboard.with_xkb_state(&mut self.state, |context| {
+                        let Ok(xkb) = context.xkb().lock() else {
+                            return false;
+                        };
+                        let code = keycode.saturating_add(8).into();
+                        // SAFETY: the state is borrowed only while the XKB
+                        // mutex is held; no state reference escapes this call.
+                        let layout = smithay::input::keyboard::Layout(unsafe {
+                            xkb.state().key_get_layout(code)
+                        });
                         self.cursor.locate.matches_keysym(
-                            context
-                                .keysym_handle(keycode.saturating_add(8).into())
-                                .raw_syms()
-                                .into_iter()
+                            xkb.raw_syms_for_key_in_layout(code, layout)
+                                .iter()
                                 .map(|symbol| symbol.raw()),
                         )
                     })

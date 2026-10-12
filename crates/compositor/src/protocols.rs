@@ -294,7 +294,7 @@ impl State {
     /// Ring the system bell for the compositor itself (the keyboard
     /// accessibility beeps, #350).
     pub(crate) fn ring_bell(&mut self) {
-        self.protocols.bell.ring();
+        self.protocols.bell.ring(None);
     }
 
     /// Whether the surface holding keyboard focus inhibits the

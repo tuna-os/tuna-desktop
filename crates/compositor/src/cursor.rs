@@ -1040,7 +1040,7 @@ pub(crate) fn surface_visible_on_output(
     .unwrap_or_default();
     let origin = (pointer - hotspot.to_f64() - output_location.to_f64())
         .to_physical(scale)
-        .to_i32_round()
+        .to_i32_round::<i32>()
         .to_f64();
     let mut visible = false;
     with_surface_tree_downward(
