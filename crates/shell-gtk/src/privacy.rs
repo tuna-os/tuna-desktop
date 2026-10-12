@@ -154,7 +154,6 @@ impl Tracker {
                 node: *id,
                 muted: true,
             });
-            self.muted_by_policy.insert(*id);
         }
         for id in &scan.destroy {
             if !scan.serials.contains_key(id) {
@@ -189,6 +188,7 @@ impl Tracker {
     /// Retain its restore obligation even when the latest scan is unmuted.
     pub fn dispatched(&mut self, action: &Action) {
         if let Action::SetMute { node, muted: true } = action {
+            self.muted_by_policy.insert(*node);
             self.unsettled_mutes.insert(*node);
         }
     }
@@ -689,11 +689,29 @@ mod tests {
                 Action::DestroyNode { node: 61 },
             ]
         );
+        assert!(tracker.tracked().is_empty(), "planning alone owns nothing");
+        tracker.dispatched(&actions[0]);
         // Only the node this tracker muted is tracked: 49 was
         // already muted (by the user, say) and stays untracked.
         assert_eq!(tracker.tracked(), &BTreeSet::from([48]));
         // A steady scan plans nothing.
         assert!(tracker.plan(&scan(&[48, 49], &[], &[48, 49])).is_empty());
+    }
+
+    #[test]
+    fn deferred_mute_does_not_own_a_later_user_mute() {
+        let mut tracker = Tracker::default();
+        let mut queue = ActionQueue::default();
+        queue.offer(tracker.plan(&scan(&[7, 8], &[], &[])));
+        let dispatched = queue.take(1);
+        assert_eq!(dispatched, vec![mute(7)]);
+        tracker.dispatched(&dispatched[0]);
+        // User mutes deferred8 before Tuna dispatches it. Fresh graph demand
+        // cancels8's queued action; lifting policy must restore only7.
+        queue.offer(tracker.plan(&scan(&[7, 8], &[], &[7, 8])));
+        let lifted = tracker.plan(&scan(&[], &[], &[7, 8]));
+        assert_eq!(lifted, vec![unmute(7)]);
+        assert_eq!(tracker.tracked(), &BTreeSet::from([7]));
     }
 
     #[test]
@@ -716,6 +734,7 @@ mod tests {
     fn plan_restore_unmutes_only_tracked_nodes() {
         let mut tracker = Tracker::default();
         assert_eq!(tracker.plan(&scan(&[48], &[], &[])).len(), 1);
+        tracker.dispatched(&mute(48));
         assert!(tracker.plan(&scan(&[48], &[], &[48])).is_empty());
         // Policy lifted: the tracked node is still muted, so an
         // unmute plans — and ownership is retained, so a deferred or
@@ -729,7 +748,8 @@ mod tests {
         assert_eq!(tracker.tracked(), &BTreeSet::from([48]));
         assert_eq!(tracker.plan(&scan(&[], &[], &[48, 49])), unmute);
         assert_eq!(tracker.tracked(), &BTreeSet::from([48]));
-        // Observed unmuted: forgotten silently.
+        tracker.completed(&unmute[0], true);
+        // Observed unmuted after completed restore: forgotten silently.
         assert!(tracker.plan(&scan(&[], &[], &[49])).is_empty());
         assert!(tracker.tracked().is_empty());
         assert!(tracker.plan(&scan(&[], &[], &[49])).is_empty());
@@ -739,6 +759,7 @@ mod tests {
     fn plan_forgets_vanished_nodes_silently() {
         let mut tracker = Tracker::default();
         assert_eq!(tracker.plan(&scan(&[48], &[], &[])).len(), 1);
+        tracker.dispatched(&mute(48));
         // The node left the graph (neither required nor muted):
         // no unmute for a node that is gone.
         assert!(tracker.plan(&scan(&[], &[], &[])).is_empty());
@@ -1463,7 +1484,10 @@ mod tests {
                         break;
                     }
                     for action in &actions {
-                        if run_blocking(action, &self.runtime, &self.address) {
+                        tracker.dispatched(action);
+                        let ok = run_blocking(action, &self.runtime, &self.address);
+                        tracker.completed(action, ok);
+                        if ok {
                             executed.push(*action);
                         }
                     }
