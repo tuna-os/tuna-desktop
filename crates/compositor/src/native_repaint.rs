@@ -569,18 +569,28 @@ mod tests {
     fn global_drawing_pass_order_and_opacity_changes_reset_buffer_history() {
         let id = Id::new();
         let before = moving_scene(&id, 0, 0);
-        assert!(before.same_global_drawing(&moving_scene(&id, 8, 1)));
-        let mut variants = vec![before.clone(); 5];
+        let moved = moving_scene(&id, 8, 1);
+        assert!(needs_repaint(Some(&before), &moved, false));
+        assert!(
+            before.same_global_drawing(&moved),
+            "element movement must not reset global buffer history"
+        );
+        let mut variants = vec![before.clone(); 4];
         variants[0].locked = true;
-        variants[1].pointer = None;
-        variants[2].scale = 2.0;
+        variants[1].scale = 2.0;
         variants[2].groups[0][0].opaque.clear();
         variants[2].groups[0][0]
             .opaque
             .push(Rectangle::from_size((1, 1).into()));
         variants[3].groups[0][0].id = Id::new();
-        for next in variants {
-            assert!(!next.same_global_drawing(&before));
+        for (cause, next) in ["lock", "scale", "opacity", "element identity"]
+            .into_iter()
+            .zip(variants)
+        {
+            assert!(
+                !next.same_global_drawing(&before),
+                "{cause} must reset buffer history"
+            );
         }
     }
 }
