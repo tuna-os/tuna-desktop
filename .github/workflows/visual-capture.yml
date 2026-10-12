@@ -1,0 +1,142 @@
+name: visual-capture
+
+# Reproducible per-feature visual capture (stills + transition clips) of
+# Tuna Desktop from nested compositor fixtures. Capture-only: this
+# workflow adds no gates to ci.yml and asserts no product behavior. Each
+# feature stage runs in its own job with fail-fast disabled and uploads
+# its own visual-<stage> artifact, so one failed stage never prevents
+# collecting the rest (the audit's early-exit finding).
+on:
+  workflow_dispatch:
+    inputs:
+      stages:
+        description: 'Comma-separated stages to capture (default: all)'
+        required: false
+        default: ''
+      merge_sha:
+        description: 'Tested merge commit to record distinctly from the head SHA'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - 'scripts/tuna-visual-capture*'
+      - 'scripts/lib/tuna-visual-*'
+      - 'docs/visual-capture-*'
+      - '.github/workflows/visual-capture.yml'
+  push:
+    branches: [w3-visual-capture]
+    paths:
+      - 'scripts/tuna-visual-capture*'
+      - 'scripts/lib/tuna-visual-*'
+      - 'docs/visual-capture-*'
+      - '.github/workflows/visual-capture.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Use the Ubuntu archive for GTK dependencies
+        run: |
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [[ -f "$source" ]]; then
+              sudo sed -i 's|https\?://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
+            fi
+          done
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols
+      - run: scripts/ci-install-gtk4-layer-shell
+      - run: shellcheck -x scripts/tuna-visual-capture && python3 -m py_compile scripts/lib/tuna-visual-label.py
+      - run: scripts/tuna-visual-capture --check-matrix
+      - run: cargo build --manifest-path Cargo.toml -p tuna-compositor -p tuna-shell-gtk
+      - run: |
+          mkdir -p visual-bin
+          cp target/debug/tuna-compositor target/debug/tuna-shell-gtk visual-bin/
+          cp /usr/local/lib/*/libgtk4-layer-shell.so* visual-bin/ 2>/dev/null || cp /usr/local/lib/libgtk4-layer-shell.so* visual-bin/
+          sha256sum visual-bin/* > visual-bin/sha256sums.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: visual-bin
+          path: visual-bin/
+          retention-days: 14
+
+  capture:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [panel, calendar, quick-settings, windows, x11, scroll, switcher, overview, search-apps, notifications, input, system, settings-a11y, transitions]
+    env:
+      TUNA_VISUAL_BIN_DIR: ${{ github.workspace }}/visual-bin
+      LD_LIBRARY_PATH: ${{ github.workspace }}/visual-bin
+      # Head SHA (checkout) and merge SHA stay distinct in provenance.
+      TUNA_VISUAL_MERGE_SHA: ${{ inputs.merge_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: visual-bin
+          path: visual-bin
+      - name: Use the Ubuntu archive for GTK dependencies
+        run: |
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [[ -f "$source" ]]; then
+              sudo sed -i 's|https\?://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
+            fi
+          done
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils at-spi2-core python3-pyatspi python3-pil fonts-cantarell libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev libwayland-dev wayland-protocols libpam-wrapper ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0
+      - run: chmod +x visual-bin/tuna-compositor visual-bin/tuna-shell-gtk && sha256sum -c visual-bin/sha256sums.txt
+      - name: Capture ${{ matrix.stage }}
+        if: ${{ inputs.stages == '' || contains(format(',{0},', inputs.stages), format(',{0},', matrix.stage)) }}
+        run: scripts/tuna-visual-capture --stage "${{ matrix.stage }}" --artifacts "visual-${{ matrix.stage }}"
+      - if: always()
+        run: |
+          mkdir -p "visual-${{ matrix.stage }}"
+          if [ ! -f "visual-${{ matrix.stage }}/stage.json" ]; then
+            printf '{"stage":"%s","status":"skipped","reason":"filtered out or never started"}\n' "${{ matrix.stage }}" > "visual-${{ matrix.stage }}/stage.json"
+          fi
+      - if: always()
+        run: scripts/ci-prepare-artifacts "visual-${{ matrix.stage }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: visual-${{ matrix.stage }}
+          path: visual-${{ matrix.stage }}/
+          retention-days: 90
+
+  manifest:
+    needs: capture
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: visual-*
+          path: visual-all
+          merge-multiple: false
+      - run: scripts/tuna-visual-capture --merge --artifacts visual-all
+      - run: scripts/tuna-visual-capture --check-matrix
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: visual-manifest
+          path: visual-all/manifest.json
+          retention-days: 90
