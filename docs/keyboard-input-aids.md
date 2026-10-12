@@ -17,7 +17,9 @@ their physical location does not determine whether they are a modifier or
 keypad aid. ISO Level 3 Shift is not treated as a Sticky Keys modifier.
 Before lock engagement and successful unlock, pending Slow Keys and Shift
 timers are cancelled, retained synthetic modifier/button presses are released
-to their current owner, and Mouse Keys movement stops. Settings continue to
+to their current owner, and Mouse Keys movement stops. The same reset runs before keymap/options
+replacement and input-source changes, while the old map is still active.
+Repeat and unrelated preference updates keep the current map and holds. Settings continue to
 apply to fresh input after the ownership change. State summaries expose no
 key identities and are null while locked.
 
@@ -28,6 +30,8 @@ timeout fields remain ignored, matching the original implementation's scope.
 
 The retained real nested input proof gates are G-A11Y-STICKY,
 G-A11Y-SHORTCUTS, G-A11Y-SLOW, G-A11Y-BOUNCE, and G-A11Y-MOUSEKEYS.
+G-A11Y-KEYMAP checks a real GTK Control latch across repeat changes, release
+on live map replacement, and a configured physical Caps-to-Control chord.
 Focused regressions cover configured roles, remapped modifier locations,
 nonmodifier replacements, and cancellation/release on lock ownership changes.
 These checks still require exact-candidate CI. This document does not qualify

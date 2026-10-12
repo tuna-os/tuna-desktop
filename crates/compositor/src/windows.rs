@@ -278,6 +278,8 @@ pub struct WindowManager {
     switcher_queue: Vec<SwitcherAction>,
     /// Keys the open switcher took: their releases stay invisible too.
     switcher_swallowed: Vec<u32>,
+    /// Built-in source changes are deferred until runtime releases old-map aids.
+    input_source_switches: Vec<bool>,
     /// Session window-management mode (scrollable-tiling spec).
     /// Gnome by default; Super+Shift+T flips the whole session.
     mode: SessionMode,
@@ -450,6 +452,7 @@ impl WindowManager {
             switcher_open: false,
             switcher_queue: Vec::new(),
             switcher_swallowed: Vec::new(),
+            input_source_switches: Vec::new(),
             overview_open: false,
             pre_overview_focus: None,
             overview_activated: None,
@@ -4391,6 +4394,14 @@ impl WindowManager {
                 settings.xkb_layout, settings.xkb_variant
             );
         }
+        self.apply_keyboard_repeat(settings);
+    }
+
+    /// Repeat preferences can change without replacing the active keymap.
+    pub fn apply_keyboard_repeat(&mut self, settings: &tuna_shell_control::InputSettings) {
+        let Some(keyboard) = self.keyboard.clone() else {
+            return;
+        };
         let rate = if settings.repeat && settings.repeat_interval_ms > 0 {
             (1000 / settings.repeat_interval_ms).max(1) as i32
         } else {
@@ -4400,9 +4411,8 @@ impl WindowManager {
         self.repeat = (rate, settings.repeat_delay_ms as i32);
     }
 
-    /// The next input source (GNOME's Super+Space).
-    fn next_input_source(&mut self, state: &mut State) {
-        self.switch_input_source(state, false);
+    pub fn take_input_source_switches(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.input_source_switches)
     }
 
     /// The next (or previous) input source, as the shell's rebindable
@@ -4568,7 +4578,8 @@ impl WindowManager {
                     // GNOME's next input source; press and release stay
                     // with the compositor.
                     if pressed {
-                        self.next_input_source(state);
+                        self.switcher_swallowed.push(keycode);
+                        self.input_source_switches.push(false);
                     }
                 } else if keycode == TAB_KEYCODE
                     && self.switcher_keys.is_none()

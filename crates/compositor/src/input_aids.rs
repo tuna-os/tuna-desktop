@@ -887,6 +887,31 @@ mod tests {
         assert_eq!(engine.summary()["mouse_buttons_down"], 0);
     }
 
+    #[test]
+    fn map_epoch_reset_releases_old_control_before_caps_replacement() {
+        let mut engine = InputAids::new();
+        let settings = KeyboardAids {
+            sticky: true,
+            slow: true,
+            slow_delay_ms: 100,
+            ..KeyboardAids::default()
+        };
+        engine.configure(&settings, 0);
+        engine.process_classified(key(CTRL, true, 10), 10, false, CTRL);
+        engine.poll(110);
+        engine.process_classified(key(CTRL, false, 120), 120, false, CTRL);
+        engine.process_classified(key(A, true, 130), 130, false, u32::MAX);
+        assert_eq!(keys(&engine.reset_ownership(140)), vec![(CTRL, false)]);
+        // Identical aid settings must not resurrect old-map holds/timers.
+        assert!(engine.configure(&settings, 150).is_empty());
+        assert!(engine.poll(300).is_empty());
+        assert_eq!(engine.summary()["latched"], serde_json::json!([]));
+        engine.process_classified(key(CTRL, true, 310), 310, false, CAPS_LOCK);
+        engine.poll(410);
+        engine.process_classified(key(CTRL, false, 420), 420, false, CAPS_LOCK);
+        assert_eq!(engine.summary()["latched"], serde_json::json!([]));
+    }
+
     const A: u32 = 30;
     const B: u32 = 48;
     const CTRL: u32 = 29;

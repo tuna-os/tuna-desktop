@@ -3190,6 +3190,43 @@ a11y_wait "$(a11y_typed "$mark") == [\"65:true\",\"98:false\"]" "latched shift" 
     fail G-A11Y-STICKY "the latched Shift did not apply to exactly one key"
 cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "latch spent" ||
     fail G-A11Y-STICKY "the latched Shift was not released after one key"
+# A live semantic keymap replacement must release the old modifier under
+# the old map; unrelated repeat updates must preserve a pending latch.
+a11y_xkb_options="$(gsettings get org.gnome.desktop.input-sources xkb-options)"
+xdotool key Control_L
+cstate '.input_aids.latched == ["control"]' "control before repeat update" ||
+    fail G-A11Y-KEYMAP "the old map did not latch Control"
+gsettings set org.gnome.desktop.peripherals.keyboard repeat-interval 60
+cstate '.keyboard.repeat_rate == 16 and .input_aids.latched == ["control"]' "repeat without map reset" ||
+    fail G-A11Y-KEYMAP "an unrelated repeat change discarded the Control latch"
+gsettings set org.gnome.desktop.input-sources xkb-options "['ctrl:swapcaps']"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "old-map holds released" ||
+    fail G-A11Y-KEYMAP "a keymap replacement retained old modifier state"
+mark="$(a11y_mark)"
+xdotool key a
+a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | {keyval,ctrl}] == [{\"keyval\":97,\"ctrl\":false}]" "no old-map control" ||
+    fail G-A11Y-KEYMAP "the old Control latch affected the first new-map key"
+xdotool key Caps_Lock
+cstate '.input_aids.latched == ["control"]' "remapped Caps is Control" ||
+    fail G-A11Y-KEYMAP "the configured Caps-to-Control role did not latch"
+mark="$(a11y_mark)"
+xdotool key a
+a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | {keyval,ctrl}] == [{\"keyval\":97,\"ctrl\":true}]" "real remapped control chord" ||
+    fail G-A11Y-KEYMAP "the remapped physical Caps key did not control the real GTK key"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "remapped latch spent" ||
+    fail G-A11Y-KEYMAP "the remapped Control latch did not release"
+# Balance the host Caps Lock toggle while the guest still maps it to Control.
+xdotool key Caps_Lock
+cstate '.input_aids.latched == ["control"]' "remapped control before restore" ||
+    fail G-A11Y-KEYMAP "the remapped role did not remain live before restoration"
+gsettings set org.gnome.desktop.input-sources xkb-options "$a11y_xkb_options"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "map restoration clears holds" ||
+    fail G-A11Y-KEYMAP "restoring the original map retained a remapped Control hold"
+gsettings set org.gnome.desktop.peripherals.keyboard repeat-interval 50
+cstate '.keyboard.repeat_rate == 20' "repeat restored" ||
+    fail G-A11Y-KEYMAP "repeat preferences did not restore"
+cp "$A11Y_KEYS" "$ARTIFACTS/a11y-keymap.json"
+pass G-A11Y-KEYMAP "repeat changes preserve a latch; semantic keymap replacement clears it; remapped physical Caps produces a real Control chord"
 # Two taps lock, a third releases.
 mark="$(a11y_mark)"
 xdotool key Shift_L

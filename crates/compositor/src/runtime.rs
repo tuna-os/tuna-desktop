@@ -1538,6 +1538,9 @@ impl Runtime {
                 }
             }
             self.manager.on_input(&mut self.state, input);
+            for backward in self.manager.take_input_source_switches() {
+                self.switch_input_source_with_aid_reset(backward);
+            }
             // Alt-Tab drive: forward whatever the manager queued into
             // the hub broadcast; the next hub poll delivers it to the
             // shell, which owns MRU order and rendering.
@@ -3175,8 +3178,15 @@ impl Runtime {
         self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
             .apply_workspace_policy(&mut self.state, settings.workspace_policy);
-        self.manager
-            .apply_keyboard_settings(&mut self.state, &settings);
+        // Release delayed/synthetic input under the OLD map. An unrelated
+        // preference change must not reinstall the map or lose held state.
+        if aids::keymap_changed(&self.input_settings, &settings) {
+            self.reset_input_aid_ownership();
+            self.manager
+                .apply_keyboard_settings(&mut self.state, &settings);
+        } else {
+            self.manager.apply_keyboard_repeat(&settings);
+        }
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
         self.configure_input_aids(&settings.keyboard_aids);
@@ -3691,7 +3701,7 @@ impl Runtime {
             self.manager.set_switcher_keys(keys);
         }
         for backward in outcome.input_source_switches {
-            self.manager.switch_input_source(&mut self.state, backward);
+            self.switch_input_source_with_aid_reset(backward);
         }
         // Header-bar right clicks: GNOME's window menu, drawn by the shell.
         for (window, x, y) in self.manager.take_menu_requests() {

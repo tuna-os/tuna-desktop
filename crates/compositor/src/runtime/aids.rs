@@ -67,6 +67,11 @@ impl Runtime {
         self.apply_aid_effects(effects);
     }
 
+    pub(super) fn switch_input_source_with_aid_reset(&mut self, backward: bool) {
+        self.reset_input_aid_ownership();
+        self.manager.switch_input_source(&mut self.state, backward);
+    }
+
     /// The aids' timers (Slow Keys, the Shift-hold shortcut, Mouse Keys
     /// motion), run every tick.
     pub(super) fn poll_input_aids(&mut self) {
@@ -188,5 +193,45 @@ mod tests {
         assert_eq!(canonical_role(KEY_KP_Up), 72);
         assert_eq!(canonical_role(KEY_ISO_Level3_Shift), u32::MAX);
         assert_eq!(canonical_role(KEY_a), u32::MAX);
+    }
+}
+
+pub(super) fn keymap_changed(
+    old: &tuna_shell_control::InputSettings,
+    new: &tuna_shell_control::InputSettings,
+) -> bool {
+    old.xkb_layout != new.xkb_layout
+        || old.xkb_variant != new.xkb_variant
+        || old.xkb_options != new.xkb_options
+}
+
+#[cfg(test)]
+mod keymap_tests {
+    use super::keymap_changed;
+    use tuna_shell_control::InputSettings;
+
+    #[test]
+    fn semantic_map_changes_reset_but_repeat_and_aids_preferences_do_not() {
+        let old = InputSettings::default();
+        for new in [
+            InputSettings {
+                xkb_layout: "de".into(),
+                ..old.clone()
+            },
+            InputSettings {
+                xkb_variant: "dvorak".into(),
+                ..old.clone()
+            },
+            InputSettings {
+                xkb_options: "ctrl:swapcaps".into(),
+                ..old.clone()
+            },
+        ] {
+            assert!(keymap_changed(&old, &new));
+        }
+        let mut new = old.clone();
+        new.repeat_delay_ms += 100;
+        new.keyboard_aids.sticky = true;
+        assert!(!keymap_changed(&old, &new));
     }
 }
