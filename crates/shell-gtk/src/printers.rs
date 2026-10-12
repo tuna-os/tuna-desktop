@@ -21,10 +21,12 @@
 //!   `tests/settings/gnome51-control-center-items.json`).
 //!
 //! CUPS I/O runs on worker threads with a 2s connect timeout and 5s
-//! per-read/per-write timeouts, so an absent or stuck daemon cannot
-//! block the UI thread. These timeouts bound each connect/read/write
-//! call, not the whole exchange: there is no global deadline, and a
-//! peer that keeps dribbling bytes can keep a worker past 5s. A
+//! per-read/per-write timeouts, plus a 10s absolute deadline per
+//! exchange and a 30s budget per snapshot/action, so an absent or
+//! stuck daemon cannot block the UI thread. Each connect/read/write
+//! uses the exchange's remaining budget (capped by its per-call
+//! limit), with no detached timeout thread: a peer that dribbles
+//! bytes fails by the deadline and releases its worker. A
 //! missing daemon renders as GNOME's "No Print Service". Privileged
 //! writes are attempted as direct IPP and, when cupsd answers 401 or
 //! 403, surface as "Authentication Required": a cups-pk-helper
@@ -36,7 +38,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -118,13 +120,46 @@ const CUPS_SOCKETS: [&str; 2] = ["/run/cups/cups.sock", "/var/run/cups/cups.sock
 const CUPS_TCP_HOST: &str = "127.0.0.1";
 const CUPS_TCP_PORT: u16 = 631;
 
-/// Per-call bounds (not a global deadline for the whole exchange,
-/// see the module docs): each connect fails after 2s and each
-/// read/write after 5s.
+/// Per-call bounds: each connect fails after 2s and each read/write
+/// after 5s. Absolute deadlines (below) cap the whole exchange and
+/// the whole snapshot/action via remaining-time timeouts.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Absolute deadline per CUPS exchange: connect, request write and
+/// response head/body reads together must finish within 10s.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole-worker budget for a snapshot or multi-exchange action: the
+/// serial per-printer job queries within one refresh share 30s.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
+const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on an IPP response body (printers and jobs lists are small).
 const MAX_BODY: usize = 8 << 20;
+
+/// A worker released by its deadline: retryable transport failure.
+fn deadline_error() -> CupsError {
+    CupsError::new(
+        CupsErrorKind::Transport,
+        "print server exchange exceeded its deadline",
+    )
+}
+
+/// Remaining budget capped by the per-call limit: every connect/read/
+/// write sets its socket timeout to this, so a dribbling peer fails by
+/// `deadline` even when each call is under its own limit.
+fn remaining(deadline: Instant, cap: Duration) -> Result<Duration, CupsError> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(deadline_error());
+    }
+    Ok((deadline - now).min(cap))
+}
+
+/// One exchange inside an outer snapshot/action budget: bounded by the
+/// outer deadline and by a fresh per-exchange timeout, whichever ends
+/// first.
+fn effective_exchange_deadline(outer: Instant, exchange_timeout: Duration) -> Instant {
+    outer.min(Instant::now() + exchange_timeout)
+}
 
 /// Attributes requested for each printer: everything the panel shows
 /// and nothing more.
@@ -801,6 +836,179 @@ impl Write for Stream {
     }
 }
 
+impl Stream {
+    fn set_read_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_read_timeout(Some(timeout)),
+            Stream::Unix(s) => s.set_read_timeout(Some(timeout)),
+        }
+    }
+
+    fn set_write_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_write_timeout(Some(timeout)),
+            Stream::Unix(s) => s.set_write_timeout(Some(timeout)),
+        }
+    }
+}
+
+/// Write the whole request, re-arming the socket timeout to the
+/// remaining budget before every write: no detached timeout thread.
+fn write_all_with_deadline(
+    stream: &mut Stream,
+    buf: &[u8],
+    deadline: Instant,
+    io_timeout: Duration,
+) -> Result<(), CupsError> {
+    let mut written = 0;
+    while written < buf.len() {
+        let timeout = remaining(deadline, io_timeout)?;
+        stream
+            .set_write_timeout(timeout)
+            .map_err(|e| CupsError::new(CupsErrorKind::Transport, format!("sending: {e}")))?;
+        match stream.write(&buf[written..]) {
+            Ok(0) => {
+                return Err(CupsError::new(
+                    CupsErrorKind::Transport,
+                    "sending: connection closed",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(deadline_error());
+                }
+                return Err(CupsError::new(
+                    CupsErrorKind::Transport,
+                    format!("sending: {e}"),
+                ));
+            }
+        }
+    }
+    let timeout = remaining(deadline, io_timeout)?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|e| CupsError::new(CupsErrorKind::Transport, format!("sending: {e}")))?;
+    stream.flush().map_err(|e| {
+        if Instant::now() >= deadline {
+            deadline_error()
+        } else {
+            CupsError::new(CupsErrorKind::Transport, format!("sending: {e}"))
+        }
+    })?;
+    Ok(())
+}
+
+fn read_with_deadline(
+    stream: &mut Stream,
+    buf: &mut [u8],
+    deadline: Instant,
+    io_timeout: Duration,
+) -> Result<usize, CupsError> {
+    let timeout = remaining(deadline, io_timeout)?;
+    stream.set_read_timeout(timeout).map_err(|e| {
+        CupsError::new(
+            CupsErrorKind::Transport,
+            format!("reading CUPS response: {e}"),
+        )
+    })?;
+    stream.read(buf).map_err(|e| {
+        if Instant::now() >= deadline {
+            deadline_error()
+        } else {
+            CupsError::new(
+                CupsErrorKind::Transport,
+                format!("reading CUPS response: {e}"),
+            )
+        }
+    })
+}
+
+/// Read one HTTP response under an absolute deadline: every read
+/// re-arms to the remaining budget, so dribbled bytes fail by the
+/// deadline. Same [`MAX_BODY`] cap and interim-`1xx` handling as
+/// [`read_response`].
+fn read_response_with_deadline(
+    stream: &mut Stream,
+    deadline: Instant,
+    io_timeout: Duration,
+) -> Result<(u16, Vec<u8>), CupsError> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let (status, body_start, length) = loop {
+        if Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        let n = read_with_deadline(stream, &mut chunk, deadline, io_timeout)?;
+        if n == 0 {
+            return Err(CupsError::new(
+                CupsErrorKind::Transport,
+                "CUPS closed the connection",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_BODY + 8192 {
+            return Err(CupsError::new(
+                CupsErrorKind::Transport,
+                "CUPS response head too large",
+            ));
+        }
+        let mut offset = 0;
+        let mut found = None;
+        while buf[offset..].windows(4).any(|w| w == b"\r\n\r\n") {
+            let (status, head_len, length) = parse_response_head(&buf[offset..])
+                .map_err(|e| CupsError::new(CupsErrorKind::Transport, e))?;
+            offset += head_len;
+            if (100..200).contains(&status) {
+                continue; // Interim head (e.g. 100 Continue): skip it.
+            }
+            found = Some((status, offset, length));
+            break;
+        }
+        if let Some(done) = found {
+            break done;
+        }
+    };
+    let mut body = buf[body_start..].to_vec();
+    match length {
+        Some(n) if n > MAX_BODY => {
+            return Err(CupsError::new(
+                CupsErrorKind::Transport,
+                "CUPS response body too large",
+            ));
+        }
+        Some(n) => {
+            while body.len() < n {
+                let want = (n - body.len()).min(chunk.len());
+                let got = read_with_deadline(stream, &mut chunk[..want], deadline, io_timeout)?;
+                if got == 0 {
+                    return Err(CupsError::new(
+                        CupsErrorKind::Transport,
+                        "CUPS closed the connection mid-body",
+                    ));
+                }
+                body.extend_from_slice(&chunk[..got]);
+            }
+            body.truncate(n);
+        }
+        None => loop {
+            if body.len() > MAX_BODY {
+                return Err(CupsError::new(
+                    CupsErrorKind::Transport,
+                    "CUPS response body too large",
+                ));
+            }
+            let n = read_with_deadline(stream, &mut chunk, deadline, io_timeout)?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        },
+    }
+    Ok((status, body))
+}
+
 /// The user cupsd sees. libcups sends the login name; over the domain
 /// socket cupsd authenticates by peer credentials anyway.
 pub fn cups_user() -> String {
@@ -907,48 +1115,72 @@ impl CupsClient {
         ]
     }
 
-    fn connect(&self) -> Result<Stream, CupsError> {
+    fn connect_with_budget(
+        &self,
+        deadline: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+    ) -> Result<Stream, CupsError> {
         let mut detail = String::new();
         for endpoint in &self.endpoints {
+            if Instant::now() >= deadline {
+                return Err(deadline_error());
+            }
             let attempt = match endpoint {
                 Endpoint::Unix(path) => std::os::unix::net::UnixStream::connect(path)
                     .map_err(|e| e.to_string())
                     .and_then(|s| {
-                        s.set_read_timeout(Some(IO_TIMEOUT))
-                            .and_then(|()| s.set_write_timeout(Some(IO_TIMEOUT)))
+                        let budget = remaining(deadline, io_timeout).map_err(|e| e.message)?;
+                        s.set_read_timeout(Some(budget))
+                            .and_then(|()| s.set_write_timeout(Some(budget)))
                             .map_err(|e| e.to_string())?;
                         Ok(Stream::Unix(s))
                     }),
-                Endpoint::Tcp(host, port) => format!("{host}:{port}")
-                    .parse::<std::net::SocketAddr>()
-                    .or_else(|_| {
-                        // A hostname, not a literal: resolve it.
-                        std::net::ToSocketAddrs::to_socket_addrs(format!("{host}:{port}").as_str())
+                Endpoint::Tcp(host, port) => {
+                    let budget = match remaining(deadline, connect_timeout) {
+                        Ok(b) => b,
+                        Err(e) => return Err(e),
+                    };
+                    format!("{host}:{port}")
+                        .parse::<std::net::SocketAddr>()
+                        .or_else(|_| {
+                            // A hostname, not a literal: resolve it.
+                            std::net::ToSocketAddrs::to_socket_addrs(
+                                format!("{host}:{port}").as_str(),
+                            )
                             .ok()
                             .and_then(|mut addrs| addrs.next())
                             .ok_or(())
-                    })
-                    .map_err(|()| format!("cannot resolve {host}"))
-                    .and_then(|addr| {
-                        std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-                            .map_err(|e| e.to_string())
-                    })
-                    .and_then(|s| {
-                        s.set_read_timeout(Some(IO_TIMEOUT))
-                            .and_then(|()| s.set_write_timeout(Some(IO_TIMEOUT)))
-                            .map_err(|e| e.to_string())?;
-                        Ok(Stream::Tcp(s))
-                    }),
+                        })
+                        .map_err(|()| format!("cannot resolve {host}"))
+                        .and_then(|addr| {
+                            std::net::TcpStream::connect_timeout(&addr, budget)
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|s| {
+                            let budget = remaining(deadline, io_timeout).map_err(|e| e.message)?;
+                            s.set_read_timeout(Some(budget))
+                                .and_then(|()| s.set_write_timeout(Some(budget)))
+                                .map_err(|e| e.to_string())?;
+                            Ok(Stream::Tcp(s))
+                        })
+                }
             };
             match attempt {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(deadline_error());
+                    }
                     if !detail.is_empty() {
                         detail.push_str("; ");
                     }
                     detail.push_str(&format!("{endpoint:?}: {e}"));
                 }
             }
+        }
+        if Instant::now() >= deadline {
+            return Err(deadline_error());
         }
         Err(CupsError::new(
             CupsErrorKind::NoPrintService,
@@ -960,25 +1192,46 @@ impl CupsClient {
     /// POST to `/` like libcups does, read and decode the response,
     /// and map failures to [`CupsError`]. `document`, when present, is
     /// appended after the encoding. A reply whose request id is not the
-    /// one just sent is discarded and counted, never applied.
+    /// one just sent is discarded and counted, never applied. The whole
+    /// exchange must finish by [`EXCHANGE_TIMEOUT`]: every
+    /// connect/read/write re-arms to the remaining budget.
     pub fn exchange(
         &self,
         op: u16,
         groups: Vec<(u8, Vec<OutAttr<'_>>)>,
         document: Option<&[u8]>,
     ) -> Result<IppMessage, CupsError> {
+        self.exchange_with_budget(
+            op,
+            groups,
+            document,
+            Instant::now() + EXCHANGE_TIMEOUT,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+        )
+    }
+
+    fn exchange_with_budget(
+        &self,
+        op: u16,
+        groups: Vec<(u8, Vec<OutAttr<'_>>)>,
+        document: Option<&[u8]>,
+        deadline: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+    ) -> Result<IppMessage, CupsError> {
+        if Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
         let sent_id = self.request_id();
         let mut body = encode_request(op, sent_id, &groups);
         if let Some(doc) = document {
             body.extend_from_slice(doc);
         }
         let request = build_post("/", &body);
-        let mut stream = self.connect()?;
-        stream
-            .write_all(&request)
-            .map_err(|e| CupsError::new(CupsErrorKind::Transport, format!("sending: {e}")))?;
-        let (http, reply) =
-            read_response(&mut stream).map_err(|e| CupsError::new(CupsErrorKind::Transport, e))?;
+        let mut stream = self.connect_with_budget(deadline, connect_timeout, io_timeout)?;
+        write_all_with_deadline(&mut stream, &request, deadline, io_timeout)?;
+        let (http, reply) = read_response_with_deadline(&mut stream, deadline, io_timeout)?;
         match http {
             401 => {
                 return Err(CupsError::new(
@@ -1018,13 +1271,36 @@ impl CupsClient {
 
     /// The printers the server knows, in server order.
     pub fn printers(&self) -> Result<Vec<Printer>, CupsError> {
+        self.printers_with_budget(
+            Instant::now() + EXCHANGE_TIMEOUT,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+            EXCHANGE_TIMEOUT,
+        )
+    }
+
+    fn printers_with_budget(
+        &self,
+        outer: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+        exchange_timeout: Duration,
+    ) -> Result<Vec<Printer>, CupsError> {
         let mut op = self.op_base();
         op.push(OutAttr::texts(
             "requested-attributes",
             TAG_KEYWORD,
             &PRINTER_ATTRS,
         ));
-        let reply = self.exchange(OP_CUPS_GET_PRINTERS, vec![(TAG_OPERATION, op)], None)?;
+        let deadline = effective_exchange_deadline(outer, exchange_timeout);
+        let reply = self.exchange_with_budget(
+            OP_CUPS_GET_PRINTERS,
+            vec![(TAG_OPERATION, op)],
+            None,
+            deadline,
+            connect_timeout,
+            io_timeout,
+        )?;
         let mut out = Vec::new();
         for (tag, attrs) in &reply.groups {
             if *tag != TAG_PRINTER {
@@ -1040,6 +1316,21 @@ impl CupsClient {
     /// The default printer's name: the user's `~/.cups/lpoptions`
     /// choice first (as libcups prefers it), else the server default.
     pub fn default_name(&self) -> Option<String> {
+        self.default_name_with_budget(
+            Instant::now() + EXCHANGE_TIMEOUT,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+            EXCHANGE_TIMEOUT,
+        )
+    }
+
+    fn default_name_with_budget(
+        &self,
+        outer: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+        exchange_timeout: Duration,
+    ) -> Option<String> {
         if let Ok(home) = std::env::var("HOME") {
             let path = PathBuf::from(home).join(".cups/lpoptions");
             if let Ok(text) = std::fs::read_to_string(&path) {
@@ -1048,14 +1339,37 @@ impl CupsClient {
                 }
             }
         }
-        self.server_default_name()
+        self.server_default_name_with_budget(outer, connect_timeout, io_timeout, exchange_timeout)
     }
 
     /// The server-wide default via `CUPS-Get-Default`.
     pub fn server_default_name(&self) -> Option<String> {
+        self.server_default_name_with_budget(
+            Instant::now() + EXCHANGE_TIMEOUT,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+            EXCHANGE_TIMEOUT,
+        )
+    }
+
+    fn server_default_name_with_budget(
+        &self,
+        outer: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+        exchange_timeout: Duration,
+    ) -> Option<String> {
         let op = self.op_base();
+        let deadline = effective_exchange_deadline(outer, exchange_timeout);
         let reply = self
-            .exchange(OP_CUPS_GET_DEFAULT, vec![(TAG_OPERATION, op)], None)
+            .exchange_with_budget(
+                OP_CUPS_GET_DEFAULT,
+                vec![(TAG_OPERATION, op)],
+                None,
+                deadline,
+                connect_timeout,
+                io_timeout,
+            )
             .ok()?;
         reply
             .find_any("printer-name")
@@ -1088,6 +1402,25 @@ impl CupsClient {
     /// Active (`not-completed`) jobs on one printer, newest last like
     /// the jobs dialog lists them. `my_only` restricts to our user.
     pub fn jobs(&self, printer_uri: &str, my_only: bool) -> Result<Vec<PrintJob>, CupsError> {
+        self.jobs_with_budget(
+            printer_uri,
+            my_only,
+            Instant::now() + EXCHANGE_TIMEOUT,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+            EXCHANGE_TIMEOUT,
+        )
+    }
+
+    fn jobs_with_budget(
+        &self,
+        printer_uri: &str,
+        my_only: bool,
+        outer: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+        exchange_timeout: Duration,
+    ) -> Result<Vec<PrintJob>, CupsError> {
         let mut op = self.op_base();
         op.push(OutAttr::text("printer-uri", TAG_URI, printer_uri));
         if my_only {
@@ -1099,7 +1432,15 @@ impl CupsClient {
             TAG_KEYWORD,
             &JOB_ATTRS,
         ));
-        let reply = self.exchange(OP_GET_JOBS, vec![(TAG_OPERATION, op)], None)?;
+        let deadline = effective_exchange_deadline(outer, exchange_timeout);
+        let reply = self.exchange_with_budget(
+            OP_GET_JOBS,
+            vec![(TAG_OPERATION, op)],
+            None,
+            deadline,
+            connect_timeout,
+            io_timeout,
+        )?;
         let mut out = Vec::new();
         for (tag, attrs) in &reply.groups {
             if *tag != TAG_JOB {
@@ -1114,23 +1455,82 @@ impl CupsClient {
 
     /// Cancel one job by id.
     pub fn cancel_job(&self, printer_uri: &str, job_id: i32) -> Result<(), CupsError> {
+        self.cancel_job_with_budget(
+            printer_uri,
+            job_id,
+            Instant::now() + EXCHANGE_TIMEOUT,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+            EXCHANGE_TIMEOUT,
+        )
+    }
+
+    fn cancel_job_with_budget(
+        &self,
+        printer_uri: &str,
+        job_id: i32,
+        outer: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+        exchange_timeout: Duration,
+    ) -> Result<(), CupsError> {
         let mut op = self.op_base();
         op.push(OutAttr::text("printer-uri", TAG_URI, printer_uri));
         op.push(OutAttr::int("job-id", TAG_INTEGER, job_id));
-        self.exchange(OP_CANCEL_JOB, vec![(TAG_OPERATION, op)], None)?;
+        let deadline = effective_exchange_deadline(outer, exchange_timeout);
+        self.exchange_with_budget(
+            OP_CANCEL_JOB,
+            vec![(TAG_OPERATION, op)],
+            None,
+            deadline,
+            connect_timeout,
+            io_timeout,
+        )?;
         Ok(())
     }
 
     /// Cancel our active jobs on one printer (the dialog's Clear All).
     /// Returns how many were cancelled; stops at the first failure.
+    /// The list plus the serial cancels share [`ACTION_TIMEOUT`].
     pub fn clear_my_jobs(&self, printer_uri: &str) -> Result<usize, CupsError> {
-        let jobs = self.jobs(printer_uri, true)?;
+        self.clear_my_jobs_with_budget(
+            printer_uri,
+            Instant::now() + ACTION_TIMEOUT,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+            EXCHANGE_TIMEOUT,
+        )
+    }
+
+    fn clear_my_jobs_with_budget(
+        &self,
+        printer_uri: &str,
+        outer: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+        exchange_timeout: Duration,
+    ) -> Result<usize, CupsError> {
+        let jobs = self.jobs_with_budget(
+            printer_uri,
+            true,
+            outer,
+            connect_timeout,
+            io_timeout,
+            exchange_timeout,
+        )?;
         let mut done = 0;
         for job in &jobs {
             if !job.state.is_active() {
                 continue;
             }
-            self.cancel_job(printer_uri, job.id)?;
+            self.cancel_job_with_budget(
+                printer_uri,
+                job.id,
+                outer,
+                connect_timeout,
+                io_timeout,
+                exchange_timeout,
+            )?;
             done += 1;
         }
         Ok(done)
@@ -1236,10 +1636,30 @@ impl CupsClient {
     }
 
     /// Everything the panel renders: printers with the default marked,
-    /// plus each printer's active jobs.
+    /// plus each printer's active jobs. The listing, the default lookup
+    /// and the serial per-printer job queries share
+    /// [`SNAPSHOT_TIMEOUT`]: each exchange re-arms to the remaining
+    /// budget, so two dribbling peers cannot hold a worker forever.
     pub fn snapshot(&self) -> Result<Snapshot, CupsError> {
-        let mut printers = self.printers()?;
-        let default = self.default_name();
+        self.snapshot_with_budget(
+            Instant::now() + SNAPSHOT_TIMEOUT,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+            EXCHANGE_TIMEOUT,
+        )
+    }
+
+    fn snapshot_with_budget(
+        &self,
+        outer: Instant,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+        exchange_timeout: Duration,
+    ) -> Result<Snapshot, CupsError> {
+        let mut printers =
+            self.printers_with_budget(outer, connect_timeout, io_timeout, exchange_timeout)?;
+        let default =
+            self.default_name_with_budget(outer, connect_timeout, io_timeout, exchange_timeout);
         if let Some(name) = &default {
             for p in &mut printers {
                 p.is_default = p.name == *name;
@@ -1248,7 +1668,16 @@ impl CupsClient {
         let mut entries = Vec::with_capacity(printers.len());
         for printer in printers {
             // Jobs failing must not hide the printer itself.
-            let jobs = self.jobs(&printer.uri, false).unwrap_or_default();
+            let jobs = self
+                .jobs_with_budget(
+                    &printer.uri,
+                    false,
+                    outer,
+                    connect_timeout,
+                    io_timeout,
+                    exchange_timeout,
+                )
+                .unwrap_or_default();
             entries.push(PrinterEntry { printer, jobs });
         }
         Ok(Snapshot { entries })
@@ -3239,6 +3668,189 @@ mod tests {
         assert_eq!(printers.len(), 2);
         assert!(printers.iter().all(|p| p.name != "Ghost"));
         assert_eq!(client.id_mismatch_count(), 1);
+        server.join().expect("server ends");
+    }
+
+    /// Serve `plans` in connection order: each `(reply, chunk, delay)`
+    /// is written in `chunk`-byte pieces with `delay` between pieces.
+    /// A healthy reply uses one chunk and zero delay; a dribble uses
+    /// 1-byte chunks with a delay under the per-call limit. Write
+    /// errors (the client gave up by its deadline) end that reply and
+    /// the server moves to the next connection.
+    fn start_dribble(
+        plans: Vec<(Vec<u8>, usize, Duration)>,
+    ) -> (Endpoint, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dribble");
+        let port = listener.local_addr().expect("port").port();
+        let handle = std::thread::spawn(move || {
+            for (reply, chunk_size, delay) in plans {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    break;
+                };
+                conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut head = Vec::new();
+                let mut one = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    match conn.read(&mut one) {
+                        Ok(1) => head.extend_from_slice(&one),
+                        _ => break,
+                    }
+                }
+                let length = request_length(&head);
+                let mut body = vec![0u8; length];
+                let _ = conn.read_exact(&mut body);
+                let chunk_size = chunk_size.max(1);
+                let mut offset = 0;
+                while offset < reply.len() {
+                    let end = offset.saturating_add(chunk_size).min(reply.len());
+                    if conn.write_all(&reply[offset..end]).is_err() {
+                        break;
+                    }
+                    offset = end;
+                    if offset < reply.len() && !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
+        });
+        (Endpoint::Tcp("127.0.0.1".to_string(), port), handle)
+    }
+
+    #[test]
+    fn dribble_terminates_by_absolute_deadline_and_releases_worker() {
+        // Per-call 600ms, dribble 200ms per byte (well under per-call,
+        // so only the absolute deadline can stop it), absolute 1500ms.
+        // The dribbled reply is hundreds of bytes: without the deadline
+        // it would hold the worker for over a minute.
+        let connect_timeout = Duration::from_millis(500);
+        let io_timeout = Duration::from_millis(600);
+        let exchange_timeout = Duration::from_millis(1500);
+        let dribble_delay = Duration::from_millis(200);
+        let dribble = http_ok(&ok_printers_body(1));
+        assert!(
+            dribble.len() > 50,
+            "dribble reply must be many chunks: {}",
+            dribble.len()
+        );
+        let healthy = http_ok(&ok_printers_body(2));
+        let (endpoint, server) = start_dribble(vec![
+            (dribble, 1, dribble_delay),
+            (healthy, usize::MAX, Duration::ZERO),
+        ]);
+        let client = CupsClient::single(endpoint);
+
+        // Occupy one worker slot, as the panel's refresh does.
+        let mut gate = WorkerGate::new();
+        assert!(gate.admit_refresh());
+        assert_eq!(gate.inflight(), 1);
+
+        let start = Instant::now();
+        let err = client
+            .printers_with_budget(
+                start + exchange_timeout,
+                connect_timeout,
+                io_timeout,
+                exchange_timeout,
+            )
+            .expect_err("dribble must fail");
+        let elapsed = start.elapsed();
+        assert_eq!(err.kind, CupsErrorKind::Transport);
+        assert!(
+            err.message.contains("deadline"),
+            "must fail by the deadline: {err}"
+        );
+        // Terminates by the absolute deadline (with slack for CI
+        // scheduling), far sooner than the full dribble would take.
+        assert!(
+            elapsed >= Duration::from_millis(800),
+            "must wait for the deadline, not fail fast: {elapsed:?}"
+        );
+        assert!(
+            elapsed < exchange_timeout + Duration::from_secs(5),
+            "must terminate by the deadline: {elapsed:?}"
+        );
+
+        // Releasing the worker frees the slot ...
+        assert!(!gate.release());
+        assert_eq!(gate.inflight(), 0);
+
+        // ... and the next healthy exchange succeeds on the freed worker.
+        assert!(gate.admit_refresh());
+        let printers = client
+            .printers_with_budget(
+                Instant::now() + exchange_timeout,
+                connect_timeout,
+                io_timeout,
+                exchange_timeout,
+            )
+            .expect("healthy retry succeeds");
+        assert_eq!(printers.len(), 2);
+        assert_eq!(printers[0].name, "Office");
+        gate.release();
+        assert_eq!(gate.inflight(), 0);
+        server.join().expect("server ends");
+    }
+
+    #[test]
+    fn snapshot_budget_bounds_serial_job_queries() {
+        // Outer snapshot budget 2500ms with a generous 5000ms
+        // per-exchange cap, so only the outer budget can stop the
+        // dribbled jobs queries. Printers + default answer at once;
+        // both jobs queries dribble 1 byte per 200ms (under the 600ms
+        // per-call limit).
+        let connect_timeout = Duration::from_millis(500);
+        let io_timeout = Duration::from_millis(600);
+        let exchange_timeout = Duration::from_millis(5000);
+        let snapshot_budget = Duration::from_millis(2500);
+        let dribble_delay = Duration::from_millis(200);
+        let default_body = encode_request(
+            STATUS_OK,
+            2,
+            &[
+                (TAG_OPERATION, op_group()),
+                (
+                    TAG_PRINTER,
+                    vec![OutAttr::text("printer-name", TAG_NAME, "Office")],
+                ),
+            ],
+        );
+        let (endpoint, server) = start_dribble(vec![
+            (http_ok(&ok_printers_body(1)), usize::MAX, Duration::ZERO),
+            (http_ok(&default_body), usize::MAX, Duration::ZERO),
+            (http_ok(&ok_jobs_body(3)), 1, dribble_delay),
+        ]);
+        // Force the server-default lookup (no `~/.cups/lpoptions`): the
+        // snapshot's second exchange must be the planned default reply.
+        let home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/nonexistent-tuna-printers-test");
+        let client = CupsClient::single(endpoint);
+        let start = Instant::now();
+        let snapshot = client.snapshot_with_budget(
+            start + snapshot_budget,
+            connect_timeout,
+            io_timeout,
+            exchange_timeout,
+        );
+        let elapsed = start.elapsed();
+        if let Some(value) = home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let snapshot = snapshot.expect("printers survive dribbled jobs");
+        assert_eq!(snapshot.entries.len(), 2);
+        assert!(
+            snapshot.entries.iter().all(|e| e.jobs.is_empty()),
+            "dribbled jobs must not stall the snapshot"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "must wait for the budget, not fail fast: {elapsed:?}"
+        );
+        assert!(
+            elapsed < snapshot_budget + Duration::from_secs(5),
+            "snapshot must terminate by its budget: {elapsed:?}"
+        );
         server.join().expect("server ends");
     }
 }
