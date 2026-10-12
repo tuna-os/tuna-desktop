@@ -122,13 +122,10 @@ impl OsdUi {
     /// Show with cancellable ownership. A later accepted request, including a
     /// normal ShowOSD call, replaces this identity and invalidates its token.
     pub fn show_owned(self: &Rc<Self>, request: &OsdRequest) -> Option<OsdToken> {
-        let Some(icon) = request
+        let icon = request
             .icon
             .as_deref()
-            .and_then(|s| gio::Icon::for_string(s).ok())
-        else {
-            return None;
-        };
+            .and_then(|s| gio::Icon::for_string(s).ok())?;
         let token = OsdToken(Rc::new(()));
         *self.current.borrow_mut() = Some(token.clone());
         self.icon.set_from_gicon(&icon);
