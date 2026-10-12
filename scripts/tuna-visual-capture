@@ -434,7 +434,7 @@ session_start() {
   </schema>
 </schemalist>
 XML
-        glib-compile-schemas "$ARTIFACTS/schemas" >/dev/null 2>&1
+        glib-compile-schemas "$ARTIFACTS/schemas" >/dev/null 2>&1 || return 1
         GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
         export GSETTINGS_SCHEMA_DIR
     fi
@@ -648,8 +648,12 @@ run_state() {
     export STATE_NAME
     echo "tuna-visual-capture [$STAGE]: state $1"
     start="$(date +%s)"
-    ( set +e; "$2" >"$ARTIFACTS/state-$1.log" 2>&1 )
-    code=$?
+    # Condition context: the subshell's nonzero exit must not trip -e.
+    if ( set +e; "$2" >"$ARTIFACTS/state-$1.log" 2>&1 ); then
+        code=0
+    else
+        code=$?
+    fi
     end="$(date +%s)"
     if [ "$code" = 0 ]; then
         status="ok"
@@ -1684,6 +1688,9 @@ run_stage() {
     export STAGE
     trap session_cleanup EXIT INT TERM
     mkdir -p "$ARTIFACTS"
+    # Absolute: the compositor only honors an absolute
+    # TUNA_COMPOSITOR_STATE path, and every XDG dir derives from this.
+    ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
     : >"$ARTIFACTS/frames.jsonl"
     started="$(date -u +%FT%TZ)"
     if ! session_start "$ARTIFACTS"; then
@@ -1717,7 +1724,9 @@ run_stage() {
         "$PY" "$ROOT/scripts/lib/tuna-visual-label.py" --dir "$ARTIFACTS" \
             --baseline 00-baseline-desktop.png >/dev/null 2>&1 || true
     fi
-    write_provenance "$ARTIFACTS" "$STAGE" "$ARTIFACTS/commands.txt"
+    # A provenance bug must never cost the captured frames.
+    write_provenance "$ARTIFACTS" "$STAGE" "$ARTIFACTS/commands.txt" ||
+        echo "tuna-visual-capture [$STAGE]: provenance failed" >&2
     # Stage manifest: per-state outcomes + walkthrough/ledger mapping.
     finished="$(date -u +%FT%TZ)"
     "$PY" - "$ARTIFACTS" "$STAGE" "$status" "$started" "$finished" \
