@@ -175,6 +175,7 @@ impl AudioState {
             audio_present: BTreeSet::new(),
             mute_required: BTreeSet::new(),
             destroy: Vec::new(),
+            unclassified_video_sources: Vec::new(),
             muted_now: BTreeSet::new(),
         };
         for (&id, object) in &self.objects {
@@ -199,13 +200,35 @@ impl AudioState {
                     scan.mute_required.insert(id);
                 }
             } else if policy.camera_disabled
-                && (is_camera_node(class)
+                && (self.is_camera_node(object)
                     || (class == "Stream/Input/Video" && self.video_stream_captures_camera(id)))
             {
                 scan.destroy.push(id);
+            } else if policy.camera_disabled && is_video_source(class) {
+                scan.unclassified_video_sources.push(id);
             }
         }
         scan
+    }
+
+    /// Positive provider evidence avoids destroying desktop sources sharing
+    /// Video/Source. These graph properties guide device enforcement; they are
+    /// not an access-control boundary (clients may publish properties).
+    fn is_camera_node(&self, node: &Value) -> bool {
+        let props = &node["info"]["props"];
+        if !is_video_source(props["media.class"].as_str().unwrap_or("")) {
+            return false;
+        }
+        let camera_api =
+            |props: &Value| matches!(props["device.api"].as_str(), Some("v4l2" | "libcamera"));
+        camera_api(props)
+            || number(&props["device.id"]).is_some_and(|device| {
+                self.objects.get(&device).is_some_and(|parent| {
+                    parent["type"].as_str() == Some("PipeWire:Interface:Device")
+                        && parent["info"]["props"]["media.class"].as_str() == Some("Video/Device")
+                        && camera_api(&parent["info"]["props"])
+                })
+            })
     }
 
     /// A video capture stream captures the camera while a link feeds
@@ -219,9 +242,9 @@ impl AudioState {
             let input = number(&info["input-node-id"]);
             input == Some(stream)
                 && output.is_some_and(|camera| {
-                    self.objects.get(&camera).is_some_and(|node| {
-                        is_camera_node(node["info"]["props"]["media.class"].as_str().unwrap_or(""))
-                    })
+                    self.objects
+                        .get(&camera)
+                        .is_some_and(|node| self.is_camera_node(node))
                 })
         })
     }
@@ -324,9 +347,8 @@ impl AudioState {
 fn property_bool(v: &Value) -> bool {
     v.as_bool().unwrap_or(v.as_str() == Some("true"))
 }
-/// A camera device node (`Video/Source`, plus any namespaced kind a
-/// provider may publish beneath it).
-fn is_camera_node(class: &str) -> bool {
+/// Video source class alone is not camera provenance.
+fn is_video_source(class: &str) -> bool {
     class == "Video/Source" || class.starts_with("Video/Source/")
 }
 /// A node's mixer mute flag. Missing mixer state reads as unmuted,
@@ -511,11 +533,11 @@ mod tests {
                 {"id":49,"info":{"props":{"media.class":"Audio/Sink","node.name":"hdmi"},"params":{"Props":[{"channelVolumes":[0.512],"mute":true}]}}},
                 {"id":50,"info":{"props":{"media.class":"Audio/Source","node.name":"mic"},"params":{"Props":[{"channelVolumes":[0.125],"mute":false}]}}},
                 {"id":51,"info":{"props":{"media.class":"Audio/Source","node.name":"monitor"},"params":{"Props":[{"mute":true}]}}},
-                {"id":60,"info":{"state":"running","props":{"media.class":"Video/Source","node.name":"camera"}}},
+                {"id":60,"info":{"state":"running","props":{"media.class":"Video/Source","device.api":"v4l2","node.name":"camera"}}},
                 {"id":61,"info":{"state":"running","props":{"media.class":"Stream/Input/Video","node.name":"capture"}}},
                 {"id":62,"info":{"state":"running","props":{"media.class":"Stream/Input/Video","node.name":"share-view"}}},
                 {"id":63,"info":{"state":"running","props":{"media.class":"Stream/Output/Video","node.name":"producer"}}},
-                {"id":64,"info":{"props":{"media.class":"Video/Source/Custom","node.name":"doorbell"}}},
+                {"id":64,"info":{"props":{"media.class":"Video/Source/Custom","device.api":"libcamera","node.name":"doorbell"}}},
                 {"id":70,"info":{"state":"active","output-node-id":60,"input-node-id":61}},
                 {"id":71,"info":{"state":"active","output-node-id":63,"input-node-id":62}}
             ]),
@@ -542,6 +564,40 @@ mod tests {
         });
         assert_eq!(scan.mute_required, BTreeSet::from([48, 49, 50, 51]));
         assert!(scan.destroy.is_empty());
+    }
+
+    #[test]
+    fn camera_provenance_preserves_realistic_desktop_sources_and_consumers() {
+        // xdg-desktop-portal-wlr explicitly publishes Video/Source without
+        // camera provenance. Mutter51 meta-stream-source.c and Tuna start_cast
+        // supply output streams without camera device.api. See docs references.
+        let mut graph = AudioState::default();
+        feed(
+            &mut graph,
+            json!([
+                {"id":40,"type":"PipeWire:Interface:Device","info":{"props":{"media.class":"Video/Device","device.api":"libcamera"}}},
+                {"id":41,"info":{"props":{"media.class":"Video/Source","device.id":"40"}}},
+                {"id":42,"info":{"props":{"media.class":"Video/Source","device.api":"v4l2"}}},
+                {"id":50,"info":{"props":{"media.class":"Video/Source","node.name":"xdpw-stream-ABCDEF"}}},
+                {"id":51,"info":{"props":{"media.class":"Video/Source","media.role":"Screen"}}},
+                {"id":52,"info":{"props":{"media.class":"Video/Source","media.role":"Camera"}}},
+                {"id":53,"info":{"props":{"media.class":"Stream/Output/Video","node.name":"meta-stream-source-source"}}},
+                {"id":54,"info":{"props":{"media.class":"Stream/Output/Video","node.name":"tuna-screen-cast"}}},
+                {"id":55,"info":{"props":{"media.class":"Video/Source","device.id":999}}},
+                {"id":60,"info":{"props":{"media.class":"Stream/Input/Video"}}},
+                {"id":61,"info":{"props":{"media.class":"Stream/Input/Video"}}},
+                {"id":62,"info":{"props":{"media.class":"Stream/Input/Video"}}},
+                {"id":70,"info":{"output-node-id":41,"input-node-id":60}},
+                {"id":71,"info":{"output-node-id":50,"input-node-id":61}},
+                {"id":72,"info":{"output-node-id":54,"input-node-id":62}}
+            ]),
+        );
+        let scan = graph.privacy_scan(&PrivacyPolicy {
+            camera_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert_eq!(scan.destroy, vec![41, 42, 60]);
+        assert_eq!(scan.unclassified_video_sources, vec![50, 51, 52, 55]);
     }
 
     #[test]
@@ -576,7 +632,7 @@ mod tests {
         feed(
             &mut s,
             json!([
-                {"id":60,"info":{"state":"running","props":{"media.class":"Video/Source","node.name":"camera"}}},
+                {"id":60,"info":{"state":"running","props":{"media.class":"Video/Source","device.api":"v4l2","node.name":"camera"}}},
                 {"id":70,"info":{"state":"active","output-node-id":60,"input-node-id":61}}
             ]),
         );

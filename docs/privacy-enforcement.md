@@ -112,7 +112,7 @@ what must not exist:
   re-muted on the next event. Nothing is destroyed.
 - Sound output disabled: every `Audio/Sink` reads muted, same
   re-mute shape.
-- Camera disabled: `Video/Source` nodes and video-capture streams
+- Camera disabled: video sources identified by v4l2/libcamera provider properties and their linked capture streams
   linked to them are destroyed, existing and newly appearing. An
   unlinked capture stream captures nothing and is left alone, and
   a stream wired to anything but a camera (a screen-share feed)
@@ -204,3 +204,11 @@ lookup).
 - Installed-image qualification on hardware with a real camera.
 
 Native execution verifies Core cookie and object serial, binds the Node resource, and sends mutations through that proxy. Numeric CLI execution remains only an independent legacy test driver. The GTK CI job requires an isolated real PipeWire mute/restore and wrong-identity refusal proof; unit tests alone do not qualify native execution.
+
+### Camera source classification and remaining coverage
+
+A video source class does not identify a camera. [xdg-desktop-portal-wlr](https://github.com/emersion/xdg-desktop-portal-wlr/blob/c0255d7b047b7263629ab5a314661045ff7f65e3/src/screencast/pipewire_screencast.c#L652) creates a desktop source with `media.class=Video/Source` and no camera role. [Mutter 51.0](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/backends/meta-stream-source.c#L2868) creates its output stream without camera API properties; Tuna's `screencast.rs::start_cast` likewise supplies only a node name. These producers and capture streams linked to them must survive camera disable.
+
+Graph enforcement requires `Video/Source` (including provider subclasses) plus `device.api=v4l2` or `libcamera`, either on the node or on its referenced `PipeWire:Interface:Device` with `media.class=Video/Device`. The upstream [v4l2 provider](https://github.com/PipeWire/pipewire/blob/25193624b1e27e3c36824a632bc759c8523da434/spa/plugins/v4l2/v4l2-device.c#L72) and [libcamera provider](https://github.com/PipeWire/pipewire/blob/25193624b1e27e3c36824a632bc759c8523da434/spa/plugins/libcamera/libcamera-device.cpp#L248) publish this evidence. `media.role=Camera` alone is insufficient.
+
+Unknown source provenance is left intact and exposed through `PrivacyScan.unclassified_video_sources`, with a diagnostic when the set changes. This is a coverage gap for unidentified or virtual camera providers, not proof that camera use is blocked. Graph properties are not an access-control boundary: clients can publish properties. Portal Camera requests remain governed by the portal's Lockdown policy. Issue #356 stays open until the full production and hardware acceptance is established. The virtual graph tests exercise classification and mutations with simulated provider properties; they do not qualify physical camera enforcement.
