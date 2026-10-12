@@ -732,6 +732,7 @@ struct AudioUi {
     privacy: Option<gio::Settings>,
     enforcer: RefCell<crate::privacy::Tracker>,
     last_actions: RefCell<Vec<crate::privacy::Action>>,
+    last_unclassified_video_sources: RefCell<Vec<u64>>,
     queue: RefCell<crate::privacy::ActionQueue>,
     drain_pending: Cell<bool>,
 }
@@ -929,6 +930,13 @@ impl AudioUi {
             // restarted monitor publishes a complete graph baseline.
             return;
         }
+        if scan.unclassified_video_sources != *self.last_unclassified_video_sources.borrow() {
+            if !scan.unclassified_video_sources.is_empty() {
+                eprintln!("tuna-shell-gtk: camera policy left unclassified video sources intact: {:?}; provider provenance unavailable", scan.unclassified_video_sources);
+            }
+            *self.last_unclassified_video_sources.borrow_mut() =
+                scan.unclassified_video_sources.clone();
+        }
         let planned = self.enforcer.borrow_mut().plan(&scan);
         if planned != *self.last_actions.borrow() {
             if !planned.is_empty() {
@@ -1124,6 +1132,7 @@ fn audio(w: &Rc<Widgets>) {
         privacy: privacy_settings(),
         enforcer: RefCell::default(),
         last_actions: RefCell::default(),
+        last_unclassified_video_sources: RefCell::default(),
         queue: RefCell::default(),
         drain_pending: Cell::new(false),
     });

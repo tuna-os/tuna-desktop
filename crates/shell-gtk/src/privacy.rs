@@ -14,7 +14,7 @@
 //!   explicit restore just unmutes.
 //! - Sound output disabled: every `Audio/Sink` reads muted, same
 //!   re-mute and restore shape.
-//! - Camera disabled: `Video/Source` nodes and video-capture streams
+//! - Camera disabled: camera-provider `Video/Source` nodes and capture streams
 //!   linked to them are destroyed, existing and newly appearing.
 //!   Unlinked capture streams capture nothing and are left alone, so
 //!   a screen-share consumer linking up later is never broken by a
@@ -74,6 +74,8 @@ pub struct PrivacyScan {
     pub mute_required: BTreeSet<u64>,
     /// Camera nodes/streams that must not exist right now.
     pub destroy: Vec<u64>,
+    /// Camera policy cannot classify these sources; leave them intact.
+    pub unclassified_video_sources: Vec<u64>,
     /// Nodes currently muted.
     pub muted_now: BTreeSet<u64>,
 }
@@ -640,6 +642,7 @@ mod tests {
             audio_present: mute_required.iter().chain(muted_now).copied().collect(),
             mute_required: mute_required.iter().copied().collect(),
             destroy: destroy.to_vec(),
+            unclassified_video_sources: Vec::new(),
             muted_now: muted_now.iter().copied().collect(),
         }
     }
@@ -1919,7 +1922,7 @@ mod tests {
                 "pattern=black",
                 "!",
                 "pipewiresink",
-                "stream-properties=props,media.class=Video/Source,node.name=fake-camera",
+                "stream-properties=props,media.class=Video/Source,device.api=v4l2,node.name=fake-camera",
             ]));
             assert!(harness.wait_for(Duration::from_secs(30), || {
                 !harness
@@ -1961,7 +1964,7 @@ mod tests {
                 "pattern=black",
                 "!",
                 "pipewiresink",
-                "stream-properties=props,media.class=Video/Source,node.name=fake-camera-2",
+                "stream-properties=props,media.class=Video/Source,device.api=v4l2,node.name=fake-camera-2",
             ]));
             assert!(harness.wait_for(Duration::from_secs(30), || {
                 !harness
@@ -1985,7 +1988,7 @@ mod tests {
                 "pattern=black",
                 "!",
                 "pipewiresink",
-                "stream-properties=props,media.class=Video/Source,node.name=fake-camera-3",
+                "stream-properties=props,media.class=Video/Source,device.api=v4l2,node.name=fake-camera-3",
             ]));
             assert!(harness.wait_for(Duration::from_secs(30), || {
                 !harness
