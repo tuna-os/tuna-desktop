@@ -936,6 +936,7 @@ impl AudioUi {
             queue.take(MAX_PRIVACY_ACTIONS)
         };
         for action in batch {
+            self.enforcer.borrow_mut().dispatched(&action);
             // Both legs report exit status (not just "the tool ran"),
             // so a failed step schedules a retry instead of stalling
             // until the next graph event.
@@ -955,6 +956,7 @@ impl AudioUi {
                 &argv.iter().map(String::as_str).collect::<Vec<_>>(),
                 move |ok| {
                     if let Some(ui) = weak.upgrade() {
+                        ui.enforcer.borrow_mut().completed(&action, ok);
                         if ui.queue.borrow_mut().report(&action, ok) {
                             ui.schedule_drain();
                         }

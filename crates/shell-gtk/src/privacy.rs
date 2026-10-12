@@ -62,6 +62,8 @@ impl Action {
 /// [`AudioState::privacy_scan`](crate::audio_state::AudioState::privacy_scan).
 #[derive(Debug, Default)]
 pub struct PrivacyScan {
+    /// Audio nodes still present, even when their mute snapshot is stale.
+    pub audio_present: BTreeSet<u64>,
     /// Nodes that must read muted right now.
     pub mute_required: BTreeSet<u64>,
     /// Camera nodes/streams that must not exist right now.
@@ -105,6 +107,7 @@ pub fn pw_cli_args(action: &Action) -> Option<[String; 2]> {
 #[derive(Debug, Default)]
 pub struct Tracker {
     muted_by_policy: BTreeSet<u64>,
+    unsettled_mutes: BTreeSet<u64>,
 }
 
 impl Tracker {
@@ -133,7 +136,10 @@ impl Tracker {
             .copied()
             .collect();
         for id in stale {
-            if scan.muted_now.contains(&id) {
+            if !scan.audio_present.contains(&id) {
+                self.muted_by_policy.remove(&id);
+                self.unsettled_mutes.remove(&id);
+            } else if scan.muted_now.contains(&id) || self.unsettled_mutes.contains(&id) {
                 // Still muted: retain ownership so a deferred or
                 // failed unmute re-plans on the next tick.
                 actions.push(Action::SetMute {
@@ -145,6 +151,24 @@ impl Tracker {
             }
         }
         actions
+    }
+
+    /// A dispatched mute can still change the graph after a policy lift.
+    /// Retain its restore obligation even when the latest scan is unmuted.
+    pub fn dispatched(&mut self, action: &Action) {
+        if let Action::SetMute { node, muted: true } = action {
+            self.unsettled_mutes.insert(*node);
+        }
+    }
+
+    /// Only a successful compensating unmute settles a dispatched mute.
+    /// A failed command may have changed the graph before returning failure.
+    pub fn completed(&mut self, action: &Action, success: bool) {
+        if success {
+            if let Action::SetMute { node, muted: false } = action {
+                self.unsettled_mutes.remove(node);
+            }
+        }
     }
 
     /// Nodes this tracker muted and has not restored yet (tests).
@@ -182,7 +206,7 @@ const MAX_TRACKED_FAILURES: usize = 4096;
 /// achieved, moot, or superseded — so its length never exceeds one
 /// scan's demand. Dispatched actions are remembered until reported,
 /// so a re-plan never duplicates an identical in-flight command while
-/// still superseding it when the policy changes its mind.
+/// still queueing changed intent behind the old command when the policy changes.
 #[derive(Debug, Default)]
 pub struct ActionQueue {
     queued: VecDeque<Action>,
@@ -225,13 +249,21 @@ impl ActionQueue {
     /// work stays queued for a later tick.
     pub fn take(&mut self, limit: usize) -> Vec<Action> {
         let headroom = MAX_INFLIGHT_ACTIONS.saturating_sub(self.inflight.len());
-        let count = limit.min(headroom).min(self.queued.len());
-        let mut batch = Vec::with_capacity(count);
-        for _ in 0..count {
-            if let Some(action) = self.queued.pop_front() {
-                self.inflight.insert(action.node(), action);
-                batch.push(action);
+        let limit = limit.min(headroom);
+        let queued = self.queued.len();
+        let mut batch = Vec::with_capacity(limit.min(queued));
+        for _ in 0..queued {
+            let Some(action) = self.queued.pop_front() else {
+                break;
+            };
+            // Opposite intents must wait for the old command to finish;
+            // otherwise a late mute can overwrite a completed restore.
+            if batch.len() >= limit || self.inflight.contains_key(&action.node()) {
+                self.queued.push_back(action);
+                continue;
             }
+            self.inflight.insert(action.node(), action);
+            batch.push(action);
         }
         batch
     }
@@ -348,6 +380,7 @@ mod tests {
 
     fn scan(mute_required: &[u64], destroy: &[u64], muted_now: &[u64]) -> PrivacyScan {
         PrivacyScan {
+            audio_present: mute_required.iter().chain(muted_now).copied().collect(),
             mute_required: mute_required.iter().copied().collect(),
             destroy: destroy.to_vec(),
             muted_now: muted_now.iter().copied().collect(),
@@ -486,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_skips_identical_inflight_but_supersedes_on_change() {
+    fn queue_skips_identical_inflight_and_serializes_changed_intent() {
         let mut queue = ActionQueue::default();
         queue.offer(vec![mute(7), mute(8)]);
         assert_eq!(queue.take(1), vec![mute(7)]);
@@ -495,18 +528,86 @@ mod tests {
         queue.offer(vec![mute(7), mute(8)]);
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.take(64), vec![mute(8)]);
-        // The policy changed its mind while 7's mute flies: the
-        // unmute supersedes instead of waiting behind it.
+        // The restore waits behind the mute, without blocking other nodes.
         queue.offer(vec![unmute(7)]);
+        assert!(queue.take(64).is_empty());
+        assert!(queue.report(&mute(7), true));
         assert_eq!(queue.take(64), vec![unmute(7)]);
-        // A stale report never clears newer intent: 7's unmute is
-        // still in flight after its mute reports.
-        assert!(!queue.report(&mute(7), true));
         queue.offer(vec![unmute(7), mute(9)]);
         assert_eq!(queue.len(), 1);
         assert!(queue.report(&unmute(7), true));
         assert_eq!(queue.take(64), vec![mute(9)]);
         assert!(!queue.report(&mute(9), true));
+    }
+
+    #[test]
+    fn policy_lift_before_mute_completion_keeps_serialized_restore() {
+        fn lifted() -> PrivacyScan {
+            PrivacyScan {
+                audio_present: BTreeSet::from([7]),
+                ..PrivacyScan::default()
+            }
+        }
+        let mut tracker = Tracker::default();
+        let mut queue = ActionQueue::default();
+        queue.offer(tracker.plan(&scan(&[7], &[], &[])));
+        let action = queue.take(1)[0];
+        tracker.dispatched(&action);
+        // Lift before the graph has observed the in-flight mute.
+        queue.offer(tracker.plan(&lifted()));
+        assert_eq!(tracker.tracked(), &BTreeSet::from([7]));
+        assert!(queue.take(1).is_empty());
+        tracker.completed(&action, true);
+        assert!(queue.report(&action, true));
+        // Even a stale unmuted scan cannot discard the restore obligation.
+        queue.offer(tracker.plan(&lifted()));
+        let restore = queue.take(1)[0];
+        assert_eq!(restore, unmute(7));
+        tracker.dispatched(&restore);
+        tracker.completed(&restore, true);
+        assert!(!queue.report(&restore, true));
+        assert!(tracker.plan(&lifted()).is_empty());
+        assert!(tracker.tracked().is_empty());
+    }
+
+    #[test]
+    fn failed_restore_after_policy_lift_retains_ownership() {
+        fn lifted() -> PrivacyScan {
+            PrivacyScan {
+                audio_present: BTreeSet::from([7]),
+                ..PrivacyScan::default()
+            }
+        }
+        let mut tracker = Tracker::default();
+        tracker.plan(&scan(&[7], &[], &[]));
+        tracker.dispatched(&mute(7));
+        tracker.completed(&mute(7), false);
+        assert_eq!(tracker.plan(&lifted()), vec![unmute(7)]);
+        tracker.completed(&unmute(7), false);
+        assert_eq!(tracker.plan(&lifted()), vec![unmute(7)]);
+        tracker.completed(&unmute(7), true);
+        assert!(tracker.plan(&lifted()).is_empty());
+    }
+
+    #[test]
+    fn vanished_node_releases_dispatched_mute_ownership() {
+        let mut tracker = Tracker::default();
+        tracker.plan(&scan(&[7], &[], &[]));
+        tracker.dispatched(&mute(7));
+        assert!(tracker.plan(&PrivacyScan::default()).is_empty());
+        assert!(tracker.tracked().is_empty());
+        assert!(tracker.unsettled_mutes.is_empty());
+    }
+
+    #[test]
+    fn blocked_restore_does_not_block_other_nodes() {
+        let mut queue = ActionQueue::default();
+        queue.offer(vec![mute(7)]);
+        assert_eq!(queue.take(1), vec![mute(7)]);
+        queue.offer(vec![unmute(7), mute(8)]);
+        assert_eq!(queue.take(2), vec![mute(8)]);
+        assert!(queue.report(&mute(7), true));
+        assert_eq!(queue.take(2), vec![unmute(7)]);
     }
 
     #[test]
@@ -559,7 +660,7 @@ mod tests {
         use serde_json::json;
         use tuna_shell_host::settings::PrivacyPolicy;
 
-        use super::{mute, unmute, Action, ActionQueue, Tracker};
+        use super::{Action, ActionQueue, Tracker, mute, unmute};
         use crate::audio_state::AudioState;
 
         /// A fake PipeWire graph: node id → (media class, muted).
@@ -649,7 +750,9 @@ mod tests {
                     self.queue.offer(planned);
                     let batch = self.queue.take(budget);
                     for action in &batch {
+                        self.tracker.dispatched(action);
                         let ok = self.graph.execute(action, fail);
+                        self.tracker.completed(action, ok);
                         if self.queue.report(action, ok) {
                             reticks += 1;
                         }
@@ -726,9 +829,11 @@ mod tests {
             let planned = rig.tracker.plan(&scan);
             let planned_nodes: BTreeSet<u64> = planned.iter().map(|action| action.node()).collect();
             assert_eq!(planned_nodes, policy);
-            assert!(planned
-                .iter()
-                .all(|action| *action == unmute(action.node())));
+            assert!(
+                planned
+                    .iter()
+                    .all(|action| *action == unmute(action.node()))
+            );
             rig.queue.offer(planned);
             let batch = rig.queue.take(64);
             assert_eq!(batch.len(), 64);
@@ -878,7 +983,7 @@ mod tests {
         use std::process::{Child, Command, Stdio};
         use std::time::{Duration, Instant};
 
-        use super::{run_blocking, Action, Tracker};
+        use super::{Action, Tracker, run_blocking};
         use crate::audio_state::AudioState;
         use tuna_shell_host::settings::PrivacyPolicy;
 
