@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('proof', ROOT / 'scripts/lib/gtk-privacy-portal-proof.py')
@@ -31,6 +32,24 @@ class PortalProofTests(unittest.TestCase):
         self.assertEqual(proof.classify_camera(None,
                          'g-dbus-error-quark: GDBus.Error:org.freedesktop.portal.Error.NotAllowed: Camera access disabled (19)'),
                          'lockdown-denied')
+
+    def test_publisher_is_bound_to_expected_binary_and_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shell = Path(directory) / 'tuna-shell-gtk'
+            shell.write_bytes(b'fixture binary bytes, not executed')
+            identity = {'sha256': proof.digest(shell)}
+            self.assertEqual(proof.validate_publisher(shell, shell, identity), shell.resolve())
+            impostor = Path(directory) / 'other/tuna-shell-gtk'
+            impostor.parent.mkdir()
+            impostor.write_bytes(shell.read_bytes())
+            for executable, digest in ((impostor, identity),
+                                       (shell, {'sha256': '0' * 64})):
+                with self.assertRaises(RuntimeError):
+                    proof.validate_publisher(executable, shell, digest)
+            host = Path(directory) / 'tuna-shell-host'
+            host.write_bytes(shell.read_bytes())
+            with self.assertRaises(RuntimeError):
+                proof.validate_publisher(host, host, identity)
 
     def test_only_access_is_overridden(self):
         portal = (ROOT / 'share/xdg-desktop-portal/portals/tuna.portal').read_text()
