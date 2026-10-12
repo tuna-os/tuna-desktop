@@ -1814,10 +1814,11 @@ pub enum BreakActionKind {
 }
 /// Enqueue one user-chosen break action for the next tick.
 pub type BreakActionHook = Rc<dyn Fn(BreakActionKind)>;
-/// Send both effect bools atomically to the compositor (grayscale, fade).
-/// Bound to `CommandKind::SetWellbeingEffects` once protocol 0.35 lands;
-/// until then the binding is a marked TODO (no independent schema edit).
-pub type EffectHook = Rc<dyn Fn(bool, bool)>;
+/// Send both effect bools atomically to the compositor (grayscale, fade)
+/// via `CommandKind::SetWellbeingEffects`. True when the transport
+/// accepted the pair; false (control absent or write failed) keeps the
+/// desired pair pending so the next tick retries it.
+pub type EffectHook = Rc<dyn Fn(bool, bool) -> bool>;
 
 /// Action keys and button labels for break notices. Keys are center action
 /// ids; labels are plain Header Case (GNOME 51 ships no verbatim strings
@@ -1861,13 +1862,16 @@ pub struct ShellHooks {
     pub effect_hook: EffectHook,
 }
 
-/// Send the effect pair when it differs from the last send. Both bools go
-/// together on every send, so the compositor never observes a split
-/// grayscale/fade state. Pure over its inputs; the ticks own `sent`.
-pub fn maybe_send_effect(hooks: &ShellHooks, sent: &mut EffectState, effect: &EffectState) {
-    if *sent != *effect {
-        (hooks.effect_hook)(effect.grayscale, effect.fade);
-        *sent = *effect;
+/// Send the effect pair when it differs from the last accepted send.
+/// Both bools go together on every send, so the compositor never
+/// observes a split grayscale/fade state. `sent` commits only when the
+/// hook reports acceptance: a refused pair (control absent, write
+/// failed) stays pending and retries on the next tick, including the
+/// initial false/false after startup or reconnect. No calls once the
+/// accepted pair matches. Pure over its inputs; the ticks own `sent`.
+pub fn maybe_send_effect(hooks: &ShellHooks, sent: &mut Option<EffectState>, effect: &EffectState) {
+    if *sent != Some(*effect) && (hooks.effect_hook)(effect.grayscale, effect.fade) {
+        *sent = Some(*effect);
     }
 }
 
@@ -2057,7 +2061,7 @@ struct Runtime {
     countdown: Option<BreakType>,
     resident: Option<u64>,
     actions: Rc<RefCell<Vec<BreakActionKind>>>,
-    sent_effect: EffectState,
+    sent_effect: Option<EffectState>,
 }
 
 /// One screen-time poll: idle verdict from the compositor, history edges and
@@ -2157,7 +2161,7 @@ pub fn start(
         countdown: None,
         resident: None,
         actions,
-        sent_effect: EffectState::default(),
+        sent_effect: None,
     }));
     // Baseline first: the compositor starts from neutral even if a limit
     // is already reached (the first polls then send the actual pair).
@@ -2860,6 +2864,7 @@ mod tests {
                 let effect_sends = effect_sends.clone();
                 Rc::new(move |grayscale, fade| {
                     effect_sends.borrow_mut().push((grayscale, fade));
+                    true
                 })
             },
         }
@@ -3133,17 +3138,15 @@ mod tests {
     #[test]
     fn effect_pair_sends_atomically_only_on_change() {
         let (hooks, seen) = recorded();
-        let mut sent = EffectState::default();
-        // Silence when unchanged.
-        maybe_send_effect(
-            &hooks,
-            &mut sent,
-            &EffectState {
-                grayscale: false,
-                fade: false,
-            },
-        );
-        assert!(seen.effect_sends.borrow().is_empty());
+        let mut sent = None;
+        // The initial pair sends once, even when it is false/false.
+        let initial = EffectState {
+            grayscale: false,
+            fade: false,
+        };
+        maybe_send_effect(&hooks, &mut sent, &initial);
+        maybe_send_effect(&hooks, &mut sent, &initial);
+        assert_eq!(seen.effect_sends.borrow().as_slice(), &[(false, false)]);
         // Each change sends BOTH bools together, never a split pair.
         maybe_send_effect(
             &hooks,
@@ -3171,14 +3174,46 @@ mod tests {
         );
         assert_eq!(
             seen.effect_sends.borrow().as_slice(),
-            &[(true, false), (true, true)]
+            &[(false, false), (true, false), (true, true)]
         );
         assert_eq!(
             sent,
-            EffectState {
+            Some(EffectState {
                 grayscale: true,
                 fade: true
-            }
+            })
+        );
+    }
+
+    #[test]
+    fn refused_pair_retries_until_accepted_then_silent() {
+        let (mut hooks, seen) = recorded();
+        let attempts = Rc::new(Cell::new(0u32));
+        let gate = attempts.clone();
+        hooks.effect_hook = Rc::new(move |grayscale, fade| {
+            gate.set(gate.get() + 1);
+            seen.effect_sends.borrow_mut().push((grayscale, fade));
+            // Control absent for the first two ticks, present after.
+            gate.get() > 2
+        });
+        let mut sent = None;
+        let want = EffectState {
+            grayscale: true,
+            fade: false,
+        };
+        // Refused: nothing commits, every tick retries the same pair.
+        maybe_send_effect(&hooks, &mut sent, &want);
+        maybe_send_effect(&hooks, &mut sent, &want);
+        assert_eq!(sent, None);
+        assert_eq!(attempts.get(), 2);
+        // Accepted: commits once, then silence (no per-frame spam).
+        maybe_send_effect(&hooks, &mut sent, &want);
+        maybe_send_effect(&hooks, &mut sent, &want);
+        assert_eq!(sent, Some(want));
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            seen.effect_sends.borrow().as_slice(),
+            &[(true, false), (true, false), (true, false)]
         );
     }
 
