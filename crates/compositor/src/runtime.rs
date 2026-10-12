@@ -888,7 +888,10 @@ impl Runtime {
             Some(backend) => backend,
             None => {
                 let (backend, winit_loop) = winit::init::<GlesRenderer>()
-                    .map_err(|e| RuntimeError::Backend(e.to_string()))?;
+                    // Smithay's Display omits the underlying Winit error.
+                    // Retain it so missing runtime libraries/display errors
+                    // can be distinguished from candidate render failures.
+                    .map_err(|e| RuntimeError::Backend(format!("{e:?}")))?;
                 event_loop
                     .handle()
                     .insert_source(winit_loop, |event, _, runtime: &mut Runtime| {
