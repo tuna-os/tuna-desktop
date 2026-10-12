@@ -133,7 +133,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | countdown | Honored | OSD countdown in the last 60 s before a break |
 | delay-seconds | Ignored | No notification action invokes delay yet (notify action support pending) |
 | duration-seconds | Honored | Break length for scheduling and idle-take detection |
-| fade-screen | Honored | Fade request logged; compositor hook pending |
+| fade-screen | Honored (partial) | Desired-state fade request observed and logged; no working pixels yet, compositor hook pending (#354 consumers open) |
 | interval-seconds | Honored | Time between breaks |
 | lock-screen | Honored | Locks the session when the break starts |
 | notify | Honored | Due/overdue notices posted; tray-only urgency not distinguished yet |
@@ -147,7 +147,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | countdown | Honored | OSD countdown in the last 60 s before a break |
 | delay-seconds | Ignored | No notification action invokes delay yet (notify action support pending) |
 | duration-seconds | Honored | Break length for scheduling and idle-take detection |
-| fade-screen | Honored | Fade request logged; compositor hook pending |
+| fade-screen | Honored (partial) | Desired-state fade request observed and logged; no working pixels yet, compositor hook pending (#354 consumers open) |
 | interval-seconds | Honored | Time between breaks |
 | lock-screen | Honored | Locks the session when the break starts |
 | notify | Honored | Due/overdue notices posted; tray-only urgency not distinguished yet |
@@ -455,7 +455,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 |---|---|---|
 | daily-limit-enabled | Honored | Limit evaluated on the 30 s poll and on settings change |
 | daily-limit-seconds | Honored | Daily allowance in seconds |
-| grayscale | Honored | Grayscale request logged; compositor hook pending |
+| grayscale | Honored (partial) | Desired-state grayscale request observed and logged; no working pixels yet, compositor hook pending (#354 consumers open) |
 | history-enabled | Honored | Recording on/off; off deletes the history file live |
 ## org.gnome.desktop.screensaver
 
