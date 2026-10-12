@@ -769,38 +769,40 @@ fn quick_settings_popover(
     let bluetooth = qs_menu_tile("bluetooth-active-symbolic", "Bluetooth", None, &bt_menu_ui);
     bt_menu.set_tile(bluetooth.clone());
     // Printers (#362 P-ST-10): the live CUPS queue. The tile's
-    // subtitle tracks the print service; its menu hosts the panel,
-    // refreshed whenever the menu opens.
+    // subtitle tracks the print service; its menu lists one compact
+    // row per printer, refreshed whenever the menu opens. A row, Print
+    // Settings or the toggle opens the queue window with the full
+    // panel; printers have no on/off, so the toggle is momentary.
     let printers_menu_ui = QsMenu::new("printer-symbolic", "Printers");
-    let printers_panel = printers::PrintersPanel::new();
-    printers_menu_ui.list().append(&printers_panel.widget());
+    let printers_menu = printers::PrintersMenu::new(printers_menu_ui.list());
     printers_menu_ui.separator();
     let (print_settings, _) = printers_menu_ui.item(None, "Print Settings");
-    print_settings.connect_clicked(|_| printers::open_printers_settings());
+    print_settings.connect_clicked({
+        let menu = printers_menu.clone();
+        move |_| menu.open_window()
+    });
     let printers_tile = qs_menu_tile("printer-symbolic", "Printers", None, &printers_menu_ui);
-    printers::watch_tile(printers_tile.clone());
+    printers_menu.set_tile(printers_tile.clone());
+    printers_menu.set_on_open({
+        let popover = popover.clone();
+        move || popover.popdown()
+    });
     {
-        let panel = printers_panel.clone();
+        let menu = printers_menu.clone();
         printers_menu_ui.revealer.connect_visible_notify(move |r| {
             if r.is_visible() {
-                panel.refresh();
+                menu.refresh();
             }
         });
     }
-    // The toggle mirrors the menu: printers have no on/off, so the
-    // toggle opens the queue instead. Both directions are idempotent
-    // (GTK emits no notify when the value is unchanged), so the two
-    // handlers cannot ping-pong.
     printers_tile.on_user_toggle({
-        let revealer = printers_menu_ui.revealer.clone();
-        move |on| revealer.set_visible(on)
+        let menu = printers_menu.clone();
+        move |on| {
+            if on {
+                menu.open_window();
+            }
+        }
     });
-    {
-        let button = printers_tile.button.clone();
-        printers_menu_ui
-            .revealer
-            .connect_visible_notify(move |r| button.set_active(r.is_visible()));
-    }
     let power_menu_ui = QsMenu::new("power-profile-balanced-symbolic", "Power Mode");
     let power_items: Vec<(&'static str, gtk::Button, gtk::Image)> = [
         ("performance", "Performance"),
@@ -918,10 +920,6 @@ fn quick_settings_popover(
     {
         let menu = printers_menu_ui.revealer.clone();
         popover.connect_closed(move |_| menu.set_visible(false));
-    }
-    {
-        let popover = popover.clone();
-        print_settings.connect_clicked(move |_| popover.popdown());
     }
     let dnd = dnd_tile.button.clone();
 

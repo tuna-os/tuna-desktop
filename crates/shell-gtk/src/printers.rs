@@ -27,7 +27,7 @@
 //! 403, surface as "Authentication Required": a cups-pk-helper
 //! mechanism call is the follow-up, not invented here.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -2098,12 +2098,12 @@ impl PrintersPanel {
 }
 
 // ---------------------------------------------------------------------------
-// Quick-settings tile
+// Quick-settings menu
 // ---------------------------------------------------------------------------
 
-/// The tile drains poll results every tick but re-reads CUPS only every
-/// [`TILE_POLL_TICKS`] ticks, so the subtitle settles within a second of
-/// a state change without polling the daemon every second.
+/// The menu drains poll results every tick but re-reads CUPS only every
+/// [`TILE_POLL_TICKS`] ticks, so rows and subtitle settle within a
+/// second of a state change without polling the daemon every second.
 const TILE_TICK: Duration = Duration::from_secs(1);
 const TILE_POLL_TICKS: u64 = 5;
 
@@ -2140,12 +2140,37 @@ pub fn tile_subtitle(result: &Result<Snapshot, CupsError>) -> String {
     }
 }
 
-/// The tile's live CUPS state: re-reads the snapshot on worker threads
-/// and shows it as the subtitle. Kept alive by its own timeout for the
-/// shell's lifetime. Only the subtitle label is touched, never the
-/// toggle, so the menu's toggle sync cannot fight the poller.
-struct TileWatch {
-    tile: Tile,
+/// Compact row label for one printer: name, default mark, status and
+/// active queue depth, e.g. "OfficeJet Pro (Default) — Ready — 1 Job".
+pub fn row_label(printer: &Printer, jobs: &[PrintJob]) -> String {
+    let mut label = printer.name.clone();
+    if printer.is_default {
+        label.push_str(" (Default)");
+    }
+    label.push_str(" — ");
+    label.push_str(printer.state.label(printer.accepting_jobs));
+    let active = jobs.iter().filter(|j| j.state.is_active()).count();
+    if active > 0 {
+        if active == 1 {
+            label.push_str(" — 1 Job");
+        } else {
+            label.push_str(&format!(" — {active} Jobs"));
+        }
+    }
+    label
+}
+
+/// The quick-settings printers menu: one compact row per printer plus
+/// the tile's live subtitle, refreshed from CUPS on worker threads. A
+/// row opens the queue window with the full panel; the menu itself
+/// stays short enough to fit the screen.
+pub struct PrintersMenu {
+    list: gtk::Box,
+    placeholder: gtk::Label,
+    tile: RefCell<Option<Tile>>,
+    on_open: RefCell<Option<Rc<dyn Fn()>>>,
+    panel: Rc<PrintersPanel>,
+    window: RefCell<Option<gtk::Window>>,
     client: CupsClient,
     sender: mpsc::Sender<Result<Snapshot, CupsError>>,
     receiver: mpsc::Receiver<Result<Snapshot, CupsError>>,
@@ -2153,23 +2178,116 @@ struct TileWatch {
     ticks: Cell<u64>,
 }
 
-impl TileWatch {
+impl PrintersMenu {
+    /// Fill `list` (the menu's runtime box) with compact printer rows.
+    pub fn new(list: gtk::Box) -> Rc<Self> {
+        let placeholder = gtk::Label::new(Some("Loading…"));
+        placeholder.set_halign(gtk::Align::Start);
+        list.append(&placeholder);
+        let (sender, receiver) = mpsc::channel();
+        let menu = Rc::new(Self {
+            list,
+            placeholder,
+            tile: RefCell::new(None),
+            on_open: RefCell::new(None),
+            panel: PrintersPanel::new(),
+            window: RefCell::new(None),
+            client: CupsClient::system(),
+            sender,
+            receiver,
+            inflight: Cell::new(false),
+            ticks: Cell::new(0),
+        });
+        menu.tick();
+        {
+            let menu = menu.clone();
+            glib::timeout_add_local(TILE_TICK, move || {
+                menu.tick();
+                glib::ControlFlow::Continue
+            });
+        }
+        menu
+    }
+
+    /// The tile whose subtitle tracks the print service.
+    pub fn set_tile(&self, tile: Tile) {
+        *self.tile.borrow_mut() = Some(tile);
+    }
+
+    /// Run after the queue window opens (the shell closes quick
+    /// settings, as menu activation does).
+    pub fn set_on_open(&self, on_open: impl Fn() + 'static) {
+        *self.on_open.borrow_mut() = Some(Rc::new(on_open));
+    }
+
+    /// Re-read CUPS now (the menu calls this when it opens); the
+    /// periodic tick keeps rows and subtitle fresh in between. The
+    /// shared panel refreshes too, so an open window never goes stale.
+    pub fn refresh(self: &Rc<Self>) {
+        self.poll();
+        self.panel.refresh();
+    }
+
+    /// Show the queue window with the full panel, creating it on first
+    /// use. The toggle that opened it resets to off.
+    pub fn open_window(&self) {
+        if let Some(tile) = self.tile.borrow().as_ref() {
+            // Momentary toggle: resetting to off emits no handler call
+            // that reopens, since the handler only acts when turning on.
+            tile.button.set_active(false);
+        }
+        {
+            let mut slot = self.window.borrow_mut();
+            if slot.is_none() {
+                let window = gtk::Window::new();
+                window.set_title(Some("Printers"));
+                window.set_default_size(560, 700);
+                let header = gtk::HeaderBar::new();
+                header.set_title_widget(Some(&gtk::Label::new(Some("Printers"))));
+                window.set_titlebar(Some(&header));
+                let scrolled = gtk::ScrolledWindow::new();
+                scrolled.set_child(Some(&self.panel.widget()));
+                scrolled.set_max_content_height(660);
+                scrolled.set_propagate_natural_height(true);
+                scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+                window.set_child(Some(&scrolled));
+                window.connect_close_request(|window| {
+                    window.set_visible(false);
+                    glib::Propagation::Stop
+                });
+                *slot = Some(window);
+            }
+            if let Some(window) = slot.as_ref() {
+                window.present();
+            }
+        }
+        let on_open = self.on_open.borrow().clone();
+        if let Some(on_open) = on_open {
+            on_open();
+        }
+    }
+
     fn tick(self: &Rc<Self>) {
         while let Ok(result) = self.receiver.try_recv() {
             self.inflight.set(false);
-            self.tile.subtitle.set_text(&tile_subtitle(&result));
-            self.tile.subtitle.set_visible(true);
+            self.apply(result);
         }
         let ticks = self.ticks.get() + 1;
         self.ticks.set(ticks);
-        if self.inflight.get() || ticks % TILE_POLL_TICKS != 1 {
+        if ticks % TILE_POLL_TICKS == 1 {
+            self.poll();
+        }
+    }
+
+    fn poll(&self) {
+        if self.inflight.get() {
             return;
         }
         self.inflight.set(true);
         let client = self.client.clone();
         let sender = self.sender.clone();
         if std::thread::Builder::new()
-            .name("tuna-printers-tile".to_string())
+            .name("tuna-printers-menu".to_string())
             .spawn(move || {
                 let _ = sender.send(client.snapshot());
             })
@@ -2178,27 +2296,43 @@ impl TileWatch {
             self.inflight.set(false);
         }
     }
-}
 
-/// Track live CUPS state on the quick-settings tile (see
-/// [`tile_subtitle`]). CUPS I/O stays on worker threads with the
-/// module's connect/read timeouts, so an absent daemon only ever shows
-/// "No Print Service", never a hang.
-pub fn watch_tile(tile: Tile) {
-    let (sender, receiver) = mpsc::channel();
-    let watch = Rc::new(TileWatch {
-        tile,
-        client: CupsClient::system(),
-        sender,
-        receiver,
-        inflight: Cell::new(false),
-        ticks: Cell::new(0),
-    });
-    watch.tick();
-    glib::timeout_add_local(TILE_TICK, move || {
-        watch.tick();
-        glib::ControlFlow::Continue
-    });
+    fn apply(self: &Rc<Self>, result: Result<Snapshot, CupsError>) {
+        let subtitle = tile_subtitle(&result);
+        if let Some(tile) = self.tile.borrow().as_ref() {
+            tile.subtitle.set_text(&subtitle);
+            tile.subtitle.set_visible(true);
+        }
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
+        match &result {
+            Ok(snapshot) if !snapshot.entries.is_empty() => {
+                for entry in &snapshot.entries {
+                    self.append_row(entry);
+                }
+            }
+            _ => {
+                // Tile and menu agree on the honest absence.
+                self.placeholder.set_text(&subtitle);
+                self.list.append(&self.placeholder);
+            }
+        }
+    }
+
+    fn append_row(self: &Rc<Self>, entry: &PrinterEntry) {
+        let label = row_label(&entry.printer, &entry.jobs);
+        let button = gtk::Button::with_label(&label);
+        button.add_css_class("qs-menu-item");
+        button.update_property(&[gtk::accessible::Property::Label(&label)]);
+        let weak = Rc::downgrade(self);
+        button.connect_clicked(move |_| {
+            if let Some(menu) = weak.upgrade() {
+                menu.open_window();
+            }
+        });
+        self.list.append(&button);
+    }
 }
 
 #[cfg(test)]
@@ -2623,6 +2757,28 @@ mod tests {
             }],
         };
         assert_eq!(tile_subtitle(&Ok(done)), "Office");
+    }
+
+    #[test]
+    fn row_label_names_printer_status_and_jobs() {
+        let office = Printer::from_attrs(&printer_attrs()).expect("printer");
+        assert_eq!(row_label(&office, &[]), "Office — Stopped");
+        let mut default = office.clone();
+        default.is_default = true;
+        default.state = PrinterState::Ready;
+        default.accepting_jobs = true;
+        assert_eq!(
+            row_label(&default, &[subtitle_job(5)]),
+            "Office (Default) — Ready — 1 Job"
+        );
+        assert_eq!(
+            row_label(&default, &[subtitle_job(5), subtitle_job(3)]),
+            "Office (Default) — Ready — 2 Jobs"
+        );
+        assert_eq!(
+            row_label(&default, &[subtitle_job(9)]),
+            "Office (Default) — Ready"
+        );
     }
 
     // -- Fake CUPS server ---------------------------------------------------
