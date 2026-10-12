@@ -449,6 +449,20 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Send the wellbeing grayscale/fade pair in one protocol command.
+    pub fn set_wellbeing_effects(
+        &mut self,
+        grayscale: bool,
+        fade: bool,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+        })?;
+        Ok(id)
+    }
+
     /// Tell the compositor whether the overview shows the app grid, so
     /// it draws the workspaces as thumbnails. Returns the request id.
     pub fn set_overview_app_grid(&mut self, active: bool) -> Result<u64, ControlError> {
@@ -1682,6 +1696,28 @@ mod tests {
         match client.send_activation(ActivationToken::new("token".to_owned())) {
             Err(ControlError::AppConstraint(_)) => {}
             other => panic!("expected AppConstraint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wellbeing_effects_send_one_atomic_pair_with_correlated_request_id() {
+        let (mut client, mut peer) = handshook();
+        let mut previous = None;
+        for (grayscale, fade) in [(false, false), (true, false), (true, true), (false, true)] {
+            let id = client
+                .set_wellbeing_effects(grayscale, fade)
+                .expect("effect send");
+            assert_eq!(
+                server_read(&mut peer),
+                Message::Command {
+                    id,
+                    kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+                }
+            );
+            if let Some(old) = previous {
+                assert_ne!(id, old);
+            }
+            previous = Some(id);
         }
     }
 
