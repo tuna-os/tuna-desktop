@@ -546,6 +546,20 @@ pub fn bindings(
         .collect()
 }
 
+/// Whether a fired binding runs while Ctrl+Alt+Tab holds the bar's
+/// exclusive keyboard (`mode`: the `MODE_*` bit it fired in). Session
+/// chords pause while held: a NORMAL/OVERVIEW fire then is spurious
+/// (the hold owns the keyboard), so only the hold's own chord —
+/// re-anchoring the bar — and the lock screen stay live. POPUP-mode
+/// system keys (volume, brightness) keep working: the hold lets them
+/// through, as the compositor's popup mode does.
+pub fn runs_while_panel_held(action: Action, mode: u32) -> bool {
+    if mode != MODE_NORMAL && mode != MODE_OVERVIEW {
+        return true;
+    }
+    matches!(action, Action::FocusPanel { .. } | Action::LockScreen)
+}
+
 /// The switcher's keys (`switch-applications`, `switch-group` and
 /// their backward keys) from the window-manager schema when installed,
 /// else GNOME 51's defaults. The compositor drives the switcher from
@@ -803,6 +817,36 @@ mod tests {
                 "{}",
                 b.accelerator
             );
+        }
+    }
+
+    #[test]
+    fn panel_hold_pauses_session_chords_but_keeps_its_own_and_lock() {
+        use tuna_shell_control::{MODE_LOCK_SCREEN, MODE_UNLOCK_SCREEN};
+        // The G-PANEL-FOCUS regression: Super+S (NORMAL) must not run
+        // while the bar holds the keyboard, in either session mode.
+        for mode in [MODE_NORMAL, MODE_OVERVIEW] {
+            assert!(!runs_while_panel_held(Action::ToggleQuickSettings, mode));
+            assert!(!runs_while_panel_held(Action::ToggleMessageTray, mode));
+            assert!(!runs_while_panel_held(Action::ToggleOverview, mode));
+            assert!(!runs_while_panel_held(Action::SwitchToApplication(1), mode));
+            assert!(!runs_while_panel_held(Action::WindowMenu, mode));
+            // The hold's own chord re-anchors; the lock screen stays live.
+            assert!(runs_while_panel_held(
+                Action::FocusPanel { backward: false },
+                mode
+            ));
+            assert!(runs_while_panel_held(
+                Action::FocusPanel { backward: true },
+                mode
+            ));
+            assert!(runs_while_panel_held(Action::LockScreen, mode));
+        }
+        // Popup-mode system keys and lock-screen fires pass through.
+        for mode in [MODE_POPUP, MODE_LOCK_SCREEN, MODE_UNLOCK_SCREEN] {
+            assert!(runs_while_panel_held(Action::ToggleQuickSettings, mode));
+            assert!(runs_while_panel_held(Action::VolumeUpQuiet, mode));
+            assert!(runs_while_panel_held(Action::LockScreen, mode));
         }
     }
 }

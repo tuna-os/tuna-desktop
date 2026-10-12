@@ -315,6 +315,13 @@ fn release_panel_focus(window: &gtk::ApplicationWindow, held: &Rc<Cell<bool>>) {
     window.set_keyboard_mode(KeyboardMode::OnDemand);
 }
 
+/// The panel owns exclusive keyboard (idempotent: layer-shell ignores
+/// an unchanged mode, so re-asserting a live hold is a no-op).
+fn assert_panel_hold(window: &gtk::ApplicationWindow, held: &Rc<Cell<bool>>) {
+    window.set_keyboard_mode(KeyboardMode::Exclusive);
+    held.set(true);
+}
+
 /// Ctrl+Alt+Tab (`switch-panels`): the panel takes exclusive keyboard
 /// and the first (forward) or last (backward) control takes GTK focus.
 fn focus_panel(
@@ -324,10 +331,9 @@ fn focus_panel(
     held: &Rc<Cell<bool>>,
     backward: bool,
 ) {
-    window.set_keyboard_mode(KeyboardMode::Exclusive);
+    assert_panel_hold(window, held);
     window.present();
     window.set_focus_visible(true);
-    held.set(true);
     match panel_focus::focus_end(backward) {
         panel_focus::FocusEnd::First => activities.grab_focus(),
         panel_focus::FocusEnd::Last => system.grab_focus(),
@@ -1440,6 +1446,11 @@ fn build(app: &adw::Application) {
                             escaping.set(true);
                             close_panel_menus(&clock, &system, &a11y, &tray_box);
                             escaping.set(false);
+                            // Closing keeps panel focus by contract: the
+                            // hold is re-asserted unconditionally, healing
+                            // any close signal that outran the escaping
+                            // guard above (G-PANEL-FOCUS).
+                            assert_panel_hold(&window_keys, &held);
                             glib::Propagation::Stop
                         }
                         panel_focus::EscapeOutcome::Release => {
@@ -1703,7 +1714,7 @@ fn build(app: &adw::Application) {
 
     // GNOME Shell's own keybindings (org.gnome.shell.keybindings).
     {
-        let run: Rc<dyn Fn(keybindings::Action)> = {
+        let run: Rc<dyn Fn(keybindings::Action, u32)> = {
             let (shell, overview_ui, clock, system) = (
                 shell.clone(),
                 overview_ui.clone(),
@@ -1715,8 +1726,13 @@ fn build(app: &adw::Application) {
             let workspace_popup_keys = workspace_popup.clone();
             let (panel_window_keys, activities_keys, panel_held_keys) =
                 (window.clone(), activities.clone(), panel_held.clone());
-            Rc::new(move |action| {
+            Rc::new(move |action, mode| {
                 use keybindings::Action;
+                // Ctrl+Alt+Tab owns the keyboard while held: a session
+                // chord that fires then is spurious (G-PANEL-FOCUS).
+                if panel_held_keys.get() && !keybindings::runs_while_panel_held(action, mode) {
+                    return;
+                }
                 let toggle = |button: &gtk::MenuButton| {
                     if button.is_active() {
                         button.popdown();
@@ -2046,9 +2062,9 @@ fn build(app: &adw::Application) {
                 let run = run.clone();
                 gnome_shell.set_internal(
                     &accels,
-                    Rc::new(move |i| {
+                    Rc::new(move |i, mode| {
                         if let Some(action) = actions.get(i) {
-                            run(*action);
+                            run(*action, mode);
                         }
                     }),
                 );

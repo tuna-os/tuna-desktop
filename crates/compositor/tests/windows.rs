@@ -3248,6 +3248,79 @@ fn exclusive_overlay_receives_navigation_and_retains_popup_system_accelerators()
 }
 
 #[test]
+fn panel_dynamic_exclusive_hold_suppresses_normal_accelerators() {
+    use tuna_shell_control::{
+        Accelerator, GTK_PANEL_NAMESPACE, MODE_NORMAL, MODE_OVERVIEW, MOD_LOGO,
+    };
+    // Evdev `s` (KEY_S): the Super+S quick-settings chord shape.
+    const S_KEYCODE: u32 = 31;
+    let mut f = two_windows();
+    let (conn, mut queue, mut client) = connect(&mut f.comp);
+    let qh = queue.handle();
+    let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let layer = client.layer_shell.as_ref().unwrap().get_layer_surface(
+        &surface,
+        None,
+        Layer::Top,
+        GTK_PANEL_NAMESPACE.into(),
+        &qh,
+        (),
+    );
+    layer.set_size(0, 48);
+    layer.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    for _ in 0..2 {
+        surface.commit();
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump(&mut f.comp, &mut queue, &mut client, |c| c.synced);
+    }
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(tuna_compositor::layer::exclusive_popup_keyboard_layer(&f.comp.state).is_none());
+    // The shell's Super+S: NORMAL|OVERVIEW, like toggle-quick-settings.
+    f.manager.set_accelerators(vec![Accelerator {
+        action: 7,
+        keysym: u32::from(b's'),
+        mods: MOD_LOGO,
+        modes: MODE_NORMAL | MODE_OVERVIEW,
+    }]);
+    let tap_super_s = |manager: &mut WindowManager, comp: &mut TestCompositor| {
+        press(manager, comp, SUPER_LEFT_KEYCODE);
+        press(manager, comp, S_KEYCODE);
+        release(manager, comp, S_KEYCODE);
+        release(manager, comp, SUPER_LEFT_KEYCODE);
+    };
+    tap_super_s(&mut f.manager, &mut f.comp);
+    assert_eq!(
+        f.manager.take_accelerators_fired(),
+        [(7, 5000, MODE_NORMAL)]
+    );
+    // Ctrl+Alt+Tab: the mapped bar takes exclusive keyboard.
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    surface.commit();
+    client.synced = false;
+    conn.display().sync(&qh, ());
+    pump(&mut f.comp, &mut queue, &mut client, |c| c.synced);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(tuna_compositor::layer::exclusive_popup_keyboard_layer(&f.comp.state).is_some());
+    tap_super_s(&mut f.manager, &mut f.comp);
+    assert!(f.manager.take_accelerators_fired().is_empty());
+    // Final Escape: the bar hands the keyboard back, chords resume.
+    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    surface.commit();
+    client.synced = false;
+    conn.display().sync(&qh, ());
+    pump(&mut f.comp, &mut queue, &mut client, |c| c.synced);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(tuna_compositor::layer::exclusive_popup_keyboard_layer(&f.comp.state).is_none());
+    tap_super_s(&mut f.manager, &mut f.comp);
+    assert_eq!(
+        f.manager.take_accelerators_fired(),
+        [(7, 5000, MODE_NORMAL)]
+    );
+}
+
+#[test]
 fn exclusive_overview_keeps_overview_accelerators() {
     use tuna_shell_control::{Accelerator, MODE_OVERVIEW, MOD_LOGO, OVERVIEW_NAMESPACE};
     let mut f = two_windows();
