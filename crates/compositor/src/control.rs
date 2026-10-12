@@ -637,7 +637,7 @@ impl<'a> Session<'a> {
                 kind: CommandKind::SetInputSettings(settings),
             } => {
                 // Session-level settings for the runtime (seat, libinput).
-                self.input_settings = Some(settings);
+                self.input_settings = Some(*settings);
                 self.conn.write_frame(&Message::CommandResult {
                     id,
                     status: CommandStatus::Applied,

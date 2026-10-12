@@ -318,7 +318,7 @@ pub enum CommandKind {
     /// GNOME's input settings, as the shell reads them from GSettings
     /// (#60): keymap, key repeat, pointer devices, hot corner. Sent at
     /// start and on every change; the compositor applies them live.
-    SetInputSettings(InputSettings),
+    SetInputSettings(Box<InputSettings>),
     /// The overview shows the app grid (or not): while it does, the
     /// compositor draws the workspaces as thumbnails along the top, as
     /// GNOME's app grid state does. UI state; it resets whenever the
@@ -1434,11 +1434,65 @@ mod tests {
     }
 
     #[test]
+    fn boxed_input_settings_preserve_inline_positional_wire_and_strict_decode() {
+        // The old inline SetInputSettings is variant7. Box serializes
+        // transparently; allocation changes must not change protocol0.34.
+        struct InlineSettings<'a>(&'a InputSettings);
+        impl Serialize for InlineSettings<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_newtype_variant("CommandKind", 7, "SetInputSettings", self.0)
+            }
+        }
+        struct InlineCommand<'a>(&'a InputSettings);
+        impl Serialize for InlineCommand<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStructVariant;
+                let mut command =
+                    serializer.serialize_struct_variant("Message", 3, "Command", 2)?;
+                command.serialize_field("id", &42u64)?;
+                command.serialize_field("kind", &InlineSettings(self.0))?;
+                command.end()
+            }
+        }
+        let settings = InputSettings {
+            xkb_layout: "de".into(),
+            keyboard_aids: KeyboardAids {
+                sticky: true,
+                toggle_beep: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let kind = CommandKind::SetInputSettings(Box::new(settings.clone()));
+        let mut old = vec![0; MAX_FRAME_BYTES];
+        let mut new = vec![0; MAX_FRAME_BYTES];
+        assert_eq!(
+            postcard::to_slice(&InlineSettings(&settings), &mut old).unwrap(),
+            postcard::to_slice(&kind, &mut new).unwrap()
+        );
+        let message = Message::Command { id: 42, kind };
+        let legacy_body = postcard::to_slice(&InlineCommand(&settings), &mut old).unwrap();
+        let mut legacy_frame = (legacy_body.len() as u32).to_le_bytes().to_vec();
+        legacy_frame.extend_from_slice(legacy_body);
+        assert_eq!(encode_frame(&message), legacy_frame);
+        assert_eq!(decode_frame(&legacy_frame).unwrap(), message);
+        roundtrip(&message);
+        let mut trailing = legacy_frame;
+        trailing.push(0);
+        let length = (trailing.len() - 4) as u32;
+        trailing[..4].copy_from_slice(&length.to_le_bytes());
+        assert!(matches!(
+            decode_frame(&trailing),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn combined_bell_and_modal_preferences_survive_positional_wire() {
         for attach in [false, true] {
             roundtrip(&Message::Command {
                 id: 1,
-                kind: CommandKind::SetInputSettings(InputSettings {
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                     attach_modal_dialogs: attach,
                     bell: BellPolicy {
                         audible: false,
@@ -1448,7 +1502,7 @@ mod tests {
                         theme: "custom".into(),
                     },
                     ..Default::default()
-                }),
+                })),
             });
         }
     }
@@ -1459,7 +1513,7 @@ mod tests {
             for enabled in [false, true] {
                 roundtrip(&Message::Command {
                     id: 90,
-                    kind: CommandKind::SetInputSettings(InputSettings {
+                    kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                         workspace_policy: WorkspacePolicy {
                             dynamic: enabled,
                             fixed_count,
@@ -1467,7 +1521,7 @@ mod tests {
                             edge_tiling: enabled,
                         },
                         ..Default::default()
-                    }),
+                    })),
                 });
             }
         }
@@ -1608,13 +1662,13 @@ mod tests {
         for (theme, size, locate_pointer) in [("Adwaita", 24, false), ("DMZ-White", 48, true)] {
             roundtrip(&Message::Command {
                 id: 1,
-                kind: CommandKind::SetInputSettings(InputSettings {
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                     cursor_theme: theme.into(),
                     cursor_size: size,
                     locate_pointer,
                     right_to_left: true,
                     ..InputSettings::default()
-                }),
+                })),
             });
         }
     }
@@ -1625,18 +1679,18 @@ mod tests {
         for name in ["Control_L", "Control_R", "Super_L", "", "NoSuchKeysym"] {
             roundtrip(&Message::Command {
                 id: 1,
-                kind: CommandKind::SetInputSettings(InputSettings {
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                     locate_pointer_key: name.into(),
                     ..InputSettings::default()
-                }),
+                })),
             });
         }
         let frame = encode_frame(&Message::Command {
             id: 1,
-            kind: CommandKind::SetInputSettings(InputSettings {
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                 locate_pointer_key: "x".repeat(MAX_TITLE_LEN + 1),
                 ..InputSettings::default()
-            }),
+            })),
         });
         assert!(matches!(
             decode_frame(&frame),
@@ -1648,10 +1702,10 @@ mod tests {
     fn oversized_cursor_theme_names_are_rejected() {
         let frame = encode_frame(&Message::Command {
             id: 1,
-            kind: CommandKind::SetInputSettings(InputSettings {
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                 cursor_theme: "x".repeat(MAX_TITLE_LEN + 1),
                 ..InputSettings::default()
-            }),
+            })),
         });
         assert!(matches!(
             decode_frame(&frame),
@@ -1682,7 +1736,7 @@ mod tests {
     fn live_bell_policy_survives_the_positional_control_wire() {
         roundtrip(&Message::Command {
             id: 1,
-            kind: CommandKind::SetInputSettings(InputSettings {
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                 bell: BellPolicy {
                     audible: false,
                     visual: true,
@@ -1691,7 +1745,7 @@ mod tests {
                     theme: "custom".into(),
                 },
                 ..InputSettings::default()
-            }),
+            })),
         });
     }
 
@@ -1700,10 +1754,10 @@ mod tests {
         for right_to_left in [false, true] {
             roundtrip(&Message::Command {
                 id: 1,
-                kind: CommandKind::SetInputSettings(InputSettings {
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                     right_to_left,
                     ..InputSettings::default()
-                }),
+                })),
             });
         }
     }
@@ -1712,7 +1766,7 @@ mod tests {
     fn keyboard_aids_survive_the_positional_control_wire() {
         roundtrip(&Message::Command {
             id: 1,
-            kind: CommandKind::SetInputSettings(InputSettings {
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                 keyboard_aids: KeyboardAids {
                     shortcuts: true,
                     sticky: true,
@@ -1727,7 +1781,7 @@ mod tests {
                 },
                 right_to_left: true,
                 ..InputSettings::default()
-            }),
+            })),
         });
         for aid in [KeyboardAid::StickyKeys, KeyboardAid::SlowKeys] {
             for enabled in [false, true] {
@@ -1742,11 +1796,11 @@ mod tests {
             for slowdown in [0.5, 1.0, 4.0] {
                 roundtrip(&Message::Command {
                     id: 1,
-                    kind: CommandKind::SetInputSettings(InputSettings {
+                    kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                         motion: MotionPolicy::new(level, slowdown),
                         right_to_left: true,
                         ..InputSettings::default()
-                    }),
+                    })),
                 });
             }
         }
@@ -1758,11 +1812,11 @@ mod tests {
             for touchpad in [false, true] {
                 roundtrip(&Message::Command {
                     id: 1,
-                    kind: CommandKind::SetInputSettings(InputSettings {
+                    kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                         mouse_left_handed: mouse,
                         touchpad_left_handed: touchpad,
                         ..InputSettings::default()
-                    }),
+                    })),
                 });
             }
         }

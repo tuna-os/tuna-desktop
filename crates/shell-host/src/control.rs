@@ -443,7 +443,7 @@ impl ControlClient {
             (!settings.workspace_policy.dynamic).then_some(settings.workspace_policy.fixed_count);
         self.write_message(&Message::Command {
             id,
-            kind: CommandKind::SetInputSettings(settings),
+            kind: CommandKind::SetInputSettings(Box::new(settings)),
         })?;
         self.model.set_fixed_workspace_count(fixed_count);
         Ok(id)
