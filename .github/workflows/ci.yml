@@ -279,6 +279,17 @@ jobs:
       - run: shellcheck -x scripts/tuna-gtk-shell-proof scripts/tuna-walkthrough scripts/tuna-gtk-accessibility-proof scripts/lib/tuna-fade-match
       # docs/walkthrough.md must match its manifest (docs/walkthrough.tsv).
       - run: scripts/tuna-walkthrough check
+      # Freeze source before live proofs create checkout-local artifacts.
+      - name: Check native minimize freeze identity and failure handling
+        run: /usr/bin/python3 scripts/tests/test_minimize_ci_freeze.py
+      - name: Prove source-matched native minimize and restore in LTR and RTL
+        run: scripts/tuna-minimize-ci-proof "$RUNNER_TEMP/native-minimize"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-minimize-proof
+          path: ${{ runner.temp }}/native-minimize/
+          retention-days: 14
       - name: Prove live accessibility widgets and focus timers
         run: |
           cargo test -p tuna-shell-gtk --bin tuna-shell-gtk --no-run --message-format=json > "$RUNNER_TEMP/tuna-gtk-a11y-build.json"
@@ -295,16 +306,6 @@ jobs:
           scripts/tuna-gtk-accessibility-proof gtk-shell-artifacts/a11y/bin/gtk-tests "$(git rev-parse HEAD)" gtk-shell-artifacts/a11y
       # pam_wrapper backs G-UNLOCK, IBus G-IME and wayland-utils
       # G-WAYLAND-INFO; all required so no stage can silently skip.
-      - name: Check native minimize freeze identity and failure handling
-        run: /usr/bin/python3 scripts/tests/test_minimize_ci_freeze.py
-      - name: Prove source-matched native minimize and restore in LTR and RTL
-        run: scripts/tuna-minimize-ci-proof "$RUNNER_TEMP/native-minimize"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
-        with:
-          name: native-minimize-proof
-          path: ${{ runner.temp }}/native-minimize/
-          retention-days: 14
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"

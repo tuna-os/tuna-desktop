@@ -85,6 +85,21 @@ class MinimizeFreezeTests(unittest.TestCase):
         self.assertNotEqual(self.run_freeze().returncode, 0)
         self.assertEqual((self.art / "frozen/manifest.json").read_bytes(), original)
 
+    def test_generated_checkout_artifacts_are_rejected(self):
+        generated = self.root / "gtk-shell-artifacts/a11y/bin/gtk-tests"
+        generated.parent.mkdir(parents=True)
+        generated.write_bytes(b"generated accessibility executable")
+        self.assertNotEqual(self.run_freeze().returncode, 0)
+        self.assertFalse((self.art / "frozen/manifest.json").exists())
+
+    def test_ci_freezes_before_live_accessibility_creates_artifacts(self):
+        checkout = Path(__file__).resolve().parents[2]
+        workflow = (checkout / ".github/workflows/ci.yml").read_text()
+        freeze = workflow.index("Prove source-matched native minimize and restore in LTR and RTL")
+        accessibility = workflow.index("Prove live accessibility widgets and focus timers")
+        self.assertLess(freeze, accessibility)
+        self.assertIn('scripts/tuna-minimize-ci-proof "$RUNNER_TEMP/native-minimize"', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
