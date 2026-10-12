@@ -1077,6 +1077,30 @@ fn ripples_end_ms() -> f64 {
         .fold(0.0, f64::max)
 }
 
+// Limit the three renderer buffers per locate color/scale variant.
+const MAX_DISC_SIDE: u32 = 1024;
+const MAX_DISC_ENTRIES: usize = 8;
+const MAX_DISC_BYTES: usize = 16 * 1024 * 1024;
+
+fn disc_side(scale: f64) -> Option<u32> {
+    (scale.is_finite() && scale > 0.0).then(|| {
+        ((RIPPLE_SIZE + 2.0 * RIPPLE_GLOW) * 1.5 * scale)
+            .ceil()
+            .clamp(1.0, f64::from(MAX_DISC_SIDE)) as u32
+    })
+}
+
+fn disc_bytes(side: u32) -> usize {
+    side as usize * side as usize * 4 * 3
+}
+
+fn disc_cache_must_clear(sides: impl Iterator<Item = u32>, incoming: u32) -> bool {
+    let (count, bytes) = sides.fold((0usize, 0usize), |(count, bytes), side| {
+        (count + 1, bytes.saturating_add(disc_bytes(side)))
+    });
+    count >= MAX_DISC_ENTRIES || bytes.saturating_add(disc_bytes(incoming)) > MAX_DISC_BYTES
+}
+
 /// GNOME's `locate-pointer`: a Ctrl press and release with nothing
 /// else in between plays the ripples at the pointer. The key still
 /// reaches the client, as in Mutter.
@@ -1206,6 +1230,38 @@ impl LocatePointer {
         self.elapsed_ms(now).is_some()
     }
 
+    fn cached_discs(
+        &mut self,
+        side: u32,
+        color: [u8; 3],
+        accent: [f32; 3],
+    ) -> &[MemoryRenderBuffer; 3] {
+        let side = side.clamp(1, MAX_DISC_SIDE);
+        let key = (side, color);
+        if !self.discs.contains_key(&key)
+            && disc_cache_must_clear(self.discs.keys().map(|(side, _)| *side), side)
+        {
+            self.discs.clear();
+        }
+        self.discs.entry(key).or_insert_with(|| {
+            let pixels = ripple_disc(
+                side,
+                accent,
+                RIPPLE_GLOW / (RIPPLE_SIZE + 2.0 * RIPPLE_GLOW),
+            );
+            std::array::from_fn(|_| {
+                MemoryRenderBuffer::from_slice(
+                    &pixels,
+                    Fourcc::Argb8888,
+                    (side as i32, side as i32),
+                    1,
+                    Transform::Normal,
+                    None,
+                )
+            })
+        })
+    }
+
     fn elements(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -1225,25 +1281,11 @@ impl LocatePointer {
             return Vec::new();
         };
         // The disc is drawn once at its largest on-screen size.
-        let largest = ((RIPPLE_SIZE + 2.0 * RIPPLE_GLOW) * 1.5 * scale).ceil() as u32;
+        let Some(largest) = disc_side(scale) else {
+            return Vec::new();
+        };
         let key_color = accent.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-        let discs = self.discs.entry((largest, key_color)).or_insert_with(|| {
-            let pixels = ripple_disc(
-                largest,
-                accent,
-                RIPPLE_GLOW / (RIPPLE_SIZE + 2.0 * RIPPLE_GLOW),
-            );
-            std::array::from_fn(|_| {
-                MemoryRenderBuffer::from_slice(
-                    &pixels,
-                    Fourcc::Argb8888,
-                    (largest as i32, largest as i32),
-                    1,
-                    Transform::Normal,
-                    None,
-                )
-            })
-        });
+        let discs = self.cached_discs(largest, key_color, accent);
         let mut out = Vec::new();
         // Ring 3 is on top in GNOME (`set_child_above_sibling`); the
         // caller draws front to back.
@@ -1251,7 +1293,8 @@ impl LocatePointer {
             let Some((ring_scale, opacity)) = ripple_ring(ring, elapsed) else {
                 continue;
             };
-            let side = (RIPPLE_SIZE + 2.0 * RIPPLE_GLOW) * ring_scale * scale;
+            let side = ((RIPPLE_SIZE + 2.0 * RIPPLE_GLOW) * ring_scale * scale)
+                .min(f64::from(MAX_DISC_SIDE));
             if side < 1.0 || opacity <= 0.0 {
                 continue;
             }
@@ -1782,6 +1825,37 @@ mod tests {
         // Right Ctrl is not Mutter's default key.
         locate.feed(&key(97, true), at, now);
         assert!(!locate.feed(&key(97, false), at, now));
+    }
+
+    #[test]
+    fn locate_disc_cache_evicts_on_both_entry_and_byte_limits() {
+        let mut locate = LocatePointer::default();
+        for i in 0..100u8 {
+            locate.cached_discs(32, [i, 0, 0], [0.0; 3]);
+            assert!(locate.discs.len() <= MAX_DISC_ENTRIES);
+            assert!(
+                locate
+                    .discs
+                    .keys()
+                    .map(|(side, _)| disc_bytes(*side))
+                    .sum::<usize>()
+                    <= MAX_DISC_BYTES
+            );
+        }
+        locate.discs.clear();
+        locate.cached_discs(1024, [0; 3], [0.0; 3]);
+        locate.cached_discs(512, [1; 3], [0.0; 3]);
+        assert_eq!(locate.discs.len(), 2);
+        // A hit reuses buffers rather than evicting under the byte limit.
+        locate.cached_discs(1024, [0; 3], [0.0; 3]);
+        assert_eq!(locate.discs.len(), 2);
+        locate.cached_discs(512, [2; 3], [0.0; 3]);
+        assert_eq!(locate.discs.len(), 1);
+        assert!(locate.discs.contains_key(&(512, [2; 3])));
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(disc_side(invalid).is_none());
+        }
+        assert_eq!(disc_side(f64::MAX), Some(MAX_DISC_SIDE));
     }
 
     #[test]

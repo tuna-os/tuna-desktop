@@ -41,3 +41,10 @@ actual framebuffer captures for at most10 seconds to allow the presentation
 acknowledgment, and writes PNG plus pixel receipt for each case. It rejects
 cropped, displaced and incorrectly colored fixtures in four focused tests.
 Animated fixture assertions additionally capture a second real frame without pointer input for legacy and SVG themes. All assertions await a fresh native CI journey on this port; fractional-output pixels, multiple physical outputs and hardware measurements remain separate qualification.
+
+
+## Locked privacy and locate cache bounds
+
+Lock transitions cancel in-flight locate effects and clear activity counters/key arming without changing theme or locate preferences. Locked diagnostics publish a null cursor record. The native journey freezes the owned animation clock while a real Ctrl ripple renders, requests the public D-Bus lock, and checks redaction plus authenticated-unlock nonresurrection. This fresh native regression awaits combined CI.
+
+Locate disc buffers are limited to eight color/scale entries and16MiB of owned pixel storage across the three buffers per entry. Inserting a miss above either limit evicts prior entries; hits reuse their buffers. Raster and rendered side lengths saturate at1024 physical pixels, and nonfinite/nonpositive scales are rejected. This bounds the compositor's cache, not driver texture retention or overall GPU memory.
