@@ -269,6 +269,7 @@ manifest = {
         "dir": binaries,
         "tuna-compositor": sha_file(os.path.join(binaries, "tuna-compositor")),
         "tuna-shell-gtk": sha_file(os.path.join(binaries, "tuna-shell-gtk")),
+        "tuna-ibus-bridge": sha_file(os.path.join(binaries, "tuna-ibus-bridge")),
     },
     "packages": packages,
     "image": {
@@ -552,8 +553,8 @@ EVENTS
             echo "tuna-visual-capture: no binaries in $BIN_DIR" >&2
             return 1
         fi
-        log_cmd "cargo build -p tuna-compositor -p tuna-shell-gtk"
-        cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk || return 1
+        log_cmd "cargo build -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host"
+        cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host || return 1
         BIN_DIR="$ROOT/target/debug"
     fi
     export TUNA_PROOF_BIN_DIR="$BIN_DIR"
