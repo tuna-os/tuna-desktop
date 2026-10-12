@@ -20,7 +20,9 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::intake::NotificationBus;
-use tuna_shell_host::notifications::{Notification, NotificationCenter, Urgency};
+use tuna_shell_host::notifications::{
+    Notification, NotificationAction, NotificationCenter, Urgency,
+};
 
 /// How long a normal or low banner stays up (GNOME: about 4 s).
 pub const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
@@ -155,6 +157,43 @@ struct Shown {
     dnd: bool,
 }
 
+/// Local dispatch for shell-own notice actions (wellbeing Take/Delay/Skip).
+/// External notices route through the bus to their sender; shell-own
+/// notices have no sender, so the shell registers a callback per
+/// (notice id, action key) instead. The banner path always runs the
+/// bus invoke first (replay guard + banner dismiss + signal) and only
+/// dispatches locally when that succeeds, so unregistered ids behave
+/// exactly as before. Pure and headless-testable; the UI owns one.
+#[derive(Default)]
+struct ActionDispatch {
+    handlers: HashMap<(u64, String), Rc<dyn Fn()>>,
+}
+
+impl ActionDispatch {
+    /// Register (or replace) one action callback.
+    fn register(&mut self, id: u64, action: &str, handler: Rc<dyn Fn()>) {
+        self.handlers.insert((id, action.to_owned()), handler);
+    }
+
+    /// Forget one notice entirely (replacement/removal): its keys must
+    /// never fire again, even through a previously captured path.
+    fn drop_notice(&mut self, id: u64) {
+        self.handlers.retain(|(known, _), _| *known != id);
+    }
+
+    /// Run one registered callback. False when unknown: denied keys,
+    /// closed/dropped notices, and replaced residents never fire.
+    fn dispatch(&self, id: u64, action: &str) -> bool {
+        match self.handlers.get(&(id, action.to_owned())) {
+            Some(handler) => {
+                handler();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Notification surfaces and their store.
 pub struct NotifyUi {
     center: Arc<Mutex<NotificationCenter>>,
@@ -176,6 +215,7 @@ pub struct NotifyUi {
     group_widgets: RefCell<HashMap<String, Rc<crate::group_animation::Group>>>,
     shown: RefCell<Shown>,
     last_bus_try: RefCell<Option<Instant>>,
+    local_actions: RefCell<ActionDispatch>,
 }
 
 /// One notification as GNOME 51 draws it (messageList.js
@@ -362,6 +402,7 @@ impl NotifyUi {
                 ..Default::default()
             }),
             last_bus_try: RefCell::new(None),
+            local_actions: RefCell::new(ActionDispatch::default()),
         });
         {
             let me = ui.clone();
@@ -384,6 +425,68 @@ impl NotifyUi {
             center.set_source(id, icon, "");
         }
         self.refresh();
+    }
+
+    /// Post the shell's own notification WITH invokable actions, returning
+    /// the center id (None when the store is unreachable). The banner
+    /// renders one button per action; presses run the bus invoke first
+    /// (replay guard + dismiss) and then any locally registered handler.
+    pub fn post_with_actions(
+        self: &Rc<Self>,
+        app: &str,
+        icon: &str,
+        summary: &str,
+        body: &str,
+        actions: &[(String, String)],
+    ) -> Option<u64> {
+        let id = {
+            let mut center = self.center.lock().ok()?;
+            let listed = actions
+                .iter()
+                .map(|(id, label)| NotificationAction {
+                    id: id.clone(),
+                    label: label.clone(),
+                })
+                .collect();
+            let id = center.notify(app, summary, body, listed, Urgency::Normal, None);
+            center.set_source(id, icon, "");
+            id
+        };
+        self.refresh();
+        Some(id)
+    }
+
+    /// Register a local callback for one shell-own (notice, action key).
+    pub fn on_notification_action(self: &Rc<Self>, id: u64, action: &str, handler: Rc<dyn Fn()>) {
+        self.local_actions
+            .borrow_mut()
+            .register(id, action, handler);
+    }
+
+    /// Forget one notice's local callbacks (replacement/removal).
+    pub fn drop_notification_actions(self: &Rc<Self>, id: u64) {
+        self.local_actions.borrow_mut().drop_notice(id);
+    }
+
+    /// Dismiss one banner by id (history keeps the entry); false when the
+    /// center no longer knows it.
+    pub fn dismiss_notification(self: &Rc<Self>, id: u64) -> bool {
+        let dismissed = self
+            .center
+            .lock()
+            .map(|mut center| center.dismiss(id))
+            .is_ok_and(|r| r.is_ok());
+        if dismissed {
+            self.refresh();
+        }
+        dismissed
+    }
+
+    /// Run one registered local callback; false when unknown. Only called
+    /// after a successful bus invoke, so replay/unknown/closed keys never
+    /// reach a handler (the center refuses them first).
+    fn dispatch_local_action(&self, id: u64, action: &str) -> bool {
+        self.local_actions.borrow().dispatch(id, action)
     }
 
     /// The calendar popover's notification pane.
@@ -500,7 +603,13 @@ impl NotifyUi {
                     let button = gtk::Button::with_label(&action.label);
                     let (me, id, key) = (self.clone(), n.id, action.id.clone());
                     button.connect_clicked(move |_| {
-                        let _ = me.bus.borrow().invoke_action(id as u32, &key);
+                        // Bus first: replay/unknown/closed keys fail here and
+                        // never reach a local handler. Local dispatch only
+                        // fires for registered shell-own (id, key) pairs, so
+                        // every unregistered notice behaves exactly as before.
+                        if me.bus.borrow().invoke_action(id as u32, &key).is_ok() {
+                            me.dispatch_local_action(id, &key);
+                        }
                         me.refresh();
                     });
                     row.append(&button);
@@ -732,6 +841,69 @@ mod group_tests {
         // The third 10/1.4 px further, 12 px in; never more than three.
         assert_eq!(stack_layout(3), vec![(6, 10), (12, 17)]);
         assert_eq!(stack_layout(7), stack_layout(3));
+    }
+}
+
+#[cfg(test)]
+mod action_dispatch_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn counting(flag: &Rc<Cell<bool>>) -> Rc<dyn Fn()> {
+        let flag = flag.clone();
+        Rc::new(move || flag.set(true))
+    }
+
+    #[test]
+    fn registered_keys_fire_and_unknown_keys_do_not() {
+        let mut dispatch = ActionDispatch::default();
+        let fired = Rc::new(Cell::new(false));
+        dispatch.register(7, "delay", counting(&fired));
+        // Denied: unknown key on a known notice never fires.
+        assert!(!dispatch.dispatch(7, "snooze"));
+        assert!(!fired.get());
+        // Denied: unknown notice never fires.
+        assert!(!dispatch.dispatch(8, "delay"));
+        assert!(!fired.get());
+        // Registered pair fires exactly.
+        assert!(dispatch.dispatch(7, "delay"));
+        assert!(fired.get());
+    }
+
+    #[test]
+    fn dropped_notices_stop_firing_like_closed_ones() {
+        let mut dispatch = ActionDispatch::default();
+        let fired = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&fired));
+        dispatch.drop_notice(7);
+        assert!(!dispatch.dispatch(7, "take"));
+        assert!(!fired.get());
+    }
+
+    #[test]
+    fn replacement_forgets_the_old_resident_only() {
+        let mut dispatch = ActionDispatch::default();
+        let old = Rc::new(Cell::new(false));
+        let new = Rc::new(Cell::new(false));
+        dispatch.register(7, "skip", counting(&old));
+        dispatch.register(9, "skip", counting(&new));
+        dispatch.drop_notice(7);
+        assert!(!dispatch.dispatch(7, "skip"));
+        assert!(dispatch.dispatch(9, "skip"));
+        assert!(!old.get());
+        assert!(new.get());
+    }
+
+    #[test]
+    fn reregistering_replaces_the_handler() {
+        let mut dispatch = ActionDispatch::default();
+        let first = Rc::new(Cell::new(false));
+        let second = Rc::new(Cell::new(false));
+        dispatch.register(7, "delay", counting(&first));
+        dispatch.register(7, "delay", counting(&second));
+        assert!(dispatch.dispatch(7, "delay"));
+        assert!(!first.get());
+        assert!(second.get());
     }
 }
 
