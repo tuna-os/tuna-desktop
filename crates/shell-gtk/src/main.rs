@@ -38,6 +38,7 @@ mod overview;
 mod polkit;
 mod power;
 mod preview_chrome;
+mod printers;
 mod providers;
 mod screencast;
 mod screensaver;
@@ -767,6 +768,39 @@ fn quick_settings_popover(
     });
     let bluetooth = qs_menu_tile("bluetooth-active-symbolic", "Bluetooth", None, &bt_menu_ui);
     bt_menu.set_tile(bluetooth.clone());
+    // Printers (#362 P-ST-10): the live CUPS queue. The tile's
+    // subtitle tracks the print service; its menu hosts the panel,
+    // refreshed whenever the menu opens.
+    let printers_menu_ui = QsMenu::new("printer-symbolic", "Printers");
+    let printers_panel = printers::PrintersPanel::new();
+    printers_menu_ui.list().append(&printers_panel.widget());
+    printers_menu_ui.separator();
+    let (print_settings, _) = printers_menu_ui.item(None, "Print Settings");
+    print_settings.connect_clicked(|_| printers::open_printers_settings());
+    let printers_tile = qs_menu_tile("printer-symbolic", "Printers", None, &printers_menu_ui);
+    printers::watch_tile(printers_tile.clone());
+    {
+        let panel = printers_panel.clone();
+        printers_menu_ui.revealer.connect_visible_notify(move |r| {
+            if r.is_visible() {
+                panel.refresh();
+            }
+        });
+    }
+    // The toggle mirrors the menu: printers have no on/off, so the
+    // toggle opens the queue instead. Both directions are idempotent
+    // (GTK emits no notify when the value is unchanged), so the two
+    // handlers cannot ping-pong.
+    printers_tile.on_user_toggle({
+        let revealer = printers_menu_ui.revealer.clone();
+        move |on| revealer.set_visible(on)
+    });
+    {
+        let button = printers_tile.button.clone();
+        printers_menu_ui
+            .revealer
+            .connect_visible_notify(move |r| button.set_active(r.is_visible()));
+    }
     let power_menu_ui = QsMenu::new("power-profile-balanced-symbolic", "Power Mode");
     let power_items: Vec<(&'static str, gtk::Button, gtk::Image)> = [
         ("performance", "Performance"),
@@ -798,6 +832,7 @@ fn quick_settings_popover(
     grid.add(&wifi, Some(&wifi_menu_ui));
     grid.add(&wired, Some(&wired_menu_ui));
     grid.add(&bluetooth, Some(&bt_menu_ui));
+    grid.add(&printers_tile, Some(&printers_menu_ui));
     grid.add(&power_mode, Some(&power_menu_ui));
     for tile in [&night, &dark, &dnd_tile] {
         grid.add(tile, None);
@@ -865,6 +900,26 @@ fn quick_settings_popover(
     ] {
         let popover = popover.clone();
         settings.connect_clicked(move |_| popover.popdown());
+    }
+    // The printers menu dims and resets like the other toggle menus;
+    // kept as its own block so the printers wiring stays additive.
+    {
+        let popover = popover.clone();
+        printers_menu_ui
+            .revealer
+            .connect_visible_notify(move |menu| {
+                if menu.is_visible() {
+                    popover.add_css_class("dimmed");
+                } else {
+                    popover.remove_css_class("dimmed");
+                }
+            });
+        let menu = printers_menu_ui.revealer.clone();
+        popover.connect_closed(move |_| menu.set_visible(false));
+    }
+    {
+        let popover = popover.clone();
+        print_settings.connect_clicked(move |_| popover.popdown());
     }
     let dnd = dnd_tile.button.clone();
 

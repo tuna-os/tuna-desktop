@@ -51,6 +51,9 @@
 #   G-QS-WIFI        the Wi-Fi tile turns NetworkManager's radio off
 #   G-QS-BT-MENU     the Bluetooth menu lists paired devices as GNOME does
 #                    and connects one
+#   G-QS-PRINTERS    the Printers menu lists the CUPS stub's printers with
+#                    GNOME's rows and actions; Cancel and Test Page reach it
+#   G-QS-PRINTERS-ABSENT with no print server the menu says so (no hang)
 #   G-QS-BLUETOOTH   the Bluetooth tile powers the BlueZ adapter off
 #   G-QS-POWER       the Power Mode tile switches to power saver
 #   G-QS-DARK        the Dark Style tile writes GNOME's color-scheme key
@@ -300,6 +303,7 @@ TRAY_PID=""
 OWNED_XVFB=""
 COMPOSITOR_PID=""
 STUBS_PID=""
+CUPS_STUB_PID=""
 SYSBUS_PID=""
 ACCEL_PID=""
 CAL_PID=""
@@ -339,6 +343,7 @@ cleanup() {
     fi
     if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
     if [ -n "$STUBS_PID" ]; then kill "$STUBS_PID" 2>/dev/null || true; fi
+    if [ -n "$CUPS_STUB_PID" ]; then kill "$CUPS_STUB_PID" 2>/dev/null || true; fi
     if [ -n "$PROVIDER_PID" ]; then kill "$PROVIDER_PID" 2>/dev/null || true; fi
     if [ -n "$TRAY_PID" ]; then kill "$TRAY_PID" 2>/dev/null || true; fi
     # shellcheck disable=SC2086
@@ -669,6 +674,18 @@ EVENTS
     >"$ARTIFACTS/calendar-server.log" 2>&1 &
 CAL_PID=$!
 for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/calendar-server.log" 2>/dev/null && break; sleep 0.5; done
+# The printers menu talks CUPS here (G-QS-PRINTERS); the stub records
+# every operation the shell sends it, like the NM/BlueZ stub logs.
+TUNA_STUB_CUPS_LOG="$ARTIFACTS/cups-calls"
+export TUNA_STUB_CUPS_LOG
+"$PY" "$ROOT/scripts/lib/tuna-cups-stub.py" "$TUNA_STUB_CUPS_LOG" \
+    >"$ARTIFACTS/cups-stub.log" 2>&1 &
+CUPS_STUB_PID=$!
+for _ in $(seq 1 20); do grep -q "^ready port=" "$ARTIFACTS/cups-stub.log" 2>/dev/null && break; sleep 0.5; done
+grep -q "^ready port=" "$ARTIFACTS/cups-stub.log" 2>/dev/null ||
+    fail G-QS-PRINTERS "the CUPS stub did not start"
+CUPS_SERVER="127.0.0.1:$(sed -n 's/^ready port=//p' "$ARTIFACTS/cups-stub.log" | head -1)"
+export CUPS_SERVER
 
 # The full power menu needs a hardware session; logind is the stub.
 TUNA_SESSION_KIND=hardware
@@ -2296,6 +2313,77 @@ open_qs
 showing "$ARTIFACTS/a11y-qs-bt-two.json" "2 Connected" ||
     fail G-QS-BT-MENU "the tile does not count two connected devices"
 pass G-QS-BT-MENU "the Bluetooth menu lists paired devices as GNOME does and connects one"
+
+# Printers (#362 P-ST-10): the CUPS stub's printers list with GNOME's
+# rows (model, location, address, status, ink), the stopped printer's
+# error banner and Restart, the active job with Cancel, and the Test
+# Page, Clean Print Heads, Use Printer by Default, Clear All and Remove
+# Printer actions. The stub's call log proves live discovery: the rows
+# come from its CUPS-Get-Printers and Get-Jobs answers.
+qs_press "Printers Menu" printers-menu || fail G-QS-PRINTERS "could not open the Printers menu"
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-printers-menu.json" 20 ||
+    fail G-QS-PRINTERS "accessibility dump failed"
+scrot "$ARTIFACTS/15d-printers-menu.png" >/dev/null
+grep -q "^CUPS-Get-Printers" "$TUNA_STUB_CUPS_LOG" ||
+    fail G-QS-PRINTERS "opening the menu did not query CUPS for printers"
+grep -q "^Get-Jobs" "$TUNA_STUB_CUPS_LOG" ||
+    fail G-QS-PRINTERS "opening the menu did not query CUPS for jobs"
+for name in "OfficeJet Pro (Default)" "LabelPrinter" "HP OfficeJet Pro 9020" "Front Office" \
+    "usb://HP/OfficeJet%20Pro?serial=CN123" "Black 80%, Cyan 60%, Magenta 55%, Yellow 40%" \
+    "Restart" "Quarterly Report — proof-user — Printing" \
+    "Test Page" "Clean Print Heads" "Use Printer by Default" "Clear All" "Remove Printer" \
+    "No Active Printer Jobs" "Print Settings" "Add Printer…" "Refresh" "1 Job"; do
+    showing "$ARTIFACTS/a11y-qs-printers-menu.json" "$name" ||
+        fail G-QS-PRINTERS "no '$name' in the Printers menu"
+done
+# The stopped printer's banner carries GNOME's restart advice.
+jq -e 'any(.[]; .showing and (.name | contains("Out of paper")))' \
+    "$ARTIFACTS/a11y-qs-printers-menu.json" >/dev/null ||
+    fail G-QS-PRINTERS "no Out of paper banner on the stopped printer"
+qs_press "Cancel" printers-cancel || fail G-QS-PRINTERS "could not press Cancel"
+for _ in $(seq 1 20); do grep -q "^Cancel-Job id=42" "$TUNA_STUB_CUPS_LOG" 2>/dev/null && break; sleep 0.5; done
+grep -q "^Cancel-Job id=42" "$TUNA_STUB_CUPS_LOG" ||
+    fail G-QS-PRINTERS "Cancel did not reach CUPS as Cancel-Job 42"
+qs_press "Test Page" printers-test || fail G-QS-PRINTERS "could not press Test Page"
+for _ in $(seq 1 20); do grep -q "^Print-Job" "$TUNA_STUB_CUPS_LOG" 2>/dev/null && break; sleep 0.5; done
+grep -q "^Print-Job" "$TUNA_STUB_CUPS_LOG" ||
+    fail G-QS-PRINTERS "Test Page did not reach CUPS as Print-Job"
+pass G-QS-PRINTERS "the Printers menu lists the print server's printers and jobs, and Cancel and Test Page reach it"
+sleep 1
+xdotool key Escape
+sleep 1
+
+# With the print server gone the menu says "No Print Service" (tile and
+# panel agree) instead of hanging or showing stale printers.
+kill "$CUPS_STUB_PID" 2>/dev/null || true
+CUPS_STUB_PID=""
+sleep 1
+open_qs
+qs_press "Printers Menu" printers-absent || fail G-QS-PRINTERS-ABSENT "could not open the Printers menu"
+sleep 2
+absent_ok=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-printers-absent.json" 20 ||
+        fail G-QS-PRINTERS-ABSENT "accessibility dump failed (shell hung?)"
+    # The panel placeholder and the tile subtitle both say it.
+    if [ "$(jq '[.[] | select(.showing and .name == "No Print Service")] | length' \
+        "$ARTIFACTS/a11y-qs-printers-absent.json")" -ge 2 ]; then
+        absent_ok=1
+        break
+    fi
+    sleep 1
+done
+scrot "$ARTIFACTS/15e-printers-absent.png" >/dev/null
+[ -n "$absent_ok" ] || fail G-QS-PRINTERS-ABSENT "tile and menu do not both say No Print Service"
+if showing "$ARTIFACTS/a11y-qs-printers-absent.json" "OfficeJet Pro (Default)"; then
+    fail G-QS-PRINTERS-ABSENT "stale printers still listed with the server gone"
+fi
+pass G-QS-PRINTERS-ABSENT "without a print server the Printers tile and menu honestly say No Print Service"
+sleep 1
+xdotool key Escape
+sleep 1
+open_qs
 
 # GNOME's sound output menu: both outputs, the default checked; picking
 # one makes it the default.
