@@ -51,6 +51,10 @@ jobs:
       - run: python3 scripts/lib/tuna-fade-match-tests.py
       - run: python3 scripts/lib/gtk-privacy-portal-proof-tests.py
       - run: scripts/tuna-settings-inventory-check
+      - name: Verify bundled cursor assets and rejection checks
+        run: |
+          scripts/tuna-cursor-assets-check share/tuna-desktop/icons/Adwaita
+          python3 scripts/lib/cursor-assets-tests.py
       - run: cargo fmt --all -- --check
       - name: Check bounded EIS transport regression tests
         run: |
@@ -313,6 +317,8 @@ jobs:
           scripts/tuna-gtk-accessibility-proof gtk-shell-artifacts/a11y/bin/gtk-tests "$(git rev-parse HEAD)" gtk-shell-artifacts/a11y
       # pam_wrapper backs G-UNLOCK, IBus G-IME and wayland-utils
       # G-WAYLAND-INFO; all required so no stage can silently skip.
+      - run: python3 scripts/lib/cursor-proof-theme-tests.py
+      - run: python3 scripts/lib/cursor-pixels-tests.py
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"

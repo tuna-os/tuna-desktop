@@ -4155,6 +4155,7 @@ dependencies = [
  "png",
  "rand 0.10.3",
  "reis",
+ "resvg",
  "roxmltree",
  "rustix 1.1.5",
  "serde",
@@ -4171,6 +4172,7 @@ dependencies = [
  "wayland-protocols-wlr",
  "wayland-scanner",
  "wayland-server",
+ "xcursor",
  "zbus",
 ]
 

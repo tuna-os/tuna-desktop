@@ -15,6 +15,8 @@ mod protocol_version_tests {
         assert!(ProtocolVersion::new(0, 29).is_compatible_with(&CURRENT_VERSION));
         assert!(ProtocolVersion::new(0, 30).is_compatible_with(&CURRENT_VERSION));
         assert!(ProtocolVersion::new(0, 31).is_compatible_with(&CURRENT_VERSION));
+        assert!(ProtocolVersion::new(0, 32).is_compatible_with(&CURRENT_VERSION));
+        assert!(ProtocolVersion::new(0, 33).is_compatible_with(&CURRENT_VERSION));
         assert!(!ProtocolVersion::new(0, CURRENT_VERSION.minor + 1)
             .is_compatible_with(&CURRENT_VERSION));
     }

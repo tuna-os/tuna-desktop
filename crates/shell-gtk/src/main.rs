@@ -2352,6 +2352,11 @@ fn build(app: &adw::Application) {
                 );
                 if let Some(iface) = all[4].as_ref() {
                     out.hot_corners = iface.boolean("enable-hot-corners");
+                    // GNOME's cursor and locate-pointer keys (#342): the
+                    // compositor draws its own cursors from them.
+                    out.cursor_theme = iface.string("cursor-theme").to_string();
+                    out.cursor_size = u32::try_from(iface.int("cursor-size")).unwrap_or(0);
+                    out.locate_pointer = iface.boolean("locate-pointer");
                 }
                 out.right_to_left = gtk::Widget::default_direction() == gtk::TextDirection::Rtl;
                 out.motion = motion::from_settings(all[4].as_ref(), all[5].as_ref());
@@ -2365,6 +2370,10 @@ fn build(app: &adw::Application) {
                 }
                 if let Some(mutter) = all[8].as_ref() {
                     if let Some(schema) = mutter.settings_schema() {
+                        if schema.has_key("locate-pointer-key") {
+                            out.locate_pointer_key =
+                                mutter.string("locate-pointer-key").to_string();
+                        }
                         if schema.has_key("dynamic-workspaces") {
                             out.workspace_policy.dynamic = mutter.boolean("dynamic-workspaces");
                         }

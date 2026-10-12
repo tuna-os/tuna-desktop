@@ -162,6 +162,7 @@ impl ProtocolVersion {
     /// `0.30` appends live sound/bell and attached-modal brightness preferences.
     /// `0.31` appends workspace and edge-tiling preferences.
     /// `0.32` appends trusted dash icon targets for minimize/restore.
+    /// `0.33` appends cursor theme, size, locate-pointer and its keysym preference.
     /// `0.34` appends keyboard accessibility aids and toggle notifications.
     pub const CURRENT: Self = Self {
         major: 0,
@@ -868,6 +869,15 @@ pub struct InputSettings {
     /// UNION: this field addition needs the Wave2 minor version bump.
     #[serde(default)]
     pub orientation_lock: bool,
+    /// Cursor preferences appended in 0.33; both peers ship together.
+    #[serde(default)]
+    pub cursor_theme: String,
+    #[serde(default)]
+    pub cursor_size: u32,
+    #[serde(default)]
+    pub locate_pointer: bool,
+    #[serde(default = "default_locate_pointer_key")]
+    pub locate_pointer_key: String,
     /// GNOME keyboard accessibility input aids.
     #[serde(default)]
     pub keyboard_aids: KeyboardAids,
@@ -931,6 +941,10 @@ impl Default for KeyboardAids {
     }
 }
 
+fn default_locate_pointer_key() -> String {
+    "Control_L".into()
+}
+
 fn default_attach_modal_dialogs() -> bool {
     true
 }
@@ -964,6 +978,10 @@ impl Default for InputSettings {
             // GNOME default: convertibles auto-rotate out of the box.
             orientation_lock: false,
             keyboard_aids: KeyboardAids::default(),
+            cursor_theme: "Adwaita".into(),
+            cursor_size: 24,
+            locate_pointer: false,
+            locate_pointer_key: default_locate_pointer_key(),
         }
     }
 }
@@ -1310,6 +1328,8 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             check_title(&settings.xkb_layout)?;
             check_title(&settings.xkb_variant)?;
             check_title(&settings.xkb_options)?;
+            check_title(&settings.cursor_theme)?;
+            check_title(&settings.locate_pointer_key)?;
         }
         Message::Command {
             kind: CommandKind::SetWindowIconGeometries { geometries },
@@ -1581,6 +1601,62 @@ mod tests {
             "SetUnrecognizedIconGeometries"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn cursor_settings_survive_the_positional_control_wire() {
+        for (theme, size, locate_pointer) in [("Adwaita", 24, false), ("DMZ-White", 48, true)] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(InputSettings {
+                    cursor_theme: theme.into(),
+                    cursor_size: size,
+                    locate_pointer,
+                    right_to_left: true,
+                    ..InputSettings::default()
+                }),
+            });
+        }
+    }
+
+    #[test]
+    fn locate_key_defaults_roundtrips_and_bounds() {
+        assert_eq!(InputSettings::default().locate_pointer_key, "Control_L");
+        for name in ["Control_L", "Control_R", "Super_L", "", "NoSuchKeysym"] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(InputSettings {
+                    locate_pointer_key: name.into(),
+                    ..InputSettings::default()
+                }),
+            });
+        }
+        let frame = encode_frame(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(InputSettings {
+                locate_pointer_key: "x".repeat(MAX_TITLE_LEN + 1),
+                ..InputSettings::default()
+            }),
+        });
+        assert!(matches!(
+            decode_frame(&frame),
+            Err(DecodeError::TitleTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_cursor_theme_names_are_rejected() {
+        let frame = encode_frame(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(InputSettings {
+                cursor_theme: "x".repeat(MAX_TITLE_LEN + 1),
+                ..InputSettings::default()
+            }),
+        });
+        assert!(matches!(
+            decode_frame(&frame),
+            Err(DecodeError::TitleTooLong { .. })
+        ));
     }
 
     #[test]

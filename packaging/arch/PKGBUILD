@@ -110,6 +110,9 @@ package() {
         "$pkgdir/usr/share/xdg-desktop-portal/portals/tuna.portal"
     install -Dm0644 "$root/packaging/marlin/tuna-portals.conf" \
         "$pkgdir/usr/share/xdg-desktop-portal/tuna-portals.conf"
+    # Private GNOME51 scalable cursor fallback; no system Adwaita file conflicts.
+    install -d "$pkgdir/usr/share/tuna-desktop/icons"
+    cp -a "$root/share/tuna-desktop/icons/." "$pkgdir/usr/share/tuna-desktop/icons/"
     # Lock-screen PAM service (#62): unlock under GDM, where no greetd runs.
     install -Dm0644 "$root/share/pam.d/tuna-lock" "$pkgdir/etc/pam.d/tuna-lock"
     # One release of compatibility with the former name (#505): the old
