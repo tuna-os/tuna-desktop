@@ -5,6 +5,7 @@
 //! (control model `switcher_*`); this module only draws it.
 
 use std::cell::{Cell, RefCell};
+use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -148,6 +149,32 @@ fn clear(row: &gtk::Box) {
     }
 }
 
+/// Format the entire diagnostic before locking stderr. Each fade event
+/// must remain one short record, including its newline, when several
+/// processes share the proof log. Reject labels that could forge a second
+/// record; the production labels are fixed strings (popup-out, thumbnails-in and thumbnails-out).
+fn fade_record(name: &str, animated: Option<bool>) -> Option<String> {
+    if name.contains(['\n', '\r']) {
+        return None;
+    }
+    Some(match animated {
+        Some(enabled) => {
+            format!("tuna-shell-gtk: switcher fade {name} start animated={enabled}\n")
+        }
+        None => format!("tuna-shell-gtk: switcher fade {name} settled\n"),
+    })
+}
+
+fn log_fade(name: &str, animated: Option<bool>) {
+    let Some(record) = fade_record(name, animated) else {
+        return;
+    };
+    // write_all receives a contiguous buffer instead of emitting formatted
+    // fragments. These fixed short records fit within a pipe's PIPE_BUF.
+    // Diagnostics must not abort an animation if stderr is closed.
+    let _ = std::io::stderr().lock().write_all(record.as_bytes());
+}
+
 /// Ease `widget`'s opacity to `to` (instantly when the motion policy
 /// drops fades),
 /// then run `done`. A newer fade or [`stop`] on the same `generation`
@@ -166,12 +193,12 @@ fn fade(
     let duration = fade_ms(crate::motion::current());
     let enabled = duration > 0.0;
     if from != to {
-        eprintln!("tuna-shell-gtk: switcher fade {name} start animated={enabled}");
+        log_fade(name, Some(enabled));
     }
     if !enabled || from == to {
         widget.set_opacity(to);
         if from != to {
-            eprintln!("tuna-shell-gtk: switcher fade {name} settled");
+            log_fade(name, None);
         }
         done();
         return;
@@ -189,7 +216,7 @@ fn fade(
         if t < 1.0 {
             return gtk::glib::ControlFlow::Continue;
         }
-        eprintln!("tuna-shell-gtk: switcher fade {name} settled");
+        log_fade(name, None);
         if let Some(done) = done.take() {
             done();
         }
@@ -774,6 +801,36 @@ impl SwitcherUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fade_diagnostics_are_complete_single_line_records() {
+        for (animated, suffix) in [
+            (Some(true), "start animated=true"),
+            (Some(false), "start animated=false"),
+            (None, "settled"),
+        ] {
+            let record = fade_record("popup-out", animated).unwrap();
+            assert_eq!(
+                record.as_bytes(),
+                format!("tuna-shell-gtk: switcher fade popup-out {suffix}\n").as_bytes()
+            );
+            assert_eq!(record.bytes().filter(|byte| *byte == b'\n').count(), 1);
+            assert!(!record.contains('\r'));
+            assert!(record.len() < 512); // POSIX minimum PIPE_BUF.
+        }
+        assert_eq!(
+            fade_record("thumbnails-out", None).unwrap(),
+            "tuna-shell-gtk: switcher fade thumbnails-out settled\n"
+        );
+    }
+
+    #[test]
+    fn fade_diagnostics_reject_multiline_event_attribution() {
+        for name in ["popup\nstart animated=true", "popup\rsettled"] {
+            assert!(fade_record(name, Some(true)).is_none());
+            assert!(fade_record(name, None).is_none());
+        }
+    }
 
     /// `.item-box` and `.thumbnail-box` padding on each side.
     const ITEM_PAD: i32 = 6;
