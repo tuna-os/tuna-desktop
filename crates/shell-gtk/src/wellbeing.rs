@@ -1793,6 +1793,8 @@ impl MonoClock {
 pub type NoticeHook = Rc<dyn Fn(String, String)>;
 /// Show the break countdown OSD (label, 0..1 progress as due approaches).
 pub type CountdownHook = Rc<dyn Fn(String, f64)>;
+/// Hide only the OSD display still owned by this countdown.
+pub type CountdownHideHook = Rc<dyn Fn()>;
 /// Lock the session now.
 pub type LockHook = Rc<dyn Fn()>;
 /// Post a resident notice WITH invokable actions; returns the center id.
@@ -1853,6 +1855,7 @@ pub fn notice_action_buttons(
 pub struct ShellHooks {
     pub post_notice: NoticeHook,
     pub show_countdown: CountdownHook,
+    pub hide_countdown: CountdownHideHook,
     pub lock: LockHook,
     pub post_action_notice: ActionNoticeHook,
     pub dismiss_notice: DismissHook,
@@ -1989,6 +1992,7 @@ pub fn dispatch_break_ui(
             }
             BreakUiEvent::StopCountdown => {
                 *countdown = None;
+                (hooks.hide_countdown)();
             }
             BreakUiEvent::FadeScreen(on) => {
                 effect.fade = *on;
@@ -2797,6 +2801,7 @@ mod tests {
     struct Recorded {
         posts: Rc<RefCell<Vec<(String, String)>>>,
         countdowns: Rc<RefCell<Vec<(String, f64)>>>,
+        countdown_hides: Rc<Cell<u32>>,
         locks: Rc<Cell<u32>>,
         action_posts: Rc<RefCell<Vec<ActionPost>>>,
         next_id: Rc<Cell<u64>>,
@@ -2811,6 +2816,7 @@ mod tests {
     fn recording_hooks(recorded: &Recorded) -> ShellHooks {
         let posts = recorded.posts.clone();
         let countdowns = recorded.countdowns.clone();
+        let countdown_hides = recorded.countdown_hides.clone();
         let locks = recorded.locks.clone();
         let action_posts = recorded.action_posts.clone();
         let next_id = recorded.next_id.clone();
@@ -2826,6 +2832,9 @@ mod tests {
             }),
             show_countdown: Rc::new(move |label, progress| {
                 countdowns.borrow_mut().push((label, progress));
+            }),
+            hide_countdown: Rc::new(move || {
+                countdown_hides.set(countdown_hides.get() + 1);
             }),
             lock: Rc::new(move || {
                 locks.set(locks.get() + 1);
@@ -2871,6 +2880,7 @@ mod tests {
         let hooks = Recorded {
             posts: Rc::new(RefCell::new(Vec::new())),
             countdowns: Rc::new(RefCell::new(Vec::new())),
+            countdown_hides: Rc::new(Cell::new(0)),
             locks: Rc::new(Cell::new(0)),
             action_posts: Rc::new(RefCell::new(Vec::new())),
             next_id: Rc::new(Cell::new(40)),
@@ -2999,6 +3009,7 @@ mod tests {
         assert!(!effect.grayscale && !effect.fade);
         assert_eq!(countdown, None);
         assert_eq!(seen.locks.get(), 1);
+        assert_eq!(seen.countdown_hides.get(), 1);
         // Dismissal dismisses the resident banner, drops its callbacks and
         // clears the resident; history keeps the entry, posts stay empty.
         assert_eq!(seen.dismissals.borrow().as_slice(), &[41]);
@@ -3007,6 +3018,24 @@ mod tests {
         assert!(seen.callbacks.borrow().is_empty());
         assert!(seen.posts.borrow().is_empty());
         assert_eq!(seen.action_posts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn stop_countdown_dispatches_hide_even_when_state_already_empty() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        let mut resident = None;
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::StopCountdown, BreakUiEvent::StopCountdown],
+        );
+        assert_eq!(countdown, None);
+        assert_eq!(seen.countdown_hides.get(), 2);
+        assert!(seen.countdowns.borrow().is_empty());
     }
 
     #[test]

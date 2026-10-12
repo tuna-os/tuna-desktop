@@ -1799,7 +1799,7 @@ fn build(app: &adw::Application) {
     #[cfg(not(test))]
     {
         let notices = notify.clone();
-        let countdown_osd = osd_ui.clone();
+        let (show_countdown, hide_countdown) = osd_ui.countdown_hooks();
         let lock_shell = shell.clone();
         let effect_shell = shell.clone();
         let action_notices = notify.clone();
@@ -1852,15 +1852,8 @@ fn build(app: &adw::Application) {
                         false
                     }
                 }),
-                show_countdown: Rc::new(move |label: String, progress: f64| {
-                    eprintln!("tuna-shell-gtk: wellbeing: countdown {label}");
-                    countdown_osd.show(&osd::OsdRequest {
-                        icon: Some("alarm-symbolic".into()),
-                        label: Some(label),
-                        level: Some(progress.clamp(0.0, 1.0)),
-                        max_level: Some(1.0),
-                    });
-                }),
+                show_countdown,
+                hide_countdown,
                 lock: Rc::new(move || {
                     if let Some(control) = lock_shell.borrow_mut().control.as_mut() {
                         if let Err(e) = control.lock() {
