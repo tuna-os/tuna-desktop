@@ -2095,8 +2095,11 @@ fn break_tick(rt: &Rc<RefCell<Runtime>>) {
         let mut events = r.breaks.poll(now, idle_secs);
         // Queued notice actions apply here, on the tick — never inside a
         // hook — so the model mutates under exactly one borrow and a
-        // banner press lands within one 2 s tick.
-        for kind in r.actions.borrow_mut().drain(..) {
+        // banner press lands within one 2 s tick. Drained into a local
+        // first: holding the queue borrow across model calls would
+        // alias it with the service borrow.
+        let queued: Vec<BreakActionKind> = r.actions.borrow_mut().drain(..).collect();
+        for kind in queued {
             events.extend(match kind {
                 BreakActionKind::Take => r.breaks.take_break(),
                 BreakActionKind::Delay => r.breaks.delay_break(now),
@@ -2840,10 +2843,13 @@ mod tests {
                 registered.borrow_mut().push((id, key.clone()));
                 callbacks.borrow_mut().insert((id, key), handler);
             }),
-            drop_notice_actions: Rc::new(move |id| {
-                dropped.borrow_mut().push(id);
-                callbacks.borrow_mut().retain(|(known, _), _| *known != id);
-            }),
+            drop_notice_actions: {
+                let callbacks = callbacks.clone();
+                Rc::new(move |id| {
+                    dropped.borrow_mut().push(id);
+                    callbacks.borrow_mut().retain(|(known, _), _| *known != id);
+                })
+            },
             break_action: Rc::new(move |kind| {
                 queued.borrow_mut().push(kind);
             }),
