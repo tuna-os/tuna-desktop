@@ -25,7 +25,6 @@ ARG PERF_PINNED_BASELINE=false
 ARG TUNA_PKG_SHA256
 COPY ${TUNA_PKG} /tmp/tuna.pkg.tar.zst
 COPY packaging/marlin/tuna-nested-preview.desktop /tmp/tuna-nested-preview.desktop
-COPY packaging/marlin/tuna-portals.conf /usr/share/xdg-desktop-portal/tuna-portals.conf
 COPY --chmod=0755 packaging/marlin/tuna-image-kernels /usr/libexec/tuna-image-kernels
 COPY --chmod=0755 packaging/marlin/tuna-pinned-baseline /usr/libexec/tuna-pinned-baseline
 
@@ -71,6 +70,9 @@ RUN set -eux; \
     && ! grep -q 'not found' /tmp/tuna-calendar.ldd \
     && rm -f /tmp/tuna-calendar.ldd \
     && test -f /usr/share/xdg-desktop-portal/tuna-portals.conf \
+    && test "$(pacman -Qqo /usr/share/xdg-desktop-portal/tuna-portals.conf)" = tuna-desktop \
+    && test "$(pacman -Qqo /usr/share/xdg-desktop-portal/portals/tuna.portal)" = tuna-desktop \
+    && grep -qx 'org.freedesktop.impl.portal.Lockdown=tuna;' /usr/share/xdg-desktop-portal/tuna-portals.conf \
     && if test "$PERF_PINNED_BASELINE" = true; then \
         pacman -Q > /tmp/tuna-preview-packages-unsorted.txt; \
         LC_ALL=C sort /tmp/tuna-preview-packages-unsorted.txt > /tmp/tuna-preview-packages.txt; \

@@ -72,8 +72,8 @@ absent/refused), plus the `PrivacyPolicy` snapshot,
 `refresh_privacy`, and per-key writers. Unknown or absent values
 keep the snapshot, like every other setting here.
 
-Portal leg (`crates/shell-host/src/lockdown.rs`, served by the
-panel on its slow tick): Tuna publishes the standard Lockdown
+Portal leg (`crates/shell-host/src/lockdown.rs`, started by
+`crates/shell-gtk/src/privacy_portal.rs` in the GTK application): Tuna publishes the standard Lockdown
 interface itself at `/org/freedesktop/portal/desktop` under
 `org.freedesktop.impl.portal.desktop.tuna`, synced from the same
 GSettings keys, with `PropertiesChanged` on every move — the same
@@ -83,6 +83,23 @@ GNOME's backend installed. A fail-closed Access dialog
 (response 1, cancelled) rides the same object so Camera exports;
 a prompting UI stays with the desktop backend. Bus-originated
 property sets persist back to GSettings on the next poll.
+
+The GTK publisher runs on a worker with its own GLib context, reads persisted
+policy before acquiring the backend name, and refreshes every 100 ms. Arch,
+DEB, and Marlin install the same `tuna.portal` metadata and desktop mapping:
+Lockdown resolves to Tuna; prompting Access remains GTK. This publication
+runs in the actual GTK shell, independently of the legacy shell-host panel.
+
+`G-PRIVACY-PORTAL` in the GTK CI proof verifies the bus owner is the actual
+GTK executable, a camera-disabled setting persisted before startup is
+observed, and a real portal frontend admits request handles while allowed,
+denies with its exact lockdown error while disabled, and readmits after
+restore. Its isolated Access-only fixture cancels dialogs through Tuna's
+fail-closed Access implementation; it preserves shipped Lockdown selection.
+Timeout, absent interface, generic denial, and malformed reply are failures.
+This checks the software camera gate; it does not grant camera permissions
+or qualify camera hardware. The receipt records the publisher executable
+hash, shipped metadata hashes, fixture override, and observed transitions.
 
 Graph leg (`crates/shell-gtk/src/privacy.rs`,
 `audio_state.rs::privacy_scan`, wired into the `pw-dump --monitor`
