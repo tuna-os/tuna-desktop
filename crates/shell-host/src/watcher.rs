@@ -27,6 +27,9 @@ pub const FALLBACK_ITEM_PATH: &str = "/StatusNotifierItem";
 /// Fallback menu path is per-item; empty means no menu.
 pub const INDICATOR_CELL: i32 = 28;
 
+/// Wire shape of the item `ToolTip` property: `(sa(iiay)ss)`.
+type WireToolTip = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
+
 /// One dbusmenu row, flattened one level (submenus arrive as their
 /// parent row; nesting deeper is later work).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,7 +578,7 @@ impl WatcherBus {
         let attention_pixmap: Vec<(i32, i32, Vec<u8>)> =
             item.get_property("AttentionIconPixmap").unwrap_or_default();
         let (tooltip_title, tooltip_body): (String, String) = item
-            .get_property::<(String, Vec<(i32, i32, Vec<u8>)>, String, String)>("ToolTip")
+            .get_property::<WireToolTip>("ToolTip")
             .ok()
             .map(|(_, _, title, body)| (title, body))
             .unwrap_or_default();
@@ -1158,8 +1161,8 @@ mod tests {
 
         use super::layout_fixture;
         use super::{
-            argb_to_shm, IndicatorIcon, IndicatorItem, MenuEntry, WatcherBus, FALLBACK_ITEM_PATH,
-            WATCHER_NAME, WATCHER_PATH,
+            argb_to_shm, IndicatorIcon, IndicatorItem, MenuEntry, WatcherBus, WireToolTip,
+            FALLBACK_ITEM_PATH, WATCHER_NAME, WATCHER_PATH,
         };
 
         const STUB_NAME: &str = "org.test.TunaIndicatorStub";
@@ -1199,7 +1202,7 @@ mod tests {
             }
 
             #[zbus(property)]
-            fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
+            fn tool_tip(&self) -> WireToolTip {
                 (
                     String::new(),
                     Vec::new(),
@@ -1512,13 +1515,13 @@ mod tests {
             let start = std::time::Instant::now();
             let mut live = vec![service.clone()];
             while !live.is_empty() && start.elapsed() < Duration::from_secs(20) {
-                live = bus.prune_vanished(&[service.clone()]);
+                live = bus.prune_vanished(std::slice::from_ref(&service));
                 if !live.is_empty() {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
             assert!(live.is_empty(), "released name prunes from the host");
-            bus.forget(&[service.clone()]);
+            bus.forget(std::slice::from_ref(&service));
             assert!(
                 bus.registered().is_empty(),
                 "forgotten service leaves an empty host"
