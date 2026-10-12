@@ -578,9 +578,6 @@ pub fn snapshot_element(
         smithay::backend::renderer::gles::GlesTexture,
     >,
 > {
-    use smithay::backend::renderer::element::texture::TextureRenderElement;
-    use smithay::backend::renderer::element::Kind;
-    use smithay::backend::renderer::{Renderer, Texture};
     if frame.snapshot_alpha <= 0.0 {
         return None;
     }
@@ -591,6 +588,34 @@ pub fn snapshot_element(
     if w <= 0 || h <= 0 {
         return None;
     }
+    snapshot_element_in_rect(
+        renderer,
+        snapshot,
+        frame.snapshot_alpha,
+        Rectangle::new(start, (w, h).into()),
+    )
+}
+
+/// Draw an already quantized physical destination. Lifecycle actors use the
+/// same origin/size rounding as their live RescaleRenderElement predecessor.
+pub fn snapshot_element_in_rect(
+    renderer: &smithay::backend::renderer::gles::GlesRenderer,
+    snapshot: &Snapshot,
+    alpha: f32,
+    destination: Rectangle<i32, smithay::utils::Physical>,
+) -> Option<
+    smithay::backend::renderer::element::texture::TextureRenderElement<
+        smithay::backend::renderer::gles::GlesTexture,
+    >,
+> {
+    use smithay::backend::renderer::element::texture::TextureRenderElement;
+    use smithay::backend::renderer::element::Kind;
+    use smithay::backend::renderer::{Renderer, Texture};
+    let start = destination.loc;
+    let (w, h) = (destination.size.w, destination.size.h);
+    if alpha <= 0.0 || w <= 0 || h <= 0 {
+        return None;
+    }
     Some(TextureRenderElement::from_static_texture(
         snapshot.id.clone(),
         renderer.context_id(),
@@ -598,7 +623,7 @@ pub fn snapshot_element(
         snapshot.texture.clone(),
         1,
         smithay::utils::Transform::Normal,
-        Some(frame.snapshot_alpha),
+        Some(alpha),
         // An implicit source rectangle follows the destination logical size
         // in Smithay, cropping a shrinking snapshot to its upper-left area.
         // Sample the entire imported texture while scaling its destination.

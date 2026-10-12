@@ -128,6 +128,23 @@ fn retained_geometry(normal: Rect, presentation: RectF, transformed: bool) -> Re
         normal.to_f64()
     }
 }
+fn live_snapshot_destination(
+    geometry: RectF,
+    source: smithay::utils::Size<i32, Logical>,
+    view: crate::runtime::View,
+) -> Rectangle<i32, smithay::utils::Physical> {
+    // Smithay RescaleRenderElement first rounds the unscaled surface at the
+    // output scale, then rounds its scaled SIZE independently of its origin.
+    // Rounding transformed endpoints instead adds a row at fractional origins.
+    let size = (
+        ((f64::from(source.w) * view.scale).round() * geometry.size.w / f64::from(source.w)).round()
+            as i32,
+        ((f64::from(source.h) * view.scale).round() * geometry.size.h / f64::from(source.h)).round()
+            as i32,
+    );
+    Rectangle::new(view.physical(geometry.loc.x, geometry.loc.y), size.into())
+}
+
 fn hidden_dead_actor(minimizing: bool, was_minimized: bool) -> bool {
     !minimizing && was_minimized
 }
@@ -195,6 +212,7 @@ pub struct Ghost {
     order: usize,
     parent: Option<u64>,
     geometry: RectF,
+    live_source_size: Option<smithay::utils::Size<i32, Logical>>,
     snapshot: Snapshot,
     pixels: u64,
     running: Running,
@@ -333,6 +351,14 @@ impl Lifecycle {
         } else {
             (rect_f(ghost.geometry, f), f.alpha)
         };
+        if let Some(source) = ghost.live_source_size {
+            return crate::size_change::snapshot_element_in_rect(
+                renderer,
+                &ghost.snapshot,
+                alpha,
+                live_snapshot_destination(geometry, source, view),
+            );
+        }
         crate::size_change::snapshot_element(
             renderer,
             &ghost.snapshot,
@@ -784,6 +810,7 @@ pub fn step_frame(
                     minimizing || old.restoring,
                 ),
                 pixels,
+                live_source_size: (minimizing || old.restoring).then_some(old.geometry.size),
                 snapshot: Snapshot {
                     texture,
                     id: smithay::backend::renderer::element::Id::new(),
@@ -896,6 +923,39 @@ mod tests {
     fn policy(level: MotionLevel) -> MotionPolicy {
         MotionPolicy::new(level, 1.0)
     }
+    #[test]
+    fn retained_restore_uses_live_size_rounding_not_endpoint_rounding() {
+        let weight = 2f64.powf(-2.5);
+        let geometry = Rectangle::new(
+            (390.0 * (1.0 - weight), 241.0 * (1.0 - weight)).into(),
+            (500.0 * (1.0 - weight), 350.0 * (1.0 - weight)).into(),
+        );
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let view = crate::runtime::View {
+                offset: (0, 0),
+                scale,
+            };
+            let dest = live_snapshot_destination(geometry, (500, 350).into(), view);
+            assert_eq!(dest.loc, view.physical(geometry.loc.x, geometry.loc.y));
+            assert_eq!(
+                dest.size.h,
+                ((350.0 * scale).round() * (1.0 - weight)).round() as i32
+            );
+            if scale == 1.0 {
+                assert_eq!(dest.size.h, 288);
+                let end = view.physical(
+                    geometry.loc.x + geometry.size.w,
+                    geometry.loc.y + geometry.size.h,
+                );
+                assert_eq!(
+                    end.y - dest.loc.y,
+                    289,
+                    "failed native capture added exactly one row"
+                );
+            }
+        }
+    }
+
     #[test]
     fn destroyed_restore_keeps_last_rendered_geometry_without_changing_normal_close() {
         let normal = Rect::new((100, 200).into(), (500, 350).into());
