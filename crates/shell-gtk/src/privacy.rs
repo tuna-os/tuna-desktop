@@ -62,6 +62,9 @@ impl Action {
 /// [`AudioState::privacy_scan`](crate::audio_state::AudioState::privacy_scan).
 #[derive(Debug, Default)]
 pub struct PrivacyScan {
+    /// A complete initial dump has established this monitor's graph baseline.
+    /// False during disconnect/restart and while that dump is partially read.
+    pub authoritative: bool,
     /// Audio nodes still present, even when their mute snapshot is stale.
     pub audio_present: BTreeSet<u64>,
     /// Nodes that must read muted right now.
@@ -119,6 +122,10 @@ impl Tracker {
     /// (restored, whether by us or another party, or gone from the
     /// graph) is forgotten silently.
     pub fn plan(&mut self, scan: &PrivacyScan) -> Vec<Action> {
+        if !scan.authoritative {
+            // Preserve ownership; callers must also leave queued work alone.
+            return Vec::new();
+        }
         let mut actions = Vec::new();
         for id in scan.mute_required.difference(&scan.muted_now) {
             actions.push(Action::SetMute {
@@ -380,6 +387,7 @@ mod tests {
 
     fn scan(mute_required: &[u64], destroy: &[u64], muted_now: &[u64]) -> PrivacyScan {
         PrivacyScan {
+            authoritative: true,
             audio_present: mute_required.iter().chain(muted_now).copied().collect(),
             mute_required: mute_required.iter().copied().collect(),
             destroy: destroy.to_vec(),
@@ -544,6 +552,7 @@ mod tests {
     fn policy_lift_before_mute_completion_keeps_serialized_restore() {
         fn lifted() -> PrivacyScan {
             PrivacyScan {
+                authoritative: true,
                 audio_present: BTreeSet::from([7]),
                 ..PrivacyScan::default()
             }
@@ -574,6 +583,7 @@ mod tests {
     fn failed_restore_after_policy_lift_retains_ownership() {
         fn lifted() -> PrivacyScan {
             PrivacyScan {
+                authoritative: true,
                 audio_present: BTreeSet::from([7]),
                 ..PrivacyScan::default()
             }
@@ -594,9 +604,56 @@ mod tests {
         let mut tracker = Tracker::default();
         tracker.plan(&scan(&[7], &[], &[]));
         tracker.dispatched(&mute(7));
-        assert!(tracker.plan(&PrivacyScan::default()).is_empty());
+        assert!(tracker
+            .plan(&PrivacyScan {
+                authoritative: true,
+                ..PrivacyScan::default()
+            })
+            .is_empty());
         assert!(tracker.tracked().is_empty());
         assert!(tracker.unsettled_mutes.is_empty());
+    }
+
+    #[test]
+    fn restarted_partial_monitor_preserves_restore_until_authoritative_dump() {
+        use crate::audio_state::AudioState;
+        use tuna_shell_host::settings::PrivacyPolicy;
+
+        let mut tracker = Tracker::default();
+        let mut queue = ActionQueue::default();
+        tracker.plan(&scan(&[7], &[], &[]));
+        tracker.dispatched(&mute(7));
+        tracker.completed(&mute(7), true);
+        queue.offer(vec![unmute(7)]);
+        // AudioUi::retry replaces the cache. A pending drain or settings
+        // callback during the two-second gap must not reconcile empty demand.
+        let mut graph = AudioState::default();
+        let policy = PrivacyPolicy::default();
+        let initial = graph.privacy_scan(&policy);
+        assert!(!initial.authoritative);
+        assert!(tracker.plan(&initial).is_empty());
+        assert_eq!(tracker.tracked(), &BTreeSet::from([7]));
+        assert_eq!(queue.len(), 1);
+        assert!(!graph.feed(b"[{\"id\":7,\"info\":").unwrap());
+        let partial = graph.privacy_scan(&policy);
+        assert!(!partial.authoritative);
+        assert!(tracker.plan(&partial).is_empty());
+        assert_eq!(tracker.tracked(), &BTreeSet::from([7]));
+        assert!(graph
+            .feed(
+                br#"{"props":{"media.class":"Audio/Source"},"params":{"Props":[{"mute":true}]}}}]"#
+            )
+            .unwrap());
+        let resumed = graph.privacy_scan(&policy);
+        assert!(resumed.authoritative);
+        assert_eq!(tracker.plan(&resumed), vec![unmute(7)]);
+        queue.offer(tracker.plan(&resumed));
+        assert_eq!(queue.take(1), vec![unmute(7)]);
+        // Only a complete authoritative empty baseline confirms disappearance.
+        let mut gone = AudioState::default();
+        assert!(gone.feed(b"[]").unwrap());
+        assert!(tracker.plan(&gone.privacy_scan(&policy)).is_empty());
+        assert!(tracker.tracked().is_empty());
     }
 
     #[test]
