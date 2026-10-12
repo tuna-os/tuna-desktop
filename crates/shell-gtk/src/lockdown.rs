@@ -103,6 +103,12 @@ pub struct EntryVisibility {
 }
 
 /// Shell-constrained action denied by policy, for UX copy.
+///
+/// Test-only until a shell surface renders denials inline (today's
+/// guards hide widgets or log to stderr): the unit suite pins the
+/// copy, and run-command/user-switch rows will construct their
+/// variants when they land.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellAction {
     /// Open the run-command dialog.
@@ -119,6 +125,7 @@ pub enum ShellAction {
     OpenHandler,
 }
 
+#[cfg(test)]
 impl ShellAction {
     /// Short denial message ("restricted by your administrator").
     pub fn denial(self) -> &'static str {
@@ -146,7 +153,8 @@ impl LockdownPolicy {
         }
     }
 
-    /// Nothing restricted.
+    /// Nothing restricted (test-only: asserted by the suites below).
+    #[cfg(test)]
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
@@ -251,6 +259,11 @@ pub fn apply_settings_visibility(visibility: &EntryVisibility, settings_button: 
 /// Apply visibility to the lock, log-out, and user-switch widgets.
 /// Callers pass the already-built rows; when `disable-log-out` hides
 /// the only nested row, the caller hides the menu itself.
+///
+/// Exercised by the integration target (the binary wires its own
+/// watcher around per-widget visibility); the allow keeps the
+/// binary's build quiet until the user-switch row lands.
+#[allow(dead_code)]
 pub fn apply_entry_visibility(
     visibility: &EntryVisibility,
     lock: &gtk::Widget,
