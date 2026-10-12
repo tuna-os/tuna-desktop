@@ -40,8 +40,8 @@ open until the gaps below close):
 
 Audit column: the 2026-10-12 visual audit's verdict per row
 (`Observed subset`, `No adequate capture`, `FAIL`, or
-`Transition clip required`). Tour frames whose title card reads "Roost
-on TunaOS Marlin" are labeled as observed and never presented as Tuna
+`Transition clip required`). Tour frames whose title cards still say Roost
+on TunaOS Marlin are labeled as observed and never presented as Tuna
 feature proof.
 
 A capture failure is reported as a capture failure. A still labeled

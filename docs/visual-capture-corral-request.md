@@ -160,6 +160,6 @@ behavior differs from nested (marked below).
 - `nonvisual` rows (P-SY-06, P-SY-09, P-A11Y-01 trees, P-A11Y-02,
   P-IN-04, P-IN-06, P-ST-11) are evidenced by consumer output and CI
   logs, not by frames.
-- Tour media: the "Roost on TunaOS Marlin" title card is a branding
-  refresh, not feature evidence; re-shoot release media after the
-  capture-state defects close.
+- Tour media: title cards that still say Roost on TunaOS Marlin need a
+  branding refresh, not feature-evidence treatment; re-shoot release
+  media after the capture-state defects close.
