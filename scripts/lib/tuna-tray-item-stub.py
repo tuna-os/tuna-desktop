@@ -21,6 +21,7 @@ XML = """
   <property name="IconPixmap" type="a(iiay)" access="read"/>
   <property name="AttentionIconName" type="s" access="read"/>
   <property name="AttentionIconPixmap" type="a(iiay)" access="read"/>
+  <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
   <property name="Menu" type="o" access="read"/>
   <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
  </interface>
@@ -44,6 +45,7 @@ PROPS = {
     "IconPixmap": GLib.Variant("a(iiay)", []),
     "AttentionIconName": GLib.Variant("s", ""),
     "AttentionIconPixmap": GLib.Variant("a(iiay)", []),
+    "ToolTip": GLib.Variant("(sa(iiay)ss)", ("", [], "Tray probe tip", "Menu opens on click")),
     "Menu": GLib.Variant("o", "/MenuBar"),
 }
 

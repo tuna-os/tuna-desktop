@@ -24,12 +24,15 @@ struct Item {
     icon_name: String,
     /// Largest pixmap as big-endian ARGB32 (`width`, `height`, bytes).
     pixmap: Option<(i32, i32, Vec<u8>)>,
+    /// Composed tooltip text, if the item sends any.
+    tooltip: Option<String>,
 }
 
 enum ToWorker {
     Menu(String),
     Fire(String, i32),
     Activate(String),
+    SecondaryActivate(String),
 }
 
 enum FromWorker {
@@ -56,6 +59,10 @@ fn worker(rx: mpsc::Receiver<ToWorker>, tx: mpsc::Sender<FromWorker>) {
             }
             Ok(ToWorker::Activate(service)) => {
                 bus.activate(&service);
+                continue;
+            }
+            Ok(ToWorker::SecondaryActivate(service)) => {
+                bus.secondary_activate(&service);
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -88,6 +95,7 @@ fn worker(rx: mpsc::Receiver<ToWorker>, tx: mpsc::Sender<FromWorker>) {
                     title: info.title.clone(),
                     icon_name: name,
                     pixmap: pick_pixmap(pixmaps),
+                    tooltip: model::tooltip_text(&info.tooltip_title, &info.tooltip_body),
                 }
             })
             .collect();
@@ -159,6 +167,17 @@ pub fn tray() -> gtk::Box {
                             item.title.as_str()
                         };
                         button.update_property(&[gtk::accessible::Property::Label(label)]);
+                        button.set_tooltip_text(item.tooltip.as_deref());
+                        // Alternate click activates the item's secondary action.
+                        let secondary_click = gtk::GestureClick::new();
+                        secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
+                        let (to_secondary, service_secondary) =
+                            (to_worker.clone(), item.service.clone());
+                        secondary_click.connect_pressed(move |_, _, _, _| {
+                            let _ = to_secondary
+                                .send(ToWorker::SecondaryActivate(service_secondary.clone()));
+                        });
+                        button.add_controller(secondary_click);
                         // Fresh rows each time the menu opens.
                         let (to, service) = (to_worker.clone(), item.service.clone());
                         popover.connect_show(move |_| {
@@ -374,6 +393,19 @@ pub mod model {
                 && self.pixmaps.is_empty()
                 && self.title.is_empty()
                 && self.body.is_empty()
+        }
+    }
+
+    /// Compose the tooltip text the panel shows for an item: `None`
+    /// when the item sends neither a title nor a body, the single
+    /// part alone, or title over body. The icon fields stay out:
+    /// GTK tooltips are text.
+    pub fn tooltip_text(title: &str, body: &str) -> Option<String> {
+        match (title.is_empty(), body.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(title.to_owned()),
+            (true, false) => Some(body.to_owned()),
+            (false, false) => Some(format!("{title}\n{body}")),
         }
     }
 
@@ -1258,6 +1290,17 @@ mod tests {
         assert_eq!(tooltip.body, "Body");
         assert!(!tooltip.is_empty());
         assert!(ToolTip::default().is_empty());
+    }
+
+    #[test]
+    fn tooltip_text_composes_title_and_body() {
+        assert_eq!(tooltip_text("", ""), None);
+        assert_eq!(tooltip_text("Title", ""), Some("Title".to_owned()));
+        assert_eq!(tooltip_text("", "Body"), Some("Body".to_owned()));
+        assert_eq!(
+            tooltip_text("Title", "Body"),
+            Some("Title\nBody".to_owned())
+        );
     }
 
     #[test]

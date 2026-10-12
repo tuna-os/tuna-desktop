@@ -87,6 +87,10 @@ pub struct ItemInfo {
     pub attention_name: String,
     /// Attention icon pixmaps.
     pub attention_pixmap: Vec<(i32, i32, Vec<u8>)>,
+    /// Tooltip title line (empty when the item sends none).
+    pub tooltip_title: String,
+    /// Tooltip body text (empty when the item sends none).
+    pub tooltip_body: String,
 }
 
 impl ItemInfo {
@@ -570,6 +574,11 @@ impl WatcherBus {
         let attention_name: String = item.get_property("AttentionIconName").unwrap_or_default();
         let attention_pixmap: Vec<(i32, i32, Vec<u8>)> =
             item.get_property("AttentionIconPixmap").unwrap_or_default();
+        let (tooltip_title, tooltip_body): (String, String) = item
+            .get_property::<(String, Vec<(i32, i32, Vec<u8>)>, String, String)>("ToolTip")
+            .ok()
+            .map(|(_, _, title, body)| (title, body))
+            .unwrap_or_default();
         Some(ItemInfo {
             service: service.to_owned(),
             title,
@@ -578,6 +587,8 @@ impl WatcherBus {
             icon_pixmap,
             attention_name,
             attention_pixmap,
+            tooltip_title,
+            tooltip_body,
         })
     }
 
@@ -667,6 +678,24 @@ impl WatcherBus {
             return false;
         };
         item.call::<&str, _, ()>("Activate", &(0i32, 0i32)).is_ok()
+    }
+
+    /// Send `SecondaryActivate` to an item (alternate click).
+    pub fn secondary_activate(&self, service: &str) -> bool {
+        let Some(conn) = self.conn.as_ref() else {
+            return false;
+        };
+        let (bus, path) = split_service(service);
+        let Ok(item) = zbus::blocking::Proxy::new(
+            conn,
+            bus.as_str(),
+            path.as_str(),
+            "org.kde.StatusNotifierItem",
+        ) else {
+            return false;
+        };
+        item.call::<&str, _, ()>("SecondaryActivate", &(0i32, 0i32))
+            .is_ok()
     }
 
     /// Send a dbusmenu `Event` for a row press.
@@ -846,6 +875,8 @@ mod tests {
             icon_pixmap: Vec::new(),
             attention_name: String::new(),
             attention_pixmap: Vec::new(),
+            tooltip_title: String::new(),
+            tooltip_body: String::new(),
         }
     }
 
@@ -1128,6 +1159,7 @@ mod tests {
         use super::layout_fixture;
         use super::{
             argb_to_shm, IndicatorIcon, IndicatorItem, MenuEntry, WatcherBus, FALLBACK_ITEM_PATH,
+            WATCHER_NAME, WATCHER_PATH,
         };
 
         const STUB_NAME: &str = "org.test.TunaIndicatorStub";
@@ -1145,6 +1177,8 @@ mod tests {
 
         struct StubItem {
             activated: Arc<AtomicBool>,
+            secondary: Arc<AtomicBool>,
+            icon_name: Arc<Mutex<String>>,
         }
 
         #[zbus::interface(name = "org.kde.StatusNotifierItem")]
@@ -1161,7 +1195,17 @@ mod tests {
 
             #[zbus(property)]
             fn icon_name(&self) -> String {
-                String::new()
+                self.icon_name.lock().expect("test lock").clone()
+            }
+
+            #[zbus(property)]
+            fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
+                (
+                    String::new(),
+                    Vec::new(),
+                    "Stub tip".to_owned(),
+                    "Stub body".to_owned(),
+                )
             }
 
             #[zbus(property)]
@@ -1187,6 +1231,10 @@ mod tests {
 
             fn activate(&self, _x: i32, _y: i32) {
                 self.activated.store(true, Ordering::SeqCst);
+            }
+
+            fn secondary_activate(&self, _x: i32, _y: i32) {
+                self.secondary.store(true, Ordering::SeqCst);
             }
         }
 
@@ -1298,6 +1346,8 @@ mod tests {
             let _bus_address = BusAddressGuard::point_at(&address);
 
             let activated = Arc::new(AtomicBool::new(false));
+            let secondary = Arc::new(AtomicBool::new(false));
+            let stub_icon = Arc::new(Mutex::new(String::new()));
             let events = Arc::new(Mutex::new(Vec::new()));
             let mut stub: Option<zbus::blocking::Connection> = None;
             for _ in 0..50 {
@@ -1308,6 +1358,8 @@ mod tests {
                                 ITEM_PATH,
                                 StubItem {
                                     activated: activated.clone(),
+                                    secondary: secondary.clone(),
+                                    icon_name: stub_icon.clone(),
                                 },
                             )
                             .and_then(|builder| {
@@ -1331,7 +1383,7 @@ mod tests {
                     Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
-            let Some(_stub) = stub else {
+            let Some(stub_conn) = stub else {
                 let _ = daemon.kill();
                 eprintln!("SKIP live indicator test: private bus refused connections");
                 return;
@@ -1355,6 +1407,25 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(50));
             }
             assert!(owned, "host takes the watcher role on a private bus");
+
+            // Honest empty state: nothing registered yet, nothing hosted.
+            assert!(bus.registered().is_empty());
+
+            // The stub registers through the served D-Bus method, as a
+            // real item does; re-registration is a spec no-op.
+            let watcher =
+                zbus::blocking::Proxy::new(&stub_conn, WATCHER_NAME, WATCHER_PATH, WATCHER_NAME)
+                    .expect("watcher proxy builds");
+            for _ in 0..2 {
+                watcher
+                    .call::<&str, _, ()>("RegisterStatusNotifierItem", &(service.as_str(),))
+                    .expect("register over D-Bus");
+            }
+            assert_eq!(bus.registered(), vec![service.clone()]);
+            let watched: Vec<String> = watcher
+                .get_property("RegisteredStatusNotifierItems")
+                .expect("watcher items property reads");
+            assert!(watched.contains(&service));
 
             let item: IndicatorItem = bus.fetch_item(&service).expect("stub item fetches");
             assert_eq!(item.service, service);
@@ -1380,6 +1451,8 @@ mod tests {
                 info.attention_pixmap,
                 vec![(1, 1, ATTENTION_PIXMAP.to_vec())]
             );
+            assert_eq!(info.tooltip_title, "Stub tip");
+            assert_eq!(info.tooltip_body, "Stub body");
             assert_eq!(
                 info.attention_pixmap_icon(),
                 Some(IndicatorIcon::Pixmap {
@@ -1413,13 +1486,42 @@ mod tests {
 
             assert!(bus.activate(&service));
             assert!(activated.load(Ordering::SeqCst));
+            assert!(bus.secondary_activate(&service));
+            assert!(secondary.load(Ordering::SeqCst));
             assert!(bus.fire_menu(&service, 2));
             assert_eq!(*events.lock().expect("test lock"), vec![2]);
 
+            // Icon updates flow: the next fetch sees the new name.
+            *stub_icon.lock().expect("test lock") = "stub-updated".to_owned();
+            let updated = bus.fetch_info(&service).expect("updated info fetches");
+            assert_eq!(updated.icon_name, "stub-updated");
+            assert_eq!(updated.tooltip_title, "Stub tip");
+
             // Our stub owns its name; the ghost never existed.
             assert_eq!(
-                bus.prune_vanished(&[service, "org.test.TunaGhost/Item".to_owned()]),
+                bus.prune_vanished(&[service.clone(), "org.test.TunaGhost/Item".to_owned()]),
                 vec![format!("{STUB_NAME}{ITEM_PATH}")]
+            );
+
+            // Disappearance: releasing the stub's name prunes it from
+            // the host, and forgetting leaves an honest empty state.
+            // The watcher proxy clones the stub's connection, so both
+            // handles must drop before the name is released.
+            drop(watcher);
+            drop(stub_conn);
+            let start = std::time::Instant::now();
+            let mut live = vec![service.clone()];
+            while !live.is_empty() && start.elapsed() < Duration::from_secs(20) {
+                live = bus.prune_vanished(&[service.clone()]);
+                if !live.is_empty() {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            assert!(live.is_empty(), "released name prunes from the host");
+            bus.forget(&[service.clone()]);
+            assert!(
+                bus.registered().is_empty(),
+                "forgotten service leaves an empty host"
             );
 
             let _ = daemon.kill();
