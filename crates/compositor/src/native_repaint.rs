@@ -281,7 +281,11 @@ mod tests {
         after.groups[0][0] = cursor(25);
         assert!(needs_repaint(Some(&before), &after, false));
         assert!(after.same_global_drawing(&before));
-        let mut tracker = OutputDamageTracker::new((1280, 800).into(), 1.0, Transform::Normal);
+        let mut tracker = OutputDamageTracker::new(
+            smithay::utils::Size::<i32, smithay::utils::Physical>::from((1280, 800)),
+            1.0,
+            Transform::Normal,
+        );
         damage_region(&mut tracker, 0, &before).unwrap();
         let damage = damage_region(&mut tracker, 1, &after).unwrap();
         assert!(!damage.is_empty());
