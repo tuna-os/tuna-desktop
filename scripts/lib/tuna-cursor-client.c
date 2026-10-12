@@ -28,7 +28,26 @@ struct client {
     uint32_t shape;
     int size;
     int configured;
+    int callback_mode;
+    unsigned callbacks;
 };
+
+/* Recommit only a frame request: no buffer reattach, damage, or input. */
+static void request_cursor_frame(struct client *c);
+static void cursor_done(void *data, struct wl_callback *callback, uint32_t time) {
+    struct client *c = data;
+    wl_callback_destroy(callback);
+    c->callbacks++;
+    printf("{\"cursor_callback\":%u,\"time\":%u,\"reattached\":false}\n", c->callbacks, time);
+    fflush(stdout);
+    if (c->callbacks < 16) request_cursor_frame(c);
+}
+static const struct wl_callback_listener cursor_callback_listener = { .done = cursor_done };
+static void request_cursor_frame(struct client *c) {
+    struct wl_callback *callback = wl_surface_frame(c->cursor);
+    wl_callback_add_listener(callback, &cursor_callback_listener, c);
+    wl_surface_commit(c->cursor);
+}
 
 static const struct { const char *name; uint32_t shape; } shape_names[] = {
     { "default", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT },
@@ -120,8 +139,8 @@ static const struct xdg_toplevel_listener top_listener = { .configure = top_conf
 
 int main(int argc, char **argv) {
     struct client c = { 0 };
-    if (argc != 3 || (strcmp(argv[1], "shape") && strcmp(argv[1], "surface"))) {
-        fprintf(stderr, "usage: tuna-cursor-client shape NAME | surface SIZE\n");
+    if (argc != 3 || (strcmp(argv[1], "shape") && strcmp(argv[1], "surface") && strcmp(argv[1], "callbacks"))) {
+        fprintf(stderr, "usage: tuna-cursor-client shape NAME | surface SIZE | callbacks SIZE\n");
         return 2;
     }
     struct wl_display *display = wl_display_connect(NULL);
@@ -148,6 +167,8 @@ int main(int argc, char **argv) {
         wl_surface_attach(c.cursor, buffer(&c, c.size, c.size, 0xffe01b24), 0, 0);
         wl_surface_damage(c.cursor, 0, 0, c.size, c.size);
         wl_surface_commit(c.cursor);
+        c.callback_mode = !strcmp(argv[1], "callbacks");
+        if (c.callback_mode) request_cursor_frame(&c);
     }
     c.surface = wl_compositor_create_surface(c.compositor);
     struct xdg_surface *xs = xdg_wm_base_get_xdg_surface(c.wm, c.surface);

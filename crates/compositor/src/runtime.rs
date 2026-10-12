@@ -4129,7 +4129,17 @@ impl Runtime {
         #[cfg(feature = "drm")]
         let overview_requested = self.control.overview_open();
         #[cfg(feature = "drm")]
-        let timing_roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
+        let timing_roots = {
+            let mut roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
+            // Cursor refresh obligations are output-local: only visible cursor
+            // geometry below joins that output's drawn/timing roots.
+            if let smithay::input::pointer::CursorImageStatus::Surface(surface) =
+                &self.state.cursor_image
+            {
+                roots.retain(|root| root != surface);
+            }
+            roots
+        };
         let desktop = self.background_desktop();
         let bell = self.bell_frame();
         // Window clones (overview, switcher) and casts show windows the
@@ -4155,6 +4165,7 @@ impl Runtime {
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
                 let drawn;
+                let presented_cursor;
                 {
                     let (renderer, mut framebuffer) = backend
                         .bind()
@@ -4223,6 +4234,12 @@ impl Runtime {
                         cursor_now,
                         accent,
                     );
+                    presented_cursor = crate::cursor::presented_surface(
+                        &cursor,
+                        &cursor_what,
+                        view.scale,
+                        Rectangle::from_size(size),
+                    );
                     // The winit EGL surface presents bottom-up (see the
                     // Y-flip in the backend's own damage path), so the
                     // output transform mirrors vertically; placements
@@ -4255,17 +4272,23 @@ impl Runtime {
                 send_surface_scales(&self.state, &self.manager);
                 let hidden = hidden_surfaces(&self.manager, &self.frame_costs, clones_shown);
                 send_frame_callbacks(&self.state, &self.manager, &hidden);
-                crate::cursor::Cursor::frame_done(&cursor_what, cursor_now);
                 backend
                     .submit(Some(&[damage]))
                     .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                if let Some(surface) = &presented_cursor {
+                    crate::cursor::Cursor::frame_done(
+                        &crate::cursor::Pointer::Surface(surface.clone()),
+                        cursor_now,
+                    );
+                }
                 // The host took the frame: presentation feedback,
                 // fifo barriers and commit timers (#89).
-                crate::frame_timing::present_nested_frame(
+                crate::frame_timing::present_nested_frame_with_cursor(
                     &mut self.state,
                     &self.manager,
                     locked,
                     self.stats.frames,
+                    presented_cursor,
                 );
                 self.stats.frames += 1;
             }
@@ -4291,6 +4314,7 @@ impl Runtime {
                     rects.iter().position(|r| r.contains(*at)).unwrap_or(0)
                 };
                 let mut queued = false;
+                let mut cursor_presented = false;
                 for (index, out) in outputs.iter_mut().enumerate() {
                     // Display-paced: one frame in flight per output.
                     if out.pending {
@@ -4378,7 +4402,6 @@ impl Runtime {
                         background,
                         blank_alpha,
                         accent,
-                        pointer: (!locked && blank_alpha < 1.0).then_some((pointer.x, pointer.y)),
                         decor: decor.clone(),
                         above: elements.above,
                         effects: elements
@@ -4432,14 +4455,23 @@ impl Runtime {
                                 .collect(),
                         ],
                     };
-                    signature
-                        .groups
-                        .extend(crate::cursor::signatures(&cursor, view.scale));
+                    signature.groups.extend(crate::cursor::signatures(
+                        &cursor,
+                        view.scale,
+                        Rectangle::from_size(logical),
+                    ));
+                    let presented_cursor = crate::cursor::presented_surface(
+                        &cursor,
+                        &cursor_what,
+                        view.scale,
+                        Rectangle::from_size(logical),
+                    );
                     let mine: Vec<_> = drawn
                         .iter()
                         .filter(|(_, at)| owner(at) == index)
                         .map(|(surface, _)| surface.clone())
                         .chain(lock_surface.clone())
+                        .chain(presented_cursor.clone())
                         .collect();
                     let timing_work =
                         crate::frame_timing::pending_output_work(&timing_roots, &mine);
@@ -4548,6 +4580,7 @@ impl Runtime {
                             },
                         );
                     }
+                    cursor_presented |= presented_cursor.is_some();
                     out.last_frame = Some(signature);
                     self.frame_costs.insert(out.name.clone(), cost);
                     queued = true;
@@ -4559,7 +4592,9 @@ impl Runtime {
                     // let redraws outrun the display and keep the loop busy.
                     let hidden = hidden_surfaces(&self.manager, &self.frame_costs, clones_shown);
                     send_frame_callbacks(&self.state, &self.manager, &hidden);
-                    crate::cursor::Cursor::frame_done(&cursor_what, cursor_now);
+                    if cursor_presented {
+                        crate::cursor::Cursor::frame_done(&cursor_what, cursor_now);
+                    }
                     self.stats.frames += 1;
                 }
             }

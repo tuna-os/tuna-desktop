@@ -75,7 +75,6 @@ pub(crate) struct FrameSignature {
     pub background: Color32F,
     pub blank_alpha: f32,
     pub accent: [f32; 3],
-    pub pointer: Option<(f64, f64)>,
     pub decor: Vec<(Color32F, Vec<Rectangle<i32, Physical>>)>,
     pub above: usize,
     // Separate passes preserve both ordering and which scale each pass uses.
@@ -94,7 +93,6 @@ impl FrameSignature {
             && self.background == old.background
             && self.blank_alpha == old.blank_alpha
             && self.accent == old.accent
-            && self.pointer == old.pointer
             && self.decor == old.decor
             && self.effects == old.effects
             && self.above == old.above
@@ -214,7 +212,6 @@ mod tests {
             background: Color32F::BLACK,
             blank_alpha: 0.0,
             accent: [0.0; 3],
-            pointer: Some((100.0, 200.0)),
             decor: vec![],
             above: 0,
             groups: vec![],
@@ -246,24 +243,55 @@ mod tests {
     }
 
     #[test]
-    fn lock_fade_cursor_output_and_decor_changes_render_immediately() {
+    fn lock_fade_output_and_decor_changes_render_immediately() {
         let before = scene();
-        let mut variants = vec![before.clone(); 9];
+        let mut variants = vec![before.clone(); 8];
         variants[0].locked = true;
         variants[1].blank_alpha = 1.0;
-        variants[2].pointer = Some((101.0, 200.0));
-        variants[3].size = (800, 600);
-        variants[4].scale = 1.25;
-        variants[5].location = (1280, 0);
-        variants[6].background = Color32F::new(1.0, 1.0, 1.0, 1.0);
-        variants[7].accent = [1.0; 3];
-        variants[8].decor = vec![(
+        variants[2].size = (800, 600);
+        variants[3].scale = 1.25;
+        variants[4].location = (1280, 0);
+        variants[5].background = Color32F::new(1.0, 1.0, 1.0, 1.0);
+        variants[6].accent = [1.0; 3];
+        variants[7].decor = vec![(
             Color32F::new(1.0, 1.0, 1.0, 1.0),
             vec![Rectangle::from_size((40, 30).into())],
         )];
         for next in variants {
             assert!(needs_repaint(Some(&before), &next, false));
         }
+    }
+
+    #[test]
+    fn cursor_motion_keeps_buffer_age_history_and_bounds_damage() {
+        let id = Id::new();
+        let cursor = |x| {
+            let element = SolidColorRenderElement::new(
+                id.clone(),
+                Rectangle::new((x, 40).into(), (24, 24).into()),
+                CommitCounter::default(),
+                Color32F::BLACK,
+                Kind::Cursor,
+            );
+            ElementSignature::capture(&element, 1.0)
+        };
+        let mut before = scene();
+        before.groups = vec![vec![cursor(20)]];
+        let mut after = before.clone();
+        after.groups[0][0] = cursor(25);
+        assert!(needs_repaint(Some(&before), &after, false));
+        assert!(after.same_global_drawing(&before));
+        let mut tracker = OutputDamageTracker::new((1280, 800).into(), 1.0, Transform::Normal);
+        damage_region(&mut tracker, 0, &before).unwrap();
+        let damage = damage_region(&mut tracker, 1, &after).unwrap();
+        assert!(!damage.is_empty());
+        let expected = Rectangle::new((20, 40).into(), (29, 24).into());
+        assert!(damage
+            .iter()
+            .all(|rect| rect.intersection(expected) == Some(*rect)));
+        // No cursor element on a second output means no changed signature.
+        let other_output = scene();
+        assert!(!needs_repaint(Some(&other_output), &other_output, false));
     }
 
     #[test]
@@ -546,11 +574,11 @@ mod tests {
         variants[0].locked = true;
         variants[1].pointer = None;
         variants[2].scale = 2.0;
-        variants[3].groups[0][0].opaque.clear();
-        variants[3].groups[0][0]
+        variants[2].groups[0][0].opaque.clear();
+        variants[2].groups[0][0]
             .opaque
             .push(Rectangle::from_size((1, 1).into()));
-        variants[4].groups[0][0].id = Id::new();
+        variants[3].groups[0][0].id = Id::new();
         for next in variants {
             assert!(!next.same_global_drawing(&before));
         }

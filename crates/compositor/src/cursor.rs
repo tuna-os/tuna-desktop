@@ -977,20 +977,49 @@ pub fn draw(
 pub(crate) fn signatures(
     elements: &CursorElements,
     scale: f64,
+    bounds: Rectangle<i32, Physical>,
 ) -> [Vec<crate::native_repaint::ElementSignature>; 2] {
     use crate::native_repaint::ElementSignature;
+    use smithay::backend::renderer::element::Element;
     [
         elements
             .images
             .iter()
+            .filter(|e| visible_geometry(e.geometry(1.0.into()), bounds))
             .map(|e| ElementSignature::capture(e, 1.0))
             .collect(),
         elements
             .surface
             .iter()
+            .filter(|e| visible_geometry(e.geometry(scale.into()), bounds))
             .map(|e| ElementSignature::capture(e, scale))
             .collect(),
     ]
+}
+
+/// Exclude cursor trees wholly outside this output from timing and damage.
+/// A cursor straddling an edge belongs to every output it visibly intersects.
+pub(crate) fn presented_surface(
+    elements: &CursorElements,
+    what: &Pointer,
+    scale: f64,
+    bounds: Rectangle<i32, Physical>,
+) -> Option<WlSurface> {
+    use smithay::backend::renderer::element::Element;
+    let Pointer::Surface(surface) = what else {
+        return None;
+    };
+    elements
+        .surface
+        .iter()
+        .any(|e| visible_geometry(e.geometry(scale.into()), bounds))
+        .then(|| surface.clone())
+}
+
+fn visible_geometry(geometry: Rectangle<i32, Physical>, bounds: Rectangle<i32, Physical>) -> bool {
+    geometry
+        .intersection(bounds)
+        .is_some_and(|intersection| !intersection.is_empty())
 }
 
 /// A cursor surface's logical size and its buffer's pixel size.
@@ -1422,6 +1451,37 @@ pub fn ripple_disc(size: u32, accent: [f32; 3], glow: f64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_edge_intersections_include_neighbors_but_not_off_output_motion() {
+        let bounds = Rectangle::from_size((1280, 800).into());
+        assert!(visible_geometry(
+            Rectangle::new((1270, 40).into(), (24, 24).into()),
+            bounds
+        ));
+        assert!(visible_geometry(
+            Rectangle::new((-10, 40).into(), (24, 24).into()),
+            bounds
+        ));
+        assert!(!visible_geometry(
+            Rectangle::new((1280, 40).into(), (24, 24).into()),
+            bounds
+        ));
+        assert!(!visible_geometry(
+            Rectangle::new((-24, 40).into(), (24, 24).into()),
+            bounds
+        ));
+        // Pre-transform physical bounds apply to rotated/fractional outputs.
+        let rotated = Rectangle::from_size((800, 1280).into());
+        assert!(visible_geometry(
+            Rectangle::new((795, 1260).into(), (30, 30).into()),
+            rotated
+        ));
+        assert!(!visible_geometry(
+            Rectangle::new((805, 1260).into(), (30, 30).into()),
+            rotated
+        ));
+    }
 
     #[test]
     fn animated_cursors_keep_each_frame_of_the_nearest_size() {

@@ -48,3 +48,25 @@ Animated fixture assertions additionally capture a second real frame without poi
 Lock transitions cancel in-flight locate effects and clear activity counters/key arming without changing theme or locate preferences. Locked diagnostics publish a null cursor record. The native journey freezes the owned animation clock while a real Ctrl ripple renders, requests the public D-Bus lock, and checks redaction plus authenticated-unlock nonresurrection. This fresh native regression awaits combined CI.
 
 Locate disc buffers are limited to eight color/scale entries and16MiB of owned pixel storage across the three buffers per entry. Inserting a miss above either limit evicts prior entries; hits reuse their buffers. Raster and rendered side lengths saturate at1024 physical pixels, and nonfinite/nonpositive scales are rejected. This bounds the compositor's cache, not driver texture retention or overall GPU memory.
+
+# Native cursor timing and damage followup
+
+Visible client cursor surfaces join each output's drawn timing and presentation
+roots. Frame-only commits with unchanged buffers still request real scanout;
+callbacks are sent only after an output containing cursor geometry submits.
+Cursor trees also participate in refresh-cycle barriers and commit timing.
+Nested cursor callbacks follow successful host submission.
+
+Cursor geometry outside an output is excluded from that output's signatures
+and timing demand. Geometry crossing an edge belongs to both outputs. Physical
+bounds use the pre-transform output size, including rotated outputs. Pointer
+position no longer separately invalidates the complete native drawing state;
+cursor, drag, and hover elements retain their own geometry/effect signatures,
+so buffer-age history can damage the old and new cursor rectangles.
+
+G-CURSOR-FRAME uses a real Wayland client: an unselected cursor gets no callback,
+then 16 frame-request-only commits progress without buffer reattachment,
+damage, or fresh input. Native unit regressions bound cursor movement damage
+and exercise edge/rotated-output intersection admission. These need exact-head
+CI. The nested proof does not qualify installed DRM, hardware frame timing,
+physical multi-output rendering, or total GPU/power performance.
