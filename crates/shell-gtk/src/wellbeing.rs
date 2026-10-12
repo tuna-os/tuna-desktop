@@ -44,9 +44,12 @@
 //!   tuna-compositor has no desaturate/brightness effect hook yet, so applying
 //!   them is a union-time compositor item (no protocol bump is made here).
 
+#[cfg(not(test))]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gio::prelude::*;
@@ -1745,9 +1748,321 @@ impl MonoClock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live runtime: timers, settings watches and shell dispatch
+// ---------------------------------------------------------------------------
+
+/// Post a resident notice (title, body) to the shell's message list.
+pub type NoticeHook = Rc<dyn Fn(String, String)>;
+/// Show the break countdown OSD (label, 0..1 progress as due approaches).
+pub type CountdownHook = Rc<dyn Fn(String, f64)>;
+/// Lock the session now.
+pub type LockHook = Rc<dyn Fn()>;
+
+/// Shell surfaces the wellbeing runtime drives. All hooks run on the GTK
+/// thread. A hook must not call back into the runtime: the runtime lends
+/// surfaces, it never borrows them back.
+#[derive(Clone)]
+pub struct ShellHooks {
+    pub post_notice: NoticeHook,
+    pub show_countdown: CountdownHook,
+    pub lock: LockHook,
+}
+
+/// Desired effect state. The compositor has no desaturate/brightness hook
+/// yet, so the runtime logs transitions and the proof gates read them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EffectState {
+    pub grayscale: bool,
+    pub fade: bool,
+}
+
+/// OSD countdown progress: 0 when the countdown starts, 1 at due.
+pub fn countdown_progress(due_in_secs: i64) -> f64 {
+    if due_in_secs >= BREAK_COUNTDOWN_SECONDS {
+        0.0
+    } else if due_in_secs <= 0 {
+        1.0
+    } else {
+        1.0 - due_in_secs as f64 / BREAK_COUNTDOWN_SECONDS as f64
+    }
+}
+
+fn log_effect(effect: EffectState) {
+    eprintln!(
+        "tuna-shell-gtk: wellbeing: effect grayscale={} fade={} (desired; compositor hook pending)",
+        effect.grayscale, effect.fade
+    );
+}
+
+/// Deliver screen-time events to the shell: limit notices go to the message
+/// list, grayscale updates the desired effect state.
+pub fn dispatch_screen_time(
+    hooks: &ShellHooks,
+    effect: &mut EffectState,
+    events: &[ScreenTimeEvent],
+) {
+    for event in events {
+        match event {
+            ScreenTimeEvent::StateChanged(state) => {
+                eprintln!("tuna-shell-gtk: wellbeing: screen-time state {state:?}");
+            }
+            ScreenTimeEvent::LimitUpcoming { .. } => {
+                let notice = limit_upcoming_notice();
+                (hooks.post_notice)(notice.title, notice.body);
+            }
+            ScreenTimeEvent::LimitReached => {
+                let notice = limit_reached_notice();
+                (hooks.post_notice)(notice.title, notice.body);
+            }
+            ScreenTimeEvent::GrayscaleChanged(on) => {
+                effect.grayscale = *on;
+                log_effect(*effect);
+            }
+        }
+    }
+}
+
+/// Deliver break events to the shell: notices to the message list, the
+/// countdown to the OSD, lock to the session. `countdown` tracks the live
+/// OSD countdown as (type, due wall time) so the tick can refresh its label;
+/// the OSD hides itself 1.5 s after the last show, so stopping needs no call.
+/// Dismissal only clears local state: posted entries are independent history
+/// items, and replacing the resident notice needs notify action support.
+pub fn dispatch_break_ui(
+    hooks: &ShellHooks,
+    effect: &mut EffectState,
+    countdown: &mut Option<(BreakType, i64)>,
+    now: i64,
+    events: &[BreakUiEvent],
+) {
+    for event in events {
+        match event {
+            BreakUiEvent::StateChanged(state) => {
+                eprintln!("tuna-shell-gtk: wellbeing: break state {state:?}");
+            }
+            BreakUiEvent::Notify(notice) => {
+                (hooks.post_notice)(notice.title.clone(), notice.body.clone());
+            }
+            BreakUiEvent::DismissNotice => {}
+            BreakUiEvent::StartCountdown {
+                break_type,
+                due_in_secs,
+            } => {
+                *countdown = Some((*break_type, now + due_in_secs));
+                (hooks.show_countdown)(
+                    countdown_text(*due_in_secs),
+                    countdown_progress(*due_in_secs),
+                );
+            }
+            BreakUiEvent::StopCountdown => {
+                *countdown = None;
+            }
+            BreakUiEvent::FadeScreen(on) => {
+                effect.fade = *on;
+                log_effect(*effect);
+            }
+            BreakUiEvent::LockScreen => (hooks.lock)(),
+            BreakUiEvent::PlayCompleteSound => {
+                eprintln!("tuna-shell-gtk: wellbeing: break complete sound");
+                play_complete_sound();
+            }
+        }
+    }
+}
+
+/// Best-effort break-complete sound (`complete` in the GNOME sound theme),
+/// gated on `org.gnome.desktop.sound event-sounds` and spawned with the same
+/// guards as volume feedback. Silence on failure: a break ending is not an
+/// error worth surfacing.
+pub fn play_complete_sound() {
+    let Some(sound) = open_settings("org.gnome.desktop.sound") else {
+        return;
+    };
+    if !sound.boolean("event-sounds") {
+        return;
+    }
+    let theme = format!("canberra.xdg-theme.name={}", sound.string("theme-name"));
+    let launcher = gio::SubprocessLauncher::new(
+        gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE,
+    );
+    let parent = std::process::id() as libc::pid_t;
+    launcher.set_child_setup(move || unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+            || libc::getppid() != parent
+        {
+            libc::_exit(127);
+        }
+        // The deadline survives exec and is independent of GTK's loop.
+        libc::signal(libc::SIGALRM, libc::SIG_DFL);
+        libc::alarm(5);
+    });
+    let _ = launcher.spawn(&[
+        "canberra-gtk-play".as_ref(),
+        "--id".as_ref(),
+        "complete".as_ref(),
+        "--description".as_ref(),
+        "Break complete".as_ref(),
+        "--property".as_ref(),
+        theme.as_ref(),
+    ]);
+}
+
+/// Live shell runtime. The GLib timeouts and settings watches own the `Rc`,
+/// so this lives for the shell process lifetime.
+#[cfg(not(test))]
+struct Runtime {
+    hooks: ShellHooks,
+    tracker: ScreenTimeTracker,
+    breaks: BreakService,
+    mono: MonoClock,
+    screen_settings: Option<gio::Settings>,
+    break_parent: Option<gio::Settings>,
+    break_children: Vec<(BreakType, gio::Settings)>,
+    effect: EffectState,
+    countdown: Option<(BreakType, i64)>,
+}
+
+/// One screen-time poll: idle verdict from the compositor, history edges and
+/// limit state, then dispatch. Hooks run outside the runtime borrow.
+#[cfg(not(test))]
+fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
+    let (hooks, mut effect, events) = {
+        let mut r = rt.borrow_mut();
+        let now_wall = wall_now();
+        let mono_now = r.mono.now();
+        let active = is_user_active(idle_time(), session_idle_delay());
+        let poll = r.tracker.poll(now_wall, mono_now, active);
+        if let Err(e) = &poll.stored {
+            eprintln!("tuna-shell-gtk: wellbeing: history store failed: {e}");
+        }
+        if let Some(loaded) = &poll.loaded {
+            if let Err(e) = loaded {
+                eprintln!("tuna-shell-gtk: wellbeing: {e}");
+            }
+        }
+        (r.hooks.clone(), r.effect, poll.events)
+    };
+    dispatch_screen_time(&hooks, &mut effect, &events);
+    rt.borrow_mut().effect = effect;
+}
+
+/// One break poll, plus a countdown label refresh from the stored due time
+/// (the dispatcher only announces the countdown's start and stop).
+#[cfg(not(test))]
+fn break_tick(rt: &Rc<RefCell<Runtime>>) {
+    let now = wall_now();
+    let (hooks, mut effect, mut countdown, events, stored_due) = {
+        let mut r = rt.borrow_mut();
+        let idle_secs = idle_time().map(|d| d.as_secs() as i64).unwrap_or(0);
+        let events = r.breaks.poll(now, idle_secs);
+        let stored_due = r.countdown.map(|(_, due)| due);
+        (r.hooks.clone(), r.effect, r.countdown, events, stored_due)
+    };
+    if let Some(due) = stored_due {
+        let due_in = due - now;
+        if due_in > 0 {
+            (hooks.show_countdown)(countdown_text(due_in), countdown_progress(due_in));
+        }
+    }
+    dispatch_break_ui(&hooks, &mut effect, &mut countdown, now, &events);
+    let mut r = rt.borrow_mut();
+    r.effect = effect;
+    r.countdown = countdown;
+}
+
+/// Start the live runtime: an immediate first poll, then the 30 s screen-time
+/// and 2 s break timers, live settings watches that re-poll at once (as
+/// GNOME's changed handlers re-evaluate instead of waiting for the next
+/// tick), and a shutdown flush of the closing history edge.
+#[cfg(not(test))]
+pub fn start(app: &gio::Application, hooks: ShellHooks) {
+    let tracker = ScreenTimeTracker::new(
+        read_screen_time_settings(),
+        HistoryStore::new(history_path()),
+    );
+    let mut breaks = BreakService::new();
+    breaks
+        .manager
+        .set_selected(&read_selected_breaks(), wall_now());
+    let rt = Rc::new(RefCell::new(Runtime {
+        hooks,
+        tracker,
+        breaks,
+        mono: MonoClock::start(),
+        screen_settings: open_settings(SCREEN_TIME_SCHEMA),
+        break_parent: open_settings(BREAK_SCHEMA),
+        break_children: SUPPORTED_BREAK_TYPES
+            .iter()
+            .copied()
+            .filter_map(BreakType::from_id)
+            .filter_map(|t| open_settings(t.schema_id()).map(|s| (t, s)))
+            .collect(),
+        effect: EffectState::default(),
+        countdown: None,
+    }));
+    // The first polls run now so the startup edge, the limit state and any
+    // due break apply immediately instead of a tick late.
+    screen_tick(&rt);
+    break_tick(&rt);
+    {
+        let rt = rt.clone();
+        glib::timeout_add_local(SCREEN_TIME_POLL, move || {
+            screen_tick(&rt);
+            glib::ControlFlow::Continue
+        });
+    }
+    {
+        let rt = rt.clone();
+        glib::timeout_add_local(BREAK_POLL, move || {
+            break_tick(&rt);
+            glib::ControlFlow::Continue
+        });
+    }
+    if let Some(settings) = rt.borrow().screen_settings.clone() {
+        let rt = rt.clone();
+        settings.connect_changed(None, move |settings, _| {
+            rt.borrow_mut()
+                .tracker
+                .set_settings(read_screen_time_settings_from(settings));
+            screen_tick(&rt);
+        });
+    }
+    if let Some(parent) = rt.borrow().break_parent.clone() {
+        let rt = rt.clone();
+        parent.connect_changed(Some("selected-breaks"), move |_, _| {
+            let now = wall_now();
+            rt.borrow_mut()
+                .breaks
+                .manager
+                .set_selected(&read_selected_breaks(), now);
+            break_tick(&rt);
+        });
+    }
+    for (break_type, child) in rt.borrow().break_children.clone() {
+        let rt = rt.clone();
+        child.connect_changed(None, move |settings, _| {
+            rt.borrow_mut()
+                .breaks
+                .manager
+                .set_break_settings(break_type, read_break_settings_from(settings));
+            break_tick(&rt);
+        });
+    }
+    {
+        let rt = rt.clone();
+        app.connect_shutdown(move |_| {
+            if let Err(e) = rt.borrow_mut().tracker.shutdown(wall_now()) {
+                eprintln!("tuna-shell-gtk: wellbeing: shutdown flush failed: {e}");
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     const T0: i64 = 1_760_000_000; // fixed wall clock for scripted days
 
@@ -2315,5 +2630,190 @@ mod tests {
         // quiet None, never a block or a crash.
         let _ = idle_time();
         let _ = session_idle_delay();
+    }
+
+    struct Recorded {
+        posts: Rc<RefCell<Vec<(String, String)>>>,
+        countdowns: Rc<RefCell<Vec<(String, f64)>>>,
+        locks: Rc<Cell<u32>>,
+    }
+
+    fn recording_hooks(recorded: &Recorded) -> ShellHooks {
+        let posts = recorded.posts.clone();
+        let countdowns = recorded.countdowns.clone();
+        let locks = recorded.locks.clone();
+        ShellHooks {
+            post_notice: Rc::new(move |title, body| {
+                posts.borrow_mut().push((title, body));
+            }),
+            show_countdown: Rc::new(move |label, progress| {
+                countdowns.borrow_mut().push((label, progress));
+            }),
+            lock: Rc::new(move || {
+                locks.set(locks.get() + 1);
+            }),
+        }
+    }
+
+    fn recorded() -> (ShellHooks, Recorded) {
+        let hooks = Recorded {
+            posts: Rc::new(RefCell::new(Vec::new())),
+            countdowns: Rc::new(RefCell::new(Vec::new())),
+            locks: Rc::new(Cell::new(0)),
+        };
+        let shell = recording_hooks(&hooks);
+        (shell, hooks)
+    }
+
+    #[test]
+    fn dispatch_posts_limit_notices_with_gnome_strings_and_tracks_grayscale() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        dispatch_screen_time(
+            &hooks,
+            &mut effect,
+            &[
+                ScreenTimeEvent::StateChanged(TimeLimitsState::Active),
+                ScreenTimeEvent::LimitUpcoming {
+                    remaining_secs: 600,
+                },
+            ],
+        );
+        assert_eq!(
+            seen.posts.borrow().as_slice(),
+            &[(
+                "Screen Time Limit in 10 Minutes".to_string(),
+                "Your screen time limit is approaching".to_string(),
+            )]
+        );
+        assert!(!effect.grayscale);
+        dispatch_screen_time(
+            &hooks,
+            &mut effect,
+            &[
+                ScreenTimeEvent::LimitReached,
+                ScreenTimeEvent::GrayscaleChanged(true),
+            ],
+        );
+        assert_eq!(
+            seen.posts.borrow().as_slice()[1],
+            (
+                "Screen Time Limit Reached".to_string(),
+                "It's time to stop using the device".to_string(),
+            )
+        );
+        assert!(effect.grayscale);
+        dispatch_screen_time(
+            &hooks,
+            &mut effect,
+            &[ScreenTimeEvent::GrayscaleChanged(false)],
+        );
+        assert!(!effect.grayscale);
+        // State changes and grayscale post no notices of their own.
+        assert_eq!(seen.posts.borrow().len(), 2);
+    }
+
+    #[test]
+    fn dispatch_drives_break_surfaces_and_countdown_state() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            T0,
+            &[
+                BreakUiEvent::StateChanged(BreakState::BreakDue),
+                BreakUiEvent::Notify(due_notice(BreakType::Eyesight, 20, true)),
+                BreakUiEvent::StartCountdown {
+                    break_type: BreakType::Eyesight,
+                    due_in_secs: 30,
+                },
+            ],
+        );
+        assert_eq!(
+            seen.posts.borrow().as_slice(),
+            &[(
+                "Time for an Eyesight Break".to_string(),
+                "Take a break from the screen. Look at least 6 meters away for at least 20 seconds"
+                    .to_string(),
+            )]
+        );
+        assert_eq!(countdown, Some((BreakType::Eyesight, T0 + 30)));
+        assert_eq!(
+            seen.countdowns.borrow().as_slice(),
+            &[("Break in 30 seconds".to_string(), 0.5)]
+        );
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            T0 + 5,
+            &[
+                BreakUiEvent::FadeScreen(true),
+                BreakUiEvent::LockScreen,
+                BreakUiEvent::PlayCompleteSound,
+                BreakUiEvent::StopCountdown,
+                BreakUiEvent::DismissNotice,
+                BreakUiEvent::FadeScreen(false),
+            ],
+        );
+        assert!(!effect.grayscale && !effect.fade);
+        assert_eq!(countdown, None);
+        assert_eq!(seen.locks.get(), 1);
+        // Dismissal posts nothing: entries are independent history items.
+        assert_eq!(seen.posts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn countdown_progress_clamps_to_the_countdown_window() {
+        assert_eq!(countdown_progress(60), 0.0);
+        assert_eq!(countdown_progress(600), 0.0);
+        assert_eq!(countdown_progress(30), 0.5);
+        assert_eq!(countdown_progress(0), 1.0);
+        assert_eq!(countdown_progress(-5), 1.0);
+    }
+
+    #[test]
+    fn empty_break_selection_stays_disabled_silently() {
+        let (hooks, seen) = recorded();
+        let mut service = BreakService::new();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        // No selection, no config: polls stay Disabled and silent.
+        for now in [T0, T0 + 3600] {
+            let events = service.poll(now, 0);
+            assert!(events.is_empty());
+            dispatch_break_ui(&hooks, &mut effect, &mut countdown, now, &events);
+        }
+        assert_eq!(service.manager.state(), BreakState::Disabled);
+        assert!(seen.posts.borrow().is_empty());
+        assert!(seen.countdowns.borrow().is_empty());
+        assert_eq!(seen.locks.get(), 0);
+        assert_eq!(countdown, None);
+    }
+
+    #[test]
+    fn disabled_history_dispatches_no_limit_notices() {
+        let (hooks, seen) = recorded();
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = ScreenTimeTracker::new(
+            ScreenTimeSettings {
+                history_enabled: false,
+                daily_limit_enabled: true,
+                daily_limit_secs: 10,
+                grayscale: true,
+            },
+            HistoryStore::new(dir.path().join("session-active-history.json")),
+        );
+        let mut effect = EffectState::default();
+        let poll = tracker.poll(T0, 1000, true);
+        assert!(poll.stored.is_ok());
+        assert_eq!(tracker.state(), TimeLimitsState::Disabled);
+        dispatch_screen_time(&hooks, &mut effect, &poll.events);
+        assert!(seen.posts.borrow().is_empty());
+        assert!(!effect.grayscale);
+        assert!(!dir.path().join("session-active-history.json").exists());
     }
 }
