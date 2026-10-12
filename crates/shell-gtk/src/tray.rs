@@ -124,7 +124,12 @@ fn icon_for(item: &Item) -> gtk::Image {
 /// The tray box for the panel's right side. Empty (and invisible)
 /// until an item registers. `on_popdown` runs whenever a tray popover
 /// closes, so keyboard panel focus can return to the client.
-pub fn tray(on_popdown: std::rc::Rc<dyn Fn()>) -> gtk::Box {
+/// `escape_guard` is the shared Escape credit: a tray popover showing
+/// bounds stale credit, as for the built-in menus (G-PANEL-FOCUS).
+pub fn tray(
+    on_popdown: std::rc::Rc<dyn Fn()>,
+    escape_guard: std::rc::Rc<std::cell::Cell<crate::panel_focus::EscapeGuard>>,
+) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     row.set_visible(false);
     let (to_worker, worker_rx) = mpsc::channel();
@@ -165,9 +170,16 @@ pub fn tray(on_popdown: std::rc::Rc<dyn Fn()>) -> gtk::Box {
                         };
                         button.update_property(&[gtk::accessible::Property::Label(label)]);
                         // Fresh rows each time the menu opens.
-                        let (to, service) = (to_worker.clone(), item.service.clone());
+                        let (to, service, guard) = (
+                            to_worker.clone(),
+                            item.service.clone(),
+                            escape_guard.clone(),
+                        );
                         popover.connect_show(move |_| {
                             let _ = to.send(ToWorker::Menu(service.clone()));
+                            let mut state = guard.get();
+                            state.note_shown();
+                            guard.set(state);
                         });
                         menus.borrow_mut().push((item.service.clone(), popover));
                         row2.append(&button);
