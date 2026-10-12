@@ -30,7 +30,7 @@
 #
 # --check-matrix verifies docs/visual-capture-matrix.md names every
 # parity-ledger row, every walkthrough.tsv entry and every stage here.
-# shellcheck disable=SC2329 # state functions run indirectly via run_state
+# shellcheck disable=SC2329,SC2317 # state functions run indirectly via run_state
 set -eu
 
 unset CDPATH
