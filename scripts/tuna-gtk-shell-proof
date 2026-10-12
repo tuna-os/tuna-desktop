@@ -1104,9 +1104,14 @@ n=0
 for spec in Alpha:#3584e4 Beta:#2ec27e Gamma:#e66100; do
     WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
         "${spec%%:*}" "${spec#*:}" >"$ARTIFACTS/window-${spec%%:*}.log" 2>&1 &
+    fixture_pid=$!
     n=$((n + 1))
     cstate "(.windows | length) == $n" "window $n" ||
         fail G-WINDOWS "${spec%%:*} never mapped"
+    if [ "${spec%%:*}" = Alpha ]; then
+        "$PY" "$ROOT/scripts/lib/tuna_window_menu_fixture.py" record "$CSTATE" "$ARTIFACTS/alpha-window-owner.json" "$fixture_pid" ||
+            fail G-WINDOWS "original native Alpha launch identity could not be recorded"
+    fi
 done
 cstate '(.windows | length) == 3' "three app windows" ||
     fail G-WINDOWS "three libadwaita windows never mapped"
@@ -4898,13 +4903,22 @@ pass G-SWIPE-MOMENTUM "a released swipe keeps its momentum: projected target and
 # GNOME's workspace thumbnails: a window moved one workspace right makes
 # three (the trailing empty one included), so the overview shows the
 # strip; a thumbnail click switches there with the overview still open.
-home_ws="$(jq -r '.active_workspace' "$CSTATE")"
-moved="$(jq -r .focused "$CSTATE")"
-window_menu
+# Swipes restore the previous focus, which can legitimately be XEyes.
+# Select the owned native header fixture before the single menu attempt.
+pick_alpha || fail G-WS-THUMBS "could not focus the original native Alpha fixture"
+cp "$CSTATE" "$ARTIFACTS/ws-thumbs-native-before.json"
+menu_target="$("$PY" "$ROOT/scripts/lib/tuna_window_menu_fixture.py" target "$ARTIFACTS/ws-thumbs-native-before.json" "$ARTIFACTS/alpha-window-owner.json")" ||
+    fail G-WS-THUMBS "original native Alpha identity/focus/geometry is not ready"
+read -r moved home_ws menu_x menu_y <<EOF
+$menu_target
+EOF
+xdotool mousemove --window "$WID" "$menu_x" "$menu_y" click 3
+sleep 1.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-ws-right.json" 20 \
     --press "Move to Workspace Right" || fail G-WS-THUMBS "the window menu has no Move to Workspace Right"
 cstate ".active_workspace == $home_ws and any(.windows[]; .id == $moved and .workspace == $home_ws + 1)" \
-    "moved" || fail G-WS-THUMBS "the window did not move one workspace right"
+    "moved" || fail G-WS-THUMBS "the original native Alpha did not move one workspace right"
+cp "$CSTATE" "$ARTIFACTS/ws-thumbs-native-after.json"
 sleep 1
 # Hold a synthetic three-finger swipe at half progress. The event enters the
 # compositor's normal gesture handler; the held frame lets CI sample it.
