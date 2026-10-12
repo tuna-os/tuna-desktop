@@ -19,6 +19,7 @@ Listens on 127.0.0.1 with an ephemeral port and prints "ready port=N".
 import socketserver
 import struct
 import sys
+import time
 
 # Group tags (cups/ipp.h ipp_tag_t, RFC 8011).
 G_OPERATION = 0x01
@@ -209,6 +210,13 @@ def attr_int(attrs, name):
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         calls = self.server.calls_log
+
+        def log(op):
+            # Monotonic timestamp first: the gate asserts queries that
+            # arrive AFTER its line-count marker, so startup/tile-tick
+            # queries cannot satisfy menu-open evidence (f118 proved the
+            # vacuous-presence failure).
+            calls.write(f"{time.monotonic():.3f} {op}\n")
         try:
             head = b""
             while b"\r\n\r\n" not in head and len(head) < 65536:
@@ -234,10 +242,10 @@ class Handler(socketserver.BaseRequestHandler):
                 body += chunk
             op, request_id, attrs = parse_request(body)
             if op == OP_CUPS_GET_PRINTERS:
-                calls.write("CUPS-Get-Printers\n")
+                log("CUPS-Get-Printers")
                 payload = response(0, request_id, op_base(), officejet_group(), label_group())
             elif op == OP_CUPS_GET_DEFAULT:
-                calls.write("CUPS-Get-Default\n")
+                log("CUPS-Get-Default")
                 payload = response(
                     0,
                     request_id,
@@ -246,17 +254,17 @@ class Handler(socketserver.BaseRequestHandler):
                 )
             elif op == OP_GET_JOBS:
                 uri = attr_text(attrs, "printer-uri")
-                calls.write(f"Get-Jobs uri={uri}\n")
+                log(f"Get-Jobs uri={uri}")
                 if "OfficeJet" in uri:
                     payload = response(0, request_id, op_base(), officejet_jobs_group())
                 else:
                     payload = response(0, request_id, op_base())
             elif op == OP_CANCEL_JOB:
-                calls.write(f"Cancel-Job id={attr_int(attrs, 'job-id')}\n")
+                log(f"Cancel-Job id={attr_int(attrs, 'job-id')}")
                 payload = response(0, request_id, op_base())
             elif op == OP_PRINT_JOB:
                 uri = attr_text(attrs, "printer-uri")
-                calls.write(f"Print-Job uri={uri} bytes={len(body)}\n")
+                log(f"Print-Job uri={uri} bytes={len(body)}")
                 payload = response(
                     0,
                     request_id,
@@ -264,7 +272,7 @@ class Handler(socketserver.BaseRequestHandler):
                     group(G_JOB, attr(V_INTEGER, "job-id", integer(43))),
                 )
             else:
-                calls.write(f"op=0x{op:04x}\n")
+                log(f"op=0x{op:04x}")
                 payload = response(0, request_id, op_base())
             calls.flush()
             reply = (
