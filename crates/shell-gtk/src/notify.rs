@@ -336,18 +336,33 @@ fn source_icon(icon: &str) -> Option<gio::Icon> {
 impl NotifyUi {
     /// Build the surfaces; the bus is claimed on the first tick.
     pub fn new(app: &gtk::Application) -> Rc<Self> {
-        let center = Arc::new(Mutex::new(NotificationCenter::load_system()));
+        Self::build(
+            app,
+            Arc::new(Mutex::new(NotificationCenter::load_system())),
+            true,
+        )
+    }
+
+    // Tests use an in-memory center and ordinary GTK window. Production
+    // always retains the layer-shell surface and persisted notification store.
+    fn build(
+        app: &gtk::Application,
+        center: Arc<Mutex<NotificationCenter>>,
+        layered: bool,
+    ) -> Rc<Self> {
         let bus = NotificationBus::new(center.clone());
 
         let banner_window = gtk::ApplicationWindow::new(app);
         banner_window.add_css_class("tuna-banners");
-        banner_window.init_layer_shell();
-        banner_window.set_layer(Layer::Overlay);
-        banner_window.set_namespace(Some(tuna_shell_control::GTK_BANNERS_NAMESPACE));
-        banner_window.set_anchor(Edge::Top, true);
-        // The card's own 4px margin puts it 4px under the bar (GNOME).
-        banner_window.set_margin(Edge::Top, 0);
-        banner_window.set_keyboard_mode(KeyboardMode::None);
+        if layered {
+            banner_window.init_layer_shell();
+            banner_window.set_layer(Layer::Overlay);
+            banner_window.set_namespace(Some(tuna_shell_control::GTK_BANNERS_NAMESPACE));
+            banner_window.set_anchor(Edge::Top, true);
+            // The card's own 4px margin puts it 4px under the bar (GNOME).
+            banner_window.set_margin(Edge::Top, 0);
+            banner_window.set_keyboard_mode(KeyboardMode::None);
+        }
         let keys = gtk::EventControllerKey::new();
         let banner_weak = banner_window.downgrade();
         keys.connect_key_pressed(move |_, key, _, _| {
@@ -680,7 +695,7 @@ impl NotifyUi {
             c.add_controller(click);
             self.banner_box.append(&c);
         }
-        if now.banners.is_empty() {
+        if now.banners.is_empty() && self.banner_window.is_layer_window() {
             self.banner_window.set_keyboard_mode(KeyboardMode::None);
         }
         self.banner_window.set_visible(!now.banners.is_empty());
@@ -1020,5 +1035,169 @@ mod timer_tests {
         // No idle monitor: the user counts as active.
         let mut t = BannerTimer::new(t0, None);
         assert!(t.expired(t0 + s(4), None));
+    }
+}
+
+#[cfg(test)]
+mod gtk_action_lifecycle_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn button(root: &impl IsA<gtk::Widget>, wanted: &str) -> gtk::Button {
+        fn collect(widget: &gtk::Widget, wanted: &str, found: &mut Vec<gtk::Button>) {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                if button.label().as_deref() == Some(wanted)
+                    || (wanted == "close" && button.has_css_class("message-close-button"))
+                {
+                    found.push(button.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                collect(&widget, wanted, found);
+                child = widget.next_sibling();
+            }
+        }
+        let mut found = Vec::new();
+        collect(root.as_ref(), wanted, &mut found);
+        assert_eq!(found.len(), 1, "one captured {wanted} button required");
+        found.pop().unwrap()
+    }
+
+    fn post(ui: &Rc<NotifyUi>) -> (u64, gtk::Button, gtk::Button, Rc<Cell<u32>>) {
+        let id = ui
+            .post_with_actions(
+                "Owned callback fixture",
+                "",
+                "Break",
+                "",
+                &[
+                    ("take".into(), "Take".into()),
+                    ("delay".into(), "Delay".into()),
+                ],
+            )
+            .unwrap();
+        let fired = Rc::new(Cell::new(0));
+        for key in ["take", "delay"] {
+            let count = fired.clone();
+            ui.on_notification_action(id, key, Rc::new(move || count.set(count.get() + 1)));
+        }
+        (
+            id,
+            button(&ui.banner_box, "Take"),
+            button(&ui.banner_box, "Delay"),
+            fired,
+        )
+    }
+
+    #[test]
+    #[ignore = "requires an owned Xvfb/private D-Bus session and explicit admission"]
+    fn actual_gtk_captured_actions_obey_resident_lifecycle() {
+        assert_eq!(std::env::var("TUNA_REQUIRE_NOTIFY_UI").as_deref(), Ok("1"));
+        assert!(std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok());
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        assert!(std::env::var_os("WAYLAND_SOCKET").is_none());
+        gtk::init().expect("real GTK display required");
+        let app = gtk::Application::builder()
+            .application_id("org.tuna.NotifyCallbackProof")
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let center = Arc::new(Mutex::new(NotificationCenter::new()));
+        let ui = NotifyUi::build(&app, center.clone(), false);
+        // Real clicked callbacks, retained even after their widgets leave the UI.
+        let (id, take, delay, fired) = post(&ui);
+        take.emit_clicked();
+        take.emit_clicked();
+        delay.emit_clicked();
+        assert_eq!(
+            fired.get(),
+            1,
+            "Take wins exactly once, stale sibling stays inert"
+        );
+        assert_eq!(center.lock().unwrap().history().len(), 1);
+        ui.clear.emit_clicked();
+        assert!(center.lock().unwrap().history().is_empty());
+        assert!(ui.bus.borrow().invoke_action(id as u32, "delay").is_err());
+
+        for terminal in [
+            "user-close",
+            "dismiss",
+            "replacement",
+            "timeout",
+            "history-close",
+            "clear",
+        ] {
+            let (id, take, delay, fired) = post(&ui);
+            match terminal {
+                "user-close" => button(&ui.banner_box, "close").emit_clicked(),
+                "dismiss" => assert!(ui.dismiss_notification(id)),
+                "replacement" => {
+                    // Production wellbeing replaces through these public APIs;
+                    // retain old buttons and ensure a new resident remains usable.
+                    ui.drop_notification_actions(id);
+                    assert!(ui.dismiss_notification(id));
+                }
+                "timeout" => {
+                    ui.first_seen.borrow_mut().insert(
+                        id,
+                        BannerTimer {
+                            shown: Instant::now() - Duration::from_secs(10),
+                            deadline: Some(Instant::now() - Duration::from_secs(1)),
+                        },
+                    );
+                    ui.tick(); // Real expiry and retirement path, no sleep/retry.
+                    assert!(!center.lock().unwrap().banners().iter().any(|n| n.id == id));
+                }
+                "history-close" => button(&ui.list, "close").emit_clicked(),
+                "clear" => ui.clear.emit_clicked(),
+                _ => unreachable!(),
+            }
+            take.emit_clicked();
+            delay.emit_clicked();
+            assert_eq!(
+                fired.get(),
+                0,
+                "captured old callbacks fired after {terminal}"
+            );
+            if matches!(terminal, "clear" | "history-close") {
+                assert!(ui.bus.borrow().invoke_action(id as u32, "take").is_err());
+            } else {
+                assert!(center.lock().unwrap().history().iter().any(|n| n.id == id));
+            }
+            ui.clear.emit_clicked();
+            let (_, new_take, _, new_fired) = post(&ui);
+            new_take.emit_clicked();
+            assert_eq!(
+                new_fired.get(),
+                1,
+                "fresh resident remains actionable after {terminal}"
+            );
+            ui.clear.emit_clicked();
+        }
+        // External notices have no local handler. Dismiss keeps each history
+        // action invokable once, including a captured button after dismissal.
+        let id = ui
+            .post_with_actions(
+                "External fixture",
+                "",
+                "External",
+                "",
+                &[
+                    ("take".into(), "Take".into()),
+                    ("delay".into(), "Delay".into()),
+                ],
+            )
+            .unwrap();
+        let take = button(&ui.banner_box, "Take");
+        let delay = button(&ui.banner_box, "Delay");
+        button(&ui.banner_box, "close").emit_clicked();
+        take.emit_clicked();
+        delay.emit_clicked();
+        assert!(ui.bus.borrow().invoke_action(id as u32, "take").is_err());
+        assert!(ui.bus.borrow().invoke_action(id as u32, "delay").is_err());
+        assert_eq!(center.lock().unwrap().history().len(), 1);
+        ui.clear.emit_clicked();
+        ui.banner_window.close();
+        println!("G-NOTIFY-LOCAL-LIFECYCLE pass actual GTK clicked handlers and in-memory NotificationCenter; Xvfb source scope only");
     }
 }
