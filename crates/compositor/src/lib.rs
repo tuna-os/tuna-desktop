@@ -73,6 +73,7 @@ pub mod mutter;
 #[cfg(feature = "drm")]
 mod native_repaint;
 pub mod night_light;
+pub mod wellbeing_effects;
 mod occlusion;
 pub mod orca;
 pub mod orientation;

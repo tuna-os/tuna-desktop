@@ -640,6 +640,7 @@ pub struct Runtime {
     scale: f64,
     /// GNOME's input settings as last applied (#60).
     input_settings: tuna_shell_control::InputSettings,
+    wellbeing_effects: crate::wellbeing_effects::Effects,
     /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
     input_aids: aids::RuntimeAids,
     /// PipeWire, connected on the first screen cast (#61).
@@ -1134,6 +1135,7 @@ impl Runtime {
             animation_clock: crate::animation_clock::AnimationClock::real(),
             scale: clamp_scale(session.scale),
             input_settings: Default::default(),
+            wellbeing_effects: Default::default(),
             input_aids: aids::RuntimeAids::default(),
             orca: crate::orca::Reader::new(&session.socket_name),
             pipewire: None,
@@ -1822,6 +1824,7 @@ impl Runtime {
         let x11_ready = false;
         let mut doc = serde_json::json!({
             "rendered_frames": self.stats.frames,
+            "wellbeing_effects": { "desaturation": self.wellbeing_effects.sample(self.animation_clock.now()).desaturation, "brightness": self.wellbeing_effects.sample(self.animation_clock.now()).brightness, "animating": self.wellbeing_effects.animating(self.animation_clock.now()) },
             "x11_display": self.x11_display.map(|d| format!(":{d}")),
             "capture_streams": self.casts.len(),
             "remote_input_sessions": self.remote_held.len(),
@@ -2570,11 +2573,13 @@ impl Runtime {
             offset: (0, 0),
             scale,
         };
+        let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
+        let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
         // Surface-local origin such that the window geometry (inside any
         // client-side shadow) starts at the buffer's corner.
         let geo = crate::popup::window_geometry_loc(&surface);
@@ -2614,7 +2619,7 @@ impl Runtime {
                     damage: &[Rectangle::from_size(size)],
                     scale,
                     blank_alpha: 0.0,
-                    tint: None,
+                    tint: color_effect.as_ref(),
                 },
                 &[],
                 &[],
@@ -2734,6 +2739,7 @@ impl Runtime {
         };
         let desktop = self.background_desktop();
         let bell = self.bell_frame();
+        let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
         let (renderer, size, view) = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = backend.window_size();
@@ -2759,6 +2765,7 @@ impl Runtime {
                 (renderer, out.size, view)
             }
         };
+        let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
         let buffer_size = (size.w, size.h).into();
         let mut texture: smithay::backend::renderer::gles::GlesTexture =
             renderer.create_buffer(fourcc, buffer_size).ok()?;
@@ -2821,7 +2828,7 @@ impl Runtime {
                     blank_alpha,
                     // Captures stay untinted, like GNOME's (gamma
                     // applies past the framebuffer).
-                    tint: None,
+                    tint: color_effect.as_ref(),
                 },
                 &decor,
                 &previews,
@@ -3214,6 +3221,7 @@ impl Runtime {
     /// Apply GNOME's input settings (#60): the seat's keymap and key
     /// repeat, libinput pointer devices (hardware), the hot corner.
     fn apply_input_settings(&mut self, settings: tuna_shell_control::InputSettings) {
+        self.wellbeing_effects.motion(settings.motion);
         self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
             .apply_workspace_policy(&mut self.state, settings.workspace_policy);
@@ -3592,6 +3600,7 @@ impl Runtime {
                 || self.manager.window_lifecycle().running()
                 || self.manager.modal_dim().running()
                 || self.cursor.animating(self.animation_clock.now())
+                || self.wellbeing_effects.animating(self.animation_clock.now())
                 || self.screenshot_flashes.running()
                 || !self.screenshot_replies.is_empty()
                 || self.tile_animation.as_ref().is_some_and(|(_, _, start)| {
@@ -3755,6 +3764,14 @@ impl Runtime {
         }
         if let Some(settings) = outcome.input_settings {
             self.apply_input_settings(settings);
+        }
+        if let Some((grayscale, fade)) = outcome.wellbeing_effects {
+            self.wellbeing_effects.set(
+                grayscale,
+                fade,
+                self.animation_clock.now(),
+                self.input_settings.motion,
+            );
         }
         if let Some((x, y)) = outcome.screenshot_pointer {
             self.move_screenshot_pointer(x, y);
@@ -4120,6 +4137,7 @@ impl Runtime {
             self.manager.workspace_slide().running(),
             locked,
         );
+        let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
             #[cfg(feature = "drm")]
@@ -4142,13 +4160,8 @@ impl Runtime {
         );
         // The tint program is compiled once per renderer and cached;
         // a compile failure draws this frame untinted.
-        let night_tint: Option<NightTint> = night_gains.and_then(|gains| {
-            crate::night_light::tint_program(renderer).map(|program| NightTint {
-                program,
-                uniform: crate::night_light::gains_f32(gains),
-                gains,
-            })
-        });
+        let night_tint =
+            crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, night_gains);
         let overview = (show_content && !overlay_visible && drawn).then(|| self.overview_layout());
         // While search shows results, the workspace view steps aside.
         let cards = overview
@@ -4160,12 +4173,6 @@ impl Runtime {
             .flatten();
         let tile = self.animated_tile_preview(tile);
         let accent = self.wallpaper.accent();
-        // Accent-derived solids (tile preview, overview decor) follow
-        // the tint; captures keep the untinted accent.
-        let accent = night_tint
-            .as_ref()
-            .map(|tint| crate::night_light::apply_gains(accent, tint.gains))
-            .unwrap_or(accent);
         let decor_global = cards
             .map(|layout| overview_decor(layout, accent))
             .unwrap_or_default();
@@ -4243,11 +4250,9 @@ impl Runtime {
                         elements.tile = tile_elements(rect, view, accent);
                     }
                     if overview.is_none() && show_content {
-                        elements.tile.extend(focus_ring_elements(
-                            &self.manager,
-                            view,
-                            night_tint.as_ref().map(|tint| tint.gains),
-                        ));
+                        elements
+                            .tile
+                            .extend(focus_ring_elements(&self.manager, view, None));
                     }
                     elements.top = previews_to_elements(
                         renderer,
@@ -4394,11 +4399,9 @@ impl Runtime {
                         elements.tile = tile_elements(rect, view, accent);
                     }
                     if overview.is_none() && show_content {
-                        elements.tile.extend(focus_ring_elements(
-                            &self.manager,
-                            view,
-                            night_tint.as_ref().map(|tint| tint.gains),
-                        ));
+                        elements
+                            .tile
+                            .extend(focus_ring_elements(&self.manager, view, None));
                     }
                     elements.top = previews_to_elements(
                         renderer,
@@ -4462,6 +4465,7 @@ impl Runtime {
                             // Night Light gains: a temperature step
                             // repaints, an unchanged filter sleeps.
                             .chain(self.night_light.effect_bits())
+                            .chain(wellbeing.bits())
                             .collect(),
                         groups: vec![
                             elements
@@ -4823,15 +4827,7 @@ fn switcher_previews(
         .collect()
 }
 
-/// Installed Night Light tint for one live frame (#339): the
-/// texture program plus the gains as a shader uniform and as
-/// schedule gains for CPU-side colours. Captures never carry one.
-#[derive(Debug)]
-struct NightTint {
-    program: smithay::backend::renderer::gles::GlesTexProgram,
-    uniform: [f32; 3],
-    gains: crate::night_light::ColorGains,
-}
+use crate::wellbeing_effects::FrameColor;
 
 /// One output's surfaces, front to back, with GNOME's tile preview
 /// slotted in: `elements[..above]` draw over the preview (the dragged
@@ -5467,8 +5463,8 @@ struct Target<'a> {
     damage: &'a [Rectangle<i32, smithay::utils::Physical>],
     scale: f64,
     blank_alpha: f32,
-    /// Installed Night Light tint, if this live frame carries one.
-    tint: Option<&'a NightTint>,
+    /// Scene wellbeing effect and output temperature; captures use unity temperature.
+    tint: Option<&'a FrameColor>,
 }
 
 fn draw_scene(
@@ -5490,29 +5486,27 @@ fn draw_scene(
         blank_alpha,
         tint,
     } = target;
-    // The clear follows the tint; solid overlays keep their colours
-    // (accent-derived ones arrive pre-tinted, feedback stays raw).
-    let background = tint
-        .map(|tint| {
-            let [r, g, b] = crate::night_light::apply_gains(
-                [background.r(), background.g(), background.b()],
-                tint.gains,
-            );
-            Color32F::new(r, g, b, background.a())
-        })
-        .unwrap_or(background);
+    let recolor = |color| tint.map_or(color, |tint| tint.color(color));
+    let background = recolor(background);
+    let recolor_solid =
+        |element: &smithay::backend::renderer::element::solid::SolidColorRenderElement| {
+            use smithay::backend::renderer::element::Element;
+            SolidColorRenderElement::new(
+                element.id().clone(),
+                element.geometry(1.0.into()),
+                element.current_commit(),
+                recolor(element.color()),
+                element.kind(),
+            )
+        };
+    let tile: Vec<_> = scene.tile.iter().map(recolor_solid).collect();
+    let flashes: Vec<_> = scene.flashes.iter().map(recolor_solid).collect();
     // Install the tint program around one texture group; a no-op
     // without a tint, cleared right after like the modal-dim override.
     let set_tint = |frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
                     brightness: f32| {
         if let Some(tint) = tint {
-            frame.override_default_tex_program(
-                tint.program.clone(),
-                vec![
-                    smithay::backend::renderer::gles::Uniform::new("brightness", brightness),
-                    smithay::backend::renderer::gles::Uniform::new("nl_gains", tint.uniform),
-                ],
-            );
+            frame.override_default_tex_program(tint.program.clone(), tint.uniforms(brightness));
         }
     };
     let error =
@@ -5538,7 +5532,7 @@ fn draw_scene(
         .bell
         .iter()
         .filter(|(at, _)| at.is_none())
-        .map(|(_, e)| e.clone())
+        .map(|(_, e)| recolor_solid(e))
         .collect();
     let bell_plan = occlusion.plan(1.0, &fullscreen_bell);
     let top_plan = occlusion.plan(scale, &scene.top);
@@ -5571,7 +5565,7 @@ fn draw_scene(
     frame.clear_tex_program_override();
     for ((color, _), rects) in decor.iter().zip(decor_plan.iter().rev()) {
         if !rects.is_empty() {
-            frame.clear(*color, rects).map_err(error)?;
+            frame.clear(recolor(*color), rects).map_err(error)?;
         }
     }
     // Surfaces carry logical sizes: draw them at the output scale. The
@@ -5580,13 +5574,13 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
     frame.clear_tex_program_override();
     draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.tile, &tile_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &tile, &tile_plan).map_err(error)?;
     draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
     set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
     frame.clear_tex_program_override();
     draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.flashes, &flash_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &flashes, &flash_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, visible) in over
@@ -5672,7 +5666,7 @@ fn draw_slots(
     scene: &Scene,
     slots: &[SceneSlot],
     plan: &[Vec<Rectangle<i32, smithay::utils::Physical>>],
-    tint: Option<&NightTint>,
+    tint: Option<&FrameColor>,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
@@ -5686,13 +5680,7 @@ fn draw_slots(
         // program (brightness folds into the same override);
         // otherwise only dimmed elements take an override.
         if let Some(tint) = tint {
-            frame.override_default_tex_program(
-                tint.program.clone(),
-                vec![
-                    smithay::backend::renderer::gles::Uniform::new("brightness", brightness),
-                    smithay::backend::renderer::gles::Uniform::new("nl_gains", tint.uniform),
-                ],
-            );
+            frame.override_default_tex_program(tint.program.clone(), tint.uniforms(brightness));
         } else if brightness < 1.0 {
             if let Some(program) = &scene.dim_program {
                 frame.override_default_tex_program(
@@ -5714,7 +5702,19 @@ fn draw_slots(
             SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
                 frame,
                 1.0,
-                std::slice::from_ref(&scene.bell[k].1),
+                std::slice::from_ref(&{
+                    use smithay::backend::renderer::element::{
+                        solid::SolidColorRenderElement, Element,
+                    };
+                    let e = &scene.bell[k].1;
+                    SolidColorRenderElement::new(
+                        e.id().clone(),
+                        e.geometry(1.0.into()),
+                        e.current_commit(),
+                        tint.map_or(e.color(), |tint| tint.color(e.color())),
+                        e.kind(),
+                    )
+                }),
                 visible,
             ),
             SceneSlot::Snapshot(k) => draw_planned::<GlesRenderer, _>(

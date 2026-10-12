@@ -164,9 +164,10 @@ impl ProtocolVersion {
     /// `0.32` appends trusted dash icon targets for minimize/restore.
     /// `0.33` appends cursor theme, size, locate-pointer and its keysym preference.
     /// `0.34` appends keyboard accessibility aids and toggle notifications.
+    /// `0.35` appends atomic wellbeing scene effects.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 34,
+        minor: 35,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -391,6 +392,8 @@ pub enum CommandKind {
     MoveScreenshotPointer { x: i32, y: i32 },
     /// Trusted shell dash icon bounds in global logical coordinates. Full replacement.
     SetWindowIconGeometries { geometries: Vec<WindowIconGeometry> },
+    /// Atomic scene effects from the authenticated shell; cursor excluded.
+    SetWellbeingEffects { grayscale: bool, fade: bool },
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -1565,8 +1568,33 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_34() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 34));
+    fn current_version_is_0_35() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 35));
+    }
+
+    #[test]
+    fn wellbeing_effects_are_atomic_bounded_and_strictly_decoded() {
+        for grayscale in [false, true] {
+            for fade in [false, true] {
+                let msg = Message::Command {
+                    id: 71,
+                    kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+                };
+                roundtrip(&msg);
+                let mut frame = encode_frame(&msg);
+                let n = frame.len();
+                frame[n - 1] = 2; // postcard bool accepts only 0/1
+                assert!(decode_frame(&frame).is_err());
+                let mut frame = encode_frame(&msg);
+                frame.push(0);
+                let body_len = (frame.len() - 4) as u32;
+                frame[..4].copy_from_slice(&body_len.to_le_bytes());
+                assert!(
+                    decode_frame(&frame).is_err(),
+                    "trailing fields must not be silently accepted"
+                );
+            }
+        }
     }
 
     #[test]

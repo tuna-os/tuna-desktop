@@ -274,6 +274,7 @@ pub struct Session<'a> {
     unlock_pending: Option<u64>,
     /// Latest `SetInputSettings` from the shell, drained by the hub.
     input_settings: Option<tuna_shell_control::InputSettings>,
+    wellbeing_effects: Option<(bool, bool)>,
     icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     screen_reader: Option<bool>,
     screenshot_pointer: Option<(i32, i32)>,
@@ -349,6 +350,7 @@ impl<'a> Session<'a> {
             unlock_request: None,
             unlock_pending: None,
             input_settings: None,
+            wellbeing_effects: None,
             icon_geometries: None,
             screen_reader: None,
             screenshot_pointer: None,
@@ -626,6 +628,17 @@ impl<'a> Session<'a> {
                 kind: CommandKind::SetScreenReader { enabled },
             } => {
                 self.screen_reader = Some(enabled);
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+            } => {
+                self.wellbeing_effects = Some((grayscale, fade));
                 self.conn.write_frame(&Message::CommandResult {
                     id,
                     status: CommandStatus::Applied,
@@ -1020,6 +1033,7 @@ fn apply_command(
         | CommandKind::ShortcutConsent { .. }
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
+        | CommandKind::SetWellbeingEffects { .. }
         | CommandKind::SetSwitcherThumbnails { .. }
         | CommandKind::SetSwitcherKeys { .. }
         | CommandKind::MoveScreenshotPointer { .. }
@@ -1062,6 +1076,7 @@ pub struct PollOutcome {
     pub unlock: Option<(u64, tuna_shell_control::Secret)>,
     /// GNOME input settings the shell sent, if any.
     pub input_settings: Option<tuna_shell_control::InputSettings>,
+    pub wellbeing_effects: Option<(bool, bool)>,
     pub icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     pub screen_reader: Option<bool>,
     pub screenshot_pointer: Option<(i32, i32)>,
@@ -1524,6 +1539,9 @@ impl ControlHub {
                     }
                     if let Some(geometries) = session.icon_geometries.take() {
                         outcome.icon_geometries = Some(geometries);
+                    }
+                    if let Some(effects) = session.wellbeing_effects.take() {
+                        outcome.wellbeing_effects = Some(effects);
                     }
                     if let Some(settings) = session.input_settings.take() {
                         outcome.input_settings = Some(settings);
