@@ -40,7 +40,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | bouncekeys-beep-reject | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | bouncekeys-delay | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | bouncekeys-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| disable-timeout | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| disable-timeout | Ignored | No Tuna inactivity-timeout consumer. Mutter51 native loads this legacy delay but never applies it; compatibility disposition remains open under #365. See [native keyboard audit](keyboard-native-parity.md) |
 | enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | feature-state-change-beep | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | mousekeys-accel-time | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
@@ -55,7 +55,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | stickykeys-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | stickykeys-modifier-beep | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | stickykeys-two-key-off | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| timeout-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| timeout-enable | Ignored | No Tuna inactivity-timeout consumer. Mutter51 native loads the flag but never tests it in the native aid engine; compatibility disposition remains open under #365. See [native keyboard audit](keyboard-native-parity.md) |
 | togglekeys-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 ## org.gnome.desktop.a11y.magnifier
 
