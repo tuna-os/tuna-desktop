@@ -5499,8 +5499,11 @@ fn draw_scene(
                 element.kind(),
             )
         };
-    let tile: Vec<_> = scene.tile.iter().map(recolor_solid).collect();
-    let flashes: Vec<_> = scene.flashes.iter().map(recolor_solid).collect();
+    // The usual neutral frame borrows its solids without an extra allocation.
+    let colored_tile = tint.map(|_| scene.tile.iter().map(recolor_solid).collect::<Vec<_>>());
+    let tile = colored_tile.as_deref().unwrap_or(&scene.tile);
+    let colored_flashes = tint.map(|_| scene.flashes.iter().map(recolor_solid).collect::<Vec<_>>());
+    let flashes = colored_flashes.as_deref().unwrap_or(&scene.flashes);
     // Install the tint program around one texture group; a no-op
     // without a tint, cleared right after like the modal-dim override.
     let set_tint = |frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
@@ -5574,13 +5577,13 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
     frame.clear_tex_program_override();
     draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &tile, &tile_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
     draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
     set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
     frame.clear_tex_program_override();
     draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &flashes, &flash_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, visible) in over
