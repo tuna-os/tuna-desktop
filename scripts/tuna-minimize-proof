@@ -411,7 +411,29 @@ try:
     own=wait(lambda d:not d["window_lifecycle"]["restoring"],"family-parent-only-restored")
     assert child_id in own["minimized"] and wid not in own["minimized"]
     assert own["focused"]==wid
-    assert screenshot("18-family-independent-child-hidden").getpixel(child_point)!=(78,154,6)
+    own_image=screenshot("18-family-independent-child-hidden")
+    assert own_image.getpixel(child_point)!=(78,154,6)
+    # Shell51 _checkDimming -> Mutter has_attached_dialogs excludes unmanaged
+    # children, not minimized ones. Confirm the actual restored parent pixels
+    # remain dim, then unset modal on that same hidden live child as a negative
+    # control. Logical hiding/own minimize must remain independent of dimming.
+    parent_rect=next(w["rect"] for w in own["windows"] if w["id"]==wid)
+    hidden_dim=next(p for p in own["modal_dim"]["parents"] if p["parent"]==wid)
+    assert hidden_dim["dimmed"] and hidden_dim["multiplier"] < 1.0
+    check_pixel(own_image,parent_rect,1.0,hidden_dim["multiplier"])
+    action("unset-modal",2301)
+    wait(lambda d:not any(p["parent"]==wid and p["dimmed"] for p in d["modal_dim"]["parents"]),"family-hidden-modal-unset")
+    settle_extra(250)
+    undimmed=wait(lambda d:not any(p["parent"]==wid for p in d["modal_dim"]["parents"]),"family-hidden-modal-undim-complete")
+    assert child_id in undimmed["minimized"] and undimmed["focused"]==wid
+    check_pixel(screenshot("18-family-hidden-modal-unset-brightness"),parent_rect,1.0,1.0)
+    action("set-modal",2302)
+    wait(lambda d:any(p["parent"]==wid and p["dimmed"] for p in d["modal_dim"]["parents"]),"family-hidden-modal-reset")
+    settle_extra(500)
+    reset_dim=wait(lambda d:not d["modal_dim"]["running"],"family-hidden-modal-redim-complete")
+    assert child_id in reset_dim["minimized"] and reset_dim["focused"]==wid
+    multiplier=next(p["multiplier"] for p in reset_dim["modal_dim"]["parents"] if p["parent"]==wid)
+    check_pixel(screenshot("18-family-hidden-modal-reset-brightness"),parent_rect,1.0,multiplier)
     action("minimize",24)
     wait(lambda d:wid in d["minimized"],"family-hidden-parent-again")
     move(6475)
@@ -494,5 +516,5 @@ finally:
 
 require_owned_cleanup(manifest["owned_cleanup"])
 if success:
-    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-CLEANUP pass private session owned process cleanup\n")
+    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-FAMILY-DIM-HIDDEN pass independently minimized managed modal retains dim until actual unset-modal brightness control\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-CLEANUP pass private session owned process cleanup\n")
     print(f"native minimize proof passed: {art}")

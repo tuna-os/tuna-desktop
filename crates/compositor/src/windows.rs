@@ -825,6 +825,10 @@ impl WindowManager {
         enabled: bool,
     ) {
         let alive = self.windows.keys().copied().collect();
+        // GNOME Shell 51 _checkDimming uses has_attached_dialogs(). Mutter 51
+        // has_attached_foreach_func checks attached && !unmanaging, without
+        // consulting minimized/visibility. A managed independently minimized
+        // modal therefore keeps its parent dimmed until detached or destroyed.
         let parents = self
             .windows
             .iter()
