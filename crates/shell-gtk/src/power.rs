@@ -81,6 +81,15 @@ pub fn menu_actions(nested: bool) -> &'static [Action] {
     }
 }
 
+/// Whether the power menu itself shows under a lockdown policy: any
+/// visible row keeps it, so a nested session (whose only row is Log
+/// Out) shows no menu while `disable-log-out` denies.
+pub fn power_menu_visible_for(actions: &[Action], logout_allowed: bool) -> bool {
+    actions
+        .iter()
+        .any(|action| *action != Action::LogOut || logout_allowed)
+}
+
 /// Whether this shell runs inside another desktop.
 pub fn is_nested() -> bool {
     std::env::var("TUNA_SESSION_KIND").map_or(true, |kind| kind != "hardware")
@@ -355,6 +364,17 @@ mod tests {
                 Action::LogOut
             ]
         );
+    }
+
+    #[test]
+    fn lockdown_hides_nested_menu_but_keeps_hardware_menu() {
+        // Negative: nested sessions lose their only row and show no menu.
+        assert!(!power_menu_visible_for(menu_actions(true), false));
+        // Positive: allowed policies show both menus.
+        assert!(power_menu_visible_for(menu_actions(true), true));
+        assert!(power_menu_visible_for(menu_actions(false), true));
+        // Hardware keeps its power rows while Log Out hides.
+        assert!(power_menu_visible_for(menu_actions(false), false));
     }
 
     #[test]

@@ -6,20 +6,20 @@
 //! visible, and apply that to the widgets. The decision engine — key
 //! inventory, owners, denial copy — lives in the compositor's
 //! `lockdown` module; this file mirrors only the key names needed to
-//! read GSettings directly, and stays free of `crate::` uses so it
-//! compiles standalone until union registers `mod lockdown` in
-//! `main.rs`.
+//! read GSettings directly, and stays free of `crate::` uses so the
+//! integration test can include it by path (binary modules are not
+//! importable from integration targets).
 //!
-//! Wiring (union-time; entry points verified at `a445af2e`):
+//! Wiring (live; entry points verified at `a445af2e`, wired on w2-357):
 //!
 //! | Entry point | Call site | Application |
 //! |---|---|---|
-//! | Lock button | `main.rs` `qs_round("system-lock-screen-symbolic", "Lock")` | `visible.lock_screen`; also guards the `control.lock()` click path |
-//! | Log Out row | `main.rs` power menu `power::Action::LogOut` item | `visible.log_out`; nested sessions with no rows show no menu |
+//! | Lock button | `main.rs` `qs_round("system-lock-screen-symbolic", "Lock")` | hidden when denied, plus a live guard on every `control.lock()` path (button, sleep, screensaver/D-Bus, keybinding) |
+//! | Log Out row | `main.rs` power menu `power::Action::LogOut` item | hidden when denied; nested sessions with no rows show no menu |
 //! | User switch row | none yet | `visible.user_switch` gates the row when it lands |
 //! | Run-command dialog | none yet | `visible.run_command` gates the dialog when it lands |
-//! | Password reveal | `network_agent.rs` secret-entry reveal toggle | `visible.password_reveal` |
-//! | Settings buttons | `main.rs`/`wifi.rs`/`accessibility.rs` `gnome-control-center` spawns | `visible.url_handlers` |
+//! | Password reveal | `network_agent.rs` secret-entry reveal toggle | [`password_reveal_icon`] omits the toggle when denied |
+//! | Settings buttons | `main.rs`/`wifi.rs`/`accessibility.rs` `gnome-control-center` spawns | [`open_settings_panel`]/[`handlers_allowed`] block the spawn when denied; the top Settings button hides too |
 //!
 //! App-owned (`disable-printing`, `disable-print-setup`,
 //! `disable-save-to-disk`) and daemon-owned
@@ -191,6 +191,61 @@ pub fn read_from(settings: &gio::Settings) -> LockdownPolicy {
 /// GNOME defaults (everything allowed).
 pub fn read() -> LockdownPolicy {
     settings().map(|s| read_from(&s)).unwrap_or_default()
+}
+
+/// Whether shell-opened URL/MIME handlers may run (live read of
+/// `disable-application-handlers`). Guards every Settings launch and
+/// the enterprise Wi-Fi setup path, which all re-read per activation.
+pub fn handlers_allowed() -> bool {
+    read().entry_visibility().url_handlers
+}
+
+/// Open a Settings panel unless policy blocks handlers. Returns
+/// whether it launched (`false` covers both denial and spawn
+/// failure; only denial is logged here).
+pub fn open_settings_panel(panel: Option<&str>) -> bool {
+    let policy = read();
+    let launched = spawn_settings_for_policy(panel, &policy, &|panel| {
+        let mut command = std::process::Command::new("gnome-control-center");
+        if let Some(panel) = panel {
+            command.arg(panel);
+        }
+        command.spawn().is_ok()
+    });
+    if !launched && !policy.entry_visibility().url_handlers {
+        eprintln!("tuna-shell-gtk: opening settings is disabled by your administrator.");
+    }
+    launched
+}
+
+/// Testable core of [`open_settings_panel`]: the spawn runs only when
+/// the policy allows handlers. Callers pass the live [`read`] policy;
+/// tests inject restrictive policies with a recording spawn.
+pub fn spawn_settings_for_policy(
+    panel: Option<&str>,
+    policy: &LockdownPolicy,
+    spawn: &dyn Fn(Option<&str>) -> bool,
+) -> bool {
+    if !policy.entry_visibility().url_handlers {
+        return false;
+    }
+    spawn(panel)
+}
+
+/// Reveal-toggle icon for a secret entry, if the field is a password
+/// field and the policy shows passwords. A denied policy (or a
+/// non-password field) yields no icon, so no toggle path exists.
+pub fn password_reveal_icon(
+    password_field: bool,
+    visibility: &EntryVisibility,
+) -> Option<&'static str> {
+    (password_field && visibility.password_reveal).then_some("view-reveal-symbolic")
+}
+
+/// Apply handler visibility to the top Settings button: hidden while
+/// `disable-application-handlers` denies, restored when it lifts.
+pub fn apply_settings_visibility(visibility: &EntryVisibility, settings_button: &gtk::Button) {
+    settings_button.set_visible(visibility.url_handlers);
 }
 
 /// Apply visibility to the lock, log-out, and user-switch widgets.
@@ -379,6 +434,59 @@ mod tests {
             assert!(action.denial().contains(fragment), "{action:?}");
             assert!(action.denial().contains("administrator"), "{action:?}");
         }
+    }
+
+    #[test]
+    fn settings_spawn_blocked_under_deny_and_runs_when_allowed() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let spawn = |_: Option<&str>| {
+            calls.set(calls.get() + 1);
+            true
+        };
+        let denied = LockdownPolicy {
+            disable_application_handlers: true,
+            ..LockdownPolicy::default()
+        };
+        assert!(!spawn_settings_for_policy(Some("wifi"), &denied, &spawn));
+        assert_eq!(calls.get(), 0, "denied policy must not spawn");
+        assert!(spawn_settings_for_policy(
+            Some("wifi"),
+            &LockdownPolicy::default(),
+            &spawn
+        ));
+        assert_eq!(calls.get(), 1, "allowed policy spawns");
+        // Unrelated keys never block the spawn.
+        let unrelated = LockdownPolicy {
+            disable_lock_screen: true,
+            disable_log_out: true,
+            ..LockdownPolicy::default()
+        };
+        assert!(spawn_settings_for_policy(None, &unrelated, &spawn));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn reveal_icon_hidden_under_deny_and_shown_when_allowed() {
+        let denied = LockdownPolicy {
+            disable_show_password: true,
+            ..LockdownPolicy::default()
+        };
+        assert_eq!(
+            password_reveal_icon(true, &denied.entry_visibility()),
+            None,
+            "denied policy yields no toggle"
+        );
+        assert_eq!(
+            password_reveal_icon(true, &LockdownPolicy::default().entry_visibility()),
+            Some("view-reveal-symbolic"),
+            "allowed policy keeps the toggle"
+        );
+        assert_eq!(
+            password_reveal_icon(false, &LockdownPolicy::default().entry_visibility()),
+            None,
+            "non-password fields never reveal"
+        );
     }
 
     #[test]
