@@ -1133,6 +1133,8 @@ fn quick_settings_popover(
                     popover.remove_css_class("dimmed");
                 }
             });
+    }
+    {
         let menu = printers_menu_ui.revealer.clone();
         popover.connect_closed(move |_| menu.set_visible(false));
     }
