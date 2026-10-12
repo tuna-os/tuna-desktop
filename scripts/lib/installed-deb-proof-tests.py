@@ -18,6 +18,17 @@ spec.loader.exec_module(M)
 
 
 class InstalledPolicy(unittest.TestCase):
+    def test_release_keeps_single_versioned_gtk_and_sound_dependencies(self):
+        source = (ROOT / 'scripts/tuna-release').read_text()
+        depends = next(line for line in source.splitlines() if line.startswith('Depends: '))
+        fields = depends[len('Depends: '):].split(', ')
+        for name, floor in [('libgtk-4-1', '(>= 4.12)'), ('libadwaita-1-0', '(>= 1.0)'), ('libgtk4-layer-shell0', '(>= 1.1)')]:
+            matches = [field for field in fields if field.split()[0] == name]
+            self.assertEqual(matches, [name + ' ' + floor])
+        for name in ['gnome-session-canberra', 'libcanberra-pulse', 'sound-theme-freedesktop']:
+            self.assertEqual(fields.count(name), 1)
+        self.assertTrue(fields[0].startswith('$SHLIBS'))
+
     def process_case(self, inode=20, replacement=None, changed_field=None):
         original = {'sha256': 'a' * 64, 'dev': 1, 'ino': 20, 'size': 100}
         executed = SimpleNamespace(st_dev=1, st_ino=inode, st_size=100,
