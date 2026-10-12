@@ -344,21 +344,21 @@ AT_SPI_PID=""
 CLIP_PID=""
 
 session_cleanup() {
-    [ -n "$CLIP_PID" ] && kill -INT "$CLIP_PID" 2>/dev/null || true
+    if [ -n "$CLIP_PID" ]; then kill -INT "$CLIP_PID" 2>/dev/null || true; fi
     # shellcheck disable=SC2086
-    [ -n "$IME_PIDS" ] && kill $IME_PIDS 2>/dev/null || true
-    [ -n "$TRAY_PID" ] && kill "$TRAY_PID" 2>/dev/null || true
-    [ -n "$CAL_PID" ] && kill "$CAL_PID" 2>/dev/null || true
-    [ -n "$PROV_PID" ] && kill "$PROV_PID" 2>/dev/null || true
+    if [ -n "$IME_PIDS" ]; then kill $IME_PIDS 2>/dev/null || true; fi
+    if [ -n "$TRAY_PID" ]; then kill "$TRAY_PID" 2>/dev/null || true; fi
+    if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
+    if [ -n "$PROV_PID" ]; then kill "$PROV_PID" 2>/dev/null || true; fi
     if [ -n "$COMPOSITOR_PID" ]; then
         kill "$COMPOSITOR_PID" 2>/dev/null || true
         wait "$COMPOSITOR_PID" 2>/dev/null || true
     fi
-    [ -n "$OWNED_XVFB" ] && kill "$OWNED_XVFB" 2>/dev/null || true
-    [ -n "$STUBS_PID" ] && kill "$STUBS_PID" 2>/dev/null || true
-    [ -n "$AT_SPI_PID" ] && kill "$AT_SPI_PID" 2>/dev/null || true
-    [ -n "$OWNED_RUNTIME" ] && rm -rf "$OWNED_RUNTIME" || true
-    [ -n "$SYSBUS_PID" ] && kill "$SYSBUS_PID" 2>/dev/null || true
+    if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+    if [ -n "$STUBS_PID" ]; then kill "$STUBS_PID" 2>/dev/null || true; fi
+    if [ -n "$AT_SPI_PID" ]; then kill "$AT_SPI_PID" 2>/dev/null || true; fi
+    if [ -n "$OWNED_RUNTIME" ]; then rm -rf "$OWNED_RUNTIME" || true; fi
+    if [ -n "$SYSBUS_PID" ]; then kill "$SYSBUS_PID" 2>/dev/null || true; fi
 }
 
 pick_display() {
@@ -571,7 +571,9 @@ shot() {
     sleep "${2:-1.5}"
     ts="$(now_ms)"
     scrot -o "$ARTIFACTS/$1.png" >/dev/null 2>&1 || return 1
-    [ -f "$TUNA_COMPOSITOR_STATE" ] && cp "$TUNA_COMPOSITOR_STATE" "$ARTIFACTS/$1.json" 2>/dev/null || true
+    if [ -f "$TUNA_COMPOSITOR_STATE" ]; then
+        cp "$TUNA_COMPOSITOR_STATE" "$ARTIFACTS/$1.json" 2>/dev/null || true
+    fi
     sum="$(sha256sum "$ARTIFACTS/$1.png" | cut -d' ' -f1)"
     printf '{"file":"%s.png","state":"%s","epoch_ms":%s,"sha256":"%s"}\n' \
         "$1" "${STATE_NAME:-?}" "$ts" "$sum" >>"$ARTIFACTS/frames.jsonl"
@@ -647,8 +649,10 @@ run_state() {
     return 0
 }
 
-state_fail() { echo "capture failed: $1"; return 1; }
-state_skip() { echo "skipped: $1"; return 70; }
+# state_fail/state_skip exit the state subshell (see run_state), so a
+# failed guard aborts the state instead of falling through.
+state_fail() { echo "capture failed: $1"; exit 1; }
+state_skip() { echo "skipped: $1"; exit 70; }
 
 park() { xdo mousemove --window "$WID" $((WIDTH - 4)) $((HEIGHT - 4)) || true; }
 open_calendar() { xdo mousemove --window "$WID" $((WIDTH / 2)) 16 click 1 && sleep 2; }
@@ -759,7 +763,9 @@ st_qs_network_agent() {
     st_qs_reopen || state_fail "quick settings would not open"
     a11y a11y-qs-wifi2.json --press "Wi-Fi Menu" >/dev/null 2>&1
     guest="$(jq -r '[.[] | select(.showing and ((.name // "") | test("Guest")))][0].name' "$ARTIFACTS/a11y-qs-wifi2.json")"
-    [ -n "$guest" ] && [ "$guest" != "null" ] || state_skip "no unsaved secured network in the stub menu"
+    if [ -z "$guest" ] || [ "$guest" = "null" ]; then
+        state_skip "no unsaved secured network in the stub menu"
+    fi
     a11y a11y-qs-agent.json --press "$guest" || state_fail "could not press $guest"
     sleep 1
     a11y a11y-qs-agent2.json >/dev/null 2>&1
@@ -844,7 +850,9 @@ st_windows_popover() {
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-test-beta "$ARTIFACTS/a11y-beta-menu.json" 20 >/dev/null 2>&1 \
         || state_fail "test window not on the a11y bus"
     beta_origin="$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")"
-    [ -n "$beta_origin" ] && [ "$beta_origin" != "null null" ] || state_fail "beta rect missing"
+    if [ -z "$beta_origin" ] || [ "$beta_origin" = "null null" ]; then
+        state_fail "beta rect missing"
+    fi
     # shellcheck disable=SC2086
     menu="$(jq -er --argjson ox "${beta_origin%% *}" --argjson oy "${beta_origin##* }" '[.[] | select(.showing and .name == "Main Menu" and ((.bounds[2] // 0) > 0) and ((.bounds[3] // 0) > 0))][0].bounds | "\((.[0] + $ox + .[2] / 2) | floor) \(.[1] + $oy + .[3] / 2 | floor)"' "$ARTIFACTS/a11y-beta-menu.json")" \
         || state_fail "menu button has no bounds"
@@ -860,7 +868,9 @@ st_windows_tile_preview() {
     read -r bx by <<EOF2
 $(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")
 EOF2
-    [ -n "$bx" ] && [ "$bx" != "null" ] || state_fail "beta rect missing"
+    if [ -z "$bx" ] || [ "$bx" = "null" ]; then
+        state_fail "beta rect missing"
+    fi
     xdo mousemove --window "$WID" $((bx + 131)) $((by + 20)) || state_fail "mouse failed"
     sleep 0.2
     xdo mousedown 1 || state_fail "mousedown failed"
@@ -883,7 +893,9 @@ st_windows_menu() {
     read -r bx by <<EOF2
 $(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")
 EOF2
-    [ -n "$bx" ] && [ "$bx" != "null" ] || state_fail "beta rect missing"
+    if [ -z "$bx" ] || [ "$bx" = "null" ]; then
+        state_fail "beta rect missing"
+    fi
     xdo mousemove --window "$WID" $((bx + 120)) $((by + 20)) || state_fail "mouse failed"
     sleep 0.2
     xdo click 3 || state_fail "right click failed"
@@ -1024,7 +1036,9 @@ st_overview_workspaces() {
     read -r bx by <<EOF2
 $(jq -r '.focused_rect | "\(.[0]) \(.[1])"' "$CSTATE")
 EOF2
-    [ -n "$bx" ] && [ "$bx" != "null" ] || state_fail "focused rect missing"
+    if [ -z "$bx" ] || [ "$bx" = "null" ]; then
+        state_fail "focused rect missing"
+    fi
     xdo mousemove --window "$WID" $((bx + 60)) $((by + 20)) || state_fail "mouse failed"
     sleep 0.2
     xdo click 3 || state_fail "right click failed"
@@ -1048,7 +1062,9 @@ st_overview_drag() {
     read -r sx sy tx ty <<EOF2
 $(jq -r '[.previews[0].rect, .thumbnails[0].rect] | "\(.[0][0] + 1) \(.[0][1] + 1) \(.[1][0] + .[1][2] + 3) \(.[1][1] + .[1][3] - 1)"' "$CSTATE")
 EOF2
-    [ -n "$sx" ] && [ "$sx" != "null" ] || state_fail "no preview/thumbnail rects to drag between"
+    if [ -z "$sx" ] || [ "$sx" = "null" ]; then
+        state_fail "no preview/thumbnail rects to drag between"
+    fi
     xdo mousemove --window "$WID" "$sx" "$sy" mousedown 1 || state_fail "mousedown failed"
     for step in $(seq 1 12); do
         xdo mousemove --window "$WID" $((sx + (tx - sx) * step / 12)) $((sy + (ty - sy) * step / 12)) || true
@@ -1157,8 +1173,9 @@ st_search_apps_folder_made() {
     a11y a11y-grid-src.json >/dev/null 2>&1 || state_fail "dump failed"
     src="$(jq -r '[.[] | select(.showing and .role == "table cell")][0].name' "$ARTIFACTS/a11y-grid-src.json")"
     dst="$(jq -r '[.[] | select(.showing and .role == "table cell")][1].name' "$ARTIFACTS/a11y-grid-src.json")"
-    [ -n "$src" ] && [ "$src" != "null" ] && [ -n "$dst" ] && [ "$dst" != "null" ] \
-        || state_fail "no two grid tiles to drag between"
+    if [ -z "$src" ] || [ "$src" = "null" ] || [ -z "$dst" ] || [ "$dst" = "null" ]; then
+        state_fail "no two grid tiles to drag between"
+    fi
     read -r sx sy <<EOF2
 $(grid_point "$ARTIFACTS/a11y-grid-src.json" "$src" || true)
 EOF2
@@ -1186,7 +1203,9 @@ st_search_apps_reorder() {
     cstate_wait '.overview_open and .overview_app_grid' 3 || state_fail "app grid not open"
     a11y a11y-grid-re.json >/dev/null 2>&1 || state_fail "dump failed"
     src="$(jq -r '[.[] | select(.showing and .role == "table cell")][2].name' "$ARTIFACTS/a11y-grid-re.json")"
-    [ -n "$src" ] && [ "$src" != "null" ] || state_fail "no tile to reorder"
+    if [ -z "$src" ] || [ "$src" = "null" ]; then
+        state_fail "no tile to reorder"
+    fi
     read -r sx sy <<EOF2
 $(grid_point "$ARTIFACTS/a11y-grid-re.json" "$src" || true)
 EOF2
@@ -1213,7 +1232,9 @@ st_search_apps_drag_cancel() {
     cstate_wait '.overview_open and .overview_app_grid' 3 || state_fail "app grid not open"
     a11y a11y-grid-cancel-src.json >/dev/null 2>&1 || state_fail "dump failed"
     src="$(jq -r '[.[] | select(.showing and .role == "table cell")][0].name' "$ARTIFACTS/a11y-grid-cancel-src.json")"
-    [ -n "$src" ] && [ "$src" != "null" ] || state_fail "no tile to drag"
+    if [ -z "$src" ] || [ "$src" = "null" ]; then
+        state_fail "no tile to drag"
+    fi
     read -r sx sy <<EOF2
 $(grid_point "$ARTIFACTS/a11y-grid-cancel-src.json" "$src" || true)
 EOF2
