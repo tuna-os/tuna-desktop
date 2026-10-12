@@ -100,7 +100,7 @@ jobs:
             fi
           done
       - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils at-spi2-core python3-pyatspi python3-pil fonts-cantarell libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev libwayland-dev wayland-protocols libpam-wrapper ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0
-      - run: chmod +x visual-bin/tuna-compositor visual-bin/tuna-shell-gtk && sha256sum -c visual-bin/sha256sums.txt
+      - run: chmod +x visual-bin/tuna-compositor visual-bin/tuna-shell-gtk visual-bin/tuna-ibus-bridge && sha256sum -c visual-bin/sha256sums.txt
       - name: Capture ${{ matrix.stage }}
         if: ${{ inputs.stages == '' || contains(format(',{0},', inputs.stages), format(',{0},', matrix.stage)) }}
         run: scripts/tuna-visual-capture --stage "${{ matrix.stage }}" --artifacts "visual-${{ matrix.stage }}"
