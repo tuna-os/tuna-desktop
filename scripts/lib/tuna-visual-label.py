@@ -22,7 +22,12 @@ Clips (*.webm) are listed, never pixel-compared: label `clip` with the
  recorded duration and byte size.
 
 Usage: tuna-visual-label.py --dir ARTIFACTS --baseline FILE
-Exit status is always 0: labeling never fails a capture run.
+       tuna-visual-label.py --compare OLD NEW [--threshold PCT]
+Exit status is always 0 in labeling mode: labeling never fails a capture
+run. In --compare mode the exit status is 0 when the two frames differ
+by at least the threshold percent of pixels, 1 when they are visually
+the same, and 2 when the comparison cannot run (missing file, size
+mismatch, or no PIL): callers fail closed on 2, never treat it as a pass.
 """
 import argparse
 import hashlib
@@ -61,11 +66,42 @@ def diff_fraction(baseline_rgb, other_rgb):
     return changed / total if total else 0.0
 
 
+def compare(old_path, new_path, threshold_pct):
+    """0 differs, 1 same, 2 cannot compare (fail closed, never a pass)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("tuna-visual-label: PIL unavailable; cannot compare", file=sys.stderr)
+        return 2
+    try:
+        old = Image.open(old_path).convert("RGB")
+        new = Image.open(new_path).convert("RGB")
+    except Exception as exc:
+        print("tuna-visual-label: cannot open frames: %s" % exc, file=sys.stderr)
+        return 2
+    if old.size != new.size:
+        print("tuna-visual-label: size mismatch %s vs %s" % (old.size, new.size),
+              file=sys.stderr)
+        return 2
+    fraction = diff_fraction(old, new)
+    if fraction is None:
+        return 2
+    pct = fraction * 100
+    print("tuna-visual-label: diff %.3f%% (threshold %.3f%%)" % (pct, threshold_pct))
+    return 0 if pct >= threshold_pct else 1
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dir", required=True)
-    parser.add_argument("--baseline", required=True)
+    parser.add_argument("--dir")
+    parser.add_argument("--baseline")
+    parser.add_argument("--compare", nargs=2, metavar=("OLD", "NEW"))
+    parser.add_argument("--threshold", type=float, default=THRESHOLD_FRACTION * 100)
     args = parser.parse_args()
+    if args.compare:
+        return compare(args.compare[0], args.compare[1], args.threshold)
+    if not args.dir or not args.baseline:
+        parser.error("--dir and --baseline are required in labeling mode")
     directory = args.dir
     frames_path = os.path.join(directory, "frames.jsonl")
     frames = load_frames(frames_path) if os.path.exists(frames_path) else []

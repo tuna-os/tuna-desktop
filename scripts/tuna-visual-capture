@@ -175,14 +175,24 @@ for name in sorted(os.listdir(root)):
     if os.path.isfile(prov_path):
         with open(prov_path, encoding="utf-8") as handle:
             provs[name] = json.load(handle)
-ok = sum(1 for s in stages.values() if s.get("status") == "ok")
+counts = {"ok": 0, "partial": 0, "failed": 0, "skipped": 0}
+state_totals = {"ok": 0, "failed": 0, "skipped": 0}
+for s in stages.values():
+    counts[s.get("status", "failed")] = counts.get(s.get("status"), 0) + 1
+    for name, num in (s.get("state_counts") or {}).items():
+        state_totals[name] = state_totals.get(name, 0) + num
 manifest = {"stages": stages, "provenance": provs,
-            "summary": {"stages_total": len(stages), "stages_ok": ok}}
+            "summary": {"stages_total": len(stages), "stages_ok": counts["ok"],
+                        "stages_partial": counts["partial"],
+                        "stages_failed": counts["failed"],
+                        "stages_skipped": counts["skipped"],
+                        "state_totals": state_totals}}
 with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, indent=2)
     handle.write("\n")
-print("tuna-visual-capture: merged %d stages (%d ok) into %s/manifest.json"
-      % (len(stages), ok, root))
+print("tuna-visual-capture: merged %d stages (ok=%d partial=%d failed=%d skipped=%d) into %s/manifest.json"
+      % (len(stages), counts["ok"], counts["partial"], counts["failed"],
+         counts["skipped"], root))
 print("tuna-visual-capture: per-stage report (missing/failed/skipped are explicit)")
 for name in sorted(stages):
     stage = stages[name]
@@ -266,12 +276,18 @@ manifest = {
     "tool": "tuna-visual-capture",
     "stage": stage or None,
     "source": {
-        "head_sha": git("rev-parse", "HEAD"),
-        "merge_sha": os.environ.get("TUNA_VISUAL_MERGE_SHA"),
+        # The exact tree that was built and captured, pinned from the
+        # checkout itself -- never from the event payload.
+        "built_head_sha": git("rev-parse", "HEAD"),
+        "built_tree_sha": git("rev-parse", "HEAD^{tree}"),
+        "tree_diff_sha256": hashlib.sha256(diff_bytes).hexdigest() if diff_bytes is not None else None,
+        "tree_diff_bytes": len(diff_bytes) if diff_bytes is not None else None,
+        # The triggering event's commit (for pull_request events: the
+        # merge ref). Informational only: the merge is NOT built here.
+        "event_sha": os.environ.get("GITHUB_SHA"),
+        "event_name": os.environ.get("GITHUB_EVENT_NAME"),
         "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
         "describe": git("describe", "--always", "--dirty"),
-        "diff_sha256": hashlib.sha256(diff_bytes).hexdigest() if diff_bytes is not None else None,
-        "diff_bytes": len(diff_bytes) if diff_bytes is not None else None,
     },
     "binaries": {
         "dir": binaries,
@@ -649,6 +665,57 @@ observe() {
     return 0
 }
 
+# Per-state consumer+render validators. Generic screening ("differs from
+# the desktop", "stage exited ok") is not named-state proof: every named
+# state requires its actual consumer to have rendered the expected
+# content, and a validator miss fails the state. Never silent green.
+require_jq() {
+    # require_jq <file> <jq> <desc>: fail unless the JSON matches.
+    observe "$1" "$2" "$3"
+    if [ -s "$ARTIFACTS/$1" ] && jq -e "$2" "$ARTIFACTS/$1" >/dev/null 2>&1; then
+        return 0
+    fi
+    state_fail "validator miss: $3"
+}
+require_absent() {
+    # require_absent <file> <jq> <desc>: fail when the JSON matches.
+    if [ -s "$ARTIFACTS/$1" ] && jq -e "$2" "$ARTIFACTS/$1" >/dev/null 2>&1; then
+        printf '{"state":"%s","observation":"%s","result":"PRESENT (want absent)"}\n' \
+            "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+        state_fail "validator miss: $3"
+    fi
+    printf '{"state":"%s","observation":"%s","result":"absent"}\n' \
+        "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+    return 0
+}
+require_cstate() {
+    # require_cstate <jq> <desc>: fail unless compositor state matches.
+    require_jq compositor-state.json "$1" "$2"
+}
+require_frame_differs() {
+    # require_frame_differs <new.png> <old.png> <desc>: fail unless the
+    # new frame differs from the old one above threshold. Fails closed
+    # when the comparison cannot run.
+    "$PY" "$ROOT/scripts/lib/tuna-visual-label.py" --compare \
+        "$ARTIFACTS/$2" "$ARTIFACTS/$1" >>"$ARTIFACTS/validators.log" 2>&1
+    code=$?
+    if [ "$code" = 0 ]; then
+        printf '{"state":"%s","observation":"%s","result":"differs"}\n' \
+            "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+        return 0
+    fi
+    printf '{"state":"%s","observation":"%s","result":"same-or-uncomparable"}\n' \
+        "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+    state_fail "validator miss: $3"
+}
+require_nonempty_file() {
+    # require_nonempty_file <path> <desc>: fail unless path is non-empty.
+    if [ -s "$1" ]; then
+        return 0
+    fi
+    state_fail "validator miss: $2"
+}
+
 # run_state <name> <function>: try/continue wrapper. The function runs in
 # a subshell with -e off so no failing command can abort the stage; its
 # outcome (ok/failed/skipped + reason) lands in steps.jsonl.
@@ -719,7 +786,7 @@ notify() {
 # --- stage: panel -----------------------------------------------------------
 st_panel_desktop() {
     a11y a11y-panel.json || state_fail "shell a11y dump failed"
-    observe a11y-panel.json 'any(.[]; .name == "Activities" and .showing)' "panel exposes Activities"
+    require_jq a11y-panel.json 'any(.[]; .name == "Activities" and .showing)' "panel exposes Activities"
     shot panel-desktop 2 || state_fail "scrot failed"
 }
 st_panel_tray() {
@@ -737,7 +804,7 @@ st_panel_tray() {
     done
     showing a11y-tray.json "Tuna Desktop Tray Probe" || state_fail "tray item never showed"
     a11y a11y-tray-menu.json --press "Tuna Desktop Tray Probe" || state_fail "could not open tray menu"
-    observe a11y-tray-menu.json 'any(.[]; .name == "Open Probe" and .showing)' "tray menu row showing"
+    require_jq a11y-tray-menu.json 'any(.[]; .name == "Open Probe" and .showing)' "tray menu row showing"
     shot panel-tray-menu || state_fail "scrot failed"
     kill "$TRAY_PID" 2>/dev/null || true
     TRAY_PID=""
@@ -752,7 +819,7 @@ states_panel() {
 st_calendar_menu() {
     open_calendar || state_fail "could not click the clock"
     a11y a11y-calendar.json || state_fail "a11y dump failed"
-    observe a11y-calendar.json 'any(.[]; .name == "Design review" and .showing)' "seeded event listed"
+    require_jq a11y-calendar.json 'any(.[]; .name == "Design review" and .showing)' "seeded event listed"
     observe a11y-calendar.json 'any(.[]; .name == "No Notifications" and .showing)' "empty notification list"
     shot calendar-menu || state_fail "scrot failed"
     close_all
@@ -762,7 +829,7 @@ st_calendar_with_notification() {
     sleep 1
     open_calendar || state_fail "could not click the clock"
     a11y a11y-calendar-list.json || state_fail "a11y dump failed"
-    observe a11y-calendar-list.json 'any(.[]; .name == "Calendar Note" and .showing)' "notification listed"
+    require_jq a11y-calendar-list.json 'any(.[]; .name == "Calendar Note" and .showing)' "notification listed"
     shot calendar-with-notification || state_fail "scrot failed"
     close_all
 }
@@ -775,7 +842,7 @@ states_calendar() {
 st_qs_grid() {
     open_qs || state_fail "could not open quick settings"
     a11y a11y-qs.json || state_fail "a11y dump failed"
-    observe a11y-qs.json 'any(.[]; .name == "Dark Style" and .showing)' "toggle grid showing"
+    require_jq a11y-qs.json 'any(.[]; .name == "Dark Style" and .showing)' "toggle grid showing"
     shot qs-grid || state_fail "scrot failed"
     # Leave it open: submenu states reuse it; each reopens if needed.
 }
@@ -787,7 +854,7 @@ st_qs_reopen() {
 st_qs_wifi_menu() {
     st_qs_reopen || state_fail "quick settings would not open"
     a11y a11y-qs-wifi.json --press "Wi-Fi Menu" || state_fail "could not open the Wi-Fi menu"
-    observe a11y-qs-wifi.json 'any(.[]; (.name // "" | startswith("Tuna Desktop")) and .showing)' "stub networks listed"
+    require_jq a11y-qs-wifi.json 'any(.[]; (.name // "" | startswith("Tuna Desktop")) and .showing)' "stub networks listed"
     shot qs-wifi-menu || state_fail "scrot failed"
 }
 st_qs_network_agent() {
@@ -800,7 +867,7 @@ st_qs_network_agent() {
     a11y a11y-qs-agent.json --press "$guest" || state_fail "could not press $guest"
     sleep 1
     a11y a11y-qs-agent2.json >/dev/null 2>&1
-    observe a11y-qs-agent2.json 'any(.[]; (.name // "" | test("Authentication required|Password")) and .showing)' "secret dialog showing"
+    require_jq a11y-qs-agent2.json 'any(.[]; (.name // "" | test("Authentication required|Password")) and .showing)' "secret dialog showing"
     shot qs-network-agent || state_fail "scrot failed"
     xdo key Escape || true
     sleep 1
@@ -808,13 +875,13 @@ st_qs_network_agent() {
 st_qs_wired_menu() {
     st_qs_reopen || state_fail "quick settings would not open"
     a11y a11y-qs-wired.json --press "Wired Menu" || state_fail "could not open the Wired menu"
-    observe a11y-qs-wired.json 'any(.[]; (.name // "" | test("Disconnect|Wired Settings")) and .showing)' "wired menu entries"
+    require_jq a11y-qs-wired.json 'any(.[]; (.name // "" | test("Disconnect|Wired Settings")) and .showing)' "wired menu entries"
     shot qs-wired-menu || state_fail "scrot failed"
 }
 st_qs_bluetooth_menu() {
     st_qs_reopen || state_fail "quick settings would not open"
     a11y a11y-qs-bt.json --press "Bluetooth Menu" || state_fail "could not open the Bluetooth menu"
-    observe a11y-qs-bt.json 'any(.[]; (.name // "" | test("Headphones|Bluetooth Settings")) and .showing)' "bluetooth menu entries"
+    require_jq a11y-qs-bt.json 'any(.[]; (.name // "" | test("Headphones|Bluetooth Settings")) and .showing)' "bluetooth menu entries"
     shot qs-bluetooth-menu || state_fail "scrot failed"
     close_all
 }
@@ -824,9 +891,9 @@ st_qs_microphone() {
     "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event >/dev/null 2>&1 || true
     sleep 1
     a11y a11y-mic.json >/dev/null 2>&1
-    observe a11y-mic.json 'any(.[]; .name == "Microphone in use" and .showing)' "panel mic indicator"
+    require_jq a11y-mic.json 'any(.[]; .name == "Microphone in use" and .showing)' "panel mic indicator"
     st_qs_reopen || state_fail "quick settings would not open"
-    observe a11y-qs-check.json 'any(.[]; .name == "Microphone" and .showing)' "Microphone slider"
+    require_jq a11y-qs-check.json 'any(.[]; .name == "Microphone" and .showing)' "Microphone slider"
     shot qs-microphone || state_fail "scrot failed"
     rm -f "$ARTIFACTS/recording"
     "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event >/dev/null 2>&1 || true
@@ -838,6 +905,7 @@ st_qs_osd_volume() {
         "{'icon': <'audio-volume-medium-symbolic'>, 'level': <0.5>, 'max_level': <1.0>}" \
         >/dev/null 2>&1 || state_fail "ShowOSD call failed"
     shot qs-osd-volume 0.5 || state_fail "scrot failed"
+    require_frame_differs qs-osd-volume.png 00-baseline-desktop.png "volume OSD rendered"
     sleep 2
 }
 st_qs_osd_brightness() {
@@ -850,13 +918,14 @@ st_qs_osd_brightness() {
     done
     [ "$ok" = 1 ] || state_skip "backlight did not move; OSD would be stale"
     shot qs-osd-brightness 0.5 || state_fail "scrot failed"
+    require_frame_differs qs-osd-brightness.png 00-baseline-desktop.png "brightness OSD rendered"
     sleep 2
 }
 st_qs_power_menu() {
     open_qs || state_fail "quick settings would not open"
     a11y a11y-power-menu.json --press "Power Off Menu" || state_fail "could not press the power button"
     sleep 1
-    observe a11y-power-menu.json 'any(.[]; .name == "Suspend" and .showing)' "power menu entries"
+    require_jq a11y-power-menu.json 'any(.[]; .name == "Suspend" and .showing)' "power menu entries"
     shot qs-power-menu || state_fail "scrot failed"
     close_all
 }
@@ -876,6 +945,7 @@ states_quick_settings() {
 st_windows_three() {
     spawn_test_windows || state_fail "test windows never mapped"
     shot windows-three 2 || state_fail "scrot failed"
+    require_cstate '(.windows | length) == 3' "three windows mapped"
 }
 st_windows_popover() {
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-test-beta "$ARTIFACTS/a11y-beta-menu.json" 20 >/dev/null 2>&1 \
@@ -891,7 +961,7 @@ st_windows_popover() {
     xdo mousemove --window "$WID" $menu click 1 || state_fail "could not click the menu"
     sleep 2
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-test-beta "$ARTIFACTS/a11y-beta.json" 20 >/dev/null 2>&1
-    observe a11y-beta.json 'any(.[]; .name == "Popover content" and .showing)' "popover open"
+    require_jq a11y-beta.json 'any(.[]; .name == "Popover content" and .showing)' "popover open"
     shot windows-popover || state_fail "scrot failed"
     close_all
 }
@@ -913,7 +983,7 @@ EOF2
         sleep 0.05
     done
     sleep 0.5
-    observe compositor-state.json '.tile_preview != null' "tile preview in compositor state"
+    require_cstate '.tile_preview != null' "tile preview in compositor state"
     shot windows-tile-preview || state_fail "scrot failed"
     xdo mousemove --window "$WID" $((bx + 120)) $((by + 20)) || true
     xdo mouseup 1 || true
@@ -932,20 +1002,20 @@ EOF2
     xdo click 3 || state_fail "right click failed"
     sleep 1.5
     a11y a11y-window-menu.json >/dev/null 2>&1
-    observe a11y-window-menu.json 'any(.[]; .name == "Close" and .showing)' "window menu open"
+    require_jq a11y-window-menu.json 'any(.[]; .name == "Close" and .showing)' "window menu open"
     shot windows-menu || state_fail "scrot failed"
     close_all
 }
 st_windows_maximize() {
     xdo key super+Up || state_fail "Super+Up failed"
-    cstate_wait '.focused_rect == [0,32,1280,768]' 10 || state_skip "maximize geometry not observed"
+    cstate_wait '.focused_rect == [0,32,1280,768]' 10 || state_fail "validator miss: maximize geometry not observed"
     shot windows-maximized || state_fail "scrot failed"
     xdo key super+Down || true
     sleep 1
 }
 st_windows_tiled() {
     xdo key super+Left || state_fail "Super+Left failed"
-    cstate_wait '.focused_rect == [0,32,640,768]' 10 || state_skip "tile geometry not observed"
+    cstate_wait '.focused_rect == [0,32,640,768]' 10 || state_fail "validator miss: tile geometry not observed"
     shot windows-tiled-left || state_fail "scrot failed"
     xdo key super+Down || true
     sleep 1
@@ -977,6 +1047,8 @@ st_x11_app() {
     cstate_wait '(.windows | length) >= 1' 20 || state_fail "X11 window never mapped"
     sleep 1
     shot x11-app 2 || state_fail "scrot failed"
+    require_nonempty_file "$X11_MARKER" "X probe launched with DISPLAY"
+    require_cstate '(.windows | length) >= 1' "X11 window mapped"
     close_all
 }
 states_x11() {
@@ -988,18 +1060,20 @@ st_scroll_strip() {
     spawn_test_windows || state_fail "test windows never mapped"
     xdo key super+shift+t || state_fail "Super+Shift+T failed"
     sleep 2
-    observe compositor-state.json '.scroll_mode == true' "strip mode in compositor state"
+    require_cstate '.session_mode == "scroll"' "strip mode in compositor state"
     shot scroll-strip 2 || state_fail "scrot failed"
 }
 st_scroll_follow() {
     xdo key super+Left || state_fail "Super+Left failed"
     sleep 1.5
     shot scroll-follow || state_fail "scrot failed"
+    require_frame_differs scroll-follow.png scroll-strip.png "view followed focus"
 }
 st_scroll_preset() {
     xdo key super+r || state_fail "Super+R failed"
     sleep 1.5
     shot scroll-preset || state_fail "scrot failed"
+    require_frame_differs scroll-preset.png scroll-follow.png "column preset changed the strip"
     xdo key super+shift+t || true
     sleep 1
 }
@@ -1016,7 +1090,7 @@ st_switcher_popup() {
     xdo key Tab || { xdo keyup Alt_L || true; state_fail "Tab failed"; }
     sleep 1
     a11y a11y-switcher.json >/dev/null 2>&1
-    observe a11y-switcher.json 'any(.[]; (.name // "" | test("Tuna Desktop Test")) and .showing)' "switcher lists apps"
+    require_jq a11y-switcher.json 'any(.[]; (.name // "" | test("Tuna Desktop Test")) and .showing)' "switcher lists apps"
     shot switcher-popup || { xdo keyup Alt_L || true; state_fail "scrot failed"; }
     xdo keyup Alt_L || true
     sleep 1
@@ -1033,7 +1107,7 @@ st_switcher_thumbnails() {
     sleep 1
     xdo key Down || { xdo keyup Alt_L || true; state_fail "Down failed"; }
     sleep 1
-    observe compositor-state.json '.switcher_thumbnails == true' "thumbnail view in compositor state"
+    require_cstate '.switcher_thumbnails > 0' "thumbnail view in compositor state"
     shot switcher-thumbnails || { xdo keyup Alt_L || true; state_fail "scrot failed"; }
     xdo keyup Alt_L || true
     sleep 1
@@ -1050,11 +1124,11 @@ st_overview_open() {
     xdo key Super_L || state_fail "Super failed"
     cstate_wait '.overview_open and (.previews | length) == 3' 10 || state_fail "overview did not open with three previews"
     sleep 1
-    observe compositor-state.json '.overview_open' "overview open in compositor state"
+    require_cstate '.overview_open' "overview open in compositor state"
     shot overview-open || state_fail "scrot failed"
     a11y a11y-overview-shell.json >/dev/null 2>&1
-    observe a11y-overview-shell.json 'any(.[]; .name == "Search" and .showing)' "search entry showing"
-    observe a11y-overview-shell.json 'any(.[]; .name == "Show Apps" and .showing)' "dash showing"
+    require_jq a11y-overview-shell.json 'any(.[]; .name == "Search" and .showing)' "search entry showing"
+    require_jq a11y-overview-shell.json 'any(.[]; .name == "Show Apps" and .showing)' "dash showing"
 }
 st_overview_workspaces() {
     cstate_wait '.overview_open' 3 || {
@@ -1081,7 +1155,7 @@ EOF2
     xdo key Super_L || state_fail "Super failed"
     cstate_wait '.overview_open' 10 || state_fail "overview did not open"
     sleep 1
-    observe compositor-state.json '(.thumbnails | length) >= 2' "thumbnail strip in compositor state"
+    require_cstate '(.thumbnails | length) >= 2' "thumbnail strip in compositor state"
     shot overview-workspaces || state_fail "scrot failed"
 }
 st_overview_drag() {
@@ -1102,7 +1176,7 @@ EOF2
         sleep 0.05
     done
     sleep 0.5
-    observe compositor-state.json '.workspace_placeholder != null' "insertion placeholder in compositor state"
+    require_cstate '.workspace_placeholder != null' "insertion placeholder in compositor state"
     shot overview-drag || { xdo mouseup 1 || true; state_fail "scrot failed"; }
     xdo key Escape || true
     xdo mouseup 1 || true
@@ -1111,8 +1185,9 @@ EOF2
 st_overview_popup() {
     xdo key super+Page_Down || state_fail "Super+Page_Down failed"
     shot overview-workspace-popup 0.35 || state_fail "scrot failed"
+    require_frame_differs overview-workspace-popup.png 00-baseline-desktop.png "workspace popup rendered"
     sleep 1.5
-    observe compositor-state.json '.active_workspace == 1' "second workspace active"
+    require_cstate '.active_workspace == 1' "second workspace active"
     shot overview-workspace-switched || state_fail "scrot failed"
     xdo key super+Page_Up || true
     sleep 1.2
@@ -1132,7 +1207,7 @@ st_search_apps_search() {
     xdo type --delay 40 "tuna probe" || state_fail "typing failed"
     sleep 1
     a11y a11y-search.json >/dev/null 2>&1
-    observe a11y-search.json 'any(.[]; .name == "Tuna Probe" and .showing)' "probe app listed"
+    require_jq a11y-search.json 'any(.[]; .name == "Tuna Probe" and .showing)' "probe app listed"
     shot search-results || state_fail "scrot failed"
     close_all
 }
@@ -1143,7 +1218,7 @@ st_search_apps_provider() {
     xdo type --delay 40 "quarterly" || state_fail "typing failed"
     sleep 1.5
     a11y a11y-provider.json >/dev/null 2>&1
-    observe a11y-provider.json 'any(.[]; .name == "Quarterly Report.odt" and .showing)' "provider result listed"
+    require_jq a11y-provider.json 'any(.[]; .name == "Quarterly Report.odt" and .showing)' "provider result listed"
     shot search-provider || state_fail "scrot failed"
     close_all
 }
@@ -1151,7 +1226,7 @@ st_search_apps_grid() {
     xdo key super+a || state_fail "Super+A failed"
     cstate_wait '.overview_open and .overview_app_grid' 10 || state_fail "app grid did not open"
     sleep 1.5
-    observe compositor-state.json '.overview_app_grid' "app grid in compositor state"
+    require_cstate '.overview_app_grid' "app grid in compositor state"
     shot app-grid || state_fail "scrot failed"
 }
 st_search_apps_folder() {
@@ -1165,11 +1240,13 @@ st_search_apps_folder() {
     gset set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/CaptureTools/ apps "['tuna-probe.desktop']" || true
     sleep 1.5
     a11y a11y-folders.json >/dev/null 2>&1
-    observe a11y-folders.json 'any(.[]; .name == "Capture Tools" and .showing)' "folder tile showing"
+    require_jq a11y-folders.json 'any(.[]; .name == "Capture Tools" and .showing)' "folder tile showing"
     a11y a11y-folder-open.json --press "Capture Tools" >/dev/null 2>&1 \
         || state_fail "could not open the folder"
     sleep 1
     shot app-folder || state_fail "scrot failed"
+    a11y a11y-folder-shown.json >/dev/null 2>&1
+    require_jq a11y-folder-shown.json 'any(.[]; .name == "Tuna Probe" and .showing)' "folder dialog lists its app"
     xdo key Escape || true
     sleep 1
 }
@@ -1185,7 +1262,7 @@ st_search_apps_pages() {
         sleep 1
     }
     a11y a11y-grid-pages.json >/dev/null 2>&1
-    observe a11y-grid-pages.json 'any(.[]; .name == "Next Page" and .showing)' "page arrows showing"
+    require_jq a11y-grid-pages.json 'any(.[]; .name == "Next Page" and .showing)' "page arrows showing"
     shot app-grid-pages || state_fail "scrot failed"
     a11y a11y-grid-next.json --press "Next Page" >/dev/null 2>&1 || state_fail "could not press Next Page"
     sleep 1
@@ -1215,6 +1292,7 @@ EOF2
 $(grid_point "$ARTIFACTS/a11y-grid-src.json" "$dst" || true)
 EOF2
     [ -n "$tx" ] || state_fail "target tile has no bounds"
+    layout_before="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null; gsettings get org.gnome.desktop.app-folders folder-children 2>/dev/null)"
     xdo mousemove --window "$WID" "$sx" "$sy" || state_fail "mouse failed"
     sleep 0.3
     xdo mousedown 1 || state_fail "mousedown failed"
@@ -1229,6 +1307,10 @@ EOF2
     a11y a11y-grid-made.json >/dev/null 2>&1
     shot grid-folder-made || state_fail "scrot failed"
     observe a11y-grid-made.json 'any(.[]; (.name // "" | test("Folder|folder")) and .showing)' "folder dialog after drop"
+    layout_after="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null; gsettings get org.gnome.desktop.app-folders folder-children 2>/dev/null)"
+    if [ "$layout_before" = "$layout_after" ]; then
+        state_fail "validator miss: the drop changed no saved grid state"
+    fi
 }
 st_search_apps_reorder() {
     cstate_wait '.overview_open and .overview_app_grid' 3 || state_fail "app grid not open"
@@ -1241,6 +1323,7 @@ st_search_apps_reorder() {
 $(grid_point "$ARTIFACTS/a11y-grid-re.json" "$src" || true)
 EOF2
     [ -n "$sx" ] || state_fail "tile has no bounds"
+    layout_before="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null)"
     xdo mousemove --window "$WID" "$sx" "$sy" || state_fail "mouse failed"
     sleep 0.3
     xdo mousedown 1 || state_fail "mousedown failed"
@@ -1254,6 +1337,10 @@ EOF2
     xdo mouseup 1 || true
     sleep 1
     shot grid-reordered || state_fail "scrot failed"
+    layout_after="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null)"
+    if [ "$layout_before" = "$layout_after" ]; then
+        state_fail "validator miss: the reorder changed no saved order"
+    fi
 }
 st_search_apps_drag_cancel() {
     # The audit's DRAG-CANCEL finding, as capture: a real folder-tile
@@ -1294,12 +1381,12 @@ EOF2
     xdo mousemove --window "$WID" $((WIDTH - 6)) "$sy" || true
     sleep 1.5
     a11y a11y-grid-cancelled.json >/dev/null 2>&1
-    observe a11y-grid-cancelled.json 'any(.[]; .name == "Next Page" and .showing)' "arrows back after cancel"
+    require_jq a11y-grid-cancelled.json 'any(.[]; .name == "Next Page" and .showing)' "arrows back after cancel"
     layout_after="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null || echo unknown)"
     printf '%s\n---\n%s\n' "$layout_before" "$layout_after" >"$ARTIFACTS/grid-cancel-layout.txt"
-    [ "$layout_before" = "$layout_after" ] \
-        && echo "saved layout unchanged" >>"$ARTIFACTS/observations.jsonl" \
-        || echo "saved layout CHANGED by cancelled drag" >>"$ARTIFACTS/observations.jsonl"
+    if [ "$layout_before" != "$layout_after" ]; then
+        state_fail "validator miss: cancelled drag changed the saved layout"
+    fi
     shot grid-drag-cancelled || state_fail "scrot failed"
     close_all
 }
@@ -1320,7 +1407,7 @@ st_notify_banner() {
     notify "Tuna Desktop Proof" "Proof Banner" "Sent over D-Bus" || state_fail "Notify failed"
     sleep 1
     a11y a11y-banner.json >/dev/null 2>&1
-    observe a11y-banner.json 'any(.[]; .name == "Proof Banner" and .showing)' "banner showing"
+    require_jq a11y-banner.json 'any(.[]; .name == "Proof Banner" and .showing)' "banner showing"
     shot notify-banner || state_fail "scrot failed"
     sleep 6
     xdo mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) || true
@@ -1329,7 +1416,7 @@ st_notify_banner() {
 st_notify_list() {
     open_calendar || state_fail "could not click the clock"
     a11y a11y-list.json >/dev/null 2>&1
-    observe a11y-list.json 'any(.[]; .name == "Proof Banner" and .showing)' "banner in history"
+    require_jq a11y-list.json 'any(.[]; .name == "Proof Banner" and .showing)' "banner in history"
     shot notify-list || state_fail "scrot failed"
     a11y a11y-cleared.json --press "Clear" >/dev/null 2>&1 || true
     sleep 1
@@ -1343,10 +1430,10 @@ st_notify_dnd() {
     notify "Tuna Desktop Proof" "Quiet Note" "Held back by Do Not Disturb" || state_fail "Notify failed"
     sleep 1
     a11y a11y-dnd-banner.json >/dev/null 2>&1
-    observe a11y-dnd-banner.json 'any(.[]; .name == "Quiet Note" and .showing)' "banner showing despite DND (want no)"
+    require_absent a11y-dnd-banner.json 'any(.[]; .name == "Quiet Note" and .showing)' "banner held back by DND"
     open_calendar || state_fail "could not click the clock"
     a11y a11y-dnd-list.json >/dev/null 2>&1
-    observe a11y-dnd-list.json 'any(.[]; .name == "Quiet Note" and .showing)' "held note in history"
+    require_jq a11y-dnd-list.json 'any(.[]; .name == "Quiet Note" and .showing)' "held note in history"
     shot notify-dnd-list || state_fail "scrot failed"
     a11y a11y-dnd-cleared.json --press "Clear" >/dev/null 2>&1 || true
     sleep 1
@@ -1364,12 +1451,12 @@ st_notify_group() {
     sleep 3.5
     open_calendar || state_fail "could not click the clock"
     a11y a11y-group.json >/dev/null 2>&1
-    observe a11y-group.json 'any(.[]; .name == "Tuna Desktop Proof" and .showing)' "group header showing"
+    require_jq a11y-group.json 'any(.[]; .name == "Tuna Desktop Proof" and .showing)' "group header showing"
     shot notify-group || state_fail "scrot failed"
     a11y a11y-group-open.json --press "Tuna Desktop Proof" >/dev/null 2>&1 \
         || state_fail "could not expand the group"
     sleep 1
-    observe a11y-group-open.json 'any(.[]; .name == "First Note" and .showing)' "group expanded"
+    require_jq a11y-group-open.json 'any(.[]; .name == "First Note" and .showing)' "group expanded"
     shot notify-group-expanded || state_fail "scrot failed"
     close_all
 }
@@ -1405,6 +1492,7 @@ st_input_preedit() {
     sleep 0.8
     [ ! -s "$IME_OUT" ] || state_fail "pinyin committed before Space"
     shot ime-preedit || state_fail "scrot failed"
+    require_frame_differs ime-preedit.png 00-baseline-desktop.png "IME composition rendered"
     xdo key space || state_fail "Space failed"
     ok=0
     for _ in $(seq 1 20); do [ "$(cat "$IME_OUT" 2>/dev/null)" = "你好" ] && { ok=1; break; }; sleep 0.3; done
@@ -1417,7 +1505,7 @@ st_input_candidates() {
     xdo type --delay 100 ni || state_fail "typing failed"
     sleep 1
     a11y a11y-ime-candidates.json >/dev/null 2>&1
-    observe a11y-ime-candidates.json 'any(.[]; (.name // "" | test("你|尼|泥")) and .showing)' "candidates showing"
+    require_jq a11y-ime-candidates.json 'any(.[]; (.name // "" | test("你|尼|泥")) and .showing)' "candidates showing"
     shot ime-candidates || state_fail "scrot failed"
 }
 states_input() {
@@ -1438,6 +1526,8 @@ st_system_screenshot_ui() {
     [ "$ok" = 1 ] || state_fail "screenshot overlay never mapped"
     sleep 1
     shot system-screenshot-ui || state_fail "scrot failed"
+    require_cstate '[.layers[]? | select(.namespace == "tuna-screenshot-ui")] | length > 0' "screenshot overlay mapped"
+    require_frame_differs system-screenshot-ui.png 00-baseline-desktop.png "screenshot UI rendered"
     xdo key Escape || true
     sleep 1
 }
@@ -1464,7 +1554,7 @@ st_system_polkit() {
     xdo key Return || true
     sleep 1.5
     a11y a11y-polkit-failed.json >/dev/null 2>&1
-    observe a11y-polkit-failed.json 'any(.[]; (.name // "" | test("didn.t work")) and .showing)' "wrong password refused"
+    require_jq a11y-polkit-failed.json 'any(.[]; (.name // "" | test("didn.t work")) and .showing)' "wrong password refused"
     shot system-polkit-denied || state_fail "scrot failed"
     xdo type --delay 30 "tuna-proof" || true
     xdo key Return || true
@@ -1476,7 +1566,7 @@ st_system_end_session() {
     a11y a11y-end.json --press "Power Off…" >/dev/null 2>&1 || state_fail "could not press Power Off…"
     sleep 1
     a11y a11y-end2.json >/dev/null 2>&1
-    observe a11y-end2.json 'any(.[]; .name == "Power Off" and .showing)' "confirmation dialog open"
+    require_jq a11y-end2.json 'any(.[]; .name == "Power Off" and .showing)' "confirmation dialog open"
     shot system-end-session || state_fail "scrot failed"
     a11y a11y-end-cancel.json --press "Cancel" >/dev/null 2>&1 || true
     sleep 1
@@ -1493,12 +1583,15 @@ st_system_lock() {
     }
     sleep 2
     shot system-locked || state_fail "scrot failed"
+    require_cstate '.locked' "session locked"
 }
 st_system_unlock_prompt() {
     cstate_wait '.locked' 5 || state_fail "session is not locked"
     xdo mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1 || state_fail "click failed"
     sleep 1
     shot system-unlock-prompt || state_fail "scrot failed"
+    require_cstate '.locked' "session still locked at the prompt"
+    require_frame_differs system-unlock-prompt.png system-locked.png "unlock prompt raised"
 }
 st_system_unlock() {
     cstate_wait '.locked' 5 || state_skip "session is not locked; nothing to unlock"
@@ -1511,6 +1604,7 @@ st_system_unlock() {
         || state_fail "the password did not unlock the session"
     sleep 1
     shot system-unlocked || state_fail "scrot failed"
+    require_cstate '(.locked | not) and (.windows | length) > 0' "session unlocked with windows"
 }
 st_system_scale() {
     cstate_wait '(.locked | not)' 5 || state_skip "session is locked; scale capture needs the desktop"
@@ -1523,6 +1617,7 @@ st_system_scale() {
         || state_fail "layout did not follow scale 1.25"
     sleep 1
     shot system-scale-125 || state_fail "scrot failed"
+    require_cstate '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' "layout at scale 1.25"
     bus call --session --dest org.gnome.Mutter.DisplayConfig \
         --object-path /org/gnome/Mutter/DisplayConfig \
         --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
@@ -1545,6 +1640,10 @@ st_settings_dark() {
     open_qs || state_fail "quick settings would not open"
     a11y a11y-dark.json --press "Dark Style" >/dev/null 2>&1 || state_fail "could not press Dark Style"
     sleep 1
+    case "$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)" in
+        *prefer-dark*) ;;
+        *) state_fail "validator miss: Dark Style tile did not write prefer-dark" ;;
+    esac
     scheme="$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null || echo unknown)"
     printf '{"state":"%s","observation":"color-scheme after tile","result":"%s"}\n' \
         "${STATE_NAME:-?}" "$scheme" >>"$ARTIFACTS/observations.jsonl"
@@ -1556,6 +1655,10 @@ st_settings_dark() {
 st_settings_clock() {
     gset set org.gnome.desktop.interface clock-show-seconds true || state_fail "gsettings failed"
     sleep 2
+    case "$(gsettings get org.gnome.desktop.interface clock-show-seconds 2>/dev/null)" in
+        *true*) ;;
+        *) state_fail "validator miss: clock-show-seconds did not stick" ;;
+    esac
     a11y a11y-clock.json >/dev/null 2>&1
     shot settings-clock-seconds || state_fail "scrot failed"
     gset reset org.gnome.desktop.interface clock-show-seconds || true
@@ -1566,7 +1669,7 @@ st_settings_a11y_menu() {
         || state_skip "a11y status key missing on this host"
     sleep 2
     a11y a11y-menu.json >/dev/null 2>&1
-    observe a11y-menu.json 'any(.[]; (.name // "" | test("Accessibility|Universal Access")) and .showing)' "a11y indicator showing"
+    require_jq a11y-menu.json 'any(.[]; (.name // "" | test("Accessibility|Universal Access")) and .showing)' "a11y indicator showing"
     shot settings-a11y-menu || state_fail "scrot failed"
     gset reset org.gnome.desktop.a11y always-show-universal-access-status 2>/dev/null || true
     sleep 1
@@ -1575,13 +1678,15 @@ st_settings_background() {
     ffmpeg -nostdin -loglevel error -y -f lavfi -i color=c=0x2ec27e:s=64x64 -frames:v 1 \
         "$ARTIFACTS/wallpaper-green.png" 2>/dev/null || state_skip "ffmpeg unavailable for wallpaper fixture"
     uri="$(printf 'file://%s' "$ARTIFACTS/wallpaper-green.png")"
+    shot settings-wallpaper-before 0.2 || state_fail "scrot failed"
     gset set org.gnome.desktop.background picture-uri "$uri" || state_fail "gsettings failed"
     gset set org.gnome.desktop.background picture-options zoom || true
     ok=0
     for _ in $(seq 1 40); do grep -q "wallpaper decoded" "$LOG" 2>/dev/null && { ok=1; break; }; sleep 0.5; done
-    [ "$ok" = 1 ] || state_skip "wallpaper never decoded; frame would be stale"
+    [ "$ok" = 1 ] || state_fail "validator miss: wallpaper never decoded"
     sleep 1
     shot settings-wallpaper || state_fail "scrot failed"
+    require_frame_differs settings-wallpaper.png settings-wallpaper-before.png "wallpaper rendered"
 }
 states_settings_a11y() {
     run_state dark-style st_settings_dark
@@ -1600,22 +1705,26 @@ st_trans_overview() {
     if clip_start trans-overview-open 6; then
         xdo key Super_L || true
         sleep 2
-        clip_stop trans-overview-open || true
+        clip_stop trans-overview-open || state_fail "validator miss: overview-open clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-overview-open.webm" "overview-open clip recorded"
     else
         xdo key Super_L || state_fail "Super failed"
         sleep 1
     fi
     cstate_wait '.overview_open' 10 || state_fail "overview did not open"
     shot trans-overview-open-settled || state_fail "scrot failed"
+    require_cstate '.overview_open' "overview open"
     if clip_start trans-overview-close 6; then
         xdo key Escape || true
         sleep 2
-        clip_stop trans-overview-close || true
+        clip_stop trans-overview-close || state_fail "validator miss: overview-close clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-overview-close.webm" "overview-close clip recorded"
     else
         xdo key Escape || state_fail "Escape failed"
         sleep 1
     fi
     cstate_wait '.overview_open | not' 10 || state_fail "overview did not close"
+    require_cstate '.overview_open | not' "overview closed"
     shot trans-overview-after || state_fail "scrot failed"
 }
 st_trans_workspace_slide() {
@@ -1624,12 +1733,13 @@ st_trans_workspace_slide() {
     if clip_start trans-workspace-slide 6; then
         xdo key super+Page_Down || true
         sleep 2
-        clip_stop trans-workspace-slide || true
+        clip_stop trans-workspace-slide || state_fail "validator miss: workspace-slide clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-workspace-slide.webm" "workspace-slide clip recorded"
     else
         xdo key super+Page_Down || state_fail "Super+Page_Down failed"
         sleep 1.5
     fi
-    observe compositor-state.json '.active_workspace == 1' "second workspace active"
+    require_cstate '.active_workspace == 1' "second workspace active"
     shot trans-slide-after || state_fail "scrot failed"
     xdo key super+Page_Up || true
     sleep 1.2
@@ -1640,12 +1750,14 @@ st_trans_size_change() {
     if clip_start trans-maximize 6; then
         xdo key super+Up || true
         sleep 2
-        clip_stop trans-maximize || true
+        clip_stop trans-maximize || state_fail "validator miss: maximize clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-maximize.webm" "maximize clip recorded"
     else
         xdo key super+Up || state_fail "Super+Up failed"
         sleep 1
     fi
     cstate_wait '.focused_rect == [0,32,1280,768]' 10 || state_fail "maximize geometry not observed"
+    require_cstate '.focused_rect == [0,32,1280,768]' "window maximized"
     shot trans-size-after || state_fail "scrot failed"
     xdo key super+Down || true
     sleep 1
@@ -1658,13 +1770,17 @@ st_trans_switcher_fade() {
         sleep 1.5
         xdo keyup Alt_L || true
         sleep 1
-        clip_stop trans-switcher || true
+        clip_stop trans-switcher || state_fail "validator miss: switcher clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-switcher.webm" "switcher clip recorded"
     else
         xdo keydown Alt_L || state_fail "Alt down failed"
         xdo key Tab || { xdo keyup Alt_L || true; state_fail "Tab failed"; }
         shot trans-switcher-mid 0.8 || { xdo keyup Alt_L || true; state_fail "scrot failed"; }
         xdo keyup Alt_L || true
         sleep 1
+        shot trans-switcher-after || state_fail "scrot failed"
+        require_frame_differs trans-switcher-mid.png trans-switcher-after.png "switcher shown mid-transition"
+        return 0
     fi
     shot trans-switcher-after || state_fail "scrot failed"
 }
@@ -1673,12 +1789,14 @@ st_trans_grid_morph() {
     if clip_start trans-grid-morph 6; then
         xdo key super+a || true
         sleep 2
-        clip_stop trans-grid-morph || true
+        clip_stop trans-grid-morph || state_fail "validator miss: grid-morph clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-grid-morph.webm" "grid-morph clip recorded"
     else
         xdo key super+a || state_fail "Super+A failed"
         sleep 1.5
     fi
     cstate_wait '.overview_app_grid' 10 || state_fail "app grid did not open"
+    require_cstate '.overview_app_grid' "app grid open"
     shot trans-grid-settled || state_fail "scrot failed"
     close_all
 }
@@ -1706,7 +1824,11 @@ run_stage() {
         echo "tuna-visual-capture [$STAGE]: session never came up" >&2
         status="failed"
     else
+        STATE_NAME="baseline"
+        export STATE_NAME
         shot 00-baseline-desktop 2 || true
+        STATE_NAME=""
+        export STATE_NAME
         case "$STAGE" in
             panel) states_panel ;;
             calendar) states_calendar ;;
@@ -1736,58 +1858,11 @@ run_stage() {
     # A provenance bug must never cost the captured frames.
     write_provenance "$ARTIFACTS" "$STAGE" "$ARTIFACTS/commands.txt" ||
         echo "tuna-visual-capture [$STAGE]: provenance failed" >&2
-    # Stage manifest: per-state outcomes + walkthrough/ledger mapping.
+    # Stage manifest with label-coupled verdicts (see tuna-visual-finalize.py).
     finished="$(date -u +%FT%TZ)"
-    "$PY" - "$ARTIFACTS" "$STAGE" "$status" "$started" "$finished" \
-        "$(stage_ledger "$STAGE")" "$(stage_walkthrough "$STAGE")" <<'STAGEJSON'
-import json, os, sys
-artifacts, stage, status, started, finished = sys.argv[1:6]
-ledger, walkthrough = sys.argv[6], sys.argv[7]
-def read_jsonl(name):
-    path = os.path.join(artifacts, name)
-    rows = []
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except ValueError:
-                        pass
-    return rows
-steps = read_jsonl("steps.jsonl")
-if status != "failed":
-    if not steps:
-        status = "failed"
-    elif all(s.get("status") == "ok" for s in steps):
-        status = "ok"
-    elif any(s.get("status") == "ok" for s in steps):
-        status = "partial"
-    else:
-        status = "failed"
-frames = {}
-frames_path = os.path.join(artifacts, "frames.json")
-if os.path.exists(frames_path):
-    with open(frames_path, encoding="utf-8") as handle:
-        frames = json.load(handle)
-manifest = {
-    "stage": stage,
-    "status": status,
-    "started_utc": started,
-    "finished_utc": finished,
-    "ledger": ledger.split(),
-    "walkthrough": walkthrough.split(),
-    "steps": steps,
-    "observations": read_jsonl("observations.jsonl"),
-    "frame_summary": frames.get("summary", {}),
-}
-with open(os.path.join(artifacts, "stage.json"), "w", encoding="utf-8") as handle:
-    json.dump(manifest, handle, indent=2)
-    handle.write("\n")
-print("tuna-visual-capture [%s]: %s" % (stage, status))
-STAGEJSON
-    [ "$status" = "failed" ] && [ ! -s "$ARTIFACTS/frames.jsonl" ] && return 1
+    "$PY" "$ROOT/scripts/lib/tuna-visual-finalize.py" "$ARTIFACTS" "$STAGE" \
+        "$(stage_ledger "$STAGE")" "$(stage_walkthrough "$STAGE")" \
+        "$started" "$finished"
     return 0
 }
 

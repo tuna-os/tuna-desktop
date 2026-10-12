@@ -8,6 +8,7 @@ without ever labeling existing images current automatically.
 """
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,8 +20,9 @@ SCRIPT = ROOT / "scripts" / "tuna-walkthrough"
 MANIFEST_TSV = ROOT / "docs" / "walkthrough.tsv"
 VISUAL_TSV = ROOT / "docs" / "walkthrough-visual.tsv"
 RUN_ID = "38240110439"
-MERGE_SHA = "7b6c85922af14f4c239a4f958262b657adc6b03f"
+EVENT_SHA = "7b6c85922af14f4c239a4f958262b657adc6b03f"
 HEAD_SHA = "9dc2efb27f20087301abf3c6dbc65fe02294cfcb"
+TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
 def tsv_ids(path):
@@ -44,7 +46,7 @@ def visual_map():
 
 class FreshnessCase(unittest.TestCase):
     def make_bundle(self, root, *, statuses=None, labels=None, attempts=None,
-                    run_ids=None, heads=None):
+                    run_ids=None, heads=None, trees=None, events=None):
         """Fabricate a visual-* bundle dir with one frame per mapped id."""
         mapping = visual_map()
         statuses = statuses or {}
@@ -52,6 +54,8 @@ class FreshnessCase(unittest.TestCase):
         attempts = attempts or {}
         run_ids = run_ids or {}
         heads = heads or {}
+        trees = trees or {}
+        events = events or {}
         bundle = Path(root) / "bundle"
         stages = sorted({stage for stage, _ in mapping.values()})
         for stage in stages:
@@ -63,8 +67,11 @@ class FreshnessCase(unittest.TestCase):
                 "finished_utc": "2026-10-12T11:00:00Z",
             }), encoding="utf-8")
             (stagedir / "provenance.json").write_text(json.dumps({
-                "source": {"head_sha": heads.get(stage, HEAD_SHA),
-                           "diff_sha256": "tree" + HEAD_SHA[:8]},
+                "source": {"built_head_sha": heads.get(stage, HEAD_SHA),
+                           "built_tree_sha": trees.get(stage, TREE_SHA),
+                           "tree_diff_sha256": "diff" + HEAD_SHA[:8],
+                           "event_sha": events.get(stage, EVENT_SHA),
+                           "event_name": "pull_request"},
                 "packages": {"xvfb": "2:21.1.4-2ubuntu2"},
                 "image": {"github_run_id": run_ids.get(stage, RUN_ID),
                           "github_run_attempt": attempts.get(stage, "1"),
@@ -86,12 +93,13 @@ class FreshnessCase(unittest.TestCase):
     def refresh(self, bundle, dest, *extra):
         return subprocess.run(
             [str(SCRIPT), "refresh", str(bundle), "--dest", str(dest),
-             "--run-id", RUN_ID, "--merge-sha", MERGE_SHA, *extra],
+             "--run-id", RUN_ID, "--merge-sha", EVENT_SHA, *extra],
             capture_output=True, text=True)
 
-    def freshness(self, dest):
+    def freshness(self, dest, *extra):
         return subprocess.run(
-            [str(SCRIPT), "freshness", "--dest", str(dest)],
+            [str(SCRIPT), "freshness", "--dest", str(dest),
+             "--expect-head", HEAD_SHA, "--expect-tree", TREE_SHA, *extra],
             capture_output=True, text=True)
 
     def test_visual_map_covers_every_walkthrough_id(self):
@@ -108,9 +116,10 @@ class FreshnessCase(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = json.loads((dest / "walkthrough" / "manifest.json").read_text())
             self.assertEqual(manifest["run_id"], RUN_ID)
-            self.assertEqual(manifest["merge_sha"], MERGE_SHA)
+            self.assertEqual(manifest["source"]["event_sha"], EVENT_SHA)
             self.assertEqual(manifest["branch"], "w3-visual-capture")
-            self.assertEqual(manifest["source"]["head_sha"], HEAD_SHA)
+            self.assertEqual(manifest["source"]["built_head_sha"], HEAD_SHA)
+            self.assertEqual(manifest["source"]["built_tree_sha"], TREE_SHA)
             self.assertIn("xvfb", manifest["source"]["packages"])
             self.assertEqual(len(manifest["frames"]), 46)
             for ident in tsv_ids(MANIFEST_TSV):
@@ -127,6 +136,7 @@ class FreshnessCase(unittest.TestCase):
             dest = Path(directory) / "dest"
             result = self.refresh(bundle, dest)
             self.assertEqual(result.returncode, 1)
+            self.assertIn("input", result.stderr)
             self.assertIn("not ok", result.stderr)
             self.assertIn("partial run", result.stderr)
             self.assertFalse((dest / "walkthrough" / "manifest.json").exists())
@@ -156,23 +166,205 @@ class FreshnessCase(unittest.TestCase):
             self.assertIn("quick-settings", result.stderr)
             self.assertIn("not feature proof", result.stderr)
 
-    def test_refresh_resolves_duplicate_to_original(self):
+    def mark_duplicate(self, bundle, frame, original, *, original_label="feature"):
+        stagedir = bundle / "visual-panel"
+        blob = (stagedir / frame).read_bytes()
+        (stagedir / original).write_bytes(blob)
+        frames = json.loads((stagedir / "frames.json").read_text())
+        frames["frames"].append({
+            "file": original, "label": original_label,
+            "sha256": hashlib.sha256(blob).hexdigest()})
+        for entry in frames["frames"]:
+            if entry["file"] == frame:
+                entry["label"] = "duplicate"
+                entry["duplicate_of"] = original
+        (stagedir / "frames.json").write_text(json.dumps(frames))
+
+    def test_refresh_resolves_duplicate_preserving_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory)
+            self.mark_duplicate(bundle, "panel-desktop.png", "00-baseline-desktop.png",
+                                original_label="baseline")
+            dest = Path(directory) / "dest"
+            result = self.refresh(bundle, dest)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads((dest / "walkthrough" / "manifest.json").read_text())
+            entry = manifest["frames"]["panel"]
+            self.assertEqual(entry["label"], "duplicate")
+            self.assertEqual(entry["resolved_from"], "00-baseline-desktop.png")
+            self.assertEqual((dest / "walkthrough" / "panel.png").read_bytes(),
+                             b"PNG:panel")
+
+    def test_refresh_refuses_unverified_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             bundle = self.make_bundle(directory)
             stagedir = bundle / "visual-panel"
+            (stagedir / "00-baseline-desktop.png").write_bytes(b"PNG:other-bytes")
             frames = json.loads((stagedir / "frames.json").read_text())
+            frames["frames"].append({
+                "file": "00-baseline-desktop.png", "label": "baseline",
+                "sha256": hashlib.sha256(b"PNG:other-bytes").hexdigest()})
             for entry in frames["frames"]:
                 if entry["file"] == "panel-desktop.png":
                     entry["label"] = "duplicate"
                     entry["duplicate_of"] = "00-baseline-desktop.png"
             (stagedir / "frames.json").write_text(json.dumps(frames))
-            (stagedir / "00-baseline-desktop.png").write_bytes(b"PNG:baseline")
+            dest = Path(directory) / "dest"
+            result = self.refresh(bundle, dest)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("unverified duplicate", result.stderr)
+
+    def test_refresh_refuses_duplicate_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory)
+            stagedir = bundle / "visual-panel"
+            blob = (stagedir / "panel-desktop.png").read_bytes()
+            (stagedir / "cycle-b.png").write_bytes(blob)
+            frames = json.loads((stagedir / "frames.json").read_text())
+            frames["frames"].append({
+                "file": "cycle-b.png", "label": "duplicate",
+                "duplicate_of": "panel-desktop.png",
+                "sha256": hashlib.sha256(blob).hexdigest()})
+            for entry in frames["frames"]:
+                if entry["file"] == "panel-desktop.png":
+                    entry["label"] = "duplicate"
+                    entry["duplicate_of"] = "cycle-b.png"
+            (stagedir / "frames.json").write_text(json.dumps(frames))
+            dest = Path(directory) / "dest"
+            result = self.refresh(bundle, dest)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("duplicate cycle", result.stderr)
+
+    def test_refresh_refuses_tampered_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory)
+            (bundle / "visual-panel" / "panel-desktop.png").write_bytes(b"tampered")
+            dest = Path(directory) / "dest"
+            result = self.refresh(bundle, dest)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("do not match the recorded input hash", result.stderr)
+
+    def test_refresh_refuses_baseline_for_non_desktop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory, labels={"qs-grid.png": "baseline"})
+            dest = Path(directory) / "dest"
+            result = self.refresh(bundle, dest)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("allowed only for the desktop state", result.stderr)
+
+    def test_refresh_allows_baseline_for_panel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory, labels={"panel-desktop.png": "baseline"})
             dest = Path(directory) / "dest"
             result = self.refresh(bundle, dest)
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = json.loads((dest / "walkthrough" / "manifest.json").read_text())
-            self.assertEqual(manifest["frames"]["panel"]["resolved_from"], "00-baseline-desktop.png")
-            self.assertEqual((dest / "walkthrough" / "panel.png").read_bytes(), b"PNG:baseline")
+            self.assertEqual(manifest["frames"]["panel"]["label"], "baseline")
+
+    def test_refresh_refuses_forged_merge_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory)
+            dest = Path(directory) / "dest"
+            result = subprocess.run(
+                [str(SCRIPT), "refresh", str(bundle), "--dest", str(dest),
+                 "--run-id", RUN_ID, "--merge-sha", "0" * 40],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("does not match the recorded event SHA", result.stderr)
+
+    def test_refresh_refuses_mixed_built_trees(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory, trees={"input": "1" * 40})
+            dest = Path(directory) / "dest"
+            result = self.refresh(bundle, dest)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("mixed or missing built tree", result.stderr)
+
+    def test_freshness_stale_when_recorded_source_differs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory)
+            dest = Path(directory) / "dest"
+            self.assertEqual(self.refresh(bundle, dest).returncode, 0)
+            result = subprocess.run(
+                [str(SCRIPT), "freshness", "--dest", str(dest),
+                 "--expect-head", HEAD_SHA, "--expect-tree", "2" * 40],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("recorded tree", result.stdout)
+            self.assertIn("!= expected", result.stdout)
+            self.assertNotIn("CURRENT", result.stdout)
+
+    def test_freshness_stale_when_merge_differs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory)
+            dest = Path(directory) / "dest"
+            self.assertEqual(self.refresh(bundle, dest).returncode, 0)
+            result = self.freshness(dest, "--expect-merge", "3" * 40)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("recorded event", result.stdout)
+
+    def make_git_repo(self, root):
+        repo = Path(root) / "repo"
+        repo.mkdir()
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "product.txt").write_text("v1")
+        (repo / "docs" / "walkthrough").mkdir(parents=True)
+        (repo / "docs" / "walkthrough" / "panel.png").write_bytes(b"old")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "a"], check=True,
+                       env={**dict(os.environ), **env})
+        head_a = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+        tree_a = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+                                capture_output=True, text=True).stdout.strip()
+        (repo / "docs" / "walkthrough" / "panel.png").write_bytes(b"new")
+        subprocess.run(["git", "-C", str(repo), "commit", "-qam", "adopt"], check=True,
+                       env={**dict(os.environ), **env})
+        head_b = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+        tree_b = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+                                capture_output=True, text=True).stdout.strip()
+        (repo / "product.txt").write_text("v2")
+        subprocess.run(["git", "-C", str(repo), "commit", "-qam", "product"], check=True,
+                       env={**dict(os.environ), **env})
+        tree_c = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+                                capture_output=True, text=True).stdout.strip()
+        return repo, head_a, tree_a, head_b, tree_b, tree_c
+
+    def test_freshness_accepts_walkthrough_only_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, head_a, tree_a, head_b, tree_b, _ = self.make_git_repo(directory)
+            bundle = self.make_bundle(directory, heads={s: head_a for s in
+                {stage for stage, _ in visual_map().values()}},
+                trees={s: tree_a for s in {stage for stage, _ in visual_map().values()}})
+            dest = Path(directory) / "dest"
+            self.assertEqual(self.refresh(bundle, dest).returncode, 0)
+            env = {"TUNA_WALKTHROUGH_REPO_ROOT": str(repo)}
+            result = subprocess.run(
+                [str(SCRIPT), "freshness", "--dest", str(dest),
+                 "--expect-head", head_b, "--expect-tree", tree_b],
+                capture_output=True, text=True, env={**dict(os.environ), **env})
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("adopt drift", result.stdout)
+
+    def test_freshness_rejects_product_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, head_a, tree_a, _, _, tree_c = self.make_git_repo(directory)
+            bundle = self.make_bundle(directory, heads={s: head_a for s in
+                {stage for stage, _ in visual_map().values()}},
+                trees={s: tree_a for s in {stage for stage, _ in visual_map().values()}})
+            dest = Path(directory) / "dest"
+            self.assertEqual(self.refresh(bundle, dest).returncode, 0)
+            env = {"TUNA_WALKTHROUGH_REPO_ROOT": str(repo)}
+            result = subprocess.run(
+                [str(SCRIPT), "freshness", "--dest", str(dest),
+                 "--expect-tree", tree_c],
+                capture_output=True, text=True, env={**dict(os.environ), **env})
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("recorded tree", result.stdout)
+            self.assertNotIn("CURRENT", result.stdout)
 
     def test_freshness_current_after_refresh(self):
         with tempfile.TemporaryDirectory() as directory:

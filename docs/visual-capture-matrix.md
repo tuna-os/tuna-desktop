@@ -11,11 +11,14 @@ it, or to an explicit reason nested fixtures cannot show it. Checked by
 
 - Branch head: `b1c929aa55b0f3286458035fbc81ecd62d168496` (#633 integration head).
 - PR #633 tested merge commit: `7b6c85922af14f4c239a4f958262b657adc6b03f`.
-  The two identities are distinct: per-run `provenance.json` records the
-  checked-out head SHA and the merge SHA separately, and CI attempts are
-  never merged into one capture session (audit provenance finding).
+  The two identities are distinct: per-run `provenance.json` pins the
+  exact built tree from the checkout (`built_head_sha`,
+  `built_tree_sha`) and records the event SHA separately as
+  informational (never as the tested tree), and CI attempts are never
+  merged into one capture session (audit provenance finding).
 - Capture tooling: `scripts/tuna-visual-capture` (stages) plus
-  `scripts/lib/tuna-visual-label.py` (honest frame labels);
+  `scripts/lib/tuna-visual-label.py` (honest frame labels) and
+  `scripts/lib/tuna-visual-finalize.py` (label-coupled verdicts);
   dispatchable workflow `.github/workflows/visual-capture.yml`.
 
 ## Reading this matrix
@@ -225,17 +228,57 @@ The checked-in `docs/walkthrough/` images predate this pipeline and are
 STALE until a refresh lands; `scripts/tuna-walkthrough freshness`
 reports all 46 as such (exit 1) when no per-frame manifest exists, and
 the `visual-capture` workflow's manifest job prints that report on
-every run as a visible, non-gating step. `scripts/tuna-walkthrough
+every run as a visible, non-gating step. CURRENT requires the bytes to
+match the recorded capture hash AND the recorded built tree to equal
+the expected identity for the reviewed head (explicit `--expect-*`
+flags, defaulting to the checkout); self-consistent but
+different-source manifests read STALE, except for adopt drift (trees
+differing only in the walkthrough's own paths). `scripts/tuna-walkthrough
 refresh` rebuilds images ONLY from exact successful artifacts (pinned
-run id, one attempt, all consumed stages ok, every frame labeled
-feature/baseline), writing `walkthrough/manifest.json` with each
-frame's hash, capture outcome and source IDs (head SHA, merge SHA,
-branch, package/image IDs). Map: `docs/walkthrough-visual.tsv`.
-Procedure and exact commands: `docs/visual-capture-refresh.md`.
-Behavioral coverage for the new subcommands lives in
+run id, one attempt, all consumed stages ok, one built tree,
+hash-validated inputs, proven frames with preserved labels, baseline
+only for the desktop state), writing `walkthrough/manifest.json` with
+each frame's hash, capture outcome and source IDs (built head/tree,
+event SHA, branch, package/image IDs, run id, attempt). Map:
+`docs/walkthrough-visual.tsv`. Procedure and exact commands:
+`docs/visual-capture-refresh.md`. No refresh has been performed from
+any run yet. Behavioral coverage for the new subcommands lives in
 `scripts/lib/tuna-walkthrough-freshness-tests.py` (run by the
 visual-capture build job, not by any existing gate). The existing
 `tuna-walkthrough check` (markdown + existence) is unchanged.
+
+## Per-state validators and verdict coupling
+
+Generic screening ("differs from the desktop", "stage exited ok") is
+not named-state proof: every capture state declares a
+consumer+render validator (`require_jq`, `require_cstate`,
+`require_frame_differs`, `require_nonempty_file`, `require_absent`)
+that fails the state when the expected content did not render, and
+`scripts/lib/tuna-visual-validators-tests.py` fails if any driven
+state lacks one. As a second layer,
+`scripts/lib/tuna-visual-finalize.py` demotes any non-exempt state
+whose stills hold no `feature` frame (wallpaper-only, duplicates, or
+unverified) to failed, however its drive commands exited. Exemptions:
+`panel/desktop` (the desktop is the baseline),
+`settings-a11y/clock` (sub-threshold seconds digits; settings-key
+validated), and `transitions/*` (clip-led; gated by clips plus
+compositor end-states). Partial stages stay collectable (collector
+green) but are exposed per-state in `stage.json`, the merged
+`manifest.json` summary counts, and the CI merge report -- and
+`refresh` refuses them by name. Labeling and finalize behavior are
+covered by `scripts/lib/tuna-visual-label-tests.py` and
+`scripts/lib/tuna-visual-finalize-tests.py`; provenance pinning by
+`scripts/lib/tuna-visual-provenance-tests.py`.
+
+## Provenance identity
+
+Per-stage `provenance.json` pins the exact built tree from the
+checkout itself (`built_head_sha`, `built_tree_sha`,
+`tree_diff_sha256`); the triggering event's commit (`event_sha`,
+e.g. the PR merge ref) is recorded separately as informational and
+is never presented as the tested tree. Refresh validates a passed
+`--merge-sha` against every consumed provenance and fails closed on
+mismatch.
 
 ## Known-blocker coverage
 
