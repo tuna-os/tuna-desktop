@@ -57,6 +57,16 @@ def process_identity(pid):
             'sha256': digest(proc / 'exe')}
 
 
+
+def validate_publisher(executable, expected, identity):
+    if executable.resolve().name != 'tuna-shell-gtk':
+        raise RuntimeError(f'publisher is not actual GTK shell: {executable.resolve()}')
+    expected = expected.resolve(strict=True)
+    if executable.resolve() != expected or identity['sha256'] != digest(expected):
+        raise RuntimeError('publisher does not match the harness expected GTK binary')
+    return expected
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
@@ -94,12 +104,8 @@ def main():
     owner = dbus('GetNameOwner', GLib.Variant('(s)', (NAME,)))[0]
     pid = dbus('GetConnectionUnixProcessID', GLib.Variant('(s)', (owner,)))[0]
     executable = Path(f'/proc/{pid}/exe')
-    if executable.resolve().name != 'tuna-shell-gtk':
-        raise RuntimeError(f'publisher is not actual GTK shell: {executable.resolve()}')
-    expected = args.expected_shell.resolve(strict=True)
     identity = process_identity(pid)
-    if executable.resolve() != expected or identity['sha256'] != digest(expected):
-        raise RuntimeError('publisher does not match the harness expected GTK binary')
+    expected = validate_publisher(executable, args.expected_shell, identity)
     receipt = {
         'scope': 'GTK-owned Lockdown and real portal camera gate; no hardware or permission grant qualification',
         'publisher': {'name': NAME, 'owner': owner, 'pid': pid,
