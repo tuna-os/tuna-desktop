@@ -30,6 +30,7 @@ mod ibus_property_menu;
 mod kbd_a11y;
 mod keybindings;
 mod live_apps;
+mod location;
 mod lock;
 mod lockdown;
 mod logic;
@@ -71,6 +72,7 @@ mod window_menu;
 mod wired;
 mod ws_dots;
 mod ws_popup;
+mod wwan;
 
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
@@ -793,6 +795,7 @@ fn qs_round(icon: &str, label: &str) -> gtk::Button {
 struct PanelIcons {
     mic: gtk::Image,
     network: gtk::Image,
+    location: gtk::Image,
     dnd: gtk::Image,
     volume: gtk::Image,
     power_profile: gtk::Image,
@@ -1094,6 +1097,36 @@ fn quick_settings_popover(
             }
         }
     });
+    // GNOME's mobile broadband menu: the modems, then Mobile Network
+    // Settings. Opening it re-reads the modems, so a freshly appeared
+    // one lists without waiting for a daemon signal.
+    let wwan_menu_ui = QsMenu::new(
+        "network-cellular-signal-excellent-symbolic",
+        "Mobile Network",
+    );
+    let wwan_menu = wwan::WwanMenu::new(wwan_menu_ui.list());
+    wwan_menu_ui.separator();
+    let (wwan_settings, _) = wwan_menu_ui.item(None, "Mobile Network Settings");
+    wwan_settings.connect_clicked(|_| {
+        let _ = std::process::Command::new("gnome-control-center")
+            .arg("network")
+            .spawn();
+    });
+    let wwan = qs_menu_tile(
+        "network-cellular-signal-excellent-symbolic",
+        "Mobile Network",
+        None,
+        &wwan_menu_ui,
+    );
+    wwan_menu.set_tile(wwan.clone());
+    {
+        let wwan_menu = wwan_menu.clone();
+        wwan_menu_ui.revealer.connect_visible_notify(move |r| {
+            if r.is_visible() {
+                wwan_menu.refresh();
+            }
+        });
+    }
     let power_menu_ui = QsMenu::new("power-profile-balanced-symbolic", "Power Mode");
     let power_items: Vec<(&'static str, gtk::Button, gtk::Image)> = [
         ("performance", "Performance"),
@@ -1121,15 +1154,32 @@ fn quick_settings_popover(
     let night = qs_tile("night-light-symbolic", "Night Light", None);
     let dark = qs_tile("dark-mode-symbolic", "Dark Style", None);
     let dnd_tile = qs_tile("notifications-disabled-symbolic", "Do Not Disturb", None);
+    // Location services: the master switch tile and the panel's in-use
+    // indicator, both driven by the GeoClue2 agent.
+    let location_agent = location::LocationAgent::new();
+    location_agent.set_indicator(icons.location);
+    let location_tile = qs_tile("location-services-active-symbolic", "Location", None);
+    location_agent.set_tile(location_tile.clone());
     grid.add(&wifi, Some(&wifi_menu_ui));
     grid.add(&wired, Some(&wired_menu_ui));
     grid.add(&bluetooth, Some(&bt_menu_ui));
     grid.add(&printers_tile, Some(&printers_menu_ui));
+    grid.add(&wwan, Some(&wwan_menu_ui));
     grid.add(&power_mode, Some(&power_menu_ui));
-    for tile in [&night, &dark, &dnd_tile] {
+    for tile in [&night, &dark, &dnd_tile, &location_tile] {
         grid.add(tile, None);
     }
-    let (wifi_outer, wired_outer, bluetooth_outer, power_outer, night_outer, dark_outer, dnd_outer) = (
+    let (
+        wifi_outer,
+        wired_outer,
+        bluetooth_outer,
+        power_outer,
+        night_outer,
+        dark_outer,
+        dnd_outer,
+        wwan_outer,
+        location_outer,
+    ) = (
         wifi.outer.clone(),
         wired.outer.clone(),
         bluetooth.outer.clone(),
@@ -1137,6 +1187,8 @@ fn quick_settings_popover(
         night.outer.clone(),
         dark.outer.clone(),
         dnd_tile.outer.clone(),
+        wwan.outer.clone(),
+        location_tile.outer.clone(),
     );
     // While a toggle menu is open GNOME dims everything else in the
     // panel (brightness -0.4); selecting an item closes the panel, as
@@ -1169,6 +1221,7 @@ fn quick_settings_popover(
         &wifi_menu_ui.revealer,
         &wired_menu_ui.revealer,
         &bt_menu_ui.revealer,
+        &wwan_menu_ui.revealer,
         &sound_menu_ui.revealer,
     ] {
         {
@@ -1188,6 +1241,7 @@ fn quick_settings_popover(
         &all_networks,
         &wired_settings,
         &bt_settings,
+        &wwan_settings,
         &sound_settings,
     ] {
         let popover = popover.clone();
@@ -1241,6 +1295,9 @@ fn quick_settings_popover(
         bt_menu,
         wired,
         bluetooth,
+        wwan,
+        wwan_menu,
+        location_agent,
         power_mode,
         power_header: power_menu_ui.header_icon.clone(),
         power_items,
@@ -1328,10 +1385,12 @@ fn quick_settings_popover(
         &wifi_outer,
         &wired_outer,
         &bluetooth_outer,
+        &wwan_outer,
         &power_outer,
         &night_outer,
         &dark_outer,
         &dnd_outer,
+        &location_outer,
     ] {
         tile.add_css_class("qs-dimmable");
     }
@@ -1568,6 +1627,8 @@ fn build(app: &adw::Application) {
     let panel_mic = status_icon("microphone-sensitivity-medium-symbolic", false);
     panel_mic.update_property(&[gtk::accessible::Property::Label("Microphone in use")]);
     let panel_network = status_icon("network-wired-symbolic", false);
+    let panel_location = status_icon("location-services-active-symbolic", false);
+    panel_location.update_property(&[gtk::accessible::Property::Label("Location in use")]);
     let panel_dnd = status_icon("notifications-disabled-symbolic", false);
     let panel_volume = status_icon("audio-volume-high-symbolic", false);
     let panel_power_profile = status_icon("power-profile-balanced-symbolic", false);
@@ -1625,6 +1686,7 @@ fn build(app: &adw::Application) {
         PanelIcons {
             mic: panel_mic,
             network: panel_network,
+            location: panel_location,
             dnd: panel_dnd,
             volume: panel_volume,
             power_profile: panel_power_profile,
