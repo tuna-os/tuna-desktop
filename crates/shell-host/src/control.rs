@@ -149,9 +149,27 @@ pub enum Handled {
     },
 }
 
+/// Write errors that mean the peer is gone for good (evicted,
+/// crashed, restarted): the session must redial rather than retry on
+/// the dead stream. `WouldBlock` is deliberately absent — transient
+/// backpressure keeps surfacing to the caller per the nonblocking
+/// contract, and a refused redial reports its own error normally.
+fn is_dead_peer(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
+}
+
 /// Shell-side control client over a connected Unix socket.
 pub struct ControlClient {
     stream: UnixStream,
+    /// Socket path for redial, kept by [`ControlClient::connect`]
+    /// (`None` for a caller-supplied stream, which has no redial path).
+    socket_path: Option<std::path::PathBuf>,
     read_buf: Vec<u8>,
     model: ShellModel,
     revision: Option<u64>,
@@ -179,18 +197,27 @@ impl ControlClient {
     /// Connect to the compositor's control socket and wrap the stream.
     /// Sends nothing: call [`hello`](Self::hello) first, then await the
     /// full snapshot before trusting any delta.
+    ///
+    /// The path is kept for redial: if the hub later evicts and closes
+    /// this session, the next send reconnects and resends instead of
+    /// failing forever (spec R6 keeps the hub's side drop-happy).
     pub fn connect(path: &std::path::Path) -> io::Result<Self> {
-        Self::new(UnixStream::connect(path)?)
+        let mut client = Self::new(UnixStream::connect(path)?)?;
+        client.socket_path = Some(path.to_path_buf());
+        Ok(client)
     }
 
     /// Wrap a connected stream, switching it to nonblocking mode.
     ///
     /// Starts with no revision and [`ControlClient::needs_snapshot`] set:
-    /// handshake first, then await the initial full snapshot.
+    /// handshake first, then await the initial full snapshot. A stream
+    /// wrapped here has no redial path ([`ControlClient::connect`] keeps
+    /// the socket path for that).
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream,
+            socket_path: None,
             read_buf: Vec::new(),
             model: ShellModel::new(),
             revision: None,
@@ -806,8 +833,48 @@ impl ControlClient {
     }
 
     /// Encode and write one frame. `WouldBlock` propagates to the caller.
+    ///
+    /// A dead peer (the hub evicted and closed our session) reconnects
+    /// instead of failing: one redial over a fresh `Hello`, then the
+    /// original frame is resent once with its original request id (the
+    /// dead session never saw it, so no id is skipped). Every command
+    /// method funnels through here, so all of them inherit the recovery
+    /// with no call-site changes.
     fn write_message(&mut self, msg: &Message) -> Result<(), ControlError> {
         let frame = tuna_shell_control::encode_frame(msg);
+        match self.stream.write_all(&frame) {
+            Ok(()) => Ok(()),
+            Err(e) if is_dead_peer(&e) && self.socket_path.is_some() => {
+                self.reconnect()?;
+                self.stream.write_all(&frame)?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Redial the hub after an eviction: fresh stream, cleared buffers
+    /// and revision, then `Hello` — the resync signal, which the hub
+    /// answers with its own `Hello` plus a full snapshot through the
+    /// normal poll path (which already accepts both mid-session). Never
+    /// blocks awaiting that answer; the request-id counter keeps
+    /// incrementing so no id is ever reused across the boundary.
+    ///
+    /// Uses a raw write for the greeting, never [`write_message`](Self::write_message):
+    /// a redial that is itself dead must surface its error, not recurse.
+    fn reconnect(&mut self) -> Result<(), ControlError> {
+        let path = self.socket_path.clone().ok_or_else(|| {
+            ControlError::Unexpected("reconnect without a socket path".to_owned())
+        })?;
+        let stream = UnixStream::connect(&path)?;
+        stream.set_nonblocking(true)?;
+        self.stream = stream;
+        self.read_buf.clear();
+        self.revision = None;
+        self.needs_snapshot = true;
+        let frame = tuna_shell_control::encode_frame(&Message::Hello {
+            version: CURRENT_VERSION,
+        });
         self.stream.write_all(&frame)?;
         Ok(())
     }
@@ -1575,5 +1642,89 @@ mod tests {
             }
             other => panic!("expected WouldBlock, got {other:?}"),
         }
+    }
+
+    /// Bound listener for reconnect tests: the client dials the path,
+    /// like against the real hub, so a dropped server end exercises
+    /// the redial path instead of a dead socketpair.
+    fn listener_at(
+        dir: &tempfile::TempDir,
+    ) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        (path, listener)
+    }
+
+    #[test]
+    fn evicted_session_reconnects_and_resends_over_hello() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, listener) = listener_at(&dir);
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+
+        let mut client = ControlClient::connect(&path).expect("connect");
+        let (mut server1, _) = listener.accept().expect("accept one");
+        client.send_hello().expect("hello");
+        assert_eq!(
+            server_read(&mut server1),
+            Message::Hello {
+                version: CURRENT_VERSION
+            }
+        );
+
+        // The hub evicts and closes our session (spec R6): the shell
+        // sees EOF on its next poll, then EPIPE on its next send.
+        drop(server1);
+        assert!(client.poll().is_err());
+        let id = client.toggle_overview().expect("resend after reconnect");
+
+        // The reconnect redials: Hello (the resync signal), then the
+        // original command with its original request id.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut server2 = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "reconnect redial timed out");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        assert_eq!(
+            server_read(&mut server2),
+            Message::Hello {
+                version: CURRENT_VERSION
+            }
+        );
+        assert_eq!(
+            server_read(&mut server2),
+            Message::Command {
+                id,
+                kind: CommandKind::ToggleOverview
+            }
+        );
+        // Fresh-session semantics: no revision until the new snapshot
+        // lands through the normal poll path.
+        assert!(client.needs_snapshot());
+        assert_eq!(client.revision(), None);
+    }
+
+    #[test]
+    fn reconnect_failure_returns_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).expect("connect");
+        let (server1, _) = listener.accept().expect("accept one");
+        // Hub and socket both gone: the redial must fail cleanly, not
+        // hang or recurse.
+        drop(server1);
+        drop(listener);
+        std::fs::remove_file(&path).expect("remove socket");
+        assert!(client.poll().is_err());
+        assert!(client.toggle_overview().is_err());
     }
 }
