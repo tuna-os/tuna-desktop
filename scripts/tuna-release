@@ -86,6 +86,10 @@ install -m0644 share/wayland-sessions/tuna.desktop \
     "$STAGE/usr/share/wayland-sessions/tuna.desktop"
 install -Dm0644 share/systemd/user/tuna-session.target \
     "$STAGE/usr/lib/systemd/user/tuna-session.target"
+install -Dm0644 share/xdg-desktop-portal/portals/tuna.portal \
+    "$STAGE/usr/share/xdg-desktop-portal/portals/tuna.portal"
+install -Dm0644 packaging/marlin/tuna-portals.conf \
+    "$STAGE/usr/share/xdg-desktop-portal/tuna-portals.conf"
 # Lock-screen PAM service (#62); a conffile, so local edits survive.
 install -m0644 share/pam.d/tuna-lock "$STAGE/etc/pam.d/tuna-lock"
 echo /etc/pam.d/tuna-lock >"$STAGE/DEBIAN/conffiles"

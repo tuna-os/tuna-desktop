@@ -39,6 +39,7 @@ mod polkit;
 mod power;
 mod preview_chrome;
 mod privacy;
+mod privacy_portal;
 mod providers;
 mod screencast;
 mod screensaver;
@@ -2367,6 +2368,7 @@ fn main() -> glib::ExitCode {
         .application_id("org.tuna.Shell")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    privacy_portal::start(&app);
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
 }

@@ -720,6 +720,11 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
 fi
+# Persist the disabled policy before the GTK publisher starts. The portal
+# probe must observe it on first acquisition, before testing live toggles.
+if [ "$SCREENSHOT_KEYS_ONLY" != 1 ]; then
+    gsettings set org.gnome.desktop.privacy disable-camera true
+fi
 if [ -n "$PAM_ON" ]; then
     env IBUS_ADDRESS="unix:path=$ARTIFACTS/not-the-private-ibus" \
         LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
@@ -819,6 +824,19 @@ SCREENSHOT_SOURCE
     screenshot_keys_proof
     exit 0
 fi
+
+set --
+privacy_expected_shell="${TUNA_PROOF_SHELL_BIN:-${TUNA_PROOF_BIN_DIR:-$ROOT/target/debug}/tuna-shell-gtk}"
+if [ "$INSTALLED_PACKAGE" = 1 ]; then
+    set -- --installed
+    privacy_expected_shell=/usr/bin/tuna-shell-gtk
+fi
+"$PY" "$ROOT/scripts/lib/gtk-privacy-portal-proof.py" --root "$ROOT" \
+    --output "$ARTIFACTS/privacy-portal" --expected-shell "$privacy_expected_shell" "$@" ||
+    fail G-PRIVACY-PORTAL "actual GTK publisher/real portal camera gate failed"
+pass G-PRIVACY-PORTAL "GTK owns Lockdown; real portal denies camera and readmits requests on restore (no hardware qualification)"
+# Return this owned startup fixture to the schema default for later stages.
+gsettings reset org.gnome.desktop.privacy disable-camera
 
 sleep 2
 scrot "$ARTIFACTS/01-panel.png" >/dev/null
