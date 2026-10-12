@@ -2,7 +2,7 @@
 
 | Target | Path | Built by |
 |---|---|---|
-| Debian / Ubuntu `.deb` (dev hosts) | `scripts/tuna-release` | CI `journey` job |
+| Debian / Ubuntu `.deb` (Ubuntu 26.04) | `scripts/tuna-release` | CI `journey` job |
 | Arch Linux package (TunaOS Marlin) | `packaging/arch/PKGBUILD` | CI `arch-package` job |
 | Marlin preview image | `packaging/marlin/Containerfile` | CI `marlin-image` job (main) |
 
@@ -25,12 +25,18 @@ also opens Tuna Desktop in a window inside GNOME. Upstreaming a `marlin:tuna`
 flavor to `tuna-os/tunaOS` (#69) follows once hardware runs in the VM
 lane (#68) are green.
 
-The Arch package ships both shells. The compositor runs the
+The Arch package and `.deb` ship both shells. The compositor runs the
 GTK4/libadwaita shell (`tuna-shell-gtk`, ADR 0006) when it is installed
 beside it and falls back to the legacy `tuna-shell-host`; set
 `TUNA_SHELL_BIN=tuna-shell-host` to choose the legacy shell. The
-`.deb` keeps only the legacy shell, because Ubuntu 24.04 has no
-gtk4-layer-shell package.
+`.deb` targets Ubuntu 26.04; Debian 13 requires a separate packaged
+backport and installed-session qualification (see `docs/install.md`).
+
+The release builder uses `dpkg-deb --root-owner-group`. CI verifies original
+archive ownership with `scripts/check-release-package`, then runs
+`scripts/check-deb-clean-install` on a pristine `ubuntu:26.04` container
+without recommendations. Installed GTK session and real greeter acceptance
+are separate from this clean dependency and binary-version check.
 
 Try the preview on a Marlin machine:
 
