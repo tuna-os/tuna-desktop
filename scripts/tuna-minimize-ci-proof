@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Build and freeze exact source once, then prove both native text directions.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+art=$(realpath -m -- "${1:?usage: tuna-minimize-ci-proof <outside-checkout-artifacts>}")
+case "$art/" in "$root/"*) echo 'Artifacts must be outside the source checkout' >&2; exit 2;; esac
+if [[ -n $(git status --porcelain) ]]; then
+  echo 'Native proof requires clean source' >&2
+  exit 2
+fi
+mkdir -p "$art"
+cargo build --locked -p tuna-compositor -p tuna-shell-gtk --bins --example tuna-modal-dim-client --message-format=json > "$art/build.json"
+python3 - "$root" "$art" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+root, art = map(Path, sys.argv[1:])
+frozen = art / "frozen"
+frozen.mkdir(exist_ok=False)
+required = {"tuna-compositor", "tuna-shell-gtk", "tuna-modal-dim-client"}
+artifacts = {}
+for line in (art / "build.json").read_text().splitlines():
+    message = json.loads(line)
+    if message.get("reason") != "compiler-artifact" or not message.get("executable"):
+        continue
+    name = message["target"]["name"]
+    if name in required:
+        if name in artifacts:
+            raise RuntimeError(f"ambiguous executable: {name}")
+        artifacts[name] = Path(message["executable"])
+if artifacts.keys() != required:
+    raise RuntimeError("missing required native executables")
+for name, source in artifacts.items():
+    shutil.copy2(source, frozen / name)
+shutil.copy2(root / "Cargo.lock", frozen / "Cargo.lock")
+revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+if subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True).strip():
+    raise RuntimeError("build changed source")
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+(frozen / "SOURCE_COMMIT").write_text(revision + "\n")
+manifest = {
+    "source_commit": revision,
+    "cargo_lock_sha256": sha(frozen / "Cargo.lock"),
+    "sha256": {name: sha(frozen / name) for name in sorted(required)},
+    "scope": "native winit/Xvfb rendering; no paired GNOME qualification",
+}
+(frozen / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+PY
+dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$art/frozen" --artifacts "$art/ltr" --display :109
+dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$art/frozen" --artifacts "$art/rtl" --display :110 --rtl

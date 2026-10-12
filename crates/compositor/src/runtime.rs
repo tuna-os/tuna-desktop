@@ -2433,11 +2433,12 @@ impl Runtime {
         let model = self.manager.model();
         let active = model.active_workspace();
         let focused = model.focused();
+        let hidden = self.manager.hidden_by_minimize();
         let mut windows: Vec<(u64, Rectangle<i32, Logical>)> = self
             .manager
             .overview_windows()
             .into_iter()
-            .filter(|w| w.workspace == active && !self.manager.is_minimized(w.id))
+            .filter(|w| w.workspace == active && !hidden.contains(&w.id))
             .map(|w| (w.id, w.geometry))
             .collect();
         // GNOME sorts by stable sequence: creation order (Tuna Desktop ids rise).
@@ -3630,6 +3631,19 @@ impl Runtime {
         if let Some(active) = outcome.overview_app_grid {
             self.overview_app_grid = active;
         }
+        if let Some(geometries) = outcome.icon_geometries {
+            self.manager.set_icon_geometries(
+                geometries
+                    .into_iter()
+                    .map(|g| {
+                        (
+                            g.window,
+                            Rectangle::new((g.x, g.y).into(), (g.width, g.height).into()),
+                        )
+                    })
+                    .collect(),
+            );
+        }
         if let Some(settings) = outcome.input_settings {
             self.apply_input_settings(settings);
         }
@@ -4014,6 +4028,7 @@ impl Runtime {
             now,
             self.input_settings.motion,
             allowed,
+            self.input_settings.right_to_left,
         );
         // The tint program is compiled once per renderer and cached;
         // a compile failure draws this frame untinted.
@@ -5026,6 +5041,25 @@ fn scene_elements(
             if split_from.is_none() && split.is_some_and(|s| *s == *surface) {
                 split_from = Some(elements.len());
             }
+            let buffer_size =
+                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+            let buffer_geometry = Rectangle::new(
+                crate::popup::surface_origin(&surface, geometry.loc),
+                buffer_size,
+            );
+            if let Some((r, fade)) = manager
+                .window_lifecycle()
+                .minimizing_frame(id, buffer_geometry.to_f64())
+            {
+                let scale = (
+                    r.size.w / f64::from(buffer_size.w),
+                    r.size.h / f64::from(buffer_size.h),
+                );
+                let origin = view.physical(r.loc.x, r.loc.y);
+                elements.extend(render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(renderer, &surface, origin, view.scale, fade, Kind::Unspecified).into_iter().map(|e| smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e, origin, scale)));
+                owners.resize(elements.len(), Some(id));
+                continue;
+            }
             if let Some((mut frame, snapshot)) = manager.size_changes().frame(id) {
                 // A workspace switch carries the transition along with its
                 // window: the live frame and the snapshot above it.
@@ -5068,6 +5102,25 @@ fn scene_elements(
                         |element| (elements.len(), element, manager.modal_dim().multiplier(id)),
                     ),
                 );
+                owners.resize(elements.len(), Some(id));
+                continue;
+            }
+            let buffer_size =
+                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+            let buffer_geometry = Rectangle::new(
+                crate::popup::surface_origin(&surface, geometry.loc),
+                buffer_size,
+            );
+            if let Some((r, fade)) = manager
+                .window_lifecycle()
+                .restoring_frame(id, buffer_geometry.to_f64())
+            {
+                let scale = (
+                    r.size.w / f64::from(buffer_size.w),
+                    r.size.h / f64::from(buffer_size.h),
+                );
+                let origin = view.physical(r.loc.x, r.loc.y);
+                elements.extend(render_elements_from_surface_tree::<_,WaylandSurfaceRenderElement<_>>(renderer,&surface,origin,view.scale,fade*manager.render_alpha(&window),Kind::Unspecified).into_iter().map(|e|smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e,origin,scale)));
                 owners.resize(elements.len(), Some(id));
                 continue;
             }

@@ -137,6 +137,11 @@ struct Shell {
 struct ShellActions(Rc<RefCell<Shell>>);
 
 impl overview::OverviewActions for ShellActions {
+    fn set_window_icon_geometries(&self, geometries: Vec<tuna_shell_control::WindowIconGeometry>) {
+        if let Some(control) = self.0.borrow_mut().control.as_mut() {
+            let _ = control.set_window_icon_geometries(geometries);
+        }
+    }
     fn close_overview(&self) {
         if let Some(control) = self.0.borrow_mut().control.as_mut() {
             if control.model().is_overview_open() {

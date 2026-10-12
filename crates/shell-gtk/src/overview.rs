@@ -37,6 +37,8 @@ pub trait OverviewActions {
         None
     }
     fn running(&self) -> Vec<(u64, Option<String>)>;
+    fn set_window_icon_geometries(&self, _geometries: Vec<tuna_shell_control::WindowIconGeometry>) {
+    }
     /// Search results are showing (or not): the compositor hides the
     /// workspace view meanwhile.
     fn set_search(&self, active: bool);
@@ -49,11 +51,14 @@ pub trait OverviewActions {
 
 /// One dash item (`#dash .overview-tile`): the 64px icon in a 76px
 /// rounded tile, with GNOME's running dot under it.
-fn dash_tile(entry: &AppEntry, running: bool) -> gtk::Button {
+fn dash_tile(entry: &AppEntry, running: bool) -> (gtk::Button, gtk::Image) {
     let tile = gtk::Overlay::new();
     let icon = gtk::Box::new(gtk::Orientation::Vertical, 0);
     icon.add_css_class("overview-icon");
-    icon.append(&app_icon(entry, 64));
+    let image = app_icon(entry, 64);
+    image.set_halign(gtk::Align::Center);
+    image.set_valign(gtk::Align::Center);
+    icon.append(&image);
     tile.set_child(Some(&icon));
     if running {
         let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -68,7 +73,7 @@ fn dash_tile(entry: &AppEntry, running: bool) -> gtk::Button {
         button.add_css_class("running");
     }
     button.update_property(&[gtk::accessible::Property::Label(&entry.name)]);
-    button
+    (button, image)
 }
 
 fn app_icon(entry: &AppEntry, size: i32) -> gtk::Image {
@@ -146,6 +151,10 @@ pub struct OverviewUi {
     dash: gtk::ApplicationWindow,
     dash_row: gtk::Box,
     dash_signature: Vec<(u64, Option<String>, Option<String>)>,
+    dash_icons: Vec<(Vec<u64>, gtk::Image)>,
+    dash_layout: Option<(gtk::gdk::Surface, gtk::glib::SignalHandlerId)>,
+    icon_publication_pending: Rc<std::cell::Cell<bool>>,
+    published_icons: Vec<tuna_shell_control::WindowIconGeometry>,
     grid: gtk::ApplicationWindow,
     apps: Rc<LiveApps>,
     favorites: Vec<String>,
@@ -275,6 +284,10 @@ impl OverviewUi {
             dash,
             dash_row,
             dash_signature: Vec::new(),
+            dash_icons: Vec::new(),
+            dash_layout: None,
+            icon_publication_pending: Rc::new(std::cell::Cell::new(false)),
+            published_icons: Vec::new(),
             grid,
             apps,
             favorites,
@@ -286,6 +299,35 @@ impl OverviewUi {
                 Rc::new(crate::folders::rename),
             ),
         }));
+        {
+            let dash = ui.borrow().dash.clone();
+            let weak = Rc::downgrade(&ui);
+            dash.connect_map(move |dash| {
+                let weak = weak.clone();
+                let dash = dash.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Some((surface, handler)) = ui.borrow_mut().dash_layout.take() {
+                        surface.disconnect(handler);
+                    }
+                    if let Some(surface) = dash.surface() {
+                        let weak = Rc::downgrade(&ui);
+                        let handler = surface.connect_layout(move |_, _, _| {
+                            let weak = weak.clone();
+                            gtk::glib::idle_add_local_once(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    Self::publish_dash_icons(&ui);
+                                }
+                            });
+                        });
+                        ui.borrow_mut().dash_layout = Some((surface, handler));
+                    }
+                    Self::publish_dash_icons(&ui);
+                });
+            });
+        }
         // An app dragged out of a folder's dialog leaves the folder.
         {
             let weak = Rc::downgrade(&ui);
@@ -423,8 +465,80 @@ impl OverviewUi {
         }
     }
 
-    fn rebuild_dash(ui: &Rc<RefCell<Self>>) {
+    /// One bounded layout observer per rebuild; steady state has no frame callback.
+    fn publish_dash_icons(ui: &Rc<RefCell<Self>>) {
         let me = ui.borrow();
+        if me.icon_publication_pending.replace(true) {
+            return;
+        }
+        let pending = me.icon_publication_pending.clone();
+        let dash = me.dash.clone();
+        drop(me);
+        let weak = Rc::downgrade(ui);
+        let attempts = std::cell::Cell::new(0usize);
+        dash.add_tick_callback(move |dash, _| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            let Some(ui) = weak.upgrade() else {
+                pending.set(false);
+                return gtk::glib::ControlFlow::Break;
+            };
+            let Ok(mut me) = ui.try_borrow_mut() else {
+                return if attempt < 30 {
+                    gtk::glib::ControlFlow::Continue
+                } else {
+                    pending.set(false);
+                    gtk::glib::ControlFlow::Break
+                };
+            };
+            // Tick precedes allocation; allow a completed frame before sampling.
+            if attempt < 2 {
+                return gtk::glib::ControlFlow::Continue;
+            }
+            let monitor = dash.surface().and_then(|surface| {
+                gtk::prelude::WidgetExt::display(dash).monitor_at_surface(&surface)
+            });
+            let Some(monitor) = monitor else {
+                if attempt < 30 {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                pending.set(false);
+                return gtk::glib::ControlFlow::Break;
+            };
+            let monitor = monitor.geometry();
+            let mut geometries = Vec::new();
+            for (ids, image) in &me.dash_icons {
+                let Some(bounds) = image.compute_bounds(dash) else {
+                    continue;
+                };
+                if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+                    continue;
+                }
+                for id in ids {
+                    geometries.push(tuna_shell_control::WindowIconGeometry {
+                        window: *id,
+                        x: monitor.x() + bounds.x().round() as i32,
+                        y: monitor.y() + monitor.height() - dash.height() - 12
+                            + bounds.y().round() as i32,
+                        width: bounds.width().round() as i32,
+                        height: bounds.height().round() as i32,
+                    });
+                }
+            }
+            geometries.sort_by_key(|g| g.window);
+            geometries.truncate(tuna_shell_control::MAX_WINDOW_ICON_GEOMETRIES);
+            if geometries != me.published_icons {
+                me.actions.set_window_icon_geometries(geometries.clone());
+                me.published_icons = geometries;
+            }
+            pending.set(false);
+            gtk::glib::ControlFlow::Break
+        });
+    }
+
+    fn rebuild_dash(ui: &Rc<RefCell<Self>>) {
+        let mut me = ui.borrow_mut();
+        me.dash_icons.clear();
         while let Some(child) = me.dash_row.first_child() {
             me.dash_row.remove(&child);
         }
@@ -433,7 +547,8 @@ impl OverviewUi {
         // Running apps in the order their windows appeared.
         let mut running = me.actions.running();
         running.sort_by_key(|(id, _)| *id);
-        let apps = me.apps.get();
+        let live_apps = me.apps.clone();
+        let apps = live_apps.get();
         let window_of = |entry: &AppEntry| {
             running
                 .iter()
@@ -475,7 +590,15 @@ impl OverviewUi {
                 me.dash_row.append(&separator);
             }
             let window = window_of(entry);
-            let button = dash_tile(entry, window.is_some());
+            let (button, image) = dash_tile(entry, window.is_some());
+            let ids = running
+                .iter()
+                .filter(|(_, app)| {
+                    app.as_deref() == Some(entry.app_id.trim_end_matches(".desktop"))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            me.dash_icons.push((ids, image));
             let entry = entry.clone();
             let actions = me.actions.clone();
             button.connect_clicked(move |_| match window {
@@ -510,7 +633,8 @@ impl OverviewUi {
                     .or_else(|| Some("application-x-executable".to_owned())),
                 categories: Vec::new(),
             };
-            let button = dash_tile(&entry, true);
+            let (button, image) = dash_tile(&entry, true);
+            me.dash_icons.push((vec![window], image));
             let actions = me.actions.clone();
             button.connect_clicked(move |_| {
                 actions.activate_window(window);
@@ -542,6 +666,7 @@ impl OverviewUi {
         me.dash_row.append(&show_apps);
         drop(apps);
         drop(me);
+        Self::publish_dash_icons(ui);
         Self::rebuild_grid(ui);
     }
 

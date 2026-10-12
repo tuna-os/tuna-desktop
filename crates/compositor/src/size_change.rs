@@ -562,6 +562,10 @@ pub struct Snapshot {
     pub id: smithay::backend::renderer::element::Id,
 }
 
+fn snapshot_source(size: Size<i32, smithay::utils::Buffer>) -> RectF {
+    Rectangle::from_size((f64::from(size.w), f64::from(size.h)).into())
+}
+
 /// The snapshot drawn for one output (`view`) as a texture element in
 /// physical pixels; draw it at scale 1.
 pub fn snapshot_element(
@@ -576,7 +580,7 @@ pub fn snapshot_element(
 > {
     use smithay::backend::renderer::element::texture::TextureRenderElement;
     use smithay::backend::renderer::element::Kind;
-    use smithay::backend::renderer::Renderer;
+    use smithay::backend::renderer::{Renderer, Texture};
     if frame.snapshot_alpha <= 0.0 {
         return None;
     }
@@ -595,7 +599,10 @@ pub fn snapshot_element(
         1,
         smithay::utils::Transform::Normal,
         Some(frame.snapshot_alpha),
-        None,
+        // An implicit source rectangle follows the destination logical size
+        // in Smithay, cropping a shrinking snapshot to its upper-left area.
+        // Sample the entire imported texture while scaling its destination.
+        Some(snapshot_source(snapshot.texture.size())),
         Some((w, h).into()),
         None,
         Kind::Unspecified,
@@ -729,6 +736,15 @@ pub fn step_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shrinking_snapshot_samples_full_texture_instead_of_destination_crop() {
+        let source = snapshot_source((500, 350).into());
+        assert_eq!(source.loc, (0.0, 0.0).into());
+        assert_eq!(source.size, (500.0, 350.0).into());
+        // A 64px icon or monitor-scale destination never changes this source.
+        assert_ne!(source.size, (64.0, 64.0).into());
+    }
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
         Rect::new((x, y).into(), (w, h).into())

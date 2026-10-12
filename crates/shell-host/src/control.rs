@@ -548,6 +548,19 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Replace global logical minimize targets published by the dash.
+    pub fn set_window_icon_geometries(
+        &mut self,
+        geometries: Vec<tuna_shell_control::WindowIconGeometry>,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::SetWindowIconGeometries { geometries },
+        })?;
+        Ok(id)
+    }
+
     /// Where the switcher's window thumbnails sit (empty: none).
     pub fn set_switcher_thumbnails(
         &mut self,

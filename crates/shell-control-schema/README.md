@@ -12,7 +12,10 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION`.
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.32).
+- Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
+  appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
+  windows are ignored by the compositor; an empty list selects monitor fallback.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,

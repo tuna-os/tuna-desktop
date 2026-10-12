@@ -98,7 +98,14 @@ wayland_client::delegate_noop!(Peer: ignore xdg_dialog_v1::XdgDialogV1);
 impl Peer {
     fn create(&mut self, q: &QueueHandle<Self>, index: usize, modal: bool) {
         let parent = index == 0;
-        let (width, height) = if parent { (500, 350) } else { (220, 100) };
+        let fullscreen = parent && std::env::var_os("TUNA_PROOF_FULLSCREEN").is_some();
+        let (width, height) = if fullscreen {
+            (1280, 800)
+        } else if parent {
+            (500, 350)
+        } else {
+            (220, 100)
+        };
         let mut file = tempfile::tempfile().unwrap();
         let mut bytes = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height {
@@ -135,6 +142,9 @@ impl Peer {
         let top = xdg.get_toplevel(q, ());
         top.set_app_id("tuna-modal-dim-proof".into());
         top.set_title(format!("Modal dim {index}"));
+        if fullscreen {
+            top.set_fullscreen(None);
+        }
         if !parent {
             top.set_parent(Some(&self.windows[0].as_ref().unwrap().top));
         }
@@ -166,6 +176,36 @@ impl Peer {
         });
         self.windows[index].as_ref().unwrap().surface.commit();
     }
+    fn recolor(&mut self, q: &QueueHandle<Self>, index: usize) {
+        let Some(w) = self.windows.get_mut(index).and_then(Option::as_mut) else {
+            return;
+        };
+        let (width, height) = w.size;
+        let mut file = tempfile::tempfile().unwrap();
+        let mut bytes = Vec::with_capacity((width * height * 4) as usize);
+        for _y in 0..height {
+            for x in 0..width {
+                let color: u32 = if index == 0 && x < 40 { 0 } else { 0xffad7fa8 };
+                bytes.extend_from_slice(&color.to_ne_bytes());
+            }
+        }
+        file.write_all(&bytes).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let pool = self
+            .shm
+            .as_ref()
+            .unwrap()
+            .create_pool(file.as_fd(), bytes.len() as i32, q, ());
+        let buffer =
+            pool.create_buffer(0, width, height, width * 4, wl_shm::Format::Argb8888, q, ());
+        pool.destroy();
+        w.surface.attach(Some(&buffer), 0, 0);
+        w.surface.damage_buffer(0, 0, width, height);
+        w.surface.commit();
+        w.buffer.destroy();
+        w.buffer = buffer;
+        w._file = file;
+    }
     fn close(&mut self, index: usize) {
         if let Some(w) = self.windows.get_mut(index).and_then(Option::take) {
             if let Some(d) = w.dialog {
@@ -196,6 +236,14 @@ fn main() {
                 if next != generation {
                     generation = next;
                     match value["action"].as_str().unwrap_or("") {
+                        "minimize" => peer.windows[0].as_ref().unwrap().top.set_minimized(),
+                        "minimize-dialog" => peer.windows[1].as_ref().unwrap().top.set_minimized(),
+                        "recolor" => peer.recolor(&q, 0),
+                        "recolor-dialog" => peer.recolor(&q, 1),
+                        "new" => {
+                            peer.close(0);
+                            peer.create(&q, 0, false);
+                        }
                         "dialog" => peer.create(&q, 1, true),
                         "second-dialog" => peer.create(&q, 2, true),
                         "nonmodal" => peer.create(&q, 1, false),

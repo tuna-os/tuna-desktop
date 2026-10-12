@@ -12,7 +12,7 @@
 //! and focused; titles are read from the surface role data; stacking is
 //! insertion order with focus raising to top. All code here is original.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "xwayland")]
 use crate::xwayland::{map_x11_identity, X11ManagerEvent};
@@ -229,6 +229,9 @@ pub struct WindowManager {
     x11_index: HashMap<u32, u64>,
     /// Model ids bottom-to-top; focus raises to the top.
     stacking: Vec<u64>,
+    // Explicit activation history is independent of raising transient families.
+    // GNOME workspace.c focus_ancestor_or_mru_window uses MRU after detach.
+    focus_history: Vec<u64>,
     cascade: i32,
     keyboard: Option<KeyboardHandle<State>>,
     pointer: Option<PointerHandle<State>>,
@@ -320,6 +323,7 @@ pub struct WindowManager {
     workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
     workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
     modal_dim: crate::modal_dim::ModalDim,
+    icon_geometries: HashMap<u64, Rectangle<i32, Logical>>,
 }
 
 impl WindowManager {
@@ -406,6 +410,7 @@ impl WindowManager {
             #[cfg(feature = "xwayland")]
             x11_index: HashMap::new(),
             stacking: Vec::new(),
+            focus_history: Vec::new(),
             cascade: 0,
             keyboard,
             pointer,
@@ -450,6 +455,7 @@ impl WindowManager {
             workspace_outputs: Vec::new(),
             workspace_tracker: Default::default(),
             modal_dim: Default::default(),
+            icon_geometries: Default::default(),
         }
     }
 
@@ -563,16 +569,56 @@ impl WindowManager {
         match window.surface.underlying_surface() {
             WindowSurface::Wayland(toplevel) => read_parent(toplevel)
                 .filter(|p| p.is_alive())
-                .and_then(|p| {
-                    self.windows.iter().find_map(|(id, w)| {
-                        (w.surface.wl_surface().as_deref() == Some(&p)).then_some(*id)
-                    })
-                }),
+                .and_then(|p| self.surface_index.get(&p).copied()),
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(surface) => surface
                 .is_transient_for()
                 .and_then(|xid| self.x11_index.get(&xid).copied()),
         }
+    }
+
+    fn transient_parents(&self) -> HashMap<u64, u64> {
+        self.windows
+            .keys()
+            .filter_map(|id| self.transient_parent(*id).map(|p| (*id, p)))
+            .collect()
+    }
+
+    /// Logical hiding follows every transient ancestor, while own minimize
+    /// flags remain independent for restore and lifecycle transitions.
+    pub fn hidden_by_minimize(&self) -> HashSet<u64> {
+        let flags = self
+            .windows
+            .iter()
+            .filter_map(|(id, w)| w.minimized.then_some(*id))
+            .collect();
+        crate::transient_family::inherit_flags(
+            &self.transient_parents(),
+            &flags,
+            self.windows.keys().copied(),
+        )
+    }
+
+    fn activation_target(&mut self, requested: u64) -> u64 {
+        let parents = self.transient_parents();
+        for id in crate::transient_family::ancestors(requested, &parents) {
+            if let Some(window) = self.windows.get_mut(&id) {
+                window.minimized = false;
+            }
+        }
+        let target = self.modal_target(requested);
+        for id in crate::transient_family::ancestors(target, &parents) {
+            if let Some(window) = self.windows.get_mut(&id) {
+                window.minimized = false;
+            }
+        }
+        target
+    }
+
+    fn raise_family(&mut self, id: u64) {
+        let parents = self.transient_parents();
+        crate::transient_family::raise_family(&mut self.stacking, id, &parents);
+        self.keep_above_on_top();
     }
 
     #[cfg(feature = "xwayland")]
@@ -714,9 +760,22 @@ impl WindowManager {
         if self.workspace_slide.running() {
             return self.sliding_entries();
         }
-        self.visible_entries()
-            .into_iter()
-            .map(|(id, window, geometry)| (id, window, self.shifted(id, geometry)))
+        let visible: HashSet<_> = self.visible_entries().into_iter().map(|e| e.0).collect();
+        let active = self.model.active_workspace();
+        self.stacking
+            .iter()
+            .copied()
+            .filter_map(|id| {
+                let w = self.windows.get(&id)?;
+                let animating = self.window_lifecycle.is_minimizing(id)
+                    && (self.on_all_workspaces(id)
+                        || self
+                            .model
+                            .window(id)
+                            .is_some_and(|entry| entry.workspace == active));
+                (visible.contains(&id) || animating)
+                    .then(|| (id, w.surface.clone(), self.shifted(id, w.geometry)))
+            })
             .collect()
     }
 
@@ -739,6 +798,22 @@ impl WindowManager {
         }
     }
 
+    pub fn is_fullscreen(&self, id: u64) -> bool {
+        self.windows
+            .get(&id)
+            .is_some_and(|w| w.layout == WindowLayout::Fullscreen)
+    }
+    pub fn icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
+        self.icon_geometries.get(&id).copied()
+    }
+    /// Replace trusted shell-published global logical dash icon bounds.
+    pub fn set_icon_geometries(&mut self, geometries: Vec<(u64, Rectangle<i32, Logical>)>) {
+        self.icon_geometries = geometries
+            .into_iter()
+            .filter(|(id, r)| self.windows.contains_key(id) && r.size.w > 0 && r.size.h > 0)
+            .collect();
+    }
+
     pub fn modal_dim(&self) -> &crate::modal_dim::ModalDim {
         &self.modal_dim
     }
@@ -755,9 +830,7 @@ impl WindowManager {
             .iter()
             .filter_map(|(id, w)| match w.surface.underlying_surface() {
                 WindowSurface::Wayland(top)
-                    if !w.minimized
-                        && read_modal(top)
-                        && committed_size(top.wl_surface()).is_some() =>
+                    if read_modal(top) && committed_size(top.wl_surface()).is_some() =>
                 {
                     self.transient_parent(*id)
                 }
@@ -807,10 +880,11 @@ impl WindowManager {
     }
 
     fn sliding_entries(&self) -> Vec<(u64, Window, Rectangle<i32, Logical>)> {
+        let hidden = self.hidden_by_minimize();
         self.stacking
             .iter()
             .filter_map(|id| {
-                let window = self.windows.get(id).filter(|w| !w.minimized)?;
+                let window = self.windows.get(id).filter(|_| !hidden.contains(id))?;
                 let mut geometry = self.shifted(*id, window.geometry);
                 if !self.on_all_workspaces(*id) {
                     let workspace = self.model.window(*id)?.workspace;
@@ -920,6 +994,7 @@ impl WindowManager {
     /// Visible windows bottom-to-top with their ids and target geometry.
     fn visible_entries(&self) -> Vec<(u64, Window, Rectangle<i32, Logical>)> {
         let active = self.model.active_workspace();
+        let hidden = self.hidden_by_minimize();
         self.stacking
             .iter()
             .copied()
@@ -932,7 +1007,7 @@ impl WindowManager {
             .filter_map(|id| {
                 self.windows
                     .get(&id)
-                    .filter(|w| !w.minimized)
+                    .filter(|_| !hidden.contains(&id))
                     .map(|w| (id, w.surface.clone(), w.geometry))
             })
             .collect()
@@ -1072,12 +1147,14 @@ impl WindowManager {
         // refocuses the new topmost here, converging seat focus and
         // Activated states on the next tick.
         let active = self.model.active_workspace();
+        let hidden = self.hidden_by_minimize();
         let stranded = self.model.focused().is_some_and(|id| {
-            !self.on_all_workspaces(id)
-                && self
-                    .model
-                    .window(id)
-                    .is_some_and(|entry| entry.workspace != active)
+            hidden.contains(&id)
+                || (!self.on_all_workspaces(id)
+                    && self
+                        .model
+                        .window(id)
+                        .is_some_and(|entry| entry.workspace != active))
         });
         // Arriving on a workspace with nothing focused focuses its top
         // window, as GNOME does, whichever path switched (keys, shell).
@@ -1167,10 +1244,21 @@ impl WindowManager {
 
     fn restore_pre_overview_focus(&mut self, state: &mut State) {
         self.overview_held = None;
+        let visible: HashSet<_> = self
+            .visible_entries()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
         let restore = self
             .pre_overview_focus
-            .filter(|id| self.windows.contains_key(id))
-            .or_else(|| self.stacking.last().copied());
+            .filter(|id| visible.contains(id))
+            .or_else(|| {
+                self.stacking
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|id| visible.contains(id))
+            });
         self.pre_overview_focus = None;
         if let Some(old) = self.overview_activated.take() {
             if Some(old) != restore {
@@ -1230,9 +1318,11 @@ impl WindowManager {
             .then(|| self.model.focused())
             .flatten()
             .and_then(|focused| self.stacking.iter().position(|other| *other == focused));
-        match after_focused {
-            Some(index) => self.stacking.insert(index + 1, id),
-            None => self.stacking.push(id),
+        if !self.stacking.contains(&id) {
+            match after_focused {
+                Some(index) => self.stacking.insert(index + 1, id),
+                None => self.stacking.push(id),
+            }
         }
         // Forced strip membership: windows mapped mid-scroll join the
         // strip as columns. Dialogs keep their after-parent stacking
@@ -1240,6 +1330,10 @@ impl WindowManager {
         // their rule instead of floating centering.
         if self.mode == SessionMode::Scroll {
             self.apply_layout(state, id, WindowLayout::Strip);
+        }
+        if self.hidden_by_minimize().contains(&id) {
+            self.configure(id, false);
+            return;
         }
         self.configure(id, true);
         // A window mapping while the overview holds focus (launched
@@ -1650,13 +1744,35 @@ impl WindowManager {
             }
         }
         self.stacking.retain(|other| *other != id);
+        self.focus_history.retain(|other| *other != id);
+        self.icon_geometries.remove(&id);
         self.model.remove(id);
         for window in self.windows.values_mut() {
             if window.x11_parent == Some(id) {
                 window.x11_parent = None;
             }
         }
-        let fallback = return_parent.or_else(|| self.stacking.last().copied());
+        let visible: HashSet<_> = self
+            .visible_entries()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        let fallback = return_parent
+            .filter(|id| visible.contains(id))
+            .or_else(|| self.model.focused().filter(|id| visible.contains(id)))
+            .or_else(|| {
+                self.focus_history
+                    .iter()
+                    .copied()
+                    .find(|id| visible.contains(id))
+            })
+            .or_else(|| {
+                self.stacking
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|id| visible.contains(id))
+            });
         self.apply_focus(state, fallback);
         if self.mode == SessionMode::Scroll {
             self.relayout_strip(state);
@@ -1790,11 +1906,12 @@ impl WindowManager {
     /// Focus while the overview holds the keyboard: the window is the
     /// one restored on close, rises, and takes the activated look.
     fn focus_parked(&mut self, id: Option<u64>) {
+        let id = id.map(|id| self.activation_target(id));
         self.pre_overview_focus = id;
         if let Some(id) = id {
+            self.remember_focus(id);
             if self.mode == SessionMode::Gnome {
-                self.stacking.retain(|other| *other != id);
-                self.stacking.push(id);
+                self.raise_family(id);
             }
         }
         if self.overview_activated != id {
@@ -1809,12 +1926,23 @@ impl WindowManager {
         }
     }
 
+    fn remember_focus(&mut self, id: u64) {
+        if self.focus_history.first() == Some(&id) {
+            return;
+        }
+        self.focus_history.retain(|other| *other != id);
+        self.focus_history.insert(0, id);
+    }
+
     fn apply_focus(&mut self, state: &mut State, id: Option<u64>) {
         // GNOME attaches modal dialogs to their parent: the parent
         // cannot take focus from its dialog (xdg-dialog, #89).
-        let id = id.map(|id| self.modal_target(id));
+        let id = id.map(|id| self.activation_target(id));
         let previous = self.model.focused();
         self.model.set_focused(id);
+        if let Some(id) = id {
+            self.remember_focus(id);
+        }
         // Shell activation may set model focus before this manager runs.
         // Compare the last applied activation too, so Alt+Tab follows the
         // selected column while ordinary reassertion preserves wheel panning.
@@ -1834,9 +1962,7 @@ impl WindowManager {
             // column order independent of focus (niri shape), so focus
             // never reorders in scroll mode.
             if self.mode == SessionMode::Gnome {
-                self.stacking.retain(|other| *other != id);
-                self.stacking.push(id);
-                self.keep_above_on_top();
+                self.raise_family(id);
             }
         }
         let serial = SERIAL_COUNTER.next_serial();
@@ -2627,7 +2753,11 @@ impl WindowManager {
             return true;
         }
         window.minimized = true;
-        if self.model.focused() == Some(id) {
+        if self
+            .model
+            .focused()
+            .is_some_and(|focused| self.hidden_by_minimize().contains(&focused))
+        {
             let workspace = self.model.active_workspace();
             self.focus_topmost(state, workspace);
         }
@@ -2637,11 +2767,18 @@ impl WindowManager {
     /// Always on Top windows stay above every other window: a stable
     /// partition of the stacking order.
     fn keep_above_on_top(&mut self) {
-        let windows = &self.windows;
-        let (above, rest): (Vec<u64>, Vec<u64>) = self
-            .stacking
+        let flags = self
+            .windows
             .iter()
-            .partition(|id| windows.get(id).is_some_and(|w| w.above));
+            .filter_map(|(id, w)| w.above.then_some(*id))
+            .collect();
+        let inherited = crate::transient_family::inherit_flags(
+            &self.transient_parents(),
+            &flags,
+            self.windows.keys().copied(),
+        );
+        let (above, rest): (Vec<u64>, Vec<u64>) =
+            self.stacking.iter().partition(|id| inherited.contains(id));
         self.stacking = rest.into_iter().chain(above).collect();
     }
 
@@ -3784,13 +3921,15 @@ impl WindowManager {
 
     /// Focus the topmost window on `workspace`, or unfocus when empty.
     fn focus_topmost(&mut self, state: &mut State, workspace: u32) {
+        let hidden = self.hidden_by_minimize();
         let topmost = self.stacking.iter().rev().copied().find(|id| {
             (self
                 .model
                 .window(*id)
                 .is_some_and(|entry| entry.workspace == workspace)
                 || self.on_all_workspaces(*id))
-                && self.windows.get(id).is_some_and(|w| !w.minimized)
+                && self.windows.contains_key(id)
+                && !hidden.contains(id)
         });
         // In the overview a workspace switch moves the activated look
         // and the window restored on close; the keys stay with the

@@ -63,6 +63,7 @@ pub mod ime;
 pub mod introspect;
 pub mod layer;
 pub mod lock;
+pub mod minimize;
 pub mod modal_dim;
 pub mod monitors;
 pub mod mutter;
@@ -96,6 +97,7 @@ pub mod sleep;
 pub mod spring;
 pub mod state;
 pub mod supervise;
+mod transient_family;
 pub mod unlock;
 mod wake;
 pub mod wallpaper;
@@ -1061,6 +1063,25 @@ impl State {
             .and_then(|entry| entry.output.as_ref())
             .map(|output| output.current_scale().fractional_scale())
             .unwrap_or(self.protocols.preferred_scale)
+    }
+
+    /// Logical monitor selected by maximum overlap, including nested outputs.
+    pub fn monitor_geometry(
+        &self,
+        rect: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        self.outputs
+            .iter()
+            .max_by_key(|e| {
+                let r = smithay::utils::Rectangle::new(e.loc.into(), e.size);
+                (
+                    r.intersection(rect)
+                        .map_or(0i64, |i| i64::from(i.size.w) * i64::from(i.size.h)),
+                    e.primary,
+                )
+            })
+            .map(|e| smithay::utils::Rectangle::new(e.loc.into(), e.size))
+            .unwrap_or(rect)
     }
 
     /// Scale of the output a logical rect overlaps most (the primary on

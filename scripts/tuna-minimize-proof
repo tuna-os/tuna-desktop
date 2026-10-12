@@ -1,0 +1,498 @@
+#!/usr/bin/python3
+"""Actual native minimize/unminimize rendering proof; requires built binaries + Xvfb.
+
+Run under dbus-run-session. --bin-dir points to a source-identified frozen bundle.
+Uses a private display, settings, runtime directory, and manual animation clock.
+This is local rendering evidence, not a GNOME paired benchmark or v1 verdict.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import shutil
+import hashlib
+import signal
+import select
+import gi
+from gi.repository import Gio, GLib
+import time
+from PIL import Image
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument("--bin-dir", type=Path, required=True)
+p.add_argument("--artifacts", type=Path, required=True)
+p.add_argument("--display", default=":95")
+p.add_argument("--rtl",action="store_true")
+a = p.parse_args()
+root = Path(__file__).resolve().parent.parent
+art = a.artifacts.resolve()
+art.mkdir(parents=True, exist_ok=True)
+runtime = art / "runtime"
+runtime.mkdir(mode=0o700, exist_ok=True)
+os.chmod(runtime, 0o700)
+state = art / "state.json"
+clock = art / "clock"
+command = art / "command.json"
+clock.write_text("0\n")
+(art / "assertions.txt").unlink(missing_ok=True)
+state.unlink(missing_ok=True)
+command.unlink(missing_ok=True)
+env = dict(os.environ, DISPLAY=a.display, XDG_RUNTIME_DIR=str(runtime),
+           XDG_CONFIG_HOME=str(art / "config"), XDG_DATA_HOME=str(art / "data"), GSETTINGS_BACKEND="keyfile",
+           TUNA_COMPOSITOR_STATE=str(state), TUNA_ANIMATION_CLOCK=str(clock),
+           TUNA_XWAYLAND="0", LIBGL_ALWAYS_SOFTWARE="1", ADW_DISABLE_PORTAL="1", GSK_RENDERER="cairo", TUNA_LIFECYCLE_COMMAND=str(command))
+if a.rtl: env["GTK_DEBUG"]="invert-text-dir"
+# Give the actual GTK dash a distinctive real desktop-entry icon, so its
+# published bounds can be checked against visible pixels rather than only
+# trusting the geometry reported by the compositor.
+icon_path=art / "data/icons/animation-proof.png"
+icon_path.parent.mkdir(parents=True,exist_ok=True)
+Image.new("RGB",(64,64),(127,211,33)).save(icon_path)
+applications=art / "data/applications"
+applications.mkdir(parents=True,exist_ok=True)
+(applications / "tuna-modal-dim-proof.desktop").write_text(
+    "[Desktop Entry]\nType=Application\nName=Animation Proof\nExec=/usr/bin/true\nIcon="+str(icon_path)+"\nStartupWMClass=tuna-modal-dim-proof\n")
+clock_shift=0
+nominal_clock=0
+# Freeze the tested binaries so another worktree's build cannot change this run.
+frozen = art / "bin"
+frozen.mkdir(exist_ok=True)
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream,"sha256").hexdigest()
+binaries = {}
+for name in ("tuna-compositor","tuna-shell-gtk","tuna-modal-dim-client"):
+    source = a.bin_dir.resolve() / name
+    dest = frozen / name
+    shutil.copy2(source,dest)
+    binaries[name] = {"source_path":str(source),"sha256":digest(dest)}
+manifest = {
+    "source_revision":subprocess.check_output(["git","rev-parse","HEAD"],cwd=root,text=True).strip(),
+    "source_dirty":bool(subprocess.check_output(["git","status","--porcelain"],cwd=root,text=True).strip()),
+    "binaries":binaries,
+    "binary_source_revision":(a.bin_dir / "SOURCE_COMMIT").read_text().strip(),
+    "proof_sha256":digest(Path(__file__).resolve()),
+    "client_sha256":digest(root / "crates/compositor/examples/tuna-modal-dim-client.rs"),
+    "backend":"winit/Xvfb/llvmpipe", "gnome_comparison":False,"direction_fixture":"GTK_DEBUG=invert-text-dir" if a.rtl else "default",
+}
+freeze_manifest=json.loads((a.bin_dir / "manifest.json").read_text())
+assert manifest["source_revision"]==manifest["binary_source_revision"]==freeze_manifest["source_commit"]
+assert not manifest["source_dirty"],"proof must use clean source"
+for name,record in binaries.items(): assert record["sha256"]==freeze_manifest["sha256"][name]
+manifest["cargo_lock_sha256"] = digest(root / "Cargo.lock")
+assert manifest["cargo_lock_sha256"] == digest(a.bin_dir / "Cargo.lock") == freeze_manifest["cargo_lock_sha256"]
+(art / "manifest.json").write_text(json.dumps(manifest,indent=2))
+processes = []
+logs = []
+def spawn(args, name, extra=None):
+    log = (art / f"{name}.log").open("w")
+    logs.append(log)
+    proc = subprocess.Popen(args, env=env | (extra or {}), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    processes.append(proc)
+    return proc
+def wait(check, label):
+    end = time.monotonic() + 25
+    while time.monotonic() < end:
+        try:
+            data = json.loads(state.read_text())
+            if check(data):
+                (art / f"{label}.json").write_text(json.dumps(data, indent=2))
+                return data
+        except (OSError, ValueError, KeyError, IndexError):
+            pass
+        time.sleep(.05)
+    raise AssertionError(f"timed out: {label}; see {art}")
+def screenshot(name):
+    time.sleep(.1)
+    path = art / f"{name}.png"
+    path.unlink(missing_ok=True)
+    subprocess.run(["scrot", str(path)], env=env, check=True)
+    return Image.open(path).convert("RGB")
+def move(ms):
+    global nominal_clock
+    nominal_clock=ms
+    ms+=clock_shift
+    temp = art / "clock.tmp"
+    temp.write_text(str(ms))
+    before = json.loads(state.read_text())["rendered_frames"]
+    temp.replace(clock)
+    wait(lambda d:d["animation_clock_ms"] >= clock_base + ms and d["rendered_frames"] >= before+2, f"clock-{ms}")
+def settle_extra(ms):
+    global clock_shift
+    clock_shift+=ms
+    move(nominal_clock)
+def action(name, generation):
+    temp = art / "command.tmp"
+    temp.write_text(json.dumps(dict(action=name, generation=generation)))
+    temp.replace(command)
+def require_owned_cleanup(cleanup):
+    if not cleanup["runtime_removed"] or not cleanup["accessibility_processes_stopped"] or not cleanup["accessibility_identity_verified"]:
+        raise AssertionError("owned proof session cleanup failed")
+
+def expected_missing_accessibility_owner(name, remote_error):
+    return name == "org.a11y.atspi.Registry" and remote_error == "org.freedesktop.DBus.Error.NameHasNoOwner"
+
+success = False
+owned_pidfds = []
+accessibility = None
+try:
+    # Private session buses alone do not isolate the fixed AT-SPI runtime socket.
+    launcher = spawn(["/usr/libexec/at-spi-bus-launcher","--launch-immediately"],"atspi")
+    session_bus = Gio.bus_get_sync(Gio.BusType.SESSION,None)
+    deadline = time.monotonic()+10
+    while True:
+        try:
+            address = session_bus.call_sync("org.a11y.Bus","/org/a11y/bus","org.a11y.Bus","GetAddress",None,None,Gio.DBusCallFlags.NO_AUTO_START,2000,None).unpack()[0]
+            break
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.1)
+    assert str(runtime) in address, "accessibility bus escaped private runtime"
+    env["AT_SPI_BUS_ADDRESS"] = address
+    accessibility = Gio.DBusConnection.new_for_address_sync(address,Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,None,None)
+    bus_pid = accessibility.call_sync("org.freedesktop.DBus","/org/freedesktop/DBus","org.freedesktop.DBus","GetConnectionUnixProcessID",GLib.Variant("(s)",("org.freedesktop.DBus",)),None,Gio.DBusCallFlags.NONE,2000,None).unpack()[0]
+    owned_pidfds.append(os.pidfd_open(bus_pid))
+    manifest["session_isolation"] = {
+        "runtime_directory":str(runtime), "runtime_mode":oct(runtime.stat().st_mode & 0o777),
+        "session_bus":env.get("DBUS_SESSION_BUS_ADDRESS"), "accessibility_bus":address,
+        "accessibility_launcher_pid":launcher.pid,"accessibility_bus_pid":bus_pid,
+    }
+    (art / "manifest.json").write_text(json.dumps(manifest,indent=2))
+    # Refuse an existing display; never point the proof at a user's session.
+    if Path(f"/tmp/.X11-unix/X{a.display.lstrip(':')}").exists():
+        raise RuntimeError("display already in use; choose a private unused display")
+    spawn(["Xvfb", a.display, "-screen", "0", "1280x800x24"], "xvfb")
+    for _ in range(100):
+        if subprocess.run(["xdotool", "getdisplaygeometry"], env=env, capture_output=True).returncode == 0:
+            break
+        time.sleep(.05)
+    fixture_keys = []
+    schemas = art / "schemas"
+    for schema, key, fixture in (
+        ("org.gnome.desktop.a11y.interface", "reduced-motion", "gnome51-a11y-interface.gschema.xml"),
+        ("org.gnome.mutter", "attach-modal-dialogs", "gnome51-mutter.gschema.xml"),
+    ):
+        if subprocess.run(["gsettings", "range", schema, key], env=env, capture_output=True).returncode:
+            schemas.mkdir(exist_ok=True)
+            shutil.copy(root / "tests/settings" / fixture, schemas)
+            fixture_keys.append(f"{schema}:{key}")
+    if fixture_keys:
+        subprocess.run(["glib-compile-schemas", str(schemas)], check=True)
+        env["GSETTINGS_SCHEMA_DIR"] = str(schemas)
+    manifest["settings_fixture_keys"] = fixture_keys
+    subprocess.run(["gsettings", "set", "org.gnome.mutter", "attach-modal-dialogs", "true"], env=env, check=True)
+    subprocess.run(["gsettings","set","org.gnome.desktop.a11y.interface","reduced-motion","no-preference"],env=env,check=True)
+    subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "enable-animations", "true"], env=env, check=True)
+    compositor = spawn([str(frozen / "tuna-compositor"), "--socket", "lifecycle-proof", "--shell-bin", str(frozen / "tuna-shell-gtk")], "compositor")
+    wait(lambda d: d["animation_clock_manual"] and d["rendered_frames"] >= 5 and d["wallpaper_diagnostics"]["decode_result_count"] > 0 and any(layer["namespace"] == "tuna-panel" for layer in d["layers"]), "ready")
+    host = subprocess.check_output(["xdotool","search","--pid",str(compositor.pid),"--name","Smithay"],env=env,text=True).splitlines()
+    assert len(host)==1
+    subprocess.run(["xdotool","windowfocus","--sync",host[0]],env=env,check=True)
+    manifest["x11_host_window"] = host[0]
+    clock_base = json.loads(state.read_text())["animation_clock_ms"]
+    # Settle the compositor wallpaper crossfade before a fixed background
+    # is used for alpha composition checks at later animation times.
+    settle_extra(1000)
+    baseline=screenshot("00-baseline")
+    client=spawn([str(frozen / "tuna-modal-dim-client")],"client",{"WAYLAND_DISPLAY":"lifecycle-proof"})
+    wait(lambda d:len(d["windows"])==1 and d["window_lifecycle"]["opening"],"native-map")
+    move(150)
+    ready=wait(lambda d:not d["window_lifecycle"]["opening"],"map-complete")
+    window=ready["windows"][0];wid=window["id"]; normal_rect=window["rect"]
+    normal=screenshot("01-normal")
+    def keys(*args):subprocess.run(["xdotool",*args],env=env,check=True)
+    def restore():
+        keys("keydown","Alt_L","key","Tab")
+        time.sleep(.7)
+        keys("keyup","Alt_L")
+        return wait(lambda d:wid not in d["minimized"] and d["window_lifecycle"]["restoring"],"restore-start")
+    def check_pixel(image,rect,alpha,brightness=1.0):
+        x,y,w,h=rect
+        point=(round(x+w*.7),round(y+h*.8))
+        before=(52,101,164)
+        bg=baseline.getpixel(point)
+        actual=image.getpixel(point)
+        expected=tuple(before[i]*brightness*alpha+bg[i]*(1-alpha) for i in range(3))
+        assert all(abs(actual[i]-expected[i])<=4 for i in range(3)),(point,actual,expected,rect,alpha)
+    # Missing icon geometry goes to the leading corner of this actual output.
+    action("minimize",1)
+    started=wait(lambda d:wid in d["minimized"] and d["window_lifecycle"]["minimizing"],"fallback-minimize-start")
+    assert started["window_lifecycle"]["minimizing"][0]["icon"]==[1280 if a.rtl else 0,0,0,0]
+    assert started["window_lifecycle"]["minimizing"][0]["duration_ms"]==400
+    move(250)
+    quarter=wait(lambda d:abs(d["window_lifecycle"]["minimizing"][0]["alpha"]-45/255)<1e-5,"fallback-minimize-quarter")
+    f=quarter["window_lifecycle"]["minimizing"][0]
+    check_pixel(screenshot("02-fallback-minimize-quarter"),f["rect"],f["alpha"])
+    move(550)
+    wait(lambda d:not d["window_lifecycle"]["minimizing"],"minimize-finished")
+    restore()
+    move(650)
+    q=wait(lambda d:d["window_lifecycle"]["restoring"],"restore-quarter")
+    icon=q["window_lifecycle"]["restoring"][0]["icon"]
+    weight=2**(-2.5)
+    rect=[normal_rect[i]+(icon[i]-normal_rect[i])*weight for i in range(4)]
+    check_pixel(screenshot("03-restore-quarter-opaque"),rect,1.0)
+    move(950)
+    wait(lambda d:not d["window_lifecycle"]["restoring"],"restore-finished")
+    # Open the actual GTK overview once to publish the native window-backed dash icon.
+    keys("key","Super_L")
+    wait(lambda d:d["overview_open"] and any(l["namespace"]=="tuna-shell-dash" for l in d["layers"]),"dash-visible")
+    settle_extra(300)
+    time.sleep(1)
+    dash_source=screenshot("04-dash-target-source")
+    keys("key","Escape")
+    wait(lambda d:not d["overview_open"],"dash-hidden")
+    settle_extra(300)
+    time.sleep(.3)
+    action("minimize",2)
+    target=wait(lambda d:d["window_lifecycle"]["minimizing"],"dash-minimize-start")["window_lifecycle"]["minimizing"][0]["icon"]
+    assert target[2:]==[64,64] and target[1]>600,target
+    center=(target[0]+32,target[1]+32)
+    assert dash_source.getpixel(center)==(127,211,33),(target,center,dash_source.getpixel(center))
+    move(1050)
+    q=wait(lambda d:d["window_lifecycle"]["minimizing"],"dash-minimize-quarter")["window_lifecycle"]["minimizing"][0]
+    check_pixel(screenshot("05-dash-minimize-quarter"),q["rect"],q["alpha"])
+    move(1350)
+    wait(lambda d:not d["window_lifecycle"]["minimizing"],"dash-minimize-finished")
+    restore();move(1750)
+    wait(lambda d:not d["window_lifecycle"]["restoring"],"dash-restore-finished")
+    subprocess.run(["gsettings","set","org.gnome.desktop.a11y.interface","reduced-motion","reduce"],env=env,check=True)
+    wait(lambda d:d["motion_policy"]=="fade-only","reduced-motion")
+    action("minimize",3)
+    wait(lambda d:d["window_lifecycle"]["minimizing"],"reduced-minimize-start")
+    move(1850)
+    q=wait(lambda d:d["window_lifecycle"]["minimizing"],"reduced-minimize-quarter")["window_lifecycle"]["minimizing"][0]
+    assert q["rect"]==normal_rect,(q,normal_rect)
+    check_pixel(screenshot("06-reduced-minimize-quarter"),normal_rect,q["alpha"])
+    move(2150)
+    wait(lambda d:not d["window_lifecycle"]["minimizing"],"reduced-minimize-finished")
+    restore();move(2250)
+    check_pixel(screenshot("07-reduced-restore-quarter"),normal_rect,209/255)
+    subprocess.run(["gsettings","set","org.gnome.desktop.interface","enable-animations","false"],env=env,check=True)
+    wait(lambda d:d["motion_policy"]=="off" and not d["window_lifecycle"]["restoring"],"off-clears-running")
+    action("minimize",4)
+    wait(lambda d:wid in d["minimized"] and not d["window_lifecycle"]["minimizing"],"off-immediate-minimize")
+    hidden=screenshot("08-off-hidden")
+    x,y,w,h=normal_rect
+    point=(round(x+w*.7),round(y+h*.8))
+    assert hidden.getpixel(point)==baseline.getpixel(point),(point,hidden.getpixel(point),baseline.getpixel(point))
+    keys("keydown","Alt_L","key","Tab");time.sleep(.7);keys("keyup","Alt_L")
+    wait(lambda d:wid not in d["minimized"] and not d["window_lifecycle"]["restoring"],"off-immediate-restore")
+    off_end=time.monotonic()+10
+    while True:
+        try:
+            check_pixel(screenshot("08-off-restored"),normal_rect,1.0)
+            break
+        except AssertionError:
+            if time.monotonic()>=off_end: raise
+    action("close",5);client.wait(timeout=10)
+    wait(lambda d:not d["windows"] and not d["window_lifecycle"]["minimizing"] and not d["window_lifecycle"]["restoring"],"native-death-clean")
+    subprocess.run(["gsettings","set","org.gnome.desktop.a11y.interface","reduced-motion","no-preference"],env=env,check=True)
+    subprocess.run(["gsettings","set","org.gnome.desktop.interface","enable-animations","true"],env=env,check=True)
+    wait(lambda d:d["motion_policy"]=="full","motion-for-fullscreen")
+    command.unlink(missing_ok=True)
+    client=spawn([str(frozen / "tuna-modal-dim-client")],"fullscreen-client",{"WAYLAND_DISPLAY":"lifecycle-proof","TUNA_PROOF_FULLSCREEN":"1"})
+    full=wait(lambda d:len(d["windows"])==1 and d["window_lifecycle"]["opening"],"fullscreen-map")
+    wid=full["windows"][0]["id"]
+    move(2400)
+    full=wait(lambda d:not d["window_lifecycle"]["opening"],"fullscreen-landed")
+    assert full["windows"][0]["rect"]==[0,0,1280,800],full["windows"]
+    action("minimize",6)
+    f=wait(lambda d:d["window_lifecycle"]["minimizing"],"fullscreen-minimize-start")["window_lifecycle"]["minimizing"][0]
+    assert f["monitor_sized"]
+    move(2500)
+    f=wait(lambda d:d["window_lifecycle"]["minimizing"],"fullscreen-minimize-quarter")["window_lifecycle"]["minimizing"][0]
+    assert f["rect"]==[0,0,1280,800]
+    check_pixel(screenshot("09-fullscreen-minimize-quarter"),f["rect"],f["alpha"])
+    move(2800)
+    wait(lambda d:not d["window_lifecycle"]["minimizing"],"fullscreen-minimize-complete")
+    restore();move(2900)
+    check_pixel(screenshot("10-fullscreen-restore-quarter"),[0,0,1280,800],209/255)
+    move(3200)
+    wait(lambda d:not d["window_lifecycle"]["restoring"],"fullscreen-restore-complete")
+    action("close",7);client.wait(timeout=10)
+    wait(lambda d:not d["windows"],"fullscreen-death")
+    move(3350)
+    wait(lambda d:not d["window_lifecycle"]["destroying"],"fullscreen-death-clean")
+    # Mutter kills prior map effects before minimize: reset the actor to its
+    # normal opaque buffer, then keep its content live through the new effect.
+    command.unlink(missing_ok=True)
+    client=spawn([str(frozen / "tuna-modal-dim-client")],"interrupted-map-client",{"WAYLAND_DISPLAY":"lifecycle-proof"})
+    mapped=wait(lambda d:len(d["windows"])==1 and d["window_lifecycle"]["opening"],"interrupted-map-start")
+    wid=mapped["windows"][0]["id"]
+    normal_rect=mapped["windows"][0]["rect"]
+    move(3425)
+    mapped=wait(lambda d:d["window_lifecycle"]["opening"],"interrupted-map-visible")
+    opening=mapped["window_lifecycle"]["opening"][0]["frame"]
+    sx,sy=opening["scale"]
+    x,y,w,h=normal_rect
+    shown=[x+w*(1-sx)*.5,y+h*(1-sy),w*sx,h*sy]
+    check_pixel(screenshot("11-interrupted-map-before"),shown,opening["alpha"])
+    action("minimize",8)
+    ghost=wait(lambda d:d["window_lifecycle"]["minimizing"],"interrupted-map-minimize-start")["window_lifecycle"]["minimizing"][0]
+    assert all(abs(ghost["rect"][i]-normal_rect[i])<1e-5 for i in range(4)),(ghost,normal_rect)
+    assert ghost["alpha"] == 1.0 and ghost["live"]
+    assert not json.loads(state.read_text())["window_lifecycle"]["opening"]
+    move(3525)
+    ghost=wait(lambda d:d["window_lifecycle"]["minimizing"],"interrupted-map-minimize-quarter")["window_lifecycle"]["minimizing"][0]
+    check_pixel(screenshot("12-interrupted-map-reset"),ghost["rect"],ghost["alpha"])
+    action("recolor",9)
+    # Wait for the actual native buffer to reach displayed pixels; same clock.
+    x,y,w,h=ghost["rect"]; point=(round(x+w*.7),round(y+h*.8))
+    alpha=ghost["alpha"]; bg=baseline.getpixel(point)
+    expected=tuple((173,127,168)[i]*alpha+bg[i]*(1-alpha) for i in range(3))
+    end=time.monotonic()+10
+    while True:
+        live=screenshot("13-minimize-live-commit")
+        actual=live.getpixel(point)
+        if all(abs(actual[i]-expected[i])<=4 for i in range(3)): break
+        if time.monotonic()>=end: raise AssertionError((point,actual,expected))
+    assert json.loads(state.read_text())["window_lifecycle"]["retained_destroy_bytes"] == 0
+    action("close",10);client.wait(timeout=10)
+    dead=wait(lambda d:not d["windows"] and d["window_lifecycle"]["minimizing"] and d["window_lifecycle"]["retained_destroy_bytes"] > 0,"minimize-dead-actor-retained")
+    assert dead["window_lifecycle"]["retained_destroy_bytes"] > 0
+    dead_frame=dead["window_lifecycle"]["minimizing"][0]
+    retained=screenshot("14-minimize-destroyed-surface-safe")
+    assert all(abs(retained.getpixel(point)[i]-expected[i])<=4 for i in range(3))
+    move(3825)
+    wait(lambda d:not d["window_lifecycle"]["minimizing"],"interrupted-map-death-clean")
+    # Real attached modal family: inherited hiding and independent own flags.
+    command.unlink(missing_ok=True)
+    client=spawn([str(frozen / "tuna-modal-dim-client")],"family-client",{"WAYLAND_DISPLAY":"lifecycle-proof"})
+    parent=wait(lambda d:len(d["windows"])==1,"family-parent-map")["windows"][0]
+    wid=parent["id"]; normal_rect=parent["rect"]
+    wait(lambda d:any(f["window"]==wid for f in d["window_lifecycle"]["opening"]),"family-parent-animation-start")
+    move(3975)
+    action("dialog",20)
+    dialog=wait(lambda d:len(d["windows"])==2 and any(f["window"]!=wid for f in d["window_lifecycle"]["opening"]),"family-dialog-map")
+    child=next(w for w in dialog["windows"] if w["id"]!=wid)
+    child_id=child["id"]; cx,cy,cw,ch=child["rect"]
+    child_point=(round(cx+cw*.7),round(cy+ch*.8))
+    wait(lambda d:any(f["window"]==child_id for f in d["window_lifecycle"]["opening"]),"family-dialog-animation-start")
+    move(4075)
+    wait(lambda d:not d["window_lifecycle"]["opening"],"family-dialog-animation-complete")
+    visible=screenshot("15-family-visible")
+    assert visible.getpixel(child_point)==(78,154,6)
+    action("minimize",21)
+    start=wait(lambda d:wid in d["minimized"],"family-parent-minimize")
+    assert child_id not in start["minimized"] and start["focused"] is None
+    move(4175)
+    dimmed=wait(lambda d:d["window_lifecycle"]["minimizing"] and any(p["parent"]==wid for p in d["modal_dim"]["parents"]),"family-dimmed-parent-minimize-quarter")
+    effect=next(f for f in dimmed["window_lifecycle"]["minimizing"] if f["window"]==wid)
+    brightness=next(p["multiplier"] for p in dimmed["modal_dim"]["parents"] if p["parent"]==wid)
+    assert brightness < 1.0
+    check_pixel(screenshot("16-family-parent-minimize-dim"),effect["rect"],effect["alpha"],brightness)
+    move(4475)
+    hidden=screenshot("16-family-inherited-hidden")
+    assert hidden.getpixel(child_point)==baseline.getpixel(child_point)
+    restore()
+    move(4875)
+    resumed=wait(lambda d:not d["window_lifecycle"]["restoring"],"family-restored")
+    assert resumed["focused"]==child_id and child_id not in resumed["minimized"]
+    assert screenshot("17-family-restored").getpixel(child_point)==(78,154,6)
+    action("minimize-dialog",22)
+    wait(lambda d:child_id in d["minimized"],"family-child-own-minimize")
+    move(5275)
+    action("minimize",23)
+    wait(lambda d:wid in d["minimized"],"family-parent-own-minimize")
+    move(5675)
+    # Select the actual parent preview, rather than an app-group activation
+    # whose remembered window could legitimately be the minimized child.
+    keys("key","Super_L")
+    wait(lambda d:d["overview_open"],"family-parent-preview-overview")
+    settle_extra(300)
+    parent_preview=next(w for w in wait(lambda d:any(p["id"]==wid for p in d["previews"]),"family-parent-preview")["previews"] if w["id"]==wid)
+    px,py,pw,ph=parent_preview["rect"]
+    keys("mousemove",str(round(px+pw/2)),str(round(py+ph/2)),"click","1")
+    wait(lambda d:not d["overview_open"] and wid not in d["minimized"],"family-parent-preview-activated")
+    settle_extra(300)
+    move(6075)
+    own=wait(lambda d:not d["window_lifecycle"]["restoring"],"family-parent-only-restored")
+    assert child_id in own["minimized"] and wid not in own["minimized"]
+    assert own["focused"]==wid
+    assert screenshot("18-family-independent-child-hidden").getpixel(child_point)!=(78,154,6)
+    action("minimize",24)
+    wait(lambda d:wid in d["minimized"],"family-hidden-parent-again")
+    move(6475)
+    action("close-dialog",25)
+    wait(lambda d:len(d["windows"])==1 and wid in d["minimized"],"family-hidden-child-close")
+    action("dialog",26)
+    mapped_hidden=wait(lambda d:len(d["windows"])==2,"family-hidden-child-map")
+    assert mapped_hidden["focused"] is None and wid in mapped_hidden["minimized"]
+    move(6575)
+    assert screenshot("19-family-hidden-child-map").getpixel(child_point)==baseline.getpixel(child_point)
+    action("close-dialog",27)
+    closed_hidden=wait(lambda d:len(d["windows"])==1,"family-hidden-new-child-close")
+    assert closed_hidden["focused"] is None and wid in closed_hidden["minimized"]
+    assert screenshot("20-family-hidden-child-close").getpixel(child_point)==baseline.getpixel(child_point)
+    action("close",28); client.wait(timeout=10)
+    wait(lambda d:not d["windows"],"family-clean")
+    command.unlink(missing_ok=True)
+    client=spawn([str(frozen / "tuna-modal-dim-client")],"deadline-client",{"WAYLAND_DISPLAY":"lifecycle-proof"})
+    wid=wait(lambda d:len(d["windows"])==1,"deadline-parent-map")["windows"][0]["id"]
+    move(6725)
+    action("minimize",30)
+    wait(lambda d:d["window_lifecycle"]["minimizing"],"deadline-minimize-start")
+    move(7125)
+    wait(lambda d:not d["window_lifecycle"]["minimizing"],"deadline-minimize-complete")
+    action("close",31);client.wait(timeout=10)
+    ended=wait(lambda d:not d["windows"],"death-after-minimize-deadline")
+    assert not ended["window_lifecycle"]["destroying"] and ended["window_lifecycle"]["retained_destroy_bytes"]==0
+    assert compositor.poll() is None
+    success=True
+finally:
+    owned_accessibility_pids = [manifest["session_isolation"]["accessibility_bus_pid"]] if "session_isolation" in manifest else []
+    cleanup_query_errors = []
+    if accessibility:
+        for name in ("org.a11y.atspi.Registry",):
+            try:
+                owned_accessibility_pids.append(accessibility.call_sync("org.freedesktop.DBus","/org/freedesktop/DBus","org.freedesktop.DBus","GetConnectionUnixProcessID",GLib.Variant("(s)",(name,)),None,Gio.DBusCallFlags.NONE,2000,None).unpack()[0])
+            except GLib.Error as error:
+                if not expected_missing_accessibility_owner(name, Gio.DBusError.get_remote_error(error)):
+                    cleanup_query_errors.append(str(error))
+            except Exception as error:
+                cleanup_query_errors.append(str(error))
+    for pid in owned_accessibility_pids[1:]:
+        try:
+            owned_pidfds.append(os.pidfd_open(pid))
+        except ProcessLookupError:
+            pass
+    for proc in reversed(processes):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid,signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid,signal.SIGKILL)
+                proc.wait()
+    accessibility_stopped = True
+    for pidfd in owned_pidfds:
+        poller = select.poll()
+        poller.register(pidfd,select.POLLIN)
+        try:
+            signal.pidfd_send_signal(pidfd,signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if not poller.poll(1000):
+            signal.pidfd_send_signal(pidfd,signal.SIGKILL)
+            accessibility_stopped = bool(poller.poll(1000)) and accessibility_stopped
+        os.close(pidfd)
+    if accessibility:
+        try:
+            accessibility.close_sync(None)
+        except GLib.Error:
+            pass
+    shutil.rmtree(runtime)
+    manifest["owned_cleanup"] = {"runtime_removed":not runtime.exists(), "accessibility_pids":owned_accessibility_pids,"accessibility_processes_stopped":accessibility_stopped, "accessibility_identity_verified":bool(owned_accessibility_pids) and not cleanup_query_errors, "query_errors":cleanup_query_errors}
+    (art / "manifest.json").write_text(json.dumps(manifest,indent=2))
+    for log in logs:
+        log.close()
+
+require_owned_cleanup(manifest["owned_cleanup"])
+if success:
+    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-CLEANUP pass private session owned process cleanup\n")
+    print(f"native minimize proof passed: {art}")

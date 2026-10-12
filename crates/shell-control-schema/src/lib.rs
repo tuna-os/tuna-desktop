@@ -161,9 +161,10 @@ impl ProtocolVersion {
     /// `0.29` appends private screenshot selection pointer movement.
     /// `0.30` appends live sound/bell and attached-modal brightness preferences.
     /// `0.31` appends workspace and edge-tiling preferences.
+    /// `0.32` appends trusted dash icon targets for minimize/restore.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 31,
+        minor: 32,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -386,7 +387,21 @@ pub enum CommandKind {
     /// local to the mapped exclusive screenshot overlay in logical pixels,
     /// never global input.
     MoveScreenshotPointer { x: i32, y: i32 },
+    /// Trusted shell dash icon bounds in global logical coordinates. Full replacement.
+    SetWindowIconGeometries { geometries: Vec<WindowIconGeometry> },
 }
+
+/// A running window's dash icon target; empty replacement selects monitor fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowIconGeometry {
+    pub window: u64,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+pub const MAX_WINDOW_ICON_GEOMETRIES: usize = 256;
 
 /// Screen Reader process lifecycle, not proof of spoken usability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1165,7 +1180,12 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Message, DecodeError> {
             postcard::Error::DeserializeBadEncoding,
         ));
     }
-    let msg: Message = postcard::from_bytes(&body[..len])?;
+    let (msg, trailing): (Message, &[u8]) = postcard::take_from_bytes(&body[..len])?;
+    if !trailing.is_empty() {
+        return Err(DecodeError::Malformed(
+            postcard::Error::DeserializeBadEncoding,
+        ));
+    }
     validate_titles(&msg)?;
     if let Message::Hello { version } = &msg {
         if version.major != CURRENT_VERSION.major {
@@ -1214,6 +1234,23 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             check_title(&settings.xkb_layout)?;
             check_title(&settings.xkb_variant)?;
             check_title(&settings.xkb_options)?;
+        }
+        Message::Command {
+            kind: CommandKind::SetWindowIconGeometries { geometries },
+            ..
+        } if geometries.len() > MAX_WINDOW_ICON_GEOMETRIES
+            || geometries.iter().any(|g| {
+                g.width <= 0
+                    || g.height <= 0
+                    || g.width > 16384
+                    || g.height > 16384
+                    || g.x.checked_add(g.width).is_none()
+                    || g.y.checked_add(g.height).is_none()
+            }) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
         }
         Message::Command {
             kind: CommandKind::SetSwitcherThumbnails { thumbnails },
@@ -1377,8 +1414,96 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_31() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 31));
+    fn current_version_is_0_32() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 32));
+    }
+
+    #[test]
+    fn dash_icon_targets_roundtrip_and_reject_oversize_invalid_bounds() {
+        let icon = WindowIconGeometry {
+            window: 4,
+            x: -900,
+            y: 700,
+            width: 64,
+            height: 64,
+        };
+        roundtrip(&Message::Command {
+            id: 77,
+            kind: CommandKind::SetWindowIconGeometries {
+                geometries: vec![icon],
+            },
+        });
+        for geometries in [
+            vec![icon; MAX_WINDOW_ICON_GEOMETRIES + 1],
+            vec![WindowIconGeometry { width: 0, ..icon }],
+            vec![WindowIconGeometry { height: -1, ..icon }],
+            vec![WindowIconGeometry {
+                width: 16385,
+                ..icon
+            }],
+            vec![WindowIconGeometry {
+                height: 16385,
+                ..icon
+            }],
+            vec![WindowIconGeometry {
+                x: i32::MAX,
+                ..icon
+            }],
+            vec![WindowIconGeometry {
+                y: i32::MAX,
+                ..icon
+            }],
+        ] {
+            let bytes = encode_frame(&Message::Command {
+                id: 77,
+                kind: CommandKind::SetWindowIconGeometries { geometries },
+            });
+            assert!(decode_frame(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn dash_icon_targets_accept_empty_and_maximum_replacements_but_no_trailing_fields() {
+        let icon = WindowIconGeometry {
+            window: 4,
+            x: i32::MIN,
+            y: -500,
+            width: 16384,
+            height: 16384,
+        };
+        for geometries in [Vec::new(), vec![icon; MAX_WINDOW_ICON_GEOMETRIES]] {
+            let message = Message::Command {
+                id: 77,
+                kind: CommandKind::SetWindowIconGeometries { geometries },
+            };
+            roundtrip(&message);
+            let mut bytes = encode_frame(&message);
+            bytes.push(0);
+            let size = (bytes.len() - 4) as u32;
+            bytes[..4].copy_from_slice(&size.to_le_bytes());
+            assert!(decode_frame(&bytes).is_err(), "undeclared postcard fields");
+        }
+    }
+
+    #[test]
+    fn dash_icon_targets_reject_unknown_fields_and_command_variants() {
+        use serde::de::value::{Error, MapDeserializer, StrDeserializer};
+        let fields = [
+            ("window", 4_u64),
+            ("x", 10),
+            ("y", 20),
+            ("width", 64),
+            ("height", 64),
+        ];
+        let valid = MapDeserializer::<_, Error>::new(fields.into_iter());
+        assert!(WindowIconGeometry::deserialize(valid).is_ok());
+        let invalid =
+            MapDeserializer::<_, Error>::new(fields.into_iter().chain([("unexpected", 1)]));
+        assert!(WindowIconGeometry::deserialize(invalid).is_err());
+        assert!(CommandKind::deserialize(StrDeserializer::<Error>::new(
+            "SetUnrecognizedIconGeometries"
+        ))
+        .is_err());
     }
 
     #[test]
