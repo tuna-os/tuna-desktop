@@ -1815,9 +1815,9 @@ pub enum BreakActionKind {
 /// Enqueue one user-chosen break action for the next tick.
 pub type BreakActionHook = Rc<dyn Fn(BreakActionKind)>;
 /// Send both effect bools atomically to the compositor (grayscale, fade)
-/// via `CommandKind::SetWellbeingEffects`. True when the transport
-/// accepted the pair; false (control absent or write failed) keeps the
-/// desired pair pending so the next tick retries it.
+/// via `CommandKind::SetWellbeingEffects`. True only after a correlated
+/// Applied response in the current connection; false keeps the desired
+/// pair pending. The hook bounds retries and outstanding wire commands.
 pub type EffectHook = Rc<dyn Fn(bool, bool) -> bool>;
 
 /// Action keys and button labels for break notices. Keys are center action
@@ -1862,17 +1862,11 @@ pub struct ShellHooks {
     pub effect_hook: EffectHook,
 }
 
-/// Send the effect pair when it differs from the last accepted send.
-/// Both bools go together on every send, so the compositor never
-/// observes a split grayscale/fade state. `sent` commits only when the
-/// hook reports acceptance: a refused pair (control absent, write
-/// failed) stays pending and retries on the next tick, including the
-/// initial false/false after startup or reconnect. No calls once the
-/// accepted pair matches. Pure over its inputs; the ticks own `sent`.
+/// Reconcile effects on each tick, including an unchanged desired pair after
+/// reconnect. The hook owns bounded wire sends and correlated Applied state;
+/// a cached pair here never bypasses checking that connection state.
 pub fn maybe_send_effect(hooks: &ShellHooks, sent: &mut Option<EffectState>, effect: &EffectState) {
-    if *sent != Some(*effect) && (hooks.effect_hook)(effect.grayscale, effect.fade) {
-        *sent = Some(*effect);
-    }
+    *sent = (hooks.effect_hook)(effect.grayscale, effect.fade).then_some(*effect);
 }
 
 /// Desired effect state. The runtime sends the pair atomically through
@@ -1898,7 +1892,7 @@ pub fn countdown_progress(due_in_secs: i64) -> f64 {
 
 fn log_effect(effect: EffectState) {
     eprintln!(
-        "tuna-shell-gtk: wellbeing: effect grayscale={} fade={} (gray fades {}s to {}; break fades {}s to {}; compositor hook pending)",
+        "tuna-shell-gtk: wellbeing: effect grayscale={} fade={} (gray fades {}s to {}; break fades {}s to {}; compositor Applied correlation active)",
         effect.grayscale,
         effect.fade,
         GRAYSCALE_FADE_SECONDS,
@@ -3136,18 +3130,21 @@ mod tests {
     }
 
     #[test]
-    fn effect_pair_sends_atomically_only_on_change() {
+    fn effect_pair_consults_connection_state_even_when_unchanged() {
         let (hooks, seen) = recorded();
         let mut sent = None;
-        // The initial pair sends once, even when it is false/false.
+        // Initial neutral pair is also reconciled on each tick.
         let initial = EffectState {
             grayscale: false,
             fade: false,
         };
         maybe_send_effect(&hooks, &mut sent, &initial);
         maybe_send_effect(&hooks, &mut sent, &initial);
-        assert_eq!(seen.effect_sends.borrow().as_slice(), &[(false, false)]);
-        // Each change sends BOTH bools together, never a split pair.
+        assert_eq!(
+            seen.effect_sends.borrow().as_slice(),
+            &[(false, false), (false, false)]
+        );
+        // Each hook consult carries BOTH bools together.
         maybe_send_effect(
             &hooks,
             &mut sent,
@@ -3174,7 +3171,13 @@ mod tests {
         );
         assert_eq!(
             seen.effect_sends.borrow().as_slice(),
-            &[(false, false), (true, false), (true, true)]
+            &[
+                (false, false),
+                (false, false),
+                (true, false),
+                (true, true),
+                (true, true)
+            ]
         );
         assert_eq!(
             sent,
@@ -3186,7 +3189,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_pair_retries_until_accepted_then_silent() {
+    fn refused_pair_retries_and_accepted_pair_rechecks_connection() {
         let (mut hooks, seen) = recorded();
         let attempts = Rc::new(Cell::new(0u32));
         let gate = attempts.clone();
@@ -3207,15 +3210,36 @@ mod tests {
         maybe_send_effect(&hooks, &mut sent, &want);
         assert_eq!(sent, None);
         assert_eq!(attempts.get(), 2);
-        // Accepted: commits once, then silence (no per-frame spam).
+        // Applied: retain the pair, but recheck the connection every tick.
         maybe_send_effect(&hooks, &mut sent, &want);
         maybe_send_effect(&hooks, &mut sent, &want);
         assert_eq!(sent, Some(want));
-        assert_eq!(attempts.get(), 3);
+        assert_eq!(attempts.get(), 4);
         assert_eq!(
             seen.effect_sends.borrow().as_slice(),
-            &[(true, false), (true, false), (true, false)]
+            &[(true, false), (true, false), (true, false), (true, false)]
         );
+    }
+
+    #[test]
+    fn unchanged_pair_loses_cached_application_when_connection_is_lost() {
+        let (mut hooks, _) = recorded();
+        let connected = Rc::new(Cell::new(true));
+        let check = connected.clone();
+        hooks.effect_hook = Rc::new(move |_, _| check.get());
+        let want = EffectState {
+            grayscale: true,
+            fade: true,
+        };
+        let mut sent = None;
+        maybe_send_effect(&hooks, &mut sent, &want);
+        assert_eq!(sent, Some(want));
+        connected.set(false);
+        maybe_send_effect(&hooks, &mut sent, &want);
+        assert_eq!(sent, None);
+        connected.set(true);
+        maybe_send_effect(&hooks, &mut sent, &want);
+        assert_eq!(sent, Some(want));
     }
 
     #[test]

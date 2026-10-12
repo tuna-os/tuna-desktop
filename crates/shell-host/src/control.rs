@@ -199,6 +199,9 @@ pub struct ControlClient {
     environment: Vec<(String, String)>,
     /// Overview previews and the hovered one, from the compositor.
     overview_previews: (Vec<tuna_shell_control::PreviewInfo>, Option<u64>),
+    connection_generation: u64,
+    wellbeing_applied: Option<(bool, bool)>,
+    wellbeing_pending: Option<(u64, (bool, bool), Instant)>,
 }
 
 impl ControlClient {
@@ -239,6 +242,9 @@ impl ControlClient {
             pointer_output: None,
             environment: Vec::new(),
             overview_previews: (Vec::new(), None),
+            connection_generation: 0,
+            wellbeing_applied: None,
+            wellbeing_pending: None,
         })
     }
 
@@ -463,6 +469,36 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Reconcile desired effects with a correlated Applied result in this
+    /// connection generation. One pending request bounds wire traffic; a lost
+    /// reply expires after five seconds. Superseded results cannot acknowledge
+    /// the current desired pair. Reconnect invalidates both caches.
+    pub fn reconcile_wellbeing_effects(
+        &mut self,
+        grayscale: bool,
+        fade: bool,
+    ) -> Result<bool, ControlError> {
+        let pair = (grayscale, fade);
+        if let Some((_, _, deadline)) = self.wellbeing_pending {
+            if Instant::now() < deadline {
+                return Ok(false);
+            }
+            self.wellbeing_pending = None;
+        }
+        if self.wellbeing_applied == Some(pair) {
+            return Ok(true);
+        }
+        let id = self.set_wellbeing_effects(grayscale, fade)?;
+        self.wellbeing_applied = None;
+        self.wellbeing_pending = Some((id, pair, Instant::now() + Duration::from_secs(5)));
+        Ok(false)
+    }
+
+    /// Local connection identity, advanced when a fresh socket replaces a peer.
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation
+    }
+
     /// Tell the compositor whether the overview shows the app grid, so
     /// it draws the workspaces as thumbnails. Returns the request id.
     pub fn set_overview_app_grid(&mut self, active: bool) -> Result<u64, ControlError> {
@@ -681,6 +717,8 @@ impl ControlClient {
                 if self.socket_path.is_some()
                     && (is_dead_peer(&e) || e.kind() == io::ErrorKind::UnexpectedEof) =>
             {
+                self.wellbeing_applied = None;
+                self.wellbeing_pending = None;
                 self.read_buf.clear();
                 self.revision = None;
                 self.needs_snapshot = true;
@@ -761,7 +799,17 @@ impl ControlClient {
                 self.revision = Some(to_revision);
                 Ok(Handled::Changes { to_revision })
             }
-            Message::CommandResult { id, status } => Ok(Handled::CommandResult { id, status }),
+            Message::CommandResult { id, status } => {
+                if let Some((pending_id, pair, _)) = self.wellbeing_pending {
+                    if pending_id == id {
+                        self.wellbeing_pending = None;
+                        if matches!(status, tuna_shell_control::CommandStatus::Applied) {
+                            self.wellbeing_applied = Some(pair);
+                        }
+                    }
+                }
+                Ok(Handled::CommandResult { id, status })
+            }
             Message::Outputs { outputs } => {
                 // Structural state, not model truth — never touches
                 // revision, `needs_snapshot`, or the window list. The
@@ -932,6 +980,9 @@ impl ControlClient {
         let stream = UnixStream::connect(&path)?;
         stream.set_nonblocking(true)?;
         self.stream = stream;
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.wellbeing_applied = None;
+        self.wellbeing_pending = None;
         self.read_buf.clear();
         self.revision = None;
         self.needs_snapshot = true;
@@ -1719,6 +1770,160 @@ mod tests {
             }
             previous = Some(id);
         }
+    }
+
+    fn effect_command_id(peer: &mut UnixStream, pair: (bool, bool)) -> u64 {
+        match server_read(peer) {
+            Message::Command {
+                id,
+                kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+            } => {
+                assert_eq!((grayscale, fade), pair);
+                id
+            }
+            other => panic!("unexpected effect frame {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wellbeing_requires_matching_applied_and_bounds_lost_reply_retry() {
+        let (mut client, mut peer) = handshook();
+        assert!(!client.reconcile_wellbeing_effects(true, false).unwrap());
+        let first = effect_command_id(&mut peer, (true, false));
+        let next = client.next_request_id;
+        for _ in 0..20 {
+            assert!(!client.reconcile_wellbeing_effects(true, false).unwrap());
+        }
+        assert_eq!(
+            client.next_request_id, next,
+            "pending request must not flood"
+        );
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: first + 100,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.wellbeing_applied.is_none());
+        client.wellbeing_pending.as_mut().unwrap().2 = Instant::now();
+        assert!(!client.reconcile_wellbeing_effects(true, false).unwrap());
+        let second = effect_command_id(&mut peer, (true, false));
+        assert_ne!(first, second);
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: first,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(
+            client.wellbeing_applied.is_none(),
+            "late result cannot qualify replacement request"
+        );
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: second,
+                status: CommandStatus::Denied {
+                    reason: "denied".into(),
+                },
+            },
+        );
+        client.poll().unwrap();
+        assert!(!client.reconcile_wellbeing_effects(true, false).unwrap());
+        let third = effect_command_id(&mut peer, (true, false));
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: third,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.reconcile_wellbeing_effects(true, false).unwrap());
+        assert!(client.wellbeing_pending.is_none());
+        let next = client.next_request_id;
+        assert!(client.reconcile_wellbeing_effects(true, false).unwrap());
+        assert_eq!(
+            client.next_request_id, next,
+            "acknowledged unchanged pair sends no frames"
+        );
+    }
+
+    #[test]
+    fn wellbeing_replays_unchanged_pair_after_real_idle_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut first_peer, _) = listener.accept().unwrap();
+        assert!(!client.reconcile_wellbeing_effects(true, true).unwrap());
+        let first = effect_command_id(&mut first_peer, (true, true));
+        server_write(
+            &mut first_peer,
+            &Message::CommandResult {
+                id: first,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.reconcile_wellbeing_effects(true, true).unwrap());
+        drop(first_peer);
+        assert!(client.poll().is_err());
+        assert_eq!(client.connection_generation(), 1);
+        let (mut second_peer, _) = listener.accept().unwrap();
+        assert!(matches!(
+            server_read(&mut second_peer),
+            Message::Hello { .. }
+        ));
+        assert!(!client.reconcile_wellbeing_effects(true, true).unwrap());
+        let second = effect_command_id(&mut second_peer, (true, true));
+        assert_ne!(first, second);
+        server_write(
+            &mut second_peer,
+            &Message::CommandResult {
+                id: first,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.wellbeing_applied.is_none());
+        server_write(
+            &mut second_peer,
+            &Message::CommandResult {
+                id: second,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.reconcile_wellbeing_effects(true, true).unwrap());
+    }
+
+    #[test]
+    fn wellbeing_failed_redial_invalidates_previous_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        assert!(!client.reconcile_wellbeing_effects(false, false).unwrap());
+        let id = effect_command_id(&mut peer, (false, false));
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        drop(peer);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        assert!(client.poll().is_err());
+        assert!(client.wellbeing_applied.is_none());
+        assert!(client.reconcile_wellbeing_effects(false, false).is_err());
+        assert!(client.wellbeing_pending.is_none());
     }
 
     #[test]

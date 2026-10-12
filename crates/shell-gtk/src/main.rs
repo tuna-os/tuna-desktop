@@ -1795,17 +1795,9 @@ fn build(app: &adw::Application) {
     // lends it the message list, the OSD countdown and the lock action.
     // Test builds compile the module for its unit tests but never start
     // the live runtime (it owns process timers and the real history file).
-    // Effect sends bind below, once protocol 0.35 lands (root owns the
-    // schema + compositor consumer; this lane makes no schema edit).
+    // The 0.35 control client reconciles effects with Applied responses.
     #[cfg(not(test))]
     {
-        /// Forward one atomic effect pair toward the compositor.
-        ///
-        /// TODO(0.35): send `CommandKind::SetWellbeingEffects { grayscale,
-        /// fade }` through the shell control client here. Until the 0.35
-        /// schema lands, the pair is logged as a diagnostic so the wiring
-        /// (change detection + atomic sends + initial false/false) is
-        /// reviewable without inventing wire bytes.
         let notices = notify.clone();
         let countdown_osd = osd_ui.clone();
         let lock_shell = shell.clone();
@@ -1844,17 +1836,13 @@ fn build(app: &adw::Application) {
                 break_action: Rc::new(move |kind: wellbeing::BreakActionKind| {
                     break_push.borrow_mut().push(kind);
                 }),
-                // Production 0.35 send: both bools go atomically on every
-                // changed EffectState (plus the initial false/false at
-                // startup) via the same control-client pattern as lock.
-                // Requires the reconciled schema variant
-                // `CommandKind::SetWellbeingEffects { grayscale, fade }`
-                // and `ControlClient::set_wellbeing_effects`; this
-                // commit is picked into the tree that carries both.
+                // Reconcile on every wellbeing tick. ControlClient bounds
+                // outstanding sends, correlates Applied, and invalidates the
+                // pair when it replaces a dead connection.
                 effect_hook: Rc::new(move |grayscale: bool, fade: bool| {
                     if let Some(control) = effect_shell.borrow_mut().control.as_mut() {
-                        match control.set_wellbeing_effects(grayscale, fade) {
-                            Ok(_) => true,
+                        match control.reconcile_wellbeing_effects(grayscale, fade) {
+                            Ok(applied) => applied,
                             Err(e) => {
                                 eprintln!("tuna-shell-gtk: wellbeing: effects send failed: {e}");
                                 false
