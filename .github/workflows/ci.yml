@@ -614,6 +614,7 @@ jobs:
           scripts/tuna-ledger check --tests ledger-in/test-list.txt
           --assertions ledger-in/journey/assertions.txt
           --assertions ledger-in/gtk-shell/assertions.txt
+          --assertions ledger-in/gtk-shell/a11y/assertions.txt
           --assertions ledger-in/gtk-shell/scale/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
