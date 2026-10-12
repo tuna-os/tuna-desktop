@@ -191,8 +191,9 @@ impl Grabs {
     }
 }
 
-/// Runs one of the shell's own keybindings by index.
-type InternalRun = Rc<dyn Fn(usize)>;
+/// Runs one of the shell's own keybindings by index, with the
+/// `MODE_*` bit it fired in (panel focus pauses session chords).
+type InternalRun = Rc<dyn Fn(usize, u32)>;
 
 /// Action ids of the shell's own keybindings start here, clear of the
 /// ids D-Bus callers get.
@@ -220,7 +221,7 @@ impl Service {
     }
 
     /// Bind the shell's own keys: `accelerators[i]` with its modes runs
-    /// `run(i)`. Keys that do not parse are skipped.
+    /// `run(i, mode)`. Keys that do not parse are skipped.
     pub fn set_internal(&self, accelerators: &[(String, u32)], run: InternalRun) {
         let mut list = Vec::new();
         let mut reserved = Vec::new();
@@ -248,7 +249,7 @@ impl Service {
         if action >= INTERNAL_BASE {
             let run = self.on_internal.borrow().clone();
             if let Some(run) = run {
-                run((action - INTERNAL_BASE) as usize);
+                run((action - INTERNAL_BASE) as usize, mode);
             }
             return;
         }
