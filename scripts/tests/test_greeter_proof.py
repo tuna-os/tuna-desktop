@@ -30,11 +30,24 @@ class GreeterProof(unittest.TestCase):
         self.assertIn('cargo test -p tuna-greeter --test gtk_login',
                       (ROOT / 'scripts/tuna-greeter-proof').read_text())
 
-    def test_ci_captures_failure_receipts_after_source_clean_freeze(self):
+    def test_ci_captures_failure_receipts_in_independent_checked_job(self):
+        import re
         ci = (ROOT / '.github/workflows/ci.yml').read_text()
-        self.assertLess(ci.index('scripts/tuna-minimize-ci-proof'), ci.index('scripts/tuna-greeter-proof'))
-        self.assertLess(ci.index('scripts/tuna-greeter-proof'), ci.index('Prove live accessibility'))
-        self.assertIn('name: native-greeter-proof', ci)
+        def job(name):
+            return re.search(r'^  ' + name + r':\n(.*?)(?=^  [a-z][a-z-]*:|\Z)', ci, re.M | re.S).group(1)
+        greeter = job('greeter')
+        self.assertIn('needs: [check]', greeter)
+        self.assertIn('runs-on: ubuntu-26.04', greeter)
+        self.assertIn('timeout-minutes: 15', greeter)
+        self.assertNotIn('tuna-minimize', greeter)
+        self.assertNotIn('tuna-greeter-proof', job('gtk-shell'))
+        self.assertEqual(ci.count('run: scripts/tuna-greeter-proof'), 1)
+        self.assertIn('needs: [check, journey, greeter, gtk-shell, drm-smoke, marlin-vm]', job('parity-ledger'))
+        for tool in ['libgtk-4-dev', 'libadwaita-1-dev', 'xvfb', 'xauth', 'scrot', 'dbus', 'python3-pil']:
+            self.assertIn(tool, greeter)
+        self.assertIn('run: scripts/tuna-greeter-proof "$RUNNER_TEMP/native-greeter"', greeter)
+        self.assertIn('if: always()', greeter)
+        self.assertIn('name: native-greeter-proof', greeter)
         proof = (ROOT / 'scripts/tuna-greeter-proof').read_text()
         self.assertIn('git status --porcelain', proof)
         self.assertIn("m.get('executable')", proof)
