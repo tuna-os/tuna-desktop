@@ -73,7 +73,6 @@ pub mod mutter;
 #[cfg(feature = "drm")]
 mod native_repaint;
 pub mod night_light;
-pub mod wellbeing_effects;
 mod occlusion;
 pub mod orca;
 pub mod orientation;
@@ -106,6 +105,7 @@ mod transient_family;
 pub mod unlock;
 mod wake;
 pub mod wallpaper;
+pub mod wellbeing_effects;
 pub mod window_icons;
 pub mod window_lifecycle;
 pub mod windows;

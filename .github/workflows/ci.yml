@@ -320,6 +320,7 @@ jobs:
       # G-WAYLAND-INFO; all required so no stage can silently skip.
       - run: python3 scripts/lib/cursor-proof-theme-tests.py
       - run: python3 scripts/lib/cursor-pixels-tests.py
+      - run: /usr/bin/python3 scripts/lib/wellbeing-pixels-tests.py
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
