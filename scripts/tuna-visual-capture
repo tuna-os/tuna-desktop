@@ -588,7 +588,11 @@ PW_CLI
     export DBUS_SYSTEM_BUS_ADDRESS
     TUNA_STUB_NM_LOG="$ARTIFACTS/nm-calls"
     TUNA_STUB_BT_LOG="$ARTIFACTS/bt-calls"
-    export TUNA_STUB_NM_LOG TUNA_STUB_BT_LOG
+    # The Authority stub reads TUNA_STUB_POLKIT_LOG from its own
+    # environment when the agent registers, so it must be exported
+    # before the stubs launch -- a later export never reaches them.
+    TUNA_STUB_POLKIT_LOG="$ARTIFACTS/polkit-agent"
+    export TUNA_STUB_NM_LOG TUNA_STUB_BT_LOG TUNA_STUB_POLKIT_LOG
     "$PY" "$ROOT/scripts/lib/tuna-service-stubs.py" "$BACKLIGHT" >"$ARTIFACTS/stubs.log" 2>&1 &
     STUBS_PID=$!
     for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/stubs.log" 2>/dev/null && break; sleep 0.5; done
@@ -606,9 +610,8 @@ EVENTS
     for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/provider.log" 2>/dev/null && break; sleep 0.5; done
     TUNA_SESSION_KIND=hardware
     TUNA_POLKIT_HELPER="$ROOT/scripts/lib/tuna-polkit-helper-stub.py"
-    TUNA_STUB_POLKIT_LOG="$ARTIFACTS/polkit-agent"
     TUNA_IBUS=1
-    export TUNA_SESSION_KIND TUNA_POLKIT_HELPER TUNA_STUB_POLKIT_LOG TUNA_IBUS
+    export TUNA_SESSION_KIND TUNA_POLKIT_HELPER TUNA_IBUS
     # pam_wrapper serves the lock screen's PAM stack from a private
     # password file when it is installed; otherwise unlock-auth states
     # record skipped instead of failing the stage.
