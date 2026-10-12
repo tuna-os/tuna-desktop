@@ -327,7 +327,8 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     finally:
         agent.run("mouse-speed", "0.0")
         agent.run("mouse-natural", "false")
-        with open(os.path.join(evidence, "pointer-live.json"), "w") as stream:
+        # Keep await_state's last observed pointer-live.json on failure.
+        with open(os.path.join(evidence, "pointer-live-events.json"), "w") as stream:
             json.dump(pointer_live, stream, indent=2)
     # A mouse plugged in after the settings changed must arrive with
     # the current settings already applied (the DRM DeviceAdded path),

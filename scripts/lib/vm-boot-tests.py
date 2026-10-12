@@ -553,5 +553,20 @@ class InterleavedShellStartup(unittest.TestCase):
         self.assertFalse(bool(shell) and lane.EXHAUSTED not in text)
 
 
+class PointerEvidenceRetention(unittest.TestCase):
+    def test_aggregate_does_not_overwrite_last_live_inventory(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text())
+        aggregate = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute) and n.func.attr == "join"
+                     and any(isinstance(a, ast.Constant) and a.value == "pointer-live-events.json"
+                             for a in n.args)]
+        self.assertEqual(len(aggregate), 1)
+        overwritten = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                       and isinstance(n.func, ast.Attribute) and n.func.attr == "join"
+                       and any(isinstance(a, ast.Constant) and a.value == "pointer-live.json"
+                               for a in n.args)]
+        self.assertEqual(overwritten, [])
+
+
 if __name__ == "__main__":
     unittest.main()
