@@ -168,6 +168,9 @@ pub fn permission_entry(level: u32, unix_secs: u64) -> Vec<String> {
 
 /// One app's row for the Location settings list.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// The shell shows no per-app list (GNOME puts it in Settings Privacy);
+// the model stays for that consumer, covered by unit tests.
+#[allow(dead_code)]
 pub struct AppPermission {
     pub desktop_id: String,
     pub accuracy: u32,
@@ -176,6 +179,9 @@ pub struct AppPermission {
 }
 
 /// The whole `location` table, sorted by id.
+// The shell shows no per-app list (GNOME puts it in Settings Privacy);
+// the model stays for that consumer, covered by unit tests.
+#[allow(dead_code)]
 pub fn parse_lookup(perms: &HashMap<String, Vec<String>>) -> Vec<AppPermission> {
     let mut apps: Vec<AppPermission> = perms
         .iter()
@@ -279,6 +285,9 @@ impl LocationAgent {
 
     /// The authorization dialog: `respond` carries the user's level
     /// (or `NONE`). Without one every unknown app is denied.
+    // No dialog is wired yet; unknown apps stay denied (G-QS-LOCATION
+    // asserts both denials), and the hook stays for that dialog.
+    #[allow(dead_code)]
     pub fn on_prompt(&self, f: impl Fn(String, u32, Rc<dyn Fn(u32)>) + 'static) {
         *self.prompt.borrow_mut() = Some(Rc::new(f));
     }
@@ -568,10 +577,12 @@ impl LocationAgent {
 
     fn sync_indicator(&self) {
         if let Some(indicator) = self.indicator.borrow().clone() {
-            let show = self.enabled() && self.in_use.get();
-            indicator.set_visible(show);
-            if show {
-                indicator.set_icon_name(Some("location-services-active-symbolic"));
+            match indicator_icon(self.enabled(), self.in_use.get()) {
+                Some(icon) => {
+                    indicator.set_visible(true);
+                    indicator.set_icon_name(Some(icon));
+                }
+                None => indicator.set_visible(false),
             }
         }
     }

@@ -114,6 +114,9 @@ pub fn modem_state_label(state: i32) -> &'static str {
 }
 
 /// Whether the modem can carry data (registered or beyond).
+// The rows key off NetworkManager's connected state; the predicate
+// stays for that distinction, covered by unit tests.
+#[allow(dead_code)]
 pub fn modem_registered(state: i32) -> bool {
     matches!(
         state,
