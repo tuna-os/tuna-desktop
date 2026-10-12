@@ -923,7 +923,7 @@ impl AudioUi {
     fn enforce_privacy(self: &Rc<Self>) {
         let policy = privacy_policy(self.privacy.as_ref());
         let scan = self.state.borrow().privacy_scan(&policy);
-        if !scan.authoritative {
+        if !scan.authoritative || scan.cookie.is_none() {
             // A retry cleared the cache or its initial dump is incomplete.
             // Preserve both restore ownership and queued intent until the
             // restarted monitor publishes a complete graph baseline.
@@ -941,6 +941,7 @@ impl AudioUi {
             queue.offer(planned);
             queue.take(MAX_PRIVACY_ACTIONS)
         };
+        let cookie = scan.cookie.expect("validated Core cookie");
         for action in batch {
             self.enforcer.borrow_mut().dispatched(&action);
             let Some(serial) = scan.serials.get(&action.node()).copied() else {
@@ -948,10 +949,22 @@ impl AudioUi {
                 continue;
             };
             let weak = Rc::downgrade(self);
-            crate::privacy::run_async(action, serial, move |ok| {
+            crate::privacy::run_async(action, cookie, serial, move |ok| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.enforcer.borrow_mut().completed_for(&action, serial, ok);
-                    if ui.queue.borrow_mut().report(&action, ok) {
+                    ui.enforcer
+                        .borrow_mut()
+                        .completed_for(&action, Some(cookie), serial, ok);
+                    let current = ui
+                        .state
+                        .borrow()
+                        .privacy_scan(&privacy_policy(ui.privacy.as_ref()));
+                    let replaced = crate::privacy::completion_needs_replan(
+                        &current,
+                        action.node(),
+                        cookie,
+                        serial,
+                    );
+                    if ui.queue.borrow_mut().report(&action, ok) || replaced {
                         ui.schedule_drain();
                     }
                 }
