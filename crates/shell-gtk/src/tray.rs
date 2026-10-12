@@ -126,9 +126,14 @@ fn icon_for(item: &Item) -> gtk::Image {
 /// closes, so keyboard panel focus can return to the client.
 /// `escape_guard` is the shared Escape credit: a tray popover showing
 /// bounds stale credit, as for the built-in menus (G-PANEL-FOCUS).
+/// `on_tray_escape` runs the panel's Escape unwind for the given tray
+/// button: the popover's grab delivers Escape to the popover, never
+/// to the panel window controller, so each tray menu intercepts it
+/// the same way the built-ins do.
 pub fn tray(
     on_popdown: std::rc::Rc<dyn Fn()>,
     escape_guard: std::rc::Rc<std::cell::Cell<crate::panel_focus::EscapeGuard>>,
+    on_tray_escape: std::rc::Rc<dyn Fn(&gtk::MenuButton) -> glib::Propagation>,
 ) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     row.set_visible(false);
@@ -169,6 +174,19 @@ pub fn tray(
                             item.title.as_str()
                         };
                         button.update_property(&[gtk::accessible::Property::Label(label)]);
+                        {
+                            let on_escape = on_tray_escape.clone();
+                            let button = button.clone();
+                            let escape_keys = gtk::EventControllerKey::new();
+                            escape_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+                            escape_keys.connect_key_pressed(move |_, key, _, _| {
+                                if key != gtk::gdk::Key::Escape {
+                                    return glib::Propagation::Proceed;
+                                }
+                                on_escape(&button)
+                            });
+                            popover.add_controller(escape_keys);
+                        }
                         // Fresh rows each time the menu opens.
                         let (to, service, guard) = (
                             to_worker.clone(),

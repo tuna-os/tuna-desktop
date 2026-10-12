@@ -1392,6 +1392,48 @@ fn build(app: &adw::Application) {
     // AppIndicator items sit left of the system indicators.
     let end = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     end.append(&screencast::indicator(&recorder));
+    let a11y = accessibility::menu();
+    // Escape inside a tray popover: the popover's grab delivers the key
+    // to the popover, never to our window controller — each tray menu
+    // calls this instead of closing natively, so the hold survives and
+    // focus returns to the tray button (G-PANEL-FOCUS). Other menus
+    // cannot be open under the grab, but the built-ins close too.
+    let on_tray_escape = {
+        let (window, held, guard) = (
+            window.clone(),
+            panel_held.clone(),
+            panel_escape_guard.clone(),
+        );
+        let (clock, system, a11y) = (clock.clone(), system.clone(), a11y.clone());
+        Rc::new(move |button: &gtk::MenuButton| {
+            if !held.get() {
+                return glib::Propagation::Proceed;
+            }
+            for other in [&clock, &system, &a11y] {
+                if other.is_active() {
+                    if let Some(popover) = other.popover() {
+                        if popover.is_visible() {
+                            let mut state = guard.get();
+                            state.note_escape_close();
+                            guard.set(state);
+                        }
+                    }
+                    other.popdown();
+                }
+            }
+            if let Some(popover) = button.popover() {
+                if popover.is_visible() {
+                    let mut state = guard.get();
+                    state.note_escape_close();
+                    guard.set(state);
+                }
+            }
+            button.popdown();
+            button.grab_focus();
+            assert_panel_hold(&window, &held);
+            glib::Propagation::Stop
+        })
+    };
     let tray_box = {
         let (window, held, guard) = (
             window.clone(),
@@ -1408,10 +1450,10 @@ fn build(app: &adw::Application) {
                 }
             }),
             panel_escape_guard.clone(),
+            on_tray_escape.clone(),
         )
     };
     end.append(&tray_box);
-    let a11y = accessibility::menu();
     end.append(&a11y);
     end.append(&system);
     bar.set_end_widget(Some(&end));
@@ -1421,6 +1463,19 @@ fn build(app: &adw::Application) {
     // Ctrl+Alt+Tab holds the bar.
     for button in [&clock, &system, &a11y] {
         if let Some(popover) = button.popover() {
+            // Cloned before the shadowing bindings below are moved
+            // into the signal closures.
+            let (window_e, held_e, guard_e) = (
+                window.clone(),
+                panel_held.clone(),
+                panel_escape_guard.clone(),
+            );
+            let (clock_e, system_e, a11y_e, tray_box_e) = (
+                clock.clone(),
+                system.clone(),
+                a11y.clone(),
+                tray_box.clone(),
+            );
             let guard = panel_escape_guard.clone();
             popover.connect_show(move |_| {
                 let mut state = guard.get();
@@ -1440,6 +1495,23 @@ fn build(app: &adw::Application) {
                     release_panel_focus(&window, &held);
                 }
             });
+            // Escape inside the popover: its grab delivers the key here,
+            // never to our window controller — intercept it or the menu
+            // closes natively, the hold is lost, and focus leaves the
+            // bar (G-PANEL-FOCUS). Without the hold, Proceed: normal
+            // popover behavior is unchanged.
+            let escape_keys = gtk::EventControllerKey::new();
+            escape_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            escape_keys.connect_key_pressed(move |_, key, _, _| {
+                use gtk::gdk::Key;
+                if key != Key::Escape || !held_e.get() {
+                    return glib::Propagation::Proceed;
+                }
+                close_panel_menus(&clock_e, &system_e, &a11y_e, &tray_box_e, &guard_e);
+                assert_panel_hold(&window_e, &held_e);
+                glib::Propagation::Stop
+            });
+            popover.add_controller(escape_keys);
         }
     }
     // Panel-focus keys: Escape unwinds the open panel menu, then
@@ -1460,9 +1532,10 @@ fn build(app: &adw::Application) {
         );
         let shell = shell.clone();
         let keys = gtk::EventControllerKey::new();
-        // Capture: Escape must reach us before an open popover's own
-        // Escape handling, or the menu would close natively and the
-        // unwind would release focus instead of keeping the button.
+        // Fallback for Escape with no popover shown (no grab in the
+        // way): unwind or release. An open popover's grab delivers
+        // Escape to the popover instead, which carries its own
+        // interceptor above — this controller never sees those keys.
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let window_keys = window.clone();
         keys.connect_key_pressed(move |_, key, _, _| {

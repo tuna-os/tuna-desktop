@@ -991,8 +991,29 @@ impl WindowManager {
         state.refresh_ime_cursor_origins();
         // Never pull focus out from under a live grab.
         if state.take_popup_refocus() && !state.popup_grab_active() {
-            let focused = self.model.focused();
-            self.apply_focus(state, focused);
+            // The grab stole keyboard from whoever held it: hand it back
+            // to the same owner — the parked overview first, then an
+            // Exclusive layer surface (the panel holding Ctrl+Alt+Tab
+            // focus keeps its keyboard across its own menus), and only
+            // then the focused window. Handing an Exclusive hold back
+            // to a window (or nothing) strands the panel inactive with
+            // GTK focus intact but no keyboard (G-PANEL-FOCUS).
+            if let Some(held) = self.overview_held.clone() {
+                let serial = SERIAL_COUNTER.next_serial();
+                if let Some(keyboard) = self.keyboard.clone() {
+                    keyboard.set_focus(state, Some(held.clone()), serial);
+                }
+                state.sync_selection_focus(Some(&held));
+            } else if let Some(exclusive) = crate::layer::exclusive_keyboard_layer(state) {
+                let serial = SERIAL_COUNTER.next_serial();
+                if let Some(keyboard) = self.keyboard.clone() {
+                    keyboard.set_focus(state, Some(exclusive.clone()), serial);
+                }
+                state.sync_selection_focus(Some(&exclusive));
+            } else {
+                let focused = self.model.focused();
+                self.apply_focus(state, focused);
+            }
             // The grab held pointer focus wherever the pointer went:
             // re-deliver it where the pointer is now, so the surface it
             // left hears the leave (a panel button drops its hover).
