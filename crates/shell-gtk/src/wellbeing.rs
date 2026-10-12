@@ -3190,9 +3190,10 @@ mod tests {
         let (mut hooks, seen) = recorded();
         let attempts = Rc::new(Cell::new(0u32));
         let gate = attempts.clone();
+        let effect_sends = seen.effect_sends.clone();
         hooks.effect_hook = Rc::new(move |grayscale, fade| {
             gate.set(gate.get() + 1);
-            seen.effect_sends.borrow_mut().push((grayscale, fade));
+            effect_sends.borrow_mut().push((grayscale, fade));
             // Control absent for the first two ticks, present after.
             gate.get() > 2
         });
