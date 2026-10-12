@@ -162,6 +162,7 @@ impl AudioState {
     pub fn privacy_scan(&self, policy: &PrivacyPolicy) -> crate::privacy::PrivacyScan {
         let mut scan = crate::privacy::PrivacyScan {
             authoritative: self.authoritative,
+            serials: BTreeMap::new(),
             audio_present: BTreeSet::new(),
             mute_required: BTreeSet::new(),
             destroy: Vec::new(),
@@ -170,6 +171,9 @@ impl AudioState {
         for (&id, object) in &self.objects {
             let props = &object["info"]["props"];
             let class = props["media.class"].as_str().unwrap_or("");
+            if let Some(serial) = number(&props["object.serial"]) {
+                scan.serials.insert(id, serial);
+            }
             let audio_required = if class == "Audio/Source" {
                 Some(policy.microphone_disabled)
             } else if class == "Audio/Sink" {
@@ -354,7 +358,14 @@ mod tests {
         assert!(!muted);
     }
 
-    fn feed(state: &mut AudioState, value: Value) {
+    fn feed(state: &mut AudioState, mut value: Value) {
+        if let Some(objects) = value.as_array_mut() {
+            for object in objects {
+                if object["info"].is_object() && object["info"]["props"].is_object() {
+                    object["info"]["props"]["object.serial"] = object["id"].clone();
+                }
+            }
+        }
         state.feed(value.to_string().as_bytes()).unwrap();
     }
     #[test]

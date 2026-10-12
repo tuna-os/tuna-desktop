@@ -943,32 +943,19 @@ impl AudioUi {
         };
         for action in batch {
             self.enforcer.borrow_mut().dispatched(&action);
-            // Both legs report exit status (not just "the tool ran"),
-            // so a failed step schedules a retry instead of stalling
-            // until the next graph event.
-            let argv = if let Some(argv) = crate::privacy::wpctl_args(&action) {
-                std::iter::once("wpctl".to_owned())
-                    .chain(argv)
-                    .collect::<Vec<_>>()
-            } else if let Some(argv) = crate::privacy::pw_cli_args(&action) {
-                std::iter::once("pw-cli".to_owned())
-                    .chain(argv)
-                    .collect::<Vec<_>>()
-            } else {
+            let Some(serial) = scan.serials.get(&action.node()).copied() else {
+                self.queue.borrow_mut().report(&action, false);
                 continue;
             };
             let weak = Rc::downgrade(self);
-            audio_command(
-                &argv.iter().map(String::as_str).collect::<Vec<_>>(),
-                move |ok| {
-                    if let Some(ui) = weak.upgrade() {
-                        ui.enforcer.borrow_mut().completed(&action, ok);
-                        if ui.queue.borrow_mut().report(&action, ok) {
-                            ui.schedule_drain();
-                        }
+            crate::privacy::run_async(action, serial, move |ok| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.enforcer.borrow_mut().completed_for(&action, serial, ok);
+                    if ui.queue.borrow_mut().report(&action, ok) {
+                        ui.schedule_drain();
                     }
-                },
-            );
+                }
+            });
         }
         if !self.queue.borrow().is_empty() {
             self.schedule_drain();

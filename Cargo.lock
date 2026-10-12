@@ -4205,6 +4205,7 @@ dependencies = [
  "jiff",
  "libadwaita",
  "libc",
+ "pipewire",
  "serde_json",
  "tempfile",
  "tuna-shell-control",
