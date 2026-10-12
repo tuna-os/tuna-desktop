@@ -3,6 +3,9 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import sys
+
+sys.dont_write_bytecode = True
 
 spec = importlib.util.spec_from_file_location("folder_watch_proof", Path(__file__).with_name("gtk-folder-watch-proof.py"))
 proof = importlib.util.module_from_spec(spec)

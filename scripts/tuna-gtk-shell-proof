@@ -1994,7 +1994,7 @@ fi
 folder_watch_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)"
 case "$folder_watch_pid" in *[!0-9]*|'') fail G-APP-FOLDERS "GTK child PID is not unique" ;; esac
 folder_watch_observe() {
-    "$PY" "$ROOT/scripts/lib/gtk-folder-watch-proof.py" --pid "$folder_watch_pid" \
+    timeout --kill-after=2s 10s "$PY" "$ROOT/scripts/lib/gtk-folder-watch-proof.py" --pid "$folder_watch_pid" \
         --parent "$COMPOSITOR_PID" --binary "$privacy_expected_shell" \
         --output "$ARTIFACTS/folder-watch-$1.json" --present "$2" --absent "$3" || \
         fail G-APP-FOLDERS "live settings change did not update the owned grid: $1"
