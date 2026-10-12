@@ -720,14 +720,20 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
 fi
+# The compositor and the shell share this log from one file description.
+# Truncate first (a fresh log each run, as before), then append: O_APPEND
+# keeps each process's write() contiguous, so concurrent lines can only
+# interleave whole pieces, never overwrite bytes (tuna-fade-match tolerates
+# the interleaved pieces).
+: >"$LOG"
 if [ -n "$PAM_ON" ]; then
     env IBUS_ADDRESS="unix:path=$ARTIFACTS/not-the-private-ibus" \
         LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
         PAM_WRAPPER_SERVICE_DIR="$ARTIFACTS/pam/services" \
-        "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >"$LOG" 2>&1 &
+        "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >>"$LOG" 2>&1 &
 else
     env IBUS_ADDRESS="unix:path=$ARTIFACTS/not-the-private-ibus" \
-        "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >"$LOG" 2>&1 &
+        "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >>"$LOG" 2>&1 &
 fi
 COMPOSITOR_PID=$!
 
@@ -1357,11 +1363,11 @@ cstate ".focused != $second and .focused_app_id == \"tuna-test-alpha\" and .swit
 # over 100 ms, each starting animated and settling.
 cstate 'all(.layers[]; .namespace != "tuna-shell-switcher")' "switcher faded out" 5 ||
     fail G-SWITCHER-FADE "the switcher never finished fading out"
-fades="$(tail -c +"$((fade_mark + 1))" "$LOG" | grep 'tuna-shell-gtk: switcher fade' || true)"
+fade_seg="$(tail -c +"$((fade_mark + 1))" "$LOG")"
 for fade in thumbnails-in popup-out; do
-    printf '%s\n' "$fades" | grep -q "fade $fade start animated=true" ||
+    printf '%s\n' "$fade_seg" | "$ROOT/scripts/lib/tuna-fade-match" "$fade" start true ||
         fail G-SWITCHER-FADE "the $fade fade did not start animated"
-    printf '%s\n' "$fades" | grep -q "fade $fade settled" ||
+    printf '%s\n' "$fade_seg" | "$ROOT/scripts/lib/tuna-fade-match" "$fade" settled ||
         fail G-SWITCHER-FADE "the $fade fade did not settle"
 done
 pass G-SWITCHER-FADE "the switcher's thumbnails fade in and its popup fades out, animated and settled"
@@ -2840,7 +2846,7 @@ sleep 0.3
 xdotool key Escape keyup Alt_L
 cstate 'all(.layers[]; .namespace != "tuna-shell-switcher")' "switcher closed without motion" 5 ||
     fail G-ANIMATIONS-OFF "the switcher did not close"
-tail -c +"$((fade_mark + 1))" "$LOG" | grep -q 'switcher fade popup-out start animated=false' ||
+tail -c +"$((fade_mark + 1))" "$LOG" | "$ROOT/scripts/lib/tuna-fade-match" popup-out start false ||
     fail G-ANIMATIONS-OFF "the switcher popup still faded with animations off"
 gsettings set org.gnome.desktop.interface enable-animations true
 cstate '.animations_enabled' "animations enabled" ||
@@ -2867,7 +2873,7 @@ sleep 0.3
 xdotool key Escape keyup Alt_L
 cstate 'all(.layers[]; .namespace != "tuna-shell-switcher")' "reduced switcher closed" 5 ||
     fail G-ANIMATIONS-OFF "the Reduced Motion switcher did not close"
-tail -c +"$((fade_mark + 1))" "$LOG" | grep -q 'switcher fade popup-out start animated=true' ||
+tail -c +"$((fade_mark + 1))" "$LOG" | "$ROOT/scripts/lib/tuna-fade-match" popup-out start true ||
     fail G-ANIMATIONS-OFF "Reduced Motion dropped the switcher popup's fade"
 # The idle shield is a fade: Reduced Motion keeps it (GNOME's screenShield
 # uses adjustAnimationTime), while animations off removes it.
