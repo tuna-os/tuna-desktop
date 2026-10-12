@@ -1800,11 +1800,39 @@ fn build(app: &adw::Application) {
         let notices = notify.clone();
         let countdown_osd = osd_ui.clone();
         let lock_shell = shell.clone();
+        let action_notices = notify.clone();
+        let dismiss_notices = notify.clone();
+        let register_notices = notify.clone();
+        let drop_notices = notify.clone();
+        let break_queue: Rc<RefCell<Vec<wellbeing::BreakActionKind>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let break_push = break_queue.clone();
         wellbeing::start(
             app.upcast_ref(),
             wellbeing::ShellHooks {
                 post_notice: Rc::new(move |title: String, body: String| {
                     notices.post("Wellbeing", "alarm-symbolic", &title, &body);
+                }),
+                post_action_notice: Rc::new(
+                    move |title: String, body: String, actions: Vec<(String, String)>| {
+                        action_notices.post_with_actions(
+                            "Wellbeing",
+                            "alarm-symbolic",
+                            &title,
+                            &body,
+                            &actions,
+                        )
+                    },
+                ),
+                dismiss_notice: Rc::new(move |id: u64| dismiss_notices.dismiss_notification(id)),
+                on_notice_action: Rc::new(move |id: u64, key: String, handler: Rc<dyn Fn()>| {
+                    register_notices.on_notification_action(id, &key, handler);
+                }),
+                drop_notice_actions: Rc::new(move |id: u64| {
+                    drop_notices.drop_notification_actions(id);
+                }),
+                break_action: Rc::new(move |kind: wellbeing::BreakActionKind| {
+                    break_push.borrow_mut().push(kind);
                 }),
                 show_countdown: Rc::new(move |label: String, progress: f64| {
                     eprintln!("tuna-shell-gtk: wellbeing: countdown {label}");
@@ -1823,6 +1851,7 @@ fn build(app: &adw::Application) {
                     }
                 }),
             },
+            break_queue,
         );
     }
     let gnome_shell = shell_dbus::start(Rc::new(GnomeShellDbus {

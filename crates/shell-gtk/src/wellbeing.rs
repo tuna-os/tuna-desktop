@@ -47,6 +47,8 @@
 #[cfg(not(test))]
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -1793,6 +1795,51 @@ pub type NoticeHook = Rc<dyn Fn(String, String)>;
 pub type CountdownHook = Rc<dyn Fn(String, f64)>;
 /// Lock the session now.
 pub type LockHook = Rc<dyn Fn()>;
+/// Post a resident notice WITH invokable actions; returns the center id.
+/// Actions are (key, label) pairs; only allow-listed keys are posted.
+pub type ActionNoticeHook = Rc<dyn Fn(String, String, Vec<(String, String)>) -> Option<u64>>;
+/// Dismiss one banner by center id (history keeps the entry).
+pub type DismissHook = Rc<dyn Fn(u64) -> bool>;
+/// Register a local callback for one (notice id, action key).
+pub type ActionRegisterHook = Rc<dyn Fn(u64, String, Rc<dyn Fn()>)>;
+/// Forget one notice's local callbacks (replacement/removal).
+pub type ActionDropHook = Rc<dyn Fn(u64)>;
+/// One user-chosen break action, queued for the next break tick (the hook
+/// must not call back into the runtime; see [`ShellHooks`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakActionKind {
+    Take,
+    Delay,
+    Skip,
+}
+/// Enqueue one user-chosen break action for the next tick.
+pub type BreakActionHook = Rc<dyn Fn(BreakActionKind)>;
+
+/// Action keys and button labels for break notices. Keys are center action
+/// ids; labels are plain Header Case (GNOME 51 ships no verbatim strings
+/// for these buttons to match).
+pub const ACTION_TAKE: (&str, &str) = ("take", "Take");
+pub const ACTION_DELAY: (&str, &str) = ("delay", "Delay");
+pub const ACTION_SKIP: (&str, &str) = ("skip", "Skip");
+
+/// Buttons for one break notice, from its allow flags (take, delay, skip
+/// order). Only allow-listed keys are ever posted or registered, so a
+/// denied key has no callback to reach.
+pub fn notice_action_buttons(
+    notice: &Notice,
+) -> Vec<(&'static str, &'static str, BreakActionKind)> {
+    let mut out = Vec::new();
+    if notice.allow_take {
+        out.push((ACTION_TAKE.0, ACTION_TAKE.1, BreakActionKind::Take));
+    }
+    if notice.allow_delay {
+        out.push((ACTION_DELAY.0, ACTION_DELAY.1, BreakActionKind::Delay));
+    }
+    if notice.allow_skip {
+        out.push((ACTION_SKIP.0, ACTION_SKIP.1, BreakActionKind::Skip));
+    }
+    out
+}
 
 /// Shell surfaces the wellbeing runtime drives. All hooks run on the GTK
 /// thread. A hook must not call back into the runtime: the runtime lends
@@ -1802,6 +1849,11 @@ pub struct ShellHooks {
     pub post_notice: NoticeHook,
     pub show_countdown: CountdownHook,
     pub lock: LockHook,
+    pub post_action_notice: ActionNoticeHook,
+    pub dismiss_notice: DismissHook,
+    pub on_notice_action: ActionRegisterHook,
+    pub drop_notice_actions: ActionDropHook,
+    pub break_action: BreakActionHook,
 }
 
 /// Desired effect state. The compositor has no desaturate/brightness hook
@@ -1867,13 +1919,14 @@ pub fn dispatch_screen_time(
 /// countdown to the OSD, lock to the session. `countdown` marks the live
 /// OSD countdown so the tick can refresh its label from the manager's due
 /// time; the OSD hides itself 1.5 s after the last show, so stopping needs
-/// no call. Dismissal only clears local state: posted entries are
-/// independent history items, and replacing the resident notice needs
-/// notify action support.
+/// no call. `resident` tracks the single resident break notice's center
+/// id: replacing it dismisses the old banner and drops its action
+/// callbacks, and dismissal clears it (history keeps every entry).
 pub fn dispatch_break_ui(
     hooks: &ShellHooks,
     effect: &mut EffectState,
     countdown: &mut Option<BreakType>,
+    resident: &mut Option<u64>,
     events: &[BreakUiEvent],
 ) {
     for event in events {
@@ -1882,9 +1935,33 @@ pub fn dispatch_break_ui(
                 eprintln!("tuna-shell-gtk: wellbeing: break state {state:?}");
             }
             BreakUiEvent::Notify(notice) => {
-                (hooks.post_notice)(notice.title.clone(), notice.body.clone());
+                if let Some(old) = resident.take() {
+                    (hooks.dismiss_notice)(old);
+                    (hooks.drop_notice_actions)(old);
+                }
+                let buttons = notice_action_buttons(notice);
+                let posted = (hooks.post_action_notice)(
+                    notice.title.clone(),
+                    notice.body.clone(),
+                    buttons
+                        .iter()
+                        .map(|(key, label, _)| (key.to_string(), label.to_string()))
+                        .collect(),
+                );
+                if let Some(id) = posted {
+                    for (key, _, kind) in buttons {
+                        let push = hooks.break_action.clone();
+                        (hooks.on_notice_action)(id, key.to_string(), Rc::new(move || push(kind)));
+                    }
+                    *resident = Some(id);
+                }
             }
-            BreakUiEvent::DismissNotice => {}
+            BreakUiEvent::DismissNotice => {
+                if let Some(id) = resident.take() {
+                    (hooks.dismiss_notice)(id);
+                    (hooks.drop_notice_actions)(id);
+                }
+            }
             BreakUiEvent::StartCountdown {
                 break_type,
                 due_in_secs,
@@ -1961,6 +2038,8 @@ struct Runtime {
     break_children: Vec<(BreakType, gio::Settings)>,
     effect: EffectState,
     countdown: Option<BreakType>,
+    resident: Option<u64>,
+    actions: Rc<RefCell<Vec<BreakActionKind>>>,
 }
 
 /// One screen-time poll: idle verdict from the compositor, history edges and
@@ -1990,13 +2069,23 @@ fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
 #[cfg(not(test))]
 fn break_tick(rt: &Rc<RefCell<Runtime>>) {
     let now = wall_now();
-    let (hooks, mut effect, mut countdown, events) = {
+    let (hooks, mut effect, mut countdown, mut resident, mut events) = {
         let mut r = rt.borrow_mut();
         let idle_secs = idle_time().map(|d| d.as_secs() as i64).unwrap_or(0);
-        let events = r.breaks.poll(now, idle_secs);
-        (r.hooks.clone(), r.effect, r.countdown, events)
+        let mut events = r.breaks.poll(now, idle_secs);
+        // Queued notice actions apply here, on the tick — never inside a
+        // hook — so the model mutates under exactly one borrow and a
+        // banner press lands within one 2 s tick.
+        for kind in r.actions.borrow_mut().drain(..) {
+            events.extend(match kind {
+                BreakActionKind::Take => r.breaks.take_break(),
+                BreakActionKind::Delay => r.breaks.delay_break(now),
+                BreakActionKind::Skip => r.breaks.skip_break(now),
+            });
+        }
+        (r.hooks.clone(), r.effect, r.countdown, r.resident, events)
     };
-    dispatch_break_ui(&hooks, &mut effect, &mut countdown, &events);
+    dispatch_break_ui(&hooks, &mut effect, &mut countdown, &mut resident, &events);
     if countdown.is_some() {
         let due_in = rt.borrow().breaks.manager.next_break_due_time(now) - now;
         if due_in > 0 {
@@ -2006,6 +2095,7 @@ fn break_tick(rt: &Rc<RefCell<Runtime>>) {
     let mut r = rt.borrow_mut();
     r.effect = effect;
     r.countdown = countdown;
+    r.resident = resident;
 }
 
 /// Start the live runtime: an immediate first poll, then the 30 s screen-time
@@ -2013,7 +2103,11 @@ fn break_tick(rt: &Rc<RefCell<Runtime>>) {
 /// GNOME's changed handlers re-evaluate instead of waiting for the next
 /// tick), and a shutdown flush of the closing history edge.
 #[cfg(not(test))]
-pub fn start(app: &gio::Application, hooks: ShellHooks) {
+pub fn start(
+    app: &gio::Application,
+    hooks: ShellHooks,
+    actions: Rc<RefCell<Vec<BreakActionKind>>>,
+) {
     let tracker = ScreenTimeTracker::new(
         read_screen_time_settings(),
         HistoryStore::new(history_path()),
@@ -2037,6 +2131,8 @@ pub fn start(app: &gio::Application, hooks: ShellHooks) {
             .collect(),
         effect: EffectState::default(),
         countdown: None,
+        resident: None,
+        actions,
     }));
     // The first polls run now so the startup edge, the limit state and any
     // due break apply immediately instead of a tick late.
@@ -2673,12 +2769,26 @@ mod tests {
         posts: Rc<RefCell<Vec<(String, String)>>>,
         countdowns: Rc<RefCell<Vec<(String, f64)>>>,
         locks: Rc<Cell<u32>>,
+        action_posts: Rc<RefCell<Vec<(String, String, Vec<(String, String)>, u64)>>>,
+        next_id: Rc<Cell<u64>>,
+        dismissals: Rc<RefCell<Vec<u64>>>,
+        registered: Rc<RefCell<Vec<(u64, String)>>>,
+        callbacks: Rc<RefCell<HashMap<(u64, String), Rc<dyn Fn()>>>>,
+        dropped: Rc<RefCell<Vec<u64>>>,
+        queued: Rc<RefCell<Vec<BreakActionKind>>>,
     }
 
     fn recording_hooks(recorded: &Recorded) -> ShellHooks {
         let posts = recorded.posts.clone();
         let countdowns = recorded.countdowns.clone();
         let locks = recorded.locks.clone();
+        let action_posts = recorded.action_posts.clone();
+        let next_id = recorded.next_id.clone();
+        let dismissals = recorded.dismissals.clone();
+        let registered = recorded.registered.clone();
+        let callbacks = recorded.callbacks.clone();
+        let dropped = recorded.dropped.clone();
+        let queued = recorded.queued.clone();
         ShellHooks {
             post_notice: Rc::new(move |title, body| {
                 posts.borrow_mut().push((title, body));
@@ -2689,6 +2799,27 @@ mod tests {
             lock: Rc::new(move || {
                 locks.set(locks.get() + 1);
             }),
+            post_action_notice: Rc::new(move |title, body, actions| {
+                let id = next_id.get() + 1;
+                next_id.set(id);
+                action_posts.borrow_mut().push((title, body, actions, id));
+                Some(id)
+            }),
+            dismiss_notice: Rc::new(move |id| {
+                dismissals.borrow_mut().push(id);
+                true
+            }),
+            on_notice_action: Rc::new(move |id, key, handler| {
+                registered.borrow_mut().push((id, key.clone()));
+                callbacks.borrow_mut().insert((id, key), handler);
+            }),
+            drop_notice_actions: Rc::new(move |id| {
+                dropped.borrow_mut().push(id);
+                callbacks.borrow_mut().retain(|(known, _), _| *known != id);
+            }),
+            break_action: Rc::new(move |kind| {
+                queued.borrow_mut().push(kind);
+            }),
         }
     }
 
@@ -2697,6 +2828,13 @@ mod tests {
             posts: Rc::new(RefCell::new(Vec::new())),
             countdowns: Rc::new(RefCell::new(Vec::new())),
             locks: Rc::new(Cell::new(0)),
+            action_posts: Rc::new(RefCell::new(Vec::new())),
+            next_id: Rc::new(Cell::new(40)),
+            dismissals: Rc::new(RefCell::new(Vec::new())),
+            registered: Rc::new(RefCell::new(Vec::new())),
+            callbacks: Rc::new(RefCell::new(HashMap::new())),
+            dropped: Rc::new(RefCell::new(Vec::new())),
+            queued: Rc::new(RefCell::new(Vec::new())),
         };
         let shell = recording_hooks(&hooks);
         (shell, hooks)
@@ -2755,10 +2893,12 @@ mod tests {
         let (hooks, seen) = recorded();
         let mut effect = EffectState::default();
         let mut countdown = None;
+        let mut resident = None;
         dispatch_break_ui(
             &hooks,
             &mut effect,
             &mut countdown,
+            &mut resident,
             &[
                 BreakUiEvent::StateChanged(BreakState::BreakDue),
                 BreakUiEvent::Notify(due_notice(BreakType::Eyesight, 20, true)),
@@ -2768,14 +2908,30 @@ mod tests {
                 },
             ],
         );
+        // Break notices post WITH actions (plain posts stay empty). A due
+        // notice allows take + delay, never skip.
+        assert!(seen.posts.borrow().is_empty());
+        let posted = seen.action_posts.borrow();
+        assert_eq!(posted.len(), 1);
+        let (title, body, actions, id) = &posted[0];
+        assert_eq!(title, "Time for an Eyesight Break");
         assert_eq!(
-            seen.posts.borrow().as_slice(),
-            &[(
-                "Time for an Eyesight Break".to_string(),
-                "Take a break from the screen. Look at least 6 meters away for at least 20 seconds"
-                    .to_string(),
-            )]
+            body,
+            "Take a break from the screen. Look at least 6 meters away for at least 20 seconds"
         );
+        assert_eq!(
+            actions.as_slice(),
+            &[
+                ("take".to_string(), "Take".to_string()),
+                ("delay".to_string(), "Delay".to_string()),
+            ]
+        );
+        assert_eq!(resident, Some(*id));
+        assert_eq!(
+            seen.registered.borrow().as_slice(),
+            &[(41, "take".to_string()), (41, "delay".to_string())]
+        );
+        drop(posted);
         assert_eq!(countdown, Some(BreakType::Eyesight));
         assert_eq!(
             seen.countdowns.borrow().as_slice(),
@@ -2785,6 +2941,7 @@ mod tests {
             &hooks,
             &mut effect,
             &mut countdown,
+            &mut resident,
             &[
                 BreakUiEvent::FadeScreen(true),
                 BreakUiEvent::LockScreen,
@@ -2797,8 +2954,137 @@ mod tests {
         assert!(!effect.grayscale && !effect.fade);
         assert_eq!(countdown, None);
         assert_eq!(seen.locks.get(), 1);
-        // Dismissal posts nothing: entries are independent history items.
-        assert_eq!(seen.posts.borrow().len(), 1);
+        // Dismissal dismisses the resident banner, drops its callbacks and
+        // clears the resident; history keeps the entry, posts stay empty.
+        assert_eq!(seen.dismissals.borrow().as_slice(), &[41]);
+        assert_eq!(seen.dropped.borrow().as_slice(), &[41]);
+        assert_eq!(resident, None);
+        assert!(seen.callbacks.borrow().is_empty());
+        assert!(seen.posts.borrow().is_empty());
+        assert_eq!(seen.action_posts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn break_action_callbacks_enqueue_take_delay_skip() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        let mut resident = None;
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::Notify(due_notice(
+                BreakType::Movement,
+                20,
+                true,
+            ))],
+        );
+        assert_eq!(resident, Some(41));
+        // Fire every registered callback the way the banner path does
+        // after a successful bus invoke; each enqueues exactly its kind.
+        for key in ["take", "delay"] {
+            seen.callbacks.borrow()[&(41, key.to_string())]();
+        }
+        assert_eq!(
+            seen.queued.borrow().as_slice(),
+            &[BreakActionKind::Take, BreakActionKind::Delay]
+        );
+        // Denied: a due notice never allows skip, so no callback exists.
+        assert!(!seen
+            .callbacks
+            .borrow()
+            .contains_key(&(41, "skip".to_string())));
+        // Denied: upcoming notices never allow take.
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::Notify(upcoming_notice(
+                BreakType::Movement,
+                120,
+                true,
+            ))],
+        );
+        assert_eq!(resident, Some(42));
+        assert!(!seen
+            .callbacks
+            .borrow()
+            .contains_key(&(42, "take".to_string())));
+    }
+
+    #[test]
+    fn replacement_dismisses_and_forgets_the_old_resident() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        let mut resident = None;
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::Notify(due_notice(
+                BreakType::Movement,
+                20,
+                true,
+            ))],
+        );
+        assert_eq!(resident, Some(41));
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::Notify(due_notice(
+                BreakType::Eyesight,
+                20,
+                true,
+            ))],
+        );
+        // The old banner is dismissed and its callbacks forgotten; only
+        // the new resident can fire.
+        assert_eq!(seen.dismissals.borrow().as_slice(), &[41]);
+        assert_eq!(seen.dropped.borrow().as_slice(), &[41]);
+        assert_eq!(resident, Some(42));
+        assert!(!seen
+            .callbacks
+            .borrow()
+            .contains_key(&(41, "take".to_string())));
+        seen.callbacks.borrow()[&(42, "take".to_string())]();
+        assert_eq!(seen.queued.borrow().as_slice(), &[BreakActionKind::Take]);
+    }
+
+    #[test]
+    fn dismiss_without_a_resident_is_a_noop() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        let mut resident = None;
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::DismissNotice],
+        );
+        assert!(seen.dismissals.borrow().is_empty());
+        assert!(seen.dropped.borrow().is_empty());
+        assert_eq!(resident, None);
+    }
+
+    #[test]
+    fn disabled_manager_ignores_take_delay_and_skip() {
+        let mut service = BreakService::new();
+        assert_eq!(service.manager.state(), BreakState::Disabled);
+        let due_before = service.manager.next_break_due_time(T0);
+        assert!(service.take_break().is_empty());
+        assert!(service.delay_break(T0).is_empty());
+        assert!(service.skip_break(T0).is_empty());
+        assert_eq!(service.manager.state(), BreakState::Disabled);
+        assert_eq!(service.manager.next_break_due_time(T0), due_before);
     }
 
     #[test]
@@ -2840,11 +3126,12 @@ mod tests {
         let mut service = BreakService::new();
         let mut effect = EffectState::default();
         let mut countdown = None;
+        let mut resident = None;
         // No selection, no config: polls stay Disabled and silent.
         for now in [T0, T0 + 3600] {
             let events = service.poll(now, 0);
             assert!(events.is_empty());
-            dispatch_break_ui(&hooks, &mut effect, &mut countdown, &events);
+            dispatch_break_ui(&hooks, &mut effect, &mut countdown, &mut resident, &events);
         }
         assert_eq!(service.manager.state(), BreakState::Disabled);
         assert!(seen.posts.borrow().is_empty());
