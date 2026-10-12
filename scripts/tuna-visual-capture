@@ -167,14 +167,16 @@ stages = {}
 for name in sorted(os.listdir(root)):
     stage_path = os.path.join(root, name, "stage.json")
     if os.path.isfile(stage_path):
+        key = name[len("visual-"):] if name.startswith("visual-") else name
         with open(stage_path, encoding="utf-8") as handle:
-            stages[name] = json.load(handle)
+            stages[key] = json.load(handle)
 provs = {}
 for name in sorted(os.listdir(root)):
     prov_path = os.path.join(root, name, "provenance.json")
     if os.path.isfile(prov_path):
+        key = name[len("visual-"):] if name.startswith("visual-") else name
         with open(prov_path, encoding="utf-8") as handle:
-            provs[name] = json.load(handle)
+            provs[key] = json.load(handle)
 counts = {"ok": 0, "partial": 0, "failed": 0, "skipped": 0}
 state_totals = {"ok": 0, "failed": 0, "skipped": 0}
 for s in stages.values():
@@ -512,18 +514,72 @@ XDESK
     VOLUME_FILE="$ARTIFACTS/volume"
     echo 0.80 >"$VOLUME_FILE"
     export VOLUME_FILE
+    VOLUME_MUTED_FILE="$ARTIFACTS/volume-muted"
+    MIC_MUTED_FILE="$ARTIFACTS/mic-muted"
+    echo 0 >"$VOLUME_MUTED_FILE"
+    echo 0 >"$MIC_MUTED_FILE"
+    SINK_FILE="$ARTIFACTS/default-sink"
+    echo 48 >"$SINK_FILE"
+    MIC_FILE="$ARTIFACTS/mic-volume"
+    echo 0.50 >"$MIC_FILE"
+    RECORDING_FILE="$ARTIFACTS/recording"
+    export RECORDING_FILE
     cat >"$ARTIFACTS/bin/wpctl" <<WPCTL
 #!/bin/sh
+mark() { [ "\$(cat "$SINK_FILE")" = "\$1" ] && echo "*" || echo " "; }
+muted() { [ "\$(cat "\$1")" = 1 ] && printf ' [MUTED]' || true; }
 case "\$1" in
-    get-volume) echo "Volume: \$(cat "$VOLUME_FILE")" ;;
-    set-volume) echo "\$3" >"$VOLUME_FILE" ;;
-    set-mute) exit 0 ;;
-    set-default) exit 0 ;;
-    status) printf 'Audio\n ├─ Sinks:\n │  *   48. Built-in Audio Analog Stereo    [vol: 0.80]\n' ;;
+    get-volume)
+        case "\$2" in
+            *SOURCE*) echo "Volume: \$(cat "$MIC_FILE")\$(muted "$MIC_MUTED_FILE")" ;;
+            *) echo "Volume: \$(cat "$VOLUME_FILE")\$(muted "$VOLUME_MUTED_FILE")" ;;
+        esac ;;
+    set-volume)
+        case "\$2" in
+            *SOURCE*) echo "\$3" >"$MIC_FILE" ;;
+            *) echo "\$3" >"$VOLUME_FILE" ;;
+        esac ;;
+    set-mute)
+        case "\$2" in *SOURCE*) mute_file="$MIC_MUTED_FILE" ;; *) mute_file="$VOLUME_MUTED_FILE" ;; esac
+        case "\$3" in toggle) echo "\$((1 - \$(cat "\$mute_file")))" >"\$mute_file" ;; *) echo "\$3" >"\$mute_file" ;; esac ;;
+    set-default) echo "\$2" >"$SINK_FILE" ;;
+    status)
+        printf 'Audio\n ├─ Sinks:\n'
+        printf ' │  %s   48. Built-in Audio Analog Stereo    [vol: 0.80]\n' "\$(mark 48)"
+        printf ' │  %s   52. Tuna Desktop HDMI Output               [vol: 1.00]\n' "\$(mark 52)"
+        printf ' │\n ├─ Sources:\n'
+        printf ' │  *   49. Built-in Audio Analog Stereo    [vol: 0.50]\n'
+        printf ' │\n └─ Streams:\n'
+        if [ -e "$RECORDING_FILE" ]; then
+            printf '        70. Voice Recorder\n'
+            printf '             71. input_MONO      < Built-in Audio Analog Stereo:capture_FL\t[active]\n'
+        fi ;;
     *) ;;
 esac
+"$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event
 WPCTL
-    chmod +x "$ARTIFACTS/bin/wpctl"
+    PW_DUMP_REAL="$(command -v pw-dump || true)"
+    cat >"$ARTIFACTS/bin/pw-dump" <<PW_DUMP
+#!/bin/sh
+for arg do
+    if [ "\$arg" = --monitor ] || [ "\$arg" = -m ]; then
+        exec "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS"
+    fi
+done
+[ -n "$PW_DUMP_REAL" ] || exit 127
+exec "$PW_DUMP_REAL" "\$@"
+PW_DUMP
+    cat >"$ARTIFACTS/bin/pw-cli" <<PW_CLI
+#!/bin/sh
+printf '%s\\n' "\$*" >>"$ARTIFACTS/audio-route-calls"
+case "\$*" in
+    'set-param 40 Route { index: 2, device: 0, save: true }') echo 2 >"$ARTIFACTS/audio-route" ;;
+    'set-param 40 Route { index: 1, device: 0, save: true }') echo 1 >"$ARTIFACTS/audio-route" ;;
+    *) exit 1 ;;
+esac
+"$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event
+PW_CLI
+    chmod +x "$ARTIFACTS/bin/wpctl" "$ARTIFACTS/bin/pw-dump" "$ARTIFACTS/bin/pw-cli"
     PATH="$ARTIFACTS/bin:$PATH"
     export PATH
     SYSBUS_INFO="$(dbus-daemon --session --fork --print-address=1 --print-pid=1)"
@@ -826,9 +882,14 @@ st_calendar_menu() {
 }
 st_calendar_with_notification() {
     notify "Tuna Desktop Proof" "Calendar Note" "Listed under the calendar" || state_fail "Notify failed"
-    sleep 1
+    # Let the banner expire first: it covers the clock and its node
+    # would satisfy the validator while the menu stays shut.
+    sleep 6
+    xdo mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) || true
+    sleep 3.5
     open_calendar || state_fail "could not click the clock"
     a11y a11y-calendar-list.json || state_fail "a11y dump failed"
+    require_jq a11y-calendar-list.json 'any(.[]; .name == "Design review" and .showing)' "calendar menu open"
     require_jq a11y-calendar-list.json 'any(.[]; .name == "Calendar Note" and .showing)' "notification listed"
     shot calendar-with-notification || state_fail "scrot failed"
     close_all
@@ -846,19 +907,29 @@ st_qs_grid() {
     shot qs-grid || state_fail "scrot failed"
     # Leave it open: submenu states reuse it; each reopens if needed.
 }
-st_qs_reopen() {
-    a11y a11y-qs-check.json >/dev/null 2>&1
-    showing a11y-qs-check.json "Dark Style" || open_qs || return 1
+# qs_grid: leave quick settings showing its toggle grid, whatever it
+# showed before (grid, submenu, or closed). Each submenu state starts
+# here so presses never race a stale submenu.
+qs_grid() {
+    close_all
+    a11y a11y-qs-probe.json >/dev/null 2>&1
+    if showing a11y-qs-probe.json "Dark Style"; then
+        xdo key Escape || true
+        sleep 1
+    fi
+    open_qs || return 1
+    a11y a11y-qs-grid.json >/dev/null 2>&1 || return 1
+    showing a11y-qs-grid.json "Dark Style" || return 1
     return 0
 }
 st_qs_wifi_menu() {
-    st_qs_reopen || state_fail "quick settings would not open"
+    qs_grid || state_fail "quick settings would not open"
     a11y a11y-qs-wifi.json --press "Wi-Fi Menu" || state_fail "could not open the Wi-Fi menu"
     require_jq a11y-qs-wifi.json 'any(.[]; (.name // "" | startswith("Tuna Desktop")) and .showing)' "stub networks listed"
     shot qs-wifi-menu || state_fail "scrot failed"
 }
 st_qs_network_agent() {
-    st_qs_reopen || state_fail "quick settings would not open"
+    qs_grid || state_fail "quick settings would not open"
     a11y a11y-qs-wifi2.json --press "Wi-Fi Menu" >/dev/null 2>&1
     guest="$(jq -r '[.[] | select(.showing and ((.name // "") | test("Guest")))][0].name' "$ARTIFACTS/a11y-qs-wifi2.json")"
     if [ -z "$guest" ] || [ "$guest" = "null" ]; then
@@ -873,13 +944,13 @@ st_qs_network_agent() {
     sleep 1
 }
 st_qs_wired_menu() {
-    st_qs_reopen || state_fail "quick settings would not open"
+    qs_grid || state_fail "quick settings would not open"
     a11y a11y-qs-wired.json --press "Wired Menu" || state_fail "could not open the Wired menu"
     require_jq a11y-qs-wired.json 'any(.[]; (.name // "" | test("Disconnect|Wired Settings")) and .showing)' "wired menu entries"
     shot qs-wired-menu || state_fail "scrot failed"
 }
 st_qs_bluetooth_menu() {
-    st_qs_reopen || state_fail "quick settings would not open"
+    qs_grid || state_fail "quick settings would not open"
     a11y a11y-qs-bt.json --press "Bluetooth Menu" || state_fail "could not open the Bluetooth menu"
     require_jq a11y-qs-bt.json 'any(.[]; (.name // "" | test("Headphones|Bluetooth Settings")) and .showing)' "bluetooth menu entries"
     shot qs-bluetooth-menu || state_fail "scrot failed"
@@ -892,18 +963,23 @@ st_qs_microphone() {
     sleep 1
     a11y a11y-mic.json >/dev/null 2>&1
     require_jq a11y-mic.json 'any(.[]; .name == "Microphone in use" and .showing)' "panel mic indicator"
-    st_qs_reopen || state_fail "quick settings would not open"
-    require_jq a11y-qs-check.json 'any(.[]; .name == "Microphone" and .showing)' "Microphone slider"
+    qs_grid || state_fail "quick settings would not open"
+    require_jq a11y-qs-grid.json 'any(.[]; .name == "Microphone" and .showing)' "Microphone slider"
     shot qs-microphone || state_fail "scrot failed"
     rm -f "$ARTIFACTS/recording"
     "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event >/dev/null 2>&1 || true
     close_all
 }
 st_qs_osd_volume() {
-    bus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
-        --method org.gnome.Shell.ShowOSD \
-        "{'icon': <'audio-volume-medium-symbolic'>, 'level': <0.5>, 'max_level': <1.0>}" \
-        >/dev/null 2>&1 || state_fail "ShowOSD call failed"
+    # Native media key: the shell steps the volume and raises the OSD.
+    before="$(cat "$VOLUME_FILE")"
+    xdo key XF86AudioRaiseVolume || state_fail "volume key failed"
+    ok=0
+    for _ in $(seq 1 30); do
+        [ "$(cat "$VOLUME_FILE")" != "$before" ] && { ok=1; break; }
+        sleep 0.2
+    done
+    [ "$ok" = 1 ] || state_fail "validator miss: volume key changed nothing"
     shot qs-osd-volume 0.5 || state_fail "scrot failed"
     require_frame_differs qs-osd-volume.png 00-baseline-desktop.png "volume OSD rendered"
     sleep 2
@@ -1090,7 +1166,7 @@ st_switcher_popup() {
     xdo key Tab || { xdo keyup Alt_L || true; state_fail "Tab failed"; }
     sleep 1
     a11y a11y-switcher.json >/dev/null 2>&1
-    require_jq a11y-switcher.json 'any(.[]; (.name // "" | test("Tuna Desktop Test")) and .showing)' "switcher lists apps"
+    require_jq a11y-switcher.json 'any(.[]; (.name // "" | test("tuna-test-")) and .showing)' "switcher lists apps"
     shot switcher-popup || { xdo keyup Alt_L || true; state_fail "scrot failed"; }
     xdo keyup Alt_L || true
     sleep 1
@@ -1215,7 +1291,7 @@ st_search_apps_provider() {
     xdo key Super_L || state_fail "Super failed"
     cstate_wait '.overview_open' 10 || state_fail "overview did not open"
     sleep 1
-    xdo type --delay 40 "quarterly" || state_fail "typing failed"
+    xdo type --delay 40 "report" || state_fail "typing failed"
     sleep 1.5
     a11y a11y-provider.json >/dev/null 2>&1
     require_jq a11y-provider.json 'any(.[]; .name == "Quarterly Report.odt" and .showing)' "provider result listed"
@@ -1223,6 +1299,16 @@ st_search_apps_provider() {
     close_all
 }
 st_search_apps_grid() {
+    # Seed page apps and folder config BEFORE the first grid open: the
+    # grid snapshots entries and folders when it opens.
+    for i in $(seq -w 1 30); do
+        printf '[Desktop Entry]\nName=Tuna Page App %s\nExec=true\nType=Application\n' "$i" \
+            >"$XDG_DATA_HOME/applications/tuna-page-$i.desktop"
+    done
+    gset set org.gnome.desktop.app-folders folder-children "['CaptureTools']" || state_fail "gsettings failed"
+    gset set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/CaptureTools/ name "Capture Tools" || true
+    gset set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/CaptureTools/ apps "['tuna-probe.desktop']" || true
+    sleep 1
     xdo key super+a || state_fail "Super+A failed"
     cstate_wait '.overview_open and .overview_app_grid' 10 || state_fail "app grid did not open"
     sleep 1.5
@@ -1235,10 +1321,6 @@ st_search_apps_folder() {
         cstate_wait '.overview_open and .overview_app_grid' 10 || state_fail "app grid did not open"
         sleep 1
     }
-    gset set org.gnome.desktop.app-folders folder-children "['CaptureTools']" || state_fail "gsettings failed"
-    gset set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/CaptureTools/ name "Capture Tools" || true
-    gset set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/CaptureTools/ apps "['tuna-probe.desktop']" || true
-    sleep 1.5
     a11y a11y-folders.json >/dev/null 2>&1
     require_jq a11y-folders.json 'any(.[]; .name == "Capture Tools" and .showing)' "folder tile showing"
     a11y a11y-folder-open.json --press "Capture Tools" >/dev/null 2>&1 \
@@ -1251,11 +1333,6 @@ st_search_apps_folder() {
     sleep 1
 }
 st_search_apps_pages() {
-    for i in $(seq -w 1 30); do
-        printf '[Desktop Entry]\nName=Tuna Page App %s\nExec=true\nType=Application\n' "$i" \
-            >"$XDG_DATA_HOME/applications/tuna-page-$i.desktop"
-    done
-    sleep 1.5
     cstate_wait '.overview_open and .overview_app_grid' 3 || {
         xdo key super+a || state_fail "Super+A failed"
         cstate_wait '.overview_open and .overview_app_grid' 10 || state_fail "app grid did not open"
@@ -1532,8 +1609,10 @@ st_system_screenshot_ui() {
     sleep 1
 }
 st_system_polkit() {
+    # Agent registration is asynchronous and can trail shell startup by
+    # tens of seconds; the stub log existing proves the round trip.
     ok=0
-    for _ in $(seq 1 50); do [ -s "$TUNA_STUB_POLKIT_LOG" ] && { ok=1; break; }; sleep 0.3; done
+    for _ in $(seq 1 180); do [ -s "$TUNA_STUB_POLKIT_LOG" ] && { ok=1; break; }; sleep 0.5; done
     [ "$ok" = 1 ] || state_fail "the shell never registered a polkit agent"
     read -r agent_name agent_path <"$TUNA_STUB_POLKIT_LOG"
     bus call --system --dest "$agent_name" --object-path "$agent_path" \
@@ -1670,7 +1749,18 @@ st_settings_a11y_menu() {
     sleep 2
     a11y a11y-menu.json >/dev/null 2>&1
     require_jq a11y-menu.json 'any(.[]; (.name // "" | test("Accessibility|Universal Access")) and .showing)' "a11y indicator showing"
+    read -r ax ay <<EOF2
+$(jq -r '[.[] | select((.name // "" | test("Accessibility|Universal Access")) and .showing and ((.bounds[2] // 0) > 0))][0].bounds | "\(.[0] + .[2] / 2 | floor) \(.[1] + .[3] / 2 | floor)"' "$ARTIFACTS/a11y-menu.json")
+EOF2
+    if [ -z "$ax" ] || [ "$ax" = "null" ]; then
+        state_fail "a11y indicator has no clickable bounds"
+    fi
+    shot settings-a11y-before 0.2 || state_fail "scrot failed"
+    xdo mousemove --window "$WID" "$ax" "$ay" click 1 || state_fail "could not click the indicator"
+    sleep 2
     shot settings-a11y-menu || state_fail "scrot failed"
+    require_frame_differs settings-a11y-menu.png settings-a11y-before.png "a11y menu rendered"
+    close_all
     gset reset org.gnome.desktop.a11y always-show-universal-access-status 2>/dev/null || true
     sleep 1
 }
@@ -1679,7 +1769,9 @@ st_settings_background() {
         "$ARTIFACTS/wallpaper-green.png" 2>/dev/null || state_skip "ffmpeg unavailable for wallpaper fixture"
     uri="$(printf 'file://%s' "$ARTIFACTS/wallpaper-green.png")"
     shot settings-wallpaper-before 0.2 || state_fail "scrot failed"
+    # Both keys: the session runs dark, so picture-uri alone changes nothing.
     gset set org.gnome.desktop.background picture-uri "$uri" || state_fail "gsettings failed"
+    gset set org.gnome.desktop.background picture-uri-dark "$uri" || state_fail "gsettings failed"
     gset set org.gnome.desktop.background picture-options zoom || true
     ok=0
     for _ in $(seq 1 40); do grep -q "wallpaper decoded" "$LOG" 2>/dev/null && { ok=1; break; }; sleep 0.5; done
@@ -1687,6 +1779,9 @@ st_settings_background() {
     sleep 1
     shot settings-wallpaper || state_fail "scrot failed"
     require_frame_differs settings-wallpaper.png settings-wallpaper-before.png "wallpaper rendered"
+    gset reset org.gnome.desktop.background picture-uri 2>/dev/null || true
+    gset reset org.gnome.desktop.background picture-uri-dark 2>/dev/null || true
+    sleep 1
 }
 states_settings_a11y() {
     run_state dark-style st_settings_dark
