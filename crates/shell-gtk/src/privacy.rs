@@ -65,6 +65,8 @@ pub struct PrivacyScan {
     /// A complete initial dump has established this monitor's graph baseline.
     /// False during disconnect/restart and while that dump is partially read.
     pub authoritative: bool,
+    /// PipeWire object.serial identifies the lifetime behind a reusable id.
+    pub serials: BTreeMap<u64, u64>,
     /// Audio nodes still present, even when their mute snapshot is stale.
     pub audio_present: BTreeSet<u64>,
     /// Nodes that must read muted right now.
@@ -76,6 +78,7 @@ pub struct PrivacyScan {
 }
 
 /// `wpctl` argv for an action (`None` for non-wpctl actions).
+#[cfg(test)]
 pub fn wpctl_args(action: &Action) -> Option<[String; 3]> {
     match action {
         Action::SetMute { node, muted } => Some([
@@ -92,6 +95,7 @@ pub fn wpctl_args(action: &Action) -> Option<[String; 3]> {
 }
 
 /// `pw-cli` argv for an action (`None` for non-pw-cli actions).
+#[cfg(test)]
 pub fn pw_cli_args(action: &Action) -> Option<[String; 2]> {
     match action {
         Action::DestroyNode { node } => Some(["destroy".to_owned(), node.to_string()]),
@@ -111,6 +115,7 @@ pub fn pw_cli_args(action: &Action) -> Option<[String; 2]> {
 pub struct Tracker {
     muted_by_policy: BTreeSet<u64>,
     unsettled_mutes: BTreeSet<u64>,
+    serials: BTreeMap<u64, u64>,
 }
 
 impl Tracker {
@@ -126,8 +131,18 @@ impl Tracker {
             // Preserve ownership; callers must also leave queued work alone.
             return Vec::new();
         }
+        // Coalesced tombstone/replacement events can reuse an id without an
+        // observable absent scan. Never transfer restore ownership to it.
+        self.muted_by_policy
+            .retain(|id| self.serials.get(id) == scan.serials.get(id));
+        self.unsettled_mutes
+            .retain(|id| self.serials.get(id) == scan.serials.get(id));
+        self.serials.clone_from(&scan.serials);
         let mut actions = Vec::new();
         for id in scan.mute_required.difference(&scan.muted_now) {
+            if !scan.serials.contains_key(id) {
+                continue;
+            }
             actions.push(Action::SetMute {
                 node: *id,
                 muted: true,
@@ -135,6 +150,9 @@ impl Tracker {
             self.muted_by_policy.insert(*id);
         }
         for id in &scan.destroy {
+            if !scan.serials.contains_key(id) {
+                continue;
+            }
             actions.push(Action::DestroyNode { node: *id });
         }
         let stale: Vec<u64> = self
@@ -170,7 +188,19 @@ impl Tracker {
 
     /// Only a successful compensating unmute settles a dispatched mute.
     /// A failed command may have changed the graph before returning failure.
+    #[cfg(test)]
     pub fn completed(&mut self, action: &Action, success: bool) {
+        if let Some(serial) = self.serials.get(&action.node()).copied() {
+            self.completed_for(action, serial, success);
+        }
+    }
+
+    /// Async outcomes belong to the serial captured at dispatch, not a
+    /// replacement with the same global id observed before completion.
+    pub fn completed_for(&mut self, action: &Action, serial: u64, success: bool) {
+        if self.serials.get(&action.node()) != Some(&serial) {
+            return;
+        }
         if success {
             if let Action::SetMute { node, muted: false } = action {
                 self.unsettled_mutes.remove(node);
@@ -328,6 +358,191 @@ impl ActionQueue {
     }
 }
 
+fn serial_matches(expected: u64, observed: Option<u64>) -> bool {
+    observed == Some(expected)
+}
+
+/// Execute against a verified bound Node proxy, never a reusable global id.
+/// Each worker has one two-second deadline for discovery, identity and mutation.
+fn run_bound(action: Action, serial: u64) -> bool {
+    use pipewire::spa::pod::{self, serialize::PodSerializer, Pod, Property};
+    use pipewire::{context::ContextRc, core::CoreRc, loop_::Timeout, main_loop::MainLoopRc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+
+    fn roundtrip(loop_: &MainLoopRc, core: &CoreRc, failed: &Cell<bool>, end: Instant) -> bool {
+        let Ok(sequence) = core.sync(0) else {
+            return false;
+        };
+        let done = Rc::new(Cell::new(false));
+        let observed = done.clone();
+        let _done = core
+            .add_listener_local()
+            .done(move |id, seq| {
+                if id == pipewire::core::PW_ID_CORE && seq == sequence {
+                    observed.set(true);
+                }
+            })
+            .register();
+        while !done.get() && !failed.get() && Instant::now() < end {
+            loop_
+                .loop_()
+                .iterate(Timeout::Finite(Duration::from_millis(25)));
+        }
+        done.get() && !failed.get()
+    }
+
+    let Ok(id) = u32::try_from(action.node()) else {
+        return false;
+    };
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(pipewire::init);
+    let Ok(loop_) = MainLoopRc::new(None) else {
+        return false;
+    };
+    struct Entered<'a>(&'a pipewire::loop_::Loop);
+    impl Drop for Entered<'_> {
+        fn drop(&mut self) {
+            // SAFETY: matched to enter below on this worker thread.
+            unsafe { self.0.leave() };
+        }
+    }
+    // SAFETY: one worker owns this loop, and the guard pairs leave on every
+    // return path. No callbacks enter this loop recursively.
+    unsafe { loop_.loop_().enter() };
+    let _entered = Entered(loop_.loop_());
+    let Ok(context) = ContextRc::new(&loop_, None) else {
+        return false;
+    };
+    let Ok(core) = context.connect_rc(None) else {
+        return false;
+    };
+    let Ok(registry) = core.get_registry_rc() else {
+        return false;
+    };
+    let failed = Rc::new(Cell::new(false));
+    let errors = failed.clone();
+    let _errors = core
+        .add_listener_local()
+        .error(move |_, _, _, _| errors.set(true))
+        .register();
+    let bound = Rc::new(RefCell::new(None));
+    let target = bound.clone();
+    let observed = Rc::new(Cell::new(None));
+    let info_serial = observed.clone();
+    let lookup = registry.clone();
+    let _registry = registry
+        .add_listener_local()
+        .global(move |global| {
+            if global.id != id || global.type_ != pipewire::types::ObjectType::Node {
+                return;
+            }
+            if global
+                .props
+                .and_then(|props| props.get("object.serial"))
+                .and_then(|value| value.parse::<u64>().ok())
+                != Some(serial)
+            {
+                return;
+            }
+            let Ok(node) = lookup.bind::<pipewire::node::Node, _>(global) else {
+                return;
+            };
+            let observed = info_serial.clone();
+            let listener = node
+                .add_listener_local()
+                .info(move |info| {
+                    observed.set(
+                        info.props()
+                            .and_then(|props| props.get("object.serial"))
+                            .and_then(|value| value.parse::<u64>().ok()),
+                    );
+                })
+                .register();
+            *target.borrow_mut() = Some((node, listener));
+        })
+        .register();
+    let end = Instant::now() + Duration::from_secs(2);
+    // First barrier discovers globals; binds sent from those callbacks need
+    // their own second barrier before the Node's authoritative info arrives.
+    if !roundtrip(&loop_, &core, &failed, end)
+        || !roundtrip(&loop_, &core, &failed, end)
+        || !serial_matches(serial, observed.get())
+    {
+        return false;
+    }
+    let Some((node, listener)) = bound.borrow_mut().take() else {
+        return false;
+    };
+    match action {
+        Action::SetMute { muted, .. } => {
+            let object = pod::Object {
+                type_: pipewire::spa::sys::SPA_TYPE_OBJECT_Props,
+                id: pipewire::spa::sys::SPA_PARAM_Props,
+                properties: vec![Property {
+                    key: pipewire::spa::sys::SPA_PROP_mute,
+                    flags: pod::PropertyFlags::empty(),
+                    value: pod::Value::Bool(muted),
+                }],
+            };
+            let Ok((cursor, _)) = PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &pod::Value::Object(object),
+            ) else {
+                return false;
+            };
+            let buffer = cursor.into_inner();
+            let Some(param) = Pod::from_bytes(&buffer) else {
+                return false;
+            };
+            node.set_param(pipewire::spa::param::ParamType::Props, 0, param);
+            // Keep the proxy alive until the mutation's ordered barrier; if
+            // the object disappears, the request fails, never retargets by id.
+            let ok = roundtrip(&loop_, &core, &failed, end);
+            drop(listener);
+            drop(node);
+            ok
+        }
+        Action::DestroyNode { .. } => {
+            drop(listener);
+            if core.destroy_object(node).is_err() {
+                return false;
+            }
+            roundtrip(&loop_, &core, &failed, end)
+        }
+    }
+}
+
+/// GTK completion polling keeps native PipeWire discovery off its main loop.
+pub fn run_async(action: Action, serial: u64, done: impl FnOnce(bool) + 'static) {
+    let (send, receive) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name("tuna-privacy".into())
+        .spawn(move || {
+            let _ = send.send(run_bound(action, serial));
+        })
+        .is_err()
+    {
+        done(false);
+        return;
+    }
+    let mut done = Some(done);
+    glib::timeout_add_local(std::time::Duration::from_millis(25), move || {
+        let outcome = match receive.try_recv() {
+            Ok(ok) => ok,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        };
+        if let Some(done) = done.take() {
+            done(outcome);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 /// Bound on one blocking enforcement command (tests only).
 #[cfg(test)]
 const RUN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -388,6 +603,11 @@ mod tests {
     fn scan(mute_required: &[u64], destroy: &[u64], muted_now: &[u64]) -> PrivacyScan {
         PrivacyScan {
             authoritative: true,
+            serials: mute_required
+                .iter()
+                .chain(muted_now)
+                .map(|id| (*id, *id))
+                .collect(),
             audio_present: mute_required.iter().chain(muted_now).copied().collect(),
             mute_required: mute_required.iter().copied().collect(),
             destroy: destroy.to_vec(),
@@ -553,6 +773,7 @@ mod tests {
         fn lifted() -> PrivacyScan {
             PrivacyScan {
                 authoritative: true,
+                serials: BTreeMap::from([(7, 7)]),
                 audio_present: BTreeSet::from([7]),
                 ..PrivacyScan::default()
             }
@@ -584,6 +805,7 @@ mod tests {
         fn lifted() -> PrivacyScan {
             PrivacyScan {
                 authoritative: true,
+                serials: BTreeMap::from([(7, 7)]),
                 audio_present: BTreeSet::from([7]),
                 ..PrivacyScan::default()
             }
@@ -641,7 +863,7 @@ mod tests {
         assert_eq!(tracker.tracked(), &BTreeSet::from([7]));
         assert!(graph
             .feed(
-                br#"{"props":{"media.class":"Audio/Source"},"params":{"Props":[{"mute":true}]}}}]"#
+                br#"{"props":{"media.class":"Audio/Source","object.serial":7},"params":{"Props":[{"mute":true}]}}}]"#
             )
             .unwrap());
         let resumed = graph.privacy_scan(&policy);
@@ -654,6 +876,53 @@ mod tests {
         assert!(gone.feed(b"[]").unwrap());
         assert!(tracker.plan(&gone.privacy_scan(&policy)).is_empty());
         assert!(tracker.tracked().is_empty());
+    }
+
+    #[test]
+    fn coalesced_reused_id_does_not_inherit_restore_ownership() {
+        use crate::audio_state::AudioState;
+        use tuna_shell_host::settings::PrivacyPolicy;
+        let mut graph = AudioState::default();
+        let mut tracker = Tracker::default();
+        let mut queue = ActionQueue::default();
+        graph.feed(br#"[{"id":7,"info":{"props":{"media.class":"Audio/Source","object.serial":100},"params":{"Props":[{"mute":false}]}}}]"#).unwrap();
+        let denied = PrivacyPolicy {
+            microphone_disabled: true,
+            ..PrivacyPolicy::default()
+        };
+        queue.offer(tracker.plan(&graph.privacy_scan(&denied)));
+        let old_mute = queue.take(1)[0];
+        tracker.dispatched(&old_mute);
+        // A single monitor read can remove old7 and introduce a user-muted
+        // replacement7. No intermediate empty scan is visible to the tracker.
+        graph.feed(br#"[{"id":7,"info":null},{"id":7,"info":{"props":{"media.class":"Audio/Source","object.serial":101},"params":{"Props":[{"mute":true}]}}}]"#).unwrap();
+        let lifted = graph.privacy_scan(&PrivacyPolicy::default());
+        assert!(tracker.plan(&lifted).is_empty());
+        assert!(tracker.tracked().is_empty());
+        queue.offer(tracker.plan(&lifted));
+        assert!(queue.take(1).is_empty());
+        // A late completion from old100 cannot acquire/release ownership101.
+        tracker.completed_for(&old_mute, 100, true);
+        assert!(tracker.plan(&lifted).is_empty());
+    }
+
+    #[test]
+    fn stale_bound_identity_never_mutates_replacement_and_other_nodes_progress() {
+        let mut mutations = Vec::new();
+        let mut bound_apply = |expected, bound_serial, action| {
+            if serial_matches(expected, Some(bound_serial)) {
+                mutations.push(action);
+            }
+        };
+        // A queued old100 intent is refused if lookup now binds replacement101.
+        bound_apply(100, 101, unmute(7));
+        bound_apply(200, 200, mute(8));
+        assert_eq!(mutations, vec![mute(8)]);
+        assert!(!serial_matches(100, None));
+        // A previously verified bound100 remains that resource if the global
+        // id is reused; native requests use the proxy, never another id lookup.
+        assert!(serial_matches(100, Some(100)));
+        assert!(!serial_matches(100, Some(101)));
     }
 
     #[test]
@@ -746,7 +1015,7 @@ mod tests {
                     .iter()
                     .map(|(&id, (class, muted))| {
                         json!({"id": id,
-                            "info": {"props": {"media.class": class, "node.name": format!("node-{id}")},
+                            "info": {"props": {"media.class": class, "object.serial": id, "node.name": format!("node-{id}")},
                             "params": {"Props": [{"mute": muted}]}}})
                     })
                     .collect();
