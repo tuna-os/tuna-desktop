@@ -1,0 +1,288 @@
+#!/usr/bin/python3
+"""Source-matched native wellbeing pixels; synthetic supervised control, no GTK policy claim.
+Run in dbus-run-session with the same build.json/frozen bundle as native minimize.
+"""
+import argparse
+import ctypes
+import importlib.util
+import json
+import os
+from pathlib import Path
+import select
+import shutil
+import signal
+import subprocess
+import time
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, ROOT / 'scripts/lib' / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+BUNDLE = load('wellbeing_bundle', 'wellbeing-bundle.py')
+PIXELS = load('wellbeing_pixels', 'wellbeing-pixels.py')
+
+
+def identity(pid, expected):
+    executable = Path(f'/proc/{pid}/exe').resolve(strict=True)
+    assert executable == expected.resolve(), (pid, executable, expected)
+    stat = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+    return {'pid': pid, 'start_tick': stat[19], 'executable': str(executable), 'sha256': BUNDLE.digest(executable), 'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+
+
+def validate_saved_pixels(baseline, candidate, regions, desaturation, brightness):
+    # Saved output excludes the cursor; its other passes must still transform.
+    return PIXELS.verify(baseline, candidate, [r for r in regions if r['kind'] != 'cursor'], desaturation, brightness, required_kinds=frozenset(('texture', 'solid')))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bin-dir', type=Path, required=True)
+    parser.add_argument('--build-receipt', type=Path, required=True)
+    parser.add_argument('--artifacts', type=Path, required=True)
+    parser.add_argument('--display', default=':111')
+    args = parser.parse_args()
+    assert args.display.startswith(':') and args.display[1:].isdigit()
+    art = args.artifacts.resolve()
+    assert not art.exists(), 'fresh artifact directory required'
+    assert ROOT not in art.parents and art != ROOT
+    assert os.environ.get('DBUS_SESSION_BUS_ADDRESS'), 'private dbus-run-session required'
+    assert not Path(f'/tmp/.X11-unix/X{args.display[1:]}').exists(), 'refuse existing display'
+    manifest = BUNDLE.admit(ROOT, args.bin_dir, args.build_receipt, art / 'bin')
+    manifest.update({'proof_sha256': BUNDLE.digest(Path(__file__)), 'pixel_helper_sha256': BUNDLE.digest(ROOT / 'scripts/lib/wellbeing-pixels.py'), 'backend': 'native Wayland under winit/Xvfb/llvmpipe', 'installed_drm': False, 'gtk_wellbeing_policy': False})
+    runtime = art / 'runtime'
+    runtime.mkdir(mode=0o700)
+    clock, state, command, reply = [art / name for name in ('clock', 'state.json', 'command.json', 'reply.json')]
+    clock.write_text('0\n')
+    (runtime / 'tuna-wallpaper').write_text('file:///nonexistent-owned-wellbeing-image.png\n#309850\n#35b14b\n\n')
+    env = dict(os.environ, DISPLAY=args.display, XDG_RUNTIME_DIR=str(runtime), XDG_CONFIG_HOME=str(art / 'config'), XDG_DATA_HOME=str(art / 'data'), XDG_CACHE_HOME=str(art / 'cache'), GSETTINGS_BACKEND='keyfile', TUNA_COMPOSITOR_STATE=str(state), TUNA_ANIMATION_CLOCK=str(clock), TUNA_WELLBEING_COMMAND=str(command), TUNA_WELLBEING_REPLY=str(reply), TUNA_XWAYLAND='0', LIBGL_ALWAYS_SOFTWARE='1')
+    for key in ('WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'TUNA_SHELL_BIN', 'TUNA_PROOF_SHELL_BIN', 'LD_LIBRARY_PATH'):
+        env.pop(key, None)
+    processes, logs, pidfds, identities = [], [], [], []
+    generation, clock_value = 0, 0
+    success = False
+    def save_manifest():
+        (art / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    def spawn(argv, name, extra=None):
+        parent = os.getpid()
+        def parent_exit():
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() != parent:
+                os._exit(127)
+        log = (art / f'{name}.log').open('w')
+        logs.append(log)
+        proc = subprocess.Popen(argv, env=env | (extra or {}), stdout=log, stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=parent_exit)
+        processes.append(proc)
+        return proc
+    def wait(check, label):
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            assert all(p.poll() is None for p in processes), 'owned proof process exited'
+            try:
+                doc = json.loads(state.read_text())
+                if check(doc):
+                    (art / f'{label}.json').write_text(json.dumps(doc, indent=2) + '\n')
+                    return doc
+            except (OSError, ValueError, KeyError, IndexError):
+                pass
+            time.sleep(.05)
+        raise AssertionError(f'timed out: {label}')
+    def action(name, **kwargs):
+        nonlocal generation
+        generation += 1
+        temp = command.with_suffix('.tmp')
+        temp.write_text(json.dumps(dict(generation=generation, action=name, **kwargs)))
+        temp.replace(command)
+        wait(lambda _: reply.exists() and json.loads(reply.read_text())['generation'] == generation, f'command-{generation}-{name}')
+    def advance(delta):
+        nonlocal clock_value
+        before = json.loads(state.read_text())['rendered_frames']
+        clock_value += delta
+        temp = clock.with_suffix('.tmp')
+        temp.write_text(str(clock_value))
+        temp.replace(clock)
+        wait(lambda d: d['animation_clock_ms'] >= base + clock_value and d['rendered_frames'] >= before + 2, f'clock-{clock_value}')
+    def keys(*argv):
+        subprocess.run(['xdotool', *map(str, argv)], env=env, check=True, timeout=5)
+    def capture(name):
+        before = json.loads(state.read_text())['rendered_frames']
+        wait(lambda d: d['rendered_frames'] >= before + 2, name + '-presented')
+        path = art / f'{name}-host.png'
+        assert not path.exists()
+        subprocess.run(['scrot', str(path)], env=env, check=True, timeout=5)
+        assert path.exists()
+        saved = art / f'{name}-saved.png'
+        action('capture', filename=str(saved))
+        assert saved.exists()
+        return path, saved
+    def check_pair(baseline, candidate, regions, desaturation, brightness, label, *, cursor=True):
+        receipts = []
+        for kind, first, second in zip(('host', 'saved'), baseline, candidate):
+            with Image.open(first) as a, Image.open(second) as b:
+                if kind == 'saved':
+                    result = validate_saved_pixels(a.convert('RGB'), b.convert('RGB'), regions, desaturation, brightness)
+                else:
+                    result = PIXELS.verify(a.convert('RGB'), b.convert('RGB'), regions, desaturation, brightness, required_kinds=frozenset(('texture', 'solid', 'cursor') if cursor else ('texture', 'solid')))
+            result.update({'baseline_sha256': BUNDLE.digest(first), 'current_sha256': BUNDLE.digest(second), 'capture': kind})
+            receipts.append(result)
+        (art / f'{label}-pixels.json').write_text(json.dumps(receipts, indent=2) + '\n')
+    def effect(grayscale, fade):
+        action('effects', grayscale=grayscale, fade=fade)
+        wait(lambda d: abs(d['wellbeing_effects']['desaturation']) < 1e-5 if not grayscale else True, f'effect-{generation}-admitted')
+    def stop_on_signal(signum, _frame):
+        raise RuntimeError(f'proof interrupted by signal {signum}')
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, stop_on_signal)
+    save_manifest()
+    try:
+        subprocess.run([str(ROOT / 'scripts/tuna-cursor-client-build'), str(art / 'client')], env=env, check=True, timeout=60)
+        client_exe = art / 'client/tuna-cursor-client'
+        manifest['color_client'] = {'source_sha256': BUNDLE.digest(ROOT / 'scripts/lib/tuna-cursor-client.c'), 'builder_sha256': BUNDLE.digest(ROOT / 'scripts/tuna-cursor-client-build'), 'sha256': BUNDLE.digest(client_exe)}
+        xvfb = spawn(['Xvfb', args.display, '-screen', '0', '1280x800x24'], 'xvfb')
+        for _ in range(100):
+            assert xvfb.poll() is None
+            if subprocess.run(['xdotool', 'getdisplaygeometry'], env=env, capture_output=True, timeout=5).returncode == 0:
+                break
+            time.sleep(.05)
+        else:
+            raise AssertionError('Xvfb readiness failed')
+        compositor = spawn([str(art / 'bin/tuna-compositor'), '--socket', 'wellbeing-proof', '--shell-bin', str(art / 'bin/tuna-wellbeing-proof-shell')], 'compositor')
+        ready = wait(lambda d: d['animation_clock_manual'] and d['rendered_frames'] >= 3 and (art / 'compositor.log').exists() and '"ready":true' in (art / 'compositor.log').read_text(), 'ready')
+        identities.append(identity(compositor.pid, art / 'bin/tuna-compositor'))
+        # Supervised shell writes its PID through the compositor's inherited log.
+        peer_line = next(line for line in (art / 'compositor.log').read_text().splitlines() if line.startswith('{"ready":true'))
+        peer = json.loads(peer_line)
+        assert peer['parent'] == compositor.pid and peer['protocol'] == 35
+        identities.append(identity(peer['pid'], art / 'bin/tuna-wellbeing-proof-shell'))
+        pidfds.append(os.pidfd_open(peer['pid']))
+        manifest['processes'] = identities
+        save_manifest()
+        base = ready['animation_clock_ms']
+        host = subprocess.check_output(['xdotool', 'search', '--pid', str(compositor.pid), '--name', 'Smithay'], env=env, text=True, timeout=5).splitlines()
+        assert len(host) == 1
+        keys('windowfocus', '--sync', host[0])
+        geometry = dict(line.split('=', 1) for line in subprocess.check_output(['xdotool', 'getwindowgeometry', '--shell', host[0]], env=env, text=True).splitlines())
+        assert [int(geometry[k]) for k in ('X', 'Y', 'WIDTH', 'HEIGHT')] == [0, 0, 1280, 800]
+        client = spawn([str(client_exe), 'surface', '32'], 'color-client', {'WAYLAND_DISPLAY': 'wellbeing-proof'})
+        identities.append(identity(client.pid, client_exe))
+        wait(lambda d: len(d['windows']) == 1, 'native-map')
+        advance(1000)
+        settled = wait(lambda d: not d['window_lifecycle']['opening'], 'native-map-settled')
+        x, y, w, h = settled['windows'][0]['rect']
+        px, py = x + w // 2, y + h // 2
+        keys('mousemove', '--window', host[0], px, py)
+        wait(lambda d: d['cursor']['kind'] == 'surface', 'client-cursor-selected')
+        regions = [{'name': 'native-window-texture', 'kind': 'texture', 'rect': [x + 64, y + 64, 16, 16]}, {'name': 'chromatic-solid-clear', 'kind': 'solid', 'rect': [1000, 600, 16, 16]}, {'name': 'unchanged-client-cursor', 'kind': 'cursor', 'rect': [px + 4, py + 4, 16, 16]}]
+        (art / 'regions.json').write_text(json.dumps(regions, indent=2))
+        baseline = capture('00-neutral')
+        with Image.open(baseline[0]) as image:
+            for region, expected in zip(regions, [(143, 63, 208), (48, 152, 80), (224, 27, 36)]):
+                rx, ry, rw, rh = region['rect']
+                assert set(image.crop((rx, ry, rx + rw, ry + rh)).convert('RGB').getdata()) == {expected}, (region['name'], 'neutral producer pixels disagree')
+        # Independent effects and combined entry; disabled pair proves exact restoration.
+        for label, grayscale, fade in [('grayscale', True, False), ('fade', False, True), ('combined', True, True)]:
+            effect(grayscale, fade)
+            check_pair(baseline, capture(label + '-entry-zero'), regions, 0, 1, label + '-entry-zero')
+            advance(1500)
+            check_pair(baseline, capture(label + '-midpoint'), regions, .75 if grayscale else 0, .7 if fade else 1, label + '-midpoint')
+            advance(1500)
+            check_pair(baseline, capture(label + '-endpoint'), regions, 1 if grayscale else 0, .6 if fade else 1, label + '-endpoint')
+            effect(False, False)
+            check_pair(baseline, capture(label + '-immediate-off'), regions, 0, 1, label + '-immediate-off')
+        action('motion', level='fade-only')
+        effect(True, True)
+        advance(1500)
+        check_pair(baseline, capture('reduce-midpoint'), regions, .75, .7, 'reduce-midpoint')
+        effect(False, False)
+        action('motion', level='off')
+        effect(True, True)
+        check_pair(baseline, capture('off-immediate-endpoint'), regions, 1, .6, 'off-immediate-endpoint')
+        effect(False, False)
+        check_pair(baseline, capture('off-disabled'), regions, 0, 1, 'off-disabled')
+        # Held real Super+drag creates the native translucent tile solid pass.
+        keys('mousemove', '--window', host[0], x + 120, y + 40, 'keydown', 'Super_L', 'mousedown', 1)
+        keys('mousemove', '--window', host[0], 1, 400)
+        tile = wait(lambda d: d['tile_preview'] is not None, 'tile-preview-active')
+        tile_rect = tile['windows'][0]['rect']
+        tx, ty, tw, th = tile_rect
+        tile_regions = [{'name': 'dragged-window-texture', 'kind': 'texture', 'rect': [max(0, tx) + 40, max(32, ty) + 40, 16, 16]}, {'name': 'translucent-tile-solid', 'kind': 'solid', 'rect': [400, 700, 16, 16]}]
+        tile_neutral = capture('tile-neutral')
+        effect(True, True)
+        check_pair(tile_neutral, capture('tile-affected'), tile_regions, 1, .6, 'tile-affected', cursor=False)
+        effect(False, False)
+        check_pair(tile_neutral, capture('tile-restored'), tile_regions, 0, 1, 'tile-restored', cursor=False)
+        keys('mousemove', '--window', host[0], px, py, 'mouseup', 1, 'keyup', 'Super_L')
+        wait(lambda d: d['tile_preview'] is None, 'tile-ended')
+        # Populate two workspaces with real native windows so the dynamic
+        # trailing empty workspace exposes GNOME's actual thumbnail indicator.
+        action('workspace', workspace=1)
+        second_client = spawn([str(client_exe), 'surface', '32'], 'second-color-client', {'WAYLAND_DISPLAY': 'wellbeing-proof'})
+        identities.append(identity(second_client.pid, client_exe))
+        wait(lambda d: len(d['windows']) == 2, 'second-workspace-map')
+        action('workspace', workspace=0)
+        action('overview')
+        overview = wait(lambda d: d['overview_open'] and d['overview_progress'] == 1 and d['thumbnails'] and d['previews'], 'overview-active')
+        # Source geometry supplies candidate locations; chromatic pixels remain
+        # the assertion authority, with explicit kind controls rather than labels.
+        neutral = capture('overview-neutral')
+        active_thumbnails = [thumbnail for thumbnail in overview['thumbnails'] if thumbnail['active']]
+        assert len(active_thumbnails) == 1, 'one real active workspace indicator required'
+        sx, sy, sw, sh = active_thumbnails[0]['rect']
+        sx, sy = sx + sw // 2 - 2, sy - 3
+        with Image.open(neutral[0]) as image:
+            assert set(image.crop((sx, sy, sx + 4, sy + 3)).convert('RGB').getdata()) == {(53, 177, 75)}, 'source-indicated ring must render the configured chromatic accent'
+        previews = overview['previews']
+        assert previews, 'no real overview window preview'
+        vx, vy, vw, vh = previews[0]['rect']
+        overview_regions = [{'name': 'overview-window-texture', 'kind': 'texture', 'rect': [vx + vw // 2 - 32, vy + vh // 2, 8, 8]}, {'name': 'overview-indicator-solid', 'kind': 'solid', 'rect': [sx, sy, 4, 3]}]
+        effect(True, True)
+        check_pair(neutral, capture('overview-affected'), overview_regions, 1, .6, 'overview-affected', cursor=False)
+        effect(False, False)
+        check_pair(neutral, capture('overview-restored'), overview_regions, 0, 1, 'overview-restored', cursor=False)
+        for record in identities:
+            assert identity(record['pid'], Path(record['executable'])) == record, 'process identity changed during proof'
+        assert BUNDLE.digest(art / 'bin/tuna-compositor') == manifest['sha256']['tuna-compositor']
+        assert BUNDLE.digest(art / 'bin/tuna-wellbeing-proof-shell') == manifest['sha256']['tuna-wellbeing-proof-shell']
+        assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip() == manifest['source_commit']
+        assert not subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip()
+        manifest['processes'] = identities
+        success = True
+    finally:
+        stopped = True
+        for proc in reversed(processes):
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=5)
+            stopped &= proc.poll() is not None
+        for pidfd in pidfds:
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
+            if not poller.poll(1000):
+                signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                if not poller.poll(1000):
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    stopped &= bool(poller.poll(1000))
+            os.close(pidfd)
+        for log in logs:
+            log.close()
+        shutil.rmtree(runtime)
+        manifest['owned_cleanup'] = {'processes_stopped': stopped, 'runtime_removed': not runtime.exists()}
+        manifest['success'] = success and stopped and not runtime.exists()
+        save_manifest()
+        assert manifest['owned_cleanup'] == {'processes_stopped': True, 'runtime_removed': True}
+    assert manifest['success']
+    (art / 'assertions.txt').write_text('WB-RENDER pass actual host and authorized saved output pixels; independent and combined entry/midpoint/endpoint, immediate off, reduce and Off controls; cursor bypass; real tile/overview solids; source/process ownership and cleanup\n')
+    print(f'wellbeing renderer proof passed: {art}')
+
+
+if __name__ == '__main__':
+    main()

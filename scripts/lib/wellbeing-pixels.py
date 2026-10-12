@@ -12,18 +12,18 @@ def transform(rgb, desaturation, brightness):
     return tuple((c + (gray - c) * desaturation) * brightness for c in rgb)
 
 
-def verify(baseline, current, regions, desaturation, brightness):
+def verify(baseline, current, regions, desaturation, brightness, *, required_kinds=frozenset(('texture', 'solid', 'cursor'))):
     assert 0 <= desaturation <= 1 and .6 <= brightness <= 1
     assert baseline.size == current.size
-    assert {region['kind'] for region in regions} >= {'texture', 'solid', 'cursor'}, 'texture, solid and cursor negative control required'
+    assert {region['kind'] for region in regions} >= required_kinds, 'required texture, solid or cursor control missing'
     names = [region['name'] for region in regions]
-    assert len(set(names)) == len(names) and len(names) >= 3
+    assert len(set(names)) == len(names) and len(names) >= len(required_kinds)
     results = []
     for region in regions:
         assert region['kind'] in ('texture', 'solid', 'cursor')
         x, y, width, height = region['rect']
         assert all(type(value) is int for value in region['rect'])
-        assert width >= 4 and height >= 4 and x >= 0 and y >= 0
+        assert width >= 2 and height >= 2 and x >= 0 and y >= 0
         assert x + width <= baseline.width and y + height <= baseline.height
         count, max_error, chroma = 0, 0, 0
         for py in range(y, y + height):

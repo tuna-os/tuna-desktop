@@ -68,3 +68,50 @@ Four focused Python checker tests pass. Rust transition/codec/color tests and
 real compositor framebuffer acceptance await exact-head CI. Installed DRM,
 multi-output pixels, hardware power/performance and full #354 acceptance remain
 unqualified.
+
+## Live CI renderer proof
+
+The existing native freeze build invocation must additionally include
+`--example tuna-wellbeing-proof-shell`. Retain its original Cargo JSON output
+and frozen bundle; the wellbeing proof admits the extra example from that
+same receipt only after all original executable hashes, source commit and
+Cargo.lock match. Original freeze receipts remain immutable. Run before live
+accessibility creates artifacts inside the checkout:
+
+```sh
+/usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
+/usr/bin/python3 scripts/lib/wellbeing-pixels-tests.py
+dbus-run-session -- /usr/bin/python3 scripts/tuna-wellbeing-proof \
+  --bin-dir "$RUNNER_TEMP/native-minimize/frozen" \
+  --build-receipt "$RUNNER_TEMP/native-minimize/build.json" \
+  --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
+```
+
+This proof performs actual capture and pixel checks. Its supervised synthetic
+shell owns the authenticated control connection and authorized Screenshot
+D-Bus calls; the native C color client sets a real client cursor. Commands go
+through protocol 0.35, not a compositor state-file override. Frozen animation
+time drives independent and combined effect entry, midpoint, endpoint,
+immediate disabled restoration, reduced motion and animations-off. Both host
+`scrot` captures and saved Screenshot PNGs are checked; saved output has no
+cursor region. The host cursor remains colored. Held real Super+drag creates
+the translucent tile pass; real native windows on two dynamic workspaces expose the overview workspace
+indicator solid and window texture preview. Required regions are admitted by
+source geometry and checked against actual chromatic producer pixels.
+
+Artifacts live outside the checkout in a fresh directory and include original
+freeze/build-receipt hashes, exact compositor/proof-peer/client identities,
+boot ID and process start ticks, per-image SHA receipts, passive frame admission
+and cleanup status. The proof refuses existing displays, mismatched/stale/dirty
+source, ambiguous/missing examples and overwritten bundles. Child processes
+have parent-exit signals; an owned pidfd tracks the supervised peer. Source and
+process identities are checked again before a pass. Interruptions enter owned
+cleanup and cannot emit the acceptance receipt.
+
+Seven admission/source tests and four pixel checker tests pass locally. The
+new example and live proof still await exact-head CI; these tests use fake
+artifact bytes and synthetic pixels and do not count as native acceptance.
+Retain the reconciled boxed InputSettings API before combined CI. This proof
+qualifies renderer behavior only when it runs successfully; GTK GSettings,
+usage timers, notifications, screen-cast transport, installed DRM and hardware
+acceptance remain separate.
