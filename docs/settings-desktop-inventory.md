@@ -10,6 +10,8 @@ Orientation follow-up: w2-345 (#345). `orientation-lock` never lived under `org.
 
 Privacy follow-up: w3-356-privacy (#356). The three `org.gnome.desktop.privacy` device kill-switches move to Honored with the enforcing services identified per key; retention, diagnostics, and reporting rows stay Ignored as external-service responsibilities. Mechanism, GNOME 51 comparison, and proof matrix are in [privacy-enforcement.md](privacy-enforcement.md).
 
+Wellbeing follow-up: candidate `529f71648f3286092b55b93f59983a2882de3ec5` (2026-10-12). The GTK entry point starts [the wellbeing runtime](../crates/shell-gtk/src/wellbeing.rs), which watches the schemas, maintains `$XDG_DATA_HOME/gnome-shell/session-active-history.json`, registers notice actions and sends effects through the control client with correlated `Applied` responses. [Exact-source native renderer evidence](https://github.com/tuna-os/tuna-desktop/actions/runs/38320982358) was independently rechecked for 38 pixel comparisons from 44 original PNGs: entry/midpoint/endpoint, combined effects, immediate disable, reduced-motion/animations-off controls and cursor exclusion under nested winit/Xvfb/llvmpipe. This uses a supervised synthetic control peer; it does not qualify production GTK wellbeing policy, installed DRM/GPU sessions or the complete feature. Countdown stop currently clears runtime state without an explicit OSD dismissal. [#354](https://github.com/tuna-os/tuna-desktop/issues/354) remains open.
+
 Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.14.5/gdk/wayland/gdkdisplay-wayland.c). Related shell, Mutter and settings-daemon keys are in [settings-map.md](settings-map.md).
 
 ## org.gnome.desktop.a11y
@@ -132,10 +134,10 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| countdown | Honored | OSD countdown in the last 60 s before a break |
-| delay-seconds | Ignored | No notification action invokes delay yet (notify action support pending) |
+| countdown | Honored (partial) | OSD countdown in the last 60 s before a break; StopCountdown clears runtime state without an explicit OSD dismissal. Production GTK policy and installed-session acceptance remain open (#354) |
+| delay-seconds | Honored (partial) | GTK wellbeing notice Delay callback queues the action; the 2 s break tick invokes delay_break with the live per-type delay setting. Production GTK policy and installed-session acceptance remain open (#354) |
 | duration-seconds | Honored | Break length for scheduling and idle-take detection |
-| fade-screen | Honored (partial) | Desired-state fade request observed and logged; no working pixels yet, compositor hook pending (#354 consumers open) |
+| fade-screen | Honored (partial) | GTK wellbeing effect hook → correlated protocol0.35 Applied → compositor wellbeing_effects brightness fade. Exact-source native renderer pixels independently verified; production GTK policy and installed DRM/GPU acceptance remain open (#354) |
 | interval-seconds | Honored | Time between breaks |
 | lock-screen | Honored | Locks the session when the break starts |
 | notify | Honored | Due/overdue notices posted; tray-only urgency not distinguished yet |
@@ -146,10 +148,10 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| countdown | Honored | OSD countdown in the last 60 s before a break |
-| delay-seconds | Ignored | No notification action invokes delay yet (notify action support pending) |
+| countdown | Honored (partial) | OSD countdown in the last 60 s before a break; StopCountdown clears runtime state without an explicit OSD dismissal. Production GTK policy and installed-session acceptance remain open (#354) |
+| delay-seconds | Honored (partial) | GTK wellbeing notice Delay callback queues the action; the 2 s break tick invokes delay_break with the live per-type delay setting. Production GTK policy and installed-session acceptance remain open (#354) |
 | duration-seconds | Honored | Break length for scheduling and idle-take detection |
-| fade-screen | Honored (partial) | Desired-state fade request observed and logged; no working pixels yet, compositor hook pending (#354 consumers open) |
+| fade-screen | Honored (partial) | GTK wellbeing effect hook → correlated protocol0.35 Applied → compositor wellbeing_effects brightness fade. Exact-source native renderer pixels independently verified; production GTK policy and installed DRM/GPU acceptance remain open (#354) |
 | interval-seconds | Honored | Time between breaks |
 | lock-screen | Honored | Locks the session when the break starts |
 | notify | Honored | Due/overdue notices posted; tray-only urgency not distinguished yet |
@@ -457,7 +459,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 |---|---|---|
 | daily-limit-enabled | Honored | Limit evaluated on the 30 s poll and on settings change |
 | daily-limit-seconds | Honored | Daily allowance in seconds |
-| grayscale | Honored (partial) | Desired-state grayscale request observed and logged; no working pixels yet, compositor hook pending (#354 consumers open) |
+| grayscale | Honored (partial) | GTK screen-time tracker → correlated protocol0.35 Applied → compositor wellbeing_effects desaturation. Exact-source native renderer pixels independently verified; production GTK policy and installed DRM/GPU acceptance remain open (#354) |
 | history-enabled | Honored | Recording on/off; off deletes the history file live |
 ## org.gnome.desktop.screensaver
 
