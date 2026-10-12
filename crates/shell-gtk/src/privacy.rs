@@ -660,7 +660,7 @@ mod tests {
         use serde_json::json;
         use tuna_shell_host::settings::PrivacyPolicy;
 
-        use super::{Action, ActionQueue, Tracker, mute, unmute};
+        use super::{mute, unmute, Action, ActionQueue, Tracker};
         use crate::audio_state::AudioState;
 
         /// A fake PipeWire graph: node id → (media class, muted).
@@ -829,11 +829,9 @@ mod tests {
             let planned = rig.tracker.plan(&scan);
             let planned_nodes: BTreeSet<u64> = planned.iter().map(|action| action.node()).collect();
             assert_eq!(planned_nodes, policy);
-            assert!(
-                planned
-                    .iter()
-                    .all(|action| *action == unmute(action.node()))
-            );
+            assert!(planned
+                .iter()
+                .all(|action| *action == unmute(action.node())));
             rig.queue.offer(planned);
             let batch = rig.queue.take(64);
             assert_eq!(batch.len(), 64);
@@ -983,7 +981,7 @@ mod tests {
         use std::process::{Child, Command, Stdio};
         use std::time::{Duration, Instant};
 
-        use super::{Action, Tracker, run_blocking};
+        use super::{run_blocking, Action, Tracker};
         use crate::audio_state::AudioState;
         use tuna_shell_host::settings::PrivacyPolicy;
 
