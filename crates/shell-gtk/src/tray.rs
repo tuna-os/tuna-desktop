@@ -196,9 +196,10 @@ pub fn tray(
                             popover.add_controller(escape_keys);
                         }
                         button.set_tooltip_text(item.tooltip.as_deref());
-                        // Alternate click activates the item's secondary action.
+                        // Middle click sends SecondaryActivate, as GNOME's
+                        // AppIndicator extension does.
                         let secondary_click = gtk::GestureClick::new();
-                        secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
+                        secondary_click.set_button(gtk::gdk::BUTTON_MIDDLE);
                         let (to_secondary, service_secondary) =
                             (to_worker.clone(), item.service.clone());
                         secondary_click.connect_pressed(move |_, _, _, _| {
