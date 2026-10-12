@@ -89,6 +89,11 @@ def set_value(acc, target, value):
 
 def main():
     args = sys.argv[1:]
+    expected_pid = None
+    if "--pid" in args:
+        i = args.index("--pid")
+        expected_pid = int(args[i + 1])
+        del args[i:i + 2]
     target = None
     setting = None
     if "--press" in args:
@@ -107,6 +112,8 @@ def main():
         for i in range(desktop.childCount):
             app = desktop.getChildAtIndex(i)
             if app is not None and app.name == name:
+                if expected_pid is not None and app.get_process_id() != expected_pid:
+                    continue
                 if target is not None:
                     if not press(app, target):
                         print(f"tuna-a11y-dump: nothing named {target} to press", file=sys.stderr)
@@ -119,6 +126,8 @@ def main():
                     time.sleep(1.5)
                 nodes = []
                 walk(app, 0, nodes)
+                if expected_pid is not None:
+                    nodes[0]["process_id"] = app.get_process_id()
                 with open(path, "w") as fh:
                     json.dump(nodes, fh, indent=1)
                 print(f"tuna-a11y-dump: {len(nodes)} nodes from {name}")

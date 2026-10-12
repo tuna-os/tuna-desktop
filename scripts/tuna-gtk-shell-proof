@@ -1098,14 +1098,19 @@ end=$(($(date +%s) + 10))
 until [ -s "$TRAY_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q "^clicked 1" "$TRAY_MARKER" 2>/dev/null || fail G-TRAY "the menu row never reached the item"
 kill "$TRAY_PID" 2>/dev/null || true
+tray_absent=0
 for _ in $(seq 1 30); do
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-tray-gone.json" 20 >/dev/null 2>&1
-    showing "$ARTIFACTS/a11y-tray-gone.json" "Tuna Desktop Tray Probe" || break
+    if "$PY" "$ROOT/scripts/lib/tuna_tray_absence.py" "$ARTIFACTS/privacy-portal/receipt.json" \
+        "$ARTIFACTS/a11y-tray-gone.json" "$ROOT/scripts/lib/tuna-a11y-dump.py"; then
+        tray_absent=1
+        break
+    else
+        tray_observation=$?
+        [ "$tray_observation" = 2 ] || fail G-TRAY "fresh owner-bound tray absence observation failed"
+    fi
     sleep 0.5
 done
-if showing "$ARTIFACTS/a11y-tray-gone.json" "Tuna Desktop Tray Probe"; then
-    fail G-TRAY "the item stayed in the panel after it exited"
-fi
+[ "$tray_absent" = 1 ] || fail G-TRAY "the item stayed in the panel after it exited"
 pass G-TRAY "an AppIndicator item shows with its tooltip, fires its menu, and leaves on exit"
 xdotool key Escape
 sleep 1
