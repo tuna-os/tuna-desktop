@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -185,6 +186,15 @@ class InstalledPolicy(unittest.TestCase):
                 self.assertEqual(M.observe(100, 'owned', base, prior, True)['shell']['pid'], 102)
 
 
+def copy_shipped_icons(destination):
+    # Local worktrees may use a group-writable checkout umask. Build an
+    # immutable fixture payload with the same bytes/symlinks as the CI source.
+    shutil.copytree(ROOT / 'share/tuna-desktop/icons', destination, symlinks=True)
+    for path in destination.rglob('*'):
+        if path.is_file() and not path.is_symlink():
+            path.chmod(path.stat().st_mode & ~0o022)
+
+
 class PackagePolicy(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -203,6 +213,9 @@ class PackagePolicy(unittest.TestCase):
             p = self.stage / name
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('fixture\n')
+        # Use the real shipped private theme and its integrity manifest rather
+        # than bypassing asset admission in these controlled package fixtures.
+        copy_shipped_icons(self.stage / 'usr/share/tuna-desktop/icons')
         self.env = dict(os.environ, PATH=str(self.tools) + ':' + os.environ['PATH'], FIXTURE=str(self.stage))
         self.tool('dpkg-deb', '''case "$1" in
 -c) find "$FIXTURE" -type f | while read -r path; do echo "-rwxr-xr-x $path"; done ;;
@@ -232,6 +245,21 @@ esac''')
 
     def test_positive_controlled_tool_policy(self):
         self.assertEqual(self.check(), 0)
+
+    def test_missing_shipped_cursor_asset_is_rejected(self):
+        theme = self.stage / 'usr/share/tuna-desktop/icons/Adwaita'
+        manifest = json.loads((theme / 'UPSTREAM.json').read_text())
+        entry = next(item for item in manifest['entries'] if item['path'].endswith('.svg'))
+        (theme / entry['path']).unlink()
+        self.assertNotEqual(self.check(), 0)
+
+    def test_group_writable_shipped_cursor_asset_is_rejected(self):
+        theme = self.stage / 'usr/share/tuna-desktop/icons/Adwaita'
+        manifest = json.loads((theme / 'UPSTREAM.json').read_text())
+        entry = next(item for item in manifest['entries'] if item['path'].endswith('.svg'))
+        path = theme / entry['path']
+        path.chmod(path.stat().st_mode | 0o020)
+        self.assertNotEqual(self.check(), 0)
 
     def test_compatibility_names_required(self):
         # tuna-rename: keep-begin
@@ -292,7 +320,7 @@ esac''')
 
 
 class ReleaseDelegatePolicy(unittest.TestCase):
-    def run_release(self, failure='', version_exit=0):
+    def run_release(self, failure='', version_exit=0, missing_cursor=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             tools = root / 'tools'
@@ -318,6 +346,15 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
+            copy_shipped_icons(root / 'share/tuna-desktop/icons')
+            checker = root / 'scripts/tuna-cursor-assets-check'
+            checker.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / 'scripts/tuna-cursor-assets-check', checker)
+            if missing_cursor:
+                theme = root / 'share/tuna-desktop/icons/Adwaita'
+                manifest = json.loads((theme / 'UPSTREAM.json').read_text())
+                entry = next(item for item in manifest['entries'] if item['path'].endswith('.svg'))
+                (theme / entry['path']).unlink()
             output = root / 'control'
             result = subprocess.run(['sh', str(ROOT / 'scripts/tuna-release'), '--allow-dirty', '--out', str(root/'out')], cwd=root, env=dict(os.environ, PATH=str(tools)+':'+os.environ['PATH'], OUTPUT=str(output)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             return result.returncode, output.read_text() if output.exists() else None
@@ -333,6 +370,11 @@ class ReleaseDelegatePolicy(unittest.TestCase):
         self.assertIn('libpam0g', depends)
         self.assertIn('gsettings-desktop-schemas', depends)
         self.assertNotIn('libpam0', depends)
+
+    def test_release_rejects_missing_private_cursor_asset(self):
+        status, control = self.run_release(missing_cursor=True)
+        self.assertNotEqual(status, 0)
+        self.assertIsNone(control)
 
     def test_shlibs_failure_or_unknown_output_cannot_package(self):
         for failure in ('shlibs', 'malformed'):
