@@ -479,8 +479,8 @@ impl ControlClient {
         fade: bool,
     ) -> Result<bool, ControlError> {
         let pair = (grayscale, fade);
-        if let Some((_, _, deadline)) = self.wellbeing_pending {
-            if Instant::now() < deadline {
+        if let Some((_, pending_pair, deadline)) = self.wellbeing_pending {
+            if pending_pair == pair && Instant::now() < deadline {
                 return Ok(false);
             }
             self.wellbeing_pending = None;
@@ -1783,6 +1783,35 @@ mod tests {
             }
             other => panic!("unexpected effect frame {other:?}"),
         }
+    }
+
+    #[test]
+    fn wellbeing_disable_supersedes_pending_enable_without_waiting_for_timeout() {
+        let (mut client, mut peer) = handshook();
+        assert!(!client.reconcile_wellbeing_effects(true, true).unwrap());
+        let enable = effect_command_id(&mut peer, (true, true));
+        assert!(!client.reconcile_wellbeing_effects(false, false).unwrap());
+        let disable = effect_command_id(&mut peer, (false, false));
+        assert_ne!(enable, disable);
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: enable,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.wellbeing_applied.is_none());
+        assert_eq!(client.wellbeing_pending.unwrap().0, disable);
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: disable,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.reconcile_wellbeing_effects(false, false).unwrap());
     }
 
     #[test]
