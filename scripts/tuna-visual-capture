@@ -46,22 +46,40 @@ STAGE_FILTER=""
 ARTIFACTS=""
 BIN_DIR=""
 DISPLAY_ARG=""
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --list) MODE="list"; shift ;;
-        --all) MODE="all"; shift ;;
-        --merge) MODE="merge"; shift ;;
-        --check-matrix) MODE="check-matrix"; shift ;;
-        --provenance) MODE="provenance"; shift ;;
-        --stage) MODE="stage"; STAGE="$2"; shift 2 ;;
-        --stages) STAGE_FILTER="$2"; shift 2 ;;
-        --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --bin-dir) BIN_DIR="$2"; shift 2 ;;
-        --display) DISPLAY_ARG="$2"; shift 2 ;;
+# Parsed without shifting: "$@" must stay intact for the private-bus
+# re-exec below.
+expect=""
+for arg in "$@"; do
+    if [ -n "$expect" ]; then
+        case "$expect" in
+            stage) MODE="stage"; STAGE="$arg" ;;
+            stages) STAGE_FILTER="$arg" ;;
+            artifacts) ARTIFACTS="$arg" ;;
+            bin-dir) BIN_DIR="$arg" ;;
+            display) DISPLAY_ARG="$arg" ;;
+        esac
+        expect=""
+        continue
+    fi
+    case "$arg" in
+        --list) MODE="list" ;;
+        --all) MODE="all" ;;
+        --merge) MODE="merge" ;;
+        --check-matrix) MODE="check-matrix" ;;
+        --provenance) MODE="provenance" ;;
+        --stage) expect="stage" ;;
+        --stages) expect="stages" ;;
+        --artifacts) expect="artifacts" ;;
+        --bin-dir) expect="bin-dir" ;;
+        --display) expect="display" ;;
         --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
-        *) echo "tuna-visual-capture: unknown argument $1" >&2; exit 1 ;;
+        *) echo "tuna-visual-capture: unknown argument $arg" >&2; exit 1 ;;
     esac
 done
+if [ -n "$expect" ]; then
+    echo "tuna-visual-capture: --$expect needs a value" >&2
+    exit 1
+fi
 
 # Ledger rows each stage collects evidence for (space-separated).
 stage_ledger() {
@@ -1665,7 +1683,8 @@ run_stage() {
     ARTIFACTS="$2"
     export STAGE
     trap session_cleanup EXIT INT TERM
-    : >"$ARTIFACTS/frames.jsonl" 2>/dev/null || true
+    mkdir -p "$ARTIFACTS"
+    : >"$ARTIFACTS/frames.jsonl"
     started="$(date -u +%FT%TZ)"
     if ! session_start "$ARTIFACTS"; then
         echo "tuna-visual-capture [$STAGE]: session never came up" >&2
