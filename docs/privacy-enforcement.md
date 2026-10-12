@@ -185,3 +185,5 @@ lookup).
 - A prompting Access UI (production uses the desktop backend's).
 - Mutter full-tree consumer check for the two audio keys.
 - Installed-image qualification on hardware with a real camera.
+
+Native execution verifies Core cookie and object serial, binds the Node resource, and sends mutations through that proxy. Numeric CLI execution remains only an independent legacy test driver. The GTK CI job requires an isolated real PipeWire mute/restore and wrong-identity refusal proof; unit tests alone do not qualify native execution.

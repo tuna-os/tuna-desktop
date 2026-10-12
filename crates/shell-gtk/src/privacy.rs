@@ -2,9 +2,8 @@
 //!
 //! GTK-free: the [`Tracker`] plans mute/destroy steps from graph
 //! scans ([`AudioState::privacy_scan`](crate::audio_state::AudioState::privacy_scan))
-//! and the caller executes them — the GLib loop through the existing
-//! async `wpctl`/`pw-cli` helpers, blocking test drivers through
-//! [`run_blocking`].
+//! and native workers execute them against verified bound Node proxies.
+//! Numeric CLI helpers are retained only as independent test drivers.
 //!
 //! Enforcement rules (see `docs/privacy-enforcement.md` for the
 //! GNOME comparison):
@@ -33,14 +32,14 @@ use std::time::{Duration, Instant};
 /// One enforcement step against the PipeWire graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Set a node's mute flag by id (`wpctl set-mute`).
+    /// Set a verified bound node's mute flag.
     SetMute {
         /// Node id from `pw-dump`.
         node: u64,
         /// Target mute state (`false` only on restore).
         muted: bool,
     },
-    /// Destroy a node by id (`pw-cli destroy`): camera devices and
+    /// Destroy a verified bound node: camera devices and
     /// their capture streams while the camera is disabled.
     DestroyNode {
         /// Node id from `pw-dump`.
@@ -65,6 +64,8 @@ pub struct PrivacyScan {
     /// A complete initial dump has established this monitor's graph baseline.
     /// False during disconnect/restart and while that dump is partially read.
     pub authoritative: bool,
+    /// Server instance identity: serials are unique only within this Core.
+    pub cookie: Option<u32>,
     /// PipeWire object.serial identifies the lifetime behind a reusable id.
     pub serials: BTreeMap<u64, u64>,
     /// Audio nodes still present, even when their mute snapshot is stale.
@@ -116,6 +117,7 @@ pub struct Tracker {
     muted_by_policy: BTreeSet<u64>,
     unsettled_mutes: BTreeSet<u64>,
     serials: BTreeMap<u64, u64>,
+    cookie: Option<u32>,
 }
 
 impl Tracker {
@@ -127,10 +129,15 @@ impl Tracker {
     /// (restored, whether by us or another party, or gone from the
     /// graph) is forgotten silently.
     pub fn plan(&mut self, scan: &PrivacyScan) -> Vec<Action> {
-        if !scan.authoritative {
+        if !scan.authoritative || scan.cookie.is_none() {
             // Preserve ownership; callers must also leave queued work alone.
             return Vec::new();
         }
+        if self.cookie != scan.cookie {
+            self.muted_by_policy.clear();
+            self.unsettled_mutes.clear();
+        }
+        self.cookie = scan.cookie;
         // Coalesced tombstone/replacement events can reuse an id without an
         // observable absent scan. Never transfer restore ownership to it.
         self.muted_by_policy
@@ -191,14 +198,20 @@ impl Tracker {
     #[cfg(test)]
     pub fn completed(&mut self, action: &Action, success: bool) {
         if let Some(serial) = self.serials.get(&action.node()).copied() {
-            self.completed_for(action, serial, success);
+            self.completed_for(action, self.cookie, serial, success);
         }
     }
 
     /// Async outcomes belong to the serial captured at dispatch, not a
     /// replacement with the same global id observed before completion.
-    pub fn completed_for(&mut self, action: &Action, serial: u64, success: bool) {
-        if self.serials.get(&action.node()) != Some(&serial) {
+    pub fn completed_for(
+        &mut self,
+        action: &Action,
+        cookie: Option<u32>,
+        serial: u64,
+        success: bool,
+    ) {
+        if self.cookie != cookie || self.serials.get(&action.node()) != Some(&serial) {
             return;
         }
         if success {
@@ -364,7 +377,7 @@ fn serial_matches(expected: u64, observed: Option<u64>) -> bool {
 
 /// Execute against a verified bound Node proxy, never a reusable global id.
 /// Each worker has one two-second deadline for discovery, identity and mutation.
-fn run_bound(action: Action, serial: u64) -> bool {
+fn run_bound(action: Action, cookie: u32, serial: u64) -> bool {
     use pipewire::spa::pod::{self, serialize::PodSerializer, Pod, Property};
     use pipewire::{context::ContextRc, core::CoreRc, loop_::Timeout, main_loop::MainLoopRc};
     use std::{
@@ -425,6 +438,12 @@ fn run_bound(action: Action, serial: u64) -> bool {
     };
     let failed = Rc::new(Cell::new(false));
     let errors = failed.clone();
+    let server_cookie = Rc::new(Cell::new(None));
+    let info_cookie = server_cookie.clone();
+    let _info = core
+        .add_listener_local()
+        .info(move |info| info_cookie.set(Some(info.cookie())))
+        .register();
     let _errors = core
         .add_listener_local()
         .error(move |_, _, _, _| errors.set(true))
@@ -470,6 +489,7 @@ fn run_bound(action: Action, serial: u64) -> bool {
     // their own second barrier before the Node's authoritative info arrives.
     if !roundtrip(&loop_, &core, &failed, end)
         || !roundtrip(&loop_, &core, &failed, end)
+        || server_cookie.get() != Some(cookie)
         || !serial_matches(serial, observed.get())
     {
         return false;
@@ -516,13 +536,20 @@ fn run_bound(action: Action, serial: u64) -> bool {
     }
 }
 
+/// A successful old-resource command does not settle replacement demand.
+pub fn completion_needs_replan(scan: &PrivacyScan, node: u64, cookie: u32, serial: u64) -> bool {
+    scan.authoritative
+        && scan.cookie.is_some()
+        && (scan.cookie != Some(cookie) || scan.serials.get(&node) != Some(&serial))
+}
+
 /// GTK completion polling keeps native PipeWire discovery off its main loop.
-pub fn run_async(action: Action, serial: u64, done: impl FnOnce(bool) + 'static) {
+pub fn run_async(action: Action, cookie: u32, serial: u64, done: impl FnOnce(bool) + 'static) {
     let (send, receive) = std::sync::mpsc::channel();
     if std::thread::Builder::new()
         .name("tuna-privacy".into())
         .spawn(move || {
-            let _ = send.send(run_bound(action, serial));
+            let _ = send.send(run_bound(action, cookie, serial));
         })
         .is_err()
     {
@@ -603,9 +630,11 @@ mod tests {
     fn scan(mute_required: &[u64], destroy: &[u64], muted_now: &[u64]) -> PrivacyScan {
         PrivacyScan {
             authoritative: true,
+            cookie: Some(1),
             serials: mute_required
                 .iter()
                 .chain(muted_now)
+                .chain(destroy)
                 .map(|id| (*id, *id))
                 .collect(),
             audio_present: mute_required.iter().chain(muted_now).copied().collect(),
@@ -773,6 +802,7 @@ mod tests {
         fn lifted() -> PrivacyScan {
             PrivacyScan {
                 authoritative: true,
+                cookie: Some(1),
                 serials: BTreeMap::from([(7, 7)]),
                 audio_present: BTreeSet::from([7]),
                 ..PrivacyScan::default()
@@ -805,6 +835,7 @@ mod tests {
         fn lifted() -> PrivacyScan {
             PrivacyScan {
                 authoritative: true,
+                cookie: Some(1),
                 serials: BTreeMap::from([(7, 7)]),
                 audio_present: BTreeSet::from([7]),
                 ..PrivacyScan::default()
@@ -829,6 +860,7 @@ mod tests {
         assert!(tracker
             .plan(&PrivacyScan {
                 authoritative: true,
+                cookie: Some(1),
                 ..PrivacyScan::default()
             })
             .is_empty());
@@ -856,7 +888,7 @@ mod tests {
         assert!(tracker.plan(&initial).is_empty());
         assert_eq!(tracker.tracked(), &BTreeSet::from([7]));
         assert_eq!(queue.len(), 1);
-        assert!(!graph.feed(b"[{\"id\":7,\"info\":").unwrap());
+        assert!(!graph.feed(b"[{\"id\":0,\"type\":\"PipeWire:Interface:Core\",\"info\":{\"cookie\":1}},{\"id\":7,\"info\":").unwrap());
         let partial = graph.privacy_scan(&policy);
         assert!(!partial.authoritative);
         assert!(tracker.plan(&partial).is_empty());
@@ -873,7 +905,9 @@ mod tests {
         assert_eq!(queue.take(1), vec![unmute(7)]);
         // Only a complete authoritative empty baseline confirms disappearance.
         let mut gone = AudioState::default();
-        assert!(gone.feed(b"[]").unwrap());
+        assert!(gone
+            .feed(br#"[{"id":0,"type":"PipeWire:Interface:Core","info":{"cookie":1}}]"#)
+            .unwrap());
         assert!(tracker.plan(&gone.privacy_scan(&policy)).is_empty());
         assert!(tracker.tracked().is_empty());
     }
@@ -885,7 +919,7 @@ mod tests {
         let mut graph = AudioState::default();
         let mut tracker = Tracker::default();
         let mut queue = ActionQueue::default();
-        graph.feed(br#"[{"id":7,"info":{"props":{"media.class":"Audio/Source","object.serial":100},"params":{"Props":[{"mute":false}]}}}]"#).unwrap();
+        graph.feed(br#"[{"id":0,"type":"PipeWire:Interface:Core","info":{"cookie":1}},{"id":7,"info":{"props":{"media.class":"Audio/Source","object.serial":100},"params":{"Props":[{"mute":false}]}}}]"#).unwrap();
         let denied = PrivacyPolicy {
             microphone_disabled: true,
             ..PrivacyPolicy::default()
@@ -902,8 +936,41 @@ mod tests {
         queue.offer(tracker.plan(&lifted));
         assert!(queue.take(1).is_empty());
         // A late completion from old100 cannot acquire/release ownership101.
-        tracker.completed_for(&old_mute, 100, true);
+        tracker.completed_for(&old_mute, None, 100, true);
         assert!(tracker.plan(&lifted).is_empty());
+    }
+
+    #[test]
+    fn replacement_before_old_success_rearms_suppressed_queue_demand() {
+        let mut queue = ActionQueue::default();
+        let mute = Action::SetMute {
+            node: 7,
+            muted: true,
+        };
+        queue.offer(vec![mute]);
+        assert_eq!(queue.take(1), vec![mute]);
+        queue.offer(vec![mute]);
+        assert!(!queue.report(&mute, true));
+        let mut replacement = scan(&[7], &[], &[]);
+        replacement.serials.insert(7, 101);
+        assert!(completion_needs_replan(&replacement, 7, 1, 100));
+        queue.offer(vec![mute]);
+        assert_eq!(queue.take(1), vec![mute]);
+    }
+
+    #[test]
+    fn new_server_same_id_and_serial_does_not_inherit_restore() {
+        let mut tracker = Tracker::default();
+        let mut before = scan(&[7], &[], &[]);
+        before.cookie = Some(100);
+        let mute = tracker.plan(&before)[0];
+        tracker.dispatched(&mute);
+        let mut after = scan(&[], &[], &[7]);
+        after.cookie = Some(101);
+        assert!(tracker.plan(&after).is_empty());
+        tracker.completed_for(&mute, Some(100), 7, true);
+        assert!(tracker.tracked().is_empty());
+        assert!(tracker.plan(&after).is_empty());
     }
 
     #[test]
@@ -1010,7 +1077,7 @@ mod tests {
 
             /// Feed the current graph as one `pw-dump` batch.
             fn publish(&mut self) {
-                let batch: Vec<serde_json::Value> = self
+                let mut batch: Vec<serde_json::Value> = self
                     .nodes
                     .iter()
                     .map(|(&id, (class, muted))| {
@@ -1019,6 +1086,7 @@ mod tests {
                             "params": {"Props": [{"mute": muted}]}}})
                     })
                     .collect();
+                batch.push(json!({"id":0,"type":"PipeWire:Interface:Core","info":{"cookie":1}}));
                 self.state
                     .feed(&serde_json::Value::Array(batch).to_string().into_bytes())
                     .unwrap();
@@ -1620,6 +1688,84 @@ mod tests {
                 return None;
             }
             Some(harness)
+        }
+
+        /// Invoked only by the parent with its private daemon environment;
+        /// never mutates the parallel test process's environment.
+        #[test]
+        #[ignore = "private native-executor subprocess entry"]
+        fn native_executor_child() {
+            let parse = |key: &str| std::env::var(key).expect(key).parse::<u64>().expect(key);
+            let node = parse("TUNA_NATIVE_NODE");
+            let serial = parse("TUNA_NATIVE_SERIAL");
+            let cookie = u32::try_from(parse("TUNA_NATIVE_COOKIE")).unwrap();
+            let muted = std::env::var("TUNA_NATIVE_MUTED").unwrap() == "1";
+            let expected = std::env::var("TUNA_NATIVE_EXPECTED").unwrap() == "1";
+            assert_eq!(
+                super::super::run_bound(Action::SetMute { node, muted }, cookie, serial),
+                expected
+            );
+        }
+
+        #[test]
+        fn live_native_executor_mutes_restores_and_refuses_wrong_identity() {
+            if std::env::var_os("TUNA_REQUIRE_NATIVE_PRIVACY").is_none() {
+                eprintln!("SKIP native privacy proof: enable TUNA_REQUIRE_NATIVE_PRIVACY in the dependency-equipped CI job");
+                return;
+            }
+            let harness = harness().expect("required private PipeWire harness unavailable");
+            let state = harness.dump().expect("complete private graph");
+            let scan = state.privacy_scan(&PrivacyPolicy::default());
+            let cookie = scan.cookie.expect("private Core cookie");
+            let node = harness.nodes("Audio/Source", Some("virt-source"))[0];
+            let serial = scan.serials[&node];
+            let execute = |cookie: u32, serial: u64, muted: bool, expected: bool| {
+                let output = harness
+                    .command(std::env::current_exe().unwrap().to_str().unwrap())
+                    .args([
+                        "--exact",
+                        "privacy::tests::live_pw::native_executor_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("TUNA_NATIVE_NODE", node.to_string())
+                    .env("TUNA_NATIVE_SERIAL", serial.to_string())
+                    .env("TUNA_NATIVE_COOKIE", cookie.to_string())
+                    .env("TUNA_NATIVE_MUTED", if muted { "1" } else { "0" })
+                    .env("TUNA_NATIVE_EXPECTED", if expected { "1" } else { "0" })
+                    .output()
+                    .expect("native executor subprocess");
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "child entry must actually run"
+                );
+            };
+            assert_eq!(harness.muted("virt-source"), Some(false));
+            execute(cookie, serial.wrapping_add(1), true, false);
+            execute(cookie.wrapping_add(1), serial, true, false);
+            assert_eq!(harness.muted("virt-source"), Some(false));
+            execute(cookie, serial, true, true);
+            assert!(
+                harness.wait_for(Duration::from_secs(3), || harness.muted("virt-source")
+                    == Some(true))
+            );
+            execute(cookie, serial.wrapping_add(1), false, false);
+            assert_eq!(harness.muted("virt-source"), Some(true));
+            execute(cookie, serial, false, true);
+            assert!(
+                harness.wait_for(Duration::from_secs(3), || harness.muted("virt-source")
+                    == Some(false))
+            );
+            assert_eq!(
+                harness.muted("virt-sink"),
+                Some(false),
+                "unrelated node remains untouched"
+            );
         }
 
         #[test]

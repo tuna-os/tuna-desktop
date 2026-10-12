@@ -88,7 +88,11 @@ impl AudioState {
                         object["metadata"] = Value::Array(entries);
                     }
                 }
-                if self.objects.len() < MAX_OBJECTS || self.objects.contains_key(&id) {
+                if self.objects.len() >= MAX_OBJECTS && !self.objects.contains_key(&id) {
+                    self.authoritative = false;
+                    return Err("audio graph exceeds the object-count limit");
+                }
+                {
                     let previous = self.objects.get(&id).map_or(0, |old| old.to_string().len());
                     let total = self
                         .state_bytes
@@ -162,6 +166,11 @@ impl AudioState {
     pub fn privacy_scan(&self, policy: &PrivacyPolicy) -> crate::privacy::PrivacyScan {
         let mut scan = crate::privacy::PrivacyScan {
             authoritative: self.authoritative,
+            cookie: self.objects.values().find_map(|object| {
+                (object["type"].as_str() == Some("PipeWire:Interface:Core"))
+                    .then(|| number(&object["info"]["cookie"]).and_then(|v| u32::try_from(v).ok()))
+                    .flatten()
+            }),
             serials: BTreeMap::new(),
             audio_present: BTreeSet::new(),
             mute_required: BTreeSet::new(),
@@ -368,6 +377,19 @@ mod tests {
         }
         state.feed(value.to_string().as_bytes()).unwrap();
     }
+    #[test]
+    fn oversized_initial_graph_cannot_claim_authority() {
+        let mut state = AudioState::default();
+        let objects: Vec<Value> = (0..=MAX_OBJECTS)
+            .map(|id| json!({"id":id,"info":{"props":{}}}))
+            .collect();
+        assert_eq!(
+            state.feed(Value::Array(objects).to_string().as_bytes()),
+            Err("audio graph exceeds the object-count limit")
+        );
+        assert!(!state.privacy_scan(&PrivacyPolicy::default()).authoritative);
+    }
+
     #[test]
     fn split_events_remove_capture_and_ignore_monitor_streams() {
         let mut s = AudioState::default();

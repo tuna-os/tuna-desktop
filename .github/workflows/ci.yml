@@ -274,6 +274,10 @@ jobs:
       - run: shellcheck -x scripts/tuna-gtk-shell-proof scripts/tuna-walkthrough scripts/tuna-gtk-accessibility-proof
       # docs/walkthrough.md must match its manifest (docs/walkthrough.tsv).
       - run: scripts/tuna-walkthrough check
+      - name: Bound native privacy executor proof
+        run: cargo test -p tuna-shell-gtk --bin tuna-shell-gtk privacy::tests::live_pw::live_native_executor_mutes_restores_and_refuses_wrong_identity -- --exact --nocapture
+        env:
+          TUNA_REQUIRE_NATIVE_PRIVACY: "1"
       - name: Prove live accessibility widgets and focus timers
         run: |
           cargo test -p tuna-shell-gtk --bin tuna-shell-gtk --no-run --message-format=json > "$RUNNER_TEMP/tuna-gtk-a11y-build.json"
