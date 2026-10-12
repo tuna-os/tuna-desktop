@@ -9,6 +9,7 @@ import sys
 import subprocess
 import time
 from urllib.parse import unquote, urlparse
+from tuna_picker_geometry import committed_window
 from gi.repository import Gio, GLib
 import gi
 
@@ -212,17 +213,24 @@ if parent_mode != "none":
                 or record["start_time"] != start):
             raise RuntimeError("Independent application identity changed")
         return record
+    unrelated_window = None
     def unrelated_ready():
+        global unrelated_window
         if not unrelated_path.exists():
             return False
         record = unrelated_state()
-        windows = [w for w in scene()["windows"] if w.get("app_id") == record["app_id"]]
-        return (record["mapped"] and len(windows) == 1
-                and windows[0]["id"] != parent_identity["id"]
-                and scene()["focused"] == windows[0]["id"])
-    pump_parent_until(unrelated_ready, "Independent application did not map and receive focus", timeout=10)
-    unrelated_window, = [w for w in scene()["windows"]
-                        if w.get("app_id") == unrelated_state()["app_id"]]
+        unrelated_window = committed_window(scene(), record,
+            pid=unrelated_process.pid, uid=os.getuid(), start_time=record["start_time"],
+            parent_id=parent_identity["id"])
+        return unrelated_window is not None
+    pump_parent_until(unrelated_ready,
+        "Independent application did not commit its mapped geometry and receive focus", timeout=10)
+    # Revalidate once before the sole real injection; never replay a failed
+    # click/key or activate the client to manufacture a passing control.
+    if not unrelated_ready():
+        raise RuntimeError("Independent application committed placement changed before input")
+    out.with_suffix(".unrelated-ready.json").write_text(json.dumps({
+        "client": unrelated_state(), "window": unrelated_window, "scene": scene()}, indent=2))
     ux, uy, uw, uh = unrelated_window["rect"]
     if uw < 100 or uh < 150:
         raise RuntimeError("Independent application content has no usable input target")
