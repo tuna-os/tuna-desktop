@@ -3398,6 +3398,37 @@ cstate '.keyboard.repeat_rate == 20' "repeat restored" ||
     fail G-A11Y-KEYMAP "repeat preferences did not restore"
 cp "$A11Y_KEYS" "$ARTIFACTS/a11y-keymap.json"
 pass G-A11Y-KEYMAP "repeat changes preserve a latch; semantic keymap replacement clears it; remapped physical Caps produces a real Control chord"
+# Actual German Level3 selector: an AltGr tap must affect exactly one
+# subsequent real client key, and be inert with Sticky Keys disabled.
+a11y_sources="$(gsettings get org.gnome.desktop.input-sources sources)"
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de')]"
+cstate '.keyboard.layouts == ["German"] and .input_aids.latched == [] and .seat_pressed_key_count == 0' "German map resets holds" ||
+    fail G-A11Y-KEYMAP "German layout replacement did not clear held modifiers"
+gsettings set "$A11Y_KBD" stickykeys-enable false
+cstate '(.input_aids.sticky | not)' "German sticky off" || fail G-A11Y-KEYMAP "Sticky Keys off did not apply"
+mark="$(a11y_mark)"
+xdotool key Alt_R q
+a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | .keyval] == [113]" "plain German AltGr tap" ||
+    fail G-A11Y-KEYMAP "without Sticky Keys an AltGr tap changed the next q"
+gsettings set "$A11Y_KBD" stickykeys-enable true
+cstate '.input_aids.sticky and (.input_aids.shortcuts | not)' "German sticky without shortcuts" ||
+    fail G-A11Y-KEYMAP "Sticky Keys must operate independently of shortcut enable"
+mark="$(a11y_mark)"
+xdotool key Alt_R
+cstate '.input_aids.latched == ["level3"]' "German Level3 latched" ||
+    fail G-A11Y-KEYMAP "the configured German AltGr selector did not latch Level3"
+xdotool key q q
+a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | .keyval] == [64,113]" "German Level3 spent once" ||
+    fail G-A11Y-KEYMAP "the real German client did not receive @ then plain q"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "German latch released" ||
+    fail G-A11Y-KEYMAP "German Level3 retained a synthetic hold"
+xdotool key Alt_R
+cstate '.input_aids.latched == ["level3"]' "German pending latch before restore" ||
+    fail G-A11Y-KEYMAP "German Level3 second latch was missing"
+gsettings set org.gnome.desktop.input-sources sources "$a11y_sources"
+cstate '.keyboard.layouts != ["German"] and .input_aids.latched == [] and .seat_pressed_key_count == 0' "restore map clears German hold" ||
+    fail G-A11Y-KEYMAP "restoring original source retained the Level3 hold"
+cp "$A11Y_KEYS" "$ARTIFACTS/a11y-keymap-level3.json"
 # Two taps lock, a third releases.
 mark="$(a11y_mark)"
 xdotool key Shift_L
@@ -3444,11 +3475,42 @@ cstate 'all(.layers[]; .namespace != "tuna-kbd-a11y")' "leave on" ||
     fail G-A11Y-SHORTCUTS "Leave On did not close the confirmation"
 gsettings set "$A11Y_KBD" stickykeys-enable false
 cstate '(.input_aids.sticky | not)' "sticky off" || fail G-A11Y-SHORTCUTS "stickykeys-enable false did not apply"
-# Toggle Keys: Caps Lock and Num Lock beep (twice each restores them).
+# Toggle Keys follows actual XKB LED transitions (twice restores Caps).
+cstate '.input_aids.toggle_beep' "toggle preference live" || fail G-A11Y-SHORTCUTS "Toggle Keys preference did not apply"
 bells="$(jq '.input_aids.bells' "$CSTATE")"
+xdotool key Caps_Lock Caps_Lock Num_Lock Num_Lock
+cstate ".input_aids.bells == $((bells + 4))" "toggle beeps" ||
+    fail G-A11Y-SHORTCUTS "Toggle Keys did not ring once per actual Caps/Num LED change"
+# The setting must be live before measuring. No bell for Caps remapped
+# to Control: its keysym/physical location does not change actual LEDs.
+cstate '.input_aids.toggle_beep' "toggle preference live" || fail G-A11Y-SHORTCUTS "Toggle Keys preference did not apply"
+gsettings set org.gnome.desktop.input-sources xkb-options "['ctrl:swapcaps']"
+gsettings set "$A11Y_KBD" stickykeys-enable true
+cstate '.input_aids.sticky' "toggle map barrier sticky on" || fail G-A11Y-SHORTCUTS "Sticky Keys on did not apply"
 xdotool key Caps_Lock Caps_Lock
-cstate ".input_aids.bells >= $((bells + 2))" "toggle beeps" ||
-    fail G-A11Y-SHORTCUTS "togglekeys-enable did not beep for Caps Lock"
+cstate '.input_aids.locked == ["control"]' "toggle actual remapped role" || fail G-A11Y-SHORTCUTS "the actual Caps-to-Control keymap was not applied"
+gsettings set "$A11Y_KBD" stickykeys-enable false
+cstate '(.input_aids.sticky | not)' "toggle remap sticky off" || fail G-A11Y-SHORTCUTS "Sticky Keys off did not apply"
+bells="$(jq '.input_aids.bells' "$CSTATE")"
+mark="$(a11y_mark)"
+xdotool key Caps_Lock Caps_Lock a
+a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | .keyval] == [97]" "remapped no-LED client barrier" || fail G-A11Y-SHORTCUTS "remapped key sequence did not reach client"
+cstate ".input_aids.bells == $bells" "no LED change no bell" || fail G-A11Y-SHORTCUTS "a Caps-to-Control press rang without a LED transition"
+gsettings set "$A11Y_KBD" stickykeys-enable true
+cstate '.input_aids.sticky' "toggle restore barrier sticky on" || fail G-A11Y-SHORTCUTS "Sticky Keys on did not apply"
+xdotool key Caps_Lock Caps_Lock
+cstate '.input_aids.locked == ["control"]' "toggle pending remapped latch" || fail G-A11Y-SHORTCUTS "the remapped Control barrier was missing"
+gsettings set org.gnome.desktop.input-sources xkb-options "$a11y_xkb_options"
+cstate '.input_aids.latched == [] and .input_aids.locked == [] and .seat_pressed_key_count == 0' "toggle original map restored" || fail G-A11Y-SHORTCUTS "toggle map restoration retained holds"
+gsettings set "$A11Y_KBD" stickykeys-enable false
+cstate '(.input_aids.sticky | not)' "toggle restore sticky off" || fail G-A11Y-SHORTCUTS "Sticky Keys off did not apply"
+gsettings set "$A11Y_KBD" togglekeys-enable false
+cstate '(.input_aids.toggle_beep | not)' "toggle preference off" || fail G-A11Y-SHORTCUTS "Toggle Keys off did not apply"
+bells="$(jq '.input_aids.bells' "$CSTATE")"
+mark="$(a11y_mark)"
+xdotool key Caps_Lock Caps_Lock a
+a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | .keyval] == [97]" "toggle off client barrier" || fail G-A11Y-SHORTCUTS "Toggle Keys off sequence did not reach client"
+cstate ".input_aids.bells == $bells" "toggle disabled no bell" || fail G-A11Y-SHORTCUTS "disabled Toggle Keys rang for an actual LED transition"
 # Shift held eight seconds switches Slow Keys on.
 xdotool keydown Shift_L
 sleep 9

@@ -35,3 +35,9 @@ with tarfile.open('mutter-51.0.tar.gz') as archive:
 - Slow, Bounce, Sticky and shortcut beep preferences reach `AidEffect::Bell`, which `runtime/aids.rs` sends to the shared bell policy. That identifies a consumer; source comparison alone does not establish audible output, visual-only policy behavior, or hardware volume/mute acceptance.
 
 These findings leave keyboard capability completion and owner disposition open; timeout compatibility and actual LED-change bell behavior must not be hidden by a broad keyboard settings claim.
+
+## Bounded followup implementation
+
+The followup compares Smithay's actual `keyboard.led_state()` immediately before and after each key delivered through the aid pipeline. `InputAids::led_changed` rings only for an observed change while Toggle Keys is enabled; a Caps/Num keysym alone no longer rings. Keymap configuration does not use that delivered-input path. `ISO_Level3_Shift` now maps to the existing Level3 role, preserving physical key identity through synthetic release and the existing lock/keymap ownership reset.
+
+The existing CI GTK proof adds actual German AltGr tap→`@` once→plain `q`, aid-off negative control, shortcuts-off independence, keymap restoration with a pending Level3 latch, Caps/Num LED transition counts, remapped Caps-to-Control no-LED negative control, and preference-off negative control. Rust regressions cover LED-change/preference gates and Level3 release on ownership reset. These are committed acceptance probes, not completed runtime qualification until exact-head CI executes them. No inactivity timer or protocol fields were added.

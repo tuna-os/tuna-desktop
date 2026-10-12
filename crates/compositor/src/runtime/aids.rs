@@ -101,7 +101,18 @@ impl Runtime {
     fn apply_aid_effects(&mut self, effects: Vec<AidEffect>) {
         for effect in effects {
             match effect {
-                AidEffect::Input(input) => self.on_manager_input(input),
+                AidEffect::Input(input) => {
+                    let before = matches!(input, ManagerInput::Key { .. })
+                        .then(|| self.manager.keyboard_led_state())
+                        .flatten();
+                    self.on_manager_input(input);
+                    let after = self.manager.keyboard_led_state();
+                    let changed = matches!((before, after), (Some(a), Some(b)) if a != b);
+                    // Smithay updates the seat XKB state synchronously before
+                    // returning from input(), including intercepted keys.
+                    let bells = self.input_aids.engine.led_changed(changed);
+                    self.apply_aid_effects(bells);
+                }
                 AidEffect::PointerMove { dx, dy, time } => {
                     let pos = self.manager.pointer_pos();
                     let pos = self.clamp_to_outputs(pos.x + dx, pos.y + dy);
@@ -155,6 +166,7 @@ fn canonical_role(sym: u32) -> u32 {
         KEY_Control_L => 29,
         KEY_Control_R => 97,
         KEY_Alt_L | KEY_Alt_R => 56,
+        KEY_ISO_Level3_Shift => 100,
         KEY_Super_L | KEY_Super_R => 125,
         KEY_Meta_L | KEY_Meta_R => 200,
         KEY_Hyper_L | KEY_Hyper_R => 201,
@@ -191,7 +203,7 @@ mod tests {
         assert_eq!(canonical_role(KEY_Meta_L), 200);
         assert_eq!(canonical_role(KEY_Hyper_R), 201);
         assert_eq!(canonical_role(KEY_KP_Up), 72);
-        assert_eq!(canonical_role(KEY_ISO_Level3_Shift), u32::MAX);
+        assert_eq!(canonical_role(KEY_ISO_Level3_Shift), 100);
         assert_eq!(canonical_role(KEY_a), u32::MAX);
     }
 }

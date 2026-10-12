@@ -19,7 +19,7 @@
 //!   Mutter's acceleration curve; 5 clicks, 0 presses, `.` releases, `+`
 //!   double-clicks, `/` `*` `-` choose the primary, middle or secondary
 //!   button.
-//! - **Toggle Keys** beep when Caps Lock or Num Lock is pressed.
+//! - **Toggle Keys** beep when delivered input changes the seat XKB LEDs.
 //! - **Keyboard shortcuts** (`enable`): Shift pressed five times in a row
 //!   switches Sticky Keys, Shift held for eight seconds switches Slow
 //!   Keys. The shell saves the change and confirms it.
@@ -79,6 +79,7 @@ impl Modifier {
 const SHIFT_LEFT: u32 = 42;
 const SHIFT_RIGHT: u32 = 54;
 const CAPS_LOCK: u32 = 58;
+#[cfg(test)]
 const NUM_LOCK: u32 = 69;
 
 /// What a key is to Sticky Keys: a modifier (Caps Lock counts, but is
@@ -543,7 +544,17 @@ impl InputAids {
         }
     }
 
-    /// The last stage: Sticky Keys and the Toggle Keys beep, then out.
+    /// Toggle Keys follows actual XKB LED transitions after delivered input,
+    /// rather than inferring a transition from a Caps/Num keysym.
+    pub fn led_changed(&mut self, changed: bool) -> Vec<AidEffect> {
+        let mut out = Vec::new();
+        if changed && self.settings.toggle_beep {
+            self.bell(&mut out);
+        }
+        out
+    }
+
+    /// The last stage: Sticky Keys, then out.
     fn deliver(&mut self, keycode: u32, pressed: bool, time: u32, out: &mut Vec<AidEffect>) {
         let key = AidEffect::Input(ManagerInput::Key {
             keycode,
@@ -551,10 +562,6 @@ impl InputAids {
             time,
         });
         let canonical = self.canonical.get(&keycode).copied().unwrap_or(u32::MAX);
-        if pressed && self.settings.toggle_beep && (canonical == CAPS_LOCK || canonical == NUM_LOCK)
-        {
-            self.bell(out);
-        }
         if !self.sticky {
             out.push(key);
             return;
@@ -770,6 +777,7 @@ impl InputAids {
             "bounce": self.settings.bounce,
             "mouse": self.settings.mouse,
             "shortcuts": self.settings.shortcuts,
+            "toggle_beep": self.settings.toggle_beep,
             "latched": names(&self.latched),
             "locked": names(&self.locked),
             "slow_pending": self.slow_pending.len(),
@@ -1330,7 +1338,24 @@ mod tests {
     }
 
     #[test]
-    fn toggle_keys_beep_on_caps_and_num_lock() {
+    fn level3_selector_latches_once_and_releases_on_ownership_reset() {
+        let mut aids = with(KeyboardAids {
+            sticky: true,
+            ..KeyboardAids::default()
+        });
+        run(&mut aids, &tap(100, 0));
+        assert_eq!(aids.summary()["latched"], serde_json::json!(["level3"]));
+        let out = run(&mut aids, &tap(A, 20));
+        assert!(keys(&out).contains(&(100, false)));
+        assert_eq!(aids.summary()["latched"], serde_json::json!([]));
+        run(&mut aids, &tap(100, 40));
+        assert!(keys(&aids.reset_ownership(60)).contains(&(100, false)));
+        assert_eq!(aids.summary()["latched"], serde_json::json!([]));
+        assert!(aids.summary()["locked"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn toggle_keys_require_actual_led_change_and_enabled_preference() {
         let mut aids = with(KeyboardAids {
             toggle_beep: true,
             ..KeyboardAids::default()
@@ -1339,8 +1364,14 @@ mod tests {
         script.extend(tap(NUM_LOCK, 50));
         script.extend(tap(A, 100));
         let out = run(&mut aids, &script);
-        assert_eq!(bells(&out), 2);
+        assert_eq!(bells(&out), 0);
         assert_eq!(keys(&out).len(), 6);
+        assert!(aids.led_changed(false).is_empty());
+        assert_eq!(bells(&aids.led_changed(true)), 1);
+        assert_eq!(aids.summary()["bells"], 1);
+        aids.configure(&KeyboardAids::default(), 200);
+        assert!(aids.led_changed(true).is_empty());
+        assert_eq!(aids.summary()["bells"], 1);
     }
 
     fn mouse() -> InputAids {

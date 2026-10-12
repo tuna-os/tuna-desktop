@@ -406,6 +406,11 @@ impl WindowManager {
             .is_some_and(|keyboard| keyboard.modifier_state().num_lock)
     }
 
+    /// Actual LEDs after the seat's XKB state processed delivered input.
+    pub(crate) fn keyboard_led_state(&self) -> Option<smithay::input::keyboard::LedState> {
+        self.keyboard.as_ref().map(|keyboard| keyboard.led_state())
+    }
+
     /// Empty manager; attaches keyboard and pointer capabilities to the
     /// state's seat and keeps their handles for input routing.
     pub fn new(state: &mut State) -> Self {
