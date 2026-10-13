@@ -4473,6 +4473,30 @@ fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() 
         strip_drawn_geometry(&f.manager, child).unwrap().loc.x - child_drawn.loc.x,
         200
     );
+    // Viewport motion must not strand the actual newly attached family.
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 14);
+    let anchored_parent = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    let anchored_child = strip_drawn_geometry(&f.manager, child).unwrap();
+    for _ in 0..40 {
+        assert!(f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+        assert_eq!(
+            strip_drawn_geometry(&f.manager, f.id_a).unwrap(),
+            anchored_parent
+        );
+        assert_eq!(
+            strip_drawn_geometry(&f.manager, child).unwrap(),
+            anchored_child
+        );
+    }
+    assert!(f.manager.strip_offset() > 0.0);
+    let edge_order: Vec<_> = f
+        .manager
+        .render_entries()
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect();
+    assert_eq!(&edge_order[edge_order.len() - 2..], &[f.id_a, child]);
     dialog.destroy();
     top.destroy();
     xdg.destroy();
@@ -4489,4 +4513,546 @@ fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() 
     assert!(!f.manager.grab_active());
     assert!(f.manager.tile_preview(&f.comp.state).is_none());
     assert!(f.manager.render_entries().iter().all(|e| e.0 != child));
+}
+
+#[test]
+fn strip_stationary_edge_reveals_offscreen_column_and_commits_observed_slot() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    assert!(strip_drawn_geometry(&f.manager, f.id_c).unwrap().loc.x >= 1280);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    let actor = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    assert!(
+        f.manager.strip_animating(),
+        "stationary dwell owns actual frame demand"
+    );
+    assert!(f.manager.step_strip_view_with_pointer_dt(0.0, 30.0));
+    assert_eq!(
+        f.manager.strip_offset(),
+        0.0,
+        "old idle delta is not drag time"
+    );
+    // No more pointer motion: the actual manager frame phase alone scrolls.
+    for _ in 0..2000 {
+        let demand = f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+        assert_eq!(strip_drawn_geometry(&f.manager, f.id_a).unwrap(), actor);
+        if !demand {
+            break;
+        }
+    }
+    assert!(
+        !f.manager.strip_animating(),
+        "clamped edge cannot schedule forever"
+    );
+    let final_offset = f.manager.strip_offset();
+    assert!(final_offset > 0.0);
+    assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+    assert_eq!(f.manager.strip_offset(), final_offset);
+    let c = strip_drawn_geometry(&f.manager, f.id_c).unwrap();
+    assert!(c.loc.x >= 0 && c.loc.x + c.size.w <= 1280);
+    assert!(actor.loc.x + actor.size.w / 2 > c.loc.x + c.size.w / 2);
+    let (owner, bar) = f.manager.tile_preview(&f.comp.state).unwrap();
+    assert_eq!(owner, f.id_a);
+    assert_eq!(bar.size.w, 8);
+    assert_eq!(bar.loc.x, c.loc.x + c.size.w + 16 - 4);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT + 1, false, 13);
+    assert!(f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 14);
+    assert!(!f.manager.grab_active());
+    assert!(f.manager.geometry(f.id_a).unwrap().loc.x > f.manager.geometry(f.id_c).unwrap().loc.x);
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+}
+
+#[test]
+fn strip_edge_cancel_restores_original_view_order_and_rectangles() {
+    let mut f = three_windows();
+    let floating = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    let original = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    let original_offset = f.manager.strip_offset();
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    for _ in 0..40 {
+        f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    }
+    assert!(f.manager.strip_offset() > original_offset);
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    assert_eq!(f.manager.strip_offset(), original_offset);
+    assert_eq!(f.manager.strip_view(), original_offset);
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        original
+    );
+    assert!(!f.manager.strip_animating());
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    f.manager.set_scroll(&mut f.comp.state, false);
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        floating
+    );
+}
+
+#[test]
+fn strip_edge_dwell_restarts_on_interior_exit_and_opposite_edge() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (640.0, pos.y).into(), 13);
+    assert!(!f.manager.strip_animating());
+    assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.05));
+    assert_eq!(f.manager.strip_offset(), 0.0);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 14);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05); // first frame
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    assert!(f.manager.strip_offset().abs() < 1e-8);
+    for _ in 0..40 {
+        f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    }
+    let right = f.manager.strip_offset();
+    assert!(right > 0.0);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (0.0, pos.y).into(), 15);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    assert_eq!(
+        f.manager.strip_offset(),
+        right,
+        "opposite edge has a fresh dwell"
+    );
+    for _ in 0..2000 {
+        if !f.manager.step_strip_view_with_pointer_dt(0.0, 0.02) {
+            break;
+        }
+    }
+    assert_eq!(f.manager.strip_offset(), 0.0);
+    assert!(!f.manager.strip_animating());
+}
+
+#[test]
+fn strip_edge_invalid_frame_delta_never_advances_view_or_dwell() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.0);
+    for dt in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+        assert!(f.manager.step_strip_view_with_pointer_dt(0.0, dt));
+        assert_eq!(f.manager.strip_offset(), 0.0);
+    }
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    assert!(f.manager.strip_offset().abs() < 1e-8);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 1e300);
+    assert!(f.manager.strip_offset() > 0.0 && f.manager.strip_offset() <= 2.5);
+    let width = f.manager.geometry(f.id_a).unwrap().size;
+    assert_eq!(width, f.manager.geometry(f.id_b).unwrap().size);
+}
+
+#[test]
+fn strip_edge_owner_unmap_stops_demand_without_resurrection() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    for _ in 0..40 {
+        f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    }
+    f.client_a.toplevel.as_ref().unwrap().destroy();
+    f.client_a.xdg_surface.as_ref().unwrap().destroy();
+    f.client_a.surface.as_ref().unwrap().destroy();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(!f.manager.grab_active());
+    assert!(f.manager.geometry(f.id_a).is_none());
+    assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+    assert!(!f.manager.strip_animating());
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    assert!(f
+        .manager
+        .render_entries()
+        .iter()
+        .all(|entry| entry.0 != f.id_a));
+}
+
+#[test]
+fn strip_edge_preserves_other_workspace_canonical_geometry_on_cancel() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.move_to_workspace(&mut f.comp.state, f.id_c, 1);
+    f.manager.switch_workspace(&mut f.comp.state, 0);
+    let (conn, mut queue, mut client) = connect(&mut f.comp);
+    map_toplevel(
+        &mut f.comp,
+        &conn,
+        &mut queue,
+        &mut client,
+        "edge-active-neighbor",
+    );
+    f.manager.reconcile(&mut f.comp.state);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    let other = f.manager.geometry(f.id_c).unwrap();
+    let original = f.manager.geometry(f.id_a).unwrap();
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    for _ in 0..40 {
+        f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    }
+    assert!(f.manager.strip_offset() > 0.0);
+    assert_eq!(f.manager.geometry(f.id_c).unwrap(), other);
+    assert_eq!(f.manager.model().window(f.id_c).unwrap().workspace, 1);
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), original);
+    assert_eq!(f.manager.geometry(f.id_c).unwrap(), other);
+    let _keep = (conn, queue, client);
+}
+
+#[test]
+fn strip_edge_demand_excludes_resize_and_floating_grabs() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let pos = start_strip_resize(&mut f, false);
+    let original = f.manager.strip_offset();
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 22);
+    for _ in 0..40 {
+        assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+        assert_eq!(f.manager.strip_offset(), original);
+    }
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 23);
+    f.manager.set_scroll(&mut f.comp.state, false);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 24);
+    for _ in 0..40 {
+        assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+        assert_eq!(f.manager.strip_offset(), 0.0);
+    }
+    assert!(
+        f.manager.grab_active(),
+        "existing floating grab remains live"
+    );
+}
+
+#[test]
+fn strip_edge_full_motion_preserves_inflight_new_modal_family_and_fractional_spring() {
+    strip_edge_family_world_invariant(false);
+}
+
+#[test]
+fn strip_edge_fractional_admission_and_live_map_keep_world_targets_stable() {
+    strip_edge_family_world_invariant(true);
+}
+
+fn start_fractional_strip_drag(f: &mut ThreeFixture, owner: u64) -> Point<f64, Logical> {
+    // Gamma maps last and entering scroll mode follows it to the far edge.
+    // Focus A to return to zero, then B which fits without moving that view.
+    // A real smooth-axis input creates the fractional initial view; the actual
+    // button focus path must preserve it when it selects B again.
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    f.manager.focus(&mut f.comp.state, Some(owner));
+    f.manager.set_motion_allowed(false);
+    f.manager.step_strip_view(0.0);
+    assert_eq!(f.manager.strip_offset(), 0.0);
+    axis(&mut f.manager, &mut f.comp, 0.7, 0.0);
+    f.manager.step_strip_view(0.0);
+    assert!((f.manager.strip_offset() - 0.7).abs() < 1e-8);
+    let drawn = strip_drawn_geometry(&f.manager, owner).unwrap();
+    let pos: Point<f64, Logical> =
+        (f64::from(drawn.loc.x + 60), f64::from(drawn.loc.y + 25)).into();
+    f.manager.pointer_motion(&mut f.comp.state, pos, 10);
+    press(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 11);
+    assert!(f.manager.grab_active());
+    assert!((f.manager.strip_offset() - 0.7).abs() < 1e-8);
+    pos
+}
+
+fn strip_edge_family_world_invariant(fractional_admission: bool) {
+    use tuna_compositor::animation::ColumnSpring;
+
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let owner = if fractional_admission { f.id_b } else { f.id_a };
+    let pos = if fractional_admission {
+        start_fractional_strip_drag(&mut f, owner)
+    } else {
+        start_strip_drag(&mut f, owner)
+    };
+    // The old helper settles only admission geometry. The entire mapping and
+    // edge phase below uses actual full-motion column springs.
+    f.manager.set_motion_allowed(true);
+    let original_offset = f.manager.strip_offset();
+    let original_rectangles = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    let mut c_before_map = strip_drawn_geometry(&f.manager, f.id_c).unwrap();
+    c_before_map.loc.x += original_offset.round() as i32;
+    let (parent_client, parent_queue) = if fractional_admission {
+        (&f.client_b, &f.queue_b)
+    } else {
+        (&f.client_a, &f.queue_a)
+    };
+    let qh = parent_queue.handle();
+    let surface = parent_client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let xdg = parent_client
+        .xdg_base
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(&surface, &qh, ());
+    let top = xdg.get_toplevel(&qh, ());
+    top.set_title("full-motion-live-strip-modal".into());
+    top.set_parent(parent_client.toplevel.as_ref());
+    let dialog = parent_client
+        .dialogs
+        .as_ref()
+        .unwrap()
+        .get_xdg_dialog(&top, &qh, ());
+    dialog.set_modal();
+    surface.commit();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    let child = f
+        .manager
+        .model()
+        .windows()
+        .find(|window| window.title == "full-motion-live-strip-modal")
+        .unwrap()
+        .id;
+    assert!(f.manager.grab_active());
+    let mut c_target = f.manager.geometry(f.id_c).unwrap();
+    c_target.loc.x += original_offset.round() as i32;
+    assert!(
+        c_target.loc.x > c_before_map.loc.x,
+        "new family column changes actual neighbor slot"
+    );
+    let mut retained = ColumnSpring::new(c_before_map, c_target);
+    assert!(f.manager.step_strip_view_with_pointer_dt(0.005, 0.02));
+    retained.step(0.005, true);
+    assert_eq!(strip_drawn_geometry(&f.manager, f.id_c).unwrap(), {
+        let mut drawn = retained.value();
+        drawn.loc.x -= original_offset.round() as i32;
+        drawn
+    });
+    assert_ne!(
+        retained.value(),
+        c_target,
+        "a real column spring must be in flight before edge scrolling"
+    );
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1278.25, pos.y).into(), 12);
+    let parent_anchor = strip_drawn_geometry(&f.manager, owner).unwrap();
+    let child_anchor = strip_drawn_geometry(&f.manager, child).unwrap();
+    let animation_dt = 0.003;
+    let pointer_dt = 0.013;
+    // Ignore pre-drag idle time, while the independent spring still advances.
+    assert!(f
+        .manager
+        .step_strip_view_with_pointer_dt(animation_dt, pointer_dt));
+    retained.step(animation_dt, true);
+    assert_eq!(strip_drawn_geometry(&f.manager, f.id_c).unwrap(), {
+        let mut drawn = retained.value();
+        drawn.loc.x -= original_offset.round() as i32;
+        drawn
+    });
+    let mut saw_scrolling_inflight = false;
+    let mut saw_fractional_view = false;
+    let mut kept_neighbor = None;
+    for frame in 0..64 {
+        if fractional_admission && frame == 18 {
+            let offset = f.manager.strip_offset();
+            assert!((0.1..0.4).contains(&(offset - offset.floor())));
+            let (conn, mut queue, mut client) = connect(&mut f.comp);
+            map_toplevel(
+                &mut f.comp,
+                &conn,
+                &mut queue,
+                &mut client,
+                "fractional-edge-live-neighbor",
+            );
+            f.manager.reconcile(&mut f.comp.state);
+            let mapped = f
+                .manager
+                .model()
+                .windows()
+                .find(|window| window.title == "fractional-edge-live-neighbor")
+                .unwrap()
+                .id;
+            // A new real column adds its configured width and one gap. Pin
+            // this legitimate topology change ONCE, not from C's world value.
+            c_target.loc.x += f.manager.geometry(mapped).unwrap().size.w + 16;
+            retained.retarget(c_target);
+            kept_neighbor = Some((conn, queue, client));
+        }
+        assert!(f
+            .manager
+            .step_strip_view_with_pointer_dt(animation_dt, pointer_dt));
+        let offset = f.manager.strip_view();
+        assert_eq!(
+            offset,
+            f.manager.strip_offset(),
+            "direct viewport, independent spring"
+        );
+        // The world target is pinned before scrolling. A fractional view must
+        // not retarget it by a pixel; the oracle never repeats that calculation.
+        let mut observed_world = f.manager.geometry(f.id_c).unwrap();
+        observed_world.loc.x += offset.round() as i32;
+        assert_eq!(observed_world, c_target);
+        retained.step(animation_dt, true);
+        let mut expected = retained.value();
+        expected.loc.x -= offset.round() as i32;
+        let actual = strip_drawn_geometry(&f.manager, f.id_c).unwrap();
+        assert_eq!(
+            actual, expected,
+            "edge viewport movement must not reset column spring position/velocity"
+        );
+        if offset > original_offset && retained.value() != c_target {
+            saw_scrolling_inflight = true;
+            assert_ne!(actual, f.manager.geometry(f.id_c).unwrap());
+        }
+        saw_fractional_view |= offset > original_offset && (offset - offset.round()).abs() > 0.01;
+        assert_eq!(
+            strip_drawn_geometry(&f.manager, owner).unwrap(),
+            parent_anchor
+        );
+        assert_eq!(
+            strip_drawn_geometry(&f.manager, child).unwrap(),
+            child_anchor
+        );
+        let order: Vec<_> = f
+            .manager
+            .render_entries()
+            .into_iter()
+            .map(|entry| entry.0)
+            .collect();
+        assert_eq!(&order[order.len() - 2..], &[owner, child]);
+    }
+    assert!(saw_scrolling_inflight && saw_fractional_view);
+    // Actual elapsed pointer time is not slowed to the spring interval.
+    let expected_offset = original_offset + (64.0 * pointer_dt - 0.1) * 50.0 * 0.825;
+    assert!((f.manager.strip_offset() - expected_offset).abs() < 1e-8);
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    assert_eq!(f.manager.strip_view(), original_offset);
+    assert_eq!(f.manager.strip_offset(), original_offset);
+    let restored = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    // New columns legitimately change C's slot; original A/B rectangles return
+    // exactly to their admitted fractional-layout convention on cancel.
+    if fractional_admission {
+        assert_eq!(&restored[..2], &original_rectangles[..2]);
+    } else {
+        // The new modal legitimately inserts after A and moves B's slot.
+        assert_eq!(restored[0], original_rectangles[0]);
+        let mut b_after_map = original_rectangles[1];
+        b_after_map.loc.x += f.manager.geometry(child).unwrap().size.w + 16;
+        assert_eq!(restored[1], b_after_map);
+    }
+    let mut c_after_map = c_target;
+    c_after_map.loc.x -= original_offset.round() as i32;
+    assert_eq!(restored[2], c_after_map);
+    assert!(f.manager.geometry(child).is_some());
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    let _keep = (surface, xdg, top, dialog, kept_neighbor);
+}
+
+#[test]
+fn strip_edge_full_motion_actual_pointer_cadence_is_independent_of_spring_slowdown() {
+    let run = |animation_dt: f64| {
+        let mut f = three_windows();
+        f.manager.set_scroll(&mut f.comp.state, true);
+        let id_a = f.id_a;
+        let pos = start_strip_drag(&mut f, id_a);
+        f.manager.set_motion_allowed(true);
+        f.manager
+            .pointer_motion(&mut f.comp.state, (1278.25, pos.y).into(), 12);
+        let actor = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+        f.manager
+            .step_strip_view_with_pointer_dt(animation_dt, 0.013);
+        for _ in 0..64 {
+            assert!(f
+                .manager
+                .step_strip_view_with_pointer_dt(animation_dt, 0.013));
+            assert_eq!(strip_drawn_geometry(&f.manager, f.id_a).unwrap(), actor);
+        }
+        let observed = f.manager.strip_offset();
+        let expected = (64.0 * 0.013 - 0.1) * 50.0 * 0.825;
+        assert!((observed - expected).abs() < 1e-8);
+        assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+        assert_eq!(f.manager.strip_offset(), 0.0);
+        observed
+    };
+    let slow = run(0.003);
+    let normal = run(0.013);
+    assert!((slow - normal).abs() < 1e-8);
+}
+
+#[test]
+fn strip_edge_fractional_matching_release_returns_to_ordinary_layout_convention() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let owner = f.id_b;
+    let pos = start_fractional_strip_drag(&mut f, owner);
+    f.manager.set_motion_allowed(true);
+    let mut c_world = strip_drawn_geometry(&f.manager, f.id_c).unwrap();
+    c_world.loc.x += f.manager.strip_view().round() as i32;
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1278.25, pos.y).into(), 12);
+    let anchor = strip_drawn_geometry(&f.manager, owner).unwrap();
+    for _ in 0..2000 {
+        let demand = f.manager.step_strip_view_with_pointer_dt(0.016, 0.02);
+        let mut observed_world = f.manager.geometry(f.id_c).unwrap();
+        observed_world.loc.x += f.manager.strip_view().round() as i32;
+        assert_eq!(observed_world, c_world);
+        assert_eq!(strip_drawn_geometry(&f.manager, owner).unwrap(), anchor);
+        if !demand {
+            break;
+        }
+    }
+    assert!(!f.manager.strip_animating());
+    let c = strip_drawn_geometry(&f.manager, f.id_c).unwrap();
+    assert!(c.loc.x >= 0 && c.loc.x + c.size.w <= 1280);
+    let (_, bar) = f.manager.tile_preview(&f.comp.state).unwrap();
+    assert_eq!(bar.loc.x, c.loc.x + c.size.w + 16 - 4);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 13);
+    assert!(!f.manager.grab_active());
+    assert!(f.manager.geometry(f.id_a).unwrap().loc.x < f.manager.geometry(f.id_c).unwrap().loc.x);
+    assert!(f.manager.geometry(f.id_c).unwrap().loc.x < f.manager.geometry(owner).unwrap().loc.x);
+    // Drop ends the admission-biased convention. Observe the original non-grab
+    // column layout after its genuine normal-motion spring has finished.
+    for _ in 0..1000 {
+        if !f.manager.step_strip_view_with_pointer_dt(0.016, 0.016) {
+            break;
+        }
+    }
+    assert!(!f.manager.strip_animating());
+    let last = f.manager.geometry(owner).unwrap();
+    assert_eq!(last.loc.x + last.size.w, 1280 - 16);
+    assert_eq!(strip_drawn_geometry(&f.manager, owner).unwrap(), last);
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
 }
