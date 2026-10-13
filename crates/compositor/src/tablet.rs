@@ -396,8 +396,10 @@ mod tests {
 
     #[test]
     fn unmatched_output_falls_back_to_primary_never_nowhere() {
-        let mut config = TabletConfig::default();
-        config.output = ["nope".to_owned(), "nope".to_owned(), "nope".to_owned()];
+        let config = TabletConfig {
+            output: ["nope".to_owned(), "nope".to_owned(), "nope".to_owned()],
+            ..TabletConfig::default()
+        };
         assert_eq!(
             select_output(&outputs(), &config),
             Some(rect(0, 0, 1920, 1080))
@@ -423,9 +425,11 @@ mod tests {
 
     #[test]
     fn area_padding_insets_active_region_and_clamps_edges() {
-        let mut config = TabletConfig::default();
         // 10% left, 20% top: the active area starts there.
-        config.area_milli = [10_000, 0, 20_000, 0];
+        let mut config = TabletConfig {
+            area_milli: [10_000, 0, 20_000, 0],
+            ..TabletConfig::default()
+        };
         let target = rect(0, 0, 1000, 1000);
         assert_eq!(
             map_absolute(0.1, 0.2, &config, (100.0, 100.0), target),
@@ -450,8 +454,10 @@ mod tests {
 
     #[test]
     fn keep_aspect_restricts_tablet_area_to_output_aspect() {
-        let mut config = TabletConfig::default();
-        config.keep_aspect = true;
+        let config = TabletConfig {
+            keep_aspect: true,
+            ..TabletConfig::default()
+        };
         // Square tablet onto a 2:1 output: full width, restricted
         // height, so the middle of the tablet is the middle.
         let middle = map_absolute(0.5, 0.5, &config, (100.0, 100.0), rect(0, 0, 2000, 1000));
@@ -482,9 +488,11 @@ mod tests {
 
     #[test]
     fn eraser_uses_its_own_curve() {
-        let mut config = TabletConfig::default();
-        config.pressure_curve = [50, 0, 50, 100];
-        config.eraser_pressure_curve = [0, 50, 100, 50];
+        let config = TabletConfig {
+            pressure_curve: [50, 0, 50, 100],
+            eraser_pressure_curve: [0, 50, 100, 50],
+            ..TabletConfig::default()
+        };
         assert_eq!(config.curve_for(TabletToolType::Pen), [50, 0, 50, 100]);
         assert_eq!(config.curve_for(TabletToolType::Eraser), [0, 50, 100, 50]);
     }
