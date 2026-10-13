@@ -1713,6 +1713,14 @@ folder_coordinates="$(grid_point "$ARTIFACTS/a11y-folder-page-source.json" "$gri
 read -r folder_source_x folder_source_y <<EOF
 $folder_coordinates
 EOF
+# Select an empty interior gap from the real owned tree, not a nominal hint
+# width. The later live preview tree must confirm it against actual hints.
+neutral_coordinates="$("$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" neutral \
+    "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-source.json" \
+    "$CSTATE" "$ARTIFACTS/grid-cancel-neutral-point.json")" || fail G-GRID-DRAG-CANCEL "no actual neutral grid region"
+read -r grid_neutral_x grid_neutral_y <<EOF
+$neutral_coordinates
+EOF
 folder_layout_before="$(gsettings get org.gnome.shell app-picker-layout)"
 printf '%s\n' "$folder_layout_before" > "$ARTIFACTS/grid-cancel-layout-before.txt"
 xdotool mousemove --window "$WID" "$folder_source_x" "$folder_source_y"
@@ -1723,12 +1731,19 @@ for step in $(seq 1 6); do
     xdotool mousemove --window "$WID" $((folder_source_x + step * 10)) "$folder_source_y"
     sleep 0.05
 done
+# Keep the actual button held, but leave timed page hints and tile hover
+# targets before slow AT-SPI/screenshot/state acquisition. No extra sleep.
+xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
 sleep 0.25
 grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" || fail G-GRID-DRAG-CANCEL "folder preview dump failed"
 scrot "$ARTIFACTS/11h-folder-page-peek.png" >/dev/null
 showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview" || fail G-GRID-DRAG-CANCEL "real local folder drag has no neighboring-page hint"
-cstate '.client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false)' "real folder drag active" || fail G-GRID-DRAG-CANCEL "native client drag never acquired grab"
+cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" || fail G-GRID-DRAG-CANCEL "native client drag never acquired grab"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
+"$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" neutral-check \
+    "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-peek.json" \
+    "$ARTIFACTS/grid-cancel-before-escape.json" "$grid_neutral_x" "$grid_neutral_y" \
+    "$ARTIFACTS/a11y-folder-page-source.json" "$ARTIFACTS/grid-cancel-neutral-admission.json" || fail G-GRID-DRAG-CANCEL "active neutral pointer or first page not observed"
 [ "$(gsettings get org.gnome.shell app-picker-layout)" = "$folder_layout_before" ] || fail G-GRID-DRAG-CANCEL "preview already committed layout"
 grid_cancel_before_frame="$(jq -er .rendered_frames "$ARTIFACTS/grid-cancel-before-escape.json")" || fail G-GRID-DRAG-CANCEL "drag frame missing"
 xdotool key Escape
