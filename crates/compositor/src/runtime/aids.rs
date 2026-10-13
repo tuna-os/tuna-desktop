@@ -62,6 +62,9 @@ impl Runtime {
     }
 
     pub(super) fn reset_input_aid_ownership(&mut self) {
+        // Roll back direct strip manipulation before synthetic releases
+        // can accidentally commit it during lock/keymap ownership changes.
+        self.manager.cancel_strip_pointer(&mut self.state);
         self.dnd_escape_held = false;
         let now = self.input_aids.now_ms();
         let effects = self.input_aids.engine.reset_ownership(now);

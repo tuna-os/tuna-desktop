@@ -82,13 +82,14 @@ fn child() {
     let own_user = tuna_compositor::unlock::session_user().expect("kernel session account");
     let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tuna-compositor"));
     let backend = tuna_compositor::pam_backend::Backend::with_trusted_factory(
-        move |identity, service, user, budget| {
-            tuna_compositor::pam_helper::Supervisor::spawn(
+        move |identity, service, user, budget, cancel| {
+            tuna_compositor::pam_helper::Supervisor::spawn_cancellable(
                 &executable,
                 identity,
                 service,
                 user,
                 budget,
+                cancel,
             )
         },
     )

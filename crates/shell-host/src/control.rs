@@ -170,6 +170,16 @@ fn is_dead_peer(e: &io::Error) -> bool {
     )
 }
 
+/// Admission for input-method UI actions on this connection only. A compatible
+/// greeting and a subsequent snapshot are both required; this is protocol
+/// compatibility, not authentication of a Unix peer's process identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMethodAdmission {
+    AwaitHello,
+    AwaitSnapshot,
+    Ready,
+}
+
 /// Shell-side control client over a connected Unix socket.
 pub struct ControlClient {
     stream: UnixStream,
@@ -201,6 +211,7 @@ pub struct ControlClient {
     overview_previews: (Vec<tuna_shell_control::PreviewInfo>, Option<u64>),
     connection_generation: u64,
     auth_needs_snapshot: bool,
+    input_method_admission: InputMethodAdmission,
     wellbeing_applied: Option<(bool, bool)>,
     wellbeing_pending: Option<(u64, (bool, bool), Instant)>,
 }
@@ -245,6 +256,7 @@ impl ControlClient {
             overview_previews: (Vec::new(), None),
             connection_generation: 0,
             auth_needs_snapshot: true,
+            input_method_admission: InputMethodAdmission::AwaitHello,
             wellbeing_applied: None,
             wellbeing_pending: None,
         })
@@ -285,6 +297,15 @@ impl ControlClient {
         self.locked
     }
 
+    /// Whether an input-method menu may dispatch an action. The current peer
+    /// must have supplied a compatible Hello followed by a snapshot, that
+    /// snapshot must still be current, and its session must be unlocked.
+    pub fn input_method_actions_allowed(&self) -> bool {
+        self.input_method_admission == InputMethodAdmission::Ready
+            && !self.needs_snapshot
+            && !self.locked
+    }
+
     /// Session environment from the latest `Environment` message
     /// (empty before the first one), already applied to app launches.
     pub fn environment(&self) -> &[(String, String)] {
@@ -321,9 +342,11 @@ impl ControlClient {
     /// A stale-major `Hello` never arrives as a message: schema decoding
     /// rejects it first, surfacing [`ControlError::Decode`].
     pub fn await_hello(&mut self) -> Result<(), ControlError> {
+        self.input_method_admission = InputMethodAdmission::AwaitHello;
         match self.read_frame()? {
             Message::Hello { version } => {
                 if version.is_compatible_with(&CURRENT_VERSION) {
+                    self.input_method_admission = InputMethodAdmission::AwaitSnapshot;
                     Ok(())
                 } else {
                     Err(ControlError::Remote {
@@ -732,6 +755,7 @@ impl ControlClient {
                 if self.socket_path.is_some()
                     && (is_dead_peer(&e) || e.kind() == io::ErrorKind::UnexpectedEof) =>
             {
+                self.input_method_admission = InputMethodAdmission::AwaitHello;
                 self.wellbeing_applied = None;
                 self.wellbeing_pending = None;
                 self.read_buf.clear();
@@ -750,7 +774,12 @@ impl ControlClient {
                 // the snapshot. Do not spin or wait inside the UI tick.
                 Err(ControlError::WouldBlock)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if !matches!(&e, ControlError::WouldBlock) {
+                    self.input_method_admission = InputMethodAdmission::AwaitHello;
+                }
+                Err(e)
+            }
         }
     }
 
@@ -759,11 +788,13 @@ impl ControlClient {
         match msg {
             Message::Hello { version } => {
                 if version.is_compatible_with(&CURRENT_VERSION) {
+                    self.input_method_admission = InputMethodAdmission::AwaitSnapshot;
                     Ok(Handled::Hello)
                 } else {
+                    self.input_method_admission = InputMethodAdmission::AwaitHello;
                     // Same-major decode already passed, so this is a newer
                     // minor we cannot speak: report it as typed, keep the
-                    // connection state untouched.
+                    // model state untouched; input-method admission fails closed.
                     Ok(Handled::ServerError {
                         kind: ErrorKind::IncompatibleVersion,
                         message: format!(
@@ -792,6 +823,9 @@ impl ControlClient {
                 self.revision = Some(revision);
                 self.needs_snapshot = false;
                 self.auth_needs_snapshot = false;
+                if self.input_method_admission != InputMethodAdmission::AwaitHello {
+                    self.input_method_admission = InputMethodAdmission::Ready;
+                }
                 Ok(Handled::Snapshot { revision })
             }
             Message::Changes {
@@ -942,6 +976,9 @@ impl ControlClient {
                 Ok(Handled::Switcher { action, selection })
             }
             Message::Error { kind, message } => {
+                if kind == ErrorKind::IncompatibleVersion {
+                    self.input_method_admission = InputMethodAdmission::AwaitHello;
+                }
                 if kind == ErrorKind::RevisionGap {
                     // Compositor-side gap signal: same handling as a local
                     // `from_revision` mismatch.
@@ -998,6 +1035,7 @@ impl ControlClient {
     /// Uses a raw write for the greeting, never [`write_message`](Self::write_message):
     /// a redial that is itself dead must surface its error, not recurse.
     fn reconnect(&mut self) -> Result<(), ControlError> {
+        self.input_method_admission = InputMethodAdmission::AwaitHello;
         let path = self.socket_path.clone().ok_or_else(|| {
             ControlError::Unexpected("reconnect without a socket path".to_owned())
         })?;
@@ -1271,6 +1309,141 @@ mod tests {
             workspaces: vec![workspace(1, true), workspace(2, false)],
             locked: false,
         }
+    }
+
+    #[test]
+    fn input_method_admission_requires_current_hello_snapshot_and_unlocked_state() {
+        let (mut client, mut peer) = pair();
+        assert!(!client.input_method_actions_allowed());
+        // A snapshot without a compatible greeting cannot qualify this peer.
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        assert!(matches!(client.poll(), Err(ControlError::WouldBlock)));
+        assert!(client.input_method_actions_allowed());
+        let mut locked = snapshot_rev7();
+        if let Message::Snapshot { locked, .. } = &mut locked {
+            *locked = true;
+        }
+        server_write(&mut peer, &locked);
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Changes {
+                from_revision: 999,
+                to_revision: 1000,
+                ops: vec![],
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.needs_snapshot());
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        drop(peer);
+        assert!(client.poll().is_err());
+        assert!(!client.input_method_actions_allowed());
+    }
+
+    #[test]
+    fn input_method_admission_refuses_incompatible_peer_even_with_snapshot() {
+        let (mut client, mut peer) = handshook();
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Hello {
+                version: ProtocolVersion::new(CURRENT_VERSION.major, CURRENT_VERSION.minor + 1),
+            },
+        );
+        assert!(matches!(
+            client.poll().unwrap(),
+            Handled::ServerError { .. }
+        ));
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Error {
+                kind: ErrorKind::IncompatibleVersion,
+                message: "incompatible controlled peer".into(),
+            },
+        );
+        client.poll().unwrap();
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+    }
+
+    #[test]
+    fn input_method_admission_reconnect_never_reuses_cached_unlocked_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut first_peer, _) = listener.accept().unwrap();
+        server_write(
+            &mut first_peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        client.poll().unwrap();
+        server_write(&mut first_peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        let generation = client.connection_generation();
+        drop(first_peer);
+        assert!(client.poll().is_err());
+        assert_eq!(client.connection_generation(), generation + 1);
+        assert!(!client.input_method_actions_allowed());
+        let (mut second_peer, _) = listener.accept().unwrap();
+        assert!(matches!(
+            server_read(&mut second_peer),
+            Message::Hello { .. }
+        ));
+        server_write(&mut second_peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(
+            &mut second_peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut second_peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
     }
 
     #[test]

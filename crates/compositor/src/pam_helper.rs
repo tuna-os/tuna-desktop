@@ -3,6 +3,7 @@
 //! An authenticated result is provisional until the owned helper and its process
 //! group retire. Keep a quarantined supervisor alive; a deadline is not retirement.
 //! Detached module processes/external daemon state require separate stack proof.
+use crate::pam_cancel::Cancellation;
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::{self, Read, Write};
@@ -140,25 +141,65 @@ fn nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 fn ready(fd: RawFd, events: i16, deadline: Instant) -> io::Result<()> {
+    ready_with_cancel(fd, events, deadline, None)
+}
+fn ready_with_cancel(
+    fd: RawFd,
+    events: i16,
+    deadline: Instant,
+    cancel: Option<&Cancellation>,
+) -> io::Result<()> {
     loop {
+        if cancel.is_some_and(Cancellation::is_canceled) {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
         let remaining = deadline
             .checked_duration_since(Instant::now())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-        let mut poll = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
+            .ok_or(io::ErrorKind::TimedOut)?;
+        let mut polls = [
+            libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancel.and_then(Cancellation::fd).unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        if cancel.is_some() && polls[1].fd < 0 {
+            return Err(invalid());
+        }
+        let count = if cancel.is_some() { 2 } else { 1 };
         let millis = remaining
             .as_millis()
             .saturating_add(1)
             .min(i32::MAX as u128) as i32;
-        // SAFETY: one valid pollfd, only borrowed for this call.
-        let count = unsafe { libc::poll(&mut poll, 1, millis) };
-        if count > 0 {
-            return Ok(());
+        // SAFETY: valid borrowed descriptors and array storage for this call.
+        let result = unsafe { libc::poll(polls.as_mut_ptr(), count, millis) };
+        if result > 0 {
+            if let Some(cancel) = cancel {
+                if cancel.is_canceled() {
+                    return Err(io::ErrorKind::ConnectionAborted.into());
+                }
+                if polls[1].revents != 0 {
+                    if polls[1].revents & libc::POLLIN == 0 {
+                        return Err(invalid());
+                    }
+                    cancel.drain()?;
+                    if cancel.is_canceled() {
+                        return Err(io::ErrorKind::ConnectionAborted.into());
+                    }
+                }
+            }
+            if polls[0].revents != 0 {
+                return Ok(());
+            }
+            // A stale wake is only notification; the current job remains authoritative.
+            continue;
         }
-        if count == 0 {
+        if result == 0 {
             return Err(io::ErrorKind::TimedOut.into());
         }
         let error = io::Error::last_os_error();
@@ -171,10 +212,11 @@ fn read_exact<T: Read + AsRawFd>(
     stream: &mut T,
     bytes: &mut [u8],
     deadline: Instant,
+    cancel: Option<&Cancellation>,
 ) -> io::Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {
-        ready(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+        ready_with_cancel(stream.as_raw_fd(), libc::POLLIN, deadline, cancel)?;
         match stream.read(&mut bytes[offset..]) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(count) => offset += count,
@@ -193,6 +235,14 @@ fn send<T: Write + AsRawFd, V: Serialize>(
     value: &V,
     deadline: Instant,
 ) -> io::Result<()> {
+    send_with_cancel(stream, value, deadline, None)
+}
+fn send_with_cancel<T: Write + AsRawFd, V: Serialize>(
+    stream: &mut T,
+    value: &V,
+    deadline: Instant,
+    cancel: Option<&Cancellation>,
+) -> io::Result<()> {
     let body = Bytes(serde_json::to_vec(value).map_err(|_| invalid())?);
     if body.0.is_empty() || body.0.len() > FRAME_LIMIT {
         return Err(invalid());
@@ -201,7 +251,7 @@ fn send<T: Write + AsRawFd, V: Serialize>(
     for part in [&header[..], &body.0[..]] {
         let mut offset = 0;
         while offset < part.len() {
-            ready(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+            ready_with_cancel(stream.as_raw_fd(), libc::POLLOUT, deadline, cancel)?;
             match stream.write(&part[offset..]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(count) => offset += count,
@@ -220,14 +270,21 @@ fn receive<T: Read + AsRawFd, V: serde::de::DeserializeOwned>(
     stream: &mut T,
     deadline: Instant,
 ) -> io::Result<V> {
+    receive_with_cancel(stream, deadline, None)
+}
+fn receive_with_cancel<T: Read + AsRawFd, V: serde::de::DeserializeOwned>(
+    stream: &mut T,
+    deadline: Instant,
+    cancel: Option<&Cancellation>,
+) -> io::Result<V> {
     let mut header = [0; 4];
-    read_exact(stream, &mut header, deadline)?;
+    read_exact(stream, &mut header, deadline, cancel)?;
     let count = u32::from_le_bytes(header) as usize;
     if count == 0 || count > FRAME_LIMIT {
         return Err(invalid());
     }
     let mut body = Bytes(vec![0; count]);
-    read_exact(stream, &mut body.0, deadline)?;
+    read_exact(stream, &mut body.0, deadline, cancel)?;
     serde_json::from_slice(&body.0).map_err(|_| invalid())
 }
 
@@ -282,6 +339,27 @@ impl SelfImage {
             user,
             budget,
             Some(self.file.clone()),
+            None,
+        )
+    }
+    pub fn spawn_cancellable(
+        &self,
+        identity: Identity,
+        service: String,
+        user: String,
+        budget: Duration,
+        cancel: Cancellation,
+    ) -> io::Result<Supervisor> {
+        let executable =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+        Supervisor::spawn_inner(
+            &executable,
+            identity,
+            service,
+            user,
+            budget,
+            Some(self.file.clone()),
+            Some(cancel),
         )
     }
 }
@@ -300,6 +378,7 @@ pub struct Supervisor {
     pending: Vec<Style>,
     retirement: Retirement,
     _source_image: Option<std::sync::Arc<std::fs::File>>,
+    cancellation: Option<Cancellation>,
 }
 impl Supervisor {
     /// Trusted caller/test boundary: `executable` must be an independently admitted
@@ -318,7 +397,26 @@ impl Supervisor {
         user: String,
         budget: Duration,
     ) -> io::Result<Self> {
-        Self::spawn_inner(executable, identity, service, user, budget, None)
+        Self::spawn_inner(executable, identity, service, user, budget, None, None)
+    }
+    /// Same trusted executable boundary; cancellation must be bound by its owner.
+    pub fn spawn_cancellable(
+        executable: &std::path::Path,
+        identity: Identity,
+        service: String,
+        user: String,
+        budget: Duration,
+        cancel: Cancellation,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(
+            executable,
+            identity,
+            service,
+            user,
+            budget,
+            None,
+            Some(cancel),
+        )
     }
     fn spawn_inner(
         executable: &std::path::Path,
@@ -327,6 +425,7 @@ impl Supervisor {
         user: String,
         budget: Duration,
         source_image: Option<std::sync::Arc<std::fs::File>>,
+        cancellation: Option<Cancellation>,
     ) -> io::Result<Self> {
         if budget.as_millis() == 0
             || budget > MAX_BUDGET
@@ -376,6 +475,7 @@ impl Supervisor {
             pending: Vec::new(),
             retirement: Retirement::Running,
             _source_image: source_image,
+            cancellation,
         };
         let setup: io::Result<()> = (|| {
             let pid =
@@ -388,7 +488,7 @@ impl Supervisor {
             let output = supervisor.output.as_mut().ok_or_else(invalid)?;
             nonblocking(input.as_raw_fd())?;
             nonblocking(output.as_raw_fd())?;
-            send(
+            send_with_cancel(
                 input,
                 &Request::Start {
                     identity: supervisor.identity.clone(),
@@ -397,6 +497,7 @@ impl Supervisor {
                     budget_ms: budget.as_millis() as u64,
                 },
                 deadline,
+                supervisor.cancellation.as_ref(),
             )
         })();
         if let Err(error) = setup {
@@ -426,7 +527,11 @@ impl Supervisor {
         result
     }
     fn read_event(&mut self) -> io::Result<Event> {
-        match receive(self.output.as_mut().ok_or_else(invalid)?, self.deadline)? {
+        match receive_with_cancel(
+            self.output.as_mut().ok_or_else(invalid)?,
+            self.deadline,
+            self.cancellation.as_ref(),
+        )? {
             Reply::Challenge {
                 identity,
                 sequence,
@@ -484,10 +589,11 @@ impl Supervisor {
             sequence,
             answers,
         };
-        let result = send(
+        let result = send_with_cancel(
             self.input.as_mut().ok_or_else(invalid)?,
             &request,
             self.deadline,
+            self.cancellation.as_ref(),
         );
         if result.is_ok() {
             self.pending.clear();
@@ -911,7 +1017,164 @@ pub fn entry() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
 
+    fn await_cancelable_poll(tid: libc::c_long) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let text = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")).unwrap();
+            let fields: Vec<_> = text.split_whitespace().collect();
+            let syscall = fields.first().and_then(|v| v.parse::<libc::c_long>().ok());
+            let polling = syscall == Some(libc::SYS_ppoll);
+            #[cfg(target_arch = "x86_64")]
+            let polling = polling || syscall == Some(libc::SYS_poll);
+            if polling && fields.get(2).copied() == Some("0x2") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("worker never entered the actual two-fd cancellation poll");
+    }
+    fn bound_cancel() -> Cancellation {
+        let cancel = Cancellation::default();
+        cancel
+            .bind(
+                crate::pam_cancel::WakeFd::new(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                    .unwrap(),
+            )
+            .unwrap();
+        cancel
+    }
+    #[test]
+    fn private_pam_cancel_interrupts_idle_partial_header_and_partial_body() {
+        for prefix in [vec![], vec![1, 0], vec![10, 0, 0, 0, b'{']] {
+            let (mut input, mut peer) = UnixStream::pair().unwrap();
+            nonblocking(input.as_raw_fd()).unwrap();
+            peer.write_all(&prefix).unwrap();
+            let cancel = bound_cancel();
+            let reader_cancel = cancel.clone();
+            let (entered, observed) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                entered
+                    .send(unsafe { libc::syscall(libc::SYS_gettid) })
+                    .unwrap();
+                receive_with_cancel::<_, Request>(
+                    &mut input,
+                    Instant::now() + MAX_BUDGET,
+                    Some(&reader_cancel),
+                )
+                .err()
+                .unwrap()
+                .kind()
+            });
+            await_cancelable_poll(observed.recv_timeout(Duration::from_secs(2)).unwrap());
+            let started = Instant::now();
+            cancel.cancel();
+            assert_eq!(reader.join().unwrap(), io::ErrorKind::ConnectionAborted);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            drop(peer);
+        }
+    }
+    #[test]
+    fn private_pam_old_attempt_wake_does_not_abort_a_fresh_read() {
+        let wake =
+            crate::pam_cancel::WakeFd::new(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .unwrap();
+        let old = Cancellation::default();
+        old.bind(wake.clone()).unwrap();
+        let fresh = Cancellation::default();
+        fresh.bind(wake).unwrap();
+        old.cancel();
+        let (mut input, mut peer) = UnixStream::pair().unwrap();
+        nonblocking(input.as_raw_fd()).unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            entered
+                .send(unsafe { libc::syscall(libc::SYS_gettid) })
+                .unwrap();
+            receive_with_cancel::<_, Request>(&mut input, Instant::now() + MAX_BUDGET, Some(&fresh))
+        });
+        await_cancelable_poll(observed.recv_timeout(Duration::from_secs(2)).unwrap());
+        old.cancel();
+        send(
+            &mut peer,
+            &Request::Cancel {
+                identity: Identity {
+                    nonce: [1; 16],
+                    request: 1,
+                    generation: 1,
+                    uid: unsafe { libc::getuid() },
+                },
+            },
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.join().unwrap().unwrap(),
+            Request::Cancel { .. }
+        ));
+    }
+    #[test]
+    fn private_pam_cancel_interrupts_blocked_start_and_answer_writes() {
+        for request in [
+            Request::Answers {
+                identity: Identity {
+                    nonce: [1; 16],
+                    request: 1,
+                    generation: 1,
+                    uid: unsafe { libc::getuid() },
+                },
+                sequence: 1,
+                answers: vec![Answer {
+                    index: 0,
+                    text: Some(AnswerText::new("controlled-only".into())),
+                }],
+            },
+            Request::Start {
+                identity: Identity {
+                    nonce: [1; 16],
+                    request: 1,
+                    generation: 1,
+                    uid: unsafe { libc::getuid() },
+                },
+                service: "controlled".into(),
+                user: "controlled".into(),
+                budget_ms: 10000,
+            },
+        ] {
+            let (mut output, peer) = UnixStream::pair().unwrap();
+            nonblocking(output.as_raw_fd()).unwrap();
+            loop {
+                match output.write(&[0; 4096]) {
+                    Ok(n) => assert!(n > 0),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("socket fill failed: {e}"),
+                }
+            }
+            let cancel = bound_cancel();
+            let writer_cancel = cancel.clone();
+            let (entered, observed) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                entered
+                    .send(unsafe { libc::syscall(libc::SYS_gettid) })
+                    .unwrap();
+                send_with_cancel(
+                    &mut output,
+                    &request,
+                    Instant::now() + MAX_BUDGET,
+                    Some(&writer_cancel),
+                )
+                .unwrap_err()
+                .kind()
+            });
+            await_cancelable_poll(observed.recv_timeout(Duration::from_secs(2)).unwrap());
+            let started = Instant::now();
+            cancel.cancel();
+            assert_eq!(writer.join().unwrap(), io::ErrorKind::ConnectionAborted);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            drop(peer);
+        }
+    }
     #[test]
     fn private_pam_codec_rejects_unknown_duplicate_oversized_and_redacts_errors() {
         for bytes in [
@@ -1032,6 +1295,7 @@ mod tests {
             pending: Vec::new(),
             retirement: Retirement::Running,
             _source_image: None,
+            cancellation: None,
         };
         assert_eq!(owner.retire(false), Retirement::Quarantined);
         assert!(std::path::Path::new(&format!("/proc/{}", owner.pid())).exists());

@@ -83,6 +83,7 @@ struct Client {
     pointer_axes: u32,
     /// (button, pressed) in arrival order.
     pointer_buttons: Vec<(u32, bool)>,
+    pointer_press_serial: Option<u32>,
     /// Every advertised toplevel size, in arrival order.
     configure_sizes: Vec<(i32, i32)>,
     /// Every advertised toplevel state array (raw wire bytes), in
@@ -297,11 +298,15 @@ impl Dispatch<WlPointer, ()> for Client {
             PointerEvent::Button {
                 button,
                 state: button_state,
+                serial,
                 ..
-            } => state.pointer_buttons.push((
-                button,
-                matches!(button_state, WEnum::Value(ClientButtonState::Pressed)),
-            )),
+            } => {
+                let pressed = matches!(button_state, WEnum::Value(ClientButtonState::Pressed));
+                state.pointer_buttons.push((button, pressed));
+                if pressed {
+                    state.pointer_press_serial = Some(serial);
+                }
+            }
             _ => {}
         }
     }
@@ -3776,4 +3781,674 @@ fn native_modal_close_with_destroyed_parent_focuses_live_window() {
 #[test]
 fn unfocused_native_modal_close_does_not_steal_focus_from_another_app() {
     close_native_modal(false, false, true);
+}
+
+/// Geometry from the actual actor/render path, never a shell dash icon hint.
+fn strip_drawn_geometry(
+    manager: &WindowManager,
+    id: u64,
+) -> Option<smithay::utils::Rectangle<i32, Logical>> {
+    manager
+        .render_entries()
+        .into_iter()
+        .find(|entry| entry.0 == id)
+        .map(|entry| entry.2)
+}
+
+/// Drive the actual compositor modifier/button route, without a private grab API.
+fn start_strip_drag(f: &mut ThreeFixture, id: u64) -> Point<f64, Logical> {
+    assert!(f.manager.focus(&mut f.comp.state, Some(id)));
+    f.manager.set_motion_allowed(false);
+    // Runtime runs this actual frame phase after reconciliation/focus and
+    // before subsequent input. Retarget columns before sampling the actor.
+    assert!(!f.manager.step_strip_view(0.0));
+    let geometry = strip_drawn_geometry(&f.manager, id).unwrap();
+    let pos: Point<f64, Logical> = (
+        f64::from(geometry.loc.x + 60),
+        f64::from(geometry.loc.y + 25),
+    )
+        .into();
+    f.manager.pointer_motion(&mut f.comp.state, pos, 10);
+    press(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 11);
+    assert!(f.manager.grab_active());
+    pos
+}
+
+#[test]
+fn strip_pointer_move_presents_actor_keeps_slots_and_commits_only_own_button() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let before = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    let next = (pos.x + 850.0, pos.y + 40.0).into();
+    f.manager.pointer_motion(&mut f.comp.state, next, 12);
+    assert_eq!(
+        f.manager.geometry(f.id_a).unwrap(),
+        before[0],
+        "canonical slot stays reserved until drop"
+    );
+    let drawn = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    assert_eq!(
+        drawn.loc,
+        (before[0].loc.x + 850, before[0].loc.y + 40).into()
+    );
+    assert_eq!(
+        f.manager
+            .window_at((drawn.loc.x as f64 + 20.0, drawn.loc.y as f64 + 20.0).into()),
+        Some(f.id_a)
+    );
+    let (_, marker) = f.manager.tile_preview(&f.comp.state).unwrap();
+    assert_eq!(
+        marker.size.w, 8,
+        "insertion marker is distinct from half tiling"
+    );
+    assert_eq!(f.manager.render_entries().last().unwrap().0, f.id_a);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT + 1, false, 13);
+    assert!(f.manager.grab_active(), "unrelated release cannot commit");
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 14);
+    assert!(!f.manager.grab_active());
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    let a = f.manager.geometry(f.id_a).unwrap();
+    let b = f.manager.geometry(f.id_b).unwrap();
+    assert!(a.loc.x > b.loc.x, "actual drop reorders columns");
+    assert_eq!(a.size, before[0].size);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+}
+
+#[test]
+fn strip_pointer_move_escape_restores_order_view_and_floating_restore() {
+    let mut f = three_windows();
+    let floating = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let before = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    let offset = f.manager.strip_offset();
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 900.0, pos.y + 30.0).into(), 12);
+    press(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    assert!(!f.manager.grab_active());
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        before
+    );
+    assert_eq!(f.manager.strip_offset(), offset);
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 13);
+    release(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    f.manager.set_scroll(&mut f.comp.state, false);
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        floating
+    );
+}
+
+/// Use the genuine wl_pointer serial and xdg_toplevel resize request.
+fn start_strip_resize(f: &mut ThreeFixture, left: bool) -> Point<f64, Logical> {
+    use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
+    f.manager.set_motion_allowed(false);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    assert!(!f.manager.step_strip_view(0.0));
+    let g = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    let x = if left {
+        g.loc.x + 2
+    } else {
+        g.loc.x + g.size.w - 2
+    };
+    let pos = (f64::from(x), f64::from(g.loc.y + 30)).into();
+    f.manager.pointer_motion(&mut f.comp.state, pos, 20);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 21);
+    sync_three(f);
+    let serial = f
+        .client_a
+        .pointer_press_serial
+        .expect("actual pointer press serial");
+    f.client_a.toplevel.as_ref().unwrap().resize(
+        f.client_a.seat.as_ref().unwrap(),
+        serial,
+        if left {
+            ResizeEdge::Left
+        } else {
+            ResizeEdge::Right
+        },
+    );
+    sync_three(f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(f.manager.grab_active());
+    pos
+}
+
+#[test]
+fn strip_resize_configures_continuous_width_neighbors_and_preserves_floating_stash() {
+    let mut f = three_windows();
+    let floating = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let pos = start_strip_resize(&mut f, false);
+    // Baseline the selected owner's view, not Gamma's pre-focus view.
+    let before = f.manager.geometry(f.id_a).unwrap();
+    let b = f.manager.geometry(f.id_b).unwrap();
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 73.0, pos.y + 100.0).into(), 22);
+    let after = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!(after.size.w, before.size.w + 73);
+    assert_eq!(
+        after.size.h, before.size.h,
+        "vertical motion does not invent stacked rows"
+    );
+    assert_eq!(f.manager.geometry(f.id_b).unwrap().loc.x, b.loc.x + 73);
+    sync_three(&mut f);
+    assert_eq!(
+        f.client_a.configure_sizes.last(),
+        Some(&(after.size.w, after.size.h))
+    );
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_a).unwrap(),
+        after,
+        "direct resize has no lagging actor"
+    );
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT + 1, false, 23);
+    assert!(f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 24);
+    assert!(!f.manager.grab_active());
+    press(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    press(&mut f.manager, &mut f.comp, R_KEYCODE);
+    assert_eq!(
+        f.manager.geometry(f.id_a).unwrap().size.w,
+        826,
+        "preset cycling advances from actual resized width"
+    );
+    release(&mut f.manager, &mut f.comp, R_KEYCODE);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    f.manager.set_scroll(&mut f.comp.state, false);
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        floating
+    );
+}
+
+#[test]
+fn strip_resize_cancel_restores_width_neighbors_view_and_ignores_unmapped_actor() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let before = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    let offset = f.manager.strip_offset();
+    let pos = start_strip_resize(&mut f, true);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x - 100.0, pos.y).into(), 22);
+    assert_eq!(
+        f.manager.geometry(f.id_a).unwrap().size.w,
+        before[0].size.w + 100
+    );
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    assert!(!f.manager.cancel_strip_pointer(&mut f.comp.state));
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        before
+    );
+    assert_eq!(f.manager.strip_offset(), offset);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 23);
+    let pos = start_strip_resize(&mut f, false);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 75.0, pos.y).into(), 24);
+    f.client_a.toplevel.as_ref().unwrap().destroy();
+    f.client_a.xdg_surface.as_ref().unwrap().destroy();
+    f.client_a.surface.as_ref().unwrap().destroy();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(!f.manager.grab_active());
+    assert!(
+        f.manager.geometry(f.id_a).is_none(),
+        "cancel never resurrects an unmapped actor"
+    );
+    assert_eq!(f.manager.geometry(f.id_b).unwrap().size, before[1].size);
+    assert_eq!(f.manager.geometry(f.id_c).unwrap().size, before[2].size);
+}
+
+#[test]
+fn strip_pointer_ownership_cancels_on_lock_output_mode_and_workspace_changes() {
+    for change in 0..4 {
+        let mut f = three_windows();
+        f.manager.set_scroll(&mut f.comp.state, true);
+        f.manager.focus(&mut f.comp.state, Some(f.id_a));
+        let id_a = f.id_a;
+        let pos = start_strip_drag(&mut f, id_a);
+        f.manager
+            .pointer_motion(&mut f.comp.state, (pos.x + 850.0, pos.y).into(), 12);
+        match change {
+            0 => {
+                f.comp.state.set_shortcut_inhibition_locked(true);
+                f.manager.reconcile(&mut f.comp.state);
+            }
+            1 => {
+                f.comp.state.set_output_size(1024, 768);
+                f.manager.reconcile(&mut f.comp.state);
+            }
+            2 => {
+                f.manager.set_scroll(&mut f.comp.state, false);
+            }
+            _ => {
+                f.manager.switch_relative(&mut f.comp.state, 1);
+            }
+        }
+        assert!(!f.manager.grab_active());
+        assert!(f.manager.tile_preview(&f.comp.state).is_none());
+        assert!(f.manager.geometry(f.id_a).is_some());
+    }
+}
+
+#[test]
+fn strip_client_resize_rejects_stale_serial_wrong_owner_and_vertical_only_edges() {
+    use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.set_motion_allowed(false);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    assert!(!f.manager.step_strip_view(0.0));
+    let g = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    f.manager.pointer_motion(
+        &mut f.comp.state,
+        (g.loc.x as f64 + 50.0, g.loc.y as f64 + 20.0).into(),
+        20,
+    );
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 21);
+    sync_three(&mut f);
+    let serial = f.client_a.pointer_press_serial.unwrap();
+    // A genuine press on alpha does not authorize another client's beta.
+    f.client_b.toplevel.as_ref().unwrap().resize(
+        f.client_b.seat.as_ref().unwrap(),
+        serial,
+        ResizeEdge::Right,
+    );
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(!f.manager.grab_active());
+    // Full-height single-window columns do not invent vertical resizing.
+    f.client_a.toplevel.as_ref().unwrap().resize(
+        f.client_a.seat.as_ref().unwrap(),
+        serial,
+        ResizeEdge::Top,
+    );
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(!f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 22);
+    f.client_a.toplevel.as_ref().unwrap().resize(
+        f.client_a.seat.as_ref().unwrap(),
+        serial,
+        ResizeEdge::Right,
+    );
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(
+        !f.manager.grab_active(),
+        "released serial cannot start a grab"
+    );
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), g);
+}
+
+#[test]
+fn strip_drag_translates_attached_dialog_family_and_keeps_child_above_parent() {
+    let mut f = three_windows();
+    let qh = f.queue_a.handle();
+    let surface = f
+        .client_a
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let xdg = f
+        .client_a
+        .xdg_base
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(&surface, &qh, ());
+    let top = xdg.get_toplevel(&qh, ());
+    top.set_title("strip-attached-dialog".into());
+    top.set_parent(f.client_a.toplevel.as_ref());
+    surface.commit();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    let child = f
+        .manager
+        .model()
+        .windows()
+        .find(|w| w.title == "strip-attached-dialog")
+        .unwrap()
+        .id;
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    f.manager.set_motion_allowed(false);
+    assert!(!f.manager.step_strip_view(0.0));
+    let original_parent = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    let original_child = strip_drawn_geometry(&f.manager, child).unwrap();
+    let original_neighbor = strip_drawn_geometry(&f.manager, f.id_b).unwrap();
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    // Make this already-attached child modal without replacing the moving
+    // actor. Both geometries and visibility must remain one moving family.
+    let dialog = f
+        .client_a
+        .dialogs
+        .as_ref()
+        .unwrap()
+        .get_xdg_dialog(&top, &qh, ());
+    dialog.set_modal();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(f.manager.grab_active());
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 350.0, pos.y + 45.0).into(), 12);
+    let parent = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    let child_drawn = strip_drawn_geometry(&f.manager, child).unwrap();
+    assert_eq!(
+        parent.loc,
+        (original_parent.loc.x + 350, original_parent.loc.y + 45).into()
+    );
+    assert_eq!(
+        child_drawn.loc,
+        (original_child.loc.x + 350, original_child.loc.y + 45).into(),
+        "dialog must not remain stranded in the old column"
+    );
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_b).unwrap(),
+        original_neighbor
+    );
+    let order: Vec<_> = f
+        .manager
+        .render_entries()
+        .iter()
+        .map(|entry| entry.0)
+        .collect();
+    assert_eq!(&order[order.len() - 2..], &[f.id_a, child]);
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_a).unwrap(),
+        original_parent
+    );
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, child).unwrap(),
+        original_child
+    );
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    let _keep = (surface, xdg, top, dialog);
+}
+
+#[test]
+fn strip_drag_survives_unrelated_map_and_neighbor_close_without_resurrection() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 400.0, pos.y).into(), 12);
+    f.client_b.toplevel.as_ref().unwrap().destroy();
+    f.client_b.xdg_surface.as_ref().unwrap().destroy();
+    f.client_b.surface.as_ref().unwrap().destroy();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(
+        f.manager.grab_active(),
+        "closing a neighbor must not end the owner's drag"
+    );
+    assert!(f.manager.geometry(f.id_b).is_none());
+    // Topology changed canonical slots. Present that actual frame before
+    // later pointer input uses the surviving neighbor's rendered center.
+    let actor = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    assert!(!f.manager.step_strip_view(0.0));
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_c).unwrap(),
+        f.manager.geometry(f.id_c).unwrap()
+    );
+    assert_eq!(strip_drawn_geometry(&f.manager, f.id_a).unwrap(), actor);
+    let (conn, mut queue, mut client) = connect(&mut f.comp);
+    map_toplevel(
+        &mut f.comp,
+        &conn,
+        &mut queue,
+        &mut client,
+        "mapped-during-strip-drag",
+    );
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(
+        f.manager.grab_active(),
+        "an unrelated map preserves live actor ownership"
+    );
+    assert!(!f.manager.step_strip_view(0.0));
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_c).unwrap(),
+        f.manager.geometry(f.id_c).unwrap()
+    );
+    assert_eq!(strip_drawn_geometry(&f.manager, f.id_a).unwrap(), actor);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 950.0, pos.y).into(), 13);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 14);
+    assert!(!f.manager.grab_active());
+    assert!(f.manager.geometry(f.id_b).is_none());
+    assert!(f.manager.geometry(f.id_a).unwrap().loc.x > f.manager.geometry(f.id_c).unwrap().loc.x);
+    let _keep = (conn, queue, client);
+}
+
+#[test]
+fn strip_reorder_preserves_unrelated_workspace_geometry_and_identity() {
+    let mut f = three_windows();
+    f.manager.move_to_workspace(&mut f.comp.state, f.id_c, 1);
+    f.manager.switch_workspace(&mut f.comp.state, 0);
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let other = f.manager.geometry(f.id_c).unwrap();
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 750.0, pos.y).into(), 12);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 13);
+    assert_eq!(f.manager.geometry(f.id_c).unwrap(), other);
+    assert_eq!(f.manager.model().window(f.id_c).unwrap().workspace, 1);
+    assert!(f.manager.geometry(f.id_a).unwrap().loc.x > f.manager.geometry(f.id_b).unwrap().loc.x);
+}
+
+#[test]
+fn strip_left_edge_resize_preserves_opposite_edge_then_release_follows_focus() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let before = f.manager.geometry(f.id_a).unwrap();
+    let pos = start_strip_resize(&mut f, true);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x - 100.0, pos.y).into(), 22);
+    let after = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!(after.size.w, before.size.w + 100);
+    assert_eq!(
+        after.loc.x + after.size.w,
+        before.loc.x + before.size.w,
+        "opposite edge remains anchored while overflow permits it"
+    );
+    assert!(after.loc.x < before.loc.x);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 23);
+    let released = f.manager.geometry(f.id_a).unwrap();
+    assert!(released.loc.x >= 0, "release restores minimal focus-follow");
+    assert_eq!(released.size, after.size);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+}
+
+#[test]
+fn strip_actor_extreme_finite_deltas_are_safe_and_nonfinite_input_cancels() {
+    for delta in [1e300, -1e300] {
+        let mut f = three_windows();
+        f.manager.set_scroll(&mut f.comp.state, true);
+        f.manager.focus(&mut f.comp.state, Some(f.id_a));
+        let id_a = f.id_a;
+        let pos = start_strip_drag(&mut f, id_a);
+        f.manager
+            .pointer_motion(&mut f.comp.state, (delta, delta).into(), 12);
+        let drawn = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+        // Bounds include extents; subsequent renderer/hit-test additions
+        // remain representable even for finite input far beyond i32.
+        assert!(drawn.loc.x.checked_add(drawn.size.w).is_some());
+        assert!(drawn.loc.y.checked_add(drawn.size.h).is_some());
+        let _ = f
+            .manager
+            .window_at((f64::from(drawn.loc.x), f64::from(drawn.loc.y)).into());
+        let _ = f.manager.tile_preview(&f.comp.state);
+        assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+        f.manager
+            .pointer_button(&mut f.comp.state, BTN_LEFT, false, 13);
+        release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+        f.manager.pointer_motion(&mut f.comp.state, pos, 14);
+        let pos = start_strip_drag(&mut f, id_a);
+        f.manager
+            .pointer_motion(&mut f.comp.state, (f64::NAN, pos.y).into(), 15);
+        assert!(!f.manager.grab_active());
+        assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    }
+}
+
+#[test]
+fn strip_super_drag_second_button_preserves_initiator_and_balanced_client_events() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    let second = BTN_LEFT + 1;
+    f.manager
+        .pointer_button(&mut f.comp.state, second, true, 12);
+    sync_three(&mut f);
+    assert!(f.manager.grab_active());
+    assert_eq!(
+        f.client_a.pointer_buttons,
+        vec![(second, true)],
+        "Super drag's initiating press remains swallowed, second press is balanced client input"
+    );
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 750.0, pos.y).into(), 13);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 14);
+    assert!(
+        !f.manager.grab_active(),
+        "original initiating release still commits"
+    );
+    f.manager
+        .pointer_button(&mut f.comp.state, second, false, 15);
+    sync_three(&mut f);
+    assert_eq!(
+        f.client_a.pointer_buttons,
+        vec![(second, true), (second, false)],
+        "neither an unmatched original release nor an overwritten swallowed owner may leak"
+    );
+    assert!(f.client_b.pointer_buttons.is_empty());
+    assert!(f.client_c.pointer_buttons.is_empty());
+}
+
+#[test]
+fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 300.0, pos.y + 35.0).into(), 12);
+    let parent_before = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    // Map an actual attached modal AFTER the pointer owner is established.
+    let qh = f.queue_a.handle();
+    let surface = f
+        .client_a
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let xdg = f
+        .client_a
+        .xdg_base
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(&surface, &qh, ());
+    let top = xdg.get_toplevel(&qh, ());
+    top.set_title("new-live-strip-modal".into());
+    top.set_parent(f.client_a.toplevel.as_ref());
+    let dialog = f
+        .client_a
+        .dialogs
+        .as_ref()
+        .unwrap()
+        .get_xdg_dialog(&top, &qh, ());
+    dialog.set_modal();
+    surface.commit();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    let child = f
+        .manager
+        .model()
+        .windows()
+        .find(|w| w.title == "new-live-strip-modal")
+        .unwrap()
+        .id;
+    assert!(
+        f.manager.grab_active(),
+        "a newly mapped family member does not discard the original owner"
+    );
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_a).unwrap(),
+        parent_before
+    );
+    let canonical_parent = f.manager.geometry(f.id_a).unwrap();
+    let canonical_child = f.manager.geometry(child).unwrap();
+    let child_drawn = strip_drawn_geometry(&f.manager, child).unwrap();
+    assert_eq!(
+        child_drawn.loc.x - parent_before.loc.x,
+        canonical_child.loc.x - canonical_parent.loc.x
+    );
+    assert_eq!(
+        child_drawn.loc.y - parent_before.loc.y,
+        canonical_child.loc.y - canonical_parent.loc.y
+    );
+    let order: Vec<_> = f
+        .manager
+        .render_entries()
+        .into_iter()
+        .map(|e| e.0)
+        .collect();
+    assert_eq!(&order[order.len() - 2..], &[f.id_a, child]);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 500.0, pos.y + 45.0).into(), 13);
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, child).unwrap().loc.x - child_drawn.loc.x,
+        200
+    );
+    dialog.destroy();
+    top.destroy();
+    xdg.destroy();
+    surface.destroy();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(
+        f.manager.grab_active(),
+        "closing the attached child preserves live parent ownership"
+    );
+    assert!(f.manager.geometry(child).is_none());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 14);
+    assert!(!f.manager.grab_active());
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    assert!(f.manager.render_entries().iter().all(|e| e.0 != child));
 }

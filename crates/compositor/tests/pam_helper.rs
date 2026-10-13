@@ -512,16 +512,20 @@ fn private_pam_helper_actual_binary_conversation_and_retirement() {
 // The library's Rust test image cannot serve the private entrypoint. This
 // explicit trusted factory uses the same admitted built compositor as above.
 fn run_backend_cases() {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
     use tuna_compositor::pam_backend::{Backend, Verification};
     use tuna_shell_control::Secret;
     let (created, creators) = std::sync::mpsc::channel();
-    let backend = Backend::with_trusted_factory(move |identity, service, user, budget| {
-        created.send(std::thread::current().id()).unwrap();
-        Supervisor::spawn(executable(), identity, service, user, budget)
+    let backend = Backend::with_trusted_factory(move |identity, service, user, budget, cancel| {
+        let helper =
+            Supervisor::spawn_cancellable(executable(), identity, service, user, budget, cancel)?;
+        created
+            .send((
+                std::thread::current().id(),
+                unsafe { libc::syscall(libc::SYS_gettid) },
+                helper.pid(),
+            ))
+            .unwrap();
+        Ok(helper)
     })
     .unwrap();
     let mut creator = None;
@@ -539,10 +543,10 @@ fn run_backend_cases() {
                 format!("private-{mode}"),
                 user(),
                 Secret(password.into()),
-                Arc::new(AtomicBool::new(false)),
+                tuna_compositor::pam_cancel::Cancellation::default(),
             )
             .unwrap();
-        let actual = creators.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (actual, _, _) = creators.recv_timeout(Duration::from_secs(2)).unwrap();
         if let Some(original) = creator {
             assert_eq!(original, actual);
         } else {
@@ -564,7 +568,7 @@ fn run_backend_cases() {
     }
     // Busy admission cannot queue another credential. Caller/ticket cancellation
     // leaves the creator owning its helper until the physical Retired receipt.
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = tuna_compositor::pam_cancel::Cancellation::default();
     let ticket = backend
         .begin(
             "private-hang".into(),
@@ -573,20 +577,20 @@ fn run_backend_cases() {
             cancel.clone(),
         )
         .unwrap();
-    assert_eq!(
-        creators.recv_timeout(Duration::from_secs(2)).unwrap(),
-        creator.unwrap()
-    );
+    let (actual, tid, pid) = creators.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(actual, creator.unwrap());
+    wait_backend_idle_read(tid);
     assert!(matches!(
         backend.begin(
             "private-single".into(),
             user(),
             Secret("second".into()),
-            Arc::new(AtomicBool::new(false))
+            tuna_compositor::pam_cancel::Cancellation::default()
         ),
         Err(Verification::RejectedBeforeSpawn)
     ));
-    cancel.store(true, Ordering::Release);
+    let started = Instant::now();
+    cancel.cancel();
     let mut pending = false;
     assert_eq!(
         ticket.wait_retired(|| pending = true),
@@ -595,12 +599,22 @@ fn run_backend_cases() {
         }
     );
     assert!(pending);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "idle helper cancellation waited for its ten-second deadline"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "Retired must follow actual helper reap"
+    );
+    // A wake retained by the previous attempt must not deny its successor.
+    cancel.cancel();
     let ticket = backend
         .begin(
             "private-single".into(),
             user(),
             Secret("right-password".into()),
-            Arc::new(AtomicBool::new(false)),
+            tuna_compositor::pam_cancel::Cancellation::default(),
         )
         .unwrap();
     assert_eq!(
@@ -609,6 +623,85 @@ fn run_backend_cases() {
             authenticated: true
         }
     );
+    let _ = creators.recv_timeout(Duration::from_secs(2)).unwrap();
+    // Exercise shutdown and ticket-drop on an actual blocked helper read too.
+    let ticket = backend
+        .begin(
+            "private-hang".into(),
+            user(),
+            Secret("right-password".into()),
+            tuna_compositor::pam_cancel::Cancellation::default(),
+        )
+        .unwrap();
+    let (_, tid, pid) = creators.recv_timeout(Duration::from_secs(2)).unwrap();
+    wait_backend_idle_read(tid);
+    let started = Instant::now();
     backend.shutdown();
+    assert_eq!(
+        ticket.wait_retired(|| {}),
+        Verification::Retired {
+            authenticated: false
+        }
+    );
+    wait_helper_reaped(pid, started);
+    let (created, creators) = std::sync::mpsc::channel();
+    let dropped_backend =
+        Backend::with_trusted_factory(move |identity, service, user, budget, cancel| {
+            let helper = Supervisor::spawn_cancellable(
+                executable(),
+                identity,
+                service,
+                user,
+                budget,
+                cancel,
+            )?;
+            created
+                .send((unsafe { libc::syscall(libc::SYS_gettid) }, helper.pid()))
+                .unwrap();
+            Ok(helper)
+        })
+        .unwrap();
+    let ticket = dropped_backend
+        .begin(
+            "private-hang".into(),
+            user(),
+            Secret("right-password".into()),
+            tuna_compositor::pam_cancel::Cancellation::default(),
+        )
+        .unwrap();
+    let (tid, pid) = creators.recv_timeout(Duration::from_secs(2)).unwrap();
+    wait_backend_idle_read(tid);
+    let started = Instant::now();
+    drop(ticket);
+    wait_helper_reaped(pid, started);
+    dropped_backend.shutdown();
     println!("stable PAM creator: single/wrong/account/repeated-secret/busy/cancel/actual-retirement controls passed");
+}
+
+// Observe the stable creator actually blocked in the production two-fd poll
+// after Start was sent, rather than canceling before it enters helper I/O.
+fn wait_backend_idle_read(tid: libc::c_long) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let state = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")).unwrap();
+        let fields: Vec<_> = state.split_whitespace().collect();
+        let syscall = fields.first().and_then(|v| v.parse::<libc::c_long>().ok());
+        let polling = syscall == Some(libc::SYS_ppoll);
+        #[cfg(target_arch = "x86_64")]
+        let polling = polling || syscall == Some(libc::SYS_poll);
+        if polling && fields.get(2).copied() == Some("0x2") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("creator did not enter the actual cancellable helper read poll");
+}
+fn wait_helper_reaped(pid: u32, started: Instant) {
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation did not retire idle helper promptly"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }

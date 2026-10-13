@@ -92,7 +92,7 @@ pub fn unlock_user() -> Option<String> {
 }
 
 /// Verify one entered password through the greeter login path: open a
-/// greetd attempt for `user`, answer each prompt with the password
+/// greetd attempt for `user`, answer ordinary prompts with the password
 /// (info/error notices auto-acknowledge exactly like login), and
 /// report the outcome. Success cancels the pending conversation —
 /// this session is already running, so nothing starts.
@@ -109,7 +109,13 @@ pub fn attempt_unlock(client: &mut impl UnlockClient, user: &str, password: &str
     };
     for _ in 0..MAX_AUTH_ROUNDS {
         match model.apply_response(&response) {
-            ModelEvent::NeedAnswer { .. } => {
+            ModelEvent::NeedAnswer { prompt } => {
+                if prompt.fingerprint {
+                    // This adapter has no typed answer for a device challenge.
+                    // Never replay a password (or acknowledge it as an answer).
+                    let _ = client.cancel();
+                    return UnlockOutcome::Denied;
+                }
                 response = match client.answer(Some(password.to_string())) {
                     Ok(response) => response,
                     Err(_) => return UnlockOutcome::Denied,
@@ -212,7 +218,7 @@ pub fn verify(user: &str, password: &str) -> bool {
 pub fn verify_owned(
     user: &str,
     password: tuna_shell_control::Secret,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: crate::pam_cancel::Cancellation,
     pending: impl FnMut(),
 ) -> crate::pam_backend::Verification {
     verify_owned_credential(
@@ -226,7 +232,7 @@ pub fn verify_owned(
 pub(crate) fn verify_owned_credential(
     user: &str,
     password: crate::pam_backend::Credential,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: crate::pam_cancel::Cancellation,
     pending: impl FnMut(),
 ) -> crate::pam_backend::Verification {
     use crate::pam_backend::Verification;
@@ -359,6 +365,53 @@ mod tests {
             self.cancelled = true;
             Ok(())
         }
+    }
+
+    #[test]
+    fn fingerprint_questions_never_receive_password_and_cancel_the_attempt() {
+        for style in [AuthMessageType::Secret, AuthMessageType::Visible] {
+            let mut stub = ScriptStub::new(vec![
+                Ok(Response::AuthMessage {
+                    auth_message_type: style,
+                    auth_message: "Place your finger on the fingerprint reader".into(),
+                }),
+                Ok(Response::Success),
+            ]);
+            assert_eq!(
+                attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
+                UnlockOutcome::Denied
+            );
+            assert!(stub.answers.is_empty());
+            assert!(stub.cancelled);
+        }
+    }
+    #[test]
+    fn password_then_fingerprint_does_not_replay_password_into_second_question() {
+        let mut stub = ScriptStub::new(vec![
+            Ok(secret_prompt("Password:")),
+            Ok(secret_prompt("Swipe your finger again")),
+            Ok(Response::Success),
+        ]);
+        assert_eq!(
+            attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
+            UnlockOutcome::Denied
+        );
+        assert_eq!(stub.answers, [Some("owned-fixture-secret".into())]);
+        assert!(stub.cancelled);
+    }
+    #[test]
+    fn fingerprint_info_remains_empty_ack_then_normal_password_succeeds() {
+        let mut stub = ScriptStub::new(vec![
+            Ok(info_notice("Place your finger on the fingerprint reader")),
+            Ok(secret_prompt("Password:")),
+            Ok(Response::Success),
+        ]);
+        assert_eq!(
+            attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
+            UnlockOutcome::Unlocked
+        );
+        assert_eq!(stub.answers, [None, Some("owned-fixture-secret".into())]);
+        assert!(stub.cancelled);
     }
 
     #[test]

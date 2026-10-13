@@ -4192,8 +4192,9 @@ wb_gate_begin() {
         fail "$WB_GATE" "the action proof helper is missing"
     [ -f "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" ] ||
         fail "$WB_GATE" "the probe bind helper is missing"
-    [ -n "$COMPOSITOR_PID" ] && kill -0 "$COMPOSITOR_PID" 2>/dev/null ||
+    if [ -z "$COMPOSITOR_PID" ] || ! kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
         fail "$WB_GATE" "the compositor process went missing"
+    fi
     wb_shell_matches="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk || true)"
     [ -n "$wb_shell_matches" ] ||
         fail "$WB_GATE" "no shell process under the compositor (expected exactly one)"
@@ -4283,8 +4284,9 @@ wb_probe_ensure() {
         probe_center="$(jq -r '.rect | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' \
             "$ARTIFACTS/wb-probe-owner.json")" ||
             fail "$WB_GATE" "the bound probe rect went missing"
-        [ -n "$probe_center" ] && [ "$probe_center" != "null null" ] ||
+        if [ -z "$probe_center" ] || [ "$probe_center" = "null null" ]; then
             fail "$WB_GATE" "the bound probe rect went missing"
+        fi
         wb_bound_x="$(jq -r '.rect[0]' "$ARTIFACTS/wb-probe-owner.json")" ||
             fail "$WB_GATE" "the bound probe rect went missing"
         wb_bound_y="$(jq -r '.rect[1]' "$ARTIFACTS/wb-probe-owner.json")" ||
@@ -4359,8 +4361,9 @@ wb_probe_ensure() {
     fi
     owner_rect="$(jq -c '.rect' "$ARTIFACTS/wb-probe-owner.json")" ||
         fail "$WB_GATE" "the bound probe rect went missing"
-    [ -n "$owner_rect" ] && [ "$owner_rect" != "null" ] ||
+    if [ -z "$owner_rect" ] || [ "$owner_rect" = "null" ]; then
         fail "$WB_GATE" "the bound probe rect went missing"
+    fi
     region_rect="$(jq -n --argjson r "$owner_rect" '[($r[0]+64),($r[1]+64),16,16]')" ||
         fail "$WB_GATE" "could not derive the sample region"
     jq -n --argjson rect "$region_rect" \
@@ -4387,6 +4390,8 @@ wb_pixel_preconditions() {
 
 wb_capture() {
     label="$1"
+    cstate '.animation_clock_manual == true and (.animation_clock_ms | type) == "number" and .animation_clock_ms >= 0 and .animation_clock_ms == (.animation_clock_ms | floor)' "manual capture clock" ||
+        fail "$WB_GATE" "pixel capture $label requires a typed manual animation clock"
     png="$ARTIFACTS/wb-$label.png"
     cstate_before="$ARTIFACTS/wb-$label-cstate-before.json"
     cstate_after="$ARTIFACTS/wb-$label-cstate-after.json"
@@ -4420,6 +4425,18 @@ wb_capture() {
         --argjson proc "$proc_json" --argjson proc_before "$proc_before_json" \
         '{label:$label,image:$image,cstate_before:$before,cstate_after:$after,clock_ms:$clock,epoch:$epoch,iso:$iso,proc:$proc,proc_before:$proc_before}' \
         >>"$WB_CAPS_JSONL" || fail "$WB_GATE" "could not record $label"
+}
+
+# Live Delay/Skip schedules use wall time. Freeze only their resulting pixel
+# capture, then restore wall time before the next action or cleanup.
+wb_capture_after_live_action() {
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen capture clock" ||
+        fail "$WB_GATE" "the clock did not freeze for the live-action capture"
+    wb_capture "$1" || fail "$WB_GATE" "live-action pixel capture failed"
+    rm -f "$TUNA_ANIMATION_CLOCK"
+    cstate '.animation_clock_manual | not' "real clock" ||
+        fail "$WB_GATE" "real time did not resume after the live-action capture"
 }
 
 wb_state_capture() {
@@ -4551,6 +4568,12 @@ wb_gate_begin G-WELLBEING-PIXEL-GRAY
 WB_WINDOWS_BEFORE="$(jq '.windows | length' "$CSTATE")"
 wb_probe_ensure
 wb_pixel_preconditions
+# Freeze before the baseline: bracketed captures require identical
+# typed manual-clock samples, and real time reports ms null.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-PIXEL-GRAY "the clock file did not freeze animation time"
+WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
 wb_capture gray-baseline
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
     --image "$ARTIFACTS/wb-gray-baseline.png" \
@@ -4562,10 +4585,6 @@ wb_capture gray-baseline
     --gate-start "$WB_START" \
     --receipt "$ARTIFACTS/wb-gray-baseline-check.json" ||
     fail G-WELLBEING-PIXEL-GRAY "baseline is not the live owned probe interior (overlap?)"
-anim_clock 0
-cstate '.animation_clock_manual' "frozen clock" ||
-    fail G-WELLBEING-PIXEL-GRAY "the clock file did not freeze animation time"
-WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
 gray_mark="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.screen-time-limits grayscale true ||
     fail G-WELLBEING-PIXEL-GRAY "could not set grayscale"
@@ -4621,6 +4640,12 @@ pass G-WELLBEING-PIXEL-GRAY "gray-only pixels ease 3s EASE_OUT_QUAD to full desa
 wb_gate_begin G-WELLBEING-PIXEL-FADE
 wb_probe_ensure
 wb_pixel_preconditions
+# Freeze before the baseline: bracketed captures require identical
+# typed manual-clock samples, and real time reports ms null.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-PIXEL-FADE "the clock file did not freeze animation time"
+WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
 wb_capture fade-baseline
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
     --image "$ARTIFACTS/wb-fade-baseline.png" \
@@ -4632,10 +4657,6 @@ wb_capture fade-baseline
     --gate-start "$WB_START" \
     --receipt "$ARTIFACTS/wb-fade-baseline-check.json" ||
     fail G-WELLBEING-PIXEL-FADE "baseline is not the live owned probe interior (overlap?)"
-anim_clock 0
-cstate '.animation_clock_manual' "frozen clock" ||
-    fail G-WELLBEING-PIXEL-FADE "the clock file did not freeze animation time"
-WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
 fade_mark="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
     fail G-WELLBEING-PIXEL-FADE "could not set the break interval"
@@ -4706,6 +4727,12 @@ pass G-WELLBEING-PIXEL-FADE "fade-only pixels ease 3s EASE_OUT_QUAD to brightnes
 wb_gate_begin G-WELLBEING-PIXEL-BOTH
 wb_probe_ensure
 wb_pixel_preconditions
+# Freeze before the baseline: bracketed captures require identical
+# typed manual-clock samples, and real time reports ms null.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-PIXEL-BOTH "the clock file did not freeze animation time"
+WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
 wb_capture both-baseline
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
     --image "$ARTIFACTS/wb-both-baseline.png" \
@@ -4717,10 +4744,6 @@ wb_capture both-baseline
     --gate-start "$WB_START" \
     --receipt "$ARTIFACTS/wb-both-baseline-check.json" ||
     fail G-WELLBEING-PIXEL-BOTH "baseline is not the live owned probe interior (overlap?)"
-anim_clock 0
-cstate '.animation_clock_manual' "frozen clock" ||
-    fail G-WELLBEING-PIXEL-BOTH "the clock file did not freeze animation time"
-WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
 both_gray_mark="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.screen-time-limits grayscale true ||
     fail G-WELLBEING-PIXEL-BOTH "could not set grayscale"
@@ -4817,6 +4840,12 @@ pass G-WELLBEING-PIXEL-BOTH "combined pixels settle at desaturation 1.0 and brig
 wb_gate_begin G-WELLBEING-PIXEL-RESET
 wb_probe_ensure
 wb_pixel_preconditions
+# Freeze before the baseline: bracketed captures require identical
+# typed manual-clock samples, and real time reports ms null.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-PIXEL-RESET "the clock file did not freeze animation time"
+WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
 wb_capture reset-baseline
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
     --image "$ARTIFACTS/wb-reset-baseline.png" \
@@ -4828,10 +4857,6 @@ wb_capture reset-baseline
     --gate-start "$WB_START" \
     --receipt "$ARTIFACTS/wb-reset-baseline-check.json" ||
     fail G-WELLBEING-PIXEL-RESET "baseline is not the live owned probe interior (overlap?)"
-anim_clock 0
-cstate '.animation_clock_manual' "frozen clock" ||
-    fail G-WELLBEING-PIXEL-RESET "the clock file did not freeze animation time"
-WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
 wb_step_ramp reset-neutral 0
 jq -s '[.[] | select(.label | startswith("reset-neutral-"))]' "$WB_CAPS_JSONL" \
     >"$ARTIFACTS/wb-reset-ramp-captures.json"
@@ -4956,6 +4981,12 @@ cstate '.motion_policy == "full"' "full motion" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "motion is not full"
 cstate '.wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1' "neutral" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "effects are not neutral at gate start"
+# Freeze brackets the baseline only: bracketed captures require identical
+# typed manual-clock samples, while the live break countdown and fade run
+# on real time below.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "the clock file did not freeze animation time"
 wb_capture take-fade-baseline
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
     --image "$ARTIFACTS/wb-take-fade-baseline.png" \
@@ -4967,6 +4998,9 @@ wb_capture take-fade-baseline
     --gate-start "$WB_START" \
     --receipt "$ARTIFACTS/wb-take-fade-baseline-check.json" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "baseline is not the live owned probe interior (overlap?)"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '.animation_clock_manual | not' "real clock" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "real time did not resume after the baseline"
 gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "could not set the break interval"
 # The break must outlive settle + capture + stale check so the settled
@@ -4998,8 +5032,17 @@ wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-press.json" 20 --press "Take" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "could not press Take"
 cstate '.wellbeing_effects.brightness < 1' "fade started" 10 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "Take produced no fade"
-cstate '.wellbeing_effects.brightness == 0.6' "fade settled" 10 ||
+# The compositor stores effects as f32: settled brightness serializes as
+# 0.6000000238418579, which exact f64 equality can never match. Compare
+# within 1e-6 of the unchanged 0.6 target instead, and require the ramp
+# to have finished so a still-running pass near target cannot qualify.
+cstate '(.wellbeing_effects.animating == false) and ((.wellbeing_effects.brightness - 0.6 | if . < 0 then -. else . end) < 0.000001)' "fade settled" 10 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "the fade did not settle at 0.6"
+# Re-freeze the settled fade for its bracketed capture: progress already
+# reached 1, so freezing holds 0.6 instead of stalling a live ramp.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "the clock file did not freeze animation time"
 wb_capture take-fade-settled
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" fade-sample \
     "$ARTIFACTS/wb-take-fade-settled-cstate-after.json" --expect faded ||
@@ -5015,6 +5058,9 @@ wb_capture take-fade-settled
     --gate-start "$WB_START" \
     --receipt "$ARTIFACTS/wb-take-fade-check.json" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "no faded frame on the owned probe"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '.animation_clock_manual | not' "real clock" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "real time did not resume after the settled capture"
 cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-before.json"
 stale_code=0
 wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
@@ -5113,7 +5159,7 @@ while [ "$(date +%s)" -le "$end" ]; do
     fi
 done
 [ -n "$DELAYREDUE" ] || fail G-WELLBEING-ACTION-DELAY "no redue banner after Delay"
-wb_capture delay-redue
+wb_capture_after_live_action delay-redue
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" delay \
     --old-due "$delay_due_epoch" --new-due "$delay_redue_epoch" --delay-secs 30 ||
     fail G-WELLBEING-ACTION-DELAY "live due did not move by delay-seconds"
@@ -5204,7 +5250,7 @@ while [ "$(date +%s)" -le "$end" ]; do
     fi
 done
 [ -n "$SKIPREDUE" ] || fail G-WELLBEING-ACTION-SKIP "no redue banner after Skip"
-wb_capture skip-redue
+wb_capture_after_live_action skip-redue
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" skip \
     --press "$skip_press_epoch" --new-due "$skip_redue_epoch" --interval-secs 10 ||
     fail G-WELLBEING-ACTION-SKIP "the interval did not restart at the press"
@@ -5240,8 +5286,9 @@ pass G-WELLBEING-ACTION-SKIP "an actual Skip press restarts the interval and a s
 wb_gate_begin G-WELLBEING-NEGATIVE
 wb_probe_ensure
 gray_start="$(jq -r '.gate_start_epoch' "$ARTIFACTS/wb-G-WELLBEING-PIXEL-GRAY-provenance.json")"
-[ -n "$gray_start" ] && [ "$gray_start" != "null" ] ||
+if [ -z "$gray_start" ] || [ "$gray_start" = "null" ]; then
     fail G-WELLBEING-NEGATIVE "gray gate provenance missing; controls have no admitted source"
+fi
 for spec in "gray:1:1" "fade:0:0.6" "both:1:0.6"; do
     name="${spec%%:*}"
     rest="${spec#*:}"
@@ -5292,7 +5339,7 @@ negative_retired_seq="$WB_DUMP_SEQ"
     --expect-nonce "$WB_NONCE" \
     --expect-seq "$negative_retired_seq" ||
     fail G-WELLBEING-NEGATIVE "a post-cleanup stale Take press fired"
-wb_capture negative-baseline
+wb_capture_after_live_action negative-baseline
 wb_provenance_finish
 pass G-WELLBEING-NEGATIVE "neutral frames fail every effect assertion, intermediates hold, stale presses fail"
 
@@ -6052,6 +6099,65 @@ if command -v ibus-daemon >/dev/null 2>&1 &&
         fail G-IME-CANDIDATES "the candidate window stayed after the commit"
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT - 40))
     pass G-IME-CANDIDATES "the shell draws IBus's candidates (你 尼 泥) under the cursor, the first highlighted (surface $surface), and clicking 尼 commits it"
+    # The active engine's real properties travel through ibus-daemon, not a
+    # synthetic GTK model. This helper binds the exact live shell PID and uses
+    # its private accessibility bus. External timeout also bounds blocked AT-SPI.
+    property_shell_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" ||
+        fail G-IME-PROPERTIES "shell owner absent"
+    case "$property_shell_pid" in *[!0-9]*|"") fail G-IME-PROPERTIES "shell owner not unique";; esac
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+        TUNA_PROOF_SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD)" timeout --kill-after=2s 40s "$PY" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" \
+        "$property_shell_pid" "$ENGINE_LOG" "$ARTIFACTS/ibus-properties-receipt.json" \
+        "$privacy_expected_shell" "${IME_PIDS%% *}" \
+        >"$ARTIFACTS/ibus-properties-proof.log" 2>&1 || fail G-IME-PROPERTIES "live properties proof failed"
+    scrot "$ARTIFACTS/24p-ime-properties.png" >/dev/null
+    pass G-IME-PROPERTIES "real daemon toggle/radio/submenu/action traffic; hidden/disabled and forged-peer denials"
+    # Separate lifecycle proof: preserve the original 40s property gate above.
+    # Two real nested lock cycles use the existing private PAM fixture. No
+    # password enters the observer, phase file, trace, or receipt.
+    [ -n "$PAM_ON" ] || fail G-IME-PROPERTIES-LIFECYCLE "private PAM fixture absent"
+    property_engine_pid="${IME_PIDS%% *}"
+    property_phase="$ARTIFACTS/ibus-properties-lifecycle-phase.json"
+    rm -f "$property_phase"
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+        TUNA_PROOF_SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD)" timeout --kill-after=2s 80s \
+        "$PY" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" "$property_shell_pid" "$ENGINE_LOG" \
+        "$ARTIFACTS/ibus-properties-lifecycle-receipt.json" "$privacy_expected_shell" \
+        "$property_engine_pid" "$property_phase" "$LOG" \
+        >"$ARTIFACTS/ibus-properties-lifecycle.log" 2>&1 &
+    property_driver_pid=$!
+    IME_PIDS="$IME_PIDS $property_driver_pid"
+    for property_case in normal other-panel; do
+        end=$(($(date +%s) + 35))
+        until [ -f "$property_phase" ] && jq -e --arg phase "locked-$property_case" \
+            --argjson gtk "$property_shell_pid" '.phase == $phase and .gtk.pid == $gtk' \
+            "$property_phase" >/dev/null; do
+            kill -0 "$property_driver_pid" 2>/dev/null || fail G-IME-PROPERTIES-LIFECYCLE "observer exited before lock phase"
+            [ "$(date +%s)" -le "$end" ] || fail G-IME-PROPERTIES-LIFECYCLE "lock phase deadline"
+            sleep 0.1
+        done
+        "$PY" - "$property_phase" "$property_driver_pid" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" <<'PY_IBUS_PHASE'
+import json, pathlib, sys
+phase = json.loads(pathlib.Path(sys.argv[1]).read_text())
+pid = int(phase["pid"])
+fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+if int(fields[1]) != int(sys.argv[2]):
+    raise SystemExit("observer is not the owned timeout child")
+if sys.argv[3].encode() not in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"):
+    raise SystemExit("observer source path differs")
+PY_IBUS_PHASE
+        cstate '.locked' "IBus lifecycle locked" 5 || fail G-IME-PROPERTIES-LIFECYCLE "observer phase disagrees with runtime lock"
+        # Same real lock UI wake/submission path as G-UNLOCK below.
+        sleep 1
+        xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
+        sleep 1
+        xdotool type --delay 30 "$UNLOCK_PASSWORD"
+        xdotool key Return
+        cstate '(.locked | not)' "IBus lifecycle authenticated unlock" 15 || \
+            fail G-IME-PROPERTIES-LIFECYCLE "private PAM fixture did not unlock"
+    done
+    wait "$property_driver_pid" || fail G-IME-PROPERTIES-LIFECYCLE "context/owner/lock property proof failed"
+    pass G-IME-PROPERTIES-LIFECYCLE "fresh unchanged-engine unlock; old context/lock actions have no effect; other panel is not replaced"
     # XIM talks to the session's XWayland, never the outer Xvfb display.
     x11_display="$(jq -r .x11_display "$CSTATE")"
     [ "$x11_display" != null ] || fail G-IME-XIM "XWayland display missing"
