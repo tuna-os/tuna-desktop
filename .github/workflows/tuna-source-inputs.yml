@@ -1,0 +1,47 @@
+name: Tuna candidate source inputs
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/tuna-source-inputs.yml'
+      - 'scripts/tuna-source-inputs'
+      - 'scripts/lib/tuna-source-inputs*.py'
+  workflow_dispatch:
+    inputs:
+      source_ci_run_id:
+        description: Completed exact-source ci run with check and arch-package success
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 scripts/lib/tuna-source-inputs-tests.py
+  capture:
+    if: github.event_name == 'workflow_dispatch'
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - name: Capture exact offline inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_ci_run_id }}
+        run: scripts/tuna-source-inputs capture --source-run "$SOURCE_RUN" --output "$RUNNER_TEMP/tuna-source-inputs"
+      - name: Upload exact inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: tuna-source-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tuna-source-inputs/
+          if-no-files-found: error
+          retention-days: 14
