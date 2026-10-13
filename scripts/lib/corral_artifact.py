@@ -5,6 +5,22 @@ import re,stat,subprocess,time,zipfile
 from corral_perf import GIB
 
 REPO='tuna-os/tuna-desktop'
+# Reviewed dense consumer bounds (explicit, no silent widening).
+# Compact 20Gi path is FROZEN: transfer <=2Gi. Dense 28Gi path is NEW:
+# transfer <=5Gi to admit the measured full-paired export (transfer
+# 4105446912 = 76.47% of 5Gi, allocated 4074299392 = 75.89% of 5Gi).
+# Archive: member <=5Gi covers the 5Gi disk.qcow2 member; total/ZIP <=6Gi
+# covers 5Gi + ~1Gi manifest/evidence/ZIP overhead. Download headroom:
+# free >= size + 6Gi + 0.5Gi (ZIP + expansion + allowance, max 12.5Gi).
+COMPACT_PVC='20Gi'
+COMPACT_PVC_BYTES=20*GIB
+COMPACT_MAX_TRANSFER_BYTES=2*GIB
+DENSE_PVC='28Gi'
+DENSE_PVC_BYTES=28*GIB
+DENSE_MAX_TRANSFER_BYTES=5*GIB
+ARCHIVE_MAX_MEMBER_BYTES=5*GIB
+ARCHIVE_MAX_TOTAL_BYTES=6*GIB
+ARCHIVE_MAX_ZIP_BYTES=6*GIB
 
 
 def gh_json(path):
@@ -21,20 +37,39 @@ def original_run(run,source,path):
 
 
 def disk_plan(manifest, *, method='qcow2-upload', raw_proof=None):
-    storage=manifest['storage']
-    if storage.get('virtual_bytes')!=18*GIB or not 0<storage.get('transfer_bytes',0)<=2*GIB or manifest.get('requested_pvc')!='20Gi' or manifest.get('firmware')!='uefi':
-        raise ValueError('bounded18Gi/20Gi UEFI export required')
+    storage=manifest.get('storage')
+    if not isinstance(storage,dict):raise ValueError('bounded storage manifest required')
+    transfer=storage.get('transfer_bytes')
+    if type(transfer) is not int:raise ValueError('bounded integer transfer bytes required')
+    virtual=storage.get('virtual_bytes')
+    if type(virtual) is not int:raise ValueError('bounded integer virtual bytes required')
+    # Reviewed bound: 20Gi path keeps its exact 2Gi transfer cap (frozen);
+    # 28Gi dense path admits transfer <=5Gi. No other PVC ask is admitted.
+    if manifest.get('requested_pvc')==COMPACT_PVC:
+        if virtual!=18*GIB or not 0<transfer<=COMPACT_MAX_TRANSFER_BYTES or manifest.get('firmware')!='uefi':
+            raise ValueError('bounded18Gi/20Gi UEFI export required')
+        pvc_bytes=COMPACT_PVC_BYTES
+    elif manifest.get('requested_pvc')==DENSE_PVC:
+        if virtual!=18*GIB or not 0<transfer<=DENSE_MAX_TRANSFER_BYTES or manifest.get('firmware')!='uefi':
+            raise ValueError('bounded18Gi/28Gi dense UEFI export required (5Gi transfer)')
+        pvc_bytes=DENSE_PVC_BYTES
+    else:
+        raise ValueError('bounded18Gi/20Gi-or-28Gi UEFI export required (20Gi:2Gi transfer; 28Gi:5Gi transfer)')
     if method=='raw-upload':
         if not raw_proof or raw_proof.get('full_image_import_qualified') is not False or not re.fullmatch('[0-9a-f]{64}',raw_proof.get('original_probe_receipt_sha256','')):raise ValueError('backend-bound original RAW probe required')
-        return {'method':method,'target_pvc_bytes':20*GIB,'scratch_pvc_bytes':20*GIB,'scratch_physical_metadata_allowance_bytes':GIB,'runtime_layer_allowance_bytes':GIB,'guest_write_allowance_bytes':GIB//2,'estimated_peak_bytes':22*GIB+GIB//2,'raw_method_proof':raw_proof,'full_image_import_qualified':False,'performance_qualified':False}
+        return {'method':method,'target_pvc_bytes':pvc_bytes,'scratch_pvc_bytes':pvc_bytes,'scratch_physical_metadata_allowance_bytes':GIB,'runtime_layer_allowance_bytes':GIB,'guest_write_allowance_bytes':GIB//2,'estimated_peak_bytes':pvc_bytes+GIB+GIB+GIB//2,'raw_method_proof':raw_proof,'full_image_import_qualified':False,'performance_qualified':False,'node_peak_qualified':False,'limitation':'node admission pending measurement: full target+scratch reserve and CDI scratch/preallocation plus guest writes must be measured on a pressure-free node; no node is admitted by this plan'}
     if method!='qcow2-upload':raise ValueError('raw optimization requires separately qualified actual method')
     # Reserve full target AND scratch capacity until a measured/source-proven
     # method supports a smaller physical bound. Mapped estimates are not enough.
-    return {'method':method,'target_pvc_bytes':20*GIB,'scratch_pvc_bytes':20*GIB,
+    # Dense 28Gi example: 56Gi + transfer 4105446912 + 1Gi + 0.5Gi = 65845601792
+    # (~61.32Gi). Node admission stays pending measurement (see the plan
+    # limitation + node_peak_qualified False); no node claim is made here.
+    return {'method':method,'target_pvc_bytes':pvc_bytes,'scratch_pvc_bytes':pvc_bytes,
             'transfer_temporary_allowance_bytes':storage['transfer_bytes'],
             'guest_write_allowance_bytes':GIB//2,'runtime_layer_allowance_bytes':GIB,
-            'estimated_peak_bytes':40*GIB+storage['transfer_bytes']+GIB+GIB//2,
-            'performance_qualified':False}
+            'estimated_peak_bytes':2*pvc_bytes+storage['transfer_bytes']+GIB+GIB//2,
+            'performance_qualified':False,'node_peak_qualified':False,
+            'limitation':'node admission pending measurement: full target+scratch reserve and CDI scratch/preallocation plus guest writes must be measured on a pressure-free node; no node is admitted by this plan'}
 
 
 def safe_members(archive):
@@ -48,7 +83,7 @@ def safe_members(archive):
         normalized=path.as_posix()
         if normalized!=entry.filename.rstrip('/') or normalized in names:raise ValueError('ambiguous artifact path')
         names.add(normalized);total+=entry.file_size
-        if entry.file_size>2*GIB or total>3*GIB:raise ValueError('artifact expansion exceeds bound')
+        if entry.file_size>ARCHIVE_MAX_MEMBER_BYTES or total>ARCHIVE_MAX_TOTAL_BYTES:raise ValueError('artifact expansion exceeds bound')
     if 'manifest.json' not in names or 'disk.qcow2' not in names:raise ValueError('disk artifact members missing')
     return entries,total
 
@@ -62,9 +97,9 @@ def download(run_id,artifact_id,source,profile,out):
     if artifact.get('name')!='marlin-benchmark-disk-'+profile or artifact.get('expired') is not False or artifact.get('workflow_run',{}).get('id')!=run_id or artifact.get('workflow_run',{}).get('head_sha')!=source:
         raise ValueError('artifact identity/retention differs')
     expected=artifact.get('digest','');size=artifact.get('size_in_bytes')
-    if not re.fullmatch(r'sha256:[0-9a-f]{64}',expected) or type(size) is not int or not 0<size<=3*GIB:raise ValueError('bounded original archive digest required')
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}',expected) or type(size) is not int or not 0<size<=ARCHIVE_MAX_ZIP_BYTES:raise ValueError('bounded original archive digest required')
     free=os.statvfs(out).f_bavail*os.statvfs(out).f_frsize
-    if free<size+3*GIB+GIB//2:raise ValueError('local download/extraction disk headroom insufficient')
+    if free<size+ARCHIVE_MAX_TOTAL_BYTES+GIB//2:raise ValueError('local download/extraction disk headroom insufficient')
     archive_path=out/'original-artifact.zip'
     with archive_path.open('xb') as stream,(out/'download-error.log').open('wb') as error:
         process=subprocess.Popen(['gh','api','repos/'+REPO+f'/actions/artifacts/{artifact_id}/zip'],stdout=stream,stderr=error,start_new_session=True)
