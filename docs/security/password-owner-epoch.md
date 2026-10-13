@@ -39,3 +39,25 @@ Rust and runtime results remain pending until the exact candidate passes CI.
 This fixture covers native control IPC under winit and Xvfb. It does not qualify
 the GTK lock screen, installed DRM, physical devices or multiple authentication
 challenges. Existing GTK unlock and Marlin sleep controls remain required.
+
+## Controlled runtime epoch proof
+
+A second required CI case uses a separate admitted Rust example. It calls the
+same private runtime loop on its main thread through a narrow authentication
+probe. The normal compositor supplies a no-op probe. It gains no environment,
+CLI, configuration or control-wire injection command.
+
+While a correct delayed greetd attempt owns the outer slot, the probe verifies
+that public `Runtime::try_unlock` rejects another attempt. It advances the same
+epoch helper used by the sleep monitor. The late correct result must deny while
+its original connection stays live. A fresh connection can then authenticate.
+After manual relock, the probe calls the real synchronous public unlock path and
+checks its success epoch and lock flags.
+
+This is controlled runtime epoch injection. It is not actual logind notification
+or S3, nor an observation of a backend sending a duplicate result. Existing
+Marlin sleep gates still qualify that native path. Pure slot tests separately
+check mismatched and duplicate callbacks while a newer attempt owns the slot.
+The example and test executable require exact Cargo package, target kind,
+profile, source path and hash admission before and after execution. Runtime
+qualification remains pending until those required exact-head cases pass CI.

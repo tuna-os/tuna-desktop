@@ -5940,6 +5940,57 @@ fn send_frame_callbacks(
 /// `WAYLAND_DISPLAY` is set, so setting it first would point winit at our
 /// own not-yet-existing socket.
 pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
+    run_loop(session, |_| None)
+}
+
+/// Narrow, trusted Rust-only CI driver. The normal binary supplies no probe.
+/// No credential challenge, UI/configuration or IPC entry point is added.
+pub struct AuthOwnerProbe<'a> {
+    runtime: &'a mut Runtime,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct AuthOwnerStatus {
+    pub locked: bool,
+    pub epoch: u64,
+    pub outer_pending: bool,
+}
+impl AuthOwnerProbe<'_> {
+    pub fn status(&self) -> AuthOwnerStatus {
+        AuthOwnerStatus {
+            locked: self.runtime.is_locked(),
+            epoch: self
+                .runtime
+                .unlock_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            outer_pending: self.runtime.unlock_worker.is_some(),
+        }
+    }
+    /// Controlled epoch injection, not an observation of logind or S3.
+    pub fn invalidate_epoch(&mut self) -> bool {
+        crate::auth_owner::advance_epoch(&self.runtime.unlock_generation)
+    }
+    pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
+        self.runtime.try_unlock(user, password)
+    }
+    pub fn request_exit(&mut self) {
+        self.runtime.exit = true;
+        self.runtime.wake.signal();
+    }
+}
+
+/// Runs the identical runtime, input, IPC and owned-worker loop on the caller's
+/// main thread. A deadline belongs solely to the trusted probe caller.
+pub fn run_auth_owner_probe(
+    session: &NestedSession,
+    probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
+) -> Result<RunStats, RuntimeError> {
+    run_loop(session, probe)
+}
+
+fn run_loop(
+    session: &NestedSession,
+    mut probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
+) -> Result<RunStats, RuntimeError> {
     let (mut runtime, mut event_loop) = Runtime::launch(session)?;
     let prev_env = apply_nested_env(&session.socket_name);
     #[cfg(feature = "drm")]
@@ -6016,9 +6067,16 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
             }
         }
         let ticked = dispatched.and_then(|_| runtime.tick());
+        let probe_delay = probe(&mut AuthOwnerProbe {
+            runtime: &mut runtime,
+        });
         match ticked {
             Ok(true) => {
                 wait = runtime.next_wait();
+                if let Some(delay) = probe_delay {
+                    let delay = delay.clamp(Duration::from_millis(1), Duration::from_millis(100));
+                    wait = Some(wait.map_or(delay, |runtime_delay| runtime_delay.min(delay)));
+                }
                 continue;
             }
             done => {

@@ -172,6 +172,72 @@ fn client() {
     // Keep the supervised process alive until parent sends graceful termination.
     std::thread::sleep(Duration::from_secs(2));
 }
+fn epoch_client() {
+    let root = PathBuf::from(std::env::var_os("TUNA_AUTH_OWNER_ROOT").unwrap());
+    wait(|| state(&root)["auth_owner"].is_object());
+    let mut original = connect();
+    let mut other = connect();
+    send(&mut original, 10, CommandKind::Lock);
+    result(&mut original, 10, true);
+    wait(|| state(&root)["auth_owner"]["epoch"] == 1 && state(&root)["locked"] == true);
+    send(
+        &mut original,
+        1,
+        CommandKind::Unlock {
+            password: Secret("controlled-only".into()),
+        },
+    );
+    wait(|| root.join("started-1").exists());
+    std::fs::write(root.join("inject-epoch"), b"1").unwrap();
+    wait(|| root.join("epoch-injected.json").exists());
+    let injected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("epoch-injected.json")).unwrap()).unwrap();
+    assert_eq!(injected["busy_sync_denied"], true);
+    send(
+        &mut other,
+        1,
+        CommandKind::Unlock {
+            password: Secret("controlled-only".into()),
+        },
+    );
+    result(&mut other, 1, false);
+    std::fs::write(root.join("release-1"), b"1").unwrap();
+    result(&mut original, 1, false);
+    wait(|| state(&root)["auth_owner"]["outer_pending"] == false);
+    assert_eq!(state(&root)["locked"], true);
+    assert_eq!(state(&root)["auth_owner"]["epoch"], 2);
+    drop(original);
+    let mut replacement = connect();
+    std::fs::write(root.join("release-2"), b"1").unwrap();
+    send(
+        &mut replacement,
+        1,
+        CommandKind::Unlock {
+            password: Secret("controlled-only".into()),
+        },
+    );
+    result(&mut replacement, 1, true);
+    wait(|| state(&root)["locked"] == false && state(&root)["auth_owner"]["epoch"] == 3);
+    send(&mut replacement, 11, CommandKind::Lock);
+    result(&mut replacement, 11, true);
+    wait(|| state(&root)["locked"] == true && state(&root)["auth_owner"]["epoch"] == 4);
+    std::fs::write(root.join("release-3"), b"1").unwrap();
+    std::fs::write(root.join("try-sync"), b"1").unwrap();
+    wait(|| root.join("sync-result.json").exists());
+    let synced: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("sync-result.json")).unwrap()).unwrap();
+    assert_eq!(synced["applied"], true);
+    wait(|| state(&root)["locked"] == false && state(&root)["auth_owner"]["epoch"] == 5);
+    std::fs::write(root.join("success.json"),serde_json::to_vec(&serde_json::json!({
+        "supervised_client_pid":std::process::id(),"late_epoch_success_denied":true,
+        "busy_public_sync_denied":true,"fresh_origin_success":true,"public_sync_success":true,
+        "manual_epoch":1,"injected_epoch":2,"fresh_epoch":3,"relock_epoch":4,"sync_epoch":5,
+        "scope":"actual runtime controlled epoch injection and public try_unlock; not logind/S3/backend duplicate"
+    })).unwrap()).unwrap();
+    // Parent admits this live process, copies receipts, then terminates the driver.
+    std::thread::sleep(Duration::from_secs(2));
+}
+
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
     fn drop(&mut self) {
@@ -200,16 +266,22 @@ impl Drop for Artifacts {
     fn drop(&mut self) {
         if let Some(out) = &self.out {
             let _ = std::fs::create_dir_all(out);
-            for name in ["success.json", "compositor.log", "state.json"] {
+            for name in [
+                "success.json",
+                "compositor.log",
+                "state.json",
+                "epoch-injected.json",
+                "sync-result.json",
+            ] {
                 let _ = std::fs::copy(self.root.join(name), out.join(name));
             }
         }
     }
 }
 
-fn greetd(listener: UnixListener, root: PathBuf) {
+fn greetd(listener: UnixListener, root: PathBuf, attempts: usize) {
     listener.set_nonblocking(true).unwrap();
-    for n in 1..=2 {
+    for n in 1..=attempts {
         let mut connection = None;
         wait(|| match listener.accept() {
             Ok((s, _)) => {
@@ -249,9 +321,40 @@ fn greetd(listener: UnixListener, root: PathBuf) {
 }
 #[test]
 fn actual_runtime_owns_delayed_greetd_result_and_lock_epochs() {
-    if std::env::var_os(ROLE).is_some() {
-        return client();
+    match std::env::var(ROLE).ok().as_deref() {
+        Some("1") => return client(),
+        Some(_) => return,
+        None => {}
     }
+    run_parent(
+        Path::new(env!("CARGO_BIN_EXE_tuna-compositor")),
+        "1",
+        2,
+        "compositor",
+    );
+}
+
+#[test]
+fn actual_runtime_epoch_invalidation_and_public_sync_unlock() {
+    match std::env::var(ROLE).ok().as_deref() {
+        Some("2") => return epoch_client(),
+        Some(_) => return,
+        None => {}
+    }
+    if std::env::var_os("DISPLAY").is_none() {
+        assert!(
+            std::env::var_os("TUNA_REQUIRE_AUTH_OWNER_RUNTIME").is_none(),
+            "owned display required"
+        );
+        return;
+    }
+    let bin = PathBuf::from(
+        std::env::var_os("TUNA_AUTH_OWNER_PROBE_BIN").expect("admitted probe example"),
+    );
+    run_parent(&bin, "2", 3, "probe");
+}
+
+fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
     if std::env::var_os("DISPLAY").is_none() {
         assert!(
             std::env::var_os("TUNA_REQUIRE_AUTH_OWNER_RUNTIME").is_none(),
@@ -270,12 +373,11 @@ fn actual_runtime_owns_delayed_greetd_result_and_lock_epochs() {
     let socket = root.path().join("greetd.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server_root = root.path().to_owned();
-    let server = std::thread::spawn(move || greetd(listener, server_root));
-    let bin = Path::new(env!("CARGO_BIN_EXE_tuna-compositor"));
+    let server = std::thread::spawn(move || greetd(listener, server_root, attempts));
     let sha = Command::new("sha256sum").arg(bin).output().unwrap();
     assert!(sha.status.success());
     println!(
-        "auth owner compositor sha256: {}",
+        "auth owner {kind} sha256: {}",
         String::from_utf8_lossy(&sha.stdout)
             .split_whitespace()
             .next()
@@ -294,7 +396,8 @@ fn actual_runtime_owns_delayed_greetd_result_and_lock_epochs() {
                 "--shell-bin",
             ])
             .arg(std::env::current_exe().unwrap())
-            .env(ROLE, "1")
+            .env(ROLE, role)
+            .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
             .env("TUNA_AUTH_OWNER_ROOT", root.path())
             .env("XDG_RUNTIME_DIR", root.path())
             .env("GREETD_SOCK", &socket)
@@ -344,14 +447,22 @@ fn actual_runtime_owns_delayed_greetd_result_and_lock_epochs() {
     receipt["compositor_pid"] = serde_json::json!(child.0.id());
     std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
     println!(
-        "auth owner runtime receipt: {}",
+        "auth owner {kind} runtime receipt: {}",
         std::fs::read_to_string(root.path().join("success.json")).unwrap()
     );
     if let Some(out) = std::env::var_os("TUNA_AUTH_OWNER_ARTIFACTS") {
         let out = PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
-        for name in ["success.json", "compositor.log", "state.json"] {
-            std::fs::copy(root.path().join(name), out.join(name)).unwrap();
+        for name in [
+            "success.json",
+            "compositor.log",
+            "state.json",
+            "epoch-injected.json",
+            "sync-result.json",
+        ] {
+            if root.path().join(name).is_file() {
+                std::fs::copy(root.path().join(name), out.join(name)).unwrap();
+            }
         }
     }
     drop(child);
