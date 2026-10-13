@@ -284,43 +284,64 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
-    /// Drive [`conversation`] with one message, returning the status and
-    /// (on success) the first reply text. Frees the C responses.
-    fn run_once(style: c_int, text: Option<&str>) -> (c_int, Option<String>) {
+    /// Drive [`conversation`] with `messages`, returning the status and
+    /// (on success) each reply text. Frees the C responses.
+    fn run_all(messages: &[(c_int, Option<&str>)]) -> (c_int, Vec<Option<String>>) {
         let user = CString::new("ada").unwrap();
         let password = CString::new("s3cret").unwrap();
         let secrets = Box::new(Secrets { user, password });
-        let prompt = text.map(|t| CString::new(t).unwrap());
-        let message = PamMessage {
-            msg_style: style,
-            msg: prompt.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
-        };
-        let mut messages = [&message as *const PamMessage];
+        let prompts: Vec<Option<CString>> = messages
+            .iter()
+            .map(|(_, text)| text.map(|t| CString::new(t).unwrap()))
+            .collect();
+        let pam_messages: Vec<PamMessage> = prompts
+            .iter()
+            .zip(messages.iter())
+            .map(|(prompt, (style, _))| PamMessage {
+                msg_style: *style,
+                msg: prompt.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+            })
+            .collect();
+        let mut ptrs: Vec<*const PamMessage> = pam_messages
+            .iter()
+            .map(|m| m as *const PamMessage)
+            .collect();
         let mut out: *mut PamResponse = std::ptr::null_mut();
         let rc = unsafe {
             conversation(
-                1,
-                messages.as_mut_ptr(),
+                ptrs.len() as c_int,
+                ptrs.as_mut_ptr(),
                 &mut out,
                 &*secrets as *const Secrets as *mut c_void,
             )
         };
-        let reply = if rc == PAM_SUCCESS && !out.is_null() {
-            let resp = unsafe { (*out).resp };
-            let text = if resp.is_null() {
-                None
-            } else {
-                Some(
-                    unsafe { std::ffi::CStr::from_ptr(resp) }
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            };
-            unsafe { free_responses(out, 1) };
-            text
+        let replies = if rc == PAM_SUCCESS && !out.is_null() {
+            let mut replies = Vec::with_capacity(ptrs.len());
+            for i in 0..ptrs.len() {
+                let resp = unsafe { (*out.add(i)).resp };
+                replies.push(if resp.is_null() {
+                    None
+                } else {
+                    Some(
+                        unsafe { std::ffi::CStr::from_ptr(resp) }
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                });
+            }
+            unsafe { free_responses(out, ptrs.len()) };
+            replies
         } else {
-            None
+            Vec::new()
         };
+        (rc, replies)
+    }
+
+    /// Drive [`conversation`] with one message, returning the status and
+    /// (on success) the first reply text. Frees the C responses.
+    fn run_once(style: c_int, text: Option<&str>) -> (c_int, Option<String>) {
+        let (rc, mut replies) = run_all(&[(style, text)]);
+        let reply = replies.pop().unwrap_or(None);
         (rc, reply)
     }
 
@@ -349,6 +370,22 @@ mod tests {
             assert_eq!(rc, PAM_CONV_ERR, "answered a fingerprint prompt: {text}");
             assert_eq!(reply, None);
         }
+    }
+
+    #[test]
+    fn mixed_password_and_fingerprint_conversation_fails_closed() {
+        // A stack that asks for a password and then a fingerprint: the
+        // whole conversation fails rather than answering the password
+        // prompt and handing the secret to the fingerprint one.
+        let (rc, replies) = run_all(&[
+            (PAM_PROMPT_ECHO_OFF, Some("Password:")),
+            (
+                PAM_PROMPT_ECHO_OFF,
+                Some("Place your finger on the fingerprint reader"),
+            ),
+        ]);
+        assert_eq!(rc, PAM_CONV_ERR);
+        assert!(replies.is_empty());
     }
 
     #[test]

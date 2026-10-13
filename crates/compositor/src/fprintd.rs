@@ -21,10 +21,13 @@
 //! Failure rules: no daemon, no device, no enrolled prints, a denied
 //! PolicyKit check, a dropped connection or a timeout all fail closed
 //! ([`VerifyOutcome::Error`] and friends — never unlock), carry no
-//! detail, and log nothing. Fingerprints never leave the daemon; this
-//! client only learns match/no-match.
-use std::sync::mpsc;
-use std::time::Duration;
+//! detail, and log nothing. Every D-Bus wait is bounded: method calls
+//! by [`DBUS_CALL_TIMEOUT`], the signal wait by the attempt deadline,
+//! so a wedged daemon can delay but never hang the caller.
+//! Fingerprints never leave the daemon; this client only learns
+//! match/no-match.
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// fprintd's well-known name on the system bus.
 pub const BUS_NAME: &str = "net.reactivated.Fprint";
@@ -40,6 +43,10 @@ pub const VERIFY_ANY: &str = "any";
 /// probe reports unavailable and every attempt fails closed. Tests and
 /// hardened images use it to pin the no-reader path.
 pub const DISABLE_ENV: &str = "TUNA_FPRINTD_OFF";
+/// Bound on one D-Bus method call (device lookup, enrollment query,
+/// claim, verify start/stop, release). The bus default waits forever;
+/// a wedged daemon must fail the attempt, not hang the caller.
+pub const DBUS_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default bound on one verification (finger press included).
 pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on intermediate retry signals per attempt. A daemon that
@@ -133,6 +140,46 @@ pub fn effective_claim_name<'a>(user: &'a str, process_user: Option<&str>) -> &'
     }
 }
 
+/// Drain one attempt's `VerifyStatus` bodies until a terminal signal
+/// ends it, retries (or malformed messages) run out, the daemon goes
+/// away, or `deadline` passes. `Err(())` is a malformed signal body:
+/// tolerated bounded, like a retry. A dropped sender means the daemon
+/// went away mid-attempt. Each wait carries only the remaining budget,
+/// so the loop can never outlive the deadline.
+fn collect_verify_outcome(
+    rx: &mpsc::Receiver<Result<(String, bool), ()>>,
+    deadline: Instant,
+) -> VerifyOutcome {
+    let mut retries = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return VerifyOutcome::TimedOut;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Ok((result, done))) => match classify_verify_status(&result, done) {
+                VerifySignal::Done(outcome) => return outcome,
+                VerifySignal::Continue => {
+                    retries += 1;
+                    if retries > MAX_VERIFY_RETRIES {
+                        return VerifyOutcome::Error;
+                    }
+                }
+            },
+            Ok(Err(())) => {
+                // Malformed signal: tolerate bounded, like a retry.
+                retries += 1;
+                if retries > MAX_VERIFY_RETRIES {
+                    return VerifyOutcome::Error;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return VerifyOutcome::TimedOut,
+            // The daemon went away mid-attempt.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return VerifyOutcome::Error,
+        }
+    }
+}
+
 /// Process-wide lock serializing [`DISABLE_ENV`] mutation between
 /// tests (env is per-process; parallel tests must not interleave a
 /// set/assert/remove cycle).
@@ -140,6 +187,24 @@ pub fn effective_claim_name<'a>(user: &'a str, process_user: Option<&str>) -> &'
 pub(crate) fn test_serialize_env() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Process-wide lock serializing verification attempts: one claim at
+/// a time. A second attempt while one is in flight fails closed
+/// immediately ([`VerifyOutcome::Error`], like the daemon's own
+/// already-claimed denial) instead of queueing behind a finger press.
+fn verify_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Hold the verification lock (a stand-in for an in-flight attempt),
+/// so tests can pin the concurrent-attempt path without a reader.
+#[cfg(test)]
+pub(crate) fn test_hold_verify_lock() -> std::sync::MutexGuard<'static, ()> {
+    verify_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Login name of the process owner, for [`effective_claim_name`].
@@ -170,13 +235,15 @@ impl Fprintd {
         std::env::var_os(DISABLE_ENV).is_some()
     }
 
-    /// Connect to the system bus. `None` when disabled or unreachable:
+    /// Connect to the system bus, with method calls bounded by
+    /// [`DBUS_CALL_TIMEOUT`]. `None` when disabled or unreachable:
     /// callers treat that as no reader and stay password-only.
     pub fn connect() -> Option<Self> {
         if Self::disabled_by_env() {
             return None;
         }
-        zbus::blocking::Connection::system()
+        zbus::blocking::connection::Builder::system()
+            .and_then(|builder| builder.method_timeout(DBUS_CALL_TIMEOUT).build())
             .ok()
             .map(|conn| Self { conn })
     }
@@ -239,17 +306,29 @@ impl Fprintd {
     /// One verification for `user`, bounded by `timeout`: claim the
     /// reader, start any-finger verification, and wait for the terminal
     /// `VerifyStatus`. Always stops and releases the claim, best
-    /// effort. Runs the blocking signal wait on a worker thread (the
+    /// effort. Runs the blocking D-Bus work on a worker thread (the
     /// same shape as [`crate::pam::authenticate_with_deadline`]); on
     /// timeout the worker still releases once the daemon answers.
+    /// A second attempt while one is in flight fails closed at once
+    /// ([`VerifyOutcome::Error`]).
     pub fn verify(&self, user: &str, timeout: Duration) -> VerifyOutcome {
+        // One claim at a time: contention fails closed at once, like
+        // the daemon's already-claimed denial. A poisoned lock still
+        // yields its guard: a past panic must not disable the reader.
+        let guard = match verify_lock().try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return VerifyOutcome::Error,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
         let (tx, rx) = mpsc::channel();
         let worker = self.clone();
         let user = user.to_owned();
+        let deadline = Instant::now() + timeout;
         let spawned = std::thread::Builder::new()
             .name("tuna-fprintd".into())
             .spawn(move || {
-                let _ = tx.send(worker.verify_inner(&user));
+                let _guard = guard;
+                let _ = tx.send(worker.verify_inner(&user, deadline));
             });
         if spawned.is_err() {
             return VerifyOutcome::Error;
@@ -265,8 +344,10 @@ impl Fprintd {
     /// Claim, verify, stop, release. Every error fails closed; the
     /// release runs on all paths so a user never wedges the reader
     /// for the next attempt ("already claimed" is a denial, not a
-    /// wedge, and clears when this call's connection drops).
-    fn verify_inner(&self, user: &str) -> VerifyOutcome {
+    /// wedge, and clears when this call's connection drops). Every
+    /// method call carries [`DBUS_CALL_TIMEOUT`]; the signal wait
+    /// carries the attempt `deadline`.
+    fn verify_inner(&self, user: &str, deadline: Instant) -> VerifyOutcome {
         let Some(path) = self.default_device() else {
             return VerifyOutcome::NoDevice;
         };
@@ -284,7 +365,7 @@ impl Fprintd {
         if device.call::<_, _, ()>("Claim", &(&name,)).is_err() {
             return VerifyOutcome::Error;
         }
-        let outcome = self.verify_claimed(&device);
+        let outcome = self.verify_claimed(&device, deadline);
         // Always stop and release; errors are best-effort cleanup.
         let _: Result<(), _> = device.call("VerifyStop", &());
         let _: Result<(), _> = device.call("Release", &());
@@ -293,8 +374,18 @@ impl Fprintd {
 
     /// The claimed-device signal wait: subscribe before starting so no
     /// terminal signal is missed, then classify each `VerifyStatus`
-    /// until one ends the attempt or retries run out.
-    fn verify_claimed(&self, device: &zbus::blocking::Proxy<'_>) -> VerifyOutcome {
+    /// until one ends the attempt, retries run out, or `deadline`
+    /// passes. The blocking iterator cannot wait with a timeout, so a
+    /// forwarder thread carries signals to a channel and this thread
+    /// waits on the channel with the remaining budget. If the deadline
+    /// passes first the forwarder detaches: it exits when the daemon
+    /// answers or the connection drops, and attempts are user-paced
+    /// and serialized, so at most one lingers per abandoned attempt.
+    fn verify_claimed(
+        &self,
+        device: &zbus::blocking::Proxy<'_>,
+        deadline: Instant,
+    ) -> VerifyOutcome {
         let mut signals = match device.receive_signal("VerifyStatus") {
             Ok(signals) => signals,
             Err(_) => return VerifyOutcome::Error,
@@ -305,28 +396,21 @@ impl Fprintd {
         {
             return VerifyOutcome::Error;
         }
-        let mut retries = 0usize;
-        for message in &mut signals {
-            let Ok((result, done)): Result<(String, bool), _> = message.body().deserialize() else {
-                // Malformed signal: tolerate bounded, like a retry.
-                retries += 1;
-                if retries > MAX_VERIFY_RETRIES {
-                    return VerifyOutcome::Error;
-                }
-                continue;
-            };
-            match classify_verify_status(&result, done) {
-                VerifySignal::Done(outcome) => return outcome,
-                VerifySignal::Continue => {
-                    retries += 1;
-                    if retries > MAX_VERIFY_RETRIES {
-                        return VerifyOutcome::Error;
+        let (tx, rx) = mpsc::channel::<Result<(String, bool), ()>>();
+        let forwarded = std::thread::Builder::new()
+            .name("tuna-fprintd-signal".into())
+            .spawn(move || {
+                for message in &mut signals {
+                    let body = message.body().deserialize::<(String, bool)>();
+                    if tx.send(body.map_err(|_| ())).is_err() {
+                        break;
                     }
                 }
-            }
+            });
+        if forwarded.is_err() {
+            return VerifyOutcome::Error;
         }
-        // The daemon went away mid-attempt.
-        VerifyOutcome::Error
+        collect_verify_outcome(&rx, deadline)
     }
 }
 
@@ -439,5 +523,91 @@ mod tests {
                     | VerifyOutcome::TimedOut
             ));
         }
+    }
+
+    #[test]
+    fn method_calls_are_bounded() {
+        // The bus default waits forever; our connection must not.
+        if let Some(client) = Fprintd::connect() {
+            assert_eq!(client.conn.method_timeout(), Some(DBUS_CALL_TIMEOUT));
+        }
+    }
+
+    #[test]
+    fn concurrent_verify_attempt_fails_closed() {
+        // An in-flight attempt holds the lock: a second attempt must
+        // fail closed at once instead of queueing behind a finger
+        // press, like the daemon's already-claimed denial.
+        let _held = test_hold_verify_lock();
+        assert!(verify_lock().try_lock().is_err());
+        if let Some(client) = Fprintd::connect() {
+            assert_eq!(
+                client.verify("nobody-fprintd-probe", Duration::from_secs(5)),
+                VerifyOutcome::Error
+            );
+        }
+    }
+
+    #[test]
+    fn silent_daemon_times_out_at_the_deadline() {
+        let (_tx, rx) = mpsc::channel::<Result<(String, bool), ()>>();
+        // Sender alive but silent: the production loop must give up at
+        // the deadline, not wait forever.
+        let outcome = collect_verify_outcome(&rx, Instant::now() + Duration::from_millis(50));
+        assert_eq!(outcome, VerifyOutcome::TimedOut);
+    }
+
+    #[test]
+    fn expired_deadline_times_out_without_waiting() {
+        let (_tx, rx) = mpsc::channel::<Result<(String, bool), ()>>();
+        let outcome = collect_verify_outcome(&rx, Instant::now());
+        assert_eq!(outcome, VerifyOutcome::TimedOut);
+    }
+
+    #[test]
+    fn terminal_signal_through_the_loop_matches() {
+        let (tx, rx) = mpsc::channel::<Result<(String, bool), ()>>();
+        tx.send(Ok(("verify-match".to_string(), true))).unwrap();
+        let outcome = collect_verify_outcome(&rx, Instant::now() + Duration::from_secs(5));
+        assert_eq!(outcome, VerifyOutcome::Matched);
+    }
+
+    #[test]
+    fn retry_then_match_through_the_loop_matches() {
+        let (tx, rx) = mpsc::channel::<Result<(String, bool), ()>>();
+        tx.send(Ok(("verify-retry-scan".to_string(), false)))
+            .unwrap();
+        tx.send(Ok(("verify-match".to_string(), true))).unwrap();
+        let outcome = collect_verify_outcome(&rx, Instant::now() + Duration::from_secs(5));
+        assert_eq!(outcome, VerifyOutcome::Matched);
+    }
+
+    #[test]
+    fn endless_retries_through_the_loop_deny_bounded() {
+        let (tx, rx) = mpsc::channel::<Result<(String, bool), ()>>();
+        for _ in 0..=MAX_VERIFY_RETRIES {
+            tx.send(Ok(("verify-retry-scan".to_string(), false)))
+                .unwrap();
+        }
+        let outcome = collect_verify_outcome(&rx, Instant::now() + Duration::from_secs(5));
+        assert_eq!(outcome, VerifyOutcome::Error);
+    }
+
+    #[test]
+    fn malformed_signals_through_the_loop_deny_bounded() {
+        let (tx, rx) = mpsc::channel::<Result<(String, bool), ()>>();
+        for _ in 0..=MAX_VERIFY_RETRIES {
+            tx.send(Err(())).unwrap();
+        }
+        let outcome = collect_verify_outcome(&rx, Instant::now() + Duration::from_secs(5));
+        assert_eq!(outcome, VerifyOutcome::Error);
+    }
+
+    #[test]
+    fn daemon_gone_mid_attempt_is_an_error() {
+        let (tx, rx) = mpsc::channel::<Result<(String, bool), ()>>();
+        drop(tx);
+        let outcome = collect_verify_outcome(&rx, Instant::now() + Duration::from_secs(5));
+        assert_eq!(outcome, VerifyOutcome::Error);
     }
 }

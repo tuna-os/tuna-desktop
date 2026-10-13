@@ -258,6 +258,42 @@ pub fn unlock_session(
     }
 }
 
+/// Apply one fingerprint attempt to the compositor-owned lock state:
+/// verify `user` through `verifier`, and on a daemon-reported match
+/// clear the idle flag plus the hub mirror (the next poll restores
+/// the intact session) and drop the lock surface. Returns whether
+/// the session is unlocked afterwards.
+///
+/// An already-unlocked session returns true without contacting the
+/// reader — nothing is protected, so no finger press is needed.
+/// Non-matches touch nothing: the flag, the hub mirror, and the
+/// surface stay exactly as they were, silently.
+pub fn unlock_session_fprint(
+    lock: &mut SessionLock,
+    hub: &ControlHub,
+    overlay: &mut Overlay,
+    now_ms: u64,
+    user: &str,
+    verifier: &mut impl FprintVerifier,
+) -> bool {
+    if !lock.is_locked() && !hub.is_locked() {
+        return true;
+    }
+    if matches!(
+        attempt_fprint_unlock(verifier, user),
+        UnlockOutcome::Unlocked
+    ) {
+        // Restart the idle accumulator at now so the session does not
+        // relock on the next tick; the hub poll carries the restore.
+        lock.unlock(now_ms);
+        hub.set_locked(false);
+        overlay.hide();
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

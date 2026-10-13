@@ -10,7 +10,14 @@
 //! the session locked with no window content leaked anywhere.
 //!
 //! All code here is original.
+//!
+//! The fingerprint half mirrors the password half through
+//! [`FprintVerifier`](tuna_compositor::unlock::FprintVerifier): a
+//! scripted reader stands in for fprintd (no hardware in CI), a match
+//! restores the session intact, and every non-match keeps it locked
+//! without leaking window content.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
@@ -18,10 +25,13 @@ use std::time::Duration;
 
 use greetd_ipc::{codec::Error as CodecError, AuthMessageType, ErrorType, Response};
 use tuna_compositor::control::ControlHub;
+use tuna_compositor::fprintd::VerifyOutcome;
 use tuna_compositor::lock::SessionLock;
 use tuna_compositor::overlay::Overlay;
 use tuna_compositor::state::{StateModel, TokenStore};
-use tuna_compositor::unlock::{unlock_session, UnlockClient};
+use tuna_compositor::unlock::{
+    unlock_session, unlock_session_fprint, FprintVerifier, UnlockClient,
+};
 use tuna_compositor::SEAT_NAME;
 use tuna_shell_control::{decode_frame, encode_frame, Message, CURRENT_VERSION};
 
@@ -317,6 +327,201 @@ fn triple_wrong_password_stays_locked_without_leak() {
             );
         }
     }
+}
+
+/// Scripted fingerprint reader behind the verifier seam: canned
+/// outcomes, recording the verified user of every attempt.
+struct OutcomeStub {
+    outcomes: VecDeque<VerifyOutcome>,
+    users: Vec<String>,
+}
+
+impl OutcomeStub {
+    fn new(outcomes: Vec<VerifyOutcome>) -> Self {
+        Self {
+            outcomes: outcomes.into(),
+            users: Vec::new(),
+        }
+    }
+}
+
+impl FprintVerifier for OutcomeStub {
+    fn verify(&mut self, user: &str) -> VerifyOutcome {
+        self.users.push(user.to_string());
+        self.outcomes.pop_front().unwrap_or(VerifyOutcome::Error)
+    }
+}
+
+/// A daemon-reported match dismisses the lock and restores the
+/// session intact: flags clear, the lock surface drops, and the next
+/// poll carries every window with titles at the current revision.
+#[test]
+fn fingerprint_match_dismisses_lock_intact() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = two_window_model();
+    let mut client = handshake_shell(&mut hub, &mut model, &path);
+
+    // Lock exactly as the runtime does: idle machine, hub mirror, and
+    // the exclusive surface with an empty list.
+    let mut idle = SessionLock::new(60_000);
+    idle.note_input(1_000);
+    let mut overlay = Overlay::new(3);
+    idle.lock();
+    hub.set_locked(true);
+    overlay.show(Vec::new());
+    hub.poll(&mut model);
+    assert_locked_without_content(&client_read(&mut client));
+
+    // The match clears everything through the fingerprint path.
+    let mut stub = OutcomeStub::new(vec![VerifyOutcome::Matched]);
+    assert!(unlock_session_fprint(
+        &mut idle,
+        &hub,
+        &mut overlay,
+        31_000,
+        "ada",
+        &mut stub
+    ));
+    assert_eq!(stub.users, vec!["ada".to_string()]);
+    assert!(!idle.is_locked(), "idle flag clears");
+    assert!(!hub.is_locked(), "hub mirror clears");
+    assert!(!overlay.visible, "lock surface drops");
+    // The idle accumulator restarts: no instant relock on next check.
+    assert!(!idle.check_timeout(90_999));
+
+    hub.poll(&mut model);
+    let Message::Snapshot {
+        windows,
+        locked,
+        revision,
+        ..
+    } = client_read(&mut client)
+    else {
+        panic!("expected restoring Snapshot after unlock");
+    };
+    assert!(!locked);
+    assert_eq!(revision, model.revision());
+    assert_eq!(windows.len(), 2, "unlock restores every window");
+    assert!(
+        windows.iter().any(|w| w.title == "Terminal"),
+        "titles survive the lock round-trip"
+    );
+    assert!(
+        windows.iter().any(|w| w.title == "Browser"),
+        "titles survive the lock round-trip"
+    );
+}
+
+/// Every fingerprint non-match keeps the session locked with no
+/// window content leaked: flags and surface untouched, deltas
+/// suppressed, and no titles in any shell traffic.
+#[test]
+fn fingerprint_non_matches_stay_locked_without_leak() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = two_window_model();
+    let mut client = handshake_shell(&mut hub, &mut model, &path);
+
+    // Every message the shell receives from here on is recorded so
+    // the leak scan below covers real traffic, not expectations.
+    let mut received: Vec<String> = Vec::new();
+
+    let mut idle = SessionLock::new(60_000);
+    idle.note_input(1_000);
+    let mut overlay = Overlay::new(3);
+    idle.lock();
+    hub.set_locked(true);
+    overlay.show(Vec::new());
+    hub.poll(&mut model);
+    let snapshot = client_read(&mut client);
+    assert_locked_without_content(&snapshot);
+    received.push(format!("{snapshot:?}"));
+
+    // A window opened while locked must never reach the shell either.
+    model.insert("Secrets", Some("org.example.Secrets"), 1);
+
+    let outcomes = [
+        VerifyOutcome::NoMatch,
+        VerifyOutcome::NoDevice,
+        VerifyOutcome::NotEnrolled,
+        VerifyOutcome::Cancelled,
+        VerifyOutcome::TimedOut,
+        VerifyOutcome::Error,
+    ];
+    let mut stub = OutcomeStub::new(outcomes.to_vec());
+    for outcome in outcomes {
+        assert!(
+            !unlock_session_fprint(&mut idle, &hub, &mut overlay, 31_000, "ada", &mut stub),
+            "{outcome:?} must not unlock"
+        );
+        assert!(idle.is_locked(), "idle flag holds on {outcome:?}");
+        assert!(hub.is_locked(), "hub mirror holds on {outcome:?}");
+        assert!(overlay.visible, "lock surface holds on {outcome:?}");
+        assert!(overlay.windows.is_empty(), "surface stays title-free");
+
+        hub.poll(&mut model);
+        assert_nothing_sent(&mut client);
+    }
+    assert_eq!(
+        stub.users,
+        vec!["ada".to_string(); outcomes.len()],
+        "every attempt verified the session user, nothing else"
+    );
+
+    // A shell reconnect mid-attack still gets a stripped snapshot.
+    let mut second = connect(&path);
+    hub.poll(&mut model);
+    client_write(&mut second, &hello());
+    hub.poll(&mut model);
+    assert!(matches!(client_read(&mut second), Message::Hello { .. }));
+    let snapshot = client_read(&mut second);
+    assert_locked_without_content(&snapshot);
+    received.push(format!("{snapshot:?}"));
+
+    // No shell traffic after locking may carry window content —
+    // titles or app ids. (A fingerprint attempt types no secret, so
+    // unlike the password half there is no entered text to scan for.)
+    for msg in &received {
+        for leaked in ["Terminal", "Browser", "Secrets", "org.example"] {
+            assert!(
+                !msg.contains(leaked),
+                "locked traffic leaks {leaked:?}: {msg}"
+            );
+        }
+    }
+}
+
+/// An already-unlocked session needs no finger press: the attempt
+/// succeeds without contacting the reader at all.
+#[test]
+fn fingerprint_unlock_when_already_unlocked_skips_the_reader() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = two_window_model();
+    let _client = handshake_shell(&mut hub, &mut model, &path);
+
+    let mut idle = SessionLock::new(60_000);
+    idle.note_input(1_000);
+    let mut overlay = Overlay::new(3);
+    assert!(!idle.is_locked() && !hub.is_locked());
+
+    let mut stub = OutcomeStub::new(vec![VerifyOutcome::Error]);
+    assert!(unlock_session_fprint(
+        &mut idle,
+        &hub,
+        &mut overlay,
+        31_000,
+        "ada",
+        &mut stub
+    ));
+    assert!(
+        stub.users.is_empty(),
+        "unlocked session must not wake the reader"
+    );
 }
 
 /// Temp dir with owner-only permissions: the control socket refuses to
