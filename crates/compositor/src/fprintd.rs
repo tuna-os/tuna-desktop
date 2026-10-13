@@ -3757,7 +3757,7 @@ mod tests {
         let mut inq: libc::c_int = 0;
         // SAFETY: out-param points at a live c_int; the fd is open.
         let read = unsafe { libc::ioctl(sock.as_raw_fd(), libc::FIONREAD, &mut inq) };
-        (read == 0 && inq >= 0).then(|| inq as usize)
+        (read == 0 && inq >= 0).then_some(inq as usize)
     }
 
     /// Relay counters, shared with the test. `last_client_inq` is the
@@ -4199,8 +4199,8 @@ mod tests {
     /// (freeze tripped on the attempt's own early traffic + backlog
     /// sampled live pre-teardown); a zero backlog takes the EXPLICIT
     /// non-fill branch — never silently the same proof. Retirement
-    /// claimed here is exactly owned application work (bounded outcome)
-    /// + socket shutdown/drop + handles released: NO zero-driver-linger
+    /// claimed here is exactly owned application work (bounded outcome),
+    /// socket shutdown/drop and handles released: NO zero-driver-linger
     /// claim is made (driver exit stays unobserved, outside the claim).
     #[test]
     fn frozen_peer_leaves_attempt_output_pending_and_bounded() {
