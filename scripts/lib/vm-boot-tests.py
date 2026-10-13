@@ -716,6 +716,17 @@ class TourRecorderTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 recorder.close()
 
+    def test_existing_pending_capture_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, lambda *args, **kwargs: self.fail("must not overwrite"))
+            target = Path(recorder.dir) / "f000000.png.pending"
+            target.write_bytes(b"existing pending")
+            with self.assertRaisesRegex(RuntimeError, "identity already exists"):
+                recorder.still("intro")
+            self.assertEqual(target.read_bytes(), b"existing pending")
+            with self.assertRaises(RuntimeError):
+                recorder.close()
+
     def test_periodic_indexing_and_marks_have_no_future_frame_offset(self):
         def command(name, **args):
             Path(args["filename"]).write_bytes(b"frame")

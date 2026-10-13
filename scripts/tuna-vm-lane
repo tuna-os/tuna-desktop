@@ -1078,12 +1078,16 @@ class Recorder:
             self.stop.set()
             raise error
         pending = None
+        owns_pending = False
         try:
             index = self.n
             final = os.path.join(self.dir, f"f{index:06d}.png")
             pending = final + ".pending"
             if os.path.exists(final) or os.path.exists(pending):
                 raise RuntimeError("tour frame identity already exists")
+            with open(pending, "xb"):
+                pass
+            owns_pending = True
             requested_ns = time.monotonic_ns()
             self._command("screendump", _deadline=deadline, filename=pending, format="png")
             while not os.path.isfile(pending) or os.path.getsize(pending) == 0:
@@ -1103,7 +1107,7 @@ class Recorder:
         except (OSError, RuntimeError, ValueError) as error:
             self.error = error
             self.stop.set()
-            if pending is not None:
+            if owns_pending:
                 try:
                     os.unlink(pending)
                 except FileNotFoundError:
