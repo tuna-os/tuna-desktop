@@ -200,6 +200,7 @@ pub struct ControlClient {
     /// Overview previews and the hovered one, from the compositor.
     overview_previews: (Vec<tuna_shell_control::PreviewInfo>, Option<u64>),
     connection_generation: u64,
+    auth_needs_snapshot: bool,
     wellbeing_applied: Option<(bool, bool)>,
     wellbeing_pending: Option<(u64, (bool, bool), Instant)>,
 }
@@ -243,6 +244,7 @@ impl ControlClient {
             environment: Vec::new(),
             overview_previews: (Vec::new(), None),
             connection_generation: 0,
+            auth_needs_snapshot: false,
             wellbeing_applied: None,
             wellbeing_pending: None,
         })
@@ -657,16 +659,29 @@ impl ControlClient {
     /// compositor verifies it off its loop (PAM or greetd) and answers
     /// `Applied` once the session is unlocked or `Denied` when the
     /// password was wrong; the unlocked snapshot follows an `Applied`.
+    /// Credentials are never replayed after an uncertain write or reconnect.
+    /// An uncertain stream is shut down; after resnapshot only a new explicit
+    /// call can send another password. Owned input/frame buffers are wiped.
     /// The password is never logged (`Secret` redacts its `Debug`).
     /// Returns the request id for `CommandResult` correlation.
     pub fn unlock(&mut self, password: String) -> Result<u64, ControlError> {
         let id = self.alloc_request_id();
-        self.write_message(&Message::Command {
-            id,
-            kind: CommandKind::Unlock {
-                password: tuna_shell_control::Secret(password),
-            },
-        })?;
+        let frame =
+            tuna_shell_control::encode_unlock_frame(id, tuna_shell_control::Secret(password))?;
+        if self.auth_needs_snapshot {
+            return Err(ControlError::Unexpected(
+                "authentication requires a fresh snapshot".into(),
+            ));
+        }
+        // No cross-generation resend, including a partial write/WouldBlock.
+        if let Err(error) = self.stream.write_all(frame.as_bytes()) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            self.auth_needs_snapshot = true;
+            self.read_buf.clear();
+            self.revision = None;
+            self.needs_snapshot = true;
+            return Err(error.into());
+        }
         Ok(id)
     }
 
@@ -776,6 +791,7 @@ impl ControlClient {
                 ));
                 self.revision = Some(revision);
                 self.needs_snapshot = false;
+                self.auth_needs_snapshot = false;
                 Ok(Handled::Snapshot { revision })
             }
             Message::Changes {
@@ -952,6 +968,17 @@ impl ControlClient {
     /// method funnels through here, so all of them inherit the recovery
     /// with no call-site changes.
     fn write_message(&mut self, msg: &Message) -> Result<(), ControlError> {
+        if matches!(
+            msg,
+            Message::Command {
+                kind: CommandKind::Unlock { .. },
+                ..
+            }
+        ) {
+            return Err(ControlError::Unexpected(
+                "credentials require the dedicated writer".into(),
+            ));
+        }
         let frame = tuna_shell_control::encode_frame(msg);
         match self.stream.write_all(&frame) {
             Ok(()) => Ok(()),
@@ -981,6 +1008,7 @@ impl ControlClient {
         stream.set_nonblocking(true)?;
         self.stream = stream;
         self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.auth_needs_snapshot = true;
         self.wellbeing_applied = None;
         self.wellbeing_pending = None;
         self.read_buf.clear();
@@ -1975,6 +2003,113 @@ mod tests {
         let path = dir.path().join("control.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         (path, listener)
+    }
+
+    fn auth_reconnect_only_hello(
+        client: &mut ControlClient,
+        listener: &std::os::unix::net::UnixListener,
+    ) -> UnixStream {
+        assert!(matches!(client.poll(), Err(ControlError::WouldBlock)));
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert!(matches!(server_read(&mut peer), Message::Hello { .. }));
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        assert!(
+            matches!(peer.read(&mut byte),Err(e) if e.kind()==io::ErrorKind::WouldBlock),
+            "no credential replay in new generation"
+        );
+        assert!(client.unlock("explicit-before-snapshot".into()).is_err());
+        assert!(matches!(peer.read(&mut byte),Err(e) if e.kind()==io::ErrorKind::WouldBlock));
+        peer.set_nonblocking(false).unwrap();
+        server_write(
+            &mut peer,
+            &Message::Snapshot {
+                revision: 1,
+                windows: vec![],
+                workspaces: vec![],
+                locked: true,
+            },
+        );
+        assert!(matches!(client.poll().unwrap(), Handled::Snapshot { .. }));
+        peer
+    }
+    #[test]
+    fn authentication_disconnect_never_replays_and_fresh_action_after_snapshot_can_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer);
+        assert!(client.unlock("old-controlled-secret".into()).is_err());
+        assert_eq!(
+            client.connection_generation(),
+            0,
+            "credential failure must not redial/resend"
+        );
+        let mut new_peer = auth_reconnect_only_hello(&mut client, &listener);
+        let id = client
+            .unlock("explicit-new-controlled-secret".into())
+            .unwrap();
+        assert_eq!(
+            server_read(&mut new_peer),
+            Message::Command {
+                id,
+                kind: CommandKind::Unlock {
+                    password: tuna_shell_control::Secret("explicit-new-controlled-secret".into())
+                }
+            }
+        );
+    }
+    #[test]
+    fn partial_authentication_write_closes_uncertain_stream_and_never_contaminates_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut old_peer, _) = listener.accept().unwrap();
+        rustix::net::sockopt::set_socket_send_buffer(&client.stream, 1024).unwrap();
+        let password = "controlled-p".repeat(8192);
+        let expected = tuna_shell_control::encode_unlock_frame(
+            1,
+            tuna_shell_control::Secret(password.clone()),
+        )
+        .unwrap();
+        assert!(
+            matches!(client.unlock(password),Err(ControlError::Io(e)) if e.kind()==io::ErrorKind::WouldBlock)
+        );
+        old_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut partial = Vec::new();
+        old_peer.read_to_end(&mut partial).unwrap();
+        assert!(
+            !partial.is_empty() && partial.len() < expected.as_bytes().len(),
+            "real kernel partial write required"
+        );
+        assert_eq!(partial, expected.as_bytes()[..partial.len()]);
+        drop(old_peer);
+        let mut new_peer = auth_reconnect_only_hello(&mut client, &listener);
+        let id = client.unlock("fresh-input".into()).unwrap();
+        assert_eq!(
+            server_read(&mut new_peer),
+            Message::Command {
+                id,
+                kind: CommandKind::Unlock {
+                    password: tuna_shell_control::Secret("fresh-input".into())
+                }
+            }
+        );
+    }
+    #[test]
+    fn uncertain_caller_stream_without_redial_path_stays_closed() {
+        let (mut client, peer) = pair();
+        drop(peer);
+        assert!(client.unlock("controlled-input".into()).is_err());
+        assert!(client
+            .unlock("new-input-without-new-transport".into())
+            .is_err());
+        assert!(client.poll().is_err());
+        assert_eq!(client.connection_generation(), 0);
     }
 
     #[test]

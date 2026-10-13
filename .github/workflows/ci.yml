@@ -51,6 +51,7 @@ jobs:
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
       - run: python3 scripts/tests/test_auth_owner_admission.py
+      - run: python3 scripts/tests/test_auth_no_replay_contract.py
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
@@ -403,6 +404,8 @@ jobs:
           }, indent=2) + '\n')
           PY
           scripts/tuna-gtk-accessibility-proof gtk-shell-artifacts/a11y/bin/gtk-tests "$(git rev-parse HEAD)" gtk-shell-artifacts/a11y
+      - name: Prove GTK authentication transport reset callbacks
+        run: python3 scripts/tuna-auth-no-replay-gtk-proof
       - name: Prove real GTK notification action retirement
         run: |
           /usr/bin/python3 scripts/tests/test_notify_callback_contract.py

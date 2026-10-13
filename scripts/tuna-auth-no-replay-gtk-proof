@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Admitted GTK callback controls; not an installed/session-lock pixel proof."""
+import hashlib,json,os,re,signal,subprocess,time
+from pathlib import Path
+
+def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+root=Path.cwd().resolve()
+admission=json.loads(Path('gtk-shell-artifacts/a11y/bin/build-admission.json').read_text())
+source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+assert admission['source_commit']==source==os.environ['GITHUB_SHA']
+assert admission['cargo_lock_sha256']==sha('Cargo.lock')
+for key,env in [('run_id','GITHUB_RUN_ID'),('run_attempt','GITHUB_RUN_ATTEMPT')]:assert admission[key]==os.environ[env]
+metadata=json.loads(subprocess.check_output(['cargo','metadata','--locked','--no-deps','--format-version=1']))
+packages=[p for p in metadata['packages'] if p['name']=='tuna-shell-gtk' and Path(p['manifest_path']).resolve()==root/'crates/shell-gtk/Cargo.toml']
+assert len(packages)==1
+rows=[json.loads(line) for line in Path(os.environ['RUNNER_TEMP'],'tuna-gtk-a11y-build.json').read_text().splitlines()]
+rows=[r for r in rows if r.get('reason')=='compiler-artifact' and r.get('package_id')==packages[0]['id'] and r.get('target',{}).get('name')=='tuna-shell-gtk' and r['target'].get('kind')==['bin'] and r.get('profile',{}).get('test') is True and Path(r['target'].get('src_path','')).resolve()==root/'crates/shell-gtk/src/main.rs' and r.get('executable')]
+assert len(rows)==1 and rows[0]['executable']==admission['cargo_executable']
+binary=Path(admission['admitted_executable']).resolve();assert sha(binary)==sha(rows[0]['executable'])==admission['executable_sha256']
+out=Path('gtk-shell-artifacts/auth-no-replay');out.mkdir(parents=True,exist_ok=False)
+case='lock::auth_transport_ui_tests::actual_gtk_auth_send_failure_and_generation_reset'
+argv=['env','-u','WAYLAND_DISPLAY','-u','WAYLAND_SOCKET','dbus-run-session','--','xvfb-run','-a','env','GDK_BACKEND=x11','TUNA_REQUIRE_AUTH_TRANSPORT_GTK=1',str(binary),case,'--exact','--ignored','--test-threads=1','--nocapture']
+receipt={'source':source,'build_admission':admission,'cargo_artifact':rows[0],'argv':argv,'scope':'real GTK activation/reset callbacks; host socket transport tests separate; not installed session-lock surface/physical input'}
+with (out/'output.txt').open('w') as stream:
+ process=subprocess.Popen(argv,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True)
+ try:status=process.wait(timeout=30)
+ except subprocess.TimeoutExpired:
+  os.killpg(process.pid,signal.SIGTERM)
+  try:process.wait(timeout=2)
+  except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=2)
+  status=process.returncode;receipt['timeout']=True
+receipt['exit_status']=status
+receipt['binary_unchanged']=sha(binary)==admission['executable_sha256']
+(out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+text=(out/'output.txt').read_text();print(text)
+assert not receipt.get('timeout') and status==0 and receipt['binary_unchanged']
+assert re.search(r'^running 1 test$',text,re.M) and '1 passed; 0 failed; 0 ignored;' in text
