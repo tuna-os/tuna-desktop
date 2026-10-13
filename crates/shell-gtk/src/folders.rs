@@ -249,8 +249,9 @@ pub fn create(apps: &[&AppEntry]) -> Option<String> {
     created
 }
 
-// The observer preserves this existing sequence and its ignored-result behavior.
-// Publication/failure semantics will be corrected in a separately reviewed change.
+// Prepare the unadvertised child before publishing its id. Setter acceptance and
+// cached readback are required; neither proves disk durability or a transaction
+// against another process changing the same settings concurrently.
 fn create_with_settings(
     apps: &[&AppEntry],
     id: &str,
@@ -258,25 +259,13 @@ fn create_with_settings(
     make_child: impl FnOnce() -> gio::Settings,
     mut observation: Option<&mut FolderCreateObservation>,
 ) -> Option<String> {
-    let mut children: Vec<String> = root
-        .strv("folder-children")
-        .iter()
-        .map(|v| v.to_string())
-        .collect();
-    children.push(id.to_owned());
-    let refs: Vec<&str> = children.iter().map(String::as_str).collect();
-    let writable = observation
-        .as_ref()
-        .map(|_| root.is_writable("folder-children"));
-    let result = root.set_strv("folder-children", refs.as_slice()).is_ok();
-    if let Some(trace) = observation.as_deref_mut() {
-        trace.observe(
-            "root-children-write",
-            root,
-            None,
-            Some(writable.unwrap()),
-            Some(result),
-        );
+    if apps.is_empty()
+        || root
+            .strv("folder-children")
+            .iter()
+            .any(|value| value.as_str() == id)
+    {
+        return None;
     }
     let child = make_child();
     let name = best_folder_name(apps).unwrap_or_else(|| "Unnamed Folder".to_owned());
@@ -294,6 +283,9 @@ fn create_with_settings(
             Some(result),
         );
     }
+    if !result || child.string("name").as_str() != name {
+        return None;
+    }
     let ids: Vec<String> = apps.iter().map(|a| desktop_id(&a.app_id)).collect();
     if let Some(trace) = observation.as_deref_mut() {
         trace.expected_apps = ids.clone();
@@ -309,6 +301,54 @@ fn create_with_settings(
             Some(writable.unwrap()),
             Some(result),
         );
+    }
+    if !result {
+        return None;
+    }
+    // Either setter can dispatch a same-process consumer that changes another
+    // child key. Require the complete child together before advertising it.
+    if child.string("name").as_str() != name
+        || child
+            .strv("apps")
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            != refs
+    {
+        return None;
+    }
+    // Re-read just before publication; initialization can dispatch a same-process
+    // change to the root. This is not cross-process compare-and-swap.
+    let mut children: Vec<String> = root
+        .strv("folder-children")
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+    if children.iter().any(|value| value == id) {
+        return None;
+    }
+    children.push(id.to_owned());
+    let refs: Vec<&str> = children.iter().map(String::as_str).collect();
+    let writable = observation
+        .as_ref()
+        .map(|_| root.is_writable("folder-children"));
+    let result = root.set_strv("folder-children", refs.as_slice()).is_ok();
+    if let Some(trace) = observation.as_deref_mut() {
+        trace.observe(
+            "root-children-write",
+            root,
+            Some(&child),
+            Some(writable.unwrap()),
+            Some(result),
+        );
+    }
+    if !result
+        || !root
+            .strv("folder-children")
+            .iter()
+            .any(|value| value.as_str() == id)
+    {
+        return None;
     }
     gio::Settings::sync();
     if let Some(trace) = observation {
@@ -737,6 +777,10 @@ mod tests {
         }
 
         fn with_name_refusal(refuse_name: bool) -> Self {
+            Self::with_create_refusal(refuse_name, false, false)
+        }
+
+        fn with_create_refusal(refuse_name: bool, refuse_apps: bool, refuse_root: bool) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "tuna-folder-schemas-{}",
                 glib::uuid_string_random()
@@ -759,6 +803,20 @@ mod tests {
                         "<key name=\"name\" type=\"s\"><choices><choice value=\"\"/></choices><default>''</default></key>"
                     } else {
                         "<key name=\"name\" type=\"s\"><default>''</default></key>"
+                    },
+                ).replace(
+                    "<key name=\"apps\" type=\"as\"><default>[]</default></key>",
+                    if refuse_apps {
+                        "<key name=\"apps\" type=\"as\"><choices><choice value=\"one.desktop\"/></choices><default>[]</default></key>"
+                    } else {
+                        "<key name=\"apps\" type=\"as\"><default>[]</default></key>"
+                    },
+                ).replace(
+                    "<key name=\"folder-children\" type=\"as\"><default>[]</default></key>",
+                    if refuse_root {
+                        "<key name=\"folder-children\" type=\"as\"><choices><choice value=\"Existing\"/></choices><default>[]</default></key>"
+                    } else {
+                        "<key name=\"folder-children\" type=\"as\"><default>[]</default></key>"
                     },
                 ),
             )
@@ -912,8 +970,21 @@ mod tests {
         gio::Settings,
         gio::Settings,
     ) {
+        observed_keyfile_create_with_refusal(refuse_name, false, false)
+    }
+
+    fn observed_keyfile_create_with_refusal(
+        refuse_name: bool,
+        refuse_apps: bool,
+        refuse_root: bool,
+    ) -> (
+        TestSchemas,
+        FolderCreateObservation,
+        gio::Settings,
+        gio::Settings,
+    ) {
         use std::os::unix::fs::PermissionsExt;
-        let fixture = TestSchemas::with_name_refusal(refuse_name);
+        let fixture = TestSchemas::with_create_refusal(refuse_name, refuse_apps, refuse_root);
         let config = fixture.dir.join("config");
         std::fs::create_dir_all(config.join("glib-2.0/settings")).unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -929,6 +1000,7 @@ mod tests {
             Some(&backend),
             Some("/org/gnome/desktop/app-folders/folders/Live/"),
         );
+        root.set_strv("folder-children", ["Existing"]).unwrap();
         let mut trace = FolderCreateObservation {
             id: "Live".to_owned(),
             declared_source: "a".repeat(40),
@@ -947,7 +1019,11 @@ mod tests {
                 || child.clone(),
                 Some(&mut trace)
             ),
-            Some("Live".to_owned())
+            if refuse_name || refuse_apps || refuse_root {
+                None
+            } else {
+                Some("Live".to_owned())
+            }
         );
         (fixture, trace, root, child)
     }
@@ -959,9 +1035,9 @@ mod tests {
         assert_eq!(trace.expected_apps, ["one.desktop", "two.desktop"]);
         assert_eq!(trace.events.len(), 4);
         for (index, operation) in [
-            "root-children-write",
             "name-write",
             "apps-write",
+            "root-children-write",
             "after-sync",
         ]
         .iter()
@@ -973,6 +1049,15 @@ mod tests {
                 assert_eq!(trace.events[index]["setter_result"], true);
             }
         }
+        assert_eq!(trace.events[0]["advertised"], false);
+        assert_eq!(trace.events[1]["advertised"], false);
+        assert_eq!(trace.events[2]["advertised"], true);
+        // The publication event already observes the complete child.
+        assert_eq!(trace.events[2]["cached_name"], "Unnamed Folder");
+        assert_eq!(
+            trace.events[2]["cached_apps"],
+            serde_json::json!(["one.desktop", "two.desktop"])
+        );
         let final_event = &trace.events[3];
         assert_eq!(final_event["cached_name"], "Unnamed Folder");
         assert_eq!(
@@ -987,29 +1072,187 @@ mod tests {
     }
 
     #[test]
-    fn create_observer_real_gio_refusal_is_distinct_from_writable_and_late_loss() {
-        let (_fixture, trace, _root, _child) = observed_keyfile_create(true);
-        // Deliberately restrictive real schema: this is NOT the original CI cause.
-        assert_eq!(trace.events[1]["writable"], true);
+    fn create_refused_name_does_not_publish_or_write_apps() {
+        let (_fixture, trace, root, child) = observed_keyfile_create(true);
+        // Deliberately restrictive real schema: not an attribution of the old CI failure.
+        assert_eq!(trace.events.len(), 1);
+        assert_eq!(trace.events[0]["operation"], "name-write");
+        assert_eq!(trace.events[0]["writable"], true);
+        assert_eq!(trace.events[0]["setter_result"], false);
+        assert_eq!(trace.events[0]["advertised"], false);
+        assert_eq!(
+            root.strv("folder-children")
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["Existing"]
+        );
+        assert_eq!(child.string("name"), "");
+        assert!(child.strv("apps").is_empty());
+    }
+
+    #[test]
+    fn create_refused_apps_does_not_publish_or_change_existing_children() {
+        let (_fixture, trace, root, child) =
+            observed_keyfile_create_with_refusal(false, true, false);
+        assert_eq!(trace.events.len(), 2);
+        assert_eq!(trace.events[1]["operation"], "apps-write");
         assert_eq!(trace.events[1]["setter_result"], false);
-        assert_eq!(trace.events[2]["setter_result"], true);
-        assert_eq!(trace.events[3]["cached_name"], "");
+        assert!(trace.events.iter().all(|e| e["advertised"] == false));
         assert_eq!(
-            trace.events[3]["file_sample"]["name_variant"],
-            serde_json::Value::Null
+            root.strv("folder-children")
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["Existing"]
+        );
+        assert_eq!(child.string("name"), "Unnamed Folder");
+        assert!(child.strv("apps").is_empty());
+    }
+
+    #[test]
+    fn create_refused_root_does_not_report_success_or_remove_existing_children() {
+        let (_fixture, trace, root, child) =
+            observed_keyfile_create_with_refusal(false, false, true);
+        assert_eq!(trace.events.len(), 3);
+        assert_eq!(trace.events[2]["operation"], "root-children-write");
+        assert_eq!(trace.events[2]["setter_result"], false);
+        assert!(trace.events.iter().all(|e| e["advertised"] == false));
+        assert_eq!(
+            root.strv("folder-children")
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["Existing"]
+        );
+        assert_eq!(child.string("name"), "Unnamed Folder");
+        assert_eq!(
+            child
+                .strv("apps")
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["one.desktop", "two.desktop"]
+        );
+    }
+
+    #[test]
+    fn create_existing_id_or_empty_members_leaves_existing_folder_untouched() {
+        let fixture = TestSchemas::new();
+        let backend = gio::memory_settings_backend_new();
+        let root = gio::Settings::new_full(
+            &fixture.source.lookup(SCHEMA, true).unwrap(),
+            Some(&backend),
+            None,
+        );
+        root.set_strv("folder-children", ["Existing"]).unwrap();
+        let one = app("one", "One", &[]);
+        assert_eq!(
+            create_with_settings(
+                &[&one],
+                "Existing",
+                &root,
+                || panic!("must not touch existing child"),
+                None
+            ),
+            None
         );
         assert_eq!(
-            trace.events[3]["file_sample"]["apps_variant"],
-            "['one.desktop', 'two.desktop']"
+            create_with_settings(
+                &[],
+                "New",
+                &root,
+                || panic!("empty input must not touch child"),
+                None
+            ),
+            None
         );
-        // Observation preserves the OLD unsafe publication, not a claimed fix.
-        assert_eq!(trace.events[0]["advertised"], true);
+        assert_eq!(
+            root.strv("folder-children")
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["Existing"]
+        );
+    }
+
+    #[test]
+    fn create_preserves_root_change_dispatched_during_child_initialization() {
+        let fixture = TestSchemas::new();
+        let backend = gio::memory_settings_backend_new();
+        let root = gio::Settings::new_full(
+            &fixture.source.lookup(SCHEMA, true).unwrap(),
+            Some(&backend),
+            None,
+        );
+        let child = gio::Settings::new_full(
+            &fixture.source.lookup(FOLDER_SCHEMA, true).unwrap(),
+            Some(&backend),
+            Some("/org/gnome/desktop/app-folders/folders/Live/"),
+        );
+        root.set_strv("folder-children", ["Existing"]).unwrap();
+        let changing_root = root.clone();
+        child.connect_changed(Some("name"), move |_, _| {
+            changing_root
+                .set_strv("folder-children", ["Existing", "Other"])
+                .unwrap();
+        });
+        // Gio requires reading this key after connecting for changed delivery.
+        let _ = child.string("name");
+        let one = app("one", "One", &[]);
+        assert_eq!(
+            create_with_settings(&[&one], "Live", &root, || child.clone(), None),
+            Some("Live".to_owned())
+        );
+        assert_eq!(
+            root.strv("folder-children")
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["Existing", "Other", "Live"]
+        );
+    }
+
+    #[test]
+    fn create_refuses_name_changed_by_actual_apps_setter_callback() {
+        let fixture = TestSchemas::new();
+        let backend = gio::memory_settings_backend_new();
+        let root = gio::Settings::new_full(
+            &fixture.source.lookup(SCHEMA, true).unwrap(),
+            Some(&backend),
+            None,
+        );
+        let child = gio::Settings::new_full(
+            &fixture.source.lookup(FOLDER_SCHEMA, true).unwrap(),
+            Some(&backend),
+            Some("/org/gnome/desktop/app-folders/folders/Live/"),
+        );
+        root.set_strv("folder-children", ["Existing"]).unwrap();
+        child.connect_changed(Some("apps"), move |child, _| {
+            child
+                .set_string("name", "Changed during app initialization")
+                .unwrap();
+        });
+        let _ = child.strv("apps");
+        let one = app("one", "One", &[]);
+        assert_eq!(
+            create_with_settings(&[&one], "Live", &root, || child.clone(), None),
+            None
+        );
+        assert_eq!(
+            root.strv("folder-children")
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["Existing"]
+        );
+        assert_eq!(child.string("name"), "Changed during app initialization");
     }
 
     #[test]
     fn create_observer_actual_file_replacement_distinguishes_later_loss() {
         let (_fixture, mut trace, root, child) = observed_keyfile_create(false);
-        assert_eq!(trace.events[1]["setter_result"], true);
+        assert_eq!(trace.events[0]["setter_result"], true);
         let path = trace
             .proof_config
             .as_ref()
