@@ -39,6 +39,20 @@ def sample():
 
 
 class Tests(unittest.TestCase):
+    def test_shared_application_id_never_substitutes_for_unique_role_map(self):
+        value = sample()
+        for window in value['inventory']['state']['windows']:
+            window['app_id'] = f"org.tuna.VmStrip.n{value['owner']['nonce']}"
+        with self.assertRaisesRegex(proof.NotReady, 'missing/ambiguous actual native map'):
+            proof.windows(value, value['owner'])
+        # Duplicated role IDs also remain ambiguous, regardless of distinct IDs.
+        value = sample()
+        duplicate = copy.deepcopy(value['inventory']['state']['windows'][0])
+        duplicate['id'] = 999
+        value['inventory']['state']['windows'].append(duplicate)
+        with self.assertRaisesRegex(proof.NotReady, 'missing/ambiguous actual native map'):
+            proof.windows(value, value['owner'])
+
     def test_all_actual_role_allocation_and_process_fields_required(self):
         value = sample()
         self.assertEqual(set(proof.windows(value, copy.deepcopy(value['owner']))), set(proof.ROLES))

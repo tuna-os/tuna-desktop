@@ -86,11 +86,10 @@ def strip_fixture(nonce, edge=False):
 
             area.set_draw_func(paint)
 
-            def realized(widget, role=role, app_id=app_id):
+            def realized(widget, role=role):
                 surface = widget.get_surface()
                 if not isinstance(surface, GdkWayland.WaylandToplevel):
                     raise RuntimeError("strip fixture did not use actual Wayland")
-                GdkWayland.WaylandToplevel.set_application_id(surface, app_id)
                 def after_paint(_clock):
                     records[role]["paint_count"] += 1
                     records[role]["width"] = widget.get_width()
@@ -100,6 +99,15 @@ def strip_fixture(nonce, edge=False):
                     publish()
                 widget.get_frame_clock().connect("after-paint", after_paint)
             window.connect("realize", realized)
+            def mapped(widget, app_id=app_id):
+                # GtkWindow's map default creates the xdg_toplevel. Setting
+                # its ID at realize is a no-op in GDK Wayland: the protocol
+                # toplevel does not exist yet. Reapply after every actual map.
+                surface = widget.get_surface()
+                if not isinstance(surface, GdkWayland.WaylandToplevel):
+                    raise RuntimeError("strip fixture did not map actual Wayland")
+                GdkWayland.WaylandToplevel.set_application_id(surface, app_id)
+            window.connect("map", mapped)
             window.connect("notify::is-active", lambda widget, _prop, role=role:
                            (records[role].update(active=widget.is_active()), publish()))
             window.connect("notify::mapped", lambda widget, _prop, role=role:

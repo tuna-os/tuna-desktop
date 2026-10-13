@@ -158,6 +158,32 @@ class Tests(unittest.TestCase):
         self.assertNotIn('subprocess', body)
         self.assertNotIn('tuna-vm-state', body)
 
+    def test_role_id_is_applied_after_map_and_reapplied_on_remap(self):
+        # Execute the actual callback against an explicit synthetic GDK edge;
+        # native xdg_toplevel IDs still require the installed CI observations.
+        source = (ROOT / 'packaging/marlin/vm-lane/tuna-vm-input').read_text()
+        fixture = next(node for node in ast.parse(source).body
+                       if isinstance(node, ast.FunctionDef) and node.name == 'strip_fixture')
+        callbacks = {node.name: node for node in ast.walk(fixture)
+                     if isinstance(node, ast.FunctionDef)}
+        self.assertNotIn('set_application_id', ast.get_source_segment(source, callbacks['realized']))
+        self.assertIn('window.connect("map", mapped)', ast.get_source_segment(source, fixture))
+        calls = []
+        class Surface:
+            @staticmethod
+            def set_application_id(surface, value):
+                calls.append((surface, value))
+        surface = Surface()
+        scope = {'app_id': 'org.tuna.VmStrip.n' + 'a' * 32 + '.alpha',
+                 'GdkWayland': SimpleNamespace(WaylandToplevel=Surface)}
+        exec(compile(ast.Module(body=[callbacks['mapped']], type_ignores=[]), str(SOURCE), 'exec'), scope)
+        widget = SimpleNamespace(get_surface=lambda: surface)
+        scope['mapped'](widget)
+        scope['mapped'](widget)
+        self.assertEqual(calls, [(surface, scope['app_id'])] * 2)
+        with self.assertRaisesRegex(RuntimeError, 'map actual Wayland'):
+            scope['mapped'](SimpleNamespace(get_surface=lambda: object()))
+
 
 if __name__ == '__main__':
     unittest.main()
