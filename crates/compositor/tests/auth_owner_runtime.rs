@@ -2,6 +2,7 @@
 //! This proves outer ownership, not PAM retirement, GTK UI or installed DRM.
 use greetd_ipc::{codec::SyncCodec, AuthMessageType, Request, Response};
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -372,6 +373,8 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         return;
     }
     let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(tuna_compositor::control::is_private_dir(root.path()));
     let _artifacts = Artifacts {
         root: root.path().to_owned(),
         out: std::env::var_os("TUNA_AUTH_OWNER_ARTIFACTS").map(PathBuf::from),
