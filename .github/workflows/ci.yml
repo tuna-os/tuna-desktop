@@ -319,6 +319,9 @@ jobs:
           retention-days: 14
 
   gtk-shell:
+    permissions:
+      contents: read
+      actions: read
     outputs:
       proof_artifact_id: ${{ steps.gtk_artifact.outputs.artifact-id }}
     # GTK4/libadwaita shell (ADR 0006) in the nested session: panel,

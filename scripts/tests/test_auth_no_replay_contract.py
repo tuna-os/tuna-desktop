@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Source routing checks only; Rust sockets/GTK callback execution belongs to CI."""
 from pathlib import Path
+import re
 import unittest
 ROOT=Path(__file__).resolve().parents[2]
 class Contract(unittest.TestCase):
@@ -26,8 +27,8 @@ class Contract(unittest.TestCase):
   self.assertIn('owned_cleanup',proof)
   self.assertIn('lifetime.bounded_command',proof)
   workflow=(ROOT/'.github/workflows/ci.yml').read_text()
-  for job,next_job in [('check','content-tests'),('gtk-shell','portal-security')]:
-   block=workflow.split('  '+job+':',1)[1].split('\n  '+next_job+':',1)[0]
+  for job in ('check','gtk-shell'):
+   block=re.search(r'^  '+re.escape(job)+r':\n(.*?)(?=^  [A-Za-z_][A-Za-z0-9_-]*:|\Z)',workflow,re.M|re.S).group(1)
    self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}',block)
  def test_generic_writer_refuses_credentials_before_generic_encoder(self):
   text=(ROOT/'crates/shell-host/src/control.rs').read_text().split('fn write_message(',1)[1]
