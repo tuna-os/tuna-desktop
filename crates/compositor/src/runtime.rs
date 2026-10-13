@@ -779,6 +779,9 @@ impl Runtime {
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
+                        if matches!(event, smithay::backend::session::Event::PauseSession) {
+                            rt.manager.cancel_strip_pointer(&mut rt.state);
+                        }
                         if let Backend::Drm(drm) = &mut rt.backend {
                             drm.on_session_event(event);
                         }
