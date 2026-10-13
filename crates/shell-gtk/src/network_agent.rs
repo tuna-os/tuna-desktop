@@ -130,6 +130,14 @@ pub fn live_entry_visibility(
     currently_visible && (!password_field || reveal_allowed)
 }
 
+/// Next visibility for a reveal-icon press under the live policy
+/// (stale-action guard): deny forces hidden — a reveal authorized while
+/// allowed never lands once `disable-show-password` engages — and lift
+/// alone never restores; only a fresh press while allowed toggles.
+pub fn reveal_toggle_visibility(currently_visible: bool, reveal_allowed: bool) -> bool {
+    reveal_allowed && !currently_visible
+}
+
 /// GSettings for the lockdown schema when installed; `None` keeps the
 /// shell running without it (same guard as the shell's `settings()`).
 fn lockdown_settings() -> Option<gio::Settings> {
@@ -408,7 +416,15 @@ impl NetworkAgent {
             // reveal on the open prompt when the policy lifts.
             if field.password {
                 entry.connect_icon_press(|e, _| {
-                    e.set_visibility(!gtk::prelude::EntryExt::is_visible(e))
+                    // Stale-action guard (#357 fd3): re-read the live
+                    // `disable-show-password` policy on every press — an
+                    // icon shown while allowed must not reveal once the
+                    // policy denies.
+                    let allowed = crate::lockdown::read().entry_visibility().password_reveal;
+                    e.set_visibility(reveal_toggle_visibility(
+                        gtk::prelude::EntryExt::is_visible(e),
+                        allowed,
+                    ));
                 });
             }
             if let Some(icon) = crate::lockdown::password_reveal_icon(
@@ -782,6 +798,21 @@ mod tests {
         assert!(live_entry_visibility(false, true, true));
         assert!(!live_entry_visibility(false, false, false));
         assert!(!live_entry_visibility(false, false, true));
+    }
+
+    #[test]
+    fn stale_reveal_press_denies_and_lift_needs_fresh_authorize() {
+        // Revealed earlier, then the policy engages: the stale press
+        // hides instead of toggling (denies).
+        assert!(!reveal_toggle_visibility(true, false));
+        // Hidden plus a denied press stays hidden.
+        assert!(!reveal_toggle_visibility(false, false));
+        // Lift alone restores nothing (the live-reset keeps it hidden);
+        // only a fresh press while allowed reveals.
+        assert!(!live_entry_visibility(true, false, true));
+        assert!(reveal_toggle_visibility(false, true));
+        // The normal toggle still hides while allowed.
+        assert!(!reveal_toggle_visibility(true, true));
     }
 
     #[test]

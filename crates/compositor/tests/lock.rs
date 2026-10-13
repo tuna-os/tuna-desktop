@@ -594,6 +594,111 @@ fn lockdown_refresh_never_blocks_on_hung_backend() {
     assert!(!hub.lock_screen_allowed(), "errors keep the cached value");
 }
 
+/// Last-valid-wins (#357 fd3): a batch whose restriction lands before an
+/// unreadable result keeps the restriction — the trailing `None` (a source
+/// boundary from overlapping readers, not a polling failure) never wipes it.
+#[test]
+fn lockdown_batch_some_then_none_preserves_restriction() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    assert!(hub.lock_screen_allowed(), "hub starts at GNOME defaults");
+
+    // Two overlapping readers land one batch, arrival order
+    // [Some(true), None]: the staggered sleeps keep both in flight
+    // across the two spawns, then land them in order.
+    hub.refresh_lockdown_with(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        Some(true)
+    });
+    hub.refresh_lockdown_with(|| {
+        std::thread::sleep(Duration::from_millis(300));
+        None
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    hub.refresh_lockdown_with(|| None);
+    assert!(
+        !hub.lock_screen_allowed(),
+        "Some-then-None must keep the restriction"
+    );
+
+    // Fail-safe afterwards: further unreadable reads keep denied.
+    std::thread::sleep(Duration::from_millis(100));
+    hub.refresh_lockdown_with(|| None);
+    assert!(!hub.lock_screen_allowed(), "errors keep the cached value");
+}
+
+/// None-then-Some applies the restoration (#357 fd3): starting denied, a
+/// batch whose unreadable result lands before a valid `false` restores.
+#[test]
+fn lockdown_batch_none_then_some_applies_restoration() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    hub.set_lockdown_policy(LockdownPolicy {
+        disable_lock_screen: true,
+        ..LockdownPolicy::default()
+    });
+    assert!(!hub.lock_screen_allowed(), "hub starts denied");
+
+    // Arrival order [None, Some(false)]: the valid restoration wins.
+    hub.refresh_lockdown_with(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        None
+    });
+    hub.refresh_lockdown_with(|| {
+        std::thread::sleep(Duration::from_millis(300));
+        Some(false)
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    hub.refresh_lockdown_with(|| None);
+    assert!(
+        hub.lock_screen_allowed(),
+        "None-then-Some must apply the restoration"
+    );
+}
+
+/// Single-flight bound (#357 fd3): rapid refreshes with slow readers never
+/// stack more than two concurrent readers — excess ticks drain only.
+#[test]
+fn lockdown_concurrent_refreshes_single_flight() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+    for _ in 0..8 {
+        let running = running.clone();
+        let peak = peak.clone();
+        let done = done.clone();
+        hub.refresh_lockdown_with(move || {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            running.fetch_sub(1, Ordering::SeqCst);
+            done.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+    }
+    // Every spawned reader sleeps 300 ms from a near-simultaneous start;
+    // unbounded this would run eight, bounded it runs two.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        done.load(Ordering::SeqCst),
+        2,
+        "only two of eight rapid readers may run"
+    );
+    assert!(
+        peak.load(Ordering::SeqCst) <= 2,
+        "peak concurrent readers bounded, got {}",
+        peak.load(Ordering::SeqCst)
+    );
+}
+
 /// The lock surface reuses the Overlay shape with an empty list: no
 /// window content or titles, and no frame content beneath it.
 #[test]
