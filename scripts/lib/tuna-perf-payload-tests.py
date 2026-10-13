@@ -317,6 +317,39 @@ class PayloadTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, allowed)
                 self.assertEqual(marker.exists(), allowed)
 
+    def assert_package_portal_contract(self, container):
+        config = '/usr/share/xdg-desktop-portal/tuna-portals.conf'
+        portal = '/usr/share/xdg-desktop-portal/portals/tuna.portal'
+        self.assertNotIn('COPY packaging/marlin/tuna-portals.conf ' + config, container)
+        install = container.index('pacman -U --noconfirm /tmp/tuna.pkg.tar.zst')
+        for path in (config, portal):
+            query = 'test "$(pacman -Qqo ' + path + ')" = tuna-desktop'
+            self.assertEqual(container.count(query), 1)
+            self.assertGreater(container.index(query), install)
+        mapping = "grep -qx 'org.freedesktop.impl.portal.Lockdown=tuna;' " + config
+        self.assertEqual(container.count(mapping), 1)
+        self.assertGreater(container.index(mapping), install)
+        self.assertNotIn('--overwrite', container)
+        self.assertNotIn('rm -f ' + config, container)
+
+    def test_preview_portal_mapping_is_owned_by_admitted_package(self):
+        container = Path(__file__).resolve().parents[2] / 'packaging/marlin/Containerfile'
+        self.assert_package_portal_contract(container.read_text())
+
+    def test_preview_portal_contract_rejects_pre_copy_and_missing_guards(self):
+        container = (Path(__file__).resolve().parents[2] / 'packaging/marlin/Containerfile').read_text()
+        variants = [container + '\nCOPY packaging/marlin/tuna-portals.conf /usr/share/xdg-desktop-portal/tuna-portals.conf\n']
+        for part in [
+            'test "$(pacman -Qqo /usr/share/xdg-desktop-portal/tuna-portals.conf)" = tuna-desktop',
+            'test "$(pacman -Qqo /usr/share/xdg-desktop-portal/portals/tuna.portal)" = tuna-desktop',
+            "grep -qx 'org.freedesktop.impl.portal.Lockdown=tuna;' /usr/share/xdg-desktop-portal/tuna-portals.conf",
+        ]:
+            variants.append(container.replace(part, 'true'))
+        for mutated in variants:
+            with self.subTest(mutated=variants.index(mutated)):
+                with self.assertRaises(AssertionError):
+                    self.assert_package_portal_contract(mutated)
+
     @unittest.skipUnless(shutil.which("zstd"), "zstd must be installed by CI preflight")
     def test_cli_failure_retains_original_zip_and_unpacked_package_identity(self):
         compressed = subprocess.run(["zstd", "-c"], input=self.archive(missing=payload.BINS[3]),
