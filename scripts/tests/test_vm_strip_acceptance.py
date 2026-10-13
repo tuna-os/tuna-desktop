@@ -1,4 +1,5 @@
 """Explicit synthetic validator controls; no guest or framebuffer qualification."""
+import ast
 import copy
 import hashlib
 import importlib.machinery
@@ -39,6 +40,32 @@ def sample():
 
 
 class Tests(unittest.TestCase):
+    def test_initial_focus_point_avoids_observed_staggered_fixture_overlap(self):
+        # Recorded rectangles from exact 9c CI: synthetic geometry control,
+        # not a replacement for actual focus/input/framebuffer qualification.
+        rects = {'alpha': [630, 446, 320, 240], 'beta': [580, 396, 320, 240],
+                 'gamma': [480, 296, 320, 240], 'delta': [530, 346, 320, 240]}
+        source = Path(proof.__file__).read_text()
+        tree = ast.parse(source)
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name) and n.func.id == 'move'
+                 and any(isinstance(k, ast.Name) and k.id == 'alpha'
+                         for arg in n.args for k in ast.walk(arg))]
+        initial = min(calls, key=lambda n: n.lineno)
+        point = tuple(eval(compile(ast.Expression(arg), '<actual-focus-expression>', 'eval'),
+                           {'__builtins__': {}}, {'alpha': rects['alpha']})
+                      for arg in initial.args)
+        def inside(point, rect):
+            x, y, w, h = rect
+            return x <= point[0] < x + w and y <= point[1] < y + h
+        self.assertTrue(inside(point, rects['alpha']))
+        self.assertTrue(0 <= point[0] < 1280 and 0 <= point[1] < 800)
+        for role in ('beta', 'gamma', 'delta'):
+            self.assertFalse(inside(point, rects[role]), role)
+        old = (rects['alpha'][0] + 12, rects['alpha'][1] + 20)
+        self.assertTrue(inside(old, rects['delta']))
+        self.assertIn("sample['inventory']['state']['focused'] == found['alpha']['id']", source)
+
     def test_shared_application_id_never_substitutes_for_unique_role_map(self):
         value = sample()
         for window in value['inventory']['state']['windows']:

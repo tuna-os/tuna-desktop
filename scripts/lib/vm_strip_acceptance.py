@@ -458,7 +458,10 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         first = ready('gnome')
         found = windows(first, original, edge=edge)
         alpha = found['alpha']['rect']
-        move(alpha[0] + 12, alpha[1] + 20)
+        # The actual staggered floating map can cover Alpha's titlebar with
+        # later fixture windows. Click its lower-right client interior; the
+        # following endpoint still requires the actual Alpha ID to gain focus.
+        move(alpha[0] + alpha[2] - 12, alpha[1] + alpha[3] - 20)
         button(True)
         button(False)
         first = ready('gnome', extra=lambda sample, found: sample['inventory']['state']['focused'] == found['alpha']['id'])
