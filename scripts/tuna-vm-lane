@@ -74,6 +74,73 @@ CARD_HOLD = 10      # frames a title card is held (2.5 s at PLAY_FPS)
 OVMF = ("/usr/share/ovmf/OVMF.fd", "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/qemu/OVMF.fd")
 
 
+def auth_uint(value):
+    return type(value) is int and 0 < value <= (1 << 64) - 1
+
+
+def sleep_auth_attempt(snapshot):
+    """Bind a pending original password attempt before real S3; no secret data."""
+    state = snapshot.get('state', {})
+    owner = state.get('auth_owner')
+    if state.get('locked') is not True or type(owner) is not dict or owner.get('outer_pending') is not True:
+        raise ValueError('pre-sleep owned authentication not pending')
+    attempt = owner.get('attempt')
+    if type(attempt) is not dict or set(attempt) != {'serial', 'epoch', 'origin'}:
+        raise ValueError('pre-sleep owned attempt missing')
+    origin = attempt['origin']
+    if type(origin) is not dict or set(origin) != {'connection', 'request'}:
+        raise ValueError('pre-sleep original connection missing')
+    values = [attempt['serial'], attempt['epoch'], origin['connection'], origin['request']]
+    if not all(auth_uint(value) for value in values) or not auth_uint(owner.get('epoch')) or owner['epoch'] != attempt['epoch']:
+        raise ValueError('pre-sleep attempt identity or current epoch invalid')
+    processes = [p for p in snapshot.get('processes', []) if p.get('executable') == 'tuna-compositor']
+    if len(processes) != 1 or not all(auth_uint(processes[0].get(key)) for key in ['pid', 'start_ticks']):
+        raise ValueError('unique original compositor process required')
+    return {'pid': processes[0]['pid'], 'start_ticks': processes[0]['start_ticks'],
+            'serial': attempt['serial'], 'epoch': attempt['epoch'], 'origin': origin}
+
+
+def stale_sleep_auth_retirement(trace, expected, current_epoch):
+    """Require the exact joined accepted attempt, stale epoch and its shell denial."""
+    prefix = 'tuna-compositor: lock authentication retired '
+    keys = {'pid', 'joined_ok', 'backend_accepted', 'reported_ok', 'applied',
+            'attempt_serial', 'attempt_epoch', 'current_epoch', 'origin', 'origin_live', 'locked_after'}
+    matches = []
+    if not auth_uint(current_epoch) or current_epoch <= expected['epoch']:
+        return None
+    for line in trace.splitlines():
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if type(event) is not dict or set(event) != keys:
+            return None
+        if not all(type(event[key]) is bool for key in ['joined_ok', 'backend_accepted', 'reported_ok',
+                                                      'applied', 'origin_live', 'locked_after']):
+            return None
+        if not all(auth_uint(event[key]) for key in ['pid', 'attempt_serial', 'attempt_epoch', 'current_epoch']):
+            return None
+        origin = event['origin']
+        if type(origin) is not dict or set(origin) != {'connection', 'request'} or not all(auth_uint(v) for v in origin.values()):
+            return None
+        if (event['pid'], event['attempt_serial'], event['attempt_epoch'], origin) == (
+                expected['pid'], expected['serial'], expected['epoch'], expected['origin']):
+            matches.append(event)
+    if len(matches) != 1:
+        return None
+    event = matches[0]
+    if not (event['joined_ok'] and event['backend_accepted'] and event['reported_ok']
+            and event['origin_live'] and event['locked_after'] and not event['applied']
+            and event['current_epoch'] == current_epoch and event['attempt_epoch'] < current_epoch):
+        return None
+    denial = re.compile(r'tuna-shell-gtk: lock command result applied=false request_id=([0-9]+)(?:\s|$)')
+    if not any(int(match.group(1)) == expected['origin']['request'] for match in denial.finditer(trace)):
+        return None
+    return event
+
+
 def log(msg):
     print(f"tuna-vm-lane: {msg}", flush=True)
 
@@ -883,6 +950,10 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if agent.run("delayed-auth-state")["real_pam_delay_running"]:
+                pending_auth = inventory("sleep-auth-owned-attempt")
+                if not same_apps(before, pending_auth):
+                    raise RuntimeError("pre-sleep authentication replaced the session")
+                original_auth = sleep_auth_attempt(pending_auth)
                 break
             time.sleep(0.1)
         else:
@@ -899,9 +970,15 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
             record("V-SLEEP-AUTH-FAIL-CLOSED", False, "pre-sleep PAM result exposed or replaced the session")
             raise RuntimeError("pre-sleep authentication unlocked the resumed session")
         trace = read_text(serial_path)[stale_auth_offset:]
-        stale_rejected = ("lock authentication finished accepted=true applied=false" in trace
-                          and "tuna-shell-gtk: lock command result applied=false" in trace)
+        owner = state["state"].get("auth_owner")
+        current_epoch = owner.get("epoch") if type(owner) is dict else None
+        retirement = stale_sleep_auth_retirement(trace, original_auth, current_epoch)
+        stale_rejected = retirement is not None
         if stale_rejected:
+            with open(os.path.join(evidence, "sleep-auth-retirement.json"), "w") as stream:
+                json.dump({"owned_attempt": original_auth, "retirement": retirement,
+                           "scope": "actual joined outer password wrapper and real S3 epoch; no PAM helper retirement"},
+                          stream, indent=2)
             break
         time.sleep(0.2)
     record("V-SLEEP-AUTH-FAIL-CLOSED", stale_rejected,

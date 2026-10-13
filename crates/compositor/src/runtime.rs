@@ -1396,7 +1396,10 @@ impl Runtime {
             return;
         }
         let (_, worker) = self.unlock_worker.take().expect("matched owned worker");
-        let ok = worker.join().unwrap_or(false) && reported_ok;
+        let joined = worker.join();
+        let joined_ok = joined.is_ok();
+        let backend_accepted = joined.unwrap_or(false);
+        let ok = backend_accepted && reported_ok;
         if !self.unlock_slot.retire(attempt) {
             return;
         }
@@ -1405,7 +1408,19 @@ impl Runtime {
             .is_some_and(|origin| self.control.origin_pending_live(origin));
         let applied = ok && live && self.apply_verified_unlock(attempt.epoch);
         if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
-            eprintln!("tuna-compositor: lock outer wrapper retired applied={applied}");
+            eprintln!(
+                "tuna-compositor: lock authentication retired {}",
+                serde_json::json!({
+                    "pid": std::process::id(), "joined_ok": joined_ok,
+                    "backend_accepted": backend_accepted, "reported_ok": reported_ok,
+                    "applied": applied, "attempt_serial": attempt.serial,
+                    "attempt_epoch": attempt.epoch,
+                    "current_epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                    "origin": attempt.origin.map(|origin| serde_json::json!({
+                        "connection": origin.connection, "request": origin.request })),
+                    "origin_live": live, "locked_after": self.is_locked()
+                })
+            );
         }
         if let Some(origin) = attempt.origin {
             self.control.finish_unlock(origin, applied);
@@ -2017,7 +2032,12 @@ impl Runtime {
         // Owned proof diagnostics only: no credentials, prompts or typed input.
         doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
-                "epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire) })
+                "epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                "attempt": self.unlock_worker.as_ref().map(|(attempt, _)| serde_json::json!({
+                    "serial": attempt.serial, "epoch": attempt.epoch,
+                    "origin": attempt.origin.map(|origin| serde_json::json!({
+                        "connection": origin.connection, "request": origin.request }))
+                })) })
         } else {
             serde_json::Value::Null
         };
