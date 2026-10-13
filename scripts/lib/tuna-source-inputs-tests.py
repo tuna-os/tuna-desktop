@@ -60,6 +60,11 @@ def bundle(change=None, tar_change=None):
                             'cargo metadata --locked --offline --format-version 1']}
     if change:
         change(receipt, files)
+    import gzip
+    receipt['vendor_archive_budget'] = {'expanded_tar_bytes': len(gzip.decompress(files['tuna-desktop-vendor.tar.gz'])),
+                                        'expanded_limit_bytes': inputs.EXPANDED_LIMIT,
+                                        'compressed_bytes': len(files['tuna-desktop-vendor.tar.gz']),
+                                        'compressed_limit_bytes': inputs.LIMIT}
     files['receipt.json'] = json.dumps(receipt).encode()
     result = io.BytesIO()
     with zipfile.ZipFile(result, 'w') as archive:
@@ -184,13 +189,12 @@ class AdmissionTests(unittest.TestCase):
             if args[:2] == ['git', 'rev-parse']:
                 return (TREE_SHA + '\n').encode()
             if args[:2] == ['cargo', 'vendor']:
+                (cwd / 'vendor/fixture').mkdir(parents=True)
+                (cwd / 'vendor/fixture/Cargo.toml').write_bytes(b'fixture')
                 return emitted
             if args[:2] == ['cargo', 'metadata']:
                 self.assertEqual((cwd / '.cargo/config.toml').read_bytes(), emitted)
                 return b'{"packages":[{"name":"fixture"}]}'
-            if args[0] == 'tar':
-                import gzip
-                return gzip.decompress(vendor_archive)
             return b''
         producer = run(20, PRODUCER_SHA, inputs.WORKFLOW)
         response = io.BytesIO(source_archive)
@@ -208,6 +212,45 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(receipt['source']['overall_conclusion'], 'failure')
             self.assertIn(['cargo', 'vendor', '--locked', '--versioned-dirs', 'vendor'], calls)
             self.assertIn(['cargo', 'metadata', '--locked', '--offline', '--format-version', '1'], calls)
+            self.assertGreater(receipt['vendor_archive_budget']['expanded_tar_bytes'], 0)
+            self.assertEqual(receipt['vendor_archive_budget']['expanded_limit_bytes'], inputs.EXPANDED_LIMIT)
+
+    def test_streaming_archive_separate_budgets_and_determinism(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'vendor').mkdir(); (root / '.cargo').mkdir()
+            (root / 'vendor/data').write_bytes(b'a' * 100000)
+            (root / '.cargo/config.toml').write_bytes(b'config')
+            first = root / 'first.gz'; second = root / 'second.gz'
+            measured = inputs.stream_vendor_archive(root, first, expanded_limit=200000, compressed_limit=1000)
+            self.assertGreater(measured['expanded_tar_bytes'], 1000)
+            self.assertLess(measured['compressed_bytes'], 1000)
+            inputs.stream_vendor_archive(root, second, expanded_limit=200000, compressed_limit=1000)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            for expanded, compressed in [(1000, 1000), (200000, 1)]:
+                with self.subTest(expanded=expanded), self.assertRaises(ValueError):
+                    inputs.stream_vendor_archive(root, root / f'bad-{expanded}.gz', expanded, compressed)
+
+    def test_expanded_member_admission_still_bounded(self):
+        archive = tar([('vendor/payload', b'a' * 10000, 'file')])
+        with patch.object(inputs, 'EXPANDED_LIMIT', 9999), self.assertRaises(ValueError):
+            inputs.archive_members(archive, {'vendor'})
+
+    def test_forged_expanded_measurement_is_refused(self):
+        data, artifact, tree = bundle()
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            files = {name: archive.read(name) for name in archive.namelist()}
+        receipt = json.loads(files['receipt.json'])
+        receipt['vendor_archive_budget']['expanded_tar_bytes'] += 1
+        files['receipt.json'] = json.dumps(receipt).encode()
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, 'w') as archive:
+            for name, value in files.items():
+                archive.writestr(name, value)
+        data = output.getvalue()
+        artifact.update(digest='sha256:' + inputs.sha256(data), size_in_bytes=len(data))
+        with self.assertRaisesRegex(ValueError, 'measured budget mismatch'):
+            inputs.verify_bundle(data, artifact, SOURCE, 20, PRODUCER_SHA, 2, tree)
 
     def test_empty_metadata_and_vendor_config_mismatch_not_admitted_even_rehashed(self):
         def empty(receipt, files):

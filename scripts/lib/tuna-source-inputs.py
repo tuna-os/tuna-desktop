@@ -17,6 +17,7 @@ REPO = 'tuna-os/tuna-desktop'
 WORKFLOW = '.github/workflows/tuna-source-inputs.yml'
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 LIMIT = 512 * 1024 * 1024
+EXPANDED_LIMIT = 2 * 1024 * 1024 * 1024
 FILES = {'tuna-desktop-source.tar.gz', 'tuna-desktop-vendor.tar.gz', 'Cargo.lock',
          'vendor-config.toml', 'cargo-metadata.json', 'vendor.log', 'metadata.log', 'rustc.txt', 'cargo.txt'}
 
@@ -89,7 +90,7 @@ def source_gate(run_id, expected_sha=None):
             'overall_conclusion': run['conclusion'], 'required_jobs': gates}
 
 
-def archive_members(data, roots):
+def archive_members(data, roots, retain=None):
     require(len(data) <= LIMIT, 'archive budget exceeded')
     result = {}
     total = 0
@@ -101,7 +102,7 @@ def archive_members(data, roots):
                     and path.parts[0] in roots and member.name not in result, 'unsafe/duplicate archive member')
             require(member.isdir() or member.isfile() or member.issym(), 'unsupported archive member')
             total += member.size
-            require(total <= LIMIT, 'expanded archive budget exceeded')
+            require(total <= EXPANDED_LIMIT, 'expanded archive budget exceeded')
             if member.issym():
                 target = PurePosixPath(member.linkname)
                 # No source symlink may escape its archive root.
@@ -110,7 +111,7 @@ def archive_members(data, roots):
                 for part in target.parts:
                     depth += -1 if part == '..' else (0 if part == '.' else 1)
                     require(depth >= 1, 'escaping archive symlink')
-            value = archive.extractfile(member).read() if member.isfile() else (
+            value = archive.extractfile(member).read() if member.isfile() and (retain is None or member.name in retain) else (
                 member.linkname.encode() if member.issym() else b'')
             result[member.name] = (member, value)
     return result
@@ -144,6 +145,33 @@ def command(args, cwd, log=None):
     if log:
         Path(log).write_bytes(result.stderr)
     return result.stdout
+
+
+def stream_vendor_archive(root, output, expanded_limit=EXPANDED_LIMIT, compressed_limit=LIMIT):
+    """Never materialize the uncompressed vendor tar; bound both representations."""
+    import gzip
+    args = ['tar', '--sort=name', '--mtime=@0', '--owner=0', '--group=0', '--numeric-owner',
+            '-cf', '-', 'vendor', '.cargo']
+    total = 0
+    with tempfile.TemporaryFile() as errors, Path(output).open('xb') as raw:
+        process = subprocess.Popen(args, cwd=root, stdout=subprocess.PIPE, stderr=errors)
+        try:
+            with gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as compressed:
+                while chunk := process.stdout.read(1024 * 1024):
+                    total += len(chunk)
+                    require(total <= expanded_limit, f'expanded vendor tar exceeds budget: {total} > {expanded_limit}')
+                    compressed.write(chunk)
+                    require(raw.tell() <= compressed_limit, 'compressed vendor archive exceeds budget')
+            require(raw.tell() <= compressed_limit, 'compressed vendor archive exceeds budget')
+            require(process.wait() == 0, 'vendor tar command failed')
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            process.stdout.close()
+    return {'expanded_tar_bytes': total, 'expanded_limit_bytes': expanded_limit,
+            'compressed_bytes': Path(output).stat().st_size, 'compressed_limit_bytes': compressed_limit}
 
 
 def capture(source_run_id, output):
@@ -189,17 +217,15 @@ def capture(source_run_id, output):
         require((root / 'Cargo.lock').read_bytes() == lock, 'vendor/metadata changed Cargo.lock')
         (out / 'cargo-metadata.json').write_bytes(metadata)
         # Stable tar ownership/time/order; gzip header has no source timestamp.
-        tar = command(['tar', '--sort=name', '--mtime=@0', '--owner=0', '--group=0', '--numeric-owner',
-                       '-cf', '-', 'vendor', '.cargo'], root)
-        require(len(tar) <= LIMIT, 'vendor archive exceeds budget')
-        import gzip
-        (out / 'tuna-desktop-vendor.tar.gz').write_bytes(gzip.compress(tar, mtime=0))
+        archive_budget = stream_vendor_archive(root, out / 'tuna-desktop-vendor.tar.gz')
+        print(json.dumps({'vendor_archive_budget': archive_budget}, sort_keys=True))
     artifacts = {name: {'sha256': sha256((out / name).read_bytes()), 'size': (out / name).stat().st_size}
                  for name in sorted(FILES)}
     receipt = {'schema': 1, 'candidate_only': True, 'release_qualified': False, 'published': False,
                'source': source, 'producer': {'run_id': producer_id, 'run_attempt': producer['run_attempt'],
                                              'source_sha': producer_sha, 'workflow': WORKFLOW},
                'lock_sha256': artifacts['Cargo.lock']['sha256'], 'artifacts': artifacts,
+               'vendor_archive_budget': archive_budget,
                'commands': ['cargo vendor --locked --versioned-dirs vendor',
                             'cargo metadata --locked --offline --format-version 1']}
     (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
@@ -233,7 +259,17 @@ def verify_bundle(data, artifact, source, producer_id, producer_sha, attempt, so
     require(json.loads(blobs['cargo-metadata.json']).get('packages'), 'empty offline metadata')
     require(verify_source_archive(blobs['tuna-desktop-source.tar.gz'], source, source_tree) == blobs['Cargo.lock'],
             'archive lock mismatch')
-    vendor = archive_members(blobs['tuna-desktop-vendor.tar.gz'], {'vendor', '.cargo'})
+    import gzip
+    expanded = 0
+    with gzip.GzipFile(fileobj=io.BytesIO(blobs['tuna-desktop-vendor.tar.gz'])) as stream:
+        while chunk := stream.read(1024 * 1024):
+            expanded += len(chunk)
+            require(expanded <= EXPANDED_LIMIT, 'expanded vendor tar exceeds budget')
+    require(receipt['vendor_archive_budget'] == {
+        'expanded_tar_bytes': expanded, 'expanded_limit_bytes': EXPANDED_LIMIT,
+        'compressed_bytes': len(blobs['tuna-desktop-vendor.tar.gz']), 'compressed_limit_bytes': LIMIT},
+        'vendor archive measured budget mismatch')
+    vendor = archive_members(blobs['tuna-desktop-vendor.tar.gz'], {'vendor', '.cargo'}, {'.cargo/config.toml'})
     require('.cargo/config.toml' in vendor and vendor['.cargo/config.toml'][0].isfile()
             and vendor['.cargo/config.toml'][1] == blobs['vendor-config.toml'], 'vendor config mismatch')
     require(any(name.startswith('vendor/') and member.isfile() for name, (member, _) in vendor.items()),
