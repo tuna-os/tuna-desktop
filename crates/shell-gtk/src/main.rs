@@ -84,9 +84,24 @@ fn release_version() -> &'static str {
 /// GSettings for `schema` when installed (Marlin ships the GNOME desktop
 /// schemas); `None` keeps the shell running without them.
 fn settings(schema: &str) -> Option<gio::Settings> {
-    let source = gio::SettingsSchemaSource::default()?;
-    source.lookup(schema, true)?;
-    Some(gio::Settings::new(schema))
+    settings_in(&gio::SettingsSchemaSource::default()?, schema)
+}
+
+/// [`settings`] against an explicit schema source, so tests can pin the
+/// relocatable refusal without depending on installed schemas.
+fn settings_in(source: &gio::SettingsSchemaSource, schema: &str) -> Option<gio::Settings> {
+    let found = source.lookup(schema, true)?;
+    // Relocatable schemas have no fixed path, and constructing one
+    // without a path aborts the process (GLib-GIO-ERROR): the tablet
+    // schemas did exactly that, killing the shell before it owned its
+    // bus name. Refuse them so the shell keeps running on defaults;
+    // per-device settings must use `with_path` call sites instead.
+    found.path()?;
+    Some(gio::Settings::new_full(
+        &found,
+        None::<&gio::SettingsBackend>,
+        None,
+    ))
 }
 
 fn is_would_block(e: &ControlError) -> bool {
@@ -1898,6 +1913,13 @@ fn build(app: &adw::Application) {
     // GNOME's input settings (#60): keymap, repeat, touchpad, mouse,
     // graphics tablet (#344) and hot corner, sent now and on every change.
     {
+        // The tablet schemas are relocatable (one instance per device, no
+        // fixed path), so `settings()` refuses them and they resolve to
+        // `None`: the shell sends `InputSettings` GNOME defaults until
+        // per-device tablet settings land. Constructing them without a
+        // path aborts the shell before it owns its bus name (V-SHELL,
+        // V-PANEL and V-PORTAL in the VM lane), so they must stay refused
+        // here until a `with_path` call site replaces them.
         let schemas = [
             "org.gnome.desktop.input-sources",
             "org.gnome.desktop.peripherals.keyboard",
@@ -2281,4 +2303,43 @@ fn main() -> glib::ExitCode {
         .build();
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::{settings, settings_in};
+
+    #[test]
+    fn relocatable_tablet_schemas_resolve_to_none_without_aborting() {
+        // Where the GNOME schemas are installed this pins the refusal;
+        // where they are missing the lookup already yields `None`. On the
+        // pre-fix constructor this test aborted the test binary outright
+        // (GLib-GIO-ERROR), the same crash that kept the shell off its
+        // bus name and failed V-SHELL, V-PANEL and V-PORTAL.
+        assert!(settings("org.gnome.desktop.peripherals.tablet").is_none());
+        assert!(settings("org.gnome.desktop.peripherals.tablet.stylus").is_none());
+    }
+
+    #[test]
+    fn missing_schema_stays_none() {
+        assert!(settings("org.tuna_desktop.no_such_schema").is_none());
+    }
+
+    #[test]
+    fn fixed_path_schema_still_constructs_when_installed() {
+        // The refusal must not swallow fixed-path schemas: where any are
+        // installed, the first one must still construct. Schema-less
+        // environments have nothing to check, so they pass vacuously.
+        let Some(source) = gio::SettingsSchemaSource::default() else {
+            return;
+        };
+        let (fixed, _) = source.list_schemas(true);
+        let Some(id) = fixed.first() else {
+            return;
+        };
+        assert!(
+            settings_in(&source, id).is_some(),
+            "fixed-path schema {id} must still construct"
+        );
+    }
 }

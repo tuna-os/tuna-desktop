@@ -319,11 +319,11 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| area | Honored | Live calibration padding insets the mapped tablet area, including the hotplug path; physical tablet qualification remains open (#344) |
-| keep-aspect | Honored | Live aspect letterboxing against the tablet's physical size; physical tablet qualification remains open (#344) |
-| left-handed | Honored | Live rotation reaches libinput, including the hotplug path; physical tablet qualification remains open (#344) |
-| mapping | Honored | Live absolute/relative stylus mapping; physical tablet qualification remains open (#344) |
-| output | Honored | Automatic mapping takes the primary output and explicit triples match connector names; EDID-precise matching awaits EDID plumbing, and physical tablet qualification remains open (#344) |
+| area | Honored | Live calibration padding insets the mapped tablet area, including the hotplug path; physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
+| keep-aspect | Honored | Live aspect letterboxing against the tablet's physical size; physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
+| left-handed | Honored | Live rotation reaches libinput, including the hotplug path; physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
+| mapping | Honored | Live absolute/relative stylus mapping; physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
+| output | Honored | Automatic mapping takes the primary output and explicit triples match connector names; EDID-precise matching awaits EDID plumbing, and physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
 ## org.gnome.desktop.peripherals.tablet.deprecated
 
 | Key | Status | Reason |
@@ -339,18 +339,18 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open (#344) |
+| button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
 | button-keybinding | Ignored | Keybinding synthesis for stylus buttons is not implemented (#344) |
 | eraser-button-action | Ignored | Eraser button actions are not split from the stylus ones (#344) |
 | eraser-button-keybinding | Ignored | Keybinding synthesis for stylus buttons is not implemented (#344) |
 | eraser-button-mode | Ignored | Eraser button modes are not implemented (#344) |
-| eraser-pressure-curve | Honored | Live piecewise-linear curve through GNOME's control points reaches tool clients; Mutter's exact spline shape is unconfirmed, and physical tablet qualification remains open (#344) |
+| eraser-pressure-curve | Honored | Live piecewise-linear curve through GNOME's control points reaches tool clients; Mutter's exact spline shape is unconfirmed, and physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
 | eraser-pressure-range | Ignored | Pressure range remapping is not implemented (#344) |
-| pressure-curve | Honored | Live piecewise-linear curve through GNOME's control points reaches tool clients; Mutter's exact spline shape is unconfirmed, and physical tablet qualification remains open (#344) |
+| pressure-curve | Honored | Live piecewise-linear curve through GNOME's control points reaches tool clients; Mutter's exact spline shape is unconfirmed, and physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
 | pressure-range | Ignored | Pressure range remapping is not implemented (#344) |
-| secondary-button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open (#344) |
+| secondary-button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
 | secondary-button-keybinding | Ignored | Keybinding synthesis for stylus buttons is not implemented (#344) |
-| tertiary-button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open (#344) |
+| tertiary-button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open; shell sends GNOME defaults until per-device settings land (#344) |
 | tertiary-button-keybinding | Ignored | Keybinding synthesis for stylus buttons is not implemented (#344) |
 ## org.gnome.desktop.peripherals.touchpad
 
