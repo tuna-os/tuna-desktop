@@ -2033,6 +2033,7 @@ mod auth_origin_tests {
     use super::*;
     use crate::auth_owner::Origin;
     use std::net::Shutdown;
+    use std::os::unix::fs::PermissionsExt;
 
     fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
         let dir = tempfile::tempdir().unwrap();
