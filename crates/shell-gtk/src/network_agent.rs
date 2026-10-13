@@ -268,7 +268,7 @@ impl NetworkAgent {
         for (field, entry) in request.fields.iter().zip(self.entries.borrow().iter()) {
             entry.set_visibility(live_entry_visibility(
                 field.password,
-                entry.is_visible(),
+                gtk::prelude::EntryExt::is_visible(entry),
                 visibility.password_reveal,
             ));
             let icon = crate::lockdown::password_reveal_icon(field.password, visibility);
