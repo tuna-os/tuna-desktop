@@ -3783,10 +3783,22 @@ fn unfocused_native_modal_close_does_not_steal_focus_from_another_app() {
     close_native_modal(false, false, true);
 }
 
+/// Geometry from the actual actor/render path, never a shell dash icon hint.
+fn strip_drawn_geometry(
+    manager: &WindowManager,
+    id: u64,
+) -> Option<smithay::utils::Rectangle<i32, Logical>> {
+    manager
+        .render_entries()
+        .into_iter()
+        .find(|entry| entry.0 == id)
+        .map(|entry| entry.2)
+}
+
 /// Drive the actual compositor modifier/button route, without a private grab API.
 fn start_strip_drag(f: &mut ThreeFixture, id: u64) -> Point<f64, Logical> {
     f.manager.set_motion_allowed(false);
-    let geometry = f.manager.icon_geometry(id).unwrap();
+    let geometry = strip_drawn_geometry(&f.manager, id).unwrap();
     let pos: Point<f64, Logical> = (
         f64::from(geometry.loc.x + 60),
         f64::from(geometry.loc.y + 25),
@@ -3815,7 +3827,7 @@ fn strip_pointer_move_presents_actor_keeps_slots_and_commits_only_own_button() {
         before[0],
         "canonical slot stays reserved until drop"
     );
-    let drawn = f.manager.icon_geometry(f.id_a).unwrap();
+    let drawn = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
     assert_eq!(
         drawn.loc,
         (before[0].loc.x + 850, before[0].loc.y + 40).into()
@@ -3881,7 +3893,7 @@ fn start_strip_resize(f: &mut ThreeFixture, left: bool) -> Point<f64, Logical> {
     use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
     f.manager.set_motion_allowed(false);
     f.manager.focus(&mut f.comp.state, Some(f.id_a));
-    let g = f.manager.icon_geometry(f.id_a).unwrap();
+    let g = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
     let x = if left {
         g.loc.x + 2
     } else {
@@ -3934,7 +3946,7 @@ fn strip_resize_configures_continuous_width_neighbors_and_preserves_floating_sta
         Some(&(after.size.w, after.size.h))
     );
     assert_eq!(
-        f.manager.icon_geometry(f.id_a).unwrap(),
+        strip_drawn_geometry(&f.manager, f.id_a).unwrap(),
         after,
         "direct resize has no lagging actor"
     );
@@ -4039,7 +4051,7 @@ fn strip_client_resize_rejects_stale_serial_wrong_owner_and_vertical_only_edges(
     f.manager.set_scroll(&mut f.comp.state, true);
     f.manager.set_motion_allowed(false);
     f.manager.focus(&mut f.comp.state, Some(f.id_a));
-    let g = f.manager.icon_geometry(f.id_a).unwrap();
+    let g = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
     f.manager.pointer_motion(
         &mut f.comp.state,
         (g.loc.x as f64 + 50.0, g.loc.y as f64 + 20.0).into(),
@@ -4115,9 +4127,9 @@ fn strip_drag_translates_attached_dialog_family_and_keeps_child_above_parent() {
     f.manager.set_scroll(&mut f.comp.state, true);
     f.manager.focus(&mut f.comp.state, Some(f.id_a));
     f.manager.set_motion_allowed(false);
-    let original_parent = f.manager.icon_geometry(f.id_a).unwrap();
-    let original_child = f.manager.icon_geometry(child).unwrap();
-    let original_neighbor = f.manager.icon_geometry(f.id_b).unwrap();
+    let original_parent = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    let original_child = strip_drawn_geometry(&f.manager, child).unwrap();
+    let original_neighbor = strip_drawn_geometry(&f.manager, f.id_b).unwrap();
     let id_a = f.id_a;
     let pos = start_strip_drag(&mut f, id_a);
     // Make this already-attached child modal without replacing the moving
@@ -4134,8 +4146,8 @@ fn strip_drag_translates_attached_dialog_family_and_keeps_child_above_parent() {
     assert!(f.manager.grab_active());
     f.manager
         .pointer_motion(&mut f.comp.state, (pos.x + 350.0, pos.y + 45.0).into(), 12);
-    let parent = f.manager.icon_geometry(f.id_a).unwrap();
-    let child_drawn = f.manager.icon_geometry(child).unwrap();
+    let parent = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    let child_drawn = strip_drawn_geometry(&f.manager, child).unwrap();
     assert_eq!(
         parent.loc,
         (original_parent.loc.x + 350, original_parent.loc.y + 45).into()
@@ -4145,7 +4157,10 @@ fn strip_drag_translates_attached_dialog_family_and_keeps_child_above_parent() {
         (original_child.loc.x + 350, original_child.loc.y + 45).into(),
         "dialog must not remain stranded in the old column"
     );
-    assert_eq!(f.manager.icon_geometry(f.id_b).unwrap(), original_neighbor);
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_b).unwrap(),
+        original_neighbor
+    );
     let order: Vec<_> = f
         .manager
         .render_entries()
@@ -4154,8 +4169,14 @@ fn strip_drag_translates_attached_dialog_family_and_keeps_child_above_parent() {
         .collect();
     assert_eq!(&order[order.len() - 2..], &[f.id_a, child]);
     assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
-    assert_eq!(f.manager.icon_geometry(f.id_a).unwrap(), original_parent);
-    assert_eq!(f.manager.icon_geometry(child).unwrap(), original_child);
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_a).unwrap(),
+        original_parent
+    );
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, child).unwrap(),
+        original_child
+    );
     assert!(f.manager.tile_preview(&f.comp.state).is_none());
     let _keep = (surface, xdg, top, dialog);
 }
@@ -4256,7 +4277,7 @@ fn strip_actor_extreme_finite_deltas_are_safe_and_nonfinite_input_cancels() {
         let pos = start_strip_drag(&mut f, id_a);
         f.manager
             .pointer_motion(&mut f.comp.state, (delta, delta).into(), 12);
-        let drawn = f.manager.icon_geometry(f.id_a).unwrap();
+        let drawn = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
         // Bounds include extents; subsequent renderer/hit-test additions
         // remain representable even for finite input far beyond i32.
         assert!(drawn.loc.x.checked_add(drawn.size.w).is_some());
@@ -4324,7 +4345,7 @@ fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() 
     let pos = start_strip_drag(&mut f, id_a);
     f.manager
         .pointer_motion(&mut f.comp.state, (pos.x + 300.0, pos.y + 35.0).into(), 12);
-    let parent_before = f.manager.icon_geometry(f.id_a).unwrap();
+    let parent_before = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
     // Map an actual attached modal AFTER the pointer owner is established.
     let qh = f.queue_a.handle();
     let surface = f
@@ -4363,10 +4384,13 @@ fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() 
         f.manager.grab_active(),
         "a newly mapped family member does not discard the original owner"
     );
-    assert_eq!(f.manager.icon_geometry(f.id_a).unwrap(), parent_before);
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_a).unwrap(),
+        parent_before
+    );
     let canonical_parent = f.manager.geometry(f.id_a).unwrap();
     let canonical_child = f.manager.geometry(child).unwrap();
-    let child_drawn = f.manager.icon_geometry(child).unwrap();
+    let child_drawn = strip_drawn_geometry(&f.manager, child).unwrap();
     assert_eq!(
         child_drawn.loc.x - parent_before.loc.x,
         canonical_child.loc.x - canonical_parent.loc.x
@@ -4385,7 +4409,7 @@ fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() 
     f.manager
         .pointer_motion(&mut f.comp.state, (pos.x + 500.0, pos.y + 45.0).into(), 13);
     assert_eq!(
-        f.manager.icon_geometry(child).unwrap().loc.x - child_drawn.loc.x,
+        strip_drawn_geometry(&f.manager, child).unwrap().loc.x - child_drawn.loc.x,
         200
     );
     dialog.destroy();
