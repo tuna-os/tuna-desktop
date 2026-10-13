@@ -4108,11 +4108,13 @@ wb_gate_begin() {
 wb_stamp_dump() {
     wb_stamp_ticks="$(wb_proc_start_ticks "$WB_SHELL_PID")" || return 1
     [ "$wb_stamp_ticks" = "$WB_SHELL_START" ] || return 1
+    wb_stamp_sha="$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" || return 1
+    [ -n "$wb_stamp_sha" ] || return 1
     jq -n --arg gate "$WB_GATE" --arg nonce "$WB_NONCE" \
         --argjson seq "$WB_DUMP_SEQ" --argjson pid "$WB_SHELL_PID" \
         --argjson start_ticks "$wb_stamp_ticks" \
-        --argjson epoch "$(date +%s)" \
-        '{gate:$gate,nonce:$nonce,seq:$seq,pid:$pid,start_ticks:$start_ticks,epoch:$epoch}' \
+        --argjson epoch "$(date +%s)" --arg dump_sha256 "$wb_stamp_sha" \
+        '{gate:$gate,nonce:$nonce,seq:$seq,pid:$pid,start_ticks:$start_ticks,epoch:$epoch,dump_sha256:$dump_sha256}' \
         >"$1.stamp" || return 1
 }
 
@@ -4164,19 +4166,40 @@ wb_probe_ensure() {
             --app-id tuna-cursor-probe --out "$ARTIFACTS/wb-probe-owner.json" ||
             fail "$WB_GATE" "the owned probe map is ambiguous (decoy?) or not native"
         # Fresh-enter handshake: only our client writes this log.
-        # Park away (explicit leave), record the log byte offset, move
-        # onto the bound center, then require a NEW enter strictly
-        # after the offset while the pointer sits inside the bound
-        # rect; bound geometry and the owned-client lifetime are
-        # pinned before and after. Whole-log matching is gone.
+        # Park away and OBSERVE the pointer outside the bound rect (an
+        # actual leave, not a commanded move), record the log byte
+        # offset, move onto the bound center, then require a NEW
+        # complete enter strictly after the offset while the pointer
+        # sits inside the bound rect; bound geometry and the
+        # owned-client lifetime are pinned before and after.
+        # Whole-log matching is gone, and the wait itself only
+        # completes on a complete NEW record (no substring grep).
         probe_center="$(jq -r '.rect | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' \
             "$ARTIFACTS/wb-probe-owner.json")" ||
             fail "$WB_GATE" "the bound probe rect went missing"
         [ -n "$probe_center" ] && [ "$probe_center" != "null null" ] ||
             fail "$WB_GATE" "the bound probe rect went missing"
-        xdotool mousemove --window "$WID" 20 $((HEIGHT - 20)) ||
+        wb_bound_x="$(jq -r '.rect[0]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_y="$(jq -r '.rect[1]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_w="$(jq -r '.rect[2]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_h="$(jq -r '.rect[3]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        for wb_bound_v in "$wb_bound_x" "$wb_bound_y" "$wb_bound_w" "$wb_bound_h"; do
+            case "$wb_bound_v" in ''|*[!0-9]*) fail "$WB_GATE" "the bound probe rect is not integer geometry" ;; esac
+        done
+        wb_park_x=20
+        wb_park_y=$((HEIGHT - 20))
+        if [ "$wb_park_x" -ge "$wb_bound_x" ] && [ "$wb_park_x" -lt "$((wb_bound_x + wb_bound_w))" ] &&
+            [ "$wb_park_y" -ge "$wb_bound_y" ] && [ "$wb_park_y" -lt "$((wb_bound_y + wb_bound_h))" ]; then
+            fail "$WB_GATE" "the probe covers the park corner; no leave is observable"
+        fi
+        xdotool mousemove --window "$WID" "$wb_park_x" "$wb_park_y" ||
             fail "$WB_GATE" "could not park the pointer for a fresh enter"
-        sleep 0.5
+        cstate ".pointer_position != null and (.pointer_position[0] < $wb_bound_x or .pointer_position[0] >= $((wb_bound_x + wb_bound_w)) or .pointer_position[1] < $wb_bound_y or .pointer_position[1] >= $((wb_bound_y + wb_bound_h)))" "pointer outside the bound rect" 5 ||
+            fail "$WB_GATE" "the pointer never left the bound rect before the enter mark"
         kill -0 "$WB_PROBE_PID" 2>/dev/null ||
             fail "$WB_GATE" "the owned probe client died before the enter handshake"
         "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" check \
@@ -4190,19 +4213,12 @@ wb_probe_ensure() {
         # shellcheck disable=SC2086 # two coordinates, second move after leave
         xdotool mousemove --window "$WID" $probe_center ||
             fail "$WB_GATE" "could not move onto the bound probe"
-        wb_bound_x="$(jq -r '.rect[0]' "$ARTIFACTS/wb-probe-owner.json")" ||
-            fail "$WB_GATE" "the bound probe rect went missing"
-        wb_bound_y="$(jq -r '.rect[1]' "$ARTIFACTS/wb-probe-owner.json")" ||
-            fail "$WB_GATE" "the bound probe rect went missing"
-        wb_bound_w="$(jq -r '.rect[2]' "$ARTIFACTS/wb-probe-owner.json")" ||
-            fail "$WB_GATE" "the bound probe rect went missing"
-        wb_bound_h="$(jq -r '.rect[3]' "$ARTIFACTS/wb-probe-owner.json")" ||
-            fail "$WB_GATE" "the bound probe rect went missing"
         cstate ".pointer_position != null and .pointer_position[0] >= $wb_bound_x and .pointer_position[1] >= $wb_bound_y and .pointer_position[0] < $((wb_bound_x + wb_bound_w)) and .pointer_position[1] < $((wb_bound_y + wb_bound_h))" "pointer inside the bound rect" 5 ||
             fail "$WB_GATE" "the pointer did not land inside the bound rect"
         wb_entered=""
         for _ in $(seq 1 20); do
-            if tail -c +$((wb_enter_mark + 1)) "$ARTIFACTS/wb-cursor-probe.log" 2>/dev/null | grep -q '"enter"'; then wb_entered=1; break; fi
+            if "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" fresh-enter \
+                --log "$ARTIFACTS/wb-cursor-probe.log" --offset "$wb_enter_mark" >/dev/null 2>&1; then wb_entered=1; break; fi
             sleep 0.25
         done
         [ -n "$wb_entered" ] ||
@@ -4763,15 +4779,20 @@ else
     cstate '.locked' "locked" 10 ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "Take did not lock the session"
     wb_state_capture take-lock-locked
-    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" locked \
-        "$ARTIFACTS/wb-take-lock-locked-cstate-after.json" --expect true ||
-        fail G-WELLBEING-ACTION-TAKE-LOCK "lock not observed in state"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" locked-state \
+        --cstate-before "$ARTIFACTS/wb-take-lock-locked-cstate-before.json" \
+        --cstate-after "$ARTIFACTS/wb-take-lock-locked-cstate-after.json" \
+        --proc-before "$ARTIFACTS/wb-take-lock-locked-proc-before.json" \
+        --proc-after "$ARTIFACTS/wb-take-lock-locked-proc-after.json" \
+        --label take-lock-locked ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "lock not observed in state (full typed presence, redaction, sandwich)"
     cp "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-before.json"
     stale_code=0
     wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
     cp "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-after.json"
     wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-retired.json" 20 ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+    take_lock_retired_seq="$WB_DUMP_SEQ"
     "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
         --exit-code "$stale_code" \
         --before "$ARTIFACTS/wb-take-lock-stale-before.json" \
@@ -4784,7 +4805,8 @@ else
         --expect-start "$WB_SHELL_START" \
         --stamp "$ARTIFACTS/a11y-wb-take-lock-retired.json.stamp" \
         --expect-gate G-WELLBEING-ACTION-TAKE-LOCK \
-        --expect-nonce "$WB_NONCE" ||
+        --expect-nonce "$WB_NONCE" \
+        --expect-seq "$take_lock_retired_seq" ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "a stale Take press fired"
     sleep 1
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1 ||
@@ -4879,6 +4901,7 @@ wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-stale.json" 20 --press "Take" >/dev/n
 cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-after.json"
 wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-retired.json" 20 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+take_fade_retired_seq="$WB_DUMP_SEQ"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
     --exit-code "$stale_code" \
     --before "$ARTIFACTS/wb-take-fade-stale-before.json" \
@@ -4891,7 +4914,8 @@ wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-retired.json" 20 ||
     --expect-start "$WB_SHELL_START" \
     --stamp "$ARTIFACTS/a11y-wb-take-fade-retired.json.stamp" \
     --expect-gate G-WELLBEING-ACTION-TAKE-FADE \
-    --expect-nonce "$WB_NONCE" ||
+    --expect-nonce "$WB_NONCE" \
+    --expect-seq "$take_fade_retired_seq" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "a stale Take press fired"
 wb_break_cleanup
 gsettings set org.gnome.desktop.notifications show-banners false ||
@@ -4951,6 +4975,7 @@ cp "$CSTATE" "$ARTIFACTS/wb-delay-stale-after.json"
 # press set is proven undisturbed by the stale press.
 wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-retired.json" 20 ||
     fail G-WELLBEING-ACTION-DELAY "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+delay_retired_seq="$WB_DUMP_SEQ"
 DELAYREDUE=""
 end=$(($(date +%s) + 45))
 while [ "$(date +%s)" -le "$end" ]; do
@@ -4985,6 +5010,7 @@ wb_capture delay-redue
     --stamp "$ARTIFACTS/a11y-wb-delay-retired.json.stamp" \
     --expect-gate G-WELLBEING-ACTION-DELAY \
     --expect-nonce "$WB_NONCE" \
+    --expect-seq "$delay_retired_seq" \
     --due-kind delay --due-old "$delay_due_epoch" --due-new "$delay_redue_epoch" --due-expect 30 ||
     fail G-WELLBEING-ACTION-DELAY "a stale Delay press fired"
 wb_break_cleanup
@@ -5040,6 +5066,7 @@ cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-after.json"
 # live press set is proven undisturbed by the stale press.
 wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-retired.json" 20 ||
     fail G-WELLBEING-ACTION-SKIP "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+skip_retired_seq="$WB_DUMP_SEQ"
 SKIPREDUE=""
 end=$(($(date +%s) + 30))
 while [ "$(date +%s)" -le "$end" ]; do
@@ -5074,6 +5101,7 @@ wb_capture skip-redue
     --stamp "$ARTIFACTS/a11y-wb-skip-retired.json.stamp" \
     --expect-gate G-WELLBEING-ACTION-SKIP \
     --expect-nonce "$WB_NONCE" \
+    --expect-seq "$skip_retired_seq" \
     --due-kind skip --due-old "$skip_press_epoch" --due-new "$skip_redue_epoch" --due-expect 10 ||
     fail G-WELLBEING-ACTION-SKIP "a stale Skip press fired"
 wb_break_cleanup
@@ -5128,6 +5156,7 @@ wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-stale.json" 20 --press "Take" >/dev/nu
 cp "$CSTATE" "$ARTIFACTS/wb-negative-stale-after.json"
 wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-retired.json" 20 ||
     fail G-WELLBEING-NEGATIVE "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+negative_retired_seq="$WB_DUMP_SEQ"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
     --exit-code "$stale_code" \
     --before "$ARTIFACTS/wb-negative-stale-before.json" \
@@ -5140,7 +5169,8 @@ wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-retired.json" 20 ||
     --expect-start "$WB_SHELL_START" \
     --stamp "$ARTIFACTS/a11y-wb-negative-retired.json.stamp" \
     --expect-gate G-WELLBEING-NEGATIVE \
-    --expect-nonce "$WB_NONCE" ||
+    --expect-nonce "$WB_NONCE" \
+    --expect-seq "$negative_retired_seq" ||
     fail G-WELLBEING-NEGATIVE "a post-cleanup stale Take press fired"
 wb_capture negative-baseline
 wb_provenance_finish

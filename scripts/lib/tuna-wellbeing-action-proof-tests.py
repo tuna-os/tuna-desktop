@@ -7,6 +7,7 @@ only on an alive owned tree with zero transport errors; dead bus and
 killed trees fail), and the Delay/Skip due-schedule checks. No cargo,
 no compositor required.
 """
+import hashlib
 import importlib.util
 import json
 import os
@@ -121,13 +122,28 @@ def owner_identity():
     return pid, mod.proc_start_ticks(pid, 'test')
 
 
-def write_stamp(path, pid, start, gate=GATE, nonce=NONCE, epoch=None):
+def write_stamp(path, pid, start, gate=GATE, nonce=NONCE, epoch=None,
+                seq=1, dump_sha256=None):
+    if dump_sha256 is None:
+        raise TypeError('a test stamp must bind exact dump bytes (dump_sha256)')
     path.write_text(json.dumps({
-        'gate': gate, 'nonce': nonce, 'seq': 1, 'pid': pid,
+        'gate': gate, 'nonce': nonce, 'seq': seq, 'pid': pid,
         'start_ticks': start,
         'epoch': time.time() if epoch is None else epoch,
+        'dump_sha256': dump_sha256,
     }))
     return path
+
+
+def bound_stamp(path, dump_path, pid, start, **over):
+    """A stamp bound to the actual bytes on disk, like wb_stamp_dump."""
+    sha = hashlib.sha256(Path(dump_path).read_bytes()).hexdigest()
+    return write_stamp(path, pid, start, dump_sha256=sha, **over)
+
+
+def bytes_sha(nodes):
+    """The dump_sha256 check_dump will bind for these exact nodes."""
+    return hashlib.sha256(json.dumps(nodes).encode()).hexdigest()
 
 
 def owned_nodes(pid, banner_showing=False, anchor=True):
@@ -157,10 +173,10 @@ class NarrowedStalePress(unittest.TestCase):
                 nodes.append({'role': 'error', 'name': 'bus died', 'depth': 0,
                               'showing': False})
             retired.write_text(json.dumps(nodes))
-        stamp = write_stamp(tmp / 'retired.json.stamp', pid, start)
+        stamp = bound_stamp(tmp / 'retired.json.stamp', retired, pid, start)
         owned = {'expected_pid': pid, 'expected_start_ticks': start,
                  'stamp_path': stamp, 'expected_gate': GATE,
-                 'expected_nonce': NONCE}
+                 'expected_nonce': NONCE, 'expected_seq': 1}
         return before, after, retired, gate_start, owned
 
     def check(self, exit_code, before, after, retired, gate_start, owned,
@@ -277,11 +293,11 @@ class PresenceFirstStaleState(unittest.TestCase):
         gate_start = time.time() - 1
         retired = tmp / 'retired.json'
         retired.write_text(json.dumps(owned_nodes(pid)))
-        stamp = write_stamp(tmp / 'retired.json.stamp', pid, start,
+        stamp = bound_stamp(tmp / 'retired.json.stamp', retired, pid, start,
                             epoch=stamp_epoch)
         owned = {'expected_pid': pid, 'expected_start_ticks': start,
                  'stamp_path': stamp, 'expected_gate': GATE,
-                 'expected_nonce': NONCE}
+                 'expected_nonce': NONCE, 'expected_seq': 1}
         return retired, gate_start, owned
 
     def docs(self, tmp, before_doc, after_doc):
@@ -402,11 +418,10 @@ class StampedRetiredAnchor(unittest.TestCase):
     def setup(self, tmp):
         pid, start = owner_identity()
         gate_start = time.time() - 1
-        stamp = write_stamp(tmp / 'retired.json.stamp', pid, start)
-        return pid, start, gate_start, stamp
+        return pid, start, gate_start
 
     def check_dump(self, tmp, nodes, pid=None, start=None, gate_start=None,
-                   stamp=None, gate=GATE, nonce=NONCE):
+                   stamp=None, gate=GATE, nonce=NONCE, seq=1):
         real_pid, real_start = owner_identity()
         pid = real_pid if pid is None else pid
         start = real_start if start is None else start
@@ -414,16 +429,17 @@ class StampedRetiredAnchor(unittest.TestCase):
         retired = tmp / 'retired.json'
         retired.write_text(json.dumps(nodes))
         if stamp is None:
-            stamp = write_stamp(tmp / 'retired.json.stamp', pid, start)
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start)
         return mod.check_retired_absent(
             retired, DUE, gate_start, expected_pid=pid,
             expected_start_ticks=start, stamp_path=stamp,
-            expected_gate=gate, expected_nonce=nonce)
+            expected_gate=gate, expected_nonce=nonce, expected_seq=seq)
 
     def test_owned_stamped_anchored_dump_passes(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, _, _, _ = self.setup(tmp)
+            pid, _, _ = self.setup(tmp)
             self.assertTrue(self.check_dump(tmp, owned_nodes(pid)))
 
     def test_bare_object_errors(self):
@@ -434,7 +450,7 @@ class StampedRetiredAnchor(unittest.TestCase):
     def test_missing_process_id_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, _, _, _ = self.setup(tmp)
+            pid, _, _ = self.setup(tmp)
             nodes = owned_nodes(pid)
             del nodes[0]['process_id']
             with self.assertRaises(mod.HarnessError):
@@ -443,7 +459,7 @@ class StampedRetiredAnchor(unittest.TestCase):
     def test_wrong_process_id_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, _, _, _ = self.setup(tmp)
+            pid, _, _ = self.setup(tmp)
             nodes = owned_nodes(pid + 1000000)
             with self.assertRaises(mod.HarnessError):
                 self.check_dump(tmp, nodes)
@@ -451,7 +467,7 @@ class StampedRetiredAnchor(unittest.TestCase):
     def test_bool_process_id_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, _, _, _ = self.setup(tmp)
+            pid, _, _ = self.setup(tmp)
             nodes = owned_nodes(pid)
             nodes[0]['process_id'] = True
             with self.assertRaises(mod.HarnessError):
@@ -467,7 +483,7 @@ class StampedRetiredAnchor(unittest.TestCase):
     def test_replaced_pid_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, start, _, _ = self.setup(tmp)
+            pid, start, _ = self.setup(tmp)
             with self.assertRaises(mod.HarnessError):
                 self.check_dump(tmp, owned_nodes(pid),
                                 start=start + 999999999)
@@ -475,7 +491,7 @@ class StampedRetiredAnchor(unittest.TestCase):
     def test_missing_stamp_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, _, _, _ = self.setup(tmp)
+            pid, _, _ = self.setup(tmp)
             retired = tmp / 'retired.json'
             retired.write_text(json.dumps(owned_nodes(pid)))
             real_pid, real_start = owner_identity()
@@ -485,38 +501,45 @@ class StampedRetiredAnchor(unittest.TestCase):
                     expected_pid=real_pid,
                     expected_start_ticks=real_start,
                     stamp_path=tmp / 'gone.stamp',
-                    expected_gate=GATE, expected_nonce=NONCE)
+                    expected_gate=GATE, expected_nonce=NONCE,
+                    expected_seq=1)
 
     def test_replayed_stamp_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, start, _, _ = self.setup(tmp)
+            pid, start, _ = self.setup(tmp)
+            nodes = owned_nodes(pid)
             other = write_stamp(tmp / 'other.stamp', pid, start,
-                                nonce='nonce-other-gate')
+                                nonce='nonce-other-gate',
+                                dump_sha256=bytes_sha(nodes))
             with self.assertRaises(mod.HarnessError):
-                self.check_dump(tmp, owned_nodes(pid), stamp=other)
+                self.check_dump(tmp, nodes, stamp=other)
 
     def test_wrong_gate_stamp_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, start, _, _ = self.setup(tmp)
+            pid, start, _ = self.setup(tmp)
+            nodes = owned_nodes(pid)
             other = write_stamp(tmp / 'other.stamp', pid, start,
-                                gate='G-OTHER')
+                                gate='G-OTHER',
+                                dump_sha256=bytes_sha(nodes))
             with self.assertRaises(mod.HarnessError):
-                self.check_dump(tmp, owned_nodes(pid), stamp=other)
+                self.check_dump(tmp, nodes, stamp=other)
 
     def test_stamp_for_other_process_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, start, _, _ = self.setup(tmp)
-            other = write_stamp(tmp / 'other.stamp', pid + 1000000, start)
+            pid, start, _ = self.setup(tmp)
+            nodes = owned_nodes(pid)
+            other = write_stamp(tmp / 'other.stamp', pid + 1000000, start,
+                                dump_sha256=bytes_sha(nodes))
             with self.assertRaises(mod.HarnessError):
-                self.check_dump(tmp, owned_nodes(pid), stamp=other)
+                self.check_dump(tmp, nodes, stamp=other)
 
     def test_stamp_missing_key_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, start, _, _ = self.setup(tmp)
+            pid, start, _ = self.setup(tmp)
             stamp = tmp / 'short.stamp'
             stamp.write_text(json.dumps({'gate': GATE, 'nonce': NONCE}))
             with self.assertRaises(mod.HarnessError):
@@ -525,26 +548,152 @@ class StampedRetiredAnchor(unittest.TestCase):
     def test_stale_stamp_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, start, _, _ = self.setup(tmp)
+            pid, start, _ = self.setup(tmp)
+            nodes = owned_nodes(pid)
             old = write_stamp(tmp / 'old.stamp', pid, start,
-                              epoch=time.time() - 100)
+                              epoch=time.time() - 100,
+                              dump_sha256=bytes_sha(nodes))
             with self.assertRaises(mod.HarnessError):
-                self.check_dump(tmp, owned_nodes(pid), stamp=old,
+                self.check_dump(tmp, nodes, stamp=old,
                                 gate_start=time.time() - 1)
 
     def test_missing_showing_anchor_errors(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, _, _, _ = self.setup(tmp)
+            pid, _, _ = self.setup(tmp)
             with self.assertRaises(mod.HarnessError):
                 self.check_dump(tmp, owned_nodes(pid, anchor=False))
 
     def test_showing_title_still_fails(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            pid, _, _, _ = self.setup(tmp)
+            pid, _, _ = self.setup(tmp)
             with self.assertRaises(AssertionError):
                 self.check_dump(tmp, owned_nodes(pid, banner_showing=True))
+
+
+class StampedObservationBinding(unittest.TestCase):
+    """The stamp binds the exact observation seq and the exact dump bytes."""
+
+    def setup(self, tmp):
+        pid, start = owner_identity()
+        return pid, start, time.time() - 1
+
+    def test_bound_seq_and_bytes_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start, gate_start = self.setup(tmp)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start, seq=7)
+            self.assertTrue(mod.check_retired_absent(
+                retired, DUE, gate_start, expected_pid=pid,
+                expected_start_ticks=start, stamp_path=stamp,
+                expected_gate=GATE, expected_nonce=NONCE, expected_seq=7))
+
+    def test_wrong_seq_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start, gate_start = self.setup(tmp)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start, seq=7)
+            with self.assertRaisesRegex(mod.HarnessError, 'observation 1'):
+                mod.check_retired_absent(
+                    retired, DUE, gate_start, expected_pid=pid,
+                    expected_start_ticks=start, stamp_path=stamp,
+                    expected_gate=GATE, expected_nonce=NONCE,
+                    expected_seq=1)
+
+    def test_bool_seq_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start, gate_start = self.setup(tmp)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start, seq=True)
+            with self.assertRaises(mod.HarnessError):
+                mod.check_retired_absent(
+                    retired, DUE, gate_start, expected_pid=pid,
+                    expected_start_ticks=start, stamp_path=stamp,
+                    expected_gate=GATE, expected_nonce=NONCE,
+                    expected_seq=1)
+
+    def test_bad_expected_seq_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start, gate_start = self.setup(tmp)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start)
+            for bad in (0, -1, True, '1', None):
+                with self.assertRaises(mod.HarnessError, msg=f'seq={bad!r}'):
+                    mod.check_retired_absent(
+                        retired, DUE, gate_start, expected_pid=pid,
+                        expected_start_ticks=start, stamp_path=stamp,
+                        expected_gate=GATE, expected_nonce=NONCE,
+                        expected_seq=bad)
+
+    def test_replayed_dump_bytes_error(self):
+        # A valid owned tree paired with a stamp bound to DIFFERENT
+        # bytes: the dump was swapped under a fresh stamp.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start, gate_start = self.setup(tmp)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            swapped = owned_nodes(pid) + [
+                {'role': 'button', 'name': 'Extra', 'showing': False}]
+            stamp = write_stamp(tmp / 'retired.json.stamp', pid, start,
+                                dump_sha256=bytes_sha(swapped))
+            with self.assertRaisesRegex(mod.HarnessError, 'actual current'):
+                mod.check_retired_absent(
+                    retired, DUE, gate_start, expected_pid=pid,
+                    expected_start_ticks=start, stamp_path=stamp,
+                    expected_gate=GATE, expected_nonce=NONCE,
+                    expected_seq=1)
+
+    def test_tampered_dump_after_stamp_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start, gate_start = self.setup(tmp)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start)
+            retired.write_text(json.dumps(
+                owned_nodes(pid) + [
+                    {'role': 'button', 'name': 'Extra', 'showing': False}]))
+            with self.assertRaisesRegex(mod.HarnessError, 'actual current'):
+                mod.check_retired_absent(
+                    retired, DUE, gate_start, expected_pid=pid,
+                    expected_start_ticks=start, stamp_path=stamp,
+                    expected_gate=GATE, expected_nonce=NONCE,
+                    expected_seq=1)
+
+    def test_missing_seq_or_sha_key_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start, gate_start = self.setup(tmp)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start)
+            doc = json.loads(stamp.read_text())
+            for key in ('seq', 'dump_sha256'):
+                short = tmp / f'short-{key}.stamp'
+                short.write_text(json.dumps(
+                    {k: v for k, v in doc.items() if k != key}))
+                with self.assertRaises(mod.HarnessError, msg=key):
+                    mod.check_retired_absent(
+                        retired, DUE, gate_start, expected_pid=pid,
+                        expected_start_ticks=start, stamp_path=short,
+                        expected_gate=GATE, expected_nonce=NONCE,
+                        expected_seq=1)
 
 
 if __name__ == '__main__':

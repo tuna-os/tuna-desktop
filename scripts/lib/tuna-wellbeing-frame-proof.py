@@ -40,8 +40,11 @@ receipts are labeled live self-consistency under outer CI build
 admission, never standalone attestation. Locked captures travel a
 separate state-only + process evidence path (no pixels, no pixel
 bracket, no pixel label; state-only labels in gate output and
-receipt); unlocked gates keep full bracketing. The lock CSTATE
-schema receipt is PENDING (see LOCK_SCHEMA_RECEIPT_PENDING).
+receipt); unlocked gates keep full bracketing. Locked observation
+is strict at capture time (locked-state: full typed locked presence
+on BOTH sides plus the full four-key redaction set plus the process
+sandwich), not just at provenance close. The lock CSTATE schema
+receipt is PENDING (see LOCK_SCHEMA_RECEIPT_PENDING).
 
 Semantics match GNOME 51 source (docs/wellbeing-effect-protocol.md):
 gray entry eases DesaturateEffect factor 0->1.0 over 3000 ms
@@ -686,14 +689,16 @@ def validate_state_capture(cap):
 
 
 def require_locked_state(doc, label):
-    """Locked CSTATE shape: locked true, typed effects, redacted pointers.
+    """Locked CSTATE shape: locked true, typed clock, typed effects, redacted.
 
     Implemented against the source-validated redaction shape (the
-    snapshot emitter always writes wellbeing_effects; cursor,
-    pointer_position, pointer_fullscreen_blocked and
-    wallpaper_diagnostics are null while locked). No exact
-    current-schema locked receipt has been observed yet
-    (LOCK_SCHEMA_RECEIPT_PENDING): nested-CI observation pending.
+    snapshot emitter always writes animation_clock_manual/ms,
+    wellbeing_effects, cursor, pointer_position,
+    pointer_fullscreen_blocked and wallpaper_diagnostics; the last
+    four are null while locked, and the clock ms is null unless the
+    clock is manual). No exact current-schema locked receipt has been
+    observed yet (LOCK_SCHEMA_RECEIPT_PENDING): nested-CI observation
+    pending.
     """
     if not isinstance(doc, dict):
         raise HarnessError(f'{label}: cstate is not an object')
@@ -701,6 +706,20 @@ def require_locked_state(doc, label):
     if type(locked) is not bool:
         raise HarnessError(f'{label}: locked must be an actual bool, got {locked!r}')
     assert locked is True, (label, 'state-only locked capture is not locked')
+    manual = doc.get('animation_clock_manual')
+    if type(manual) is not bool:
+        raise HarnessError(
+            f'{label}: animation_clock_manual must be a bool, got {manual!r}')
+    ms = doc.get('animation_clock_ms')
+    if manual:
+        if type(ms) is not int or ms < 0:
+            raise HarnessError(
+                f'{label}: animation_clock_ms must be a non-negative int '
+                f'under a manual clock, got {ms!r}')
+    elif ms is not None:
+        raise HarnessError(
+            f'{label}: animation_clock_ms must be null under real time, '
+            f'got {ms!r}')
     wb = doc.get('wellbeing_effects')
     if not isinstance(wb, dict):
         raise HarnessError(f'{label}: wellbeing_effects missing or malformed')
@@ -715,8 +734,12 @@ def require_locked_state(doc, label):
         raise HarnessError(
             f'{label}: wellbeing_effects.animating must be a bool, '
             f'got {wb.get("animating")!r}')
-    for key in ('pointer_position', 'cursor'):
-        if key in doc and doc[key] is not None:
+    for key in ('pointer_position', 'cursor', 'pointer_fullscreen_blocked',
+                'wallpaper_diagnostics'):
+        if key not in doc:
+            raise HarnessError(
+                f'{label}: locked snapshot must carry {key} (null while locked)')
+        if doc[key] is not None:
             raise HarnessError(
                 f'{label}: locked snapshot must redact {key}, got {doc[key]!r:.60}')
     return wb
@@ -879,6 +902,13 @@ def main(argv=None):
     p.add_argument('--after', type=Path, required=True)
     p.add_argument('--label', default='capture')
 
+    p = sub.add_parser('locked-state')
+    p.add_argument('--cstate-before', type=Path, required=True)
+    p.add_argument('--cstate-after', type=Path, required=True)
+    p.add_argument('--proc-before', type=Path, required=True)
+    p.add_argument('--proc-after', type=Path, required=True)
+    p.add_argument('--label', default='locked')
+
     p = sub.add_parser('provenance')
     p.add_argument('--gate', required=True)
     p.add_argument('--source-commit', required=True)
@@ -978,6 +1008,21 @@ def main(argv=None):
                 raise HarnessError(f'sandwich snapshot unreadable: {exc}')
             check_proc_sandwich(before, after, args.label)
             print(json.dumps({'label': args.label, 'sandwich': 'held'}))
+        elif args.command == 'locked-state':
+            before_doc, _ = load_cstate(args.cstate_before)
+            after_doc, after_wb = load_cstate(args.cstate_after)
+            require_locked_state(before_doc, f"{args.label}/before")
+            require_locked_state(after_doc, f"{args.label}/after")
+            try:
+                proc_before = json.loads(args.proc_before.read_text())
+                proc_after = json.loads(args.proc_after.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise HarnessError(f'sandwich snapshot unreadable: {exc}')
+            check_proc_sandwich(proc_before, proc_after, args.label)
+            print(json.dumps({'label': args.label, 'evidence': 'state-only',
+                              'locked': True,
+                              'wellbeing_effects': after_wb,
+                              'sandwich': 'held'}))
         elif args.command == 'provenance':
             state_caps = []
             if args.state_captures is not None:

@@ -22,7 +22,10 @@ presence-first (an actual bool locked plus a complete typed finite
 effect state in BOTH docs before any equality; {} vs {} errors), and
 the retired dump must carry the stamped root process_id of the live
 expected owner (PID/start identity), a gate/attempt-tied observation
-stamp (mtime alone never qualifies), and a live showing anchor.
+stamp (mtime alone never qualifies), and a live showing anchor. The
+stamp binds the exact observation (expected gate/nonce/seq) and the
+exact dump bytes (dump_sha256 over the actual current file); a
+replayed, swapped, or tampered dump never qualifies.
 
 Break ticks run every 2s (BREAK_POLL) and the press helper sleeps
 1.5s after pressing, so timing assertions allow a bounded tick
@@ -30,6 +33,7 @@ tolerance instead of exact seconds. No weakening: bounds are fixed
 here, and missing dumps or states fail closed.
 """
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -104,7 +108,8 @@ def load_stamp(stamp_path, label):
 
 def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
                          expected_pid, expected_start_ticks,
-                         stamp_path, expected_gate, expected_nonce):
+                         stamp_path, expected_gate, expected_nonce,
+                         expected_seq):
     """Assert retired-UI-absence only on a live, error-free OWNED tree.
 
     The dump must carry the stamped root process_id of the expected
@@ -112,7 +117,9 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
     dead PID, no PID reuse), a gate/attempt-tied observation stamp
     must bind this exact dump to this gate (mtime alone never
     qualifies), and a live showing anchor must prove the tree is the
-    true owner's, not an empty or replayed husk.
+    true owner's, not an empty or replayed husk. The stamp's
+    gate/nonce/seq must equal the expected observation, and its
+    dump_sha256 must equal the hash of the actual current dump bytes.
     """
     if type(expected_pid) is not int or expected_pid <= 0:
         raise HarnessError(f'expected owner pid must be a positive int, got {expected_pid!r}')
@@ -121,6 +128,9 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
             f'expected owner start time must be a positive int, got {expected_start_ticks!r}')
     if not expected_gate or not expected_nonce:
         raise HarnessError('expected gate and nonce are required to qualify a retired dump')
+    if type(expected_seq) is not int or expected_seq <= 0:
+        raise HarnessError(
+            f'expected observation seq must be a positive int, got {expected_seq!r}')
     nodes = load_nodes(dump_path)
     if not nodes:
         raise HarnessError(f'a11y tree dead in {dump_path}: no nodes')
@@ -140,13 +150,27 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
             f'owned shell PID {expected_pid} was replaced '
             f'(start {expected_start_ticks} -> {live_start})')
     stamp = load_stamp(stamp_path, str(dump_path))
-    for key in ('gate', 'nonce', 'pid', 'start_ticks', 'epoch'):
+    for key in ('gate', 'nonce', 'seq', 'pid', 'start_ticks', 'epoch',
+                'dump_sha256'):
         if key not in stamp:
             raise HarnessError(f'{stamp_path}: observation stamp missing {key!r}')
     if stamp['gate'] != expected_gate or stamp['nonce'] != expected_nonce:
         raise HarnessError(
             f'{stamp_path}: observation stamp is not for this gate/attempt '
             f'(got {stamp["gate"]!r}/{stamp["nonce"]!r})')
+    if type(stamp['seq']) is not int or stamp['seq'] != expected_seq:
+        raise HarnessError(
+            f'{stamp_path}: observation stamp is not for observation '
+            f'{expected_seq} (got {stamp["seq"]!r})')
+    try:
+        dump_bytes = Path(dump_path).read_bytes()
+    except OSError as exc:
+        raise HarnessError(f'{dump_path}: retired dump unreadable for binding: {exc}')
+    if not isinstance(stamp['dump_sha256'], str) \
+            or stamp['dump_sha256'] != hashlib.sha256(dump_bytes).hexdigest():
+        raise HarnessError(
+            f'{stamp_path}: observation stamp does not bind the actual '
+            f'current dump bytes of {dump_path} (replayed, swapped, or tampered)')
     if type(stamp['pid']) is not int or stamp['pid'] != expected_pid:
         raise HarnessError(
             f'{stamp_path}: observation stamp is not for the owned shell PID')
@@ -252,7 +276,8 @@ def check_stale_press_fails(press_exit_code, before_cstate, after_cstate,
                             action_label, dump_path, title,
                             gate_start_epoch=0.0, due=None, *,
                             expected_pid, expected_start_ticks,
-                            stamp_path, expected_gate, expected_nonce):
+                            stamp_path, expected_gate, expected_nonce,
+                            expected_seq):
     assert press_exit_code != 0, \
         f'stale {action_label} press unexpectedly succeeded (retired resident fired)'
     before = load_cstate(before_cstate)
@@ -275,7 +300,8 @@ def check_stale_press_fails(press_exit_code, before_cstate, after_cstate,
                          expected_pid=expected_pid,
                          expected_start_ticks=expected_start_ticks,
                          stamp_path=stamp_path, expected_gate=expected_gate,
-                         expected_nonce=expected_nonce)
+                         expected_nonce=expected_nonce,
+                         expected_seq=expected_seq)
     return True
 
 
@@ -322,6 +348,7 @@ def main(argv=None):
     p.add_argument('--stamp', type=Path, required=True)
     p.add_argument('--expect-gate', required=True)
     p.add_argument('--expect-nonce', required=True)
+    p.add_argument('--expect-seq', type=int, required=True)
     p.add_argument('--due-kind', choices=('delay', 'skip'), default=None)
     p.add_argument('--due-old', type=float, default=None)
     p.add_argument('--due-new', type=float, default=None)
@@ -363,7 +390,8 @@ def main(argv=None):
                                     expected_start_ticks=args.expect_start,
                                     stamp_path=args.stamp,
                                     expected_gate=args.expect_gate,
-                                    expected_nonce=args.expect_nonce)
+                                    expected_nonce=args.expect_nonce,
+                                    expected_seq=args.expect_seq)
             print(f'stale {args.action} press correctly failed')
     except HarnessError as exc:
         print(f'harness error: {exc}', file=sys.stderr)

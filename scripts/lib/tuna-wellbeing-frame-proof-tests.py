@@ -981,10 +981,13 @@ class StateOnlyLocked(unittest.TestCase):
     REGIONS = [{'name': 'probe', 'kind': 'texture', 'rect': [8, 8, 16, 16]}]
 
     def locked_doc(self, locked=True, pointer=None, cursor=None,
-                   brightness=1.0, wb=True):
-        doc = {'animation_clock_manual': False, 'animation_clock_ms': None,
+                   fullscreen=None, wallpaper=None, brightness=1.0,
+                   wb=True, manual=False, ms=None):
+        doc = {'animation_clock_manual': manual, 'animation_clock_ms': ms,
                'motion_policy': 'full', 'locked': locked,
                'pointer_position': pointer, 'cursor': cursor,
+               'pointer_fullscreen_blocked': fullscreen,
+               'wallpaper_diagnostics': wallpaper,
                'wellbeing_effects': {'desaturation': 0.0,
                                      'brightness': brightness,
                                      'animating': False}}
@@ -1075,6 +1078,111 @@ class StateOnlyLocked(unittest.TestCase):
                 tmp, after_doc=self.locked_doc(cursor={'theme': 'x'}))
             with self.assertRaises(mod.HarnessError):
                 self.record(tmp, binaries, caps)
+
+    def test_unredacted_fullscreen_blocked_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(
+                tmp, after_doc=self.locked_doc(fullscreen=True))
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_unredacted_wallpaper_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(
+                tmp, after_doc=self.locked_doc(
+                    wallpaper={'outputs': []}))
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_missing_redaction_key_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for key in ('pointer_position', 'cursor',
+                        'pointer_fullscreen_blocked',
+                        'wallpaper_diagnostics'):
+                doc = self.locked_doc()
+                del doc[key]
+                binaries, caps = self.build(tmp, after_doc=doc)
+                with self.assertRaises(mod.HarnessError, msg=key):
+                    self.record(tmp, binaries, caps)
+
+    def test_untyped_clock_manual_is_harness_error(self):
+        for bad in (1, 0, 'false', None):
+            with self.assertRaises(mod.HarnessError,
+                                   msg=f'manual={bad!r}'):
+                mod.require_locked_state(self.locked_doc(manual=bad),
+                                         'locked')
+
+    def test_clock_ms_matches_manual_mode(self):
+        # Real time reports a null ms; a manual clock needs an int ms.
+        mod.require_locked_state(
+            self.locked_doc(manual=False, ms=None), 'locked')
+        mod.require_locked_state(
+            self.locked_doc(manual=True, ms=5), 'locked')
+        for bad_ms in (None, -1, True, 1.5, '5'):
+            with self.assertRaises(mod.HarnessError,
+                                   msg=f'manual ms={bad_ms!r}'):
+                mod.require_locked_state(
+                    self.locked_doc(manual=True, ms=bad_ms), 'locked')
+        with self.assertRaises(mod.HarnessError):
+            mod.require_locked_state(
+                self.locked_doc(manual=False, ms=5), 'locked')
+
+    def locked_state_args(self, tmp):
+        _, caps = self.build(tmp)
+        proc_before = tmp / 'proc-before.json'
+        proc_after = tmp / 'proc-after.json'
+        proc_before.write_text(json.dumps(caps[0]['proc_before']))
+        proc_after.write_text(json.dumps(caps[0]['proc']))
+        return ['locked-state',
+                '--cstate-before', str(tmp / 'locked-before.json'),
+                '--cstate-after', str(tmp / 'locked-after.json'),
+                '--proc-before', str(proc_before),
+                '--proc-after', str(proc_after),
+                '--label', 'take-lock-locked']
+
+    def test_locked_state_cli_observes_strict(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            self.assertEqual(mod.main(self.locked_state_args(tmp)), 0)
+
+    def test_locked_state_cli_rejects_unredacted(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            _, caps = self.build(
+                tmp, after_doc=self.locked_doc(pointer=[1, 2]))
+            proc_before = tmp / 'proc-before.json'
+            proc_after = tmp / 'proc-after.json'
+            proc_before.write_text(json.dumps(caps[0]['proc_before']))
+            proc_after.write_text(json.dumps(caps[0]['proc']))
+            self.assertEqual(mod.main(['locked-state',
+                                       '--cstate-before',
+                                       str(tmp / 'locked-before.json'),
+                                       '--cstate-after',
+                                       str(tmp / 'locked-after.json'),
+                                       '--proc-before', str(proc_before),
+                                       '--proc-after', str(proc_after),
+                                       '--label', 'take-lock-locked']), 2)
+
+    def test_locked_state_cli_rejects_unlocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            _, caps = self.build(
+                tmp, after_doc=self.locked_doc(locked=False))
+            proc_before = tmp / 'proc-before.json'
+            proc_after = tmp / 'proc-after.json'
+            proc_before.write_text(json.dumps(caps[0]['proc_before']))
+            proc_after.write_text(json.dumps(caps[0]['proc']))
+            with self.assertRaises(AssertionError):
+                mod.main(['locked-state',
+                          '--cstate-before',
+                          str(tmp / 'locked-before.json'),
+                          '--cstate-after', str(tmp / 'locked-after.json'),
+                          '--proc-before', str(proc_before),
+                          '--proc-after', str(proc_after),
+                          '--label', 'take-lock-locked'])
 
     def test_pixel_keys_forbidden_in_state_path(self):
         with tempfile.TemporaryDirectory() as td:
