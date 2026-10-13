@@ -96,6 +96,8 @@ use smithay::{
     },
 };
 
+use crate::bell::Bell;
+pub use crate::bell::BELL_SOUND;
 use crate::{State, WindowRequest};
 
 /// How long an activation token stays usable (Mutter allows a few
@@ -195,50 +197,6 @@ impl Protocols {
     }
 }
 
-/// The system bell: rings counted, sounds played through libcanberra's
-/// `canberra-gtk-play` when it is installed, at most one at a time.
-#[derive(Default)]
-pub(crate) struct Bell {
-    rings: u64,
-    last: Option<Instant>,
-    player: Option<std::process::Child>,
-}
-
-/// GNOME's bell sound (Mutter's `meta_bell_notify`).
-pub const BELL_SOUND: &str = "bell-window-system";
-
-impl Bell {
-    fn ring(&mut self) {
-        self.rings += 1;
-        // A burst of rings is one sound, as a held key would otherwise
-        // queue a sound per repeat.
-        let now = Instant::now();
-        if self
-            .last
-            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
-        {
-            return;
-        }
-        self.last = Some(now);
-        if let Some(child) = self.player.as_mut() {
-            match child.try_wait() {
-                Ok(None) => return,
-                _ => self.player = None,
-            }
-        }
-        if std::env::var_os("TUNA_BELL").is_some_and(|v| v == "0") {
-            return;
-        }
-        self.player = std::process::Command::new("canberra-gtk-play")
-            .args(["--id", BELL_SOUND, "--description", "Bell event"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-    }
-}
-
 /// A window's xdg-toplevel-tag: what it is to the app ("main window",
 /// "settings") and a human description. Kept in the surface data.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -329,7 +287,20 @@ impl State {
 
     /// Times the system bell rang.
     pub fn bell_rings(&self) -> u64 {
-        self.protocols.bell.rings
+        self.protocols.bell.rings()
+    }
+
+    /// Visual flashes recorded while `visual-bell` was on.
+    pub fn bell_flashes(&self) -> u64 {
+        self.protocols.bell.flashes()
+    }
+
+    /// The live visual flash for the frame path: its opacity now and
+    /// whether it targets the ringing window (`frame-flash`) rather
+    /// than the fullscreen. `None` is no flash.
+    pub fn bell_flash(&self) -> Option<(f32, bool)> {
+        let (alpha, surface) = self.protocols.bell.visual(Instant::now())?;
+        (alpha > 0.0).then_some((alpha, surface.is_some()))
     }
 
     /// Whether the surface holding keyboard focus inhibits the
@@ -825,8 +796,8 @@ impl XdgForeignHandler for State {
 delegate_xdg_foreign!(State);
 
 impl XdgSystemBellHandler for State {
-    fn ring(&mut self, _surface: Option<WlSurface>) {
-        self.protocols.bell.ring();
+    fn ring(&mut self, surface: Option<WlSurface>) {
+        self.protocols.bell.ring(surface);
     }
 }
 delegate_xdg_system_bell!(State);

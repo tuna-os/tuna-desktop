@@ -1095,8 +1095,9 @@ impl Runtime {
     }
 
     /// Engage the lock: flag (idle machine plus hub mirror for
-    /// snapshots), overview dismissed, and the exclusive lock surface
-    /// up with an empty list — no window titles while locked.
+    /// snapshots), overview dismissed, the bell's visual flash dropped,
+    /// and the exclusive lock surface up with an empty list — no window
+    /// titles while locked.
     fn engage_lock(&mut self) {
         #[cfg(feature = "drm")]
         self.performance_trace.cancel();
@@ -1109,6 +1110,7 @@ impl Runtime {
         self.capture_authority.publish(true, self.shell.child_pid());
         self.state.set_shortcut_inhibition_locked(true);
         self.control.set_overview(false);
+        self.state.protocols.bell.clear_visual();
         self.overlay.show(Vec::new());
     }
 
@@ -2850,8 +2852,10 @@ impl Runtime {
     }
 
     /// Apply GNOME's input settings (#60): the seat's keymap and key
-    /// repeat, libinput pointer devices (hardware), the hot corner.
+    /// repeat, libinput pointer devices (hardware), the hot corner,
+    /// and the shell's live bell policy (P-SN-01).
     fn apply_input_settings(&mut self, settings: tuna_shell_control::InputSettings) {
+        self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
             .apply_keyboard_settings(&mut self.state, &settings);
         self.triggers.set_hot_corner(settings.hot_corners);

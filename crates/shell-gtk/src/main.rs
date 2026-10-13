@@ -1895,8 +1895,8 @@ fn build(app: &adw::Application) {
         }
     }
 
-    // GNOME's input settings (#60): keymap, repeat, touchpad, mouse and
-    // hot corner, sent now and on every change.
+    // GNOME's input settings (#60): keymap, repeat, touchpad, mouse,
+    // hot corner and bell policy (P-SN-01), sent now and on every change.
     {
         let schemas = [
             "org.gnome.desktop.input-sources",
@@ -1905,6 +1905,8 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.peripherals.mouse",
             INTERFACE_SCHEMA,
             A11Y_INTERFACE_SCHEMA,
+            "org.gnome.desktop.wm.preferences",
+            "org.gnome.desktop.sound",
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -1955,6 +1957,15 @@ fn build(app: &adw::Application) {
                 out.right_to_left = gtk::Widget::default_direction() == gtk::TextDirection::Rtl;
                 out.motion = motion::from_settings(all[4].as_ref(), all[5].as_ref());
                 motion::set(out.motion);
+                if let Some(wm) = all[6].as_ref() {
+                    out.bell.audible = wm.boolean("audible-bell");
+                    out.bell.visual = wm.boolean("visual-bell");
+                    out.bell.frame_flash = wm.string("visual-bell-type") == "frame-flash";
+                }
+                if let Some(sound) = all[7].as_ref() {
+                    out.bell.event_sounds = sound.boolean("event-sounds");
+                    out.bell.theme = sound.string("theme-name").to_string();
+                }
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }

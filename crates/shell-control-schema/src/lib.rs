@@ -159,9 +159,12 @@ impl ProtocolVersion {
     /// GNOME's three-state motion policy plus its slow-down factor.
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
+    /// `0.30` appends `bell` (GNOME's audible/visual bell and
+    /// event-sound policy, P-SN-01) to `InputSettings`, again last.
+    /// The positional postcard body changes, so both peers ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 29,
+        minor: 30,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -743,6 +746,38 @@ pub struct PreviewInfo {
     pub height: i32,
 }
 
+/// GNOME's bell policy: `org.gnome.desktop.wm.preferences`
+/// audible/visual bells and `org.gnome.desktop.sound` event sounds,
+/// read live by the shell and consumed by the compositor's
+/// xdg-system-bell handler (P-SN-01).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BellPolicy {
+    /// `audible-bell`: the bell makes a sound.
+    pub audible: bool,
+    /// `visual-bell`: the bell flashes.
+    pub visual: bool,
+    /// `visual-bell-type` is `frame-flash` (else fullscreen flash).
+    pub frame_flash: bool,
+    /// `event-sounds`: event sounds play at all.
+    pub event_sounds: bool,
+    /// `theme-name`: the sound theme for the bell.
+    pub theme: String,
+}
+
+impl Default for BellPolicy {
+    /// GNOME 51's defaults.
+    fn default() -> Self {
+        Self {
+            audible: true,
+            visual: false,
+            frame_flash: false,
+            event_sounds: true,
+            theme: "freedesktop".into(),
+        }
+    }
+}
+
 /// GNOME's input settings (`org.gnome.desktop.input-sources` and
 /// `org.gnome.desktop.peripherals.*`), flattened for the compositor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,6 +815,9 @@ pub struct InputSettings {
     /// GTK shell default text direction; corners and Activities follow it.
     #[serde(default)]
     pub right_to_left: bool,
+    /// GNOME's bell policy, read live by the shell (P-SN-01).
+    #[serde(default)]
+    pub bell: BellPolicy,
 }
 
 impl Default for InputSettings {
@@ -803,6 +841,7 @@ impl Default for InputSettings {
             mouse_left_handed: false,
             touchpad_left_handed: false,
             right_to_left: false,
+            bell: BellPolicy::default(),
         }
     }
 }
@@ -1239,8 +1278,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_29() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 29));
+    fn current_version_is_0_30() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 30));
     }
 
     #[test]
@@ -1308,6 +1347,34 @@ mod tests {
     }
 
     #[test]
+    fn bell_policy_survives_the_positional_control_wire() {
+        for (audible, visual, frame_flash, event_sounds) in [
+            (true, false, false, true),
+            (false, true, true, true),
+            (false, false, false, false),
+        ] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(InputSettings {
+                    bell: BellPolicy {
+                        audible,
+                        visual,
+                        frame_flash,
+                        event_sounds,
+                        theme: "freedesktop".into(),
+                    },
+                    ..InputSettings::default()
+                }),
+            });
+        }
+        let gnome = BellPolicy::default();
+        assert!(gnome.audible);
+        assert!(!gnome.visual);
+        assert!(!gnome.frame_flash);
+        assert!(gnome.event_sounds);
+    }
+
+    #[test]
     fn version_compat_same_major_minor_not_newer() {
         let ours = ProtocolVersion::CURRENT;
         assert!(ours.is_compatible_with(&ours));
@@ -1341,7 +1408,8 @@ mod tests {
         assert!(ProtocolVersion::new(0, 27).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 28).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 29).is_compatible_with(&ours));
-        assert!(!ProtocolVersion::new(0, 30).is_compatible_with(&ours));
+        assert!(ProtocolVersion::new(0, 30).is_compatible_with(&ours));
+        assert!(!ProtocolVersion::new(0, 31).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 4).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 0).is_compatible_with(&ours));
     }

@@ -751,6 +751,9 @@ fn the_system_bell_rings() {
     bell.ring(None);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(comp.state.bell_rings(), 2);
+    // GNOME's default policy: audible, never visual.
+    assert_eq!(comp.state.bell_flashes(), 0);
+    assert!(comp.state.bell_flash().is_none());
 }
 
 #[test]
