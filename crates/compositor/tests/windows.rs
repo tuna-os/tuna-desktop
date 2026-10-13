@@ -4208,6 +4208,15 @@ fn strip_drag_survives_unrelated_map_and_neighbor_close_without_resurrection() {
         "closing a neighbor must not end the owner's drag"
     );
     assert!(f.manager.geometry(f.id_b).is_none());
+    // Topology changed canonical slots. Present that actual frame before
+    // later pointer input uses the surviving neighbor's rendered center.
+    let actor = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    assert!(!f.manager.step_strip_view(0.0));
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_c).unwrap(),
+        f.manager.geometry(f.id_c).unwrap()
+    );
+    assert_eq!(strip_drawn_geometry(&f.manager, f.id_a).unwrap(), actor);
     let (conn, mut queue, mut client) = connect(&mut f.comp);
     map_toplevel(
         &mut f.comp,
@@ -4221,6 +4230,12 @@ fn strip_drag_survives_unrelated_map_and_neighbor_close_without_resurrection() {
         f.manager.grab_active(),
         "an unrelated map preserves live actor ownership"
     );
+    assert!(!f.manager.step_strip_view(0.0));
+    assert_eq!(
+        strip_drawn_geometry(&f.manager, f.id_c).unwrap(),
+        f.manager.geometry(f.id_c).unwrap()
+    );
+    assert_eq!(strip_drawn_geometry(&f.manager, f.id_a).unwrap(), actor);
     f.manager
         .pointer_motion(&mut f.comp.state, (pos.x + 950.0, pos.y).into(), 13);
     f.manager
