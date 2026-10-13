@@ -40,13 +40,81 @@ class _Component:
         return _Rect(self._rect)
 
 
+class _FakeAction:
+    def __init__(self, node):
+        self._node = node
+
+    @property
+    def nActions(self):
+        if self._node._action_count_error is not None:
+            raise self._node._action_count_error
+        return self._node._actions
+
+    def getName(self, index):
+        assert index == 0
+        if self._node._getname_error is not None:
+            raise self._node._getname_error
+        return self._node._action_name
+
+    def doAction(self, index):
+        self._node.do_calls.append(index)
+        if self._node._do_raise is not None:
+            raise self._node._do_raise
+        return self._node._do_return
+
+
+class _NoNameAction(_FakeAction):
+    def __getattribute__(self, name):
+        if name == 'getName':
+            raise AttributeError('getName')
+        return super().__getattribute__(name)
+
+
+class _GoneError(Exception):
+    """Fake retired-object error with the 2bc triple shape."""
+
+    def __init__(self, domain='atspi_error', code=1,
+                 message='Object does not exist at path "/org/foo"'):
+        super().__init__(message)
+        self.domain = domain
+        self.code = code
+        self.message = message
+
+
+def _make_gone(domain='atspi_error', code=1,
+               message='Object does not exist at path "/org/foo"'):
+    """Real GLib.Error retired signal when gi exists (exercises the exact
+    production strict path), else the duck-typed triple fallback."""
+    try:
+        from gi.repository import GLib
+        return GLib.Error.new_literal(GLib.quark_from_string(domain),
+                                      message, code)
+    except Exception:
+        return _GoneError(domain, code, message)
+
+
+class _NoClearApp:
+    """App-shaped object genuinely lacking clear_cache."""
+
+    name = 'tuna-shell-gtk'
+
+    def __init__(self):
+        self._pid = 4242
+
+    def get_process_id(self):
+        return self._pid
+
+
 class FakeAccessible:
     """Scriptable accessible: children, states, errors, drifting counts."""
 
     def __init__(self, name, role='button', children=(), states=(),
                  description='', rect=(1, 2, 3, 4), pid=4242, counts=None,
                  child_errors=None, role_error=None, state_error=None,
-                 component_error=None):
+                 component_error=None, actions=0, no_action=False,
+                 action_count_error=None, do_return=True, do_raise=None,
+                 action_name='click', no_getname=False, getname_error=None,
+                 clear_error=None, pid_error=None, pids=None):
         self._name = name
         self._role = role
         self._children = list(children)
@@ -59,6 +127,31 @@ class FakeAccessible:
         self._role_error = role_error
         self._state_error = state_error
         self._component_error = component_error
+        self._actions = actions
+        self._no_action = no_action
+        self._action_count_error = action_count_error
+        self._do_return = do_return
+        self._do_raise = do_raise
+        self._action_name = action_name
+        self._no_getname = no_getname
+        self._getname_error = getname_error
+        self._clear_error = clear_error
+        self._pid_error = pid_error
+        self._pids = list(pids) if pids else None
+        self.do_calls = []
+        self.clear_calls = 0
+
+    def clear_cache(self):
+        if self._clear_error is not None:
+            raise self._clear_error
+        self.clear_calls += 1
+
+    def queryAction(self):
+        if self._no_action:
+            raise NotImplementedError('no Action')
+        if self._no_getname:
+            return _NoNameAction(self)
+        return _FakeAction(self)
 
     @property
     def name(self):
@@ -95,6 +188,12 @@ class FakeAccessible:
         return _Component(self._rect)
 
     def get_process_id(self):
+        if self._pid_error is not None:
+            raise self._pid_error
+        if self._pids is not None:
+            if len(self._pids) > 1:
+                return self._pids.pop(0)
+            return self._pids[0]
         return self._pid
 
 
@@ -110,14 +209,21 @@ class _FakeRegistry:
 class _FakeTime:
     """Scripted clock with recording no-op sleep: bounded, instant."""
 
-    def __init__(self, ticks):
+    def __init__(self, ticks, mono=None):
         self._ticks = list(ticks)
+        self._mono = list(mono) if mono is not None else None
         self.sleeps = []
 
     def time(self):
         if len(self._ticks) > 1:
             return self._ticks.pop(0)
         return self._ticks[0]
+
+    def monotonic(self):
+        assert self._mono is not None, 'monotonic not scripted'
+        if len(self._mono) > 1:
+            return self._mono.pop(0)
+        return self._mono[0]
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
@@ -356,6 +462,917 @@ class PidBinding(unittest.TestCase):
             code, _ = self.run_main([APP, str(out), '0'])
             self.assertEqual(code, 1)
             self.assertFalse(out.exists())
+
+
+class _ClearGatedApp(FakeAccessible):
+    """App whose name is unreadable until clear_cache ran (order probe)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._gated_cleared = False
+
+    def clear_cache(self):
+        super().clear_cache()
+        self._gated_cleared = True
+
+    @property
+    def name(self):
+        if not self._gated_cleared:
+            raise RuntimeError('name read before clear_cache')
+        return self._name
+
+
+class _ClearGatedDesktop(FakeAccessible):
+    """Desktop whose childCount is unreadable until cleared (order probe)."""
+
+    def __init__(self, children):
+        super().__init__('desktop', role='desktop', children=children)
+        self._gated_cleared = False
+
+    def clear_cache(self):
+        super().clear_cache()
+        self._gated_cleared = True
+
+    @property
+    def childCount(self):
+        if not self._gated_cleared:
+            raise RuntimeError('childCount read before clear_cache')
+        return len(self._children)
+
+
+class _FlipButton(FakeAccessible):
+    """Take button whose showing state advances per getState call."""
+
+    def __init__(self, name, states_seq, **kw):
+        super().__init__(name, states=(), **kw)
+        self._seq = [frozenset(s) for s in states_seq]
+
+    def getState(self):
+        current = self._seq[0]
+        if len(self._seq) > 1:
+            self._seq.pop(0)
+        return _State(current)
+
+
+class _FlakyTake(FakeAccessible):
+    """Take button raising once, then behaving."""
+
+    def __init__(self, name, first_error, **kw):
+        super().__init__(name, **kw)
+        self._first = first_error
+        self._flaked = False
+
+    def getState(self):
+        if not self._flaked:
+            self._flaked = True
+            raise self._first
+        return super().getState()
+
+
+class _FlipDesktop(FakeAccessible):
+    """Desktop whose top-level children change per getChildAtIndex call."""
+
+    def __init__(self, seq):
+        super().__init__('desktop', role='desktop')
+        self._seq = [list(s) for s in seq]
+
+    @property
+    def childCount(self):
+        return len(self._seq[0])
+
+    def getChildAtIndex(self, i):
+        kids = self._seq[0]
+        if len(self._seq) > 1:
+            self._seq.pop(0)
+        if 0 <= i < len(kids):
+            return kids[i]
+        return None
+
+
+class _FlakyDesktop(FakeAccessible):
+    """Desktop whose childCount works once, then raises."""
+
+    def __init__(self, children, error):
+        super().__init__('desktop', role='desktop', children=children)
+        self._error = error
+        self._calls = 0
+
+    @property
+    def childCount(self):
+        self._calls += 1
+        if self._calls == 1:
+            return len(self._children)
+        raise self._error
+
+
+class PressReadiness(unittest.TestCase):
+    def run_press(self, argv, ticks=(1000.0, 1000.0),
+                    mono=(1000.0, 1000.0, 1000.0)):
+        import contextlib
+        import io
+        clock = _FakeTime(ticks, mono=mono)
+        err = io.StringIO()
+        with mock.patch.object(sys, 'argv',
+                               ['tuna-a11y-dump.py'] + argv), \
+                mock.patch.object(mod, 'time', clock), \
+                contextlib.redirect_stderr(err):
+            return mod.main(), clock, err.getvalue()
+
+    def set_desktop(self, *children):
+        _FAKE.Registry.desktop = FakeAccessible(
+            'desktop', role='desktop', children=list(children))
+
+    @staticmethod
+    def record(stderr_text):
+        line = [ln for ln in stderr_text.splitlines()
+                if 'press-failed' in ln]
+        assert len(line) == 1, stderr_text
+        return json.loads(line[0].split('tuna-a11y-dump: ', 1)[1])
+
+    def test_ready_immediately_invokes_once(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1)
+            self.set_desktop(app_node(take, pid=4242))
+            out = str(Path(td) / 'press.json')
+            code, _, _ = self.run_press(
+                [APP, out, '5', '--press', 'Take', '--pid', '4242'])
+            self.assertEqual(code, 0)
+            self.assertEqual(take.do_calls, [0])
+            nodes = json.loads(Path(out).read_text())
+            self.assertEqual(nodes[0]['process_id'], 4242)
+            self.assertIn('Take', [n['name'] for n in nodes])
+
+    def test_late_candidate_found_within_budget(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = _FlipButton('Take', [(), (SHOWING,)], role='button',
+                               actions=1)
+            self.set_desktop(app_node(take))
+            out = str(Path(td) / 'press.json')
+            code, _, _ = self.run_press([APP, out, '5', '--press', 'Take'])
+            self.assertEqual(code, 0)
+            self.assertEqual(take.do_calls, [0])
+
+    def test_doaction_false_honored_no_second_call(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=False)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIs(rec['returned'], False)
+            self.assertIsNone(rec['error'])
+            self.assertEqual(rec['invocations'], 1)
+            self.assertEqual(rec['actions'], 1)
+            self.assertEqual(rec['action'], 'click')
+            self.assertEqual(rec['pid'], 4242)
+            nodes = json.loads(out.read_text())
+            self.assertIn('Take', [n['name'] for n in nodes])
+
+    def test_doaction_none_counts_one_invocation(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=None)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIsNone(rec['returned'])
+            self.assertEqual(rec['invocations'], 1)
+
+    def test_role_error_refuses_immediately(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1,
+                          role_error=RuntimeError('role gone'))
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['observations'], 1)
+            self.assertEqual(rec['invocations'], 0)
+            self.assertTrue(any('role err=' in c and 'role gone' in c
+                                for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_arbitrary_error_fails_without_retry(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1,
+                          state_error=RuntimeError('bus boom'))
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['observations'], 1)
+            self.assertTrue(any('bus boom' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_retired_signal_retries_then_succeeds(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = _FlakyTake('Take', _make_gone(), role='button',
+                              states=(SHOWING,), actions=1)
+            self.set_desktop(app_node(take))
+            out = str(Path(td) / 'press.json')
+            code, _, _ = self.run_press([APP, out, '5', '--press', 'Take'])
+            self.assertEqual(code, 0)
+            self.assertEqual(take.do_calls, [0])
+
+    def test_retired_nearmiss_is_fatal(self):
+        import tempfile
+        for label, gone in (
+                ('code', _make_gone(code=2)),
+                ('message', _make_gone(message='gone')),
+                ('domain', _make_gone(domain='other'))):
+            with tempfile.TemporaryDirectory() as td:
+                take = button('Take', actions=1, state_error=gone)
+                self.set_desktop(app_node(take))
+                out = Path(td) / 'press.json'
+                code, _, err = self.run_press(
+                    [APP, str(out), '5', '--press', 'Take'])
+                self.assertEqual(code, 1, msg=label)
+                self.assertEqual(take.do_calls, [], msg=label)
+                rec = self.record(err)
+                self.assertEqual(rec['observations'], 1, msg=label)
+
+    def test_non_glib_triple_rejected_when_gi_present(self):
+        import tempfile
+        try:
+            from gi.repository import GLib  # noqa: F401
+        except Exception:
+            self.skipTest('gi absent: duck path accepts the triple')
+            return
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, state_error=_GoneError())
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['observations'], 1)
+
+    def test_none_child_retries_then_succeeds(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1)
+            fake_app = app_node(take)
+            desktop = _FlipDesktop([[fake_app], [None], [fake_app]])
+            _FAKE.Registry.desktop = desktop
+            out = str(Path(td) / 'press.json')
+            code, _, _ = self.run_press([APP, out, '5', '--press', 'Take'])
+            self.assertEqual(code, 0)
+            self.assertEqual(take.do_calls, [0])
+
+    def test_clear_cache_error_is_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1,
+                          clear_error=RuntimeError('cache gone'))
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['observations'], 1)
+            self.assertTrue(any('clear_cache' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_clear_cache_missing_is_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            _FAKE.Registry.desktop = FakeAccessible(
+                'desktop', role='desktop', children=[_NoClearApp()])
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            rec = self.record(err)
+            self.assertEqual(rec['observations'], 1)
+            self.assertTrue(any('clear_cache missing' in c
+                                for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_node_budget_trip_is_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', showing=False)
+            self.set_desktop(app_node(take, button('B')))
+            out = Path(td) / 'press.json'
+            with mock.patch.object(mod, 'PRESS_NODES_MAX', 2):
+                code, _, err = self.run_press(
+                    [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertTrue(any('node budget' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_children_cap_trip_is_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', showing=False)
+            self.set_desktop(app_node(take, button('B')))
+            out = Path(td) / 'press.json'
+            with mock.patch.object(mod, 'PRESS_CHILDREN_MAX', 1):
+                code, _, err = self.run_press(
+                    [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            rec = self.record(err)
+            self.assertTrue(any('exceeds' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_depth_cap_trip_is_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', showing=False)
+            self.set_desktop(app_node(button('Mid', children=[take])))
+            out = Path(td) / 'press.json'
+            with mock.patch.object(mod, 'PRESS_DEPTH_MAX', 1):
+                code, _, err = self.run_press(
+                    [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            rec = self.record(err)
+            self.assertTrue(any('max depth' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_late_ready_invokes_zero_times(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '2', '--press', 'Take'],
+                ticks=(1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1005.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['invocations'], 0)
+            self.assertIn('late-ready', rec['error'])
+
+    def test_post_owner_expiry_refuses_true(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'],
+                ticks=(1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1006.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIs(rec['returned'], True)
+            self.assertEqual(rec['invocations'], 1)
+            self.assertIn('post-owner past deadline', rec['error'])
+
+    def test_final_dump_expiry_refuses_true(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'],
+                ticks=(1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
+                      1000.0, 1000.0, 1009.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIs(rec['returned'], True)
+            self.assertIn('late-success refused', rec['error'])
+
+    def test_action_name_unsupported_keeps_candidate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, no_getname=True)
+            self.set_desktop(app_node(take))
+            out = str(Path(td) / 'press.json')
+            code, _, _ = self.run_press([APP, out, '5', '--press', 'Take'])
+            self.assertEqual(code, 0)
+            self.assertEqual(take.do_calls, [0])
+
+    def test_action_name_error_is_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1,
+                          getname_error=RuntimeError('name boom'))
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertTrue(any('name boom' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_resolve_desktop_error_is_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1)
+            fake_app = app_node(take)
+            desktop = _FlakyDesktop([fake_app], RuntimeError('bus timeout'))
+            _FAKE.Registry.desktop = desktop
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['observations'], 1)
+            self.assertTrue(any('bus timeout' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_ambiguous_owner_is_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1)
+            self.set_desktop(app_node(take, pid=1),
+                             app_node(button('Other'), pid=2))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertTrue(any('unique' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_wall_jump_cannot_extend_press_budget(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', showing=False)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'],
+                ticks=(1000.0, 0.0),
+                mono=(1000.0, 1000.0, 1006.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['observations'], 1)
+
+    def test_pre_pid_error_invokes_zero_times(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            fake_app = app_node(take, pid_error=RuntimeError('pid gone'))
+            self.set_desktop(fake_app)
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['invocations'], 0)
+            self.assertIn('pre-pid', rec['error'])
+
+    def test_pre_pid_nonint_invokes_zero_times(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(take, pid='4242'))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['invocations'], 0)
+            self.assertIn('pre-pid non-positive', rec['error'])
+
+    def test_invocation_gate_expiry_invokes_zero_times(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '2', '--press', 'Take'],
+                ticks=(1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1000.0, 1005.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['invocations'], 0)
+            self.assertIn('invocation gate', rec['error'])
+
+    def test_resolve_clears_before_reads(self):
+        take = button('Take', actions=1)
+        gated_app = _ClearGatedApp(APP, role='application',
+                                   children=[take], pid=4242)
+        gated = _ClearGatedDesktop([gated_app])
+        _FAKE.Registry.desktop = gated
+        matches = mod.resolve_named_app(APP, None, [])
+        self.assertEqual(matches, [gated_app])
+        self.assertGreater(gated.clear_calls, 0)
+        self.assertGreater(gated_app.clear_calls, 0)
+
+    def test_probe_clears_before_reads(self):
+        take = button('Take', actions=1)
+        gated_app = _ClearGatedApp(APP, role='application',
+                                   children=[take], pid=4242)
+        found = mod.press_candidate(gated_app, 'Take', [], 0, {'nodes': 0})
+        self.assertIsNotNone(found)
+        self.assertEqual(found[2], 1)
+        self.assertEqual(found[3], 'click')
+        self.assertGreater(gated_app.clear_calls, 0)
+        self.assertGreater(take.clear_calls, 0)
+
+    def test_capped_postmortem_noted_and_bounded(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', showing=False)
+            self.set_desktop(app_node(take, button('B')))
+            out = Path(td) / 'press.json'
+            with mock.patch.object(mod, 'PRESS_NODES_MAX', 2):
+                code, _, err = self.run_press(
+                    [APP, str(out), '2', '--press', 'Take'],
+                    ticks=(1000.0, 1000.0),
+                    mono=(1000.0, 1000.0, 1003.0))
+            self.assertEqual(code, 1)
+            rec = self.record(err)
+            nodes = json.loads(out.read_text())
+            self.assertLessEqual(len(nodes), 2)
+            self.assertTrue(any('postmortem tree capped' in c
+                                for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_capped_success_dump_fails_closed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            sibs = [button('S%d' % i) for i in range(3)]
+            self.set_desktop(app_node(take, *sibs))
+            out = Path(td) / 'press.json'
+            with mock.patch.object(mod, 'PRESS_NODES_MAX', 2):
+                code, _, err = self.run_press(
+                    [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIs(rec['returned'], True)
+            self.assertIn('success dump capped', rec['error'])
+
+    def test_walk_limit_bounds_records_and_traversal(self):
+        kids = [button('K%d' % i) for i in range(5)]
+        fake_app = app_node(*kids)
+        out, stats = [], {}
+        mod.walk(fake_app, 0, out, False, 3, stats)
+        self.assertLessEqual(len(out), 3)
+        self.assertTrue(stats.get('capped'))
+        out2, stats2 = [], {}
+        mod.walk(fake_app, 0, out2, False, None, stats2)
+        self.assertEqual(len(out2), 6)
+        self.assertNotIn('capped', stats2)
+
+    def test_doaction_exception_honored_no_second_call(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=2,
+                          do_raise=RuntimeError('bus gone'))
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIsNone(rec['returned'])
+            self.assertIn('RuntimeError', rec['error'])
+            self.assertIn('bus gone', rec['error'])
+            self.assertEqual(rec['invocations'], 1)
+            self.assertTrue(out.exists())
+
+    def test_budget_expiry_retains_conditions_never_invokes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', showing=False, actions=1)
+            zero = button('Take', actions=0)
+            self.set_desktop(app_node(take, zero))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '2', '--press', 'Take'],
+                ticks=(1000.0, 1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1003.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            self.assertEqual(zero.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['invocations'], 0)
+            self.assertIsNone(rec['returned'])
+            self.assertTrue(any('unshowing' in c for c in rec['conditions']),
+                            rec['conditions'])
+            self.assertTrue(any('actions=0' in c for c in rec['conditions']),
+                            rec['conditions'])
+            self.assertTrue(out.exists())
+
+    def test_label_only_never_pressed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            lbl = FakeAccessible('Take', role='label', states=(SHOWING,),
+                                 actions=1)
+            self.set_desktop(app_node(lbl))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '2', '--press', 'Take'],
+                ticks=(1000.0, 1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1003.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(lbl.do_calls, [])
+            rec = self.record(err)
+            self.assertTrue(any('label' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_none_branch_recorded_explicitly(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self.set_desktop(app_node(button('A'), None))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '2', '--press', 'Take'],
+                ticks=(1000.0, 1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1003.0))
+            self.assertEqual(code, 1)
+            rec = self.record(err)
+            self.assertTrue(any('None' in c for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_late_true_refused_never_positive(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '2', '--press', 'Take'],
+                ticks=(1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1000.0, 1000.0, 1005.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIs(rec['returned'], True)
+            self.assertIn('late-positive refused', rec['error'])
+
+    def test_owner_change_refused_after_true(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            fake_app = app_node(take, pid=4242)
+            pids = [4242, 9999]
+
+            def drifting():
+                if len(pids) > 1:
+                    return pids.pop(0)
+                return pids[0]
+            fake_app.get_process_id = drifting
+            self.set_desktop(fake_app)
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press([APP, str(out), '5', '--press',
+                                           'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIs(rec['returned'], True)
+            self.assertIn('owner identity', rec['error'])
+            self.assertIn('4242', rec['error'])
+            self.assertIn('9999', rec['error'])
+
+
+class PressV4Bounds(unittest.TestCase):
+    """v4: record-independent walk bounds, gated pre-PID, malformed
+    action counts fail, honest failure scope. Standalone (no parent
+    tests re-run); helpers mirror PressReadiness exactly."""
+
+    def run_press(self, argv, ticks=(1000.0, 1000.0),
+                    mono=(1000.0, 1000.0, 1000.0)):
+        import contextlib
+        import io
+        clock = _FakeTime(ticks, mono=mono)
+        err = io.StringIO()
+        with mock.patch.object(sys, 'argv',
+                               ['tuna-a11y-dump.py'] + argv), \
+                mock.patch.object(mod, 'time', clock), \
+                contextlib.redirect_stderr(err):
+            return mod.main(), clock, err.getvalue()
+
+    def set_desktop(self, *children):
+        _FAKE.Registry.desktop = FakeAccessible(
+            'desktop', role='desktop', children=list(children))
+
+    @staticmethod
+    def record(stderr_text):
+        line = [ln for ln in stderr_text.splitlines()
+                if 'press-failed' in ln]
+        assert len(line) == 1, stderr_text
+        return json.loads(line[0].split('tuna-a11y-dump: ', 1)[1])
+
+    def test_walk_huge_none_flood_trips_before_any_read(self):
+        fake_app = app_node(counts=[2000])
+        reads = []
+        orig = fake_app.getChildAtIndex
+
+        def counted(i):
+            reads.append(i)
+            return orig(i)
+
+        fake_app.getChildAtIndex = counted
+        out, stats = [], {}
+        mod.walk(fake_app, 0, out, False, mod.PRESS_NODES_MAX, stats)
+        self.assertTrue(stats.get('capped'))
+        self.assertEqual(reads, [])
+        self.assertEqual(len(out), 1)
+
+    def test_walk_none_run_counts_visits_not_records(self):
+        fake_app = app_node(counts=[3])
+        out, stats = [], {}
+        mod.walk(fake_app, 0, out, False, mod.PRESS_NODES_MAX, stats)
+        self.assertNotIn('capped', stats)
+        self.assertEqual(stats.get('visits'), 4)
+        self.assertEqual(len(out), 1)
+
+    def test_walk_malformed_count_trips_bounded_dump(self):
+        for bad in (True, -1, 1.5, '3'):
+            with self.subTest(count=bad):
+                fake_app = app_node(button('K'), counts=[bad])
+                out, stats = [], {}
+                mod.walk(fake_app, 0, out, False, mod.PRESS_NODES_MAX,
+                         stats)
+                self.assertTrue(stats.get('capped'), bad)
+                self.assertEqual(len(out), 1)
+
+    def test_walk_deep_chain_trips_bounded_dump(self):
+        node = button('Leaf')
+        for i in range(70):
+            node = FakeAccessible('N%d' % i, role='panel',
+                                  children=[node])
+        fake_app = app_node(node)
+        out, stats = [], {}
+        mod.walk(fake_app, 0, out, False, mod.PRESS_NODES_MAX, stats)
+        self.assertTrue(stats.get('capped'))
+        self.assertLess(len(out), 72)
+
+    def test_walk_deadline_trip_flags_distinctly(self):
+        clock = _FakeTime((1000.0,), mono=(1000.0, 1009.0))
+        fake_app = app_node(button('K'))
+        out, stats = [], {}
+        with mock.patch.object(mod, 'time', clock):
+            mod.walk(fake_app, 0, out, False, 100, stats,
+                     deadline=1005.0)
+        self.assertTrue(stats.get('deadline_tripped'))
+        self.assertNotIn('capped', stats)
+        self.assertEqual(len(out), 1)
+
+    def test_walk_unlimited_legacy_ignores_new_bounds(self):
+        kid = button('K')
+        legacy = app_node(kid, counts=[True])
+        out = []
+        mod.walk(legacy, 0, out, False, None, None, deadline=0.0)
+        self.assertEqual([n['name'] for n in out], [APP, 'K'])
+        negative = app_node(kid, counts=[-1])
+        out2 = []
+        mod.walk(negative, 0, out2, False, None, None, deadline=0.0)
+        self.assertEqual([n['name'] for n in out2], [APP])
+
+    def test_malformed_action_count_fails_whole_walk(self):
+        import tempfile
+        for bad in (True, 1.5, -1, '1'):
+            with self.subTest(count=bad):
+                with tempfile.TemporaryDirectory() as td:
+                    take = button('Take', actions=bad)
+                    self.set_desktop(app_node(take))
+                    out = Path(td) / 'press.json'
+                    code, _, err = self.run_press(
+                        [APP, str(out), '5', '--press', 'Take'])
+                    self.assertEqual(code, 1)
+                    self.assertEqual(take.do_calls, [])
+                    rec = self.record(err)
+                    self.assertEqual(rec['observations'], 1)
+                    self.assertTrue(any('malformed actions' in c
+                                       for c in rec['conditions']),
+                                    rec['conditions'])
+
+    def test_zero_actions_sibling_still_pressed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            zero = button('Take', actions=0)
+            ready = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(zero, ready))
+            out = str(Path(td) / 'press.json')
+            code, _, _ = self.run_press(
+                [APP, out, '5', '--press', 'Take'])
+            self.assertEqual(code, 0)
+            self.assertEqual(zero.do_calls, [])
+            self.assertEqual(ready.do_calls, [0])
+
+    def test_malformed_sibling_blocks_ready_candidate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            bad = button('Take', actions=True)
+            ready = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(bad, ready))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'])
+            self.assertEqual(code, 1)
+            self.assertEqual(bad.do_calls, [])
+            self.assertEqual(ready.do_calls, [])
+            rec = self.record(err)
+            self.assertTrue(any('malformed actions' in c
+                               for c in rec['conditions']),
+                            rec['conditions'])
+
+    def test_pre_pid_nonpositive_refused_without_invocation(self):
+        import tempfile
+        for bad in (0, -5):
+            with self.subTest(pid=bad):
+                with tempfile.TemporaryDirectory() as td:
+                    take = button('Take', actions=1, do_return=True)
+                    self.set_desktop(app_node(take, pid=bad))
+                    out = Path(td) / 'press.json'
+                    code, _, err = self.run_press(
+                        [APP, str(out), '5', '--press', 'Take'])
+                    self.assertEqual(code, 1)
+                    self.assertEqual(take.do_calls, [])
+                    rec = self.record(err)
+                    self.assertEqual(rec['invocations'], 0)
+                    self.assertIn('pre-pid non-positive', rec['error'])
+
+    def test_pre_pid_mismatch_refused_without_invocation(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            fake_app = app_node(take, pids=[4242, 4242, 9999])
+            self.set_desktop(fake_app)
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take',
+                 '--pid', '4242'])
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [])
+            rec = self.record(err)
+            self.assertEqual(rec['invocations'], 0)
+            self.assertIn('pre-pid owner mismatch', rec['error'])
+            self.assertIn('9999', rec['error'])
+
+    def test_success_dump_deadline_trip_fails_closed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'],
+                ticks=(1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
+                      1000.0, 1009.0))
+            self.assertEqual(code, 1)
+            self.assertEqual(take.do_calls, [0])
+            rec = self.record(err)
+            self.assertIs(rec['returned'], True)
+            self.assertEqual(rec['invocations'], 1)
+            self.assertIn('success dump deadline tripped', rec['error'])
+
+    def test_failure_scope_names_failed_check(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            take = button('Take', actions=1, do_return=True)
+            self.set_desktop(app_node(take))
+            out = Path(td) / 'press.json'
+            code, _, err = self.run_press(
+                [APP, str(out), '5', '--press', 'Take'],
+                ticks=(1000.0, 1000.0),
+                mono=(1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
+                      1000.0, 1009.0))
+            self.assertEqual(code, 1)
+            rec = self.record(err)
+            self.assertIn('failed at:', rec['scope'])
+            self.assertIn('success dump deadline tripped', rec['scope'])
+            self.assertNotIn('every readout inside', rec['scope'])
 
 
 if __name__ == '__main__':
