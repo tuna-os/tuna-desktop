@@ -3802,6 +3802,7 @@ impl Runtime {
         }
         if let Some(list) = outcome.accelerators {
             self.manager.set_accelerators(list);
+            self.manager.trace_media_accelerators(self.is_locked());
         }
         for (window, action) in outcome.window_actions {
             self.manager.window_action(&mut self.state, window, action);

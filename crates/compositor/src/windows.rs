@@ -14,6 +14,32 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// Fixed audio-key observations only; no arbitrary key or application data.
+pub(crate) fn trace_media(stage: &str, details: serde_json::Value, locked: bool) {
+    if locked || !media_trace_enabled() {
+        return;
+    }
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return;
+    }
+    eprintln!(
+        "tuna-media-diagnostic: {}",
+        serde_json::json!({
+            "actor": "compositor", "pid": std::process::id(), "stage": stage,
+            "monotonic_ns": now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
+            "details": details,
+        })
+    );
+}
+
+fn media_trace_enabled() -> bool {
+    std::env::var_os("TUNA_MEDIA_DIAGNOSTICS").is_some_and(|p| std::path::Path::new(&p).is_file())
+}
+
 #[cfg(feature = "xwayland")]
 use crate::xwayland::{map_x11_identity, X11ManagerEvent};
 use smithay::reexports::wayland_server::Resource as _;
@@ -2834,6 +2860,22 @@ impl WindowManager {
             },
         );
         if let Some(action) = intercepted {
+            if let Some(a) = grabs
+                .iter()
+                .filter(|_| !self.lock_input_active && media_trace_enabled())
+                .find(|a| {
+                    a.action == action
+                        && matches!(a.keysym, 0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2)
+                })
+            {
+                trace_media(
+                    "media-accelerator-fired",
+                    serde_json::json!({
+                        "action": action, "keysym": a.keysym, "mods": a.mods, "mode": mode,
+                    }),
+                    self.lock_input_active,
+                );
+            }
             self.accel_held.push(keycode);
             self.accel_fired.push((action, time, mode));
         }
@@ -3023,6 +3065,21 @@ impl WindowManager {
     /// Replace the accelerator grabs (org.gnome.Shell GrabAccelerators).
     pub fn set_accelerators(&mut self, accelerators: Vec<tuna_shell_control::Accelerator>) {
         self.accelerators = accelerators;
+    }
+
+    pub fn trace_media_accelerators(&self, locked: bool) {
+        if locked || !media_trace_enabled() {
+            return;
+        }
+        trace_media(
+            "accelerators-runtime-applied",
+            serde_json::json!({
+                "media": self.accelerators.iter()
+                    .filter(|a| matches!(a.keysym, 0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2))
+                    .map(|a| [a.action, a.keysym, a.mods, a.modes]).collect::<Vec<_>>(),
+            }),
+            locked,
+        );
     }
 
     /// Replace the switcher's chords (the shell's GNOME keybindings).

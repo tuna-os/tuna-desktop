@@ -444,6 +444,9 @@ PY=/usr/bin/python3
 CSTATE="$ARTIFACTS/compositor-state.json"
 TUNA_COMPOSITOR_STATE="$CSTATE"
 export TUNA_COMPOSITOR_STATE
+# The marker exists only during the unlocked media sequence, not lock proofs.
+TUNA_MEDIA_DIAGNOSTICS="$ARTIFACTS/media-diagnostics-enabled"
+export TUNA_MEDIA_DIAGNOSTICS
 
 # Accessibility bus for GTK's AT-SPI backend.
 if [ -x /usr/libexec/at-spi-bus-launcher ]; then
@@ -645,6 +648,9 @@ echo 0.50 >"$MIC_FILE"
 RECORDING_FILE="$ARTIFACTS/recording"
 cat >"$ARTIFACTS/bin/wpctl" <<WPCTL
 #!/bin/sh
+if [ -f "$ARTIFACTS/media-diagnostics-enabled" ]; then
+    "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" wpctl-enter "\$$" "\$@" || exit 125
+fi
 mark() { [ "\$(cat "$SINK_FILE")" = "\$1" ] && echo "*" || echo " "; }
 muted() { [ "\$(cat "\$1")" = 1 ] && printf ' [MUTED]' || true; }
 case "\$1" in
@@ -675,6 +681,9 @@ case "\$1" in
         fi ;;
     *) ;;
 esac
+if [ -f "$ARTIFACTS/media-diagnostics-enabled" ]; then
+    "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" wpctl-exit "\$$" "\$@" || exit 125
+fi
 "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event
 WPCTL
 # Only audio monitoring uses the event fixture. Capture revocation must inspect
@@ -4015,6 +4024,9 @@ pass G-ACCEL "gnome-settings-daemon's grab fires on its key and its ShowOSD show
 
 # Native media actions work even without gsd-media-keys. These assert
 # the actual asynchronous backend mutations, including GNOME's unmute rule.
+touch "$TUNA_MEDIA_DIAGNOSTICS"
+media_mark() { "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" marker "$$" "$1"; }
+media_mark begin
 echo 0.40 >"$VOLUME_FILE"
 echo 0 >"$VOLUME_MUTED_FILE"
 media_volume() {
@@ -4066,16 +4078,26 @@ sleep 0.3
 echo 0.98 >"$VOLUME_FILE"
 xdotool key XF86AudioRaiseVolume
 media_volume 1.0000 || fail G-MEDIA-AMPLIFICATION "live disable did not restore the ordinary limit"
+media_mark amplification-reset-before
 gsettings reset "$SOUND_SCHEMA" allow-volume-above-100-percent
+media_mark amplification-reset-after
 echo 0.4200 >"$VOLUME_FILE"
+media_mark baseline-written
 pass G-MEDIA-AMPLIFICATION "same shell follows live opt-in and reset; native VM qualifies real PipeWire separately"
 
 # Live rebinding and an empty static array must take effect without restart.
 MEDIA_SCHEMA=org.gnome.settings-daemon.plugins.media-keys
+media_mark static-disable-before
 gsettings set "$MEDIA_SCHEMA" volume-up-static '[]'
+media_mark static-disable-after
 sleep 0.7
+media_mark disabled-key-before
+cp "$CSTATE" "$ARTIFACTS/media-before-disabled-key.json"
 xdotool key XF86AudioRaiseVolume
+media_mark disabled-key-after
 sleep 0.7
+media_mark disabled-check
+cp "$CSTATE" "$ARTIFACTS/media-after-disabled-key.json"
 [ "$(cat "$VOLUME_FILE")" = 0.4200 ] || fail G-MEDIA-VOLUME "an explicitly disabled hardware key still changed volume"
 gsettings set "$MEDIA_SCHEMA" volume-up "['F8']"
 gsettings set "$MEDIA_SCHEMA" volume-step 10
@@ -4088,6 +4110,7 @@ gsettings reset "$MEDIA_SCHEMA" volume-step
 sleep 0.7
 echo 0.4200 >"$VOLUME_FILE"
 scrot "$ARTIFACTS/media-volume-osd.png" >/dev/null
+rm -f "$TUNA_MEDIA_DIAGNOSTICS"
 pass G-MEDIA-VOLUME "native volume/precise/mute/microphone keys mutate PipeWire state; unmute preserves the level"
 
 # GNOME Shell's own keybindings (org.gnome.shell.keybindings defaults).

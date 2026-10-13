@@ -9,6 +9,42 @@ use gtk4::{gio, glib};
 
 const AMPLIFIED_KEY: &str = "allow-volume-above-100-percent";
 
+/// Opt-in journey diagnostics, enabled only while the harness marker exists.
+/// Callers suppress these observations during lock input.
+pub(crate) fn trace(stage: &str, details: serde_json::Value, locked: bool) {
+    if locked || !trace_enabled() {
+        return;
+    }
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return;
+    }
+    eprintln!(
+        "tuna-media-diagnostic: {}",
+        serde_json::json!({
+            "actor": "shell", "pid": std::process::id(), "stage": stage,
+            "monotonic_ns": now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
+            "details": details,
+        })
+    );
+}
+
+pub(crate) fn trace_enabled() -> bool {
+    std::env::var_os("TUNA_MEDIA_DIAGNOSTICS")
+        .is_some_and(|path| std::path::Path::new(&path).is_file())
+}
+
+pub(crate) fn media_subset(list: &[tuna_shell_control::Accelerator]) -> serde_json::Value {
+    serde_json::json!(list
+        .iter()
+        .filter(|a| matches!(a.keysym, 0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2))
+        .map(|a| serde_json::json!([a.action, a.keysym, a.mods, a.modes]))
+        .collect::<Vec<_>>())
+}
+
 pub fn sound_settings() -> Option<gio::Settings> {
     let schema = gio::SettingsSchemaSource::default()?.lookup("org.gnome.desktop.sound", true)?;
     schema

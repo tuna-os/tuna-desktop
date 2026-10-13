@@ -240,7 +240,20 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
 
     fn set_accelerators(&self, accelerators: Vec<tuna_shell_control::Accelerator>) {
         if let Some(control) = self.shell.borrow_mut().control.as_mut() {
-            let _ = control.set_accelerators(accelerators);
+            let locked = control.locked();
+            let subset =
+                media_keys::trace_enabled().then(|| media_keys::media_subset(&accelerators));
+            let result = control.set_accelerators(accelerators);
+            if let Some(subset) = subset {
+                media_keys::trace(
+                    "accelerators-send",
+                    serde_json::json!({
+                        "request_id": result.as_ref().ok(), "write_ok": result.is_ok(),
+                        "media": subset,
+                    }),
+                    locked,
+                );
+            }
         }
     }
 }
@@ -1940,6 +1953,27 @@ fn build(app: &adw::Application) {
                     let id = id.trim_end_matches(".desktop");
                     apps.get().entry(id).cloned()
                 };
+                if media_keys::trace_enabled()
+                    && matches!(
+                        action,
+                        Action::VolumeUp { .. }
+                            | Action::VolumeDown { .. }
+                            | Action::VolumeUpQuiet
+                            | Action::VolumeDownQuiet
+                            | Action::VolumeMute
+                            | Action::VolumeMuteQuiet
+                            | Action::MicrophoneMute
+                    )
+                {
+                    let locked = shell.borrow().control.as_ref().is_some_and(|c| c.locked());
+                    media_keys::trace(
+                        "media-action",
+                        serde_json::json!({
+                            "action": format!("{action:?}"), "mode": mode,
+                        }),
+                        locked,
+                    );
+                }
                 match action {
                     Action::LockScreen => {
                         if let Some(control) = shell.borrow_mut().control.as_mut() {
@@ -2700,6 +2734,14 @@ fn build(app: &adw::Application) {
                 kbd_a11y_dialog.dismiss();
             }
             for (id, applied) in results {
+                // Receipt of Applied precedes the runtime manager replacement.
+                media_keys::trace(
+                    "control-ack-not-runtime-application",
+                    serde_json::json!({
+                        "request_id": id, "applied": applied,
+                    }),
+                    locked,
+                );
                 lock_ui.command_result(id, applied);
             }
             // The bar goes see-through and Activities shows as checked
