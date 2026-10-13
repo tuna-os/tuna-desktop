@@ -10,6 +10,13 @@ class Contract(unittest.TestCase):
   self.assertIn('encode_unlock_frame',body);self.assertIn('Shutdown::Both',body)
   self.assertNotIn('write_message',body);self.assertNotIn('reconnect()',body)
   self.assertIn('auth_needs_snapshot',body)
+ def test_proof_imports_load_before_any_ci_or_gui_execution(self):
+  path=ROOT/'scripts/tuna-auth-no-replay-gtk-proof'
+  prefix=path.read_text().split('root=Path.cwd().resolve()',1)[0]
+  namespace={'__file__':str(path)}
+  exec(compile(prefix,str(path),'exec'),namespace)
+  self.assertTrue(callable(namespace['identity'].current_identity))
+  self.assertTrue(callable(namespace['lifetime'].bounded_command))
  def test_initial_snapshot_and_pr_checkout_admission(self):
   text=(ROOT/'crates/shell-host/src/control.rs').read_text()
   self.assertIn('auth_needs_snapshot: true',text)
