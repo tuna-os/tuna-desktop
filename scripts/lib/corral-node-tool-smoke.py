@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Actual tool-image smoke; synthetic sparse bytes, never a Marlin boot claim."""
 import hashlib
+import _hashlib
+import _ssl
+import zlib
+import sys
 import importlib.util
 import json
 import os
@@ -8,6 +12,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 import zipfile
+
+sys.path.insert(0, '/opt/tuna-tools')
+import corral_node_tools as tools
 
 spec = importlib.util.spec_from_file_location('worker', '/opt/tuna-tools/corral_node_worker.py')
 worker = importlib.util.module_from_spec(spec)
@@ -18,13 +25,16 @@ qemu_version = subprocess.check_output(['qemu-img', '--version'], timeout=10).de
 qemu = worker.digest('/usr/bin/qemu-img')
 if qemu != '250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad':
     raise ValueError('retained qemu executable differs')
-loader = subprocess.run(['/lib64/ld-linux-x86-64.so.2', '--list', '/usr/bin/qemu-img'], check=True, capture_output=True, text=True, timeout=10)
-libraries = {}
-for line in loader.stdout.splitlines():
-    for token in line.split():
-        if token.startswith('/'):
-            libraries[token] = worker.digest(token)
-if not libraries:raise ValueError('actual ELF library closure absent')
+baseline = tools.baseline_libraries('/opt/tuna-tools/qemu-before-libraries.sha256')
+libraries = tools.qemu_libraries()
+tools.same_qemu_libraries(baseline, libraries)
+private_paths = tools.private_elf_paths(Path('/proc/self/maps').read_text())
+python_libraries = {str(p): tools.sha(p) for p in private_paths}
+for module in (_hashlib, _ssl, zlib):
+    if not Path(module.__file__).resolve().is_relative_to(tools.PRIVATE_ROOT):
+        raise ValueError('required Python extension escaped its private prefix')
+if not Path(sys.executable).resolve().is_relative_to(tools.PRIVATE_ROOT):
+    raise ValueError('Python executable escaped its private prefix')
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
     raw = root/'original.raw'
@@ -70,9 +80,14 @@ with tempfile.TemporaryDirectory() as directory:
         rejected += 1
     else:
         raise ValueError('backing file was admitted')
+    after_libraries = tools.qemu_libraries()
+    tools.same_qemu_libraries(baseline, after_libraries)
+    after_private_paths = tools.private_elf_paths(Path('/proc/self/maps').read_text())
+    for path in after_private_paths:python_libraries[str(path)] = tools.sha(path)
     print(json.dumps({'schema': 1, 'qemu_version': qemu_version, 'python_version': list(__import__('sys').version_info[:3]), 'smoke_passed': True, 'uid': os.getuid(),
                       'qemu_before_sha256': qemu, 'qemu_after_sha256': worker.digest('/usr/bin/qemu-img'),
                       'worker_sha256': worker.digest('/opt/tuna-tools/corral_node_worker.py'),
-                      'qemu_libraries': libraries, 'raw_sha256': manifest['raw_sha256'], 'negative_controls': rejected,
+                      'qemu_libraries': libraries, 'qemu_libraries_before': baseline, 'qemu_libraries_after': after_libraries,
+                      'python_executable': str(Path(sys.executable).resolve()), 'python_libraries': python_libraries, 'raw_sha256': manifest['raw_sha256'], 'negative_controls': rejected,
                       'logical_bytes': converted['logical_bytes'], 'allocated_bytes': converted['allocated_bytes'],
                       'scope': 'Synthetic mixed extents and tool runtime only; no image import or boot.'}))

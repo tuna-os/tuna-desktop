@@ -35,7 +35,7 @@ class Tests(unittest.TestCase):
     def test_build_only_honest_false_and_exact_source_hashes(self):
         root,result=self.generate();self.assertEqual(result.returncode,0,result.stderr.decode())
         closure=json.loads((root/'closure/tool-closure.json').read_text())
-        self.assertFalse(closure['registry_published']);self.assertEqual(len(closure['source_files_sha256']),6)
+        self.assertFalse(closure['registry_published']);self.assertEqual(len(closure['source_files_sha256']),8)
         self.assertEqual(closure['layers'][0]['uncompressed_bytes'],len(b'synthetic layer contents'))
         self.assertEqual(closure['layers'][0]['diff_id'],'sha256:'+hashlib.sha256(b'synthetic layer contents').hexdigest())
 

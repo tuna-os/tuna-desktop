@@ -1,22 +1,34 @@
-FROM registry.access.redhat.com/ubi9/ubi@sha256:ee3871c273cc65a2bd24970b47c15b90fbf962841bc2e41e4f915b1c4c0208e2 AS python-rpms
+FROM registry.access.redhat.com/ubi9/ubi@sha256:ee3871c273cc65a2bd24970b47c15b90fbf962841bc2e41e4f915b1c4c0208e2 AS private-python
 RUN dnf install -y dnf-plugins-core && mkdir /rpms && \
     dnf download --resolve --alldeps --destdir /rpms python3.12 && \
     cd /rpms && rpm --checksig *.rpm && \
     rpm -qp --queryformat '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' *.rpm > RPM-NEVRA.txt && \
-    sha256sum *.rpm > RPM-SHA256SUMS
+    sha256sum *.rpm > RPM-SHA256SUMS && \
+    dnf --installroot=/opt/tuna-python --releasever=9 --setopt=install_weak_deps=False \
+        install -y /rpms/*.rpm && \
+    mkdir /private-inventory && cp RPM-SHA256SUMS RPM-NEVRA.txt /private-inventory/ && \
+    rpm --root /opt/tuna-python -qa --queryformat '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > /private-inventory/installed-private-packages.txt
 FROM quay.io/kubevirt/virt-launcher@sha256:574fabe0ff9719fa1e3800dcca8530fa4e02fd71ef74109508e59800e13e8b5d
 USER 0
-RUN test "$(sha256sum /usr/bin/qemu-img | cut -d' ' -f1)" = 250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad
-COPY --from=python-rpms /rpms /tmp/python-rpms
-RUN cd /tmp/python-rpms && sha256sum -c RPM-SHA256SUMS && \
-    rpm -Uvh --replacepkgs *.rpm && \
-    mkdir -p /opt/tuna-tools && cp RPM-SHA256SUMS RPM-NEVRA.txt /opt/tuna-tools/ && \
-    rpm -qa | sort > /opt/tuna-tools/installed-packages.txt && \
-    rm -rf /tmp/python-rpms && \
-    test "$(sha256sum /usr/bin/qemu-img | cut -d' ' -f1)" = 250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad && \
-    /usr/bin/python3.12 -c 'import hashlib,json,zipfile,zlib,subprocess,pathlib'
+RUN test "$(sha256sum /usr/bin/qemu-img | cut -d' ' -f1)" = 250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad && \
+    mkdir -p /opt/tuna-tools && \
+    /lib64/ld-linux-x86-64.so.2 --list /usr/bin/qemu-img > /opt/tuna-tools/qemu-before-loader.txt && \
+    while read -r lib arrow path rest; do \
+        case "$arrow" in \
+          '=>') case "$path" in /*) sha256sum "$path";; esac;; \
+          *) case "$lib" in /*) sha256sum "$lib";; esac;; \
+        esac; \
+    done < /opt/tuna-tools/qemu-before-loader.txt > /opt/tuna-tools/qemu-before-libraries.sha256
+COPY --from=private-python /opt/tuna-python /opt/tuna-python
+COPY --from=private-python /private-inventory /opt/tuna-tools/private-inventory
+COPY packaging/benchmark/python-private /opt/tuna-tools/python
 COPY scripts/lib/corral_node_worker.py /opt/tuna-tools/corral_node_worker.py
+COPY scripts/lib/corral_node_tools.py /opt/tuna-tools/corral_node_tools.py
 COPY scripts/lib/corral-node-tool-smoke.py /opt/tuna-tools/smoke.py
+RUN chmod 0755 /opt/tuna-tools/python && \
+    sha256sum -c /opt/tuna-tools/qemu-before-libraries.sha256 && \
+    test "$(sha256sum /usr/bin/qemu-img | cut -d' ' -f1)" = 250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad && \
+    /opt/tuna-tools/python -c 'import hashlib,_hashlib,_ssl,json,zipfile,zlib,subprocess,pathlib'
 ENV PYTHONDONTWRITEBYTECODE=1
 USER 107:107
-ENTRYPOINT ["/usr/bin/python3.12"]
+ENTRYPOINT ["/opt/tuna-tools/python"]

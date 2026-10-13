@@ -16,7 +16,10 @@ import corral_node_worker as worker
 class Tests(unittest.TestCase):
     def closure(self):
         return {'schema': 1, 'base_image': stage.BASE_IMAGE, 'installer_image': stage.INSTALLER_IMAGE,
-                'python_version': [3, 12, 0], 'qemu_libraries': {'/lib64/libc.so.6': 'c'*64}, 'qemu_before_sha256': stage.QEMU_SHA,
+                'python_version': [3, 12, 0], 'qemu_libraries': {'/lib64/libc.so.6': 'c'*64},
+                'qemu_libraries_before': {'/lib64/libc.so.6': 'c'*64}, 'qemu_libraries_after': {'/lib64/libc.so.6': 'c'*64},
+                'python_executable': '/opt/tuna-python/usr/bin/python3.12',
+                'python_libraries': {'/opt/tuna-python/usr/lib64/libc.so.6': 'd'*64}, 'qemu_before_sha256': stage.QEMU_SHA,
                 'qemu_after_sha256': stage.QEMU_SHA, 'registry_published': True, 'smoke_passed': True,
                 'uid': 107, 'image': 'ghcr.io/tuna-os/benchmark-node-tools@sha256:'+'a'*64,
                 'worker_sha256': stage.sha(Path(worker.__file__)),
@@ -27,7 +30,7 @@ class Tests(unittest.TestCase):
 
     def test_tool_contract_failures(self):
         for key, value in [('registry_published', False), ('smoke_passed', False), ('uid', 0),
-                           ('installer_image', 'mutable:tag'), ('python_version', [3, 9]), ('qemu_libraries', {}), ('qemu_after_sha256', '0'*64), ('worker_sha256', '0'*64), ('image', 'mutable:tag')]:
+                           ('installer_image', 'mutable:tag'), ('python_version', [3, 9]), ('qemu_libraries', {}), ('qemu_libraries_after', {}), ('python_executable', '/usr/bin/python3.12'), ('python_libraries', {'/lib/global.so': 'd'*64}), ('qemu_after_sha256', '0'*64), ('worker_sha256', '0'*64), ('image', 'mutable:tag')]:
             with self.subTest(key=key):
                 closure = self.closure();closure[key] = value
                 with self.assertRaises(ValueError):stage.tool_contract(closure)

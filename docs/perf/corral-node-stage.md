@@ -14,11 +14,16 @@ The immutable launcher image is pinned in the Containerfile. It had neither
 Python nor dnf/microdnf/yum, so it cannot run the strict ZIP/helper contract.
 
 The dedicated manual CI workflow uses a separately pinned official EL9 installer
-stage to resolve Python 3.12 RPMs, verify signatures, and retain package NEVRAs and
-SHA256s. Python 3.12 is available since RHEL 9.4 according to
+stage to resolve Python 3.12 RPMs, verify signatures, and install an isolated
+`/opt/tuna-python` root. Package NEVRAs and SHA256s describe only that private
+root; the launcher RPM database and system libraries remain untouched. An
+explicit private loader wrapper disables the loader cache and supplies a private
+library path and process-local Python home. Python 3.12 is available since RHEL 9.4 according to
 [Red Hat's Python documentation](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/installing_and_using_dynamic_programming_languages/assembly_installing-and-using-python_installing-and-using-dynamic-programming-languages).
 It preserves the original qemu executable SHA before and after installation,
-records the actual ELF library file hashes, and exercises actual synthetic
+compares the original QEMU required ELF library paths and hashes before and
+after installation and the entire operation, checks actual Python mapped ELF
+files and `_hashlib`/`_ssl`/zlib modules remain under the private prefix, and exercises actual synthetic
 mixed-extents QCOW2-to-RAW conversion plus ZIP roundtrip and negative controls
 as UID 107 without capabilities and with a read-only image root.
 

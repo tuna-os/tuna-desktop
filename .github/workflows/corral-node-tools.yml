@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_candidate_tools:
-        description: Publish only reviewed benchmark tooling to the dedicated GHCR repository
+        description: Reserved publication request; held until registered publication and closure review
         type: boolean
         default: false
 permissions:
@@ -15,10 +15,14 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
+      - name: Refuse held candidate publication
+        if: inputs.publish_candidate_tools
+        run: |
+          echo 'Candidate publication requires reviewed registered-workflow admission and original digest preservation' >&2
+          exit 2
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Validate source and install CI tools
         run: |
@@ -30,15 +34,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/node-tools"
           podman build --platform linux/amd64 -f packaging/benchmark/Containerfile.node-tools -t node-tools:qualified .
           podman run --rm --user 107:107 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,size=256m,mode=1777 --memory 512m --cpus 1 node-tools:qualified /opt/tuna-tools/smoke.py > "$RUNNER_TEMP/node-tools/smoke.json"
-          podman run --rm --user 107:107 --cap-drop ALL --security-opt no-new-privileges --read-only node-tools:qualified -c 'from pathlib import Path; print(Path("/opt/tuna-tools/installed-packages.txt").read_text()); print(Path("/opt/tuna-tools/RPM-SHA256SUMS").read_text())' > "$RUNNER_TEMP/node-tools/rpm-inventory.txt"
+          podman run --rm --user 107:107 --cap-drop ALL --security-opt no-new-privileges --read-only node-tools:qualified -c 'from pathlib import Path; print(Path("/opt/tuna-tools/private-inventory/installed-private-packages.txt").read_text()); print(Path("/opt/tuna-tools/private-inventory/RPM-SHA256SUMS").read_text())' > "$RUNNER_TEMP/node-tools/rpm-inventory.txt"
           podman save --format oci-archive -o "$RUNNER_TEMP/node-tools/original-tools.oci.tar" node-tools:qualified
-      - name: Publish reviewed candidate tooling only
-        if: inputs.publish_candidate_tools
-        env:
-          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          podman push --format oci --digestfile "$RUNNER_TEMP/node-tools/published-digest" node-tools:qualified "docker://ghcr.io/tuna-os/benchmark-node-tools:$GITHUB_SHA"
       - name: Retain exact closure
         run: |
           publish_args=()

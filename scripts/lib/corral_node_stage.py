@@ -36,6 +36,13 @@ def tool_contract(closure):
     libraries = closure.get('qemu_libraries')
     if not isinstance(libraries, dict) or not libraries or any(not p.startswith('/') or not re.fullmatch('[0-9a-f]{64}', d) for p, d in libraries.items()):
         raise ValueError('actual qemu ELF library closure required')
+    if closure.get('qemu_libraries_before') != libraries or closure.get('qemu_libraries_after') != libraries:
+        raise ValueError('qemu required ELF closure changed during tool operation')
+    python = closure.get('python_libraries')
+    if not isinstance(python, dict) or not python or any(not p.startswith('/opt/tuna-python/') or not re.fullmatch('[0-9a-f]{64}', d) for p, d in python.items()):
+        raise ValueError('actual private Python ELF closure required')
+    if not closure.get('python_executable', '').startswith('/opt/tuna-python/'):
+        raise ValueError('actual private Python executable required')
     layers = closure.get('layers')
     if not isinstance(layers, list) or not 0 < len(layers) <= 128:
         raise ValueError('complete bounded OCI layer closure required')
@@ -115,7 +122,7 @@ def pod_spec(name, namespace, node, stage, target, image, worker_sha):
                      'securityContext': {'runAsUser': 107, 'runAsGroup': 107, 'fsGroup': 107,
                                          'runAsNonRoot': True, 'seccompProfile': {'type': 'RuntimeDefault'}},
                      'containers': [{'name': 'stage', 'image': image, 'imagePullPolicy': 'IfNotPresent',
-                                     'command': ['/usr/bin/python3.12', '-c', 'import time; time.sleep(3600)'],
+                                     'command': ['/opt/tuna-tools/python', '-c', 'import time; time.sleep(3600)'],
                                      'securityContext': {'allowPrivilegeEscalation': False,
                                                          'readOnlyRootFilesystem': True,
                                                          'capabilities': {'drop': ['ALL']}},
@@ -281,7 +288,7 @@ def execute(args):
     def remote(pod, operation, *values):
         observe(pod, closure)
         return ['kubectl', '--context', args.context, 'exec', '-n', args.namespace,
-                pod['metadata']['name'], '-c', 'stage', '--', '/usr/bin/python3.12', '-c', worker_source,
+                pod['metadata']['name'], '-c', 'stage', '--', '/opt/tuna-tools/python', '-c', worker_source,
                 operation, *map(str, values)]
 
     try:

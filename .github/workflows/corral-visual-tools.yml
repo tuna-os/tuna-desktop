@@ -52,7 +52,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/node-tools"
           podman build --platform linux/amd64 -f packaging/benchmark/Containerfile.node-tools -t node-tools:qualified .
           podman run --rm --user 107:107 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,size=256m,mode=1777 --memory 512m --cpus 1 node-tools:qualified /opt/tuna-tools/smoke.py > "$RUNNER_TEMP/node-tools/smoke.json"
-          podman run --rm --user 107:107 --cap-drop ALL --security-opt no-new-privileges --read-only node-tools:qualified -c 'from pathlib import Path; print(Path("/opt/tuna-tools/installed-packages.txt").read_text()); print(Path("/opt/tuna-tools/RPM-SHA256SUMS").read_text())' > "$RUNNER_TEMP/node-tools/rpm-inventory.txt"
+          podman run --rm --user 107:107 --cap-drop ALL --security-opt no-new-privileges --read-only node-tools:qualified -c 'from pathlib import Path; print(Path("/opt/tuna-tools/private-inventory/installed-private-packages.txt").read_text()); print(Path("/opt/tuna-tools/private-inventory/RPM-SHA256SUMS").read_text())' > "$RUNNER_TEMP/node-tools/rpm-inventory.txt"
           podman save --format oci-archive -o "$RUNNER_TEMP/node-tools/original-tools.oci.tar" node-tools:qualified
       - name: Retain exact closure
         run: |

@@ -59,7 +59,7 @@ with tarfile.open(a.archive) as archive:
     source_root = Path(__file__).resolve().parents[2]
     names = ['scripts/lib/corral_node_stage.py', 'scripts/lib/corral_node_worker.py',
              'scripts/lib/corral-node-tool-smoke.py', 'scripts/lib/corral-node-tool-closure.py',
-             'scripts/tuna-corral-benchmark-import', 'packaging/benchmark/Containerfile.node-tools']
+             'scripts/tuna-corral-benchmark-import', 'packaging/benchmark/Containerfile.node-tools', 'packaging/benchmark/python-private', 'scripts/lib/corral_node_tools.py']
     source_hashes = {n: hashlib.sha256((source_root/n).read_bytes()).hexdigest() for n in names}
     closure = {**smoke, 'source_files_sha256': source_hashes, 'source_commit': a.source,
                'installer_image': 'registry.access.redhat.com/ubi9/ubi@sha256:ee3871c273cc65a2bd24970b47c15b90fbf962841bc2e41e4f915b1c4c0208e2',
@@ -68,6 +68,6 @@ with tarfile.open(a.archive) as archive:
                'registry_published': bool(a.published_digest), 'layers': layers,
                'config': config, 'original_manifest': manifest,
                'oci_sha256': hashlib.file_digest(a.archive.open('rb'), 'sha256').hexdigest(),
-               'sbom_scope': 'RPM inventory and downloaded RPM SHA list retained in image; not a full transitive security certification.'}
+               'sbom_scope': 'Private Python installroot RPM inventory and downloaded RPM SHA list retained in image; original launcher RPM database is untouched; not a full transitive security certification.'}
     a.out.mkdir(parents=True, exist_ok=False)
     (a.out/'tool-closure.json').write_text(json.dumps(closure, indent=2)+'\n')
