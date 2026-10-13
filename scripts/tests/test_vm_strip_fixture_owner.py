@@ -114,6 +114,32 @@ class Tests(unittest.TestCase):
             scope['strip_stop_identity'](identity, os.getuid(), time.monotonic() - 1)
         self.assertIsNone(child.poll())
 
+    def test_actual_owned_process_argv_and_typed_mode_are_bound(self):
+        scope = helper()
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / 'owned-mode-fixture.py'
+            script.write_text('import time; time.sleep(15)')
+            scope['STRIP_EXE'] = script
+            nonce = 'a' * 32
+            child = subprocess.Popen([sys.executable, str(script), '--strip-edge-fixture', nonce],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                identity = scope['strip_identity'](child.pid, os.getuid())
+                value = {'schema': 1, 'nonce': nonce, 'backend': 'wayland', 'fixture_mode': 'edge',
+                         'identity': identity | {'script_sha256': scope['strip_sha'](script)}}
+                actual = scope['strip_validate_client'](value, nonce, None, 'edge')
+                self.assertEqual(actual, value['identity'])
+                for bad in ('baseline', 'unknown', True, None):
+                    with self.subTest(mode=bad), self.assertRaises(RuntimeError):
+                        scope['strip_validate_client'](value, nonce, None, bad)
+                # Matching declared baseline still cannot disguise actual edge argv.
+                value['fixture_mode'] = 'baseline'
+                with self.assertRaisesRegex(RuntimeError, 'actual admitted script invocation'):
+                    scope['strip_validate_client'](value, nonce, None, 'baseline')
+            finally:
+                if child.poll() is None: child.kill()
+                child.wait(timeout=2)
+
     def test_default_count_client_is_retained_and_explicit_mode_uses_real_gdk(self):
         source = (ROOT / 'packaging/marlin/vm-lane/tuna-vm-input').read_text()
         tree = ast.parse(source)

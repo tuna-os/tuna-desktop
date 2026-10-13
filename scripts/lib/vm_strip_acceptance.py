@@ -5,16 +5,23 @@ import threading
 import time
 
 ROLES = ('alpha', 'beta', 'gamma')
-COLORS = {'alpha': (44, 102, 164), 'beta': (171, 65, 81), 'gamma': (65, 145, 89)}
+EDGE_ROLES = (*ROLES, 'delta')
+COLORS = {'alpha': (44, 102, 164), 'beta': (171, 65, 81), 'gamma': (65, 145, 89), 'delta': (147, 96, 179)}
 
 
 class NotReady(RuntimeError):
     pass
 
 
-def windows(sample, original):
+def windows(sample, original, *, edge=False, live_edge=False):
     """Validate original process/boot identity before treating geometry as ready."""
+    if type(edge) is not bool or type(live_edge) is not bool or (live_edge and not edge):
+        raise RuntimeError('invalid source-owned fixture observation mode')
+    roles = EDGE_ROLES if edge else ROLES
     owner, fixture, inventory = sample['owner'], sample['fixture'], sample['inventory']
+    mode = 'edge' if edge else 'baseline'
+    if owner.get('fixture_mode') != mode or fixture.get('fixture_mode') != mode:
+        raise RuntimeError('original fixture mode/argv contract differs')
     if owner != original or fixture['nonce'] != original['nonce']:
         raise RuntimeError('fixture ownership differs from original admission')
     identity = fixture['identity']
@@ -36,10 +43,10 @@ def windows(sample, original):
         matches = [p for p in processes if p['executable'] == name]
         if len(matches) != 1 or any(matches[0].get(k) != expected[k] for k in ('pid', 'uid', 'start_ticks')):
             raise RuntimeError('native compositor/shell process identity drift')
-    if set(fixture['windows']) != set(ROLES):
-        raise NotReady('three actual fixture windows not ready')
+    if set(fixture['windows']) != set(roles):
+        raise NotReady('all actual fixture windows not ready')
     result = {}
-    for role in ROLES:
+    for role in roles:
         actual = fixture['windows'][role]
         want = f"org.tuna.VmStrip.n{original['nonce']}.{role}"
         if tuple(actual.get('color', ())) != COLORS[role]:
@@ -65,30 +72,134 @@ def windows(sample, original):
                 or [actual['painted_width'], actual['painted_height']] != rect[2:]):
             raise NotReady('actual GTK allocation/paint differs from compositor')
         result[role] = window
-    if len({w['id'] for w in result.values()}) != len(ROLES):
+    if len({w['id'] for w in result.values()}) != len(roles):
         raise RuntimeError('fixture windows reused the same compositor identity')
     if (state.get('session_mode') not in ('gnome', 'scroll')
             or type(state.get('rendered_frames')) is not int or state['rendered_frames'] <= 0):
         raise NotReady('native render/session observation absent')
-    if state.get('strip_animating') is not False:
+    if type(state.get('strip_animating')) is not bool:
+        raise RuntimeError('genuine strip animation flag missing')
+    if not live_edge and state['strip_animating']:
         raise NotReady('actual strip view or column animation still running')
     return result
 
 
-def endpoint(sample, original, *, mode, previous=None):
-    actual = windows(sample, original)
+def endpoint(sample, original, *, mode, previous=None, edge=False):
+    actual = windows(sample, original, edge=edge)
     state = sample['inventory']['state']
     if state['session_mode'] != mode:
         raise NotReady('requested mode has not reached the actual consumer')
     if previous is not None:
         if sample['fixture']['sequence'] < previous['fixture']['sequence']:
             raise RuntimeError('fixture observation sequence regressed')
-        old = {role: w['id'] for role, w in windows(previous, original).items()}
+        old = {role: w['id'] for role, w in windows(previous, original, edge=edge).items()}
         if {role: w['id'] for role, w in actual.items()} != old:
             raise RuntimeError('native windows remapped during interaction')
         if state['rendered_frames'] <= previous['inventory']['state']['rendered_frames']:
             raise NotReady('no newer actual compositor render')
     return actual
+
+
+def await_stationary_edge(read, original, before, *, deadline):
+    """Observe genuine ongoing demand, then a settled terminal; sends NO input."""
+    import math
+    initial = windows(before, original, edge=True)
+    target = initial['delta']['rect']
+    if target[0] < 1280:
+        raise RuntimeError('stationary target was already visible before demand')
+    def number(value):
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise RuntimeError('genuine finite native viewport coordinate missing')
+        return value
+    start_offset = number(before['inventory']['state']['strip_offset'])
+    start_frame = before['inventory']['state']['rendered_frames']
+    original_ids = {role: item['id'] for role, item in initial.items()}
+    def counters(sample):
+        values = []
+        for role in EDGE_ROLES:
+            for field in ('move_requests', 'resize_requests', 'delivered_buttons', 'key_count'):
+                value = sample['fixture']['windows'][role].get(field)
+                if type(value) is not int or value < 0:
+                    raise RuntimeError('genuine GTK input counter missing')
+                values.append(value)
+        return tuple(values)
+    counters(before)
+    initial_moves = before['fixture']['windows']['alpha']['move_requests']
+    pointer = frozen_input = None
+    previous_offset = start_offset
+    previous_sequence = before['fixture']['sequence']
+    last_frame = last_live_frame = start_frame
+    observed_frames = set()
+    advances = 0
+    saw_live_advance = False
+    terminal_key = None
+    stable_terminal = 0
+    observations = []
+    while time.monotonic() < deadline:
+        sample = read(deadline)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('stationary read exceeded absolute deadline')
+        if len(observations) >= 128 or len(json.dumps(sample).encode()) > 65536:
+            raise RuntimeError('stationary evidence count/byte bound exceeded')
+        observations.append(sample)
+        try:
+            found = windows(sample, original, edge=True, live_edge=True)
+            state = sample['inventory']['state']
+            if state['session_mode'] != 'scroll':
+                raise RuntimeError('stationary consumer left actual strip mode')
+            if {role: item['id'] for role, item in found.items()} != original_ids:
+                raise RuntimeError('stationary native windows remapped')
+            sequence = sample['fixture']['sequence']
+            if sequence < previous_sequence or state['rendered_frames'] < last_frame:
+                raise RuntimeError('stationary observation sequence/frame regressed')
+            previous_sequence = sequence
+            current = counters(sample)
+            preview = state['tile_preview'] or {}
+            point = state.get('pointer_position')
+            if not isinstance(point, list) or len(point) != 2:
+                raise RuntimeError('actual native pointer observation missing')
+            actual_pointer = tuple(number(value) for value in point)
+            if pointer is None:
+                if (preview.get('window') != found['alpha']['id'] or not (1270 <= actual_pointer[0] < 1280 and 0 <= actual_pointer[1] < 800)
+                        or sample['fixture']['windows']['alpha']['move_requests'] <= initial_moves):
+                    raise NotReady('genuine delivered GTK edge gesture not yet admitted')
+                pointer, frozen_input = actual_pointer, current
+            elif actual_pointer != pointer or current != frozen_input:
+                raise RuntimeError('stationary phase received pointer or fixture input changes')
+            if preview.get('window') != found['alpha']['id']:
+                raise RuntimeError('stationary initiating drag owner disappeared')
+            offset = number(state['strip_offset'])
+            shown = number(state['strip_view'])
+            if offset < previous_offset or abs(shown - offset) > 1e-6:
+                raise RuntimeError('stationary direct viewport regressed or retained lag')
+            if offset > previous_offset:
+                advances += 1
+                saw_live_advance |= state['strip_animating']
+            previous_offset = offset
+            frame = state['rendered_frames']
+            if frame > last_frame:
+                observed_frames.add(frame)
+                last_frame = frame
+            if state['strip_animating']:
+                last_live_frame = frame
+            rect = found['delta']['rect']
+            terminal = (not state['strip_animating'] and offset > start_offset + 8
+                        and 0 <= rect[0] and rect[0] + rect[2] <= 1280
+                        and frame > last_live_frame and advances >= 2 and len(observed_frames) >= 3 and saw_live_advance)
+            key = (offset, tuple(rect), tuple(preview.get('rect', ())))
+            if terminal and frame in observed_frames:
+                stable_terminal = stable_terminal + 1 if key == terminal_key else 1
+                terminal_key = key
+            else:
+                stable_terminal, terminal_key = 0, None
+            if time.monotonic() >= deadline:
+                raise TimeoutError('stationary validation exceeded absolute deadline')
+            if stable_terminal >= 3:
+                return sample, observations
+        except NotReady:
+            stable_terminal, terminal_key = 0, None
+        time.sleep(min(.5, max(0, deadline - time.monotonic())))
+    raise TimeoutError('actual stationary edge never reached a settled terminal')
 
 
 def colored_frame(image, rect, color):
@@ -190,12 +301,14 @@ def await_endpoint(read, original, predicate, *, deadline, previous=None):
     raise TimeoutError('installed strip endpoint did not become ready before deadline')
 
 
-def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
+def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *, edge=False):
     """Run actual installed input. CI image admission is separate from signed release admission."""
     import hashlib
     import uuid
     from pathlib import Path
     import re
+    if type(edge) is not bool:
+        raise RuntimeError('genuine explicit installed edge flag missing')
     required = ('commit', 'image_id', 'base_image', 'package_sha256', 'member_sha256')
     if image.get('schema') != 1 or any(key not in image for key in required):
         raise RuntimeError('actual selected image/package identity receipt missing')
@@ -215,7 +328,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
     transport = QmpDeadline(qmp, deadline)
     receipt = {'schema': 1, 'nonce': nonce, 'image': image, 'completed': False,
                'cleanup_confirmed': False, 'installed_signed_release_qualified': False,
-               'native_window_kernel_pid_join_qualified': False, 'cases': []}
+               'native_window_kernel_pid_join_qualified': False, 'cases': [], 'stationary_edge_requested': edge}
     original = None
     started = False
     primary = None
@@ -234,7 +347,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
 
     def ready(mode, previous=None, extra=lambda _sample, _found: True):
         def predicate(sample, owner, old):
-            found = endpoint(sample, owner, mode=mode, previous=old)
+            found = endpoint(sample, owner, mode=mode, previous=old, edge=edge)
             if not extra(sample, found):
                 raise NotReady('specific actual input endpoint absent')
             return {role: {'id': item['id'], 'rect': item['rect']} for role, item in found.items()}
@@ -254,7 +367,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         transport.command('send-key', keys=[{'type': 'qcode', 'data': key} for key in keys], **{'hold-time': 80})
 
     def capture(label, sample, role='alpha'):
-        found = windows(sample, original)
+        found = windows(sample, original, edge=edge)
         png = destination / (label + '.png')
         ppm = destination / (label + '.ppm')
         if png.exists() or ppm.exists():
@@ -277,7 +390,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         after = read(deadline)
         if time.monotonic() >= deadline:
             raise TimeoutError('installed framebuffer validation exceeded absolute deadline')
-        if windows(after, original) != found:
+        if windows(after, original, edge=edge) != found:
             raise RuntimeError('actual window geometry changed across framebuffer acquisition')
         entry = {'label': label, 'sample': sample, 'after': after,
                  'png_sha256': hashlib.sha256(png.read_bytes()).hexdigest(),
@@ -292,13 +405,13 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         # Launch uncertainty exists before QGA send; a lost reply is never
         # represented as an absent fixture or successful cleanup.
         started = True
-        admitted = guest('strip-start', nonce)
+        admitted = guest('strip-edge-start' if edge else 'strip-start', nonce)
         original = admitted['owner']
         for name, identity in original['core'].items():
             if identity['exe_sha256'] != image['member_sha256'].get('/usr/bin/' + name):
                 raise RuntimeError('running native executable differs from selected installed image')
         first = ready('gnome')
-        found = windows(first, original)
+        found = windows(first, original, edge=edge)
         alpha = found['alpha']['rect']
         move(alpha[0] + 12, alpha[1] + 20)
         button(True)
@@ -313,7 +426,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
             raise RuntimeError('mode toggle changed actual window/workspace identities')
         capture('02-strip-enabled', strip)
         # Actual preset input must resize this same client's allocated/painted buffer.
-        before_width = windows(strip, original)['alpha']['rect'][2]
+        before_width = windows(strip, original, edge=edge)['alpha']['rect'][2]
         chord('meta_l', 'r')
         preset = ready('scroll', strip, extra=lambda sample, found: found['alpha']['rect'][2] != before_width)
         capture('03-preset-width', preset)
@@ -325,7 +438,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         owner = ready('scroll', neighbor, extra=lambda sample, found: sample['inventory']['state']['focused'] == found['alpha']['id'])
         # Real GTK bottom-right grip requests xdg resize. Keep target within
         # the viewport; choose a shrink if the current preset reaches the edge.
-        rect = windows(owner, original)['alpha']['rect']
+        rect = windows(owner, original, edge=edge)['alpha']['rect']
         x, y = rect[0] + rect[2] - 6, rect[1] + rect[3] - 6
         delta = 53 if x + 53 < 1270 else -53
         move(x, y)
@@ -340,7 +453,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         capture('05-pointer-width', resized)
         # Reorder via actual custom titlebar Gdk begin_move. Select the
         # current visible Beta center, using the real observed slot geometry.
-        current = windows(resized, original)
+        current = windows(resized, original, edge=edge)
         alpha, beta = current['alpha']['rect'], current['beta']['rect']
         origin_x, origin_y = alpha[0] + 24, alpha[1] + 20
         target_x = min(1260, beta[0] + beta[2] // 2 + 30)
@@ -358,7 +471,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         capture('06-pointer-reorder', reordered)
         # The actual libseat PauseSession callback must cancel, not commit,
         # a held titlebar move when switching VT and returning.
-        before_cancel = windows(reordered, original)
+        before_cancel = windows(reordered, original, edge=edge)
         rect = before_cancel['alpha']['rect']
         beta_rect = before_cancel['beta']['rect']
         # Grab near the visible right side, so an actual in-viewport motion
@@ -390,17 +503,43 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         if guest('vt', vt)['active_vt'] != f'tty{vt}':
             raise RuntimeError('actual VT did not return to original session')
         returned = ready('scroll', extra=lambda sample, found: sample['inventory']['state']['tile_preview'] is None)
-        if {role: item['rect'] for role, item in windows(returned, original).items()} != {role: item['rect'] for role, item in before_cancel.items()}:
+        if {role: item['rect'] for role, item in windows(returned, original, edge=edge).items()} != {role: item['rect'] for role, item in before_cancel.items()}:
             raise RuntimeError('VT cancellation committed a column move')
         button(False)
         capture('07-vt-cancel', returned)
+        if edge:
+            before_edge = returned
+            before_found = windows(before_edge, original, edge=True)
+            rect = before_found['alpha']['rect']
+            move(rect[0] + 24, rect[1] + 20)
+            button(True)
+            move(rect[0] + 36, rect[1] + 20)
+            # ONE movement into the band; the following observer has no input
+            # capability and cannot repeatedly drive the viewport itself.
+            move(1279, rect[1] + 20)
+            terminal, observations = await_stationary_edge(
+                read, original, before_edge, deadline=min(deadline, time.monotonic() + 60))
+            receipt['stationary_edge'] = {'observations': observations,
+                'stationary_input_verified': True, 'sampled_not_every_frame': True,
+                'presented_latency_qualified': False}
+            capture('08-stationary-delta-revealed', terminal, 'delta')
+            final = windows(terminal, original, edge=True)
+            bar = terminal['inventory']['state']['tile_preview']['rect']
+            delta_rect = final['delta']['rect']
+            if bar[0] != delta_rect[0] + delta_rect[2] + 16 - 4:
+                raise RuntimeError('actual stationary insertion is not after Delta')
+            button(False)
+            returned = ready('scroll', terminal, extra=lambda sample, found:
+                sample['inventory']['state']['tile_preview'] is None and
+                found['alpha']['rect'][0] > found['delta']['rect'][0])
+            capture('09-stationary-matching-release', returned)
         chord('meta_l', 'shift', 't')
         restored = ready('gnome', returned)
         if {w['id']: w['workspace'] for w in restored['inventory']['state']['windows']} != initial_ids:
             raise RuntimeError('mode restore changed actual native identities')
         if {w['id']: w['rect'] for w in restored['inventory']['state']['windows']} != initial_rects:
             raise RuntimeError('mode restore lost independent floating rectangles')
-        capture('08-floating-restored', restored)
+        capture('10-floating-restored' if edge else '08-floating-restored', restored)
         if time.monotonic() >= deadline:
             raise TimeoutError('installed strip completion exceeded absolute deadline')
         receipt['completed'] = True
@@ -431,5 +570,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
     if primary is not None:
         record('V-STRIP-INSTALLED', False, 'actual installed strip input/identity/pixels/cleanup failed; receipt retained')
         raise primary
-    record('V-STRIP-INSTALLED', True, 'eight actual installed strip frames, same native identities, mode restore and exact owned fixture cleanup')
+    record('V-STRIP-INSTALLED', True, f"{len(receipt['cases'])} actual installed strip frames, same native identities, mode restore and exact owned fixture cleanup")
+    if edge:
+        record('V-STRIP-EDGE-STATIONARY', True, 'one real edge motion, unchanged actual pointer/counters, live viewport/new frames, terminal Delta PNG/PPM and matching release')
     return receipt

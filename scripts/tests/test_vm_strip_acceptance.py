@@ -23,7 +23,7 @@ def sample():
                 'exe_inode': 3, 'exe_device': 4, 'exe_sha256': 'b' * 64, 'script_sha256': 'c' * 64}
     core = {'tuna-compositor': {'pid': 10, 'uid': 1000, 'start_ticks': 10},
             'tuna-shell-gtk': {'pid': 11, 'uid': 1000, 'start_ticks': 11}}
-    owner = {'nonce': nonce, 'boot_id': 'boot', 'client': identity, 'core': core, 'launch_state': 'known'}
+    owner = {'fixture_mode': 'baseline', 'nonce': nonce, 'boot_id': 'boot', 'client': identity, 'core': core, 'launch_state': 'known'}
     roles = {}
     windows = []
     for index, role in enumerate(proof.ROLES):
@@ -32,7 +32,7 @@ def sample():
                        'painted_width': 240, 'painted_height': 160, 'color': list(proof.COLORS[role])}
         windows.append({'id': index + 1, 'app_id': app, 'rect': [16 + index * 256, 48, 240, 160]})
     return {'owner': owner, 'fixture': {'nonce': nonce, 'identity': copy.deepcopy(identity), 'backend': 'wayland',
-                                      'schema': 1, 'windows': roles, 'sequence': 5},
+                                      'schema': 1, 'fixture_mode': 'baseline', 'windows': roles, 'sequence': 5},
             'inventory': {'processes': [{'executable': name, **value} for name, value in core.items()],
                           'state': {'locked': False, 'overview_open': False, 'session_mode': 'scroll',
                                     'rendered_frames': 20, 'strip_animating': False, 'windows': windows}}}

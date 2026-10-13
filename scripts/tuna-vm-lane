@@ -226,7 +226,7 @@ def usb_bus_from_qtree(qtree):
     raise RuntimeError("no USB bus in qtree output")
 
 
-def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None):
+def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None, strip_edge=False):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
     evidence = os.path.join(out, "lifecycle")
     os.makedirs(evidence, exist_ok=True)
@@ -810,7 +810,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         from vm_strip_acceptance import prove_installed_strip
         if reconnect is None:
             raise RuntimeError("installed acceptance needs independent cleanup transport")
-        prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm, record)
+        prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm, record, edge=strip_edge)
 
     # Capture the stable desktop after the final key OSD has disappeared.
     time.sleep(2)
@@ -1621,6 +1621,8 @@ def repeat_boots(args):
             command.append("--tour")
         if getattr(args, "strip_image", None) and index == args.boots:
             command.extend(["--strip-image", args.strip_image])
+            if getattr(args, "strip_edge", False):
+                command.append("--strip-edge")
         for value in args.meta:
             command.extend(["--meta", value])
         result = subprocess.run(command, check=False)
@@ -1675,12 +1677,15 @@ def main():
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--tour", action="store_true",
                     help="after the assertions, record the feature tour video")
+    ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
     ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
     ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--boots", type=int, default=1,
                     help="repeat pristine snapshot boots; tour only on the last boot")
     a = ap.parse_args()
     strip_image = None
+    if a.strip_edge and not a.strip_image:
+        ap.error("--strip-edge requires exact installed image admission")
     if a.strip_image:
         if not a.tour:
             ap.error("--strip-image requires --tour lifecycle")
@@ -1794,7 +1799,7 @@ def main():
                     agent = guest_agent.GuestAgent(agent_path)
                     try:
                         run_lifecycle(qmp, agent, out, serial_path, record, strip_image=strip_image,
-                                      reconnect=lambda: guest_agent.GuestAgent(agent_path))
+                                      reconnect=lambda: guest_agent.GuestAgent(agent_path), strip_edge=a.strip_edge)
                     finally:
                         agent.close()
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:

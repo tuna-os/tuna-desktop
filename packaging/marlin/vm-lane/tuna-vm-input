@@ -8,7 +8,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
-def strip_fixture(nonce):
+def strip_fixture(nonce, edge=False):
     """Actual GTK clients and input requests; no compositor geometry/state writes."""
     import hashlib
     import re
@@ -38,6 +38,9 @@ def strip_fixture(nonce):
     sequence = 0
     colors = {"alpha": (44, 102, 164), "beta": (171, 65, 81), "gamma": (65, 145, 89)}
 
+    if edge:
+        colors["delta"] = (147, 96, 179)
+
     def publish():
         nonlocal sequence
         sequence += 1
@@ -45,7 +48,7 @@ def strip_fixture(nonce):
                  "monotonic_ns": time.monotonic_ns(),
                  "boottime_ns": time.clock_gettime_ns(time.CLOCK_BOOTTIME),
                  "gtk_version": [Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()],
-                 "backend": "wayland", "windows": records}
+                 "backend": "wayland", "fixture_mode": "edge" if edge else "baseline", "windows": records}
         temporary = target.with_suffix(".tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as stream:
@@ -150,9 +153,9 @@ def strip_fixture(nonce):
 
 import sys
 if len(sys.argv) > 1:
-    if len(sys.argv) != 3 or sys.argv[1] != "--strip-fixture":
+    if len(sys.argv) != 3 or sys.argv[1] not in ("--strip-fixture", "--strip-edge-fixture"):
         raise SystemExit("unsupported input fixture mode")
-    strip_fixture(sys.argv[2])
+    strip_fixture(sys.argv[2], edge=sys.argv[1] == "--strip-edge-fixture")
     raise SystemExit(0)
 
 

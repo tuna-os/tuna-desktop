@@ -43,6 +43,7 @@ jobs:
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
       - run: python3 scripts/tests/test_vm_strip_image.py
+      - run: python3 scripts/tests/test_vm_strip_stationary_edge.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
       - run: python3 scripts/lib/ledger-tests.py
@@ -861,7 +862,7 @@ jobs:
       - name: Boot the disk, assert the Tuna Desktop hardware session, record the tour
         run: >-
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour
-          --strip-image vm-lane-artifacts/strip-image.json
+          --strip-image vm-lane-artifacts/strip-image.json --strip-edge
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
