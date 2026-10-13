@@ -1,15 +1,14 @@
 # Private PAM helper foundation
 
-This helper is an authentication-only foundation for issue #366. It is not
-connected to `PamClient`, live unlock, GTK, fingerprint verification or greetd.
-The existing password path and shell control protocol remain unchanged.
+This authentication-only source increment for issue #366 connects `PamClient`
+and Runtime password checks to a private helper. GTK, fingerprint and the shell
+control protocol are unchanged. Actual CI execution of this increment is pending.
 
 The generic `Supervisor::spawn(executable, ...)` is a trusted caller/test seam;
 private IPC cannot authenticate an arbitrary executable. The CI fixture admits
-its Cargo compositor inode and byte hash. Future live adoption must enforce
-re-execution of the held compositor image (for example `/proc/self/exe`), never
-accept an executable path from UI, environment or configuration. No live
-constructor/adoption is introduced by this foundation.
+its Cargo compositor inode and byte hash. The live factory re-executes the held
+current compositor image through a private file descriptor. It never accepts an
+executable path from UI, environment or configuration.
 
 The fixed internal compositor entry point runs before desktop or legacy-directory
 initialization. A supervisor owns its child, private pipes, absolute IPC budget,
