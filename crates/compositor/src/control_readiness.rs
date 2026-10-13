@@ -1,5 +1,6 @@
 //! Wake plumbing only: control parsing and policy remain in ControlHub::poll.
-//! The retained 16 ms tick still handles buffered frames and handshake phases.
+//! Kernel readiness remains active until its bytes are consumed. Buffered
+//! complete frames and handshake phases use bounded runtime continuations.
 use rustix::event::epoll;
 use std::os::fd::{AsFd, OwnedFd};
 
@@ -17,10 +18,26 @@ impl ControlReadiness {
             &self.0,
             socket,
             epoll::EventData::new_u64(0),
-            epoll::EventFlags::IN | epoll::EventFlags::ET,
+            // ControlConn returns one complete frame per bounded hub poll. A
+            // partial next frame can remain in userspace while the kernel still
+            // has bytes; retain readiness without requiring a new write/edge.
+            epoll::EventFlags::IN,
         )?;
         Ok(())
     }
+    /// Recreate the previous inner-edge flags solely for the kernel regression.
+    #[cfg(test)]
+    pub(crate) fn old_edge_fixture(socket: impl AsFd) -> std::io::Result<Self> {
+        let this = Self::new(&socket)?;
+        epoll::modify(
+            &this.0,
+            socket,
+            epoll::EventData::new_u64(0),
+            epoll::EventFlags::IN | epoll::EventFlags::ET,
+        )?;
+        Ok(this)
+    }
+
     pub fn source(&self) -> std::io::Result<calloop::generic::Generic<OwnedFd>> {
         Ok(calloop::generic::Generic::new(
             self.0.as_fd().try_clone_to_owned()?,

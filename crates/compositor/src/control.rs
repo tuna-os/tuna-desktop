@@ -1736,6 +1736,128 @@ mod readiness_tests {
         );
     }
     #[test]
+    fn partial_buffer_and_unread_kernel_bytes_rewake_without_a_new_write() {
+        use std::os::fd::AsRawFd;
+
+        for old_edge in [true, false] {
+            let (receiver, mut sender) = UnixStream::pair().unwrap();
+            let mut conn = ControlConn::new(receiver).unwrap();
+            let readiness = if old_edge {
+                crate::control_readiness::ControlReadiness::old_edge_fixture(&conn.stream)
+            } else {
+                crate::control_readiness::ControlReadiness::new(&conn.stream)
+            }
+            .unwrap();
+            let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+            event_loop
+                .handle()
+                .insert_source(readiness.source().unwrap(), |_, fd, wakes| {
+                    crate::control_readiness::drain(fd).unwrap();
+                    *wakes += 1;
+                    Ok(calloop::PostAction::Continue)
+                })
+                .unwrap();
+            let first = Message::Command {
+                id: 1,
+                kind: CommandKind::SetIdleTimeout { ms: 10 },
+            };
+            // A valid maximum-count session command with multi-byte postcard
+            // integers spans the actual 8192-byte ControlConn read boundary.
+            let second = Message::Command {
+                id: 2,
+                kind: CommandKind::SetAccelerators {
+                    accelerators: vec![
+                        tuna_shell_control::Accelerator {
+                            action: u32::MAX,
+                            keysym: u32::MAX,
+                            mods: u32::MAX,
+                            modes: u32::MAX,
+                        };
+                        tuna_shell_control::MAX_ACCELERATORS
+                    ],
+                },
+            };
+            let first_frame = encode_frame(&first);
+            let second_frame = encode_frame(&second);
+            assert!(second_frame.len() > 8192 && second_frame.len() < MAX_FRAME_BYTES);
+            assert_eq!(decode_frame(&second_frame).unwrap(), second);
+            let bytes = [first_frame.as_slice(), second_frame.as_slice()].concat();
+            assert_eq!(
+                sender.write(&bytes).unwrap(),
+                bytes.len(),
+                "one bounded socket write"
+            );
+            let mut wakes = 0;
+            event_loop
+                .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+                .unwrap();
+            assert_eq!(wakes, 1);
+            assert_eq!(conn.read_frame().unwrap(), first);
+            assert_eq!(conn.rbuf.len(), 8192 - first_frame.len());
+            assert!(
+                !conn.buffered_work(),
+                "partial userspace frame does not request continuation"
+            );
+            let mut unread: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(conn.stream.as_raw_fd(), libc::FIONREAD, &mut unread) },
+                0
+            );
+            assert!(
+                unread > 0,
+                "remaining bytes are already in the kernel, no future write needed"
+            );
+
+            // No sender write, external input, animation or runtime timer here.
+            event_loop
+                .dispatch(Some(Duration::ZERO), &mut wakes)
+                .unwrap();
+            assert_eq!(
+                wakes,
+                if old_edge { 1 } else { 2 },
+                "old inner edge loses the wake; fixed inner level preserves it"
+            );
+            let before_close = wakes;
+            assert_eq!(
+                conn.read_frame().unwrap(),
+                second,
+                "frame bytes and decode unchanged"
+            );
+            assert!(matches!(conn.read_frame(), Err(ControlError::WouldBlock)));
+            event_loop
+                .dispatch(Some(Duration::ZERO), &mut wakes)
+                .unwrap();
+            assert_eq!(
+                wakes, before_close,
+                "fully drained idle socket must not spin"
+            );
+
+            drop(sender);
+            event_loop
+                .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+                .unwrap();
+            assert_eq!(
+                wakes,
+                before_close + 1,
+                "peer closure must wake the registered receiver"
+            );
+            assert!(matches!(
+                conn.read_frame(),
+                Err(ControlError::Unexpected(_))
+            ));
+            drop(conn);
+            event_loop
+                .dispatch(Some(Duration::ZERO), &mut wakes)
+                .unwrap();
+            assert_eq!(
+                wakes,
+                before_close + 1,
+                "closed original socket must retire interest without a duplicate"
+            );
+        }
+    }
+
+    #[test]
     fn hub_listener_hello_commands_and_peer_eviction_use_real_readiness() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
