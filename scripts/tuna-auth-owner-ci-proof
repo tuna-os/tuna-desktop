@@ -75,7 +75,7 @@ for key in ['late_epoch_success_denied','busy_public_sync_denied','fresh_origin_
 probe_lines=[l.removeprefix('auth owner probe sha256: ') for l in (out/'test-epoch.log').read_text().splitlines() if l.startswith('auth owner probe sha256: ')]
 assert len(probe_lines)==1 and probe_lines[0]==r['executables'][r['probe']],'actual Runtime probe mismatched'
 pam_receipt=json.loads((out/'runtime-pam/success.json').read_text())
-for key in ['late_closed_origin_success_denied','fresh_origin_success','held_self_path_replaced']:assert pam_receipt[key] is True
+for key in ['closed_origin_canceled_retired','origin_loss_wakes_private_pam_without_fixture_release','fresh_origin_success','held_self_path_replaced']:assert pam_receipt[key] is True
 assert pam_receipt['compositor_sha256']==r['executables'][r['compositor']],'actual PAM main image differs'
 pam_lines=[l.removeprefix('auth owner pam sha256: ') for l in (out/'test-pam.log').read_text().splitlines() if l.startswith('auth owner pam sha256: ')]
 assert len(pam_lines)==1 and pam_lines[0]==r['executables'][r['compositor']],'PAM source admission differs'

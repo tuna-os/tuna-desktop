@@ -589,7 +589,7 @@ enum UnlockEvent {
 struct UnlockWorker {
     attempt: crate::auth_owner::Attempt,
     worker: std::thread::JoinHandle<crate::pam_backend::Verification>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancel: crate::pam_cancel::Cancellation,
     phase: Arc<std::sync::atomic::AtomicU8>,
     denied: bool,
 }
@@ -746,9 +746,7 @@ pub fn control_socket_path(socket_name: &str) -> Option<std::path::PathBuf> {
 impl Drop for Runtime {
     fn drop(&mut self) {
         if let Some(worker) = &self.unlock_worker {
-            worker
-                .cancel
-                .store(true, std::sync::atomic::Ordering::Release);
+            worker.cancel.cancel();
         }
         // Shutdown requests cancellation; it never certifies retirement.
         crate::pam_backend::Backend::shutdown_live();
@@ -1089,7 +1087,9 @@ impl Runtime {
                 if let calloop::channel::Event::Msg((attempt, event)) = event {
                     match event {
                         UnlockEvent::Pending => rt.deny_pending_unlock(attempt),
-                        UnlockEvent::Finished(ok) => rt.finish_unlock(attempt, ok),
+                        // Grant only after tick consumes control EOF/gate changes.
+                        UnlockEvent::Finished(false) => rt.deny_pending_unlock(attempt),
+                        UnlockEvent::Finished(true) => {}
                     }
                 }
             })
@@ -1395,7 +1395,7 @@ impl Runtime {
                 && ok
                 && self.apply_verified_unlock(attempt.epoch);
         }
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = crate::pam_cancel::Cancellation::default();
         let ticket = crate::pam_backend::Backend::live()
             .ok_or(Verification::RejectedBeforeSpawn)
             .and_then(|backend| {
@@ -1439,7 +1439,7 @@ impl Runtime {
     fn start_unlock_worker(
         &mut self,
         attempt: crate::auth_owner::Attempt,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancel: crate::pam_cancel::Cancellation,
         denied: bool,
         verify: impl FnOnce(Box<dyn FnMut() + Send>) -> crate::pam_backend::Verification
             + Send
@@ -1474,7 +1474,7 @@ impl Runtime {
                 })
             }
             Err(_) => {
-                cancel.store(true, std::sync::atomic::Ordering::Release);
+                cancel.cancel();
                 // A public pending ticket may already own a helper: no fabricated reap.
                 if denied {
                     self.unlock_quarantined = Some(attempt);
@@ -1499,12 +1499,33 @@ impl Runtime {
         else {
             return;
         };
+        worker.cancel.cancel();
         if worker.denied {
             return;
         }
         worker.denied = true;
         if let Some(origin) = attempt.origin {
             self.control.finish_unlock(origin, false);
+        }
+    }
+
+    fn cancel_invalid_unlock(&mut self) {
+        let Some(worker) = self.unlock_worker.as_ref() else {
+            return;
+        };
+        let attempt = worker.attempt;
+        if !self.unlock_slot.matches(attempt) {
+            return;
+        }
+        let epoch = self
+            .unlock_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let origin_lost = attempt
+            .origin
+            .is_some_and(|origin| !self.control.origin_pending_live(origin));
+        if epoch != attempt.epoch || origin_lost || !self.is_locked() {
+            // Retain this exact worker and slot until actual helper retirement.
+            self.deny_pending_unlock(attempt);
         }
     }
 
@@ -1532,6 +1553,7 @@ impl Runtime {
         if worker.attempt != attempt || !worker.worker.is_finished() {
             return;
         }
+        self.cancel_invalid_unlock();
         let worker = self.unlock_worker.take().expect("matched owned worker");
         let denied = worker.denied;
         let joined = worker.worker.join();
@@ -3887,13 +3909,6 @@ impl Runtime {
     }
 
     fn tick(&mut self) -> Result<bool, RuntimeError> {
-        let completed = self
-            .unlock_worker
-            .as_ref()
-            .and_then(|worker| worker.worker.is_finished().then_some(worker.attempt));
-        if let Some(attempt) = completed {
-            self.finish_unlock(attempt, true);
-        }
         if let Some(signal) = self.idle_blank_signal.as_mut() {
             self.blank = crate::lock::IdleBlank::parse(signal.text());
         }
@@ -4088,7 +4103,7 @@ impl Runtime {
                 .then(|| self.unlock_slot.begin(Some(origin), epoch))
                 .flatten();
             if let Some(attempt) = attempt {
-                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let cancel = crate::pam_cancel::Cancellation::default();
                 let backend_cancel = cancel.clone();
                 self.start_unlock_worker(attempt, cancel, false, move |pending| {
                     match crate::unlock::session_user() {
@@ -4165,6 +4180,17 @@ impl Runtime {
             Some(pid) => PeerGate::Pid(pid),
             None => PeerGate::Closed,
         });
+        // Control EOF, manual/protocol/idle gates and shell PID gating are now current.
+        // Never grant from a channel callback before those changes are observed.
+        self.cancel_invalid_unlock();
+        let completed = self
+            .unlock_worker
+            .as_ref()
+            .and_then(|worker| worker.worker.is_finished().then_some(worker.attempt));
+        if let Some(attempt) = completed {
+            self.finish_unlock(attempt, true);
+        }
+
         for event in self.shell.drain_events() {
             eprintln!("tuna-compositor: shell supervision: {event:?}");
         }

@@ -161,7 +161,7 @@ pub fn verify(user: &str, password: &str) -> bool {
 pub fn verify_owned(
     user: &str,
     password: tuna_shell_control::Secret,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: crate::pam_cancel::Cancellation,
     pending: impl FnMut(),
 ) -> crate::pam_backend::Verification {
     verify_owned_credential(
@@ -175,7 +175,7 @@ pub fn verify_owned(
 pub(crate) fn verify_owned_credential(
     user: &str,
     password: crate::pam_backend::Credential,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: crate::pam_cancel::Cancellation,
     pending: impl FnMut(),
 ) -> crate::pam_backend::Verification {
     use crate::pam_backend::Verification;

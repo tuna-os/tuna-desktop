@@ -16,8 +16,6 @@
 //! deadline denies without releasing a still-live or quarantined helper.
 
 use std::ffi::{c_char, c_int, c_void, CString};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::time::Duration;
 
 use greetd_ipc::{codec::Error as CodecError, AuthMessageType, ErrorType, Response};
@@ -197,7 +195,7 @@ pub fn authenticate_with_deadline(service: &str, user: &str, password: &str) -> 
         service.to_owned(),
         user.to_owned(),
         tuna_shell_control::Secret(password.to_owned()),
-        Arc::new(AtomicBool::new(false)),
+        crate::pam_cancel::Cancellation::default(),
     ) else {
         return false;
     };
@@ -258,7 +256,7 @@ impl crate::unlock::UnlockClient for PamClient {
         };
         let accepted = self.backend.as_ref().and_then(|backend| {
             backend.begin_credential(self.service.clone(), user.to_owned(), password,
-                Arc::new(AtomicBool::new(false))).ok()
+                crate::pam_cancel::Cancellation::default()).ok()
         }).is_some_and(|mut ticket| {
             matches!(ticket.initial(), crate::pam_backend::Initial::Finished(result) if result.authenticated())
         });

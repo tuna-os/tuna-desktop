@@ -1,4 +1,5 @@
 //! Stable creator ownership for live private PAM helpers; deadlines never retire.
+use crate::pam_cancel::{Cancellation, WakeFd};
 use crate::pam_helper::{
     Answer, AnswerText, Event, Identity, Retirement, SelfImage, Style, Supervisor,
 };
@@ -15,8 +16,11 @@ const POISONED: u8 = 2;
 const TEXT_LIMIT: usize = 4096;
 static LIVE: OnceLock<Option<Backend>> = OnceLock::new();
 
-type Factory =
-    Arc<dyn Fn(Identity, String, String, Duration) -> io::Result<Supervisor> + Send + Sync>;
+type Factory = Arc<
+    dyn Fn(Identity, String, String, Duration, Cancellation) -> io::Result<Supervisor>
+        + Send
+        + Sync,
+>;
 
 /// Only Retired or a proven rejection before submitting this attempt can free it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +97,7 @@ struct Job {
     service: String,
     user: String,
     password: Credential,
-    cancel: Arc<AtomicBool>,
+    cancel: Cancellation,
     reply: mpsc::Sender<Reply>,
 }
 enum Command {
@@ -106,12 +110,13 @@ pub struct Backend {
     state: Arc<AtomicU8>,
     serial: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+    wake: Arc<WakeFd>,
     owner: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 pub struct Ticket {
     pub serial: u64,
     reply: mpsc::Receiver<Reply>,
-    cancel: Arc<AtomicBool>,
+    cancel: Cancellation,
     deadline: Instant,
     denied: bool,
 }
@@ -124,14 +129,14 @@ impl Ticket {
     pub fn initial(&mut self) -> Initial {
         let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
             self.denied = true;
-            self.cancel.store(true, Ordering::Release);
+            self.cancel.cancel();
             return Initial::Pending;
         };
         match self.reply.recv_timeout(remaining) {
             Ok(Reply::Retired(authenticated)) => self.retired_at(authenticated, Instant::now()),
             Ok(Reply::Pending) | Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.denied = true;
-                self.cancel.store(true, Ordering::Release);
+                self.cancel.cancel();
                 Initial::Pending
             }
             Ok(Reply::Poisoned) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -144,7 +149,7 @@ impl Ticket {
     fn retired_at(&mut self, authenticated: bool, observed: Instant) -> Initial {
         self.denied |= observed >= self.deadline;
         if self.denied {
-            self.cancel.store(true, Ordering::Release);
+            self.cancel.cancel();
         }
         Initial::Finished(Verification::Retired {
             authenticated: authenticated && !self.denied,
@@ -174,7 +179,7 @@ impl Ticket {
 }
 impl Drop for Ticket {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancel.cancel();
     }
 }
 struct OwnerGuard(Arc<AtomicU8>);
@@ -193,8 +198,8 @@ impl Backend {
     pub fn live() -> Option<Self> {
         LIVE.get_or_init(|| {
             let image = SelfImage::capture().ok()?;
-            Self::from_factory(Arc::new(move |identity, service, user, budget| {
-                image.spawn(identity, service, user, budget)
+            Self::from_factory(Arc::new(move |identity, service, user, budget, cancel| {
+                image.spawn_cancellable(identity, service, user, budget, cancel)
             }))
             .ok()
         })
@@ -204,7 +209,7 @@ impl Backend {
     /// The factory runs on this stable creator; callers must admit its binary.
     #[doc(hidden)]
     pub fn with_trusted_factory(
-        factory: impl Fn(Identity, String, String, Duration) -> io::Result<Supervisor>
+        factory: impl Fn(Identity, String, String, Duration, Cancellation) -> io::Result<Supervisor>
             + Send
             + Sync
             + 'static,
@@ -215,6 +220,7 @@ impl Backend {
         let (sender, receiver) = mpsc::sync_channel(1);
         let state = Arc::new(AtomicU8::new(FREE));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let wake = WakeFd::new(shutdown.clone())?;
         let owner_state = state.clone();
         let owner_shutdown = shutdown.clone();
         let owner = std::thread::Builder::new()
@@ -239,6 +245,7 @@ impl Backend {
             sender,
             state,
             shutdown,
+            wake,
             serial: Arc::new(AtomicU64::new(0)),
             owner: Arc::new(Mutex::new(Some(owner))),
         })
@@ -248,7 +255,7 @@ impl Backend {
         service: String,
         user: String,
         password: Secret,
-        cancel: Arc<AtomicBool>,
+        cancel: Cancellation,
     ) -> Result<Ticket, Verification> {
         self.begin_credential(service, user, Credential::from_schema(password), cancel)
     }
@@ -257,7 +264,7 @@ impl Backend {
         service: String,
         user: String,
         password: Credential,
-        cancel: Arc<AtomicBool>,
+        cancel: Cancellation,
     ) -> Result<Ticket, Verification> {
         if service.is_empty()
             || service.len() > 128
@@ -282,6 +289,11 @@ impl Backend {
             return Err(Verification::RejectedBeforeSpawn);
         }
         let serial = self.serial.load(Ordering::Acquire);
+        if cancel.bind(self.wake.clone()).is_err() {
+            // This exact latch was already bound: reject before submission/spawn.
+            self.state.store(FREE, Ordering::Release);
+            return Err(Verification::RejectedBeforeSpawn);
+        }
         let (reply, receive) = mpsc::channel();
         let job = Job {
             serial,
@@ -305,6 +317,7 @@ impl Backend {
     }
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        let _ = self.wake.signal();
         let _ = self.sender.try_send(Command::Shutdown);
     }
     /// An already-finished owner may be joined for cleanup. This does not promise
@@ -331,6 +344,7 @@ fn run_job(job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8)
         job.service,
         job.user.clone(),
         crate::pam::DEADLINE,
+        job.cancel.clone(),
     ) {
         Ok(supervisor) => supervisor,
         Err(_) => {
@@ -345,7 +359,7 @@ fn run_job(job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8)
     let mut visible_used = false;
     let mut rounds = 0;
     loop {
-        if job.cancel.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
+        if job.cancel.is_canceled() || shutdown.load(Ordering::Acquire) {
             break;
         }
         match supervisor.next_event() {
@@ -353,9 +367,8 @@ fn run_job(job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8)
                 if supervisor.retirement() != Retirement::Retired {
                     break;
                 }
-                let accepted = authenticated
-                    && !job.cancel.load(Ordering::Acquire)
-                    && !shutdown.load(Ordering::Acquire);
+                let accepted =
+                    authenticated && !job.cancel.is_canceled() && !shutdown.load(Ordering::Acquire);
                 drop(secret);
                 // Release only after actual Retired, before telling the caller.
                 state.store(FREE, Ordering::Release);
@@ -461,14 +474,14 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         let counter = Arc::new(AtomicUsize::new(0));
         let backend =
-            Backend::with_trusted_factory(|_, _, _, _| panic!("denials must not dispatch"))
+            Backend::with_trusted_factory(|_, _, _, _, _| panic!("denials must not dispatch"))
                 .unwrap();
         assert!(backend
             .begin_credential(
                 "bad/service".into(),
                 "owner".into(),
                 observed_credential(&counter),
-                Arc::new(AtomicBool::new(false))
+                Cancellation::default()
             )
             .is_err());
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -478,7 +491,7 @@ mod tests {
                 "tuna-lock".into(),
                 "owner".into(),
                 observed_credential(&counter),
-                Arc::new(AtomicBool::new(false))
+                Cancellation::default()
             )
             .is_err());
         assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -491,6 +504,7 @@ mod tests {
             state: Arc::new(AtomicU8::new(FREE)),
             serial: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            wake: WakeFd::new(Arc::new(AtomicBool::new(false))).unwrap(),
             owner: Arc::new(Mutex::new(None)),
         };
         assert!(backend
@@ -498,7 +512,7 @@ mod tests {
                 "tuna-lock".into(),
                 "owner".into(),
                 observed_credential(&counter),
-                Arc::new(AtomicBool::new(false))
+                Cancellation::default()
             )
             .is_err());
         assert_eq!(counter.load(Ordering::SeqCst), 3);
@@ -513,7 +527,7 @@ mod tests {
             service: "tuna-lock".into(),
             user: "owner".into(),
             password: observed_credential(&counter),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Cancellation::default(),
             reply,
         };
         let (send, receive) = mpsc::sync_channel(1);
@@ -550,7 +564,7 @@ mod tests {
         Ticket {
             serial: 1,
             reply,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Cancellation::default(),
             deadline: Instant::now() + Duration::from_secs(1),
             denied: false,
         }
@@ -576,7 +590,7 @@ mod tests {
         let mut ticket = ticket(receive);
         ticket.deadline = Instant::now() - Duration::from_millis(1);
         assert!(matches!(ticket.initial(), Initial::Pending));
-        assert!(ticket.denied && ticket.cancel.load(Ordering::Acquire));
+        assert!(ticket.denied && ticket.cancel.is_canceled());
         assert_eq!(
             ticket.wait_retired(|| panic!("already latched denial")),
             Verification::Retired {
@@ -637,13 +651,14 @@ mod tests {
     #[test]
     fn owner_factory_failure_poison_refuses_a_second_credential() {
         let backend =
-            Backend::with_trusted_factory(|_, _, _, _| Err(io::ErrorKind::Other.into())).unwrap();
+            Backend::with_trusted_factory(|_, _, _, _, _| Err(io::ErrorKind::Other.into()))
+                .unwrap();
         let attempt = backend
             .begin(
                 "tuna-lock".into(),
                 "own-user".into(),
                 Secret("first".into()),
-                Arc::new(AtomicBool::new(false)),
+                Cancellation::default(),
             )
             .unwrap();
         assert_eq!(
@@ -655,7 +670,7 @@ mod tests {
                 "tuna-lock".into(),
                 "own-user".into(),
                 Secret("second".into()),
-                Arc::new(AtomicBool::new(false))
+                Cancellation::default()
             ),
             Err(Verification::RejectedBeforeSpawn)
         ));
@@ -663,7 +678,7 @@ mod tests {
     }
     #[test]
     fn exhausted_serial_poison_never_runs_a_factory() {
-        let backend = Backend::with_trusted_factory(|_, _, _, _| {
+        let backend = Backend::with_trusted_factory(|_, _, _, _, _| {
             panic!("overflow must not dispatch a credential")
         })
         .unwrap();
@@ -673,7 +688,7 @@ mod tests {
                 "tuna-lock".into(),
                 "own-user".into(),
                 Secret("first".into()),
-                Arc::new(AtomicBool::new(false))
+                Cancellation::default()
             ),
             Err(Verification::RejectedBeforeSpawn)
         ));
