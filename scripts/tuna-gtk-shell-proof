@@ -4833,6 +4833,19 @@ if command -v ibus-daemon >/dev/null 2>&1 &&
         fail G-IME-CANDIDATES "the candidate window stayed after the commit"
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT - 40))
     pass G-IME-CANDIDATES "the shell draws IBus's candidates (你 尼 泥) under the cursor, the first highlighted (surface $surface), and clicking 尼 commits it"
+    # The active engine's real properties travel through ibus-daemon, not a
+    # synthetic GTK model. This helper binds the exact live shell PID and uses
+    # its private accessibility bus. External timeout also bounds blocked AT-SPI.
+    property_shell_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" ||
+        fail G-IME-PROPERTIES "shell owner absent"
+    case "$property_shell_pid" in *[!0-9]*|"") fail G-IME-PROPERTIES "shell owner not unique";; esac
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+        TUNA_PROOF_SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD)" timeout --kill-after=2s 40s "$PY" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" \
+        "$property_shell_pid" "$ENGINE_LOG" "$ARTIFACTS/ibus-properties-receipt.json" \
+        "$privacy_expected_shell" "${IME_PIDS%% *}" \
+        >"$ARTIFACTS/ibus-properties-proof.log" 2>&1 || fail G-IME-PROPERTIES "live properties proof failed"
+    scrot "$ARTIFACTS/24p-ime-properties.png" >/dev/null
+    pass G-IME-PROPERTIES "real daemon toggle/radio/submenu/action traffic; hidden/disabled and forged-peer denials"
     # XIM talks to the session's XWayland, never the outer Xvfb display.
     x11_display="$(jq -r .x11_display "$CSTATE")"
     [ "$x11_display" != null ] || fail G-IME-XIM "XWayland display missing"
