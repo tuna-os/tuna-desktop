@@ -1183,6 +1183,13 @@ pub fn is_private_dir(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Bound on concurrent background lockdown readers (#357 fd3): one slow
+/// backend may overlap one fresh poll, but a hung backend never stacks a
+/// thread per tick. Production ticks 2 s apart with a 500 ms reader bound,
+/// so steady state holds one; the headroom keeps a slow poll from
+/// suppressing its successor.
+const LOCKDOWN_MAX_READERS: usize = 2;
+
 /// Live control-plane driver: accepts shell connections, handshakes them
 /// into [`Session`]s against one [`TokenStore`], emits deltas, and applies
 /// commands — one nonblocking round per [`poll`](Self::poll), so slow or
@@ -1221,10 +1228,17 @@ pub struct ControlHub {
     /// is live here; the shell owns the rest of the surface.
     lockdown: LockdownPolicy,
     /// Background policy reads (#357 follow-up): each refresh spawns
-    /// one reader thread reporting here; the tick drains completed
-    /// results without waiting, so a hung backend never stalls it.
+    /// one reader thread reporting here (up to
+    /// [`LOCKDOWN_MAX_READERS`] concurrent); the tick drains
+    /// completed results without waiting, so a hung backend never
+    /// stalls it.
     lockdown_tx: std::sync::mpsc::Sender<Option<bool>>,
     lockdown_rx: std::sync::mpsc::Receiver<Option<bool>>,
+    /// Readers currently running (#357 fd3): refreshes while this many
+    /// run skip spawning (single-flight bound), so a hung backend
+    /// cannot stack a thread per tick; the drain still applies every
+    /// landed result with last-valid-wins.
+    lockdown_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Alt-Tab drive events awaiting broadcast. Unlike the overview
     /// intent (level), steps are discrete events: each one is sent to
     /// every live session exactly once, retained until all sends land.
@@ -1301,6 +1315,7 @@ impl ControlHub {
             }
         });
         let (lockdown_tx, lockdown_rx) = std::sync::mpsc::channel();
+        let lockdown_inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Ok(Self {
             listener,
             readiness,
@@ -1314,6 +1329,7 @@ impl ControlHub {
             lockdown,
             lockdown_tx,
             lockdown_rx,
+            lockdown_inflight,
             switcher_queue: Vec::new(),
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
@@ -1463,11 +1479,11 @@ impl ControlHub {
     }
 
     /// Poll the live `disable-lock-screen` key without blocking: drain
-    /// completed background reads (latest wins; unreadable keeps the
-    /// cached value, never resets) and spawn the next reader. The
-    /// runtime calls this on a slow tick; a hung backend never stalls
-    /// it, and the shell enforces its own surface immediately, so this
-    /// backstop's lag fails safe.
+    /// completed background reads (last valid wins; unreadable keeps the
+    /// cached value, never resets) and spawn the next reader unless
+    /// enough already run. The runtime calls this on a slow tick; a hung
+    /// backend never stalls it, and the shell enforces its own surface
+    /// immediately, so this backstop's lag fails safe.
     pub fn refresh_lockdown(&mut self) {
         self.refresh_lockdown_with(crate::lockdown::read_lock_screen_key);
     }
@@ -1479,16 +1495,34 @@ impl ControlHub {
         &mut self,
         reader: impl FnOnce() -> Option<bool> + Send + 'static,
     ) {
-        if let Some(Some(value)) = self.lockdown_rx.try_iter().last() {
+        // Last-valid-wins: overlapping readers land delayed results as one
+        // batch, and a trailing unreadable result must not wipe the live
+        // restriction (or restoration) the batch's valid result carries.
+        if let Some(value) = self.lockdown_rx.try_iter().flatten().last() {
             self.lockdown
                 .refresh(&|key| (key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN).then_some(value));
             for session in &mut self.sessions {
                 session.set_lockdown_policy(self.lockdown);
             }
         }
+        // Single-flight bound: skip spawning while enough readers run, so
+        // a hung backend cannot stack a thread per tick. The drain above
+        // still runs, so landed results always apply.
+        if self
+            .lockdown_inflight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            >= LOCKDOWN_MAX_READERS
+        {
+            self.lockdown_inflight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         let tx = self.lockdown_tx.clone();
+        let inflight = self.lockdown_inflight.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(reader());
+            let result = reader();
+            let _ = tx.send(result);
+            inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         });
     }
 
