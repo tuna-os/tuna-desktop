@@ -264,8 +264,8 @@ pub struct Widgets {
     /// The mobile-broadband tile and its modem menu.
     pub wwan: Tile,
     pub wwan_menu: Rc<crate::wwan::WwanMenu>,
-    /// The location agent: the master-switch tile, the GeoClue2 agent
-    /// and the panel's in-use indicator.
+    /// The location agent: the GeoClue2 agent behind the panel's
+    /// in-use indicator (the switch lives in Settings).
     pub location_agent: Rc<crate::location::LocationAgent>,
     pub power_mode: Tile,
     /// The Power Mode menu: its header icon and one item per profile
