@@ -75,6 +75,7 @@ const EXPECTED: &[(&str, u32)] = &[
     ("zwp_pointer_gestures_v1", 3),
     ("zwp_primary_selection_device_manager_v1", 1),
     ("zwp_relative_pointer_manager_v1", 1),
+    ("zwp_tablet_manager_v2", 1),
     ("zwp_text_input_manager_v3", 1),
     ("zxdg_exporter_v2", 1),
     ("zxdg_importer_v2", 1),
