@@ -89,6 +89,19 @@ impl Refresh {
     }
 }
 
+/// Shared async-reply admission: stale callbacks cannot touch a newer refresh;
+/// an expired current callback MUST run failure cleanup instead of staying busy.
+fn admit_refresh_reply(current: bool, refresh: &Refresh, fail: impl FnOnce()) -> bool {
+    if !current {
+        return false;
+    }
+    if refresh.timeout_ms().is_none() {
+        fail();
+        return false;
+    }
+    true
+}
+
 pub struct PropertyMenu {
     pub button: gtk::MenuButton,
     popover: gtk::Popover,
@@ -605,9 +618,14 @@ impl PropertyMenu {
         ) && self.refresh_id.get() == refresh.id
             && self.refreshing.get()
             && !(self.locked)()
-            && refresh.timeout_ms().is_some()
+    }
+    fn refresh_ready(self: &Rc<Self>, conn: &gio::DBusConnection, refresh: &Refresh) -> bool {
+        admit_refresh_reply(self.refresh_current(conn, refresh), refresh, || {
+            self.refresh_failed("deadline expired before current reply")
+        })
     }
     fn refresh_failed(self: &Rc<Self>, phase: &str) {
+        self.hide_candidates();
         self.refreshing.set(false);
         self.owned.set(false);
         self.model.borrow_mut().reset();
@@ -658,7 +676,7 @@ impl PropertyMenu {
             gio::Cancellable::NONE,
             move |reply| {
                 let Some(menu) = weak.upgrade() else { return };
-                if !menu.refresh_current(&c, &refresh) {
+                if !menu.refresh_ready(&c, &refresh) {
                     return;
                 }
                 if reply
@@ -692,7 +710,7 @@ impl PropertyMenu {
             gio::Cancellable::NONE,
             move |reply| {
                 let Some(menu) = weak.upgrade() else { return };
-                if !menu.refresh_current(&c, &refresh) {
+                if !menu.refresh_ready(&c, &refresh) {
                     return;
                 }
                 match reply {
@@ -716,7 +734,7 @@ impl PropertyMenu {
         );
     }
     fn release_for_refresh(self: &Rc<Self>, conn: &gio::DBusConnection, refresh: Refresh) {
-        if !self.refresh_current(conn, &refresh) {
+        if !self.refresh_ready(conn, &refresh) {
             return;
         }
         // This records an offered release, not a successful one. If interrupted
@@ -740,7 +758,7 @@ impl PropertyMenu {
             gio::Cancellable::NONE,
             move |reply| {
                 let Some(menu) = weak.upgrade() else { return };
-                if !menu.refresh_current(&c, &refresh) {
+                if !menu.refresh_ready(&c, &refresh) {
                     return;
                 }
                 if reply.ok().and_then(|v| v.get::<(u32,)>()) != Some((1,)) {
@@ -752,7 +770,7 @@ impl PropertyMenu {
         );
     }
     fn acquire_for_refresh(self: &Rc<Self>, conn: &gio::DBusConnection, refresh: Refresh) {
-        if !self.refresh_current(conn, &refresh) {
+        if !self.refresh_ready(conn, &refresh) {
             return;
         }
         let weak = Rc::downgrade(self);
@@ -774,7 +792,7 @@ impl PropertyMenu {
             gio::Cancellable::NONE,
             move |reply| {
                 let Some(menu) = weak.upgrade() else { return };
-                if !menu.refresh_current(&c, &refresh) {
+                if !menu.refresh_ready(&c, &refresh) {
                     return;
                 }
                 if !matches!(reply.ok().and_then(|v| v.get::<(u32,)>()), Some((1 | 4,))) {
@@ -945,6 +963,37 @@ fn trusted_sender(peer: Option<&Peer>, sender: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn current_expired_reply_cleans_up_but_stale_reply_cannot_touch_new_refresh() {
+        let mut refresh = Refresh {
+            connection: 1,
+            owner_epoch: 1,
+            id: 1,
+            owner: ":1.999999".into(),
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        let busy = Cell::new(true);
+        let failed = Cell::new(0);
+        assert!(!admit_refresh_reply(true, &refresh, || {
+            busy.set(false);
+            failed.set(failed.get() + 1);
+        }));
+        assert!(!busy.get());
+        assert_eq!(failed.get(), 1);
+        // The same expired ticket, after a newer operation took ownership:
+        // neither its denial nor its successful late reply can clear that owner.
+        busy.set(true);
+        assert!(!admit_refresh_reply(false, &refresh, || {
+            busy.set(false);
+            failed.set(failed.get() + 1);
+        }));
+        assert!(busy.get());
+        assert_eq!(failed.get(), 1);
+        refresh.deadline = Instant::now() + Duration::from_secs(5);
+        assert!(admit_refresh_reply(true, &refresh, || panic!(
+            "fresh reply"
+        )));
+    }
     #[test]
     fn old_owner_replies_and_absent_or_replaced_owner_are_refused() {
         assert!(same_owner(2, 2, Some(":1.1"), ":1.1"));
