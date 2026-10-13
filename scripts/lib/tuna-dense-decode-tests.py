@@ -71,12 +71,14 @@ class Dense(unittest.TestCase):
    self.assertEqual(disk.read_bytes(),b'unchanged')
    self.assertEqual(len(commands.calls),2);self.assertTrue(all('pull' not in args for args in commands.calls))
    self.assertEqual(json.loads((artifacts/'dense-decode.json').read_text())['status'],'capacity-refused-before-pull')
- def test_production_guard_is_after_observer_and_unchanged(self):
+ def test_production_guard_is_after_observer_with_reviewed_binding(self):
   root=Path(__file__).resolve().parents[2]
   text=(root/'scripts/tuna-benchmark-disk-export').read_text()
   compile(text,'actual-exporter','exec')
-  self.assertLess(text.index("receipt['dense_decode'] = dense_decode"),text.index("receipt['storage'] = storage_receipt"))
-  self.assertIn("receipt['storage'] = storage_receipt(info, mapping, disk.stat().st_size)",text)
+  self.assertLess(text.index("receipt['dense_decode'] = dense_decode"),text.index("receipt['storage'] = dense_full_paired_storage_receipt"))
+  self.assertIn("receipt['storage'] = dense_full_paired_storage_receipt(info, mapping, disk.stat().st_size)",text)
+  self.assertLess(text.index("receipt['historical_compact_storage_error']"),text.index("receipt['storage'] = dense_full_paired_storage_receipt"))
+  self.assertNotIn("except NameError",text)
   self.assertIn("require(receipt['dense_decode'].get('owned_cleanup', True)",text)
 
 class DecoderRetirement(unittest.TestCase):

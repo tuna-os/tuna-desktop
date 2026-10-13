@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import textwrap
 import unittest
-from tuna_benchmark_disk import storage_receipt, GIB, VIRTUAL_BYTES, require
+from tuna_benchmark_disk import storage_receipt, dense_full_paired_storage_receipt, GIB, VIRTUAL_BYTES, require
 from tuna_benchmark_footprint import PATHS, disk_evidence, image_footprints
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -71,7 +71,7 @@ class FootprintTests(unittest.TestCase):
         sequence = textwrap.dedent(source[begin:end])
         disk=self.out/'disk.qcow2'; disk.write_bytes(b'owned-disk')
         raw=self.out/'disk.raw'; raw.write_bytes(b'owned-raw')
-        info={'format':'qcow2','virtual-size':VIRTUAL_BYTES,'actual-size':3*GIB}
+        info={'format':'qcow2','virtual-size':VIRTUAL_BYTES,'actual-size':6*GIB}
         mapping=[{'start':0,'length':VIRTUAL_BYTES,'data':True,'zero':False}]
         receipt={'raw_sha256':'a'*64}
         observed_dense=[]
@@ -79,11 +79,13 @@ class FootprintTests(unittest.TestCase):
             observed_dense.append(args)
             return {'qualified':False,'owned_cleanup':True}
         scope={'json':json,'output':lambda args:json.dumps(info if 'info' in args else mapping),
-               'require':require,'disk_evidence':disk_evidence,'storage_receipt':storage_receipt,'disk':disk,'raw':raw,
+               'require':require,'disk_evidence':disk_evidence,'storage_receipt':storage_receipt,
+               'dense_full_paired_storage_receipt':dense_full_paired_storage_receipt,'disk':disk,'raw':raw,
                'artifacts':self.out,'receipt':receipt,'dense_decode':dense_decode,
                'commands':None,'args':type('Args',(),{'scratch':self.out})()}
-        with self.assertRaisesRegex(ValueError, 'allocation exceeds'):exec(compile(sequence,'<actual-export-sequence>','exec'),scope)
+        with self.assertRaisesRegex(ValueError, 'dense full-paired 5Gi bound'):exec(compile(sequence,'<actual-export-sequence>','exec'),scope)
         self.assertNotIn('storage',receipt)
+        self.assertEqual(receipt['historical_compact_storage_error'], 'actual qcow2 allocation exceeds export bound')
         for name, wanted in receipt['storage_evidence_sha256'].items():
             self.assertEqual(hashlib.sha256((self.out/name).read_bytes()).hexdigest(),wanted)
         self.assertEqual(json.loads((self.out/'qemu-map.json').read_text()),mapping)
@@ -92,11 +94,37 @@ class FootprintTests(unittest.TestCase):
         self.assertFalse(stat['decoder_rss_measured'])
         # Existing resource limits and exporter failure cleanup remain enforced.
         self.assertIn('disk.unlink(missing_ok=True)',source)
-        self.assertIn('storage_receipt(info, mapping, disk.stat().st_size)',sequence)
+        self.assertIn("receipt['storage'] = dense_full_paired_storage_receipt(info, mapping, disk.stat().st_size)",sequence)
+        self.assertIn("receipt['historical_compact_storage'] = storage_receipt(info, mapping, disk.stat().st_size)",sequence)
+        self.assertNotIn('except NameError',source)
         old_sequence='\n'.join(line for line in sequence.splitlines() if "receipt['storage_evidence_sha256']" not in line)
         scope['artifacts']=self.out/'old';scope['artifacts'].mkdir();scope['receipt']={'raw_sha256':'a'*64}
-        with self.assertRaisesRegex(ValueError, 'allocation exceeds'):exec(compile(old_sequence,'<old-no-persist-sequence>','exec'),scope)
+        with self.assertRaisesRegex(ValueError, 'dense full-paired 5Gi bound'):exec(compile(old_sequence,'<old-no-persist-sequence>','exec'),scope)
         self.assertEqual(list(scope['artifacts'].iterdir()),[])
         self.assertNotIn('storage_evidence_sha256',scope['receipt'])
+        self.assertEqual(scope['receipt']['historical_compact_storage_error'], 'actual qcow2 allocation exceeds export bound')
+
+    def test_actual_export_sequence_binding_admits_dense_policy_with_historical_diagnostic(self):
+        source = (ROOT/'scripts/tuna-benchmark-disk-export').read_text()
+        begin = source.index("        info = json.loads(output(['qemu-img', 'info'")
+        end = source.index("        receipt['disk_sha256']", begin)
+        sequence = textwrap.dedent(source[begin:end])
+        admit = self.out/'admit'; admit.mkdir()
+        disk=admit/'disk.qcow2'; disk.write_bytes(b'owned-disk')
+        raw=admit/'disk.raw'; raw.write_bytes(b'owned-raw')
+        info={'format':'qcow2','virtual-size':VIRTUAL_BYTES,'actual-size':3*GIB}
+        mapping=[{'start':0,'length':VIRTUAL_BYTES,'data':True,'zero':False}]
+        receipt={'raw_sha256':'a'*64}
+        scope={'json':json,'output':lambda args:json.dumps(info if 'info' in args else mapping),
+               'require':require,'disk_evidence':disk_evidence,'storage_receipt':storage_receipt,
+               'dense_full_paired_storage_receipt':dense_full_paired_storage_receipt,'disk':disk,'raw':raw,
+               'artifacts':admit,'receipt':receipt,
+               'dense_decode':lambda *args: {'qualified':False,'owned_cleanup':True},
+               'commands':None,'args':type('Args',(),{'scratch':admit})()}
+        exec(compile(sequence,'<actual-export-sequence>','exec'),scope)
+        self.assertEqual(receipt['storage']['policy'], 'dense-full-paired-5gi-24gi')
+        self.assertEqual(receipt['storage']['requested_pvc'], '28Gi')
+        self.assertFalse(receipt['storage']['node_peak_qualified'])
+        self.assertEqual(receipt['historical_compact_storage_error'], 'actual qcow2 allocation exceeds export bound')
 
 if __name__ == '__main__': unittest.main()

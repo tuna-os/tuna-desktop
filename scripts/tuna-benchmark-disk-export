@@ -10,7 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT/'scripts/lib'))
-from tuna_benchmark_disk import digest, provenance, require, storage_receipt, VIRTUAL_BYTES
+from tuna_benchmark_disk import digest, provenance, require, storage_receipt, dense_full_paired_storage_receipt, VIRTUAL_BYTES, DENSE_FULL_PAIRED_REQUESTED_PVC
 from tuna_benchmark_esp import repair as repair_esp, Commands, retire_backing
 from tuna_benchmark_footprint import image_footprints, disk_evidence
 from tuna_dense_decode import observe as dense_decode
@@ -148,7 +148,11 @@ def main():
         receipt['storage_evidence_sha256'] = disk_evidence(artifacts, disk, raw, info, mapping)
         receipt['dense_decode'] = dense_decode(commands, artifacts, args.scratch, disk, receipt['raw_sha256'], info, receipt)
         require(receipt['dense_decode'].get('owned_cleanup', True), 'dense diagnostic cleanup unconfirmed')
-        receipt['storage'] = storage_receipt(info, mapping, disk.stat().st_size)
+        try:
+            receipt['historical_compact_storage'] = storage_receipt(info, mapping, disk.stat().st_size)
+        except ValueError as historical_error:
+            receipt['historical_compact_storage_error'] = str(historical_error)
+        receipt['storage'] = dense_full_paired_storage_receipt(info, mapping, disk.stat().st_size)
         receipt['disk_sha256'] = digest(disk)
         receipt['evidence'] = {}
         for name in ['reference-image.json', 'baseline-critical.sha256', 'baseline-packages.txt',
@@ -159,7 +163,7 @@ def main():
         (artifacts/'SHA256SUMS').write_text(receipt['disk_sha256']+'  disk.qcow2\n')
         receipt.update(export_succeeded=True, phase='complete', disk_format='qcow2',
                        import_transport='authenticated CI artifact download/extract then owned CDI upload; artifact ZIP is not an HTTP qcow2 endpoint',
-                       firmware='uefi', requested_pvc='20Gi', node_storage_qualified=False)
+                       firmware='uefi', requested_pvc=DENSE_FULL_PAIRED_REQUESTED_PVC, node_storage_qualified=False)
         result_code = 0
     except Exception as error:
         receipt['error'] = str(error)

@@ -9,6 +9,13 @@ VIRTUAL_BYTES = 18 * GIB
 MAX_EXPORT_BYTES = 2 * GIB
 MAX_ESTIMATED_PEAK = 7 * GIB
 GUEST_WRITE_ALLOWANCE = GIB // 2
+# Dense full-paired benchmark policy (NEW binding gate; the original 2Gi/7Gi
+# bounds above are frozen and serve only as the exporter's historical diagnostic).
+# Admits the measured full GNOME 51 + Tuna paired image.
+DENSE_FULL_PAIRED_MAX_EXPORT_BYTES = 5 * GIB
+DENSE_FULL_PAIRED_MAX_ESTIMATED_PEAK = 24 * GIB
+DENSE_FULL_PAIRED_REQUESTED_PVC = '28Gi'
+DENSE_FULL_PAIRED_REQUESTED_PVC_BYTES = 28 * GIB
 
 
 def require(condition, message):
@@ -56,6 +63,38 @@ def storage_receipt(info, mapping, file_bytes):
             'qcow2_allocated_bytes': actual, 'mapped_nonzero_bytes': nonzero,
             'guest_write_allowance_bytes': GUEST_WRITE_ALLOWANCE,
             'estimated_peak_bytes': estimate, 'estimated_peak_limit_bytes': MAX_ESTIMATED_PEAK,
+            'node_peak_qualified': False,
+            'limitation': 'CDI scratch/preallocation and guest writes must be measured on a pressure-free node; virtual capacity is not allocated usage'}
+
+
+def dense_full_paired_storage_receipt(info, mapping, file_bytes):
+    """Dense full-paired policy (binding): 5Gi caps + 24Gi estimate, SAME formula.
+
+    estimate = nonzero + file_bytes + GUEST_WRITE_ALLOWANCE (conservative by design).
+    RSS and raw allocation are NOT inputs. Node/import/VM/boot/performance remain
+    unqualified; CDI scratch/preallocation and guest writes still require
+    pressure-free-node measurement. Original storage_receipt() is unchanged."""
+    require(type(info) is dict and info.get('format') == 'qcow2', 'qcow2 required')
+    require(info.get('virtual-size') == VIRTUAL_BYTES, '18Gi virtual disk required')
+    require(not info.get('backing-filename') and not info.get('full-backing-filename')
+            and not info.get('snapshots'), 'external backing/snapshots refused')
+    actual = info.get('actual-size')
+    require(type(actual) is int and 0 < actual <= DENSE_FULL_PAIRED_MAX_EXPORT_BYTES,
+            'actual qcow2 allocation exceeds dense full-paired 5Gi bound')
+    require(type(file_bytes) is int and 0 < file_bytes <= DENSE_FULL_PAIRED_MAX_EXPORT_BYTES,
+            'qcow2 transfer exceeds dense full-paired 5Gi bound')
+    nonzero = allocated_extents(mapping, VIRTUAL_BYTES)
+    estimate = nonzero + file_bytes + GUEST_WRITE_ALLOWANCE
+    require(estimate <= DENSE_FULL_PAIRED_MAX_ESTIMATED_PEAK,
+            'estimated expanded/import peak exceeds dense full-paired 24Gi bound')
+    return {'policy': 'dense-full-paired-5gi-24gi', 'virtual_bytes': VIRTUAL_BYTES,
+            'transfer_bytes': file_bytes, 'qcow2_allocated_bytes': actual,
+            'mapped_nonzero_bytes': nonzero,
+            'guest_write_allowance_bytes': GUEST_WRITE_ALLOWANCE,
+            'estimated_peak_bytes': estimate,
+            'estimated_peak_limit_bytes': DENSE_FULL_PAIRED_MAX_ESTIMATED_PEAK,
+            'requested_pvc': DENSE_FULL_PAIRED_REQUESTED_PVC,
+            'requested_pvc_bytes': DENSE_FULL_PAIRED_REQUESTED_PVC_BYTES,
             'node_peak_qualified': False,
             'limitation': 'CDI scratch/preallocation and guest writes must be measured on a pressure-free node; virtual capacity is not allocated usage'}
 
