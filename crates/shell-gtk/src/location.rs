@@ -170,7 +170,6 @@ pub fn classify_lookup_error(message: &str) -> LookupError {
 /// unknown apps prompt, lookup failures deny, and an unknown desktop
 /// id is denied outright.
 pub fn authorize(
-    req: u32,
     max: u32,
     stored: Option<u32>,
     store_missing: bool,
@@ -199,10 +198,8 @@ pub fn authorize(
 
 /// Decide from a full lookup outcome: unavailable denies (fail
 /// closed), a present table answers from its row or prompts when the
-/// app has no row. `req` is unused on the error path on purpose: no
-/// failure may grant at the requested level.
+/// app has no row. No failure may grant at the requested level.
 pub fn authorize_lookup(
-    req: u32,
     max: u32,
     outcome: &LookupOutcome,
     desktop_id: &str,
@@ -221,7 +218,7 @@ pub fn authorize_lookup(
         },
         LookupOutcome::Available(perms) => {
             let stored = stored_accuracy(perms, desktop_id);
-            authorize(req, max, stored, false, true)
+            authorize(max, stored, false, true)
         }
     }
 }
@@ -471,7 +468,7 @@ impl LocationAgent {
                 invocation.return_value(Some(&auth_reply(ACC_NONE).to_variant()));
                 return;
             }
-            let decision = authorize_lookup(req, live_max, &outcome, &desktop_id, app_known);
+            let decision = authorize_lookup(live_max, &outcome, &desktop_id, app_known);
             match decision {
                 AuthDecision::Answer { accuracy, save } => {
                     let accuracy = live_grant(accuracy, this.max_accuracy_level());
@@ -680,8 +677,12 @@ pub struct LocationPrompt {
     window: gtk::Window,
     title: gtk::Label,
     detail: gtk::Label,
-    pending: RefCell<Option<(String, u32, Rc<dyn Fn(u32)>)>>,
+    pending: RefCell<Option<PendingPrompt>>,
 }
+
+/// One pending consent: the app id, its requested level, and the
+/// answer callback (the user's level, or `NONE`).
+type PendingPrompt = (String, u32, Rc<dyn Fn(u32)>);
 
 impl LocationPrompt {
     pub fn new(app: &gtk::Application) -> Rc<Self> {
@@ -866,7 +867,7 @@ mod tests {
     fn authorization_matches_the_authorizer() {
         // A stored grant answers, clamped to the ceiling.
         assert_eq!(
-            authorize(ACC_EXACT, ACC_CITY, Some(ACC_EXACT), false, true),
+            authorize(ACC_CITY, Some(ACC_EXACT), false, true),
             AuthDecision::Answer {
                 accuracy: ACC_CITY,
                 save: true
@@ -874,13 +875,13 @@ mod tests {
         );
         // Unknown apps prompt.
         assert_eq!(
-            authorize(ACC_EXACT, ACC_EXACT, None, false, true),
+            authorize(ACC_EXACT, None, false, true),
             AuthDecision::Prompt
         );
         // A missing store denies, unsaved (fail closed, like GNOME's
         // missing proxy): no failure may grant at the request.
         assert_eq!(
-            authorize(ACC_CITY, ACC_EXACT, None, true, true),
+            authorize(ACC_EXACT, None, true, true),
             AuthDecision::Answer {
                 accuracy: ACC_NONE,
                 save: false
@@ -888,7 +889,7 @@ mod tests {
         );
         // An unknown desktop id is denied outright.
         assert_eq!(
-            authorize(ACC_EXACT, ACC_EXACT, Some(ACC_EXACT), false, false),
+            authorize(ACC_EXACT, Some(ACC_EXACT), false, false),
             AuthDecision::Answer {
                 accuracy: ACC_NONE,
                 save: false
@@ -935,7 +936,6 @@ mod tests {
         assert_eq!(
             authorize_lookup(
                 ACC_EXACT,
-                ACC_EXACT,
                 &LookupOutcome::Unavailable(LookupError::Timeout),
                 "proof-location-app",
                 true
@@ -952,7 +952,6 @@ mod tests {
     fn lookup_dbus_error_denies_known_apps() {
         assert_eq!(
             authorize_lookup(
-                ACC_EXACT,
                 ACC_EXACT,
                 &LookupOutcome::Unavailable(LookupError::Dbus),
                 "proof-location-app",
@@ -974,7 +973,6 @@ mod tests {
         assert_eq!(
             authorize_lookup(
                 ACC_EXACT,
-                ACC_EXACT,
                 &LookupOutcome::Unavailable(LookupError::Malformed),
                 "proof-location-app",
                 true
@@ -991,7 +989,6 @@ mod tests {
         assert_eq!(
             authorize_lookup(
                 ACC_EXACT,
-                ACC_EXACT,
                 &LookupOutcome::Unavailable(LookupError::NoSession),
                 "proof-location-app",
                 true
@@ -1007,7 +1004,6 @@ mod tests {
     fn lookup_store_missing_denies_known_apps() {
         assert_eq!(
             authorize_lookup(
-                ACC_EXACT,
                 ACC_EXACT,
                 &LookupOutcome::Unavailable(LookupError::StoreMissing),
                 "proof-location-app",
@@ -1033,7 +1029,7 @@ mod tests {
         // Only a present table with no row prompts; every failure denies.
         let empty = LookupOutcome::Available(HashMap::new());
         assert_eq!(
-            authorize_lookup(ACC_EXACT, ACC_EXACT, &empty, "proof-location-app", true),
+            authorize_lookup(ACC_EXACT, &empty, "proof-location-app", true),
             AuthDecision::Prompt
         );
     }

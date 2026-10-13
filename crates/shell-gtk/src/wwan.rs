@@ -90,13 +90,17 @@ impl WwanDevice {
     }
 
     /// The row's second line: the operator while the NetworkManager
-    /// device is up and the modem is registered, else the modem state
-    /// (a SIM lock wins over both).
+    /// device is up, its ModemManager modem is present and registered,
+    /// else the modem state (a SIM lock wins over both).
     pub fn subtitle(&self) -> String {
         if let Some(lock) = sim_lock_label(self.sim_lock) {
             return lock.to_owned();
         }
-        if self.connected() && modem_registered(self.modem_state) && !self.operator.is_empty() {
+        if self.modem.is_some()
+            && self.connected()
+            && modem_registered(self.modem_state)
+            && !self.operator.is_empty()
+        {
             return self.operator.clone();
         }
         modem_state_label(self.modem_state).to_owned()
@@ -781,6 +785,7 @@ mod tests {
         let on = wwan_toggle(
             &[WwanDevice {
                 state: ACTIVATED,
+                modem: Some("/org/freedesktop/ModemManager1/Modem/0".into()),
                 operator: "ExampleTel".into(),
                 quality: Some((80, true)),
                 modem_state: MM_STATE_CONNECTED,
@@ -924,6 +929,7 @@ mod tests {
     fn operator_shows_only_while_registered() {
         let searching = WwanDevice {
             state: ACTIVATED,
+            modem: Some("/org/freedesktop/ModemManager1/Modem/0".into()),
             operator: "ExampleTel".into(),
             modem_state: MM_STATE_SEARCHING,
             sim_lock: MM_LOCK_NONE,
@@ -935,5 +941,12 @@ mod tests {
             ..searching.clone()
         };
         assert_eq!(registered.subtitle(), "ExampleTel");
+        // Without the ModemManager modem the state shows even with a
+        // cached operator name (ModemManager gone blanks the row).
+        let gone = WwanDevice {
+            modem: None,
+            ..registered.clone()
+        };
+        assert_eq!(gone.subtitle(), "Registered");
     }
 }
