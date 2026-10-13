@@ -1275,7 +1275,6 @@ impl ControlHub {
         let listener = UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
-        let readiness = crate::control_readiness::ControlReadiness::new(&listener)?;
         // Administrative lockdown (#357): constructed from the live
         // key at startup (bounded read); unreadable reads GNOME defaults
         // (allowed).

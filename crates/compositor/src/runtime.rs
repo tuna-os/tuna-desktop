@@ -573,15 +573,6 @@ pub struct Runtime {
     /// snapshots; the shell never owns it.
     lock: SessionLock,
     blank: crate::lock::IdleBlank,
-    screenshot_flashes: crate::screenshot_flash::Flashes,
-    screenshot_replies: Vec<PendingScreenshotReply>,
-    idle_blank_signal: Option<crate::runtime_signal::CachedSignal>,
-    wake: crate::wake::Wake,
-    proof_signals: Vec<crate::runtime_signal::CachedSignal>,
-    child_sources: std::collections::HashMap<u32, calloop::RegistrationToken>,
-    child_watch_failed: bool,
-    exited_children: std::collections::HashSet<u32>,
-    was_inhibited: bool,
     /// Last live lockdown refresh (see [`LOCKDOWN_REFRESH_INTERVAL`]).
     lockdown_refresh_at: Instant,
     /// On-demand XWayland server supervisor. Idle until the first X11
@@ -983,20 +974,7 @@ impl Runtime {
             triggers: TriggerState::default(),
             lock: SessionLock::new(idle_timeout_ms()),
             blank: crate::lock::IdleBlank::default(),
-            screenshot_flashes: Default::default(),
-            screenshot_replies: Vec::new(),
-            wake,
-            proof_signals: Vec::new(),
-            child_sources: Default::default(),
-            child_watch_failed: false,
-            exited_children: Default::default(),
-            was_inhibited: false,
             lockdown_refresh_at: Instant::now(),
-            idle_blank_signal: std::env::var_os("XDG_RUNTIME_DIR").map(|dir| {
-                crate::runtime_signal::CachedSignal::new(
-                    std::path::PathBuf::from(dir).join("tuna-idle-blank"),
-                )
-            }),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
             #[cfg(feature = "xwayland")]

@@ -61,7 +61,6 @@ pub mod introspect;
 pub mod layer;
 pub mod lock;
 pub mod lockdown;
-pub mod modal_dim;
 pub mod monitors;
 pub mod mutter;
 #[cfg(feature = "drm")]
