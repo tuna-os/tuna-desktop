@@ -34,6 +34,7 @@ RUN pacman -Qlq linux mutter gnome-shell > /tmp/tuna-baseline-critical-files.txt
                 printf '%s\n' "$module_dir/vmlinuz" "$module_dir/initramfs.img" "$module_dir/modules.dep" || exit 1; \
         fi; \
     done >> /tmp/tuna-baseline-critical-files.txt && \
+    LC_ALL=C sort -u -o /tmp/tuna-baseline-critical-files.txt /tmp/tuna-baseline-critical-files.txt && \
     while IFS= read -r path; do \
         test ! -f "$path" || sha256sum "$path" || exit 1; \
     done < /tmp/tuna-baseline-critical-files.txt > /usr/share/tuna-perf-baseline-critical.sha256 && \
@@ -74,6 +75,7 @@ RUN cd /usr/share/tuna-perf-mutter-profiler && sha256sum -c sha256sums && \
                 printf '%s\n' "$module_dir/vmlinuz" "$module_dir/initramfs.img" "$module_dir/modules.dep" || exit 1; \
         fi; \
     done >> /tmp/tuna-baseline-critical-files.txt && \
+    LC_ALL=C sort -u -o /tmp/tuna-baseline-critical-files.txt /tmp/tuna-baseline-critical-files.txt && \
     while IFS= read -r path; do \
         test ! -f "$path" || sha256sum "$path" || exit 1; \
     done < /tmp/tuna-baseline-critical-files.txt > /usr/share/tuna-perf-baseline-critical.sha256 && \

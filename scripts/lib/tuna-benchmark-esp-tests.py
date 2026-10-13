@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Owned-resource/error/byte-identity tests; no real privileged image build."""
 import json
+import os
+import subprocess
 from pathlib import Path
 import shutil
 import tempfile
@@ -249,6 +251,75 @@ class DeadlineTests(unittest.TestCase):
         self.assertIn('commands.interrupted_build',source)
         self.assertIn('commands.process_cleanup_uncertain',source)
         self.assertLess(source.index('retire_backing(commands,'),source.index('raw.unlink('))
+
+
+class BaselineCriticalProducerTests(unittest.TestCase):
+    # Execute each actual producer block with owned paths and a private pacman
+    # listing. No image, package install, privileged mount or boot occurs.
+    def producers(self):
+        source = Path(__file__).resolve().parents[2].joinpath(
+            'packaging/marlin/perf/Containerfile.baseline').read_text()
+        parts = source.split('pacman -Qlq ')[1:]
+        self.assertEqual(len(parts), 2, 'stock and diagnostic producers required')
+        return [('pacman -Qlq ' + part.split(
+            '    test -s /usr/share/tuna-perf-baseline-critical.sha256', 1)[0])
+            .replace('\\\n', '').rstrip().removesuffix('&&').rstrip() for part in parts]
+
+    def execute(self, producer):
+        with tempfile.TemporaryDirectory(prefix='tuna-critical-producer-') as temporary:
+            root = Path(temporary)
+            modules = root / 'modules'
+            kernel = modules / '7.2.9-arch1-1'
+            kernel.mkdir(parents=True)
+            members = {kernel / 'vmlinuz': b'owned real kernel bytes',
+                       kernel / 'initramfs.img': b'owned initramfs bytes',
+                       kernel / 'modules.dep': b'owned module dependency bytes',
+                       root / 'mutter': b'owned Mutter bytes'}
+            for path, content in members.items():
+                path.write_bytes(content)
+            listing = root / 'package-files'
+            listing.write_text(str(modules) + '/\n' + str(kernel / 'vmlinuz') + '\n'
+                               + str(root / 'mutter') + '\n')
+            binary = root / 'bin'
+            binary.mkdir()
+            pacman = binary / 'pacman'
+            pacman.write_text('#!/bin/sh\ncat "$TUNA_TEST_PACKAGED_FILES"\n')
+            pacman.chmod(0o700)
+            critical = root / 'critical.sha256'
+            body = producer.replace('/usr/lib/modules', str(modules)).replace(
+                '/tmp/tuna-baseline-critical-files.txt', str(root / 'critical-files')).replace(
+                '/usr/share/tuna-perf-baseline-critical.sha256', str(critical))
+            result = subprocess.run(['sh', '-c', 'set -eu; ' + body],
+                                    env={**os.environ, 'PATH': str(binary) + os.pathsep + os.environ['PATH'],
+                                         'TUNA_TEST_PACKAGED_FILES': str(listing)},
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [line.split('  ', 1) for line in critical.read_text().splitlines()]
+            for sha, path in rows:
+                self.assertEqual(sha, digest(path), 'every recorded byte hash must remain exact')
+            self.assertEqual(set(path for _, path in rows), set(map(str, members)))
+            # Only translate this owned fixture module prefix for the unchanged
+            # production validator; it expects the installed /usr/lib layout.
+            text = critical.read_text().replace(str(modules), '/usr/lib/modules')
+            return rows, text
+
+    def test_stock_and_diagnostic_producers_emit_complete_unique_hash_receipts(self):
+        for producer in self.producers():
+            with self.subTest(producer=producer.splitlines()[0]):
+                rows, text = self.execute(producer)
+                self.assertEqual(len(rows), 4, 'each unique source member recorded once')
+                self.assertEqual(len(critical_hashes(text, '7.2.9-arch1-1')), 2)
+
+    def test_old_unsorted_path_producers_fail_unchanged_strict_consumer(self):
+        dedup = ('    LC_ALL=C sort -u -o /tmp/tuna-baseline-critical-files.txt '
+                 '/tmp/tuna-baseline-critical-files.txt && ')
+        for producer in self.producers():
+            with self.subTest(producer=producer.splitlines()[0]):
+                self.assertIn(dedup, producer)
+                rows, text = self.execute(producer.replace(dedup, ''))
+                self.assertEqual(len(rows), 5, 'old overlap records the kernel twice')
+                with self.assertRaisesRegex(ValueError, 'duplicate protected kernel member'):
+                    critical_hashes(text, '7.2.9-arch1-1')
 
 
 if __name__=='__main__':unittest.main()
