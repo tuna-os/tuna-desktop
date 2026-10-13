@@ -79,5 +79,3 @@ def current_identity(root):
     if result["tree"] != source["tree"]:
         raise ValueError("GitHub source tree does not match checkout")
     return result
-
-

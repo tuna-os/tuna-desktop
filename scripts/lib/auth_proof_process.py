@@ -89,4 +89,3 @@ def bounded_command(argv, path, deadline, *, limit=1024*1024, env=None):
             'adopted_descendants_observed':lingered,
             'command_error':str(primary) if primary is not None else None,
             'ownership_method':'exclusive-single-thread-subreaper-held-leader-pidfd'}
-
