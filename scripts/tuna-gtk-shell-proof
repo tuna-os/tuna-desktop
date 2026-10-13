@@ -4027,9 +4027,11 @@ pass G-ACCEL "gnome-settings-daemon's grab fires on its key and its ShowOSD show
 touch "$TUNA_MEDIA_DIAGNOSTICS"
 media_mark() { "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" marker "$$" "$1"; }
 media_mark begin
-mapfile -t MEDIA_SHELL_PIDS < <(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)
-[ "${#MEDIA_SHELL_PIDS[@]}" -eq 1 ] || fail G-MEDIA-VOLUME "expected exactly one owned shell"
-MEDIA_SHELL_PID="${MEDIA_SHELL_PIDS[0]}"
+MEDIA_SHELL_PID="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" ||
+    fail G-MEDIA-VOLUME "expected exactly one owned shell"
+case "$MEDIA_SHELL_PID" in
+    ''|0|*[!0-9]*) fail G-MEDIA-VOLUME "expected exactly one owned shell" ;;
+esac
 "$PY" - "$MEDIA_SHELL_PID" "$ARTIFACTS/media-completion-owner.json" <<'PY_MEDIA_OWNER'
 import json, pathlib, sys
 pid = int(sys.argv[1])
