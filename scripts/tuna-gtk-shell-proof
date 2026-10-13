@@ -76,11 +76,11 @@
 #                    operator, signal and APN; the tile flips WwanEnabled
 #   G-QS-WWAN-ABSENT without modems the tile hides; without ModemManager
 #                    the rows honestly show no signal or operator
-#   G-QS-LOCATION    the Location tile drives the master switch, the shell
-#                    registers its GeoClue agent, InUse lights the panel,
-#                    and AuthorizeApp answers from the permission store
+#   G-QS-LOCATION    the shell registers its GeoClue agent, InUse lights
+#                    the panel, and AuthorizeApp answers from the store
+#                    under the Settings-owned master switch and ceiling
 #   G-QS-LOCATION-ABSENT without GeoClue the indicator hides while the
-#                    switch keeps working and unknown apps stay denied
+#                    switch keeps gating grants and unknown apps stay denied
 #   G-QS-ABSENT      with the daemons gone, their tiles hide (no hang)
 #   G-GL-WINDOW      a GTK window on the GL renderer maps and paints
 #                    (linux-dmabuf, #89)
@@ -3362,27 +3362,15 @@ sleep 1
 xdotool key Escape
 sleep 1
 
-# Location (#362): the tile drives the master switch, the shell's agent
-# registers with GeoClue, InUse lights the panel, and AuthorizeApp
-# answers from the permission store.
-location_checked() {
-    jq -e --arg want "$2" 'any(.[]; .name == "Location" and .role == "toggle button"
-        and (.checked | tostring) == $want)' "$1" >/dev/null
-}
+# Location (#362): the shell's agent registers with GeoClue, InUse
+# lights the panel, and AuthorizeApp answers from the permission store
+# under the Settings-owned master switch and ceiling (GNOME keeps the
+# switch in Settings, so the proof writes it like Settings does, as
+# the DND gate writes show-banners).
 gsettings set org.gnome.system.location enabled true ||
     fail G-QS-LOCATION "could not switch location on"
 gsettings set org.gnome.system.location max-accuracy-level 'exact' ||
     fail G-QS-LOCATION "could not set the accuracy ceiling"
-open_qs
-loc_on=""
-for _ in $(seq 1 15); do
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location.json" 20 ||
-        fail G-QS-LOCATION "accessibility dump failed"
-    if location_checked "$ARTIFACTS/a11y-qs-location.json" true; then loc_on=1; break; fi
-    sleep 1
-done
-scrot "$ARTIFACTS/16e-location.png" >/dev/null
-[ -n "$loc_on" ] || fail G-QS-LOCATION "the Location tile is not checked with the master switch on"
 # Re-appearing GeoClue gets a fresh registration: only post-mark
 # AddAgent lines prove the agent registers live.
 gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
@@ -3414,10 +3402,19 @@ for _ in $(seq 1 15); do
     sleep 1
 done
 [ -n "$in_use" ] || fail G-QS-LOCATION "no Location in use indicator while GeoClue is in use"
+scrot "$ARTIFACTS/16e-location.png" >/dev/null
 gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
     --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
     org.freedesktop.GeoClue2.Manager InUse "<false>" >/dev/null ||
     fail G-QS-LOCATION "could not clear GeoClue InUse"
+in_use_dark=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-idle.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if ! showing "$ARTIFACTS/a11y-qs-location-idle.json" "Location in use"; then in_use_dark=1; break; fi
+    sleep 1
+done
+[ -n "$in_use_dark" ] || fail G-QS-LOCATION "the Location indicator stayed after GeoClue went idle"
 # Authorization end to end: a stored EXACT grant for an installed app
 # authorizes at the request; the ceiling clamps it; unknown apps and
 # unlisted known apps are denied.
@@ -3459,23 +3456,49 @@ auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
 echo "$auth" | grep -q "(false, 0)" ||
     fail G-QS-LOCATION "unknown app answered $auth, not denied"
-# The tile flips the master switch back off; GSettings reads it back.
-qs_press "Location" location-off || fail G-QS-LOCATION "could not press the Location tile"
-[ "$(gsettings get org.gnome.system.location enabled)" = "false" ] ||
-    fail G-QS-LOCATION "the Location tile did not switch the master switch off"
-pass G-QS-LOCATION "the Location tile drives the switch, the agent registers, InUse lights the panel, and AuthorizeApp answers from the store"
-sleep 1
-xdotool key Escape
-sleep 1
+# Switching off denies live: the stored grant stops authorizing and the
+# indicator stays dark even while GeoClue reports in use.
+gsettings set org.gnome.system.location enabled false ||
+    fail G-QS-LOCATION "could not switch location off"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -q "(false, 0)" ||
+    fail G-QS-LOCATION "stored grant answered $auth with the switch off, not denied"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<true>" >/dev/null ||
+    fail G-QS-LOCATION "could not set GeoClue InUse"
+off_dark=""
+for _ in $(seq 1 10); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-off.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if ! showing "$ARTIFACTS/a11y-qs-location-off.json" "Location in use"; then
+        # Absence must hold, not merely race the signal: one more dump.
+        sleep 1
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-off.json" 20 ||
+            fail G-QS-LOCATION "accessibility dump failed"
+        if ! showing "$ARTIFACTS/a11y-qs-location-off.json" "Location in use"; then off_dark=1; break; fi
+    fi
+    sleep 1
+done
+[ -n "$off_dark" ] || fail G-QS-LOCATION "the Location indicator lit with the switch off"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<false>" >/dev/null ||
+    fail G-QS-LOCATION "could not clear GeoClue InUse"
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION "could not switch location back on"
+pass G-QS-LOCATION "the agent registers, InUse lights the panel, and AuthorizeApp answers from the store under the switch and ceiling"
 
-# Without GeoClue the indicator hides while the switch keeps working
-# and unknown apps stay denied.
+# Without GeoClue the indicator hides while the switch keeps gating
+# grants and unknown apps stay denied.
 gsettings set org.gnome.system.location enabled true ||
     fail G-QS-LOCATION-ABSENT "could not switch location on"
 gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
     --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent false >/dev/null ||
     fail G-QS-LOCATION-ABSENT "could not release the stub GeoClue name"
-open_qs
 loc_dark=""
 for _ in $(seq 1 15); do
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-absent.json" 20 ||
@@ -3485,14 +3508,24 @@ for _ in $(seq 1 15); do
 done
 scrot "$ARTIFACTS/16f-location-absent.png" >/dev/null
 [ -n "$loc_dark" ] || fail G-QS-LOCATION-ABSENT "the Location indicator stayed with GeoClue gone"
-showing "$ARTIFACTS/a11y-qs-location-absent.json" "Location" ||
-    fail G-QS-LOCATION-ABSENT "the Location tile went away with the daemon"
-qs_press "Location" location-absent-off || fail G-QS-LOCATION-ABSENT "could not press the Location tile"
-[ "$(gsettings get org.gnome.system.location enabled)" = "false" ] ||
-    fail G-QS-LOCATION-ABSENT "the switch stopped working with GeoClue gone"
-qs_press "Location" location-absent-on || fail G-QS-LOCATION-ABSENT "could not press the Location tile back on"
-[ "$(gsettings get org.gnome.system.location enabled)" = "true" ] ||
-    fail G-QS-LOCATION-ABSENT "the switch did not come back with GeoClue gone"
+# The switch still gates the agent with the daemon gone: off denies the
+# stored grant, on restores it, and unknown apps stay denied throughout.
+gsettings set org.gnome.system.location enabled false ||
+    fail G-QS-LOCATION-ABSENT "could not switch location off"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -q "(false, 0)" ||
+    fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch off, not denied"
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION-ABSENT "could not switch location back on"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -q "(true, 8)" ||
+    fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch back on, not (true, 8)"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp no-such-app-xyz 8 2>&1) ||
@@ -3502,10 +3535,7 @@ echo "$auth" | grep -q "(false, 0)" ||
 gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
     --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent true >/dev/null ||
     fail G-QS-LOCATION-ABSENT "could not restore the stub GeoClue name"
-pass G-QS-LOCATION-ABSENT "without GeoClue the indicator hides while the switch works and unknown apps stay denied"
-sleep 1
-xdotool key Escape
-sleep 1
+pass G-QS-LOCATION-ABSENT "without GeoClue the indicator hides while the switch gates grants and unknown apps stay denied"
 
 kill "$STUBS_PID" 2>/dev/null || true
 STUBS_PID=""
@@ -3522,8 +3552,6 @@ for label in "Wi-Fi" "Bluetooth" "Mobile Network" "Power Mode"; do
 done
 showing "$ARTIFACTS/a11y-qs-absent.json" "Dark Style" ||
     fail G-QS-ABSENT "the settings tiles went away with the daemons"
-showing "$ARTIFACTS/a11y-qs-absent.json" "Location" ||
-    fail G-QS-ABSENT "the Location tile went away with the daemons"
 pass G-QS-ABSENT "tiles hide when their daemons leave the bus"
 xdotool key Escape
 

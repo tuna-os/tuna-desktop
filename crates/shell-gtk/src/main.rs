@@ -1154,19 +1154,19 @@ fn quick_settings_popover(
     let night = qs_tile("night-light-symbolic", "Night Light", None);
     let dark = qs_tile("dark-mode-symbolic", "Dark Style", None);
     let dnd_tile = qs_tile("notifications-disabled-symbolic", "Do Not Disturb", None);
-    // Location services: the master switch tile and the panel's in-use
-    // indicator, both driven by the GeoClue2 agent.
+    // Location services: the GeoClue2 agent behind the panel's in-use
+    // indicator. GNOME puts the master switch in Settings, not quick
+    // settings, so there is no tile: Settings (and the proof) writes
+    // the switch, the agent honors it.
     let location_agent = location::LocationAgent::new();
     location_agent.set_indicator(icons.location);
-    let location_tile = qs_tile("location-services-active-symbolic", "Location", None);
-    location_agent.set_tile(location_tile.clone());
     grid.add(&wifi, Some(&wifi_menu_ui));
     grid.add(&wired, Some(&wired_menu_ui));
     grid.add(&bluetooth, Some(&bt_menu_ui));
     grid.add(&printers_tile, Some(&printers_menu_ui));
     grid.add(&wwan, Some(&wwan_menu_ui));
     grid.add(&power_mode, Some(&power_menu_ui));
-    for tile in [&night, &dark, &dnd_tile, &location_tile] {
+    for tile in [&night, &dark, &dnd_tile] {
         grid.add(tile, None);
     }
     let (
@@ -1178,7 +1178,6 @@ fn quick_settings_popover(
         dark_outer,
         dnd_outer,
         wwan_outer,
-        location_outer,
     ) = (
         wifi.outer.clone(),
         wired.outer.clone(),
@@ -1188,7 +1187,6 @@ fn quick_settings_popover(
         dark.outer.clone(),
         dnd_tile.outer.clone(),
         wwan.outer.clone(),
-        location_tile.outer.clone(),
     );
     // While a toggle menu is open GNOME dims everything else in the
     // panel (brightness -0.4); selecting an item closes the panel, as
@@ -1390,7 +1388,6 @@ fn quick_settings_popover(
         &night_outer,
         &dark_outer,
         &dnd_outer,
-        &location_outer,
     ] {
         tile.add_css_class("qs-dimmable");
     }

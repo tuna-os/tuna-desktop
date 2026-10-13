@@ -21,8 +21,6 @@ use gio::prelude::*;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
-use crate::services::Tile;
-
 pub const LOCATION_SCHEMA: &str = "org.gnome.system.location";
 pub const ENABLED_KEY: &str = "enabled";
 pub const MAX_ACCURACY_KEY: &str = "max-accuracy-level";
@@ -200,12 +198,6 @@ pub fn indicator_icon(enabled: bool, in_use: bool) -> Option<&'static str> {
     (enabled && in_use).then_some("location-services-active-symbolic")
 }
 
-/// The Location tile's (visible, checked): hidden without its
-/// GSettings schema, checked with the master switch.
-pub fn tile_state(schema_present: bool, enabled: bool) -> (bool, bool) {
-    (schema_present, schema_present && enabled)
-}
-
 /// The authorization dialog: its app id, requested level, and the
 /// answer callback (the user's level, or `NONE`).
 pub type AuthorizePrompt = dyn Fn(String, u32, Rc<dyn Fn(u32)>);
@@ -215,7 +207,6 @@ pub type AuthorizePrompt = dyn Fn(String, u32, Rc<dyn Fn(u32)>);
 pub struct LocationAgent {
     settings: Option<gio::Settings>,
     indicator: RefCell<Option<gtk::Image>>,
-    tile: RefCell<Option<Tile>>,
     conn: RefCell<Option<gio::DBusConnection>>,
     session: RefCell<Option<gio::DBusConnection>>,
     in_use: Cell<bool>,
@@ -230,7 +221,6 @@ impl LocationAgent {
         let agent = Rc::new(Self {
             settings,
             indicator: RefCell::default(),
-            tile: RefCell::default(),
             conn: RefCell::default(),
             session: RefCell::default(),
             in_use: Cell::new(false),
@@ -260,29 +250,6 @@ impl LocationAgent {
         self.sync_indicator();
     }
 
-    /// The Location toggle: checked with the master switch, hidden
-    /// without its schema. A click flips the switch; writes from
-    /// elsewhere (Settings, the proof) update the tile the same way.
-    pub fn set_tile(self: &Rc<Self>, tile: Tile) {
-        let weak = Rc::downgrade(self);
-        tile.on_user_toggle(move |on| {
-            let Some(agent) = weak.upgrade() else { return };
-            agent.set_enabled(on);
-            // The tile shows GSettings' state, not the click.
-            agent.sync_tile();
-        });
-        *self.tile.borrow_mut() = Some(tile);
-        if let Some(settings) = self.settings.as_ref() {
-            let weak = Rc::downgrade(self);
-            settings.connect_changed(Some(ENABLED_KEY), move |_, _| {
-                if let Some(agent) = weak.upgrade() {
-                    agent.sync_tile();
-                }
-            });
-        }
-        self.sync_tile();
-    }
-
     /// The authorization dialog: `respond` carries the user's level
     /// (or `NONE`). Without one every unknown app is denied.
     // No dialog is wired yet; unknown apps stay denied (G-QS-LOCATION
@@ -300,6 +267,9 @@ impl LocationAgent {
     }
 
     /// Flip the master switch (the Location settings toggle).
+    // The shell honors external writes (Settings, the proof); the
+    // programmatic flip stays for a future settings surface.
+    #[allow(dead_code)]
     pub fn set_enabled(&self, on: bool) {
         if let Some(settings) = self.settings.as_ref() {
             let _ = settings.set_boolean(ENABLED_KEY, on);
@@ -587,15 +557,6 @@ impl LocationAgent {
         }
     }
 
-    fn sync_tile(&self) {
-        let Some(tile) = self.tile.borrow().clone() else {
-            return;
-        };
-        let (visible, checked) = tile_state(self.settings.is_some(), self.enabled());
-        tile.present(visible);
-        tile.show_state(checked, None);
-    }
-
     /// Tell GeoClue the ceiling moved (GNOME's `_notifyMaxAccuracyLevel`).
     fn emit_max_accuracy(&self) {
         let Some(conn) = self.conn.borrow().clone() else {
@@ -725,14 +686,6 @@ mod tests {
         assert_eq!(apps[0].accuracy, ACC_NONE);
         assert_eq!(apps[1].seen, Some(1_700_000_000));
         assert_eq!(apps[2].seen, None);
-    }
-
-    #[test]
-    fn tile_hides_without_schema_and_mirrors_switch() {
-        assert_eq!(tile_state(false, false), (false, false));
-        assert_eq!(tile_state(false, true), (false, false));
-        assert_eq!(tile_state(true, false), (true, false));
-        assert_eq!(tile_state(true, true), (true, true));
     }
 
     #[test]
