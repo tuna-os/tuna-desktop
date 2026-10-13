@@ -19,45 +19,89 @@ spec = importlib.util.spec_from_file_location("contract", ROOT / "scripts/lib/fp
 contract = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(contract)
 
-def owned_processes(token):
-    result = []
-    for directory in Path("/proc").iterdir():
-        if not directory.name.isdecimal():
-            continue
-        try:
-            if directory.stat().st_uid != os.getuid():
-                continue
-            if f"TUNA_FPRINT_PHASE_OWNER={token}".encode() not in (directory / "environ").read_bytes().split(b"\0"):
-                continue
-            start = (directory / "stat").read_text().rsplit(")", 1)[1].split()[19]
-            result.append((int(directory.name), start))
-        except (FileNotFoundError, ProcessLookupError, PermissionError):
-            continue
-    return result
+def bounded_command(argv, path, deadline, *, limit=1024*1024, env=None):
+    """Linux single-owner command retirement, including orphaned descendants.
 
-
-def cleanup_owned(child, token):
-    # This wrapper is a subreaper. Reap inherited proof descendants after its
-    # own session/group was terminated, including daemonized private services.
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try: os.killpg(child.pid, sig)
-        except ProcessLookupError: pass
-        for pid, start in owned_processes(token):
+    Require one thread and no preexisting children. A temporary subreaper scope
+    owns adopted descendants. Keep the session leader unreaped until group kill
+    so its PID cannot be reused. Adopted children are killed via pidfds and reaped.
+    Cleanup has a separate five-second budget; unconfirmed retirement fails closed.
+    Subreaper ownership lasts only while this process lives, not after CLI exit.
+    Spawn/kernel I/O stalls are not hard real-time guarantees.
+    """
+    def children():
+        return [int(value) for value in Path('/proc/self/task/'+str(os.getpid())+'/children').read_text().split()]
+    if len(list(Path('/proc/self/task').iterdir()))!=1 or children():
+        raise ValueError('command supervisor requires exclusive single-thread child ownership')
+    if deadline-time.monotonic()<=0:raise TimeoutError('absolute phase deadline')
+    libc=ctypes.CDLL(None,use_errno=True)
+    prior=ctypes.c_int()
+    if libc.prctl(37,ctypes.byref(prior),0,0,0)!=0 or libc.prctl(36,1,0,0,0)!=0:
+        raise OSError('command subreaper setup failed')
+    proc=None;lingered=False;retired=False;primary=None;timed_out=False;exit_status=None
+    try:
+        with path.open('wb') as f:
+            proc=subprocess.Popen(argv,stdin=subprocess.DEVNULL,
+                                  stdout=f,stderr=subprocess.STDOUT,start_new_session=True,env=env)
+            while True:
+                # WNOWAIT preserves the owned leader PID until group retirement.
+                status=os.waitid(os.P_PID,proc.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+                if status is not None:break
+                if time.monotonic()>=deadline or f.tell()>limit:
+                    timed_out=True
+                    raise TimeoutError('phase child bound')
+                time.sleep(.02)
+            exit_status = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+            if exit_status != 0 or f.tell()>limit:
+                raise RuntimeError('phase child failed')
+    except BaseException as error:
+        primary=error
+    finally:
+        if proc is not None:
+            # The unreaped owned leader reserves the PGID even after exit.
+            # Always kill the group: a successful leader can leave writers alive.
             try:
-                if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19] == start:
-                    os.kill(pid, sig)
-            except (FileNotFoundError, ProcessLookupError): pass
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            try:
-                while os.waitpid(-1, os.WNOHANG)[0]: pass
-            except ChildProcessError: pass
-            try: os.killpg(child.pid, 0)
+                os.killpg(proc.pid,signal.SIGKILL)
             except ProcessLookupError:
-                if not owned_processes(token): return True
-            time.sleep(.05)
-    return False
-
+                pass
+            cleanup_deadline=time.monotonic()+5
+            while time.monotonic()<cleanup_deadline:
+                direct=children()
+                if not direct:
+                    retired=True;break
+                for pid in direct:
+                    if pid!=proc.pid:lingered=True
+                    try:
+                        fd=os.pidfd_open(pid)
+                    except ProcessLookupError:
+                        continue
+                    try:
+                        # Direct children cannot be stolen/reused without our
+                        # reaping; pidfd also binds the actual kernel process.
+                        signal.pidfd_send_signal(fd,signal.SIGKILL)
+                    finally:
+                        os.close(fd)
+                while True:
+                    try:pid,status=os.waitpid(-1,os.WNOHANG)
+                    except ChildProcessError:break
+                    if pid==0:break
+                    if pid==proc.pid:proc.returncode=os.waitstatus_to_exitcode(status)
+                time.sleep(.01)
+            if not retired and not children():retired=True
+        else:
+            retired=not children()
+        if retired:
+            if libc.prctl(36,prior.value,0,0,0)!=0:
+                raise OSError('command subreaper restore failed')
+        else:
+            # Keep ownership while this process lives; an ensuing CLI exit is not
+            # physical retirement or persistent quarantine proof.
+            primary=RuntimeError('command retirement unconfirmed; phase wrapper must abort')
+    return {'pid':proc.pid if proc is not None else None,
+            'exit':124 if timed_out else exit_status, 'owned_cleanup':retired,
+            'adopted_descendants_observed':lingered,
+            'command_error':str(primary) if primary is not None else None,
+            'ownership_method':'exclusive-single-thread-subreaper-held-leader-pidfd'}
 
 
 def verify_unchanged(admission):
@@ -83,20 +127,16 @@ def run_filter(work, admission, number, filter_name, phases):
     path = work / f"output-{number}.txt"
     argv = [admission["files"]["tuna_compositor"]["admitted_executable"],
             filter_name, "--exact", "--nocapture", "--test-threads=1"]
-    with path.open("wb") as output:
-        child = subprocess.Popen(argv, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
-                                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-        try: status = child.wait(timeout=CHILD_TIMEOUT)
-        except subprocess.TimeoutExpired: status = 124
-        clean = cleanup_owned(child, nonce)
-        child.poll()  # Refresh Popen after subreaper cleanup may reap its leader.
-    receipt = {"filter": filter_name, "pid": child.pid, "nonce": nonce, "argv": argv,
-               "exit": status, "owned_cleanup": clean, "output_sha256": contract.digest(path)}
+    lifecycle = bounded_command(argv, path, time.monotonic() + CHILD_TIMEOUT, env=env)
+    receipt = {"filter": filter_name, "nonce": nonce, "argv": argv,
+               "output_sha256": contract.digest(path), **lifecycle}
     (work / f"child-{number}.json").write_text(json.dumps(receipt, indent=2) + "\n")
     verify_unchanged(admission)
-    if status != 0 or not clean: raise ValueError("child failed/timed out or leaked owned processes")
+    if (receipt["exit"] != 0 or not receipt["owned_cleanup"]
+            or receipt["adopted_descendants_observed"] or receipt["command_error"] is not None):
+        raise ValueError("child failed/timed out/left descendants or retirement unproven")
     if path.stat().st_size > 1024 * 1024: raise ValueError("phase output exceeds budget")
-    return contract.phase_vectors(path.read_text(), nonce, child.pid, phases)
+    return contract.phase_vectors(path.read_text(), nonce, receipt["pid"], phases)
 
 
 def main():
@@ -105,7 +145,6 @@ def main():
     args = p.parse_args()
     work = args.artifacts.resolve()
     work.mkdir(parents=True, exist_ok=False)
-    if ctypes.CDLL(None, use_errno=True).prctl(36,1,0,0,0) != 0: raise OSError("subreaper unavailable")
     ci = contract.current_identity(ROOT)
     source = contract.source_tuple(ROOT)
     (work / "api-admission.json").write_text(json.dumps(ci, indent=2) + "\n")

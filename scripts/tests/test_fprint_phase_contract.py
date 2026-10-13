@@ -4,6 +4,10 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import os
+import subprocess
+import sys
+import time
 import importlib.machinery
 from unittest import mock
 import unittest
@@ -90,6 +94,45 @@ class Contract(unittest.TestCase):
                 with mock.patch.object(w,"CHILD_TIMEOUT",0.1):
                     with self.assertRaises(ValueError):w.run_filter(root,admission,2,"fixture",("B",))
                 receipt=json.loads((root/"child-2.json").read_text());self.assertEqual(receipt["exit"],124);self.assertTrue(receipt["owned_cleanup"])
+    def test_exited_leader_still_reserves_pid_at_group_kill(self):
+        loader=importlib.machinery.SourceFileLoader("held_wrapper",str(Path(__file__).resolve().parents[1]/"tuna-fprint-phase-proof"))
+        ws=importlib.util.spec_from_loader(loader.name,loader);w=importlib.util.module_from_spec(ws);loader.exec_module(w)
+        real_killpg=os.killpg; observed=[]
+        def checked_killpg(pid,sig):
+            # WNOWAIT leaves the exited leader as an owned zombie; no PGID reuse.
+            state=Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()[0]
+            self.assertEqual(state,"Z");observed.append(pid);real_killpg(pid,sig)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(w.os,"killpg",side_effect=checked_killpg):
+            receipt=w.bounded_command([sys.executable,"-c","raise SystemExit(0)"],Path(tmp)/"out",time.monotonic()+2)
+            self.assertTrue(receipt["owned_cleanup"]);self.assertEqual(receipt["exit"],0)
+            self.assertFalse(receipt["adopted_descendants_observed"]);self.assertEqual(observed,[receipt["pid"]])
+            self.assertFalse(Path(f"/proc/{receipt['pid']}").exists())
+    def test_setsid_cleared_env_lingering_descendant_refused_and_retired(self):
+        loader=importlib.machinery.SourceFileLoader("orphan_wrapper",str(Path(__file__).resolve().parents[1]/"tuna-fprint-phase-proof"))
+        ws=importlib.util.spec_from_loader(loader.name,loader);w=importlib.util.module_from_spec(ws);loader.exec_module(w)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);exe=root/"fixture-child";pidfile=root/"escaped.pid"
+            # Separate process/session and empty environment defeats token scans.
+            descendant="import os,time;os.environ.clear();time.sleep(20)"
+            script="#!/usr/bin/python3\nimport os,json,subprocess\np=subprocess.Popen(['/usr/bin/python3','-c',"+repr(descendant)+"],start_new_session=True,env={})\nopen("+repr(str(pidfile))+",'w').write(str(p.pid))\nr="+repr(vectors()["B"])+"\nr['nonce']=os.environ['TUNA_FPRINT_PHASE_NONCE'];r['pid']=os.getpid()\nprint('FPRINT-PHASE '+json.dumps(r))\nprint('test result: ok. 1 passed; 0 failed; 0 ignored;')\n"
+            exe.write_text(script);exe.chmod(0o755)
+            admission=dict(files={"tuna_compositor":dict(admitted_executable=str(exe))})
+            with mock.patch.object(w,"verify_unchanged"):
+                with self.assertRaises(ValueError):w.run_filter(root,admission,0,"fixture",("B",))
+            receipt=json.loads((root/"child-0.json").read_text())
+            self.assertEqual(receipt["exit"],0);self.assertTrue(receipt["owned_cleanup"])
+            self.assertTrue(receipt["adopted_descendants_observed"])
+            self.assertFalse((Path("/proc")/pidfile.read_text()).exists())
+    def test_preexisting_child_refused_without_killing_it(self):
+        loader=importlib.machinery.SourceFileLoader("exclusive_wrapper",str(Path(__file__).resolve().parents[1]/"tuna-fprint-phase-proof"))
+        ws=importlib.util.spec_from_loader(loader.name,loader);w=importlib.util.module_from_spec(ws);loader.exec_module(w)
+        other=subprocess.Popen([sys.executable,"-c","import time;time.sleep(20)"])
+        try:
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(w.os,"killpg") as kill:
+                with self.assertRaises(ValueError):w.bounded_command([sys.executable,"-c","pass"],Path(tmp)/"out",time.monotonic()+2)
+                kill.assert_not_called();self.assertIsNone(other.poll())
+        finally:other.terminate();other.wait(timeout=2)
+
     def test_hash_drift_refuses_admission(self):
         loader=importlib.machinery.SourceFileLoader("hash_wrapper",str(Path(__file__).resolve().parents[1]/"tuna-fprint-phase-proof"))
         ws=importlib.util.spec_from_loader(loader.name,loader);w=importlib.util.module_from_spec(ws);loader.exec_module(w)
