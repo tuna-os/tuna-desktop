@@ -68,6 +68,7 @@ jobs:
         run: |
           scripts/tuna-cursor-assets-check share/tuna-desktop/icons/Adwaita
           python3 scripts/lib/cursor-assets-tests.py
+      - run: /usr/bin/python3 scripts/tests/test_strip_endpoint.py
       - run: cargo fmt --all -- --check
       - name: Check bounded EIS transport regression tests
         run: |

@@ -2036,6 +2036,8 @@ impl Runtime {
         // Keep this unlocked drag observation outside the large scene macro.
         doc["client_dnd_active"] =
             serde_json::Value::Bool(!self.is_locked() && self.state.client_dnd_active());
+        // Canonical view AND column spring state, outside the large scene macro.
+        doc["strip_animating"] = serde_json::Value::Bool(self.manager.strip_animating());
         doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
         let doc = doc.to_string();
         if doc == self.state_last {
@@ -4061,7 +4063,18 @@ impl Runtime {
         self.publish_state();
         self.publish_cast_outputs();
         self.publish_overview_previews();
+        let strip_was_animating = self.manager.strip_animating();
         self.render()?;
+        // Rendering advances the strip's springs. Publish the terminal frame
+        // before the motion scheduler goes idle; the pre-render snapshot can
+        // otherwise retain the previous frame's residual indefinitely. With
+        // motion disabled, publish the instant frame's actual render count too.
+        let strip_lands_immediately = self.manager.session_mode()
+            == crate::windows::SessionMode::Scroll
+            && !self.input_settings.motion.allows_motion();
+        if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
+            self.publish_state();
+        }
         self.screencast_tick();
         #[cfg(feature = "drm")]
         if matches!(self.backend, Backend::Drm(_)) {
