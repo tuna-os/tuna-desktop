@@ -182,6 +182,9 @@ def observe(_legacy_commands,artifacts,scratch,disk,raw_hash,info,source):
  result['root_launcher']=launcher
  if not launcher['owned_cleanup'] or launcher['command_error'] or launcher['exit']!=0:
   result.update(qualified=False,owned_cleanup=False)
+ if not result.get('owned_cleanup',False):
+  # Retain original backing/source if any diagnostic owner is uncertain.
+  _legacy_commands.process_cleanup_uncertain=True
  # Root receipt has mode644. Parent writes a separate launcher receipt.
  outer=artifacts/'dense-launcher-receipt.json';write_json(outer,result)
  return {'file':outer.name,'sha256':digest(outer),'qualified':result.get('qualified',False),

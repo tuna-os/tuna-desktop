@@ -70,9 +70,19 @@ class Dense(unittest.TestCase):
    self.assertEqual(disk.read_bytes(),b'unchanged')
    self.assertEqual(len(commands.calls),2);self.assertTrue(all('pull' not in args for args in commands.calls))
    self.assertEqual(json.loads((artifacts/'dense-decode.json').read_text())['status'],'capacity-refused-before-pull')
+ def test_unconfirmed_outer_owner_retains_original_export_backing(self):
+  with tempfile.TemporaryDirectory() as d:
+   base=Path(d);artifacts=base/'artifacts';artifacts.mkdir();scratch=base/'scratch';scratch.mkdir();disk=artifacts/'disk.qcow2';disk.write_bytes(b'original')
+   legacy=SimpleNamespace(process_cleanup_uncertain=False)
+   (artifacts/'dense-decode.json').write_text(json.dumps({'qualified':False,'owned_cleanup':False}))
+   with patch.object(host,'bounded_command',return_value={'owned_cleanup':False,'command_error':'retirement unknown','exit':None}):
+    result=host.observe(legacy,artifacts,scratch,disk,'a'*64,{}, {})
+   self.assertFalse(result['owned_cleanup']);self.assertTrue(legacy.process_cleanup_uncertain)
+   self.assertEqual(disk.read_bytes(),b'original')
  def test_production_guard_is_after_observer_and_unchanged(self):
   root=Path(__file__).resolve().parents[2]
   text=(root/'scripts/tuna-benchmark-disk-export').read_text()
+  compile(text,'actual-exporter','exec')
   self.assertLess(text.index("receipt['dense_decode'] = dense_decode"),text.index("receipt['storage'] = storage_receipt"))
   self.assertIn("receipt['storage'] = storage_receipt(info, mapping, disk.stat().st_size)",text)
   self.assertIn("require(receipt['dense_decode'].get('owned_cleanup', True)",text)
