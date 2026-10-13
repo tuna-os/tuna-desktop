@@ -46,6 +46,7 @@ jobs:
       - run: python3 scripts/lib/tuna-perf-payload-tests.py
       - run: python3 scripts/lib/tuna-perf-reference-tests.py
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
+      - run: python3 scripts/ibus-property-proof-tests.py
       - run: python3 scripts/lib/grid-target-settled-tests.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_comparison.py

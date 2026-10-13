@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import shutil
+import re
 import time
 from pathlib import Path
 import gi
@@ -54,7 +55,7 @@ def validate_traffic(before, after, positive):
         raise RuntimeError("old property emitted traffic after engine change")
 
 
-def run(pid, log_path, output, expected_shell, engine_pid):
+def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_log=None):
     expected_hash = file_hash(expected_shell)
     origin = identity(pid)
     if origin["exe_sha256"] != expected_hash:
@@ -65,7 +66,7 @@ def run(pid, log_path, output, expected_shell, engine_pid):
         raise RuntimeError("engine process is not the owned fixture")
     engine_fixture_hash = file_hash(engine_fixture)
     basic_origin = {k: v for k, v in origin.items() if k != "exe_sha256"}
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + (70 if phase_file else 30)
     seen = []
 
     def node(name):
@@ -101,24 +102,6 @@ def run(pid, log_path, output, expected_shell, engine_pid):
     def heard(line):
         return line in log_path.read_text().splitlines()
 
-    press("中")
-    wait(lambda: len(node("Input Mode")) == 1)
-    if node("Proof Hidden"):
-        raise RuntimeError("hidden property exposed")
-    disabled = node("Proof Disabled")
-    if len(disabled) != 1 or disabled[0].get_state_set().contains(Atspi.StateType.SENSITIVE):
-        raise RuntimeError("disabled property is actionable")
-    press("Input Mode")
-    wait(lambda: heard("tuna-ibus-test-engine: property activated InputMode 1 engine=tuna-test"))
-    press("Proof Radio B")
-    wait(lambda: heard("tuna-ibus-test-engine: property activated proof-radio-a 0 engine=tuna-test")
-         and heard("tuna-ibus-test-engine: property activated proof-radio-b 1 engine=tuna-test"))
-    press("Proof Submenu")
-    press("Proof Action")
-    wait(lambda: heard("tuna-ibus-test-engine: property activated proof-action 0 engine=tuna-test"))
-
-    # A real second bus peer cannot forge the daemon's reserved sender. This
-    # calls the production registered object (including its shared dispatcher).
     IBus.init()
     bus = IBus.Bus()
     if not bus.is_connected():
@@ -138,6 +121,162 @@ def run(pid, log_path, output, expected_shell, engine_pid):
                           "org.freedesktop.DBus", "GetNameOwner",
                           GLib.Variant("(s)", ("org.freedesktop.IBus.Panel",)),
                           GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+    if phase_file is not None:
+        def traffic():
+            return [line for line in log_path.read_text().splitlines() if "property activated" in line]
+        def trace():
+            return [line for line in gtk_log.read_text().splitlines()
+                    if line.startswith("tuna-shell-gtk: ibus properties applied ")]
+        def fresh_menu():
+            if not node("Input Mode"):
+                press("中")
+            wait(lambda: len(node("Input Mode")) == 1)
+        def stale_call(action):
+            try:
+                return {"returned": bool(action.do_action(0)), "error": None}
+            except GLib.Error as exc:
+                return {"returned": None, "error": type(exc).__name__}
+        def ordered_fresh(before):
+            fresh_menu()
+            press("Proof Submenu")
+            press("Proof Action")
+            positive = "tuna-ibus-test-engine: property activated proof-action 0 engine=tuna-test"
+            wait(lambda: len(traffic()) >= len(before) + 1)
+            validate_traffic(before, traffic(), positive)
+        def instance():
+            return [line for line in log_path.read_text().splitlines()
+                    if line.startswith("tuna-ibus-test-engine: property instance engine=tuna-test ")][-1]
+        session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        ss_owner = session.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus", "GetNameOwner", GLib.Variant("(s)", ("org.gnome.ScreenSaver",)),
+            GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+        ss_pid = session.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus", "GetConnectionUnixProcessID", GLib.Variant("(s)", (ss_owner,)),
+            GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+        if ss_pid != pid:
+            raise RuntimeError("lock service not owned by admitted GTK")
+        def screensaver(method):
+            return session.call_sync(ss_owner, "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver",
+                method, None, None, Gio.DBusCallFlags.NONE, 2000, None)
+        def active():
+            return screensaver("GetActive").unpack()[0]
+        def panel_owner():
+            return conn.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus", "GetNameOwner", GLib.Variant("(s)", ("org.freedesktop.IBus.Panel",)),
+                GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+        outcomes = []
+        fresh_menu()
+        ordered_fresh(traffic())
+        original_instance = instance()
+
+        # The same context object is used twice. These are real daemon Focus
+        # methods; a fresh consumer RegisterProperties trace is mandatory.
+        context = bus.create_input_context("tuna-property-lifecycle")
+        context.set_capabilities(IBus.Capabilite.FOCUS)
+        context_sha = hashlib.sha256(context.get_object_path().encode()).hexdigest()
+        def registered(since):
+            focus = None
+            for line in trace()[since:]:
+                match = re.fullmatch(r"tuna-shell-gtk: ibus properties applied (\w+) epoch=(\d+) focus=(\d+) context_sha=(\w+)", line)
+                if not match or match[4] != context_sha:
+                    continue
+                if match[1] == "FocusIn":
+                    focus = match[3]
+                if match[1] == "RegisterProperties" and focus is not None and match[3] == focus:
+                    return True
+            return False
+        before_trace = len(trace())
+        context.focus_in()
+        wait(lambda: registered(before_trace))
+        fresh_menu()
+        held = node("Input Mode")[0].get_action_iface()
+        before = traffic(); before_trace = len(trace())
+        context.focus_out(); context.focus_in()
+        wait(lambda: registered(before_trace))
+        result = stale_call(held); ordered_fresh(before)
+        outcomes.append({"edge": "same-context reentry", "old_action": result,
+                         "traffic": traffic(), "consumer_trace": trace()[before_trace:]})
+        before_trace = len(trace())
+        context.focus_out(); context.destroy()
+        wait(lambda: len(trace()) > before_trace and "RegisterProperties" in trace()[-1])
+        fresh_menu()
+
+        for case in ("normal", "other-panel"):
+            held = node("Input Mode")[0].get_action_iface()
+            checked = node("Input Mode")[0].get_state_set().contains(Atspi.StateType.CHECKED)
+            before = traffic(); before_trace = len(trace())
+            screensaver("Lock"); wait(active)
+            if node("中") or node("Input Mode"):
+                raise RuntimeError("property menu exposed while locked")
+            challenger = None
+            if case == "other-panel":
+                # This is the driver's real second bus peer. Its takeover is
+                # deliberate, and production refresh must NOT replace it.
+                challenger = conn.get_unique_name()
+                code = conn.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "RequestName",
+                    GLib.Variant("(su)", ("org.freedesktop.IBus.Panel", 2 | 4)),
+                    GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+                if code != 1 or panel_owner() != challenger:
+                    raise RuntimeError("challenger did not acquire owned test panel")
+            # The parent drives the existing real nested lock UI using its
+            # private pam_wrapper credential; the helper never sees that value.
+            phase_file.write_text(json.dumps({"phase": "locked-" + case, "pid": os.getpid(),
+                "gtk": basic_origin, "source": os.environ["TUNA_PROOF_SOURCE_SHA"]}) + "\n")
+            wait(lambda: not active())
+            if case == "other-panel":
+                wait(lambda: any("another panel owns" in line for line in gtk_log.read_text().splitlines()))
+                if panel_owner() != challenger or node("中") or node("Input Mode"):
+                    raise RuntimeError("refresh stole another panel or exposed its properties")
+            result = stale_call(held)
+            if challenger is not None:
+                code = conn.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "ReleaseName",
+                    GLib.Variant("(s)", ("org.freedesktop.IBus.Panel",)),
+                    GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+                if code != 1:
+                    raise RuntimeError("challenger release not confirmed")
+                wait(lambda: panel_owner() == owner)
+            fresh_menu(); ordered_fresh(before)
+            if node("Input Mode")[0].get_state_set().contains(Atspi.StateType.CHECKED) != checked:
+                raise RuntimeError("old action mutated restored checked state")
+            if instance() != original_instance:
+                raise RuntimeError("lock recovery recreated or changed the engine")
+            outcomes.append({"edge": "lock-unlock-" + case, "old_action": result,
+                "same_engine_instance": original_instance, "other_panel_not_replaced": bool(challenger),
+                "traffic": traffic(), "consumer_trace": trace()[before_trace:]})
+        if node("Input Mode"):
+            press("中")
+            wait(lambda: not node("Input Mode"))
+        if (identity(pid) != origin or file_hash(expected_shell) != expected_hash
+                or identity(daemon_origin["pid"]) != daemon_origin
+                or identity(engine_pid) != engine_origin
+                or file_hash(engine_fixture) != engine_fixture_hash):
+            raise RuntimeError("process/source changed during lifecycle proof")
+        output.write_text(json.dumps({"scope": "nested real daemon context/owner and real GTK lock lifecycle",
+            "gtk": origin, "daemon": daemon_origin, "engine": engine_origin,
+            "source_sha": os.environ["TUNA_PROOF_SOURCE_SHA"], "outcomes": outcomes,
+            "installed_or_all_ime_qualified": False}, indent=2) + "\n")
+        return
+
+    press("中")
+    wait(lambda: len(node("Input Mode")) == 1)
+    if node("Proof Hidden"):
+        raise RuntimeError("hidden property exposed")
+    disabled = node("Proof Disabled")
+    if len(disabled) != 1 or disabled[0].get_state_set().contains(Atspi.StateType.SENSITIVE):
+        raise RuntimeError("disabled property is actionable")
+    press("Input Mode")
+    wait(lambda: heard("tuna-ibus-test-engine: property activated InputMode 1 engine=tuna-test"))
+    press("Proof Radio B")
+    wait(lambda: heard("tuna-ibus-test-engine: property activated proof-radio-a 0 engine=tuna-test")
+         and heard("tuna-ibus-test-engine: property activated proof-radio-b 1 engine=tuna-test"))
+    press("Proof Submenu")
+    press("Proof Action")
+    wait(lambda: heard("tuna-ibus-test-engine: property activated proof-action 0 engine=tuna-test"))
+
+    # A real second bus peer cannot forge the daemon's reserved sender. This
+    # calls the production registered object (including its shared dispatcher).
     for method, params in [
             ("FocusOut", GLib.Variant("(o)", ("/forged/context",))),
             ("RegisterProperties", GLib.Variant("(v)", (GLib.Variant("s", "forged"),)))]:
@@ -215,4 +354,6 @@ def run(pid, log_path, output, expected_shell, engine_pid):
 
 
 if __name__ == "__main__":
-    run(int(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), int(sys.argv[5]))
+    run(int(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), int(sys.argv[5]),
+        Path(sys.argv[6]) if len(sys.argv) > 6 else None,
+        Path(sys.argv[7]) if len(sys.argv) > 7 else None)

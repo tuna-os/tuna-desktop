@@ -336,6 +336,15 @@ impl CandidatePopup {
             properties,
         });
         ui.wire();
+        let weak = Rc::downgrade(&ui);
+        ui.properties.set_unavailable(Rc::new(move || {
+            if let Some(ui) = weak.upgrade() {
+                // No call to ui.reset(): that would recursively reset the
+                // property connection that is in the middle of its refresh.
+                *ui.state.borrow_mut() = State::default();
+                ui.window.set_visible(false);
+            }
+        }));
         ui
     }
 

@@ -29,12 +29,26 @@ The property wire does not include an engine or context generation. Local tokens
 
 ## Required CI execution
 
-Rust parser/state/peer tests run in the existing workspace test job. Run `python3 scripts/ibus-property-proof-tests.py` for source and helper controls. These tests do not execute GTK or the daemon.
+Rust parser/state/peer tests run in the existing workspace test job. Run `python3 scripts/ibus-property-proof-tests.py` for source and helper controls. These tests do not execute GTK or the daemon. CI invokes these controls in its early check.
 
 The existing GTK journey now needs G-IME-PROPERTIES after its composition and candidate gates. It uses the actual private daemon and shell, an owned two-engine fixture, PID/start/executable checks, and real accessibility actions. It checks toggle/radio/action traffic, hidden and disabled controls, forged peer denial, and an old accessible action after an engine change. A fresh action from the same GTK producer provides an ordered positive callback. The receipt records the old action's actual return and checks the exact daemon traffic and current checked state. The helper bounds each call with an external timeout.
 
-No live result exists for this source leaf yet. A successful gate qualifies its stated nested scope only. Owner-loss and context-change tokens have source tests; their complete live negative matrix still needs qualification. Installed package/image identities and a matched GNOME capture remain required.
+No live result exists for this source leaf yet. A successful gate qualifies its stated nested scope only. The successor adds live controls for context reentry, lock recovery with the same engine, and panel-owner loss. Those controls have not run yet. Installed package/image identities and a matched GNOME capture remain required.
 
 ## Remaining #592 requirements
 
 This menu does not yet list configured XKB/IBus input sources or select a particular configured source. The existing cyclic source shortcut remains. A configured source chooser needs an authoritative active-source mapping and consumer proof. This change does not cover all toolkit composition clients, Unicode offsets, moving caret/windows, or all focus transitions. Existing IME gates remain required. Native installed and hardware cases remain open.
+
+## Recovery follow-up
+
+The consumer retires tokens from prior actions on every engine or FocusIn edge, even if the identifier is the same. The consumer watches both daemon and panel owners. Async responses need the same pinned transport, owner epoch, request, and lock state. Engine and context queries target the resolved daemon owner.
+
+On unlock, the consumer reads current daemon and panel owners before it releases its own panel name. It then requests the name with ALLOW_REPLACEMENT and DO_NOT_QUEUE. It never uses REPLACE_EXISTING for recovery. The daemon sends fresh FocusIn and cached engine properties when it creates the new panel proxy. The consumer does not replay an old UI list.
+
+Another panel retains its name; the menu stays disabled with a diagnostic. If that name becomes empty later, a previous panel can reclaim it after fresh owner checks. Five seconds bounds the refresh operation. Each call has a timeout of at most two seconds.
+
+The candidate popup uses a weak callback to clear and hide when trust or panel ownership is lost, or lock starts. The callback does not reset the property connection recursively. Test diagnostics contain fixed method names, counters, and a SHA256 of the daemon context path. They contain no raw context paths, property keys, labels, text, or key values. Locked diagnostics stay silent.
+
+The original menu gate still has a 40-second bound. The separate G-IME-PROPERTIES-LIFECYCLE gate has an 80-second bound for context reentry and two cycles of lock and unlock. The helper sees no password. The parent uses its existing private PAM fixture and native lock UI. The first cycle checks refresh without another panel. The other checks refusal while a second peer owns the panel name, then recovery after that peer releases it.
+
+The observer needs fresh consumer traces, exact daemon traffic, checked state, and the same engine instance. An old action from accessibility may return handled, rejected, or defunct; its effects must remain absent. CI must execute all these runtime controls.

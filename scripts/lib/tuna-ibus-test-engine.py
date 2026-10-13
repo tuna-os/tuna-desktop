@@ -73,6 +73,7 @@ class TunaTestEngine(IBus.Engine):
     def do_property_activate(self, key, state):
         if key not in {"InputMode", "proof-radio-a", "proof-radio-b", "proof-action"}:
             raise RuntimeError("unexpected property activation")
+        print(f"tuna-ibus-test-engine: property instance engine={self.proof_engine} path={self.get_object_path()}", flush=True)
         print(f"tuna-ibus-test-engine: property activated {key} {state} engine={self.proof_engine}", flush=True)
         for p in (self.input_mode, self.radio_a, self.radio_b):
             if p.get_key() == key:

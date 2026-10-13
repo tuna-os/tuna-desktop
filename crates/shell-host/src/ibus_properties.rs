@@ -202,10 +202,9 @@ impl Properties {
         self.context = None;
     }
     pub fn engine(&mut self, engine: Option<String>) {
-        if self.engine != engine {
-            self.invalidate();
-            self.engine = engine;
-        }
+        // A real activation edge can reuse the same engine identifier.
+        self.invalidate();
+        self.engine = engine;
     }
     pub fn initial_engine(&mut self, engine: String) {
         if self.engine.is_none() && !self.exhausted {
@@ -222,10 +221,9 @@ impl Properties {
         }
     }
     pub fn focus_in(&mut self, context: String) {
-        if self.context.as_ref() != Some(&context) {
-            self.invalidate();
-            self.context = Some(context);
-        }
+        // Focus reentry can reuse the same object path with new ownership.
+        self.invalidate();
+        self.context = Some(context);
     }
     pub fn focus_out(&mut self, context: &str) {
         if self.context.as_deref() == Some(context) {
@@ -363,6 +361,20 @@ mod tests {
         state.focus_in("/context/1".into());
         state.register(parse_list(&wire_list(items)).unwrap());
         state
+    }
+    #[test]
+    fn same_name_engine_and_same_path_focus_edges_retire_actions() {
+        let mut model = model(vec![wire("x", 0, 0, vec![])]);
+        let engine_token = model.token("x");
+        model.engine(Some("engine".into()));
+        assert!(model.activate(&engine_token).is_empty());
+        model.register(parse_list(&wire_list(vec![wire("x", 0, 0, vec![])])).unwrap());
+        let focus_token = model.token("x");
+        model.focus_in("/context/1".into());
+        assert!(model.activate(&focus_token).is_empty());
+        model.register(parse_list(&wire_list(vec![wire("x", 0, 0, vec![])])).unwrap());
+        model.focus_out("/context/stale");
+        assert_eq!(model.activate(&model.token("x")), [("x".into(), 0)]);
     }
     #[test]
     fn initial_engine_reply_preserves_only_current_context_graph() {

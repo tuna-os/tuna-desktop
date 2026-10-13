@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use tuna_shell_host::ibus_properties::{self as wire, Kind, Properties, Property, Token};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -38,19 +39,9 @@ fn same_file(a: &File, b: &File) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
 }
 fn expected_daemon() -> Option<File> {
-    let paths = std::env::var_os("PATH")?;
-    // First executable, exactly as PATH resolution. Symlinks work; scripts do
-    // not silently substitute basename/comm trust for the actual running ELF.
-    for dir in std::env::split_paths(&paths) {
-        let path = dir.join("ibus-daemon");
-        let Ok(metadata) = path.metadata() else {
-            continue;
-        };
-        if metadata.is_file() && metadata.mode() & 0o111 != 0 {
-            return File::open(std::fs::canonicalize(path).ok()?).ok();
-        }
-    }
-    None
+    // GLib resolves the first executable on PATH with its normal permission
+    // checks. Resolve symlinks, then hold the exact file; no basename fallback.
+    File::open(std::fs::canonicalize(glib::find_program_in_path("ibus-daemon")?).ok()?).ok()
 }
 impl Peer {
     fn bind(conn: &gio::DBusConnection) -> Option<Self> {
@@ -83,6 +74,21 @@ impl Peer {
     }
 }
 
+#[derive(Clone)]
+struct Refresh {
+    connection: u64,
+    owner_epoch: u64,
+    id: u64,
+    owner: String,
+    deadline: Instant,
+}
+impl Refresh {
+    fn timeout_ms(&self) -> Option<i32> {
+        let left = self.deadline.checked_duration_since(Instant::now())?;
+        (left.as_millis() > 0).then_some(left.as_millis().min(2000) as i32)
+    }
+}
+
 pub struct PropertyMenu {
     pub button: gtk::MenuButton,
     popover: gtk::Popover,
@@ -92,11 +98,19 @@ pub struct PropertyMenu {
     peer: RefCell<Option<Peer>>,
     subscriptions: RefCell<Vec<gio::SignalSubscription>>,
     owner: RefCell<Option<String>>,
+    owner_epoch: Cell<u64>,
+    engine_watch: RefCell<Option<gio::SignalSubscription>>,
+    focus_epoch: Cell<u64>,
+    refresh_id: Cell<u64>,
+    refreshing: Cell<bool>,
+    release_offered: Cell<bool>,
+    had_panel: Cell<bool>,
     owned: Cell<bool>,
     generation: Cell<u64>,
     engine_query: Cell<u64>,
     locked: Rc<dyn Fn() -> bool>,
     was_locked: Cell<bool>,
+    unavailable: RefCell<Option<Rc<dyn Fn()>>>,
 }
 impl PropertyMenu {
     pub fn new(locked: Rc<dyn Fn() -> bool>) -> Rc<Self> {
@@ -117,12 +131,28 @@ impl PropertyMenu {
             peer: RefCell::default(),
             subscriptions: RefCell::default(),
             owner: RefCell::default(),
+            owner_epoch: Cell::new(0),
+            engine_watch: RefCell::default(),
+            focus_epoch: Cell::new(0),
+            refresh_id: Cell::new(0),
+            refreshing: Cell::new(false),
+            release_offered: Cell::new(false),
+            had_panel: Cell::new(false),
             owned: Cell::new(false),
             generation: Cell::new(0),
             engine_query: Cell::new(0),
             locked,
             was_locked: Cell::new(false),
+            unavailable: RefCell::default(),
         })
+    }
+    pub fn set_unavailable(&self, callback: Rc<dyn Fn()>) {
+        self.unavailable.replace(Some(callback));
+    }
+    fn hide_candidates(&self) {
+        if let Some(callback) = self.unavailable.borrow().as_ref() {
+            callback();
+        }
     }
     fn current(&self, conn: &gio::DBusConnection, generation: u64) -> bool {
         self.generation.get() == generation
@@ -131,10 +161,15 @@ impl PropertyMenu {
             && self.peer.borrow().as_ref().is_some_and(Peer::live)
     }
     pub fn reset(self: &Rc<Self>) {
+        self.hide_candidates();
         self.owned.set(false);
         self.model.borrow_mut().reset();
         self.owner.replace(None);
         self.subscriptions.borrow_mut().clear();
+        self.engine_watch.replace(None);
+        self.refreshing.set(false);
+        self.release_offered.set(false);
+        self.had_panel.set(false);
         self.peer.replace(None);
         self.conn.replace(None);
         self.popover.popdown();
@@ -158,24 +193,89 @@ impl PropertyMenu {
             Some(DIRECT_SENDER),
             Some("NameOwnerChanged"),
             Some("/org/freedesktop/DBus"),
-            Some(PANEL),
+            None,
             gio::DBusSignalFlags::NONE,
             move |signal| {
                 let Some(menu) = weak.upgrade() else { return };
-                if !menu.current(signal.connection, generation) {
+                if !menu.current(signal.connection, generation)
+                    || signal.sender_name != DIRECT_SENDER
+                {
                     return;
                 }
-                if let Some((_, _, owner)) = signal.parameters.get::<(String, String, String)>() {
-                    if Some(owner.as_str()) != signal.connection.unique_name().as_deref() {
-                        menu.owned.set(false);
-                        menu.model.borrow_mut().reset();
-                        menu.popover.popdown();
-                        menu.render();
+                let Some((name, _, owner)) = signal.parameters.get::<(String, String, String)>()
+                else {
+                    return;
+                };
+                if name == IBUS {
+                    if !menu.retire_owner() {
+                        return;
                     }
+                    if !owner.is_empty() {
+                        menu.resolve_owner(signal.connection, generation, Some(owner));
+                    }
+                } else if name == PANEL {
+                    let ours = Some(owner.as_str()) == signal.connection.unique_name().as_deref();
+                    menu.owned.set(ours);
+                    menu.model.borrow_mut().reset();
+                    menu.retire_query();
+                    if ours {
+                        menu.had_panel.set(true);
+                        menu.release_offered.set(false);
+                        // Query after this ownership reset. Fresh FocusIn and
+                        // cached RegisterProperties may arrive before its reply.
+                        menu.query_engine(signal.connection, generation);
+                    } else {
+                        menu.hide_candidates();
+                        menu.popover.popdown();
+                        // A previous owned panel can reclaim a freshly empty
+                        // name. Another owner is always left alone.
+                        if owner.is_empty()
+                            && menu.had_panel.get()
+                            && !menu.refreshing.get()
+                            && !(menu.locked)()
+                        {
+                            menu.refresh(signal.connection);
+                        }
+                    }
+                    menu.render();
                 }
             },
         );
         self.subscriptions.borrow_mut().push(sub);
+        self.resolve_owner(conn, generation, None);
+    }
+    fn retire_query(self: &Rc<Self>) -> bool {
+        if let Some(next) = self.engine_query.get().checked_add(1) {
+            self.engine_query.set(next);
+            true
+        } else {
+            self.reset();
+            false
+        }
+    }
+    fn retire_owner(self: &Rc<Self>) -> bool {
+        self.hide_candidates();
+        self.owner.replace(None);
+        self.engine_watch.replace(None);
+        self.model.borrow_mut().reset();
+        self.popover.popdown();
+        self.refreshing.set(false);
+        let Some(next) = self.owner_epoch.get().checked_add(1) else {
+            self.reset();
+            return false;
+        };
+        self.owner_epoch.set(next);
+        self.retire_query();
+        self.render();
+        true
+    }
+    fn resolve_owner(
+        self: &Rc<Self>,
+        conn: &gio::DBusConnection,
+        generation: u64,
+        expected: Option<String>,
+    ) {
+        let epoch = self.owner_epoch.get();
         let weak = Rc::downgrade(self);
         let c = conn.clone();
         conn.call(
@@ -190,13 +290,16 @@ impl PropertyMenu {
             gio::Cancellable::NONE,
             move |reply| {
                 let Some(menu) = weak.upgrade() else { return };
-                if !menu.current(&c, generation) {
+                if !menu.current(&c, generation) || menu.owner_epoch.get() != epoch {
                     return;
                 }
                 let Some((owner,)) = reply.ok().and_then(|v| v.get::<(String,)>()) else {
                     return;
                 };
-                if owner.is_empty() || owner.len() > wire::MAX_TEXT {
+                if owner.is_empty()
+                    || owner.len() > wire::MAX_TEXT
+                    || expected.as_ref().is_some_and(|e| e != &owner)
+                {
                     return;
                 }
                 menu.owner.replace(Some(owner.clone()));
@@ -211,6 +314,7 @@ impl PropertyMenu {
                     move |signal| {
                         let Some(menu) = weak.upgrade() else { return };
                         if !menu.current(signal.connection, generation)
+                            || menu.owner_epoch.get() != epoch
                             || menu.owner.borrow().as_deref() != Some(signal.sender_name)
                         {
                             return;
@@ -218,58 +322,134 @@ impl PropertyMenu {
                         let Some((name,)) = signal.parameters.get::<(String,)>() else {
                             return;
                         };
-                        if name.len() > wire::MAX_TEXT {
-                            menu.model.borrow_mut().reset();
-                            menu.render();
+                        if !menu.retire_query() {
                             return;
                         }
-                        // Invalidate before any async query can finish. The
-                        // daemon registers the new engine's cached properties.
-                        let Some(next) = menu.engine_query.get().checked_add(1) else {
-                            menu.reset();
-                            return;
-                        };
-                        menu.engine_query.set(next);
-                        menu.model
-                            .borrow_mut()
-                            .engine((!name.is_empty()).then_some(name));
+                        menu.model.borrow_mut().engine(
+                            (!name.is_empty() && name.len() <= wire::MAX_TEXT).then_some(name),
+                        );
                         menu.render();
                     },
                 );
-                menu.subscriptions.borrow_mut().push(sub);
-                menu.query_engine(&c, generation);
+                menu.engine_watch.replace(Some(sub));
+                if expected.is_some() && !(menu.locked)() {
+                    menu.refresh(&c);
+                } else {
+                    menu.query_engine(&c, generation);
+                }
             },
         );
     }
     fn query_engine(self: &Rc<Self>, conn: &gio::DBusConnection, generation: u64) {
-        let Some(query) = self.engine_query.get().checked_add(1) else {
-            self.reset();
+        if (self.locked)() {
+            return;
+        }
+        let Some(owner) = self.owner.borrow().clone() else {
             return;
         };
-        self.engine_query.set(query);
+        if !self.retire_query() {
+            return;
+        }
+        let query = self.engine_query.get();
+        let epoch = self.owner_epoch.get();
         let weak = Rc::downgrade(self);
         let c = conn.clone();
+        // The resolved owner is the destination, never the well-known name.
+        let destination = owner.clone();
         conn.call(
-            Some(IBUS),
+            Some(&destination),
             IBUS_PATH,
-            IBUS,
-            "GetGlobalEngine",
-            None,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&(IBUS, "GlobalEngine").to_variant()),
             glib::VariantTy::new("(v)").ok(),
             gio::DBusCallFlags::NONE,
             2000,
             gio::Cancellable::NONE,
             move |reply| {
                 let Some(menu) = weak.upgrade() else { return };
-                if !menu.current(&c, generation) || menu.engine_query.get() != query {
+                if !menu.owner_current(&c, generation, epoch, &owner)
+                    || menu.engine_query.get() != query
+                    || (menu.locked)()
+                {
                     return;
                 }
-                let Some(name) = reply.ok().and_then(|v| engine_name(&v.child_value(0))) else {
+                // Properties.Get adds its own v around the property's v.
+                let Some(name) = reply
+                    .ok()
+                    .and_then(|v| v.child_value(0).as_variant())
+                    .and_then(|v| engine_name(&v))
+                else {
                     return;
                 };
-                // Properties may precede this initial async reply. They were
-                // not actionable without an engine; bind them to this reply.
                 menu.model.borrow_mut().initial_engine(name);
+                menu.query_context(&c, generation, epoch, query, owner);
+                menu.render();
+            },
+        );
+    }
+    fn owner_current(
+        &self,
+        conn: &gio::DBusConnection,
+        generation: u64,
+        epoch: u64,
+        owner: &str,
+    ) -> bool {
+        self.current(conn, generation)
+            && same_owner(
+                self.owner_epoch.get(),
+                epoch,
+                self.owner.borrow().as_deref(),
+                owner,
+            )
+    }
+    fn query_context(
+        self: &Rc<Self>,
+        conn: &gio::DBusConnection,
+        generation: u64,
+        epoch: u64,
+        query: u64,
+        owner: String,
+    ) {
+        let focus = self.focus_epoch.get();
+        let weak = Rc::downgrade(self);
+        let c = conn.clone();
+        let destination = owner.clone();
+        conn.call(
+            Some(&destination),
+            IBUS_PATH,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&(IBUS, "CurrentInputContext").to_variant()),
+            glib::VariantTy::new("(v)").ok(),
+            gio::DBusCallFlags::NONE,
+            2000,
+            gio::Cancellable::NONE,
+            move |reply| {
+                let Some(menu) = weak.upgrade() else { return };
+                if !menu.owner_current(&c, generation, epoch, &owner)
+                    || menu.engine_query.get() != query
+                    || menu.focus_epoch.get() != focus
+                    || (menu.locked)()
+                {
+                    return;
+                }
+                let Some(value) = reply.ok().and_then(|v| v.child_value(0).as_variant()) else {
+                    return;
+                };
+                if !value.is_type(glib::VariantTy::OBJECT_PATH) {
+                    return;
+                }
+                let Some(path) = value.str().filter(|s| s.len() <= wire::MAX_TEXT) else {
+                    return;
+                };
+                // Only fill a missing context. An incoming FocusIn is newer
+                // authority and must not lose its just-registered property list.
+                let mut model = menu.model.borrow_mut();
+                if model.context.is_none() {
+                    model.focus_in(path.into());
+                }
+                drop(model);
                 menu.render();
             },
         );
@@ -279,8 +459,14 @@ impl PropertyMenu {
             return;
         }
         self.owned.set(acquired);
+        if acquired {
+            self.had_panel.set(true);
+        }
         if !acquired {
             self.model.borrow_mut().reset();
+            self.retire_query();
+        } else {
+            self.query_engine(conn, self.generation.get());
         }
         self.render();
     }
@@ -295,6 +481,7 @@ impl PropertyMenu {
     ) -> Result<(), &'static str> {
         if !self.current(conn, self.generation.get())
             || !trusted_sender(self.peer.borrow().as_ref(), sender)
+            || self.owner.borrow().is_none()
         {
             return Err("org.freedesktop.DBus.Error.AccessDenied");
         }
@@ -334,6 +521,12 @@ impl PropertyMenu {
                     .str()
                     .filter(|s| s.len() <= wire::MAX_TEXT)
                     .ok_or("org.freedesktop.DBus.Error.InvalidArgs")?;
+                let Some(next) = self.focus_epoch.get().checked_add(1) else {
+                    drop(model);
+                    self.reset();
+                    return Err("org.freedesktop.DBus.Error.Failed");
+                };
+                self.focus_epoch.set(next);
                 model.focus_in(path.into());
             }
             "FocusOut" | "DestroyContext" => {
@@ -341,11 +534,36 @@ impl PropertyMenu {
                 let path = value
                     .str()
                     .ok_or("org.freedesktop.DBus.Error.InvalidArgs")?;
-                model.focus_out(path);
+                if model.context.as_deref() == Some(path) {
+                    let Some(next) = self.focus_epoch.get().checked_add(1) else {
+                        drop(model);
+                        self.reset();
+                        return Err("org.freedesktop.DBus.Error.Failed");
+                    };
+                    self.focus_epoch.set(next);
+                    model.focus_out(path);
+                }
             }
             _ => return Ok(()),
         }
+        let diagnostic = (tuna_shell_host::ibus::debug() && !(self.locked)()).then(|| {
+            (
+                model.epoch(),
+                model
+                    .context
+                    .as_deref()
+                    .and_then(|path| {
+                        glib::compute_checksum_for_data(glib::ChecksumType::Sha256, path.as_bytes())
+                    })
+                    .unwrap_or_else(|| "none".into()),
+            )
+        });
         drop(model);
+        if let Some((epoch, context_sha)) = diagnostic {
+            // Fixed methods/counters and a hash of the daemon object path:
+            // no raw context paths, engine keys, labels, text or input values.
+            eprintln!("tuna-shell-gtk: ibus properties applied {method} epoch={epoch} focus={} context_sha={context_sha}", self.focus_epoch.get());
+        }
         self.render();
         Ok(())
     }
@@ -361,16 +579,222 @@ impl PropertyMenu {
     pub fn sync_lock(self: &Rc<Self>) {
         let locked = (self.locked)();
         if locked != self.was_locked.replace(locked) {
+            let Some(id) = self.refresh_id.get().checked_add(1) else {
+                self.reset();
+                return;
+            };
+            self.refresh_id.set(id);
+            self.refreshing.set(false);
+            self.retire_query();
+            self.model.borrow_mut().reset();
             if locked {
-                self.model.borrow_mut().reset();
+                self.hide_candidates();
                 self.popover.popdown();
+            } else if let Some(conn) = self.conn.borrow().clone() {
+                self.refresh(&conn);
             }
             self.render();
         }
     }
+    fn refresh_current(&self, conn: &gio::DBusConnection, refresh: &Refresh) -> bool {
+        self.owner_current(
+            conn,
+            refresh.connection,
+            refresh.owner_epoch,
+            &refresh.owner,
+        ) && self.refresh_id.get() == refresh.id
+            && self.refreshing.get()
+            && !(self.locked)()
+            && refresh.timeout_ms().is_some()
+    }
+    fn refresh_failed(self: &Rc<Self>, phase: &str) {
+        self.refreshing.set(false);
+        self.owned.set(false);
+        self.model.borrow_mut().reset();
+        self.popover.popdown();
+        self.render();
+        eprintln!("tuna-shell-gtk: IBus properties refresh unavailable: {phase}");
+    }
+    /// The actual daemon has no property-list getter. Reacquiring our panel
+    /// name makes ibusimpl send fresh FocusIn + cached engine RegisterProperties.
+    /// No context or engine is changed, and a competing panel is never replaced.
+    fn refresh(self: &Rc<Self>, conn: &gio::DBusConnection) {
+        if (self.locked)() || !self.current(conn, self.generation.get()) {
+            return;
+        }
+        let Some(owner) = self.owner.borrow().clone() else {
+            return;
+        };
+        let Some(id) = self.refresh_id.get().checked_add(1) else {
+            self.reset();
+            return;
+        };
+        self.refresh_id.set(id);
+        self.refreshing.set(true);
+        self.owned.set(false);
+        self.retire_query();
+        self.hide_candidates();
+        self.model.borrow_mut().reset();
+        self.popover.popdown();
+        self.render();
+        let refresh = Refresh {
+            connection: self.generation.get(),
+            owner_epoch: self.owner_epoch.get(),
+            id,
+            owner,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let weak = Rc::downgrade(self);
+        let c = conn.clone();
+        conn.call(
+            Some(DIRECT_SENDER),
+            "/org/freedesktop/DBus",
+            DIRECT_SENDER,
+            "GetNameOwner",
+            Some(&(IBUS,).to_variant()),
+            glib::VariantTy::new("(s)").ok(),
+            gio::DBusCallFlags::NONE,
+            refresh.timeout_ms().unwrap_or(1),
+            gio::Cancellable::NONE,
+            move |reply| {
+                let Some(menu) = weak.upgrade() else { return };
+                if !menu.refresh_current(&c, &refresh) {
+                    return;
+                }
+                if reply
+                    .ok()
+                    .and_then(|v| v.get::<(String,)>())
+                    .is_none_or(|(owner,)| owner != refresh.owner)
+                {
+                    menu.refresh_failed("daemon owner changed before panel release");
+                    return;
+                }
+                menu.check_panel_for_refresh(&c, refresh);
+            },
+        );
+    }
+    fn check_panel_for_refresh(self: &Rc<Self>, conn: &gio::DBusConnection, refresh: Refresh) {
+        let weak = Rc::downgrade(self);
+        let c = conn.clone();
+        let Some(timeout) = refresh.timeout_ms() else {
+            self.refresh_failed("deadline");
+            return;
+        };
+        conn.call(
+            Some(DIRECT_SENDER),
+            "/org/freedesktop/DBus",
+            DIRECT_SENDER,
+            "GetNameOwner",
+            Some(&(PANEL,).to_variant()),
+            glib::VariantTy::new("(s)").ok(),
+            gio::DBusCallFlags::NONE,
+            timeout,
+            gio::Cancellable::NONE,
+            move |reply| {
+                let Some(menu) = weak.upgrade() else { return };
+                if !menu.refresh_current(&c, &refresh) {
+                    return;
+                }
+                match reply {
+                    Ok(value)
+                        if value.get::<(String,)>().is_some_and(|(owner,)| {
+                            Some(owner.as_str()) == c.unique_name().as_deref()
+                        }) =>
+                    {
+                        menu.release_for_refresh(&c, refresh)
+                    }
+                    Err(error)
+                        if (menu.release_offered.get() || menu.had_panel.get())
+                            && gio::DBusError::remote_error(&error).as_deref()
+                                == Some("org.freedesktop.DBus.Error.NameHasNoOwner") =>
+                    {
+                        menu.acquire_for_refresh(&c, refresh)
+                    }
+                    _ => menu.refresh_failed("another panel owns the name or owner is unavailable"),
+                }
+            },
+        );
+    }
+    fn release_for_refresh(self: &Rc<Self>, conn: &gio::DBusConnection, refresh: Refresh) {
+        if !self.refresh_current(conn, &refresh) {
+            return;
+        }
+        // This records an offered release, not a successful one. If interrupted
+        // by lock, a later fresh GetNameOwner must observe no owner before reclaim.
+        self.release_offered.set(true);
+        let weak = Rc::downgrade(self);
+        let c = conn.clone();
+        let Some(timeout) = refresh.timeout_ms() else {
+            self.refresh_failed("deadline");
+            return;
+        };
+        conn.call(
+            Some(DIRECT_SENDER),
+            "/org/freedesktop/DBus",
+            DIRECT_SENDER,
+            "ReleaseName",
+            Some(&(PANEL,).to_variant()),
+            glib::VariantTy::new("(u)").ok(),
+            gio::DBusCallFlags::NONE,
+            timeout,
+            gio::Cancellable::NONE,
+            move |reply| {
+                let Some(menu) = weak.upgrade() else { return };
+                if !menu.refresh_current(&c, &refresh) {
+                    return;
+                }
+                if reply.ok().and_then(|v| v.get::<(u32,)>()) != Some((1,)) {
+                    menu.refresh_failed("panel release not confirmed");
+                    return;
+                }
+                menu.acquire_for_refresh(&c, refresh);
+            },
+        );
+    }
+    fn acquire_for_refresh(self: &Rc<Self>, conn: &gio::DBusConnection, refresh: Refresh) {
+        if !self.refresh_current(conn, &refresh) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let c = conn.clone();
+        let Some(timeout) = refresh.timeout_ms() else {
+            self.refresh_failed("deadline");
+            return;
+        };
+        // ALLOW_REPLACEMENT | DO_NOT_QUEUE. Never REPLACE_EXISTING.
+        conn.call(
+            Some(DIRECT_SENDER),
+            "/org/freedesktop/DBus",
+            DIRECT_SENDER,
+            "RequestName",
+            Some(&(PANEL, 1u32 | 4u32).to_variant()),
+            glib::VariantTy::new("(u)").ok(),
+            gio::DBusCallFlags::NONE,
+            timeout,
+            gio::Cancellable::NONE,
+            move |reply| {
+                let Some(menu) = weak.upgrade() else { return };
+                if !menu.refresh_current(&c, &refresh) {
+                    return;
+                }
+                if !matches!(reply.ok().and_then(|v| v.get::<(u32,)>()), Some((1 | 4,))) {
+                    menu.refresh_failed("panel name taken during refresh");
+                    return;
+                }
+                menu.refreshing.set(false);
+                menu.release_offered.set(false);
+                // Ownership watcher already reset before fresh FocusIn/cache.
+                // Do not reset this just-registered graph here.
+                menu.name_acquired(&c, true);
+            },
+        );
+    }
     fn activate(self: &Rc<Self>, token: &Token) {
         let conn = self.conn.borrow().clone();
         let Some(conn) = conn else { return };
+        if self.refreshing.get() {
+            return;
+        }
         if !self.owned.get() || (self.locked)() || !self.current(&conn, self.generation.get()) {
             self.model.borrow_mut().reset();
             self.render();
@@ -455,7 +879,10 @@ impl PropertyMenu {
             self.content.remove(&child);
         }
         let model = self.model.borrow();
-        let show = self.owned.get() && !(self.locked)() && model.engine.is_some();
+        let show = self.owned.get()
+            && !self.refreshing.get()
+            && !(self.locked)()
+            && model.engine.is_some();
         self.button.set_visible(show);
         let Some(engine) = model.engine.clone() else {
             return;
@@ -502,6 +929,15 @@ fn engine_name(value: &glib::Variant) -> Option<String> {
     (!name.is_empty() && name.len() <= wire::MAX_TEXT).then_some(name)
 }
 
+fn same_owner(
+    current_epoch: u64,
+    captured_epoch: u64,
+    current: Option<&str>,
+    expected: &str,
+) -> bool {
+    current_epoch == captured_epoch && current == Some(expected)
+}
+
 fn trusted_sender(peer: Option<&Peer>, sender: Option<&str>) -> bool {
     sender == Some(DIRECT_SENDER) && peer.is_some_and(Peer::live)
 }
@@ -509,6 +945,26 @@ fn trusted_sender(peer: Option<&Peer>, sender: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_owner_replies_and_absent_or_replaced_owner_are_refused() {
+        assert!(same_owner(2, 2, Some(":1.1"), ":1.1"));
+        assert!(!same_owner(3, 2, Some(":1.1"), ":1.1"));
+        assert!(!same_owner(2, 2, Some(":1.2"), ":1.1"));
+        assert!(!same_owner(2, 2, None, ":1.1"));
+    }
+    #[test]
+    fn refresh_deadline_is_absolute_and_bounds_each_phase() {
+        let mut refresh = Refresh {
+            connection: 1,
+            owner_epoch: 1,
+            id: 1,
+            owner: ":1.999999".into(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        assert!(refresh.timeout_ms().is_some_and(|ms| ms > 0 && ms <= 2000));
+        refresh.deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(refresh.timeout_ms(), None);
+    }
     #[test]
     fn held_executable_and_process_start_are_required_not_basename() {
         let pid = std::process::id() as i32;

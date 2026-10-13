@@ -4846,6 +4846,52 @@ if command -v ibus-daemon >/dev/null 2>&1 &&
         >"$ARTIFACTS/ibus-properties-proof.log" 2>&1 || fail G-IME-PROPERTIES "live properties proof failed"
     scrot "$ARTIFACTS/24p-ime-properties.png" >/dev/null
     pass G-IME-PROPERTIES "real daemon toggle/radio/submenu/action traffic; hidden/disabled and forged-peer denials"
+    # Separate lifecycle proof: preserve the original 40s property gate above.
+    # Two real nested lock cycles use the existing private PAM fixture. No
+    # password enters the observer, phase file, trace, or receipt.
+    [ -n "$PAM_ON" ] || fail G-IME-PROPERTIES-LIFECYCLE "private PAM fixture absent"
+    property_engine_pid="${IME_PIDS%% *}"
+    property_phase="$ARTIFACTS/ibus-properties-lifecycle-phase.json"
+    rm -f "$property_phase"
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+        TUNA_PROOF_SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD)" timeout --kill-after=2s 80s \
+        "$PY" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" "$property_shell_pid" "$ENGINE_LOG" \
+        "$ARTIFACTS/ibus-properties-lifecycle-receipt.json" "$privacy_expected_shell" \
+        "$property_engine_pid" "$property_phase" "$LOG" \
+        >"$ARTIFACTS/ibus-properties-lifecycle.log" 2>&1 &
+    property_driver_pid=$!
+    IME_PIDS="$IME_PIDS $property_driver_pid"
+    for property_case in normal other-panel; do
+        end=$(($(date +%s) + 35))
+        until [ -f "$property_phase" ] && jq -e --arg phase "locked-$property_case" \
+            --argjson gtk "$property_shell_pid" '.phase == $phase and .gtk.pid == $gtk' \
+            "$property_phase" >/dev/null; do
+            kill -0 "$property_driver_pid" 2>/dev/null || fail G-IME-PROPERTIES-LIFECYCLE "observer exited before lock phase"
+            [ "$(date +%s)" -le "$end" ] || fail G-IME-PROPERTIES-LIFECYCLE "lock phase deadline"
+            sleep 0.1
+        done
+        "$PY" - "$property_phase" "$property_driver_pid" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" <<'PY_IBUS_PHASE'
+import json, pathlib, sys
+phase = json.loads(pathlib.Path(sys.argv[1]).read_text())
+pid = int(phase["pid"])
+fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+if int(fields[1]) != int(sys.argv[2]):
+    raise SystemExit("observer is not the owned timeout child")
+if sys.argv[3].encode() not in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"):
+    raise SystemExit("observer source path differs")
+PY_IBUS_PHASE
+        cstate '.locked' "IBus lifecycle locked" 5 || fail G-IME-PROPERTIES-LIFECYCLE "observer phase disagrees with runtime lock"
+        # Same real lock UI wake/submission path as G-UNLOCK below.
+        sleep 1
+        xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
+        sleep 1
+        xdotool type --delay 30 "$UNLOCK_PASSWORD"
+        xdotool key Return
+        cstate '(.locked | not)' "IBus lifecycle authenticated unlock" 15 || \
+            fail G-IME-PROPERTIES-LIFECYCLE "private PAM fixture did not unlock"
+    done
+    wait "$property_driver_pid" || fail G-IME-PROPERTIES-LIFECYCLE "context/owner/lock property proof failed"
+    pass G-IME-PROPERTIES-LIFECYCLE "fresh unchanged-engine unlock; old context/lock actions have no effect; other panel is not replaced"
     # XIM talks to the session's XWayland, never the outer Xvfb display.
     x11_display="$(jq -r .x11_display "$CSTATE")"
     [ "$x11_display" != null ] || fail G-IME-XIM "XWayland display missing"

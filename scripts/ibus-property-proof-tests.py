@@ -46,6 +46,22 @@ class Controls(unittest.TestCase):
         self.assertIn('fail G-IME-PROPERTIES "live properties proof failed"', harness)
         self.assertIn('file_hash(expected_shell) != expected_hash', SOURCE.read_text())
 
+    def test_owner_refresh_and_lifecycle_admission_are_explicit(self):
+        gtk = (ROOT / "crates/shell-gtk/src/ibus_property_menu.rs").read_text()
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn('python3 scripts/ibus-property-proof-tests.py', workflow)
+        self.assertIn('Some(&destination)', gtk)
+        self.assertIn('name == IBUS', gtk)
+        self.assertIn('menu.owner_epoch.get() != epoch', gtk)
+        self.assertIn('1u32 | 4u32', gtk)
+        self.assertNotIn('1u32 | 2u32', gtk)
+        self.assertIn('another panel owns the name', gtk)
+        helper = SOURCE.read_text()
+        self.assertIn('phase_file.write_text', helper)
+        self.assertIn('ss_pid != pid', helper)
+        self.assertIn('instance() != original_instance', helper)
+        self.assertIn('validate_traffic(before, traffic(), positive)', helper)
+
     def test_production_callback_keeps_epoch_and_peer_lock_guards(self):
         gtk = (ROOT / "crates/shell-gtk/src/ibus_property_menu.rs").read_text()
         host = (ROOT / "crates/shell-host/src/ibus_properties.rs").read_text()
