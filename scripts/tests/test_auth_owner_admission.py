@@ -164,5 +164,90 @@ class Admission(unittest.TestCase):
         path = self.out/'test-pam.log'; path.write_text(path.read_text()*2)
         with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
 
+class DisplayReadiness(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'auth_display_readiness', ROOT / 'scripts/lib/auth-display-readiness.py')
+        cls.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.module)
+
+    def observe(self, rows, *, read_cost=0, live=True):
+        now = [0.0]
+        remaining = iter(rows)
+        last = [b'']
+        def read():
+            now[0] += read_cost
+            last[0] = next(remaining, last[0])
+            return last[0]
+        def pause(duration):
+            now[0] += duration
+        return self.module.wait_display(
+            'unused-owned-file', 123, clock=lambda: now[0], pause=pause,
+            alive=lambda pid: live, read=read, budget=5.0)
+
+    def test_partial_token_waits_for_complete_newline(self):
+        receipt = self.observe([b'', b'1', b'12', b'12\n'])
+        self.assertTrue(receipt['admitted'])
+        self.assertEqual(receipt['display'], '12')
+
+    def test_complete_zero_is_valid(self):
+        self.assertEqual(self.observe([b'0\n'])['display'], '0')
+
+    def test_unterminated_and_empty_tokens_expire(self):
+        for token in [b'', b'0']:
+            with self.subTest(token=token):
+                receipt = self.observe([token])
+                self.assertFalse(receipt['admitted'])
+                self.assertEqual(receipt['reason'], 'deadline')
+
+    def test_invalid_complete_and_oversized_tokens_refused(self):
+        for token in [b'\n', b'-1\n', b'0\n1\n', b'x\n', b'1' * 65]:
+            with self.subTest(token=token):
+                self.assertFalse(self.observe([token])['admitted'])
+
+    def test_read_crossing_deadline_cannot_admit(self):
+        receipt = self.observe([b'0\n'], read_cost=5)
+        self.assertFalse(receipt['admitted'])
+        self.assertEqual(receipt['reason'], 'deadline')
+
+    def test_dead_owned_process_cannot_admit(self):
+        receipt = self.observe([b'0\n'], live=False)
+        self.assertFalse(receipt['admitted'])
+        self.assertEqual(receipt['reason'], 'xvfb_exited')
+
+    def test_process_dying_after_read_cannot_admit(self):
+        calls = iter([True, False])
+        receipt = self.module.wait_display(
+            'unused', 123, clock=lambda: 0, pause=lambda duration: None,
+            alive=lambda pid: next(calls), read=lambda: b'0\n')
+        self.assertFalse(receipt['admitted'])
+
+    def test_actual_pretest_error_trap_records_phase_line_status(self):
+        import subprocess
+        start = SCRIPT.index('pretest_failure() {')
+        end = SCRIPT.index('git rev-parse HEAD', start)
+        with tempfile.TemporaryDirectory() as directory:
+            owned = Path(directory)
+            script = ('set -Eeuo pipefail\n'
+                      + 'out="$1"; pretest_phase=display_admission\n'
+                      + SCRIPT[start:end] + 'false\n')
+            result = subprocess.run(['bash', '-c', script, 'owned-test', str(owned)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            receipt = json.loads((owned / 'pretest-failure.json').read_text())
+            self.assertEqual(receipt['phase'], 'display_admission')
+            self.assertEqual(receipt['status'], 1)
+            self.assertIs(type(receipt['line']), int)
+            self.assertGreater(receipt['line'], 0)
+
+    def test_real_file_read_closes_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'display'
+            path.write_bytes(b'3\n')
+            receipt = self.module.wait_display(path, 123, alive=lambda pid: True)
+            self.assertEqual(receipt['display'], '3')
+
 if __name__ == '__main__':
     unittest.main()

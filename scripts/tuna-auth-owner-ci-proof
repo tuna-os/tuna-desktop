@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 # Source/runtime proof only: no installed/PAM retirement qualification.
-set -euo pipefail
+set -Eeuo pipefail
 out=${1:?owned artifact directory required}
 mkdir -p "$out"
+pretest_phase=source_admission
+pretest_failure() {
+    local status=$?
+    printf '{"phase":"%s","line":%s,"status":%s}\n' "$pretest_phase" "$1" "$status" > "$out/pretest-failure.json"
+    return "$status"
+}
+trap 'pretest_failure "$LINENO"' ERR
 git rev-parse HEAD > "$out/source.txt"
 git rev-parse --show-toplevel > "$out/root.txt"
 git diff --quiet
 git diff --cached --quiet
-sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/main.rs crates/compositor/src/lib.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/sleep.rs crates/compositor/src/pam.rs crates/compositor/src/pam_backend.rs crates/compositor/src/pam_helper.rs crates/compositor/src/unlock.rs crates/compositor/tests/fixtures/pam_conversation.c crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
+sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/lib/auth-display-readiness.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/main.rs crates/compositor/src/lib.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/sleep.rs crates/compositor/src/pam.rs crates/compositor/src/pam_backend.rs crates/compositor/src/pam_helper.rs crates/compositor/src/unlock.rs crates/compositor/tests/fixtures/pam_conversation.c crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
 cargo metadata --locked --no-deps --format-version=1 > "$out/metadata.json"
+pretest_phase=test_build
 cargo test --locked -p tuna-compositor --test auth_owner_runtime --no-run --message-format=json > "$out/build.json"
+pretest_phase=probe_build
 cargo build --locked -p tuna-compositor --example native-auth-owner-probe --message-format=json > "$out/probe-build.json"
 python3 - "$out" <<'PY'
 import hashlib,importlib.util,json,pathlib,sys
@@ -27,17 +36,18 @@ receipt={'source':(out/'source.txt').read_text().strip(),'executables':inputs,**
 (out/'test-executable').write_text(selected['test']+'\n')
 (out/'probe-executable').write_text(selected['probe']+'\n')
 PY
+pretest_phase=test_executable_admission
 IFS= read -r test_executable < "$out/test-executable"
+pretest_phase=xvfb_launch
+: > "$out/display"
 Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp 3>"$out/display" >"$out/xvfb.log" 2>&1 &
 xvfb_pid=$!
 trap 'kill "$xvfb_pid" 2>/dev/null || true; wait "$xvfb_pid" 2>/dev/null || true' EXIT
-for _ in $(seq 1 50); do
-    [ -s "$out/display" ] && break
-    kill -0 "$xvfb_pid"
-    sleep 0.1
-done
-IFS= read -r display_num < "$out/display"
+pretest_phase=display_admission
+python3 scripts/lib/auth-display-readiness.py "$out/display" "$xvfb_pid" "$out/display-readiness.json" > "$out/display-admitted"
+IFS= read -r display_num < "$out/display-admitted"
 case "$display_num" in ''|*[!0-9]*) exit 1 ;; esac
+trap - ERR
 DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime" \
     timeout --kill-after=3s 45s \
     "$test_executable" --exact actual_runtime_owns_delayed_greetd_result_and_lock_epochs --nocapture 2>&1 | tee "$out/test.log"
