@@ -14,9 +14,9 @@ import urllib.request
 REPO = "tuna-os/tuna-desktop"
 WORKFLOW = ".github/workflows/ci.yml"
 JOB = "grid-cancel-comparison"
-OLD_SHA = "c2f6e6bb8bd52692aaca5e26cf3a7e8182e9b0fd"
+OLD_SHA = "da1b7c40c7cc69f5800970e61cffa3d4e95c3f65"
 OLD_PARENT = "416ce950cb4dabc7701f8c66ab1cdb680d493287"
-OLD_PATCH = "a2c0ac70a3d275d71cc9750338d358873e1e5552754c8ee6b43f1fee7faebee9"
+OLD_PATCH = "0050999ead67c1fcc56a81402c6d2377ed39a2e234900eb35a6525654d4761ef"
 ROLES = {
     "tuna-compositor": ("tuna-compositor", "bin", "crates/compositor/src/main.rs"),
     "tuna-shell-gtk": ("tuna-shell-gtk", "bin", "crates/shell-gtk/src/main.rs"),
