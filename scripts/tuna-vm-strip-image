@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Produce a CI image receipt from original package and immutable-image inspection."""
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / 'scripts/lib'))
+from vm_strip_image import IMAGE_INSPECTION, admission
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--inspection-program', action='store_true')
+    parser.add_argument('--package')
+    parser.add_argument('--observed')
+    parser.add_argument('--commit')
+    parser.add_argument('--image-id')
+    parser.add_argument('--base-image')
+    parser.add_argument('--out')
+    args = parser.parse_args()
+    if args.inspection_program:
+        print(IMAGE_INSPECTION, end='')
+        return
+    if any(getattr(args, name) is None for name in ('package', 'observed', 'commit', 'image_id', 'base_image', 'out')):
+        parser.error('complete original package/image/source inputs required')
+    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, timeout=5, text=True).strip()
+    if head != args.commit:
+        raise ValueError('executing checkout differs from exact CI commit')
+    spec = importlib.util.spec_from_file_location('payload', root / 'scripts/lib/tuna-perf-payload.py')
+    payload = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(payload)
+    package = payload.inspect_package(args.package)
+    with open(args.observed, 'rb') as stream:
+        raw = stream.read(16385)
+    if len(raw) > 16384:
+        raise ValueError('image inspection receipt bound exceeded')
+    receipt = admission(package, json.loads(raw), root, head, args.image_id, args.base_image)
+    with open(args.out, 'x') as output:
+        json.dump(receipt, output, indent=2)
+        output.write('\n')
+
+
+if __name__ == '__main__':
+    main()

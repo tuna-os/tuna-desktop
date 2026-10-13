@@ -415,6 +415,208 @@ def background_user_diagnostics():
     return result
 
 
+STRIP_EXE = pathlib.Path("/usr/libexec/tuna-vm-input")
+STRIP_OWNER = pathlib.Path("/run/tuna-vm-strip-owner.json")
+
+
+def strip_nonce(value):
+    import re
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise ValueError("invalid strip fixture nonce")
+    return value
+
+
+def strip_json(path, uid):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not file_stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
+            raise RuntimeError("strip receipt ownership/permissions mismatch")
+        value = stream.read(131073)
+    if len(value) > 131072:
+        raise RuntimeError("strip receipt exceeds byte bound")
+    return json.loads(value)
+
+
+def strip_sha(path):
+    digest = hashlib.sha256()
+    size = 0
+    with pathlib.Path(path).open("rb") as stream:
+        while block := stream.read(65536):
+            size += len(block)
+            if size > 256 * 1024 * 1024:
+                raise RuntimeError("strip executable exceeds hash byte bound")
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def strip_core(current):
+    members = [p for p in current["processes"] if p["executable"] in ("tuna-compositor", "tuna-shell-gtk")]
+    if sorted(p["executable"] for p in members) != ["tuna-compositor", "tuna-shell-gtk"]:
+        raise RuntimeError("original native compositor/shell pair absent or ambiguous")
+    return {p["executable"]: strip_identity(p["pid"], OWNER.pw_uid) for p in members}
+
+
+def strip_identity(pid, uid):
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("invalid strip process PID")
+    path = pathlib.Path(f"/proc/{pid}")
+    fd = os.pidfd_open(pid)
+    try:
+        before = (path / "stat").read_text().rsplit(")", 1)[1].split()
+        inode = (path / "exe").stat()
+        if path.stat().st_uid != uid or before[0] == "Z":
+            raise RuntimeError("strip process owner/liveness mismatch")
+        actual = {"pid": pid, "uid": uid, "start_ticks": int(before[19]),
+                  "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                  "exe_inode": inode.st_ino, "exe_device": inode.st_dev,
+                  "exe_sha256": strip_sha(path / "exe")}
+        after = (path / "stat").read_text().rsplit(")", 1)[1].split()
+        new_inode = (path / "exe").stat()
+        stable = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if before[19] != after[19] or after[0] == "Z" or stable(new_inode) != stable(inode):
+            raise RuntimeError("strip process changed during identity read")
+        return actual
+    finally:
+        os.close(fd)
+
+
+def strip_validate_client(value, nonce, launcher):
+    if value.get("schema") != 1 or value.get("nonce") != nonce or value.get("backend") != "wayland":
+        raise RuntimeError("strip fixture receipt identity mismatch")
+    original = value["identity"]
+    actual = strip_identity(original["pid"], OWNER.pw_uid)
+    if any(original.get(key) != actual[key] for key in actual):
+        raise RuntimeError("strip fixture process restarted or receipt is stale")
+    if original.get("script_sha256") != strip_sha(STRIP_EXE):
+        raise RuntimeError("strip fixture installed script bytes changed")
+    path = pathlib.Path(f"/proc/{actual['pid']}")
+    with (path / "cmdline").open("rb") as stream:
+        command = stream.read(16385)
+    argv = command.rstrip(b"\0").split(b"\0")
+    if len(command) > 16384 or len(argv) != 4 or argv[1:] != [os.fsencode(STRIP_EXE), b"--strip-fixture", nonce.encode()]:
+        raise RuntimeError("strip fixture is not the actual admitted script invocation")
+    # A Python script receipt is not an executable binary identity by itself.
+    # The exact interpreter inode/hash plus actual argv and parent link are checked.
+    if launcher is not None:
+        parent = int((path / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        if parent != launcher["pid"]:
+            raise RuntimeError("strip fixture was not launched by the owned original launcher")
+    return actual | {"script_sha256": original["script_sha256"]}
+
+
+def strip_write_owner(value, exclusive=False):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_EXCL if exclusive else os.O_TRUNC)
+    fd = os.open(STRIP_OWNER, flags, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        if os.fstat(stream.fileno()).st_uid != 0:
+            raise RuntimeError("strip owner record is not root-owned")
+        json.dump(value, stream)
+
+
+def strip_stop_identity(original, uid, deadline):
+    import select
+    import signal
+    pid = original["pid"]
+    if time.monotonic() >= deadline:
+        raise TimeoutError("strip cleanup absolute deadline expired")
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return {"original": original, "retired": True, "proc_absent": True}
+    try:
+        # A replacement PID is never signalled. Exit readiness before identity
+        # acquisition is accepted only when the original process is gone.
+        poll = select.poll()
+        poll.register(fd, select.POLLIN)
+        if not poll.poll(0):
+            if strip_identity(pid, uid) != original:
+                raise RuntimeError("refuse to signal changed strip process identity")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("strip cleanup absolute deadline expired")
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+            remaining = min(2.0, max(0.0, deadline - time.monotonic()))
+            if not poll.poll(int(remaining * 1000)):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("strip process retirement unconfirmed at absolute deadline")
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                remaining = max(0.0, deadline - time.monotonic())
+                if not poll.poll(int(remaining * 1000)):
+                    raise RuntimeError("strip process physical retirement unconfirmed")
+        while pathlib.Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+            time.sleep(min(.02, max(0, deadline - time.monotonic())))
+        absent = not pathlib.Path(f"/proc/{pid}").exists()
+        if not absent:
+            raise RuntimeError("strip process PID remains; cleanup unconfirmed")
+        return {"original": original, "retired": True, "proc_absent": True}
+    finally:
+        os.close(fd)
+
+
+def strip_client(action, nonce):
+    nonce = strip_nonce(nonce)
+    receipt_path = pathlib.Path(RUNTIME, f"tuna-vm-strip-{nonce}.json")
+    if action == "start":
+        current = inventory()
+        if receipt_path.exists():
+            raise RuntimeError("refuse an existing strip fixture receipt")
+        owner = {"nonce": nonce, "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                 "launch_state": "unknown", "launcher": None, "client": None, "core": strip_core(current)}
+        strip_write_owner(owner, exclusive=True)
+        compositor = next(p for p in current["processes"] if p["executable"] == "tuna-compositor")
+        launcher = subprocess.Popen(["runuser", "-u", OWNER.pw_name, "--", "env",
+                                     f"XDG_RUNTIME_DIR={RUNTIME}",
+                                     f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus",
+                                     f"WAYLAND_DISPLAY=tuna-nested-{compositor['pid']}", "GDK_BACKEND=wayland",
+                                     str(STRIP_EXE), "--strip-fixture", nonce],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+        owner["launcher"] = strip_identity(launcher.pid, 0)
+        strip_write_owner(owner)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                value = strip_json(receipt_path, OWNER.pw_uid)
+                owner["client"] = strip_validate_client(value, nonce, owner["launcher"])
+                owner["launch_state"] = "known"
+                strip_write_owner(owner)
+                return {"owner": owner, "fixture": value, "inventory": inventory()}
+            except FileNotFoundError:
+                time.sleep(min(.05, max(0, deadline - time.monotonic())))
+        raise RuntimeError("strip launch acknowledgement absent; retirement unconfirmed")
+    owner = strip_json(STRIP_OWNER, 0)
+    if owner.get("nonce") != nonce or owner.get("boot_id") != pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip():
+        raise RuntimeError("strip owner nonce/boot mismatch")
+    if action == "stop":
+        deadline = time.monotonic() + 6
+        records = []
+        client = owner.get("client")
+        if client is not None:
+            identity = {key: value for key, value in client.items() if key != "script_sha256"}
+            records.append(strip_stop_identity(identity, OWNER.pw_uid, deadline))
+        if owner.get("launcher") is not None:
+            records.append(strip_stop_identity(owner["launcher"], 0, deadline))
+        if owner.get("launch_state") != "known" or client is None:
+            raise RuntimeError("unknown fixture launch prevents confirmed cleanup")
+        return {"nonce": nonce, "boot_id": owner["boot_id"], "owned_processes": records,
+                "cleanup_confirmed": True, "descendant_group_retirement_qualified": False}
+    if action != "state" or owner.get("launch_state") != "known":
+        raise RuntimeError("strip fixture ownership not admitted")
+    fixture = strip_json(receipt_path, OWNER.pw_uid)
+    if strip_validate_client(fixture, nonce, owner["launcher"]) != owner["client"]:
+        raise RuntimeError("strip client identity differs from original admission")
+    current = inventory()
+    if strip_core(current) != owner["core"]:
+        raise RuntimeError("native compositor/shell identity changed since original fixture admission")
+    summary = strip_json(STATE, OWNER.pw_uid)
+    current["state"].update({key: summary.get(key) for key in
+                           ("session_mode", "strip_offset", "strip_view", "strip_animating", "rendered_frames", "tile_preview")})
+    # Native window->PID kernel credentials are not in the current summary.
+    # Nonce app IDs/new-map sets are checked by the host; never fabricate that join.
+    return {"owner": owner, "fixture": fixture, "inventory": current,
+            "native_window_kernel_pid_join_qualified": False}
+
+
 def main():
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
@@ -427,6 +629,10 @@ def main():
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
     elif action == "inventory":
         result = inventory()
+    elif action in ("strip-start", "strip-state", "strip-stop"):
+        if len(sys.argv) != 3:
+            raise ValueError("strip action requires exactly one nonce")
+        result = strip_client(action.removeprefix("strip-"), sys.argv[2])
     elif action == "orca-departed":
         pid, ticks = int(sys.argv[2]), int(sys.argv[3])
         try:

@@ -48,7 +48,9 @@ import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
 _loader = importlib.machinery.SourceFileLoader("tuna_baseline",
                                                os.path.join(HERE, "tuna-baseline"))
 _spec = importlib.util.spec_from_loader("tuna_baseline", _loader)
@@ -224,7 +226,7 @@ def usb_bus_from_qtree(qtree):
     raise RuntimeError("no USB bus in qtree output")
 
 
-def run_lifecycle(qmp, agent, out, serial_path, record):
+def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
     evidence = os.path.join(out, "lifecycle")
     os.makedirs(evidence, exist_ok=True)
@@ -803,6 +805,12 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
             {"principal": principal, "observations": constraint_observations,
              "devices": mice, "relative_inputs": corner_inputs,
              "primary_error": constraint_primary_error})
+
+    if strip_image is not None:
+        from vm_strip_acceptance import prove_installed_strip
+        if reconnect is None:
+            raise RuntimeError("installed acceptance needs independent cleanup transport")
+        prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm, record)
 
     # Capture the stable desktop after the final key OSD has disappeared.
     time.sleep(2)
@@ -1611,6 +1619,8 @@ def repeat_boots(args):
                    "--timeout", str(args.timeout)]
         if args.tour and index == args.boots:
             command.append("--tour")
+        if getattr(args, "strip_image", None) and index == args.boots:
+            command.extend(["--strip-image", args.strip_image])
         for value in args.meta:
             command.extend(["--meta", value])
         result = subprocess.run(command, check=False)
@@ -1665,10 +1675,24 @@ def main():
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--tour", action="store_true",
                     help="after the assertions, record the feature tour video")
+    ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
     ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--boots", type=int, default=1,
                     help="repeat pristine snapshot boots; tour only on the last boot")
     a = ap.parse_args()
+    strip_image = None
+    if a.strip_image:
+        if not a.tour:
+            ap.error("--strip-image requires --tour lifecycle")
+        with open(a.strip_image, "rb") as stream:
+            raw = stream.read(1048577)
+        if len(raw) > 1048576:
+            ap.error("strip image receipt bound exceeded")
+        strip_image = json.loads(raw)
+        metadata = dict(value.split("=", 1) for value in a.meta)
+        if any(strip_image.get(field) != metadata.get(meta) for field, meta in
+               (("commit", "commit"), ("image_id", "test_image_id"), ("base_image", "base_image"))):
+            ap.error("strip receipt differs from actual VM image/source metadata")
     if not 1 <= a.boots <= 10:
         ap.error("--boots must be between 1 and 10")
     if a.boots > 1:
@@ -1769,7 +1793,8 @@ def main():
                     tour_serial_end = len(read_text(serial_path))
                     agent = guest_agent.GuestAgent(agent_path)
                     try:
-                        run_lifecycle(qmp, agent, out, serial_path, record)
+                        run_lifecycle(qmp, agent, out, serial_path, record, strip_image=strip_image,
+                                      reconnect=lambda: guest_agent.GuestAgent(agent_path))
                     finally:
                         agent.close()
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:

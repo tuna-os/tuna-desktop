@@ -40,6 +40,9 @@ jobs:
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
+      - run: python3 scripts/tests/test_vm_strip_acceptance.py
+      - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
+      - run: python3 scripts/tests/test_vm_strip_image.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
       - run: python3 scripts/lib/ledger-tests.py
@@ -796,12 +799,14 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           df -h / /mnt
-      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core
+      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd
       - name: Build the Marlin Tuna Desktop image and the VM test layer
         run: |
           cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst
           sudo podman build -f packaging/marlin/Containerfile \
-            --build-arg TUNA_PKG=tuna.pkg.tar.zst -t localhost/marlin-tuna-preview:ci .
+            --build-arg TUNA_PKG=tuna.pkg.tar.zst \
+            --build-arg "TUNA_PKG_SHA256=$(sha256sum tuna.pkg.tar.zst | cut -d' ' -f1)" \
+            -t localhost/marlin-tuna-preview:ci .
           sudo podman build -f packaging/marlin/vm-lane/Containerfile \
             -t localhost/marlin-tuna-vm:ci .
           sudo podman image inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee /mnt/vm/base-digest
@@ -813,6 +818,20 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" vm-lane-artifacts/image-kernels
           sudo podman run --rm localhost/marlin-tuna-vm:ci sh -c 'bootc --version; ls -ld /home; ls /usr/lib/bootc/install/ && cat /usr/lib/bootc/install/*' || true
           df -h / /mnt
+      - name: Bind installed acceptance to the original package and immutable final image
+        run: |
+          image_id=$(cat /mnt/vm/image-id)
+          owned_container="tuna-strip-inspect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'sudo podman rm -f "$owned_container" >/dev/null 2>&1 || true' EXIT
+          scripts/tuna-vm-strip-image --inspection-program > /mnt/vm/strip-inspect.py
+          timeout --kill-after=5s 60s sudo podman run --rm --name "$owned_container" -i \
+            --entrypoint /usr/bin/python3 "$image_id" - "$image_id" \
+            < /mnt/vm/strip-inspect.py > /mnt/vm/strip-image-observed.json
+          scripts/tuna-vm-strip-image --package tuna.pkg.tar.zst \
+            --observed /mnt/vm/strip-image-observed.json --commit "$GITHUB_SHA" \
+            --image-id "$image_id" \
+            --base-image "ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)" \
+            --out vm-lane-artifacts/strip-image.json
       - name: Install the image to a raw disk with bootc
         run: |
           # Marlin boots with systemd-boot, not bootupd, so it installs
@@ -842,6 +861,7 @@ jobs:
       - name: Boot the disk, assert the Tuna Desktop hardware session, record the tour
         run: >-
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour
+          --strip-image vm-lane-artifacts/strip-image.json
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
