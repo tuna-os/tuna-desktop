@@ -14,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use calloop::{EventLoop, LoopHandle};
 use smithay::{

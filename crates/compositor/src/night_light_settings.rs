@@ -592,7 +592,7 @@ mod tests {
     );
     fn controlled() -> Harness {
         let (wake, source) = Wake::new().unwrap();
-        let mut loop_ = calloop::EventLoop::try_new().unwrap();
+        let loop_ = calloop::EventLoop::try_new().unwrap();
         loop_
             .handle()
             .insert_source(source, |_, _, count| *count += 1)
