@@ -164,16 +164,30 @@ pub fn verify_owned(
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pending: impl FnMut(),
 ) -> crate::pam_backend::Verification {
+    verify_owned_credential(
+        user,
+        crate::pam_backend::Credential::from_schema(password),
+        cancel,
+        pending,
+    )
+}
+
+pub(crate) fn verify_owned_credential(
+    user: &str,
+    password: crate::pam_backend::Credential,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending: impl FnMut(),
+) -> crate::pam_backend::Verification {
     use crate::pam_backend::Verification;
     if let Some(path) = greetd_socket_path() {
         return Verification::Retired {
-            authenticated: verify_greetd(&path, user, &password.0),
+            authenticated: verify_greetd(&path, user, password.as_str()),
         };
     }
     let Some(backend) = crate::pam_backend::Backend::live() else {
         return Verification::RejectedBeforeSpawn;
     };
-    match backend.begin(crate::pam::service(), user.to_owned(), password, cancel) {
+    match backend.begin_credential(crate::pam::service(), user.to_owned(), password, cancel) {
         Ok(ticket) => ticket.wait_retired(pending),
         Err(result) => result,
     }

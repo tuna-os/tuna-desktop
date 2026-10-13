@@ -44,11 +44,55 @@ enum Reply {
     Retired(bool),
     Poisoned,
 }
+/// Private owned credential buffer. Schema Secret only redacts Debug and has
+/// no Drop; conversion moves its String, with no extra raw credential copy.
+pub(crate) struct Credential {
+    text: String,
+    #[cfg(test)]
+    dropped: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+impl Credential {
+    pub(crate) fn from_string(text: String) -> Self {
+        Self {
+            text,
+            #[cfg(test)]
+            dropped: None,
+        }
+    }
+    pub(crate) fn from_schema(secret: Secret) -> Self {
+        Self::from_string(secret.0)
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
+    }
+    fn wipe(&mut self) {
+        unsafe {
+            crate::pam_helper::wipe(self.text.as_mut_vec());
+        }
+    }
+    fn take_answer(&mut self) -> AnswerText {
+        AnswerText::new(std::mem::take(&mut self.text))
+    }
+}
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.wipe();
+        #[cfg(test)]
+        if let Some(dropped) = &self.dropped {
+            dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("Credential(<redacted>)")
+    }
+}
 struct Job {
     serial: u64,
     service: String,
     user: String,
-    password: Secret,
+    password: Credential,
     cancel: Arc<AtomicBool>,
     reply: mpsc::Sender<Reply>,
 }
@@ -206,6 +250,15 @@ impl Backend {
         password: Secret,
         cancel: Arc<AtomicBool>,
     ) -> Result<Ticket, Verification> {
+        self.begin_credential(service, user, Credential::from_schema(password), cancel)
+    }
+    pub(crate) fn begin_credential(
+        &self,
+        service: String,
+        user: String,
+        password: Credential,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Ticket, Verification> {
         if service.is_empty()
             || service.len() > 128
             || !service
@@ -214,8 +267,8 @@ impl Backend {
             || user.is_empty()
             || user.len() > TEXT_LIMIT
             || user.contains('\0')
-            || password.0.len() > TEXT_LIMIT
-            || password.0.contains('\0')
+            || password.as_str().len() > TEXT_LIMIT
+            || password.as_str().contains('\0')
             || self.shutdown.load(Ordering::Acquire)
             || self
                 .state
@@ -329,7 +382,7 @@ fn run_job(job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8)
                             let Some(mut password) = secret.take() else {
                                 unreachable!("validated single secret")
                             };
-                            Some(AnswerText::new(std::mem::take(&mut password.0)))
+                            Some(password.take_answer())
                         }
                         Style::Visible => {
                             visible_used = true;
@@ -382,6 +435,96 @@ fn supported_styles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn observed_credential(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Credential {
+        Credential {
+            text: "owned-control-value".into(),
+            dropped: Some(counter.clone()),
+        }
+    }
+    #[test]
+    fn private_credential_wipes_owned_storage_and_moves_into_answer_without_clone() {
+        let mut credential = Credential::from_string("owned-control-value".into());
+        let answer = credential.take_answer();
+        assert!(credential.as_str().is_empty());
+        assert_eq!(
+            serde_json::to_string(&answer).unwrap(),
+            "\"owned-control-value\""
+        );
+        let mut credential = Credential::from_string("owned-control-value".into());
+        credential.wipe();
+        assert!(credential.as_str().as_bytes().iter().all(|b| *b == 0));
+        assert!(!format!("{credential:?}").contains("owned-control-value"));
+        // SAME method used by Drop, observed while storage is still owned.
+    }
+    #[test]
+    fn denied_validation_busy_and_lost_receiver_drop_owned_credential() {
+        use std::sync::atomic::AtomicUsize;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let backend =
+            Backend::with_trusted_factory(|_, _, _, _| panic!("denials must not dispatch"))
+                .unwrap();
+        assert!(backend
+            .begin_credential(
+                "bad/service".into(),
+                "owner".into(),
+                observed_credential(&counter),
+                Arc::new(AtomicBool::new(false))
+            )
+            .is_err());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        backend.state.store(BUSY, Ordering::Release);
+        assert!(backend
+            .begin_credential(
+                "tuna-lock".into(),
+                "owner".into(),
+                observed_credential(&counter),
+                Arc::new(AtomicBool::new(false))
+            )
+            .is_err());
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        backend.shutdown();
+        // A closed submission receiver rejects BEFORE any helper could start.
+        let (sender, receive) = mpsc::sync_channel(1);
+        drop(receive);
+        let backend = Backend {
+            sender,
+            state: Arc::new(AtomicU8::new(FREE)),
+            serial: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            owner: Arc::new(Mutex::new(None)),
+        };
+        assert!(backend
+            .begin_credential(
+                "tuna-lock".into(),
+                "owner".into(),
+                observed_credential(&counter),
+                Arc::new(AtomicBool::new(false))
+            )
+            .is_err());
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+    #[test]
+    fn discarded_queued_credential_and_pending_unanswered_credential_drop() {
+        use std::sync::atomic::AtomicUsize;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (reply, _receive) = mpsc::channel();
+        let job = Job {
+            serial: 1,
+            service: "tuna-lock".into(),
+            user: "owner".into(),
+            password: observed_credential(&counter),
+            cancel: Arc::new(AtomicBool::new(false)),
+            reply,
+        };
+        let (send, receive) = mpsc::sync_channel(1);
+        send.send(Command::Attempt(job)).ok().unwrap();
+        drop(receive);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let pending = Some(observed_credential(&counter));
+        drop(pending);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        // These are ownership/drop controls, not physical helper retirement.
+    }
     #[test]
     fn single_password_never_answers_a_distinct_second_secret() {
         assert!(supported_styles(

@@ -121,7 +121,7 @@ impl Drop for Bytes {
         wipe(&mut self.0);
     }
 }
-fn wipe(bytes: &mut [u8]) {
+pub(crate) fn wipe(bytes: &mut [u8]) {
     for byte in bytes {
         // SAFETY: this writes exclusively owned bytes; volatile prevents elision.
         unsafe { std::ptr::write_volatile(byte, 0) };

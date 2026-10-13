@@ -35,6 +35,19 @@ class SourceContracts(unittest.TestCase):
         self.assertIn('ticket.wait_retired', runtime)
         self.assertIn('verify_owned', (ROOT / 'crates/compositor/src/unlock.rs').read_text())
 
+    def test_owned_credential_wrap_precedes_early_denials_and_moves_answer(self):
+        backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
+        self.assertIn('impl Drop for Credential', backend)
+        self.assertIn('crate::pam_helper::wipe(self.text.as_mut_vec())', backend)
+        self.assertIn('AnswerText::new(std::mem::take(&mut self.text))', backend)
+        self.assertIn('Credential::from_schema(password)', backend)
+        pam = (ROOT / 'crates/compositor/src/pam.rs').read_text()
+        self.assertIn('text.map(crate::pam_backend::Credential::from_string)', pam)
+        self.assertIn('begin_credential', pam)
+        runtime = (ROOT / 'crates/compositor/src/runtime.rs').read_text()
+        begin = runtime.index('if let Some((origin, password)) = outcome.unlock')
+        self.assertLess(runtime.index('Credential::from_schema(password)', begin), runtime.index('self.unlock_slot.begin', begin))
+
     def test_private_framing_retirement_and_redaction_contracts(self):
         helper = (ROOT / 'crates/compositor/src/pam_helper.rs').read_text()
         for token in ('deny_unknown_fields', 'FRAME_LIMIT', 'TEXT_LIMIT', 'MESSAGE_LIMIT',

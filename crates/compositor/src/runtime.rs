@@ -4079,6 +4079,7 @@ impl Runtime {
         // A lock-screen password: verified off the loop (PAM may stall
         // for seconds on a failure), one attempt at a time.
         if let Some((origin, password)) = outcome.unlock {
+            let password = crate::pam_backend::Credential::from_schema(password);
             let epoch = self
                 .unlock_generation
                 .load(std::sync::atomic::Ordering::Acquire);
@@ -4091,9 +4092,12 @@ impl Runtime {
                 let backend_cancel = cancel.clone();
                 self.start_unlock_worker(attempt, cancel, false, move |pending| {
                     match crate::unlock::session_user() {
-                        Some(user) => {
-                            crate::unlock::verify_owned(&user, password, backend_cancel, pending)
-                        }
+                        Some(user) => crate::unlock::verify_owned_credential(
+                            &user,
+                            password,
+                            backend_cancel,
+                            pending,
+                        ),
                         None => crate::pam_backend::Verification::RejectedBeforeSpawn,
                     }
                 });
