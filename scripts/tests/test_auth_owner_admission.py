@@ -12,6 +12,13 @@ SCRIPT = (ROOT / 'scripts/tuna-auth-owner-ci-proof').read_text()
 BLOCKS = [part.split('\nPY\n', 1)[0] for part in SCRIPT.split("<<'PY'\n")[1:]]
 
 
+INTERACTIVE_FIELDS = (
+    'mixed_styles', 'separate_pin', 'no_input_denied', 'foreign_denied',
+    'replay_denied', 'cancel_retired', 'epoch_denied', 'backend_phase_timeout',
+    'tagged_fingerprint_denied',
+)
+
+
 class Admission(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -66,6 +73,13 @@ class Admission(unittest.TestCase):
             'closed_origin_canceled_retired': True, 'origin_loss_wakes_private_pam_without_fixture_release': True, 'fresh_origin_success': True,
             'held_self_path_replaced': True, 'compositor_sha256': r['executables'][str(self.bin)]}))
         (self.out/'test-pam.log').write_text('auth owner pam sha256: '+r['executables'][str(self.bin)]+'\n')
+        # Synthetic admission input ONLY. These booleans do not claim an
+        # actual Runtime/PAM/GTK/seat invocation by this Python fixture.
+        (self.out/'runtime-interactive').mkdir(exist_ok=True)
+        (self.out/'runtime-interactive/success.json').write_text(json.dumps({
+            'fixture_kind': 'synthetic admission input, no runtime qualification',
+            **{key: True for key in INTERACTIVE_FIELDS},
+        }))
         return r
 
     def test_exact_roles_and_unchanged_files_admitted(self):
@@ -163,6 +177,44 @@ class Admission(unittest.TestCase):
         self.admit()
         path = self.out/'test-pam.log'; path.write_text(path.read_text()*2)
         with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+
+    def test_interactive_receipt_is_explicitly_synthetic_positive_input(self):
+        self.admit()
+        receipt = json.loads((self.out/'runtime-interactive/success.json').read_text())
+        self.assertEqual(receipt['fixture_kind'],
+                         'synthetic admission input, no runtime qualification')
+        self.execute(BLOCKS[1])
+
+    def test_every_interactive_phase_false_missing_or_non_bool_refused(self):
+        for field in INTERACTIVE_FIELDS:
+            for wrong in [False, None, 0, 1, 'true', [], {}]:
+                self.admit()
+                path = self.out/'runtime-interactive/success.json'
+                receipt = json.loads(path.read_text())
+                receipt[field] = wrong
+                path.write_text(json.dumps(receipt))
+                with self.subTest(field=field, wrong=wrong), self.assertRaises(AssertionError):
+                    self.execute(BLOCKS[1])
+            self.admit()
+            path = self.out/'runtime-interactive/success.json'
+            receipt = json.loads(path.read_text())
+            del receipt[field]
+            path.write_text(json.dumps(receipt))
+            with self.subTest(missing=field), self.assertRaises(KeyError):
+                self.execute(BLOCKS[1])
+
+    def test_missing_or_malformed_interactive_receipt_refused(self):
+        self.admit()
+        path = self.out/'runtime-interactive/success.json'
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.execute(BLOCKS[1])
+        for malformed in ['', '{', '[]', 'null']:
+            self.admit()
+            path.write_text(malformed)
+            with self.subTest(malformed=malformed), self.assertRaises(
+                    (json.JSONDecodeError, TypeError)):
+                self.execute(BLOCKS[1])
 
 if __name__ == '__main__':
     unittest.main()
