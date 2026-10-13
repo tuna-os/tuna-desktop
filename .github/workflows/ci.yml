@@ -84,7 +84,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/private-pam-helper-proof"
           git rev-parse HEAD > "$RUNNER_TEMP/private-pam-helper-proof/source.txt"
           sha256sum crates/compositor/src/pam_helper.rs crates/compositor/src/main.rs crates/compositor/tests/pam_helper.rs crates/compositor/tests/fixtures/pam_conversation.c > "$RUNNER_TEMP/private-pam-helper-proof/source-sha256.txt"
-          cargo test -p tuna-compositor --test pam_helper -- --exact private_pam_helper_actual_binary_conversation_and_retirement --nocapture 2>&1 | tee "$RUNNER_TEMP/private-pam-helper-proof/test.log"
+          cargo test --locked -p tuna-compositor --test pam_helper -- --exact private_pam_helper_actual_binary_conversation_and_retirement --nocapture 2>&1 | tee "$RUNNER_TEMP/private-pam-helper-proof/test.log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/private-pam-helper-proof/test.log"
           grep -Eq '^private PAM helper executable sha256: [a-f0-9]{64}$' "$RUNNER_TEMP/private-pam-helper-proof/test.log"
         env:
