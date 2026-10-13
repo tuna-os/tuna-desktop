@@ -49,6 +49,29 @@ class Tests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(RuntimeError):
                 proof.windows(bad, copy.deepcopy(value['owner']))
 
+    def test_malformed_flags_schema_sequence_and_counters_never_qualify(self):
+        value = sample()
+        for field, replacements in [('mapped', [0, 1, 'true']),
+                                    ('paint_count', [True, False, -1, 0, 1.5]),
+                                    ('width', [True, -1]), ('height', [True, -1]),
+                                    ('painted_width', [True, -1]), ('painted_height', [True, -1])]:
+            for replacement in replacements:
+                bad = copy.deepcopy(value)
+                bad['fixture']['windows']['alpha'][field] = replacement
+                with self.subTest(field=field, value=replacement), self.assertRaises(RuntimeError):
+                    proof.windows(bad, value['owner'])
+        for container, field, replacements in [('fixture', 'schema', [True, False]),
+                                               ('fixture', 'sequence', [True, 0, -1]),
+                                               ('state', 'rendered_frames', [True, 0, -1]),
+                                               ('state', 'locked', [0, 1]),
+                                               ('state', 'overview_open', [0, 1])]:
+            for replacement in replacements:
+                bad = copy.deepcopy(value)
+                target = bad['fixture'] if container == 'fixture' else bad['inventory']['state']
+                target[field] = replacement
+                with self.subTest(field=field, value=replacement), self.assertRaises(RuntimeError):
+                    proof.windows(bad, value['owner'])
+
     def test_partial_map_or_allocation_cannot_be_completed_endpoint(self):
         value = sample()
         for role in proof.ROLES:
@@ -121,6 +144,49 @@ class Tests(unittest.TestCase):
                 lambda actual, original, previous: proof.endpoint(actual, original, mode='scroll'),
                 deadline=time.monotonic() + 1)
         self.assertEqual(calls, [1])
+
+    def test_late_third_observation_cannot_pass_absolute_deadline(self):
+        value = sample()
+        clock = [0.0]
+        calls = []
+        def read(_deadline):
+            calls.append(1)
+            clock[0] = .01 if len(calls) < 3 else 2.0
+            return value
+        from unittest.mock import patch
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(proof.time, 'sleep'):
+            with self.assertRaisesRegex(TimeoutError, 'observation exceeded'):
+                proof.await_endpoint(read, value['owner'],
+                    lambda actual, original, previous: proof.endpoint(actual, original, mode='scroll'),
+                    deadline=1.0)
+        self.assertEqual(len(calls), 3)
+
+    def test_late_validation_cannot_pass_absolute_deadline(self):
+        value = sample()
+        clock = [0.0]
+        calls = []
+        def predicate(actual, original, previous):
+            calls.append(1)
+            if len(calls) == 3:
+                clock[0] = 2.0
+            return proof.endpoint(actual, original, mode='scroll')
+        from unittest.mock import patch
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(proof.time, 'sleep'):
+            with self.assertRaisesRegex(TimeoutError, 'validation exceeded'):
+                proof.await_endpoint(lambda _: value, value['owner'], predicate, deadline=1.0)
+        self.assertEqual(len(calls), 3)
+
+    def test_actual_mode_chord_and_nonvacuous_vt_control_are_retained(self):
+        import inspect
+        source = inspect.getsource(proof.prove_installed_strip)
+        self.assertEqual(source.count("chord('meta_l', 'shift', 't')"), 2)
+        self.assertNotIn("chord('meta_l', 't')", source)
+        self.assertIn("held = ready('scroll', extra=before_beta)", source)
+        self.assertIn("bar[0] == found['beta']['rect'][0] - 4", source)
+        self.assertIn("cancel control did not start after Beta", source)
+        self.assertIn("with Image.open(png) as frame:", source)
+        self.assertIn("colored_frame((png_image.width, png_image.height, png_image.tobytes())", source)
+        self.assertIn("'same_acquisition_qualified': False", source)
 
 
 class TransportAndCleanup(unittest.TestCase):

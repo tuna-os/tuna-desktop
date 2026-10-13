@@ -20,9 +20,14 @@ def windows(sample, original):
     identity = fixture['identity']
     if identity != original['client'] or identity['boot_id'] != original['boot_id']:
         raise RuntimeError('fixture PID/start/executable/boot drift')
-    if fixture.get('backend') != 'wayland' or fixture.get('schema') != 1:
+    if (fixture.get('backend') != 'wayland' or type(fixture.get('schema')) is not int
+            or fixture['schema'] != 1):
         raise RuntimeError('actual Wayland fixture schema missing')
+    if (type(fixture.get('sequence')) is not int or fixture['sequence'] <= 0):
+        raise RuntimeError('genuine positive fixture sequence missing')
     state = inventory['state']
+    if type(state.get('locked')) is not bool or type(state.get('overview_open')) is not bool:
+        raise RuntimeError('genuine lock/overview flags missing')
     if state['locked'] or state['overview_open']:
         raise NotReady('window interaction is owned by lock/overview')
     core = original['core']
@@ -50,14 +55,20 @@ def windows(sample, original):
                 or len(rect) != 4 or any(type(v) is not int for v in rect)
                 or rect[2] < 120 or rect[3] < 80):
             raise RuntimeError('invalid actual window identity/geometry')
-        if (not actual['mapped'] or actual['paint_count'] <= 0
+        if type(actual.get('mapped')) is not bool:
+            raise RuntimeError('genuine GTK mapped flag missing')
+        for field in ('paint_count', 'width', 'height', 'painted_width', 'painted_height'):
+            if type(actual.get(field)) is not int or actual[field] <= 0:
+                raise NotReady('genuine positive GTK paint/allocation observations missing')
+        if (not actual['mapped']
                 or [actual['width'], actual['height']] != rect[2:]
                 or [actual['painted_width'], actual['painted_height']] != rect[2:]):
             raise NotReady('actual GTK allocation/paint differs from compositor')
         result[role] = window
     if len({w['id'] for w in result.values()}) != len(ROLES):
         raise RuntimeError('fixture windows reused the same compositor identity')
-    if state.get('session_mode') not in ('gnome', 'scroll') or type(state.get('rendered_frames')) is not int:
+    if (state.get('session_mode') not in ('gnome', 'scroll')
+            or type(state.get('rendered_frames')) is not int or state['rendered_frames'] <= 0):
         raise NotReady('native render/session observation absent')
     if state.get('strip_animating') is not False:
         raise NotReady('actual strip view or column animation still running')
@@ -158,6 +169,8 @@ def await_endpoint(read, original, predicate, *, deadline, previous=None):
     observations = []
     while time.monotonic() < deadline:
         sample = read(deadline)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('installed strip observation exceeded absolute deadline')
         if len(observations) >= 256 or len(json.dumps(sample).encode()) > 65536:
             raise RuntimeError('installed observation count/byte bound exceeded')
         observations.append(sample)
@@ -170,6 +183,8 @@ def await_endpoint(read, original, predicate, *, deadline, previous=None):
             stable = stable + 1 if signature == last else 1
             last = signature
             if stable >= 3:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('installed strip validation exceeded absolute deadline')
                 return sample, observations
         time.sleep(min(.05, max(0, deadline - time.monotonic())))
     raise TimeoutError('installed strip endpoint did not become ready before deadline')
@@ -250,14 +265,26 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         if actual_image[:2] != (1280, 800):
             raise RuntimeError('actual framebuffer dimensions differ from admitted viewport')
         colored_frame(actual_image, found[role]['rect'], COLORS[role])
+        # QMP PNG and PPM are separate acquisitions. Validate both actual
+        # images; an earlier unvalidated PNG is not a qualified walkthrough.
+        from PIL import Image
+        with Image.open(png) as frame:
+            if frame.format != 'PNG' or frame.size != (1280, 800):
+                raise RuntimeError('actual PNG framebuffer format/dimensions differ')
+            png_image = frame.convert('RGB')
+            colored_frame((png_image.width, png_image.height, png_image.tobytes()),
+                          found[role]['rect'], COLORS[role])
         after = read(deadline)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('installed framebuffer validation exceeded absolute deadline')
         if windows(after, original) != found:
             raise RuntimeError('actual window geometry changed across framebuffer acquisition')
         entry = {'label': label, 'sample': sample, 'after': after,
                  'png_sha256': hashlib.sha256(png.read_bytes()).hexdigest(),
                  'ppm_sha256': hashlib.sha256(ppm.read_bytes()).hexdigest(),
                  'capture_completed_monotonic_ns': time.monotonic_ns(),
-                 'presented_latency_qualified': False}
+                 'png_rgb_verified': True, 'ppm_rgb_verified': True,
+                 'same_acquisition_qualified': False, 'presented_latency_qualified': False}
         receipt['cases'].append(entry)
         return after
 
@@ -280,7 +307,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         initial_ids = {w['id']: w['workspace'] for w in first['inventory']['state']['windows']}
         initial_rects = {w['id']: w['rect'] for w in first['inventory']['state']['windows']}
         capture('01-floating', first)
-        chord('meta_l', 't')
+        chord('meta_l', 'shift', 't')
         strip = ready('scroll', first)
         if {w['id']: w['workspace'] for w in strip['inventory']['state']['windows']} != initial_ids:
             raise RuntimeError('mode toggle changed actual window/workspace identities')
@@ -331,11 +358,31 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         capture('06-pointer-reorder', reordered)
         # The actual libseat PauseSession callback must cancel, not commit,
         # a held titlebar move when switching VT and returning.
-        rect = windows(reordered, original)['alpha']['rect']
-        move(rect[0] + 24, rect[1] + 20)
+        before_cancel = windows(reordered, original)
+        rect = before_cancel['alpha']['rect']
+        beta_rect = before_cancel['beta']['rect']
+        # Grab near the visible right side, so an actual in-viewport motion
+        # can move the actor center left of Beta's center even for a wide A.
+        grab_x = min(1250, rect[0] + rect[2] - 24)
+        if not rect[0] < grab_x < rect[0] + rect[2]:
+            raise RuntimeError('actual cancellation title target is not visible')
+        grab_offset = grab_x - rect[0]
+        target_x = max(20, min(1260, beta_rect[0] + beta_rect[2] // 2 - 48 - rect[2] // 2 + grab_offset))
+        move(grab_x, rect[1] + 20)
         button(True)
-        move(rect[0] + 36, rect[1] + 20)
-        held = ready('scroll', extra=lambda sample, found: (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id'])
+        move(grab_x - 12, rect[1] + 20)
+        ready('scroll', extra=lambda sample, found: (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id'])
+        move(target_x, rect[1] + 20)
+        def before_beta(sample, found):
+            preview = sample['inventory']['state']['tile_preview'] or {}
+            bar = preview.get('rect', [])
+            return (preview.get('window') == found['alpha']['id'] and len(bar) == 4
+                    and bar[2] == 8 and bar[0] == found['beta']['rect'][0] - 4)
+        held = ready('scroll', extra=before_beta)
+        # This observed insertion would change [Beta, A, ...] on release.
+        # Cancellation must instead preserve every original canonical rectangle.
+        if before_cancel['alpha']['rect'][0] <= before_cancel['beta']['rect'][0]:
+            raise RuntimeError('cancel control did not start after Beta')
         vt = int(held['inventory']['session']['VTNr'])
         away = 2 if vt != 2 else 3
         if guest('vt', away)['active_vt'] != f'tty{away}':
@@ -343,17 +390,19 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record):
         if guest('vt', vt)['active_vt'] != f'tty{vt}':
             raise RuntimeError('actual VT did not return to original session')
         returned = ready('scroll', extra=lambda sample, found: sample['inventory']['state']['tile_preview'] is None)
-        if {role: item['rect'] for role, item in windows(returned, original).items()} != {role: item['rect'] for role, item in windows(held, original).items()}:
+        if {role: item['rect'] for role, item in windows(returned, original).items()} != {role: item['rect'] for role, item in before_cancel.items()}:
             raise RuntimeError('VT cancellation committed a column move')
         button(False)
         capture('07-vt-cancel', returned)
-        chord('meta_l', 't')
+        chord('meta_l', 'shift', 't')
         restored = ready('gnome', returned)
         if {w['id']: w['workspace'] for w in restored['inventory']['state']['windows']} != initial_ids:
             raise RuntimeError('mode restore changed actual native identities')
         if {w['id']: w['rect'] for w in restored['inventory']['state']['windows']} != initial_rects:
             raise RuntimeError('mode restore lost independent floating rectangles')
         capture('08-floating-restored', restored)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('installed strip completion exceeded absolute deadline')
         receipt['completed'] = True
     except BaseException as error:
         primary = error
