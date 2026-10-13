@@ -9,12 +9,13 @@ import sys
 sys.dont_write_bytecode = True
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / 'scripts/lib'))
-from vm_strip_image import IMAGE_INSPECTION, admission
+from vm_strip_image import IMAGE_INSPECTION, admission, canonical_image_id
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--inspection-program', action='store_true')
+    parser.add_argument('--canonical-image-id')
     parser.add_argument('--package')
     parser.add_argument('--observed')
     parser.add_argument('--commit')
@@ -22,6 +23,12 @@ def main():
     parser.add_argument('--base-image')
     parser.add_argument('--out')
     args = parser.parse_args()
+    if args.canonical_image_id is not None:
+        if args.inspection_program or any(getattr(args, name) is not None for name in
+                ('package', 'observed', 'commit', 'image_id', 'base_image', 'out')):
+            parser.error('image ID canonicalization requires a separate invocation')
+        print(canonical_image_id(args.canonical_image_id))
+        return
     if args.inspection_program:
         print(IMAGE_INSPECTION, end='')
         return

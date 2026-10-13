@@ -812,8 +812,10 @@ jobs:
           sudo podman build -f packaging/marlin/vm-lane/Containerfile \
             -t localhost/marlin-tuna-vm:ci .
           sudo podman image inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee /mnt/vm/base-digest
-          sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' | tee /mnt/vm/image-id
+          sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
+          scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
           mkdir -p vm-lane-artifacts/image-kernels
+          cp /mnt/vm/image-id-observed /mnt/vm/image-id vm-lane-artifacts/
           kernel_container=$(sudo podman create localhost/marlin-tuna-vm:ci /usr/bin/true)
           trap 'sudo podman rm "$kernel_container"' EXIT
           sudo podman cp "$kernel_container:/usr/share/tuna-image-kernels/." vm-lane-artifacts/image-kernels/

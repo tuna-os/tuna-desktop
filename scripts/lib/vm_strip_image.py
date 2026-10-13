@@ -5,6 +5,13 @@ from pathlib import Path
 import re
 
 
+def canonical_image_id(observed):
+    """Canonicalize Podman's full image ID without admitting tags or short IDs."""
+    if not isinstance(observed, str) or not re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', observed):
+        raise ValueError('full immutable Podman image ID required')
+    return observed if observed.startswith('sha256:') else 'sha256:' + observed
+
+
 def admission(package, observed, root, commit, image_id, base_image):
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('exact source commit missing')
