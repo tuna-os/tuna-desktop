@@ -82,6 +82,7 @@ jobs:
           python3 scripts/lib/cursor-assets-tests.py
       - run: /usr/bin/python3 scripts/tests/test_strip_endpoint.py
       - run: /usr/bin/python3 scripts/tests/test_fprint_phase_contract.py
+      - run: /usr/bin/python3 scripts/tests/test_stock_slideshow_proof.py
       - run: cargo fmt --all -- --check
       - name: Check bounded EIS transport regression tests
         run: |
@@ -625,7 +626,7 @@ jobs:
           name: tuna-arch
           path: ${{ runner.temp }}/portal-package
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends podman zstd shellcheck
-      - run: shellcheck scripts/tuna-portal-security tests/portal-reference/run.sh tests/portal-reference/settings-run.sh tests/portal-reference/backgrounds-run.sh
+      - run: shellcheck scripts/tuna-portal-security tests/portal-reference/run.sh tests/portal-reference/settings-run.sh tests/portal-reference/backgrounds-run.sh tests/portal-reference/slideshow-run.sh
       - run: python3 scripts/lib/tuna-portal-artifact-tests.py
       - name: Test packaged compositor with actual GNOME 51 portal consent
         run: |

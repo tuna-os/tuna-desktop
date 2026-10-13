@@ -775,7 +775,12 @@ impl ControlClient {
                 Err(ControlError::WouldBlock)
             }
             Err(e) => {
-                if !matches!(&e, ControlError::WouldBlock) {
+                // A nonblocking read commonly exposes the underlying I/O
+                // variant. Ordinary EAGAIN is readiness, not peer loss.
+                let would_block = matches!(&e, ControlError::WouldBlock)
+                    || matches!(&e, ControlError::Io(error)
+                        if error.kind() == io::ErrorKind::WouldBlock);
+                if !would_block {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                 }
                 Err(e)
@@ -1330,8 +1335,11 @@ mod tests {
         server_write(&mut peer, &snapshot_rev7());
         client.poll().unwrap();
         assert!(client.input_method_actions_allowed());
-        assert!(matches!(client.poll(), Err(ControlError::WouldBlock)));
-        assert!(client.input_method_actions_allowed());
+        for _ in 0..3 {
+            assert!(matches!(client.poll(), Err(ControlError::Io(error))
+                if error.kind() == io::ErrorKind::WouldBlock));
+            assert!(client.input_method_actions_allowed());
+        }
         let mut locked = snapshot_rev7();
         if let Message::Snapshot { locked, .. } = &mut locked {
             *locked = true;

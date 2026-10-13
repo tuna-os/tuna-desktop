@@ -4267,7 +4267,7 @@ fn strip_drag_survives_unrelated_map_and_neighbor_close_without_resurrection() {
     );
     // A different release cannot commit the initiating left-button grab.
     f.manager
-        .pointer_button(&mut f.comp.state, BTN_RIGHT, false, 13);
+        .pointer_button(&mut f.comp.state, BTN_LEFT + 1, false, 13);
     assert!(f.manager.grab_active());
     assert_eq!(f.manager.geometry(f.id_a).unwrap(), canonical_a);
     assert_eq!(f.manager.geometry(mapped).unwrap(), canonical_new);
