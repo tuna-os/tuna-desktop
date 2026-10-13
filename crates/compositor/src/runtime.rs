@@ -1182,6 +1182,7 @@ impl Runtime {
         // callback plus the unconditional tick/render below serve
         // them, so no second wake source or thread is needed.
         night_light_share.set_wake(&runtime.wake);
+        night_light_share.start_reader(&runtime.wake);
         runtime.orca.set_wake(&runtime.wake);
         runtime.idle_monitor.set_wake(&runtime.wake);
         if let Some(ime) = &runtime.ime {
@@ -3929,23 +3930,17 @@ impl Runtime {
         }
     }
 
-    /// Poll the Night Light settings and evaluate the schedule for
-    /// this frame (#339). A refreshed config mirrors into the window
-    /// model; a wedged clock keeps the previous gains.
+    /// Consume the bounded settings cache and evaluate the schedule for
+    /// this frame (#339). Native reads stay on the owned GIO worker.
+    /// Every wall-clock outcome still consumes monotonic preview expiry.
     fn night_light_tick(&mut self) -> Option<crate::night_light::ColorGains> {
-        if self
-            .night_light
-            .maybe_refresh(Instant::now(), crate::night_light::load_from_gsettings)
-        {
+        if self.night_light.poll_settings(Instant::now()) {
             self.manager
                 .model_mut()
                 .set_night_light(self.night_light.config().clone());
         }
-        if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
-            self.night_light.tick(elapsed.as_secs() as i64)
-        } else {
-            self.night_light.current_gains()
-        }
+        self.night_light
+            .tick_at_system_time(SystemTime::now(), Instant::now())
     }
 
     /// Render all mapped toplevels stacked at the origin, then send frame
@@ -5828,21 +5823,30 @@ mod tests {
             .unwrap();
         let mut count = 0;
         share.set_preview(2000, 5).unwrap();
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 1);
         share.clear_preview();
         loop_
             .dispatch(Some(Duration::from_secs(2)), &mut count)
             .unwrap();
-        assert_eq!(count, 1, "clear must ping; coalesced with preview");
+        assert_eq!(
+            count, 2,
+            "clear must provide its own wake after preview was drained"
+        );
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+        assert_eq!(count, 2, "no repeated clear wake");
         share.set_disabled_until_tmw(Some(1_700_000_000));
         loop_
             .dispatch(Some(Duration::from_secs(2)), &mut count)
             .unwrap();
-        assert_eq!(count, 2, "temp-disable set must ping");
+        assert_eq!(count, 3, "temp-disable set must ping");
         share.set_disabled_until_tmw(None);
         loop_
             .dispatch(Some(Duration::from_secs(2)), &mut count)
             .unwrap();
-        assert_eq!(count, 3, "temp-disable clear must ping");
+        assert_eq!(count, 4, "temp-disable clear must ping");
     }
 
     /// Without `set_wake` the share still records (fallback path),
@@ -5861,6 +5865,8 @@ mod tests {
         share.set_preview(2000, 5).unwrap();
         loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
         assert_eq!(count, 0, "unconnected share must not ping");
-        assert!(share.preview_temperature(std::time::Instant::now()).is_some());
+        assert!(share
+            .preview_temperature(std::time::Instant::now())
+            .is_some());
     }
 }

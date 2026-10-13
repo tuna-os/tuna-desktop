@@ -4147,6 +4147,7 @@ name = "tuna-compositor"
 version = "0.1.0"
 dependencies = [
  "calloop 0.14.5",
+ "gio",
  "greetd_ipc",
  "image",
  "libc",

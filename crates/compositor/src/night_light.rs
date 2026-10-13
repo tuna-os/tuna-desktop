@@ -14,10 +14,10 @@
 //!   [`MIN_TEMPERATURE_K`]..=[`MAX_TEMPERATURE_K`].
 //! - [`temperature_to_gains`]: colour-temperature-to-gains mapping,
 //!   normalised so [`NEUTRAL_TEMPERATURE_K`] is unity.
-//! - [`load_from_gsettings`]: the production settings reader. It runs
-//!   `gsettings list-recursively` over [`COLOR_SCHEMA`] and parses
-//!   the keys; any failure leaves the previous config in place
-//!   (fail closed).
+//! - The owned GIO settings reader caches six typed keys and watches changes.
+//!   Native calls run on one worker; the render and D-Bus consumers never wait
+//!   for native I/O. Failure retains the previous config; deadline expiry
+//!   permanently quarantines that reader without spawning a replacement.
 //! - [`NightLightController`]: per-tick evaluation (settings
 //!   refresh, schedule, smear, temp-disable, preview, 10 K hysteresis)
 //!   shared with the D-Bus thread through [`NightLightShare`].
@@ -80,8 +80,8 @@
 //! Known divergences from GNOME 51, all recorded rather than
 //! invented: Kelvin maps through Tanner Helland's approximation where
 //! mutter uses colord's Planckian blackbody
-//! (`cd_color_get_blackbody_rgb`); settings refresh polls every
-//! [`READ_INTERVAL`] where g-s-d gets instant change signals; polar
+//! (`cd_color_get_blackbody_rgb`); settings refresh watches changes with a fallback recheck every
+//! [`READ_INTERVAL`]; polar
 //! day/night read inactive/active where g-s-d keeps its last
 //! sunrise/sunset (manual fallback); transient solid feedback
 //! (screenshot flashes; the bell and the blank shield are black, so
@@ -163,10 +163,9 @@ pub const SMEAR_HOURS: f64 = 1.0;
 /// (`GSD_TEMPERATURE_MAX_DELTA`): during a smear the applied gains
 /// step at most every few seconds instead of every frame.
 pub const TEMPERATURE_QUANTUM_K: u32 = 10;
-/// How often the controller re-reads the settings keys
-/// (`GSD_NIGHT_LIGHT_SCHEDULE_TIMEOUT`). GNOME reacts to change
-/// signals instantly and rechecks on this cadence; polling on the
-/// same cadence bounds our worst-case lag to one interval.
+/// Schedule and cached-reader fallback cadence. Native change watches also
+/// signal the existing runtime wake. A quarantined reader never retries; only
+/// enabled schedule evaluation retains this clock obligation.
 pub const READ_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long a Settings slider preview lasts: the slider calls
 /// `NightLightPreview(5)` while dragged, forcing the requested
@@ -589,11 +588,9 @@ fn night_intervals(
     let mut sunsets = Vec::new();
     let mut sunrises = Vec::new();
     for date in [day - 2, day - 1, day, day + 1, day + 2] {
-        if let Daylight::Normal(window) = sun_window_for_day_of_year(
-            latitude_deg,
-            longitude_deg,
-            day_of_year_for_days(date),
-        ) {
+        if let Daylight::Normal(window) =
+            sun_window_for_day_of_year(latitude_deg, longitude_deg, day_of_year_for_days(date))
+        {
             sunsets.push(date * 86_400 + (window.sunset_utc_min * 60.0).round() as i64);
             sunrises.push(date * 86_400 + (window.sunrise_utc_min * 60.0).round() as i64);
         }
@@ -626,21 +623,12 @@ fn automatic_temperature(
     utc_offset_secs: i64,
 ) -> Option<u32> {
     let local_day = (unix_seconds + utc_offset_secs).div_euclid(86_400);
-    match sun_window_for_day_of_year(
-        latitude_deg,
-        longitude_deg,
-        day_of_year_for_days(local_day),
-    ) {
+    match sun_window_for_day_of_year(latitude_deg, longitude_deg, day_of_year_for_days(local_day)) {
         Daylight::PolarDay => return None,
         Daylight::PolarNight => return Some(target_k),
         Daylight::Normal(_) => {}
     }
-    for interval in night_intervals(
-        latitude_deg,
-        longitude_deg,
-        unix_seconds,
-        utc_offset_secs,
-    ) {
+    for interval in night_intervals(latitude_deg, longitude_deg, unix_seconds, utc_offset_secs) {
         let night = (interval.end - interval.start) as f64;
         if night <= 0.0 || night > 86_400.0 {
             continue;
@@ -707,11 +695,7 @@ pub fn sun_window(latitude_deg: f64, longitude_deg: f64, unix_seconds: i64) -> D
 /// year so the automatic window follows local dates; the returned
 /// minutes stay minutes since 00:00 UTC on the date with that day
 /// of year, and callers pair them into absolute instants.
-fn sun_window_for_day_of_year(
-    latitude_deg: f64,
-    longitude_deg: f64,
-    day_of_year: u16,
-) -> Daylight {
+fn sun_window_for_day_of_year(latitude_deg: f64, longitude_deg: f64, day_of_year: u16) -> Daylight {
     let lat = latitude_deg.clamp(-90.0, 90.0).to_radians();
     let lon = longitude_deg.rem_euclid(360.0);
     let lon = if lon > 180.0 { lon - 360.0 } else { lon };
@@ -798,6 +782,20 @@ pub fn local_offset_seconds(unix_seconds: i64) -> i64 {
         + i64::from(tm.tm_min) * 60
         + i64::from(tm.tm_sec);
     wall - unix_seconds
+}
+
+/// Signed whole Unix seconds for the actual system clock, including dates
+/// before 1970. Floor negative fractions rather than treating them as a failed
+/// clock. Unrepresentable dates have an explicit neutral consumer policy.
+pub(crate) fn system_unix_seconds(now: std::time::SystemTime) -> Option<i64> {
+    let seconds = match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(value) => i128::from(value.as_secs()),
+        Err(error) => {
+            let value = error.duration();
+            -i128::from(value.as_secs()) - i128::from(value.subsec_nanos() != 0)
+        }
+    };
+    i64::try_from(seconds).ok()
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date.
@@ -988,27 +986,6 @@ pub fn load_from_reader(
     parse_list_recursively(&run()?).map(RawSettings::into_config)
 }
 
-/// Production settings reader: one `gsettings list-recursively`
-/// call over [`COLOR_SCHEMA`]. Reads hit the local dconf database;
-/// a missing schema, a missing binary or unparsable output all fail
-/// closed (the caller keeps its previous config).
-pub fn load_from_gsettings() -> Result<NightLightConfig, ReadError> {
-    load_from_reader(|| {
-        let output = std::process::Command::new("gsettings")
-            .args(["list-recursively", COLOR_SCHEMA])
-            .output()
-            .map_err(|e| ReadError(format!("cannot run gsettings: {e}")))?;
-        if !output.status.success() {
-            return Err(ReadError(format!(
-                "gsettings exited with {}",
-                output.status
-            )));
-        }
-        String::from_utf8(output.stdout)
-            .map_err(|_| ReadError("gsettings output is not UTF-8".to_owned()))
-    })
-}
-
 /// Longest `NightLightPreview` duration g-s-d accepts: durations
 /// outside `1..=MAX_PREVIEW_SECONDS` are rejected with
 /// `InvalidArgument` and never touch the recorded preview
@@ -1060,6 +1037,7 @@ pub struct NightLightShare {
     /// waiting for unrelated input. Disconnected (default) pings
     /// nothing; see [`NightLightShare::set_wake`].
     wake: crate::wake::Wake,
+    reader: std::sync::Mutex<Option<crate::night_light_settings::Reader>>,
 }
 
 impl Default for NightLightShare {
@@ -1071,11 +1049,75 @@ impl Default for NightLightShare {
             disabled_until_tmw: std::sync::Mutex::new(None),
             preview: std::sync::Mutex::new(None),
             wake: crate::wake::Wake::default(),
+            reader: std::sync::Mutex::new(None),
         }
     }
 }
 
 impl NightLightShare {
+    pub(crate) fn start_reader(self: &std::sync::Arc<Self>, wake: &crate::wake::Wake) {
+        if let Ok(mut reader) = self.reader.lock() {
+            if reader.is_none() {
+                *reader = Some(crate::night_light_settings::Reader::new(self, wake));
+            }
+        }
+    }
+
+    pub(crate) fn request_preview(
+        &self,
+        duration: u32,
+    ) -> Result<crate::night_light_settings::PreviewFuture, PreviewRejected> {
+        // Invalid duration must never touch the reader, native I/O or live preview.
+        if duration == 0 || duration > MAX_PREVIEW_SECONDS {
+            return Err(PreviewRejected::InvalidDuration(duration));
+        }
+        let admitted = std::time::Instant::now();
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| PreviewRejected::Unavailable)?;
+        reader
+            .as_ref()
+            .ok_or(PreviewRejected::Unavailable)?
+            .preview(duration, admitted)
+    }
+
+    pub(crate) fn record_preview_until(
+        &self,
+        temperature_k: u32,
+        until: std::time::Instant,
+    ) -> Result<(), PreviewRejected> {
+        if std::time::Instant::now() >= until {
+            return Err(PreviewRejected::Unavailable);
+        }
+        let mut preview = self
+            .preview
+            .lock()
+            .map_err(|_| PreviewRejected::Unavailable)?;
+        if std::time::Instant::now() >= until {
+            return Err(PreviewRejected::Unavailable);
+        }
+        *preview = Some(Preview {
+            temperature_k: clamp_temperature(temperature_k),
+            until,
+        });
+        self.wake.signal();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swap_reader_for_test(
+        &self,
+        reader: Option<crate::night_light_settings::Reader>,
+    ) -> Option<crate::night_light_settings::Reader> {
+        std::mem::replace(&mut *self.reader.lock().unwrap(), reader)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reader_for_test_is_absent(&self) -> bool {
+        self.reader.lock().unwrap().is_none()
+    }
+
     /// Read `NightLightActive`.
     pub fn active(&self) -> bool {
         self.active.load(std::sync::atomic::Ordering::SeqCst)
@@ -1109,6 +1151,20 @@ impl NightLightShare {
             // way a preview does; signal only when recorded.
             self.wake.signal();
         }
+    }
+
+    /// Retire only the disable timestamp evaluated by this tick. A new D-Bus
+    /// disable recorded concurrently remains owned by that newer write.
+    pub(crate) fn clear_disabled_until_if(&self, expected: i64) -> bool {
+        let Ok(mut set) = self.disabled_until_tmw.lock() else {
+            return false;
+        };
+        if *set != Some(expected) {
+            return false;
+        }
+        *set = None;
+        self.wake.signal();
+        true
     }
 
     /// Record a `NightLightPreview` from the D-Bus side: force
@@ -1198,6 +1254,11 @@ impl NightLightShare {
 
     /// Clear any recorded preview without applying it.
     pub fn clear_preview(&self) {
+        if let Ok(reader) = self.reader.lock() {
+            if let Some(reader) = reader.as_ref() {
+                reader.cancel_preview();
+            }
+        }
         if let Ok(mut guard) = self.preview.lock() {
             *guard = None;
             // Restoring the schedule tint must not wait for
@@ -1241,6 +1302,7 @@ pub struct NightLightController {
     last_read: Option<std::time::Instant>,
     applied_temperature: Option<u32>,
     applied_gains: Option<ColorGains>,
+    reader_status: Option<crate::night_light_settings::CacheStatus>,
 }
 
 impl NightLightController {
@@ -1252,6 +1314,7 @@ impl NightLightController {
             last_read: None,
             applied_temperature: None,
             applied_gains: None,
+            reader_status: None,
         }
     }
 
@@ -1292,19 +1355,67 @@ impl NightLightController {
         true
     }
 
-    /// Earliest instant the loop must re-tick for night light at
-    /// monotonic `now`, if any: a live preview's exact expiry (or
-    /// its past-due obligation) wins, else the next settings
-    /// re-read. The settings arm runs even while the filter is
-    /// disabled: there is no settings watch, so a disabled filter
-    /// that never polled could never observe a later enable
-    /// without unrelated input. The arm stays bounded by
-    /// [`READ_INTERVAL`] — at most one settings wake per
-    /// interval, never a spin — until a real watch replaces it.
-    /// This is the timing callsite behind the runtime's idle
-    /// deadline; the schedule itself is evaluated on ticks, not
-    /// predicted here.
+    /// Actual frame consumer: bounded Rust cache only, never native GIO.
+    pub(crate) fn poll_settings(&mut self, now: std::time::Instant) -> bool {
+        // This cadence is also the schedule re-evaluation obligation, distinct
+        // from native retry. Quarantine never starts another reader operation.
+        if self
+            .last_read
+            .is_none_or(|last| now.saturating_duration_since(last) >= READ_INTERVAL)
+        {
+            self.last_read = Some(now);
+        }
+        let Ok(reader) = self.share.reader.lock() else {
+            return false;
+        };
+        let Some(reader) = reader.as_ref() else {
+            return false;
+        };
+        let config = reader.poll(now);
+        let status = reader.status();
+        if self.reader_status != Some(status) {
+            if matches!(
+                status,
+                crate::night_light_settings::CacheStatus::Unavailable
+                    | crate::night_light_settings::CacheStatus::Quarantined
+            ) {
+                eprintln!("tuna-compositor: night light settings cache {status:?}; retaining prior config");
+            }
+            self.reader_status = Some(status);
+        }
+        let Some(mut config) = config else {
+            return false;
+        };
+        config.disabled_until_tmw = self.share.disabled_until_tmw();
+        if config == self.config {
+            return false;
+        }
+        self.config = config;
+        true
+    }
+
+    /// Earliest owned reader admission, pending/live preview expiry, or enabled
+    /// schedule recheck. Reader quarantine consumes its native deadline once;
+    /// a disabled quarantined reader has no periodic retry obligation.
+    /// Unconnected pure-controller callers retain their legacy test cadence.
     pub fn next_deadline_at(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        if let Ok(reader) = self.share.reader.lock() {
+            if let Some(reader) = reader.as_ref() {
+                let schedule = (self.config.enabled || self.share.disabled_until_tmw().is_some())
+                    .then(|| {
+                        self.last_read
+                            .and_then(|last| last.checked_add(READ_INTERVAL))
+                            .unwrap_or(now)
+                            .max(now)
+                    });
+                return reader
+                    .next_deadline(now)
+                    .into_iter()
+                    .chain(self.share.preview_deadline_at(now))
+                    .chain(schedule)
+                    .min();
+            }
+        }
         let preview = self.share.preview_deadline_at(now);
         // Never-read or stale settings are due now; fresh settings
         // are due one interval after the last read. Either way the
@@ -1362,13 +1473,15 @@ impl NightLightController {
         monotonic_now: std::time::Instant,
     ) -> Option<ColorGains> {
         self.config.disabled_until_tmw = self.share.disabled_until_tmw();
-        if let Some(preview_k) = self.share.preview_temperature(monotonic_now) {
-            self.applied_temperature = Some(preview_k);
-            let gains = Some(preview_k)
-                .filter(|kelvin| *kelvin != NEUTRAL_TEMPERATURE_K)
-                .map(temperature_to_gains);
-            self.applied_gains = gains;
-            self.share.publish(true, preview_k);
+        if let Some(set_at) = self.config.disabled_until_tmw {
+            if !self.config.temp_disabled_at(unix_seconds, utc_offset_secs)
+                && self.share.clear_disabled_until_if(set_at)
+            {
+                self.config.disabled_until_tmw = None;
+            }
+        }
+        self.config.disabled_until_tmw = self.share.disabled_until_tmw();
+        if let Some(gains) = self.preview_tick(monotonic_now) {
             return gains;
         }
         let target = self
@@ -1393,6 +1506,39 @@ impl NightLightController {
         self.share
             .publish(active, temperature.unwrap_or(NEUTRAL_TEMPERATURE_K));
         gains
+    }
+
+    /// Actual render consumer: every clock outcome consumes monotonic preview
+    /// expiry. A valid signed date uses the local schedule. An unrepresentable
+    /// wall date retains a live explicit preview, then restores neutral.
+    pub(crate) fn tick_at_system_time(
+        &mut self,
+        wall: std::time::SystemTime,
+        monotonic_now: std::time::Instant,
+    ) -> Option<ColorGains> {
+        if let Some(unix) = system_unix_seconds(wall) {
+            return self.tick_with_clock(unix, local_offset_seconds(unix), monotonic_now);
+        }
+        if let Some(gains) = self.preview_tick(monotonic_now) {
+            return gains;
+        }
+        self.applied_temperature = None;
+        self.applied_gains = None;
+        self.share.publish(false, NEUTRAL_TEMPERATURE_K);
+        None
+    }
+
+    fn preview_tick(&mut self, monotonic_now: std::time::Instant) -> Option<Option<ColorGains>> {
+        if let Some(preview_k) = self.share.preview_temperature(monotonic_now) {
+            self.applied_temperature = Some(preview_k);
+            let gains = Some(preview_k)
+                .filter(|kelvin| *kelvin != NEUTRAL_TEMPERATURE_K)
+                .map(temperature_to_gains);
+            self.applied_gains = gains;
+            self.share.publish(true, preview_k);
+            return Some(gains);
+        }
+        None
     }
 
     /// The last applied gains as `f32` bits (unity when neutral):
@@ -1909,10 +2055,7 @@ mod tests {
             .active_temperature_at_offset(day + 5 * 3600 + 3540, 0)
             .unwrap();
         assert!((2700..6500).contains(&trailing), "trailing={trailing}");
-        assert_eq!(
-            night.active_temperature_at_offset(day + 6 * 3600, 0),
-            None
-        );
+        assert_eq!(night.active_temperature_at_offset(day + 6 * 3600, 0), None);
     }
 
     #[test]
@@ -1967,9 +2110,7 @@ mod tests {
             auto.active_temperature_at_offset(sunset - 2 * 3600, 0),
             None
         );
-        let leading = auto
-            .active_temperature_at_offset(sunset - 1800, 0)
-            .unwrap();
+        let leading = auto.active_temperature_at_offset(sunset - 1800, 0).unwrap();
         assert!((2700..6500).contains(&leading), "leading={leading}");
         // An hour after sunset: full temperature.
         assert_eq!(
@@ -2279,10 +2420,7 @@ mod tests {
         );
         assert!(!share.active());
         assert_eq!(share.temperature(), NEUTRAL_TEMPERATURE_K);
-        assert_eq!(
-            share.preview_temperature(t0 + Duration::from_secs(5)),
-            None
-        );
+        assert_eq!(share.preview_temperature(t0 + Duration::from_secs(5)), None);
     }
 
     #[test]
@@ -2325,29 +2463,17 @@ mod tests {
         let t0 = Instant::now();
         // Out-of-range temperatures clamp into range.
         assert_eq!(share.set_preview_at(u32::MAX, t0, 60), Ok(()));
-        assert_eq!(
-            share.preview_temperature(t0),
-            Some(MAX_TEMPERATURE_K)
-        );
+        assert_eq!(share.preview_temperature(t0), Some(MAX_TEMPERATURE_K));
         assert_eq!(share.set_preview_at(0, t0, 60), Ok(()));
-        assert_eq!(
-            share.preview_temperature(t0),
-            Some(MIN_TEMPERATURE_K)
-        );
+        assert_eq!(share.preview_temperature(t0), Some(MIN_TEMPERATURE_K));
         share.clear_preview();
         assert_eq!(share.preview_temperature(t0), None);
         // A settings refresh replaces the config but the live
         // preview (which sits in the share, not the config)
         // survives it.
-        assert_eq!(
-            share.set_preview_at(3000, t0, 60),
-            Ok(())
-        );
+        assert_eq!(share.set_preview_at(3000, t0, 60), Ok(()));
         let now = Instant::now();
-        assert!(controller.maybe_refresh(now, || Ok::<_, ReadError>(fixed_at(
-            22.0, 6.0,
-            4000
-        ))));
+        assert!(controller.maybe_refresh(now, || Ok::<_, ReadError>(fixed_at(22.0, 6.0, 4000))));
         assert_eq!(controller.config().temperature_k(), 4000);
         let gains = controller
             .tick_with_clock(day + 2 * 3600, 0, t0 + Duration::from_secs(1))
@@ -2365,10 +2491,7 @@ mod tests {
         let mut controller = NightLightController::new(share.clone());
         let day = midnight(2026, 3, 20);
         let t0 = Instant::now();
-        assert_eq!(
-            share.set_preview_at(NEUTRAL_TEMPERATURE_K, t0, 5),
-            Ok(())
-        );
+        assert_eq!(share.set_preview_at(NEUTRAL_TEMPERATURE_K, t0, 5), Ok(()));
         assert_eq!(controller.tick_with_clock(day, 0, t0), None);
         assert!(share.active());
         assert_eq!(share.temperature(), NEUTRAL_TEMPERATURE_K);
@@ -2411,7 +2534,10 @@ mod tests {
         assert_eq!(share.set_preview_at(3000, t0, 1), Ok(()));
         assert_eq!(share.set_preview_at(3000, t0, 120), Ok(()));
         // The production entry point validates identically.
-        assert_eq!(share.set_preview(3000, 0), Err(PreviewRejected::InvalidDuration(0)));
+        assert_eq!(
+            share.set_preview(3000, 0),
+            Err(PreviewRejected::InvalidDuration(0))
+        );
         assert_eq!(
             share.set_preview(3000, 121),
             Err(PreviewRejected::InvalidDuration(121))
@@ -2435,10 +2561,7 @@ mod tests {
             Some(2100),
             "replaced timer runs from the second request"
         );
-        assert_eq!(
-            share.preview_temperature(t1 + Duration::from_secs(5)),
-            None
-        );
+        assert_eq!(share.preview_temperature(t1 + Duration::from_secs(5)), None);
     }
 
     #[test]
@@ -2473,10 +2596,7 @@ mod tests {
         let share = Arc::new(NightLightShare::default());
         let t0 = Instant::now();
         assert_eq!(share.preview_deadline_at(t0), None);
-        assert_eq!(
-            share.set_preview_at(2000, t0, 5),
-            Ok(())
-        );
+        assert_eq!(share.set_preview_at(2000, t0, 5), Ok(()));
         assert_eq!(
             share.preview_deadline_at(t0),
             Some(t0 + Duration::from_secs(5))
@@ -2508,13 +2628,8 @@ mod tests {
         // Fresh read: due exactly one interval later — bounded, no spin.
         // (maybe_refresh reports "changed", so the identical value
         // returns false while still stamping last_read.)
-        assert!(!controller.maybe_refresh(t0, || Ok::<_, ReadError>(
-            fixed_at(22.0, 6.0, 2700)
-        )));
-        assert_eq!(
-            controller.next_deadline_at(t0),
-            Some(t0 + READ_INTERVAL)
-        );
+        assert!(!controller.maybe_refresh(t0, || Ok::<_, ReadError>(fixed_at(22.0, 6.0, 2700))));
+        assert_eq!(controller.next_deadline_at(t0), Some(t0 + READ_INTERVAL));
         // A live preview expiring sooner wins over the settings arm.
         assert_eq!(share.set_preview_at(2000, t0, 2), Ok(()));
         assert_eq!(
@@ -2535,21 +2650,14 @@ mod tests {
         let t0 = Instant::now();
         // Disabled with a fresh read: next poll one interval out —
         // bounded even while off.
-        assert!(!controller.maybe_refresh(t0, || Ok::<_, ReadError>(
-            NightLightConfig::default()
-        )));
+        assert!(!controller.maybe_refresh(t0, || Ok::<_, ReadError>(NightLightConfig::default())));
         assert!(!controller.config.enabled);
-        assert_eq!(
-            controller.next_deadline_at(t0),
-            Some(t0 + READ_INTERVAL)
-        );
+        assert_eq!(controller.next_deadline_at(t0), Some(t0 + READ_INTERVAL));
         // Past the interval the poll is due now, so the loop
         // re-reads and picks up the enable with no other input.
         let late = t0 + READ_INTERVAL + Duration::from_secs(1);
         assert_eq!(controller.next_deadline_at(late), Some(late));
-        assert!(controller.maybe_refresh(late, || Ok::<_, ReadError>(
-            fixed_at(22.0, 6.0, 2700)
-        )));
+        assert!(controller.maybe_refresh(late, || Ok::<_, ReadError>(fixed_at(22.0, 6.0, 2700))));
         assert!(controller.config.enabled);
     }
 
@@ -2574,6 +2682,62 @@ mod tests {
         assert_eq!(share.set_preview_at(2000, between, 5), Ok(()));
         share.clear_preview();
         assert_eq!(share.preview_deadline_at(between), None);
+    }
+
+    #[test]
+    fn actual_clock_consumer_handles_pre_epoch_and_consumes_monotonic_expiry() {
+        use std::time::{Duration, Instant, UNIX_EPOCH};
+        assert_eq!(
+            system_unix_seconds(UNIX_EPOCH - Duration::from_secs(1)),
+            Some(-1)
+        );
+        assert_eq!(
+            system_unix_seconds(UNIX_EPOCH - Duration::from_millis(1)),
+            Some(-1)
+        );
+        assert_eq!(
+            system_unix_seconds(UNIX_EPOCH + Duration::from_millis(1)),
+            Some(0)
+        );
+        let share = std::sync::Arc::new(NightLightShare::default());
+        let mut controller = NightLightController::new(share.clone());
+        let t0 = Instant::now();
+        share.set_preview_at(2000, t0, 5).unwrap();
+        assert_eq!(
+            controller.tick_at_system_time(UNIX_EPOCH - Duration::from_secs(1), t0),
+            Some(temperature_to_gains(2000))
+        );
+        assert_eq!(
+            controller.tick_at_system_time(
+                UNIX_EPOCH - Duration::from_secs(1),
+                t0 + Duration::from_secs(5)
+            ),
+            None
+        );
+        assert_eq!(share.preview_deadline_at(t0 + Duration::from_secs(5)), None);
+        assert!(!share.active());
+        assert_eq!(controller.effect_bits(), [1.0f32.to_bits(); 3]);
+    }
+
+    #[test]
+    fn disable_expiry_clears_property_without_erasing_a_newer_timestamp() {
+        let share = std::sync::Arc::new(NightLightShare::default());
+        let mut controller = NightLightController::new(share.clone());
+        let day = midnight(2026, 3, 20);
+        controller.config = fixed_at(22.0, 6.0, 2700);
+        let previous = day + 23 * 3600;
+        share.set_disabled_until_tmw(Some(previous));
+        assert_eq!(controller.tick_with_offset(day + 26 * 3600, 0), None);
+        assert_eq!(share.disabled_until_tmw(), Some(previous));
+        assert!(controller.tick_with_offset(day + 47 * 3600, 0).is_some());
+        assert_eq!(share.disabled_until_tmw(), None);
+        let newer = day + 48 * 3600;
+        share.set_disabled_until_tmw(Some(previous));
+        share.set_disabled_until_tmw(Some(newer));
+        assert!(!share.clear_disabled_until_if(previous));
+        assert_eq!(share.disabled_until_tmw(), Some(newer));
+        assert!(share.clear_disabled_until_if(newer));
+        assert!(!share.clear_disabled_until_if(newer));
     }
 
     #[test]

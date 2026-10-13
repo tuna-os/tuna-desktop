@@ -365,12 +365,8 @@ impl NightLightColor {
     /// than a bogus one.
     #[zbus(property)]
     fn set_disabled_until_tomorrow(&self, value: bool) {
-        let set_at = value.then(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|elapsed| elapsed.as_secs() as i64)
-        });
+        let set_at =
+            value.then(|| crate::night_light::system_unix_seconds(std::time::SystemTime::now()));
         self.share.set_disabled_until_tmw(set_at.flatten());
     }
 
@@ -378,13 +374,14 @@ impl NightLightColor {
     /// for `duration` seconds; the share expires it automatically and
     /// the schedule resumes. Durations outside 1..=120 are rejected
     /// as InvalidArgs without touching any live preview; a poisoned
-    /// share (nothing recorded) reports Failed instead. A gsettings
-    /// read failure falls back to the last published temperature.
-    fn night_light_preview(&self, duration: u32) -> fdo::Result<()> {
-        let temp = crate::night_light::load_from_gsettings()
-            .map(|config| config.temperature_k())
-            .unwrap_or_else(|_| self.share.temperature());
-        self.share.set_preview(temp, duration).map_err(|rejected| {
+    /// share (nothing recorded) reports Failed instead. The owned reader must
+    /// return a fresh, request-bound temperature; failures never use stale cache.
+    async fn night_light_preview(&self, duration: u32) -> fdo::Result<()> {
+        let result = match self.share.request_preview(duration) {
+            Ok(request) => request.await,
+            Err(error) => Err(error),
+        };
+        result.map_err(|rejected| {
             use crate::night_light::PreviewRejected;
             match rejected {
                 PreviewRejected::InvalidDuration(_) => {
@@ -1054,22 +1051,42 @@ pub fn start(
             // portal names above. When a real settings daemon owns
             // this name its temp-disable wins and ours stays
             // local-only; the tint still follows the settings keys.
-            match conn.request_name_with_flags("org.gnome.SettingsDaemon.Color", flags) {
-                Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
-                    eprintln!("tuna-compositor: serving org.gnome.SettingsDaemon.Color");
-                }
-                _ => {
-                    eprintln!(
-                        "tuna-compositor: org.gnome.SettingsDaemon.Color is taken; \
+            let color_owned =
+                match conn.request_name_with_flags("org.gnome.SettingsDaemon.Color", flags) {
+                    Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
+                        eprintln!("tuna-compositor: serving org.gnome.SettingsDaemon.Color");
+                        true
+                    }
+                    _ => {
+                        eprintln!(
+                            "tuna-compositor: org.gnome.SettingsDaemon.Color is taken; \
                          night light D-Bus properties off"
-                    );
-                }
-            }
+                        );
+                        false
+                    }
+                };
+            let mut last_disabled = night_light.disabled_until_tmw().is_some();
             // Revoke on lock, unique-name disconnect or loss of the trusted
             // service identity. 100ms admission scan plus one compositor tick
             // bounds stream teardown; frames additionally fail closed on lock.
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
+                let disabled = night_light.disabled_until_tmw().is_some();
+                if color_owned && disabled != last_disabled {
+                    if let Ok(interface) = conn
+                        .object_server()
+                        .interface::<_, NightLightColor>("/org/gnome/SettingsDaemon/Color")
+                    {
+                        let color = interface.get();
+                        if zbus::block_on(
+                            color.disabled_until_tomorrow_changed(interface.signal_emitter()),
+                        )
+                        .is_ok()
+                        {
+                            last_disabled = disabled;
+                        }
+                    }
+                }
                 let remote_snapshot = remote.lock().map(|s| s.clone()).unwrap_or_default();
                 for (remote_id, grant) in remote_snapshot {
                     let alive = zbus::block_on(authority.owner_alive(conn.inner(), &grant.owner));
