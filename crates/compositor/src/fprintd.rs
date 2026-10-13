@@ -2038,9 +2038,13 @@ mod tests {
 
         /// One more peer on this bus (stub service, client outer handle).
         fn connect(&self) -> zbus::blocking::Connection {
+            self.connect_with_timeout(Duration::from_secs(2))
+        }
+
+        fn connect_with_timeout(&self, timeout: Duration) -> zbus::blocking::Connection {
             zbus::blocking::connection::Builder::address(self.address.as_str())
                 .expect("test address parses")
-                .method_timeout(Duration::from_secs(2))
+                .method_timeout(timeout)
                 .build()
                 .expect("test peer connects")
         }
@@ -2346,7 +2350,10 @@ mod tests {
             release_delay: Duration,
         ) -> (Self, StubEvents) {
             let bus = TestBus::spawn();
-            let stub_conn = bus.connect();
+            // Name acquisition is a control-plane setup call on a freshly
+            // started private bus; allow CI process contention without
+            // changing the client calls' two-second failure bound.
+            let stub_conn = bus.connect_with_timeout(Duration::from_secs(10));
             stub_conn
                 .request_name(BUS_NAME)
                 .expect("stub owns the fprintd name");
