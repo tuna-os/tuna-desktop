@@ -4236,13 +4236,51 @@ fn strip_drag_survives_unrelated_map_and_neighbor_close_without_resurrection() {
         f.manager.geometry(f.id_c).unwrap()
     );
     assert_eq!(strip_drawn_geometry(&f.manager, f.id_a).unwrap(), actor);
+    let mapped = f
+        .manager
+        .model()
+        .windows()
+        .find(|window| window.id != f.id_a && window.id != f.id_c)
+        .unwrap()
+        .id;
+    // finish_map inserts immediately right of focused A: [A, new, C].
+    // The unchanged motion crosses new, not C.
+    let canonical_a = f.manager.geometry(f.id_a).unwrap();
+    let canonical_new = f.manager.geometry(mapped).unwrap();
+    let canonical_c = f.manager.geometry(f.id_c).unwrap();
+    assert!(canonical_a.loc.x < canonical_new.loc.x);
+    assert!(canonical_new.loc.x < canonical_c.loc.x);
     f.manager
         .pointer_motion(&mut f.comp.state, (pos.x + 950.0, pos.y).into(), 13);
+    let center = |rect: smithay::utils::Rectangle<i32, Logical>| {
+        f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0
+    };
+    let actor_center = center(strip_drawn_geometry(&f.manager, f.id_a).unwrap());
+    assert!(actor_center > center(strip_drawn_geometry(&f.manager, mapped).unwrap()));
+    assert!(actor_center < center(strip_drawn_geometry(&f.manager, f.id_c).unwrap()));
+    let (preview_owner, insertion) = f.manager.tile_preview(&f.comp.state).unwrap();
+    assert_eq!(preview_owner, f.id_a);
+    assert_eq!(insertion.size.w, 8);
+    assert_eq!(
+        insertion.loc.x,
+        strip_drawn_geometry(&f.manager, f.id_c).unwrap().loc.x - 4
+    );
+    // A different release cannot commit the initiating left-button grab.
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, false, 13);
+    assert!(f.manager.grab_active());
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), canonical_a);
+    assert_eq!(f.manager.geometry(mapped).unwrap(), canonical_new);
+    assert_eq!(f.manager.geometry(f.id_c).unwrap(), canonical_c);
     f.manager
         .pointer_button(&mut f.comp.state, BTN_LEFT, false, 14);
     assert!(!f.manager.grab_active());
     assert!(f.manager.geometry(f.id_b).is_none());
-    assert!(f.manager.geometry(f.id_a).unwrap().loc.x > f.manager.geometry(f.id_c).unwrap().loc.x);
+    // Commit exactly the observed insertion [new, A, C], not [new, C, A].
+    assert!(f.manager.geometry(mapped).unwrap().loc.x < f.manager.geometry(f.id_a).unwrap().loc.x);
+    assert!(f.manager.geometry(f.id_a).unwrap().loc.x < f.manager.geometry(f.id_c).unwrap().loc.x);
+    assert_eq!(f.manager.model().windows().count(), 3);
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
     let _keep = (conn, queue, client);
 }
 
