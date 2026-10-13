@@ -97,6 +97,7 @@ struct Job {
     service: String,
     user: String,
     password: Credential,
+    relay: Option<crate::pam_conversation::Relay>,
     cancel: Cancellation,
     reply: mpsc::Sender<Reply>,
 }
@@ -119,6 +120,61 @@ pub struct Ticket {
     cancel: Cancellation,
     deadline: Instant,
     denied: bool,
+}
+/// Pollable verifier result plus one bounded challenge channel. A retired true
+/// still needs the runtime's exact live-origin/common Slot epoch grant.
+pub struct ConversationTicket {
+    ticket: Ticket,
+    receiver: crate::pam_conversation::Receiver,
+    outcome: Option<Verification>,
+}
+impl ConversationTicket {
+    pub fn serial(&self) -> u64 {
+        self.ticket.serial
+    }
+    pub fn try_challenge(&self) -> Result<crate::pam_conversation::Challenge, mpsc::TryRecvError> {
+        if self.ticket.cancel.is_canceled() {
+            return Err(mpsc::TryRecvError::Disconnected);
+        }
+        self.receiver.try_challenge()
+    }
+    pub fn cancel(&mut self) {
+        self.ticket.denied = true;
+        self.ticket.cancel.cancel();
+        if matches!(self.outcome, Some(Verification::Retired { .. })) {
+            self.outcome = Some(Verification::Retired {
+                authenticated: false,
+            });
+        }
+    }
+    /// Cancellation or deadline expiry is denial, never a retirement receipt.
+    pub fn try_outcome(&mut self) -> Option<Verification> {
+        if Instant::now() >= self.ticket.deadline || self.ticket.cancel.is_canceled() {
+            self.cancel();
+        }
+        if self.outcome.is_some() {
+            return self.outcome;
+        }
+        let outcome = match self.ticket.reply.try_recv() {
+            Ok(Reply::Retired(authenticated)) => {
+                self.ticket.denied |= self.ticket.cancel.is_canceled();
+                match self.ticket.retired_at(authenticated, Instant::now()) {
+                    Initial::Finished(result) => Some(result),
+                    Initial::Pending => None,
+                }
+            }
+            Ok(Reply::Pending) => {
+                self.cancel();
+                None
+            }
+            Ok(Reply::Poisoned) | Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Verification::Unretired)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        };
+        self.outcome = outcome;
+        outcome
+    }
 }
 pub enum Initial {
     Finished(Verification),
@@ -199,7 +255,11 @@ impl Backend {
         LIVE.get_or_init(|| {
             let image = SelfImage::capture().ok()?;
             Self::from_factory(Arc::new(move |identity, service, user, budget, cancel| {
-                image.spawn_cancellable(identity, service, user, budget, cancel)
+                if budget <= crate::pam::DEADLINE {
+                    image.spawn_cancellable(identity, service, user, budget, cancel)
+                } else {
+                    image.spawn_conversation(identity, service, user, budget, cancel)
+                }
             }))
             .ok()
         })
@@ -266,6 +326,41 @@ impl Backend {
         password: Credential,
         cancel: Cancellation,
     ) -> Result<Ticket, Verification> {
+        self.begin_mode(service, user, password, cancel, None)
+    }
+    /// Internal challenge relay. The trusted runtime supplies its admitted common
+    /// Slot identity; this starts verification only and never grants unlock.
+    pub fn begin_conversation(
+        &self,
+        service: String,
+        user: String,
+        binding: crate::pam_conversation::Binding,
+        policy: crate::pam_conversation::Policy,
+        cancel: Cancellation,
+    ) -> Result<ConversationTicket, Verification> {
+        let (relay, receiver) = crate::pam_conversation::channel(binding, policy, cancel.clone())
+            .map_err(|_| Verification::RejectedBeforeSpawn)?;
+        let ticket = self.begin_mode(
+            service,
+            user,
+            Credential::from_string(String::new()),
+            cancel,
+            Some(relay),
+        )?;
+        Ok(ConversationTicket {
+            ticket,
+            receiver,
+            outcome: None,
+        })
+    }
+    fn begin_mode(
+        &self,
+        service: String,
+        user: String,
+        password: Credential,
+        cancel: Cancellation,
+        relay: Option<crate::pam_conversation::Relay>,
+    ) -> Result<Ticket, Verification> {
         if service.is_empty()
             || service.len() > 128
             || !service
@@ -295,11 +390,15 @@ impl Backend {
             return Err(Verification::RejectedBeforeSpawn);
         }
         let (reply, receive) = mpsc::channel();
+        let total = relay
+            .as_ref()
+            .map_or(crate::pam::DEADLINE, |relay| relay.total());
         let job = Job {
             serial,
             service,
             user,
             password,
+            relay,
             cancel: cancel.clone(),
             reply,
         };
@@ -311,7 +410,7 @@ impl Backend {
             serial,
             reply: receive,
             cancel,
-            deadline: Instant::now() + crate::pam::DEADLINE,
+            deadline: Instant::now() + total,
             denied: false,
         })
     }
@@ -332,7 +431,7 @@ impl Backend {
         }
     }
 }
-fn run_job(job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8) -> bool {
+fn run_job(mut job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8) -> bool {
     let identity = Identity {
         nonce: rand::random(),
         request: job.serial,
@@ -343,7 +442,9 @@ fn run_job(job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8)
         identity,
         job.service,
         job.user.clone(),
-        crate::pam::DEADLINE,
+        job.relay
+            .as_ref()
+            .map_or(crate::pam::DEADLINE, |relay| relay.total()),
         job.cancel.clone(),
     ) {
         Ok(supervisor) => supervisor,
@@ -362,13 +463,27 @@ fn run_job(job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8)
         if job.cancel.is_canceled() || shutdown.load(Ordering::Acquire) {
             break;
         }
+        let phase_deadline = if let Some(relay) = &job.relay {
+            let Ok(deadline) = relay.phase() else {
+                break;
+            };
+            if supervisor.set_phase_deadline(deadline).is_err() {
+                break;
+            }
+            Some(deadline)
+        } else {
+            None
+        };
         match supervisor.next_event() {
             Ok(Event::Finished { authenticated }) => {
                 if supervisor.retirement() != Retirement::Retired {
                     break;
                 }
-                let accepted =
-                    authenticated && !job.cancel.is_canceled() && !shutdown.load(Ordering::Acquire);
+                let accepted = authenticated
+                    && !job.cancel.is_canceled()
+                    && !shutdown.load(Ordering::Acquire)
+                    && job.relay.as_ref().is_none_or(|relay| relay.timely())
+                    && phase_deadline.is_none_or(|deadline| Instant::now() < deadline);
                 drop(secret);
                 // Release only after actual Retired, before telling the caller.
                 state.store(FREE, Ordering::Release);
@@ -377,8 +492,20 @@ fn run_job(job: Job, factory: &Factory, shutdown: &AtomicBool, state: &AtomicU8)
             }
             Ok(Event::Challenge { sequence, messages }) => {
                 rounds += 1;
-                if rounds > crate::unlock::MAX_AUTH_ROUNDS {
+                if rounds
+                    > if job.relay.is_some() {
+                        64
+                    } else {
+                        crate::unlock::MAX_AUTH_ROUNDS
+                    }
+                {
                     break;
+                }
+                if let Some(relay) = &mut job.relay {
+                    if relay.answer(&mut supervisor, sequence, messages).is_err() {
+                        break;
+                    }
+                    continue;
                 }
                 // Validate the complete batch before constructing any answer
                 // or transferring the one owned password into AnswerText.
@@ -543,6 +670,75 @@ mod tests {
     }
 
     #[test]
+    fn conversation_result_poll_keeps_retirement_but_cancellation_denies_grant() {
+        for cancel_before_result in [false, true] {
+            let (reply, receive) = mpsc::channel();
+            let (_, challenges) = mpsc::sync_channel(1);
+            let cancellation = Cancellation::default();
+            let mut ticket = ConversationTicket {
+                ticket: Ticket {
+                    serial: 1,
+                    reply: receive,
+                    cancel: cancellation.clone(),
+                    deadline: Instant::now() + Duration::from_secs(2),
+                    denied: false,
+                },
+                receiver: crate::pam_conversation::Receiver { challenges },
+                outcome: None,
+            };
+            reply.send(Reply::Retired(true)).unwrap();
+            if cancel_before_result {
+                cancellation.cancel();
+            }
+            assert_eq!(
+                ticket.try_outcome(),
+                Some(Verification::Retired {
+                    authenticated: !cancel_before_result
+                })
+            );
+            assert_eq!(
+                ticket.try_outcome(),
+                Some(Verification::Retired {
+                    authenticated: !cancel_before_result
+                })
+            );
+            ticket.cancel();
+            assert_eq!(
+                ticket.try_outcome(),
+                Some(Verification::Retired {
+                    authenticated: false
+                })
+            );
+        }
+    }
+    #[test]
+    fn conversation_denial_is_not_a_retirement_receipt() {
+        let (reply, receive) = mpsc::channel();
+        let (_, challenges) = mpsc::sync_channel(1);
+        let mut ticket = ConversationTicket {
+            ticket: Ticket {
+                serial: 1,
+                reply: receive,
+                cancel: Cancellation::default(),
+                deadline: Instant::now(),
+                denied: false,
+            },
+            receiver: crate::pam_conversation::Receiver { challenges },
+            outcome: None,
+        };
+        assert_eq!(ticket.try_outcome(), None);
+        reply.send(Reply::Pending).unwrap();
+        assert_eq!(ticket.try_outcome(), None);
+        reply.send(Reply::Retired(true)).unwrap();
+        assert_eq!(
+            ticket.try_outcome(),
+            Some(Verification::Retired {
+                authenticated: false
+            })
+        );
+    }
+
+    #[test]
     fn private_credential_wipes_owned_storage_and_moves_into_answer_without_clone() {
         let mut credential = Credential::from_string("owned-control-value".into());
         let answer = credential.take_answer();
@@ -615,6 +811,7 @@ mod tests {
             service: "tuna-lock".into(),
             user: "owner".into(),
             password: observed_credential(&counter),
+            relay: None,
             cancel: Cancellation::default(),
             reply,
         };

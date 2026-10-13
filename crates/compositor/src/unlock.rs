@@ -92,7 +92,7 @@ pub fn unlock_user() -> Option<String> {
 }
 
 /// Verify one entered password through the greeter login path: open a
-/// greetd attempt for `user`, answer ordinary prompts with the password
+/// greetd attempt for `user`, answer at most one ordinary Secret prompt
 /// (info/error notices auto-acknowledge exactly like login), and
 /// report the outcome. Success cancels the pending conversation —
 /// this session is already running, so nothing starts.
@@ -107,15 +107,17 @@ pub fn attempt_unlock(client: &mut impl UnlockClient, user: &str, password: &str
         Ok(response) => response,
         Err(_) => return UnlockOutcome::Denied,
     };
+    let mut password_used = false;
     for _ in 0..MAX_AUTH_ROUNDS {
         match model.apply_response(&response) {
             ModelEvent::NeedAnswer { prompt } => {
-                if prompt.fingerprint {
+                if prompt.fingerprint || !prompt.secret || password_used {
                     // This adapter has no typed answer for a device challenge.
                     // Never replay a password (or acknowledge it as an answer).
                     let _ = client.cancel();
                     return UnlockOutcome::Denied;
                 }
+                password_used = true;
                 response = match client.answer(Some(password.to_string())) {
                     Ok(response) => response,
                     Err(_) => return UnlockOutcome::Denied,
@@ -457,6 +459,39 @@ mod tests {
     }
 
     #[test]
+    fn distinct_pin_or_visible_prompt_never_receives_reused_password() {
+        for second in [
+            secret_prompt("Separate PIN:"),
+            Response::AuthMessage {
+                auth_message_type: AuthMessageType::Visible,
+                auth_message: "Visible second challenge".into(),
+            },
+        ] {
+            let mut stub = ScriptStub::new(vec![
+                Ok(secret_prompt("Password:")),
+                Ok(second),
+                Ok(Response::Success),
+            ]);
+            assert_eq!(
+                attempt_unlock(&mut stub, "ada", "owned-first-answer"),
+                UnlockOutcome::Denied
+            );
+            assert_eq!(stub.answers, [Some("owned-first-answer".into())]);
+            assert!(stub.cancelled);
+        }
+        let mut stub = ScriptStub::new(vec![Ok(Response::AuthMessage {
+            auth_message_type: AuthMessageType::Visible,
+            auth_message: "PIN:".into(),
+        })]);
+        assert_eq!(
+            attempt_unlock(&mut stub, "ada", "owned-first-answer"),
+            UnlockOutcome::Denied
+        );
+        assert!(stub.answers.is_empty());
+        assert!(stub.cancelled);
+    }
+
+    #[test]
     fn endless_prompts_deny_bounded() {
         let mut stub = ScriptStub::new(
             (0..MAX_AUTH_ROUNDS + 4)
@@ -467,7 +502,7 @@ mod tests {
             attempt_unlock(&mut stub, "ada", "s3cret"),
             UnlockOutcome::Denied
         );
-        assert_eq!(stub.answers.len(), MAX_AUTH_ROUNDS);
+        assert_eq!(stub.answers.len(), 1);
     }
 
     #[test]
