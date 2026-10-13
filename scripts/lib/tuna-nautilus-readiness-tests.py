@@ -36,7 +36,8 @@ class Tests(unittest.TestCase):
         self.ns = {'re': re, 'time': self.clock, 'GLib': SimpleNamespace(Error=Error),
                    'focused': lambda: self.guards.append(1)}
         names = {'removed_accessible', 'wait', 'controls', 'cell', 'select',
-                 'owned_unlocked', 'focused', 'wait_for_initial_map', 'snapshot'}
+                 'owned_unlocked', 'focused', 'wait_for_initial_map', 'snapshot',
+                 'wait_for_browser_close'}
         classes = {'IncompleteTree'}
         body = ast.parse(SOURCE.read_text()).body
         functions = [node for node in body
@@ -51,6 +52,78 @@ class Tests(unittest.TestCase):
 
     def wait(self, predicate):
         return self.ns['wait'](predicate, 'retain strict actual contents')
+
+    def test_closed_original_window_allows_resulting_focus_loss_or_app_exit(self):
+        self.ns['scene'] = lambda: {'windows': [], 'focused_app_id': 'another-app'}
+        self.ns['focused'] = lambda: self.fail('closed window cannot retain app focus')
+        self.ns['wait_for_browser_close'](42)
+
+    def test_still_mapped_window_retains_strict_focus_guard(self):
+        self.ns['scene'] = lambda: {'windows': [{'id': 42}]}
+        def lost():
+            raise RuntimeError('Files lost actual compositor keyboard focus')
+        self.ns['focused'] = lost
+        with self.assertRaisesRegex(RuntimeError, 'keyboard focus'):
+            self.ns['wait_for_browser_close'](42)
+
+    def test_close_between_scene_and_guard_requires_two_actual_absent_reads(self):
+        values = iter([{'windows': [{'id': 42}]}, {'windows': []}, {'windows': []}])
+        self.ns['scene'] = lambda: next(values)
+        def lost():
+            raise RuntimeError('Files lost actual compositor keyboard focus')
+        self.ns['focused'] = lost
+        self.ns['wait_for_browser_close'](42)
+        with self.assertRaises(StopIteration):
+            next(values)
+
+    def test_owner_failure_cannot_be_hidden_by_later_window_removal(self):
+        self.ns['scene'] = lambda: {'windows': [{'id': 42}]}
+        def replaced():
+            raise RuntimeError('Files original bus owner or installed process changed')
+        self.ns['focused'] = replaced
+        with self.assertRaisesRegex(RuntimeError, 'owner or installed process changed'):
+            self.ns['wait_for_browser_close'](42)
+
+    def test_locking_after_absent_read_is_terminal(self):
+        reads = []
+        def scene():
+            reads.append(1)
+            if len(reads) == 2:
+                raise RuntimeError('Files operation attempted while the desktop is locked')
+            return {'windows': []}
+        self.ns['scene'] = scene
+        with self.assertRaisesRegex(RuntimeError, 'locked'):
+            self.ns['wait_for_browser_close'](42)
+
+    def test_original_window_reappearance_cannot_admit(self):
+        values = iter([{'windows': []}, {'windows': [{'id': 42}]}])
+        self.ns['scene'] = lambda: next(values)
+        with self.assertRaisesRegex(RuntimeError, 'reappeared'):
+            self.ns['wait_for_browser_close'](42)
+
+    def test_late_final_absence_is_refused(self):
+        reads = []
+        def scene():
+            reads.append(1)
+            if len(reads) == 2:
+                self.clock.now = 10
+            return {'windows': []}
+        self.ns['scene'] = scene
+        with self.assertRaisesRegex(RuntimeError, 'did not close'):
+            self.ns['wait_for_browser_close'](42)
+
+    def test_close_poll_expires_without_replaying_input(self):
+        self.ns['scene'] = lambda: {'windows': [{'id': 42}]}
+        self.ns['key'] = lambda _: self.fail('close action replayed')
+        with self.assertRaisesRegex(RuntimeError, 'did not close'):
+            self.ns['wait_for_browser_close'](42)
+        self.assertEqual(self.clock.now, 10)
+
+    def test_invalid_original_window_ids_are_refused_before_observation(self):
+        self.ns['scene'] = lambda: self.fail('invalid original window observed')
+        for bad in (True, 0, -1, '42'):
+            with self.subTest(value=bad), self.assertRaises(RuntimeError):
+                self.ns['wait_for_browser_close'](bad)
 
     def startup(self, *, locked=False, changed=False, focus_at=.1):
         original = {'owner': ':1.42', 'pid': 10}

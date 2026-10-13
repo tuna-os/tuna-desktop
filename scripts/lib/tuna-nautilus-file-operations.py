@@ -216,6 +216,48 @@ def wait_for_initial_map(name):
          'map its native window with the actual fixture contents', startup=True)
 
 
+def wait_for_browser_close(browser_id):
+    """Observe this original window's removal, allowing the resulting focus loss.
+
+    While it remains mapped, retain the original bus/process/focus checks.
+    After removal the app may exit; absence proves window closure only.
+    Never send another close action or admit a late observation.
+    """
+    if type(browser_id) is not int or browser_id <= 0:
+        raise RuntimeError('Files close requires its original positive window ID')
+    deadline = time.monotonic() + 10
+    def absent(current):
+        return all(window['id'] != browser_id for window in current['windows'])
+    while time.monotonic() < deadline:
+        current = scene()  # Locking remains a terminal failure, even after close.
+        if absent(current):
+            after = scene()
+            if time.monotonic() >= deadline:
+                break
+            if not absent(after):
+                raise RuntimeError('Files original browser window reappeared during close admission')
+            return
+        try:
+            focused()
+        except RuntimeError as error:
+            # The same close may complete between the scene read and focus
+            # guard. Only this exact focus failure may observe final removal;
+            # owner/lock/transport failures remain terminal.
+            if str(error) != 'Files lost actual compositor keyboard focus':
+                raise
+            after = scene()
+            if time.monotonic() >= deadline or not absent(after):
+                raise
+            final = scene()
+            if time.monotonic() >= deadline or not absent(final):
+                raise
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    raise RuntimeError('Files did not close its native browser window')
+
+
 def key(value):
     focused()
     run('xdotool', 'key', '--clearmodifiers', value)
@@ -388,8 +430,7 @@ try:
                     'scope': 'ordinary native app in the reference container; final shipped image remains untested'})
     stage = 'close'
     key('ctrl+w')
-    wait(lambda: all(window['id'] != browser_id for window in scene()['windows']),
-         'close its native browser window')
+    wait_for_browser_close(browser_id)
     (OUT / 'nautilus-operations.json').write_text(json.dumps(records, indent=2))
     print('Nautilus genuine native file operations passed: create/copy/rename/move/trash/undo/close')
 except Exception as error:
