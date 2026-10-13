@@ -31,12 +31,10 @@ pub(crate) enum CacheStatus {
 #[derive(Clone, Copy)]
 struct Operation {
     id: u64,
-    admitted: Instant,
     deadline: Instant,
 }
 struct PreviewRequest {
     id: u64,
-    admitted: Instant,
     until: Instant,
     reply: Arc<Mutex<PreviewReply>>,
 }
@@ -225,7 +223,6 @@ impl Reader {
             }
             state.preview = Some(PreviewRequest {
                 id,
-                admitted: now,
                 until,
                 reply: reply.clone(),
             });
@@ -271,11 +268,7 @@ impl Shared {
                 return;
             };
             state.next = id;
-            let op = Operation {
-                id,
-                admitted: now,
-                deadline,
-            };
+            let op = Operation { id, deadline };
             state.active = Some(op);
             state.last = Some(now);
             if state.status == CacheStatus::Fresh {
@@ -355,7 +348,10 @@ impl Shared {
                 CacheStatus::Unavailable
             };
             if let Some(request) = state.preview.as_ref() {
-                if op.admitted >= request.admitted {
+                // Both IDs are allocated while holding the same state mutex.
+                // Timestamp equality or early request capture cannot prove
+                // that this read follows actual preview ownership.
+                if op.id > request.id {
                     let request = state.preview.take().unwrap();
                     let outcome = if observed < request.until {
                         match (&result, live_share.as_ref()) {
@@ -725,6 +721,74 @@ mod tests {
             None
         );
         retired(reader, &events);
+    }
+    fn ownership_interleave(equal_clock: bool) {
+        // This capture precedes creation/admission of the actual blocked read,
+        // representing request time captured before its ownership mutex.
+        let captured = Instant::now();
+        let (share, reader, events, answers, mut loop_) = controlled();
+        let read_time = reader.shared.state.lock().unwrap().last.unwrap();
+        let request_time = if equal_clock { read_time } else { captured };
+        assert!(
+            read_time >= request_time,
+            "old timestamp predicate would admit this read"
+        );
+        if !equal_clock {
+            assert!(captured < read_time);
+        }
+        let future = reader.preview(5, request_time).unwrap();
+        {
+            let state = reader.shared.state.lock().unwrap();
+            assert!(state.active.unwrap().id < state.preview.as_ref().unwrap().id);
+        }
+        let mut old = RawSettings::schema_defaults();
+        old.temperature_k = 2000;
+        answers.send(Ok(old.into_config())).unwrap();
+        // The next actual read's entry proves the first completion was processed.
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "entered"
+        );
+        assert_eq!(
+            future.reply.lock().unwrap().result,
+            None,
+            "equal/early captured time must not make a pre-ownership read fresh"
+        );
+        assert_eq!(share.preview_temperature(Instant::now()), None);
+        let mut controller = NightLightController::new(share.clone());
+        assert!(controller
+            .tick_at_system_time(std::time::SystemTime::now(), Instant::now())
+            .is_none());
+        assert!(!share.active(), "old read must not install preview tint");
+        let mut fresh = RawSettings::schema_defaults();
+        fresh.temperature_k = 3200;
+        answers.send(Ok(fresh.into_config())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut count = 0;
+        while future.reply.lock().unwrap().result.is_none() {
+            let now = Instant::now();
+            assert!(now < deadline);
+            loop_.dispatch(Some(deadline - now), &mut count).unwrap();
+        }
+        assert_eq!(future.reply.lock().unwrap().result, Some(Ok(())));
+        assert_eq!(share.preview_temperature(Instant::now()), Some(3200));
+        assert_eq!(
+            share.preview_deadline(),
+            Some(request_time + Duration::from_secs(5))
+        );
+        assert!(controller
+            .tick_at_system_time(std::time::SystemTime::now(), Instant::now())
+            .is_some());
+        assert_eq!(share.temperature(), 3200);
+        retired(reader, &events);
+    }
+    #[test]
+    fn actual_equal_time_read_before_preview_ownership_cannot_grant_or_install_tint() {
+        ownership_interleave(true);
+    }
+    #[test]
+    fn actual_request_time_captured_before_mutex_cannot_admit_intervening_old_read() {
+        ownership_interleave(false);
     }
     #[test]
     fn actual_pending_preview_expiry_is_consumed_before_a_later_valid_read() {

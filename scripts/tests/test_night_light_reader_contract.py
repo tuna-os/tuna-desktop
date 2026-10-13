@@ -9,6 +9,7 @@ READER = (ROOT / "crates/compositor/src/night_light_settings.rs").read_text()
 MODEL = (ROOT / "crates/compositor/src/night_light.rs").read_text()
 RUNTIME = (ROOT / "crates/compositor/src/runtime.rs").read_text()
 BUS = (ROOT / "crates/compositor/src/mutter.rs").read_text()
+CHECK_JOB = (ROOT / ".github/workflows/ci.yml").read_text().split("\n  journey:", 1)[0]
 
 
 class ReaderContracts(unittest.TestCase):
@@ -38,13 +39,20 @@ class ReaderContracts(unittest.TestCase):
         self.assertIn("state.stopped = true", READER)
         self.assertIn("state.active = None", READER)
         self.assertIn("state.preview.take()", READER)
+        for package in ("libglib2.0-dev", "libglib2.0-bin", "libglib2.0-dev-bin"):
+            self.assertIn(package, CHECK_JOB)
+        self.assertIn("pkg-config --atleast-version=2.66 gio-2.0 glib-2.0", CHECK_JOB)
+        self.assertIn("command -v glib-compile-schemas", CHECK_JOB)
+        self.assertIn("command -v timeout", CHECK_JOB)
+        self.assertIn("/usr/bin/python3 scripts/tests/test_night_light_reader_contract.py", CHECK_JOB)
 
     def test_preview_validates_before_reader_and_retains_request_expiry(self):
         method = MODEL.split("pub(crate) fn request_preview(", 1)[1].split("pub(crate) fn record_preview_until", 1)[0]
         self.assertLess(method.index("duration == 0"), method.index(".reader"))
         self.assertLess(method.index("let admitted"), method.index(".reader"))
         self.assertIn(".preview(duration, admitted)", method)
-        self.assertIn("op.admitted >= request.admitted", READER)
+        self.assertIn("op.id > request.id", READER)
+        self.assertNotIn("op.admitted >= request.admitted", READER)
         self.assertIn("record_preview_until(config.temperature_k(), request.until)", READER)
         self.assertIn("request.id == self.id", READER)
         self.assertIn("reader.cancel_preview()", MODEL)
