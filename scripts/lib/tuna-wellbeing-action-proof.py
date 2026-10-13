@@ -94,9 +94,12 @@ def require_producer_tree(nodes, dump_path):
     tuna-a11y-dump.py emits role/name/description/depth/showing/
     checked/selected/focused/bounds per node (bounds is null only when
     the component query fails); error-role nodes are transport
-    failures, never tree content. A mistyped or misshapen node is an
-    untrustworthy tree, never an anchor and never a verdict.
+    failures, never tree content. Roles are non-empty with an
+    application root at depth 0, and depths never jump more than one
+    level between consecutive nodes. A mistyped or misshapen node is
+    an untrustworthy tree, never an anchor and never a verdict.
     """
+    prev_depth = None
     for index, node in enumerate(nodes):
         where = f'{dump_path}: node {index}'
         if not isinstance(node, dict):
@@ -106,9 +109,11 @@ def require_producer_tree(nodes, dump_path):
                 raise HarnessError(
                     f'{where}: {key} must be a string, '
                     f'got {node.get(key)!r:.60}')
-        if type(node.get('depth')) is not int:
+        if not node['role']:
+            raise HarnessError(f'{where}: role must be non-empty')
+        if type(node.get('depth')) is not int or node['depth'] < 0:
             raise HarnessError(
-                f'{where}: depth must be an int, '
+                f'{where}: depth must be a non-negative int, '
                 f'got {node.get("depth")!r:.60}')
         for key in ('showing', 'checked', 'selected', 'focused'):
             if type(node.get(key)) is not bool:
@@ -125,6 +130,20 @@ def require_producer_tree(nodes, dump_path):
             raise HarnessError(
                 f'{where}: bounds must be null or 4 ints, '
                 f'got {bounds!r:.60}')
+        if index == 0:
+            if node['role'] != 'application':
+                raise HarnessError(
+                    f'{where}: root must be the application node, '
+                    f'got {node["role"]!r:.60}')
+            if node['depth'] != 0:
+                raise HarnessError(
+                    f'{where}: root depth must be 0, '
+                    f'got {node["depth"]!r:.60}')
+        elif node['depth'] > prev_depth + 1:
+            raise HarnessError(
+                f'{where}: impossible depth jump '
+                f'{prev_depth} -> {node["depth"]}')
+        prev_depth = node['depth']
     return nodes
 
 
@@ -185,8 +204,9 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
     must bind this exact dump to this gate (mtime alone never
     qualifies), and a showing allocated non-application anchor must
     prove the tree is the true owner's, not an empty, partial, or
-    replayed husk. Every node must match the actual producer's typed
-    record shape (truthy non-bool showing never anchors); the stamp's
+    replayed husk (allocated means positive-area bounds). Every node
+    must match the actual producer's typed record shape (truthy
+    non-bool showing never anchors); the stamp's
     gate/nonce/seq must equal the expected observation, and its
     dump_sha256 must equal the hash of the single owned byte buffer
     the tree was parsed from (one read; a file replaced between two
@@ -256,7 +276,8 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
             f'{stamp_path}: observation stamp is stale or predates the gate start')
     anchors = [n for n in nodes
                if n['showing'] is True and n['role'] != 'application'
-               and isinstance(n['bounds'], list)]
+               and isinstance(n['bounds'], list)
+               and n['bounds'][2] > 0 and n['bounds'][3] > 0]
     if not anchors:
         raise HarnessError(
             f'a11y tree in {dump_path} has no showing allocated '

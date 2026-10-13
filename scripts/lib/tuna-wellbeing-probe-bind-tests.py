@@ -355,9 +355,20 @@ class PointerZone(unittest.TestCase):
             tmp = Path(td)
             path = self.state(tmp, json.dumps({'pointer_position': [20, 580]}))
             for bad in ([1, 2, 3], [1.5, 2, 3, 4], [True, 2, 3, 4],
-                        'x', None):
+                        'x', None, [100, 100, 0, 200],
+                        [100, 100, 320, 0], [100, 100, -5, 200],
+                        [100, 100, 320, -5]):
                 with self.assertRaises(RuntimeError, msg=f'rect={bad!r}'):
                     mod.pointer_zone(path, bad)
+
+    def test_negative_origin_rect_legal(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rect = [-50, 500, 320, 200]
+            path = self.state(tmp, json.dumps({'pointer_position': [20, 580]}))
+            self.assertEqual(mod.pointer_zone(path, list(rect)), 'inside')
+            path = self.state(tmp, json.dumps({'pointer_position': [300, 580]}))
+            self.assertEqual(mod.pointer_zone(path, list(rect)), 'outside')
 
     def test_pointer_zone_cli_reports_zone(self):
         with tempfile.TemporaryDirectory() as td:

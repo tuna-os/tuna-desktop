@@ -828,6 +828,78 @@ class StrictProducerTree(unittest.TestCase):
                 self.check_nodes(tmp, owned_nodes(pid),
                                  patch_start=[start, start + 999999])
 
+    def test_zero_area_anchor_never_anchors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            for bounds in ([10, 70, 0, 48], [10, 70, 220, 0],
+                           [10, 70, -5, 48], [10, 70, 220, -5]):
+                nodes = owned_nodes(pid)
+                nodes[2]['bounds'] = bounds
+                with self.assertRaisesRegex(mod.HarnessError, 'allocated',
+                                            msg=f'bounds={bounds!r}'):
+                    self.check_nodes(tmp, nodes)
+
+    def test_zero_area_hidden_node_keeps_valid_anchor(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            nodes = owned_nodes(pid)
+            nodes[1]['bounds'] = [10, 10, 0, 48]
+            self.assertTrue(self.check_nodes(tmp, nodes))
+
+    def test_negative_origin_anchor_bounds_legal(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            nodes = owned_nodes(pid)
+            nodes[2]['bounds'] = [-5, -5, 220, 48]
+            self.assertTrue(self.check_nodes(tmp, nodes))
+
+    def test_empty_role_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            nodes = owned_nodes(pid)
+            nodes[2]['role'] = ''
+            with self.assertRaises(mod.HarnessError):
+                self.check_nodes(tmp, nodes)
+
+    def test_bad_depth_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            nodes = owned_nodes(pid)
+            nodes[2]['depth'] = -1
+            with self.assertRaises(mod.HarnessError):
+                self.check_nodes(tmp, nodes)
+            nodes = owned_nodes(pid)
+            nodes[0]['depth'] = 1
+            with self.assertRaises(mod.HarnessError):
+                self.check_nodes(tmp, nodes)
+            nodes = owned_nodes(pid)
+            nodes[2]['depth'] = 5
+            with self.assertRaisesRegex(mod.HarnessError, 'depth jump'):
+                self.check_nodes(tmp, nodes)
+
+    def test_valid_deeper_nesting_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            nodes = owned_nodes(pid)
+            nodes[2]['depth'] = 2
+            self.assertTrue(self.check_nodes(tmp, nodes))
+
+    def test_non_application_root_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            nodes = owned_nodes(pid)
+            nodes[0]['role'] = 'window'
+            with self.assertRaisesRegex(mod.HarnessError,
+                                        'must be the application node'):
+                self.check_nodes(tmp, nodes)
+
 
 if __name__ == '__main__':
     unittest.main()

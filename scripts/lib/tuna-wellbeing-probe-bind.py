@@ -156,11 +156,15 @@ def pointer_zone(cstate_path, rect):
     The pointer must be a present, non-null [x, y] pair of finite
     numbers; missing, null, misshapen, mistyped (bools, strings),
     or non-finite (NaN/Inf) positions are harness failures, never a
-    zone. rect is [x, y, w, h] ints.
+    zone. rect is [x, y, w, h] ints with positive width/height; a
+    zero- or negative-area rect would classify every position outside.
     """
     if (not isinstance(rect, list) or len(rect) != 4
             or not all(type(v) is int for v in rect)):
         raise RuntimeError(f'zone rect must be 4 ints, got {rect!r:.80}')
+    if rect[2] <= 0 or rect[3] <= 0:
+        raise RuntimeError(
+            f'zone rect width/height must be positive, got {rect!r:.80}')
     try:
         doc = json.loads(Path(cstate_path).read_bytes().decode('utf-8'))
     except FileNotFoundError:
