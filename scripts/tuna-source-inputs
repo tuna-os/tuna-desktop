@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Candidate source inputs; capture only in CI, admission never publishes."""
+import runpy
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+runpy.run_path(str(Path(__file__).resolve().parent / 'lib/tuna-source-inputs.py'), run_name='__main__')
