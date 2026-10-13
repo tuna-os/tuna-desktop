@@ -263,6 +263,10 @@ pub struct Supervisor {
     retirement: Retirement,
 }
 impl Supervisor {
+    /// Trusted caller/test boundary: `executable` must be an independently admitted
+    /// compositor executable. Private IPC does not authenticate an arbitrary program
+    /// supplied here. Future live adoption must re-execute the held compositor image
+    /// (for example `/proc/self/exe`), never a UI/environment/configuration path.
     /// The creating thread must stay alive through helper retirement: Linux's
     /// parent-death signal follows that thread, not the process. Use a stable
     /// supervisor owner, never a transient spawn-and-return thread.
