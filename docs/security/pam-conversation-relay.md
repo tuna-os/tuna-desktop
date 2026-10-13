@@ -48,9 +48,12 @@ not inherit the old budget of ten seconds for a password for an interactive conv
 Legacy constructors keep their ten-second limit.
 
 The initial Start write still has a separate bootstrap ceiling of ten seconds,
-clipped to the total. The supplied backend phase does not bound that write.
-The OS exec handshake also has no portable hard deadline. A later consumer
-must admit these residual startup limits before it enables a method.
+clipped to the Supervisor-local total deadline, which starts later than the
+original Relay/Ticket admission Instant. The supplied backend phase and original
+admission deadline do not bound that bootstrap write. Authentication acceptance
+still checks the original shared admission deadline after setup. The OS exec
+handshake also has no portable hard deadline. A later consumer must admit these
+residual startup limits before it enables a method.
 
 Each try at physical cleanup retains the existing 500 ms budget. Failure to
 retire leaves the Supervisor on the same creator thread in quarantine. Repeated
