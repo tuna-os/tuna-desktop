@@ -153,5 +153,61 @@ class FadeSettleFilter(unittest.TestCase):
                     self.run_filter(value, animating=self._MISSING), 0)
 
 
+class LiveActionCapture(unittest.TestCase):
+    def test_actual_capture_clock_filter_refuses_live_missing_and_untyped_values(self):
+        match = re.search(r"cstate '([^']+)' \"manual capture clock\"", PROOF.read_text())
+        self.assertIsNotNone(match)
+        good = {'animation_clock_manual': True, 'animation_clock_ms': 42}
+        cases = [(good, True)]
+        for key, value in [('animation_clock_manual', False), ('animation_clock_manual', 'true'),
+                           ('animation_clock_ms', None), ('animation_clock_ms', True),
+                           ('animation_clock_ms', '42'), ('animation_clock_ms', -1),
+                           ('animation_clock_ms', 42.5)]:
+            cases.append((dict(good, **{key: value}), False))
+        cases.append(({'animation_clock_manual': True}, False))
+        for value, accepted in cases:
+            with self.subTest(value=value):
+                proc = subprocess.run(['jq', '-e', match.group(1)],
+                                      input=json.dumps(value), capture_output=True,
+                                      text=True, timeout=5)
+                self.assertEqual(proc.returncode == 0, accepted, proc.stderr)
+
+    def test_live_action_sites_use_the_bracketed_capture(self):
+        source = PROOF.read_text()
+        for label in ('delay-redue', 'skip-redue', 'negative-baseline'):
+            self.assertEqual(source.count('wb_capture_after_live_action ' + label), 1)
+            self.assertNotRegex(source, re.compile(r'^wb_capture\s+' + re.escape(label) + r'\s*$', re.MULTILINE),
+                                'unfrozen live-action capture')
+        capture = source.split('wb_capture() {', 1)[1].split('\n}', 1)[0]
+        self.assertLess(capture.index('"manual capture clock"'), capture.index('scrot'))
+        self.assertIn('(.animation_clock_ms | floor)', capture)
+
+    def test_actual_shell_wrapper_freezes_captures_and_restores(self):
+        source = PROOF.read_text()
+        match = re.search(r'^wb_capture_after_live_action\(\) \{\n.*?^\}',
+                          source, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        script = r'''set -eu
+TUNA_ANIMATION_CLOCK="$1"
+WB_GATE=TEST
+anim_clock() { printf '%s\n' "$1" > "$TUNA_ANIMATION_CLOCK"; printf 'freeze\n'; }
+cstate() {
+    case "$2" in
+        "frozen capture clock") test -f "$TUNA_ANIMATION_CLOCK" ;;
+        "real clock") test ! -e "$TUNA_ANIMATION_CLOCK" ;;
+        *) return 2 ;;
+    esac
+}
+wb_capture() { test -f "$TUNA_ANIMATION_CLOCK"; printf 'capture:%s\n' "$1"; }
+fail() { exit 7; }
+''' + match.group(0) + '\nwb_capture_after_live_action delay-redue\ntest ! -e "$TUNA_ANIMATION_CLOCK"\nprintf "restored\\n"\n'
+        with tempfile.TemporaryDirectory() as directory:
+            proc = subprocess.run(['bash', '-c', script, 'capture-test',
+                                   str(Path(directory) / 'clock')],
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), ['freeze', 'capture:delay-redue', 'restored'])
+
+
 if __name__ == '__main__':
     unittest.main()

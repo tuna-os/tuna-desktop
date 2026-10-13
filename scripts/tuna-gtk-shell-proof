@@ -4287,6 +4287,8 @@ wb_pixel_preconditions() {
 
 wb_capture() {
     label="$1"
+    cstate '.animation_clock_manual == true and (.animation_clock_ms | type) == "number" and .animation_clock_ms >= 0 and .animation_clock_ms == (.animation_clock_ms | floor)' "manual capture clock" ||
+        fail "$WB_GATE" "pixel capture $label requires a typed manual animation clock"
     png="$ARTIFACTS/wb-$label.png"
     cstate_before="$ARTIFACTS/wb-$label-cstate-before.json"
     cstate_after="$ARTIFACTS/wb-$label-cstate-after.json"
@@ -4320,6 +4322,18 @@ wb_capture() {
         --argjson proc "$proc_json" --argjson proc_before "$proc_before_json" \
         '{label:$label,image:$image,cstate_before:$before,cstate_after:$after,clock_ms:$clock,epoch:$epoch,iso:$iso,proc:$proc,proc_before:$proc_before}' \
         >>"$WB_CAPS_JSONL" || fail "$WB_GATE" "could not record $label"
+}
+
+# Live Delay/Skip schedules use wall time. Freeze only their resulting pixel
+# capture, then restore wall time before the next action or cleanup.
+wb_capture_after_live_action() {
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen capture clock" ||
+        fail "$WB_GATE" "the clock did not freeze for the live-action capture"
+    wb_capture "$1" || fail "$WB_GATE" "live-action pixel capture failed"
+    rm -f "$TUNA_ANIMATION_CLOCK"
+    cstate '.animation_clock_manual | not' "real clock" ||
+        fail "$WB_GATE" "real time did not resume after the live-action capture"
 }
 
 wb_state_capture() {
@@ -5042,7 +5056,7 @@ while [ "$(date +%s)" -le "$end" ]; do
     fi
 done
 [ -n "$DELAYREDUE" ] || fail G-WELLBEING-ACTION-DELAY "no redue banner after Delay"
-wb_capture delay-redue
+wb_capture_after_live_action delay-redue
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" delay \
     --old-due "$delay_due_epoch" --new-due "$delay_redue_epoch" --delay-secs 30 ||
     fail G-WELLBEING-ACTION-DELAY "live due did not move by delay-seconds"
@@ -5133,7 +5147,7 @@ while [ "$(date +%s)" -le "$end" ]; do
     fi
 done
 [ -n "$SKIPREDUE" ] || fail G-WELLBEING-ACTION-SKIP "no redue banner after Skip"
-wb_capture skip-redue
+wb_capture_after_live_action skip-redue
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" skip \
     --press "$skip_press_epoch" --new-due "$skip_redue_epoch" --interval-secs 10 ||
     fail G-WELLBEING-ACTION-SKIP "the interval did not restart at the press"
@@ -5222,7 +5236,7 @@ negative_retired_seq="$WB_DUMP_SEQ"
     --expect-nonce "$WB_NONCE" \
     --expect-seq "$negative_retired_seq" ||
     fail G-WELLBEING-NEGATIVE "a post-cleanup stale Take press fired"
-wb_capture negative-baseline
+wb_capture_after_live_action negative-baseline
 wb_provenance_finish
 pass G-WELLBEING-NEGATIVE "neutral frames fail every effect assertion, intermediates hold, stale presses fail"
 
