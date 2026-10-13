@@ -98,6 +98,27 @@ class SourceContracts(unittest.TestCase):
         self.assertIn('if attempt == 0 { 30 } else { 2 }', actual)
         self.assertIn('if attempt == 0 { 900 } else { 300 }', actual)
 
+    def test_coalesced_notice_drains_bounded_queue_and_fixture_checks_after_reads(self):
+        backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
+        poll = backend.split('impl ConversationTicket {', 1)[1].split('pub enum Initial', 1)[0]
+        self.assertIn('for _ in 0..2', poll)
+        pending = poll.split('Ok(Reply::Pending) => {', 1)[1].split('}', 1)[0]
+        self.assertIn('self.cancel();', pending)
+        self.assertIn('continue;', pending)
+        self.assertEqual(backend.count('job.reply.send(Reply::Pending)'), 1)
+        self.assertIn('coalesced_pending_retired_disconnect_is_drained_by_one_owned_callback', backend)
+        actual = (ROOT / 'crates/compositor/tests/pam_helper.rs').read_text().split('fn run_interactive_relay_cases()', 1)[1]
+        next_case = actual.split('fn next(', 1)[1].split('fn finished(', 1)[0]
+        self.assertLess(next_case.index('let challenge = ticket.try_challenge();'),
+                        next_case.index('challenge observation exceeded deadline'))
+        self.assertLess(next_case.index('challenge observation exceeded deadline'),
+                        next_case.index('return challenge;'))
+        finished = actual.split('fn finished(', 1)[1].split('let (created, creators)', 1)[0]
+        self.assertLess(finished.index('let outcome = ticket.try_outcome();'),
+                        finished.index('retirement observation exceeded deadline'))
+        self.assertLess(finished.index('retirement observation exceeded deadline'),
+                        finished.index('return;'))
+
     def test_owned_credential_wrap_precedes_early_denials_and_moves_answer(self):
         backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
         self.assertIn('impl Drop for Credential', backend)

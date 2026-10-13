@@ -720,13 +720,20 @@ fn run_interactive_relay_cases() {
     ) -> Challenge {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Ok(challenge) = ticket.try_challenge() {
+            let challenge = ticket.try_challenge();
+            assert!(
+                Instant::now() < deadline,
+                "challenge observation exceeded deadline"
+            );
+            if let Ok(challenge) = challenge {
                 return challenge;
             }
+            let outcome = ticket.try_outcome();
             assert!(
-                ticket.try_outcome().is_none(),
-                "unexpected retirement before challenge"
+                Instant::now() < deadline,
+                "outcome observation exceeded challenge deadline"
             );
+            assert!(outcome.is_none(), "unexpected retirement before challenge");
             assert!(Instant::now() < deadline, "required challenge missing");
             event_loop
                 .dispatch(
@@ -744,7 +751,12 @@ fn run_interactive_relay_cases() {
     ) {
         let deadline = Instant::now() + Duration::from_secs(4);
         loop {
-            if let Some(result) = ticket.try_outcome() {
+            let outcome = ticket.try_outcome();
+            assert!(
+                Instant::now() < deadline,
+                "retirement observation exceeded deadline"
+            );
+            if let Some(result) = outcome {
                 assert_eq!(
                     result,
                     Verification::Retired {

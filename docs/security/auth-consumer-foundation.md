@@ -66,5 +66,5 @@ fresh input. It must retain NoReplay transport and owned secret buffers. Only in
 
 The final unlock still needs
 the live origin, exact common Slot, method retirement, current lock epoch, and
-atomic grant check. 
+atomic grant check.
 A GTK surface closes only on an authoritative unlocked snapshot. No schema version changes are made here.

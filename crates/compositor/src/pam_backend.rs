@@ -199,27 +199,33 @@ impl ConversationTicket {
         if self.outcome.is_some() {
             return self.outcome;
         }
-        let outcome = match self.ticket.reply.try_recv() {
-            Ok(Reply::Retired(authenticated)) => {
-                let observed = Instant::now();
-                self.ticket.denied |=
-                    self.ticket.cancel.is_canceled() || !self.receiver.timely_at(observed);
-                match self.ticket.retired_at(authenticated, observed) {
-                    Initial::Finished(result) => Some(result),
-                    Initial::Pending => None,
+        // The trusted producer publishes at most one Pending followed by
+        // one terminal reply. PingSource coalesces them, so drain both in a
+        // bounded poll rather than sleeping with Retired already queued.
+        for _ in 0..2 {
+            let outcome = match self.ticket.reply.try_recv() {
+                Ok(Reply::Retired(authenticated)) => {
+                    let observed = Instant::now();
+                    self.ticket.denied |=
+                        self.ticket.cancel.is_canceled() || !self.receiver.timely_at(observed);
+                    match self.ticket.retired_at(authenticated, observed) {
+                        Initial::Finished(result) => Some(result),
+                        Initial::Pending => None,
+                    }
                 }
-            }
-            Ok(Reply::Pending) => {
-                self.cancel();
-                None
-            }
-            Ok(Reply::Poisoned) | Err(mpsc::TryRecvError::Disconnected) => {
-                Some(Verification::Unretired)
-            }
-            Err(mpsc::TryRecvError::Empty) => None,
-        };
-        self.outcome = outcome;
-        outcome
+                Ok(Reply::Pending) => {
+                    self.cancel();
+                    continue;
+                }
+                Ok(Reply::Poisoned) | Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Verification::Unretired)
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            self.outcome = outcome;
+            return outcome;
+        }
+        None
     }
 }
 pub enum Initial {
@@ -690,6 +696,85 @@ mod tests {
             .unwrap();
         assert_eq!(seen.len(), count);
     }
+    #[test]
+    fn coalesced_pending_retired_disconnect_is_drained_by_one_owned_callback() {
+        for terminal_receipt in [true, false] {
+            let cancel = Cancellation::default();
+            let (relay, receiver) = crate::pam_conversation::channel(
+                crate::pam_conversation::Binding {
+                    origin: crate::auth_owner::Origin {
+                        connection: 1,
+                        request: 1,
+                    },
+                    attempt: 1,
+                    epoch: 1,
+                },
+                crate::pam_conversation::Policy {
+                    backend_phase: Duration::from_secs(2),
+                    total: Duration::from_secs(120),
+                },
+                cancel.clone(),
+            )
+            .unwrap();
+            let (sender, reply) = mpsc::channel();
+            let publisher = ReplyPublisher {
+                sender: Some(sender),
+                notice: Some(relay.notice()),
+            };
+            let mut ticket = ConversationTicket {
+                ticket: Ticket {
+                    serial: 1,
+                    reply,
+                    cancel,
+                    deadline: receiver.total_deadline_for_test(),
+                    denied: false,
+                },
+                receiver,
+                outcome: None,
+            };
+            let source = ticket.take_notice_source().unwrap();
+            let mut event_loop =
+                calloop::EventLoop::<Vec<Option<Verification>>>::try_new().unwrap();
+            event_loop
+                .handle()
+                .insert_source(source, move |_, _, seen| {
+                    seen.push(ticket.try_outcome());
+                    assert!(ticket.next_deadline().is_none());
+                })
+                .unwrap();
+            // Every publication happens before the sole dispatch: the actual
+            // calloop source must coalesce, not provide one wake per queue entry.
+            publisher.send(Reply::Pending).unwrap();
+            if terminal_receipt {
+                publisher.send(Reply::Retired(true)).unwrap();
+            }
+            drop(relay);
+            drop(publisher);
+            let mut seen = Vec::new();
+            event_loop
+                .dispatch(Some(Duration::from_secs(2)), &mut seen)
+                .unwrap();
+            assert_eq!(
+                seen,
+                vec![Some(if terminal_receipt {
+                    Verification::Retired {
+                        authenticated: false,
+                    }
+                } else {
+                    Verification::Unretired
+                })]
+            );
+            event_loop
+                .dispatch(Some(Duration::ZERO), &mut seen)
+                .unwrap();
+            assert_eq!(
+                seen.len(),
+                1,
+                "no idle polling or invented disconnect retirement"
+            );
+        }
+    }
+
     fn observed_credential(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Credential {
         Credential {
             text: "owned-control-value".into(),
