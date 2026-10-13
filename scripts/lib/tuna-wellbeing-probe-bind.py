@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Bind the owned wellbeing probe window to its harness-owned client (#354).
+
+CSTATE windows expose id/app_id/application_window_id (+x11_window_id,
+geometry) but NOT pid/start (runtime.rs), and no script-readable
+authenticated window/process inventory exposes the kernel client PID, so
+PID-from-CSTATE is unprovable here and is never asserted.
+
+Binding is instead exact before/after unique new-map identity plus owned
+native-client proof, following scripts/lib/tuna_window_menu_fixture.py:
+
+- bind: the after-scene minus the before-scene id set must be exactly
+  ONE new window; it must carry the expected app_id, must be native
+  (x11_window_id None), and must be the ONLY same-app native window in
+  the after scene. A decoy same-app window (pre-existing or second new
+  map) fails closed.
+- the harness holds the client child PID; bind records its /proc
+  identity (pid, uid, start_ticks, exe link). check re-reads /proc and
+  fails on any lifetime change (exit, PID reuse, binary swap).
+- the pointer-enter handshake (client logs {"enter":...} on enter) is
+  performed shell-side after bind: only the owned client writes that
+  log, and an enter at the bound rect proves the compositor routes the
+  bound surface to the owned client.
+
+check additionally requires stable owned geometry (rect equality) and
+the unchanged native identity pair (id + application_window_id).
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+
+def process_identity(pid):
+    """Live /proc identity of a harness-owned process (no PID reuse)."""
+    root = Path('/proc') / str(pid)
+    try:
+        stat = (root / 'stat').read_text().rsplit(')', 1)[1].split()
+        exe = (root / 'exe').readlink().__str__()
+    except FileNotFoundError:
+        raise RuntimeError(f'probe process {pid} is gone')
+    return {'pid': pid, 'uid': root.stat().st_uid,
+            'start_ticks': int(stat[19]), 'exe': exe}
+
+
+def native_same_app(scene, app_id):
+    return [w for w in scene.get('windows', [])
+            if w.get('app_id') == app_id and w.get('x11_window_id') is None]
+
+
+def bind(before_scene, after_scene, identity, app_id):
+    before_ids = {w.get('id') for w in before_scene.get('windows', [])}
+    new = [w for w in after_scene.get('windows', [])
+           if w.get('id') not in before_ids]
+    if len(new) != 1:
+        raise RuntimeError(
+            f'probe map is ambiguous or missing ({len(new)} new windows)')
+    window = new[0]
+    if window.get('app_id') != app_id:
+        raise RuntimeError(
+            f"new window app_id {window.get('app_id')!r} is not the owned {app_id!r}")
+    if window.get('x11_window_id') is not None:
+        raise RuntimeError('new probe window is X11, not the owned native client')
+    same = native_same_app(after_scene, app_id)
+    if len(same) != 1 or same[0].get('id') != window.get('id'):
+        raise RuntimeError(
+            f'decoy: {len(same)} same-app native windows, owned probe not unique')
+    return {**identity, 'id': window['id'],
+            'application_window_id': window.get('application_window_id'),
+            'app_id': app_id, 'rect': list(window['rect'])}
+
+
+def check(live_scene, expected, live_identity):
+    for key in ('pid', 'uid', 'start_ticks', 'exe'):
+        if expected[key] != live_identity[key]:
+            raise RuntimeError(
+                f'owned probe process lifetime changed ({key}: '
+                f'{expected[key]!r} -> {live_identity[key]!r})')
+    same = native_same_app(live_scene, expected['app_id'])
+    if len(same) != 1:
+        raise RuntimeError(
+            f"owned probe identity is ambiguous or missing ({len(same)} same-app native windows)")
+    window = same[0]
+    if (window.get('id') != expected['id']
+            or window.get('application_window_id') != expected['application_window_id']):
+        raise RuntimeError('owned probe native identity changed')
+    if list(window['rect']) != list(expected['rect']):
+        raise RuntimeError(
+            f"owned probe geometry changed ({expected['rect']!r} -> {window['rect']!r})")
+    return list(window['rect'])
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('bind')
+    p.add_argument('--before', type=Path, required=True)
+    p.add_argument('--after', type=Path, required=True)
+    p.add_argument('--pid', type=int, required=True)
+    p.add_argument('--app-id', required=True)
+    p.add_argument('--out', type=Path, required=True)
+    p = sub.add_parser('check')
+    p.add_argument('--cstate', type=Path, required=True)
+    p.add_argument('--owner', type=Path, required=True)
+    p.add_argument('--pid', type=int, required=True)
+    args = parser.parse_args(argv)
+    if args.command == 'bind':
+        before = json.loads(args.before.read_text())
+        after = json.loads(args.after.read_text())
+        owner = bind(before, after, process_identity(args.pid), args.app_id)
+        args.out.write_text(json.dumps(owner, indent=2) + '\n')
+        print(json.dumps({'id': owner['id'], 'rect': owner['rect']}))
+    elif args.command == 'check':
+        expected = json.loads(args.owner.read_text())
+        if args.pid != expected['pid']:
+            raise SystemExit(
+                f"harness pid {args.pid} does not match bound owner {expected['pid']}")
+        rect = check(json.loads(args.cstate.read_text()), expected,
+                     process_identity(expected['pid']))
+        print(json.dumps({'id': expected['id'], 'rect': rect}))
+
+
+if __name__ == '__main__':
+    main()
