@@ -2109,9 +2109,10 @@ mod tests {
             tuna_shell_control::Secret(password.clone()),
         )
         .unwrap();
-        assert!(
-            matches!(client.unlock(password),Err(ControlError::Io(e)) if e.kind()==io::ErrorKind::WouldBlock)
-        );
+        assert!(matches!(
+            client.unlock(password),
+            Err(ControlError::WouldBlock)
+        ));
         old_peer
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
