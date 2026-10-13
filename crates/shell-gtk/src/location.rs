@@ -238,14 +238,11 @@ pub fn live_grant(proposed: u32, live_max: u32) -> u32 {
 /// row denies, as GNOME's `|| NONE` does. A present row with no level
 /// word is garbled too: only a genuinely missing row prompts.
 pub fn stored_accuracy(perms: &HashMap<String, Vec<String>>, desktop_id: &str) -> Option<u32> {
-    match perms.get(desktop_id) {
-        None => None,
-        Some(row) => Some(
-            row.first()
-                .map(|level| accuracy_value(level))
-                .unwrap_or(ACC_NONE),
-        ),
-    }
+    perms.get(desktop_id).map(|row| {
+        row.first()
+            .map(|level| accuracy_value(level))
+            .unwrap_or(ACC_NONE)
+    })
 }
 
 /// The row `Set` writes back: the level word and the decision's date.
