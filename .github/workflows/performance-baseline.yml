@@ -6,6 +6,7 @@ on:
       - scripts/tuna-vm-perf
       - scripts/tuna-benchmark-disk-export
       - scripts/lib/tuna_benchmark_esp.py
+      - scripts/lib/tuna_benchmark_kernel.py
       - scripts/lib/tuna-benchmark-esp-tests.py
       - scripts/lib/tuna_benchmark_disk.py
       - scripts/lib/tuna-benchmark-disk-tests.py

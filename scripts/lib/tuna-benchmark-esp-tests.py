@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Owned-resource/error/byte-identity tests; no real privileged image build."""
 import json
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -8,14 +9,34 @@ import shutil
 import tempfile
 import unittest
 from tuna_benchmark_disk import digest
-from tuna_benchmark_esp import Commands, critical_hashes, fat_partition, repair, retire_backing
+from tuna_benchmark_esp import Commands, critical_hashes, fat_partition, repair, retire_backing, default_esp_entry
+from tuna_benchmark_kernel import kernel_release, select_kernel, collect
+
+
+def kernel_bytes(version='6.1-test'):
+    data=bytearray(1024);data[0x1f1]=4;data[0x1fe:0x200]=b'\x55\xaa';data[0x202:0x206]=b'HdrS'
+    data[0x206:0x208]=(0x20c).to_bytes(2,'little');data[0x236:0x238]=(1).to_bytes(2,'little')
+    data[0x20e:0x210]=(0x80).to_bytes(2,'little');value=(version+' controlled').encode()+b'\0'
+    data[0x280:0x280+len(value)]=value
+    return bytes(data)
+
+
+def kernel_observation(versions='6.1-test'):
+    values={'vmlinuz':kernel_bytes(),'initramfs.img':b'initramfs-real','pkgbase':b'linux\n','modules.dep':b'dep-real'}
+    return {'schema':1,'package':'linux controlled-1','package_vmlinuz':['/usr/lib/modules/6.1-test/vmlinuz'],
+            'package_manifest_sha256':'a'*64,'bootc_version':'bootc controlled',
+            'directories':[{'version':v,'genuine_directory':True,'vmlinuz_present':True,'vmlinuz_regular':True,'vmlinuz_owner':'linux'} for v in versions.splitlines()],
+            'uki_paths':[],'pkgbase':'linux','kernel_header_release':'6.1-test',
+            'members_sha256':{n:hashlib.sha256(b).hexdigest() for n,b in values.items()},
+            'module_probe':{'owner':'linux','path':'/usr/lib/modules/6.1-test/kernel/probe.ko','sha256':hashlib.sha256(b'probe-real').hexdigest(),'vermagic':'6.1-test SMP'},
+            'initramfs':{'module_abis':['6.1-test'],'bootc_root_setup':True}}
 
 
 class FakeCommands:
     def __init__(self, raw, failure=None, versions='6.1-test', target_count=1, mismatch=False, foreign=False):
         self.raw=raw; self.failure=failure; self.versions=versions
         self.target_count=target_count; self.mismatch=mismatch; self.foreign=foreign
-        self.calls=[]; self.mounted=False
+        self.calls=[]; self.mounted=False;self.observation=kernel_observation(versions)
     def call(self,args,check=True):
         self.calls.append(args)
         operation=args[1] if args[0]=='sudo' else args[0]
@@ -25,14 +46,17 @@ class FakeCommands:
             for i in range(self.target_count):
                 target=root/f'bootc_composefs-{i}';target.mkdir()
                 (target/'vmlinuz').write_bytes(bytes(20));(target/'initrd').write_bytes(bytes(30))
+            entries=Path(args[-1])/'loader/entries';entries.mkdir(parents=True)
+            (entries/'bootc.conf').write_text('linux /EFI/Linux/bootc_composefs-0/vmlinuz\ninitrd /EFI/Linux/bootc_composefs-0/initrd\n')
+            (entries.parent/'loader.conf').write_text('default bootc.conf\n')
         if self.failure==operation or (self.failure=='copy-esp' and operation=='cp') or (self.failure=='detach' and '--detach' in args):
             raise RuntimeError('injected '+operation+' failure')
         if operation=='podman' and args[2]=='container':return 1,''
         if operation=='podman' and args[2]=='run':
-            if 'printf' in args[-1]: return 0,self.versions
+            if 'python3' in args and '-c' in args: return 0,json.dumps(self.observation)
         if operation=='podman' and args[2]=='cp':
             name=args[3].rsplit('/',1)[1]
-            Path(args[4]).write_bytes(b'kernel-real' if name=='vmlinuz' else b'initramfs-real')
+            Path(args[4]).write_bytes(kernel_bytes() if name=='vmlinuz' else b'initramfs-real')
         if operation=='losetup':
             if '--find' in args:return 0,'/dev/loop77'
             if '--json' in args:return 0,json.dumps({'loopdevices':[{'name':'/dev/loop77','back-file':str(self.raw) if not self.foreign else '/foreign/backing.raw'}]})
@@ -49,12 +73,12 @@ class EspTests(unittest.TestCase):
         self.root=Path(self.temporary.name);self.raw=self.root/'disk.raw';self.raw.write_bytes(b'owned')
         self.critical=self.root/'critical.sha256'
         import hashlib
-        self.critical.write_text(''.join(hashlib.sha256(data).hexdigest()+'  /usr/lib/modules/6.1-test/'+name+'\n' for name,data in [('vmlinuz',b'kernel-real'),('initramfs.img',b'initramfs-real')]))
+        self.critical.write_text(''.join(hashlib.sha256(data).hexdigest()+'  /usr/lib/modules/6.1-test/'+name+'\n' for name,data in [('vmlinuz',kernel_bytes()),('initramfs.img',b'initramfs-real'),('pkgbase',b'linux\n'),('modules.dep',b'dep-real'),('kernel/probe.ko',b'probe-real')]))
         self.record={}
     def invoke(self,**kwargs):
         command=FakeCommands(self.raw,**kwargs)
         self.command=command
-        repair(self.raw,'a'*64,self.root,self.critical,self.record,self.root/'repair.log',command)
+        repair(self.raw,'a'*64,self.root,self.critical,self.record,self.root/'repair.log',command,expected_kernel_package='linux controlled-1')
         return command
     def test_replaces_zero_files_with_protected_exact_source_bytes_and_cleans(self):
         command=self.invoke()
@@ -120,6 +144,87 @@ class EspTests(unittest.TestCase):
         self.assertLess(source.index('repair_esp(raw,'),source.index("receipt['raw_sha256'] = digest(raw)"))
         self.assertLess(source.index("receipt['raw_sha256'] = digest(raw)"),source.index("'disk-convert')"))
         self.assertIn("get('owned_resources_removed', True)",source)
+
+    def test_owned_kernel_plus_measured_nonboot_directory_is_preserved(self):
+        command=FakeCommands(self.raw)
+        command.observation['directories'].insert(0,{'version':'9.99-newer','genuine_directory':True,'vmlinuz_present':False,'classification':'nonboot-no-vmlinuz','directory_owner':None,'contents_ownership':'not queried'})
+        repair(self.raw,'a'*64,self.root,self.critical,self.record,self.root/'repair.log',command,expected_kernel_package='linux controlled-1')
+        self.assertEqual(self.record['kernel_version'],'6.1-test')
+        self.assertEqual(self.record['kernel_observation']['directories'][0]['version'],'9.99-newer')
+        self.assertFalse(any('9.99-newer' in ' '.join(args) and 'rm' in args for args in command.calls))
+    def test_actual_collector_uses_fixture_owned_bytes_and_inert_package_queries(self):
+        from types import SimpleNamespace
+        root=self.root/'image';selected=root/'usr/lib/modules/6.1-test';selected.mkdir(parents=True)
+        old=root/'usr/lib/modules/9.99-stale';old.mkdir()
+        members={'vmlinuz':kernel_bytes(),'initramfs.img':b'initramfs-real','pkgbase':b'linux\n','modules.dep':b'dep-real','kernel/probe.ko':b'probe-real'}
+        for name,data in members.items():
+            p=selected/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
+        queried=[]
+        def query(args,**kwargs):
+            queried.append(args)
+            result=0;out=''
+            if args==('pacman','-Q','linux'):out='linux controlled-1'
+            elif args==('pacman','-Qlq','linux'):out='\n'.join('/usr/lib/modules/6.1-test/'+name for name in members)
+            elif args[:2]==('pacman','-Qqo'):
+                if '9.99-stale' in args[-1]:result=1
+                else:out='linux'
+            elif args[:3]==('modinfo','-F','vermagic'):out='6.1-test SMP'
+            elif args[0]=='lsinitrd':out='usr/lib/modules/6.1-test/kernel/probe.ko\nusr/lib/systemd/system/bootc-root-setup.service'
+            elif args==('bootc','--version'):out='bootc controlled'
+            else:self.fail('unexpected query '+repr(args))
+            return SimpleNamespace(returncode=result,stdout=out.encode(),stderr=b'')
+        value=collect('linux controlled-1',rootfs=root,run=query)
+        self.assertEqual(select_kernel(value,self.critical.read_text(),'linux controlled-1'),'6.1-test')
+        residual=next(v for v in value['directories'] if v['version']=='9.99-stale')
+        self.assertEqual(residual['classification'],'nonboot-no-vmlinuz')
+        self.assertIsNone(residual['directory_owner']);self.assertEqual(residual['contents_ownership'],'not queried')
+        self.assertTrue(old.exists());self.assertEqual((selected/'vmlinuz').read_bytes(),kernel_bytes())
+
+    def test_actual_selector_refuses_identity_abi_and_ambiguity_mutations(self):
+        import copy
+        mutations=[lambda x:x.update(schema=True),lambda x:x.update(package='linux changed'),lambda x:x.update(package_vmlinuz=[]),
+                   lambda x:x['package_vmlinuz'].append('/usr/lib/modules/other/vmlinuz'),
+                   lambda x:x['directories'][0].update(vmlinuz_owner='other'),
+                   lambda x:x['directories'].append({'version':'other','genuine_directory':True,'vmlinuz_present':True,'vmlinuz_regular':True,'vmlinuz_owner':None}),
+                   lambda x:x['directories'][0].update(genuine_directory=False),lambda x:x['directories'][0].update(version='../escape'),
+                   lambda x:x.update(uki_paths=['/boot/EFI/Linux/other.efi']),lambda x:x.update(pkgbase='other'),
+                   lambda x:x.update(kernel_header_release='other'),lambda x:x['module_probe'].update(vermagic='other SMP'),
+                   lambda x:x['initramfs'].update(module_abis=['other']),lambda x:x['initramfs'].update(bootc_root_setup=False),
+                   lambda x:x['members_sha256'].update(vmlinuz='0'*64),lambda x:x['members_sha256'].update(pkgbase='0'*64),
+                   lambda x:x['members_sha256'].update(initramfs_img='0'*64),lambda x:x['members_sha256'].update(**{'initramfs.img':'0'*64}),
+                   lambda x:x['members_sha256'].update(**{'modules.dep':'0'*64}),lambda x:x['module_probe'].update(sha256='0'*64)]
+        for mutate in mutations:
+            value=copy.deepcopy(kernel_observation());mutate(value)
+            with self.subTest(value=value),self.assertRaises(ValueError):select_kernel(value,self.critical.read_text(),'linux controlled-1')
+    def test_real_bounded_x86_header_parser_refuses_unknown_or_changed_abi(self):
+        self.assertEqual(kernel_release(kernel_bytes()),'6.1-test')
+        for offset,data in [(0x202,b'nope'),(0x20e,b'\0\0'),(0x236,b'\0\0')]:
+            bad=bytearray(kernel_bytes());bad[offset:offset+len(data)]=data
+            with self.assertRaises(ValueError):kernel_release(bytes(bad))
+        with self.assertRaises(ValueError):kernel_release(b'truncated')
+    def test_default_boot_identity_unknown_other_target_and_uki_refuse(self):
+        mount=self.root/'loader-test';target=mount/'EFI/Linux/bootc_composefs-x';target.mkdir(parents=True)
+        entries=mount/'loader/entries';entries.mkdir(parents=True)
+        entry=entries/'bootc.conf';config=entries.parent/'loader.conf'
+        entry.write_text('linux /EFI/Linux/bootc_composefs-x/vmlinuz\ninitrd /EFI/Linux/bootc_composefs-x/initrd\n')
+        self.assertEqual(default_esp_entry(mount,target)['entry'],'loader/entries/bootc.conf')
+        for selector in ('@saved','unknown.conf'):
+            config.write_text('default '+selector+'\n')
+            with self.assertRaises(ValueError):default_esp_entry(mount,target)
+        config.write_text('default bootc.conf\n')
+        entry.write_text('linux /other/vmlinuz\ninitrd /other/initrd\n')
+        with self.assertRaises(ValueError):default_esp_entry(mount,target)
+        entry.write_text('efi /EFI/Linux/kernel.efi\n')
+        with self.assertRaises(ValueError):default_esp_entry(mount,target)
+        entry.write_text('linux /EFI/Linux/bootc_composefs-x/vmlinuz\ninitrd /EFI/Linux/bootc_composefs-x/initrd\n')
+        (entries/'other.conf').write_text(entry.read_text())
+        with self.assertRaises(ValueError):default_esp_entry(mount,target)
+        (entries/'other.conf').unlink()
+        (target.parent/'other.efi').write_bytes(b'unknown UKI')
+        with self.assertRaises(ValueError):default_esp_entry(mount,target)
+        (target.parent/'other.efi').unlink()
+        config.unlink();config.symlink_to('missing.conf')
+        with self.assertRaises(ValueError):default_esp_entry(mount,target)
 
 
 class DeadlineTests(unittest.TestCase):

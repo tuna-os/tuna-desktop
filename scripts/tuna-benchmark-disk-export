@@ -117,7 +117,7 @@ def main():
         receipt['qemu_version'] = output(['qemu-img', '--version']).splitlines()[0]
         receipt['exporter_source_sha256'] = {name: digest(ROOT/name) for name in [
             'scripts/tuna-benchmark-disk-export', 'scripts/lib/tuna_benchmark_disk.py',
-            'scripts/lib/tuna_benchmark_esp.py', 'scripts/lib/tuna_benchmark_footprint.py',
+            'scripts/lib/tuna_benchmark_esp.py', 'scripts/lib/tuna_benchmark_kernel.py', 'scripts/lib/tuna_benchmark_footprint.py',
             'scripts/lib/tuna_dense_decode.py', 'scripts/lib/tuna_dense_decode_worker.py',
             'scripts/lib/tuna_dense_process.py', 'scripts/lib/tuna_dense_tool_identity.json',
             'packaging/marlin/perf/Containerfile.baseline', 'packaging/marlin/perf/Containerfile',
@@ -139,7 +139,7 @@ def main():
         if receipt['esp_repair']['required']:
             repair_esp(raw, receipt['fixture_image_id'], args.scratch,
                        profile_root/'baseline-critical.sha256', receipt['esp_repair'],
-                       artifacts/'esp-repair.log')
+                       artifacts/'esp-repair.log',expected_kernel_package=receipt['kernel_package'])
         receipt['raw_sha256'] = digest(raw)
         run(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', '-c', str(raw), str(disk)], 'disk-convert')
         run(['qemu-img', 'check', '-f', 'qcow2', str(disk)], 'disk-check')

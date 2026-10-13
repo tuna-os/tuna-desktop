@@ -1,5 +1,7 @@
 """Repair composefs ESP bytes from one exact source image, using owned resources."""
 import json
+import fnmatch
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -10,6 +12,7 @@ import tempfile
 import time
 import uuid
 from tuna_benchmark_disk import digest, require
+from tuna_benchmark_kernel import select_kernel
 
 
 class Commands:
@@ -198,7 +201,52 @@ def critical_hashes(text, version):
     return expected
 
 
-def repair(raw, image, scratch, critical, record, log, commands=None):
+def default_esp_entry(mount,target):
+    """Resolve only one explicit split-kernel default; unknown selectors refuse."""
+    require(not any(p.suffix.lower()=='.efi' for p in target.parent.iterdir()),'unknown ESP UKI precedence refused')
+    loader=mount/'loader';entries=loader/'entries'
+    require(loader.is_dir() and not loader.is_symlink() and entries.is_dir() and not entries.is_symlink(),
+            'genuine ESP loader entries required')
+    candidates=list(entries.iterdir())
+    require(0<len(candidates)<=128,'bounded ESP entry inventory required')
+    rows=[]
+    for path in candidates:
+        require(path.suffix=='.conf' and path.is_file() and not path.is_symlink()
+                and path.stat().st_size<=65536,'regular bounded BLS entry required')
+        fields={}
+        for line in path.read_text().splitlines():
+            line=line.strip()
+            if not line or line.startswith('#'):continue
+            words=line.split(None,1);key=words[0];value=words[1] if len(words)==2 else ''
+            if key in ('linux','initrd','efi'):
+                require(key not in fields and value.strip(),'unambiguous BLS boot fields required')
+                fields[key]=value.strip()
+        require('efi' not in fields and set(fields)=={'linux','initrd'},'split kernel BLS entry required')
+        rows.append((path,fields))
+    require(len(rows)==1,'one genuine ESP boot entry required')
+    config=loader/'loader.conf';selector=None
+    require(not config.is_symlink(),'linked loader config refused')
+    if config.exists():
+        require(config.is_file() and not config.is_symlink() and config.stat().st_size<=65536,'regular bounded loader config required')
+        for line in config.read_text().splitlines():
+            words=line.split()
+            if words and words[0]=='default':
+                require(selector is None and len(words)==2,'one default boot selector required')
+                selector=words[1]
+        if selector is not None:
+            require(not selector.startswith('@') and fnmatch.fnmatchcase(rows[0][0].name,selector),
+                    'unknown or conflicting default boot identity')
+    entry,fields=rows[0]
+    prefix='/'+str(target.relative_to(mount))+'/'
+    require(fields['linux']==prefix+'vmlinuz' and fields['initrd']==prefix+'initrd',
+            'default BLS entry targets another kernel')
+    return {'entry':str(entry.relative_to(mount)),'entry_sha256':digest(entry),
+            'selector':selector,'selection':'sole-regular-split-entry',
+            'loader_config_sha256':digest(config) if config.exists() else None,
+            'linux':fields['linux'],'initrd':fields['initrd'],'boot_qualified':False}
+
+
+def repair(raw, image, scratch, critical, record, log, commands=None,*,expected_kernel_package=None):
     """Always clean our container/mount/loop; failure retains unsafe raw backing."""
     require(re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', image), 'exact source image ID required')
     raw = raw.resolve(); scratch = scratch.resolve()
@@ -222,12 +270,15 @@ def repair(raw, image, scratch, critical, record, log, commands=None):
         record['protected_critical_sha256'] = digest(critical)
         container_attempted = True
         command.call(['sudo','podman','create','--name',container,image])
-        _, versions = command.call(['sudo','podman','run','--rm','--entrypoint','',image,'sh','-c',
-            'for d in /usr/lib/modules/*; do test -d "$d" || continue; test ! -L "$d" || exit 2; printf "%s\\n" "${d##*/}"; done'])
-        versions = versions.splitlines()
-        require(len(versions) == 1 and re.fullmatch(r'[A-Za-z0-9._+-]{1,128}', versions[0]),
-                'exactly one source kernel version required')
-        version = versions[0]; record['kernel_version'] = version
+        require(isinstance(expected_kernel_package,str),'explicit expected kernel package required')
+        probe=Path(__file__).with_name('tuna_benchmark_kernel.py').read_text()
+        _, observed = command.call(['sudo','podman','run','--rm','--read-only','--network','none',
+            '--entrypoint','',image,'python3','-c',probe,expected_kernel_package])
+        observation=json.loads(observed)
+        version=select_kernel(observation,critical.read_text(),expected_kernel_package)
+        record['kernel_observation']=observation
+        record['kernel_probe_source_sha256']=hashlib.sha256(probe.encode()).hexdigest()
+        record['kernel_version']=version
         expected = critical_hashes(critical.read_text(), version)
         for name in ('vmlinuz','initramfs.img'):
             path = f'/usr/lib/modules/{version}/{name}'
@@ -259,6 +310,7 @@ def repair(raw, image, scratch, critical, record, log, commands=None):
         require(len(targets) == 1 and targets[0].is_dir() and not targets[0].is_symlink(),
                 'unique bootc_composefs target required')
         target = targets[0]; record['esp_target'] = str(target.relative_to(mount))
+        record['default_boot_entry']=default_esp_entry(mount,target)
         record['members'] = {}
         for src, dest in [('vmlinuz','vmlinuz'),('initramfs.img','initrd')]:
             destination = target/dest
