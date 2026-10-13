@@ -716,9 +716,7 @@ impl LocationPrompt {
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         buttons.add_css_class("modal-dialog-button-box");
         let deny = gtk::Button::with_label("Deny");
-        deny.update_property(&[gtk::accessible::Property::Label("Deny location access")]);
         let allow = gtk::Button::with_label("Allow");
-        allow.update_property(&[gtk::accessible::Property::Label("Allow location access")]);
         for button in [&deny, &allow] {
             button.add_css_class("modal-dialog-button");
             buttons.append(button);

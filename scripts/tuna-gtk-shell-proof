@@ -3484,7 +3484,7 @@ done
 [ -n "$prompt_shown" ] || { kill "$stranger_pid" 2>/dev/null; fail G-QS-LOCATION "first-use request did not surface a consent prompt"; }
 scrot "$ARTIFACTS/16g-location-prompt.png" >/dev/null
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-deny.json" 20 \
-    --press "Deny location access" >/dev/null ||
+    --press "Deny" >/dev/null ||
     { kill "$stranger_pid" 2>/dev/null; fail G-QS-LOCATION "could not press Deny on the consent prompt"; }
 wait "$stranger_pid"
 auth=$(cat "$ARTIFACTS/location-stranger-auth.txt")
@@ -3507,7 +3507,7 @@ for _ in $(seq 1 15); do
 done
 [ -n "$prompt_shown" ] || { kill "$newcomer_pid" 2>/dev/null; fail G-QS-LOCATION "newcomer request did not surface a consent prompt"; }
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-allow.json" 20 \
-    --press "Allow location access" >/dev/null ||
+    --press "Allow" >/dev/null ||
     { kill "$newcomer_pid" 2>/dev/null; fail G-QS-LOCATION "could not press Allow on the consent prompt"; }
 wait "$newcomer_pid"
 auth=$(cat "$ARTIFACTS/location-newcomer-auth.txt")
