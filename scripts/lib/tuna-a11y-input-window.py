@@ -22,10 +22,18 @@ def save():
     temporary.replace(output)
 
 
+def printable_keyval(keyval):
+    # Modifier keyvals such as ISO_Level3_Shift (0xfe03) lie below the
+    # function-key range; a numeric cutoff does not identify characters.
+    codepoint = Gdk.keyval_to_unicode(keyval)
+    return bool(codepoint and chr(codepoint).isprintable())
+
+
 def pressed(_controller, keyval, keycode, mods):
     state['presses'].append({
         'keyval': keyval,
         'keycode': keycode,
+        'printable': printable_keyval(keyval),
         'shift': bool(mods & Gdk.ModifierType.SHIFT_MASK),
         'ctrl': bool(mods & Gdk.ModifierType.CONTROL_MASK),
     })

@@ -3393,6 +3393,8 @@ pass G-SETTINGS-INPUT "input sources, Super+Space, key repeat and the hot corner
 # host X server pass through the compositor's input pipeline into a
 # recording GTK client; each aid is first shown absent (negative control),
 # then switched on through GNOME's own settings and exercised.
+"$PY" "$ROOT/scripts/lib/tuna-a11y-input-keyvals-tests.py" >"$ARTIFACTS/a11y-keyvals-classifier.log" 2>&1 ||
+    fail G-A11Y-KEYMAP "the GTK recorder character classifier failed its negative controls"
 A11Y_KBD=org.gnome.desktop.a11y.keyboard
 A11Y_KEYS="$ARTIFACTS/a11y-input.json"
 rm -f "$A11Y_KEYS"
@@ -3413,10 +3415,11 @@ a11y_wait() {
     cat "$A11Y_KEYS" >&2 2>/dev/null || true
     return 1
 }
-# Printable presses (modifiers have keyvals >= 0xff00) since mark $1, as
+# Printable presses as classified by the real GTK recorder through GDK
+# Unicode conversion (ISO_Level3_Shift is below 0xff00), since mark $1, as
 # "keyval:shift" strings.
 a11y_typed() {
-    echo "[.presses[$1:][] | select(.keyval < 65280) | \"\\(.keyval):\\(.shift)\"]"
+    echo "[.presses[$1:][] | select(.printable) | \"\\(.keyval):\\(.shift)\"]"
 }
 a11y_mark() { jq '.presses | length' "$A11Y_KEYS"; }
 
@@ -3451,14 +3454,14 @@ cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "old-map hol
     fail G-A11Y-KEYMAP "a keymap replacement retained old modifier state"
 mark="$(a11y_mark)"
 xdotool key a
-a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | {keyval,ctrl}] == [{\"keyval\":97,\"ctrl\":false}]" "no old-map control" ||
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,ctrl}] == [{\"keyval\":97,\"ctrl\":false}]" "no old-map control" ||
     fail G-A11Y-KEYMAP "the old Control latch affected the first new-map key"
 xdotool key Caps_Lock
 cstate '.input_aids.latched == ["control"]' "remapped Caps is Control" ||
     fail G-A11Y-KEYMAP "the configured Caps-to-Control role did not latch"
 mark="$(a11y_mark)"
 xdotool key a
-a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | {keyval,ctrl}] == [{\"keyval\":97,\"ctrl\":true}]" "real remapped control chord" ||
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,ctrl}] == [{\"keyval\":97,\"ctrl\":true}]" "real remapped control chord" ||
     fail G-A11Y-KEYMAP "the remapped physical Caps key did not control the real GTK key"
 cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "remapped latch spent" ||
     fail G-A11Y-KEYMAP "the remapped Control latch did not release"
@@ -3484,7 +3487,7 @@ gsettings set "$A11Y_KBD" stickykeys-enable false
 cstate '(.input_aids.sticky | not)' "German sticky off" || fail G-A11Y-KEYMAP "Sticky Keys off did not apply"
 mark="$(a11y_mark)"
 xdotool key Alt_R q
-a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | .keyval] == [113]" "plain German AltGr tap" ||
+a11y_wait "[.presses[$mark:][] | select(.printable) | .keyval] == [113]" "plain German AltGr tap" ||
     fail G-A11Y-KEYMAP "without Sticky Keys an AltGr tap changed the next q"
 gsettings set "$A11Y_KBD" stickykeys-enable true
 cstate '.input_aids.sticky and (.input_aids.shortcuts | not)' "German sticky without shortcuts" ||
@@ -3494,7 +3497,7 @@ xdotool key Alt_R
 cstate '.input_aids.latched == ["level3"]' "German Level3 latched" ||
     fail G-A11Y-KEYMAP "the configured German AltGr selector did not latch Level3"
 xdotool key q q
-a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | .keyval] == [64,113]" "German Level3 spent once" ||
+a11y_wait "[.presses[$mark:][] | select(.printable) | .keyval] == [64,113]" "German Level3 spent once" ||
     fail G-A11Y-KEYMAP "the real German client did not receive @ then plain q"
 cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "German latch released" ||
     fail G-A11Y-KEYMAP "German Level3 retained a synthetic hold"
@@ -3570,7 +3573,7 @@ cstate '(.input_aids.sticky | not)' "toggle remap sticky off" || fail G-A11Y-SHO
 bells="$(jq '.input_aids.bells' "$CSTATE")"
 mark="$(a11y_mark)"
 xdotool key Caps_Lock Caps_Lock a
-a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | .keyval] == [97]" "remapped no-LED client barrier" || fail G-A11Y-SHORTCUTS "remapped key sequence did not reach client"
+a11y_wait "[.presses[$mark:][] | select(.printable) | .keyval] == [97]" "remapped no-LED client barrier" || fail G-A11Y-SHORTCUTS "remapped key sequence did not reach client"
 cstate ".input_aids.bells == $bells" "no LED change no bell" || fail G-A11Y-SHORTCUTS "a Caps-to-Control press rang without a LED transition"
 gsettings set "$A11Y_KBD" stickykeys-enable true
 cstate '.input_aids.sticky' "toggle restore barrier sticky on" || fail G-A11Y-SHORTCUTS "Sticky Keys on did not apply"
@@ -3585,7 +3588,7 @@ cstate '(.input_aids.toggle_beep | not)' "toggle preference off" || fail G-A11Y-
 bells="$(jq '.input_aids.bells' "$CSTATE")"
 mark="$(a11y_mark)"
 xdotool key Caps_Lock Caps_Lock a
-a11y_wait "[.presses[$mark:][] | select(.keyval < 65280) | .keyval] == [97]" "toggle off client barrier" || fail G-A11Y-SHORTCUTS "Toggle Keys off sequence did not reach client"
+a11y_wait "[.presses[$mark:][] | select(.printable) | .keyval] == [97]" "toggle off client barrier" || fail G-A11Y-SHORTCUTS "Toggle Keys off sequence did not reach client"
 cstate ".input_aids.bells == $bells" "toggle disabled no bell" || fail G-A11Y-SHORTCUTS "disabled Toggle Keys rang for an actual LED transition"
 # Shift held eight seconds switches Slow Keys on.
 xdotool keydown Shift_L
