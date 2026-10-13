@@ -12,11 +12,12 @@
 //! system without libpam fails closed. [`PamClient`] answers the same
 //! [`UnlockClient`](crate::unlock::UnlockClient) seam as greetd, so the
 //! prompt flow and its silent-failure rules stay in one place. The
-//! transaction runs on a worker thread with a deadline: a PAM stack that
-//! never returns cannot hang the compositor past it.
+//! transaction runs in a private helper owned by a stable creator thread. A
+//! deadline denies without releasing a still-live or quarantined helper.
 
 use std::ffi::{c_char, c_int, c_void, CString};
-use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use greetd_ipc::{codec::Error as CodecError, AuthMessageType, ErrorType, Response};
@@ -186,19 +187,21 @@ pub fn authenticate(service: &str, user: &str, password: &str) -> bool {
     }
 }
 
-/// [`authenticate`] on a worker thread, bounded by [`DEADLINE`].
+/// A bounded facade over the stable private-helper owner. A denial or caller
+/// return never frees its backend admission while the helper remains unretired.
 pub fn authenticate_with_deadline(service: &str, user: &str, password: &str) -> bool {
-    let (tx, rx) = mpsc::channel();
-    let (service, user, password) = (service.to_owned(), user.to_owned(), password.to_owned());
-    let spawned = std::thread::Builder::new()
-        .name("tuna-pam".into())
-        .spawn(move || {
-            let _ = tx.send(authenticate(&service, &user, &password));
-        });
-    if spawned.is_err() {
+    let Some(backend) = crate::pam_backend::Backend::live() else {
         return false;
-    }
-    rx.recv_timeout(DEADLINE).unwrap_or(false)
+    };
+    let Ok(mut ticket) = backend.begin(
+        service.to_owned(),
+        user.to_owned(),
+        tuna_shell_control::Secret(password.to_owned()),
+        Arc::new(AtomicBool::new(false)),
+    ) else {
+        return false;
+    };
+    matches!(ticket.initial(), crate::pam_backend::Initial::Finished(result) if result.authenticated())
 }
 
 /// The service to use: [`SERVICE_ENV`] when set, else [`DEFAULT_SERVICE`].
@@ -214,13 +217,24 @@ pub fn service() -> String {
 pub struct PamClient {
     service: String,
     user: Option<String>,
+    backend: Option<crate::pam_backend::Backend>,
 }
 
 impl PamClient {
+    /// Trusted Rust fixture seam; production always uses the held self image.
+    #[doc(hidden)]
+    pub fn with_backend(service: impl Into<String>, backend: crate::pam_backend::Backend) -> Self {
+        Self {
+            service: service.into(),
+            user: None,
+            backend: Some(backend),
+        }
+    }
     pub fn new(service: impl Into<String>) -> Self {
         Self {
             service: service.into(),
             user: None,
+            backend: crate::pam_backend::Backend::live(),
         }
     }
 }
@@ -241,7 +255,13 @@ impl crate::unlock::UnlockClient for PamClient {
                 description: String::new(),
             });
         };
-        if authenticate_with_deadline(&self.service, user, &password) {
+        let accepted = self.backend.as_ref().and_then(|backend| {
+            backend.begin(self.service.clone(), user.to_owned(), tuna_shell_control::Secret(password),
+                Arc::new(AtomicBool::new(false))).ok()
+        }).is_some_and(|mut ticket| {
+            matches!(ticket.initial(), crate::pam_backend::Initial::Finished(result) if result.authenticated())
+        });
+        if accepted {
             Ok(Response::Success)
         } else {
             Ok(Response::Error {

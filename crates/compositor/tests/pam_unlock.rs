@@ -71,7 +71,20 @@ fn child() {
         "right-password"
     ));
     // Through the unlock seam the lock screen uses.
-    let mut client = PamClient::new(service);
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tuna-compositor"));
+    let backend = tuna_compositor::pam_backend::Backend::with_trusted_factory(
+        move |identity, service, user, budget| {
+            tuna_compositor::pam_helper::Supervisor::spawn(
+                &executable,
+                identity,
+                service,
+                user,
+                budget,
+            )
+        },
+    )
+    .unwrap();
+    let mut client = PamClient::with_backend(service, backend.clone());
     assert_eq!(
         attempt_unlock(&mut client, "tunauser", "right-password"),
         UnlockOutcome::Unlocked
@@ -80,4 +93,5 @@ fn child() {
         attempt_unlock(&mut client, "tunauser", "nope"),
         UnlockOutcome::Denied
     );
+    backend.shutdown();
 }

@@ -433,7 +433,8 @@ fn raw_negative_cases() {
 #[test]
 fn private_pam_helper_actual_binary_conversation_and_retirement() {
     if std::env::var_os(CHILD).is_some() {
-        return run_actual_helper_cases();
+        run_actual_helper_cases();
+        return run_backend_cases();
     }
     if !Path::new(WRAPPER).exists() {
         assert!(
@@ -458,6 +459,10 @@ fn private_pam_helper_actual_binary_conversation_and_retirement() {
     let services = scratch.path().join("services");
     std::fs::create_dir(&services).unwrap();
     for mode in [
+        "single",
+        "single-deny",
+        "single-accountdeny",
+        "repeat",
         "multi",
         "deny",
         "accountdeny",
@@ -502,4 +507,100 @@ fn private_pam_helper_actual_binary_conversation_and_retirement() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(status.success(), "controlled actual helper proof failed");
+}
+
+// The library's Rust test image cannot serve the private entrypoint. This
+// explicit trusted factory uses the same admitted built compositor as above.
+fn run_backend_cases() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tuna_compositor::pam_backend::{Backend, Verification};
+    use tuna_shell_control::Secret;
+    let (created, creators) = std::sync::mpsc::channel();
+    let backend = Backend::with_trusted_factory(move |identity, service, user, budget| {
+        created.send(std::thread::current().id()).unwrap();
+        Supervisor::spawn(executable(), identity, service, user, budget)
+    })
+    .unwrap();
+    let mut creator = None;
+    for (mode, password, accepted) in [
+        ("single", "right-password", true),
+        ("single", "wrong-password", false),
+        ("single-deny", "right-password", false),
+        ("single-accountdeny", "right-password", false),
+        ("repeat", "right-password", false),
+        ("single", "right-password", true),
+    ] {
+        let ticket = backend
+            .begin(
+                format!("private-{mode}"),
+                user(),
+                Secret(password.into()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        let actual = creators.recv_timeout(Duration::from_secs(2)).unwrap();
+        if let Some(original) = creator {
+            assert_eq!(original, actual);
+        } else {
+            creator = Some(actual);
+        }
+        assert_eq!(
+            ticket.wait_retired(|| panic!("unexpected pending single-password case")),
+            Verification::Retired {
+                authenticated: accepted
+            }
+        );
+    }
+    // Busy admission cannot queue another credential. Caller/ticket cancellation
+    // leaves the creator owning its helper until the physical Retired receipt.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let ticket = backend
+        .begin(
+            "private-hang".into(),
+            user(),
+            Secret("right-password".into()),
+            cancel.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        creators.recv_timeout(Duration::from_secs(2)).unwrap(),
+        creator.unwrap()
+    );
+    assert!(matches!(
+        backend.begin(
+            "private-single".into(),
+            user(),
+            Secret("second".into()),
+            Arc::new(AtomicBool::new(false))
+        ),
+        Err(Verification::RejectedBeforeSpawn)
+    ));
+    cancel.store(true, Ordering::Release);
+    let mut pending = false;
+    assert_eq!(
+        ticket.wait_retired(|| pending = true),
+        Verification::Retired {
+            authenticated: false
+        }
+    );
+    assert!(pending);
+    let ticket = backend
+        .begin(
+            "private-single".into(),
+            user(),
+            Secret("right-password".into()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+    assert_eq!(
+        ticket.wait_retired(|| panic!("unexpected post-retirement pending")),
+        Verification::Retired {
+            authenticated: true
+        }
+    );
+    backend.shutdown();
+    println!("stable PAM creator: single/wrong/account/repeated-secret/busy/cancel/actual-retirement controls passed");
 }

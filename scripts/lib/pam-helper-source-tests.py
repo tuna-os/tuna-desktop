@@ -11,14 +11,29 @@ class SourceContracts(unittest.TestCase):
         self.assertLess(main.index('pam_helper::entry()'), main.index('NestedSession::default_for_pid'))
         self.assertIn('std::env::args_os().count() != 2', main)
 
-    def test_helper_is_authentication_only_and_not_live_password_backend(self):
+    def test_helper_is_authentication_only_and_live_factory_is_held_self(self):
         helper = (ROOT / 'crates/compositor/src/pam_helper.rs').read_text()
         for symbol in ('pam_authenticate', 'pam_acct_mgmt', 'pam_end', 'pam_get_item'):
             self.assertIn(symbol, helper)
         for symbol in ('pam_open_session', 'pam_setcred', 'StartSession'):
             self.assertNotIn(symbol, helper)
-        for filename in ('pam.rs', 'runtime.rs', 'unlock.rs'):
-            self.assertNotIn('pam_helper::', (ROOT / 'crates/compositor/src' / filename).read_text())
+        backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
+        self.assertIn('SelfImage::capture()', backend)
+        self.assertIn('image.spawn(identity, service, user, budget)', backend)
+        self.assertIn('File::open("/proc/self/exe")', helper)
+        self.assertIn('self.file.as_raw_fd()', helper)
+        self.assertIn('_source_image: source_image', helper)
+        self.assertNotIn('std::env::', backend)
+        pam = (ROOT / 'crates/compositor/src/pam.rs').read_text()
+        self.assertNotIn('std::thread::Builder', pam)
+        self.assertIn('crate::pam_backend::Backend::live()', pam)
+        runtime = (ROOT / 'crates/compositor/src/runtime.rs').read_text()
+        self.assertIn('if !result.may_retire()', runtime)
+        self.assertIn('self.unlock_quarantined = Some(attempt)', runtime)
+        self.assertIn('let ok = backend_accepted && reported_ok && !denied', runtime)
+        self.assertIn('worker.phase.load', runtime)
+        self.assertIn('ticket.wait_retired', runtime)
+        self.assertIn('verify_owned', (ROOT / 'crates/compositor/src/unlock.rs').read_text())
 
     def test_private_framing_retirement_and_redaction_contracts(self):
         helper = (ROOT / 'crates/compositor/src/pam_helper.rs').read_text()

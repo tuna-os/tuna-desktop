@@ -138,21 +138,45 @@ pub fn attempt_unlock(client: &mut impl UnlockClient, user: &str, password: &str
 /// touching any lock state: greetd's daemon when one runs, else PAM's
 /// `tuna-lock` service (GDM sessions). Blocking (PAM may delay a
 /// failure for seconds), so the runtime calls it on a worker thread.
-pub fn verify(user: &str, password: &str) -> bool {
-    if let Some(path) = greetd_socket_path() {
-        let Ok(mut client) = GreeterClient::connect(&path) else {
-            return false;
-        };
-        return matches!(
-            attempt_unlock(&mut client, user, password),
-            UnlockOutcome::Unlocked
-        );
-    }
-    let mut client = crate::pam::PamClient::new(crate::pam::service());
+pub(crate) fn verify_greetd(path: &str, user: &str, password: &str) -> bool {
+    let Ok(mut client) = GreeterClient::connect(path) else {
+        return false;
+    };
     matches!(
         attempt_unlock(&mut client, user, password),
         UnlockOutcome::Unlocked
     )
+}
+
+pub fn verify(user: &str, password: &str) -> bool {
+    if let Some(path) = greetd_socket_path() {
+        return verify_greetd(&path, user, password);
+    }
+    crate::pam::authenticate_with_deadline(&crate::pam::service(), user, password)
+}
+
+/// Off-loop ownership path. PAM timeout emits denial while the SAME outer
+/// wrapper waits for actual helper retirement; poison is never a retirement.
+/// Configured greetd remains authoritative and never falls back to PAM.
+pub fn verify_owned(
+    user: &str,
+    password: tuna_shell_control::Secret,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending: impl FnMut(),
+) -> crate::pam_backend::Verification {
+    use crate::pam_backend::Verification;
+    if let Some(path) = greetd_socket_path() {
+        return Verification::Retired {
+            authenticated: verify_greetd(&path, user, &password.0),
+        };
+    }
+    let Some(backend) = crate::pam_backend::Backend::live() else {
+        return Verification::RejectedBeforeSpawn;
+    };
+    match backend.begin(crate::pam::service(), user.to_owned(), password, cancel) {
+        Ok(ticket) => ticket.wait_retired(pending),
+        Err(result) => result,
+    }
 }
 
 /// The session's user name, for unlocking.

@@ -582,6 +582,18 @@ struct PendingScreenshotReply {
     saved: Option<std::path::PathBuf>,
 }
 
+enum UnlockEvent {
+    Pending,
+    Finished(bool),
+}
+struct UnlockWorker {
+    attempt: crate::auth_owner::Attempt,
+    worker: std::thread::JoinHandle<crate::pam_backend::Verification>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    phase: Arc<std::sync::atomic::AtomicU8>,
+    denied: bool,
+}
+
 pub struct Runtime {
     display: Display<State>,
     state: State,
@@ -700,10 +712,11 @@ pub struct Runtime {
     /// `last_stamp + anchor.elapsed()`.
     idle_since: Instant,
     /// Lock-screen password checks report back here.
-    unlock_results: calloop::channel::Sender<(crate::auth_owner::Attempt, bool)>,
+    unlock_results: calloop::channel::Sender<(crate::auth_owner::Attempt, UnlockEvent)>,
     /// A password check is running.
     unlock_slot: crate::auth_owner::Slot,
-    unlock_worker: Option<(crate::auth_owner::Attempt, std::thread::JoinHandle<bool>)>,
+    unlock_worker: Option<UnlockWorker>,
+    unlock_quarantined: Option<crate::auth_owner::Attempt>,
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
@@ -732,6 +745,13 @@ pub fn control_socket_path(socket_name: &str) -> Option<std::path::PathBuf> {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        if let Some(worker) = &self.unlock_worker {
+            worker
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // Shutdown requests cancellation; it never certifies retirement.
+        crate::pam_backend::Backend::shutdown_live();
         #[cfg(feature = "xwayland")]
         {
             // Event sources can retain loop handles after dispatch stops.
@@ -1062,12 +1082,15 @@ impl Runtime {
 
         // Lock-screen password checks finish here, between frames.
         let (unlock_results, unlock_source) =
-            calloop::channel::channel::<(crate::auth_owner::Attempt, bool)>();
+            calloop::channel::channel::<(crate::auth_owner::Attempt, UnlockEvent)>();
         event_loop
             .handle()
             .insert_source(unlock_source, |event, _, rt: &mut Runtime| {
-                if let calloop::channel::Event::Msg((attempt, ok)) = event {
-                    rt.finish_unlock(attempt, ok);
+                if let calloop::channel::Event::Msg((attempt, event)) = event {
+                    match event {
+                        UnlockEvent::Pending => rt.deny_pending_unlock(attempt),
+                        UnlockEvent::Finished(ok) => rt.finish_unlock(attempt, ok),
+                    }
                 }
             })
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
@@ -1154,6 +1177,7 @@ impl Runtime {
             unlock_results,
             unlock_slot: crate::auth_owner::Slot::default(),
             unlock_worker: None,
+            unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idle_monitor: crate::idle_monitor::start(),
             exit: false,
@@ -1353,6 +1377,7 @@ impl Runtime {
     /// silent; auth is never invented. Returns whether the session is
     /// unlocked afterwards.
     pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
+        use crate::pam_backend::{Initial, Verification};
         if !self.is_locked() {
             return true;
         }
@@ -1363,12 +1388,124 @@ impl Runtime {
         let Some(attempt) = self.unlock_slot.begin(None, epoch) else {
             return false;
         };
-        let ok = crate::unlock::verify(user, password);
-        // This retires the synchronous outer call, not any timed-out inner PAM task.
-        if !self.unlock_slot.retire(attempt) {
-            return false;
+        // A configured greetd path never falls back to PAM.
+        if let Some(path) = crate::unlock::greetd_socket_path() {
+            let ok = crate::unlock::verify_greetd(&path, user, password);
+            return self.unlock_slot.retire(attempt)
+                && ok
+                && self.apply_verified_unlock(attempt.epoch);
         }
-        ok && self.apply_verified_unlock(attempt.epoch)
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticket = crate::pam_backend::Backend::live()
+            .ok_or(Verification::RejectedBeforeSpawn)
+            .and_then(|backend| {
+                backend.begin(
+                    crate::pam::service(),
+                    user.to_owned(),
+                    tuna_shell_control::Secret(password.to_owned()),
+                    cancel.clone(),
+                )
+            });
+        match ticket {
+            Ok(mut ticket) => match ticket.initial() {
+                Initial::Finished(result) => {
+                    if !result.may_retire() {
+                        self.unlock_quarantined = Some(attempt);
+                        return false;
+                    }
+                    self.unlock_slot.retire(attempt)
+                        && result.authenticated()
+                        && self.apply_verified_unlock(attempt.epoch)
+                }
+                Initial::Pending => {
+                    // The public caller gets denial now; no later result can grant it.
+                    self.start_unlock_worker(attempt, cancel, true, move |_| {
+                        ticket.wait_retired(|| {})
+                    });
+                    false
+                }
+            },
+            Err(result) => {
+                if result.may_retire() {
+                    self.unlock_slot.retire(attempt);
+                } else {
+                    self.unlock_quarantined = Some(attempt);
+                }
+                false
+            }
+        }
+    }
+
+    fn start_unlock_worker(
+        &mut self,
+        attempt: crate::auth_owner::Attempt,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        denied: bool,
+        verify: impl FnOnce(Box<dyn FnMut() + Send>) -> crate::pam_backend::Verification
+            + Send
+            + 'static,
+    ) {
+        let reply = self.unlock_results.clone();
+        let wake = self.wake.clone();
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(u8::from(denied)));
+        let worker_phase = phase.clone();
+        let pending_reply = reply.clone();
+        let pending_phase = phase.clone();
+        let worker = std::thread::Builder::new()
+            .name("tuna-unlock".into())
+            .spawn(move || {
+                let _completion = wake.completion();
+                let result = verify(Box::new(move || {
+                    pending_phase.store(1, std::sync::atomic::Ordering::Release);
+                    let _ = pending_reply.send((attempt, UnlockEvent::Pending));
+                }));
+                worker_phase.store(2, std::sync::atomic::Ordering::Release);
+                let _ = reply.send((attempt, UnlockEvent::Finished(result.authenticated())));
+                result
+            });
+        match worker {
+            Ok(worker) => {
+                self.unlock_worker = Some(UnlockWorker {
+                    attempt,
+                    worker,
+                    cancel,
+                    phase,
+                    denied,
+                })
+            }
+            Err(_) => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                // A public pending ticket may already own a helper: no fabricated reap.
+                if denied {
+                    self.unlock_quarantined = Some(attempt);
+                } else {
+                    self.unlock_slot.retire(attempt);
+                }
+                if let Some(origin) = attempt.origin {
+                    self.control.finish_unlock(origin, false);
+                }
+            }
+        }
+    }
+
+    fn deny_pending_unlock(&mut self, attempt: crate::auth_owner::Attempt) {
+        if !self.unlock_slot.matches(attempt) {
+            return;
+        }
+        let Some(worker) = self
+            .unlock_worker
+            .as_mut()
+            .filter(|worker| worker.attempt == attempt)
+        else {
+            return;
+        };
+        if worker.denied {
+            return;
+        }
+        worker.denied = true;
+        if let Some(origin) = attempt.origin {
+            self.control.finish_unlock(origin, false);
+        }
     }
 
     fn apply_verified_unlock(&mut self, epoch: u64) -> bool {
@@ -1383,29 +1520,51 @@ impl Runtime {
         true
     }
 
-    /// Only the exact joined outer wrapper may retire its slot. Inner PAM task
-    /// lifetime remains unqualified until the private helper is adopted.
+    /// Actual helper retirement is required in addition to the joined wrapper.
+    /// A poisoned owner denies permanently; it cannot release this slot.
     fn finish_unlock(&mut self, attempt: crate::auth_owner::Attempt, reported_ok: bool) {
         if !self.unlock_slot.matches(attempt) {
             return;
         }
-        let Some((worker_attempt, worker)) = self.unlock_worker.as_ref() else {
+        let Some(worker) = self.unlock_worker.as_ref() else {
             return;
         };
-        if *worker_attempt != attempt || !worker.is_finished() {
+        if worker.attempt != attempt || !worker.worker.is_finished() {
             return;
         }
-        let (_, worker) = self.unlock_worker.take().expect("matched owned worker");
-        let joined = worker.join();
+        let worker = self.unlock_worker.take().expect("matched owned worker");
+        let denied = worker.denied;
+        let joined = worker.worker.join();
         let joined_ok = joined.is_ok();
-        let backend_accepted = joined.unwrap_or(false);
-        let ok = backend_accepted && reported_ok;
-        if !self.unlock_slot.retire(attempt) {
-            return;
-        }
+        let result = joined.unwrap_or(crate::pam_backend::Verification::Unretired);
+        let backend_accepted = result.authenticated();
+        let ok = backend_accepted && reported_ok && !denied;
         let live = attempt
             .origin
             .is_some_and(|origin| self.control.origin_pending_live(origin));
+        if !result.may_retire() {
+            self.unlock_quarantined = Some(attempt);
+            if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+                eprintln!(
+                    "tuna-compositor: lock authentication unretired {}",
+                    serde_json::json!({
+                        "pid":std::process::id(), "joined_ok":joined_ok,
+                        "attempt_serial":attempt.serial,"attempt_epoch":attempt.epoch,
+                        "current_epoch":self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                        "origin_live":live,"locked_after":self.is_locked()
+                    })
+                );
+            }
+            if !denied {
+                if let Some(origin) = attempt.origin {
+                    self.control.finish_unlock(origin, false);
+                }
+            }
+            return;
+        }
+        if !self.unlock_slot.retire(attempt) {
+            return;
+        }
         let applied = ok && live && self.apply_verified_unlock(attempt.epoch);
         if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             eprintln!(
@@ -1422,8 +1581,10 @@ impl Runtime {
                 })
             );
         }
-        if let Some(origin) = attempt.origin {
-            self.control.finish_unlock(origin, applied);
+        if !denied {
+            if let Some(origin) = attempt.origin {
+                self.control.finish_unlock(origin, applied);
+            }
         }
     }
 
@@ -2032,8 +2193,9 @@ impl Runtime {
         // Owned proof diagnostics only: no credentials, prompts or typed input.
         doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
+                "backend_unretired": self.unlock_quarantined.is_some(),
                 "epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
-                "attempt": self.unlock_worker.as_ref().map(|(attempt, _)| serde_json::json!({
+                "attempt": self.unlock_worker.as_ref().map(|worker| worker.attempt).or(self.unlock_quarantined).map(|attempt| serde_json::json!({
                     "serial": attempt.serial, "epoch": attempt.epoch,
                     "origin": attempt.origin.map(|origin| serde_json::json!({
                         "connection": origin.connection, "request": origin.request }))
@@ -3588,7 +3750,10 @@ impl Runtime {
         let mut schedule = crate::idle_schedule::Schedule::default();
         let system_now = crate::state::system_millis();
         if self.child_watch_failed
-            || self.unlock_worker.is_some()
+            || self
+                .unlock_worker
+                .as_ref()
+                .is_some_and(|worker| worker.phase.load(std::sync::atomic::Ordering::Acquire) != 1)
             || self.control.needs_continuation(self.manager.model())
             || self
                 .idle_blank_signal
@@ -3725,7 +3890,7 @@ impl Runtime {
         let completed = self
             .unlock_worker
             .as_ref()
-            .and_then(|(attempt, worker)| worker.is_finished().then_some(*attempt));
+            .and_then(|worker| worker.worker.is_finished().then_some(worker.attempt));
         if let Some(attempt) = completed {
             self.finish_unlock(attempt, true);
         }
@@ -3922,23 +4087,16 @@ impl Runtime {
                 .then(|| self.unlock_slot.begin(Some(origin), epoch))
                 .flatten();
             if let Some(attempt) = attempt {
-                let reply = self.unlock_results.clone();
-                let wake = self.wake.clone();
-                match std::thread::Builder::new()
-                    .name("tuna-unlock".into())
-                    .spawn(move || {
-                        let _completion = wake.completion();
-                        let ok = crate::unlock::session_user()
-                            .is_some_and(|user| crate::unlock::verify(&user, &password.0));
-                        let _ = reply.send((attempt, ok));
-                        ok
-                    }) {
-                    Ok(worker) => self.unlock_worker = Some((attempt, worker)),
-                    Err(_) => {
-                        self.unlock_slot.retire(attempt);
-                        self.control.finish_unlock(origin, false);
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let backend_cancel = cancel.clone();
+                self.start_unlock_worker(attempt, cancel, false, move |pending| {
+                    match crate::unlock::session_user() {
+                        Some(user) => {
+                            crate::unlock::verify_owned(&user, password, backend_cancel, pending)
+                        }
+                        None => crate::pam_backend::Verification::RejectedBeforeSpawn,
                     }
-                }
+                });
             } else {
                 self.control.finish_unlock(origin, false);
             }

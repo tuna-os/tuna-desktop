@@ -81,6 +81,7 @@ mod output_constraints;
 pub mod overlay;
 pub mod overview;
 pub mod pam;
+pub mod pam_backend;
 pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;

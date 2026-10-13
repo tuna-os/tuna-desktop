@@ -1,4 +1,4 @@
-//! Private, authentication-only PAM conversation process. Not wired into live unlock.
+//! Private, authentication-only PAM conversation process.
 //!
 //! An authenticated result is provisional until the owned helper and its process
 //! group retire. Keep a quarantined supervisor alive; a deadline is not retirement.
@@ -248,6 +248,44 @@ pub enum Retirement {
     Quarantined,
 }
 
+/// A held reference to this running compositor image, never a caller path.
+#[derive(Clone)]
+pub struct SelfImage {
+    file: std::sync::Arc<std::fs::File>,
+}
+impl SelfImage {
+    pub fn capture() -> io::Result<Self> {
+        let file = std::fs::File::open("/proc/self/exe")?;
+        if !file.metadata()?.is_file() {
+            return Err(invalid());
+        }
+        Ok(Self {
+            file: std::sync::Arc::new(file),
+        })
+    }
+    /// Retain this image and the supervisor on the creator through retirement.
+    /// Exec resolves the derived fd path before CLOEXEC closes its descriptor.
+    /// Actual replacement/unlink behavior remains an explicit CI proof obligation.
+    pub fn spawn(
+        &self,
+        identity: Identity,
+        service: String,
+        user: String,
+        budget: Duration,
+    ) -> io::Result<Supervisor> {
+        let executable =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+        Supervisor::spawn_inner(
+            &executable,
+            identity,
+            service,
+            user,
+            budget,
+            Some(self.file.clone()),
+        )
+    }
+}
+
 /// Blocking foundation API: call off the UI loop, retain ownership through retirement.
 /// The live runtime has not adopted this helper or its private protocol.
 pub struct Supervisor {
@@ -261,6 +299,7 @@ pub struct Supervisor {
     sequence: u32,
     pending: Vec<Style>,
     retirement: Retirement,
+    _source_image: Option<std::sync::Arc<std::fs::File>>,
 }
 impl Supervisor {
     /// Trusted caller/test boundary: `executable` must be an independently admitted
@@ -278,6 +317,16 @@ impl Supervisor {
         service: String,
         user: String,
         budget: Duration,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(executable, identity, service, user, budget, None)
+    }
+    fn spawn_inner(
+        executable: &std::path::Path,
+        identity: Identity,
+        service: String,
+        user: String,
+        budget: Duration,
+        source_image: Option<std::sync::Arc<std::fs::File>>,
     ) -> io::Result<Self> {
         if budget.as_millis() == 0
             || budget > MAX_BUDGET
@@ -326,6 +375,7 @@ impl Supervisor {
             sequence: 0,
             pending: Vec::new(),
             retirement: Retirement::Running,
+            _source_image: source_image,
         };
         let setup: io::Result<()> = (|| {
             let pid =
@@ -981,6 +1031,7 @@ mod tests {
             sequence: 0,
             pending: Vec::new(),
             retirement: Retirement::Running,
+            _source_image: None,
         };
         assert_eq!(owner.retire(false), Retirement::Quarantined);
         assert!(std::path::Path::new(&format!("/proc/{}", owner.pid())).exists());

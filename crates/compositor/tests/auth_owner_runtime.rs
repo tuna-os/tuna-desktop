@@ -113,6 +113,17 @@ fn client() {
         },
     );
     wait(|| root.join("started-1").exists());
+    if std::env::var(ROLE).as_deref() == Ok("3") {
+        wait(|| root.join("compositor-pid").exists());
+        // Keep the real source inode held, replace ONLY our own copied path.
+        assert_pam_helper_image(&root, 1);
+        std::fs::remove_file(root.join("compositor-copy")).unwrap();
+        std::fs::write(
+            root.join("compositor-copy"),
+            b"replaced non-executable negative control",
+        )
+        .unwrap();
+    }
     send(
         &mut b,
         1,
@@ -157,7 +168,9 @@ fn client() {
             Err(_) => panic!("replacement closed"),
         }
     }
-    std::fs::write(root.join("release-2"), b"1").unwrap();
+    if std::env::var(ROLE).as_deref() != Ok("3") {
+        std::fs::write(root.join("release-2"), b"1").unwrap();
+    }
     send(
         &mut replacement,
         3,
@@ -165,7 +178,26 @@ fn client() {
             password: Secret("controlled-only".into()),
         },
     );
+    if std::env::var(ROLE).as_deref() == Ok("3") {
+        wait(|| root.join("started-2").exists());
+        assert_pam_helper_image(&root, 2);
+        std::fs::write(root.join("release-2"), b"1").unwrap();
+    }
     result(&mut replacement, 3, true);
+    if std::env::var(ROLE).as_deref() == Ok("3") {
+        let previous: u32 = std::fs::read_to_string(root.join("started-1"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            !PathBuf::from(format!("/proc/{previous}")).exists(),
+            "previous PAM leader must be reaped before fresh grant"
+        );
+        assert_eq!(
+            std::fs::read(root.join("compositor-copy")).unwrap(),
+            b"replaced non-executable negative control"
+        );
+    }
     wait(|| state(&root)["locked"] == false && state(&root)["auth_owner"]["epoch"] == 2);
     send(&mut replacement, 12, CommandKind::SetIdleTimeout { ms: 50 });
     result(&mut replacement, 12, true);
@@ -174,7 +206,9 @@ fn client() {
         "supervised_client_pid":std::process::id(), "manual_epoch":1,"unlock_epoch":2,"idle_epoch":3,
         "concurrent_other_same_id_denied":true,"same_session_excess_denied":true,
         "replacement_same_id_busy_denied":true,"late_closed_origin_success_denied":true,
-        "fresh_origin_success":true,"scope":"actual nested outer-wrapper ownership; no PAM retirement"
+        "fresh_origin_success":true,
+        "held_self_path_replaced":std::env::var(ROLE).as_deref()==Ok("3"),
+        "scope":if std::env::var(ROLE).as_deref()==Ok("3") { "actual main Runtime PAM: stable held image, old origin denied, actual retirement; not hardware/MFA/S3" } else { "actual nested outer-wrapper ownership; no PAM retirement" }
     })).unwrap()).unwrap();
     // Keep the supervised process alive until parent sends graceful termination.
     std::thread::sleep(Duration::from_secs(2));
@@ -361,6 +395,51 @@ fn actual_runtime_epoch_invalidation_and_public_sync_unlock() {
     run_parent(&bin, "2", 3, "probe");
 }
 
+fn assert_pam_helper_image(root: &Path, attempt: u32) {
+    use std::os::unix::fs::MetadataExt;
+    let helper: u32 = std::fs::read_to_string(root.join(format!("started-{attempt}")))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let parent: u32 = std::fs::read_to_string(root.join("compositor-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expected = std::fs::metadata(format!("/proc/{parent}/exe")).unwrap();
+    let actual = std::fs::metadata(format!("/proc/{helper}/exe")).unwrap();
+    assert_eq!(
+        (actual.dev(), actual.ino()),
+        (expected.dev(), expected.ino())
+    );
+    let stat = std::fs::read_to_string(format!("/proc/{helper}/stat")).unwrap();
+    let fields: Vec<_> = stat
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        fields[1].parse::<u32>().unwrap(),
+        parent,
+        "owned actual main helper"
+    );
+}
+
+#[test]
+fn actual_main_runtime_private_pam_retirement_and_held_self() {
+    match std::env::var(ROLE).ok().as_deref() {
+        Some("3") => return client(),
+        Some(_) => return,
+        None => {}
+    }
+    run_parent(
+        Path::new(env!("CARGO_BIN_EXE_tuna-compositor")),
+        "3",
+        2,
+        "pam",
+    );
+}
+
 fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
     if std::env::var_os("DISPLAY").is_none() {
         assert!(
@@ -380,9 +459,50 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         out: std::env::var_os("TUNA_AUTH_OWNER_ARTIFACTS").map(PathBuf::from),
     };
     let socket = root.path().join("greetd.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server_root = root.path().to_owned();
-    let server = std::thread::spawn(move || greetd(listener, server_root, attempts));
+    let server = if role == "3" {
+        None
+    } else {
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_root = root.path().to_owned();
+        Some(std::thread::spawn(move || {
+            greetd(listener, server_root, attempts)
+        }))
+    };
+    let owned_bin = root.path().join("compositor-copy");
+    if role == "3" {
+        assert!(
+            Path::new("/usr/lib/x86_64-linux-gnu/libpam_wrapper.so").exists(),
+            "required actual PAM wrapper"
+        );
+        let module = root.path().join("controlled-pam.so");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pam_conversation.c");
+        assert!(Command::new("cc")
+            .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(source)
+            .arg("-o")
+            .arg(&module)
+            .arg("-lpam")
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir(root.path().join("services")).unwrap();
+        std::fs::write(
+            root.path().join("services/runtime-delay"),
+            format!(
+                "auth required {} runtime-delay\naccount required {} runtime-delay\n",
+                module.display(),
+                module.display()
+            ),
+        )
+        .unwrap();
+        std::fs::copy(bin, &owned_bin).unwrap();
+    }
+    let executable = if role == "3" {
+        owned_bin.as_path()
+    } else {
+        bin
+    };
     let sha = Command::new("sha256sum").arg(bin).output().unwrap();
     assert!(sha.status.success());
     println!(
@@ -393,8 +513,19 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             .unwrap()
     );
     let log = std::fs::File::create(root.path().join("compositor.log")).unwrap();
+    let mut command = Command::new(executable);
+    if role == "3" {
+        command
+            .env_remove("GREETD_SOCK")
+            .env("TUNA_PAM_SERVICE", "runtime-delay")
+            .env("LD_PRELOAD", "/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
+            .env("PAM_WRAPPER", "1")
+            .env("PAM_WRAPPER_SERVICE_DIR", root.path().join("services"));
+    } else {
+        command.env("GREETD_SOCK", &socket);
+    }
     let mut child = OwnedChild(
-        Command::new(bin)
+        command
             .args([
                 "--socket",
                 "auth-owner-proof",
@@ -409,7 +540,6 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
             .env("TUNA_AUTH_OWNER_ROOT", root.path())
             .env("XDG_RUNTIME_DIR", root.path())
-            .env("GREETD_SOCK", &socket)
             .env("TUNA_COMPOSITOR_STATE", root.path().join("state.json"))
             .env("TUNA_LOCK_TRACE", "1")
             .env("TUNA_XWAYLAND", "0")
@@ -419,6 +549,7 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             .spawn()
             .unwrap(),
     );
+    std::fs::write(root.path().join("compositor-pid"), child.0.id().to_string()).unwrap();
     let end = Instant::now() + Duration::from_secs(30);
     while !root.path().join("success.json").exists() {
         assert!(
@@ -454,6 +585,23 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
     );
     receipt["client_start_ticks"] = serde_json::json!(fields[19].parse::<u64>().unwrap());
     receipt["compositor_pid"] = serde_json::json!(child.0.id());
+    let actual_sha = Command::new("sha256sum")
+        .arg(format!("/proc/{}/exe", child.0.id()))
+        .output()
+        .unwrap();
+    assert!(actual_sha.status.success());
+    let actual_digest = String::from_utf8_lossy(&actual_sha.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let source_digest = String::from_utf8_lossy(&sha.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(actual_digest, source_digest, "actual live source image");
+    receipt["compositor_sha256"] = serde_json::json!(actual_digest);
     std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
     println!(
         "auth owner {kind} runtime receipt: {}",
@@ -475,7 +623,9 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         }
     }
     drop(child);
-    server.join().unwrap();
+    if let Some(server) = server {
+        server.join().unwrap();
+    }
 }
 
 #[test]

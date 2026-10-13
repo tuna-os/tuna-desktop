@@ -7,7 +7,7 @@ git rev-parse HEAD > "$out/source.txt"
 git rev-parse --show-toplevel > "$out/root.txt"
 git diff --quiet
 git diff --cached --quiet
-sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/sleep.rs crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
+sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/main.rs crates/compositor/src/lib.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/sleep.rs crates/compositor/src/pam.rs crates/compositor/src/pam_backend.rs crates/compositor/src/pam_helper.rs crates/compositor/src/unlock.rs crates/compositor/tests/fixtures/pam_conversation.c crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
 cargo metadata --locked --no-deps --format-version=1 > "$out/metadata.json"
 cargo test --locked -p tuna-compositor --test auth_owner_runtime --no-run --message-format=json > "$out/build.json"
 cargo build --locked -p tuna-compositor --example native-auth-owner-probe --message-format=json > "$out/probe-build.json"
@@ -49,6 +49,11 @@ DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFA
     "$test_executable" --exact actual_runtime_epoch_invalidation_and_public_sync_unlock --nocapture 2>&1 | tee "$out/test-epoch.log"
 grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test-epoch.log"
 grep -q '^auth owner probe runtime receipt: ' "$out/test-epoch.log"
+DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime-pam" \
+    timeout --kill-after=3s 45s \
+    "$test_executable" --exact actual_main_runtime_private_pam_retirement_and_held_self --nocapture 2>&1 | tee "$out/test-pam.log"
+grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test-pam.log"
+grep -q '^auth owner pam runtime receipt: ' "$out/test-pam.log"
 python3 - "$out" <<'PY'
 import hashlib,importlib.util,json,pathlib,sys
 sys.dont_write_bytecode=True
@@ -69,6 +74,12 @@ epoch_receipt=json.loads((out/'runtime-epoch/success.json').read_text())
 for key in ['late_epoch_success_denied','busy_public_sync_denied','fresh_origin_success','public_sync_success']:assert epoch_receipt[key] is True
 probe_lines=[l.removeprefix('auth owner probe sha256: ') for l in (out/'test-epoch.log').read_text().splitlines() if l.startswith('auth owner probe sha256: ')]
 assert len(probe_lines)==1 and probe_lines[0]==r['executables'][r['probe']],'actual Runtime probe mismatched'
+pam_receipt=json.loads((out/'runtime-pam/success.json').read_text())
+for key in ['late_closed_origin_success_denied','fresh_origin_success','held_self_path_replaced']:assert pam_receipt[key] is True
+assert pam_receipt['compositor_sha256']==r['executables'][r['compositor']],'actual PAM main image differs'
+pam_lines=[l.removeprefix('auth owner pam sha256: ') for l in (out/'test-pam.log').read_text().splitlines() if l.startswith('auth owner pam sha256: ')]
+assert len(pam_lines)==1 and pam_lines[0]==r['executables'][r['compositor']],'PAM source admission differs'
+
 
 PY
 sha256sum --check "$out/source-sha256.txt"

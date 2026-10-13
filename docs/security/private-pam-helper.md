@@ -62,5 +62,32 @@ web-login handling in [authPrompt.js](https://raw.githubusercontent.com/GNOME/gn
 and [userVerifier.js](https://raw.githubusercontent.com/GNOME/gnome-shell/51.0/js/gdm/userVerifier.js).
 This private PAM foundation does not qualify that stack, native-greeter session
 launch, keystore integration, smartcard hardware, web login or all of issue #366.
-Common-slot ownership/correlation must land with live helper adoption; accessible
-challenge UI and installed-method proofs are subsequent bounded increments.
+Common-slot ownership and live helper routing are present in the new source
+increment below. Accessible challenge UI and installed-method proofs remain
+subsequent required increments.
+
+## Live password adapter source increment
+
+The live factory holds the current executable through `/proc/self/exe`.
+It has no caller-selected executable path. One stable creator thread owns each
+helper through retirement or quarantine. A timeout sends denial. It does not
+release backend admission or the Runtime attempt slot. Lost receivers and owner
+faults fail closed. A poisoned owner cannot admit a replacement credential.
+
+Runtime retains its outer wrapper while helper retirement is pending. Its event
+channel wakes the loop for denial and completion. Quarantine does not request
+continuous frame polling. Public synchronous PAM calls deny after the same budget
+and retain the slot until actual retirement. Late results cannot grant access.
+Configured greetd keeps its existing route and never falls back to PAM.
+
+The password adapter answers one Secret challenge per transaction. A second
+Secret, or a Visible challenge after a Secret, is unsupported and denied. It never
+reuses the same password for a separate PIN. Full accessible challenge UI and
+MFA remain required for issue #366.
+
+New CI source contains controlled stable-owner, busy, cancellation, account-denial
+and repeated-secret tests. A separate actual-main Runtime case uses the admitted
+binary, replaces only its owned copied path, and checks helper inode identity,
+old-origin denial and retirement before a fresh grant. These new cases have not
+run yet. They do not qualify installed PAM stacks, detached module processes,
+physical authentication devices, logind suspend or all of issue #366.

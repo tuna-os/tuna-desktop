@@ -61,6 +61,11 @@ class Admission(unittest.TestCase):
         (self.out/'runtime-epoch').mkdir(exist_ok=True)
         (self.out/'runtime-epoch/success.json').write_text(json.dumps({k:True for k in ['late_epoch_success_denied','busy_public_sync_denied','fresh_origin_success','public_sync_success']}))
         (self.out/'test-epoch.log').write_text('auth owner probe sha256: '+r['executables'][str(self.probe)]+'\n')
+        (self.out/'runtime-pam').mkdir(exist_ok=True)
+        (self.out/'runtime-pam/success.json').write_text(json.dumps({
+            'late_closed_origin_success_denied': True, 'fresh_origin_success': True,
+            'held_self_path_replaced': True, 'compositor_sha256': r['executables'][str(self.bin)]}))
+        (self.out/'test-pam.log').write_text('auth owner pam sha256: '+r['executables'][str(self.bin)]+'\n')
         return r
 
     def test_exact_roles_and_unchanged_files_admitted(self):
@@ -141,6 +146,23 @@ class Admission(unittest.TestCase):
         self.assertIn('timeout --kill-after=3s 45s', SCRIPT)
         self.assertIn('1 passed; 0 failed; 0 ignored;', SCRIPT)
 
+
+    def test_actual_pam_receipt_false_or_wrong_image_refused(self):
+        for field, wrong in [('late_closed_origin_success_denied', False), ('fresh_origin_success', False),
+                             ('held_self_path_replaced', False), ('compositor_sha256', '0'*64)]:
+            self.admit()
+            path = self.out/'runtime-pam/success.json'
+            receipt = json.loads(path.read_text()); receipt[field] = wrong
+            path.write_text(json.dumps(receipt))
+            with self.subTest(field=field), self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+
+    def test_actual_pam_receipt_missing_or_duplicate_source_refused(self):
+        self.admit()
+        (self.out/'runtime-pam/success.json').unlink()
+        with self.assertRaises(FileNotFoundError): self.execute(BLOCKS[1])
+        self.admit()
+        path = self.out/'test-pam.log'; path.write_text(path.read_text()*2)
+        with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
 
 if __name__ == '__main__':
     unittest.main()
