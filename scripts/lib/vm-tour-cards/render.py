@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Re-render the Tuna Desktop VM tour title cards (needs Pillow and DejaVu Sans).
 
-The PNGs beside this file are committed; CI never runs this. Run it after
-changing a card's text:  python3 scripts/lib/vm-tour-cards/render.py
+CI renders current source into an owned scratch directory via --out;
+committed legacy PNGs are not used by the tour.
 """
 import os
+import argparse
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -25,7 +26,10 @@ FONTS = "/usr/share/fonts/truetype/dejavu"
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", required=True)
+    here = parser.parse_args().out
+    os.makedirs(here, exist_ok=False)
     big = ImageFont.truetype(os.path.join(FONTS, "DejaVuSans-Bold.ttf"), 64)
     small = ImageFont.truetype(os.path.join(FONTS, "DejaVuSans.ttf"), 28)
     for name, (title, sub) in CARDS.items():

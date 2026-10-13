@@ -26,7 +26,7 @@ With --tour, once the assertions pass it drives a scripted feature tour
 through QMP input (overview and search, app grid, quick settings,
 calendar, three apps and Alt+Tab, scroll mode, lock and unlock), screendumps
 it twice a second, splices in the title cards from scripts/lib/
-vm-tour-cards, and writes tour/tuna-tour.webm, tour/preview.webp and a
+vm-tour-cards rendered from source in scratch, and writes tour/tuna-tour.webm, tour/preview.webp and a
 T-<section>.png still per section (needs ffmpeg with libvpx and libwebp).
 
 Usage:
@@ -1032,41 +1032,124 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
 
 
 class Recorder:
-    """Screendump the VM TOUR_FPS times a second into numbered PNGs while
-    the tour drives input; marks splice a title card in at a frame index."""
+    """Serialize input and completed screendumps, including their frame indices.
 
-    def __init__(self, qmp, out):
+    A failed/timed-out transport aborts the tour; a still records pixels only,
+    not proof that the application reached a requested semantic state.
+    """
+
+    def __init__(self, qmp, out, timeout=10.0):
         self.qmp, self.dir = qmp, os.path.join(out, "frames")
-        os.makedirs(self.dir, exist_ok=True)
-        self.lock, self.stop, self.n, self.marks = threading.Lock(), threading.Event(), 0, []
-        self.stills = {}
-        cmd = qmp.cmd
-
-        def locked(command, **args):
-            with self.lock:
-                return cmd(command, **args)
-        qmp.cmd = locked
+        os.makedirs(self.dir, exist_ok=False)
+        self.lock, self.stop = threading.RLock(), threading.Event()
+        self.n, self.marks, self.stills = 0, [], {}
+        self.frames = []
+        self.timeout, self.error = timeout, None
+        self.original_cmd = qmp.cmd
+        self.wrapped_cmd = self._command
+        qmp.cmd = self.wrapped_cmd
         self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _command(self, command, _deadline=None, **args):
+        deadline = _deadline if _deadline is not None else time.monotonic() + self.timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self.lock.acquire(timeout=remaining):
+            raise TimeoutError("tour QMP lock deadline expired")
+        try:
+            if self.error is not None:
+                raise RuntimeError("tour capture previously failed") from self.error
+            sock = getattr(self.qmp, "sock", None)
+            previous = sock.gettimeout() if sock is not None else None
+            if sock is not None:
+                sock.settimeout(max(0.001, deadline - time.monotonic()))
+            try:
+                return self.original_cmd(command, **args)
+            finally:
+                if sock is not None:
+                    sock.settimeout(previous)
+        finally:
+            self.lock.release()
+
+    def _capture(self, mode="periodic"):
+        deadline = time.monotonic() + self.timeout
+        if not self.lock.acquire(timeout=self.timeout):
+            error = TimeoutError("tour capture lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
+        pending = None
+        try:
+            index = self.n
+            final = os.path.join(self.dir, f"f{index:06d}.png")
+            pending = final + ".pending"
+            if os.path.exists(final) or os.path.exists(pending):
+                raise RuntimeError("tour frame identity already exists")
+            requested_ns = time.monotonic_ns()
+            self._command("screendump", _deadline=deadline, filename=pending, format="png")
+            while not os.path.isfile(pending) or os.path.getsize(pending) == 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("tour screendump did not produce a frame")
+                self.stop.wait(min(0.01, remaining))
+            if time.monotonic() >= deadline:
+                raise TimeoutError("tour screendump exceeded its deadline")
+            os.rename(pending, final)
+            self.frames.append({"index": index, "mode": mode,
+                                "requested_monotonic_ns": requested_ns,
+                                "completed_monotonic_ns": time.monotonic_ns(),
+                                "sha256": baseline.sha256(final)})
+            self.n += 1
+            return index
+        except (OSError, RuntimeError, ValueError) as error:
+            self.error = error
+            self.stop.set()
+            if pending is not None:
+                try:
+                    os.unlink(pending)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            self.lock.release()
 
     def _run(self):
         while not self.stop.is_set():
-            t = time.time()
+            started = time.monotonic()
             try:
-                self.qmp.cmd("screendump", filename=os.path.join(self.dir, f"f{self.n:06d}.png"),
-                             format="png")
-                self.n += 1
-            except (OSError, RuntimeError, ValueError) as e:
-                log(f"tour: screendump failed: {e}")
-            self.stop.wait(max(0.0, 1 / TOUR_FPS - (time.time() - t)))
+                self._capture()
+            except (OSError, RuntimeError, ValueError) as error:
+                log(f"tour: screendump failed: {error}")
+                return
+            self.stop.wait(max(0.0, 1 / TOUR_FPS - (time.monotonic() - started)))
 
     def mark(self, card):
-        log(f"tour: {card}")
-        self.marks.append((self.n, card))
+        with self.lock:
+            log(f"tour: {card}")
+            self.marks.append((self.n, card))
 
     def still(self, card, delay=0.0):
-        """Keep the next captured frame as this section's still."""
+        """Finish this exact capture before the caller can send its next key."""
         time.sleep(delay)
-        self.stills[card] = self.n + 1
+        self.stills[card] = self._capture(mode="still")
+
+    def close(self):
+        self.stop.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=self.timeout + 0.1)
+            if self.thread.is_alive():
+                sock = getattr(self.qmp, "sock", None)
+                if sock is not None:
+                    import socket
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                self.thread.join(timeout=1)
+            if self.thread.is_alive():
+                raise RuntimeError("tour recorder did not stop")
+        self.qmp.cmd = self.original_cmd
+        if self.error is not None:
+            raise RuntimeError("tour capture failed") from self.error
 
 
 def run_tour(qmp, out, serial_path):
@@ -1074,8 +1157,15 @@ def run_tour(qmp, out, serial_path):
     title card per section. Returns a manifest entry."""
     tour = os.path.join(out, "tour")
     scratch = os.path.join(tour, ".work")
-    os.makedirs(scratch, exist_ok=True)
-    rec = Recorder(qmp, scratch)
+    os.makedirs(scratch, exist_ok=False)
+    cards_dir = os.path.join(scratch, "cards")
+    try:
+        subprocess.run([sys.executable, os.path.join(CARDS, "render.py"),
+                        "--out", cards_dir], check=True, timeout=30)
+        rec = Recorder(qmp, scratch)
+    except BaseException:
+        shutil.rmtree(scratch)
+        raise
     keys, wait = qmp.keys, time.sleep
 
     def launch(query):
@@ -1179,9 +1269,29 @@ def run_tour(qmp, out, serial_path):
             log("tour: PAM unlock did not arrive within 15 seconds")
             qmp.frame(os.path.join(out, "V-UNLOCK-FAILED.png"))
         wait(1)
-    finally:
-        rec.stop.set()
-        rec.thread.join(timeout=10)
+    except BaseException as error:
+        try:
+            rec.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"tour recorder cleanup: {cleanup_error}")
+        finally:
+            shutil.rmtree(scratch)
+        raise
+    else:
+        try:
+            rec.close()
+        except BaseException:
+            shutil.rmtree(scratch)
+            raise
+
+    with open(os.path.join(tour, "capture-timing.json"), "w") as stream:
+        json.dump({"schema": 1, "periodic_target_fps": TOUR_FPS,
+                   "uniform_capture_intervals": False, "frames": rec.frames,
+                   "stills": rec.stills, "title_marks": rec.marks,
+                   "lane_source_sha256": baseline.sha256(__file__),
+                   "card_source_sha256": baseline.sha256(os.path.join(CARDS, "render.py")),
+                   "card_sha256": {name: baseline.sha256(os.path.join(cards_dir, name + ".png"))
+                                   for _, name in rec.marks}}, stream, indent=2)
 
     # Final sequence: captured frames with CARD_HOLD copies of each card
     # spliced in at its mark. Cards are converted to RGB at the capture
@@ -1207,7 +1317,7 @@ def run_tour(qmp, out, serial_path):
             if card not in cards:
                 dst = os.path.join(scratch, f"card-{card}.png")
                 subprocess.run(["ffmpeg", "-loglevel", "error", "-y",
-                                "-i", os.path.join(CARDS, f"{card}.png"),
+                                "-i", os.path.join(cards_dir, f"{card}.png"),
                                 "-vf", f"scale={WIDTH}:{HEIGHT}", "-pix_fmt", "rgb24", dst],
                                check=True)
                 cards[card] = dst
@@ -1226,14 +1336,15 @@ def run_tour(qmp, out, serial_path):
                     "-c:v", "libwebp", "-quality", "60", "-compression_level", "6",
                     os.path.join(tour, "preview.webp")], check=False)
     for card, idx in rec.stills.items():
-        frame = os.path.join(rec.dir, f"f{min(idx, rec.n - 1):06d}.png")
+        frame = os.path.join(rec.dir, f"f{idx:06d}.png")
         if os.path.exists(frame):
             shutil.copyfile(frame, os.path.join(tour, f"T-{card}.png"))
     shutil.rmtree(scratch, ignore_errors=True)
     ok = os.path.exists(webm) and os.path.getsize(webm) > 0
     log(f"tour: {rec.n} frames, {len(rec.marks)} sections -> {webm if ok else 'NO VIDEO'}")
     return {"video": "tour/tuna-tour.webm" if ok else None, "frames": rec.n,
-            "sections": [c for _, c in rec.marks], "capture_fps": TOUR_FPS,
+            "sections": [c for _, c in rec.marks], "periodic_target_fps": TOUR_FPS,
+            "uniform_capture_intervals": False, "capture_timing": "tour/capture-timing.json",
             "playback_fps": PLAY_FPS}
 
 
