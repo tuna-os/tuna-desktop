@@ -434,7 +434,8 @@ fn raw_negative_cases() {
 fn private_pam_helper_actual_binary_conversation_and_retirement() {
     if std::env::var_os(CHILD).is_some() {
         run_actual_helper_cases();
-        return run_backend_cases();
+        run_backend_cases();
+        return run_interactive_relay_cases();
     }
     if !Path::new(WRAPPER).exists() {
         assert!(
@@ -704,4 +705,204 @@ fn wait_helper_reaped(pid: u32, started: Instant) {
         );
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+// Reuses the admitted actual main executable and isolated controlled PAM module.
+// This is backend conversation evidence, not a Runtime Slot/UI/hardware proof.
+fn run_interactive_relay_cases() {
+    use tuna_compositor::pam_backend::{Backend, ConversationTicket, Verification};
+    use tuna_compositor::pam_cancel::Cancellation;
+    use tuna_compositor::pam_conversation::{Binding, Challenge, Origin, Policy};
+    fn next(ticket: &mut ConversationTicket) -> Challenge {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(challenge) = ticket.try_challenge() {
+                return challenge;
+            }
+            assert!(
+                ticket.try_outcome().is_none(),
+                "unexpected retirement before challenge"
+            );
+            assert!(Instant::now() < deadline, "required challenge missing");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn finished(ticket: &mut ConversationTicket, accepted: bool) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Some(result) = ticket.try_outcome() {
+                assert_eq!(
+                    result,
+                    Verification::Retired {
+                        authenticated: accepted
+                    }
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "required actual retirement missing"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let (created, creators) = std::sync::mpsc::channel();
+    let backend = Backend::with_trusted_factory(move |identity, service, user, total, cancel| {
+        let helper =
+            Supervisor::spawn_conversation(executable(), identity, service, user, total, cancel)?;
+        let actual = std::fs::metadata(format!("/proc/{}/exe", helper.pid()))?;
+        let expected = std::fs::metadata(executable())?;
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (expected.dev(), expected.ino())
+        );
+        created
+            .send((
+                std::thread::current().id(),
+                unsafe { libc::syscall(libc::SYS_gettid) },
+                helper.pid(),
+            ))
+            .unwrap();
+        Ok(helper)
+    })
+    .unwrap();
+    let mut creator = None;
+    for (attempt, case) in [
+        "fresh-multistep",
+        "wrong-second",
+        "wrong-origin",
+        "wrong-request",
+        "wrong-epoch",
+        "wrong-sequence",
+        "cancel-pending",
+        "phase-hang",
+        "fresh-multistep",
+        "shutdown-pending",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        println!("interactive PAM relay case: {case}");
+        let binding = Binding {
+            origin: Origin {
+                connection: 70,
+                request: attempt as u64 + 1,
+            },
+            attempt: attempt as u64 + 1,
+            epoch: 50 + attempt as u64,
+        };
+        let cancel = Cancellation::default();
+        let mut ticket = backend
+            .begin_conversation(
+                if case == "phase-hang" {
+                    "private-hang"
+                } else {
+                    "private-multi"
+                }
+                .into(),
+                user(),
+                binding,
+                Policy {
+                    backend_phase: Duration::from_secs(2),
+                    total: Duration::from_secs(300),
+                },
+                cancel.clone(),
+            )
+            .unwrap();
+        let (actual_creator, tid, pid) = creators.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(*creator.get_or_insert(actual_creator), actual_creator);
+        assert!(
+            backend
+                .begin_conversation(
+                    "private-multi".into(),
+                    user(),
+                    Binding {
+                        attempt: binding.attempt + 1,
+                        ..binding
+                    },
+                    Policy {
+                        backend_phase: Duration::from_secs(2),
+                        total: Duration::from_secs(300)
+                    },
+                    Cancellation::default()
+                )
+                .is_err(),
+            "shared backend admission must remain busy"
+        );
+        if case != "phase-hang" {
+            let mut challenge = next(&mut ticket);
+            assert_eq!(challenge.binding, binding);
+            assert_eq!(challenge.sequence, 1);
+            assert_eq!(
+                challenge
+                    .messages
+                    .iter()
+                    .map(|message| message.style)
+                    .collect::<Vec<_>>(),
+                [Style::Visible, Style::Secret, Style::Info, Style::Error]
+            );
+            match case {
+                "wrong-origin" | "wrong-request" | "wrong-epoch" => {
+                    let incoming = match case {
+                        "wrong-origin" => Binding {
+                            origin: Origin {
+                                connection: binding.origin.connection + 1,
+                                ..binding.origin
+                            },
+                            ..binding
+                        },
+                        "wrong-request" => Binding {
+                            origin: Origin {
+                                request: binding.origin.request + 1,
+                                ..binding.origin
+                            },
+                            ..binding
+                        },
+                        _ => Binding {
+                            epoch: binding.epoch + 1,
+                            ..binding
+                        },
+                    };
+                    assert!(challenge.response.submit(incoming, 1, answers(1)).is_err());
+                }
+                "wrong-sequence" => {
+                    assert!(challenge.response.submit(binding, 2, answers(1)).is_err());
+                }
+                "cancel-pending" | "shutdown-pending" => {
+                    wait_backend_idle_read(tid);
+                    if case == "shutdown-pending" {
+                        backend.shutdown();
+                    } else {
+                        ticket.cancel();
+                    }
+                    assert!(challenge.response.submit(binding, 1, answers(1)).is_err());
+                }
+                _ => {
+                    challenge.response.note_user_input(binding, 1).unwrap();
+                    challenge.response.submit(binding, 1, answers(1)).unwrap();
+                    let challenge = next(&mut ticket);
+                    assert_eq!(challenge.binding, binding);
+                    assert_eq!(challenge.sequence, 2);
+                    assert_eq!(challenge.messages.len(), 1);
+                    assert_eq!(challenge.messages[0].style, Style::Secret);
+                    let values = if case == "wrong-second" {
+                        vec![Answer {
+                            index: 0,
+                            text: Some(AnswerText::new("first-secret".into())),
+                        }]
+                    } else {
+                        answers(2)
+                    };
+                    challenge.response.submit(binding, 2, values).unwrap();
+                }
+            }
+        }
+        finished(&mut ticket, case == "fresh-multistep");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "result must follow actual helper retirement"
+        );
+    }
+    backend.shutdown();
+    println!("interactive PAM relay: distinct fresh answers, Info/Error, owner/sequence, cancel, phase deadline, stable creator and physical retirement controls passed");
 }

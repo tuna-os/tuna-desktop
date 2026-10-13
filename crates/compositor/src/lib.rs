@@ -84,6 +84,7 @@ pub mod overview;
 pub mod pam;
 pub mod pam_backend;
 pub mod pam_cancel;
+pub mod pam_conversation;
 pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;

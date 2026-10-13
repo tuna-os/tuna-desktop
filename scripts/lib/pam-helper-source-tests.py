@@ -45,6 +45,25 @@ class SourceContracts(unittest.TestCase):
         self.assertIn('ticket.wait_retired', runtime)
         self.assertIn('verify_owned', (ROOT / 'crates/compositor/src/unlock.rs').read_text())
 
+    def test_interactive_relay_is_internal_fresh_bounded_and_in_actual_helper_fixture(self):
+        relay = (ROOT / 'crates/compositor/src/pam_conversation.rs').read_text()
+        backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
+        helper = (ROOT / 'crates/compositor/src/pam_helper.rs').read_text()
+        for token in ('pub const INACTIVITY', 'pub struct Policy', 'pub struct Binding',
+                      'pub struct Challenge', 'pub struct ResponseHandle', 'valid_answers',
+                      'self.cancel.fd()', 'libc::poll', 'self.total_deadline', 'Input::Activity'):
+            self.assertIn(token, relay)
+        self.assertNotIn('tuna_shell_control', relay)
+        self.assertNotIn('is_fingerprint_prompt', relay)
+        self.assertIn('pub fn begin_conversation(', backend)
+        self.assertIn('image.spawn_conversation(identity, service, user, budget, cancel)', backend)
+        self.assertIn('deadline.min(self.total_deadline)', helper)
+        actual = (ROOT / 'crates/compositor/tests/pam_helper.rs').read_text()
+        self.assertIn('return run_interactive_relay_cases();', actual)
+        for case in ('fresh-multistep', 'wrong-second', 'wrong-origin', 'wrong-request', 'wrong-epoch', 'wrong-sequence', 'cancel-pending', 'shutdown-pending', 'phase-hang'):
+            self.assertIn('"' + case + '"', actual)
+        self.assertIn('Duration::from_secs(45)', actual)
+
     def test_owned_credential_wrap_precedes_early_denials_and_moves_answer(self):
         backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
         self.assertIn('impl Drop for Credential', backend)

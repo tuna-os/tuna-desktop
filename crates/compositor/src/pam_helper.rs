@@ -330,6 +330,9 @@ impl SelfImage {
         user: String,
         budget: Duration,
     ) -> io::Result<Supervisor> {
+        if budget.is_zero() || budget > MAX_BUDGET {
+            return Err(invalid());
+        }
         let executable =
             std::path::PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
         Supervisor::spawn_inner(
@@ -350,6 +353,9 @@ impl SelfImage {
         budget: Duration,
         cancel: Cancellation,
     ) -> io::Result<Supervisor> {
+        if budget.is_zero() || budget > MAX_BUDGET {
+            return Err(invalid());
+        }
         let executable =
             std::path::PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
         Supervisor::spawn_inner(
@@ -362,10 +368,30 @@ impl SelfImage {
             Some(cancel),
         )
     }
+    pub(crate) fn spawn_conversation(
+        &self,
+        identity: Identity,
+        service: String,
+        user: String,
+        total: Duration,
+        cancel: Cancellation,
+    ) -> io::Result<Supervisor> {
+        let executable =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+        Supervisor::spawn_inner(
+            &executable,
+            identity,
+            service,
+            user,
+            total,
+            Some(self.file.clone()),
+            Some(cancel),
+        )
+    }
 }
 
 /// Blocking foundation API: call off the UI loop, retain ownership through retirement.
-/// The live runtime has not adopted this helper or its private protocol.
+/// The password backend uses this helper. Interactive UI routing is separate.
 pub struct Supervisor {
     child: Child,
     pidfd: Option<OwnedFd>,
@@ -374,6 +400,7 @@ pub struct Supervisor {
     output: Option<ChildStdout>,
     identity: Identity,
     deadline: Instant,
+    total_deadline: Instant,
     sequence: u32,
     pending: Vec<Style>,
     retirement: Retirement,
@@ -397,6 +424,9 @@ impl Supervisor {
         user: String,
         budget: Duration,
     ) -> io::Result<Self> {
+        if budget.is_zero() || budget > MAX_BUDGET {
+            return Err(invalid());
+        }
         Self::spawn_inner(executable, identity, service, user, budget, None, None)
     }
     /// Same trusted executable boundary; cancellation must be bound by its owner.
@@ -408,6 +438,9 @@ impl Supervisor {
         budget: Duration,
         cancel: Cancellation,
     ) -> io::Result<Self> {
+        if budget.is_zero() || budget > MAX_BUDGET {
+            return Err(invalid());
+        }
         Self::spawn_inner(
             executable,
             identity,
@@ -428,7 +461,7 @@ impl Supervisor {
         cancellation: Option<Cancellation>,
     ) -> io::Result<Self> {
         if budget.as_millis() == 0
-            || budget > MAX_BUDGET
+            || budget > crate::pam_conversation::MAX_TOTAL
             || identity.uid != unsafe { libc::getuid() }
             || service.is_empty()
             || service.len() > 128
@@ -471,6 +504,7 @@ impl Supervisor {
             output,
             identity,
             deadline,
+            total_deadline: deadline,
             sequence: 0,
             pending: Vec::new(),
             retirement: Retirement::Running,
@@ -496,7 +530,7 @@ impl Supervisor {
                     user,
                     budget_ms: budget.as_millis() as u64,
                 },
-                deadline,
+                deadline.min(Instant::now() + MAX_BUDGET),
                 supervisor.cancellation.as_ref(),
             )
         })();
@@ -507,6 +541,36 @@ impl Supervisor {
         // An initialized but failed helper is still returned as an owned object.
         // next_event reports its failure; quarantine is never discarded here.
         Ok(supervisor)
+    }
+    /// Trusted factory seam for explicit interactive method policies. Unlike
+    /// legacy spawn, the total ceiling is not the ten-second password budget.
+    /// Only the held-self live factory uses this for production conversations.
+    pub fn spawn_conversation(
+        executable: &std::path::Path,
+        identity: Identity,
+        service: String,
+        user: String,
+        total: Duration,
+        cancel: Cancellation,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(
+            executable,
+            identity,
+            service,
+            user,
+            total,
+            None,
+            Some(cancel),
+        )
+    }
+    /// Change only the parent's bounded IPC phase, never the child's explicit
+    /// absolute total ceiling, identity, sequence or physical retirement state.
+    pub(crate) fn set_phase_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        if deadline <= Instant::now() || self.retirement != Retirement::Running {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.deadline = deadline.min(self.total_deadline);
+        Ok(())
     }
     pub fn pid(&self) -> u32 {
         self.child.id()
@@ -714,7 +778,7 @@ fn group_has_no_live_members(group: u32, deadline: Instant) -> io::Result<bool> 
     }
     Ok(true)
 }
-fn valid_answers(styles: &[Style], answers: &[Answer]) -> bool {
+pub(crate) fn valid_answers(styles: &[Style], answers: &[Answer]) -> bool {
     !styles.is_empty()
         && styles.len() == answers.len()
         && answers.iter().enumerate().all(|(index, answer)| {
@@ -926,7 +990,7 @@ fn run_helper() -> io::Result<bool> {
         || uid != unsafe { libc::geteuid() }
         || identity.uid != uid
         || user.as_bytes() != unsafe { CStr::from_ptr((*account).pw_name) }.to_bytes()
-        || !(1..=10_000).contains(&budget_ms)
+        || !(1..=crate::pam_conversation::MAX_TOTAL.as_millis() as u64).contains(&budget_ms)
         || service.is_empty()
         || service.len() > 128
         || !service
@@ -1291,6 +1355,7 @@ mod tests {
                 uid: unsafe { libc::getuid() },
             },
             deadline: Instant::now() + MAX_BUDGET,
+            total_deadline: Instant::now() + MAX_BUDGET,
             sequence: 0,
             pending: Vec::new(),
             retirement: Retirement::Running,
