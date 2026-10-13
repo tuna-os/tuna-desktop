@@ -1,6 +1,7 @@
 """Optional dense decoder observation; existing export storage guards remain authoritative."""
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import sys
@@ -49,6 +50,16 @@ def query_capacity(commands,paths,*,before_pull):
 
 def write_json(path,value):
  Path(path).write_text(json.dumps(value,indent=2)+'\n')
+
+
+def validate_container(config,name,nonce,image):
+ """Bind execution to the exact pinned-image container observed after create."""
+ cid=config.get('Id')
+ require(isinstance(cid,str) and re.fullmatch(r'[0-9a-f]{64}',cid) is not None,'full observed container ID required')
+ require(config['Name'].lstrip('/')==name and config['Config']['Labels'].get('io.tuna.dense-owner')==nonce,'owned container name/label mismatch')
+ require(config.get('Image','').removeprefix('sha256:')==image.removeprefix('sha256:'),'actual pinned container image required')
+ require(config['Config']['User']=='107:107' and config['HostConfig']['Memory']==512*1024**2,'actual user/container memory configuration required')
+ return cid
 
 
 def _observe(commands,artifacts,scratch,disk,raw_hash,info,source,*,root_request_sha256=None):
@@ -104,14 +115,12 @@ def _observe(commands,artifacts,scratch,disk,raw_hash,info,source,*,root_request
   _,text=commands.call(['sudo','podman','inspect',container],timeout=60)
   inspect=json.loads(text);require(len(inspect)==1,'owned container inspect required')
   config=inspect[0]
-  require(config['Name'].lstrip('/')==container and config['Config']['Labels'].get('io.tuna.dense-owner')==nonce,'owned container name/label mismatch')
-  require(config['Config']['User']=='107:107' and config['HostConfig']['Memory']==512*1024**2,
-          'actual user/container memory configuration required')
-  result['container']={'id':config['Id'],'name':container,'uid_gid':config['Config']['User'],
+  exact_id=validate_container(config,container,nonce,image)
+  result['container']={'id':exact_id,'name':container,'uid_gid':config['Config']['User'],
                        'memory_bytes':config['HostConfig']['Memory'],'worker_sha256':digest(worker)}
-  code,_=commands.call(['sudo','podman','start','--attach',container],check=False,timeout=max(.01,commands.deadline-time.monotonic()),max_output=1024*1024)
+  code,_=commands.call(['sudo','podman','start','--attach',exact_id],check=False,timeout=max(.01,commands.deadline-time.monotonic()),max_output=1024*1024)
   result['host_start_exit']=code
-  _,text=commands.call(['sudo','podman','inspect',container,'--format','{{json .State}}'],timeout=60)
+  _,text=commands.call(['sudo','podman','inspect',exact_id,'--format','{{json .State}}'],timeout=60)
   state=json.loads(text)
   result['container_state']={key:state.get(key) for key in ('Status','Running','ExitCode','OOMKilled','Error')}
   require(not state.get('Running'),'owned container still running')
@@ -134,19 +143,20 @@ def _observe(commands,artifacts,scratch,disk,raw_hash,info,source,*,root_request
   try:
    commands.deadline=time.monotonic()+30 # independent exact owned cleanup budget
    if container:
-    code,text=commands.call(['sudo','podman','inspect',container],check=False,timeout=30)
+    cleanup_subject=result.get('container',{}).get('id',container)
+    code,text=commands.call(['sudo','podman','inspect',cleanup_subject],check=False,timeout=30)
     if code==0:
      current=json.loads(text)
-     require(len(current)==1 and current[0]['Name'].lstrip('/')==container and current[0]['Config']['Labels'].get('io.tuna.dense-owner')==nonce and current[0]['Image'].removeprefix('sha256:')==image.removeprefix('sha256:') and current[0]['Config']['User']=='107:107','cleanup owner changed; retain directory')
-     exact_id=current[0]['Id']
+     require(len(current)==1,'one owned cleanup container required')
+     exact_id=validate_container(current[0],container,nonce,image)
      if result.get('container'):require(exact_id==result['container']['id'],'cleanup container ID changed')
      commands.call(['sudo','podman','rm','--force','--ignore',exact_id],timeout=15)
     else:
-     code,_=commands.call(['sudo','podman','container','exists',container],check=False,timeout=30)
+     code,_=commands.call(['sudo','podman','container','exists',cleanup_subject],check=False,timeout=30)
      require(code==1,'cleanup owner status unknown')
 
     # exists exits1 only for absence; use returncode rather than error text.
-    code,_=commands.call(['sudo','podman','container','exists',container],check=False,timeout=30)
+    code,_=commands.call(['sudo','podman','container','exists',cleanup_subject],check=False,timeout=30)
     require(code==1,'owned container absence unconfirmed')
    require(not commands.process_cleanup_uncertain,'container/process retirement unconfirmed')
    if target:

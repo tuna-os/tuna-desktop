@@ -79,6 +79,24 @@ class Dense(unittest.TestCase):
   self.assertIn("receipt['storage'] = storage_receipt(info, mapping, disk.stat().st_size)",text)
   self.assertIn("require(receipt['dense_decode'].get('owned_cleanup', True)",text)
 
+class ContainerIdentity(unittest.TestCase):
+ def observation(self):
+  return {'Id':'a'*64,'Name':'/owned','Image':'sha256:'+'b'*64,
+          'Config':{'Labels':{'io.tuna.dense-owner':'nonce'},'User':'107:107'},
+          'HostConfig':{'Memory':512*1024**2}}
+ def test_actual_prestart_observation_returns_exact_cid(self):
+  self.assertEqual(host.validate_container(self.observation(),'owned','nonce','b'*64),'a'*64)
+ def test_wrong_image_or_missing_malformed_cid_refused_before_execution(self):
+  for patcher in (lambda x:x.update(Image='sha256:'+'c'*64),lambda x:x.pop('Id'),
+                  lambda x:x.update(Id=''),lambda x:x.update(Id='named-container'),lambda x:x.update(Id='a'*63)):
+   config=self.observation();patcher(config)
+   with self.assertRaises(ValueError):host.validate_container(config,'owned','nonce','b'*64)
+ def test_owner_name_user_and_memory_guards_are_preserved(self):
+  for patcher in (lambda x:x.update(Name='/other'),lambda x:x['Config']['Labels'].update({'io.tuna.dense-owner':'other'}),
+                  lambda x:x['Config'].update(User='0:0'),lambda x:x['HostConfig'].update(Memory=1024**3)):
+   config=self.observation();patcher(config)
+   with self.assertRaises(ValueError):host.validate_container(config,'owned','nonce','b'*64)
+
 class ReceiptOwnership(unittest.TestCase):
  def setUp(self):
   self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
