@@ -313,9 +313,13 @@ impl Fprintd {
     /// ([`VerifyOutcome::Error`]).
     pub fn verify(&self, user: &str, timeout: Duration) -> VerifyOutcome {
         // One claim at a time: contention fails closed at once, like
-        // the daemon's already-claimed denial. A poisoned lock still
-        // yields its guard: a past panic must not disable the reader.
-        let guard = match verify_lock().try_lock() {
+        // the daemon's already-claimed denial. The guard stays on the
+        // caller thread for the wait (a guard cannot cross threads);
+        // a worker that outlives the wait still holds the daemon
+        // claim, so a late starter is denied daemon-side instead.
+        // A poisoned lock still yields its guard: a past panic must
+        // not disable the reader.
+        let _guard = match verify_lock().try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return VerifyOutcome::Error,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -327,7 +331,6 @@ impl Fprintd {
         let spawned = std::thread::Builder::new()
             .name("tuna-fprintd".into())
             .spawn(move || {
-                let _guard = guard;
                 let _ = tx.send(worker.verify_inner(&user, deadline));
             });
         if spawned.is_err() {
