@@ -2010,6 +2010,9 @@ impl Runtime {
         );
         // Live libinput device configuration (#343): beside the macro,
         // which is already at its recursion limit.
+        // Keep this unlocked drag observation outside the large scene macro.
+        doc["client_dnd_active"] =
+            serde_json::Value::Bool(!self.is_locked() && self.state.client_dnd_active());
         doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
         let doc = doc.to_string();
         if doc == self.state_last {

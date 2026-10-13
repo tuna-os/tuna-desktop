@@ -799,6 +799,21 @@ impl State {
             .map_or(0, |keyboard| keyboard.pressed_keys().len())
     }
 
+    /// Observation-only typed grab state for the old-source cancellation comparison.
+    /// This does not change drag dispatch, cleanup or Escape routing.
+    pub(crate) fn client_dnd_active(&self) -> bool {
+        use smithay::wayland::selection::data_device::DnDGrab;
+        self.seat.get_pointer().is_some_and(|pointer| {
+            pointer
+                .with_grab(|_, grab| grab.is::<DnDGrab<Self>>())
+                .unwrap_or(false)
+        }) || self.seat.get_touch().is_some_and(|touch| {
+            touch
+                .with_grab(|_, grab| grab.is::<DnDGrab<Self>>())
+                .unwrap_or(false)
+        })
+    }
+
     /// Seat for capability attachment and input routing.
     pub(crate) fn seat_mut(&mut self) -> &mut Seat<State> {
         &mut self.seat
