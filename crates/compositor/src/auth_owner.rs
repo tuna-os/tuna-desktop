@@ -62,6 +62,14 @@ impl Slot {
     pub fn matches(&self, attempt: Attempt) -> bool {
         self.active == Some(attempt)
     }
+    /// Check a completed result before releasing its exact wrapper slot.
+    /// The caller must still use grant's CAS against a later epoch change.
+    pub fn completion_live(&self, attempt: Attempt, epoch: &AtomicU64, origin_live: bool) -> bool {
+        self.matches(attempt)
+            && attempt.origin.is_some()
+            && origin_live
+            && epoch.load(Ordering::Acquire) == attempt.epoch
+    }
     /// Linearize success against immediate suspend invalidation.
     pub fn grant(&mut self, epoch: &AtomicU64, expected: u64) -> bool {
         let Some(next) = expected.checked_add(1) else {
@@ -123,6 +131,47 @@ mod tests {
         assert!(slot.matches(fresh));
         assert!(slot.retire(fresh));
         assert!(!slot.retire(fresh));
+    }
+    #[test]
+    fn already_queued_retired_success_cannot_grant_after_origin_or_epoch_loss() {
+        // This pins the common Runtime predicate, not physical PAM retirement:
+        // the typed result is already joined/queued before invalidation.
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(crate::pam_backend::Verification::Retired {
+                authenticated: true,
+            })
+            .unwrap();
+        });
+        worker.join().unwrap();
+        let completed = receive.try_recv().unwrap();
+        assert!(completed.authenticated());
+        let epoch = AtomicU64::new(7);
+        let mut slot = Slot::default();
+        let origin = Origin {
+            connection: 1,
+            request: 1,
+        };
+        let old = slot.begin(Some(origin), 7).unwrap();
+        assert!(!slot.completion_live(old, &epoch, false));
+        assert!(slot.matches(old));
+        assert!(advance_epoch(&epoch));
+        assert!(!slot.completion_live(old, &epoch, true));
+        assert!(slot.retire(old));
+        let fresh = slot
+            .begin(
+                Some(Origin {
+                    connection: 2,
+                    request: 1,
+                }),
+                8,
+            )
+            .unwrap();
+        assert!(!slot.completion_live(old, &epoch, true));
+        assert!(slot.matches(fresh));
+        assert!(slot.completion_live(fresh, &epoch, true));
+        assert!(slot.retire(fresh));
+        assert!(slot.grant(&epoch, fresh.epoch));
     }
     #[test]
     fn overflow_is_permanently_fail_closed() {

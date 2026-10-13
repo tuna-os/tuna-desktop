@@ -1584,10 +1584,13 @@ impl Runtime {
             }
             return;
         }
+        let completion_live =
+            self.unlock_slot
+                .completion_live(attempt, &self.unlock_generation, live);
         if !self.unlock_slot.retire(attempt) {
             return;
         }
-        let applied = ok && live && self.apply_verified_unlock(attempt.epoch);
+        let applied = ok && completion_live && self.apply_verified_unlock(attempt.epoch);
         if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             eprintln!(
                 "tuna-compositor: lock authentication retired {}",
