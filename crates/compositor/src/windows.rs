@@ -3774,6 +3774,25 @@ impl WindowManager {
         }
     }
 
+    fn strip_column_layout_offset(&self, id: u64) -> i32 {
+        if let Some(PointerGrab::StripMove { owner, .. }) = self.grab {
+            if self
+                .model
+                .window(id)
+                .is_some_and(|entry| entry.workspace == owner.workspace)
+            {
+                // Preserve the admission world's floor/round bias, but use the
+                // SAME rounded viewport delta as presentation throughout this
+                // move, including a real map/reconcile at a fractional offset.
+                let admission_bias =
+                    (owner.offset as i32).saturating_sub(owner.offset.round() as i32);
+                return (self.strip_offset.round() as i32).saturating_add(admission_bias);
+            }
+        }
+        // Existing floating, resize and non-grab strip layout stays unchanged.
+        self.strip_offset as i32
+    }
+
     /// One strip column rectangle for `id`: the work area's height less
     /// a gap above and below, preset-proportion width with gaps between
     /// columns and at the strip's ends (niri gaps-twice formula).
@@ -3781,7 +3800,7 @@ impl WindowManager {
     fn strip_column_area(&self, state: &State, id: u64) -> Rectangle<i32, Logical> {
         let work = Self::work_area(state);
         let columns = self.strip_columns(state, id);
-        let mut x = work.loc.x + Self::STRIP_GAP - self.strip_offset as i32;
+        let mut x = work.loc.x + Self::STRIP_GAP - self.strip_column_layout_offset(id);
         let mut width = self.strip_width_for(id, work.size.w);
         for (other, w) in &columns {
             if *other == id {
@@ -3997,7 +4016,7 @@ impl WindowManager {
         };
         let old = self.strip_offset;
         let next = (old + pressure * 50.0 * moving_dt).clamp(0.0, self.strip_edge_max(owner.work));
-        let shift = (next as i32).saturating_sub(old as i32);
+        let shift = (next.round() as i32).saturating_sub(old.round() as i32);
         self.strip_offset = next;
         // View translation does not configure a new client size. Restrict it
         // to real active-workspace strip actors and preserve their restores.
@@ -4011,7 +4030,10 @@ impl WindowManager {
                 window.geometry.loc.x = window.geometry.loc.x.saturating_sub(shift);
             }
         }
-        self.snap_strip_columns();
+        // Direct viewport movement cancels only the view spring. Independent
+        // column/family springs keep their current position and velocity;
+        // clearing them would jump a newly mapped family's neighbors to target.
+        self.snap_strip_view();
         self.strip_pointer_edge_pressure() != 0.0
     }
 
