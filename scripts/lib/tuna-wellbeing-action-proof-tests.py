@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.dont_write_bytecode = True
 
@@ -147,10 +148,19 @@ def bytes_sha(nodes):
 
 
 def owned_nodes(pid, banner_showing=False, anchor=True):
+    """Actual producer shapes: full typed records, app root + buttons."""
     nodes = [{'role': 'application', 'name': 'tuna-shell-gtk',
-              'showing': anchor, 'process_id': pid},
-             {'role': 'button', 'name': DUE, 'showing': banner_showing},
-             {'role': 'button', 'name': 'Take', 'showing': False}]
+              'description': '', 'depth': 0, 'showing': True,
+              'checked': False, 'selected': False, 'focused': False,
+              'bounds': None, 'process_id': pid},
+             {'role': 'button', 'name': DUE, 'description': '',
+              'depth': 1, 'showing': banner_showing,
+              'checked': False, 'selected': False, 'focused': False,
+              'bounds': [10, 10, 220, 48]},
+             {'role': 'button', 'name': 'Take', 'description': '',
+              'depth': 1, 'showing': anchor,
+              'checked': False, 'selected': False, 'focused': False,
+              'bounds': [10, 70, 220, 48]}]
     return nodes
 
 
@@ -647,7 +657,10 @@ class StampedObservationBinding(unittest.TestCase):
             retired = tmp / 'retired.json'
             retired.write_text(json.dumps(owned_nodes(pid)))
             swapped = owned_nodes(pid) + [
-                {'role': 'button', 'name': 'Extra', 'showing': False}]
+                {'role': 'button', 'name': 'Extra', 'description': '',
+                 'depth': 1, 'showing': False, 'checked': False,
+                 'selected': False, 'focused': False,
+                 'bounds': [10, 130, 220, 48]}]
             stamp = write_stamp(tmp / 'retired.json.stamp', pid, start,
                                 dump_sha256=bytes_sha(swapped))
             with self.assertRaisesRegex(mod.HarnessError, 'actual current'):
@@ -667,13 +680,55 @@ class StampedObservationBinding(unittest.TestCase):
                                 pid, start)
             retired.write_text(json.dumps(
                 owned_nodes(pid) + [
-                    {'role': 'button', 'name': 'Extra', 'showing': False}]))
+                    {'role': 'button', 'name': 'Extra', 'description': '',
+                     'depth': 1, 'showing': False, 'checked': False,
+                     'selected': False, 'focused': False,
+                     'bounds': [10, 130, 220, 48]}]))
             with self.assertRaisesRegex(mod.HarnessError, 'actual current'):
                 mod.check_retired_absent(
                     retired, DUE, gate_start, expected_pid=pid,
                     expected_start_ticks=start, stamp_path=stamp,
                     expected_gate=GATE, expected_nonce=NONCE,
                     expected_seq=1)
+
+    def test_dump_read_once_parse_and_hash_same_buffer(self):
+        # The dump file is read exactly ONCE: parse and hash see the
+        # same bytes, so a file replaced between two reads cannot pair
+        # a valid parsed tree with a stamped hash of different bytes.
+        # Any second read of the dump serves hostile replacement bytes.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start, gate_start = self.setup(tmp)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start)
+            dump_reads = []
+            real_read_text = Path.read_text
+            real_read_bytes = Path.read_bytes
+
+            def counting_text(path, *args, **kwargs):
+                if path == retired:
+                    dump_reads.append('text')
+                    if len(dump_reads) > 1:
+                        return '["replaced-between-reads"]'
+                return real_read_text(path, *args, **kwargs)
+
+            def counting_bytes(path, *args, **kwargs):
+                if path == retired:
+                    dump_reads.append('bytes')
+                    if len(dump_reads) > 1:
+                        return b'["replaced-between-reads"]'
+                return real_read_bytes(path, *args, **kwargs)
+
+            with mock.patch.object(Path, 'read_text', new=counting_text), \
+                    mock.patch.object(Path, 'read_bytes', new=counting_bytes):
+                self.assertTrue(mod.check_retired_absent(
+                    retired, DUE, gate_start, expected_pid=pid,
+                    expected_start_ticks=start, stamp_path=stamp,
+                    expected_gate=GATE, expected_nonce=NONCE,
+                    expected_seq=1))
+            self.assertEqual(dump_reads, ['bytes'])
 
     def test_missing_seq_or_sha_key_errors(self):
         with tempfile.TemporaryDirectory() as td:
@@ -694,6 +749,84 @@ class StampedObservationBinding(unittest.TestCase):
                         expected_start_ticks=start, stamp_path=short,
                         expected_gate=GATE, expected_nonce=NONCE,
                         expected_seq=1)
+
+
+class StrictProducerTree(unittest.TestCase):
+    """Absence needs a strictly typed tree, a non-app anchor, stable life."""
+
+    def check_nodes(self, tmp, nodes, patch_start=None):
+        pid, start = owner_identity()
+        gate_start = time.time() - 1
+        retired = tmp / 'retired.json'
+        retired.write_text(json.dumps(nodes))
+        stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                            pid, start)
+
+        def call():
+            return mod.check_retired_absent(
+                retired, DUE, gate_start, expected_pid=pid,
+                expected_start_ticks=start, stamp_path=stamp,
+                expected_gate=GATE, expected_nonce=NONCE, expected_seq=1)
+
+        if patch_start is None:
+            return call()
+        with mock.patch.object(mod, 'proc_start_ticks',
+                               side_effect=patch_start):
+            return call()
+
+    def test_showing_string_never_anchors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            for bad in ('true', 'false', 1, 0):
+                nodes = owned_nodes(pid, anchor=False)
+                nodes[0]['showing'] = False
+                nodes[2]['showing'] = bad
+                with self.assertRaises(mod.HarnessError,
+                                       msg=f'showing={bad!r}'):
+                    self.check_nodes(tmp, nodes)
+
+    def test_mistyped_nodes_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            cases = [
+                ('missing bounds', lambda n: n[2].pop('bounds')),
+                ('short bounds', lambda n: n[2].update(bounds=[1, 2])),
+                ('bool bounds',
+                 lambda n: n[2].update(bounds=[1, 2, 3, True])),
+                ('string bounds', lambda n: n[2].update(bounds='x')),
+                ('string depth', lambda n: n[2].update(depth='1')),
+                ('bool depth', lambda n: n[2].update(depth=True)),
+                ('int checked', lambda n: n[2].update(checked=1)),
+                ('null name', lambda n: n[2].update(name=None)),
+                ('missing description', lambda n: n[1].pop('description')),
+                ('int role', lambda n: n[1].update(role=5)),
+                ('string focused', lambda n: n[1].update(focused='yes')),
+                ('int selected', lambda n: n[1].update(selected=0)),
+                ('non-dict node', lambda n: n.__setitem__(2, ['bogus'])),
+            ]
+            for label, apply in cases:
+                nodes = owned_nodes(pid)
+                apply(nodes)
+                with self.assertRaises(mod.HarnessError, msg=label):
+                    self.check_nodes(tmp, nodes)
+
+    def test_root_only_tree_cannot_establish_absence(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            with self.assertRaisesRegex(mod.HarnessError, 'root-only'):
+                self.check_nodes(tmp, owned_nodes(pid)[:1])
+
+    def test_process_replacement_during_validation_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start = owner_identity()
+            with self.assertRaisesRegex(mod.HarnessError,
+                                        'during validation'):
+                self.check_nodes(tmp, owned_nodes(pid),
+                                 patch_start=[start, start + 999999])
 
 
 if __name__ == '__main__':

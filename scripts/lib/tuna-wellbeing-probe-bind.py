@@ -30,9 +30,12 @@ fresh-only. The shell parks the pointer away (explicit leave),
 records the client-log byte offset, moves onto the bound center, and
 fresh_enter requires a NEW complete {"enter":...} line strictly after
 that offset; pre-seeded old enters never qualify and whole-log
-matching is gone.
+matching is gone. pointer_zone classifies the live pointer against
+a rect, rejecting malformed shapes and mistyped or non-finite
+coordinates (jq null-ordering would accept [] as outside).
 """
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -147,6 +150,43 @@ def fresh_enter(log_path, offset):
         f'no fresh pointer enter strictly after byte offset {offset} in {log_path}')
 
 
+def pointer_zone(cstate_path, rect):
+    """'inside' or 'outside' for a well-formed finite pointer, else fail.
+
+    The pointer must be a present, non-null [x, y] pair of finite
+    numbers; missing, null, misshapen, mistyped (bools, strings),
+    or non-finite (NaN/Inf) positions are harness failures, never a
+    zone. rect is [x, y, w, h] ints.
+    """
+    if (not isinstance(rect, list) or len(rect) != 4
+            or not all(type(v) is int for v in rect)):
+        raise RuntimeError(f'zone rect must be 4 ints, got {rect!r:.80}')
+    try:
+        doc = json.loads(Path(cstate_path).read_bytes().decode('utf-8'))
+    except FileNotFoundError:
+        raise RuntimeError(f'compositor state missing: {cstate_path}')
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f'compositor state unreadable {cstate_path}: {exc}')
+    if not isinstance(doc, dict):
+        raise RuntimeError(
+            f'compositor state {cstate_path} is not an object')
+    if 'pointer_position' not in doc or doc['pointer_position'] is None:
+        raise RuntimeError(f'{cstate_path}: pointer_position missing or null')
+    pos = doc['pointer_position']
+    if (not isinstance(pos, list) or len(pos) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                   or not math.isfinite(v) for v in pos)):
+        raise RuntimeError(
+            f'{cstate_path}: pointer_position must be a finite [x, y] '
+            f'pair, got {pos!r:.80}')
+    x, y, w, h = rect
+    px, py = pos
+    if px < x or px >= x + w or py < y or py >= y + h:
+        return 'outside'
+    return 'inside'
+
+
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
@@ -164,6 +204,9 @@ def main(argv=None):
     p = sub.add_parser('fresh-enter')
     p.add_argument('--log', type=Path, required=True)
     p.add_argument('--offset', type=int, required=True)
+    p = sub.add_parser('pointer-zone')
+    p.add_argument('--cstate', type=Path, required=True)
+    p.add_argument('--rect', required=True)
     args = parser.parse_args(argv)
     if args.command == 'bind':
         before = json.loads(args.before.read_text())
@@ -182,6 +225,13 @@ def main(argv=None):
     elif args.command == 'fresh-enter':
         entered = fresh_enter(args.log, args.offset)
         print(json.dumps(entered))
+    elif args.command == 'pointer-zone':
+        try:
+            rect = [int(v) for v in args.rect.split(',')]
+        except ValueError:
+            raise RuntimeError(
+                f'zone rect must be 4 ints, got {args.rect!r:.80}')
+        print(pointer_zone(args.cstate, rect))
 
 
 if __name__ == '__main__':

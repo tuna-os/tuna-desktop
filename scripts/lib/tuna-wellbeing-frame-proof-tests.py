@@ -981,13 +981,14 @@ class StateOnlyLocked(unittest.TestCase):
     REGIONS = [{'name': 'probe', 'kind': 'texture', 'rect': [8, 8, 16, 16]}]
 
     def locked_doc(self, locked=True, pointer=None, cursor=None,
-                   fullscreen=None, wallpaper=None, brightness=1.0,
-                   wb=True, manual=False, ms=None):
+                   fullscreen=None, wallpaper=None, motion_count=None,
+                   brightness=1.0, wb=True, manual=False, ms=None):
         doc = {'animation_clock_manual': manual, 'animation_clock_ms': ms,
                'motion_policy': 'full', 'locked': locked,
                'pointer_position': pointer, 'cursor': cursor,
                'pointer_fullscreen_blocked': fullscreen,
                'wallpaper_diagnostics': wallpaper,
+               'native_relative_motion_count': motion_count,
                'wellbeing_effects': {'desaturation': 0.0,
                                      'brightness': brightness,
                                      'animating': False}}
@@ -1101,12 +1102,34 @@ class StateOnlyLocked(unittest.TestCase):
             tmp = Path(td)
             for key in ('pointer_position', 'cursor',
                         'pointer_fullscreen_blocked',
-                        'wallpaper_diagnostics'):
+                        'wallpaper_diagnostics',
+                        'native_relative_motion_count'):
                 doc = self.locked_doc()
                 del doc[key]
                 binaries, caps = self.build(tmp, after_doc=doc)
                 with self.assertRaises(mod.HarnessError, msg=key):
                     self.record(tmp, binaries, caps)
+
+    def test_leaked_motion_count_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(
+                tmp, after_doc=self.locked_doc(motion_count=3))
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_missing_clock_key_is_harness_error(self):
+        # A missing ms must not become None and pass under real time.
+        for manual, ms in ((False, None), (True, 5)):
+            doc = self.locked_doc(manual=manual, ms=ms)
+            del doc['animation_clock_ms']
+            with self.assertRaises(mod.HarnessError,
+                                   msg=f'manual={manual}'):
+                mod.require_locked_state(doc, 'locked')
+        doc = self.locked_doc()
+        del doc['animation_clock_manual']
+        with self.assertRaises(mod.HarnessError):
+            mod.require_locked_state(doc, 'locked')
 
     def test_untyped_clock_manual_is_harness_error(self):
         for bad in (1, 0, 'false', None):

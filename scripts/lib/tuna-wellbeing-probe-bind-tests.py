@@ -277,5 +277,107 @@ class HandshakeBeforeAfter(unittest.TestCase):
             mod.check(self.live(), expected, identity(start=77777))
 
 
+class PointerZone(unittest.TestCase):
+    """Outside/inside verdicts need a well-formed finite [x, y] pair."""
+
+    RECT = [100, 100, 320, 200]
+
+    def state(self, tmp, body):
+        path = tmp / 'cstate.json'
+        path.write_text(body)
+        return path
+
+    def test_inside_outside_and_edges(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cases = [([20, 580], 'outside'), ([99, 150], 'outside'),
+                     ([100, 100], 'inside'), ([150.5, 150], 'inside'),
+                     ([419, 299], 'inside'), ([420, 150], 'outside'),
+                     ([150, 300], 'outside'), ([150, 99], 'outside')]
+            for pos, zone in cases:
+                path = self.state(tmp, json.dumps({'pointer_position': pos}))
+                self.assertEqual(mod.pointer_zone(path, list(self.RECT)),
+                                 zone, msg=f'pos={pos!r}')
+
+    def test_malformed_shape_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for bad in ([], [1], [1, 2, 3], 'x', 5, {'x': 1}):
+                path = self.state(
+                    tmp, json.dumps({'pointer_position': bad}))
+                with self.assertRaises(RuntimeError, msg=f'pos={bad!r}'):
+                    mod.pointer_zone(path, list(self.RECT))
+
+    def test_missing_or_null_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            path = self.state(tmp, json.dumps({'pointer_position': None}))
+            with self.assertRaises(RuntimeError):
+                mod.pointer_zone(path, list(self.RECT))
+            path = self.state(tmp, json.dumps({'locked': False}))
+            with self.assertRaises(RuntimeError):
+                mod.pointer_zone(path, list(self.RECT))
+
+    def test_mistyped_coordinates_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for bad in (['a', 2], [True, 1], [1, False], [None, 2],
+                        [[1], 2], ['100', '100']):
+                path = self.state(
+                    tmp, json.dumps({'pointer_position': bad}))
+                with self.assertRaises(RuntimeError, msg=f'pos={bad!r}'):
+                    mod.pointer_zone(path, list(self.RECT))
+
+    def test_nonfinite_coordinates_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for body in ('{"pointer_position": [1e999, 100]}',
+                         '{"pointer_position": [100, NaN]}',
+                         '{"pointer_position": [Infinity, 100]}'):
+                path = self.state(tmp, body)
+                with self.assertRaises(RuntimeError, msg=body):
+                    mod.pointer_zone(path, list(self.RECT))
+
+    def test_unreadable_state_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            with self.assertRaises(RuntimeError):
+                mod.pointer_zone(tmp / 'gone.json', list(self.RECT))
+            path = self.state(tmp, '{oops')
+            with self.assertRaises(RuntimeError):
+                mod.pointer_zone(path, list(self.RECT))
+            path = self.state(tmp, '[]')
+            with self.assertRaises(RuntimeError):
+                mod.pointer_zone(path, list(self.RECT))
+
+    def test_bad_rect_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            path = self.state(tmp, json.dumps({'pointer_position': [20, 580]}))
+            for bad in ([1, 2, 3], [1.5, 2, 3, 4], [True, 2, 3, 4],
+                        'x', None):
+                with self.assertRaises(RuntimeError, msg=f'rect={bad!r}'):
+                    mod.pointer_zone(path, bad)
+
+    def test_pointer_zone_cli_reports_zone(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            path = self.state(tmp, json.dumps({'pointer_position': [20, 580]}))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                mod.main(['pointer-zone', '--cstate', str(path),
+                          '--rect', '100,100,320,200'])
+            self.assertEqual(buf.getvalue().strip(), 'outside')
+            path = self.state(tmp, json.dumps({'pointer_position': [150, 150]}))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                mod.main(['pointer-zone', '--cstate', str(path),
+                          '--rect', '100,100,320,200'])
+            self.assertEqual(buf.getvalue().strip(), 'inside')
+            with self.assertRaises(RuntimeError):
+                mod.main(['pointer-zone', '--cstate', str(path),
+                          '--rect', '100,100,320'])
+
+
 if __name__ == '__main__':
     unittest.main()

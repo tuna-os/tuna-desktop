@@ -22,10 +22,14 @@ presence-first (an actual bool locked plus a complete typed finite
 effect state in BOTH docs before any equality; {} vs {} errors), and
 the retired dump must carry the stamped root process_id of the live
 expected owner (PID/start identity), a gate/attempt-tied observation
-stamp (mtime alone never qualifies), and a live showing anchor. The
-stamp binds the exact observation (expected gate/nonce/seq) and the
-exact dump bytes (dump_sha256 over the actual current file); a
-replayed, swapped, or tampered dump never qualifies.
+stamp (mtime alone never qualifies), and a showing allocated
+non-application anchor over a strictly typed producer tree (a partial
+root-only tree never qualifies; PID/start is required again after
+validation). The stamp binds the exact observation
+(expected gate/nonce/seq) and the
+exact dump bytes (dump_sha256 over the single owned buffer the tree
+was parsed from); a replayed, swapped, or tampered dump never
+qualifies, and one read means no between-reads replacement can mix.
 
 Break ticks run every 2s (BREAK_POLL) and the press helper sleeps
 1.5s after pressing, so timing assertions allow a bounded tick
@@ -58,6 +62,69 @@ def load_nodes(path):
         raise HarnessError(f'a11y dump unreadable {path}: {exc}')
     if not isinstance(nodes, list):
         raise HarnessError(f'a11y dump {path} is not a node list')
+    return nodes
+
+
+def load_owned_dump(dump_path):
+    """Read ONE owned byte buffer; parse AND hash that SAME buffer.
+
+    The tree verdict and the stamp binding must see identical bytes:
+    a second read would let a file replaced between reads pair a
+    valid parsed tree with a stamped hash of different bytes.
+    """
+    try:
+        dump_bytes = Path(dump_path).read_bytes()
+    except FileNotFoundError:
+        raise HarnessError(
+            f'a11y dump missing {dump_path}: bus dead or dump never ran')
+    except OSError as exc:
+        raise HarnessError(f'a11y dump unreadable {dump_path}: {exc}')
+    try:
+        nodes = json.loads(dump_bytes.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HarnessError(f'a11y dump unreadable {dump_path}: {exc}')
+    if not isinstance(nodes, list):
+        raise HarnessError(f'a11y dump {dump_path} is not a node list')
+    return nodes, dump_bytes
+
+
+def require_producer_tree(nodes, dump_path):
+    """Every node must match the actual producer's typed record shape.
+
+    tuna-a11y-dump.py emits role/name/description/depth/showing/
+    checked/selected/focused/bounds per node (bounds is null only when
+    the component query fails); error-role nodes are transport
+    failures, never tree content. A mistyped or misshapen node is an
+    untrustworthy tree, never an anchor and never a verdict.
+    """
+    for index, node in enumerate(nodes):
+        where = f'{dump_path}: node {index}'
+        if not isinstance(node, dict):
+            raise HarnessError(f'{where} is not an object: {node!r:.60}')
+        for key in ('role', 'name', 'description'):
+            if not isinstance(node.get(key), str):
+                raise HarnessError(
+                    f'{where}: {key} must be a string, '
+                    f'got {node.get(key)!r:.60}')
+        if type(node.get('depth')) is not int:
+            raise HarnessError(
+                f'{where}: depth must be an int, '
+                f'got {node.get("depth")!r:.60}')
+        for key in ('showing', 'checked', 'selected', 'focused'):
+            if type(node.get(key)) is not bool:
+                raise HarnessError(
+                    f'{where}: {key} must be an actual bool, '
+                    f'got {node.get(key)!r:.60}')
+        if 'bounds' not in node:
+            raise HarnessError(
+                f'{where}: bounds must be present (null or 4 ints)')
+        bounds = node['bounds']
+        if bounds is not None and (
+                not isinstance(bounds, list) or len(bounds) != 4
+                or not all(type(v) is int for v in bounds)):
+            raise HarnessError(
+                f'{where}: bounds must be null or 4 ints, '
+                f'got {bounds!r:.60}')
     return nodes
 
 
@@ -116,10 +183,16 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
     owner, that PID must be alive with the expected start time (no
     dead PID, no PID reuse), a gate/attempt-tied observation stamp
     must bind this exact dump to this gate (mtime alone never
-    qualifies), and a live showing anchor must prove the tree is the
-    true owner's, not an empty or replayed husk. The stamp's
+    qualifies), and a showing allocated non-application anchor must
+    prove the tree is the true owner's, not an empty, partial, or
+    replayed husk. Every node must match the actual producer's typed
+    record shape (truthy non-bool showing never anchors); the stamp's
     gate/nonce/seq must equal the expected observation, and its
-    dump_sha256 must equal the hash of the actual current dump bytes.
+    dump_sha256 must equal the hash of the single owned byte buffer
+    the tree was parsed from (one read; a file replaced between two
+    reads cannot mix a valid tree with a stamped hash). PID/start is
+    required again after validation, so a shell replaced mid-check
+    cannot qualify.
     """
     if type(expected_pid) is not int or expected_pid <= 0:
         raise HarnessError(f'expected owner pid must be a positive int, got {expected_pid!r}')
@@ -131,15 +204,17 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
     if type(expected_seq) is not int or expected_seq <= 0:
         raise HarnessError(
             f'expected observation seq must be a positive int, got {expected_seq!r}')
-    nodes = load_nodes(dump_path)
+    nodes, dump_bytes = load_owned_dump(dump_path)
     if not nodes:
         raise HarnessError(f'a11y tree dead in {dump_path}: no nodes')
-    errors = [n for n in nodes if n.get('role') == 'error']
+    errors = [n for n in nodes
+              if isinstance(n, dict) and n.get('role') == 'error']
     if errors:
         raise HarnessError(
             f'a11y tree untrustworthy in {dump_path}: '
             f'{len(errors)} transport-error nodes')
-    root_pid = nodes[0].get('process_id') if isinstance(nodes[0], dict) else None
+    require_producer_tree(nodes, dump_path)
+    root_pid = nodes[0].get('process_id')
     if type(root_pid) is not int or root_pid != expected_pid:
         raise HarnessError(
             f'a11y tree in {dump_path} is not stamped to the owned shell '
@@ -162,10 +237,6 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
         raise HarnessError(
             f'{stamp_path}: observation stamp is not for observation '
             f'{expected_seq} (got {stamp["seq"]!r})')
-    try:
-        dump_bytes = Path(dump_path).read_bytes()
-    except OSError as exc:
-        raise HarnessError(f'{dump_path}: retired dump unreadable for binding: {exc}')
     if not isinstance(stamp['dump_sha256'], str) \
             or stamp['dump_sha256'] != hashlib.sha256(dump_bytes).hexdigest():
         raise HarnessError(
@@ -183,13 +254,22 @@ def check_retired_absent(dump_path, title, gate_start_epoch=0.0, *,
             or not math.isfinite(epoch) or epoch < gate_start_epoch:
         raise HarnessError(
             f'{stamp_path}: observation stamp is stale or predates the gate start')
-    if not any(n.get('showing') for n in nodes if isinstance(n, dict)):
+    anchors = [n for n in nodes
+               if n['showing'] is True and n['role'] != 'application'
+               and isinstance(n['bounds'], list)]
+    if not anchors:
         raise HarnessError(
-            f'a11y tree in {dump_path} has no live showing anchor: '
-            f'not the true owner tree')
+            f'a11y tree in {dump_path} has no showing allocated '
+            f'non-application anchor: a partial root-only tree cannot '
+            f'establish retired UI absence')
     mtime = Path(dump_path).stat().st_mtime
     assert mtime + 1 >= gate_start_epoch, \
         f'stale a11y dump {dump_path} (mtime {mtime} < gate {gate_start_epoch})'
+    live_start_again = proc_start_ticks(expected_pid, str(dump_path))
+    if live_start_again != expected_start_ticks:
+        raise HarnessError(
+            f'owned shell PID {expected_pid} was replaced during validation '
+            f'(start {expected_start_ticks} -> {live_start_again})')
     assert not showing(nodes, title), \
         f'retired banner {title!r} still showing in {dump_path}'
     return True

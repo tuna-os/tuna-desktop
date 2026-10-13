@@ -42,7 +42,7 @@ separate state-only + process evidence path (no pixels, no pixel
 bracket, no pixel label; state-only labels in gate output and
 receipt); unlocked gates keep full bracketing. Locked observation
 is strict at capture time (locked-state: full typed locked presence
-on BOTH sides plus the full four-key redaction set plus the process
+on BOTH sides plus the full five-key redaction set plus the process
 sandwich), not just at provenance close. The lock CSTATE schema
 receipt is PENDING (see LOCK_SCHEMA_RECEIPT_PENDING).
 
@@ -694,11 +694,11 @@ def require_locked_state(doc, label):
     Implemented against the source-validated redaction shape (the
     snapshot emitter always writes animation_clock_manual/ms,
     wellbeing_effects, cursor, pointer_position,
-    pointer_fullscreen_blocked and wallpaper_diagnostics; the last
-    four are null while locked, and the clock ms is null unless the
-    clock is manual). No exact current-schema locked receipt has been
-    observed yet (LOCK_SCHEMA_RECEIPT_PENDING): nested-CI observation
-    pending.
+    pointer_fullscreen_blocked, wallpaper_diagnostics and
+    native_relative_motion_count; the last five are null while locked,
+    and the clock ms is null unless the clock is manual). No exact
+    current-schema locked receipt has been observed yet
+    (LOCK_SCHEMA_RECEIPT_PENDING): nested-CI observation pending.
     """
     if not isinstance(doc, dict):
         raise HarnessError(f'{label}: cstate is not an object')
@@ -706,6 +706,10 @@ def require_locked_state(doc, label):
     if type(locked) is not bool:
         raise HarnessError(f'{label}: locked must be an actual bool, got {locked!r}')
     assert locked is True, (label, 'state-only locked capture is not locked')
+    for key in ('animation_clock_manual', 'animation_clock_ms'):
+        if key not in doc:
+            raise HarnessError(
+                f'{label}: locked snapshot must carry {key}')
     manual = doc.get('animation_clock_manual')
     if type(manual) is not bool:
         raise HarnessError(
@@ -735,7 +739,7 @@ def require_locked_state(doc, label):
             f'{label}: wellbeing_effects.animating must be a bool, '
             f'got {wb.get("animating")!r}')
     for key in ('pointer_position', 'cursor', 'pointer_fullscreen_blocked',
-                'wallpaper_diagnostics'):
+                'wallpaper_diagnostics', 'native_relative_motion_count'):
         if key not in doc:
             raise HarnessError(
                 f'{label}: locked snapshot must carry {key} (null while locked)')
