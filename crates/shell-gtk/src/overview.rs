@@ -658,9 +658,19 @@ impl OverviewUi {
         {
             let ui = ui.clone();
             show_apps.connect_toggled(move |t| {
-                let me = ui.borrow();
-                me.grid.set_visible(t.is_active());
-                me.actions.set_app_grid(t.is_active());
+                let active = t.is_active();
+                {
+                    let me = ui.borrow();
+                    me.grid.set_visible(active);
+                    me.actions.set_app_grid(active);
+                }
+                // GSettings is also edited by tools outside this process.
+                // Reload the folder/app arrangement whenever the grid is
+                // opened so a settings change made after shell startup is
+                // visible on the next Show Apps action.
+                if active {
+                    Self::rebuild_grid(&ui);
+                }
             });
         }
         me.dash_row.append(&show_apps);
