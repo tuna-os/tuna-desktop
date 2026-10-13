@@ -716,6 +716,143 @@ class TourRecorderTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 recorder.close()
 
+    def assert_continuous_transport_is_bounded(self, partial, background=False):
+        import socket
+        import threading
+        import time
+        left, right = socket.socketpair()
+        stop, entered = threading.Event(), threading.Event()
+        timers = []
+        timer_class = threading.Timer
+        def timer(*args, **kwargs):
+            instance = timer_class(*args, **kwargs)
+            timers.append(instance)
+            return instance
+        def server():
+            right.settimeout(1)
+            try:
+                right.recv(4096)  # Genuine baseline.Qmp command was sent.
+                entered.set()
+                payload = b' ' if partial else b'{"event":"TEST"}\n'
+                if partial:
+                    right.sendall(b'{')
+                while not stop.wait(0.002):
+                    right.sendall(payload)
+            except OSError:
+                pass
+        worker = threading.Thread(target=server)
+        worker.start()
+        qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
+        qmp.sock = left
+        qmp.file = left.makefile("rw")
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", timer):
+                recorder = lane.Recorder(qmp, directory, timeout=0.08)
+                started = time.monotonic()
+                if background:
+                    recorder.thread.start()
+                    self.assertTrue(entered.wait(1))
+                    with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                        recorder.close()
+                    self.assertFalse(recorder.thread.is_alive())
+                else:
+                    with self.assertRaises(TimeoutError):
+                        recorder.still("overview")
+                    with self.assertRaisesRegex(RuntimeError, "previously failed"):
+                        recorder.qmp.cmd("send-key")
+                    with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                        recorder.close()
+                self.assertLess(time.monotonic() - started, 1)
+                self.assertEqual(recorder.n, 0)
+                self.assertEqual(recorder.stills, {})
+                self.assertEqual(list(Path(recorder.dir).iterdir()), [])
+                self.assertTrue(timers)
+                self.assertTrue(all(not t.is_alive() for t in timers))
+                self.assertEqual(left.recv(1), b'')  # Timeout permanently retires this transport.
+        finally:
+            stop.set()
+            right.close()
+            worker.join(1)
+            qmp.file.close()
+            left.close()
+        self.assertFalse(worker.is_alive())
+
+    def test_continuous_qmp_events_have_absolute_deadline(self):
+        self.assert_continuous_transport_is_bounded(partial=False)
+
+    def test_partial_qmp_line_dribble_has_absolute_deadline(self):
+        self.assert_continuous_transport_is_bounded(partial=True)
+
+    def test_background_event_flood_recorder_stops_without_timer_leak(self):
+        self.assert_continuous_transport_is_bounded(partial=False, background=True)
+
+    def test_success_cancels_watchdog_before_next_command(self):
+        import socket
+        import threading
+        import time
+        left, right = socket.socketpair()
+        right.settimeout(1)
+        timers, errors = [], []
+        timer_class = threading.Timer
+        def timer(*args, **kwargs):
+            instance = timer_class(*args, **kwargs)
+            timers.append(instance)
+            return instance
+        def server():
+            try:
+                with right.makefile("rw") as stream:
+                    for _ in range(2):
+                        request = json.loads(stream.readline())
+                        if request["execute"] == "screendump":
+                            Path(request["arguments"]["filename"]).write_bytes(b"complete")
+                        stream.write('{"return":{}}\n')
+                        stream.flush()
+            except BaseException as error:
+                errors.append(error)
+        worker = threading.Thread(target=server)
+        worker.start()
+        qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
+        qmp.sock, qmp.file = left, left.makefile("rw")
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", timer):
+                recorder = lane.Recorder(qmp, directory, timeout=0.08)
+                recorder.still("intro")
+                time.sleep(0.1)  # Beyond the canceled first watchdog's deadline.
+                self.assertEqual(qmp.cmd("send-key"), {})
+                recorder.close()
+                self.assertEqual(len(timers), 2)
+                self.assertTrue(all(not t.is_alive() for t in timers))
+        finally:
+            right.close()
+            worker.join(1)
+            qmp.file.close()
+            left.close()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_mark_lock_wait_is_bounded(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, lambda *args, **kwargs: None, timeout=0.02)
+            def hold():
+                with recorder.lock:
+                    held.set()
+                    release.wait(1)
+            worker = threading.Thread(target=hold)
+            worker.start()
+            try:
+                self.assertTrue(held.wait(1))
+                with self.assertRaises(TimeoutError):
+                    recorder.mark("overview")
+                self.assertEqual(recorder.marks, [])
+            finally:
+                release.set()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                recorder.close()
+
     def test_existing_pending_capture_is_never_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             recorder = self.recorder(directory, lambda *args, **kwargs: self.fail("must not overwrite"))
