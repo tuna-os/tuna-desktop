@@ -258,42 +258,6 @@ pub fn unlock_session(
     }
 }
 
-/// Apply one fingerprint attempt to the compositor-owned lock state:
-/// verify `user` through `verifier`, and on a daemon-reported match
-/// clear the idle flag plus the hub mirror (the next poll restores
-/// the intact session) and drop the lock surface. Returns whether
-/// the session is unlocked afterwards.
-///
-/// An already-unlocked session returns true without contacting the
-/// reader — nothing is protected, so no finger press is needed.
-/// Non-matches touch nothing: the flag, the hub mirror, and the
-/// surface stay exactly as they were, silently.
-pub fn unlock_session_fprint(
-    lock: &mut SessionLock,
-    hub: &ControlHub,
-    overlay: &mut Overlay,
-    now_ms: u64,
-    user: &str,
-    verifier: &mut impl FprintVerifier,
-) -> bool {
-    if !lock.is_locked() && !hub.is_locked() {
-        return true;
-    }
-    if matches!(
-        attempt_fprint_unlock(verifier, user),
-        UnlockOutcome::Unlocked
-    ) {
-        // Restart the idle accumulator at now so the session does not
-        // relock on the next tick; the hub poll carries the restore.
-        lock.unlock(now_ms);
-        hub.set_locked(false);
-        overlay.hide();
-        true
-    } else {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,16 +390,20 @@ mod tests {
         assert_eq!(stub.answers, vec![None]);
     }
 
-    /// Scripted fingerprint stub: canned outcome, recording the user.
+    /// Scripted fingerprint stub: canned outcomes, recording the user.
     struct FprintStub {
-        outcome: crate::fprintd::VerifyOutcome,
+        outcomes: VecDeque<crate::fprintd::VerifyOutcome>,
         users: Vec<String>,
     }
 
     impl FprintStub {
         fn new(outcome: crate::fprintd::VerifyOutcome) -> Self {
+            Self::sequenced(vec![outcome])
+        }
+
+        fn sequenced(outcomes: Vec<crate::fprintd::VerifyOutcome>) -> Self {
             Self {
-                outcome,
+                outcomes: outcomes.into(),
                 users: Vec::new(),
             }
         }
@@ -444,7 +412,9 @@ mod tests {
     impl FprintVerifier for FprintStub {
         fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome {
             self.users.push(user.to_string());
-            self.outcome
+            self.outcomes
+                .pop_front()
+                .unwrap_or(crate::fprintd::VerifyOutcome::Error)
         }
     }
 
@@ -469,6 +439,26 @@ mod tests {
                 "unlocked on {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn late_worker_result_cannot_apply_to_a_newer_generation() {
+        // Each attempt resolves solely on its own verification: the first
+        // attempt times out and stays denied (its worker's late result has
+        // no attempt to apply to — the waiter is gone), and the newer
+        // generation decides solely on its own outcome. Generations never
+        // leak into each other in either direction.
+        use crate::fprintd::VerifyOutcome::*;
+        let mut stub = FprintStub::sequenced(vec![TimedOut, Matched]);
+        assert_eq!(
+            attempt_fprint_unlock(&mut stub, "ada"),
+            UnlockOutcome::Denied
+        );
+        assert_eq!(
+            attempt_fprint_unlock(&mut stub, "ada"),
+            UnlockOutcome::Unlocked
+        );
+        assert_eq!(stub.users, vec!["ada".to_string(), "ada".to_string()]);
     }
 
     #[test]
