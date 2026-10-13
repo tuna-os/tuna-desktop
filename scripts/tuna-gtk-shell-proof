@@ -231,9 +231,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 if [ "$GRID_CANCEL_ONLY" = 1 ]; then
-    [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ -n "$GRID_CANCEL_ADMISSION" ] || {
-        echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1;
-    }
+    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
+        echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1
+    fi
 elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; then
     echo "old-negative/admission flags require --grid-cancel-only" >&2; exit 1
 fi
