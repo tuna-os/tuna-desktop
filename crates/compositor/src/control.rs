@@ -143,6 +143,35 @@ impl ControlConn {
         }
     }
 
+    /// Observe half/full closure without consuming queued command bytes.
+    fn peer_live(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let fd = self.stream.as_raw_fd();
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, 0) } < 0
+            || poll.revents & (libc::POLLHUP | libc::POLLRDHUP | libc::POLLERR | libc::POLLNVAL)
+                != 0
+        {
+            return false;
+        }
+        let mut byte = 0u8;
+        let count = unsafe {
+            libc::recv(
+                fd,
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        count > 0
+            || (count < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock)
+    }
+
     /// Write one message as a single frame. Returns
     /// [`ControlError::WouldBlock`] on backpressure; per the module docs the
     /// connection must then be dropped (a partial frame may be on the wire).
@@ -235,6 +264,7 @@ pub type TokenMinter = std::rc::Rc<dyn Fn(Option<&str>) -> String>;
 /// handshake sends our `Hello` plus a full snapshot, so every (re)connect
 /// starts from complete state.
 pub struct Session<'a> {
+    connection_id: u64,
     conn: ControlConn,
     validator: TokenValidator<'a>,
     minter: TokenMinter,
@@ -333,6 +363,7 @@ impl<'a> Session<'a> {
     ) -> Result<Self, ControlError> {
         let locked_sent = locked.get();
         let mut session = Self {
+            connection_id: 0,
             conn,
             validator: Box::new(validator),
             minter,
@@ -707,6 +738,15 @@ impl<'a> Session<'a> {
             } => {
                 // Verified off the event loop by the runtime; the result
                 // goes back as this id's CommandResult.
+                if self.unlock_pending.is_some() {
+                    self.conn.write_frame(&Message::CommandResult {
+                        id,
+                        status: CommandStatus::Denied {
+                            reason: "authentication failed".into(),
+                        },
+                    })?;
+                    return Ok(Handled::CommandResult { id, applied: false });
+                }
                 self.unlock_request = Some((id, password));
                 self.unlock_pending = Some(id);
                 Ok(Handled::CommandResult { id, applied: true })
@@ -1073,7 +1113,7 @@ pub struct PollOutcome {
     /// Whether the overview shows the app grid, if the shell said.
     pub overview_app_grid: Option<bool>,
     /// A lock-screen password to verify, with its request id.
-    pub unlock: Option<(u64, tuna_shell_control::Secret)>,
+    pub unlock: Option<(crate::auth_owner::Origin, tuna_shell_control::Secret)>,
     /// GNOME input settings the shell sent, if any.
     pub input_settings: Option<tuna_shell_control::InputSettings>,
     pub wellbeing_effects: Option<(bool, bool)>,
@@ -1179,6 +1219,7 @@ pub struct ControlHub {
     readiness: crate::control_readiness::ControlReadiness,
     socket_path: std::path::PathBuf,
     sessions: Vec<Session<'static>>,
+    next_connection: Option<u64>,
     /// Peers accepted in an earlier round: their `Hello` is due now.
     pending: Vec<UnixStream>,
     /// Peers accepted this round: handshake next round, once their
@@ -1267,6 +1308,7 @@ impl ControlHub {
             readiness,
             socket_path,
             sessions: Vec::new(),
+            next_connection: Some(1),
             pending: Vec::new(),
             fresh: Vec::new(),
             overview: std::rc::Rc::new(std::cell::Cell::new(false)),
@@ -1376,22 +1418,35 @@ impl ControlHub {
 
     /// Answer a lock-screen password: `Applied` when it unlocked the
     /// session, `Denied` when it did not.
-    pub fn finish_unlock(&mut self, request: u64, unlocked: bool) {
-        let status = if unlocked {
-            CommandStatus::Applied
-        } else {
-            CommandStatus::Denied {
-                reason: "authentication failed".to_owned(),
-            }
+    pub fn origin_pending_live(&self, origin: crate::auth_owner::Origin) -> bool {
+        self.sessions.iter().enumerate().any(|(i, session)| {
+            session.connection_id == origin.connection
+                && session.unlock_pending == Some(origin.request)
+                && self.gate.admits(self.session_peers[i], our_uid())
+                && session.conn.peer_live()
+        })
+    }
+    pub fn finish_unlock(&mut self, origin: crate::auth_owner::Origin, unlocked: bool) {
+        let Some(index) = self.sessions.iter().position(|s| {
+            s.connection_id == origin.connection && s.unlock_pending == Some(origin.request)
+        }) else {
+            return;
         };
-        for session in &mut self.sessions {
-            if session.unlock_pending == Some(request) {
-                session.unlock_pending = None;
-                let _ = session.conn.write_frame(&Message::CommandResult {
-                    id: request,
-                    status: status.clone(),
-                });
-            }
+        let session = &mut self.sessions[index];
+        session.unlock_pending = None;
+        let sent = session.conn.write_frame(&Message::CommandResult {
+            id: origin.request,
+            status: if unlocked {
+                CommandStatus::Applied
+            } else {
+                CommandStatus::Denied {
+                    reason: "authentication failed".to_owned(),
+                }
+            },
+        });
+        if sent.is_err() {
+            self.sessions.swap_remove(index);
+            self.session_peers.swap_remove(index);
         }
     }
 
@@ -1499,6 +1554,7 @@ impl ControlHub {
                     Err(_) => false,
                 };
                 if deltas_ok && cmd_ok {
+                    let mut reply_ok = true;
                     if model.active_workspace() != workspace_before {
                         // FocusWorkspace changes the model directly; preserve
                         // every departed slot so rapid commands cannot be
@@ -1535,7 +1591,25 @@ impl ControlHub {
                         outcome.overview_app_grid = Some(active);
                     }
                     if let Some(request) = session.unlock_request.take() {
-                        outcome.unlock = Some(request);
+                        let (request, password) = request;
+                        let origin = crate::auth_owner::Origin {
+                            connection: session.connection_id,
+                            request,
+                        };
+                        if outcome.unlock.is_none() {
+                            outcome.unlock = Some((origin, password));
+                        } else {
+                            session.unlock_pending = None;
+                            reply_ok = session
+                                .conn
+                                .write_frame(&Message::CommandResult {
+                                    id: request,
+                                    status: CommandStatus::Denied {
+                                        reason: "authentication failed".into(),
+                                    },
+                                })
+                                .is_ok();
+                        }
                     }
                     if let Some(geometries) = session.icon_geometries.take() {
                         outcome.icon_geometries = Some(geometries);
@@ -1552,7 +1626,7 @@ impl ControlHub {
                     if let Some(enabled) = session.screen_reader.take() {
                         outcome.screen_reader = Some(enabled);
                     }
-                    true
+                    reply_ok
                 } else {
                     false
                 }
@@ -1677,6 +1751,12 @@ impl ControlHub {
             let overview = self.overview.clone();
             let locked = self.locked.clone();
             let open = overview.get();
+            let Some(connection_id) = self.next_connection else {
+                self.refused += 1;
+                continue;
+            };
+            // Reserve before handshake, so failed admissions cannot reuse an ID.
+            self.next_connection = connection_id.checked_add(1);
             if let Ok(mut session) =
                 Session::handshake_with(conn, model, validator, minter, overview, locked)
             {
@@ -1698,6 +1778,7 @@ impl ControlHub {
                         name: self.pointer_output.clone(),
                     });
                 }
+                session.connection_id = connection_id;
                 self.sessions.push(session);
                 self.session_peers.push(peer);
             }
@@ -1944,5 +2025,170 @@ mod readiness_tests {
             Duration::from_secs(1),
         )
         .expect("readiness source must not retain a duplicate peer socket");
+    }
+}
+
+#[cfg(test)]
+mod auth_origin_tests {
+    use super::*;
+    use crate::auth_owner::Origin;
+    use std::net::Shutdown;
+
+    fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = ControlHub::bind(
+            dir.path().join("control"),
+            std::rc::Rc::new(TokenStore::new()),
+            crate::SEAT_NAME,
+        )
+        .unwrap();
+        (dir, hub, StateModel::new())
+    }
+    fn connect(hub: &mut ControlHub, model: &mut StateModel) -> ControlConn {
+        let mut client = ControlConn::new(UnixStream::connect(hub.socket_path()).unwrap()).unwrap();
+        client
+            .write_frame(&Message::Hello {
+                version: CURRENT_VERSION,
+            })
+            .unwrap();
+        for _ in 0..3 {
+            hub.poll(model);
+        }
+        drain(&mut client);
+        client
+    }
+    fn drain(client: &mut ControlConn) -> Vec<(u64, CommandStatus)> {
+        let mut out = Vec::new();
+        loop {
+            match client.read_frame() {
+                Ok(Message::CommandResult { id, status }) => out.push((id, status)),
+                Ok(_) => {}
+                Err(ControlError::WouldBlock) => return out,
+                Err(error) => panic!("unexpected control error {error:?}"),
+            }
+        }
+    }
+    fn submit(client: &mut ControlConn, id: u64) {
+        client
+            .write_frame(&Message::Command {
+                id,
+                kind: CommandKind::Unlock {
+                    password: tuna_shell_control::Secret("fixture-only".into()),
+                },
+            })
+            .unwrap();
+    }
+    #[test]
+    fn same_wire_id_routes_only_to_origin_and_all_excess_requests_are_denied() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut a = connect(&mut hub, &mut model);
+        let mut b = connect(&mut hub, &mut model);
+        submit(&mut a, 1);
+        submit(&mut b, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert!(hub.origin_pending_live(origin));
+        assert!(drain(&mut a).is_empty());
+        assert!(matches!(
+            drain(&mut b).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+        hub.finish_unlock(origin, true);
+        assert_eq!(drain(&mut a), [(1, CommandStatus::Applied)]);
+        assert!(drain(&mut b).is_empty());
+        submit(&mut a, 4);
+        let (first, _) = hub.poll(&mut model).unlock.unwrap();
+        submit(&mut a, 5);
+        assert!(hub.poll(&mut model).unlock.is_none());
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [(5, CommandStatus::Denied { .. })]
+        ));
+        assert!(hub.origin_pending_live(first));
+        hub.finish_unlock(first, false);
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [(4, CommandStatus::Denied { .. })]
+        ));
+    }
+    #[test]
+    fn eof_with_unread_bytes_compaction_reconnect_and_reused_ids_do_not_transfer_owner() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut a = connect(&mut hub, &mut model);
+        let mut b = connect(&mut hub, &mut model);
+        submit(&mut a, 1);
+        let (old, _) = hub.poll(&mut model).unlock.unwrap();
+        // Peer half-close must be observed even with unread commands ahead of EOF.
+        a.write_frame(&Message::Command {
+            id: 9,
+            kind: CommandKind::ToggleOverview,
+        })
+        .unwrap();
+        a.stream.shutdown(Shutdown::Write).unwrap();
+        assert!(!hub.origin_pending_live(old));
+        drop(a);
+        hub.poll(&mut model);
+        hub.poll(&mut model);
+        assert_eq!(hub.sessions.len(), 1);
+        submit(&mut b, 1);
+        let (other, _) = hub.poll(&mut model).unlock.unwrap();
+        assert_ne!(other.connection, old.connection);
+        assert!(hub.origin_pending_live(other));
+        let mut replacement = connect(&mut hub, &mut model);
+        submit(&mut replacement, 1);
+        let (fresh, _) = hub.poll(&mut model).unlock.unwrap();
+        assert_ne!(fresh.connection, old.connection);
+        assert_ne!(fresh.connection, other.connection);
+        hub.finish_unlock(old, true);
+        assert!(drain(&mut b).is_empty());
+        assert!(drain(&mut replacement).is_empty());
+        hub.finish_unlock(other, false);
+        hub.finish_unlock(fresh, false);
+        assert!(matches!(
+            drain(&mut b).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+        assert!(matches!(
+            drain(&mut replacement).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+    }
+    #[test]
+    fn changed_gate_and_unknown_connection_cannot_authorize_before_poll() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut client = connect(&mut hub, &mut model);
+        submit(&mut client, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert!(hub.origin_pending_live(origin));
+        assert!(!hub.origin_pending_live(Origin {
+            connection: origin.connection + 1,
+            ..origin
+        }));
+        hub.set_peer_gate(PeerGate::Closed);
+        assert!(!hub.origin_pending_live(origin));
+    }
+    #[test]
+    fn connection_id_overflow_refuses_future_peers_without_reuse() {
+        let (_dir, mut hub, mut model) = setup();
+        hub.next_connection = Some(u64::MAX);
+        let mut a = connect(&mut hub, &mut model);
+        submit(&mut a, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert_eq!(origin.connection, u64::MAX);
+        let mut b = UnixStream::connect(hub.socket_path()).unwrap();
+        b.write_all(&encode_frame(&Message::Hello {
+            version: CURRENT_VERSION,
+        }))
+        .unwrap();
+        for _ in 0..3 {
+            hub.poll(&mut model);
+        }
+        crate::control_readiness::test_peer::wait_for_peer_close(
+            &mut b,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(hub.sessions.len(), 1);
+        assert!(hub.next_connection.is_none());
+        assert!(hub.refused_count() > 0);
     }
 }

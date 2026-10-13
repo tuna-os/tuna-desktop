@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Source/runtime proof only: no installed/PAM retirement qualification.
+set -euo pipefail
+out=${1:?owned artifact directory required}
+mkdir -p "$out"
+git rev-parse HEAD > "$out/source.txt"
+git diff --quiet
+git diff --cached --quiet
+sha256sum Cargo.lock crates/compositor/src/auth_owner.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/sleep.rs crates/compositor/tests/auth_owner_runtime.rs > "$out/source-sha256.txt"
+cargo test -p tuna-compositor --test auth_owner_runtime --no-run --message-format=json > "$out/build.json"
+python3 - "$out" <<'PY'
+import hashlib,json,pathlib,sys
+out=pathlib.Path(sys.argv[1]); rows=[json.loads(l) for l in (out/'build.json').read_text().splitlines()]
+tests=[r['executable'] for r in rows if r.get('reason')=='compiler-artifact' and r['target']['name']=='auth_owner_runtime' and r.get('executable')]
+bins=[r['executable'] for r in rows if r.get('reason')=='compiler-artifact' and r['target']['name']=='tuna-compositor' and r['target']['kind']==['bin'] and not r['profile']['test'] and r.get('executable')]
+assert len(set(tests))==len(set(bins))==1,'exact cargoJSON identities required'
+inputs={p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in [tests[0],bins[0]]}
+(out/'binary-receipt.json').write_text(json.dumps({'source':(out/'source.txt').read_text().strip(),'executables':inputs,'compositor':bins[0],'test':tests[0]},indent=2)+'\n')
+(out/'test-executable').write_text(tests[0]+'\n')
+PY
+IFS= read -r test_executable < "$out/test-executable"
+Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp 3>"$out/display" >"$out/xvfb.log" 2>&1 &
+xvfb_pid=$!
+trap 'kill "$xvfb_pid" 2>/dev/null || true; wait "$xvfb_pid" 2>/dev/null || true' EXIT
+for _ in $(seq 1 50); do
+    [ -s "$out/display" ] && break
+    kill -0 "$xvfb_pid"
+    sleep 0.1
+done
+IFS= read -r display_num < "$out/display"
+case "$display_num" in ''|*[!0-9]*) exit 1 ;; esac
+DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime" \
+    timeout --kill-after=3s 45s \
+    "$test_executable" --exact actual_runtime_owns_delayed_greetd_result_and_lock_epochs --nocapture 2>&1 | tee "$out/test.log"
+grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test.log"
+grep -q '^auth owner runtime receipt: ' "$out/test.log"
+python3 - "$out" <<'PY'
+import hashlib,json,pathlib,sys
+out=pathlib.Path(sys.argv[1]); r=json.loads((out/'binary-receipt.json').read_text())
+for path,wanted in r['executables'].items():assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==wanted,'binary changed'
+receipt=json.loads((out/'runtime/success.json').read_text());assert receipt['late_closed_origin_success_denied'] and receipt['fresh_origin_success']
+lines=[l.removeprefix('auth owner compositor sha256: ') for l in (out/'test.log').read_text().splitlines() if l.startswith('auth owner compositor sha256: ')]
+assert len(lines)==1 and lines[0] == r['executables'][r['compositor']],'actual compositor mismatched'
+PY
+sha256sum --check "$out/source-sha256.txt"
+git diff --quiet
+git diff --cached --quiet
+[ "$(git rev-parse HEAD)" = "$(cat "$out/source.txt")" ]

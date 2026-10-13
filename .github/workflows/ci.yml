@@ -49,6 +49,7 @@ jobs:
       - run: python3 scripts/lib/grid-target-settled-tests.py
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
+      - run: python3 scripts/tests/test_auth_owner_admission.py
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
@@ -321,6 +322,14 @@ jobs:
       - run: shellcheck -x scripts/tuna-gtk-shell-proof scripts/tuna-walkthrough scripts/tuna-gtk-accessibility-proof scripts/lib/tuna-fade-match
       # docs/walkthrough.md must match its manifest (docs/walkthrough.tsv).
       - run: scripts/tuna-walkthrough check
+      - name: Prove password origin and epoch ownership in the actual nested runtime
+        run: scripts/tuna-auth-owner-ci-proof "$RUNNER_TEMP/auth-owner-proof"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: auth-owner-runtime-proof
+          path: ${{ runner.temp }}/auth-owner-proof/
+          retention-days: 14
       # Freeze source before live proofs create checkout-local artifacts.
       - name: Check native minimize freeze identity and failure handling
         run: |
