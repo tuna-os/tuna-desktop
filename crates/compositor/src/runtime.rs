@@ -2171,7 +2171,7 @@ impl Runtime {
         let dt = now.saturating_sub(self.strip_view_at).as_secs_f64();
         self.strip_view_at = now;
         self.manager
-            .step_strip_view(dt / self.input_settings.motion.slowdown());
+            .step_strip_view_with_pointer_dt(dt / self.input_settings.motion.slowdown(), dt);
     }
 
     /// Start and advance GNOME's size-change transitions (#496) before

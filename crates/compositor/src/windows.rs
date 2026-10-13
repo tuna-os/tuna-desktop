@@ -349,6 +349,10 @@ pub struct WindowManager {
     /// The running view spring and its elapsed seconds, while the drawn
     /// view has not settled on the target.
     strip_anim: Option<(crate::spring::Spring, f64)>,
+    /// Dwell belongs to the active strip move, never an idle global timer.
+    strip_edge_direction: i8,
+    strip_edge_elapsed: f64,
+    strip_edge_first_frame: bool,
     /// GNOME's workspace switch motion, stepped by the runtime once a
     /// frame. Only render positions use it.
     workspace_slide: crate::workspace_slide::WorkspaceSlide,
@@ -566,6 +570,9 @@ impl WindowManager {
             animations_enabled: true,
             column_animations: HashMap::new(),
             strip_anim: None,
+            strip_edge_direction: 0,
+            strip_edge_elapsed: 0.0,
+            strip_edge_first_frame: false,
             workspace_slide: Default::default(),
             super_held: false,
             // add_keyboard below: 200 ms delay, 200 keys/s.
@@ -2474,6 +2481,7 @@ impl WindowManager {
             return false;
         };
         self.grab = None;
+        self.reset_strip_edge();
         if let PointerGrab::StripResize {
             fixed_start,
             preset_start,
@@ -2642,7 +2650,7 @@ impl WindowManager {
             }
         }
         match grab {
-            PointerGrab::StripMove { .. } => {}
+            PointerGrab::StripMove { .. } => self.observe_strip_edge(),
             PointerGrab::StripResize {
                 owner,
                 edges,
@@ -2713,6 +2721,7 @@ impl WindowManager {
             return;
         };
         if let Some(owner) = Self::strip_grab_owner(grab) {
+            self.reset_strip_edge();
             if !self.strip_pointer_valid(state, owner) {
                 // Reinstall only to use the common rollback, never commit
                 // an actor after ownership, workspace or output changed.
@@ -3854,7 +3863,8 @@ impl WindowManager {
     /// Whether the strip view is still moving toward its target.
     pub fn strip_animating(&self) -> bool {
         self.mode == SessionMode::Scroll
-            && (self.strip_shown != self.strip_offset
+            && (self.strip_pointer_edge_pressure() != 0.0
+                || self.strip_shown != self.strip_offset
                 || self
                     .column_animations
                     .values()
@@ -3879,6 +3889,132 @@ impl WindowManager {
         }
     }
 
+    fn reset_strip_edge(&mut self) {
+        self.strip_edge_direction = 0;
+        self.strip_edge_elapsed = 0.0;
+        self.strip_edge_first_frame = false;
+    }
+
+    fn strip_edge_max(&self, work: Rectangle<i32, Logical>) -> f64 {
+        let extent = self.strip_order().into_iter().fold(0i64, |extent, id| {
+            extent
+                .saturating_add(i64::from(self.strip_width_for(id, work.size.w)))
+                .saturating_add(i64::from(Self::STRIP_GAP))
+        });
+        // One interior gap per column and one additional end gap.
+        (extent
+            .saturating_add(i64::from(Self::STRIP_GAP))
+            .saturating_sub(i64::from(work.size.w)))
+        .max(0) as f64
+    }
+
+    fn strip_pointer_edge_pressure(&self) -> f64 {
+        let Some(PointerGrab::StripMove { owner, .. }) = self.grab else {
+            return 0.0;
+        };
+        if self.mode != SessionMode::Scroll
+            || self.overview_open
+            || self.workspace_slide.running()
+            || self.model.active_workspace() != owner.workspace
+            || !self.windows.get(&owner.id).is_some_and(|window| {
+                window.layout == WindowLayout::Strip && !window.minimized && window.surface.alive()
+            })
+            || !self
+                .model
+                .window(owner.id)
+                .is_some_and(|entry| entry.workspace == owner.workspace)
+            || !self.pointer_pos.x.is_finite()
+            || !self.pointer_pos.y.is_finite()
+            || owner.work.size.w <= 0
+            || owner.work.size.h <= 0
+        {
+            return 0.0;
+        }
+        let x = self.pointer_pos.x - f64::from(owner.work.loc.x);
+        let y = self.pointer_pos.y - f64::from(owner.work.loc.y);
+        if y < 0.0 || y >= f64::from(owner.work.size.h) {
+            return 0.0;
+        }
+        let width = f64::from(owner.work.size.w);
+        let band = 10.0_f64.min(width / 2.0);
+        let x = x.clamp(0.0, width);
+        let pressure = if x < band {
+            -(band - x) / band
+        } else if width - x < band {
+            (band - (width - x)) / band
+        } else {
+            0.0
+        };
+        if (pressure < 0.0 && self.strip_offset <= 0.0)
+            || (pressure > 0.0 && self.strip_offset >= self.strip_edge_max(owner.work))
+        {
+            0.0
+        } else {
+            pressure
+        }
+    }
+
+    fn observe_strip_edge(&mut self) {
+        let pressure = self.strip_pointer_edge_pressure();
+        let direction = if pressure < 0.0 {
+            -1
+        } else if pressure > 0.0 {
+            1
+        } else {
+            0
+        };
+        if direction != self.strip_edge_direction {
+            self.strip_edge_direction = direction;
+            self.strip_edge_elapsed = 0.0;
+            self.strip_edge_first_frame = direction != 0;
+        }
+    }
+
+    fn step_strip_pointer_edge(&mut self, dt: f64) -> bool {
+        self.observe_strip_edge();
+        let pressure = self.strip_pointer_edge_pressure();
+        if pressure == 0.0 {
+            self.reset_strip_edge();
+            return false;
+        }
+        if self.strip_edge_first_frame {
+            // The previous renderer timestamp may precede this drag by minutes.
+            self.strip_edge_first_frame = false;
+            return true;
+        }
+        if !dt.is_finite() || dt <= 0.0 {
+            return true;
+        }
+        let dt = dt.min(0.05);
+        let old_dwell = self.strip_edge_elapsed;
+        self.strip_edge_elapsed = (old_dwell + dt).min(0.1);
+        let moving_dt = (old_dwell + dt - 0.1).max(0.0).min(dt);
+        if moving_dt == 0.0 {
+            return true;
+        }
+        let Some(PointerGrab::StripMove { owner, .. }) = self.grab else {
+            return false;
+        };
+        let old = self.strip_offset;
+        let next = (old + pressure * 50.0 * moving_dt).clamp(0.0, self.strip_edge_max(owner.work));
+        let shift = (next as i32).saturating_sub(old as i32);
+        self.strip_offset = next;
+        // View translation does not configure a new client size. Restrict it
+        // to real active-workspace strip actors and preserve their restores.
+        for (id, window) in &mut self.windows {
+            if window.layout == WindowLayout::Strip
+                && self
+                    .model
+                    .window(*id)
+                    .is_some_and(|entry| entry.workspace == owner.workspace)
+            {
+                window.geometry.loc.x = window.geometry.loc.x.saturating_sub(shift);
+            }
+        }
+        self.snap_strip_columns();
+        self.strip_pointer_edge_pressure() != 0.0
+    }
+
     /// Advance the drawn strip view `dt` seconds toward the target on
     /// niri's default view-movement spring (critically damped,
     /// stiffness 800, epsilon 0.0001). A target that moved mid-flight
@@ -3887,7 +4023,14 @@ impl WindowManager {
     /// returns whether the view is still moving (frames keep coming
     /// only while it does).
     pub fn step_strip_view(&mut self, dt: f64) -> bool {
+        self.step_strip_view_with_pointer_dt(dt, dt)
+    }
+
+    /// Springs use adjusted animation time; direct pointer manipulation uses
+    /// the actual frame interval, independent of the user's slow-animation aid.
+    pub fn step_strip_view_with_pointer_dt(&mut self, dt: f64, pointer_dt: f64) -> bool {
         use crate::spring::Spring;
+        let edge_demand = self.step_strip_pointer_edge(pointer_dt);
         if matches!(self.grab, Some(PointerGrab::StripResize { .. })) {
             self.snap_strip_columns();
         }
@@ -3913,7 +4056,7 @@ impl WindowManager {
         }
         if !self.animations_enabled {
             self.snap_strip_view();
-            return false;
+            return edge_demand;
         }
         if self.mode != SessionMode::Scroll {
             self.snap_strip_view();
@@ -3929,11 +4072,11 @@ impl WindowManager {
             None if self.strip_shown != target => {
                 (Spring::view_movement(self.strip_shown, target, 0.0), 0.0)
             }
-            None => return columns_moving,
+            None => return columns_moving || edge_demand,
         };
         if spring.done_at(t) {
             self.snap_strip_view();
-            return columns_moving;
+            return columns_moving || edge_demand;
         }
         self.strip_shown = spring.value_at(t);
         self.strip_anim = Some((spring, t));

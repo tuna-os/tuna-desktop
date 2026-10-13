@@ -4267,7 +4267,7 @@ fn strip_drag_survives_unrelated_map_and_neighbor_close_without_resurrection() {
     );
     // A different release cannot commit the initiating left-button grab.
     f.manager
-        .pointer_button(&mut f.comp.state, BTN_RIGHT, false, 13);
+        .pointer_button(&mut f.comp.state, BTN_LEFT + 1, false, 13);
     assert!(f.manager.grab_active());
     assert_eq!(f.manager.geometry(f.id_a).unwrap(), canonical_a);
     assert_eq!(f.manager.geometry(mapped).unwrap(), canonical_new);
@@ -4473,6 +4473,30 @@ fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() 
         strip_drawn_geometry(&f.manager, child).unwrap().loc.x - child_drawn.loc.x,
         200
     );
+    // Viewport motion must not strand the actual newly attached family.
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 14);
+    let anchored_parent = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    let anchored_child = strip_drawn_geometry(&f.manager, child).unwrap();
+    for _ in 0..40 {
+        assert!(f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+        assert_eq!(
+            strip_drawn_geometry(&f.manager, f.id_a).unwrap(),
+            anchored_parent
+        );
+        assert_eq!(
+            strip_drawn_geometry(&f.manager, child).unwrap(),
+            anchored_child
+        );
+    }
+    assert!(f.manager.strip_offset() > 0.0);
+    let edge_order: Vec<_> = f
+        .manager
+        .render_entries()
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect();
+    assert_eq!(&edge_order[edge_order.len() - 2..], &[f.id_a, child]);
     dialog.destroy();
     top.destroy();
     xdg.destroy();
@@ -4489,4 +4513,246 @@ fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() 
     assert!(!f.manager.grab_active());
     assert!(f.manager.tile_preview(&f.comp.state).is_none());
     assert!(f.manager.render_entries().iter().all(|e| e.0 != child));
+}
+
+#[test]
+fn strip_stationary_edge_reveals_offscreen_column_and_commits_observed_slot() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    assert!(strip_drawn_geometry(&f.manager, f.id_c).unwrap().loc.x >= 1280);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    let actor = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    assert!(
+        f.manager.strip_animating(),
+        "stationary dwell owns actual frame demand"
+    );
+    assert!(f.manager.step_strip_view_with_pointer_dt(0.0, 30.0));
+    assert_eq!(
+        f.manager.strip_offset(),
+        0.0,
+        "old idle delta is not drag time"
+    );
+    // No more pointer motion: the actual manager frame phase alone scrolls.
+    for _ in 0..2000 {
+        let demand = f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+        assert_eq!(strip_drawn_geometry(&f.manager, f.id_a).unwrap(), actor);
+        if !demand {
+            break;
+        }
+    }
+    assert!(
+        !f.manager.strip_animating(),
+        "clamped edge cannot schedule forever"
+    );
+    let final_offset = f.manager.strip_offset();
+    assert!(final_offset > 0.0);
+    assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+    assert_eq!(f.manager.strip_offset(), final_offset);
+    let c = strip_drawn_geometry(&f.manager, f.id_c).unwrap();
+    assert!(c.loc.x >= 0 && c.loc.x + c.size.w <= 1280);
+    assert!(actor.loc.x + actor.size.w / 2 > c.loc.x + c.size.w / 2);
+    let (owner, bar) = f.manager.tile_preview(&f.comp.state).unwrap();
+    assert_eq!(owner, f.id_a);
+    assert_eq!(bar.size.w, 8);
+    assert_eq!(bar.loc.x, c.loc.x + c.size.w + 16 - 4);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT + 1, false, 13);
+    assert!(f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 14);
+    assert!(!f.manager.grab_active());
+    assert!(f.manager.geometry(f.id_a).unwrap().loc.x > f.manager.geometry(f.id_c).unwrap().loc.x);
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+}
+
+#[test]
+fn strip_edge_cancel_restores_original_view_order_and_rectangles() {
+    let mut f = three_windows();
+    let floating = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    let original = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    let original_offset = f.manager.strip_offset();
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    for _ in 0..40 {
+        f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    }
+    assert!(f.manager.strip_offset() > original_offset);
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    assert_eq!(f.manager.strip_offset(), original_offset);
+    assert_eq!(f.manager.strip_view(), original_offset);
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        original
+    );
+    assert!(!f.manager.strip_animating());
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    f.manager.set_scroll(&mut f.comp.state, false);
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        floating
+    );
+}
+
+#[test]
+fn strip_edge_dwell_restarts_on_interior_exit_and_opposite_edge() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (640.0, pos.y).into(), 13);
+    assert!(!f.manager.strip_animating());
+    assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.05));
+    assert_eq!(f.manager.strip_offset(), 0.0);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 14);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05); // first frame
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    assert!(f.manager.strip_offset().abs() < 1e-8);
+    for _ in 0..40 {
+        f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    }
+    let right = f.manager.strip_offset();
+    assert!(right > 0.0);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (0.0, pos.y).into(), 15);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    assert_eq!(
+        f.manager.strip_offset(),
+        right,
+        "opposite edge has a fresh dwell"
+    );
+    for _ in 0..2000 {
+        if !f.manager.step_strip_view_with_pointer_dt(0.0, 0.02) {
+            break;
+        }
+    }
+    assert_eq!(f.manager.strip_offset(), 0.0);
+    assert!(!f.manager.strip_animating());
+}
+
+#[test]
+fn strip_edge_invalid_frame_delta_never_advances_view_or_dwell() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.0);
+    for dt in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+        assert!(f.manager.step_strip_view_with_pointer_dt(0.0, dt));
+        assert_eq!(f.manager.strip_offset(), 0.0);
+    }
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 0.05);
+    assert!(f.manager.strip_offset().abs() < 1e-8);
+    f.manager.step_strip_view_with_pointer_dt(0.0, 1e300);
+    assert!(f.manager.strip_offset() > 0.0 && f.manager.strip_offset() <= 2.5);
+    let width = f.manager.geometry(f.id_a).unwrap().size;
+    assert_eq!(width, f.manager.geometry(f.id_b).unwrap().size);
+}
+
+#[test]
+fn strip_edge_owner_unmap_stops_demand_without_resurrection() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    for _ in 0..40 {
+        f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    }
+    f.client_a.toplevel.as_ref().unwrap().destroy();
+    f.client_a.xdg_surface.as_ref().unwrap().destroy();
+    f.client_a.surface.as_ref().unwrap().destroy();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(!f.manager.grab_active());
+    assert!(f.manager.geometry(f.id_a).is_none());
+    assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+    assert!(!f.manager.strip_animating());
+    assert!(f.manager.tile_preview(&f.comp.state).is_none());
+    assert!(f
+        .manager
+        .render_entries()
+        .iter()
+        .all(|entry| entry.0 != f.id_a));
+}
+
+#[test]
+fn strip_edge_preserves_other_workspace_canonical_geometry_on_cancel() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.move_to_workspace(&mut f.comp.state, f.id_c, 1);
+    f.manager.switch_workspace(&mut f.comp.state, 0);
+    let (conn, mut queue, mut client) = connect(&mut f.comp);
+    map_toplevel(
+        &mut f.comp,
+        &conn,
+        &mut queue,
+        &mut client,
+        "edge-active-neighbor",
+    );
+    f.manager.reconcile(&mut f.comp.state);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    let other = f.manager.geometry(f.id_c).unwrap();
+    let original = f.manager.geometry(f.id_a).unwrap();
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 12);
+    for _ in 0..40 {
+        f.manager.step_strip_view_with_pointer_dt(0.0, 0.02);
+    }
+    assert!(f.manager.strip_offset() > 0.0);
+    assert_eq!(f.manager.geometry(f.id_c).unwrap(), other);
+    assert_eq!(f.manager.model().window(f.id_c).unwrap().workspace, 1);
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), original);
+    assert_eq!(f.manager.geometry(f.id_c).unwrap(), other);
+    let _keep = (conn, queue, client);
+}
+
+#[test]
+fn strip_edge_demand_excludes_resize_and_floating_grabs() {
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    let pos = start_strip_resize(&mut f, false);
+    let original = f.manager.strip_offset();
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 22);
+    for _ in 0..40 {
+        assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+        assert_eq!(f.manager.strip_offset(), original);
+    }
+    assert!(f.manager.cancel_strip_pointer(&mut f.comp.state));
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 23);
+    f.manager.set_scroll(&mut f.comp.state, false);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (1279.0, pos.y).into(), 24);
+    for _ in 0..40 {
+        assert!(!f.manager.step_strip_view_with_pointer_dt(0.0, 0.02));
+        assert_eq!(f.manager.strip_offset(), 0.0);
+    }
+    assert!(
+        f.manager.grab_active(),
+        "existing floating grab remains live"
+    );
 }
