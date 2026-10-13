@@ -49,7 +49,18 @@ def validate_identity(run, jobs, commit, expected_sha, run_id, attempt, event):
             or run.get("event") != event or event not in ("workflow_dispatch", "pull_request", "push")
             or run.get("status") != "in_progress" or run.get("conclusion") is not None
             or commit.get("sha") != expected_sha):
-        raise ValueError("CI repository/run/attempt/source/event/workflow mismatch")
+        # Preserve the admission predicates, but retain the actual public
+        # identity fields when refusing. A later API poll cannot reconstruct
+        # the values seen by this invocation.
+        observed = {key: run.get(key) for key in
+                    ("id", "run_attempt", "head_sha", "path", "event", "status", "conclusion")}
+        observed["repository"] = run.get("repository", {}).get("full_name")
+        observed["commit_sha"] = commit.get("sha")
+        expected = {"id": run_id, "run_attempt": attempt, "head_sha": expected_sha,
+                    "path": WORKFLOW, "event": event, "status": "in_progress",
+                    "conclusion": None, "repository": REPO, "commit_sha": expected_sha}
+        raise ValueError("CI repository/run/attempt/source/event/workflow mismatch: " +
+                         json.dumps({"expected": expected, "observed": observed}, sort_keys=True))
     current = [j for j in jobs if j.get("name") == JOB]
     check = [j for j in jobs if j.get("name") == "check"]
     if (len(current) != 1 or current[0].get("status") != "in_progress"

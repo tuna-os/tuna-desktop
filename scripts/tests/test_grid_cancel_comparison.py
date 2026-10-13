@@ -59,6 +59,17 @@ class Identity(unittest.TestCase):
     def test_commit_source_mismatch_fails(self):
         with self.assertRaises(ValueError): self.validate(commit=dict(self.commit, sha="c" * 40))
 
+    def test_mismatch_preserves_observed_public_fields_without_extra_payload(self):
+        run = dict(self.run, status="queued", private_payload="excluded fixture value")
+        with self.assertRaises(ValueError) as error:
+            self.validate(run=run)
+        receipt = json.loads(str(error.exception).split(": ", 1)[1])
+        self.assertEqual(receipt["expected"]["status"], "in_progress")
+        self.assertEqual(receipt["observed"]["status"], "queued")
+        self.assertEqual(receipt["observed"]["head_sha"], self.sha)
+        self.assertEqual(receipt["observed"]["commit_sha"], self.sha)
+        self.assertNotIn("private_payload", receipt["observed"])
+
 
 class BuildRoles(unittest.TestCase):
     def setUp(self):

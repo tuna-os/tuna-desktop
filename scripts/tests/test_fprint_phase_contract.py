@@ -29,6 +29,20 @@ def output(v):
     return "\n".join("FPRINT-PHASE "+json.dumps(r) for r in v.values())+"\ntest result: ok. 1 passed; 0 failed; 0 ignored; 51 filtered out; finished in 3s\n"
 
 class Contract(unittest.TestCase):
+    def test_ci_mismatch_retains_public_fields_and_excludes_unrelated_payload(self):
+        sha = "a" * 40
+        run = dict(id=100, run_attempt=1, repository=dict(full_name=c.REPO),
+                   head_sha=sha, path=c.WORKFLOW, event="workflow_dispatch",
+                   status="queued", conclusion=None, private_payload="excluded fixture value")
+        with self.assertRaises(ValueError) as error:
+            c.validate_identity(run, [], dict(sha=sha), sha, 100, 1, "workflow_dispatch")
+        receipt = json.loads(str(error.exception).split(": ", 1)[1])
+        self.assertEqual(receipt["expected"]["status"], "in_progress")
+        self.assertEqual(receipt["observed"]["status"], "queued")
+        self.assertEqual(receipt["observed"]["head_sha"], sha)
+        self.assertEqual(receipt["observed"]["commit_sha"], sha)
+        self.assertNotIn("private_payload", receipt["observed"])
+
     def test_positive(self):
         v=vectors(); self.assertEqual(c.phase_vectors(output(v),NONCE,123,v),v); c.positive(v)
     def test_nonfill_explicitly_not_qualified(self):
