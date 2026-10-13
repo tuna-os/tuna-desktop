@@ -25,7 +25,7 @@ On timeout or failure, prints log excerpts and exits nonzero.
 With --tour, once the assertions pass it drives a scripted feature tour
 through QMP input (overview and search, app grid, quick settings,
 calendar, three apps and Alt+Tab, scroll mode, lock and unlock), screendumps
-it twice a second, splices in the title cards from scripts/lib/
+at a nominal two frames/second plus synchronous stills, splices title cards from scripts/lib/
 vm-tour-cards rendered from source in scratch, and writes tour/tuna-tour.webm, tour/preview.webp and a
 T-<section>.png still per section (needs ffmpeg with libvpx and libwebp).
 
@@ -68,8 +68,8 @@ DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
 SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings:")
 EXHAUSTED = "shell supervision: BudgetExhausted"
 CARDS = os.path.join(HERE, "lib", "vm-tour-cards")
-TOUR_FPS = 2        # frames captured per second during the tour
-PLAY_FPS = 4        # playback rate: the tour plays at 2x
+TOUR_FPS = 2        # nominal periodic target; synchronous stills add irregular frames
+PLAY_FPS = 4        # encoded frame rate, not a uniform real-time capture clock
 CARD_HOLD = 10      # frames a title card is held (2.5 s at PLAY_FPS)
 OVMF = ("/usr/share/ovmf/OVMF.fd", "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/qemu/OVMF.fd")
 
@@ -1054,19 +1054,58 @@ class Recorder:
         deadline = _deadline if _deadline is not None else time.monotonic() + self.timeout
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not self.lock.acquire(timeout=remaining):
-            raise TimeoutError("tour QMP lock deadline expired")
+            error = TimeoutError("tour QMP lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
         try:
             if self.error is not None:
                 raise RuntimeError("tour capture previously failed") from self.error
             sock = getattr(self.qmp, "sock", None)
             previous = sock.gettimeout() if sock is not None else None
+            expired, timer = threading.Event(), None
             if sock is not None:
-                sock.settimeout(max(0.001, deadline - time.monotonic()))
+                import socket
+                # A socket timeout alone restarts for every read. The owned
+                # watchdog also bounds endless events and partial-line dribble.
+                def abort():
+                    expired.set()
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    abort()
+                    raise TimeoutError("tour QMP absolute deadline expired")
+                sock.settimeout(remaining)
+                timer = threading.Timer(remaining, abort)
+                timer.name = "tour-qmp-deadline"
+                timer.start()
             try:
-                return self.original_cmd(command, **args)
+                result = self.original_cmd(command, **args)
+            except (OSError, RuntimeError, ValueError) as error:
+                if isinstance(error, TimeoutError) and sock is not None:
+                    abort()
+                if expired.is_set():
+                    error = TimeoutError("tour QMP absolute deadline expired")
+                self.error = error
+                self.stop.set()
+                raise error
             finally:
+                if timer is not None:
+                    timer.cancel()
+                    timer.join()  # No detached callback can poison a later command.
                 if sock is not None:
                     sock.settimeout(previous)
+            if expired.is_set() or time.monotonic() >= deadline:
+                if sock is not None:
+                    abort()
+                error = TimeoutError("tour QMP absolute deadline expired")
+                self.error = error
+                self.stop.set()
+                raise error
+            return result
         finally:
             self.lock.release()
 
@@ -1127,9 +1166,18 @@ class Recorder:
             self.stop.wait(max(0.0, 1 / TOUR_FPS - (time.monotonic() - started)))
 
     def mark(self, card):
-        with self.lock:
+        if not self.lock.acquire(timeout=self.timeout):
+            error = TimeoutError("tour mark lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
+        try:
+            if self.error is not None:
+                raise RuntimeError("tour capture previously failed") from self.error
             log(f"tour: {card}")
             self.marks.append((self.n, card))
+        finally:
+            self.lock.release()
 
     def still(self, card, delay=0.0):
         """Finish this exact capture before the caller can send its next key."""
