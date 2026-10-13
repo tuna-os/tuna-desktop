@@ -24,12 +24,18 @@
 //! detail, and log nothing. Every D-Bus wait is bounded: the absolute
 //! attempt deadline starts before setup, the connect itself retries a
 //! full listener backlog only within the remaining budget, setup races
-//! the remainder, method calls carry a remaining-derived timeout, and
-//! the signal wait carries the deadline — so a wedged daemon can
-//! delay but never hang the caller. Each attempt runs on a private
-//! connection that the deadline shuts down at the fd level (bypassing
-//! the transport write lock a saturated send may hold), so a silent or
-//! backpressured daemon cannot strand the signal wait past it.
+//! the remainder, method calls carry the bound fixed from the setup
+//! remainder (NOT recomputed per call — whole-attempt enforcement past
+//! that is the parent shutdown), and the signal wait ends on shutdown
+//! or peer loss with the deadline applied to the verdict — so a wedged
+//! daemon can delay but never hang the caller. Each attempt runs on a
+//! private connection that the deadline shuts down at the fd level
+//! (bypassing the transport write lock a saturated send may hold), so
+//! a silent or backpressured daemon cannot strand the signal wait past
+//! it. Only socket waits are released that way: computation that never
+//! touches the socket (notably NSS user lookup) can outlive the
+//! deadline, and then the retirement budget expiry — not a prompt
+//! exit — retires the claim, into quarantine (fail closed).
 //! Fingerprints never leave the daemon; this client only learns
 //! match/no-match.
 //!
@@ -76,12 +82,26 @@ pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on intermediate retry signals per attempt. A daemon that
 /// keeps asking for another swipe denies instead of looping forever.
 pub const MAX_VERIFY_RETRIES: usize = 10;
-/// Bound on the reaper's wait for one worker's completion signal past
-/// the attempt deadline. Post-deadline worker work is itself bounded
-/// (the deadline shutdown fails its waits fast; each cleanup call
-/// carries at most [`DBUS_CALL_TIMEOUT`]); past this grace the attempt
-/// quarantines instead of holding the claim forever.
+/// Post-deadline wind-down budget for one worker. The reaper's
+/// retirement deadline is absolute — the attempt deadline plus this
+/// grace — and NEVER counts from spawn: a healthy attempt running
+/// longer than the grace must never quarantine early. Past the
+/// retirement deadline the attempt quarantines instead of holding the
+/// claim forever. Post-deadline worker work is itself expected to be
+/// short (the deadline shutdown fails its socket waits fast; each
+/// cleanup call carries at most [`DBUS_CALL_TIMEOUT`]), but only
+/// socket waits are released that way: computation that never touches
+/// the socket (notably NSS user lookup) can outlive the deadline, and
+/// then the budget expiry — not a prompt exit — is what retires the
+/// claim, into quarantine.
 pub const REAPER_GRACE: Duration = Duration::from_secs(20);
+/// Cap on waiting for actual thread exit after the worker's completion
+/// signal (or death): the reaper joins only an observed-finished
+/// worker, and only within the remaining retirement budget. Completion
+/// precedes thread return by program order, so this covers scheduling
+/// stalls, not logic; an exit that stays unobserved quarantines and
+/// detaches instead of parking the reaper.
+pub const REAPER_JOIN_GRACE: Duration = Duration::from_secs(5);
 /// Sleep between backlog-full (`EAGAIN`) connect retries. The absolute
 /// attempt deadline bounds the loop; this only sets the retry cadence.
 const CONNECT_RETRY_SLEEP: Duration = Duration::from_millis(2);
@@ -181,10 +201,13 @@ pub fn effective_claim_name<'a>(user: &'a str, process_user: Option<&str>) -> &'
 /// Drain one attempt's `VerifyStatus` messages until a terminal signal
 /// ends it, retries (or malformed messages) run out, the iterator ends,
 /// or `deadline` passes. Runs on the worker thread itself, straight off
-/// the signal iterator: no forwarder. The iterator ends when the daemon
-/// goes away mid-attempt (fail closed with [`VerifyOutcome::Error`]) or
-/// when our private connection is shut down, which the parent does at
-/// the deadline (past the deadline that end is [`VerifyOutcome::TimedOut`]).
+/// the signal iterator: no forwarder. The iterator itself carries NO
+/// timeout — on total silence it blocks until it ends — and it ends
+/// when the daemon goes away mid-attempt (fail closed with
+/// [`VerifyOutcome::Error`]) or when our private connection is shut
+/// down, which the parent does at the deadline (past the deadline that
+/// end is [`VerifyOutcome::TimedOut`]). The shutdown — not a receive
+/// timeout — is what bounds the silent wait.
 fn drain_verify_signals(
     signals: impl Iterator<Item = zbus::message::Message>,
     deadline: Instant,
@@ -622,64 +645,204 @@ fn build_attempt_connection(
     })
 }
 
+/// Cap on already-queued incoming bytes drained while observing
+/// shutdown. A healthy peer's chatter SURVIVES our shutdown (probed:
+/// 64KiB queued still reads back after `shutdown(Both)`), so EOF
+/// requires draining first — bounded, never an unbounded drain. 1MiB
+/// is ~1000x any legitimate daemon chatter (Hello, replies, signals
+/// are KBs); past the cap the transport quarantines (safe direction).
+const SHUTDOWN_DRAIN_CAP: usize = 1 << 20;
+
 /// Observe our own private fd shutdown on a retained clone: after the
 /// mandatory `shutdown(Both)` (issued by the worker on retirement, or by
-/// the parent at the deadline), reads return EOF. Exactly `Ok(0)`
-/// releases; anything else (a live peer, leftover data, errors)
-/// quarantines. `MSG_DONTWAIT` keeps the check nonblocking whatever
-/// mode the clone carries, so it never waits.
+/// the parent at the deadline), reads run dry to EOF. Drained-to-EOF
+/// releases; a live unshut peer (`EAGAIN`), errors, or chatter past
+/// [`SHUTDOWN_DRAIN_CAP`] quarantines. `MSG_DONTWAIT` keeps the check
+/// nonblocking whatever mode the clone carries, so it never waits —
+/// and the byte cap bounds the loop (every iteration consumes ≥1 byte
+/// or exits).
 fn shutdown_observed(observe: &UnixStream) -> bool {
-    let mut byte = [0u8; 1];
-    // `recv` (not `read`): no `Read` impl confusion on the raw socket.
-    matches!(
-        unsafe {
-            let buf = &mut byte as *mut [u8; 1] as *mut libc::c_void;
-            libc::recv(observe.as_raw_fd(), buf, 1, libc::MSG_DONTWAIT)
-        },
-        0
-    )
+    shutdown_observed_capped(observe, SHUTDOWN_DRAIN_CAP)
+}
+
+/// [`shutdown_observed`] with an explicit drain cap (the tiny-cap shape
+/// is what the cap-exceeded regression pins; production always passes
+/// [`SHUTDOWN_DRAIN_CAP`]).
+pub(crate) fn shutdown_observed_capped(observe: &UnixStream, cap_bytes: usize) -> bool {
+    let mut buf = [0u8; 4096];
+    let mut drained = 0usize;
+    loop {
+        // `recv` (not `read`): no `Read` impl confusion on the raw socket.
+        // SAFETY: buf points at 4096 live bytes; the fd is open.
+        let got = unsafe {
+            libc::recv(
+                observe.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if got == 0 {
+            return true;
+        }
+        if got > 0 {
+            drained += got as usize;
+            if drained > cap_bytes {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+}
+
+/// Join only an observed-finished worker, within `budget`; drops
+/// (detaches) the handle when exit stays unobserved. Returns the join
+/// result, or `None` when no exit was observed in budget. A channel
+/// message (or sender drop) can precede actual thread exit, so joining
+/// on the message alone could park past every budget.
+fn join_bounded(
+    worker: std::thread::JoinHandle<()>,
+    budget: Duration,
+) -> Option<std::thread::Result<()>> {
+    let end = Instant::now().checked_add(budget);
+    loop {
+        if worker.is_finished() {
+            return Some(worker.join());
+        }
+        if let Some(end) = end {
+            if Instant::now() >= end {
+                return None;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Retained external owner: holds the single-flight claim plus the
-/// worker's join handle until the worker is JOINED after its completion
-/// signal with the private fd shutdown observed — or quarantine. Always
-/// exits bounded: the completion wait carries `grace`, the join follows
-/// a completion signal (the worker returns immediately after sending
-/// it), and a wedged worker is detached (its handle dropped) after
-/// quarantine — never an endlessly parked thread. A worker that died
-/// without completing (panic/unwind drops the sender) quarantines at
-/// once via the disconnected channel, without waiting out the grace.
-/// zbus driver exit is NOT observed and stays OUTSIDE the claim:
-/// retirement is exactly application-worker-joined + fd-shutdown +
-/// handles-dropped, never a hardware/daemon-backend claim.
+/// worker's join handle until the worker's exit is OBSERVED and joined
+/// with the private fd shutdown observed — or quarantine. Always exits
+/// bounded: the completion wait runs to the absolute `retire_by`
+/// (attempt deadline plus grace — never counted from spawn, so a
+/// healthy long attempt never quarantines early), the join observes
+/// `is_finished` within the remaining budget (capped by
+/// [`REAPER_JOIN_GRACE`]), and an unobserved worker is detached (its
+/// handle dropped) after quarantine — never an endlessly parked
+/// thread. A worker that died without completing (panic/unwind drops
+/// the sender) takes the bounded join and then quarantines at once,
+/// without waiting out the retirement budget. zbus driver exit is NOT
+/// observed and stays OUTSIDE the claim: retirement is exactly
+/// application-worker-joined + fd-shutdown + application/zbus attempt
+/// handles dropped (the parent's and reaper's raw clones briefly
+/// outlive that), never a hardware/daemon-backend claim.
 fn reap_worker(
     completion: mpsc::Receiver<()>,
     worker: std::thread::JoinHandle<()>,
     observe: UnixStream,
     guard: ClaimGuard,
-    grace: Duration,
+    retire_by: Instant,
 ) {
-    match completion.recv_timeout(grace) {
+    let remaining = || retire_by.saturating_duration_since(Instant::now());
+    match completion.recv_timeout(remaining()) {
         Ok(()) => {
-            // Completion precedes thread return by program order; join it.
-            // A clean join plus observed shutdown releases; a panicked
-            // worker or a live transport quarantines (safe direction).
-            if worker.join().is_ok() && shutdown_observed(&observe) {
-                guard.release_verified(RetirementProof::reaped());
-            } else {
-                guard.quarantine();
+            // Completion precedes thread return by program order, but
+            // the exit itself is still observed before joining. A clean
+            // join plus observed shutdown releases; an unobserved exit,
+            // a panicked worker, or a live transport quarantines (safe
+            // direction).
+            let joined = join_bounded(worker, remaining().min(REAPER_JOIN_GRACE));
+            match joined {
+                Some(Ok(())) if shutdown_observed(&observe) => {
+                    guard.release_verified(RetirementProof::reaped())
+                }
+                _ => guard.quarantine(),
             }
         }
-        // The worker died without completing: collect and quarantine.
+        // The worker died without completing: collect bounded, then
+        // quarantine (death is unverified retirement).
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = worker.join();
+            let _ = join_bounded(worker, remaining().min(REAPER_JOIN_GRACE));
             guard.quarantine();
         }
-        // Wedged past grace: quarantine and detach (drop the handle).
+        // Wedged past the retirement budget: quarantine and detach
+        // (the handle drops here).
         Err(mpsc::RecvTimeoutError::Timeout) => {
             guard.quarantine();
         }
     }
+}
+
+/// Shutdown-before-drop guard: the FIRST field of [`WorkerKit`], so
+/// it drops before the captured connection on spawn failure (struct
+/// fields drop in declaration order — language guarantee). Armed at
+/// build, carrying the worker's shutdown socket; the running worker
+/// disarms it at start and takes the socket for its own explicit
+/// retirement. On spawn failure the unstarted closure drops the kit:
+/// the guard shuts the shared socket down FIRST, then the built
+/// connection drops — the approved shutdown-before-drop order,
+/// enforced by construction, not by the parent handler running later
+/// (which additionally shuts its own retained clone down).
+struct ShutdownFirst {
+    sock: Option<UnixStream>,
+    armed: bool,
+}
+
+impl ShutdownFirst {
+    fn arm(sock: UnixStream) -> Self {
+        Self {
+            sock: Some(sock),
+            armed: true,
+        }
+    }
+
+    /// Disarm and take the shutdown socket: the running worker owns
+    /// explicit retirement from here (this consumes the guard, so its
+    /// `Drop` below never fires for a started worker).
+    fn disarm(mut self) -> UnixStream {
+        self.armed = false;
+        self.sock
+            .take()
+            .expect("guard holds its socket until disarm")
+    }
+}
+
+impl Drop for ShutdownFirst {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(sock) = &self.sock {
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Everything the worker thread owns, as one container. Moves into the
+/// worker closure; on spawn failure the container drops with the
+/// unstarted closure — [`ShutdownFirst`] shuts the socket down BEFORE
+/// the captured connection drops (field order) — and the parent's
+/// factored spawn-failure handler then shuts its own retained clone
+/// down and releases. Nothing is ever recovered out of a failed spawn.
+/// (`WorkerKit` itself has no `Drop`, so the running worker can move
+/// its fields out and disarm the guard.)
+struct WorkerKit {
+    shutdown_guard: ShutdownFirst,
+    attempt: Fprintd,
+    user: String,
+    deadline: Instant,
+    outcome_tx: mpsc::Sender<VerifyOutcome>,
+    completion_tx: mpsc::Sender<()>,
+}
+
+/// Everything the reaper thread owns, as one container. Moves into the
+/// reaper closure; on spawn failure the container drops with the
+/// unstarted closure (the worker runs detached, the completion
+/// receiver is gone) and the parent's factored handler quarantines —
+/// retirement without the join handle is unverifiable, so denial is
+/// the only safe direction.
+struct ReaperKit {
+    completion_rx: mpsc::Receiver<()>,
+    worker: std::thread::JoinHandle<()>,
+    observe: UnixStream,
 }
 
 /// Blocking fprintd client. Clone shares the connection; all methods
@@ -850,6 +1013,47 @@ impl Fprintd {
         outcome
     }
 
+    /// Worker-spawn failure: the [`WorkerKit`] dropped with the
+    /// unstarted closure — [`ShutdownFirst`] shut the socket down
+    /// BEFORE the captured connection dropped (field order) — then
+    /// shut the parent's own retained clone down, release on the
+    /// verified no-thread condition (actual owned private fd shutdown
+    /// + handles drop), and deny. Shutdown precedes the release even
+    /// though no thread exists: uniform order, auditable retirement.
+    fn on_worker_spawn_failure(parent_shutdown: &UnixStream, guard: ClaimGuard) -> VerifyOutcome {
+        let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
+        guard.release_verified(RetirementProof::no_worker());
+        VerifyOutcome::Error
+    }
+
+    /// Reaper-spawn failure: the worker runs detached with no completion
+    /// receiver and no join handle, so retirement is unverifiable —
+    /// wait the recomputed remainder, shut down-only, QUARANTINE, and
+    /// return. Never joins (the parent never blocks past its budget);
+    /// the detached worker still winds down on the shutdown and exits
+    /// on its own. Quarantine is the only safe direction here.
+    fn on_reaper_spawn_failure(
+        outcome_rx: mpsc::Receiver<VerifyOutcome>,
+        parent_shutdown: &UnixStream,
+        guard: ClaimGuard,
+        deadline: Instant,
+    ) -> VerifyOutcome {
+        let outcome =
+            match outcome_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(outcome) => outcome,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
+                    VerifyOutcome::TimedOut
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
+                    VerifyOutcome::Error
+                }
+            };
+        guard.quarantine();
+        outcome
+    }
+
     /// One verification for `user`, bounded by `timeout`: claim the
     /// reader, start any-finger verification, and wait for the terminal
     /// `VerifyStatus`. Always stops and releases the claim, best
@@ -861,12 +1065,13 @@ impl Fprintd {
     /// blackholed handshake resolves instead of hanging the caller; at
     /// the deadline the caller shuts the private fd down (bypassing
     /// the transport write lock a saturated send may hold), which
-    /// releases the worker's waits, so every thread of a timed-out
-    /// attempt exits promptly instead of lingering on a silent daemon.
-    /// A late worker result can never apply: the caller is gone, so
-    /// its send fails. A retained reaper thread owns the claim plus
-    /// the worker's join handle until the verified retirement
-    /// condition, then releases — or quarantines on any failure.
+    /// releases the worker's socket waits instead of lingering on a
+    /// silent daemon (non-socket computation such as NSS lookup is not
+    /// released this way — see the module docs). A late worker result
+    /// can never apply: the caller is gone, so its send fails. A
+    /// retained reaper thread owns the claim plus the worker's join
+    /// handle until the verified retirement condition, then releases —
+    /// or quarantines on any failure.
     pub fn verify(&self, user: &str, timeout: Duration) -> VerifyOutcome {
         // One claim at a time: contention fails closed at once, like
         // the daemon's already-claimed denial — before any bus work, so
@@ -970,11 +1175,12 @@ impl Fprintd {
             conn: attempt_conn,
             bus_address: self.bus_address.clone(),
         };
-        // The parent waits only the REMAINDER (setup already spent part
-        // of the budget); nothing left retires the fresh connection
-        // explicitly instead of spawning a doomed worker.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        // Nothing left after setup retires the fresh connection
+        // explicitly instead of spawning a doomed worker: shutdown
+        // first, then drop, then release — the no-thread case releases
+        // ONLY after the actual owned private fd shutdown + handles
+        // drop below.
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Self::retire_unspawned(
                 &parent_shutdown,
                 attempt.conn,
@@ -982,16 +1188,47 @@ impl Fprintd {
                 VerifyOutcome::TimedOut,
             );
         }
+        // Absolute retirement deadline, checked: the reaper's budget
+        // runs to the attempt deadline plus grace, never from spawn.
+        let Some(retire_by) = deadline.checked_add(REAPER_GRACE) else {
+            return Self::retire_unspawned(
+                &parent_shutdown,
+                attempt.conn,
+                guard,
+                VerifyOutcome::Error,
+            );
+        };
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
-        let user = user.to_owned();
+        let kit = WorkerKit {
+            shutdown_guard: ShutdownFirst::arm(worker_shutdown),
+            attempt,
+            user: user.to_owned(),
+            deadline,
+            outcome_tx,
+            completion_tx,
+        };
         let worker = std::thread::Builder::new()
             .name("tuna-fprintd".into())
             .spawn(move || {
+                let WorkerKit {
+                    shutdown_guard,
+                    attempt,
+                    user,
+                    deadline,
+                    outcome_tx,
+                    completion_tx,
+                } = kit;
                 #[cfg(test)]
                 if TEST_PANIC_IN_WORKER.load(Ordering::Acquire) {
+                    // Fires BEFORE disarm: the unwinding kit keeps the
+                    // guard armed, so even the panicking worker shuts
+                    // down before its connection drops.
                     panic!("synthetic worker panic (test injection)");
                 }
+                // Started: disarm the spawn-failure guard and take the
+                // shutdown socket — explicit retirement owns it below.
+                let worker_shutdown = shutdown_guard.disarm();
                 let outcome = attempt.verify_inner(&user, deadline);
                 // Explicit retirement, in order — never scope-drop order:
                 // cleanup was attempted inside `verify_inner`; now shut
@@ -1001,10 +1238,13 @@ impl Fprintd {
                 // ... close the private transport (uncontended: this
                 // worker is its only sender, and its sends completed) ...
                 let _ = attempt.conn.clone().close();
-                // ... drop every attempt handle (the peer observes EOF),
-                // report (a late result finds the waiter gone and applies
-                // nowhere), and signal full exit LAST — the reaper joins
-                // on this signal, then verifies the shutdown.
+                // ... drop every application/zbus attempt handle (the
+                // peer observes EOF), report (a late result finds the
+                // waiter gone and applies nowhere), and signal full exit
+                // LAST — the reaper observes the exit, joins, then
+                // verifies the shutdown. NOTE: a positive outcome sends
+                // BEFORE reaper retirement — future live adoption must
+                // enforce retirement/callback identity separately.
                 drop(attempt);
                 drop(user);
                 let _ = outcome_tx.send(outcome);
@@ -1013,51 +1253,50 @@ impl Fprintd {
             });
         let worker = match worker {
             Ok(handle) => handle,
-            Err(_) => {
-                return Self::retire_unspawned(
-                    &parent_shutdown,
-                    attempt.conn,
-                    guard,
-                    VerifyOutcome::Error,
-                );
-            }
+            // The kit dropped with the unstarted closure: nothing is
+            // recovered out of a failed spawn (see WorkerKit).
+            Err(_) => return Self::on_worker_spawn_failure(&parent_shutdown, guard),
         };
         // The retained reaper owns the claim plus the worker handle from
         // here on; the parent never touches the claim again.
+        let reaper_kit = ReaperKit {
+            completion_rx,
+            worker,
+            observe: reaper_observe,
+        };
         let reaper = std::thread::Builder::new()
             .name("tuna-fprintd-reap".into())
             .spawn(move || {
+                let ReaperKit {
+                    completion_rx,
+                    worker,
+                    observe,
+                } = reaper_kit;
                 reap_worker(
                     completion_rx,
                     worker,
-                    reaper_observe,
+                    observe,
                     ClaimGuard::adopt(),
-                    REAPER_GRACE,
+                    retire_by,
                 );
             });
-        match reaper {
-            Ok(_) => {
-                guard.transfer();
-            }
-            Err(_) => {
-                // No reaper: the parent reaps inline (bounded by the
-                // outcome wait plus the reaper grace) rather than
-                // stranding the claim. Spawn failure is near-impossible;
-                // the path below keeps even it bounded and verified.
-                let outcome = match outcome_rx.recv_timeout(remaining) {
-                    Ok(outcome) => outcome,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
-                        VerifyOutcome::TimedOut
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
-                        VerifyOutcome::Error
-                    }
-                };
-                reap_worker(completion_rx, worker, reaper_observe, guard, REAPER_GRACE);
-                return outcome;
-            }
+        if reaper.is_err() {
+            // No reaper: quarantine (verification without the join
+            // handle is impossible) — never an inline join, which would
+            // block the parent past its budget.
+            return Self::on_reaper_spawn_failure(outcome_rx, &parent_shutdown, guard, deadline);
+        }
+        guard.transfer();
+        // Recompute the remainder AFTER both spawns: the receive below
+        // must never wait past the absolute deadline. OS thread spawn
+        // cost (~us) sits outside this budget by construction — it can
+        // skew parent-return past the deadline by the spawn cost, but
+        // never extends a socket wait (every worker-side wait keys off
+        // the absolute deadline). Nothing left: shutdown-only + return.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
+            return VerifyOutcome::TimedOut;
         }
         match outcome_rx.recv_timeout(remaining) {
             Ok(outcome) => outcome,
@@ -1088,9 +1327,11 @@ impl Fprintd {
     /// release runs on all paths so a user never wedges the reader
     /// for the next attempt ("already claimed" is a denial, not a
     /// wedge, and clears when this call's connection drops). Every
-    /// method call carries the attempt's remaining-derived timeout;
-    /// the signal wait carries the attempt `deadline`. Cleanup is
-    /// always attempted before the worker retires the transport.
+    /// method call carries the bound fixed from the setup remainder
+    /// (not recomputed per call); the signal wait ends on shutdown or
+    /// peer loss with the attempt `deadline` applied to the verdict.
+    /// Cleanup is always attempted before the worker retires the
+    /// transport.
     fn verify_inner(&self, user: &str, deadline: Instant) -> VerifyOutcome {
         let Some(path) = self.default_device() else {
             return VerifyOutcome::NoDevice;
@@ -1111,9 +1352,9 @@ impl Fprintd {
         }
         let outcome = self.verify_claimed(&device, deadline);
         // Always stop and release; errors are best-effort cleanup. Each
-        // call carries the attempt's remaining-derived method timeout,
-        // and past the deadline the parent's shutdown fails them fast.
-        // The transport itself retires in the worker after this returns:
+        // call carries the setup-remainder-derived method bound, and
+        // past the deadline the parent's shutdown fails them fast. The
+        // transport itself retires in the worker after this returns:
         // cleanup is attempted BEFORE shutdown+close, never after.
         let _: Result<(), _> = device.call("VerifyStop", &());
         let _: Result<(), _> = device.call("Release", &());
@@ -1308,6 +1549,14 @@ mod tests {
     const JOIN_BUDGET: Duration = Duration::from_secs(5);
     /// Zero stub delay (shorthand for the scripted fixtures below).
     const D0: Duration = Duration::ZERO;
+
+    /// Absolute retirement deadline `d` from now (checked: overflow
+    /// fails the test loudly instead of wrapping silently).
+    fn retire_in(d: Duration) -> Instant {
+        Instant::now()
+            .checked_add(d)
+            .expect("retirement deadline in range")
+    }
 
     /// Poll until the single-flight claim reads free or the budget runs
     /// out. Every claim-touching test calls this BEFORE releasing
@@ -1586,6 +1835,9 @@ mod tests {
         worker.join().expect("worker joins");
     }
 
+    /// Ordering-only channel test (no asynchronous callback, no
+    /// runtime generation/correlation): pins that a late send finds its
+    /// waiter gone. Must NOT qualify live async correlation.
     #[test]
     fn late_worker_result_cannot_apply_to_a_newer_generation() {
         // Locks the per-attempt handoff shape `verify` relies on: the
@@ -1779,7 +2031,7 @@ mod tests {
 
     /// Hold `sock` open until `done` flips: read with a short timeout
     /// and discard whatever arrives. The peer never sees EOF while held.
-    fn hold_until_done(sock: &std::os::unix::net::UnixStream, done: &AtomicBool) {
+    fn hold_until_done(sock: &mut std::os::unix::net::UnixStream, done: &AtomicBool) {
         let mut byte = [0u8; 1];
         while !done.load(Ordering::Acquire) {
             match sock.read(&mut byte) {
@@ -1821,10 +2073,10 @@ mod tests {
                 .spawn(move || {
                     while !worker_done.load(Ordering::Acquire) {
                         match listener.accept() {
-                            Ok((sock, _)) => {
+                            Ok((mut sock, _)) => {
                                 sock.set_read_timeout(Some(Duration::from_millis(100)))
                                     .expect("blackhole read timeout");
-                                hold_until_done(&sock, &worker_done);
+                                hold_until_done(&mut sock, &worker_done);
                                 break;
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1928,7 +2180,7 @@ mod tests {
             reader.read_line(&mut line).expect("stall reads BEGIN");
             // Authenticated; the pipelined Hello sits unread. Hold the
             // socket open (no Hello reply, no EOF) until released.
-            hold_until_done(&sock, done);
+            hold_until_done(&mut sock, done);
         }
     }
 
@@ -2652,7 +2904,7 @@ mod tests {
             worker,
             observe,
             ClaimGuard::adopt(),
-            Duration::from_secs(5),
+            retire_in(Duration::from_secs(5)),
         );
         assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
     }
@@ -2688,7 +2940,7 @@ mod tests {
             worker,
             observe,
             ClaimGuard::adopt(),
-            Duration::from_secs(5),
+            retire_in(Duration::from_secs(5)),
         );
         assert_eq!(ClaimGuard::test_state(), ClaimState::Quarantined);
         // Sticky: dropping the peer afterwards changes nothing.
@@ -2699,12 +2951,13 @@ mod tests {
         assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
     }
 
-    /// Reaper wedge path: a worker parked past a short test grace
-    /// (completion sender held, never sent) quarantines WITHOUT waiting
-    /// for it — the reaper returns at the grace and detaches the
-    /// handle. The parked worker is released afterwards and exits on
-    /// its own (signalled, so no leaked thread hides behind the
-    /// detach): quarantine is a state, not a parked thread.
+    /// Reaper wedge path: a worker parked past a short test
+    /// retirement budget (completion sender held, never sent)
+    /// quarantines WITHOUT waiting for it — the reaper returns at the
+    /// budget and detaches the handle. The parked worker is released
+    /// afterwards and exits on its own (signalled, so no leaked thread
+    /// hides behind the detach): quarantine is a state, not a parked
+    /// thread.
     #[test]
     fn reaper_quarantines_a_wedged_worker_bounded() {
         let _serial = test_serialize_claim().lock().unwrap();
@@ -2732,13 +2985,13 @@ mod tests {
             worker,
             observe,
             ClaimGuard::adopt(),
-            Duration::from_millis(300),
+            retire_in(Duration::from_millis(300)),
         );
         let elapsed = start.elapsed();
         assert_eq!(ClaimGuard::test_state(), ClaimState::Quarantined);
         assert!(
             elapsed < Duration::from_secs(5),
-            "wedged reap must return at the grace, took {elapsed:?}"
+            "wedged reap must return at the retirement budget, took {elapsed:?}"
         );
         // The detached worker still exits on its own once released.
         release_tx.send(()).expect("wedge released");
@@ -2751,8 +3004,8 @@ mod tests {
 
     /// Reaper death path: a worker that dies WITHOUT completing (panic
     /// drops the completion sender) quarantines at once via the
-    /// disconnected channel — without waiting out the grace — and the
-    /// join collects the panic.
+    /// disconnected channel — without waiting out the retirement
+    /// budget — and the bounded join collects the panic.
     #[test]
     fn reaper_quarantines_a_dead_worker_at_once() {
         let _serial = test_serialize_claim().lock().unwrap();
@@ -2775,17 +3028,345 @@ mod tests {
             worker,
             observe,
             ClaimGuard::adopt(),
-            Duration::from_secs(30),
+            retire_in(Duration::from_secs(30)),
         );
         let elapsed = start.elapsed();
         assert_eq!(ClaimGuard::test_state(), ClaimState::Quarantined);
         assert!(
             elapsed < Duration::from_secs(5),
-            "death path must not wait out the grace, took {elapsed:?}"
+            "death path must not wait out the retirement budget, took {elapsed:?}"
         );
         assert!(ClaimGuard::try_claim().is_none());
         ClaimGuard::test_reset();
         assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
+    }
+
+    /// Retirement-budget discrimination: the grace runs from the attempt
+    /// deadline, never from spawn. A healthy worker completing 3s after
+    /// spawn — past a 2s from-spawn grace, before its 5s attempt
+    /// deadline — must RELEASE (retire_by = deadline + 2s test grace).
+    /// Against from-spawn semantics this test FAILS (quarantine at 2s),
+    /// which is exactly the 58ff defect it pins.
+    #[test]
+    fn reaper_releases_a_healthy_attempt_past_from_spawn_grace() {
+        let _serial = test_serialize_claim().lock().unwrap();
+        let _watchdog = TestWatchdog::arm(120);
+        let (ours, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let observe = ours.try_clone().expect("observe clone");
+        let held = ClaimGuard::try_claim().expect("claim free in test");
+        held.transfer();
+        let (completion_tx, completion_rx) = mpsc::channel::<()>();
+        let worker = std::thread::Builder::new()
+            .name("tuna-fprintd-test-slow-healthy".into())
+            .spawn(move || {
+                // Healthy but slow: completes 3s after spawn (the
+                // attempt deadline is 5s out), with the textbook
+                // retirement order.
+                std::thread::sleep(Duration::from_secs(3));
+                let _ = ours.shutdown(std::net::Shutdown::Both);
+                drop(ours);
+                drop(peer);
+                let _ = completion_tx.send(());
+            })
+            .expect("slow worker spawns");
+        // Attempt deadline +5s, test grace +2s: retire_by is +7s, so a
+        // 3s completion releases. From-spawn grace semantics would have
+        // quarantined at +2s.
+        let retire_by = retire_in(Duration::from_secs(7));
+        reap_worker(
+            completion_rx,
+            worker,
+            observe,
+            ClaimGuard::adopt(),
+            retire_by,
+        );
+        assert_eq!(
+            ClaimGuard::test_state(),
+            ClaimState::Free,
+            "healthy completion before the attempt deadline must release"
+        );
+    }
+
+    /// Unobserved-exit path: a worker that signals completion but then
+    /// parks past the retirement budget (never exiting) quarantines —
+    /// the reaper never joins an unobserved thread — and returns
+    /// bounded. The parked worker is released afterwards and exits on
+    /// its own (signalled).
+    #[test]
+    fn reaper_quarantines_completion_without_observed_exit() {
+        let _serial = test_serialize_claim().lock().unwrap();
+        let _watchdog = TestWatchdog::arm(120);
+        let (ours, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let observe = ours.try_clone().expect("observe clone");
+        let held = ClaimGuard::try_claim().expect("claim free in test");
+        held.transfer();
+        let (completion_tx, completion_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exiting_tx, exiting_rx) = mpsc::channel::<()>();
+        let worker = std::thread::Builder::new()
+            .name("tuna-fprintd-test-completed-parked".into())
+            .spawn(move || {
+                let _ = ours.shutdown(std::net::Shutdown::Both);
+                drop(ours);
+                drop(peer);
+                let _ = completion_tx.send(());
+                // Completed but never exits: parks until released AFTER
+                // the verdict (the shape an unbounded join would hang
+                // on).
+                release_rx.recv().expect("test releases the parked worker");
+                let _ = exiting_tx.send(());
+            })
+            .expect("parking worker spawns");
+        let start = Instant::now();
+        reap_worker(
+            completion_rx,
+            worker,
+            observe,
+            ClaimGuard::adopt(),
+            retire_in(Duration::from_millis(500)),
+        );
+        let elapsed = start.elapsed();
+        assert_eq!(ClaimGuard::test_state(), ClaimState::Quarantined);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "unobserved exit must quarantine bounded, took {elapsed:?}"
+        );
+        release_tx.send(()).expect("parked worker released");
+        exiting_rx
+            .recv_timeout(JOIN_BUDGET)
+            .expect("released worker exits");
+        ClaimGuard::test_reset();
+        assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
+    }
+
+    /// Worker-spawn-failure handler, directly: shuts the retained clone
+    /// down (the peer observes EOF), releases on the verified no-thread
+    /// condition, and denies. Real pthread spawn failure is not
+    /// inducible, so the handler — not the trigger — is what CI pins;
+    /// the kit-drop test below drives the full destruction order.
+    #[test]
+    fn worker_spawn_failure_handler_shuts_down_and_releases() {
+        let _serial = test_serialize_claim().lock().unwrap();
+        let _watchdog = TestWatchdog::arm(120);
+        let (shutdown_end, peer_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer_end
+            .set_read_timeout(Some(JOIN_BUDGET))
+            .expect("peer read timeout");
+        let guard = ClaimGuard::try_claim().expect("claim free in test");
+        let outcome = Fprintd::on_worker_spawn_failure(&shutdown_end, guard);
+        assert_eq!(outcome, VerifyOutcome::Error);
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            peer_end.recv(&mut byte),
+            Ok(0),
+            "peer must observe EOF after the handler shutdown"
+        );
+        assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
+    }
+
+    /// Reaper-spawn-failure handler, directly: waits the recomputed
+    /// remainder, shuts down-only, QUARANTINES (verification without
+    /// the handle is impossible), and returns the outcome — never an
+    /// inline join. Both the timeout shape (outcome unknown, worker
+    /// detached-alive) and the answered shape are pinned.
+    #[test]
+    fn reaper_spawn_failure_handler_quarantines_without_joining() {
+        let _serial = test_serialize_claim().lock().unwrap();
+        let _watchdog = TestWatchdog::arm(120);
+        // Answered shape: the detached worker's outcome arrives, but
+        // the claim still quarantines (unverifiable retirement).
+        let (shutdown_end, peer_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer_end
+            .set_read_timeout(Some(JOIN_BUDGET))
+            .expect("peer read timeout");
+        let (outcome_tx, outcome_rx) = mpsc::channel::<VerifyOutcome>();
+        outcome_tx
+            .send(VerifyOutcome::Matched)
+            .expect("outcome sends");
+        let guard = ClaimGuard::try_claim().expect("claim free in test");
+        let outcome = Fprintd::on_reaper_spawn_failure(
+            outcome_rx,
+            &shutdown_end,
+            guard,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(outcome, VerifyOutcome::Matched, "outcome passes through");
+        assert_eq!(ClaimGuard::test_state(), ClaimState::Quarantined);
+        // Timeout shape: nothing answers within the recomputed
+        // remainder — shutdown-only, then quarantine, bounded.
+        let (shutdown_end, peer_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer_end
+            .set_read_timeout(Some(JOIN_BUDGET))
+            .expect("peer read timeout");
+        let (_held_tx, outcome_rx) = mpsc::channel::<VerifyOutcome>();
+        ClaimGuard::test_reset();
+        let guard = ClaimGuard::try_claim().expect("claim free in test");
+        let start = Instant::now();
+        let outcome = Fprintd::on_reaper_spawn_failure(
+            outcome_rx,
+            &shutdown_end,
+            guard,
+            Instant::now() + Duration::from_millis(200),
+        );
+        assert_eq!(outcome, VerifyOutcome::TimedOut);
+        assert_eq!(ClaimGuard::test_state(), ClaimState::Quarantined);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "handler must return at the remainder, bounded"
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            peer_end.recv(&mut byte),
+            Ok(0),
+            "peer must observe EOF after the handler shutdown"
+        );
+        ClaimGuard::test_reset();
+        assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
+    }
+
+    /// Kit-destruction order, simulated for real: dropping an unstarted
+    /// [`WorkerKit`] shuts the socket down BEFORE the captured
+    /// connection drops (the guard is the first field — fields drop in
+    /// declaration order), all before the parent handler runs; the
+    /// handler then releases on the verified no-thread condition. The
+    /// peer observes EOF and the bus name vanishes on the drop alone
+    /// (claim untouched); the release happens only in the handler.
+    #[test]
+    fn worker_kit_drop_shuts_down_before_parent_handler() {
+        let _serial = test_serialize_claim().lock().unwrap();
+        let _watchdog = TestWatchdog::arm(120);
+        let bus = TestBus::spawn();
+        let conn = bus.connect();
+        let proxy = zbus::blocking::Proxy::new(
+            &conn,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .expect("dbus proxy builds");
+        let ours = conn
+            .unique_name()
+            .expect("connection has a unique name")
+            .as_str()
+            .to_owned();
+        let (shutdown_end, peer_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer_end
+            .set_read_timeout(Some(JOIN_BUDGET))
+            .expect("peer read timeout");
+        let (outcome_tx, _outcome_rx) = mpsc::channel::<VerifyOutcome>();
+        let (completion_tx, _completion_rx) = mpsc::channel::<()>();
+        let guard = ClaimGuard::try_claim().expect("claim free in test");
+        let kit = WorkerKit {
+            shutdown_guard: ShutdownFirst::arm(shutdown_end),
+            attempt: Fprintd {
+                conn,
+                bus_address: None,
+            },
+            user: "ada".to_owned(),
+            deadline: retire_in(Duration::from_secs(5)),
+            outcome_tx,
+            completion_tx,
+        };
+        // The unstarted-spawn shape: the kit drops whole.
+        drop(kit);
+        // Kit destruction effects, BEFORE the parent handler: the peer
+        // observes EOF (guard shutdown) and the bus name vanishes
+        // (connection drop) — with the claim still held.
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            peer_end.recv(&mut byte),
+            Ok(0),
+            "kit drop must shut the socket down first"
+        );
+        let deadline = Instant::now() + JOIN_BUDGET;
+        loop {
+            let names: Vec<String> = proxy
+                .call::<_, _, Vec<String>>("ListNames", &())
+                .expect("ListNames answers");
+            if !names.iter().any(|listed| listed == &ours) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dropped kit connection must leave the bus"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            ClaimGuard::test_state(),
+            ClaimState::Held,
+            "kit destruction never touches the claim"
+        );
+        // ... then the parent handler (with its own retained clone, as
+        // in production) releases on the verified condition.
+        let (parent_shutdown, _) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let outcome = Fprintd::on_worker_spawn_failure(&parent_shutdown, guard);
+        assert_eq!(outcome, VerifyOutcome::Error);
+        assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
+    }
+
+    /// Shutdown observation drains healthy chatter: a peer that queued
+    /// 64KiB and then went quiet still yields EOF after our shutdown
+    /// (probed kernel behavior), so a talkative-but-retired transport
+    /// releases instead of false-quarantining.
+    #[test]
+    fn shutdown_observed_drains_queued_chatter_to_eof() {
+        let _watchdog = TestWatchdog::arm(120);
+        let (ours, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_nonblocking(true).expect("peer nonblocking");
+        let chunk = vec![0xC4u8; 4096];
+        for _ in 0..16 {
+            let mut written = 0usize;
+            while written < chunk.len() {
+                match peer.write(&chunk[written..]) {
+                    Ok(0) => panic!("peer write must progress"),
+                    Ok(n) => written += n,
+                    Err(error) => panic!("peer must queue 64KiB freely: {error}"),
+                }
+            }
+        }
+        let observe = ours.try_clone().expect("observe clone");
+        ours.shutdown(std::net::Shutdown::Both)
+            .expect("shutdown issues");
+        assert!(
+            shutdown_observed(&observe),
+            "shutdown with queued chatter must drain to EOF and release"
+        );
+    }
+
+    /// Shutdown observation is cap-bounded: chatter past a tiny test cap
+    /// quarantines (returns false) instead of draining forever. The
+    /// production cap is [`SHUTDOWN_DRAIN_CAP`]; this pins the cap
+    /// MECHANISM, not the constant. Each half uses a fresh pair with
+    /// its chatter queued BEFORE shutdown (nothing is ever sent
+    /// post-shutdown — that behavior is not relied on).
+    #[test]
+    fn shutdown_observed_cap_exceeded_quarantines() {
+        let _watchdog = TestWatchdog::arm(120);
+        // Over the tiny cap: quarantine.
+        let (ours, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_nonblocking(true).expect("peer nonblocking");
+        peer.write_all(&vec![0xC4u8; 4096])
+            .expect("peer queues 4KiB");
+        let observe = ours.try_clone().expect("observe clone");
+        ours.shutdown(std::net::Shutdown::Both)
+            .expect("shutdown issues");
+        assert!(
+            !shutdown_observed_capped(&observe, 16),
+            "chatter past the cap must quarantine, not release"
+        );
+        // Same backlog shape under the production cap: drain to EOF.
+        let (ours, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_nonblocking(true).expect("peer nonblocking");
+        peer.write_all(&vec![0xC4u8; 4096])
+            .expect("peer queues 4KiB");
+        let observe = ours.try_clone().expect("observe clone");
+        ours.shutdown(std::net::Shutdown::Both)
+            .expect("shutdown issues");
+        assert!(
+            shutdown_observed(&observe),
+            "4KiB chatter is far under the production cap"
+        );
     }
 
     /// Listener held full: backlog pinned to zero with one completed but
@@ -3054,14 +3635,15 @@ mod tests {
         (read == 0 && inq >= 0).then(|| inq as usize)
     }
 
-    /// Relay counters, shared with the test. `final_client_inq` is the
-    /// unread backlog on the relay's client socket sampled at shutdown
-    /// (`usize::MAX` when the worker never served a client — the tests
-    /// reject that as vacuous, never as pending).
+    /// Relay counters, shared with the test. `last_client_inq` is the
+    /// unread backlog on the relay's client socket, sampled live every
+    /// 100ms while frozen (monotonic — the frozen leg never reads) and
+    /// once more at shutdown (`usize::MAX` when the worker never served
+    /// a client — the tests reject that as vacuous, never as pending).
     struct RelayStats {
         c2d_forwarded: AtomicUsize,
         d2c_forwarded: AtomicUsize,
-        final_client_inq: AtomicUsize,
+        last_client_inq: AtomicUsize,
     }
 
     /// Byte relay between one client and a real bus daemon: pumps both
@@ -3087,7 +3669,7 @@ mod tests {
             let stats = Arc::new(RelayStats {
                 c2d_forwarded: AtomicUsize::new(0),
                 d2c_forwarded: AtomicUsize::new(0),
-                final_client_inq: AtomicUsize::new(usize::MAX),
+                last_client_inq: AtomicUsize::new(usize::MAX),
             });
             let done = Arc::new(AtomicBool::new(false));
             let daemon_addr = daemon_addr.to_owned();
@@ -3249,11 +3831,17 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            // Frozen: hold every socket open, read nothing, until done.
+            // Frozen: hold every socket open, read nothing, until done —
+            // sampling the unread backlog live (it only grows: nothing
+            // here ever reads it), plus once more at shutdown.
             while !done.load(TestOrdering::Acquire) {
-                std::thread::sleep(Duration::from_millis(10));
+                stats.last_client_inq.store(
+                    test_inq(&sampler).unwrap_or(usize::MAX),
+                    TestOrdering::Release,
+                );
+                std::thread::sleep(Duration::from_millis(100));
             }
-            stats.final_client_inq.store(
+            stats.last_client_inq.store(
                 test_inq(&sampler).unwrap_or(usize::MAX),
                 TestOrdering::Release,
             );
@@ -3472,17 +4060,19 @@ mod tests {
         drop(relay);
         // Corroboration: the frozen peer still holds the client's
         // unread output at shutdown.
-        let inq = stats.final_client_inq.load(TestOrdering::Acquire);
+        let inq = stats.last_client_inq.load(TestOrdering::Acquire);
         assert_ne!(inq, usize::MAX, "relay must have served the client");
         assert!(inq > 0, "frozen peer must retain unread client output");
     }
 
     /// Test B — public `verify` against a frozen peer: the attempt's
     /// output provably pends (peer-side unread backlog), the attempt
-    /// resolves bounded and fail-closed, and the claim releases. The
-    /// pending-bytes assertion runs ONLY on the mandatorily exercised
-    /// measured phases (freeze tripped on the attempt's own early
-    /// traffic + backlog sampled); a zero backlog takes the EXPLICIT
+    /// resolves bounded and fail-closed, and the claim releases — with
+    /// the frozen peer held alive THROUGH the release (teardown-first
+    /// would rescue a production failure with EOF). The pending-bytes
+    /// assertion runs ONLY on the mandatorily exercised measured phases
+    /// (freeze tripped on the attempt's own early traffic + backlog
+    /// sampled live pre-teardown); a zero backlog takes the EXPLICIT
     /// non-fill branch — never silently the same proof. Retirement
     /// claimed here is exactly owned application work (bounded outcome)
     /// + socket shutdown/drop + handles released: NO zero-driver-linger
@@ -3522,14 +4112,22 @@ mod tests {
             elapsed < Duration::from_secs(15),
             "frozen attempt must not linger, took {elapsed:?}"
         );
-        drop(relay);
+        // The frozen peer stays alive until the claim releases: the
+        // worker must retire on the PRODUCTION shutdown paths alone —
+        // tearing the relay down first would rescue a production
+        // failure with EOF and prove nothing.
         await_claim_free(Duration::from_secs(30));
+        // One sampler cadence past retirement, so the live backlog
+        // sample below postdates all client output (the relay samples
+        // every 100ms; client output is final once the claim frees).
+        std::thread::sleep(Duration::from_millis(150));
         // Mandatorily exercised measured phases: the freeze tripped
         // (the build's handshake + Hello flowed — the ONLY traffic the
         // test relies on pre-freeze), and the peer-side backlog was
-        // sampled.
+        // sampled while the peer was still frozen alive.
         let forwarded = stats.c2d_forwarded.load(TestOrdering::Acquire);
-        let inq = stats.final_client_inq.load(TestOrdering::Acquire);
+        let inq = stats.last_client_inq.load(TestOrdering::Acquire);
+        drop(relay);
         assert!(
             forwarded >= 256,
             "freeze must trip on the build traffic, forwarded {forwarded}"
