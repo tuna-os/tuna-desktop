@@ -3892,8 +3892,9 @@ while [ ! -s "$HISTORY_FILE" ] && [ "$(date +%s)" -le "$end" ]; do sleep 1; done
 [ -s "$HISTORY_FILE" ] || fail G-WELLBEING-HISTORY "history did not resume after re-enabling"
 pass G-WELLBEING-HISTORY "the shell records GNOME-compatible session-active history, deleted while disabled"
 
-# A 10 s daily limit is long spent this journey: enabling it posts GNOME's
-# limit notice and records the grayscale request, live. Banners need DND
+# History was just deleted and restarted. A real 10 s daily limit must
+# reach its deadline within this 20 s gate, post the limit notice and request
+# grayscale without waiting for the 30 s background sample. Banners need DND
 # off; the journey's DND state is restored after the break gate.
 DND_BEFORE="$(gsettings get org.gnome.desktop.notifications show-banners)"
 gsettings set org.gnome.desktop.notifications show-banners true

@@ -725,6 +725,32 @@ impl ScreenTimeTracker {
         }
     }
 
+    /// Background samples stay at most 30 seconds apart, while limit,
+    /// upcoming-warning and local-day boundaries get their own earlier wake.
+    /// GNOME 51 schedules the remaining active-time limit explicitly in
+    /// TimeLimitsManager._updateState; a fixed history poll misses short limits.
+    fn next_check_delay(&self, now_wall: i64) -> Duration {
+        let mut seconds = SCREEN_TIME_POLL.as_secs();
+        if !self.settings.history_enabled {
+            return SCREEN_TIME_POLL;
+        }
+        let (today, tomorrow) = start_of_today(now_wall);
+        seconds = seconds.min(tomorrow.saturating_sub(now_wall).max(1) as u64);
+        if self.settings.daily_limit_enabled
+            && self.state == TimeLimitsState::Active
+            && self.user_state == UserState::Active
+        {
+            let used = active_time_today(self.store.transitions(), now_wall, today);
+            let remaining = self.settings.daily_limit_secs.saturating_sub(used);
+            seconds = seconds.min(remaining.max(1) as u64);
+            let warning_in = remaining.saturating_sub(LIMIT_UPCOMING_NOTIFICATION_SECONDS);
+            if self.upcoming_fired_for_day != Some(today) && warning_in > 0 {
+                seconds = seconds.min(warning_in as u64);
+            }
+        }
+        Duration::from_secs(seconds.max(1))
+    }
+
     /// Record the shutdown edge and flush, as `_stopStateMachine` does. The
     /// shell calls this on session exit while history is still enabled.
     pub fn shutdown(&mut self, now_wall: i64) -> io::Result<()> {
@@ -2060,12 +2086,17 @@ struct Runtime {
     resident: Option<u64>,
     actions: Rc<RefCell<Vec<BreakActionKind>>>,
     sent_effect: Option<EffectState>,
+    screen_timer: Option<glib::SourceId>,
+    stopped: bool,
 }
 
 /// One screen-time poll: idle verdict from the compositor, history edges and
 /// limit state, then dispatch. Hooks run outside the runtime borrow.
 #[cfg(not(test))]
 fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
+    if rt.borrow().stopped {
+        return;
+    }
     let (hooks, mut effect, events) = {
         let mut r = rt.borrow_mut();
         let now_wall = wall_now();
@@ -2084,6 +2115,39 @@ fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
     let mut r = rt.borrow_mut();
     maybe_send_effect(&hooks, &mut r.sent_effect, &effect);
     r.effect = effect;
+    drop(r);
+    schedule_screen_tick(rt);
+}
+
+/// A single replaceable source preserves background sampling while waking at
+/// exact remaining-limit boundaries. Settings changes invoke screen_tick and
+/// replace this source; stale deadlines cannot fire after a policy update.
+#[cfg(not(test))]
+fn schedule_screen_tick(rt: &Rc<RefCell<Runtime>>) {
+    let (delay, old) = {
+        let mut r = rt.borrow_mut();
+        if r.stopped {
+            return;
+        }
+        (
+            r.tracker.next_check_delay(wall_now()),
+            r.screen_timer.take(),
+        )
+    };
+    if let Some(source) = old {
+        source.remove();
+    }
+    let weak = Rc::downgrade(rt);
+    let source = glib::timeout_add_local(delay, move || {
+        if let Some(rt) = weak.upgrade() {
+            // The current source expires on Break; clear its identity before
+            // screen_tick installs the next source, without removing it twice.
+            let _ = rt.borrow_mut().screen_timer.take();
+            screen_tick(&rt);
+        }
+        glib::ControlFlow::Break
+    });
+    rt.borrow_mut().screen_timer = Some(source);
 }
 
 /// One break poll, plus a countdown label refresh from the manager's due
@@ -2124,8 +2188,8 @@ fn break_tick(rt: &Rc<RefCell<Runtime>>) {
     r.resident = resident;
 }
 
-/// Start the live runtime: an immediate first poll, then the 30 s screen-time
-/// and 2 s break timers, live settings watches that re-poll at once (as
+/// Start the live runtime: an immediate first poll, then screen-time boundary
+/// timers with a 30 s background cap and the 2 s break timer, live settings watches that re-poll at once (as
 /// GNOME's changed handlers re-evaluate instead of waiting for the next
 /// tick), and a shutdown flush of the closing history edge.
 #[cfg(not(test))]
@@ -2160,6 +2224,8 @@ pub fn start(
         resident: None,
         actions,
         sent_effect: None,
+        screen_timer: None,
+        stopped: false,
     }));
     // Baseline first: the compositor starts from neutral even if a limit
     // is already reached (the first polls then send the actual pair).
@@ -2168,13 +2234,6 @@ pub fn start(
     // due break apply immediately instead of a tick late.
     screen_tick(&rt);
     break_tick(&rt);
-    {
-        let rt = rt.clone();
-        glib::timeout_add_local(SCREEN_TIME_POLL, move || {
-            screen_tick(&rt);
-            glib::ControlFlow::Continue
-        });
-    }
     {
         let rt = rt.clone();
         glib::timeout_add_local(BREAK_POLL, move || {
@@ -2215,7 +2274,12 @@ pub fn start(
     {
         let rt = rt.clone();
         app.connect_shutdown(move |_| {
-            if let Err(e) = rt.borrow_mut().tracker.shutdown(wall_now()) {
+            let mut r = rt.borrow_mut();
+            r.stopped = true;
+            if let Some(source) = r.screen_timer.take() {
+                source.remove();
+            }
+            if let Err(e) = r.tracker.shutdown(wall_now()) {
                 eprintln!("tuna-shell-gtk: wellbeing: shutdown flush failed: {e}");
             }
         });
@@ -3275,7 +3339,93 @@ mod tests {
     }
 
     #[test]
-    fn live_polls_use_gnome_cadence() {
+    fn fresh_short_limit_gets_a_deadline_before_the_background_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = tracker_in(dir.path());
+        tracker.poll(T0, 1000, true);
+        tracker.set_settings(ScreenTimeSettings {
+            daily_limit_enabled: true,
+            daily_limit_secs: 10,
+            grayscale: true,
+            ..ScreenTimeSettings::default()
+        });
+        tracker.poll(T0, 1000, true);
+        assert_eq!(tracker.next_check_delay(T0), Duration::from_secs(10));
+        let before = tracker.poll(T0 + 9, 1009, true);
+        assert!(!before.events.contains(&ScreenTimeEvent::LimitReached));
+        assert_eq!(tracker.next_check_delay(T0 + 9), Duration::from_secs(1));
+        let at = tracker.poll(T0 + 10, 1010, true);
+        assert!(at.events.contains(&ScreenTimeEvent::LimitReached));
+        assert!(at.events.contains(&ScreenTimeEvent::GrayscaleChanged(true)));
+        assert!(!tracker
+            .poll(T0 + 11, 1011, true)
+            .events
+            .contains(&ScreenTimeEvent::LimitReached));
+    }
+
+    #[test]
+    fn limit_changes_disable_and_inactive_state_replace_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = tracker_in(dir.path());
+        let mut settings = ScreenTimeSettings {
+            daily_limit_enabled: true,
+            daily_limit_secs: 10,
+            ..ScreenTimeSettings::default()
+        };
+        tracker.set_settings(settings);
+        tracker.poll(T0, 1000, true);
+        assert_eq!(tracker.next_check_delay(T0), Duration::from_secs(10));
+        settings.daily_limit_secs = 300;
+        tracker.set_settings(settings);
+        tracker.poll(T0, 1000, true);
+        assert_eq!(tracker.next_check_delay(T0), SCREEN_TIME_POLL);
+        settings.daily_limit_secs = 3;
+        tracker.set_settings(settings);
+        tracker.poll(T0, 1000, true);
+        assert_eq!(tracker.next_check_delay(T0), Duration::from_secs(3));
+        tracker.poll(T0 + 1, 1001, false);
+        assert_eq!(tracker.next_check_delay(T0 + 1), SCREEN_TIME_POLL);
+        tracker.poll(T0 + 20, 1020, true);
+        assert_eq!(tracker.next_check_delay(T0 + 20), Duration::from_secs(2));
+        settings.daily_limit_enabled = false;
+        tracker.set_settings(settings);
+        tracker.poll(T0 + 20, 1020, true);
+        assert_eq!(tracker.next_check_delay(T0 + 20), SCREEN_TIME_POLL);
+        settings.history_enabled = false;
+        tracker.set_settings(settings);
+        tracker.poll(T0 + 20, 1020, true);
+        assert_eq!(tracker.next_check_delay(T0 + 20), SCREEN_TIME_POLL);
+    }
+
+    #[test]
+    fn warning_and_local_day_reset_get_exact_earlier_wakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = tracker_in(dir.path());
+        tracker.set_settings(ScreenTimeSettings {
+            daily_limit_enabled: true,
+            daily_limit_secs: LIMIT_UPCOMING_NOTIFICATION_SECONDS + 5,
+            ..ScreenTimeSettings::default()
+        });
+        tracker.poll(T0, 1000, true);
+        assert_eq!(tracker.next_check_delay(T0), Duration::from_secs(5));
+        let warning = tracker.poll(T0 + 5, 1005, true);
+        assert!(warning.events.iter().any(|event| matches!(event,
+            ScreenTimeEvent::LimitUpcoming { remaining_secs } if *remaining_secs == LIMIT_UPCOMING_NOTIFICATION_SECONDS)));
+        assert_eq!(tracker.next_check_delay(T0 + 5), SCREEN_TIME_POLL);
+        let (_, tomorrow) = start_of_today(T0);
+        tracker.poll(tomorrow - 2, 1000 + (tomorrow - 2 - T0), true);
+        assert_eq!(tracker.state(), TimeLimitsState::LimitReached);
+        assert_eq!(
+            tracker.next_check_delay(tomorrow - 2),
+            Duration::from_secs(2)
+        );
+        tracker.poll(tomorrow, 1000 + (tomorrow - T0), true);
+        assert_eq!(tracker.state(), TimeLimitsState::Active);
+        assert_eq!(tracker.next_check_delay(tomorrow), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn background_sampling_and_break_poll_caps_are_preserved() {
         assert_eq!(SCREEN_TIME_POLL, Duration::from_secs(30));
         assert_eq!(BREAK_POLL, Duration::from_secs(2));
     }
