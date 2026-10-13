@@ -14,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use calloop::{EventLoop, LoopHandle};
 use smithay::{
@@ -598,6 +598,10 @@ pub struct Runtime {
     casts: Vec<crate::screencast::Cast>,
     /// Monitor list the Mutter D-Bus side serves.
     cast_outputs: crate::mutter::Outputs,
+    /// Night Light evaluation: settings, schedule, smear (#339).
+    /// The controller also owns the live state shared with the D-Bus
+    /// thread (active, temperature, "disabled until tomorrow").
+    night_light: crate::night_light::NightLightController,
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
@@ -889,6 +893,8 @@ impl Runtime {
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen
         // sharing through the stock GNOME portal.
         let cast_outputs: crate::mutter::Outputs = Default::default();
+        let night_light_share: std::sync::Arc<crate::night_light::NightLightShare> =
+            Default::default();
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
@@ -900,6 +906,7 @@ impl Runtime {
                     introspect.windows.clone(),
                     capture_authority.clone(),
                     display.handle(),
+                    night_light_share.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -997,6 +1004,7 @@ impl Runtime {
             pipewire: None,
             casts: Vec::new(),
             cast_outputs,
+            night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
@@ -2295,6 +2303,7 @@ impl Runtime {
                     damage: &[Rectangle::from_size(size)],
                     scale,
                     blank_alpha: 0.0,
+                    tint: None,
                 },
                 &[],
                 &[],
@@ -2432,7 +2441,7 @@ impl Runtime {
         if overview.is_none() {
             elements
                 .tile
-                .extend(focus_ring_elements(&self.manager, view));
+                .extend(focus_ring_elements(&self.manager, view, None));
         }
         elements.top = previews_to_elements(
             renderer,
@@ -2470,6 +2479,9 @@ impl Runtime {
                     damage: &[damage],
                     scale: view.scale,
                     blank_alpha,
+                    // Captures stay untinted, like GNOME's (gamma
+                    // applies past the framebuffer).
+                    tint: None,
                 },
                 &decor,
                 &previews,
@@ -3378,6 +3390,25 @@ impl Runtime {
         }
     }
 
+    /// Poll the Night Light settings and evaluate the schedule for
+    /// this frame (#339). A refreshed config mirrors into the window
+    /// model; a wedged clock keeps the previous gains.
+    fn night_light_tick(&mut self) -> Option<crate::night_light::ColorGains> {
+        if self
+            .night_light
+            .maybe_refresh(Instant::now(), crate::night_light::load_from_gsettings)
+        {
+            self.manager
+                .model_mut()
+                .set_night_light(self.night_light.config().clone());
+        }
+        if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            self.night_light.tick(elapsed.as_secs() as i64)
+        } else {
+            self.night_light.current_gains()
+        }
+    }
+
     /// Render all mapped toplevels stacked at the origin, then send frame
     /// callbacks. While the recovery overlay is visible the background
     /// shifts to a deep red (provisional overlay visual; full overlay
@@ -3392,6 +3423,7 @@ impl Runtime {
             self.performance_trace.cancel();
         }
         let blank_alpha = self.blank_alpha();
+        let night_gains = self.night_light_tick();
         let show_content = content_visible(locked);
         let overlay_visible = self.overlay.visible;
         let background = if locked {
@@ -3430,6 +3462,15 @@ impl Runtime {
             self.input_settings.motion,
             allowed,
         );
+        // The tint program is compiled once per renderer and cached;
+        // a compile failure draws this frame untinted.
+        let night_tint: Option<NightTint> = night_gains.and_then(|gains| {
+            crate::night_light::tint_program(renderer).map(|program| NightTint {
+                program,
+                uniform: crate::night_light::gains_f32(gains),
+                gains,
+            })
+        });
         let overview = (show_content && !overlay_visible && drawn).then(|| self.overview_layout());
         // While search shows results, the workspace view steps aside.
         let cards = overview
@@ -3441,6 +3482,12 @@ impl Runtime {
             .flatten();
         let tile = self.animated_tile_preview(tile);
         let accent = self.wallpaper.accent();
+        // Accent-derived solids (tile preview, overview decor) follow
+        // the tint; captures keep the untinted accent.
+        let accent = night_tint
+            .as_ref()
+            .map(|tint| crate::night_light::apply_gains(accent, tint.gains))
+            .unwrap_or(accent);
         let decor_global = cards
             .map(|layout| overview_decor(layout, accent))
             .unwrap_or_default();
@@ -3493,9 +3540,11 @@ impl Runtime {
                         elements.tile = tile_elements(rect, view, accent);
                     }
                     if overview.is_none() && show_content {
-                        elements
-                            .tile
-                            .extend(focus_ring_elements(&self.manager, view));
+                        elements.tile.extend(focus_ring_elements(
+                            &self.manager,
+                            view,
+                            night_tint.as_ref().map(|tint| tint.gains),
+                        ));
                     }
                     elements.top = previews_to_elements(
                         renderer,
@@ -3536,6 +3585,7 @@ impl Runtime {
                             damage: &[damage],
                             scale: view.scale,
                             blank_alpha,
+                            tint: night_tint.as_ref(),
                         },
                         &decor,
                         &previews,
@@ -3614,9 +3664,11 @@ impl Runtime {
                         elements.tile = tile_elements(rect, view, accent);
                     }
                     if overview.is_none() && show_content {
-                        elements
-                            .tile
-                            .extend(focus_ring_elements(&self.manager, view));
+                        elements.tile.extend(focus_ring_elements(
+                            &self.manager,
+                            view,
+                            night_tint.as_ref().map(|tint| tint.gains),
+                        ));
                     }
                     elements.top = previews_to_elements(
                         renderer,
@@ -3650,6 +3702,7 @@ impl Runtime {
                         background,
                         blank_alpha,
                         accent,
+                        night_light: self.night_light.effect_bits(),
                         pointer: (!locked && blank_alpha < 1.0).then_some((pointer.x, pointer.y)),
                         decor: decor.clone(),
                         above: elements.above,
@@ -3745,6 +3798,7 @@ impl Runtime {
                                 damage: &damage,
                                 scale: view.scale,
                                 blank_alpha,
+                                tint: night_tint.as_ref(),
                             },
                             &decor,
                             &previews,
@@ -3996,6 +4050,16 @@ fn switcher_previews(
         .collect()
 }
 
+/// Installed Night Light tint for one live frame (#339): the
+/// texture program plus the gains as a shader uniform and as
+/// schedule gains for CPU-side colours. Captures never carry one.
+#[derive(Debug)]
+struct NightTint {
+    program: smithay::backend::renderer::gles::GlesTexProgram,
+    uniform: [f32; 3],
+    gains: crate::night_light::ColorGains,
+}
+
 /// One output's surfaces, front to back, with GNOME's tile preview
 /// slotted in: `elements[..above]` draw over the preview (the dragged
 /// window, its popups and the shell's layers), the rest beneath it.
@@ -4096,6 +4160,7 @@ fn tile_elements(
 fn focus_ring_elements(
     manager: &WindowManager,
     view: View,
+    tint: Option<crate::night_light::ColorGains>,
 ) -> Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement> {
     use smithay::backend::renderer::element::solid::SolidColorRenderElement;
     use smithay::backend::renderer::element::Id;
@@ -4121,7 +4186,12 @@ fn focus_ring_elements(
     if w <= 2 * b || h <= 2 * b {
         return Vec::new();
     }
-    let color = Color32F::new(0x7f as f32 / 255.0, 0xc8 as f32 / 255.0, 1.0, 1.0);
+    let [fr, fg, fb] = tint
+        .map(|gains| {
+            crate::night_light::apply_gains([0x7f as f32 / 255.0, 0xc8 as f32 / 255.0, 1.0], gains)
+        })
+        .unwrap_or([0x7f as f32 / 255.0, 0xc8 as f32 / 255.0, 1.0]);
+    let color = Color32F::new(fr, fg, fb, 1.0);
     let at = |x: i32, y: i32, w: i32, h: i32| -> Rectangle<i32, smithay::utils::Physical> {
         Rectangle::new((r.loc.x + x, r.loc.y + y).into(), (w, h).into())
     };
@@ -4466,6 +4536,8 @@ struct Target<'a> {
     damage: &'a [Rectangle<i32, smithay::utils::Physical>],
     scale: f64,
     blank_alpha: f32,
+    /// Installed Night Light tint, if this live frame carries one.
+    tint: Option<&'a NightTint>,
 }
 
 fn draw_scene(
@@ -4485,7 +4557,32 @@ fn draw_scene(
         damage,
         scale,
         blank_alpha,
+        tint,
     } = target;
+    // The clear follows the tint; solid overlays keep their colours
+    // (accent-derived ones arrive pre-tinted, feedback stays raw).
+    let background = tint
+        .map(|tint| {
+            let [r, g, b] = crate::night_light::apply_gains(
+                [background.r(), background.g(), background.b()],
+                tint.gains,
+            );
+            Color32F::new(r, g, b, background.a())
+        })
+        .unwrap_or(background);
+    // Install the tint program around one texture group; a no-op
+    // without a tint, cleared right after.
+    let set_tint = |frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>| {
+        if let Some(tint) = tint {
+            frame.override_default_tex_program(
+                tint.program.clone(),
+                vec![
+                    smithay::backend::renderer::gles::Uniform::new("brightness", 1.0f32),
+                    smithay::backend::renderer::gles::Uniform::new("nl_gains", tint.uniform),
+                ],
+            );
+        }
+    };
     let error =
         |e: smithay::backend::renderer::gles::GlesError| RuntimeError::Dispatch(e.to_string());
     // Plan top to bottom (#503): each element repaints only damage that
@@ -4527,7 +4624,9 @@ fn draw_scene(
     if !clear.is_empty() {
         frame.clear(background, &clear).map_err(error)?;
     }
+    set_tint(frame);
     draw_planned::<GlesRenderer, _>(frame, 1.0, paper, &paper_plan).map_err(error)?;
+    frame.clear_tex_program_override();
     for ((color, _), rects) in decor.iter().zip(decor_plan.iter().rev()) {
         if !rects.is_empty() {
             frame.clear(*color, rects).map_err(error)?;
@@ -4535,11 +4634,15 @@ fn draw_scene(
     }
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
+    set_tint(frame);
     draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &under, &under_plan).map_err(error)?;
+    frame.clear_tex_program_override();
+    draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.tile, &tile_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan).map_err(error)?;
+    draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
+    set_tint(frame);
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
+    frame.clear_tex_program_override();
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, visible) in over
@@ -4621,8 +4724,19 @@ fn draw_slots(
     scene: &Scene,
     slots: &[SceneSlot],
     plan: &[Vec<Rectangle<i32, smithay::utils::Physical>>],
+    tint: Option<&NightTint>,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
+    // A tinted frame draws every texture through the tint program.
+    if let Some(tint) = tint {
+        frame.override_default_tex_program(
+            tint.program.clone(),
+            vec![
+                smithay::backend::renderer::gles::Uniform::new("brightness", 1.0f32),
+                smithay::backend::renderer::gles::Uniform::new("nl_gains", tint.uniform),
+            ],
+        );
+    }
     for (slot, visible) in slots.iter().zip(plan).rev() {
         let visible = std::slice::from_ref(visible);
         match *slot {
@@ -4640,6 +4754,7 @@ fn draw_slots(
             )?,
         }
     }
+    frame.clear_tex_program_override();
     Ok(())
 }
 

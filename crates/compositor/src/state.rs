@@ -112,6 +112,7 @@ pub struct StateModel {
     focused: Option<u64>,
     next_id: u64,
     changes: VecDeque<(u64, StateChange)>,
+    night_light: crate::night_light::NightLightConfig,
 }
 
 impl Default for StateModel {
@@ -125,6 +126,7 @@ impl Default for StateModel {
             focused: None,
             next_id: 1,
             changes: VecDeque::new(),
+            night_light: crate::night_light::NightLightConfig::default(),
         }
     }
 }
@@ -163,6 +165,21 @@ impl StateModel {
     /// Active workspace id (defaults to 0; always registered).
     pub fn active_workspace(&self) -> u32 {
         self.active
+    }
+
+    /// Night Light preference state (#339).
+    ///
+    /// Plain display preference, not part of the revisioned window
+    /// model: reads and writes neither bump the revision nor append
+    /// changes.
+    pub fn night_light(&self) -> &crate::night_light::NightLightConfig {
+        &self.night_light
+    }
+
+    /// Replace the Night Light preference state (no revision bump; see
+    /// [`StateModel::night_light`]).
+    pub fn set_night_light(&mut self, config: crate::night_light::NightLightConfig) {
+        self.night_light = config;
     }
 
     /// Switch the active workspace, registering it if new and pruning

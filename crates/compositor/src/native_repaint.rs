@@ -72,6 +72,9 @@ pub(crate) struct FrameSignature {
     pub background: Color32F,
     pub blank_alpha: f32,
     pub accent: [f32; 3],
+    /// Night Light gains as `f32` bits (unity when neutral, #339): a
+    /// temperature step repaints, an unchanged filter sleeps.
+    pub night_light: [u32; 3],
     pub pointer: Option<(f64, f64)>,
     pub decor: Vec<(Color32F, Vec<Rectangle<i32, Physical>>)>,
     pub above: usize,
@@ -90,6 +93,7 @@ impl FrameSignature {
             && self.background == old.background
             && self.blank_alpha == old.blank_alpha
             && self.accent == old.accent
+            && self.night_light == old.night_light
             && self.pointer == old.pointer
             && self.decor == old.decor
             && self.above == old.above
@@ -185,6 +189,7 @@ mod tests {
             background: Color32F::BLACK,
             blank_alpha: 0.0,
             accent: [0.0; 3],
+            night_light: [1.0f32.to_bits(); 3],
             pointer: Some((100.0, 200.0)),
             decor: vec![],
             above: 0,
@@ -203,7 +208,7 @@ mod tests {
     #[test]
     fn lock_fade_cursor_output_and_decor_changes_render_immediately() {
         let before = scene();
-        let mut variants = vec![before.clone(); 9];
+        let mut variants = vec![before.clone(); 10];
         variants[0].locked = true;
         variants[1].blank_alpha = 1.0;
         variants[2].pointer = Some((101.0, 200.0));
@@ -216,6 +221,8 @@ mod tests {
             Color32F::new(1.0, 1.0, 1.0, 1.0),
             vec![Rectangle::from_size((40, 30).into())],
         )];
+        // A Night Light temperature step repaints (#339).
+        variants[9].night_light = [0.5f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()];
         for next in variants {
             assert!(needs_repaint(Some(&before), &next, false));
         }

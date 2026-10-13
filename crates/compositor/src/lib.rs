@@ -97,6 +97,9 @@ mod x11_icons;
 #[cfg(feature = "xwayland")]
 pub mod x11_interop;
 pub mod xwayland;
+// Display colour-temperature subsystem (#339), appended at the end so
+// parallel sprint lanes touching this block stay conflict-free.
+pub mod night_light;
 
 /// One compositor-tracked output: protocol handle plus geometry.
 /// The first entry is the primary output; single-output sessions hold

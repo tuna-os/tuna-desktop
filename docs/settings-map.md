@@ -50,7 +50,8 @@ GNOME 51 `org.gnome.desktop.a11y.interface reduced-motion` is read live and comb
 | org.gnome.shell favorite-apps | Honored | Used for the dash when Tuna Desktop has no pins of its own |
 | org.gnome.desktop.app-folders (folder-children and each folder's name, apps, categories, excluded-apps, translate) | Honored | App-grid folders, read on each grid open. Proof G-APP-FOLDERS |
 | org.gnome.shell enabled-extensions | Ignored | GNOME Shell extensions are JavaScript. Tuna Desktop has its own extension point |
-| org.gnome.settings-daemon.plugins.color night-light-enabled | Honored (write only) | The Night Light tile writes it, but Tuna Desktop applies no colour temperature yet (#89 gamma control) |
+| org.gnome.settings-daemon.plugins.color night-light-enabled | Honored | The Night Light tile writes it and the compositor warms every live output while the schedule is active (#339) |
+| org.gnome.settings-daemon.plugins.color night-light-temperature, night-light-schedule-automatic, night-light-schedule-from, night-light-schedule-to | Honored | Temperature, automatic/manual schedule and manual window drive the output tint; DisabledUntilTomorrow is in-memory over org.gnome.SettingsDaemon.Color (#339) |
 
 ## Displays
 

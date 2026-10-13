@@ -295,6 +295,45 @@ struct DisplayConfig {
     to_loop: calloop::channel::Sender<ToLoop>,
 }
 
+/// g-s-d's Night Light properties (#339), served from the compositor
+/// on the same bus name: whether the filter applies, and the
+/// read-write "disabled until tomorrow". The loop owns the schedule
+/// and publishes through the share; this side only reads the applied
+/// state and records the disable timestamp.
+struct NightLightColor {
+    share: std::sync::Arc<crate::night_light::NightLightShare>,
+}
+
+#[interface(name = "org.gnome.SettingsDaemon.Color")]
+impl NightLightColor {
+    /// Whether the filter applies right now.
+    #[zbus(property)]
+    fn night_light_active(&self) -> bool {
+        self.share.active()
+    }
+
+    /// Whether "disabled until tomorrow" is recorded. The loop
+    /// decides whether it still suppresses (24 h lapse, sunrise).
+    #[zbus(property)]
+    fn disabled_until_tomorrow(&self) -> bool {
+        self.share.disabled_until_tmw().is_some()
+    }
+
+    /// Record (or clear) "disabled until tomorrow". Setting stamps
+    /// the current time; a wedged clock records no disable rather
+    /// than a bogus one.
+    #[zbus(property)]
+    fn set_disabled_until_tomorrow(&self, value: bool) {
+        let set_at = value.then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|elapsed| elapsed.as_secs() as i64)
+        });
+        self.share.set_disabled_until_tmw(set_at.flatten());
+    }
+}
+
 #[interface(name = "org.gnome.Mutter.DisplayConfig")]
 impl DisplayConfig {
     #[allow(clippy::type_complexity)]
@@ -415,9 +454,11 @@ impl DisplayConfig {
         false
     }
 
+    /// Night Light applies a live GL tint on every output (#339),
+    /// driven by the settings keys and the schedule.
     #[zbus(property)]
     fn night_light_supported(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -867,6 +908,7 @@ pub fn start(
     windows: Windows,
     authority: crate::capture_security::Authority,
     display: smithay::reexports::wayland_server::DisplayHandle,
+    night_light: std::sync::Arc<crate::night_light::NightLightShare>,
 ) -> calloop::channel::Channel<ToLoop> {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _ = std::thread::Builder::new()
@@ -901,11 +943,15 @@ pub fn start(
                 authority: authority.clone(),
                 clients: HashMap::new(),
             };
+            let night_light_color = NightLightColor {
+                share: night_light.clone(),
+            };
             let conn = match zbus::blocking::connection::Builder::session()
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/ScreenCast", screencast))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/DisplayConfig", display_config))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/RemoteDesktop", remote_desktop))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/ServiceChannel", service_channel))
+                .and_then(|b| b.serve_at("/org/gnome/SettingsDaemon/Color", night_light_color))
                 .and_then(|b| b.build())
             {
                 Ok(conn) => conn,
@@ -929,6 +975,21 @@ pub fn start(
                         eprintln!("tuna-compositor: {name} is taken; screen sharing off");
                         return;
                     }
+                }
+            }
+            // Night Light properties (#339): independent of the
+            // portal names above. When a real settings daemon owns
+            // this name its temp-disable wins and ours stays
+            // local-only; the tint still follows the settings keys.
+            match conn.request_name_with_flags("org.gnome.SettingsDaemon.Color", flags) {
+                Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
+                    eprintln!("tuna-compositor: serving org.gnome.SettingsDaemon.Color");
+                }
+                _ => {
+                    eprintln!(
+                        "tuna-compositor: org.gnome.SettingsDaemon.Color is taken; \
+                         night light D-Bus properties off"
+                    );
                 }
             }
             // Revoke on lock, unique-name disconnect or loss of the trusted
@@ -993,6 +1054,32 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_properties_round_trip_through_the_share() {
+        use crate::night_light::NightLightShare;
+        let share = Arc::new(NightLightShare::default());
+        let color = NightLightColor {
+            share: share.clone(),
+        };
+        assert!(!color.night_light_active());
+        assert!(!color.disabled_until_tomorrow());
+        // The loop publishes what it applies; the bus side reads it.
+        share.publish(true, 2700);
+        assert!(color.night_light_active());
+        // Setting the property stamps now; clearing drops the stamp.
+        color.set_disabled_until_tomorrow(true);
+        assert!(color.disabled_until_tomorrow());
+        let set_at = share.disabled_until_tmw().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((now - set_at).abs() < 60, "set_at={set_at} now={now}");
+        color.set_disabled_until_tomorrow(false);
+        assert!(!color.disabled_until_tomorrow());
+        assert_eq!(share.disabled_until_tmw(), None);
+    }
 
     fn snapshot(connector: &str) -> OutputSnapshot {
         OutputSnapshot {
