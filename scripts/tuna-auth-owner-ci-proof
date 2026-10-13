@@ -8,9 +8,9 @@ git rev-parse --show-toplevel > "$out/root.txt"
 git diff --quiet
 git diff --cached --quiet
 sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/sleep.rs crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
-cargo metadata --no-deps --format-version=1 > "$out/metadata.json"
-cargo test -p tuna-compositor --test auth_owner_runtime --no-run --message-format=json > "$out/build.json"
-cargo build -p tuna-compositor --example native-auth-owner-probe --message-format=json > "$out/probe-build.json"
+cargo metadata --locked --no-deps --format-version=1 > "$out/metadata.json"
+cargo test --locked -p tuna-compositor --test auth_owner_runtime --no-run --message-format=json > "$out/build.json"
+cargo build --locked -p tuna-compositor --example native-auth-owner-probe --message-format=json > "$out/probe-build.json"
 python3 - "$out" <<'PY'
 import hashlib,importlib.util,json,pathlib,sys
 sys.dont_write_bytecode=True

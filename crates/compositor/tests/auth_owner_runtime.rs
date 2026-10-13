@@ -31,14 +31,20 @@ fn connect() -> ControlConn {
     receive(&mut conn, |m| matches!(m, Message::Snapshot { .. }));
     conn
 }
-fn receive(conn: &mut ControlConn, mut wanted: impl FnMut(&Message) -> bool) -> Message {
-    let end = Instant::now() + LIMIT;
+fn receive(conn: &mut ControlConn, wanted: impl FnMut(&Message) -> bool) -> Message {
+    receive_until(conn, wanted, Instant::now() + LIMIT)
+}
+fn receive_until(
+    conn: &mut ControlConn,
+    mut wanted: impl FnMut(&Message) -> bool,
+    end: Instant,
+) -> Message {
     loop {
+        assert!(Instant::now() < end, "control reply deadline");
         match conn.read_frame() {
             Ok(m) if wanted(&m) => return m,
             Ok(_) => {}
             Err(ControlError::WouldBlock) => {
-                assert!(Instant::now() < end, "control reply deadline");
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(_) => panic!("owned control peer unexpectedly closed"),
@@ -467,4 +473,47 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
     }
     drop(child);
     server.join().unwrap();
+}
+
+#[test]
+fn chatty_control_peer_cannot_extend_absolute_receive_deadline() {
+    if std::env::var_os(ROLE).is_some() {
+        return;
+    }
+    use std::cell::Cell;
+    use std::io::Write;
+    let (receiver, mut sender) = UnixStream::pair().unwrap();
+    let frame = tuna_shell_control::encode_frame(&Message::Hello {
+        version: CURRENT_VERSION,
+    });
+    sender.write_all(&frame.repeat(32)).unwrap();
+    let mut conn = ControlConn::new(receiver).unwrap();
+    let observed = Cell::new(0u8);
+    let denied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        receive_until(
+            &mut conn,
+            |_| {
+                observed.set(observed.get() + 1);
+                assert_eq!(
+                    observed.get(),
+                    1,
+                    "chatty overrun: second unread frame reached after deadline"
+                );
+                // Keep many complete frames ready throughout the elapsed deadline.
+                std::thread::sleep(Duration::from_millis(20));
+                false
+            },
+            Instant::now() + Duration::from_millis(5),
+        )
+    }))
+    .expect_err("chatty frames cannot satisfy or extend the deadline");
+    let message = denied
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| denied.downcast_ref::<String>().map(String::as_str));
+    assert_eq!(message, Some("control reply deadline"));
+    assert!(
+        observed.get() <= 1,
+        "deadline applies to successful unrelated frame reads too"
+    );
 }
