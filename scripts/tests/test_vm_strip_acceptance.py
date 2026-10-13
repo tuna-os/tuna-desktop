@@ -190,6 +190,39 @@ class Tests(unittest.TestCase):
 
 
 class EndpointEvidence(unittest.TestCase):
+    def test_storage_failure_preserves_exact_primary_endpoint_exception(self):
+        from unittest.mock import patch
+        primary = TimeoutError('actual guest transport')
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'endpoint.json'
+            with patch.object(Path, 'write_text', side_effect=OSError('disk full')):
+                try:
+                    try:
+                        raise primary
+                    finally:
+                        secondary = proof.retain_endpoint_evidence(path, {'qualified': False}, primary)
+                except TimeoutError as actual:
+                    self.assertIs(actual, primary)
+                else:
+                    self.fail('primary exception swallowed')
+        self.assertEqual(secondary, 'OSError')
+        self.assertEqual(primary.__notes__, ['endpoint diagnostic persistence failed: OSError'])
+
+    def test_successful_endpoint_storage_failure_cannot_pass(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'endpoint.json'
+            with patch.object(Path, 'write_text', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    proof.retain_endpoint_evidence(path, {'qualified': True})
+
+    def test_retained_evidence_matches_actual_observations(self):
+        value = {'qualified': False, 'observations': [{'status': 'not-ready', 'sample': {'actual': 1}}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'endpoint.json'
+            self.assertIsNone(proof.retain_endpoint_evidence(path, value, TimeoutError()))
+            self.assertEqual(json.loads(path.read_text()), value)
+
     def test_partial_reason_survives_later_transport_timeout(self):
         from unittest.mock import patch
         evidence = {}

@@ -314,6 +314,19 @@ def await_endpoint(read, original, predicate, *, deadline, previous=None, eviden
     raise TimeoutError('installed strip endpoint did not become ready before deadline')
 
 
+def retain_endpoint_evidence(path, diagnostic, primary=None):
+    """A secondary storage failure cannot replace an actual endpoint failure."""
+    try:
+        path.write_text(json.dumps(diagnostic, indent=2))
+    except Exception as error:
+        if primary is None:
+            raise
+        error_type = type(error).__name__
+        primary.add_note('endpoint diagnostic persistence failed: ' + error_type)
+        return error_type
+    return None
+
+
 def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *, edge=False):
     """Run actual installed input. CI image admission is separate from signed release admission."""
     import hashlib
@@ -364,6 +377,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         endpoint_sequence += 1
         diagnostic = {'schema': 1, 'phase': endpoint_sequence, 'requested_mode': mode,
                       'scope': 'actual bounded endpoint observations; no framebuffer or release qualification'}
+        endpoint_error = None
         def predicate(sample, owner, old):
             found = endpoint(sample, owner, mode=mode, previous=old, edge=edge)
             if not extra(sample, found):
@@ -374,11 +388,15 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                                   deadline=min(deadline, time.monotonic() + 15),
                                   previous=previous, evidence=diagnostic)[0]
         except BaseException as error:
+            endpoint_error = error
             diagnostic['error_type'] = type(error).__name__
             raise
         finally:
-            (destination / ('endpoint-%02d.json' % endpoint_sequence)).write_text(
-                json.dumps(diagnostic, indent=2))
+            persistence_error = retain_endpoint_evidence(
+                destination / ('endpoint-%02d.json' % endpoint_sequence), diagnostic, endpoint_error)
+            if persistence_error is not None:
+                receipt.setdefault('endpoint_persistence_failures', []).append(
+                    {'phase': endpoint_sequence, 'error_type': persistence_error})
 
     def move(x, y):
         if not (0 <= x < 1280 and 0 <= y < 800):
