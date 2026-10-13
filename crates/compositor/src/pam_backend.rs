@@ -160,9 +160,10 @@ impl ConversationTicket {
         }
         let outcome = match self.ticket.reply.try_recv() {
             Ok(Reply::Retired(authenticated)) => {
+                let observed = Instant::now();
                 self.ticket.denied |=
-                    self.ticket.cancel.is_canceled() || !self.receiver.timely_at(Instant::now());
-                match self.ticket.retired_at(authenticated, Instant::now()) {
+                    self.ticket.cancel.is_canceled() || !self.receiver.timely_at(observed);
+                match self.ticket.retired_at(authenticated, observed) {
                     Initial::Finished(result) => Some(result),
                     Initial::Pending => None,
                 }
