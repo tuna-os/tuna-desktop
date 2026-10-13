@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -51,28 +52,38 @@ def nautilus_identity():
     return {'owner': owner, 'pid': pid, 'uid': uid, 'exe': str(executable)}
 
 
+def removed_accessible(error):
+    """Only Nautilus/AT-SPI's concrete retired-object error is readiness."""
+    return (isinstance(error, GLib.Error) and error.domain == 'atspi_error'
+            and error.code == 1 and re.fullmatch(
+                r'Object does not exist at path (?:“/[^”\n\x00]+”|"/[^"\n\x00]+")',
+                error.message) is not None)
+
+
 def controls():
     while GLib.MainContext.default().pending():
         GLib.MainContext.default().iteration(False)
     result = []
 
     def walk(node):
-        try:
-            node.clear_cache()
-            if node.getState().contains(pyatspi.STATE_SHOWING):
-                result.append(node)
-            for index in range(node.childCount):
-                walk(node.getChildAtIndex(index))
-        except Exception:
-            pass
+        # A disappearing owner-tree object invalidates this entire walk. The
+        # original bounded waiter may retry it, never a captured stale action.
+        node.clear_cache()
+        if node.getState().contains(pyatspi.STATE_SHOWING):
+            result.append(node)
+        for index in range(node.childCount):
+            walk(node.getChildAtIndex(index))
 
     desktop = pyatspi.Registry.getDesktop(0)
     for index in range(desktop.childCount):
         app = desktop.getChildAtIndex(index)
         try:
             app_pid = app.get_process_id()
-        except Exception:
-            # Earlier picker callers may disappear between accessibility reads.
+        except GLib.Error as error:
+            # Earlier unrelated picker callers may disappear. No other
+            # transport or accessibility failure is accepted as absence.
+            if not removed_accessible(error):
+                raise
             continue
         if identity is not None and app_pid == identity['pid']:
             walk(app)
@@ -110,7 +121,7 @@ def snapshot(label):
         except GLib.Error as error:
             # A removed file cell can disappear after the accessibility walk.
             # Keep this specific observation explicit; other errors still fail.
-            if error.domain != 'atspi_error' or 'Object does not exist at path' not in error.message:
+            if not removed_accessible(error):
                 raise
             disappeared += 1
     after = focused()
@@ -125,9 +136,23 @@ def snapshot(label):
 def wait(predicate, description):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(.05)
+        focused()
+        if time.monotonic() >= deadline:
+            break
+        try:
+            accepted = predicate()
+        except GLib.Error as error:
+            if not removed_accessible(error):
+                raise
+            accepted = None
+        # Both a retry and a positive result belong to the same actual owner
+        # and focus. An owner/lock/identity error must never become readiness.
+        focused()
+        if time.monotonic() >= deadline:
+            break
+        if accepted:
+            return accepted
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
     raise RuntimeError('Files did not ' + description)
 
 
@@ -159,9 +184,12 @@ def cell(name):
 
 
 def select(name):
-    wait(lambda: cell(name) is not None, 'show the actual file cell ' + name)
-    node = cell(name)
-    bounds = node.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
+    def target():
+        node = cell(name)
+        if node is None:
+            return None
+        return node.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
+    bounds = wait(target, 'show the actual file cell ' + name)
     current = focused()
     fx, fy, fw, fh = current['focused_rect']
     if (bounds.width <= 0 or bounds.height <= 0 or bounds.x < 0 or bounds.y < 0
@@ -169,8 +197,10 @@ def select(name):
         raise RuntimeError('Files cell is outside its actual focused surface')
     run('xdotool', 'mousemove', '--window', host,
         str(fx + bounds.x + bounds.width // 2), str(fy + bounds.y + bounds.height // 2), 'click', '1')
-    wait(lambda: cell(name) is not None and cell(name).getState().contains(pyatspi.STATE_SELECTED),
-         'select the actual file ' + name)
+    def selected():
+        node = cell(name)
+        return node is not None and node.getState().contains(pyatspi.STATE_SELECTED)
+    wait(selected, 'select the actual file ' + name)
 
 
 def navigate(path):
