@@ -110,12 +110,25 @@ def fresh_enter(log_path, offset):
         raise RuntimeError(f'fresh-enter offset must be a non-negative int, got {offset!r}')
     try:
         with open(log_path, 'rb') as stream:
+            at_boundary = True
+            if offset:
+                stream.seek(offset - 1)
+                at_boundary = stream.read(1) == b'\n'
             stream.seek(offset)
             tail = stream.read()
     except FileNotFoundError:
         raise RuntimeError(f'probe log missing: {log_path}')
     except OSError as exc:
         raise RuntimeError(f'probe log unreadable {log_path}: {exc}')
+    # A byte offset can bisect an in-flight old record. Its remainder
+    # is not a fresh record, even when it happens to be valid JSON.
+    if not at_boundary:
+        _, delimiter, tail = tail.partition(b'\n')
+        if not delimiter:
+            tail = b''
+    # The producer's newline commits the record. Never qualify a
+    # syntactically valid but still unfinished final write.
+    tail = tail.rpartition(b'\n')[0]
     try:
         text = tail.decode('utf-8')
     except UnicodeDecodeError as exc:

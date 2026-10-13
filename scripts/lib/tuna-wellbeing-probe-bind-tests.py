@@ -173,6 +173,31 @@ class FreshEnter(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 mod.fresh_enter(log, 10**6)
 
+    def test_unterminated_valid_json_is_not_a_completed_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = self.write(Path(td), '{"enter":12,"surface":32}')
+            with self.assertRaises(RuntimeError):
+                mod.fresh_enter(log, 0)
+            with log.open('ab') as stream:
+                stream.write(b'\n')
+            self.assertEqual(mod.fresh_enter(log, 0)['enter'], 12)
+
+    def test_valid_json_suffix_of_old_record_is_not_fresh(self):
+        with tempfile.TemporaryDirectory() as td:
+            # The offset was taken while the old prefix was written.
+            prefix = 'old-record-prefix '
+            log = self.write(Path(td), prefix, '{"enter":11}\n')
+            with self.assertRaises(RuntimeError):
+                mod.fresh_enter(log, len(prefix.encode()))
+            with log.open('ab') as stream:
+                stream.write(b'{"enter":12}\n')
+            self.assertEqual(mod.fresh_enter(log, len(prefix.encode()))['enter'], 12)
+
+    def test_incomplete_tail_does_not_hide_completed_enter(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = self.write(Path(td), '{"enter":12}\n', '{"enter":13}')
+            self.assertEqual(mod.fresh_enter(log, 0)['enter'], 12)
+
     def test_missing_log_fails(self):
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(RuntimeError):
