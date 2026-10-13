@@ -274,10 +274,11 @@ pub(crate) enum ClaimState {
 }
 
 impl ClaimState {
-    const FREE: u8 = 0;
-    const HELD: u8 = 1;
-    const QUARANTINED: u8 = 2;
+    const FREE: u8 = Self::Free as u8;
+    const HELD: u8 = Self::Held as u8;
+    const QUARANTINED: u8 = Self::Quarantined as u8;
 
+    #[cfg(test)]
     fn of(raw: u8) -> Self {
         match raw {
             Self::HELD => Self::Held,
@@ -707,9 +708,7 @@ fn join_bounded(
 ) -> Option<std::thread::Result<()>> {
     // An unrepresentable end is an unbounded wait: never join — fail
     // closed at once (the handle detaches here, the caller quarantines).
-    let Some(end) = Instant::now().checked_add(budget) else {
-        return None;
-    };
+    let end = Instant::now().checked_add(budget)?;
     loop {
         if worker.is_finished() {
             return Some(worker.join());
@@ -3186,8 +3185,10 @@ mod tests {
         assert_eq!(outcome, VerifyOutcome::Error);
         let mut byte = [0u8; 1];
         assert_eq!(
-            peer_end.read(&mut byte),
-            Ok(0),
+            peer_end
+                .read(&mut byte)
+                .expect("peer EOF read must succeed"),
+            0,
             "peer must observe EOF after the handler shutdown"
         );
         assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
@@ -3296,8 +3297,10 @@ mod tests {
         );
         let mut byte = [0u8; 1];
         assert_eq!(
-            peer_end.read(&mut byte),
-            Ok(0),
+            peer_end
+                .read(&mut byte)
+                .expect("peer EOF read must succeed"),
+            0,
             "peer must observe EOF after the handler shutdown"
         );
         ClaimGuard::test_reset();
@@ -3427,7 +3430,7 @@ mod tests {
     #[test]
     fn shutdown_observed_drains_queued_chatter_to_eof() {
         let _watchdog = TestWatchdog::arm(120);
-        let (ours, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (ours, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         peer.set_nonblocking(true).expect("peer nonblocking");
         let chunk = vec![0xC4u8; 4096];
         for _ in 0..16 {
@@ -3459,7 +3462,7 @@ mod tests {
     fn shutdown_observed_cap_exceeded_quarantines() {
         let _watchdog = TestWatchdog::arm(120);
         // Over the tiny cap: quarantine.
-        let (ours, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (ours, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         peer.set_nonblocking(true).expect("peer nonblocking");
         peer.write_all(&vec![0xC4u8; 4096])
             .expect("peer queues 4KiB");
@@ -3471,7 +3474,7 @@ mod tests {
             "chatter past the cap must quarantine, not release"
         );
         // Same backlog shape under the production cap: drain to EOF.
-        let (ours, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (ours, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         peer.set_nonblocking(true).expect("peer nonblocking");
         peer.write_all(&vec![0xC4u8; 4096])
             .expect("peer queues 4KiB");
@@ -3682,8 +3685,10 @@ mod tests {
         // The fd went down first: the peer reads EOF, not a hang.
         let mut byte = [0u8; 1];
         assert_eq!(
-            peer_end.read(&mut byte),
-            Ok(0),
+            peer_end
+                .read(&mut byte)
+                .expect("peer EOF read must succeed"),
+            0,
             "peer must observe EOF after the shutdown"
         );
         // The connection dropped: its bus name vanishes.
