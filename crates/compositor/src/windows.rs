@@ -14,6 +14,32 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// Fixed audio-key observations only; no arbitrary key or application data.
+pub(crate) fn trace_media(stage: &str, details: serde_json::Value, locked: bool) {
+    if locked || !media_trace_enabled() {
+        return;
+    }
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return;
+    }
+    eprintln!(
+        "tuna-media-diagnostic: {}",
+        serde_json::json!({
+            "actor": "compositor", "pid": std::process::id(), "stage": stage,
+            "monotonic_ns": now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
+            "details": details,
+        })
+    );
+}
+
+fn media_trace_enabled() -> bool {
+    std::env::var_os("TUNA_MEDIA_DIAGNOSTICS").is_some_and(|p| std::path::Path::new(&p).is_file())
+}
+
 #[cfg(feature = "xwayland")]
 use crate::xwayland::{map_x11_identity, X11ManagerEvent};
 use smithay::reexports::wayland_server::Resource as _;
@@ -71,6 +97,8 @@ struct ManagedWindow {
     /// Strip width-preset slot (`STRIP_PRESETS` index) chosen with
     /// Super+R; `None` means the default. Survives mode toggles.
     preset: Option<usize>,
+    /// Pointer-resized logical width; preset cycling clears it.
+    strip_fixed_width: Option<i32>,
     /// Not placed yet: the client picks its own size from an empty
     /// configure and is placed at that size on its first commit, as
     /// Mutter does.
@@ -158,6 +186,19 @@ pub enum SessionMode {
 /// Interactive pointer grab on one window (#58).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PointerGrab {
+    StripMove {
+        owner: StripPointer,
+        pointer_start: Point<f64, Logical>,
+        geometry_start: Rectangle<i32, Logical>,
+    },
+    StripResize {
+        owner: StripPointer,
+        edges: u32,
+        pointer_start: Point<f64, Logical>,
+        width_start: i32,
+        fixed_start: Option<i32>,
+        preset_start: Option<usize>,
+    },
     /// Move: the window follows the pointer from where the drag began.
     Move {
         id: u64,
@@ -171,6 +212,16 @@ enum PointerGrab {
         pointer_start: Point<f64, Logical>,
         geometry_start: Rectangle<i32, Logical>,
     },
+}
+
+/// Original strip ownership and view, retained until commit or cancellation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StripPointer {
+    id: u64,
+    button: u32,
+    workspace: u32,
+    work: Rectangle<i32, Logical>,
+    offset: f64,
 }
 
 /// xdg_toplevel ResizeEdge bits.
@@ -278,6 +329,8 @@ pub struct WindowManager {
     switcher_queue: Vec<SwitcherAction>,
     /// Keys the open switcher took: their releases stay invisible too.
     switcher_swallowed: Vec<u32>,
+    /// Built-in source changes are deferred until runtime releases old-map aids.
+    input_source_switches: Vec<bool>,
     /// Session window-management mode (scrollable-tiling spec).
     /// Gnome by default; Super+Shift+T flips the whole session.
     mode: SessionMode,
@@ -296,6 +349,10 @@ pub struct WindowManager {
     /// The running view spring and its elapsed seconds, while the drawn
     /// view has not settled on the target.
     strip_anim: Option<(crate::spring::Spring, f64)>,
+    /// Dwell belongs to the active strip move, never an idle global timer.
+    strip_edge_direction: i8,
+    strip_edge_elapsed: f64,
+    strip_edge_first_frame: bool,
     /// GNOME's workspace switch motion, stepped by the runtime once a
     /// frame. Only render positions use it.
     workspace_slide: crate::workspace_slide::WorkspaceSlide,
@@ -321,6 +378,7 @@ pub struct WindowManager {
     window_lifecycle: crate::window_lifecycle::Lifecycle,
     workspace_policy: tuna_shell_control::WorkspacePolicy,
     workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
+    floating_workareas: Vec<(String, crate::output_constraints::Rect)>,
     workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
     modal_dim: crate::modal_dim::ModalDim,
     icon_geometries: HashMap<u64, Rectangle<i32, Logical>>,
@@ -341,6 +399,72 @@ impl WindowManager {
                         &self.workspace_outputs,
                     ))
         })
+    }
+
+    /// Output scale/mode changes alter logical workareas independently of client
+    /// requests. Preserve fitting windows that were fully visible, once per change.
+    fn reconcile_floating_workareas(&mut self, state: &State) {
+        if self.grab.is_some() {
+            return;
+        }
+        // The common idle tick must not allocate a fresh output-name cache.
+        if state.outputs.len() == self.floating_workareas.len()
+            && state
+                .outputs
+                .iter()
+                .zip(&self.floating_workareas)
+                .all(|(output, (name, area))| {
+                    output.name == *name
+                        && *area
+                            == (
+                                output.loc.0,
+                                output.loc.1.saturating_add(WORK_AREA_TOP),
+                                output.size.w,
+                                output.size.h.saturating_sub(WORK_AREA_TOP),
+                            )
+                })
+        {
+            return;
+        }
+        let current: Vec<_> = state
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.name.clone(),
+                    (
+                        output.loc.0,
+                        output.loc.1.saturating_add(WORK_AREA_TOP),
+                        output.size.w,
+                        output.size.h.saturating_sub(WORK_AREA_TOP),
+                    ),
+                )
+            })
+            .collect();
+        let mut moved = Vec::new();
+        for (&id, window) in &mut self.windows {
+            if window.layout != WindowLayout::Floating || window.unplaced {
+                continue;
+            }
+            let rect = (
+                window.geometry.loc.x,
+                window.geometry.loc.y,
+                window.geometry.size.w,
+                window.geometry.size.h,
+            );
+            if let Some((x, y, _, _)) = crate::output_constraints::reposition_on_output(
+                rect,
+                &self.floating_workareas,
+                &current,
+            ) {
+                window.geometry.loc = (x, y).into();
+                moved.push(id);
+            }
+        }
+        self.floating_workareas = current;
+        for id in moved {
+            self.configure(id, self.model.focused() == Some(id));
+        }
     }
 
     fn refresh_workspace_affinity(&mut self, state: &State) {
@@ -397,6 +521,18 @@ impl WindowManager {
         self.pointer_pos
     }
 
+    /// Whether the seat's Num Lock is on (Mouse Keys stand aside).
+    pub fn num_lock(&self) -> bool {
+        self.keyboard
+            .as_ref()
+            .is_some_and(|keyboard| keyboard.modifier_state().num_lock)
+    }
+
+    /// Actual LEDs after the seat's XKB state processed delivered input.
+    pub(crate) fn keyboard_led_state(&self) -> Option<smithay::input::keyboard::LedState> {
+        self.keyboard.as_ref().map(|keyboard| keyboard.led_state())
+    }
+
     /// Empty manager; attaches keyboard and pointer capabilities to the
     /// state's seat and keeps their handles for input routing.
     pub fn new(state: &mut State) -> Self {
@@ -434,6 +570,9 @@ impl WindowManager {
             animations_enabled: true,
             column_animations: HashMap::new(),
             strip_anim: None,
+            strip_edge_direction: 0,
+            strip_edge_elapsed: 0.0,
+            strip_edge_first_frame: false,
             workspace_slide: Default::default(),
             super_held: false,
             // add_keyboard below: 200 ms delay, 200 keys/s.
@@ -443,6 +582,7 @@ impl WindowManager {
             switcher_open: false,
             switcher_queue: Vec::new(),
             switcher_swallowed: Vec::new(),
+            input_source_switches: Vec::new(),
             overview_open: false,
             pre_overview_focus: None,
             overview_activated: None,
@@ -453,6 +593,7 @@ impl WindowManager {
             window_lifecycle: Default::default(),
             workspace_policy: Default::default(),
             workspace_outputs: Vec::new(),
+            floating_workareas: Vec::new(),
             workspace_tracker: Default::default(),
             modal_dim: Default::default(),
             icon_geometries: Default::default(),
@@ -762,9 +903,8 @@ impl WindowManager {
         }
         let visible: HashSet<_> = self.visible_entries().into_iter().map(|e| e.0).collect();
         let active = self.model.active_workspace();
-        self.stacking
-            .iter()
-            .copied()
+        self.presentation_order()
+            .into_iter()
             .filter_map(|id| {
                 let w = self.windows.get(&id)?;
                 let animating = self.window_lifecycle.is_minimizing(id)
@@ -983,13 +1123,84 @@ impl WindowManager {
 
     /// `geometry` moved by the strip view's lag when `id` is a strip
     /// column: drawn x = target x + (target offset - drawn offset).
-    fn shifted(&self, id: u64, mut geometry: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    fn shifted(&self, id: u64, geometry: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+        let mut geometry = self.strip_shifted(id, geometry);
+        if let Some(PointerGrab::StripMove {
+            owner,
+            pointer_start,
+            geometry_start,
+        }) = self.grab
+        {
+            if self.strip_family_member(id, owner.id) {
+                let delta = self.strip_family_translation(owner.id, pointer_start, geometry_start);
+                geometry.loc.x = (i64::from(geometry.loc.x) + delta.0) as i32;
+                geometry.loc.y = (i64::from(geometry.loc.y) + delta.1) as i32;
+            }
+        }
+        geometry
+    }
+
+    fn strip_family_translation(
+        &self,
+        root: u64,
+        pointer_start: Point<f64, Logical>,
+        geometry_start: Rectangle<i32, Logical>,
+    ) -> (i64, i64) {
+        let Some(window) = self.windows.get(&root) else {
+            return (0, 0);
+        };
+        let base = self.strip_shifted(root, window.geometry);
+        // f64-to-integer casts saturate, but adding those i32 values did
+        // not. Bound deltas before arithmetic and clamp ONE translation
+        // against every family member's extents, preserving attachment.
+        let delta = |now: f64, start: f64| {
+            (now - start)
+                .round()
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i64
+        };
+        let requested = (
+            i64::from(geometry_start.loc.x) + delta(self.pointer_pos.x, pointer_start.x)
+                - i64::from(base.loc.x),
+            i64::from(geometry_start.loc.y) + delta(self.pointer_pos.y, pointer_start.y)
+                - i64::from(base.loc.y),
+        );
+        let mut x = (i64::from(i32::MIN), i64::from(i32::MAX));
+        let mut y = x;
+        for (id, window) in &self.windows {
+            if !self.strip_family_member(*id, root) {
+                continue;
+            }
+            let g = self.strip_shifted(*id, window.geometry);
+            x.0 = x.0.max(i64::from(i32::MIN) - i64::from(g.loc.x));
+            x.1 =
+                x.1.min(i64::from(i32::MAX) - i64::from(g.loc.x) - i64::from(g.size.w.max(0)));
+            y.0 = y.0.max(i64::from(i32::MIN) - i64::from(g.loc.y));
+            y.1 =
+                y.1.min(i64::from(i32::MAX) - i64::from(g.loc.y) - i64::from(g.size.h.max(0)));
+        }
+        if x.0 > x.1 || y.0 > y.1 {
+            return (0, 0);
+        }
+        (requested.0.clamp(x.0, x.1), requested.1.clamp(y.0, y.1))
+    }
+
+    fn strip_shifted(
+        &self,
+        id: u64,
+        mut geometry: Rectangle<i32, Logical>,
+    ) -> Rectangle<i32, Logical> {
         if self.mode == SessionMode::Scroll && self.window_layout(id) == Some(WindowLayout::Strip) {
             if let Some(animation) = self.column_animations.get(&id) {
                 geometry = animation.value();
-                geometry.loc.x -= self.strip_shown.round() as i32;
+                geometry.loc.x = geometry
+                    .loc
+                    .x
+                    .saturating_sub(self.strip_shown.round() as i32);
             } else {
-                geometry.loc.x += (self.strip_offset - self.strip_shown).round() as i32;
+                geometry.loc.x = geometry
+                    .loc
+                    .x
+                    .saturating_add((self.strip_offset - self.strip_shown).round() as i32);
             }
         }
         geometry
@@ -1058,6 +1269,14 @@ impl WindowManager {
     }
 
     pub fn reconcile(&mut self, state: &mut State) {
+        if self
+            .grab
+            .and_then(Self::strip_grab_owner)
+            .is_some_and(|owner| !self.strip_pointer_valid(state, owner))
+        {
+            self.cancel_strip_pointer(state);
+        }
+        self.reconcile_floating_workareas(state);
         self.refresh_workspace_affinity(state);
         // Popups (#88): drop dead trees, and once the last grabbed popup
         // is gone hand keyboard focus back to the focused window.
@@ -1301,6 +1520,7 @@ impl WindowManager {
                 layout: WindowLayout::Floating,
                 restore: None,
                 preset: None,
+                strip_fixed_width: None,
                 unplaced,
                 minimized: false,
                 above: false,
@@ -1518,6 +1738,7 @@ impl WindowManager {
                 layout: WindowLayout::Floating,
                 restore: None,
                 preset: None,
+                strip_fixed_width: None,
                 unplaced: false,
                 minimized: false,
                 above: false,
@@ -1751,6 +1972,13 @@ impl WindowManager {
         self.focus_history.retain(|other| *other != id);
         self.icon_geometries.remove(&id);
         self.model.remove(id);
+        if self
+            .grab
+            .and_then(Self::strip_grab_owner)
+            .is_some_and(|owner| owner.id == id)
+        {
+            self.cancel_strip_pointer(state);
+        }
         for window in self.windows.values_mut() {
             if window.x11_parent == Some(id) {
                 window.x11_parent = None;
@@ -1809,15 +2037,15 @@ impl WindowManager {
                         && state.seat.get_pointer().is_some_and(|p| p.has_grab(serial))
                     {
                         self.begin_move_from(state, id, origin);
-                        self.grab_motion(self.pointer_pos);
+                        self.grab_motion(state, self.pointer_pos);
                     }
                 }
                 WindowRequest::Resize(edges, serial, origin) => {
                     if self.grab.is_none()
                         && state.seat.get_pointer().is_some_and(|p| p.has_grab(serial))
                     {
-                        self.begin_resize_from(id, edges, origin);
-                        self.grab_motion(self.pointer_pos);
+                        self.begin_resize_from(state, id, edges, origin);
+                        self.grab_motion(state, self.pointer_pos);
                     }
                 }
                 WindowRequest::Activate => {
@@ -2092,6 +2320,185 @@ impl WindowManager {
         surface.send_configure();
     }
 
+    fn strip_grab_owner(grab: PointerGrab) -> Option<StripPointer> {
+        match grab {
+            PointerGrab::StripMove { owner, .. } | PointerGrab::StripResize { owner, .. } => {
+                Some(owner)
+            }
+            _ => None,
+        }
+    }
+
+    fn strip_pointer_owner(
+        &self,
+        state: &State,
+        id: u64,
+        button: Option<u32>,
+    ) -> Option<StripPointer> {
+        let window = self.windows.get(&id)?;
+        let workspace = self.model.window(id)?.workspace;
+        if self.grab.is_some()
+            || self.mode != SessionMode::Scroll
+            || window.layout != WindowLayout::Strip
+            || window.minimized
+            || !window.surface.alive()
+            || self.overview_open
+            || self.workspace_slide.running()
+            || state.protocols.shortcut_locked
+            || !self.pointer_pos.x.is_finite()
+            || !self.pointer_pos.y.is_finite()
+            || workspace != self.model.active_workspace()
+            || self.transient_parent(id).is_some()
+        {
+            return None;
+        }
+        Some(StripPointer {
+            id,
+            button: button?,
+            workspace,
+            work: Self::work_area(state),
+            offset: self.strip_offset,
+        })
+    }
+
+    fn strip_pointer_valid(&self, state: &State, owner: StripPointer) -> bool {
+        self.pointer_pos.x.is_finite()
+            && self.pointer_pos.y.is_finite()
+            && self.mode == SessionMode::Scroll
+            && !self.overview_open
+            && !self.workspace_slide.running()
+            && !state.protocols.shortcut_locked
+            && self.model.active_workspace() == owner.workspace
+            && Self::work_area(state) == owner.work
+            && self
+                .model
+                .window(owner.id)
+                .is_some_and(|w| w.workspace == owner.workspace)
+            && self.windows.get(&owner.id).is_some_and(|w| {
+                w.layout == WindowLayout::Strip && !w.minimized && w.surface.alive()
+            })
+    }
+
+    fn strip_family_member(&self, id: u64, root: u64) -> bool {
+        let mut current = Some(id);
+        // Window count bounds malformed parent cycles without trusting client metadata.
+        for _ in 0..=self.windows.len() {
+            match current {
+                Some(id) if id == root => return true,
+                Some(id) => current = self.transient_parent(id),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    fn presentation_order(&self) -> Vec<u64> {
+        let mut order = self.stacking.clone();
+        if let Some(PointerGrab::StripMove { owner, .. }) = self.grab {
+            // Parent and attached children rise as one family, preserving
+            // their relative stacking order and all other strip slots.
+            order.sort_by_key(|id| self.strip_family_member(*id, owner.id));
+        }
+        order
+    }
+
+    fn strip_move_slot(
+        &self,
+        id: u64,
+        geometry_start: Rectangle<i32, Logical>,
+        pointer_start: Point<f64, Logical>,
+    ) -> (Vec<u64>, usize) {
+        let remaining: Vec<_> = self
+            .strip_order()
+            .into_iter()
+            .filter(|other| !self.strip_family_member(*other, id))
+            .collect();
+        let center = f64::from(geometry_start.loc.x)
+            + f64::from(geometry_start.size.w) / 2.0
+            + self.pointer_pos.x
+            - pointer_start.x;
+        let slot = remaining
+            .iter()
+            .take_while(|other| {
+                self.geometry(**other).is_some_and(|g| {
+                    let g = self.strip_shifted(**other, g);
+                    center > f64::from(g.loc.x) + f64::from(g.size.w) / 2.0
+                })
+            })
+            .count();
+        (remaining, slot)
+    }
+
+    fn commit_strip_move(
+        &mut self,
+        state: &mut State,
+        owner: StripPointer,
+        geometry_start: Rectangle<i32, Logical>,
+        pointer_start: Point<f64, Logical>,
+    ) {
+        let (mut order, slot) = self.strip_move_slot(owner.id, geometry_start, pointer_start);
+        let family: Vec<_> = self
+            .strip_order()
+            .into_iter()
+            .filter(|id| self.strip_family_member(*id, owner.id))
+            .collect();
+        order.splice(slot..slot, family);
+        let positions: Vec<_> = self
+            .stacking
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| {
+                self.model
+                    .window(**id)
+                    .is_some_and(|w| w.workspace == owner.workspace)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if positions.len() != order.len() {
+            return;
+        }
+        for (position, id) in positions.into_iter().zip(order) {
+            self.stacking[position] = id;
+        }
+        self.follow_focus(state);
+        self.relayout_strip(state);
+    }
+
+    fn snap_strip_columns(&mut self) {
+        self.snap_strip_view();
+        // Direct pointer manipulation must not retain a spring target
+        // behind the actual configure/input geometry.
+        self.column_animations.clear();
+    }
+
+    /// Cancel only strip pointer ownership. Existing floating grabs keep
+    /// their previous behavior; dead actors are never reinserted.
+    pub fn cancel_strip_pointer(&mut self, state: &mut State) -> bool {
+        let Some(grab) = self.grab else {
+            return false;
+        };
+        let Some(owner) = Self::strip_grab_owner(grab) else {
+            return false;
+        };
+        self.grab = None;
+        self.reset_strip_edge();
+        if let PointerGrab::StripResize {
+            fixed_start,
+            preset_start,
+            ..
+        } = grab
+        {
+            if let Some(window) = self.windows.get_mut(&owner.id) {
+                window.strip_fixed_width = fixed_start;
+                window.preset = preset_start;
+            }
+        }
+        self.strip_offset = owner.offset;
+        self.relayout_strip(state);
+        self.snap_strip_columns();
+        true
+    }
+
     /// Start moving `id` with the pointer (header-bar drag or Super+drag).
     /// A maximized or tiled window drags off into floating first, keeping
     /// the pointer at the same fraction across its width (GNOME shape).
@@ -2100,8 +2507,31 @@ impl WindowManager {
     }
 
     fn begin_move_from(&mut self, state: &mut State, id: u64, pointer: Point<f64, Logical>) {
+        let button = state
+            .seat
+            .get_pointer()
+            .and_then(|p| p.grab_start_data())
+            .map(|g| g.button);
+        self.begin_move_owned(state, id, pointer, button);
+    }
+
+    fn begin_move_owned(
+        &mut self,
+        state: &mut State,
+        id: u64,
+        pointer: Point<f64, Logical>,
+        button: Option<u32>,
+    ) {
         self.settle(id);
         if self.mode == SessionMode::Scroll {
+            if let Some(owner) = self.strip_pointer_owner(state, id, button) {
+                let geometry_start = self.shifted(id, self.windows[&id].geometry);
+                self.grab = Some(PointerGrab::StripMove {
+                    owner,
+                    pointer_start: pointer,
+                    geometry_start,
+                });
+            }
             return;
         }
         let Some(window) = self.windows.get(&id) else {
@@ -2138,13 +2568,43 @@ impl WindowManager {
     }
 
     /// Start resizing `id` from `edges` with the pointer.
-    fn begin_resize(&mut self, id: u64, edges: u32) {
-        self.begin_resize_from(id, edges, self.pointer_pos);
+    fn begin_resize(&mut self, state: &mut State, id: u64, edges: u32) {
+        self.begin_resize_from(state, id, edges, self.pointer_pos);
     }
 
-    fn begin_resize_from(&mut self, id: u64, edges: u32, pointer: Point<f64, Logical>) {
+    fn begin_resize_from(
+        &mut self,
+        state: &mut State,
+        id: u64,
+        edges: u32,
+        pointer: Point<f64, Logical>,
+    ) {
         self.settle(id);
         if self.mode == SessionMode::Scroll {
+            let button = state
+                .seat
+                .get_pointer()
+                .and_then(|p| p.grab_start_data())
+                .map(|g| g.button);
+            // This layout has one full-height window per column. Only
+            // horizontal edges can change its width, including corners.
+            if edges & (EDGE_LEFT | EDGE_RIGHT) == 0
+                || edges & (EDGE_LEFT | EDGE_RIGHT) == (EDGE_LEFT | EDGE_RIGHT)
+            {
+                return;
+            }
+            if let Some(owner) = self.strip_pointer_owner(state, id, button) {
+                let window = &self.windows[&id];
+                self.grab = Some(PointerGrab::StripResize {
+                    owner,
+                    edges,
+                    pointer_start: pointer,
+                    width_start: self.strip_width_for(id, owner.work.size.w),
+                    fixed_start: window.strip_fixed_width,
+                    preset_start: window.preset,
+                });
+                self.snap_strip_columns();
+            }
             return;
         }
         if !self.restore_layout(id) {
@@ -2165,12 +2625,60 @@ impl WindowManager {
         self.grab.is_some()
     }
 
+    /// The pointer cursor of an interactive grab (#342): move, or
+    /// resize from these xdg edges.
+    pub fn grab_cursor(&self) -> Option<smithay::input::pointer::CursorIcon> {
+        match self.grab? {
+            PointerGrab::Move { .. } | PointerGrab::StripMove { .. } => {
+                Some(crate::cursor::grab_icon(None))
+            }
+            PointerGrab::Resize { edges, .. } | PointerGrab::StripResize { edges, .. } => {
+                Some(crate::cursor::grab_icon(Some(edges)))
+            }
+        }
+    }
+
     /// Follow the pointer during a grab. Returns whether a grab ate it.
-    fn grab_motion(&mut self, pos: Point<f64, Logical>) -> bool {
+    fn grab_motion(&mut self, state: &mut State, pos: Point<f64, Logical>) -> bool {
         let Some(grab) = self.grab else {
             return false;
         };
+        if let Some(owner) = Self::strip_grab_owner(grab) {
+            if !self.strip_pointer_valid(state, owner) {
+                self.cancel_strip_pointer(state);
+                return false;
+            }
+        }
         match grab {
+            PointerGrab::StripMove { .. } => self.observe_strip_edge(),
+            PointerGrab::StripResize {
+                owner,
+                edges,
+                pointer_start,
+                width_start,
+                ..
+            } => {
+                let delta = (pos.x - pointer_start.x).round() as i32;
+                let delta = if edges & EDGE_LEFT != 0 {
+                    delta.saturating_neg()
+                } else {
+                    delta
+                };
+                let width = width_start.saturating_add(delta).clamp(
+                    MIN_WINDOW_SIZE.0,
+                    owner.work.size.w.saturating_mul(4).max(MIN_WINDOW_SIZE.0),
+                );
+                if self.windows[&owner.id].strip_fixed_width != Some(width) {
+                    self.windows.get_mut(&owner.id).unwrap().strip_fixed_width = Some(width);
+                    self.strip_offset = if edges & EDGE_LEFT != 0 {
+                        owner.offset + f64::from(width - width_start)
+                    } else {
+                        owner.offset
+                    };
+                    self.relayout_strip(state);
+                    self.snap_strip_columns();
+                }
+            }
             PointerGrab::Move {
                 id,
                 pointer_start,
@@ -2212,6 +2720,30 @@ impl WindowManager {
         let Some(grab) = self.grab.take() else {
             return;
         };
+        if let Some(owner) = Self::strip_grab_owner(grab) {
+            self.reset_strip_edge();
+            if !self.strip_pointer_valid(state, owner) {
+                // Reinstall only to use the common rollback, never commit
+                // an actor after ownership, workspace or output changed.
+                self.grab = Some(grab);
+                self.cancel_strip_pointer(state);
+                return;
+            }
+            if let PointerGrab::StripMove {
+                geometry_start,
+                pointer_start,
+                ..
+            } = grab
+            {
+                self.commit_strip_move(state, owner, geometry_start, pointer_start);
+            } else {
+                // Direct resize no longer owns the viewport. Re-enter the
+                // usual minimal focus-follow and configure path on release.
+                self.follow_focus(state);
+                self.relayout_strip(state);
+            }
+            return;
+        }
         if let PointerGrab::Move { id, .. } = grab {
             if !self.workspace_policy.edge_tiling {
                 return;
@@ -2232,6 +2764,44 @@ impl WindowManager {
     /// the dragged window and the area it would fill on release (the
     /// work area, or one half of it).
     pub fn tile_preview(&self, state: &State) -> Option<(u64, Rectangle<i32, Logical>)> {
+        if let Some(PointerGrab::StripMove {
+            owner,
+            geometry_start,
+            pointer_start,
+        }) = self.grab
+        {
+            if !self.strip_pointer_valid(state, owner) {
+                return None;
+            }
+            let (remaining, slot) = self.strip_move_slot(owner.id, geometry_start, pointer_start);
+            let x = remaining
+                .get(slot)
+                .and_then(|id| self.geometry(*id).map(|g| self.shifted(*id, g).loc.x))
+                .or_else(|| {
+                    remaining.last().and_then(|id| {
+                        self.geometry(*id).map(|g| {
+                            let g = self.shifted(*id, g);
+                            g.loc
+                                .x
+                                .saturating_add(g.size.w)
+                                .saturating_add(Self::STRIP_GAP)
+                        })
+                    })
+                })
+                .unwrap_or(geometry_start.loc.x);
+            // A narrow insertion bar, never the half-screen snapping area.
+            return Some((
+                owner.id,
+                Rectangle::new(
+                    (
+                        x.saturating_sub(4),
+                        owner.work.loc.y.saturating_add(Self::STRIP_GAP),
+                    )
+                        .into(),
+                    (8, (owner.work.size.h - 2 * Self::STRIP_GAP).max(1)).into(),
+                ),
+            ));
+        }
         if !self.workspace_policy.edge_tiling {
             return None;
         }
@@ -2250,7 +2820,8 @@ impl WindowManager {
     /// layers they hang off paint above windows).
     pub fn placed_popups(&self, state: &State) -> Vec<crate::popup::PlacedPopup> {
         let mut out = Vec::new();
-        for (window, geometry) in self.visible_windows() {
+        for (id, window, geometry) in self.visible_entries() {
+            let geometry = self.shifted(id, geometry);
             if let Some(surface) = window.wl_surface() {
                 let origin = crate::popup::surface_origin(&surface, geometry.loc);
                 out.extend(crate::popup::placed_popups(&surface, origin, true));
@@ -2290,7 +2861,7 @@ impl WindowManager {
     /// workspace is hit-testable; hidden workspaces never take focus.
     pub fn window_at(&self, pos: Point<f64, Logical>) -> Option<u64> {
         let active = self.model.active_workspace();
-        self.stacking.iter().rev().copied().find(|id| {
+        self.presentation_order().into_iter().rev().find(|id| {
             self.model.window(*id).is_some_and(|entry| {
                 (entry.workspace == active || self.on_all_workspaces(*id))
                     && self.windows.get(id).is_some_and(|w| {
@@ -2306,6 +2877,10 @@ impl WindowManager {
     /// Layer-shell surfaces (panel, banners) paint over windows, so they
     /// win the hit test first; without this the panel never sees motion.
     pub fn pointer_motion(&mut self, state: &mut State, pos: Point<f64, Logical>, time: u32) {
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            self.cancel_strip_pointer(state);
+            return;
+        }
         // A locked pointer stays where it is (relative motion still
         // flows); a confined one stays inside its window.
         let Some(pos) = self.constrain(state, pos) else {
@@ -2313,7 +2888,7 @@ impl WindowManager {
         };
         self.pointer_pos = pos;
         // An interactive move/resize owns the pointer until release.
-        if self.grab_motion(pos) {
+        if self.grab_motion(state, pos) {
             return;
         }
         // Popups paint over everything they hang off: they win first.
@@ -2426,12 +3001,17 @@ impl WindowManager {
         // implicit click grab, and only the matching release closes it.
         // Dropping it pinned pointer focus to the dragged window for
         // good, so the panel never saw another click (#97).
-        if !pressed && self.grab.is_some() {
+        if !pressed
+            && self.grab.is_some_and(|grab| {
+                Self::strip_grab_owner(grab).is_none_or(|owner| owner.button == button)
+            })
+        {
             self.end_grab(state);
         }
         // A blocked parent click activates its modal dialog and is consumed.
         // Do this before Super+drag so the parent cannot be moved through it.
-        if pressed && !self.overview_open {
+        let strip_owned = self.grab.and_then(Self::strip_grab_owner).is_some();
+        if pressed && !self.overview_open && !strip_owned {
             let pos = self.pointer_pos;
             if crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
                 .is_none()
@@ -2447,7 +3027,7 @@ impl WindowManager {
             }
         }
         // Super+press on a window starts a move (GNOME's Super+drag).
-        if pressed && self.super_held && !self.overview_open {
+        if pressed && self.super_held && !self.overview_open && !strip_owned {
             let pos = self.pointer_pos;
             if crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
                 .is_none()
@@ -2458,7 +3038,7 @@ impl WindowManager {
                     // The trigger machine already disarmed the Super tap on
                     // this press, so releasing Super will not open the
                     // overview.
-                    self.begin_move(state, id);
+                    self.begin_move_owned(state, id, pos, Some(button));
                     // The press is not delivered, so neither is its release.
                     self.swallowed_button = Some(button);
                     return;
@@ -2667,6 +3247,15 @@ impl WindowManager {
         let Some(keyboard) = self.keyboard.clone() else {
             return false;
         };
+        if pressed && keycode == ESCAPE_KEYCODE && self.cancel_strip_pointer(state) {
+            keyboard.input_discard(
+                state,
+                keycode.saturating_add(XKB_X11_OFFSET).into(),
+                KeyState::Pressed,
+            );
+            self.accel_held.push(keycode);
+            return true;
+        }
         // A grabbed accelerator's release follows its press: swallowed.
         if !pressed {
             if let Some(i) = self.accel_held.iter().position(|k| *k == keycode) {
@@ -2741,6 +3330,22 @@ impl WindowManager {
             },
         );
         if let Some(action) = intercepted {
+            if let Some(a) = grabs
+                .iter()
+                .filter(|_| !self.lock_input_active && media_trace_enabled())
+                .find(|a| {
+                    a.action == action
+                        && matches!(a.keysym, 0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2)
+                })
+            {
+                trace_media(
+                    "media-accelerator-fired",
+                    serde_json::json!({
+                        "action": action, "keysym": a.keysym, "mods": a.mods, "mode": mode,
+                    }),
+                    self.lock_input_active,
+                );
+            }
             self.accel_held.push(keycode);
             self.accel_fired.push((action, time, mode));
         }
@@ -2750,6 +3355,7 @@ impl WindowManager {
     /// GNOME's Hide: take the window off the screen and hand focus to
     /// the next window down. Returns whether it was hidden.
     pub fn minimize(&mut self, state: &mut State, id: u64) -> bool {
+        self.cancel_strip_pointer(state);
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
@@ -2833,7 +3439,7 @@ impl WindowManager {
             WindowAction::Resize => {
                 self.focus(state, Some(id));
                 // xdg_toplevel resize edge bottom_right.
-                self.begin_resize(id, 10);
+                self.begin_resize(state, id, 10);
                 true
             }
             WindowAction::ShowMenu => {
@@ -2930,6 +3536,21 @@ impl WindowManager {
     /// Replace the accelerator grabs (org.gnome.Shell GrabAccelerators).
     pub fn set_accelerators(&mut self, accelerators: Vec<tuna_shell_control::Accelerator>) {
         self.accelerators = accelerators;
+    }
+
+    pub fn trace_media_accelerators(&self, locked: bool) {
+        if locked || !media_trace_enabled() {
+            return;
+        }
+        trace_media(
+            "accelerators-runtime-applied",
+            serde_json::json!({
+                "media": self.accelerators.iter()
+                    .filter(|a| matches!(a.keysym, 0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2))
+                    .map(|a| [a.action, a.keysym, a.mods, a.modes]).collect::<Vec<_>>(),
+            }),
+            locked,
+        );
     }
 
     /// Replace the switcher's chords (the shell's GNOME keybindings).
@@ -3098,6 +3719,19 @@ impl WindowManager {
         (((work_w - Self::STRIP_GAP) as f64 * proportion) as i32 - Self::STRIP_GAP).max(1)
     }
 
+    fn strip_width_for(&self, id: u64, work_w: i32) -> i32 {
+        self.windows
+            .get(&id)
+            .and_then(|w| w.strip_fixed_width)
+            .map(|w| {
+                w.clamp(
+                    MIN_WINDOW_SIZE.0,
+                    work_w.saturating_mul(4).max(MIN_WINDOW_SIZE.0),
+                )
+            })
+            .unwrap_or_else(|| Self::strip_width(work_w, self.strip_proportion(id)))
+    }
+
     /// Current session mode (scrollable-tiling spec).
     pub fn session_mode(&self) -> SessionMode {
         self.mode
@@ -3121,7 +3755,7 @@ impl WindowManager {
                     .is_some_and(|entry| entry.workspace == workspace)
             })
             .map(|other| {
-                let width = Self::strip_width(work.size.w, self.strip_proportion(other));
+                let width = self.strip_width_for(other, work.size.w);
                 (other, width)
             })
             .collect()
@@ -3140,6 +3774,25 @@ impl WindowManager {
         }
     }
 
+    fn strip_column_layout_offset(&self, id: u64) -> i32 {
+        if let Some(PointerGrab::StripMove { owner, .. }) = self.grab {
+            if self
+                .model
+                .window(id)
+                .is_some_and(|entry| entry.workspace == owner.workspace)
+            {
+                // Preserve the admission world's floor/round bias, but use the
+                // SAME rounded viewport delta as presentation throughout this
+                // move, including a real map/reconcile at a fractional offset.
+                let admission_bias =
+                    (owner.offset as i32).saturating_sub(owner.offset.round() as i32);
+                return (self.strip_offset.round() as i32).saturating_add(admission_bias);
+            }
+        }
+        // Existing floating, resize and non-grab strip layout stays unchanged.
+        self.strip_offset as i32
+    }
+
     /// One strip column rectangle for `id`: the work area's height less
     /// a gap above and below, preset-proportion width with gaps between
     /// columns and at the strip's ends (niri gaps-twice formula).
@@ -3147,8 +3800,8 @@ impl WindowManager {
     fn strip_column_area(&self, state: &State, id: u64) -> Rectangle<i32, Logical> {
         let work = Self::work_area(state);
         let columns = self.strip_columns(state, id);
-        let mut x = work.loc.x + Self::STRIP_GAP - self.strip_offset as i32;
-        let mut width = Self::strip_width(work.size.w, self.strip_proportion(id));
+        let mut x = work.loc.x + Self::STRIP_GAP - self.strip_column_layout_offset(id);
+        let mut width = self.strip_width_for(id, work.size.w);
         for (other, w) in &columns {
             if *other == id {
                 width = *w;
@@ -3169,12 +3822,7 @@ impl WindowManager {
         let widths: Vec<(u64, i32)> = self
             .strip_order()
             .iter()
-            .map(|id| {
-                (
-                    *id,
-                    Self::strip_width(work.size.w, self.strip_proportion(*id)),
-                )
-            })
+            .map(|id| (*id, self.strip_width_for(*id, work.size.w)))
             .collect();
         let total = Self::strip_total(&widths) + 2 * Self::STRIP_GAP;
         (total - work.size.w).max(0) as f64
@@ -3184,6 +3832,11 @@ impl WindowManager {
     /// scroll the least that shows the focused column whole, a gap from
     /// the edge it was beyond.
     fn follow_focus(&mut self, state: &mut State) {
+        // Direct manipulation owns the view even if a new modal focus
+        // target appears during this same family drag.
+        if self.grab.and_then(Self::strip_grab_owner).is_some() {
+            return;
+        }
         if self.mode != SessionMode::Scroll {
             return;
         }
@@ -3194,7 +3847,7 @@ impl WindowManager {
         let mut start = 0;
         let mut width = None;
         for id in self.strip_order() {
-            let w = Self::strip_width(work.size.w, self.strip_proportion(id));
+            let w = self.strip_width_for(id, work.size.w);
             if id == focused {
                 width = Some(w);
                 break;
@@ -3229,7 +3882,8 @@ impl WindowManager {
     /// Whether the strip view is still moving toward its target.
     pub fn strip_animating(&self) -> bool {
         self.mode == SessionMode::Scroll
-            && (self.strip_shown != self.strip_offset
+            && (self.strip_pointer_edge_pressure() != 0.0
+                || self.strip_shown != self.strip_offset
                 || self
                     .column_animations
                     .values()
@@ -3254,6 +3908,135 @@ impl WindowManager {
         }
     }
 
+    fn reset_strip_edge(&mut self) {
+        self.strip_edge_direction = 0;
+        self.strip_edge_elapsed = 0.0;
+        self.strip_edge_first_frame = false;
+    }
+
+    fn strip_edge_max(&self, work: Rectangle<i32, Logical>) -> f64 {
+        let extent = self.strip_order().into_iter().fold(0i64, |extent, id| {
+            extent
+                .saturating_add(i64::from(self.strip_width_for(id, work.size.w)))
+                .saturating_add(i64::from(Self::STRIP_GAP))
+        });
+        // One interior gap per column and one additional end gap.
+        (extent
+            .saturating_add(i64::from(Self::STRIP_GAP))
+            .saturating_sub(i64::from(work.size.w)))
+        .max(0) as f64
+    }
+
+    fn strip_pointer_edge_pressure(&self) -> f64 {
+        let Some(PointerGrab::StripMove { owner, .. }) = self.grab else {
+            return 0.0;
+        };
+        if self.mode != SessionMode::Scroll
+            || self.overview_open
+            || self.workspace_slide.running()
+            || self.model.active_workspace() != owner.workspace
+            || !self.windows.get(&owner.id).is_some_and(|window| {
+                window.layout == WindowLayout::Strip && !window.minimized && window.surface.alive()
+            })
+            || !self
+                .model
+                .window(owner.id)
+                .is_some_and(|entry| entry.workspace == owner.workspace)
+            || !self.pointer_pos.x.is_finite()
+            || !self.pointer_pos.y.is_finite()
+            || owner.work.size.w <= 0
+            || owner.work.size.h <= 0
+        {
+            return 0.0;
+        }
+        let x = self.pointer_pos.x - f64::from(owner.work.loc.x);
+        let y = self.pointer_pos.y - f64::from(owner.work.loc.y);
+        if y < 0.0 || y >= f64::from(owner.work.size.h) {
+            return 0.0;
+        }
+        let width = f64::from(owner.work.size.w);
+        let band = 10.0_f64.min(width / 2.0);
+        let x = x.clamp(0.0, width);
+        let pressure = if x < band {
+            -(band - x) / band
+        } else if width - x < band {
+            (band - (width - x)) / band
+        } else {
+            0.0
+        };
+        if (pressure < 0.0 && self.strip_offset <= 0.0)
+            || (pressure > 0.0 && self.strip_offset >= self.strip_edge_max(owner.work))
+        {
+            0.0
+        } else {
+            pressure
+        }
+    }
+
+    fn observe_strip_edge(&mut self) {
+        let pressure = self.strip_pointer_edge_pressure();
+        let direction = if pressure < 0.0 {
+            -1
+        } else if pressure > 0.0 {
+            1
+        } else {
+            0
+        };
+        if direction != self.strip_edge_direction {
+            self.strip_edge_direction = direction;
+            self.strip_edge_elapsed = 0.0;
+            self.strip_edge_first_frame = direction != 0;
+        }
+    }
+
+    fn step_strip_pointer_edge(&mut self, dt: f64) -> bool {
+        self.observe_strip_edge();
+        let pressure = self.strip_pointer_edge_pressure();
+        if pressure == 0.0 {
+            self.reset_strip_edge();
+            return false;
+        }
+        if self.strip_edge_first_frame {
+            // The previous renderer timestamp may precede this drag by minutes.
+            self.strip_edge_first_frame = false;
+            return true;
+        }
+        if !dt.is_finite() || dt <= 0.0 {
+            return true;
+        }
+        let dt = dt.min(0.05);
+        let old_dwell = self.strip_edge_elapsed;
+        self.strip_edge_elapsed = (old_dwell + dt).min(0.1);
+        let moving_dt = (old_dwell + dt - 0.1).max(0.0).min(dt);
+        if moving_dt == 0.0 {
+            return true;
+        }
+        let Some(PointerGrab::StripMove { owner, .. }) = self.grab else {
+            return false;
+        };
+        let old = self.strip_offset;
+        let next = (old + pressure * 50.0 * moving_dt).clamp(0.0, self.strip_edge_max(owner.work));
+        let shift = (next.round() as i32).saturating_sub(old.round() as i32);
+        self.strip_offset = next;
+        // View translation does not configure a new client size. Restrict it
+        // to real active-workspace strip actors and preserve their restores.
+        for (id, window) in &mut self.windows {
+            if window.layout == WindowLayout::Strip
+                && self
+                    .model
+                    .window(*id)
+                    .is_some_and(|entry| entry.workspace == owner.workspace)
+            {
+                window.geometry.loc.x = window.geometry.loc.x.saturating_sub(shift);
+            }
+        }
+        // Direct viewport movement cancels only the view spring. Independent
+        // column/family springs keep their current position and velocity;
+        // clearing them would jump a newly mapped family's neighbors to target.
+        self.snap_strip_view();
+        self.strip_pointer_edge_pressure() != 0.0
+    }
+
     /// Advance the drawn strip view `dt` seconds toward the target on
     /// niri's default view-movement spring (critically damped,
     /// stiffness 800, epsilon 0.0001). A target that moved mid-flight
@@ -3262,7 +4045,17 @@ impl WindowManager {
     /// returns whether the view is still moving (frames keep coming
     /// only while it does).
     pub fn step_strip_view(&mut self, dt: f64) -> bool {
+        self.step_strip_view_with_pointer_dt(dt, dt)
+    }
+
+    /// Springs use adjusted animation time; direct pointer manipulation uses
+    /// the actual frame interval, independent of the user's slow-animation aid.
+    pub fn step_strip_view_with_pointer_dt(&mut self, dt: f64, pointer_dt: f64) -> bool {
         use crate::spring::Spring;
+        let edge_demand = self.step_strip_pointer_edge(pointer_dt);
+        if matches!(self.grab, Some(PointerGrab::StripResize { .. })) {
+            self.snap_strip_columns();
+        }
         let columns: Vec<_> = self
             .visible_entries()
             .into_iter()
@@ -3285,7 +4078,7 @@ impl WindowManager {
         }
         if !self.animations_enabled {
             self.snap_strip_view();
-            return false;
+            return edge_demand;
         }
         if self.mode != SessionMode::Scroll {
             self.snap_strip_view();
@@ -3301,11 +4094,11 @@ impl WindowManager {
             None if self.strip_shown != target => {
                 (Spring::view_movement(self.strip_shown, target, 0.0), 0.0)
             }
-            None => return columns_moving,
+            None => return columns_moving || edge_demand,
         };
         if spring.done_at(t) {
             self.snap_strip_view();
-            return columns_moving;
+            return columns_moving || edge_demand;
         }
         self.strip_shown = spring.value_at(t);
         self.strip_anim = Some((spring, t));
@@ -3324,12 +4117,7 @@ impl WindowManager {
         let widths: Vec<(u64, i32)> = self
             .strip_order()
             .iter()
-            .map(|id| {
-                (
-                    *id,
-                    Self::strip_width(work.size.w, self.strip_proportion(*id)),
-                )
-            })
+            .map(|id| (*id, self.strip_width_for(*id, work.size.w)))
             .collect();
         let _ = (&widths, work);
         let max = self.strip_max_offset(state);
@@ -3350,6 +4138,7 @@ impl WindowManager {
     /// columns participate; other layouts and gnome mode are
     /// untouched. False with no focused strip column.
     fn cycle_preset(&mut self, state: &mut State, direction: i32) -> bool {
+        self.cancel_strip_pointer(state);
         let Some(focused) = self.model.focused() else {
             return false;
         };
@@ -3357,6 +4146,25 @@ impl WindowManager {
             || self.window_layout(focused) != Some(WindowLayout::Strip)
         {
             return false;
+        }
+        if self.windows[&focused].strip_fixed_width.is_some() {
+            let width = self.strip_width_for(focused, Self::work_area(state).size.w);
+            let presets =
+                Self::STRIP_PRESETS.map(|p| Self::strip_width(Self::work_area(state).size.w, p));
+            let next = if direction >= 0 {
+                presets.iter().position(|w| *w > width).unwrap_or(0)
+            } else {
+                presets
+                    .iter()
+                    .rposition(|w| *w < width)
+                    .unwrap_or(presets.len() - 1)
+            };
+            let window = self.windows.get_mut(&focused).unwrap();
+            window.strip_fixed_width = None;
+            window.preset = Some(next);
+            self.follow_focus(state);
+            self.relayout_strip(state);
+            return true;
         }
         let count = Self::STRIP_PRESETS.len() as i32;
         let current = self
@@ -3410,6 +4218,7 @@ impl WindowManager {
     /// with focus. Only the two swapped columns change geometry; the
     /// rest of the strip is untouched. False with no movable window.
     fn move_focused_in_strip(&mut self, state: &mut State, delta: i32) -> bool {
+        self.cancel_strip_pointer(state);
         let Some(focused) = self.model.focused() else {
             return false;
         };
@@ -3460,12 +4269,7 @@ impl WindowManager {
         let widths: Vec<(u64, i32)> = self
             .strip_order()
             .iter()
-            .map(|id| {
-                (
-                    *id,
-                    Self::strip_width(work.size.w, self.strip_proportion(*id)),
-                )
-            })
+            .map(|id| (*id, self.strip_width_for(*id, work.size.w)))
             .collect();
         let _ = (&widths, work);
         self.strip_offset = self.strip_offset.clamp(0.0, self.strip_max_offset(state));
@@ -3483,6 +4287,7 @@ impl WindowManager {
     /// leaving restores every strip column. Windows in other managed
     /// layouts keep their layout (forced membership is later work).
     pub fn set_scroll(&mut self, state: &mut State, scroll: bool) -> bool {
+        self.cancel_strip_pointer(state);
         self.mode = if scroll {
             SessionMode::Scroll
         } else {
@@ -3716,6 +4521,7 @@ impl WindowManager {
     /// primary's geometry. Floating windows are untouched (migration
     /// already placed them). Returns how many windows re-applied.
     pub fn reapply_derived_layouts(&mut self, state: &mut State) -> usize {
+        self.cancel_strip_pointer(state);
         let mut ids: Vec<u64> = self.windows.keys().copied().collect();
         ids.sort_unstable();
         let mut applied = 0;
@@ -3733,6 +4539,7 @@ impl WindowManager {
     /// Move a window to another workspace (registered if new). Focus
     /// follows the window when it leaves the active workspace.
     pub fn move_to_workspace(&mut self, state: &mut State, id: u64, workspace: u32) -> bool {
+        self.cancel_strip_pointer(state);
         if !self.windows.contains_key(&id) {
             return false;
         }
@@ -3807,6 +4614,7 @@ impl WindowManager {
         if !self.model.workspaces().contains(&workspace) {
             return false;
         }
+        self.cancel_strip_pointer(state);
         if !self.activate_workspace(workspace) {
             return false;
         }
@@ -3840,6 +4648,7 @@ impl WindowManager {
         let Some(target) = target else {
             return false;
         };
+        self.cancel_strip_pointer(state);
         if !self.activate_workspace(target) {
             return false;
         }
@@ -4001,7 +4810,7 @@ fn contains(geometry: Rectangle<i32, Logical>, pos: Point<f64, Logical>) -> bool
 }
 
 /// Backend input event kinds this manager consumes from the runtime.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ManagerInput {
     Key {
         keycode: u32,
@@ -4384,6 +5193,14 @@ impl WindowManager {
                 settings.xkb_layout, settings.xkb_variant
             );
         }
+        self.apply_keyboard_repeat(settings);
+    }
+
+    /// Repeat preferences can change without replacing the active keymap.
+    pub fn apply_keyboard_repeat(&mut self, settings: &tuna_shell_control::InputSettings) {
+        let Some(keyboard) = self.keyboard.clone() else {
+            return;
+        };
         let rate = if settings.repeat && settings.repeat_interval_ms > 0 {
             (1000 / settings.repeat_interval_ms).max(1) as i32
         } else {
@@ -4393,9 +5210,8 @@ impl WindowManager {
         self.repeat = (rate, settings.repeat_delay_ms as i32);
     }
 
-    /// The next input source (GNOME's Super+Space).
-    fn next_input_source(&mut self, state: &mut State) {
-        self.switch_input_source(state, false);
+    pub fn take_input_source_switches(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.input_source_switches)
     }
 
     /// The next (or previous) input source, as the shell's rebindable
@@ -4561,7 +5377,8 @@ impl WindowManager {
                     // GNOME's next input source; press and release stay
                     // with the compositor.
                     if pressed {
-                        self.next_input_source(state);
+                        self.switcher_swallowed.push(keycode);
+                        self.input_source_switches.push(false);
                     }
                 } else if keycode == TAB_KEYCODE
                     && self.switcher_keys.is_none()
@@ -5182,7 +5999,7 @@ impl WindowManager {
     }
 
     /// The keysym `keycode` types at the base level of the active layout.
-    fn base_keysym(&self, state: &mut State, keycode: u32) -> Option<u32> {
+    pub(crate) fn base_keysym(&self, state: &mut State, keycode: u32) -> Option<u32> {
         let keyboard = self.keyboard.clone()?;
         keyboard.with_xkb_state(state, |context| {
             let xkb = context.xkb().lock().ok()?;

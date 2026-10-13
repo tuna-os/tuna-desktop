@@ -10,6 +10,8 @@ Orientation follow-up: w2-345 (#345). `orientation-lock` never lived under `org.
 
 Privacy follow-up: w3-356-privacy (#356). The three `org.gnome.desktop.privacy` device kill-switches move to Honored with the enforcing services identified per key; retention, diagnostics, and reporting rows stay Ignored as external-service responsibilities. Mechanism, GNOME 51 comparison, and proof matrix are in [privacy-enforcement.md](privacy-enforcement.md).
 
+Wellbeing renderer evidence: candidate `529f71648f3286092b55b93f59983a2882de3ec5` (2026-10-12). The GTK entry point starts [the wellbeing runtime](../crates/shell-gtk/src/wellbeing.rs), which watches the schemas, maintains `$XDG_DATA_HOME/gnome-shell/session-active-history.json`, registers notice actions and sends effects through the control client with correlated `Applied` responses. [Exact-source native renderer evidence](https://github.com/tuna-os/tuna-desktop/actions/runs/38320982358) was independently rechecked for 38 pixel comparisons from 44 original PNGs: entry/midpoint/endpoint, combined effects, immediate disable, reduced-motion/animations-off controls and cursor exclusion under nested winit/Xvfb/llvmpipe. This uses a supervised synthetic control peer; it does not qualify production GTK wellbeing policy, installed DRM/GPU sessions or the complete feature. The countdown stop hook now cancels only its owned OSD display and timer, preserving a newer volume/brightness display; the added actual GTK regression awaits exact-source CI execution. [#354](https://github.com/tuna-os/tuna-desktop/issues/354) remains open.
+
 Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.14.5/gdk/wayland/gdkdisplay-wayland.c). Related shell, Mutter and settings-daemon keys are in [settings-map.md](settings-map.md).
 
 ## org.gnome.desktop.a11y
@@ -37,26 +39,26 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| bouncekeys-beep-reject | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| bouncekeys-delay | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| bouncekeys-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| disable-timeout | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| feature-state-change-beep | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| mousekeys-accel-time | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| mousekeys-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| mousekeys-init-delay | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| mousekeys-max-speed | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| slowkeys-beep-accept | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| slowkeys-beep-press | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| slowkeys-beep-reject | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| slowkeys-delay | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| slowkeys-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| stickykeys-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| stickykeys-modifier-beep | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| stickykeys-two-key-off | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| timeout-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| togglekeys-enable | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| bouncekeys-beep-reject | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Rejected Bounce Keys events reach the shared bell policy; audible and installed-session acceptance remain pending (#350/#365) |
+| bouncekeys-delay | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live delay reaches compositor Bounce Keys rejection timing; exact combined runtime acceptance remains pending (#350/#365) |
+| bouncekeys-enable | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference enables compositor Bounce Keys before client delivery; exact combined runtime acceptance remains pending (#350/#365) |
+| disable-timeout | Ignored | No Tuna inactivity-timeout consumer. Mutter51 native loads this legacy delay but never applies it; compatibility disposition remains open under #365. See [native keyboard audit](keyboard-native-parity.md) |
+| enable | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Controls the five-Shift/eight-second-Shift accessibility shortcuts, independently of aid enable keys, as in Mutter51; combined runtime acceptance remains pending (#350/#365) |
+| feature-state-change-beep | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Aid shortcut changes reach the shared bell policy; audible and installed-session acceptance remain pending (#350/#365) |
+| mousekeys-accel-time | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference reaches compositor Mouse Keys acceleration; actual motion and installed-session acceptance remain pending (#350/#365) |
+| mousekeys-enable | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference enables compositor keypad pointer/button synthesis; actual motion and installed-session acceptance remain pending (#350/#365) |
+| mousekeys-init-delay | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference reaches compositor Mouse Keys initial movement delay; actual motion and installed-session acceptance remain pending (#350/#365) |
+| mousekeys-max-speed | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference reaches compositor Mouse Keys speed limit; actual motion and installed-session acceptance remain pending (#350/#365) |
+| slowkeys-beep-accept | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Accepted Slow Keys events reach the shared bell policy; audible and installed-session acceptance remain pending (#350/#365) |
+| slowkeys-beep-press | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Slow Keys press events reach the shared bell policy; audible and installed-session acceptance remain pending (#350/#365) |
+| slowkeys-beep-reject | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Rejected Slow Keys events reach the shared bell policy; audible and installed-session acceptance remain pending (#350/#365) |
+| slowkeys-delay | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference reaches compositor deferred key acceptance timing; exact combined runtime acceptance remains pending (#350/#365) |
+| slowkeys-enable | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference enables compositor Slow Keys before client delivery; exact combined runtime acceptance remains pending (#350/#365) |
+| stickykeys-enable | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference enables compositor modifier latch/lock delivery; active keymap resets are implemented, but AltGr/Level3 parity and combined runtime acceptance remain pending (#350/#365) |
+| stickykeys-modifier-beep | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Sticky modifier transitions reach the shared bell policy; audible, Level3 and installed-session acceptance remain pending (#350/#365) |
+| stickykeys-two-key-off | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference controls compositor two-key Sticky Keys cancellation and GTK confirmation; exact combined runtime acceptance remains pending (#350/#365) |
+| timeout-enable | Ignored | No Tuna inactivity-timeout consumer. Mutter51 native loads the flag but never tests it in the native aid engine; compatibility disposition remains open under #365. See [native keyboard audit](keyboard-native-parity.md) |
+| togglekeys-enable | Honored (partial) | GTK kbd_a11y → combined protocol0.34 → compositor InputAids. Live preference reaches compositor Toggle Keys; actual XKB LED-change semantics and audible acceptance remain pending; see native keyboard audit (#350/#365) |
 ## org.gnome.desktop.a11y.magnifier
 
 | Key | Status | Reason |
@@ -127,35 +129,35 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| selected-breaks | Ignored | Tuna Desktop has no break reminder scheduler |
+| selected-breaks | Honored | Shell break scheduler; empty disables reminders |
 ## org.gnome.desktop.break-reminders.eyesight
 
 | Key | Status | Reason |
 |---|---|---|
-| countdown | Ignored | Tuna Desktop has no break reminder scheduler |
-| delay-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| duration-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| fade-screen | Ignored | Tuna Desktop has no break reminder scheduler |
-| interval-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| lock-screen | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify-overdue | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify-upcoming | Ignored | Tuna Desktop has no break reminder scheduler |
-| play-sound | Ignored | Tuna Desktop has no break reminder scheduler |
+| countdown | Honored (partial) | OSD countdown in the last 60 s before a break; StopCountdown cancels only its owned OSD display/timer; the added actual GTK regression awaits exact-source CI. Production GTK policy and installed-session acceptance remain open (#354) |
+| delay-seconds | Honored (partial) | GTK wellbeing notice Delay callback queues the action; the 2 s break tick invokes delay_break with the live per-type delay setting. Production GTK policy and installed-session acceptance remain open (#354) |
+| duration-seconds | Honored | Break length for scheduling and idle-take detection |
+| fade-screen | Honored (partial) | GTK wellbeing effect hook → correlated protocol0.35 Applied → compositor wellbeing_effects brightness fade. Exact-source native renderer pixels independently verified; production GTK policy and installed DRM/GPU acceptance remain open (#354) |
+| interval-seconds | Honored | Time between breaks |
+| lock-screen | Honored | Locks the session when the break starts |
+| notify | Honored | Due/overdue notices posted; tray-only urgency not distinguished yet |
+| notify-overdue | Honored | Overdue notice 60 s after due |
+| notify-upcoming | Honored | Upcoming notice 2 min before due |
+| play-sound | Honored | Complete sound via canberra, event-sounds gated |
 ## org.gnome.desktop.break-reminders.movement
 
 | Key | Status | Reason |
 |---|---|---|
-| countdown | Ignored | Tuna Desktop has no break reminder scheduler |
-| delay-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| duration-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| fade-screen | Ignored | Tuna Desktop has no break reminder scheduler |
-| interval-seconds | Ignored | Tuna Desktop has no break reminder scheduler |
-| lock-screen | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify-overdue | Ignored | Tuna Desktop has no break reminder scheduler |
-| notify-upcoming | Ignored | Tuna Desktop has no break reminder scheduler |
-| play-sound | Ignored | Tuna Desktop has no break reminder scheduler |
+| countdown | Honored (partial) | OSD countdown in the last 60 s before a break; StopCountdown cancels only its owned OSD display/timer; the added actual GTK regression awaits exact-source CI. Production GTK policy and installed-session acceptance remain open (#354) |
+| delay-seconds | Honored (partial) | GTK wellbeing notice Delay callback queues the action; the 2 s break tick invokes delay_break with the live per-type delay setting. Production GTK policy and installed-session acceptance remain open (#354) |
+| duration-seconds | Honored | Break length for scheduling and idle-take detection |
+| fade-screen | Honored (partial) | GTK wellbeing effect hook → correlated protocol0.35 Applied → compositor wellbeing_effects brightness fade. Exact-source native renderer pixels independently verified; production GTK policy and installed DRM/GPU acceptance remain open (#354) |
+| interval-seconds | Honored | Time between breaks |
+| lock-screen | Honored | Locks the session when the break starts |
+| notify | Honored | Due/overdue notices posted; tray-only urgency not distinguished yet |
+| notify-overdue | Honored | Overdue notice 60 s after due |
+| notify-upcoming | Honored | Upcoming notice 2 min before due |
+| play-sound | Honored | Complete sound via canberra, event-sounds gated |
 ## org.gnome.desktop.calendar
 
 | Key | Status | Reason |
@@ -455,10 +457,10 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| daily-limit-enabled | Ignored | Tuna Desktop has no screen-time tracking/enforcement service |
-| daily-limit-seconds | Ignored | Tuna Desktop has no screen-time tracking/enforcement service |
-| grayscale | Ignored | Tuna Desktop has no screen-time tracking/enforcement service |
-| history-enabled | Ignored | Tuna Desktop has no screen-time tracking/enforcement service |
+| daily-limit-enabled | Honored | Limit evaluated on the 30 s poll and on settings change |
+| daily-limit-seconds | Honored | Daily allowance in seconds |
+| grayscale | Honored (partial) | GTK screen-time tracker → correlated protocol0.35 Applied → compositor wellbeing_effects desaturation. Exact-source native renderer pixels independently verified; production GTK policy and installed DRM/GPU acceptance remain open (#354) |
+| history-enabled | Honored | Recording on/off; off deletes the history file live |
 ## org.gnome.desktop.screensaver
 
 | Key | Status | Reason |

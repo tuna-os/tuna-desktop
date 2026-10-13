@@ -25,8 +25,8 @@ On timeout or failure, prints log excerpts and exits nonzero.
 With --tour, once the assertions pass it drives a scripted feature tour
 through QMP input (overview and search, app grid, quick settings,
 calendar, three apps and Alt+Tab, scroll mode, lock and unlock), screendumps
-it twice a second, splices in the title cards from scripts/lib/
-vm-tour-cards, and writes tour/tuna-tour.webm, tour/preview.webp and a
+at a nominal two frames/second plus synchronous stills, splices title cards from scripts/lib/
+vm-tour-cards rendered from source in scratch, and writes tour/tuna-tour.webm, tour/preview.webp and a
 T-<section>.png still per section (needs ffmpeg with libvpx and libwebp).
 
 Usage:
@@ -48,7 +48,9 @@ import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
 _loader = importlib.machinery.SourceFileLoader("tuna_baseline",
                                                os.path.join(HERE, "tuna-baseline"))
 _spec = importlib.util.spec_from_loader("tuna_baseline", _loader)
@@ -68,10 +70,168 @@ DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
 SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings:")
 EXHAUSTED = "shell supervision: BudgetExhausted"
 CARDS = os.path.join(HERE, "lib", "vm-tour-cards")
-TOUR_FPS = 2        # frames captured per second during the tour
-PLAY_FPS = 4        # playback rate: the tour plays at 2x
+TOUR_FPS = 2        # nominal periodic target; synchronous stills add irregular frames
+PLAY_FPS = 4        # encoded frame rate, not a uniform real-time capture clock
 CARD_HOLD = 10      # frames a title card is held (2.5 s at PLAY_FPS)
 OVMF = ("/usr/share/ovmf/OVMF.fd", "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/qemu/OVMF.fd")
+
+
+def auth_uint(value):
+    return type(value) is int and 0 < value <= (1 << 64) - 1
+
+
+def sleep_auth_attempt(snapshot):
+    """Bind a pending original password attempt before real S3; no secret data."""
+    state = snapshot.get('state', {})
+    owner = state.get('auth_owner')
+    if state.get('locked') is not True or type(owner) is not dict or owner.get('outer_pending') is not True:
+        raise ValueError('pre-sleep owned authentication not pending')
+    attempt = owner.get('attempt')
+    if type(attempt) is not dict or set(attempt) != {'serial', 'epoch', 'origin'}:
+        raise ValueError('pre-sleep owned attempt missing')
+    origin = attempt['origin']
+    if type(origin) is not dict or set(origin) != {'connection', 'request'}:
+        raise ValueError('pre-sleep original connection missing')
+    values = [attempt['serial'], attempt['epoch'], origin['connection'], origin['request']]
+    if not all(auth_uint(value) for value in values) or not auth_uint(owner.get('epoch')) or owner['epoch'] != attempt['epoch']:
+        raise ValueError('pre-sleep attempt identity or current epoch invalid')
+    processes = [p for p in snapshot.get('processes', []) if p.get('executable') == 'tuna-compositor']
+    if len(processes) != 1 or not all(auth_uint(processes[0].get(key)) for key in ['pid', 'start_ticks']):
+        raise ValueError('unique original compositor process required')
+    return {'pid': processes[0]['pid'], 'start_ticks': processes[0]['start_ticks'],
+            'serial': attempt['serial'], 'epoch': attempt['epoch'], 'origin': origin}
+
+
+def stale_sleep_auth_retirement(trace, expected, current_epoch):
+    """Require the exact joined accepted attempt, stale epoch and its shell denial."""
+    prefix = 'tuna-compositor: lock authentication retired '
+    keys = {'pid', 'joined_ok', 'backend_accepted', 'reported_ok', 'applied',
+            'attempt_serial', 'attempt_epoch', 'current_epoch', 'origin', 'origin_live', 'locked_after'}
+    matches = []
+    if not auth_uint(current_epoch) or current_epoch <= expected['epoch']:
+        return None
+    for line in trace.splitlines():
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if type(event) is not dict or set(event) != keys:
+            return None
+        if not all(type(event[key]) is bool for key in ['joined_ok', 'backend_accepted', 'reported_ok',
+                                                      'applied', 'origin_live', 'locked_after']):
+            return None
+        if not all(auth_uint(event[key]) for key in ['pid', 'attempt_serial', 'attempt_epoch', 'current_epoch']):
+            return None
+        origin = event['origin']
+        if type(origin) is not dict or set(origin) != {'connection', 'request'} or not all(auth_uint(v) for v in origin.values()):
+            return None
+        if (event['pid'], event['attempt_serial'], event['attempt_epoch'], origin) == (
+                expected['pid'], expected['serial'], expected['epoch'], expected['origin']):
+            matches.append(event)
+    if len(matches) != 1:
+        return None
+    event = matches[0]
+    if not (event['joined_ok'] and event['backend_accepted'] and event['reported_ok']
+            and event['origin_live'] and event['locked_after'] and not event['applied']
+            and event['current_epoch'] == current_epoch and event['attempt_epoch'] < current_epoch):
+        return None
+    denial = re.compile(r'tuna-shell-gtk: lock command result applied=false request_id=([0-9]+)(?:\s|$)')
+    if not any(int(match.group(1)) == expected['origin']['request'] for match in denial.finditer(trace)):
+        return None
+    return event
+
+
+
+AUTH_PROCESS_KEYS = {"pid", "uid", "ppid", "pgrp", "start_ticks", "executable", "exe_device", "exe_inode"}
+
+
+def checked_auth_process(value, executable):
+    if (type(value) is not dict or set(value) != AUTH_PROCESS_KEYS
+            or value["executable"] != executable
+            or not all(auth_uint(value[key]) for key in ("pid", "uid", "ppid", "pgrp", "start_ticks", "exe_inode"))
+            or type(value["exe_device"]) is not int or value["exe_device"] < 0):
+        raise ValueError("original authentication process identity invalid")
+    return value
+
+
+def sleep_auth_helper_observation(observed, snapshot):
+    """Admit the fixed held-self helper and its actual pam_exec sleep child."""
+    expected = sleep_auth_attempt(snapshot)
+    if type(observed) is not dict or set(observed) != {"real_pam_delay_running", "compositor", "helpers", "delays", "auth_owner"} or observed["real_pam_delay_running"] is not True:
+        raise ValueError("actual original PAM delay was not observed")
+    if json.dumps(observed["auth_owner"], sort_keys=True) != json.dumps(snapshot["state"]["auth_owner"], sort_keys=True):
+        raise ValueError("PAM observation belongs to a different attempt")
+    if type(observed["helpers"]) is not list or len(observed["helpers"]) != 1 or type(observed["delays"]) is not list or len(observed["delays"]) != 1:
+        raise ValueError("unique actual helper and delay required")
+    return checked_auth_method(observed["compositor"], observed["helpers"][0], observed["delays"][0], expected)
+
+
+def checked_auth_method(desktop, helper, delay, expected):
+    desktop = checked_auth_process(desktop, "tuna-compositor")
+    helper = checked_auth_process(helper, "tuna-compositor")
+    delay = checked_auth_process(delay, "sleep")
+    if (desktop["pid"], desktop["start_ticks"]) != (expected["pid"], expected["start_ticks"]):
+        raise ValueError("desktop identity changed before helper admission")
+    if (helper["pid"] == desktop["pid"] or helper["ppid"] != desktop["pid"] or helper["pgrp"] != helper["pid"]
+            or helper["uid"] != desktop["uid"] or helper["start_ticks"] < desktop["start_ticks"]
+            or (helper["exe_device"], helper["exe_inode"]) != (desktop["exe_device"], desktop["exe_inode"])
+            or delay["pid"] in (desktop["pid"], helper["pid"]) or delay["ppid"] != helper["pid"]
+            or delay["pgrp"] != helper["pid"] or delay["uid"] != desktop["uid"] or delay["start_ticks"] < helper["start_ticks"]):
+        raise ValueError("PAM helper/delay kernel ownership differs")
+    return {"compositor": desktop, "helper": helper, "delay": delay, "attempt": expected}
+
+
+def cancelled_sleep_auth_retirement(trace, expected, current_epoch, original, physical):
+    """Canceled owned helper: never accepted success or mere wrapper join."""
+    # Reuse the SAME original admission matcher: absence without a valid
+    # previously admitted helper/delay cannot qualify cancellation.
+    try:
+        if type(original) is not dict or set(original) != {"compositor", "helper", "delay", "attempt"}:
+            return None
+        admitted = checked_auth_method(original["compositor"], original["helper"], original["delay"], expected)
+        if json.dumps(admitted, sort_keys=True) != json.dumps(original, sort_keys=True):
+            return None
+    except (ValueError, TypeError, KeyError):
+        return None
+    if (type(physical) is not dict or set(physical) != {"helper_absent", "delay_absent", "owned_group_members", "original"}
+            or json.dumps(physical["original"], sort_keys=True) != json.dumps(original, sort_keys=True) or physical["helper_absent"] is not True
+            or physical["delay_absent"] is not True or physical["owned_group_members"] != []
+            or not auth_uint(current_epoch) or current_epoch <= expected["epoch"]):
+        return None
+    prefix = 'tuna-compositor: lock authentication owned retirement '
+    keys = {'pid', 'joined_ok', 'retired', 'authenticated', 'denied', 'cancel_requested', 'reported_ok',
+            'applied', 'attempt_serial', 'attempt_epoch', 'current_epoch', 'origin', 'locked_after'}
+    matches = []
+    for line in trace.splitlines():
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if (type(event) is not dict or set(event) != keys
+                or not all(type(event[key]) is bool for key in ['joined_ok', 'retired', 'authenticated', 'denied', 'cancel_requested', 'reported_ok', 'applied', 'locked_after'])
+                or not all(auth_uint(event[key]) for key in ['pid', 'attempt_serial', 'attempt_epoch', 'current_epoch'])):
+            return None
+        origin = event['origin']
+        if type(origin) is not dict or set(origin) != {'connection', 'request'} or not all(auth_uint(v) for v in origin.values()):
+            return None
+        if (event['pid'], event['attempt_serial'], event['attempt_epoch'], origin) == (
+                expected['pid'], expected['serial'], expected['epoch'], expected['origin']):
+            matches.append(event)
+    if len(matches) != 1:
+        return None
+    event = matches[0]
+    if not (event['joined_ok'] and event['retired'] and event['denied'] and event['cancel_requested']
+            and event['locked_after'] and not event['authenticated'] and not event['reported_ok'] and not event['applied']
+            and event['current_epoch'] == current_epoch):
+        return None
+    denial = re.compile(r'tuna-shell-gtk: lock command result applied=false request_id=([0-9]+)(?:\s|$)')
+    if not any(int(match.group(1)) == expected['origin']['request'] for match in denial.finditer(trace)):
+        return None
+    return event
 
 
 def log(msg):
@@ -157,15 +317,33 @@ def usb_bus_from_qtree(qtree):
     raise RuntimeError("no USB bus in qtree output")
 
 
-def run_lifecycle(qmp, agent, out, serial_path, record):
+def s3_remaining(deadline):
+    """Refuse observations or acceptance at/after the unchanged phase budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("S3 authentication observation deadline expired")
+    return remaining
+
+
+def s3_observe(agent, action, *args, deadline):
+    result = agent.run(action, *args, timeout=s3_remaining(deadline))
+    s3_remaining(deadline)
+    return result
+
+
+def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None, strip_edge=False):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
     evidence = os.path.join(out, "lifecycle")
     os.makedirs(evidence, exist_ok=True)
 
-    def inventory(label):
-        state = agent.run("inventory")
+    def inventory(label, deadline=None):
+        # Other lifecycle callers retain their original default behavior.
+        state = (agent.run("inventory") if deadline is None else
+                 s3_observe(agent, "inventory", deadline=deadline))
         with open(os.path.join(evidence, f"{label}.json"), "w") as stream:
             json.dump(state, stream, indent=2)
+        if deadline is not None:
+            s3_remaining(deadline)
         return state
 
     def await_state(predicate, timeout=15, label=None):
@@ -737,6 +915,12 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
              "devices": mice, "relative_inputs": corner_inputs,
              "primary_error": constraint_primary_error})
 
+    if strip_image is not None:
+        from vm_strip_acceptance import prove_installed_strip
+        if reconnect is None:
+            raise RuntimeError("installed acceptance needs independent cleanup transport")
+        prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm, record, edge=strip_edge)
+
     # Capture the stable desktop after the final key OSD has disappeared.
     time.sleep(2)
 
@@ -867,8 +1051,9 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     # It combines plain and stale-auth wake checks with a prelocked session;
     # the main lifecycle lane separately qualified prepare-for-sleep locking
     # from an unlocked desktop. Keep fresh GPU upload and client repaint gates.
-    # Submit a correct password to a real delayed PAM stack before sleep.
-    # Its later success must not unlock the new sleep-lock generation.
+    # Admit an actual helper with a real delayed PAM stack before sleep.
+    # Sleep must cancel and physically retire it without unlocking. The separate
+    # controlled late-success epoch proof still tests queued accepted results.
     agent.run("delay-unlock")
     try:
         agent.run("lock")
@@ -881,10 +1066,24 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
         stale_auth_offset = len(read_text(serial_path))
         qmp.keys("ret")
         deadline = time.monotonic() + 5
+        desktop = next(process for process in before["processes"] if process["executable"] == "tuna-compositor")
+        observation_index = 0
         while time.monotonic() < deadline:
-            if agent.run("delayed-auth-state")["real_pam_delay_running"]:
+            observed = s3_observe(agent, "delayed-auth-state", desktop["pid"],
+                                  desktop["start_ticks"], deadline=deadline)
+            with open(os.path.join(evidence, f"sleep-auth-delay-{observation_index:02d}.json"), "w") as stream:
+                json.dump(observed, stream, indent=2)
+            observation_index += 1
+            s3_remaining(deadline)
+            if observed["real_pam_delay_running"]:
+                pending_auth = inventory("sleep-auth-owned-attempt", deadline=deadline)
+                if not same_apps(before, pending_auth):
+                    raise RuntimeError("pre-sleep authentication replaced the session")
+                original_auth = sleep_auth_attempt(pending_auth)
+                original_method = sleep_auth_helper_observation(observed, pending_auth)
+                s3_remaining(deadline)
                 break
-            time.sleep(0.1)
+            time.sleep(min(0.1, s3_remaining(deadline)))
         else:
             raise RuntimeError("actual PAM delay child did not start before suspend")
     finally:
@@ -894,20 +1093,34 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     deadline = time.monotonic() + 25
     stale_rejected = False
     while time.monotonic() < deadline:
-        state = inventory("sleep-auth-pending")
+        state = inventory("sleep-auth-pending", deadline=deadline)
         if not state["state"]["locked"] or not same_apps(before, state):
             record("V-SLEEP-AUTH-FAIL-CLOSED", False, "pre-sleep PAM result exposed or replaced the session")
             raise RuntimeError("pre-sleep authentication unlocked the resumed session")
         trace = read_text(serial_path)[stale_auth_offset:]
-        stale_rejected = ("lock authentication finished accepted=true applied=false" in trace
-                          and "tuna-shell-gtk: lock command result applied=false" in trace)
+        owner = state["state"].get("auth_owner")
+        current_epoch = owner.get("epoch") if type(owner) is dict else None
+        physical = s3_observe(agent, "auth-retirement-state", json.dumps(original_method),
+                              deadline=deadline)
+        with open(os.path.join(evidence, "sleep-auth-physical-retirement.json"), "w") as stream:
+            json.dump(physical, stream, indent=2)
+        retirement = cancelled_sleep_auth_retirement(trace, original_auth, current_epoch, original_method, physical)
+        s3_remaining(deadline)
+        stale_rejected = retirement is not None
         if stale_rejected:
+            with open(os.path.join(evidence, "sleep-auth-retirement.json"), "w") as stream:
+                json.dump({"owned_attempt": original_auth, "retirement": retirement,
+                           "original_method": original_method, "physical": physical,
+                           "scope": "actual canceled PAM helper and owned delay retirement after real S3; unchanged locked desktop"},
+                          stream, indent=2)
+            s3_remaining(deadline)
             break
-        time.sleep(0.2)
+        time.sleep(min(0.2, s3_remaining(deadline)))
+    s3_remaining(deadline)
     record("V-SLEEP-AUTH-FAIL-CLOSED", stale_rejected,
-           "real delayed PAM accepts correct pre-sleep password, but stale generation is refused and locked apps stay intact")
+           "original real delayed PAM helper is canceled and physically retired after real S3; no accepted stale success and locked apps stay intact")
     if not stale_rejected:
-        raise RuntimeError("actual successful pre-sleep PAM rejection was not observed")
+        raise RuntimeError("actual canceled pre-sleep PAM helper retirement was not observed")
     qmp.keys("ctrl", "a")
     qmp.type_text("tuna")
     qmp.keys("ret")
@@ -1032,41 +1245,176 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
 
 
 class Recorder:
-    """Screendump the VM TOUR_FPS times a second into numbered PNGs while
-    the tour drives input; marks splice a title card in at a frame index."""
+    """Serialize input and completed screendumps, including their frame indices.
 
-    def __init__(self, qmp, out):
+    A failed/timed-out transport aborts the tour; a still records pixels only,
+    not proof that the application reached a requested semantic state.
+    """
+
+    def __init__(self, qmp, out, timeout=10.0):
         self.qmp, self.dir = qmp, os.path.join(out, "frames")
-        os.makedirs(self.dir, exist_ok=True)
-        self.lock, self.stop, self.n, self.marks = threading.Lock(), threading.Event(), 0, []
-        self.stills = {}
-        cmd = qmp.cmd
-
-        def locked(command, **args):
-            with self.lock:
-                return cmd(command, **args)
-        qmp.cmd = locked
+        os.makedirs(self.dir, exist_ok=False)
+        self.lock, self.stop = threading.RLock(), threading.Event()
+        self.n, self.marks, self.stills = 0, [], {}
+        self.frames = []
+        self.timeout, self.error = timeout, None
+        self.original_cmd = qmp.cmd
+        self.wrapped_cmd = self._command
+        qmp.cmd = self.wrapped_cmd
         self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _command(self, command, _deadline=None, **args):
+        deadline = _deadline if _deadline is not None else time.monotonic() + self.timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self.lock.acquire(timeout=remaining):
+            error = TimeoutError("tour QMP lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
+        try:
+            if self.error is not None:
+                raise RuntimeError("tour capture previously failed") from self.error
+            sock = getattr(self.qmp, "sock", None)
+            previous = sock.gettimeout() if sock is not None else None
+            expired, timer = threading.Event(), None
+            if sock is not None:
+                import socket
+                # A socket timeout alone restarts for every read. The owned
+                # watchdog also bounds endless events and partial-line dribble.
+                def abort():
+                    expired.set()
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    abort()
+                    raise TimeoutError("tour QMP absolute deadline expired")
+                sock.settimeout(remaining)
+                timer = threading.Timer(remaining, abort)
+                timer.name = "tour-qmp-deadline"
+                timer.start()
+            try:
+                result = self.original_cmd(command, **args)
+            except (OSError, RuntimeError, ValueError) as error:
+                if isinstance(error, TimeoutError) and sock is not None:
+                    abort()
+                if expired.is_set():
+                    error = TimeoutError("tour QMP absolute deadline expired")
+                self.error = error
+                self.stop.set()
+                raise error
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                    timer.join()  # No detached callback can poison a later command.
+                if sock is not None:
+                    sock.settimeout(previous)
+            if expired.is_set() or time.monotonic() >= deadline:
+                if sock is not None:
+                    abort()
+                error = TimeoutError("tour QMP absolute deadline expired")
+                self.error = error
+                self.stop.set()
+                raise error
+            return result
+        finally:
+            self.lock.release()
+
+    def _capture(self, mode="periodic"):
+        deadline = time.monotonic() + self.timeout
+        if not self.lock.acquire(timeout=self.timeout):
+            error = TimeoutError("tour capture lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
+        pending = None
+        owns_pending = False
+        try:
+            index = self.n
+            final = os.path.join(self.dir, f"f{index:06d}.png")
+            pending = final + ".pending"
+            if os.path.exists(final) or os.path.exists(pending):
+                raise RuntimeError("tour frame identity already exists")
+            with open(pending, "xb"):
+                pass
+            owns_pending = True
+            requested_ns = time.monotonic_ns()
+            self._command("screendump", _deadline=deadline, filename=pending, format="png")
+            while not os.path.isfile(pending) or os.path.getsize(pending) == 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("tour screendump did not produce a frame")
+                self.stop.wait(min(0.01, remaining))
+            if time.monotonic() >= deadline:
+                raise TimeoutError("tour screendump exceeded its deadline")
+            os.rename(pending, final)
+            self.frames.append({"index": index, "mode": mode,
+                                "requested_monotonic_ns": requested_ns,
+                                "completed_monotonic_ns": time.monotonic_ns(),
+                                "sha256": baseline.sha256(final)})
+            self.n += 1
+            return index
+        except (OSError, RuntimeError, ValueError) as error:
+            self.error = error
+            self.stop.set()
+            if owns_pending:
+                try:
+                    os.unlink(pending)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            self.lock.release()
 
     def _run(self):
         while not self.stop.is_set():
-            t = time.time()
+            started = time.monotonic()
             try:
-                self.qmp.cmd("screendump", filename=os.path.join(self.dir, f"f{self.n:06d}.png"),
-                             format="png")
-                self.n += 1
-            except (OSError, RuntimeError, ValueError) as e:
-                log(f"tour: screendump failed: {e}")
-            self.stop.wait(max(0.0, 1 / TOUR_FPS - (time.time() - t)))
+                self._capture()
+            except (OSError, RuntimeError, ValueError) as error:
+                log(f"tour: screendump failed: {error}")
+                return
+            self.stop.wait(max(0.0, 1 / TOUR_FPS - (time.monotonic() - started)))
 
     def mark(self, card):
-        log(f"tour: {card}")
-        self.marks.append((self.n, card))
+        if not self.lock.acquire(timeout=self.timeout):
+            error = TimeoutError("tour mark lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
+        try:
+            if self.error is not None:
+                raise RuntimeError("tour capture previously failed") from self.error
+            log(f"tour: {card}")
+            self.marks.append((self.n, card))
+        finally:
+            self.lock.release()
 
     def still(self, card, delay=0.0):
-        """Keep the next captured frame as this section's still."""
+        """Finish this exact capture before the caller can send its next key."""
         time.sleep(delay)
-        self.stills[card] = self.n + 1
+        self.stills[card] = self._capture(mode="still")
+
+    def close(self):
+        self.stop.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=self.timeout + 0.1)
+            if self.thread.is_alive():
+                sock = getattr(self.qmp, "sock", None)
+                if sock is not None:
+                    import socket
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                self.thread.join(timeout=1)
+            if self.thread.is_alive():
+                raise RuntimeError("tour recorder did not stop")
+        self.qmp.cmd = self.original_cmd
+        if self.error is not None:
+            raise RuntimeError("tour capture failed") from self.error
 
 
 def run_tour(qmp, out, serial_path):
@@ -1074,8 +1422,15 @@ def run_tour(qmp, out, serial_path):
     title card per section. Returns a manifest entry."""
     tour = os.path.join(out, "tour")
     scratch = os.path.join(tour, ".work")
-    os.makedirs(scratch, exist_ok=True)
-    rec = Recorder(qmp, scratch)
+    os.makedirs(scratch, exist_ok=False)
+    cards_dir = os.path.join(scratch, "cards")
+    try:
+        subprocess.run([sys.executable, os.path.join(CARDS, "render.py"),
+                        "--out", cards_dir], check=True, timeout=30)
+        rec = Recorder(qmp, scratch)
+    except BaseException:
+        shutil.rmtree(scratch)
+        raise
     keys, wait = qmp.keys, time.sleep
 
     def launch(query):
@@ -1179,9 +1534,29 @@ def run_tour(qmp, out, serial_path):
             log("tour: PAM unlock did not arrive within 15 seconds")
             qmp.frame(os.path.join(out, "V-UNLOCK-FAILED.png"))
         wait(1)
-    finally:
-        rec.stop.set()
-        rec.thread.join(timeout=10)
+    except BaseException as error:
+        try:
+            rec.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"tour recorder cleanup: {cleanup_error}")
+        finally:
+            shutil.rmtree(scratch)
+        raise
+    else:
+        try:
+            rec.close()
+        except BaseException:
+            shutil.rmtree(scratch)
+            raise
+
+    with open(os.path.join(tour, "capture-timing.json"), "w") as stream:
+        json.dump({"schema": 1, "periodic_target_fps": TOUR_FPS,
+                   "uniform_capture_intervals": False, "frames": rec.frames,
+                   "stills": rec.stills, "title_marks": rec.marks,
+                   "lane_source_sha256": baseline.sha256(__file__),
+                   "card_source_sha256": baseline.sha256(os.path.join(CARDS, "render.py")),
+                   "card_sha256": {name: baseline.sha256(os.path.join(cards_dir, name + ".png"))
+                                   for _, name in rec.marks}}, stream, indent=2)
 
     # Final sequence: captured frames with CARD_HOLD copies of each card
     # spliced in at its mark. Cards are converted to RGB at the capture
@@ -1207,7 +1582,7 @@ def run_tour(qmp, out, serial_path):
             if card not in cards:
                 dst = os.path.join(scratch, f"card-{card}.png")
                 subprocess.run(["ffmpeg", "-loglevel", "error", "-y",
-                                "-i", os.path.join(CARDS, f"{card}.png"),
+                                "-i", os.path.join(cards_dir, f"{card}.png"),
                                 "-vf", f"scale={WIDTH}:{HEIGHT}", "-pix_fmt", "rgb24", dst],
                                check=True)
                 cards[card] = dst
@@ -1226,14 +1601,15 @@ def run_tour(qmp, out, serial_path):
                     "-c:v", "libwebp", "-quality", "60", "-compression_level", "6",
                     os.path.join(tour, "preview.webp")], check=False)
     for card, idx in rec.stills.items():
-        frame = os.path.join(rec.dir, f"f{min(idx, rec.n - 1):06d}.png")
+        frame = os.path.join(rec.dir, f"f{idx:06d}.png")
         if os.path.exists(frame):
             shutil.copyfile(frame, os.path.join(tour, f"T-{card}.png"))
     shutil.rmtree(scratch, ignore_errors=True)
     ok = os.path.exists(webm) and os.path.getsize(webm) > 0
     log(f"tour: {rec.n} frames, {len(rec.marks)} sections -> {webm if ok else 'NO VIDEO'}")
     return {"video": "tour/tuna-tour.webm" if ok else None, "frames": rec.n,
-            "sections": [c for _, c in rec.marks], "capture_fps": TOUR_FPS,
+            "sections": [c for _, c in rec.marks], "periodic_target_fps": TOUR_FPS,
+            "uniform_capture_intervals": False, "capture_timing": "tour/capture-timing.json",
             "playback_fps": PLAY_FPS}
 
 
@@ -1371,6 +1747,10 @@ def repeat_boots(args):
                    "--timeout", str(args.timeout)]
         if args.tour and index == args.boots:
             command.append("--tour")
+        if getattr(args, "strip_image", None) and index == args.boots:
+            command.extend(["--strip-image", args.strip_image])
+            if getattr(args, "strip_edge", False):
+                command.append("--strip-edge")
         for value in args.meta:
             command.extend(["--meta", value])
         result = subprocess.run(command, check=False)
@@ -1425,10 +1805,27 @@ def main():
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--tour", action="store_true",
                     help="after the assertions, record the feature tour video")
+    ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
+    ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
     ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--boots", type=int, default=1,
                     help="repeat pristine snapshot boots; tour only on the last boot")
     a = ap.parse_args()
+    strip_image = None
+    if a.strip_edge and not a.strip_image:
+        ap.error("--strip-edge requires exact installed image admission")
+    if a.strip_image:
+        if not a.tour:
+            ap.error("--strip-image requires --tour lifecycle")
+        with open(a.strip_image, "rb") as stream:
+            raw = stream.read(1048577)
+        if len(raw) > 1048576:
+            ap.error("strip image receipt bound exceeded")
+        strip_image = json.loads(raw)
+        metadata = dict(value.split("=", 1) for value in a.meta)
+        if any(strip_image.get(field) != metadata.get(meta) for field, meta in
+               (("commit", "commit"), ("image_id", "test_image_id"), ("base_image", "base_image"))):
+            ap.error("strip receipt differs from actual VM image/source metadata")
     if not 1 <= a.boots <= 10:
         ap.error("--boots must be between 1 and 10")
     if a.boots > 1:
@@ -1529,7 +1926,8 @@ def main():
                     tour_serial_end = len(read_text(serial_path))
                     agent = guest_agent.GuestAgent(agent_path)
                     try:
-                        run_lifecycle(qmp, agent, out, serial_path, record)
+                        run_lifecycle(qmp, agent, out, serial_path, record, strip_image=strip_image,
+                                      reconnect=lambda: guest_agent.GuestAgent(agent_path), strip_edge=a.strip_edge)
                     finally:
                         agent.close()
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:

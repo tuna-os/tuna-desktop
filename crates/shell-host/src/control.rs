@@ -81,6 +81,11 @@ pub enum Handled {
     PointerOutput,
     /// Show or dismiss the shortcut consent dialog.
     ShortcutConsent(Option<(u64, String)>),
+    /// The keyboard switched Sticky or Slow Keys: save and confirm.
+    KeyboardAidToggled {
+        aid: tuna_shell_control::KeyboardAid,
+        enabled: bool,
+    },
     /// A grabbed accelerator was pressed (org.gnome.Shell).
     Accelerator {
         /// The grab's action id.
@@ -165,6 +170,16 @@ fn is_dead_peer(e: &io::Error) -> bool {
     )
 }
 
+/// Admission for input-method UI actions on this connection only. A compatible
+/// greeting and a subsequent snapshot are both required; this is protocol
+/// compatibility, not authentication of a Unix peer's process identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMethodAdmission {
+    AwaitHello,
+    AwaitSnapshot,
+    Ready,
+}
+
 /// Shell-side control client over a connected Unix socket.
 pub struct ControlClient {
     stream: UnixStream,
@@ -194,6 +209,11 @@ pub struct ControlClient {
     environment: Vec<(String, String)>,
     /// Overview previews and the hovered one, from the compositor.
     overview_previews: (Vec<tuna_shell_control::PreviewInfo>, Option<u64>),
+    connection_generation: u64,
+    auth_needs_snapshot: bool,
+    input_method_admission: InputMethodAdmission,
+    wellbeing_applied: Option<(bool, bool)>,
+    wellbeing_pending: Option<(u64, (bool, bool), Instant)>,
 }
 
 impl ControlClient {
@@ -234,6 +254,11 @@ impl ControlClient {
             pointer_output: None,
             environment: Vec::new(),
             overview_previews: (Vec::new(), None),
+            connection_generation: 0,
+            auth_needs_snapshot: true,
+            input_method_admission: InputMethodAdmission::AwaitHello,
+            wellbeing_applied: None,
+            wellbeing_pending: None,
         })
     }
 
@@ -272,6 +297,15 @@ impl ControlClient {
         self.locked
     }
 
+    /// Whether an input-method menu may dispatch an action. The current peer
+    /// must have supplied a compatible Hello followed by a snapshot, that
+    /// snapshot must still be current, and its session must be unlocked.
+    pub fn input_method_actions_allowed(&self) -> bool {
+        self.input_method_admission == InputMethodAdmission::Ready
+            && !self.needs_snapshot
+            && !self.locked
+    }
+
     /// Session environment from the latest `Environment` message
     /// (empty before the first one), already applied to app launches.
     pub fn environment(&self) -> &[(String, String)] {
@@ -308,9 +342,11 @@ impl ControlClient {
     /// A stale-major `Hello` never arrives as a message: schema decoding
     /// rejects it first, surfacing [`ControlError::Decode`].
     pub fn await_hello(&mut self) -> Result<(), ControlError> {
+        self.input_method_admission = InputMethodAdmission::AwaitHello;
         match self.read_frame()? {
             Message::Hello { version } => {
                 if version.is_compatible_with(&CURRENT_VERSION) {
+                    self.input_method_admission = InputMethodAdmission::AwaitSnapshot;
                     Ok(())
                 } else {
                     Err(ControlError::Remote {
@@ -438,10 +474,54 @@ impl ControlClient {
             (!settings.workspace_policy.dynamic).then_some(settings.workspace_policy.fixed_count);
         self.write_message(&Message::Command {
             id,
-            kind: CommandKind::SetInputSettings(settings),
+            kind: CommandKind::SetInputSettings(Box::new(settings)),
         })?;
         self.model.set_fixed_workspace_count(fixed_count);
         Ok(id)
+    }
+
+    /// Send the wellbeing grayscale/fade pair in one protocol command.
+    pub fn set_wellbeing_effects(
+        &mut self,
+        grayscale: bool,
+        fade: bool,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+        })?;
+        Ok(id)
+    }
+
+    /// Reconcile desired effects with a correlated Applied result in this
+    /// connection generation. One pending request bounds wire traffic; a lost
+    /// reply expires after five seconds. Superseded results cannot acknowledge
+    /// the current desired pair. Reconnect invalidates both caches.
+    pub fn reconcile_wellbeing_effects(
+        &mut self,
+        grayscale: bool,
+        fade: bool,
+    ) -> Result<bool, ControlError> {
+        let pair = (grayscale, fade);
+        if let Some((_, pending_pair, deadline)) = self.wellbeing_pending {
+            if pending_pair == pair && Instant::now() < deadline {
+                return Ok(false);
+            }
+            self.wellbeing_pending = None;
+        }
+        if self.wellbeing_applied == Some(pair) {
+            return Ok(true);
+        }
+        let id = self.set_wellbeing_effects(grayscale, fade)?;
+        self.wellbeing_applied = None;
+        self.wellbeing_pending = Some((id, pair, Instant::now() + Duration::from_secs(5)));
+        Ok(false)
+    }
+
+    /// Local connection identity, advanced when a fresh socket replaces a peer.
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation
     }
 
     /// Tell the compositor whether the overview shows the app grid, so
@@ -602,16 +682,29 @@ impl ControlClient {
     /// compositor verifies it off its loop (PAM or greetd) and answers
     /// `Applied` once the session is unlocked or `Denied` when the
     /// password was wrong; the unlocked snapshot follows an `Applied`.
+    /// Credentials are never replayed after an uncertain write or reconnect.
+    /// An uncertain stream is shut down; after resnapshot only a new explicit
+    /// call can send another password. Owned input/frame buffers are wiped.
     /// The password is never logged (`Secret` redacts its `Debug`).
     /// Returns the request id for `CommandResult` correlation.
     pub fn unlock(&mut self, password: String) -> Result<u64, ControlError> {
         let id = self.alloc_request_id();
-        self.write_message(&Message::Command {
-            id,
-            kind: CommandKind::Unlock {
-                password: tuna_shell_control::Secret(password),
-            },
-        })?;
+        let frame =
+            tuna_shell_control::encode_unlock_frame(id, tuna_shell_control::Secret(password))?;
+        if self.auth_needs_snapshot {
+            return Err(ControlError::Unexpected(
+                "authentication requires a fresh snapshot".into(),
+            ));
+        }
+        // No cross-generation resend, including a partial write/WouldBlock.
+        if let Err(error) = self.stream.write_all(frame.as_bytes()) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            self.auth_needs_snapshot = true;
+            self.read_buf.clear();
+            self.revision = None;
+            self.needs_snapshot = true;
+            return Err(error.into());
+        }
         Ok(id)
     }
 
@@ -662,6 +755,9 @@ impl ControlClient {
                 if self.socket_path.is_some()
                     && (is_dead_peer(&e) || e.kind() == io::ErrorKind::UnexpectedEof) =>
             {
+                self.input_method_admission = InputMethodAdmission::AwaitHello;
+                self.wellbeing_applied = None;
+                self.wellbeing_pending = None;
                 self.read_buf.clear();
                 self.revision = None;
                 self.needs_snapshot = true;
@@ -678,7 +774,17 @@ impl ControlClient {
                 // the snapshot. Do not spin or wait inside the UI tick.
                 Err(ControlError::WouldBlock)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // A nonblocking read commonly exposes the underlying I/O
+                // variant. Ordinary EAGAIN is readiness, not peer loss.
+                let would_block = matches!(&e, ControlError::WouldBlock)
+                    || matches!(&e, ControlError::Io(error)
+                        if error.kind() == io::ErrorKind::WouldBlock);
+                if !would_block {
+                    self.input_method_admission = InputMethodAdmission::AwaitHello;
+                }
+                Err(e)
+            }
         }
     }
 
@@ -687,11 +793,13 @@ impl ControlClient {
         match msg {
             Message::Hello { version } => {
                 if version.is_compatible_with(&CURRENT_VERSION) {
+                    self.input_method_admission = InputMethodAdmission::AwaitSnapshot;
                     Ok(Handled::Hello)
                 } else {
+                    self.input_method_admission = InputMethodAdmission::AwaitHello;
                     // Same-major decode already passed, so this is a newer
                     // minor we cannot speak: report it as typed, keep the
-                    // connection state untouched.
+                    // model state untouched; input-method admission fails closed.
                     Ok(Handled::ServerError {
                         kind: ErrorKind::IncompatibleVersion,
                         message: format!(
@@ -719,6 +827,10 @@ impl ControlClient {
                 ));
                 self.revision = Some(revision);
                 self.needs_snapshot = false;
+                self.auth_needs_snapshot = false;
+                if self.input_method_admission != InputMethodAdmission::AwaitHello {
+                    self.input_method_admission = InputMethodAdmission::Ready;
+                }
                 Ok(Handled::Snapshot { revision })
             }
             Message::Changes {
@@ -742,7 +854,17 @@ impl ControlClient {
                 self.revision = Some(to_revision);
                 Ok(Handled::Changes { to_revision })
             }
-            Message::CommandResult { id, status } => Ok(Handled::CommandResult { id, status }),
+            Message::CommandResult { id, status } => {
+                if let Some((pending_id, pair, _)) = self.wellbeing_pending {
+                    if pending_id == id {
+                        self.wellbeing_pending = None;
+                        if matches!(status, tuna_shell_control::CommandStatus::Applied) {
+                            self.wellbeing_applied = Some(pair);
+                        }
+                    }
+                }
+                Ok(Handled::CommandResult { id, status })
+            }
             Message::Outputs { outputs } => {
                 // Structural state, not model truth — never touches
                 // revision, `needs_snapshot`, or the window list. The
@@ -793,6 +915,9 @@ impl ControlClient {
                 Ok(Handled::PointerOutput)
             }
             Message::ShortcutConsent { request } => Ok(Handled::ShortcutConsent(request)),
+            Message::KeyboardAidToggled { aid, enabled } => {
+                Ok(Handled::KeyboardAidToggled { aid, enabled })
+            }
             Message::ScreenReader { state } => Ok(Handled::ScreenReader(state)),
             Message::WorkspacePopup { index, count } => {
                 Ok(Handled::WorkspacePopup { index, count })
@@ -856,6 +981,9 @@ impl ControlClient {
                 Ok(Handled::Switcher { action, selection })
             }
             Message::Error { kind, message } => {
+                if kind == ErrorKind::IncompatibleVersion {
+                    self.input_method_admission = InputMethodAdmission::AwaitHello;
+                }
                 if kind == ErrorKind::RevisionGap {
                     // Compositor-side gap signal: same handling as a local
                     // `from_revision` mismatch.
@@ -875,13 +1003,21 @@ impl ControlClient {
 
     /// Encode and write one frame. `WouldBlock` propagates to the caller.
     ///
-    /// A dead peer (the hub evicted and closed our session) reconnects
-    /// instead of failing: one redial over a fresh `Hello`, then the
-    /// original frame is resent once with its original request id (the
-    /// dead session never saw it, so no id is skipped). Every command
-    /// method funnels through here, so all of them inherit the recovery
-    /// with no call-site changes.
+    /// Existing NONCREDENTIAL recovery resends after one fresh Hello. Its
+    /// partial-write semantics need a separate audit. Credentials never use
+    /// this path and are explicitly refused before generic serialization.
     fn write_message(&mut self, msg: &Message) -> Result<(), ControlError> {
+        if matches!(
+            msg,
+            Message::Command {
+                kind: CommandKind::Unlock { .. },
+                ..
+            }
+        ) {
+            return Err(ControlError::Unexpected(
+                "credentials require the dedicated writer".into(),
+            ));
+        }
         let frame = tuna_shell_control::encode_frame(msg);
         match self.stream.write_all(&frame) {
             Ok(()) => Ok(()),
@@ -904,12 +1040,17 @@ impl ControlClient {
     /// Uses a raw write for the greeting, never [`write_message`](Self::write_message):
     /// a redial that is itself dead must surface its error, not recurse.
     fn reconnect(&mut self) -> Result<(), ControlError> {
+        self.input_method_admission = InputMethodAdmission::AwaitHello;
         let path = self.socket_path.clone().ok_or_else(|| {
             ControlError::Unexpected("reconnect without a socket path".to_owned())
         })?;
         let stream = UnixStream::connect(&path)?;
         stream.set_nonblocking(true)?;
         self.stream = stream;
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.auth_needs_snapshot = true;
+        self.wellbeing_applied = None;
+        self.wellbeing_pending = None;
         self.read_buf.clear();
         self.revision = None;
         self.needs_snapshot = true;
@@ -1002,6 +1143,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::ScreenReader { .. } => "ScreenReader",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
+        Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
     }
 }
 
@@ -1172,6 +1314,144 @@ mod tests {
             workspaces: vec![workspace(1, true), workspace(2, false)],
             locked: false,
         }
+    }
+
+    #[test]
+    fn input_method_admission_requires_current_hello_snapshot_and_unlocked_state() {
+        let (mut client, mut peer) = pair();
+        assert!(!client.input_method_actions_allowed());
+        // A snapshot without a compatible greeting cannot qualify this peer.
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        for _ in 0..3 {
+            assert!(matches!(client.poll(), Err(ControlError::Io(error))
+                if error.kind() == io::ErrorKind::WouldBlock));
+            assert!(client.input_method_actions_allowed());
+        }
+        let mut locked = snapshot_rev7();
+        if let Message::Snapshot { locked, .. } = &mut locked {
+            *locked = true;
+        }
+        server_write(&mut peer, &locked);
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Changes {
+                from_revision: 999,
+                to_revision: 1000,
+                ops: vec![],
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.needs_snapshot());
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        drop(peer);
+        assert!(client.poll().is_err());
+        assert!(!client.input_method_actions_allowed());
+    }
+
+    #[test]
+    fn input_method_admission_refuses_incompatible_peer_even_with_snapshot() {
+        let (mut client, mut peer) = handshook();
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Hello {
+                version: ProtocolVersion::new(CURRENT_VERSION.major, CURRENT_VERSION.minor + 1),
+            },
+        );
+        assert!(matches!(
+            client.poll().unwrap(),
+            Handled::ServerError { .. }
+        ));
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        server_write(
+            &mut peer,
+            &Message::Error {
+                kind: ErrorKind::IncompatibleVersion,
+                message: "incompatible controlled peer".into(),
+            },
+        );
+        client.poll().unwrap();
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+    }
+
+    #[test]
+    fn input_method_admission_reconnect_never_reuses_cached_unlocked_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut first_peer, _) = listener.accept().unwrap();
+        server_write(
+            &mut first_peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        client.poll().unwrap();
+        server_write(&mut first_peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
+        let generation = client.connection_generation();
+        drop(first_peer);
+        assert!(client.poll().is_err());
+        assert_eq!(client.connection_generation(), generation + 1);
+        assert!(!client.input_method_actions_allowed());
+        let (mut second_peer, _) = listener.accept().unwrap();
+        assert!(matches!(
+            server_read(&mut second_peer),
+            Message::Hello { .. }
+        ));
+        server_write(&mut second_peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(
+            &mut second_peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        client.poll().unwrap();
+        assert!(!client.input_method_actions_allowed());
+        server_write(&mut second_peer, &snapshot_rev7());
+        client.poll().unwrap();
+        assert!(client.input_method_actions_allowed());
     }
 
     #[test]
@@ -1677,6 +1957,211 @@ mod tests {
     }
 
     #[test]
+    fn wellbeing_effects_send_one_atomic_pair_with_correlated_request_id() {
+        let (mut client, mut peer) = handshook();
+        let mut previous = None;
+        for (grayscale, fade) in [(false, false), (true, false), (true, true), (false, true)] {
+            let id = client
+                .set_wellbeing_effects(grayscale, fade)
+                .expect("effect send");
+            assert_eq!(
+                server_read(&mut peer),
+                Message::Command {
+                    id,
+                    kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+                }
+            );
+            if let Some(old) = previous {
+                assert_ne!(id, old);
+            }
+            previous = Some(id);
+        }
+    }
+
+    fn effect_command_id(peer: &mut UnixStream, pair: (bool, bool)) -> u64 {
+        match server_read(peer) {
+            Message::Command {
+                id,
+                kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+            } => {
+                assert_eq!((grayscale, fade), pair);
+                id
+            }
+            other => panic!("unexpected effect frame {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wellbeing_disable_supersedes_pending_enable_without_waiting_for_timeout() {
+        let (mut client, mut peer) = handshook();
+        assert!(!client.reconcile_wellbeing_effects(true, true).unwrap());
+        let enable = effect_command_id(&mut peer, (true, true));
+        assert!(!client.reconcile_wellbeing_effects(false, false).unwrap());
+        let disable = effect_command_id(&mut peer, (false, false));
+        assert_ne!(enable, disable);
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: enable,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.wellbeing_applied.is_none());
+        assert_eq!(client.wellbeing_pending.unwrap().0, disable);
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: disable,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.reconcile_wellbeing_effects(false, false).unwrap());
+    }
+
+    #[test]
+    fn wellbeing_requires_matching_applied_and_bounds_lost_reply_retry() {
+        let (mut client, mut peer) = handshook();
+        assert!(!client.reconcile_wellbeing_effects(true, false).unwrap());
+        let first = effect_command_id(&mut peer, (true, false));
+        let next = client.next_request_id;
+        for _ in 0..20 {
+            assert!(!client.reconcile_wellbeing_effects(true, false).unwrap());
+        }
+        assert_eq!(
+            client.next_request_id, next,
+            "pending request must not flood"
+        );
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: first + 100,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.wellbeing_applied.is_none());
+        client.wellbeing_pending.as_mut().unwrap().2 = Instant::now();
+        assert!(!client.reconcile_wellbeing_effects(true, false).unwrap());
+        let second = effect_command_id(&mut peer, (true, false));
+        assert_ne!(first, second);
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: first,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(
+            client.wellbeing_applied.is_none(),
+            "late result cannot qualify replacement request"
+        );
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: second,
+                status: CommandStatus::Denied {
+                    reason: "denied".into(),
+                },
+            },
+        );
+        client.poll().unwrap();
+        assert!(!client.reconcile_wellbeing_effects(true, false).unwrap());
+        let third = effect_command_id(&mut peer, (true, false));
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id: third,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.reconcile_wellbeing_effects(true, false).unwrap());
+        assert!(client.wellbeing_pending.is_none());
+        let next = client.next_request_id;
+        assert!(client.reconcile_wellbeing_effects(true, false).unwrap());
+        assert_eq!(
+            client.next_request_id, next,
+            "acknowledged unchanged pair sends no frames"
+        );
+    }
+
+    #[test]
+    fn wellbeing_replays_unchanged_pair_after_real_idle_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut first_peer, _) = listener.accept().unwrap();
+        assert!(!client.reconcile_wellbeing_effects(true, true).unwrap());
+        let first = effect_command_id(&mut first_peer, (true, true));
+        server_write(
+            &mut first_peer,
+            &Message::CommandResult {
+                id: first,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.reconcile_wellbeing_effects(true, true).unwrap());
+        drop(first_peer);
+        assert!(client.poll().is_err());
+        assert_eq!(client.connection_generation(), 1);
+        let (mut second_peer, _) = listener.accept().unwrap();
+        assert!(matches!(
+            server_read(&mut second_peer),
+            Message::Hello { .. }
+        ));
+        assert!(!client.reconcile_wellbeing_effects(true, true).unwrap());
+        let second = effect_command_id(&mut second_peer, (true, true));
+        assert_ne!(first, second);
+        server_write(
+            &mut second_peer,
+            &Message::CommandResult {
+                id: first,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.wellbeing_applied.is_none());
+        server_write(
+            &mut second_peer,
+            &Message::CommandResult {
+                id: second,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        assert!(client.reconcile_wellbeing_effects(true, true).unwrap());
+    }
+
+    #[test]
+    fn wellbeing_failed_redial_invalidates_previous_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        assert!(!client.reconcile_wellbeing_effects(false, false).unwrap());
+        let id = effect_command_id(&mut peer, (false, false));
+        server_write(
+            &mut peer,
+            &Message::CommandResult {
+                id,
+                status: CommandStatus::Applied,
+            },
+        );
+        client.poll().unwrap();
+        drop(peer);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        assert!(client.poll().is_err());
+        assert!(client.wellbeing_applied.is_none());
+        assert!(client.reconcile_wellbeing_effects(false, false).is_err());
+        assert!(client.wellbeing_pending.is_none());
+    }
+
+    #[test]
     fn idle_poll_surfaces_would_block() {
         let (mut client, _peer) = handshook();
         match client.poll() {
@@ -1696,6 +2181,153 @@ mod tests {
         let path = dir.path().join("control.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         (path, listener)
+    }
+
+    fn initial_auth_snapshot(client: &mut ControlClient, peer: &mut UnixStream) {
+        client.send_hello().unwrap();
+        assert!(matches!(server_read(peer), Message::Hello { .. }));
+        server_write(
+            peer,
+            &Message::Snapshot {
+                revision: 1,
+                windows: vec![],
+                workspaces: vec![],
+                locked: true,
+            },
+        );
+        assert!(matches!(client.poll().unwrap(), Handled::Snapshot { .. }));
+    }
+    #[test]
+    fn initial_authentication_requires_authoritative_snapshot_before_credentials() {
+        let (mut client, mut peer) = pair();
+        peer.set_nonblocking(true).unwrap();
+        assert!(client.unlock("before-initial-snapshot".into()).is_err());
+        let mut byte = [0u8; 1];
+        assert!(matches!(peer.read(&mut byte),Err(e) if e.kind()==io::ErrorKind::WouldBlock));
+        peer.set_nonblocking(false).unwrap();
+        initial_auth_snapshot(&mut client, &mut peer);
+        let id = client
+            .unlock("explicit-after-initial-snapshot".into())
+            .unwrap();
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::Unlock {
+                    password: tuna_shell_control::Secret("explicit-after-initial-snapshot".into())
+                }
+            }
+        );
+    }
+    fn auth_reconnect_only_hello(
+        client: &mut ControlClient,
+        listener: &std::os::unix::net::UnixListener,
+    ) -> UnixStream {
+        assert!(matches!(client.poll(), Err(ControlError::WouldBlock)));
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert!(matches!(server_read(&mut peer), Message::Hello { .. }));
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        assert!(
+            matches!(peer.read(&mut byte),Err(e) if e.kind()==io::ErrorKind::WouldBlock),
+            "no credential replay in new generation"
+        );
+        assert!(client.unlock("explicit-before-snapshot".into()).is_err());
+        assert!(matches!(peer.read(&mut byte),Err(e) if e.kind()==io::ErrorKind::WouldBlock));
+        peer.set_nonblocking(false).unwrap();
+        server_write(
+            &mut peer,
+            &Message::Snapshot {
+                revision: 1,
+                windows: vec![],
+                workspaces: vec![],
+                locked: true,
+            },
+        );
+        assert!(matches!(client.poll().unwrap(), Handled::Snapshot { .. }));
+        peer
+    }
+    #[test]
+    fn authentication_disconnect_never_replays_and_fresh_action_after_snapshot_can_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        initial_auth_snapshot(&mut client, &mut peer);
+        drop(peer);
+        assert!(client.unlock("old-controlled-secret".into()).is_err());
+        assert_eq!(
+            client.connection_generation(),
+            0,
+            "credential failure must not redial/resend"
+        );
+        let mut new_peer = auth_reconnect_only_hello(&mut client, &listener);
+        let id = client
+            .unlock("explicit-new-controlled-secret".into())
+            .unwrap();
+        assert_eq!(
+            server_read(&mut new_peer),
+            Message::Command {
+                id,
+                kind: CommandKind::Unlock {
+                    password: tuna_shell_control::Secret("explicit-new-controlled-secret".into())
+                }
+            }
+        );
+    }
+    #[test]
+    fn partial_authentication_write_closes_uncertain_stream_and_never_contaminates_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, listener) = listener_at(&dir);
+        let mut client = ControlClient::connect(&path).unwrap();
+        let (mut old_peer, _) = listener.accept().unwrap();
+        initial_auth_snapshot(&mut client, &mut old_peer);
+        rustix::net::sockopt::set_socket_send_buffer_size(&client.stream, 1024).unwrap();
+        let password = "controlled-p".repeat(8192);
+        let expected = tuna_shell_control::encode_unlock_frame(
+            1,
+            tuna_shell_control::Secret(password.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            client.unlock(password),
+            Err(ControlError::WouldBlock)
+        ));
+        old_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut partial = Vec::new();
+        old_peer.read_to_end(&mut partial).unwrap();
+        assert!(
+            !partial.is_empty() && partial.len() < expected.as_bytes().len(),
+            "real kernel partial write required"
+        );
+        assert_eq!(partial, expected.as_bytes()[..partial.len()]);
+        drop(old_peer);
+        let mut new_peer = auth_reconnect_only_hello(&mut client, &listener);
+        let id = client.unlock("fresh-input".into()).unwrap();
+        assert_eq!(
+            server_read(&mut new_peer),
+            Message::Command {
+                id,
+                kind: CommandKind::Unlock {
+                    password: tuna_shell_control::Secret("fresh-input".into())
+                }
+            }
+        );
+    }
+    #[test]
+    fn uncertain_caller_stream_without_redial_path_stays_closed() {
+        let (mut client, mut peer) = pair();
+        initial_auth_snapshot(&mut client, &mut peer);
+        drop(peer);
+        assert!(client.unlock("controlled-input".into()).is_err());
+        assert!(client
+            .unlock("new-input-without-new-transport".into())
+            .is_err());
+        assert!(client.poll().is_err());
+        assert_eq!(client.connection_generation(), 0);
     }
 
     #[test]

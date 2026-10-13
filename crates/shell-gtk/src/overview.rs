@@ -158,6 +158,9 @@ pub struct OverviewUi {
     grid: gtk::ApplicationWindow,
     apps: Rc<LiveApps>,
     favorites: Vec<String>,
+    folder_watch: crate::folders::FolderWatch,
+    grid_dragging: Rc<Cell<bool>>,
+    grid_external_dragging: Rc<Cell<bool>>,
     actions: Rc<dyn OverviewActions>,
     open: bool,
     /// Open on the app grid once the overview opens (ShowApplications).
@@ -291,6 +294,9 @@ impl OverviewUi {
             grid,
             apps,
             favorites,
+            folder_watch: crate::folders::FolderWatch::new(),
+            grid_dragging: Rc::new(Cell::new(false)),
+            grid_external_dragging: Rc::new(Cell::new(false)),
             actions,
             open: false,
             want_apps: std::cell::Cell::new(false),
@@ -715,7 +721,8 @@ impl OverviewUi {
         // alphabetical grid; a folder opens its apps in a popover.
         let apps = me.apps.get();
         crate::folders::ensure_defaults(apps.apps());
-        let folders = crate::folders::load();
+        me.folder_watch.take_dirty();
+        let folders = me.folder_watch.load();
         let (filled, loose) = crate::folders::arrange(&folders, apps.apps(), &me.favorites);
         enum Item<'a> {
             Folder(crate::folders::Folder, Vec<&'a AppEntry>),
@@ -920,6 +927,7 @@ impl OverviewUi {
                         let actions = me.actions.clone();
                         let members: Vec<AppEntry> = members.iter().map(|e| (*e).clone()).collect();
                         let (id, name) = (folder.id.clone(), folder.name.clone());
+                        let dragging = me.grid_dragging.clone();
                         button.connect_clicked(move |_| {
                             let tiles = members
                                 .iter()
@@ -927,7 +935,11 @@ impl OverviewUi {
                                     let tile = app_button(entry, 96, true);
                                     tile.add_css_class("folder-tile");
                                     // Dragged out onto the shade, it leaves.
-                                    drag_source(&tile, format!("folder-app:{id}:{}", entry.app_id));
+                                    let source = drag_source(
+                                        &tile,
+                                        format!("folder-app:{id}:{}", entry.app_id),
+                                    );
+                                    guard_drag_source(&source, &dragging);
                                     let (entry, actions, dialog) =
                                         (entry.clone(), actions.clone(), dialog.clone());
                                     tile.connect_clicked(move |_| {
@@ -946,7 +958,12 @@ impl OverviewUi {
                 }
             }
         }
-        me.grid.set_child(Some(&paged_grid(pages, reflow)));
+        me.grid.set_child(Some(&paged_grid(
+            pages,
+            reflow,
+            me.grid_dragging.clone(),
+            me.grid_external_dragging.clone(),
+        )));
     }
 
     /// Who to tell when the folder dialog shades the overview.
@@ -1020,6 +1037,19 @@ impl OverviewUi {
 
     /// Follow the compositor's overview state.
     pub fn set_open(ui: &Rc<RefCell<Self>>, open: bool) {
+        // Changes never rebuild the dash or reset search/visibility. Retain
+        // dirty state during a drag so its live source tree survives until end.
+        let refresh_folders = {
+            let me = ui.borrow();
+            me.folder_watch.reconcile();
+            me.folder_watch.take_dirty_if(
+                open && me.open,
+                me.grid_dragging.get() || me.grid_external_dragging.get(),
+            )
+        };
+        if refresh_folders {
+            Self::rebuild_grid(ui);
+        }
         let signature = {
             let me = ui.borrow();
             me.actions
@@ -1400,7 +1430,12 @@ glib::wrapper! {
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
-fn paged_grid(pages: Vec<gtk::FlowBox>, reflow: Rc<GridReflow>) -> gtk::Widget {
+fn paged_grid(
+    pages: Vec<gtk::FlowBox>,
+    reflow: Rc<GridReflow>,
+    dragging: Rc<Cell<bool>>,
+    external_dragging: Rc<Cell<bool>>,
+) -> gtk::Widget {
     use libadwaita as adw;
     let carousel = adw::Carousel::new();
     *reflow.carousel.borrow_mut() = Some(carousel.downgrade());
@@ -1415,6 +1450,34 @@ fn paged_grid(pages: Vec<gtk::FlowBox>, reflow: Rc<GridReflow>) -> gtk::Widget {
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&carousel));
     column.append(&overlay);
+    // Track local sources on single-page grids too (they have no pager).
+    for page in &pages {
+        let mut pending = vec![page.clone().upcast::<gtk::Widget>()];
+        while let Some(widget) = pending.pop() {
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                child = next.next_sibling();
+                pending.push(next);
+            }
+            let controllers = widget.observe_controllers();
+            for i in 0..controllers.n_items() {
+                let Some(source) = controllers.item(i).and_downcast::<gtk::DragSource>() else {
+                    continue;
+                };
+                guard_drag_source(&source, &dragging);
+            }
+        }
+    }
+    let motion = gtk::DropControllerMotion::new();
+    let active = external_dragging.clone();
+    motion.connect_enter(move |_, _, _| active.set(true));
+    let active = external_dragging.clone();
+    motion.connect_motion(move |_, _, _| active.set(true));
+    motion.connect_leave(move |_| external_dragging.set(false));
+    // The local source guard remains true when a drag leaves this overlay.
+    // External drag presence is independent of the pager's hint lifetime.
+    // Leave ends only external presence, never an active local drag.
+    overlay.add_controller(motion);
     if n <= 1 {
         return column.upcast();
     }
@@ -1876,6 +1939,14 @@ fn step_page(carousel: &libadwaita::Carousel, step: i32) {
     let target = (current + step).clamp(0, carousel.n_pages() as i32 - 1);
     let page = carousel.nth_page(target as u32);
     carousel.scroll_to(&page, true);
+}
+
+/// Shared local-drag ownership includes tiles created in the folder dialog.
+fn guard_drag_source(source: &gtk::DragSource, dragging: &Rc<Cell<bool>>) {
+    let active = dragging.clone();
+    source.connect_drag_begin(move |_, _| active.set(true));
+    let active = dragging.clone();
+    source.connect_drag_end(move |_, _, _| active.set(false));
 }
 
 /// Make `widget` a drag source of `text`, the widget itself as the

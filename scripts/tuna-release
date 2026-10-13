@@ -82,6 +82,9 @@ mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin" "$STAGE/usr/share/wayland-sessions" "$
 for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-greeter; do
     install -m0755 "target/release/$bin" "$STAGE/usr/bin/$bin"
 done
+install -d "$STAGE/usr/share/tuna-desktop/icons"
+cp -a share/tuna-desktop/icons/. "$STAGE/usr/share/tuna-desktop/icons/"
+python3 scripts/tuna-cursor-assets-check "$STAGE/usr/share/tuna-desktop/icons/Adwaita"
 install -m0644 share/wayland-sessions/tuna.desktop \
     "$STAGE/usr/share/wayland-sessions/tuna.desktop"
 install -Dm0644 share/systemd/user/tuna-session.target \
@@ -141,7 +144,7 @@ Provides: $LEGACY_PACKAGE
 Section: x11
 Priority: optional
 Architecture: amd64
-Depends: $SHLIBS, libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, libsecret-tools, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1, libgbm1, libseat1, libinput10, libudev1, libdrm2, libgtk-4-1, libadwaita-1-0, libpipewire-0.3-0t64 | libpipewire-0.3-0, libglib2.0-0t64 | libglib2.0-0
+Depends: $SHLIBS, gnome-session-canberra, libcanberra-pulse, sound-theme-freedesktop, libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, libsecret-tools, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1, libgbm1, libseat1, libinput10, libudev1, libdrm2, libpipewire-0.3-0t64 | libpipewire-0.3-0, libglib2.0-0t64 | libglib2.0-0
 Recommends: ibus, gstreamer1.0-tools, gstreamer1.0-pipewire, gstreamer1.0-plugins-good
 Maintainer: Tuna Desktop Developers <tuna@example.invalid>
 Description: Tuna Desktop Wayland desktop session

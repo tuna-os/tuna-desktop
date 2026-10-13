@@ -56,7 +56,7 @@ impl Monitor {
                     if sleeping {
                         // Invalidate old PAM results on the signal thread,
                         // before the compositor can dequeue their callbacks.
-                        generation.fetch_add(1, Ordering::AcqRel);
+                        crate::auth_owner::advance_epoch(&generation);
                         prepared = true;
                         worker_pending.lock.store(true, Ordering::Release);
                         worker_wake.signal();

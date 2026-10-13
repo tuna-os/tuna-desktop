@@ -850,7 +850,8 @@ impl OverviewMotion {
             return;
         }
         let target = if open { 1.0 } else { 0.0 };
-        if self.progress.to != target {
+        let retargeted = self.progress.to != target;
+        if retargeted {
             let curve = if open { OPEN_CURVE } else { CLOSE_CURVE };
             self.progress
                 .retarget(target, motion.adjust_ms(TRANSITION_MS), curve, animate);
@@ -868,7 +869,12 @@ impl OverviewMotion {
         } else if !animate {
             self.progress = Tween::settled(target);
         }
-        self.progress.step(dt_ms);
+        // dt_ms is time since the last rendered frame, not since this
+        // target was requested. After settled idle it can span seconds.
+        // A new transition starts from the last drawn value at this frame;
+        // only subsequent frames advance it. The same boundary applies to
+        // reversal, so pre-request time cannot consume the replacement tween.
+        self.progress.step(if retargeted { 0.0 } else { dt_ms });
         let (t, value) = (self.progress.elapsed_ms, self.progress.value());
         for trace in [&mut self.open_trace, &mut self.close_trace]
             .into_iter()
@@ -2530,6 +2536,90 @@ mod tests {
         assert_eq!(d["close"]["duration_ms"], 250.0);
         let samples = d["close"]["samples"].as_array().unwrap();
         assert!(samples.iter().any(|s| s[0] == 125.0 && s[1] == 0.25));
+    }
+
+    #[test]
+    fn settled_idle_time_does_not_consume_new_open_or_close_transition() {
+        let mut motion = OverviewMotion::default();
+        // The idle scheduler can leave the preceding render far in the past.
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(
+            motion.diagnostics()["open"]["samples"][0],
+            serde_json::json!([0.0, 0.0])
+        );
+        motion.step_progress(125.0, true, FULL);
+        assert!((motion.progress() - ease_out_sine(0.5)).abs() < 1e-9);
+        motion.step_progress(125.0, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        let diagnostics = motion.diagnostics();
+        assert_eq!(diagnostics["close"]["duration_ms"], 250.0);
+        assert_eq!(
+            diagnostics["close"]["samples"][0],
+            serde_json::json!([0.0, 1.0])
+        );
+        motion.step_progress(125.0, false, FULL);
+        assert!((motion.progress() - 0.25).abs() < 1e-9);
+        motion.step_progress(125.0, false, FULL);
+        assert_eq!(motion.progress(), 0.0);
+    }
+
+    #[test]
+    fn repeated_settled_target_does_not_restart_transition_or_trace() {
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        let before = motion.diagnostics()["open"].clone();
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        assert_eq!(motion.diagnostics()["open"], before);
+        motion.step_progress(10_000.0, false, FULL);
+        motion.step_progress(250.0, false, FULL);
+        let before = motion.diagnostics()["close"].clone();
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(motion.diagnostics()["close"], before);
+    }
+
+    #[test]
+    fn idle_elapsed_before_midflight_reversal_does_not_consume_replacement() {
+        let mut motion = OverviewMotion::default();
+        motion.step_progress(0.0, true, FULL);
+        motion.step_progress(100.0, true, FULL);
+        let drawn = motion.progress();
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), drawn);
+        motion.step_progress(125.0, false, FULL);
+        assert!((motion.progress() - drawn * 0.25).abs() < 1e-9);
+        let drawn = motion.progress();
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), drawn);
+        motion.step_progress(125.0, true, FULL);
+        assert!((motion.progress() - (drawn + (1.0 - drawn) * ease_out_sine(0.5))).abs() < 1e-9);
+    }
+
+    #[test]
+    fn idle_boundary_preserves_reduced_off_and_slowdown_policy() {
+        let reduced = MotionPolicy::new(tuna_shell_control::motion::MotionLevel::FadeOnly, 1.0);
+        for policy in [OFF, reduced] {
+            let mut motion = OverviewMotion::default();
+            motion.step_progress(10_000.0, true, policy);
+            assert_eq!(motion.progress(), 1.0);
+            motion.step_progress(10_000.0, false, policy);
+            assert_eq!(motion.progress(), 0.0);
+            assert!(motion.diagnostics()["open"].is_null());
+            assert!(motion.diagnostics()["close"].is_null());
+        }
+        let mut motion = OverviewMotion::default();
+        let slow = MotionPolicy::new(tuna_shell_control::motion::MotionLevel::Full, 2.0);
+        motion.step_progress(10_000.0, true, slow);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(motion.diagnostics()["open"]["duration_ms"], 500.0);
+        motion.step_progress(250.0, true, slow);
+        assert!((motion.progress() - ease_out_sine(0.5)).abs() < 1e-9);
+        motion.step_progress(10_000.0, false, OFF);
+        assert_eq!(motion.progress(), 0.0);
     }
 
     #[test]

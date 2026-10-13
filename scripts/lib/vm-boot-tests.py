@@ -30,7 +30,8 @@ class DeviceInventoryProjection(unittest.TestCase):
         scope = {"json": json, "STATE": SimpleNamespace(read_text=lambda: json.dumps(state)),
                  "pathlib": SimpleNamespace(Path=lambda _: SimpleNamespace(iterdir=lambda: [])),
                  "OWNER": SimpleNamespace(pw_uid=1000),
-                 "os": SimpleNamespace(geteuid=lambda: 0), "call": call}
+                 "os": SimpleNamespace(geteuid=lambda: 0), "call": call,
+                 "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), scope)
         return scope["inventory"]()
 
@@ -599,6 +600,618 @@ class PointerEvidenceRetention(unittest.TestCase):
                                for a in n.args)]
         self.assertEqual(overwritten, [])
 
+
+class TourRecorderTests(unittest.TestCase):
+    def recorder(self, directory, command, timeout=0.2):
+        return lane.Recorder(SimpleNamespace(cmd=command), directory, timeout=timeout)
+
+    def test_still_finishes_before_next_key_and_records_exact_frame(self):
+        events = []
+        def command(name, **args):
+            events.append(name)
+            if name == "screendump":
+                Path(args["filename"]).write_bytes(b"completed pixels")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, command)
+            recorder.still("overview")
+            recorder.qmp.cmd("send-key")
+            self.assertEqual(events, ["screendump", "send-key"])
+            self.assertEqual(recorder.stills, {"overview": 0})
+            self.assertEqual(recorder.n, 1)
+            self.assertEqual((Path(recorder.dir) / "f000000.png").read_bytes(), b"completed pixels")
+            recorder.close()
+
+    def test_periodic_and_still_frames_share_collision_free_indices(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def command(name, **args):
+            calls.append(args["filename"])
+            if len(calls) == 1:
+                entered.set()
+                self.assertTrue(release.wait(1))
+            Path(args["filename"]).write_bytes(str(len(calls)).encode())
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, command, timeout=1)
+            errors = []
+            def capture():
+                try:
+                    recorder._capture()
+                except BaseException as error:
+                    errors.append(error)
+            worker = threading.Thread(target=capture)
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            release.set()
+            recorder.still("calendar")
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(recorder.stills["calendar"], 1)
+            self.assertEqual(recorder.n, 2)
+            self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
+                             ["f000000.png", "f000001.png"])
+            recorder.close()
+
+    def test_failed_capture_has_no_still_or_reused_frame(self):
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(b"partial")
+            raise RuntimeError("QMP refused")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, command)
+            with self.assertRaisesRegex(RuntimeError, "QMP refused"):
+                recorder.still("lock")
+            self.assertEqual(recorder.stills, {})
+            self.assertEqual(recorder.n, 0)
+            self.assertEqual(list(Path(recorder.dir).iterdir()), [])
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                recorder.close()
+
+    def test_missing_frame_times_out_without_accepting_future_input(self):
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, lambda *args, **kwargs: None, timeout=0.03)
+            start = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                recorder.still("app-grid")
+            self.assertLess(time.monotonic() - start, 1)
+            with self.assertRaisesRegex(RuntimeError, "previously failed"):
+                recorder.qmp.cmd("send-key")
+            self.assertEqual(recorder.stills, {})
+            with self.assertRaises(RuntimeError):
+                recorder.close()
+
+    def test_stalled_real_socket_times_out_and_recorder_thread_stops(self):
+        import socket
+        import threading
+        left, right = socket.socketpair()
+        entered = threading.Event()
+        def command(*args, **kwargs):
+            entered.set()
+            return left.recv(1)
+        try:
+            qmp = SimpleNamespace(sock=left, cmd=command)
+            with tempfile.TemporaryDirectory() as directory:
+                recorder = lane.Recorder(qmp, directory, timeout=0.03)
+                recorder.thread.start()
+                self.assertTrue(entered.wait(1))
+                with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                    recorder.close()
+                self.assertFalse(recorder.thread.is_alive())
+                self.assertEqual(recorder.n, 0)
+                self.assertEqual(list(Path(recorder.dir).iterdir()), [])
+                self.assertIs(qmp.cmd, recorder.original_cmd)
+        finally:
+            left.close()
+            right.close()
+
+    def test_frame_identity_collision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, lambda *args, **kwargs: self.fail("must not overwrite"))
+            target = Path(recorder.dir) / "f000000.png"
+            target.write_bytes(b"existing")
+            with self.assertRaisesRegex(RuntimeError, "identity already exists"):
+                recorder.still("intro")
+            self.assertEqual(target.read_bytes(), b"existing")
+            self.assertEqual(recorder.stills, {})
+            with self.assertRaises(RuntimeError):
+                recorder.close()
+
+    def assert_continuous_transport_is_bounded(self, partial, background=False):
+        import socket
+        import threading
+        import time
+        left, right = socket.socketpair()
+        stop, entered = threading.Event(), threading.Event()
+        timers = []
+        timer_class = threading.Timer
+        def timer(*args, **kwargs):
+            instance = timer_class(*args, **kwargs)
+            timers.append(instance)
+            return instance
+        def server():
+            right.settimeout(1)
+            try:
+                right.recv(4096)  # Genuine baseline.Qmp command was sent.
+                entered.set()
+                payload = b' ' if partial else b'{"event":"TEST"}\n'
+                if partial:
+                    right.sendall(b'{')
+                while not stop.wait(0.002):
+                    right.sendall(payload)
+            except OSError:
+                pass
+        worker = threading.Thread(target=server)
+        worker.start()
+        qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
+        qmp.sock = left
+        qmp.file = left.makefile("rw")
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", timer):
+                recorder = lane.Recorder(qmp, directory, timeout=0.08)
+                started = time.monotonic()
+                if background:
+                    recorder.thread.start()
+                    self.assertTrue(entered.wait(1))
+                    with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                        recorder.close()
+                    self.assertFalse(recorder.thread.is_alive())
+                else:
+                    with self.assertRaises(TimeoutError):
+                        recorder.still("overview")
+                    with self.assertRaisesRegex(RuntimeError, "previously failed"):
+                        recorder.qmp.cmd("send-key")
+                    with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                        recorder.close()
+                self.assertLess(time.monotonic() - started, 1)
+                self.assertEqual(recorder.n, 0)
+                self.assertEqual(recorder.stills, {})
+                self.assertEqual(list(Path(recorder.dir).iterdir()), [])
+                self.assertTrue(timers)
+                self.assertTrue(all(not t.is_alive() for t in timers))
+                self.assertEqual(left.recv(1), b'')  # Timeout permanently retires this transport.
+        finally:
+            stop.set()
+            right.close()
+            worker.join(1)
+            qmp.file.close()
+            left.close()
+        self.assertFalse(worker.is_alive())
+
+    def test_continuous_qmp_events_have_absolute_deadline(self):
+        self.assert_continuous_transport_is_bounded(partial=False)
+
+    def test_partial_qmp_line_dribble_has_absolute_deadline(self):
+        self.assert_continuous_transport_is_bounded(partial=True)
+
+    def test_background_event_flood_recorder_stops_without_timer_leak(self):
+        self.assert_continuous_transport_is_bounded(partial=False, background=True)
+
+    def test_success_cancels_watchdog_before_next_command(self):
+        import socket
+        import threading
+        import time
+        left, right = socket.socketpair()
+        right.settimeout(1)
+        timers, errors = [], []
+        timer_class = threading.Timer
+        def timer(*args, **kwargs):
+            instance = timer_class(*args, **kwargs)
+            timers.append(instance)
+            return instance
+        def server():
+            try:
+                with right.makefile("rw") as stream:
+                    for _ in range(2):
+                        request = json.loads(stream.readline())
+                        if request["execute"] == "screendump":
+                            Path(request["arguments"]["filename"]).write_bytes(b"complete")
+                        stream.write('{"return":{}}\n')
+                        stream.flush()
+            except BaseException as error:
+                errors.append(error)
+        worker = threading.Thread(target=server)
+        worker.start()
+        qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
+        qmp.sock, qmp.file = left, left.makefile("rw")
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", timer):
+                recorder = lane.Recorder(qmp, directory, timeout=0.08)
+                recorder.still("intro")
+                time.sleep(0.1)  # Beyond the canceled first watchdog's deadline.
+                self.assertEqual(qmp.cmd("send-key"), {})
+                recorder.close()
+                self.assertEqual(len(timers), 2)
+                self.assertTrue(all(not t.is_alive() for t in timers))
+        finally:
+            right.close()
+            worker.join(1)
+            qmp.file.close()
+            left.close()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_mark_lock_wait_is_bounded(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, lambda *args, **kwargs: None, timeout=0.02)
+            def hold():
+                with recorder.lock:
+                    held.set()
+                    release.wait(1)
+            worker = threading.Thread(target=hold)
+            worker.start()
+            try:
+                self.assertTrue(held.wait(1))
+                with self.assertRaises(TimeoutError):
+                    recorder.mark("overview")
+                self.assertEqual(recorder.marks, [])
+            finally:
+                release.set()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                recorder.close()
+
+    def test_existing_pending_capture_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, lambda *args, **kwargs: self.fail("must not overwrite"))
+            target = Path(recorder.dir) / "f000000.png.pending"
+            target.write_bytes(b"existing pending")
+            with self.assertRaisesRegex(RuntimeError, "identity already exists"):
+                recorder.still("intro")
+            self.assertEqual(target.read_bytes(), b"existing pending")
+            with self.assertRaises(RuntimeError):
+                recorder.close()
+
+    def test_periodic_indexing_and_marks_have_no_future_frame_offset(self):
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(b"frame")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, command)
+            recorder._capture()
+            recorder.mark("overview")
+            recorder.still("overview")
+            self.assertEqual(recorder.marks, [(1, "overview")])
+            self.assertEqual(recorder.stills, {"overview": 1})
+            self.assertEqual(recorder.n, 2)
+            self.assertEqual([frame["index"] for frame in recorder.frames], [0, 1])
+            self.assertEqual([frame["mode"] for frame in recorder.frames], ["periodic", "still"])
+            for frame in recorder.frames:
+                self.assertLessEqual(frame["requested_monotonic_ns"], frame["completed_monotonic_ns"])
+                self.assertEqual(frame["sha256"], lane.baseline.sha256(
+                    str(Path(recorder.dir) / f"f{frame['index']:06d}.png")))
+            recorder.close()
+        self.assertEqual(lane.TOUR_FPS, 2)
+        self.assertEqual(lane.PLAY_FPS, 4)
+
+    def test_failed_tour_capture_removes_owned_work_and_restores_command(self):
+        original = lane.Recorder
+        recorders = []
+        def construct(qmp, directory):
+            recorder = original(qmp, directory, timeout=0.02)
+            recorder.thread = SimpleNamespace(start=lambda: None, ident=None)
+            recorders.append(recorder)
+            return recorder
+        command = lambda *args, **kwargs: None
+        qmp = SimpleNamespace(cmd=command, keys=lambda *args, **kwargs: None)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(lane, "Recorder", construct), patch.object(lane.subprocess, "run"), \
+                    patch.object(lane.time, "sleep", lambda delay: None):
+                with self.assertRaises(TimeoutError):
+                    lane.run_tour(qmp, directory, "unused")
+            self.assertFalse((Path(directory) / "tour/.work").exists())
+            self.assertIs(qmp.cmd, command)
+            self.assertEqual(recorders[0].stills, {})
+
+    def test_tour_renders_current_cards_into_scratch_and_ci_has_dependencies(self):
+        source = Path(lane.__file__).read_text()
+        self.assertIn('os.path.join(CARDS, "render.py")', source)
+        self.assertIn('"--out", cards_dir', source)
+        self.assertIn('os.path.join(cards_dir, f"{card}.png")', source)
+        self.assertNotIn('os.path.join(CARDS, f"{card}.png")', source)
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
+        self.assertIn('qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core', workflow)
+
+
+
+class SleepAuthRetirementTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshot = {'state': {'locked': True, 'auth_owner': {
+            'outer_pending': True, 'epoch': 7,
+            'attempt': {'serial': 9, 'epoch': 7, 'origin': {'connection': 4, 'request': 12}}}},
+            'processes': [{'executable': 'tuna-compositor', 'pid': 600, 'start_ticks': 1500}]}
+        self.expected = lane.sleep_auth_attempt(self.snapshot)
+        self.event = {'pid': 600, 'joined_ok': True, 'backend_accepted': True, 'reported_ok': True,
+                      'applied': False, 'attempt_serial': 9, 'attempt_epoch': 7, 'current_epoch': 8,
+                      'origin': {'connection': 4, 'request': 12}, 'origin_live': True, 'locked_after': True}
+        self.denial = 'tuna-shell-gtk: lock command result applied=false request_id=12'
+
+    def trace(self, event=None, denial=None):
+        return ('journal tuna-compositor: lock authentication retired '
+                + json.dumps(self.event if event is None else event) + '\n'
+                + (self.denial if denial is None else denial) + '\n')
+
+    def test_exact_pending_attempt_accepted_join_stale_epoch_and_shell_denial(self):
+        self.assertEqual(lane.stale_sleep_auth_retirement(self.trace(), self.expected, 8), self.event)
+        self.assertEqual(self.expected['start_ticks'], 1500)
+
+    def test_wrong_password_panic_unreported_applied_dead_origin_or_unlocked_refused(self):
+        for key, value in [('backend_accepted', False), ('joined_ok', False), ('reported_ok', False),
+                           ('applied', True), ('origin_live', False), ('locked_after', False)]:
+            with self.subTest(key=key):
+                self.assertIsNone(lane.stale_sleep_auth_retirement(self.trace({**self.event, key: value}), self.expected, 8))
+
+    def test_same_epoch_wrong_current_epoch_and_unrelated_attempt_refused(self):
+        for event, current in [({**self.event, 'current_epoch': 7}, 7), (self.event, 9),
+                               ({**self.event, 'attempt_serial': 10}, 8),
+                               ({**self.event, 'pid': 601}, 8),
+                               ({**self.event, 'origin': {'connection': 5, 'request': 12}}, 8),
+                               ({**self.event, 'origin': {'connection': 4, 'request': 13}}, 8)]:
+            self.assertIsNone(lane.stale_sleep_auth_retirement(self.trace(event), self.expected, current))
+
+    def test_missing_malformed_wrong_type_extra_fields_and_duplicate_retirement_refused(self):
+        for trace in ['', self.denial, 'tuna-compositor: lock authentication retired {broken',
+                      self.trace({k: v for k, v in self.event.items() if k != 'backend_accepted'}),
+                      self.trace({**self.event, 'backend_accepted': 1}),
+                      self.trace({**self.event, 'attempt_serial': True}),
+                      self.trace({**self.event, 'origin': None}),
+                      self.trace({**self.event, 'extra': True}), self.trace() + self.trace(),
+                      'lock authentication finished accepted=true applied=false\n' + self.denial]:
+            self.assertIsNone(lane.stale_sleep_auth_retirement(trace, self.expected, 8))
+
+    def test_shell_missing_wrong_request_or_success_refused(self):
+        for denial in ['', self.denial.replace('12', '13'), self.denial.replace('false', 'true'),
+                       'tuna-shell-gtk: lock command result applied=false']:
+            self.assertIsNone(lane.stale_sleep_auth_retirement(self.trace(denial=denial), self.expected, 8))
+
+    def test_pre_sleep_snapshot_missing_not_pending_or_bad_identity_refused(self):
+        import copy
+        snapshots = []
+        for field, value in [('attempt', None), ('outer_pending', False), ('epoch', True), ('epoch', 8)]:
+            changed = copy.deepcopy(self.snapshot); changed['state']['auth_owner'][field] = value; snapshots.append(changed)
+        for field, value in [('serial', True), ('epoch', 0), ('origin', None)]:
+            changed = copy.deepcopy(self.snapshot); changed['state']['auth_owner']['attempt'][field] = value; snapshots.append(changed)
+        changed = copy.deepcopy(self.snapshot); changed['processes'] *= 2; snapshots.append(changed)
+        changed = copy.deepcopy(self.snapshot); changed['state']['locked'] = False; snapshots.append(changed)
+        for snapshot in snapshots:
+            with self.assertRaises(ValueError):
+                lane.sleep_auth_attempt(snapshot)
+
+class PrivatePamSleepControls(unittest.TestCase):
+    def setUp(self):
+        self.legacy = SleepAuthRetirementTests()
+        self.legacy.setUp()
+        self.expected = self.legacy.expected
+        self.desktop = dict(pid=600, uid=1000, ppid=2, pgrp=2, start_ticks=1500,
+                            executable="tuna-compositor", exe_device=1, exe_inode=77)
+        self.helper = dict(self.desktop, pid=700, ppid=600, pgrp=700, start_ticks=1700)
+        self.delay = dict(self.helper, pid=701, ppid=700, start_ticks=1800, executable="sleep", exe_inode=78)
+        self.observed = {"real_pam_delay_running": True, "compositor": self.desktop,
+                         "helpers": [self.helper], "delays": [self.delay],
+                         "auth_owner": self.legacy.snapshot["state"]["auth_owner"]}
+        self.original = lane.sleep_auth_helper_observation(self.observed, self.legacy.snapshot)
+        self.physical = dict(helper_absent=True, delay_absent=True, owned_group_members=[], original=self.original)
+        self.event = dict(pid=600, joined_ok=True, retired=True, authenticated=False,
+                          denied=True, cancel_requested=True, reported_ok=False, applied=False,
+                          attempt_serial=9, attempt_epoch=7, current_epoch=8,
+                          origin=dict(connection=4, request=12), locked_after=True)
+
+    def trace(self, event=None, denial=None):
+        return 'tuna-compositor: lock authentication owned retirement ' + json.dumps(self.event if event is None else event) + '\n' + (self.legacy.denial if denial is None else denial)
+
+    def match(self, trace=None, original=None, physical=None, current=8):
+        return lane.cancelled_sleep_auth_retirement(self.trace() if trace is None else trace,
+            self.expected, current, self.original if original is None else original,
+            self.physical if physical is None else physical)
+
+    def test_original_helper_delay_and_canceled_actual_retired_false_positive(self):
+        self.assertEqual(self.match(), self.event)
+
+    def test_no_helper_arbitrary_sleep_or_wrong_original_attempt_refused(self):
+        import copy
+        changes = [dict(self.observed, real_pam_delay_running=False),
+                   dict(self.observed, helpers=[]), dict(self.observed, delays=[]),
+                   dict(self.observed, delays=[dict(self.delay, ppid=600)]),
+                   dict(self.observed, helpers=[dict(self.helper, exe_inode=78)]),
+                   dict(self.observed, helpers=[dict(self.helper, pgrp=600)]),
+                   dict(self.observed, helpers=[dict(self.helper, uid=1001)]),
+                   dict(self.observed, compositor=dict(self.desktop, start_ticks=1501)),
+                   dict(self.observed, helpers=[self.helper, self.helper]),
+                   dict(self.observed, delays=[dict(self.delay, pid=True)])]
+        changed = copy.deepcopy(self.observed); changed['auth_owner']['attempt']['serial'] = 10; changes.append(changed)
+        for value in changes:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                lane.sleep_auth_helper_observation(value, self.legacy.snapshot)
+        for original in ({}, dict(self.original, helper=None), dict(self.original, attempt={**self.expected, 'serial':10})):
+            self.assertIsNone(self.match(original=original))
+
+    def test_cancel_without_retirement_unretired_success_unlock_or_wrong_receipt_refused(self):
+        for key, value in [('joined_ok',False), ('retired',False), ('authenticated',True),
+                           ('denied',False), ('cancel_requested',False), ('reported_ok',True),
+                           ('applied',True), ('locked_after',False), ('attempt_serial',10),
+                           ('attempt_epoch',6), ('current_epoch',7), ('pid',601), ('retired',1),
+                           ('origin',{'connection':5,'request':12})]:
+            with self.subTest(key=key):
+                self.assertIsNone(self.match(trace=self.trace({**self.event,key:value})))
+        self.assertIsNone(self.match(current=9))
+        for physical in [dict(self.physical,helper_absent=False), dict(self.physical,delay_absent=False),
+                         dict(self.physical,owned_group_members=[dict(pid=702,start_ticks=1801)]),
+                         dict(self.physical,original=dict(self.original,helper=dict(self.helper,start_ticks=1800))), {},
+                         dict(self.physical,helper_absent=1)]:
+            self.assertIsNone(self.match(physical=physical))
+
+    def test_missing_malformed_duplicate_or_wrong_shell_denial_refused(self):
+        for trace in ['', self.legacy.trace(), self.trace()+ '\n'+self.trace(),
+                      'tuna-compositor: lock authentication owned retirement {broken',
+                      self.trace({**self.event,'extra':True}),
+                      self.trace({key:value for key,value in self.event.items() if key != 'retired'}),
+                      self.trace(denial=''), self.trace(denial=self.legacy.denial.replace('12','13')),
+                      self.trace(denial=self.legacy.denial.replace('false','true'))]:
+            self.assertIsNone(self.match(trace=trace))
+
+    def production(self):
+        source = Path(__file__).resolve().parents[2] / 'packaging/marlin/vm-lane/tuna-vm-lifecycle'
+        wanted = {'auth_process','public_auth_identity','classify_pam_helpers','pam_process_snapshot','delayed_auth_state','auth_retirement_state'}
+        nodes = [node for node in ast.parse(source.read_text()).body if isinstance(node,ast.FunctionDef) and node.name in wanted]
+        scope = dict(pathlib=__import__('pathlib'), os=__import__('os'), json=json,
+                     OWNER=SimpleNamespace(pw_uid=1000), PAM_HELPER_FLAG=b'--internal-pam-conversation')
+        exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),scope)
+        return scope
+
+    def test_actual_production_helper_classifier_rejects_wrong_fixed_flag_parent_inode_and_uid(self):
+        scope = self.production()
+        def private(row, flag=False):
+            return dict(row,_marked=flag,_private=flag,_state='S')
+        desktop, helper = private(self.desktop), private(self.helper,True)
+        self.assertEqual(scope['classify_pam_helpers']([desktop,helper]),(desktop,[helper]))
+        for bad in [dict(helper,_private=False), dict(helper,ppid=999), dict(helper,exe_inode=78),
+                    dict(helper,uid=1001), dict(helper,pgrp=600), dict(helper,_state='Z')]:
+            self.assertEqual(scope['classify_pam_helpers']([desktop,bad])[1],[])
+        self.assertEqual(scope['classify_pam_helpers']([desktop,dict(desktop,pid=601),helper]),(None,[]))
+
+    def test_actual_production_process_reader_and_absence_reject_pid_replacement_and_zombie(self):
+        import os, pathlib
+        scope = self.production()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root/'tuna-compositor'; binary.write_bytes(b'owned controlled file')
+            def process(pid,parent,group,ticks,args):
+                path=root/str(pid); path.mkdir()
+                fields=['S',str(parent),str(group)]+['0']*16+[str(ticks)]
+                (path/'stat').write_text(f'{pid} (controlled) '+ ' '.join(fields))
+                (path/'cmdline').write_bytes(args)
+                (path/'exe').symlink_to(binary)
+            process(600,2,2,1500,b'/usr/bin/tuna-compositor\0')
+            process(700,600,700,1700,b'/proc/self/fd/11\0--internal-pam-conversation\0')
+            def proc_path(path):
+                return root if path=='/proc' else root/str(path).split('/')[-1]
+            scope['pathlib']=SimpleNamespace(Path=proc_path)
+            scope['OWNER']=SimpleNamespace(pw_uid=os.getuid())
+            scope['auth_process'].__globals__['pathlib']=scope['pathlib']
+            desktop=scope['auth_process'](600); helper=scope['auth_process'](700)
+            self.assertFalse(desktop['_private']); self.assertTrue(helper['_private'])
+            expected=dict(compositor=scope['public_auth_identity'](desktop),helper=scope['public_auth_identity'](helper),delay=dict(self.delay),attempt=self.expected)
+            # A missing exe while /proc/<pid> still exists is not PID absence.
+            (root/'700/exe').unlink()
+            absent=scope['auth_retirement_state'](expected)
+            self.assertFalse(absent['helper_absent']); self.assertTrue(absent['owned_group_members'])
+            (root/'700/exe').symlink_to(binary)
+            (root/'700/stat').write_text('700 (controlled) '+ ' '.join(['S','600','700']+['0']*16+['1701']))
+            with self.assertRaisesRegex(RuntimeError,'PID was replaced'):
+                scope['auth_retirement_state'](expected)
+
+    def test_runtime_observer_is_typed_retired_and_legacy_accepted_epoch_control_preserved(self):
+        source=Path(__file__).resolve().parents[2]/'crates/compositor/src/runtime.rs'
+        text=source.read_text()
+        self.assertIn('let cancel_requested = worker.cancel.is_canceled();',text)
+        self.assertIn('"retired":matches!(result, crate::pam_backend::Verification::Retired { .. })',text)
+        self.assertIn('"cancel_requested":cancel_requested',text)
+        self.assertEqual(lane.stale_sleep_auth_retirement(self.legacy.trace(),self.expected,8),self.legacy.event)
+
+
+
+class S3AbsoluteDeadline(unittest.TestCase):
+    def execute(self, phase, *, late_action=None, late_predicate=None, advance_action=None, deadline=5):
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        tree = ast.parse(source.read_text())
+        lifecycle = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_lifecycle")
+        inventory = next(n for n in lifecycle.body if isinstance(n, ast.FunctionDef) and n.name == "inventory")
+        helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("s3_remaining", "s3_observe")]
+        needle = 'delayed-auth-state' if phase == 'admission' else 'sleep-auth-pending'
+        loop = next(n for n in ast.walk(lifecycle) if isinstance(n, ast.While) and needle in ast.dump(n))
+        now = [0.0]
+        calls = []
+        class Agent:
+            def run(self, action, *args, **kwargs):
+                calls.append((action, kwargs))
+                if action == advance_action:
+                    now[0] += 1
+                if action == late_action:
+                    now[0] = deadline
+                if action == 'delayed-auth-state':
+                    return {'real_pam_delay_running': True}
+                if action == 'inventory':
+                    return {'state': {'locked': True, 'auth_owner': {'epoch': 8}}}
+                return {'helper_absent': True}
+        def predicate(name, result):
+            def run(*args):
+                if name == late_predicate: now[0] = deadline
+                return result
+            return run
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(time=SimpleNamespace(monotonic=lambda:now[0], sleep=lambda d:now.__setitem__(0, now[0]+d)),
+                         agent=Agent(), evidence=tmp, os=lane.os, json=json, deadline=deadline,
+                         desktop={'pid':1,'start_ticks':2}, observation_index=0,
+                         before={}, same_apps=predicate('same_apps', True),
+                         sleep_auth_attempt=predicate('attempt', {'serial':9}),
+                         sleep_auth_helper_observation=predicate('helper', {'helper':7}),
+                         cancelled_sleep_auth_retirement=predicate('retirement', {'retired':True}),
+                         read_text=lambda p:'actual serial', serial_path='serial', stale_auth_offset=0,
+                         original_method={}, original_auth={}, stale_rejected=False,
+                         record=lambda *args:None)
+            exec(compile(ast.Module(body=helpers+[inventory], type_ignores=[]),str(source),'exec'),scope)
+            try:
+                exec(compile(ast.Module(body=[loop], type_ignores=[]),str(source),'exec'),scope)
+            except RuntimeError as error:
+                self.assertIn('deadline expired', str(error))
+                return calls, False, Path(tmp,'sleep-auth-retirement.json').exists()
+            return calls, True, Path(tmp,'sleep-auth-retirement.json').exists()
+
+    def test_actual_admission_loop_clips_both_reads(self):
+        calls, accepted, receipt = self.execute('admission')
+        self.assertTrue(accepted)
+        self.assertEqual([action for action,_ in calls], ['delayed-auth-state','inventory'])
+        self.assertTrue(all(0 < kw['timeout'] <= 5 for _,kw in calls))
+        self.assertFalse(receipt)
+
+    def test_second_qga_operation_uses_recomputed_remaining_budget(self):
+        for phase, action, budget in [('admission','delayed-auth-state',5), ('retirement','inventory',25)]:
+            with self.subTest(phase=phase):
+                calls,accepted,_ = self.execute(phase,advance_action=action,deadline=budget)
+                self.assertTrue(accepted)
+                self.assertEqual(calls[0][1]['timeout'],budget)
+                self.assertEqual(calls[1][1]['timeout'],budget-1)
+
+    def test_actual_admission_rejects_late_read_and_validation(self):
+        for action in ('delayed-auth-state','inventory'):
+            with self.subTest(action=action):
+                _,accepted,_ = self.execute('admission',late_action=action)
+                self.assertFalse(accepted)
+        for name in ('same_apps','attempt','helper'):
+            with self.subTest(predicate=name):
+                _,accepted,_ = self.execute('admission',late_predicate=name)
+                self.assertFalse(accepted)
+
+    def test_actual_retirement_loop_clips_inventory_and_physical_reads(self):
+        calls,accepted,receipt = self.execute('retirement',deadline=25)
+        self.assertTrue(accepted); self.assertTrue(receipt)
+        self.assertEqual([action for action,_ in calls], ['inventory','auth-retirement-state'])
+        self.assertTrue(all(0 < kw['timeout'] <= 25 for _,kw in calls))
+
+    def test_actual_retirement_rejects_late_read_or_matcher_before_receipt(self):
+        for action in ('inventory','auth-retirement-state'):
+            with self.subTest(action=action):
+                _,accepted,receipt = self.execute('retirement',late_action=action,deadline=25)
+                self.assertFalse(accepted); self.assertFalse(receipt)
+        for name in ('same_apps','retirement'):
+            with self.subTest(predicate=name):
+                _,accepted,receipt = self.execute('retirement',late_predicate=name,deadline=25)
+                self.assertFalse(accepted); self.assertFalse(receipt)
+
+    def test_default_inventory_call_remains_unchanged(self):
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        lifecycle = next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='run_lifecycle')
+        inventory = next(n for n in lifecycle.body if isinstance(n,ast.FunctionDef) and n.name=='inventory')
+        calls=[]
+        with tempfile.TemporaryDirectory() as tmp:
+            scope=dict(agent=SimpleNamespace(run=lambda *a,**kw: calls.append((a,kw)) or {}),
+                       evidence=tmp,os=lane.os,json=json,
+                       s3_observe=lambda *a,**kw: (_ for _ in ()).throw(AssertionError('unexpected deadline path')))
+            exec(compile(ast.Module(body=[inventory],type_ignores=[]),str(source),'exec'),scope)
+            self.assertEqual(scope['inventory']('ordinary'),{})
+        self.assertEqual(calls,[(('inventory',),{})])
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,7 @@ glib.workspace = true
 gio.workspace = true
 jiff.workspace = true
 libc = "0.2"
+unicode-segmentation = "=1.13.3"
 serde_json.workspace = true
 pipewire = { version = "0.10", features = ["v0_3_33"] }
 tuna-shell-host = { path = "../shell-host", version = "0.1.0" }
