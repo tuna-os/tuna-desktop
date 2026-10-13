@@ -3797,7 +3797,11 @@ fn strip_drawn_geometry(
 
 /// Drive the actual compositor modifier/button route, without a private grab API.
 fn start_strip_drag(f: &mut ThreeFixture, id: u64) -> Point<f64, Logical> {
+    assert!(f.manager.focus(&mut f.comp.state, Some(id)));
     f.manager.set_motion_allowed(false);
+    // Runtime runs this actual frame phase after reconciliation/focus and
+    // before subsequent input. Retarget columns before sampling the actor.
+    assert!(!f.manager.step_strip_view(0.0));
     let geometry = strip_drawn_geometry(&f.manager, id).unwrap();
     let pos: Point<f64, Logical> = (
         f64::from(geometry.loc.x + 60),
@@ -3893,6 +3897,7 @@ fn start_strip_resize(f: &mut ThreeFixture, left: bool) -> Point<f64, Logical> {
     use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
     f.manager.set_motion_allowed(false);
     f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    assert!(!f.manager.step_strip_view(0.0));
     let g = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
     let x = if left {
         g.loc.x + 2
@@ -3928,9 +3933,10 @@ fn strip_resize_configures_continuous_width_neighbors_and_preserves_floating_sta
     let mut f = three_windows();
     let floating = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
     f.manager.set_scroll(&mut f.comp.state, true);
+    let pos = start_strip_resize(&mut f, false);
+    // Baseline the selected owner's view, not Gamma's pre-focus view.
     let before = f.manager.geometry(f.id_a).unwrap();
     let b = f.manager.geometry(f.id_b).unwrap();
-    let pos = start_strip_resize(&mut f, false);
     f.manager
         .pointer_motion(&mut f.comp.state, (pos.x + 73.0, pos.y + 100.0).into(), 22);
     let after = f.manager.geometry(f.id_a).unwrap();
@@ -4051,6 +4057,7 @@ fn strip_client_resize_rejects_stale_serial_wrong_owner_and_vertical_only_edges(
     f.manager.set_scroll(&mut f.comp.state, true);
     f.manager.set_motion_allowed(false);
     f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    assert!(!f.manager.step_strip_view(0.0));
     let g = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
     f.manager.pointer_motion(
         &mut f.comp.state,
@@ -4127,6 +4134,7 @@ fn strip_drag_translates_attached_dialog_family_and_keeps_child_above_parent() {
     f.manager.set_scroll(&mut f.comp.state, true);
     f.manager.focus(&mut f.comp.state, Some(f.id_a));
     f.manager.set_motion_allowed(false);
+    assert!(!f.manager.step_strip_view(0.0));
     let original_parent = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
     let original_child = strip_drawn_geometry(&f.manager, child).unwrap();
     let original_neighbor = strip_drawn_geometry(&f.manager, f.id_b).unwrap();
