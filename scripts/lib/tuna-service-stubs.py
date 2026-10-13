@@ -90,12 +90,17 @@ XML = """
     <property name="DeviceType" type="u" access="read"/>
     <property name="Interface" type="s" access="read"/>
     <property name="State" type="u" access="read"/>
+    <property name="Udi" type="s" access="read"/>
     <property name="AvailableConnections" type="ao" access="read"/>
     <property name="ActiveConnection" type="o" access="read"/>
     <method name="Disconnect"/>
   </interface>
   <interface name="org.freedesktop.NetworkManager.Device.Modem">
-    <property name="Modem" type="o" access="read"/>
+    <property name="ModemCapabilities" type="u" access="read"/>
+    <property name="CurrentCapabilities" type="u" access="read"/>
+    <property name="DeviceId" type="s" access="read"/>
+    <property name="OperatorCode" type="s" access="read"/>
+    <property name="Apn" type="s" access="read"/>
   </interface>
   <interface name="org.freedesktop.NetworkManager.Device.Wireless">
     <method name="RequestScan"><arg type="a{sv}" direction="in"/></method>
@@ -216,23 +221,31 @@ state = {
         "PrimaryConnection": GLib.Variant("o", WIRED_ACTIVE)},
     (DEV_WWAN, "org.freedesktop.NetworkManager.Device"): {
         "DeviceType": GLib.Variant("u", 8), "Interface": GLib.Variant("s", "wwan0"), "State": GLib.Variant("u", 100),
+        "Udi": GLib.Variant("s", MM_MODEM),
         "AvailableConnections": GLib.Variant("ao", [WWAN_CONN]),
         "ActiveConnection": GLib.Variant("o", WWAN_ACTIVE)},
     (DEV_WWAN, NM_MODEM): {
-        "Modem": GLib.Variant("o", MM_MODEM)},
+        "ModemCapabilities": GLib.Variant("u", 12),
+        "CurrentCapabilities": GLib.Variant("u", 12),
+        "DeviceId": GLib.Variant("s", "359762080000001"),
+        "OperatorCode": GLib.Variant("s", "310260"),
+        "Apn": GLib.Variant("s", "internet.example")},
     (WWAN_ACTIVE, "org.freedesktop.NetworkManager.Connection.Active"): {
         "Connection": GLib.Variant("o", WWAN_CONN), "State": GLib.Variant("u", 2)},
     (DEV_ETH, "org.freedesktop.NetworkManager.Device"): {
         "DeviceType": GLib.Variant("u", 1), "Interface": GLib.Variant("s", "enp1s0"), "State": GLib.Variant("u", 100),
+        "Udi": GLib.Variant("s", "/sys/devices/pci0000:00/enp1s0"),
         "AvailableConnections": GLib.Variant("ao", [WIRED_CONN]),
         "ActiveConnection": GLib.Variant("o", WIRED_ACTIVE)},
     (DEV_ETH2, DEVICE): {
         "DeviceType": GLib.Variant("u", 1), "Interface": GLib.Variant("s", "enp2s0"), "State": GLib.Variant("u", 30),
+        "Udi": GLib.Variant("s", "/sys/devices/pci0000:00/enp2s0"),
         "AvailableConnections": GLib.Variant("ao", []), "ActiveConnection": GLib.Variant("o", "/")},
     (WIRED_ACTIVE, "org.freedesktop.NetworkManager.Connection.Active"): {
         "Connection": GLib.Variant("o", WIRED_CONN), "State": GLib.Variant("u", 2)},
     (DEV_WIFI, "org.freedesktop.NetworkManager.Device"): {
         "DeviceType": GLib.Variant("u", 2), "Interface": GLib.Variant("s", "wlp1s0"), "State": GLib.Variant("u", 30),
+        "Udi": GLib.Variant("s", "/sys/devices/pci0000:00/wlp1s0"),
         "AvailableConnections": GLib.Variant("ao", [HOME_CONN]),
         "ActiveConnection": GLib.Variant("o", "/")},
     (DEV_WIFI, WIRELESS): {

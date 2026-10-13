@@ -805,6 +805,7 @@ struct PanelIcons {
 }
 
 fn quick_settings_popover(
+    app: &adw::Application,
     shell: &Rc<RefCell<Shell>>,
     notify: &Rc<notify::NotifyUi>,
     power_ui: &Rc<power::PowerUi>,
@@ -1157,9 +1158,16 @@ fn quick_settings_popover(
     // Location services: the GeoClue2 agent behind the panel's in-use
     // indicator. GNOME puts the master switch in Settings, not quick
     // settings, so there is no tile: Settings (and the proof) writes
-    // the switch, the agent honors it.
+    // the switch, the agent honors it. First-use consent is the
+    // overlay dialog (unknown apps prompt, the answer is saved).
     let location_agent = location::LocationAgent::new();
     location_agent.set_indicator(icons.location);
+    {
+        let prompt = location::LocationPrompt::new(app.upcast_ref());
+        location_agent.on_prompt(move |app_id, req, respond| {
+            prompt.show(app_id, req, respond);
+        });
+    }
     grid.add(&wifi, Some(&wifi_menu_ui));
     grid.add(&wired, Some(&wired_menu_ui));
     grid.add(&bluetooth, Some(&bt_menu_ui));
@@ -1677,6 +1685,7 @@ fn build(app: &adw::Application) {
         )
     };
     let qs = quick_settings_popover(
+        app,
         &shell,
         &notify,
         &power_ui,

@@ -30,6 +30,10 @@ const ACTIVATED: u32 = 100;
 
 const MM: &str = "org.freedesktop.ModemManager1";
 const MM_MODEM_IFACE: &str = "org.freedesktop.ModemManager1.Modem";
+/// 3GPP registration: `OperatorName`/`OperatorCode` live here, not on `Modem`.
+const MM_MODEM_3GPP_IFACE: &str = "org.freedesktop.ModemManager1.Modem.Modem3gpp";
+/// `Device.Udi` values that are ModemManager modem paths start here.
+const MM_MODEM_PREFIX: &str = "/org/freedesktop/ModemManager1/";
 
 /// ModemManager states (`MMModemState` in `include/ModemManager-enums.h`).
 pub const MM_STATE_FAILED: i32 = -1;
@@ -58,16 +62,26 @@ pub struct WwanDevice {
     pub interface: String,
     /// NetworkManager device state.
     pub state: u32,
-    /// ModemManager modem path (`None` when MM is absent).
+    /// ModemManager modem path from `Device.Udi` (`None` when absent).
     pub modem: Option<String>,
     /// Signal percent and whether the reading is recent.
     pub quality: Option<(u32, bool)>,
+    /// `Modem3gpp.OperatorName` (empty until the 3GPP read lands).
     pub operator: String,
     pub modem_state: i32,
     /// `MMModemLock` (`UnlockRequired`).
     pub sim_lock: u32,
     /// The active connection's APN, when its settings say so.
     pub apn: Option<String>,
+    /// `Device.Modem` identity: `DeviceId` and `OperatorCode` (MCCMNC).
+    pub device_id: String,
+    pub operator_code: String,
+    /// `Device.Modem` capabilities (generic access-technology families).
+    pub modem_caps: u32,
+    pub current_caps: u32,
+    /// `Device.Modem.Apn` fallback, used only when the gsm settings
+    /// carry no APN (combined at reload finish to avoid a read race).
+    pub nm_apn: Option<String>,
 }
 
 impl WwanDevice {
@@ -75,13 +89,14 @@ impl WwanDevice {
         self.state == ACTIVATED
     }
 
-    /// The row's second line: the operator while registered, else the
-    /// modem state (a SIM lock wins over both).
+    /// The row's second line: the operator while the NetworkManager
+    /// device is up and the modem is registered, else the modem state
+    /// (a SIM lock wins over both).
     pub fn subtitle(&self) -> String {
         if let Some(lock) = sim_lock_label(self.sim_lock) {
             return lock.to_owned();
         }
-        if self.connected() && !self.operator.is_empty() {
+        if self.connected() && modem_registered(self.modem_state) && !self.operator.is_empty() {
             return self.operator.clone();
         }
         modem_state_label(self.modem_state).to_owned()
@@ -114,9 +129,6 @@ pub fn modem_state_label(state: i32) -> &'static str {
 }
 
 /// Whether the modem can carry data (registered or beyond).
-// The rows key off NetworkManager's connected state; the predicate
-// stays for that distinction, covered by unit tests.
-#[allow(dead_code)]
 pub fn modem_registered(state: i32) -> bool {
     matches!(
         state,
@@ -181,6 +193,88 @@ pub fn gsm_apn<'a>(
         .ok()
         .flatten()
         .filter(|apn| !apn.is_empty())
+}
+
+/// The ModemManager modem behind a NetworkManager modem device: its
+/// base `Device.Udi` string, which NetworkManager sets to the modem's
+/// D-Bus path (`nm_modem_get_path`). Anything else (a sysfs path, an
+/// empty string) means no modem.
+pub fn modem_path_from_udi(udi: &str) -> Option<String> {
+    if udi.starts_with(MM_MODEM_PREFIX) && udi.len() > MM_MODEM_PREFIX.len() {
+        Some(udi.to_owned())
+    } else {
+        None
+    }
+}
+
+/// `Device.Modem`'s real properties (`ModemCapabilities`,
+/// `CurrentCapabilities`, `DeviceId`, `OperatorCode`, `Apn`); there is
+/// no `Modem` object path on this interface.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NmModemProps {
+    pub modem_caps: u32,
+    pub current_caps: u32,
+    pub device_id: String,
+    pub operator_code: String,
+    pub apn: Option<String>,
+}
+
+pub fn parse_nm_modem(props: &glib::VariantDict) -> NmModemProps {
+    let u = |k: &str| {
+        props
+            .lookup_value(k, None)
+            .and_then(|v| v.get::<u32>())
+            .unwrap_or(0)
+    };
+    let s = |k: &str| {
+        props
+            .lookup_value(k, None)
+            .and_then(|v| v.get::<String>())
+            .unwrap_or_default()
+    };
+    NmModemProps {
+        modem_caps: u("ModemCapabilities"),
+        current_caps: u("CurrentCapabilities"),
+        device_id: s("DeviceId"),
+        operator_code: s("OperatorCode"),
+        apn: props
+            .lookup_value("Apn", None)
+            .and_then(|v| v.get::<String>())
+            .filter(|a| !a.is_empty()),
+    }
+}
+
+/// `Modem3gpp.OperatorName` (the registered operator's name); empty
+/// while unregistered. Deliberately separate from the base `Modem`
+/// read, where no such property exists.
+pub fn operator_from_3gpp(props: &glib::VariantDict) -> String {
+    props
+        .lookup_value("OperatorName", None)
+        .and_then(|v| v.get::<String>())
+        .unwrap_or_default()
+}
+
+/// The base `Modem` read: state, signal quality and SIM lock. An
+/// `OperatorName` on this interface would be an invented shape and is
+/// ignored here (it is read from `Modem3gpp` instead).
+pub fn parse_mm_modem(props: &glib::VariantDict) -> (i32, Option<(u32, bool)>, u32) {
+    let state = props
+        .lookup_value("State", None)
+        .and_then(|v| v.get::<i32>())
+        .unwrap_or(MM_STATE_UNKNOWN);
+    let quality = props
+        .lookup_value("SignalQuality", None)
+        .and_then(|v| v.get::<(u32, bool)>());
+    let lock = props
+        .lookup_value("UnlockRequired", None)
+        .and_then(|v| v.get::<u32>())
+        .unwrap_or(0);
+    (state, quality, lock)
+}
+
+/// The row's APN: the gsm settings win, `Device.Modem.Apn` fills in.
+pub fn combine_apn(gsm: Option<String>, nm: Option<String>) -> Option<String> {
+    gsm.or(nm)
 }
 
 /// The WWAN tile's menu and the state behind it.
@@ -439,6 +533,13 @@ fn read_device(
             done.tick();
             return;
         }
+        // The MM modem path is the base `Device.Udi` string, not a
+        // `Device.Modem` object path (that interface has no `Modem`).
+        let udi = props
+            .lookup_value("Udi", None)
+            .and_then(|v| v.get::<String>())
+            .unwrap_or_default();
+        let modem = modem_path_from_udi(&udi);
         let device = Rc::new(RefCell::new(WwanDevice {
             path,
             interface: props
@@ -446,52 +547,62 @@ fn read_device(
                 .and_then(|v| v.get::<String>())
                 .unwrap_or_default(),
             state: u("State"),
+            modem: modem.clone(),
             ..WwanDevice::default()
         }));
-        let finish = Countdown::new(3, {
+        let finish = Countdown::new(4, {
             let device = device.clone();
             move || {
-                found.borrow_mut().push(device.take());
+                let mut dev = device.take();
+                dev.apn = combine_apn(dev.apn.take(), dev.nm_apn.take());
+                found.borrow_mut().push(dev);
                 done.tick();
             }
         });
-        // The MM modem path behind this NM device.
-        let (device2, finish2, conn3) = (device.clone(), finish.clone(), conn2.clone());
-        let nm_path = device.borrow().path.clone();
-        get_all(&conn2, NM, &nm_path, NM_MODEM, move |props| {
-            let modem = props
-                .as_ref()
-                .and_then(|p| object_path(p, "Modem"))
-                .filter(|p| p != "/");
-            device2.borrow_mut().modem = modem.clone();
-            match modem {
-                Some(modem) => {
+        // The modem's live state: base `Modem` first, then `Modem3gpp`
+        // for the operator name (one tick for the chain).
+        match modem {
+            Some(modem) => {
+                let (device2, finish2) = (device.clone(), finish.clone());
+                let conn3 = conn2.clone();
+                let modem2 = modem.clone();
+                get_all(&conn2, MM, &modem, MM_MODEM_IFACE, move |props| {
+                    if let Some(props) = props {
+                        let (state, quality, lock) = parse_mm_modem(&props);
+                        let mut dev = device2.borrow_mut();
+                        dev.modem_state = state;
+                        dev.quality = quality;
+                        dev.sim_lock = lock;
+                    }
                     let (device2, finish2) = (device2.clone(), finish2.clone());
-                    get_all(&conn3, MM, &modem, MM_MODEM_IFACE, move |props| {
+                    get_all(&conn3, MM, &modem2, MM_MODEM_3GPP_IFACE, move |props| {
                         if let Some(props) = props {
-                            let mut dev = device2.borrow_mut();
-                            dev.modem_state = props
-                                .lookup_value("State", None)
-                                .and_then(|v| v.get::<i32>())
-                                .unwrap_or(MM_STATE_UNKNOWN);
-                            dev.quality = props
-                                .lookup_value("SignalQuality", None)
-                                .and_then(|v| v.get::<(u32, bool)>());
-                            dev.operator = props
-                                .lookup_value("OperatorName", None)
-                                .and_then(|v| v.get::<String>())
-                                .unwrap_or_default();
-                            dev.sim_lock = props
-                                .lookup_value("UnlockRequired", None)
-                                .and_then(|v| v.get::<u32>())
-                                .unwrap_or(0);
+                            device2.borrow_mut().operator = operator_from_3gpp(&props);
                         }
                         finish2.tick();
                     });
-                }
-                None => finish2.tick(),
+                });
             }
-        });
+            None => finish.tick(),
+        }
+        // `Device.Modem` identity and APN fallback (real properties;
+        // an invented `Modem` path here would be ignored).
+        {
+            let (device_nm, finish_nm) = (device.clone(), finish.clone());
+            let nm_path = device.borrow().path.clone();
+            get_all(&conn2, NM, &nm_path, NM_MODEM, move |props| {
+                if let Some(props) = props {
+                    let nm = parse_nm_modem(&props);
+                    let mut dev = device_nm.borrow_mut();
+                    dev.device_id = nm.device_id;
+                    dev.operator_code = nm.operator_code;
+                    dev.modem_caps = nm.modem_caps;
+                    dev.current_caps = nm.current_caps;
+                    dev.nm_apn = nm.apn;
+                }
+                finish_nm.tick();
+            });
+        }
         // The active connection's APN, when there is one.
         match object_path(&props, "ActiveConnection") {
             Some(active) => {
@@ -715,5 +826,114 @@ mod tests {
         assert_eq!(apn.as_deref(), Some("internet.example"));
         let empty = glib::VariantDict::new(None);
         assert_eq!(gsm_apn([("ipv4", empty)].into_iter()), None);
+    }
+
+    #[test]
+    fn modem_path_comes_from_device_udi() {
+        // The exact official linkage: base Device.Udi is the MM path.
+        assert_eq!(
+            modem_path_from_udi("/org/freedesktop/ModemManager1/Modem/0").as_deref(),
+            Some("/org/freedesktop/ModemManager1/Modem/0")
+        );
+        // Anything else means no modem behind this device.
+        assert_eq!(modem_path_from_udi("/sys/devices/pci0000:00/wwan0"), None);
+        assert_eq!(modem_path_from_udi(""), None);
+        assert_eq!(modem_path_from_udi("/"), None);
+        assert_eq!(modem_path_from_udi("/org/freedesktop/ModemManager1/"), None);
+        // Interfaces queried are the official ones.
+        assert_eq!(DEVICE, "org.freedesktop.NetworkManager.Device");
+        assert_eq!(NM_MODEM, "org.freedesktop.NetworkManager.Device.Modem");
+        assert_eq!(MM_MODEM_IFACE, "org.freedesktop.ModemManager1.Modem");
+        assert_eq!(
+            MM_MODEM_3GPP_IFACE,
+            "org.freedesktop.ModemManager1.Modem.Modem3gpp"
+        );
+    }
+
+    #[test]
+    fn nm_modem_reads_real_properties_not_an_invented_path() {
+        let props = glib::VariantDict::new(None);
+        props.insert_value("ModemCapabilities", &4u32.to_variant());
+        props.insert_value("CurrentCapabilities", &12u32.to_variant());
+        props.insert_value("DeviceId", &"359762080000001".to_variant());
+        props.insert_value("OperatorCode", &"310260".to_variant());
+        props.insert_value("Apn", &"internet.example".to_variant());
+        let parsed = parse_nm_modem(&props);
+        assert_eq!(
+            parsed,
+            NmModemProps {
+                modem_caps: 4,
+                current_caps: 12,
+                device_id: "359762080000001".into(),
+                operator_code: "310260".into(),
+                apn: Some("internet.example".into()),
+            }
+        );
+        // An invented `Modem` on this interface is ignored: the
+        // parser reads only the documented properties.
+        let invented = glib::VariantDict::new(None);
+        invented.insert_value(
+            "Modem",
+            &"/org/freedesktop/ModemManager1/Modem/0".to_variant(),
+        );
+        assert_eq!(parse_nm_modem(&invented), NmModemProps::default());
+        // Empty APN reads as absent.
+        let empty_apn = glib::VariantDict::new(None);
+        empty_apn.insert_value("Apn", &"".to_variant());
+        assert_eq!(parse_nm_modem(&empty_apn).apn, None);
+    }
+
+    #[test]
+    fn operator_name_comes_from_modem3gpp_only() {
+        let gpp = glib::VariantDict::new(None);
+        gpp.insert_value("OperatorName", &"ExampleTel".to_variant());
+        assert_eq!(operator_from_3gpp(&gpp), "ExampleTel");
+        let missing = glib::VariantDict::new(None);
+        assert_eq!(operator_from_3gpp(&missing), "");
+        // The base Modem read ignores an OperatorName even if a stub
+        // invents one there: state, quality and lock only.
+        let modem = glib::VariantDict::new(None);
+        modem.insert_value("State", &11i32.to_variant());
+        modem.insert_value("SignalQuality", &(82u32, true).to_variant());
+        modem.insert_value("UnlockRequired", &1u32.to_variant());
+        modem.insert_value("OperatorName", &"InventedTel".to_variant());
+        let (state, quality, lock) = parse_mm_modem(&modem);
+        assert_eq!(state, MM_STATE_CONNECTED);
+        assert_eq!(quality, Some((82, true)));
+        assert_eq!(lock, MM_LOCK_NONE);
+    }
+
+    #[test]
+    fn apn_prefers_gsm_settings_over_nm_modem() {
+        assert_eq!(
+            combine_apn(Some("gsm.example".into()), Some("nm.example".into())).as_deref(),
+            Some("gsm.example")
+        );
+        assert_eq!(
+            combine_apn(None, Some("nm.example".into())).as_deref(),
+            Some("nm.example")
+        );
+        assert_eq!(
+            combine_apn(Some("gsm.example".into()), None).as_deref(),
+            Some("gsm.example")
+        );
+        assert_eq!(combine_apn(None, None), None);
+    }
+
+    #[test]
+    fn operator_shows_only_while_registered() {
+        let searching = WwanDevice {
+            state: ACTIVATED,
+            operator: "ExampleTel".into(),
+            modem_state: MM_STATE_SEARCHING,
+            sim_lock: MM_LOCK_NONE,
+            ..WwanDevice::default()
+        };
+        assert_eq!(searching.subtitle(), "Searching");
+        let registered = WwanDevice {
+            modem_state: MM_STATE_REGISTERED,
+            ..searching.clone()
+        };
+        assert_eq!(registered.subtitle(), "ExampleTel");
     }
 }

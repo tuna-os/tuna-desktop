@@ -8,9 +8,13 @@ system bus):
 
 - ModemManager1: one modem (ExampleTel, connected, 82% recent signal,
   no SIM lock) at /org/freedesktop/ModemManager1/Modem/0, the modem
-  NetworkManager's wwan0 device points at. Every property read is
-  appended to LOG timestamped ("<epoch> Modem.Get <prop>"), so a gate
-  can prove the shell's rows come from live reads, not its model.
+  NetworkManager's wwan0 device names in Device.Udi. Base Modem
+  carries State/SignalQuality/UnlockRequired; Modem3gpp carries
+  OperatorName/OperatorCode (there is no OperatorName on Modem, and
+  no Modem path on NM Device.Modem). Every property read is appended
+  to LOG timestamped ("<epoch> Modem.Get <prop>" and
+  "<epoch> Modem3gpp.Get <prop>"), so a gate can prove the shell's
+  rows come from live reads, not its model.
 - GeoClue2: the Manager with AddAgent (appended timestamped with the
   caller's bus name: "<epoch> AddAgent <id> from <sender>") and a
   writable InUse property (writes appended timestamped too).
@@ -34,8 +38,11 @@ XML = """
   <interface name="org.freedesktop.ModemManager1.Modem">
     <property name="State" type="i" access="read"/>
     <property name="SignalQuality" type="(ub)" access="read"/>
-    <property name="OperatorName" type="s" access="read"/>
     <property name="UnlockRequired" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.ModemManager1.Modem.Modem3gpp">
+    <property name="OperatorName" type="s" access="read"/>
+    <property name="OperatorCode" type="s" access="read"/>
   </interface>
   <interface name="org.freedesktop.GeoClue2.Manager">
     <method name="AddAgent"><arg type="s" direction="in"/></method>
@@ -52,6 +59,7 @@ NODE = Gio.DBusNodeInfo.new_for_xml(XML)
 MM = "org.freedesktop.ModemManager1"
 MODEM = "/org/freedesktop/ModemManager1/Modem/0"
 MODEM_IFACE = "org.freedesktop.ModemManager1.Modem"
+MODEM_3GPP_IFACE = "org.freedesktop.ModemManager1.Modem.Modem3gpp"
 GEOCLUE = "org.freedesktop.GeoClue2"
 MANAGER = "/org/freedesktop/GeoClue2/Manager"
 MANAGER_IFACE = "org.freedesktop.GeoClue2.Manager"
@@ -63,8 +71,11 @@ state = {
     (MODEM, MODEM_IFACE): {
         "State": GLib.Variant("i", 11),
         "SignalQuality": GLib.Variant("(ub)", (82, True)),
-        "OperatorName": GLib.Variant("s", "ExampleTel"),
         "UnlockRequired": GLib.Variant("u", 1),
+    },
+    (MODEM, MODEM_3GPP_IFACE): {
+        "OperatorName": GLib.Variant("s", "ExampleTel"),
+        "OperatorCode": GLib.Variant("s", "310260"),
     },
     (MANAGER, MANAGER_IFACE): {
         "InUse": GLib.Variant("b", False),
@@ -100,6 +111,8 @@ def method_call(c, sender, path, iface, method, params, invocation):
 def get_property(c, sender, path, iface, prop):
     if iface == MODEM_IFACE:
         log(f"Modem.Get {prop}")
+    elif iface == MODEM_3GPP_IFACE:
+        log(f"Modem3gpp.Get {prop}")
     return state[(path, iface)][prop]
 
 
@@ -126,7 +139,8 @@ def present(c, name, owned):
                     Gio.DBusCallFlags.NONE, -1, None)
 
 
-for path, iface in ((MODEM, MODEM_IFACE), (MANAGER, MANAGER_IFACE), (PROOF_PATH, PROOF_IFACE)):
+for path, iface in ((MODEM, MODEM_IFACE), (MODEM, MODEM_3GPP_IFACE),
+                    (MANAGER, MANAGER_IFACE), (PROOF_PATH, PROOF_IFACE)):
     conn.register_object(path, NODE.lookup_interface(iface), method_call, get_property, set_property)
 
 for name in (MM, GEOCLUE, PROOF):

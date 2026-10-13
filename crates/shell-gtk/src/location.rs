@@ -20,6 +20,7 @@ use std::rc::Rc;
 use gio::prelude::*;
 use gtk::prelude::*;
 use gtk4 as gtk;
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 pub const LOCATION_SCHEMA: &str = "org.gnome.system.location";
 pub const ENABLED_KEY: &str = "enabled";
@@ -119,9 +120,55 @@ pub enum AuthDecision {
     Prompt,
 }
 
+/// Why a permission-store lookup produced no table. Every variant
+/// fails closed (denies); only a present table with no row for the
+/// app prompts. Mirrors GNOME 51 `status/location.js`, which denies
+/// a missing proxy and distinguishes lookup errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupError {
+    /// No session bus to ask the store on.
+    NoSession,
+    /// The `Lookup` call timed out.
+    Timeout,
+    /// The `Lookup` call returned a D-Bus error.
+    Dbus,
+    /// The `Lookup` reply did not unpack as `a{sas}`.
+    Malformed,
+    /// The store answered but the `location` table is unavailable
+    /// (missing table/id, unknown service).
+    StoreMissing,
+}
+
+/// A permission-store lookup: either the table or why there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupOutcome {
+    Available(HashMap<String, Vec<String>>),
+    Unavailable(LookupError),
+}
+
+/// Classify a failed `Lookup` reply for fail-closed handling: timeouts
+/// stay timeouts, store-shaped errors stay store errors, everything
+/// else is a generic D-Bus error.
+pub fn classify_lookup_error(message: &str) -> LookupError {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        LookupError::Timeout
+    } else if lower.contains("notfound")
+        || lower.contains("not found")
+        || lower.contains("unknown table")
+        || lower.contains("serviceunknown")
+        || lower.contains("has no owner")
+        || lower.contains("no such")
+    {
+        LookupError::StoreMissing
+    } else {
+        LookupError::Dbus
+    }
+}
+
 /// Decide from the store entry, as GNOME's `AppAuthorizer` does:
-/// unknown apps prompt, a missing store authorizes at the requested
-/// level, and an unknown desktop id is denied outright.
+/// unknown apps prompt, lookup failures deny, and an unknown desktop
+/// id is denied outright.
 pub fn authorize(
     req: u32,
     max: u32,
@@ -137,7 +184,7 @@ pub fn authorize(
     }
     if store_missing {
         return AuthDecision::Answer {
-            accuracy: clamp_accuracy(req, max),
+            accuracy: ACC_NONE,
             save: false,
         };
     }
@@ -147,6 +194,46 @@ pub fn authorize(
             save: true,
         },
         None => AuthDecision::Prompt,
+    }
+}
+
+/// Decide from a full lookup outcome: unavailable denies (fail
+/// closed), a present table answers from its row or prompts when the
+/// app has no row. `req` is unused on the error path on purpose: no
+/// failure may grant at the requested level.
+pub fn authorize_lookup(
+    req: u32,
+    max: u32,
+    outcome: &LookupOutcome,
+    desktop_id: &str,
+    app_known: bool,
+) -> AuthDecision {
+    if !app_known {
+        return AuthDecision::Answer {
+            accuracy: ACC_NONE,
+            save: false,
+        };
+    }
+    match outcome {
+        LookupOutcome::Unavailable(_) => AuthDecision::Answer {
+            accuracy: ACC_NONE,
+            save: false,
+        },
+        LookupOutcome::Available(perms) => {
+            let stored = stored_accuracy(perms, desktop_id);
+            authorize(req, max, stored, false, true)
+        }
+    }
+}
+
+/// Recheck an in-flight grant against the live ceiling: disabling
+/// Location mid-flight denies, lowering the ceiling clamps. The
+/// captured ceiling is intentionally not consulted.
+pub fn live_grant(proposed: u32, live_max: u32) -> u32 {
+    if live_max == ACC_NONE {
+        ACC_NONE
+    } else {
+        clamp_accuracy(proposed, live_max)
     }
 }
 
@@ -162,35 +249,6 @@ pub fn stored_accuracy(perms: &HashMap<String, Vec<String>>, desktop_id: &str) -
 /// The row `Set` writes back: the level word and the decision's date.
 pub fn permission_entry(level: u32, unix_secs: u64) -> Vec<String> {
     vec![accuracy_name(level).to_owned(), unix_secs.to_string()]
-}
-
-/// One app's row for the Location settings list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-// The shell shows no per-app list (GNOME puts it in Settings Privacy);
-// the model stays for that consumer, covered by unit tests.
-#[allow(dead_code)]
-pub struct AppPermission {
-    pub desktop_id: String,
-    pub accuracy: u32,
-    /// When the user last decided, if the row says.
-    pub seen: Option<u64>,
-}
-
-/// The whole `location` table, sorted by id.
-// The shell shows no per-app list (GNOME puts it in Settings Privacy);
-// the model stays for that consumer, covered by unit tests.
-#[allow(dead_code)]
-pub fn parse_lookup(perms: &HashMap<String, Vec<String>>) -> Vec<AppPermission> {
-    let mut apps: Vec<AppPermission> = perms
-        .iter()
-        .map(|(id, row)| AppPermission {
-            desktop_id: id.clone(),
-            accuracy: row.first().map(|l| accuracy_value(l)).unwrap_or(ACC_NONE),
-            seen: row.get(1).and_then(|d| d.parse().ok()),
-        })
-        .collect();
-    apps.sort_by(|a, b| a.desktop_id.cmp(&b.desktop_id));
-    apps
 }
 
 /// The panel icon: shown only while location is on and in use.
@@ -211,6 +269,10 @@ pub struct LocationAgent {
     session: RefCell<Option<gio::DBusConnection>>,
     in_use: Cell<bool>,
     prompt: RefCell<Option<Rc<AuthorizePrompt>>>,
+    /// Bumped whenever the live ceiling may have moved (master switch,
+    /// accuracy setting, GeoClue appearance), so in-flight lookups can
+    /// tell a stale captured ceiling from the live one.
+    generation: Cell<u64>,
 }
 
 impl LocationAgent {
@@ -225,11 +287,13 @@ impl LocationAgent {
             session: RefCell::default(),
             in_use: Cell::new(false),
             prompt: RefCell::default(),
+            generation: Cell::new(0),
         });
         if let Some(settings) = agent.settings.as_ref() {
             let weak = Rc::downgrade(&agent);
             settings.connect_changed(Some(ENABLED_KEY), move |_, _| {
                 if let Some(agent) = weak.upgrade() {
+                    agent.bump_generation();
                     agent.sync_indicator();
                     agent.emit_max_accuracy();
                 }
@@ -237,11 +301,16 @@ impl LocationAgent {
             let weak = Rc::downgrade(&agent);
             settings.connect_changed(Some(MAX_ACCURACY_KEY), move |_, _| {
                 if let Some(agent) = weak.upgrade() {
+                    agent.bump_generation();
                     agent.emit_max_accuracy();
                 }
             });
         }
         agent
+    }
+
+    fn bump_generation(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
     }
 
     /// The panel icon that follows `enabled && in_use`.
@@ -252,9 +321,6 @@ impl LocationAgent {
 
     /// The authorization dialog: `respond` carries the user's level
     /// (or `NONE`). Without one every unknown app is denied.
-    // No dialog is wired yet; unknown apps stay denied (G-QS-LOCATION
-    // asserts both denials), and the hook stays for that dialog.
-    #[allow(dead_code)]
     pub fn on_prompt(&self, f: impl Fn(String, u32, Rc<dyn Fn(u32)>) + 'static) {
         *self.prompt.borrow_mut() = Some(Rc::new(f));
     }
@@ -264,16 +330,6 @@ impl LocationAgent {
             .as_ref()
             .map(|s| s.boolean(ENABLED_KEY))
             .unwrap_or(false)
-    }
-
-    /// Flip the master switch (the Location settings toggle).
-    // The shell honors external writes (Settings, the proof); the
-    // programmatic flip stays for a future settings surface.
-    #[allow(dead_code)]
-    pub fn set_enabled(&self, on: bool) {
-        if let Some(settings) = self.settings.as_ref() {
-            let _ = settings.set_boolean(ENABLED_KEY, on);
-        }
     }
 
     pub fn max_accuracy_level(&self) -> u32 {
@@ -338,6 +394,7 @@ impl LocationAgent {
         let conn2 = conn.clone();
         crate::services::watch_name(conn, GEOCLUE, move |owned| {
             let Some(agent) = weak.upgrade() else { return };
+            agent.bump_generation();
             if owned {
                 agent.register(&conn2);
                 agent.refresh_in_use(&conn2);
@@ -377,15 +434,17 @@ impl LocationAgent {
     }
 
     /// Ask GeoClue for one app, answering from the store (or the
-    /// dialog). The invocation stays open until the answer lands.
+    /// dialog). The invocation stays open until the answer lands. The
+    /// ceiling is rechecked live at reply time and again at save time:
+    /// a captured positive never survives a mid-flight disable or a
+    /// lowered ceiling.
     fn authorize_app(
         self: &Rc<Self>,
         desktop_id: &str,
         req: u32,
         invocation: gio::DBusMethodInvocation,
     ) {
-        let max = self.max_accuracy_level();
-        if max == ACC_NONE {
+        if self.max_accuracy_level() == ACC_NONE {
             invocation.return_value(Some(&auth_reply(ACC_NONE).to_variant()));
             return;
         }
@@ -397,16 +456,31 @@ impl LocationAgent {
             .iter()
             .any(|app| app.id().as_deref() == Some(file.as_str()));
         let this = self.clone();
+        let start_gen = self.generation.get();
         let desktop_id = desktop_id.to_owned();
-        lookup_permissions(self, move |perms| {
-            // `None` is a missing store: authorize at the request. A
-            // present store with no row for the app prompts instead.
-            let stored = perms.as_ref().and_then(|p| stored_accuracy(p, &desktop_id));
-            let decision = authorize(req, max, stored, perms.is_none(), app_known);
+        lookup_permissions(self, move |outcome| {
+            // Live policy, not the entry-time capture: disabling
+            // Location or lowering the ceiling while the lookup was
+            // pending denies or clamps this reply.
+            let lookup_gen = this.generation.get();
+            if lookup_gen != start_gen {
+                eprintln!("tuna-shell-gtk: location policy moved mid-lookup, rechecked");
+            }
+            let live_max = this.max_accuracy_level();
+            if live_max == ACC_NONE {
+                invocation.return_value(Some(&auth_reply(ACC_NONE).to_variant()));
+                return;
+            }
+            let decision = authorize_lookup(req, live_max, &outcome, &desktop_id, app_known);
             match decision {
                 AuthDecision::Answer { accuracy, save } => {
+                    let accuracy = live_grant(accuracy, this.max_accuracy_level());
                     if save {
-                        this.save_permission(perms.as_ref(), &desktop_id, accuracy);
+                        let table = match &outcome {
+                            LookupOutcome::Available(t) => Some(t),
+                            LookupOutcome::Unavailable(_) => None,
+                        };
+                        this.save_permission(table, &desktop_id, accuracy);
                     }
                     invocation.return_value(Some(&auth_reply(accuracy).to_variant()));
                 }
@@ -415,7 +489,11 @@ impl LocationAgent {
                     match prompt {
                         Some(prompt) => {
                             let this = this.clone();
-                            let perms = perms.clone();
+                            let dialog_gen = this.generation.get();
+                            let table = match outcome {
+                                LookupOutcome::Available(t) => Some(t),
+                                LookupOutcome::Unavailable(_) => None,
+                            };
                             let id = desktop_id.clone();
                             // The dialog answers later; its own reference.
                             // The hook is repeat-callable, so the first
@@ -425,8 +503,19 @@ impl LocationAgent {
                                 desktop_id,
                                 req,
                                 Rc::new(move |level| {
-                                    let accuracy = clamp_accuracy(level, max);
-                                    this.save_permission(perms.as_ref(), &id, accuracy);
+                                    // Rechecked again at dialog-answer
+                                    // time: the user may have flipped
+                                    // the switch while deciding.
+                                    if this.generation.get() != dialog_gen {
+                                        eprintln!(
+                                            "tuna-shell-gtk: location policy moved mid-prompt, rechecked"
+                                        );
+                                    }
+                                    let live = this.max_accuracy_level();
+                                    let accuracy = live_grant(level, live);
+                                    if live != ACC_NONE {
+                                        this.save_permission(table.as_ref(), &id, accuracy);
+                                    }
                                     if let Some(inv) = invocation2.borrow_mut().take() {
                                         inv.return_value(Some(&auth_reply(accuracy).to_variant()));
                                     }
@@ -442,11 +531,9 @@ impl LocationAgent {
         });
     }
 
-    /// The `location` table, or `None` when the store is missing.
-    fn lookup_table(
-        session: &gio::DBusConnection,
-        done: impl FnOnce(Option<HashMap<String, Vec<String>>>) + 'static,
-    ) {
+    /// The `location` table, distinguishing a present table from every
+    /// failure (timeout, D-Bus error, malformed reply, missing table).
+    fn lookup_table(session: &gio::DBusConnection, done: impl FnOnce(LookupOutcome) + 'static) {
         session.call(
             Some(PERM_STORE),
             PERM_PATH,
@@ -457,23 +544,32 @@ impl LocationAgent {
             gio::DBusCallFlags::NONE,
             5000,
             None::<&gio::Cancellable>,
-            move |reply| {
-                done(
-                    reply
-                        .ok()
-                        .and_then(|v| v.child_value(0).get::<HashMap<String, Vec<String>>>()),
-                );
+            move |reply| match reply {
+                Ok(v) => match v.child_value(0).get::<HashMap<String, Vec<String>>>() {
+                    Some(table) => done(LookupOutcome::Available(table)),
+                    None => done(LookupOutcome::Unavailable(LookupError::Malformed)),
+                },
+                Err(e) => done(LookupOutcome::Unavailable(classify_lookup_error(
+                    &e.to_string(),
+                ))),
             },
         );
     }
 
-    /// One row back into the store, stamped with now.
+    /// One row back into the store, stamped with now. Rechecks the live
+    /// ceiling first: nothing is saved while Location is off, and the
+    /// saved level never exceeds the live ceiling.
     fn save_permission(
         &self,
         perms: Option<&HashMap<String, Vec<String>>>,
         desktop_id: &str,
         accuracy: u32,
     ) {
+        let live_max = self.max_accuracy_level();
+        if live_max == ACC_NONE {
+            return;
+        }
+        let accuracy = live_grant(accuracy, live_max);
         let Some(session) = self.session.borrow().clone() else {
             return;
         };
@@ -575,16 +671,154 @@ impl LocationAgent {
     }
 }
 
-/// The `location` table on the caller's session bus, or `None` when
-/// the store (or the bus) is missing.
-fn lookup_permissions(
-    agent: &Rc<LocationAgent>,
-    done: impl FnOnce(Option<HashMap<String, Vec<String>>>) + 'static,
-) {
+/// First-use location consent: the overlay dialog behind `on_prompt`.
+/// Allow answers at the requested level (clamped to the live ceiling
+/// by the caller); Deny, Escape and close answer `NONE`. A prompt that
+/// arrives while one is pending denies the older one first (latest
+/// wins, fail closed).
+pub struct LocationPrompt {
+    window: gtk::Window,
+    title: gtk::Label,
+    detail: gtk::Label,
+    pending: RefCell<Option<(String, u32, Rc<dyn Fn(u32)>)>>,
+}
+
+impl LocationPrompt {
+    pub fn new(app: &gtk::Application) -> Rc<Self> {
+        let window = gtk::Window::new();
+        window.set_application(Some(app));
+        window.set_title(Some("Location access"));
+        window.add_css_class("tuna-end-session");
+        window.init_layer_shell();
+        window.set_layer(Layer::Overlay);
+        window.set_namespace(Some("tuna-location-consent"));
+        for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+            window.set_anchor(edge, true);
+        }
+        window.set_exclusive_zone(-1);
+        window.set_keyboard_mode(KeyboardMode::Exclusive);
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        card.add_css_class("modal-dialog");
+        card.set_halign(gtk::Align::Center);
+        card.set_valign(gtk::Align::Center);
+        card.set_margin_top(24);
+        card.set_margin_bottom(24);
+        let title = gtk::Label::new(None);
+        title.add_css_class("message-dialog-title");
+        title.set_wrap(true);
+        title.set_max_width_chars(50);
+        card.append(&title);
+        let detail = gtk::Label::new(None);
+        detail.add_css_class("message-dialog-description");
+        detail.set_wrap(true);
+        card.append(&detail);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons.add_css_class("modal-dialog-button-box");
+        let deny = gtk::Button::with_label("Deny");
+        deny.update_property(&[gtk::accessible::Property::Label("Deny location access")]);
+        let allow = gtk::Button::with_label("Allow");
+        allow.update_property(&[gtk::accessible::Property::Label("Allow location access")]);
+        for button in [&deny, &allow] {
+            button.add_css_class("modal-dialog-button");
+            buttons.append(button);
+        }
+        card.append(&buttons);
+        window.set_child(Some(&card));
+        let ui = Rc::new(Self {
+            window,
+            title,
+            detail,
+            pending: RefCell::new(None),
+        });
+        let weak = Rc::downgrade(&ui);
+        deny.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.respond(false);
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        allow.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.respond(true);
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(&ui);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                if let Some(ui) = weak.upgrade() {
+                    ui.respond(false);
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        ui.window.add_controller(keys);
+        let weak = Rc::downgrade(&ui);
+        ui.window.connect_close_request(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.respond(false);
+            }
+            glib::Propagation::Stop
+        });
+        ui
+    }
+
+    /// Show first-use consent for `desktop_id` at `req`. Denies any
+    /// older pending prompt first.
+    pub fn show(&self, desktop_id: String, req: u32, respond: Rc<dyn Fn(u32)>) {
+        if let Some((_, _, old)) = self.pending.borrow_mut().take() {
+            old(ACC_NONE);
+        }
+        self.title.set_text(&format!(
+            "Allow {} to access your location?",
+            app_display_name(&desktop_id)
+        ));
+        let level = accuracy_name(req).to_ascii_lowercase();
+        self.detail.set_text(&format!(
+            "This app is asking for {level} location. You can change this later in Settings."
+        ));
+        *self.pending.borrow_mut() = Some((desktop_id, req, respond));
+        self.window.present();
+    }
+
+    fn respond(&self, allow: bool) {
+        if let Some((_, req, respond)) = self.pending.borrow_mut().take() {
+            self.window.set_visible(false);
+            respond(if allow { req } else { ACC_NONE });
+        } else {
+            self.window.set_visible(false);
+        }
+    }
+}
+
+/// An app's display name for the consent dialog: its desktop entry's
+/// name when installed, else the id stem.
+fn app_display_name(desktop_id: &str) -> String {
+    let file = format!("{desktop_id}.desktop");
+    let desktop = (!desktop_id.contains('/'))
+        .then(|| {
+            tuna_shell_host::apps::default_app_dirs()
+                .into_iter()
+                .map(|dir| dir.join(&file))
+                .find(|path| path.is_file())
+        })
+        .flatten();
+    desktop
+        .as_deref()
+        .and_then(tuna_shell_host::apps::handler_entry_from_file)
+        .map(|entry| entry.name)
+        .unwrap_or_else(|| desktop_id.to_owned())
+}
+
+/// The `location` table on the caller's session bus, or the lookup
+/// failure (a missing session bus denies, it never grants).
+fn lookup_permissions(agent: &Rc<LocationAgent>, done: impl FnOnce(LookupOutcome) + 'static) {
     if let Some(session) = agent.session.borrow().clone() {
         LocationAgent::lookup_table(&session, done);
     } else {
-        done(None);
+        done(LookupOutcome::Unavailable(LookupError::NoSession));
     }
 }
 
@@ -643,11 +877,12 @@ mod tests {
             authorize(ACC_EXACT, ACC_EXACT, None, false, true),
             AuthDecision::Prompt
         );
-        // A missing store authorizes at the request, unsaved.
+        // A missing store denies, unsaved (fail closed, like GNOME's
+        // missing proxy): no failure may grant at the request.
         assert_eq!(
             authorize(ACC_CITY, ACC_EXACT, None, true, true),
             AuthDecision::Answer {
-                accuracy: ACC_CITY,
+                accuracy: ACC_NONE,
                 save: false
             }
         );
@@ -679,13 +914,6 @@ mod tests {
             permission_entry(ACC_CITY, 42),
             vec!["CITY".to_owned(), "42".to_owned()]
         );
-        let apps = parse_lookup(&perms);
-        assert_eq!(apps.len(), 3);
-        assert!(apps.windows(2).all(|w| w[0].desktop_id <= w[1].desktop_id));
-        // Sorted: bad.app, org.gnome.Maps, org.gnome.Weather.
-        assert_eq!(apps[0].accuracy, ACC_NONE);
-        assert_eq!(apps[1].seen, Some(1_700_000_000));
-        assert_eq!(apps[2].seen, None);
     }
 
     #[test]
@@ -696,5 +924,148 @@ mod tests {
         );
         assert_eq!(indicator_icon(true, false), None);
         assert_eq!(indicator_icon(false, true), None);
+    }
+
+    #[test]
+    fn lookup_timeout_denies_known_apps() {
+        let denied = AuthDecision::Answer {
+            accuracy: ACC_NONE,
+            save: false,
+        };
+        assert_eq!(
+            authorize_lookup(
+                ACC_EXACT,
+                ACC_EXACT,
+                &LookupOutcome::Unavailable(LookupError::Timeout),
+                "proof-location-app",
+                true
+            ),
+            denied
+        );
+        assert_eq!(
+            classify_lookup_error("GDBus.Error:org.freedesktop.DBus.Error.Timeout: timed out"),
+            LookupError::Timeout
+        );
+    }
+
+    #[test]
+    fn lookup_dbus_error_denies_known_apps() {
+        assert_eq!(
+            authorize_lookup(
+                ACC_EXACT,
+                ACC_EXACT,
+                &LookupOutcome::Unavailable(LookupError::Dbus),
+                "proof-location-app",
+                true
+            ),
+            AuthDecision::Answer {
+                accuracy: ACC_NONE,
+                save: false
+            }
+        );
+        assert_eq!(
+            classify_lookup_error("GDBus.Error:org.freedesktop.DBus.Error.Failed: boom"),
+            LookupError::Dbus
+        );
+    }
+
+    #[test]
+    fn lookup_malformed_denies_known_apps() {
+        assert_eq!(
+            authorize_lookup(
+                ACC_EXACT,
+                ACC_EXACT,
+                &LookupOutcome::Unavailable(LookupError::Malformed),
+                "proof-location-app",
+                true
+            ),
+            AuthDecision::Answer {
+                accuracy: ACC_NONE,
+                save: false
+            }
+        );
+    }
+
+    #[test]
+    fn lookup_missing_session_denies_known_apps() {
+        assert_eq!(
+            authorize_lookup(
+                ACC_EXACT,
+                ACC_EXACT,
+                &LookupOutcome::Unavailable(LookupError::NoSession),
+                "proof-location-app",
+                true
+            ),
+            AuthDecision::Answer {
+                accuracy: ACC_NONE,
+                save: false
+            }
+        );
+    }
+
+    #[test]
+    fn lookup_store_missing_denies_known_apps() {
+        assert_eq!(
+            authorize_lookup(
+                ACC_EXACT,
+                ACC_EXACT,
+                &LookupOutcome::Unavailable(LookupError::StoreMissing),
+                "proof-location-app",
+                true
+            ),
+            AuthDecision::Answer {
+                accuracy: ACC_NONE,
+                save: false
+            }
+        );
+        assert_eq!(
+            classify_lookup_error(
+                "GDBus.Error:org.freedesktop.portal.Error.NotFound: Unknown table/id"
+            ),
+            LookupError::StoreMissing
+        );
+        assert_eq!(
+            classify_lookup_error(
+                "GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: has no owner"
+            ),
+            LookupError::StoreMissing
+        );
+        // Only a present table with no row prompts; every failure denies.
+        let empty = LookupOutcome::Available(HashMap::new());
+        assert_eq!(
+            authorize_lookup(ACC_EXACT, ACC_EXACT, &empty, "proof-location-app", true),
+            AuthDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn pending_toggle_denies_the_in_flight_grant() {
+        // Captured EXACT, but Location was disabled mid-flight.
+        assert_eq!(live_grant(ACC_EXACT, ACC_NONE), ACC_NONE);
+        assert_eq!(live_grant(ACC_CITY, ACC_NONE), ACC_NONE);
+        assert_eq!(
+            auth_reply(live_grant(ACC_EXACT, ACC_NONE)),
+            (false, ACC_NONE)
+        );
+    }
+
+    #[test]
+    fn pending_replacement_clamps_the_in_flight_grant() {
+        // Captured EXACT, but the ceiling dropped to city mid-flight.
+        assert_eq!(live_grant(ACC_EXACT, ACC_CITY), ACC_CITY);
+        assert_eq!(live_grant(ACC_COUNTRY, ACC_CITY), ACC_COUNTRY);
+        assert_eq!(live_grant(ACC_NONE, ACC_CITY), ACC_NONE);
+        assert_eq!(
+            auth_reply(live_grant(ACC_EXACT, ACC_CITY)),
+            (true, ACC_CITY)
+        );
+    }
+
+    #[test]
+    fn prompt_answer_flows_through_the_live_ceiling() {
+        // Allow at the request, clamped to the live ceiling; deny is NONE.
+        assert_eq!(live_grant(ACC_EXACT, ACC_EXACT), ACC_EXACT);
+        assert_eq!(live_grant(ACC_EXACT, ACC_CITY), ACC_CITY);
+        assert_eq!(live_grant(ACC_NONE, ACC_EXACT), ACC_NONE);
     }
 }

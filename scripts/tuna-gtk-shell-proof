@@ -3261,8 +3261,27 @@ sleep 2
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-menu.json" 20 ||
     fail G-QS-WWAN "accessibility dump failed"
 scrot "$ARTIFACTS/16c-wwan-menu.png" >/dev/null
-tail -n +"$((wl_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ Modem.Get OperatorName$" ||
-    fail G-QS-WWAN "opening the menu did not re-read the modem"
+tail -n +"$((wl_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ Modem3gpp.Get OperatorName$" ||
+    fail G-QS-WWAN "opening the menu did not re-read the 3GPP operator"
+# Invented shapes stay rejected: no OperatorName on base Modem, no
+# Modem path on NM Device.Modem (the shell reads Udi + Modem3gpp).
+if tail -n +"$((wl_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ Modem.Get OperatorName$"; then
+    fail G-QS-WWAN "shell read OperatorName from base Modem instead of Modem3gpp"
+fi
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager/Devices/4 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.NetworkManager.Device.Modem Modem \
+    >/dev/null 2>&1 && fail G-QS-WWAN "stub answers invented Device.Modem.Modem"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.ModemManager1 \
+    --object-path /org/freedesktop/ModemManager1/Modem/0 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.ModemManager1.Modem OperatorName \
+    >/dev/null 2>&1 && fail G-QS-WWAN "stub answers invented Modem.OperatorName"
+# Real linkage reads back: Udi names the modem, 3GPP names the operator.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager/Devices/4 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.NetworkManager.Device Udi \
+    2>/dev/null | grep -q "ModemManager1/Modem/0" ||
+    fail G-QS-WWAN "Device.Udi does not name the ModemManager modem"
 # Menu-lifetime split: if the menu did not stay open for the dump, say so
 # instead of misattributing bare-desktop evidence to row population.
 showing "$ARTIFACTS/a11y-qs-wwan-menu.json" "Mobile Network Settings" ||
@@ -3416,14 +3435,16 @@ for _ in $(seq 1 15); do
 done
 [ -n "$in_use_dark" ] || fail G-QS-LOCATION "the Location indicator stayed after GeoClue went idle"
 # Authorization end to end: a stored EXACT grant for an installed app
-# authorizes at the request; the ceiling clamps it; unknown apps and
-# unlisted known apps are denied.
+# authorizes at the request; the ceiling clamps it; first-use known
+# apps prompt (deny/allow flows through); unknown apps are denied.
 # Proof apps live in $XDG_DATA_HOME (the shell's user data dir), like
 # every other tuna-probe desktop file above.
 printf '[Desktop Entry]\nName=Proof Location App\nType=Application\nExec=/bin/true\n' \
     >"$XDG_DATA_HOME/applications/proof-location-app.desktop"
 printf '[Desktop Entry]\nName=Proof Location Stranger\nType=Application\nExec=/bin/true\n' \
     >"$XDG_DATA_HOME/applications/proof-location-stranger.desktop"
+printf '[Desktop Entry]\nName=Proof Location Newcomer\nType=Application\nExec=/bin/true\n' \
+    >"$XDG_DATA_HOME/applications/proof-location-newcomer.desktop"
 gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore \
     --object-path /org/freedesktop/impl/portal/PermissionStore \
     --method org.freedesktop.impl.portal.PermissionStore.SetPermission \
@@ -3445,12 +3466,59 @@ echo "$auth" | grep -qE "\(true, (uint32 )?4\)" ||
     fail G-QS-LOCATION "city ceiling answered $auth, not (true, 4)"
 gsettings set org.gnome.system.location max-accuracy-level 'exact' ||
     fail G-QS-LOCATION "could not restore the accuracy ceiling"
+# First use prompts: the stranger's request surfaces the consent
+# dialog; denying answers denied and saves the denial.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-stranger 8 \
+    --timeout 30 >"$ARTIFACTS/location-stranger-auth.txt" 2>&1 &
+stranger_pid=$!
+prompt_shown=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-prompt.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if jq -e 'any(.[]; .showing and (.name | contains("to access your location?")))' \
+        "$ARTIFACTS/a11y-location-prompt.json" >/dev/null; then prompt_shown=1; break; fi
+    sleep 1
+done
+[ -n "$prompt_shown" ] || { kill "$stranger_pid" 2>/dev/null; fail G-QS-LOCATION "first-use request did not surface a consent prompt"; }
+scrot "$ARTIFACTS/16g-location-prompt.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-deny.json" 20 \
+    --press "Deny location access" >/dev/null ||
+    { kill "$stranger_pid" 2>/dev/null; fail G-QS-LOCATION "could not press Deny on the consent prompt"; }
+wait "$stranger_pid"
+auth=$(cat "$ARTIFACTS/location-stranger-auth.txt")
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION "denied first-use answered $auth, not (false, 0)"
+# Allowing a different newcomer grants at the request (and saves it:
+# asking again answers from the store without a prompt).
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-newcomer 8 \
+    --timeout 30 >"$ARTIFACTS/location-newcomer-auth.txt" 2>&1 &
+newcomer_pid=$!
+prompt_shown=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-prompt-allow.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if jq -e 'any(.[]; .showing and (.name | contains("to access your location?")))' \
+        "$ARTIFACTS/a11y-location-prompt-allow.json" >/dev/null; then prompt_shown=1; break; fi
+    sleep 1
+done
+[ -n "$prompt_shown" ] || { kill "$newcomer_pid" 2>/dev/null; fail G-QS-LOCATION "newcomer request did not surface a consent prompt"; }
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-allow.json" 20 \
+    --press "Allow location access" >/dev/null ||
+    { kill "$newcomer_pid" 2>/dev/null; fail G-QS-LOCATION "could not press Allow on the consent prompt"; }
+wait "$newcomer_pid"
+auth=$(cat "$ARTIFACTS/location-newcomer-auth.txt")
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION "allowed first-use answered $auth, not (true, 8)"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
-    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-stranger 8 2>&1) ||
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-newcomer 8 2>&1) ||
     fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
-    fail G-QS-LOCATION "unlisted app answered $auth, not denied"
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION "saved newcomer grant answered $auth, not (true, 8)"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp no-such-app-xyz 8 2>&1) ||
@@ -3491,7 +3559,7 @@ gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 
     fail G-QS-LOCATION "could not clear GeoClue InUse"
 gsettings set org.gnome.system.location enabled true ||
     fail G-QS-LOCATION "could not switch location back on"
-pass G-QS-LOCATION "the agent registers, InUse lights the panel, and AuthorizeApp answers from the store under the switch and ceiling"
+pass G-QS-LOCATION "the agent registers, InUse lights the panel, AuthorizeApp answers from the store under the switch and ceiling, and first use prompts with deny/allow flowing through"
 
 # Without GeoClue the indicator hides while the switch keeps gating
 # grants and unknown apps stay denied.
