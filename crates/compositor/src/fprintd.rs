@@ -705,15 +705,17 @@ fn join_bounded(
     worker: std::thread::JoinHandle<()>,
     budget: Duration,
 ) -> Option<std::thread::Result<()>> {
-    let end = Instant::now().checked_add(budget);
+    // An unrepresentable end is an unbounded wait: never join — fail
+    // closed at once (the handle detaches here, the caller quarantines).
+    let Some(end) = Instant::now().checked_add(budget) else {
+        return None;
+    };
     loop {
         if worker.is_finished() {
             return Some(worker.join());
         }
-        if let Some(end) = end {
-            if Instant::now() >= end {
-                return None;
-            }
+        if Instant::now() >= end {
+            return None;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -816,14 +818,19 @@ impl Drop for ShutdownFirst {
     }
 }
 
-/// Everything the worker thread owns, as one container. Moves into the
-/// worker closure; on spawn failure the container drops with the
-/// unstarted closure — [`ShutdownFirst`] shuts the socket down BEFORE
-/// the captured connection drops (field order) — and the parent's
-/// factored spawn-failure handler then shuts its own retained clone
-/// down and releases. Nothing is ever recovered out of a failed spawn.
-/// (`WorkerKit` itself has no `Drop`, so the running worker can move
-/// its fields out and disarm the guard.)
+/// Everything the worker thread owns, as one container. Moves whole
+/// into the worker closure (`move || WorkerKit::run(kit)`); [`run`](WorkerKit::run)
+/// keeps it INTACT across panic/verify — never destructured into
+/// locals, whose reverse-order drops would release the captured
+/// connection before the guard — so every unwind path drops whole-kit
+/// field order: [`ShutdownFirst`] (field 0) shuts the socket down
+/// BEFORE the captured connection drops. On spawn failure the
+/// unstarted closure drops the kit the same way, and the parent's
+/// factored handler then shuts its own retained clone down and
+/// releases only on observed shutdown+EOF. Nothing is ever recovered
+/// out of a failed spawn. (`WorkerKit` itself has no `Drop`; fields
+/// move out only inside `run`, at explicit retirement after
+/// `verify_inner` returns.)
 struct WorkerKit {
     shutdown_guard: ShutdownFirst,
     attempt: Fprintd,
@@ -831,6 +838,48 @@ struct WorkerKit {
     deadline: Instant,
     outcome_tx: mpsc::Sender<VerifyOutcome>,
     completion_tx: mpsc::Sender<()>,
+}
+
+impl WorkerKit {
+    /// The worker body. Runs with the kit INTACT — the guard stays
+    /// armed inside the whole container through `verify_inner`, and
+    /// disarms only at explicit retirement below. Any unwind before
+    /// that (including the synthetic test panic) drops whole-kit field
+    /// order: shutdown first, connection second. Post-disarm steps
+    /// cannot unwind back into an unguarded connection drop: they are
+    /// infallible syscalls, an ignored close result, plain drops, and
+    /// ignored send results.
+    fn run(kit: Self) {
+        #[cfg(test)]
+        if TEST_PANIC_IN_WORKER.load(Ordering::Acquire) {
+            // Fires with the kit whole and the guard armed: the
+            // unwinding kit shuts down before its connection drops.
+            panic!("synthetic worker panic (test injection)");
+        }
+        let outcome = kit.attempt.verify_inner(&kit.user, kit.deadline);
+        // Started and verified: disarm the spawn-failure guard and take
+        // the shutdown socket — explicit retirement owns it from here.
+        let worker_shutdown = kit.shutdown_guard.disarm();
+        // Explicit retirement, in order — never scope-drop order:
+        // cleanup was attempted inside `verify_inner`; now shut the
+        // private fd down FIRST (this bypasses the transport write lock
+        // and releases any parked send) ...
+        let _ = worker_shutdown.shutdown(std::net::Shutdown::Both);
+        // ... close the private transport (uncontended: this worker is
+        // its only sender, and its sends completed) ...
+        let _ = kit.attempt.conn.clone().close();
+        // ... drop every application/zbus attempt handle (the peer
+        // observes EOF), report (a late result finds the waiter gone
+        // and applies nowhere), and signal full exit LAST — the reaper
+        // observes the exit, joins, then verifies the shutdown. NOTE: a
+        // positive outcome sends BEFORE reaper retirement — future live
+        // adoption must enforce retirement/callback identity separately.
+        drop(kit.attempt);
+        drop(kit.user);
+        let _ = kit.outcome_tx.send(outcome);
+        drop(kit.outcome_tx);
+        let _ = kit.completion_tx.send(());
+    }
 }
 
 /// Everything the reaper thread owns, as one container. Moves into the
@@ -1013,16 +1062,25 @@ impl Fprintd {
         outcome
     }
 
-    /// Worker-spawn failure: the [`WorkerKit`] dropped with the
+    /// Worker-spawn failure: the [`WorkerKit`] dropped whole with the
     /// unstarted closure — [`ShutdownFirst`] shut the socket down
-    /// BEFORE the captured connection dropped (field order) — then
-    /// shut the parent's own retained clone down, release on the
-    /// verified no-thread condition (actual owned private fd shutdown
-    /// + handles drop), and deny. Shutdown precedes the release even
-    /// though no thread exists: uniform order, auditable retirement.
-    fn on_worker_spawn_failure(parent_shutdown: &UnixStream, guard: ClaimGuard) -> VerifyOutcome {
-        let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
-        guard.release_verified(RetirementProof::no_worker());
+    /// BEFORE the captured connection dropped (whole-kit field order).
+    /// Then shut the parent's own retained clone down and release ONLY
+    /// on the verified condition: the shutdown syscall succeeded AND
+    /// the retained observe clone reads EOF. A failed shutdown or a
+    /// live transport quarantines (safe direction) — a shutdown error
+    /// is never ignored into a release. Denies either way.
+    fn on_worker_spawn_failure(
+        parent_shutdown: &UnixStream,
+        observe: &UnixStream,
+        guard: ClaimGuard,
+    ) -> VerifyOutcome {
+        let shut = parent_shutdown.shutdown(std::net::Shutdown::Both);
+        if shut.is_ok() && shutdown_observed(observe) {
+            guard.release_verified(RetirementProof::no_worker());
+        } else {
+            guard.quarantine();
+        }
         VerifyOutcome::Error
     }
 
@@ -1208,54 +1266,21 @@ impl Fprintd {
             outcome_tx,
             completion_tx,
         };
+        // Whole-kit capture: the closure holds the kit intact (see
+        // `WorkerKit::run`) — never destructured into locals — so a
+        // spawn failure drops whole-kit field order (guard first).
         let worker = std::thread::Builder::new()
             .name("tuna-fprintd".into())
-            .spawn(move || {
-                let WorkerKit {
-                    shutdown_guard,
-                    attempt,
-                    user,
-                    deadline,
-                    outcome_tx,
-                    completion_tx,
-                } = kit;
-                #[cfg(test)]
-                if TEST_PANIC_IN_WORKER.load(Ordering::Acquire) {
-                    // Fires BEFORE disarm: the unwinding kit keeps the
-                    // guard armed, so even the panicking worker shuts
-                    // down before its connection drops.
-                    panic!("synthetic worker panic (test injection)");
-                }
-                // Started: disarm the spawn-failure guard and take the
-                // shutdown socket — explicit retirement owns it below.
-                let worker_shutdown = shutdown_guard.disarm();
-                let outcome = attempt.verify_inner(&user, deadline);
-                // Explicit retirement, in order — never scope-drop order:
-                // cleanup was attempted inside `verify_inner`; now shut
-                // the private fd down FIRST (this bypasses the transport
-                // write lock and releases any parked send) ...
-                let _ = worker_shutdown.shutdown(std::net::Shutdown::Both);
-                // ... close the private transport (uncontended: this
-                // worker is its only sender, and its sends completed) ...
-                let _ = attempt.conn.clone().close();
-                // ... drop every application/zbus attempt handle (the
-                // peer observes EOF), report (a late result finds the
-                // waiter gone and applies nowhere), and signal full exit
-                // LAST — the reaper observes the exit, joins, then
-                // verifies the shutdown. NOTE: a positive outcome sends
-                // BEFORE reaper retirement — future live adoption must
-                // enforce retirement/callback identity separately.
-                drop(attempt);
-                drop(user);
-                let _ = outcome_tx.send(outcome);
-                drop(outcome_tx);
-                let _ = completion_tx.send(());
-            });
+            .spawn(move || WorkerKit::run(kit));
         let worker = match worker {
             Ok(handle) => handle,
-            // The kit dropped with the unstarted closure: nothing is
-            // recovered out of a failed spawn (see WorkerKit).
-            Err(_) => return Self::on_worker_spawn_failure(&parent_shutdown, guard),
+            // The kit dropped whole with the unstarted closure: nothing
+            // is recovered out of a failed spawn (see WorkerKit). The
+            // reaper never spawned either, so its observe clone is still
+            // owned here for the handler's EOF check.
+            Err(_) => {
+                return Self::on_worker_spawn_failure(&parent_shutdown, &reaper_observe, guard)
+            }
         };
         // The retained reaper owns the claim plus the worker handle from
         // here on; the parent never touches the claim again.
@@ -3140,28 +3165,82 @@ mod tests {
     }
 
     /// Worker-spawn-failure handler, directly: shuts the retained clone
-    /// down (the peer observes EOF), releases on the verified no-thread
-    /// condition, and denies. Real pthread spawn failure is not
-    /// inducible, so the handler — not the trigger — is what CI pins;
-    /// the kit-drop test below drives the full destruction order.
+    /// down (the peer observes EOF), releases ONLY on the verified
+    /// shutdown+EOF condition, and denies. Real pthread spawn failure is
+    /// not inducible, so the handler — not the trigger — is what CI
+    /// pins; the kit-drop test below drives the full destruction order.
     #[test]
     fn worker_spawn_failure_handler_shuts_down_and_releases() {
         let _serial = test_serialize_claim().lock().unwrap();
         let _watchdog = TestWatchdog::arm(120);
-        let (shutdown_end, peer_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (shutdown_end, mut peer_end) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
         peer_end
             .set_read_timeout(Some(JOIN_BUDGET))
             .expect("peer read timeout");
+        // Same-socket observe clone, as in production (the reaper's
+        // clone is still owned on the spawn-failure path).
+        let observe = shutdown_end.try_clone().expect("observe clone");
         let guard = ClaimGuard::try_claim().expect("claim free in test");
-        let outcome = Fprintd::on_worker_spawn_failure(&shutdown_end, guard);
+        let outcome = Fprintd::on_worker_spawn_failure(&shutdown_end, &observe, guard);
         assert_eq!(outcome, VerifyOutcome::Error);
         let mut byte = [0u8; 1];
         assert_eq!(
-            peer_end.recv(&mut byte),
+            peer_end.read(&mut byte),
             Ok(0),
             "peer must observe EOF after the handler shutdown"
         );
         assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
+    }
+
+    /// Worker-spawn-failure handler quarantines when the shutdown is
+    /// unobserved: the observe clone sits on a different, live,
+    /// silent transport (no EOF), so the verified condition fails and
+    /// the claim quarantines instead of releasing. Denies either way.
+    #[test]
+    fn worker_spawn_failure_handler_quarantines_when_shutdown_unobserved() {
+        let _serial = test_serialize_claim().lock().unwrap();
+        let _watchdog = TestWatchdog::arm(120);
+        let (shutdown_end, _peer_held) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
+        // A different live socket: held open and silent, so its reads
+        // never run dry — EOF stays unobserved, deterministically.
+        let (observed_end, _observed_peer) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let guard = ClaimGuard::try_claim().expect("claim free in test");
+        let outcome = Fprintd::on_worker_spawn_failure(&shutdown_end, &observed_end, guard);
+        assert_eq!(outcome, VerifyOutcome::Error);
+        assert_eq!(
+            ClaimGuard::test_state(),
+            ClaimState::Quarantined,
+            "unobserved shutdown must quarantine, never release"
+        );
+        ClaimGuard::test_reset();
+        assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
+    }
+
+    /// `join_bounded` with an unrepresentable end fails closed at once:
+    /// the parked worker is NOT joined (no unbounded wait), the handle
+    /// detaches, and the caller gets `None` immediately. The parked
+    /// thread exits on its own when its release channel drops.
+    #[test]
+    fn join_bounded_overflow_fails_closed_without_joining() {
+        let _watchdog = TestWatchdog::arm(120);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let start = Instant::now();
+        // (`thread::Result` is not `Debug`, so no `assert_eq!` here.)
+        assert!(
+            join_bounded(worker, Duration::MAX).is_none(),
+            "overflow budget must fail closed, never join"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "overflow must return at once, not after any wait"
+        );
+        drop(release_tx);
     }
 
     /// Reaper-spawn-failure handler, directly: waits the recomputed
@@ -3194,7 +3273,8 @@ mod tests {
         assert_eq!(ClaimGuard::test_state(), ClaimState::Quarantined);
         // Timeout shape: nothing answers within the recomputed
         // remainder — shutdown-only, then quarantine, bounded.
-        let (shutdown_end, peer_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (shutdown_end, mut peer_end) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
         peer_end
             .set_read_timeout(Some(JOIN_BUDGET))
             .expect("peer read timeout");
@@ -3216,7 +3296,7 @@ mod tests {
         );
         let mut byte = [0u8; 1];
         assert_eq!(
-            peer_end.recv(&mut byte),
+            peer_end.read(&mut byte),
             Ok(0),
             "peer must observe EOF after the handler shutdown"
         );
@@ -3224,59 +3304,95 @@ mod tests {
         assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
     }
 
-    /// Kit-destruction order, simulated for real: dropping an unstarted
-    /// [`WorkerKit`] shuts the socket down BEFORE the captured
-    /// connection drops (the guard is the first field — fields drop in
-    /// declaration order), all before the parent handler runs; the
-    /// handler then releases on the verified no-thread condition. The
-    /// peer observes EOF and the bus name vanishes on the drop alone
-    /// (claim untouched); the release happens only in the handler.
+    /// Closure-destruction order, for real: the ACTUAL worker spawn
+    /// closure (`move || WorkerKit::run(kit)` — whole-kit capture, never
+    /// destructured) drops unstarted over a genuinely built connection
+    /// on the RETAINED same underlying socket (production setup order:
+    /// bounded unix connect, clones retained, THEN the attempt
+    /// connection built over the original). The armed guard (field 0)
+    /// shuts the shared socket down BEFORE the captured connection
+    /// drops (whole-kit field order — a language guarantee, not handler
+    /// sequencing). An INDEPENDENT observer (a distinct bus connection —
+    /// never a proxy cloned off the dropped conn, which would pin the
+    /// name alive) sees the name vanish, and a retained same-socket
+    /// clone observes the shutdown — all BEFORE any parent handler
+    /// runs, with the claim still held. The parent handler then
+    /// releases on the verified shutdown+EOF condition.
     #[test]
     fn worker_kit_drop_shuts_down_before_parent_handler() {
         let _serial = test_serialize_claim().lock().unwrap();
         let _watchdog = TestWatchdog::arm(120);
+        TEST_PANIC_IN_WORKER.store(false, Ordering::Release);
         let bus = TestBus::spawn();
-        let conn = bus.connect();
+        // Independent observer: its own connection, so the dropped
+        // attempt's name CAN vanish from its `ListNames` poll.
+        let observer = bus.connect();
         let proxy = zbus::blocking::Proxy::new(
-            &conn,
+            &observer,
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
         )
         .expect("dbus proxy builds");
+        // Production setup order against the test bus: bounded unix
+        // connect, retain same-socket clones (guard + parent + observe),
+        // then build the attempt connection over the original socket.
+        let probe = Fprintd {
+            conn: observer.clone(),
+            bus_address: Some(bus.address.clone()),
+        };
+        let target = probe.bus_unix_target().expect("test bus is a unix target");
+        let ConnectOutcome::Connected(sock) =
+            connect_unix_deadline(&target, retire_in(Duration::from_secs(10)))
+        else {
+            panic!("test bus connect must succeed");
+        };
+        let guard_sock = sock.try_clone().expect("guard clone");
+        let parent_shutdown = sock.try_clone().expect("parent clone");
+        let observe = sock.try_clone().expect("observe clone");
+        let SetupOutcome::Built(built) =
+            build_attempt_connection(sock, DBUS_CALL_TIMEOUT, Duration::from_secs(10))
+        else {
+            panic!("attempt connection must build");
+        };
+        let conn = zbus::blocking::Connection::from(built);
         let ours = conn
             .unique_name()
             .expect("connection has a unique name")
             .as_str()
             .to_owned();
-        let (shutdown_end, peer_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        peer_end
-            .set_read_timeout(Some(JOIN_BUDGET))
-            .expect("peer read timeout");
+        let names: Vec<String> = proxy
+            .call::<_, _, Vec<String>>("ListNames", &())
+            .expect("ListNames answers");
+        assert!(
+            names.iter().any(|listed| listed == &ours),
+            "attempt connection genuinely on the bus before destruction"
+        );
         let (outcome_tx, _outcome_rx) = mpsc::channel::<VerifyOutcome>();
         let (completion_tx, _completion_rx) = mpsc::channel::<()>();
         let guard = ClaimGuard::try_claim().expect("claim free in test");
         let kit = WorkerKit {
-            shutdown_guard: ShutdownFirst::arm(shutdown_end),
+            shutdown_guard: ShutdownFirst::arm(guard_sock),
             attempt: Fprintd {
                 conn,
-                bus_address: None,
+                bus_address: Some(bus.address.clone()),
             },
             user: "ada".to_owned(),
             deadline: retire_in(Duration::from_secs(5)),
             outcome_tx,
             completion_tx,
         };
-        // The unstarted-spawn shape: the kit drops whole.
-        drop(kit);
-        // Kit destruction effects, BEFORE the parent handler: the peer
-        // observes EOF (guard shutdown) and the bus name vanishes
-        // (connection drop) — with the claim still held.
-        let mut byte = [0u8; 1];
-        assert_eq!(
-            peer_end.recv(&mut byte),
-            Ok(0),
-            "kit drop must shut the socket down first"
+        // The unstarted-spawn shape: the ACTUAL spawn closure value
+        // drops whole, never invoked — no parent handler has run.
+        let closure = move || WorkerKit::run(kit);
+        drop(closure);
+        // Destruction effects, BEFORE the parent handler: our side sees
+        // the shutdown on the retained same-socket clone (the production
+        // predicate), and the INDEPENDENT observer sees the name leave
+        // the bus (the daemon-side effect) — with the claim still held.
+        assert!(
+            shutdown_observed(&observe),
+            "kit drop must shut the shared socket down first"
         );
         let deadline = Instant::now() + JOIN_BUDGET;
         loop {
@@ -3297,10 +3413,9 @@ mod tests {
             ClaimState::Held,
             "kit destruction never touches the claim"
         );
-        // ... then the parent handler (with its own retained clone, as
-        // in production) releases on the verified condition.
-        let (parent_shutdown, _) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        let outcome = Fprintd::on_worker_spawn_failure(&parent_shutdown, guard);
+        // ... then the parent handler (retained clones, as in
+        // production) releases on the verified shutdown+EOF condition.
+        let outcome = Fprintd::on_worker_spawn_failure(&parent_shutdown, &observe, guard);
         assert_eq!(outcome, VerifyOutcome::Error);
         assert_eq!(ClaimGuard::test_state(), ClaimState::Free);
     }
@@ -3533,8 +3648,12 @@ mod tests {
         let _watchdog = TestWatchdog::arm(120);
         let bus = TestBus::spawn();
         let conn = bus.connect();
+        // Independent observer: its own connection, so the retired
+        // connection's name CAN vanish (a proxy cloned off `conn`
+        // would pin the name on the bus past the drop).
+        let observer = bus.connect();
         let proxy = zbus::blocking::Proxy::new(
-            &conn,
+            &observer,
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
@@ -3552,7 +3671,8 @@ mod tests {
             names.iter().any(|listed| listed == &ours),
             "test connection is on the bus"
         );
-        let (shutdown_end, peer_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (shutdown_end, mut peer_end) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
         peer_end
             .set_read_timeout(Some(JOIN_BUDGET))
             .expect("peer read timeout");
@@ -3562,7 +3682,7 @@ mod tests {
         // The fd went down first: the peer reads EOF, not a hang.
         let mut byte = [0u8; 1];
         assert_eq!(
-            peer_end.recv(&mut byte),
+            peer_end.read(&mut byte),
             Ok(0),
             "peer must observe EOF after the shutdown"
         );
