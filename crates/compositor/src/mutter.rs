@@ -43,6 +43,9 @@ pub struct OutputSnapshot {
     pub y: i32,
     pub scale: f64,
     pub primary: bool,
+    /// `wl_output.transform` from sensor-driven orientation (#345):
+    /// the builtin panel's applied orientation, 0 elsewhere.
+    pub transform: u32,
 }
 
 /// The runtime keeps this current; D-Bus calls read it.
@@ -142,6 +145,11 @@ pub enum ToLoop {
     ApplyMonitors {
         configs: Vec<crate::monitors::MonitorConfig>,
         persistent: bool,
+    },
+    /// The accelerometer reports a new orientation (#345); the loop
+    /// gates it on the touchscreen orientation lock.
+    SensorOrientation {
+        orientation: crate::touchscreen::Orientation,
     },
 }
 
@@ -274,7 +282,9 @@ struct LogicalMonitor {
 }
 
 /// GNOME's built-in panel test (Mutter's), for "Built-in display".
-fn is_laptop_panel(connector: &str) -> bool {
+/// Shared with the runtime, which reports sensor-driven orientation
+/// on the builtin panel only (#345).
+pub(crate) fn is_laptop_panel(connector: &str) -> bool {
     ["eDP-", "LVDS-", "DSI-"]
         .iter()
         .any(|p| connector.starts_with(p))
@@ -353,7 +363,7 @@ impl DisplayConfig {
                 x: o.x,
                 y: o.y,
                 scale: o.scale,
-                transform: 0,
+                transform: o.transform,
                 is_primary: o.primary,
                 monitors: vec![names],
                 properties: HashMap::new(),
@@ -410,9 +420,13 @@ impl DisplayConfig {
         0
     }
 
+    /// Sensor-driven orientation is managed (#345): the accelerometer
+    /// flows through the touchscreen orientation lock to the builtin
+    /// panel's reported transform. Physical output rotation rendering
+    /// remains open.
     #[zbus(property)]
     fn panel_orientation_managed(&self) -> bool {
-        false
+        true
     }
 
     #[zbus(property)]
@@ -437,6 +451,8 @@ fn validate(
         if logical.monitors.len() > 1 {
             return Err(fdo::Error::Failed("mirroring is not supported yet".into()));
         }
+        // Manual rotation through Settings stays #340's: sensor-driven
+        // orientation (#345) flows through OrientationState, not here.
         if logical.transform != 0 {
             return Err(fdo::Error::Failed("rotation is not supported yet".into()));
         }
@@ -934,8 +950,29 @@ pub fn start(
             // Revoke on lock, unique-name disconnect or loss of the trusted
             // service identity. 100ms admission scan plus one compositor tick
             // bounds stream teardown; frames additionally fail closed on lock.
+            let mut sensor_claimed = false;
+            let mut sensor_last: Option<crate::touchscreen::Orientation> = None;
+            let mut sensor_ticks: u32 = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
+                // Sensor-driven orientation (#345): poll the
+                // accelerometer at ~2 s; every change reaches the loop,
+                // which gates it on the orientation lock. No sensor
+                // (or no bus) simply never sends.
+                sensor_ticks = sensor_ticks.wrapping_add(1);
+                if sensor_ticks % 20 == 0 {
+                    if !sensor_claimed {
+                        sensor_claimed = crate::touchscreen::sensor::claim(&conn);
+                    }
+                    if sensor_claimed {
+                        if let Some(orientation) = crate::touchscreen::sensor::read(&conn) {
+                            if Some(orientation) != sensor_last {
+                                sensor_last = Some(orientation);
+                                let _ = to_loop.send(ToLoop::SensorOrientation { orientation });
+                            }
+                        }
+                    }
+                }
                 let remote_snapshot = remote.lock().map(|s| s.clone()).unwrap_or_default();
                 for (remote_id, grant) in remote_snapshot {
                     let alive = zbus::block_on(authority.owner_alive(conn.inner(), &grant.owner));
@@ -1006,6 +1043,7 @@ mod tests {
             y: 0,
             scale: 1.0,
             primary: true,
+            transform: 0,
         }
     }
 

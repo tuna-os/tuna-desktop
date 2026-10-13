@@ -1895,8 +1895,9 @@ fn build(app: &adw::Application) {
         }
     }
 
-    // GNOME's input settings (#60): keymap, repeat, touchpad, mouse and
-    // hot corner, sent now and on every change.
+    // GNOME's input settings (#60): keymap, repeat, touchpad, mouse,
+    // touchscreen output mapping and orientation lock (#345) and hot
+    // corner, sent now and on every change.
     {
         let schemas = [
             "org.gnome.desktop.input-sources",
@@ -1905,6 +1906,7 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.peripherals.mouse",
             INTERFACE_SCHEMA,
             A11Y_INTERFACE_SCHEMA,
+            "org.gnome.desktop.peripherals.touchscreen",
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -1940,6 +1942,15 @@ fn build(app: &adw::Application) {
                     out.mouse_natural_scroll = mouse.boolean("natural-scroll");
                     out.mouse_speed_milli = (mouse.double("speed") * 1000.0).round() as i32;
                     out.mouse_left_handed = mouse.boolean("left-handed");
+                }
+                if let Some(touchscreen) = all[6].as_ref() {
+                    let output: Vec<String> = touchscreen
+                        .strv("output")
+                        .iter()
+                        .map(|o| o.to_string())
+                        .collect();
+                    out.touchscreen_output = logic::touchscreen_output(&output);
+                    out.touchscreen_orientation_lock = touchscreen.boolean("orientation-lock");
                 }
                 out.touchpad_left_handed = logic::touchpad_left_handed(
                     all[2]

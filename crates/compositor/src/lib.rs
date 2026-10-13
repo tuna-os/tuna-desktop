@@ -97,6 +97,8 @@ mod x11_icons;
 #[cfg(feature = "xwayland")]
 pub mod x11_interop;
 pub mod xwayland;
+// Touchscreen input last: appended for #345 without reordering siblings.
+pub mod touchscreen;
 
 /// One compositor-tracked output: protocol handle plus geometry.
 /// The first entry is the primary output; single-output sessions hold

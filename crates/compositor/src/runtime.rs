@@ -592,6 +592,8 @@ pub struct Runtime {
     scale: f64,
     /// GNOME's input settings as last applied (#60).
     input_settings: tuna_shell_control::InputSettings,
+    /// Sensor-driven orientation with the touchscreen lock (#345).
+    orientation: crate::touchscreen::OrientationState,
     /// PipeWire, connected on the first screen cast (#61).
     pipewire: Option<crate::screencast::PipeWire>,
     /// Running screen casts.
@@ -993,6 +995,7 @@ impl Runtime {
             animation_clock: crate::animation_clock::AnimationClock::real(),
             scale: clamp_scale(session.scale),
             input_settings: Default::default(),
+            orientation: Default::default(),
             orca: crate::orca::Reader::new(&session.socket_name),
             pipewire: None,
             casts: Vec::new(),
@@ -2787,6 +2790,9 @@ impl Runtime {
                     }
                 }
             }
+            crate::mutter::ToLoop::SensorOrientation { orientation } => {
+                self.orientation.on_sensor(orientation);
+            }
         }
     }
 
@@ -2850,10 +2856,13 @@ impl Runtime {
     }
 
     /// Apply GNOME's input settings (#60): the seat's keymap and key
-    /// repeat, libinput pointer devices (hardware), the hot corner.
+    /// repeat, libinput pointer devices (hardware), touchscreen output
+    /// mapping and orientation lock (#345), the hot corner.
     fn apply_input_settings(&mut self, settings: tuna_shell_control::InputSettings) {
         self.manager
             .apply_keyboard_settings(&mut self.state, &settings);
+        self.orientation
+            .set_locked(settings.touchscreen_orientation_lock);
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
         // Introspect's AnimationsEnabled is GNOME's enable-animations
@@ -2963,12 +2972,20 @@ impl Runtime {
     fn publish_cast_outputs(&self) {
         self.introspect
             .publish_screen_size(self.state.desktop_size());
+        let applied = self.orientation.applied().transform();
         let snapshot: Vec<crate::mutter::OutputSnapshot> = self
             .state
             .output_entries()
             .into_iter()
             .filter_map(|(name, output, loc, primary)| {
                 let mode = output.current_mode()?;
+                // Sensor-driven orientation (#345) manages the builtin
+                // panel only, as in Mutter; external outputs stay put.
+                let transform = if crate::mutter::is_laptop_panel(&name) {
+                    applied
+                } else {
+                    0
+                };
                 Some(crate::mutter::OutputSnapshot {
                     connector: name,
                     make: output.physical_properties().make,
@@ -2980,6 +2997,7 @@ impl Runtime {
                     y: loc.1,
                     scale: output.current_scale().fractional_scale(),
                     primary,
+                    transform,
                 })
             })
             .collect();
@@ -4884,7 +4902,8 @@ fn input_time(input: &ManagerInput) -> u64 {
         | ManagerInput::Axis { time, .. }
         | ManagerInput::SwipeBegin { time, .. }
         | ManagerInput::SwipeUpdate { time, .. }
-        | ManagerInput::SwipeEnd { time, .. } => u64::from(time),
+        | ManagerInput::SwipeEnd { time, .. }
+        | ManagerInput::Touch { time, .. } => u64::from(time),
         ManagerInput::RelativeMotion { utime, .. } => utime / 1000,
     }
 }

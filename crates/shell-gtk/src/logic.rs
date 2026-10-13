@@ -890,6 +890,13 @@ pub fn xkb_from_sources(sources: &[(String, String)]) -> (String, String) {
     (layouts.join(","), variants)
 }
 
+/// Touchscreen output triple (`org.gnome.desktop.peripherals.touchscreen
+/// output`): the first three EDID strings; short reads pad with empty
+/// (automatic mapping).
+pub fn touchscreen_output(parts: &[String]) -> [String; 3] {
+    [0, 1, 2].map(|i| parts.get(i).cloned().unwrap_or_default())
+}
+
 #[cfg(test)]
 mod input_tests {
     use super::*;
@@ -921,6 +928,23 @@ mod input_tests {
         assert_eq!(
             xkb_from_sources(&[src("ibus", "anthy"), src("xkb", "fr+bepo")]),
             ("fr".into(), "bepo".into())
+        );
+    }
+
+    #[test]
+    fn touchscreen_output_pads_short_reads_with_automatic_mapping() {
+        let s = |v: &str| v.to_owned();
+        assert_eq!(
+            touchscreen_output(&[]),
+            [String::new(), String::new(), String::new()]
+        );
+        assert_eq!(
+            touchscreen_output(&[s("GSM"), s("5b09")]),
+            [s("GSM"), s("5b09"), String::new()]
+        );
+        assert_eq!(
+            touchscreen_output(&[s("GSM"), s("5b09"), s("31337"), s("extra")]),
+            [s("GSM"), s("5b09"), s("31337")]
         );
     }
 }

@@ -28,7 +28,10 @@ use smithay::backend::drm::{
     GbmBufferedSurface,
 };
 use smithay::backend::egl::{EGLContext, EGLDisplay};
-use smithay::backend::input::{Event, InputEvent, KeyState, KeyboardKeyEvent, PointerMotionEvent};
+use smithay::backend::input::{
+    AbsolutePositionEvent, Event, InputEvent, KeyState, KeyboardKeyEvent, PointerMotionEvent,
+    TouchEvent,
+};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
@@ -40,7 +43,8 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 
-use crate::windows::ManagerInput;
+use crate::touchscreen::TouchscreenConfig;
+use crate::windows::{ManagerInput, TouchPhase};
 
 /// Scanout surface type: GBM buffers on the DRM device, each queued
 /// frame carrying the presentation feedback of what it drew (#89).
@@ -130,6 +134,9 @@ pub struct DrmBackend {
     /// libinput devices, for GNOME's touchpad and mouse settings (#60).
     devices: Vec<smithay::reexports::input::Device>,
     input_settings: tuna_shell_control::InputSettings,
+    /// Touchscreen output mapping (#345): the manager receives contacts
+    /// already placed onto the selected output.
+    touchscreen: TouchscreenConfig,
 }
 
 /// Event sources the runtime installs on its loop.
@@ -405,6 +412,7 @@ impl DrmBackend {
                 alt: false,
                 devices: Vec::new(),
                 input_settings: Default::default(),
+                touchscreen: TouchscreenConfig::default(),
                 corner_pressure: Default::default(),
                 hot_corner_active: true,
                 relative_motion_events: 0,
@@ -634,6 +642,50 @@ impl DrmBackend {
                 self.devices.retain(|d| *d != device);
                 Vec::new()
             }
+            // Touchscreens (#345): place the contact onto the mapped
+            // output, then emulate and deliver to touch clients.
+            // Releases carry no position and fall through below.
+            InputEvent::TouchDown { event } => {
+                let time = (event.time() / 1000) as u32;
+                let target = self.touch_target();
+                let pos = crate::touchscreen::map_onto(
+                    target,
+                    event.x_transformed(target.size.w),
+                    event.y_transformed(target.size.h),
+                );
+                self.corner_pressure.observe_position(pos);
+                self.pointer = pos;
+                let mut inputs = crate::windows::touch_press((pos.x, pos.y), time)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                inputs.push(ManagerInput::Touch {
+                    slot: i32::from(event.slot()),
+                    phase: TouchPhase::Down,
+                    pos,
+                    time,
+                });
+                inputs
+            }
+            InputEvent::TouchMotion { event } => {
+                let time = (event.time() / 1000) as u32;
+                let target = self.touch_target();
+                let pos = crate::touchscreen::map_onto(
+                    target,
+                    event.x_transformed(target.size.w),
+                    event.y_transformed(target.size.h),
+                );
+                self.corner_pressure.observe_position(pos);
+                self.pointer = pos;
+                vec![
+                    ManagerInput::Motion { pos, time },
+                    ManagerInput::Touch {
+                        slot: i32::from(event.slot()),
+                        phase: TouchPhase::Motion,
+                        pos,
+                        time,
+                    },
+                ]
+            }
             // Touchpad swipes (#60): three fingers are the shell's.
             InputEvent::GestureSwipeBegin { event } => {
                 use smithay::backend::input::GestureBeginEvent;
@@ -690,6 +742,28 @@ impl DrmBackend {
         }
     }
 
+    /// The output rectangle touch contacts map onto (#345): the
+    /// configured touchscreen output, else the primary (outputs are
+    /// primary-first). Without lit outputs the primary size stands in,
+    /// as `translate_input` does.
+    fn touch_target(&self) -> Rectangle<i32, Logical> {
+        let outputs: Vec<(String, Rectangle<i32, Logical>, bool)> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, o)| {
+                let (w, h) = o.logical_size();
+                (
+                    o.name.clone(),
+                    Rectangle::new(o.loc.into(), (w, h).into()),
+                    index == 0,
+                )
+            })
+            .collect();
+        crate::touchscreen::select_output(&outputs, &self.touchscreen)
+            .unwrap_or_else(|| Rectangle::new((0, 0).into(), self.primary_size()))
+    }
+
     /// GNOME's touchpad and mouse settings on every device, now and as
     /// devices arrive (#60).
     /// Count native relative delivery without recording movement or input text.
@@ -711,6 +785,7 @@ impl DrmBackend {
             self.corner_pressure.reset();
         }
         self.input_settings = settings.clone();
+        self.touchscreen = TouchscreenConfig::new(settings);
         for device in &mut self.devices {
             apply_libinput(settings, device);
         }
@@ -791,7 +866,9 @@ mod wake_event_tests {
 /// One device's libinput configuration from GNOME's settings, as Mutter
 /// applies them (niri's `apply_libinput_settings` shape): touchpads get
 /// tap-to-click, natural scroll, disable-while-typing and their speed;
-/// other pointers their natural scroll and speed.
+/// other pointers their natural scroll and speed. Touchscreens take no
+/// libinput option from their keys: output mapping is compositor-side
+/// (`translate`, #345).
 fn apply_libinput(
     settings: &tuna_shell_control::InputSettings,
     device: &mut smithay::reexports::input::Device,

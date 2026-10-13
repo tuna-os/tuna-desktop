@@ -22,12 +22,16 @@ use smithay::xwayland::{xwm::WmWindowType, X11Surface};
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, ButtonState, Event as BackendEvent, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, TouchEvent, TouchSlot,
     },
     desktop::{Window, WindowSurface},
     input::{
         keyboard::{FilterResult, KeyboardHandle, ModifiersState, XkbConfig},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle},
+        touch::{
+            DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, TouchHandle,
+            UpEvent as TouchUpEvent,
+        },
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::IsAlive,
@@ -232,6 +236,7 @@ pub struct WindowManager {
     cascade: i32,
     keyboard: Option<KeyboardHandle<State>>,
     pointer: Option<PointerHandle<State>>,
+    touch: Option<TouchHandle<State>>,
     pointer_pos: Point<f64, Logical>,
     /// org.gnome.Shell accelerator grabs (GrabAccelerators).
     accelerators: Vec<tuna_shell_control::Accelerator>,
@@ -325,12 +330,13 @@ impl WindowManager {
         self.pointer_pos
     }
 
-    /// Empty manager; attaches keyboard and pointer capabilities to the
-    /// state's seat and keeps their handles for input routing.
+    /// Empty manager; attaches keyboard, pointer and touch capabilities
+    /// to the state's seat and keeps their handles for input routing.
     pub fn new(state: &mut State) -> Self {
         let seat = state.seat_mut();
         let keyboard = seat.add_keyboard(XkbConfig::default(), 200, 200).ok();
         let pointer = Some(seat.add_pointer());
+        let touch = Some(seat.add_touch());
         Self {
             model: StateModel::new(),
             windows: HashMap::new(),
@@ -341,6 +347,7 @@ impl WindowManager {
             cascade: 0,
             keyboard,
             pointer,
+            touch,
             pointer_pos: (0.0, 0.0).into(),
             accelerators: Vec::new(),
             accel_held: Vec::new(),
@@ -2260,6 +2267,93 @@ impl WindowManager {
         pointer.frame(state);
     }
 
+    /// Touchscreen contact: deliver to the `wl_touch` client under the
+    /// contact (#345). Targeting mirrors pointer motion (popup, then
+    /// layer, then the modal-filtered window); motion never retargets,
+    /// the contact's focus is set on down. Pointer emulation is a
+    /// separate input pair and is not repeated here.
+    pub fn touch_event(
+        &mut self,
+        state: &mut State,
+        slot: i32,
+        phase: TouchPhase,
+        pos: Point<f64, Logical>,
+        time: u32,
+    ) {
+        let Some(touch) = self.touch.clone() else {
+            return;
+        };
+        let slot = TouchSlot::from(if slot < 0 { None } else { Some(slot as u32) });
+        match phase {
+            TouchPhase::Up | TouchPhase::Cancel => {
+                // Smithay 0.7 only cancels unframed pending downs (the
+                // gesture-takeover case): cancelling a framed contact
+                // sends nothing and would strand the client's touch
+                // point, so a voided contact lifts instead. The
+                // emulated release travels separately either way.
+                touch.up(
+                    state,
+                    &TouchUpEvent {
+                        slot,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time,
+                    },
+                );
+                touch.frame(state);
+                return;
+            }
+            TouchPhase::Down | TouchPhase::Motion => {}
+        }
+        // Focus point is the surface origin: smithay reports
+        // surface-local coordinates as event minus focus.
+        let focus = if self.overview_open {
+            None
+        } else if let Some(popup) = self.popup_at(state, pos) {
+            Some((popup.surface, popup.origin.to_f64()))
+        } else if let Some((surface, (ox, oy))) =
+            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
+        {
+            Some((surface, (ox as f64, oy as f64).into()))
+        } else {
+            self.window_at(pos)
+                .filter(|id| self.modal_target(*id) == *id)
+                .and_then(|id| self.windows.get(&id))
+                .and_then(|window| {
+                    let surface = window.surface.wl_surface()?.into_owned();
+                    let origin = crate::popup::surface_origin(&surface, window.geometry.loc);
+                    Some((surface, (origin.x as f64, origin.y as f64).into()))
+                })
+        };
+        match phase {
+            TouchPhase::Down => {
+                touch.down(
+                    state,
+                    focus,
+                    &TouchDownEvent {
+                        slot,
+                        location: pos,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time,
+                    },
+                );
+                touch.frame(state);
+            }
+            TouchPhase::Motion => {
+                touch.motion(
+                    state,
+                    focus,
+                    &TouchMotionEvent {
+                        slot,
+                        location: pos,
+                        time,
+                    },
+                );
+                touch.frame(state);
+            }
+            TouchPhase::Up | TouchPhase::Cancel => {}
+        }
+    }
+
     /// Route one input event to the session-lock surface and nothing
     /// else (ext-session-lock-v1): keys go to it with keyboard focus
     /// held there, the pointer acts on it at the output origin, and no
@@ -2329,6 +2423,26 @@ impl WindowManager {
                 vertical,
                 time,
             } => self.pointer_axis(state, horizontal, vertical, time),
+            ManagerInput::Touch {
+                phase, pos, time, ..
+            } => {
+                // The lock screen hears touch as pointer motion and
+                // clicks (#345): re-enter as the emulated inputs. Touch
+                // protocol events stay session-side.
+                match phase {
+                    TouchPhase::Down => {
+                        for input in touch_press((pos.x, pos.y), time) {
+                            self.lock_input(state, surface, input);
+                        }
+                    }
+                    TouchPhase::Motion => {
+                        self.lock_input(state, surface, ManagerInput::Motion { pos, time });
+                    }
+                    TouchPhase::Up | TouchPhase::Cancel => {
+                        self.lock_input(state, surface, touch_release(time));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -3659,6 +3773,33 @@ pub enum ManagerInput {
         cancelled: bool,
         time: u32,
     },
+    /// Touchscreen contact (#345): already mapped onto its output by
+    /// the backend. The manager delivers it to the `wl_touch` client
+    /// under the contact; pointer emulation travels as its own
+    /// `Motion`/`Button` inputs alongside, as in Mutter.
+    Touch {
+        /// Multi-touch slot (`-1` when the backend reports none).
+        slot: i32,
+        phase: TouchPhase,
+        /// Contact position in global logical pixels.
+        pos: Point<f64, Logical>,
+        time: u32,
+    },
+}
+
+/// One phase of a touchscreen contact's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    /// A new contact: press emulation precedes this in the input stream.
+    Down,
+    /// An established contact moved.
+    Motion,
+    /// The contact lifted: release emulation follows in the stream.
+    Up,
+    /// The contact was cancelled: release emulation follows too, so no
+    /// emulated press sticks down, and the protocol delivery lifts the
+    /// contact (Smithay 0.7 cannot cancel a framed touch point).
+    Cancel,
 }
 
 /// What a finished three-finger touchpad swipe does (GNOME 51).
@@ -3960,7 +4101,8 @@ impl TriggerState {
             ManagerInput::RelativeMotion { .. }
             | ManagerInput::SwipeBegin { .. }
             | ManagerInput::SwipeUpdate { .. }
-            | ManagerInput::SwipeEnd { .. } => TriggerAction::None,
+            | ManagerInput::SwipeEnd { .. }
+            | ManagerInput::Touch { .. } => TriggerAction::None,
         }
     }
 }
@@ -4222,6 +4364,12 @@ impl WindowManager {
                 pressed,
                 time,
             } => self.pointer_button(state, button, pressed, time),
+            ManagerInput::Touch {
+                slot,
+                phase,
+                pos,
+                time,
+            } => self.touch_event(state, slot, phase, pos, time),
             ManagerInput::Axis {
                 horizontal,
                 vertical,
@@ -4865,7 +5013,9 @@ const TOUCH_BUTTON: u32 = 0x110;
 /// Motion must precede the press because press handlers act at the last
 /// motion position, not at any position the button event carries.
 /// Pure so unit tests pin the pairing without backend event types.
-fn touch_press(pos: (f64, f64), time: u32) -> [ManagerInput; 2] {
+/// Shared with the hardware backend, which maps the contact onto its
+/// output before emulating (#345).
+pub(crate) fn touch_press(pos: (f64, f64), time: u32) -> [ManagerInput; 2] {
     [
         ManagerInput::Motion {
             pos: pos.into(),
@@ -4882,7 +5032,7 @@ fn touch_press(pos: (f64, f64), time: u32) -> [ManagerInput; 2] {
 /// End of one touch contact: release the synthesized press so no
 /// button sticks down. Cancel releases too: a cancelled contact must
 /// never leave a press behind either.
-fn touch_release(time: u32) -> ManagerInput {
+pub(crate) fn touch_release(time: u32) -> ManagerInput {
     ManagerInput::Button {
         button: TOUCH_BUTTON,
         pressed: false,
@@ -4901,8 +5051,10 @@ pub fn is_v120_wheel(amount: f64) -> bool {
 /// Translate one backend event into manager inputs. Touch contacts
 /// emulate a left-button pointer (down moves then presses, motion
 /// moves, up/cancel releases) so touchscreens act instead of dropping
-/// silently. Multi-touch overlaps may interleave presses — there is no
-/// per-slot tracking here — but every release still balances.
+/// silently, and each contact also travels as a `Touch` protocol input
+/// for `wl_touch` clients (#345). Multi-touch overlaps may interleave
+/// presses — there is no per-slot tracking here — but every release
+/// still balances.
 ///
 /// Generic over the backend (nested winit or hardware libinput): every
 /// backend reports XKB keycodes (evdev + 8) and absolute positions are
@@ -4950,17 +5102,58 @@ pub fn translate_input<B: InputBackend>(
         }
         InputEvent::TouchDown { event } => {
             let pos = event.position_transformed(area);
-            touch_press((pos.x, pos.y), (event.time() / 1000) as u32).into()
+            let time = (event.time() / 1000) as u32;
+            let mut inputs = touch_press((pos.x, pos.y), time)
+                .into_iter()
+                .collect::<Vec<_>>();
+            inputs.push(ManagerInput::Touch {
+                slot: i32::from(event.slot()),
+                phase: TouchPhase::Down,
+                pos: (pos.x, pos.y).into(),
+                time,
+            });
+            inputs
         }
         InputEvent::TouchMotion { event } => {
             let pos = event.position_transformed(area);
-            vec![ManagerInput::Motion {
-                pos: (pos.x, pos.y).into(),
-                time: (event.time() / 1000) as u32,
-            }]
+            let time = (event.time() / 1000) as u32;
+            vec![
+                ManagerInput::Motion {
+                    pos: (pos.x, pos.y).into(),
+                    time,
+                },
+                ManagerInput::Touch {
+                    slot: i32::from(event.slot()),
+                    phase: TouchPhase::Motion,
+                    pos: (pos.x, pos.y).into(),
+                    time,
+                },
+            ]
         }
-        InputEvent::TouchUp { event } => vec![touch_release((event.time() / 1000) as u32)],
-        InputEvent::TouchCancel { event } => vec![touch_release((event.time() / 1000) as u32)],
+        InputEvent::TouchUp { event } => {
+            let time = (event.time() / 1000) as u32;
+            vec![
+                touch_release(time),
+                ManagerInput::Touch {
+                    slot: i32::from(event.slot()),
+                    phase: TouchPhase::Up,
+                    pos: (0.0, 0.0).into(),
+                    time,
+                },
+            ]
+        }
+        InputEvent::TouchCancel { event } => {
+            let time = (event.time() / 1000) as u32;
+            vec![
+                touch_release(time),
+                ManagerInput::Touch {
+                    slot: i32::from(event.slot()),
+                    phase: TouchPhase::Cancel,
+                    pos: (0.0, 0.0).into(),
+                    time,
+                },
+            ]
+        }
         _ => Vec::new(),
     }
 }

@@ -159,9 +159,11 @@ impl ProtocolVersion {
     /// GNOME's three-state motion policy plus its slow-down factor.
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
+    /// `0.30` appends touchscreen output mapping and orientation lock
+    /// to InputSettings. Both positional postcard peers ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 29,
+        minor: 30,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -780,6 +782,14 @@ pub struct InputSettings {
     /// GTK shell default text direction; corners and Activities follow it.
     #[serde(default)]
     pub right_to_left: bool,
+    /// Touchscreen (`org.gnome.desktop.peripherals.touchscreen`):
+    /// EDID `[vendor, product, serial]` of the output the touchscreen
+    /// maps onto; all empty means GNOME's automatic mapping.
+    #[serde(default)]
+    pub touchscreen_output: [String; 3],
+    /// Touchscreen `orientation-lock`: freeze sensor-driven orientation.
+    #[serde(default)]
+    pub touchscreen_orientation_lock: bool,
 }
 
 impl Default for InputSettings {
@@ -803,6 +813,8 @@ impl Default for InputSettings {
             mouse_left_handed: false,
             touchpad_left_handed: false,
             right_to_left: false,
+            touchscreen_output: Default::default(),
+            touchscreen_orientation_lock: false,
         }
     }
 }
@@ -1239,8 +1251,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_29() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 29));
+    fn current_version_is_0_30() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 30));
     }
 
     #[test]
@@ -1308,6 +1320,24 @@ mod tests {
     }
 
     #[test]
+    fn touchscreen_settings_survive_the_positional_control_wire() {
+        for lock in [false, true] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(InputSettings {
+                    touchscreen_output: ["GSM".to_owned(), "5b09".to_owned(), "31337".to_owned()],
+                    touchscreen_orientation_lock: lock,
+                    ..InputSettings::default()
+                }),
+            });
+        }
+        roundtrip(&Message::Command {
+            id: 2,
+            kind: CommandKind::SetInputSettings(InputSettings::default()),
+        });
+    }
+
+    #[test]
     fn version_compat_same_major_minor_not_newer() {
         let ours = ProtocolVersion::CURRENT;
         assert!(ours.is_compatible_with(&ours));
@@ -1341,7 +1371,8 @@ mod tests {
         assert!(ProtocolVersion::new(0, 27).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 28).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 29).is_compatible_with(&ours));
-        assert!(!ProtocolVersion::new(0, 30).is_compatible_with(&ours));
+        assert!(ProtocolVersion::new(0, 30).is_compatible_with(&ours));
+        assert!(!ProtocolVersion::new(0, 31).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 4).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 0).is_compatible_with(&ours));
     }
