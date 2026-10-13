@@ -4149,6 +4149,7 @@ dependencies = [
  "async-io",
  "calloop 0.14.5",
  "futures-lite",
+ "gio",
  "greetd_ipc",
  "image",
  "libc",
