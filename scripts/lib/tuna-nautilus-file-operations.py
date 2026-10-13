@@ -60,6 +60,10 @@ def removed_accessible(error):
                 error.message) is not None)
 
 
+class IncompleteTree(Exception):
+    """A None child invalidated the entire owned walk; transient readiness only."""
+
+
 def controls():
     while GLib.MainContext.default().pending():
         GLib.MainContext.default().iteration(False)
@@ -68,15 +72,25 @@ def controls():
     def walk(node):
         # A disappearing owner-tree object invalidates this entire walk. The
         # original bounded waiter may retry it, never a captured stale action.
+        # DISTINCT from the retired-object (2bc) path: a None child means the
+        # tree was transiently incomplete. Discard this entire walk; only the
+        # original budget/guard path may re-resolve, never a partial list.
+        if node is None:
+            raise IncompleteTree('transient incomplete accessibility tree: missing child')
         node.clear_cache()
         if node.getState().contains(pyatspi.STATE_SHOWING):
             result.append(node)
         for index in range(node.childCount):
-            walk(node.getChildAtIndex(index))
+            child = node.getChildAtIndex(index)
+            if child is None:
+                raise IncompleteTree('transient incomplete accessibility tree: missing child')
+            walk(child)
 
     desktop = pyatspi.Registry.getDesktop(0)
     for index in range(desktop.childCount):
         app = desktop.getChildAtIndex(index)
+        if app is None:
+            raise IncompleteTree('transient incomplete accessibility tree: missing child')
         try:
             app_pid = app.get_process_id()
         except GLib.Error as error:
@@ -111,7 +125,20 @@ def snapshot(label):
     before = focused()
     nodes = []
     disappeared = 0
-    for node in controls():
+    pending = None
+    for _ in range(3):
+        try:
+            pending = controls()
+            break
+        except IncompleteTree:
+            # Transient incomplete tree: re-validate the original owner/focus
+            # before one bounded re-resolution. Never a partial snapshot,
+            # never an action retry, never a stale reuse.
+            focused()
+            continue
+    if pending is None:
+        raise RuntimeError('Files snapshot observed transient incomplete accessibility tree')
+    for node in pending:
         try:
             nodes.append({'name': node.name, 'role': node.getRoleName(),
                           'selected': node.getState().contains(pyatspi.STATE_SELECTED),
@@ -142,6 +169,12 @@ def wait(predicate, description, *, startup=False):
             break
         try:
             accepted = predicate()
+        except IncompleteTree:
+            # DISTINCT from the retired-object (2bc) path: a None child made
+            # this walk incomplete. Explicit readiness only; the original
+            # budget/guard loop re-resolves. Never a partial positive, never
+            # an action retry, never a stale reuse, never a broad catch.
+            accepted = None
         except GLib.Error as error:
             if not removed_accessible(error):
                 raise

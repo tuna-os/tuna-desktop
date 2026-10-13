@@ -36,11 +36,16 @@ class Tests(unittest.TestCase):
         self.ns = {'re': re, 'time': self.clock, 'GLib': SimpleNamespace(Error=Error),
                    'focused': lambda: self.guards.append(1)}
         names = {'removed_accessible', 'wait', 'controls', 'cell', 'select',
-                 'owned_unlocked', 'focused', 'wait_for_initial_map'}
-        functions = [node for node in ast.parse(SOURCE.read_text()).body
+                 'owned_unlocked', 'focused', 'wait_for_initial_map', 'snapshot'}
+        classes = {'IncompleteTree'}
+        body = ast.parse(SOURCE.read_text()).body
+        functions = [node for node in body
                      if isinstance(node, ast.FunctionDef) and node.name in names]
+        defined = [node for node in body
+                   if isinstance(node, ast.ClassDef) and node.name in classes]
         self.assertEqual({node.name for node in functions}, names)
-        exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), 'exec'), self.ns)
+        self.assertEqual({node.name for node in defined}, classes)
+        exec(compile(ast.Module(body=defined + functions, type_ignores=[]), str(SOURCE), 'exec'), self.ns)
         self.actual_focused = self.ns['focused']
         self.ns['focused'] = lambda: self.guards.append(1)
 
@@ -245,6 +250,133 @@ class Tests(unittest.TestCase):
                     self.ns['controls']()
             else:
                 self.assertEqual(self.ns['controls'](), [])
+
+    def test_none_child_invalidates_entire_walk_without_partial_result(self):
+        Incomplete = self.ns['IncompleteTree']
+        self.walker(None)
+        with self.assertRaises(Incomplete):
+            self.ns['controls']()
+        self.walker(SimpleNamespace(clear_cache=lambda: None,
+                                    getState=lambda: SimpleNamespace(contains=lambda _: True),
+                                    childCount=0, getChildAtIndex=lambda _: None))
+        self.ns['pyatspi'].Registry.getDesktop = lambda _: SimpleNamespace(
+            childCount=1, getChildAtIndex=lambda _: None)
+        with self.assertRaises(Incomplete):
+            self.ns['controls']()
+        leaf = SimpleNamespace(clear_cache=lambda: None,
+                               getState=lambda: SimpleNamespace(contains=lambda _: True),
+                               childCount=0, getChildAtIndex=lambda _: None)
+        self.walker(leaf)
+        found = self.ns['controls']()
+        self.assertEqual(len(found), 2)
+
+    def test_transient_none_rewalks_to_positive_within_original_budget(self):
+        Incomplete = self.ns['IncompleteTree']
+        calls = []
+        class Node:
+            name = 'seed.txt'
+            def getRoleName(self):
+                return 'table cell'
+        def controls():
+            calls.append(1)
+            if len(calls) == 1:
+                raise Incomplete('transient incomplete accessibility tree: missing child')
+            return [Node()]
+        self.ns['controls'] = controls
+        found = self.wait(lambda: self.ns['cell']('seed.txt'))
+        self.assertEqual(found.name, 'seed.txt')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.guards), 4)
+        self.assertLess(self.clock.now, 10)
+
+    def test_persistent_none_never_admits_beyond_original_deadline(self):
+        Incomplete = self.ns['IncompleteTree']
+        calls = []
+        def predicate():
+            calls.append(1)
+            raise Incomplete('transient incomplete accessibility tree: missing child')
+        with self.assertRaisesRegex(RuntimeError, 'Files did not'):
+            self.wait(predicate)
+        self.assertEqual(self.clock.now, 10)
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(len(self.guards), 2 * len(calls))
+
+    def test_non_none_errors_propagate_without_becoming_readiness(self):
+        Incomplete = self.ns['IncompleteTree']
+        self.assertFalse(self.ns['removed_accessible'](Incomplete('x')))
+        for error in [Error('transport broken'), AttributeError('clear_cache boom'),
+                      RuntimeError('bad tree')]:
+            def predicate(err=error):
+                raise err
+            with self.assertRaises(type(error)):
+                self.wait(predicate)
+            self.walker(SimpleNamespace(
+                clear_cache=lambda err=error: (_ for _ in ()).throw(err)))
+            with self.assertRaises(type(error)):
+                self.ns['controls']()
+
+    def test_snapshot_retries_transient_none_then_captures_frame(self):
+        import json
+        import tempfile
+        Incomplete = self.ns['IncompleteTree']
+        tmp = Path(tempfile.mkdtemp())
+        calls = []
+        focus_calls = []
+        class Frame:
+            name = 'Files'
+            def getRoleName(self):
+                return 'frame'
+            def getState(self):
+                return SimpleNamespace(contains=lambda _: False)
+        def controls():
+            calls.append(1)
+            if len(calls) == 1:
+                raise Incomplete('transient incomplete accessibility tree: missing child')
+            return [Frame()]
+        def focused():
+            focus_calls.append(1)
+            return {'focused': 44}
+        scrots = []
+        self.ns.update(controls=controls, focused=focused, fixture_files=lambda: [],
+                       OUT=tmp, json=json,
+                       pyatspi=SimpleNamespace(STATE_SELECTED=2, STATE_FOCUSED=3),
+                       subprocess=SimpleNamespace(run=lambda *a, **k: scrots.append(a)))
+        self.ns['snapshot']('folder-created')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(focus_calls), 3)
+        payload = json.loads((tmp / 'nautilus-folder-created.json').read_text())
+        self.assertTrue(any(node['role'] == 'frame' for node in payload['a11y']))
+        self.assertEqual(len(scrots), 1)
+
+    def test_snapshot_persistent_none_fails_clearly_after_bounded_attempts(self):
+        import json
+        import tempfile
+        Incomplete = self.ns['IncompleteTree']
+        tmp = Path(tempfile.mkdtemp())
+        calls = []
+        def controls():
+            calls.append(1)
+            raise Incomplete('transient incomplete accessibility tree: missing child')
+        focus_calls = []
+        def focused():
+            focus_calls.append(1)
+            return {'focused': 44}
+        self.ns.update(controls=controls, focused=focused, fixture_files=lambda: [],
+                       OUT=tmp, json=json,
+                       pyatspi=SimpleNamespace(STATE_SELECTED=2, STATE_FOCUSED=3),
+                       subprocess=SimpleNamespace(run=lambda *a, **k: None))
+        with self.assertRaisesRegex(RuntimeError, 'transient incomplete accessibility tree'):
+            self.ns['snapshot']('folder-created')
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(focus_calls), 4)
+        transport_calls = []
+        def bad_controls():
+            transport_calls.append(1)
+            raise Error('transport broken')
+        self.ns['controls'] = bad_controls
+        with self.assertRaises(Error):
+            self.ns['snapshot']('folder-created')
+        self.assertEqual(len(transport_calls), 1)
 
     def test_select_reacquires_extents_before_single_input_never_replays(self):
         reads, inputs = [], []
