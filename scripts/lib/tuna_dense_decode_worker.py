@@ -13,6 +13,9 @@ MEMORY_BYTES=512*1024**2
 OUTPUT_RESERVE=20*GIB
 SAFETY_BYTES=2*GIB+128*1024**2
 QEMU_SHA='250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad'
+STAT_KEYS=('anon','file','file_dirty','file_writeback','shmem','slab','slab_reclaimable','slab_unreclaimable')
+STAT_SAMPLE_INTERVAL_SECONDS=.25
+STAT_SAMPLE_MAX=32
 
 
 def digest(path,deadline=None):
@@ -44,6 +47,29 @@ def memory(group):
  return {'current_bytes':number('memory.current'),'peak_bytes':number('memory.peak'),
          'max_bytes':number('memory.max'),'swap_max_bytes':number('memory.swap.max'),
          'events':{k:int(v) for k,v in (line.split() for line in (group/'memory.events').read_text().splitlines())}}
+
+
+def parse_stat(text):
+ # Absent keys stay None (never 0): a missing row is not a measured zero.
+ values={}
+ for line in text.splitlines():
+  fields=line.split()
+  if len(fields)!=2 or not fields[1].isdecimal():raise ValueError('memory.stat row malformed')
+  if fields[0] in STAT_KEYS:values[fields[0]]=int(fields[1])
+ return {key:values.get(key) for key in STAT_KEYS}
+
+
+def sample_stat(group):
+ # Observation only; a sampling failure must never disturb decoder custody.
+ try:return {'stat':parse_stat((group/'memory.stat').read_text())}
+ except Exception as error:return {'stat':None,'stat_error':str(error)[:256]}
+
+
+def push_sample(samples,entry):
+ # Keep only the most recent STAT_SAMPLE_MAX entries; True when the oldest was dropped.
+ samples.append(entry)
+ if len(samples)>STAT_SAMPLE_MAX:del samples[0];return True
+ return False
 
 
 def validate_memory(before,after):
@@ -129,6 +155,7 @@ def main():
   source=Path('/input/disk.qcow2');before_stat=source.stat()
   if digest(source,min(operation_deadline,time.monotonic()+900))!=request['qcow_sha256']:raise ValueError('source hash mismatch')
   group=own_cgroup();receipt['cgroup_path']=str(group);receipt['memory_before']=memory(group)
+  receipt['memory_stat_before']=sample_stat(group)
   if receipt['memory_before']['max_bytes']!=MEMORY_BYTES:raise ValueError('memory limit not enforced')
   if list(target.iterdir()):raise ValueError('new empty owned output directory required')
   output=target/'disk.raw';log=target/'decoder.log'
@@ -139,6 +166,8 @@ def main():
    child=subprocess.Popen([str(qemu),'convert','-f','qcow2','-O','raw','-S','4k',str(source),str(output)],
                           stdin=subprocess.DEVNULL,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True)
    receipt['decoder_pid']=child.pid
+   stat_samples=[];receipt['memory_stat_samples']=stat_samples;receipt['memory_stat_samples_capped']=False
+   next_stat=started
    while True:
     if time.monotonic()>=deadline:raise TimeoutError('decoder deadline')
     if stream.tell()>1024*1024:raise ValueError('decoder log bound')
@@ -147,6 +176,11 @@ def main():
     if fs.f_bavail*fs.f_frsize<SAFETY_BYTES+max(0,OUTPUT_RESERVE-written):raise ValueError('remaining output capacity refused')
     status=os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
     if status is not None:break
+    now=time.monotonic()
+    if now>=next_stat:
+     entry={'elapsed_seconds':now-started};entry.update(sample_stat(group))
+     if push_sample(stat_samples,entry):receipt['memory_stat_samples_capped']=True
+     next_stat=now+STAT_SAMPLE_INTERVAL_SECONDS
     time.sleep(.05)
    reaped=retire_decoder(child,receipt,time.monotonic()+5)
    if not reaped:raise ValueError('decoder retirement unconfirmed')
@@ -176,6 +210,7 @@ def main():
   receipt['owned_decoder_retired']=child is None or reaped
   try:
    receipt['memory_final']=memory(own_cgroup())
+   receipt['memory_stat_final']=sample_stat(own_cgroup())
   except Exception as error:receipt['memory_observation_error']=str(error)[:1024];receipt['qualified']=False
   (target/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
  return 0 if receipt['qualified'] else 1

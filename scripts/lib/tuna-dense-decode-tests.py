@@ -106,6 +106,58 @@ class DecoderRetirement(unittest.TestCase):
   reap.assert_not_called();self.assertTrue(receipt['decoder_retirement_unconfirmed'])
 
 
+class MemoryStatSampling(unittest.TestCase):
+ FULL=('anon 1048576\nfile 268435456\nkernel 131072\nkernel_stack 65536\npagetables 40960\n'
+       'percpu 2048\nsock 0\nshmem 8192\nslab 262144\nslab_reclaimable 196608\n'
+       'slab_unreclaimable 65536\nfile_mapped 32768\nfile_dirty 67108864\n'
+       'file_writeback 33554432\ninactive_anon 0\n')
+ def test_full_fixture_parses_selected_keys_and_ignores_unknown(self):
+  stat=worker.parse_stat(self.FULL)
+  self.assertEqual(stat,{'anon':1048576,'file':268435456,'file_dirty':67108864,'file_writeback':33554432,
+                         'shmem':8192,'slab':262144,'slab_reclaimable':196608,'slab_unreclaimable':65536})
+  self.assertNotIn('file_mapped',stat);self.assertNotIn('kernel',stat)
+ def test_missing_keys_are_none_not_zero(self):
+  stat=worker.parse_stat('anon 1\nfile 2\n')
+  self.assertEqual((stat['anon'],stat['file']),(1,2))
+  for key in ('file_dirty','file_writeback','shmem','slab','slab_reclaimable','slab_unreclaimable'):
+   self.assertIsNone(stat[key])
+  self.assertEqual(worker.parse_stat(''),{key:None for key in worker.STAT_KEYS})
+ def test_malformed_rows_refused(self):
+  for text in ('anon\n','anon 1 2','anon -1','anon 1.5','anon one','file 2\nbad line here\n'):
+   with self.subTest(text=text):
+    with self.assertRaises(ValueError):worker.parse_stat(text)
+ def test_sample_stat_reports_error_without_raising(self):
+  with tempfile.TemporaryDirectory() as d:
+   group=Path(d)
+   missing=worker.sample_stat(group)
+   self.assertIsNone(missing['stat']);self.assertTrue(missing['stat_error'])
+   (group/'memory.stat').write_text('anon bogus\n')
+   broken=worker.sample_stat(group)
+   self.assertIsNone(broken['stat']);self.assertLessEqual(len(broken['stat_error']),256)
+   (group/'memory.stat').write_text(self.FULL)
+   ok=worker.sample_stat(group)
+   self.assertEqual(ok['stat']['file'],268435456);self.assertNotIn('stat_error',ok)
+   json.dumps(ok)
+ def test_push_sample_keeps_only_most_recent_bounded_window(self):
+  samples=[]
+  for index in range(worker.STAT_SAMPLE_MAX):
+   self.assertFalse(worker.push_sample(samples,{'elapsed_seconds':index}))
+  self.assertEqual(len(samples),worker.STAT_SAMPLE_MAX)
+  self.assertTrue(worker.push_sample(samples,{'elapsed_seconds':'newest'}))
+  self.assertEqual(len(samples),worker.STAT_SAMPLE_MAX)
+  self.assertEqual(samples[0]['elapsed_seconds'],1);self.assertEqual(samples[-1]['elapsed_seconds'],'newest')
+ def test_sample_bounds_are_fixed_and_receipt_safe(self):
+  self.assertEqual(worker.STAT_KEYS,('anon','file','file_dirty','file_writeback','shmem','slab','slab_reclaimable','slab_unreclaimable'))
+  self.assertEqual(worker.STAT_SAMPLE_MAX,32);self.assertGreater(worker.STAT_SAMPLE_INTERVAL_SECONDS,0)
+  worst=[{'elapsed_seconds':900.0,'stat':{key:2**63-1 for key in worker.STAT_KEYS}} for _ in range(worker.STAT_SAMPLE_MAX)]
+  self.assertLess(len(json.dumps(worst)),64*1024)
+ def test_sampler_leaves_limit_and_qualification_semantics_untouched(self):
+  self.assertEqual(worker.MEMORY_BYTES,512*1024**2)
+  before={'max_bytes':worker.MEMORY_BYTES,'swap_max_bytes':0,'peak_bytes':1,'events':{'oom':0,'oom_kill':0}}
+  enriched=dict(before);enriched['memory_stat_before']={'stat':None,'stat_error':'x'}
+  worker.validate_memory(enriched,enriched)
+
+
 class ContainerIdentity(unittest.TestCase):
  def observation(self):
   return {'Id':'a'*64,'Name':'/owned','Image':'sha256:'+'b'*64,
