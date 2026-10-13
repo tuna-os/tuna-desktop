@@ -36,6 +36,27 @@ class Identity(unittest.TestCase):
     def test_running_own_job_is_admitted_without_fabricated_terminal_success(self):
         self.assertEqual(self.validate()["job_id"], 200)
 
+    def test_queued_run_requires_exact_running_job_and_green_check(self):
+        run = dict(self.run, status="queued")
+        self.assertEqual(self.validate(run=run)["job_id"], 200)
+        for index, key, value in ((0, "status", "queued"), (0, "status", "completed"),
+                                 (0, "conclusion", "success"), (0, "head_sha", "c" * 40),
+                                 (0, "run_id", 101), (0, "run_attempt", 2),
+                                 (1, "conclusion", "failure"), (1, "conclusion", None),
+                                 (1, "status", "queued"), (1, "head_sha", "c" * 40)):
+            jobs = copy.deepcopy(self.jobs)
+            jobs[index][key] = value
+            with self.subTest(index=index, key=key), self.assertRaises(ValueError):
+                self.validate(run=run, jobs=jobs)
+        for jobs in ([], self.jobs[:1], self.jobs + [self.jobs[0]], self.jobs + [self.jobs[1]]):
+            with self.subTest(jobs=jobs), self.assertRaises(ValueError):
+                self.validate(run=run, jobs=jobs)
+        for status in ("completed", "waiting", "pending", "requested", "unknown", None):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                self.validate(run=dict(run, status=status))
+        with self.assertRaises(ValueError):
+            self.validate(run=run, commit=dict(self.commit, sha="c" * 40))
+
     def test_wrong_run_source_event_workflow_and_attempt_fail(self):
         for key, value in (("id", 101), ("run_attempt", 2), ("head_sha", "c" * 40),
                            ("path", "wrong"), ("event", "push"), ("status", "completed"),
@@ -60,12 +81,12 @@ class Identity(unittest.TestCase):
         with self.assertRaises(ValueError): self.validate(commit=dict(self.commit, sha="c" * 40))
 
     def test_mismatch_preserves_observed_public_fields_without_extra_payload(self):
-        run = dict(self.run, status="queued", private_payload="excluded fixture value")
+        run = dict(self.run, status="completed", private_payload="excluded fixture value")
         with self.assertRaises(ValueError) as error:
             self.validate(run=run)
         receipt = json.loads(str(error.exception).split(": ", 1)[1])
-        self.assertEqual(receipt["expected"]["status"], "in_progress")
-        self.assertEqual(receipt["observed"]["status"], "queued")
+        self.assertEqual(receipt["expected"]["status"], ["in_progress", "queued"])
+        self.assertEqual(receipt["observed"]["status"], "completed")
         self.assertEqual(receipt["observed"]["head_sha"], self.sha)
         self.assertEqual(receipt["observed"]["commit_sha"], self.sha)
         self.assertNotIn("private_payload", receipt["observed"])

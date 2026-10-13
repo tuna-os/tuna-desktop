@@ -28,17 +28,55 @@ def vectors():
 def output(v):
     return "\n".join("FPRINT-PHASE "+json.dumps(r) for r in v.values())+"\ntest result: ok. 1 passed; 0 failed; 0 ignored; 51 filtered out; finished in 3s\n"
 
+class LiveIdentity(unittest.TestCase):
+    def test_queued_run_requires_exact_running_job_and_green_check(self):
+        sha = "a" * 40
+        run = dict(id=100, run_attempt=1, repository=dict(full_name=c.REPO),
+                   head_sha=sha, path=c.WORKFLOW, event="workflow_dispatch",
+                   status="queued", conclusion=None)
+        jobs = [dict(id=200, name=c.JOB, status="in_progress", conclusion=None,
+                     head_sha=sha, run_id=100, run_attempt=1),
+                dict(id=201, name="check", status="completed", conclusion="success",
+                     head_sha=sha, run_id=100, run_attempt=1)]
+        commit = dict(sha=sha, tree=dict(sha="b" * 40))
+        def validate(r=run, j=jobs, source=commit):
+            return c.validate_identity(r, j, source, sha, 100, 1, "workflow_dispatch")
+        self.assertEqual(validate()["job_id"], 200)
+        for index, key, value in ((0, "status", "queued"), (0, "status", "completed"),
+                                 (0, "conclusion", "success"), (0, "head_sha", "c" * 40),
+                                 (0, "run_id", 101), (0, "run_attempt", 2),
+                                 (1, "conclusion", "failure"), (1, "conclusion", None),
+                                 (1, "status", "queued"), (1, "head_sha", "c" * 40)):
+            wrong = copy.deepcopy(jobs)
+            wrong[index][key] = value
+            with self.subTest(index=index, key=key), self.assertRaises(ValueError):
+                validate(j=wrong)
+        for wrong in ([], jobs[:1], jobs + [jobs[0]], jobs + [jobs[1]]):
+            with self.subTest(jobs=wrong), self.assertRaises(ValueError):
+                validate(j=wrong)
+        for status in ("completed", "waiting", "pending", "requested", "unknown", None):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                validate(r=dict(run, status=status))
+        for key, value in (("id", 101), ("run_attempt", 2), ("head_sha", "c" * 40),
+                           ("event", "push"), ("path", "wrong"), ("conclusion", "success"),
+                           ("repository", dict(full_name="foreign/repo"))):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate(r=dict(run, **{key: value}))
+        with self.assertRaises(ValueError):
+            validate(source=dict(commit, sha="c" * 40))
+
+
 class Contract(unittest.TestCase):
     def test_ci_mismatch_retains_public_fields_and_excludes_unrelated_payload(self):
         sha = "a" * 40
         run = dict(id=100, run_attempt=1, repository=dict(full_name=c.REPO),
                    head_sha=sha, path=c.WORKFLOW, event="workflow_dispatch",
-                   status="queued", conclusion=None, private_payload="excluded fixture value")
+                   status="completed", conclusion=None, private_payload="excluded fixture value")
         with self.assertRaises(ValueError) as error:
             c.validate_identity(run, [], dict(sha=sha), sha, 100, 1, "workflow_dispatch")
         receipt = json.loads(str(error.exception).split(": ", 1)[1])
-        self.assertEqual(receipt["expected"]["status"], "in_progress")
-        self.assertEqual(receipt["observed"]["status"], "queued")
+        self.assertEqual(receipt["expected"]["status"], ["in_progress", "queued"])
+        self.assertEqual(receipt["observed"]["status"], "completed")
         self.assertEqual(receipt["observed"]["head_sha"], sha)
         self.assertEqual(receipt["observed"]["commit_sha"], sha)
         self.assertNotIn("private_payload", receipt["observed"])
