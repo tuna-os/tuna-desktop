@@ -1858,8 +1858,6 @@ impl Runtime {
             "idle_blank_alpha": self.blank_alpha(),
             "overview_search": self.overview_search,
             "overview_app_grid": self.overview_app_grid,
-            // Diagnostic snapshot only, never expose drag state while locked.
-            "client_dnd_active": !self.is_locked() && self.state.client_dnd_active(),
             "keyboard": keyboard,
             "overview_open": overview_open,
             "animations_enabled": self.input_settings.motion.animations_enabled(),
@@ -2035,6 +2033,9 @@ impl Runtime {
         );
         // Live libinput device configuration (#343): beside the macro,
         // which is already at its recursion limit.
+        // Keep this unlocked drag observation outside the large scene macro.
+        doc["client_dnd_active"] =
+            serde_json::Value::Bool(!self.is_locked() && self.state.client_dnd_active());
         doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
         let doc = doc.to_string();
         if doc == self.state_last {
