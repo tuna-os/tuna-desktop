@@ -153,11 +153,10 @@ impl Dispatch<ZwpTabletV2, ()> for TabletClient {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        match event {
-            zwp_tablet_v2::Event::Name { name } => state.tablet_names.push(name),
-            // Smithay 0.7 never sends `removed` for tablets (unlike
-            // tools): unplugging only drops the seat entry.
-            _ => {}
+        // Smithay 0.7 never sends `removed` for tablets (unlike
+        // tools): unplugging only drops the seat entry.
+        if let zwp_tablet_v2::Event::Name { name } = event {
+            state.tablet_names.push(name);
         }
     }
 }
