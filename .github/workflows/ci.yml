@@ -48,6 +48,7 @@ jobs:
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
       - run: python3 scripts/lib/grid-target-settled-tests.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
+      - run: /usr/bin/python3 scripts/tests/test_grid_cancel_comparison.py
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
       - run: /usr/bin/python3 scripts/lib/media-completion-barrier-tests.py
@@ -265,6 +266,55 @@ jobs:
         with:
           name: drm-smoke
           path: drm-smoke-artifacts/
+          retention-days: 14
+
+  grid-cancel-comparison:
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    # Source-only real headed old/fixed comparison; the full GTK journey stays required.
+    runs-on: ubuntu-latest
+    needs: [check]
+    permissions:
+      actions: read
+      contents: read
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - name: Use the Ubuntu archive for GTK dependencies
+        run: |
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [[ -f "$source" ]]; then
+              sudo sed -i 's|https\?://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
+            fi
+          done
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libsecret-tools gnome-keyring fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk
+      - run: scripts/ci-install-gtk4-layer-shell
+      - name: Check exact source/build/negative-verdict admission
+        run: |
+          /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
+          /usr/bin/python3 scripts/tests/test_grid_cancel_comparison.py
+          shellcheck -S warning scripts/tuna-gtk-shell-proof
+      - name: Compare exact old observation and fixed native drag cancellation
+        run: /usr/bin/python3 scripts/tuna-grid-cancel-comparison --artifacts "$RUNNER_TEMP/grid-cancel-comparison"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - if: always()
+        run: scripts/ci-prepare-artifacts "$RUNNER_TEMP/grid-cancel-comparison/old" "$RUNNER_TEMP/grid-cancel-comparison/fixed"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: grid-cancel-comparison
+          path: |
+            ${{ runner.temp }}/grid-cancel-comparison/*.json
+            ${{ runner.temp }}/grid-cancel-comparison/*.txt
+            ${{ runner.temp }}/grid-cancel-comparison/old/
+            ${{ runner.temp }}/grid-cancel-comparison/fixed/
           retention-days: 14
 
   greeter:

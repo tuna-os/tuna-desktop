@@ -4,6 +4,8 @@
 # Usage:
 #   scripts/tuna-gtk-shell-proof [--display :N] [--artifacts DIR]
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
+#   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
+#   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
 # Runs the nested compositor with tuna-shell-gtk as its supervised shell
 # on a private session bus with the AT-SPI accessibility bus, then:
@@ -211,10 +213,16 @@ WIDTH=1280
 HEIGHT=800
 INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
-COMPANIONS="$ROOT/target/debug/examples"
+GRID_CANCEL_ONLY=0
+GRID_CANCEL_OLD_NEGATIVE=0
+GRID_CANCEL_ADMISSION=""
+COMPANIONS="${TUNA_PROOF_COMPANIONS:-$ROOT/target/debug/examples}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --installed-package) INSTALLED_PACKAGE=1; shift ;;
+        --grid-cancel-only) GRID_CANCEL_ONLY=1; shift ;;
+        --expect-grid-cancel-old-negative) GRID_CANCEL_OLD_NEGATIVE=1; shift ;;
+        --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
@@ -222,6 +230,13 @@ while [ $# -gt 0 ]; do
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then
+    [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ -n "$GRID_CANCEL_ADMISSION" ] || {
+        echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1;
+    }
+elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; then
+    echo "old-negative/admission flags require --grid-cancel-only" >&2; exit 1
+fi
 mkdir -p "$ARTIFACTS"
 ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
 OWNED_RUNTIME=""
@@ -1634,16 +1649,19 @@ PY_GRID_OWNER
 )" || fail G-GRID-DRAG-CANCEL "GTK child identity unavailable"
 grid_cancel_dump() {
     rm -f "$1"
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$1" 20 --pid "$grid_cancel_pid" || return 1
-    "$PY" - "$grid_cancel_pid" "$grid_cancel_start" "$1" <<'PY_GRID_DUMP'
-import json, pathlib, sys
-pid, start, tree = int(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
-assert pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19] == start
-nodes = json.loads(tree.read_text())
-assert isinstance(nodes, list) and nodes and nodes[0].get("process_id") == pid
-assert any(n.get("showing") and n.get("role") in ("push button", "button") for n in nodes)
-PY_GRID_DUMP
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$1" 20 --strict --pid "$grid_cancel_pid" || return 1
+    "$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" tree "$grid_cancel_pid" "$grid_cancel_start" "$1"
 }
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then
+    "$PY" - "$ROOT" "$GRID_CANCEL_ADMISSION" "$COMPOSITOR_PID" "$grid_cancel_pid" "$GRID_CANCEL_OLD_NEGATIVE" <<'PY_GRID_ADMIT'
+import importlib.util, json, pathlib, sys
+root, admission, compositor, shell, old = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("comparison", pathlib.Path(root) / "scripts/lib/grid_cancel_comparison.py")
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+contract.validate_live_admission(json.loads(pathlib.Path(admission).read_text()), pathlib.Path(root), int(compositor), int(shell), old == "1")
+PY_GRID_ADMIT
+fi
 "$PY" - "$ROOT" "$grid_cancel_pid" "$grid_cancel_start" "$COMPOSITOR_PID" "$ARTIFACTS/grid-cancel-provenance.json" <<'PY_GRID_PROVENANCE'
 import hashlib, json, os, pathlib, subprocess, sys
 root, shell_pid, shell_start, compositor_pid, output = sys.argv[1:]
@@ -1696,10 +1714,30 @@ cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
 [ "$(gsettings get org.gnome.shell app-picker-layout)" = "$folder_layout_before" ] || fail G-GRID-DRAG-CANCEL "preview already committed layout"
 grid_cancel_before_frame="$(jq -er .rendered_frames "$ARTIFACTS/grid-cancel-before-escape.json")" || fail G-GRID-DRAG-CANCEL "drag frame missing"
 xdotool key Escape
+if [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ]; then
+    # Test-only old-source discriminator. The default/full gate NEVER accepts
+    # overview close, and this branch requires the exact live old tuple above.
+    cstate ".client_dnd_active == true and .overview_open == false and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame)" "old drag retained before release" || fail G-GRID-DRAG-OLD-NEG "reviewed old source did not reproduce Escape routing failure"
+    cp "$CSTATE" "$ARTIFACTS/grid-cancel-old-before-release.json"
+    scrot "$ARTIFACTS/grid-cancel-old-before-release.png" >/dev/null
+    gsettings get org.gnome.shell app-picker-layout > "$ARTIFACTS/grid-cancel-old-layout-before-release.txt"
+    "$PY" - "$ROOT" "$ARTIFACTS/grid-cancel-before-escape.json" "$ARTIFACTS/grid-cancel-old-before-release.json" <<'PY_GRID_OLD'
+import importlib.util, json, pathlib, sys
+root, before, after = map(pathlib.Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("comparison", root / "scripts/lib/grid_cancel_comparison.py")
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+contract.old_negative(json.loads(before.read_text()), json.loads(after.read_text()))
+PY_GRID_OLD
+    pass G-GRID-DRAG-OLD-NEG "exact observation-only old source retained native drag while closing grid; button still held"
+    # Exit/cleanup without releasing the button; preserve pre-release evidence.
+    exit 0
+fi
 # The source must retire while the button is STILL held. Overview close/reopen
 # cannot stand in for cancellation, and mouseup must not complete an old offer.
 cstate ".client_dnd_active == false and .overview_open and .overview_app_grid and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame)" "folder cancellation before release" || fail G-GRID-DRAG-CANCEL "Escape failed to cancel native drag while keeping grid open"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-release.json"
+scrot "$ARTIFACTS/grid-cancel-before-release.png" >/dev/null
 grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" || fail G-GRID-DRAG-CANCEL "fresh cancellation tree missing"
 showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" || fail G-GRID-DRAG-CANCEL "GTK drag cleanup did not restore arrow before release"
 if showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; then fail G-GRID-DRAG-CANCEL "GTK drag preview remains before release"; fi
@@ -1724,6 +1762,7 @@ cstate '.overview_open == false and .client_dnd_active == false' "ordinary Escap
 xdotool key super+a
 cstate '.overview_open and .overview_app_grid' "grid reopened after ordinary Escape" || fail G-GRID-DRAG-CANCEL "grid did not reopen"
 pass G-GRID-DRAG-CANCEL "native cancel before release preserves layout; subsequent ordinary Escape closes overview"
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then exit 0; fi
 # Restore page two for the existing app-drag proof's Previous Page action.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-page-next.json" 20 \
     --press "Next Page" || fail G-GRID-DRAG-CANCEL "could not return to page two"

@@ -214,6 +214,7 @@ struct ClipClient {
     drop_performed: usize,
     finished: usize,
     leaves: usize,
+    drag_enter_serial: Option<u32>,
     xdg_base: Option<XdgWmBase>,
     manager: Option<WlDataDeviceManager>,
     device: Option<WlDataDevice>,
@@ -412,6 +413,7 @@ impl Dispatch<WlDataDevice, ()> for ClipClient {
             DeviceEvent::Selection { id } => state.selection = id,
             DeviceEvent::Drop => state.drops += 1,
             DeviceEvent::Leave => state.leaves += 1,
+            DeviceEvent::Enter { serial, .. } => state.drag_enter_serial = Some(serial),
             _ => {}
         }
     }
@@ -989,6 +991,7 @@ fn native_drag_case(
     destroy_icon: bool,
     destroy_source: bool,
     touch_drag: bool,
+    source_less: bool,
 ) {
     use wayland_client::protocol::wl_data_device_manager::DndAction;
     let mut comp = TestCompositor::new();
@@ -1015,9 +1018,10 @@ fn native_drag_case(
             },
         );
         touch.frame(&mut comp.state);
-        pump_one(&mut comp, &mut queue, &mut client, |c| {
-            !c.touch_downs.is_empty()
-        });
+        client.synced = false;
+        conn.display().sync(&queue.handle(), ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(!client.touch_downs.is_empty(), "real touch serial required");
         client.touch_downs[0]
     } else {
         manager.on_input(
@@ -1035,18 +1039,27 @@ fn native_drag_case(
                 time: 11,
             },
         );
-        pump_one(&mut comp, &mut queue, &mut client, |c| {
-            !c.buttons.is_empty()
-        });
+        client.synced = false;
+        conn.display().sync(&queue.handle(), ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(!client.buttons.is_empty(), "real pointer serial required");
         client.buttons[0]
     };
+    assert!(
+        !comp.client_dnd_active(),
+        "implicit pointer/touch grab is not client DnD"
+    );
+    assert!(
+        !comp.cancel_client_dnd(11),
+        "cancellation preserves a non-DnD implicit grab"
+    );
     let qh = queue.handle();
     let source = client.manager.as_ref().unwrap().create_data_source(&qh, ());
     source.offer("text/plain".into());
     source.set_actions(DndAction::Move);
     let icon = icon_present.then(|| client.compositor.as_ref().unwrap().create_surface(&qh, ()));
     client.device.as_ref().unwrap().start_drag(
-        Some(&source),
+        if source_less { None } else { Some(&source) },
         client.surface.as_ref().unwrap(),
         icon.as_ref(),
         serial,
@@ -1090,13 +1103,32 @@ fn native_drag_case(
             },
         );
     }
-    pump_one(&mut comp, &mut queue, &mut client, |c| !c.offers.is_empty());
-    let offer = client.offers.last().unwrap().clone();
-    offer.accept(serial, Some("text/plain".into()));
-    offer.set_actions(DndAction::Move, DndAction::Move);
-    client.synced = false;
-    conn.display().sync(&qh, ());
-    pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+    // A source-less same-client drag has no offer but still owns the grab.
+    let offer = if source_less {
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(client.offers.is_empty());
+        None
+    } else {
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(
+            !client.offers.is_empty(),
+            "real drag offer required after motion"
+        );
+        let offer = client.offers.last().unwrap().clone();
+        offer.accept(
+            client.drag_enter_serial.expect("real target Enter serial"),
+            Some("text/plain".into()),
+        );
+        offer.set_actions(DndAction::Move, DndAction::Move);
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        Some(offer)
+    };
     if destroy_source {
         source.destroy();
         client.synced = false;
@@ -1107,19 +1139,24 @@ fn native_drag_case(
         assert!(comp.cancel_client_dnd(13));
         assert!(!comp.client_dnd_active());
         assert!(!comp.cancel_client_dnd(14));
-        // Requests already queued by the target cannot revive a cancelled offer.
-        offer.accept(serial, Some("text/plain".into()));
-        offer.set_actions(DndAction::Move, DndAction::Move);
-        let (_reader, writer) = UnixStream::pair().unwrap();
-        use std::os::fd::AsFd;
-        offer.receive("text/plain".into(), writer.as_fd());
-        client.synced = false;
-        conn.display().sync(&qh, ());
-        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
-        assert!(
-            client.sent_mimes.is_empty(),
-            "cancelled offer must refuse Receive before release"
-        );
+        if let Some(offer) = &offer {
+            // Requests already queued by the target cannot revive a cancelled offer.
+            offer.accept(
+                client.drag_enter_serial.expect("real target Enter serial"),
+                Some("text/plain".into()),
+            );
+            offer.set_actions(DndAction::Move, DndAction::Move);
+            let (_reader, writer) = UnixStream::pair().unwrap();
+            use std::os::fd::AsFd;
+            offer.receive("text/plain".into(), writer.as_fd());
+            client.synced = false;
+            conn.display().sync(&qh, ());
+            pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+            assert!(
+                client.sent_mimes.is_empty(),
+                "cancelled offer must refuse Receive before release"
+            );
+        }
     }
     if let Some(touch) = &touch {
         touch.up(
@@ -1145,15 +1182,50 @@ fn native_drag_case(
     conn.display().sync(&qh, ());
     pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
     assert!(!comp.client_dnd_active());
-    assert_eq!(client.drops, usize::from(!cancel && !destroy_source));
+    assert_eq!(
+        client.drops,
+        usize::from(!cancel && !destroy_source && !source_less)
+    );
     assert_eq!(
         client.drop_performed,
-        usize::from(!cancel && !destroy_source)
+        usize::from(!cancel && !destroy_source && !source_less)
     );
-    assert_eq!(client.cancelled, usize::from(cancel && !destroy_source));
+    assert_eq!(
+        client.cancelled,
+        usize::from(cancel && !destroy_source && !source_less)
+    );
     assert!(client.leaves > 0);
-    if !cancel && !destroy_source {
-        offer.finish();
+    if !cancel && !destroy_source && !source_less {
+        // Actual owned bytes must cross the successful dropped offer BEFORE Finish.
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let (reader, writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        offer
+            .as_ref()
+            .unwrap()
+            .receive("text/plain".into(), writer.as_fd());
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert_eq!(
+            client.sent_mimes,
+            vec!["text/plain".to_owned()],
+            "real Send event required before reading"
+        );
+        drop(writer);
+        let mut received = Vec::new();
+        std::io::BufReader::new(reader)
+            .read_to_end(&mut received)
+            .unwrap();
+        assert_eq!(
+            received, PASTE_BYTES,
+            "normal dropped offer delivers the owned payload"
+        );
+        assert_eq!(client.sent_mimes, vec!["text/plain".to_owned()]);
+        offer.as_ref().unwrap().finish();
         client.synced = false;
         conn.display().sync(&qh, ());
         pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
@@ -1164,32 +1236,34 @@ fn native_drag_case(
         assert!(!comp.cancel_client_dnd(16));
         assert_eq!(client.cancelled, 0);
     }
-    offer.destroy();
+    if let Some(offer) = offer {
+        offer.destroy();
+    }
     client.synced = false;
     conn.display().sync(&qh, ());
     pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
     assert_eq!(
         client.cancelled,
-        usize::from(cancel && !destroy_source),
+        usize::from(cancel && !destroy_source && !source_less),
         "destroying the retired offer cannot double-cancel"
     );
 }
 
 #[test]
 fn native_drag_cancel_without_icon_is_terminal_and_idempotent() {
-    native_drag_case(true, false, false, false, false);
+    native_drag_case(true, false, false, false, false, false);
 }
 #[test]
 fn native_drag_cancel_with_destroyed_icon_keeps_real_ownership() {
-    native_drag_case(true, true, true, false, false);
+    native_drag_case(true, true, true, false, false, false);
 }
 #[test]
 fn native_drag_dead_source_cannot_commit() {
-    native_drag_case(false, false, false, true, false);
+    native_drag_case(false, false, false, true, false, false);
 }
 #[test]
 fn native_drag_normal_drop_offer_can_finish() {
-    native_drag_case(false, true, false, false, false);
+    native_drag_case(false, true, false, false, false, false);
 }
 
 impl Dispatch<wayland_client::protocol::wl_touch::WlTouch, ()> for ClipClient {
@@ -1209,18 +1283,27 @@ impl Dispatch<wayland_client::protocol::wl_touch::WlTouch, ()> for ClipClient {
 
 #[test]
 fn native_touch_drag_cancel_without_icon_is_terminal() {
-    native_drag_case(true, false, false, false, true);
+    native_drag_case(true, false, false, false, true, false);
 }
 #[test]
 fn native_touch_drag_normal_drop_offer_can_finish() {
-    native_drag_case(false, false, false, false, true);
+    native_drag_case(false, false, false, false, true, false);
 }
 
 #[test]
 fn native_touch_drag_cancel_with_destroyed_icon_keeps_ownership() {
-    native_drag_case(true, true, true, false, true);
+    native_drag_case(true, true, true, false, true, false);
 }
 #[test]
 fn native_drag_cancel_after_source_destroy_never_double_notifies() {
-    native_drag_case(true, false, false, true, false);
+    native_drag_case(true, false, false, true, false, false);
+}
+
+#[test]
+fn native_source_less_same_client_drag_can_cancel_without_icon() {
+    native_drag_case(true, false, false, false, false, true);
+}
+#[test]
+fn native_touch_source_less_same_client_drag_can_cancel_without_icon() {
+    native_drag_case(true, false, false, false, true, true);
 }
