@@ -517,7 +517,7 @@ mod tests {
             reply,
         };
         let (send, receive) = mpsc::sync_channel(1);
-        send.send(Command::Attempt(job)).ok().unwrap();
+        assert!(send.send(Command::Attempt(job)).is_ok());
         drop(receive);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         let pending = Some(observed_credential(&counter));
