@@ -960,7 +960,7 @@ pub fn start(
                 // which gates it on the orientation lock. No sensor
                 // (or no bus) simply never sends.
                 sensor_ticks = sensor_ticks.wrapping_add(1);
-                if sensor_ticks % 20 == 0 {
+                if sensor_ticks.is_multiple_of(20) {
                     if !sensor_claimed {
                         sensor_claimed = crate::touchscreen::sensor::claim(&conn);
                     }
