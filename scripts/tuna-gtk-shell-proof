@@ -1868,6 +1868,8 @@ xdotool key Escape
 cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-REORDER "overview stayed open"; }
 # Moving an item to another page leaves its old page short; a catalog
 # rebuild must respect those saved page boundaries instead of flattening.
+"$PY" "$ROOT/scripts/lib/grid-target-settled-tests.py" >"$ARTIFACTS/grid-target-settled-tests.log" 2>&1 ||
+    fail G-GRID-SHORT-PAGES "settled target negative controls failed"
 gsettings set org.gnome.shell app-picker-layout "[{'tuna-move-One.desktop': <{'position': <0>}>, 'tuna-move-Three.desktop': <{'position': <1>}>}, {'tuna-move-Two.desktop': <{'position': <0>}>}]"
 printf '[Desktop Entry]\nName=ZZZ Rebuild Probe\nExec=true\nType=Application\n' >"$XDG_DATA_HOME/applications/tuna-grid-rebuild.desktop"
 sleep 1.5
@@ -1893,18 +1895,18 @@ for step in $(seq 1 6); do
 done
 sleep 0.25
 xdotool mousemove --window "$WID" $((WIDTH - 6)) 330
-# The carousel page turn lags on loaded runners: a fixed sleep can dump
-# while AAA Move Two is still offscreen, and grid_point (unlike
-# grid_shown) returns those offscreen bounds, so the drop lands before
-# the turn completes. Poll for the visible target instead, bounded.
-short_turned=0
-for _ in $(seq 1 20); do
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-short-target.json" 20 >/dev/null 2>&1 || { sleep 0.5; continue; }
-    if grid_shown "$ARTIFACTS/a11y-grid-short-target.json" "AAA Move Two"; then short_turned=1; break; fi
-    sleep 0.5
-done
-[ "$short_turned" = 1 ] || fail G-GRID-SHORT-PAGES "second page did not turn within 10s while holding at the edge"
-grid_coordinates="$(grid_point "$ARTIFACTS/a11y-grid-short-target.json" "AAA Move Two" 4)" || fail G-GRID-SHORT-PAGES "target edge bounds missing"
+# Observe the owned target while keeping the drag at the page edge. A
+# merely visible tile can still move 21px before release, turning +4px
+# reorder into an OnIcon folder drop. Require fully onscreen fresh bounds
+# unchanged for 200ms, with one absolute 10s deadline (including AT-SPI).
+grid_target_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk | head -1 || true)"
+[ -n "$grid_target_pid" ] || fail G-GRID-SHORT-PAGES "owned shell PID missing"
+grid_coordinates="$("$PY" "$ROOT/scripts/lib/grid-target-settled.py" \
+    --dump "$ROOT/scripts/lib/tuna-a11y-dump.py" --out "$ARTIFACTS/a11y-grid-short-target.json" \
+    --receipt "$ARTIFACTS/grid-short-target-settled.json" --name "AAA Move Two" \
+    --pid "$grid_target_pid" --origin "$grid_origin_x" "$grid_origin_y" \
+    --viewport "$WIDTH" "$HEIGHT" --timeout 10)" ||
+    fail G-GRID-SHORT-PAGES "owned second-page target did not settle within 10s at the edge"
 read -r target_x target_y <<EOF
 $grid_coordinates
 EOF
