@@ -123,8 +123,9 @@
 #                  to 0.6; stale Take fails (#354)
 #   G-WELLBEING-ACTION-DELAY an actual Delay press moves the live due
 #                  by delay-seconds; stale Delay fails (#354)
-#   G-WELLBEING-ACTION-SKIP an actual Skip press restarts the
-#                  interval; stale Skip fails (#354)
+#   G-WELLBEING-ACTION-SKIP an actual Skip press on the upcoming
+#                  notice retires it with the due schedule left
+#                  undisturbed; stale Skip fails (#354)
 #   G-WELLBEING-NEGATIVE neutral frames fail every effect assertion,
 #                  intermediates hold, stale presses fail (#354)
 #   G-SCREENSHOT   org.gnome.Shell.Screenshot saves the screen as a PNG
@@ -5185,20 +5186,26 @@ gsettings set org.gnome.desktop.notifications show-banners false ||
 wb_provenance_finish
 pass G-WELLBEING-ACTION-DELAY "an actual Delay press moves the live due by delay-seconds and a stale Delay fails"
 
-# Skip: an ACTUAL Skip press restarts the interval at the press time (10s),
-# observed as the next due banner's arrival time.
+# Skip: GNOME 51 offers Skip ONLY on the upcoming notice (breakManager.js
+# at 2177bdf9, lines 985-1023); the due notice carries Delay+Take with no
+# Skip (lines 1133-1162). An ACTUAL Skip press on the upcoming warning
+# retires it and leaves the due schedule undisturbed (the press is a
+# timer no-op), observed as the due banner still arriving on the
+# original schedule. A stale Skip press must fail.
 wb_gate_begin G-WELLBEING-ACTION-SKIP
 wb_probe_ensure
 gsettings set org.gnome.desktop.notifications show-banners true ||
     fail G-WELLBEING-ACTION-SKIP "could not show banners"
 cstate '(.overview_open | not)' "no overview" ||
     fail G-WELLBEING-ACTION-SKIP "the overview is open"
-gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 65 ||
     fail G-WELLBEING-ACTION-SKIP "could not set the break interval"
 gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 10 ||
     fail G-WELLBEING-ACTION-SKIP "could not set the break duration"
 gsettings set org.gnome.desktop.break-reminders.eyesight delay-seconds 30 ||
     fail G-WELLBEING-ACTION-SKIP "could not set delay-seconds"
+gsettings set org.gnome.desktop.break-reminders.eyesight notify-upcoming true ||
+    fail G-WELLBEING-ACTION-SKIP "could not enable upcoming notices"
 gsettings set org.gnome.desktop.break-reminders.eyesight countdown false ||
     fail G-WELLBEING-ACTION-SKIP "could not silence the countdown OSD"
 gsettings set org.gnome.desktop.break-reminders.eyesight fade-screen false ||
@@ -5207,7 +5214,9 @@ gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
     fail G-WELLBEING-ACTION-SKIP "could not clear lock-screen"
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-ACTION-SKIP "could not select the eyesight break"
-SKIPDUE=""
+skip_enable_epoch="$(date +%s)"
+skip_orig_due_epoch=$((skip_enable_epoch + 65))
+SKIPUP=""
 end=$(($(date +%s) + 25))
 while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
@@ -5216,25 +5225,28 @@ while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
     sleep 1
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-due.json" 20 >/dev/null 2>&1 || continue
-    if showing "$ARTIFACTS/a11y-wb-skip-due.json" "Time for an Eyesight Break"; then SKIPDUE=1; break; fi
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-upcoming.json" 20 >/dev/null 2>&1 || continue
+    if showing "$ARTIFACTS/a11y-wb-skip-upcoming.json" "Eyesight Break Soon"; then SKIPUP=1; break; fi
 done
-[ -n "$SKIPDUE" ] || fail G-WELLBEING-ACTION-SKIP "no due banner to skip"
-skip_press_epoch="$(date +%s)"
+[ -n "$SKIPUP" ] || fail G-WELLBEING-ACTION-SKIP "no upcoming banner to skip"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" notice-buttons \
+    "$ARTIFACTS/a11y-wb-skip-upcoming.json" --title "Eyesight Break Soon" \
+    --expect Delay,Skip --reject Take ||
+    fail G-WELLBEING-ACTION-SKIP "the upcoming banner does not offer Delay+Skip without Take"
 wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-press.json" 20 --press "Skip" ||
     fail G-WELLBEING-ACTION-SKIP "could not press Skip"
 cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-before.json"
 stale_code=0
 wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-stale.json" 20 --press "Skip" >/dev/null 2>&1 || stale_code=$?
 cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-after.json"
-# The retired dump is taken now (the redue banner is not showing yet);
-# the stale verdict waits for the redue so the interval restart the
-# live press set is proven undisturbed by the stale press.
+# The retired dump is taken now (the due banner is not showing yet);
+# the stale verdict waits for the due so the original schedule the
+# live press left undisturbed is proven intact after the stale press.
 wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-retired.json" 20 ||
     fail G-WELLBEING-ACTION-SKIP "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 skip_retired_seq="$WB_DUMP_SEQ"
-SKIPREDUE=""
-end=$(($(date +%s) + 30))
+SKIPDUE=""
+end=$(($(date +%s) + 90))
 while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
@@ -5242,25 +5254,29 @@ while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
     sleep 1
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-redue.json" 20 >/dev/null 2>&1 || continue
-    if showing "$ARTIFACTS/a11y-wb-skip-redue.json" "Time for an Eyesight Break"; then
-        skip_redue_epoch="$(date +%s)"
-        SKIPREDUE=1
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-due.json" 20 >/dev/null 2>&1 || continue
+    if showing "$ARTIFACTS/a11y-wb-skip-due.json" "Time for an Eyesight Break"; then
+        skip_due_epoch="$(date +%s)"
+        SKIPDUE=1
         break
     fi
 done
-[ -n "$SKIPREDUE" ] || fail G-WELLBEING-ACTION-SKIP "no redue banner after Skip"
-wb_capture_after_live_action skip-redue
-"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" skip \
-    --press "$skip_press_epoch" --new-due "$skip_redue_epoch" --interval-secs 10 ||
-    fail G-WELLBEING-ACTION-SKIP "the interval did not restart at the press"
+[ -n "$SKIPDUE" ] || fail G-WELLBEING-ACTION-SKIP "no due banner on the original schedule after Skip"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" notice-buttons \
+    "$ARTIFACTS/a11y-wb-skip-due.json" --title "Time for an Eyesight Break" \
+    --expect Take,Delay --reject Skip ||
+    fail G-WELLBEING-ACTION-SKIP "the due banner does not offer Take+Delay without Skip"
+wb_capture_after_live_action skip-due
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" skip-undisturbed \
+    --orig-due "$skip_orig_due_epoch" --due-arrival "$skip_due_epoch" ||
+    fail G-WELLBEING-ACTION-SKIP "the Skip press disturbed the due schedule"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
     --exit-code "$stale_code" \
     --before "$ARTIFACTS/wb-skip-stale-before.json" \
     --after "$ARTIFACTS/wb-skip-stale-after.json" \
     --action Skip \
     --dump "$ARTIFACTS/a11y-wb-skip-retired.json" \
-    --title "Time for an Eyesight Break" \
+    --title "Eyesight Break Soon" \
     --gate-start "$WB_START" \
     --expect-pid "$WB_SHELL_PID" \
     --expect-start "$WB_SHELL_START" \
@@ -5268,13 +5284,13 @@ wb_capture_after_live_action skip-redue
     --expect-gate G-WELLBEING-ACTION-SKIP \
     --expect-nonce "$WB_NONCE" \
     --expect-seq "$skip_retired_seq" \
-    --due-kind skip --due-old "$skip_press_epoch" --due-new "$skip_redue_epoch" --due-expect 10 ||
+    --due-kind skip-undisturbed --due-old "$skip_orig_due_epoch" --due-new "$skip_due_epoch" --due-expect 0 ||
     fail G-WELLBEING-ACTION-SKIP "a stale Skip press fired"
 wb_break_cleanup
 gsettings set org.gnome.desktop.notifications show-banners false ||
     fail G-WELLBEING-ACTION-SKIP "could not restore DND"
 wb_provenance_finish
-pass G-WELLBEING-ACTION-SKIP "an actual Skip press restarts the interval and a stale Skip fails"
+pass G-WELLBEING-ACTION-SKIP "an actual Skip press on the upcoming notice retires it with the schedule undisturbed and a stale Skip fails"
 
 # Negative controls: neutral frames FAIL the effect assertions (assertion
 # failure, same build, not source-identity failure); intermediate RGB is

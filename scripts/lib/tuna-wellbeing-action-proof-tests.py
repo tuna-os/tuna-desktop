@@ -48,6 +48,7 @@ class PinnedBudgets(unittest.TestCase):
     def test_tick_tolerance_not_widened(self):
         self.assertEqual(mod.TICK_TOLERANCE_SECS, 5.0)
         self.assertEqual(mod.PRESS_SETTLE_SECS, 1.5)
+        self.assertEqual(mod.SKIP_SCHEDULE_TOLERANCE_SECS, 8.0)
 
 
 class ActionPredicates(unittest.TestCase):
@@ -899,6 +900,186 @@ class StrictProducerTree(unittest.TestCase):
             with self.assertRaisesRegex(mod.HarnessError,
                                         'must be the application node'):
                 self.check_nodes(tmp, nodes)
+
+
+UPCOMING = 'Eyesight Break Soon'
+
+
+def banner_nodes(pid, title, buttons, title_showing=True):
+    """Producer-shape banner: app root, title label, push buttons.
+
+    Each button carries its inner text label (as real dumps do), so a
+    label named like a button must never satisfy an expectation: only
+    the push-button control qualifies, exactly as in press().
+    """
+    nodes = [{'role': 'application', 'name': 'tuna-shell-gtk',
+              'description': '', 'depth': 0, 'showing': True,
+              'checked': False, 'selected': False, 'focused': False,
+              'bounds': None, 'process_id': pid},
+             {'role': 'label', 'name': title, 'description': '',
+              'depth': 1, 'showing': title_showing,
+              'checked': False, 'selected': False, 'focused': False,
+              'bounds': [10, 10, 220, 48]}]
+    for name, showing in buttons:
+        nodes.append({'role': 'push button', 'name': name,
+                      'description': '', 'depth': 1, 'showing': showing,
+                      'checked': False, 'selected': False, 'focused': False,
+                      'bounds': [10, 70, 100, 40]})
+        nodes.append({'role': 'label', 'name': name, 'description': '',
+                      'depth': 2, 'showing': showing,
+                      'checked': False, 'selected': False, 'focused': False,
+                      'bounds': [12, 72, 96, 36]})
+    return nodes
+
+
+class NoticeButtons(unittest.TestCase):
+    def check_file(self, tmp, nodes):
+        path = tmp / 'banner.json'
+        path.write_text(json.dumps(nodes))
+        return path
+
+    def test_upcoming_offers_delay_and_skip_without_take(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            path = self.check_file(
+                tmp, banner_nodes(pid, UPCOMING,
+                                  [('Delay', True), ('Skip', True)]))
+            self.assertTrue(mod.notice_buttons(
+                path, UPCOMING, ('Delay', 'Skip'), ('Take',)))
+
+    def test_due_offers_take_and_delay_without_skip(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            path = self.check_file(
+                tmp, banner_nodes(pid, DUE,
+                                  [('Take', True), ('Delay', True)]))
+            self.assertTrue(mod.notice_buttons(
+                path, DUE, ('Take', 'Delay'), ('Skip',)))
+
+    def test_missing_expected_button_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            path = self.check_file(
+                tmp, banner_nodes(pid, UPCOMING, [('Delay', True)]))
+            with self.assertRaises(AssertionError):
+                mod.notice_buttons(path, UPCOMING, ('Delay', 'Skip'), ())
+
+    def test_rejected_button_present_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            path = self.check_file(
+                tmp, banner_nodes(pid, DUE,
+                                  [('Take', True), ('Delay', True),
+                                   ('Skip', True)]))
+            with self.assertRaises(AssertionError):
+                mod.notice_buttons(path, DUE, ('Take', 'Delay'), ('Skip',))
+
+    def test_inner_label_never_satisfies_expectation(self):
+        # A label named Skip (only) must not count as an offered Skip.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            nodes = banner_nodes(pid, UPCOMING, [('Delay', True)])
+            nodes.append({'role': 'label', 'name': 'Skip', 'description': '',
+                          'depth': 1, 'showing': True,
+                          'checked': False, 'selected': False,
+                          'focused': False, 'bounds': [10, 110, 100, 40]})
+            path = self.check_file(tmp, nodes)
+            with self.assertRaises(AssertionError):
+                mod.notice_buttons(path, UPCOMING, ('Skip',), ())
+
+    def test_hidden_button_never_satisfies_expectation(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            path = self.check_file(
+                tmp, banner_nodes(pid, UPCOMING,
+                                  [('Delay', True), ('Skip', False)]))
+            with self.assertRaises(AssertionError):
+                mod.notice_buttons(path, UPCOMING, ('Skip',), ())
+
+    def test_matching_is_exact_not_substring_or_folded(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            path = self.check_file(
+                tmp, banner_nodes(pid, UPCOMING,
+                                  [('Delay', True), ('Skip', True)]))
+            with self.assertRaises(AssertionError):
+                mod.notice_buttons(path, UPCOMING, ('skip',), ())
+            with self.assertRaises(AssertionError):
+                mod.notice_buttons(path, UPCOMING, ('Ski',), ())
+
+    def test_missing_banner_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, _ = owner_identity()
+            path = self.check_file(
+                tmp, banner_nodes(pid, UPCOMING, [('Delay', True)],
+                                  title_showing=False))
+            with self.assertRaises(AssertionError):
+                mod.notice_buttons(path, UPCOMING, ('Delay',), ())
+
+    def test_malformed_tree_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            path = tmp / 'banner.json'
+            path.write_text('{"not": "a list"}')
+            with self.assertRaises(mod.HarnessError):
+                mod.notice_buttons(path, UPCOMING, ('Skip',), ())
+
+
+class SkipUndisturbed(unittest.TestCase):
+    def test_zero_drift_passes_and_returns_delta(self):
+        self.assertAlmostEqual(mod.check_skip_undisturbed(1000.0, 1000.0), 0.0)
+        self.assertAlmostEqual(mod.check_skip_undisturbed(1000.0, 1003.0), 3.0)
+        self.assertAlmostEqual(mod.check_skip_undisturbed(1003.0, 1000.0), -3.0)
+
+    def test_tolerance_boundary(self):
+        self.assertAlmostEqual(mod.check_skip_undisturbed(1000.0, 1008.0), 8.0)
+        self.assertAlmostEqual(mod.check_skip_undisturbed(1000.0, 992.0), -8.0)
+        with self.assertRaises(AssertionError):
+            mod.check_skip_undisturbed(1000.0, 1008.1)
+        with self.assertRaises(AssertionError):
+            mod.check_skip_undisturbed(1000.0, 991.9)
+
+    def test_restart_sized_drift_fails(self):
+        # An interval restart (the OLD Skip expectation) is a schedule
+        # move, not an undisturbed schedule: it must fail here.
+        with self.assertRaises(AssertionError):
+            mod.check_skip_undisturbed(1000.0, 1065.0)
+
+    def test_stale_press_due_kind_routes_to_undisturbed(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            pid, start = owner_identity()
+            before, after = tmp / 'before.json', tmp / 'after.json'
+            cstate(before)
+            cstate(after)
+            retired = tmp / 'retired.json'
+            retired.write_text(json.dumps(owned_nodes(pid)))
+            stamp = bound_stamp(tmp / 'retired.json.stamp', retired,
+                                pid, start)
+            owned = {'expected_pid': pid, 'expected_start_ticks': start,
+                     'stamp_path': stamp, 'expected_gate': GATE,
+                     'expected_nonce': NONCE, 'expected_seq': 1}
+            self.assertTrue(mod.check_stale_press_fails(
+                1, before, after, 'Skip', retired, DUE, time.time() - 1,
+                ('skip-undisturbed', 1000.0, 1002.0, 0), **owned))
+            with self.assertRaises(AssertionError):
+                mod.check_stale_press_fails(
+                    1, before, after, 'Skip', retired, DUE,
+                    time.time() - 1,
+                    ('skip-undisturbed', 1000.0, 1065.0, 0), **owned)
+            with self.assertRaises(AssertionError):
+                mod.check_stale_press_fails(
+                    1, before, after, 'Skip', retired, DUE,
+                    time.time() - 1,
+                    ('skip-undisturbed', 1000.0, 1002.0, 30), **owned)
 
 
 if __name__ == '__main__':
