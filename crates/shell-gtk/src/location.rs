@@ -235,12 +235,13 @@ pub fn live_grant(proposed: u32, live_max: u32) -> u32 {
 }
 
 /// A store row (`[level, date]`) to its level; a present but garbled
-/// row denies, as GNOME's `|| NONE` does.
+/// row denies, as GNOME's `|| NONE` does. A present row with no level
+/// word is garbled too: only a genuinely missing row prompts.
 pub fn stored_accuracy(perms: &HashMap<String, Vec<String>>, desktop_id: &str) -> Option<u32> {
-    perms
-        .get(desktop_id)
-        .and_then(|row| row.first())
-        .map(|level| accuracy_value(level))
+    match perms.get(desktop_id) {
+        None => None,
+        Some(row) => Some(row.first().map(accuracy_value).unwrap_or(ACC_NONE)),
+    }
 }
 
 /// The row `Set` writes back: the level word and the decision's date.
@@ -928,6 +929,36 @@ mod tests {
         assert_eq!(
             permission_entry(ACC_CITY, 42),
             vec!["CITY".to_owned(), "42".to_owned()]
+        );
+    }
+
+    #[test]
+    fn present_empty_row_denies_without_prompt() {
+        let perms = HashMap::from([("hollow.app".to_owned(), Vec::new())]);
+        // Present-but-empty is garbled: deny, never prompt.
+        assert_eq!(stored_accuracy(&perms, "hollow.app"), Some(ACC_NONE));
+        assert_eq!(
+            authorize_lookup(
+                ACC_EXACT,
+                &LookupOutcome::Available(perms.clone()),
+                "hollow.app",
+                true
+            ),
+            AuthDecision::Answer {
+                accuracy: ACC_NONE,
+                save: true
+            }
+        );
+        // A genuinely missing row still prompts: the distinct contrast.
+        assert_eq!(stored_accuracy(&perms, "missing.app"), None);
+        assert_eq!(
+            authorize_lookup(
+                ACC_EXACT,
+                &LookupOutcome::Available(perms),
+                "missing.app",
+                true
+            ),
+            AuthDecision::Prompt
         );
     }
 
