@@ -172,13 +172,17 @@ struct Shown {
 /// second old key would still invoke after a first action or a banner
 /// close unless the shell retires the resident. Every terminal event
 /// therefore retires: a successful dispatch retires all sibling keys
-/// at once (first press wins), and banner close, body click, timeout
-/// expiry, list removal, and programmatic dismiss retire without
-/// firing. Unregistered ids behave exactly as before. Pure and
+/// at once (first press wins). Exactly one path fires on user
+/// dismiss: the banner close button runs the resident's dismiss
+/// handler once, then retires the whole resident like a press.
+/// Body click, timeout expiry, list removal, programmatic dismiss,
+/// replacement, and history render retire without firing.
+/// Unregistered ids behave exactly as before. Pure and
 /// headless-testable; the UI owns one.
 #[derive(Default)]
 struct ActionDispatch {
     handlers: HashMap<(u64, String), Rc<dyn Fn()>>,
+    dismiss: HashMap<u64, Rc<dyn Fn()>>,
     live: HashSet<u64>,
 }
 
@@ -189,12 +193,29 @@ impl ActionDispatch {
         self.live.insert(id);
     }
 
+    /// Register (or replace) one resident's user-dismiss callback,
+    /// admitting the resident. Only the banner close button may fire
+    /// it, via [`ActionDispatch::dispatch_user_dismiss`].
+    fn register_dismiss(&mut self, id: u64, handler: Rc<dyn Fn()>) {
+        self.dismiss.insert(id, handler);
+        self.live.insert(id);
+    }
+
     /// Retire one resident generation entirely (action/dismiss/replace):
     /// its keys must never fire again, even through a previously
     /// captured path. History entries are untouched.
     fn drop_notice(&mut self, id: u64) {
         self.handlers.retain(|(known, _), _| *known != id);
+        self.dismiss.remove(&id);
         self.live.remove(&id);
+    }
+
+    /// Forget one resident's user-dismiss callback only, keeping its
+    /// action keys and liveness. Called alongside
+    /// [`ActionDispatch::drop_notice`] wherever the wellbeing layer
+    /// drops a notice's routing.
+    fn drop_dismiss(&mut self, id: u64) {
+        self.dismiss.remove(&id);
     }
 
     /// Release callbacks whose center entries were removed or history-pruned.
@@ -202,6 +223,7 @@ impl ActionDispatch {
     fn retain_history(&mut self, center: &NotificationCenter) {
         let present: HashSet<u64> = center.history().iter().map(|n| n.id).collect();
         self.handlers.retain(|(id, _), _| present.contains(id));
+        self.dismiss.retain(|id, _| present.contains(id));
         self.live.retain(|id| present.contains(id));
     }
 
@@ -213,6 +235,26 @@ impl ActionDispatch {
             return false;
         }
         match self.handlers.get(&(id, action.to_owned())) {
+            Some(handler) => {
+                handler();
+                self.drop_notice(id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Run one resident's user-dismiss callback, then retire the whole
+    /// resident so the firing is once-only and a later press (or a
+    /// second dismiss) can never act. False when unadmitted: unknown
+    /// ids, retired residents, and residents without a dismiss
+    /// handler never fire. Call ONLY from the banner close-button
+    /// handler; every other teardown path retires without firing.
+    fn dispatch_user_dismiss(&mut self, id: u64) -> bool {
+        if !self.live.contains(&id) {
+            return false;
+        }
+        match self.dismiss.get(&id) {
             Some(handler) => {
                 handler();
                 self.drop_notice(id);
@@ -513,6 +555,19 @@ impl NotifyUi {
         self.local_actions.borrow_mut().drop_notice(id);
     }
 
+    /// Register one notice's user-dismiss callback (banner close
+    /// button fires it once, then retires the resident).
+    pub fn on_notice_dismiss(self: &Rc<Self>, id: u64, handler: Rc<dyn Fn()>) {
+        self.local_actions
+            .borrow_mut()
+            .register_dismiss(id, handler);
+    }
+
+    /// Forget one notice's user-dismiss callback (replacement/removal).
+    pub fn drop_notice_dismiss(self: &Rc<Self>, id: u64) {
+        self.local_actions.borrow_mut().drop_dismiss(id);
+    }
+
     /// Dismiss one banner by id (history keeps the entry); false when the
     /// center no longer knows it. Retires the resident's local callbacks:
     /// history keeps unconsumed keys invokable, so without this an old
@@ -536,6 +591,13 @@ impl NotifyUi {
     /// captured before the press can never fire afterwards.
     fn dispatch_local_action(&self, id: u64, action: &str) -> bool {
         self.local_actions.borrow_mut().dispatch(id, action)
+    }
+
+    /// Run one resident's user-dismiss callback; false when unadmitted.
+    /// Only the banner close-button handler calls this: a successful
+    /// firing retires the whole resident exactly like a press.
+    fn dispatch_user_dismiss_local(&self, id: u64) -> bool {
+        self.local_actions.borrow_mut().dispatch_user_dismiss(id)
     }
 
     /// Retire one resident's local callbacks without firing (banner
@@ -685,6 +747,11 @@ impl NotifyUi {
                 let (me, id) = (self.clone(), n.id);
                 close.connect_clicked(move |_| {
                     let _ = me.bus.borrow().dismiss_banner(id as u32, REASON_DISMISSED);
+                    // The one firing dismiss path: a genuine close
+                    // runs the resident's dismiss handler (wellbeing
+                    // Skip), then retires. Order matters — retire
+                    // first and the handler could never fire.
+                    me.dispatch_user_dismiss_local(id);
                     me.retire_local_actions(id);
                     me.refresh();
                 });
@@ -1079,6 +1146,67 @@ mod action_dispatch_tests {
         fired.set(false);
         assert!(dispatch.dispatch(7, "take"));
         assert!(fired.get());
+    }
+
+    #[test]
+    fn user_dismiss_fires_once_then_retires_the_resident() {
+        let mut dispatch = ActionDispatch::default();
+        let dismissed = Rc::new(Cell::new(false));
+        dispatch.register_dismiss(7, counting(&dismissed));
+        // First terminal event wins...
+        assert!(dispatch.dispatch_user_dismiss(7));
+        assert!(dismissed.get());
+        // ...then the firing is once-only: no second dismiss, and the
+        // resident stays retired.
+        assert!(!dispatch.dispatch_user_dismiss(7));
+    }
+
+    #[test]
+    fn press_and_dismiss_retire_each_other_first_terminal_wins() {
+        let mut dispatch = ActionDispatch::default();
+        let take = Rc::new(Cell::new(false));
+        let dismissed = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&take));
+        dispatch.register_dismiss(7, counting(&dismissed));
+        // Press first: the dismiss handler captured before it is dead.
+        assert!(dispatch.dispatch(7, "take"));
+        assert!(!dispatch.dispatch_user_dismiss(7));
+        assert!(!dismissed.get());
+        // Dismiss first: the press captured before it is dead.
+        let take = Rc::new(Cell::new(false));
+        let dismissed = Rc::new(Cell::new(false));
+        dispatch.register(9, "take", counting(&take));
+        dispatch.register_dismiss(9, counting(&dismissed));
+        assert!(dispatch.dispatch_user_dismiss(9));
+        assert!(!dispatch.dispatch(9, "take"));
+        assert!(!take.get());
+    }
+
+    #[test]
+    fn cancel_replacement_and_stale_never_fire_dismiss() {
+        let mut dispatch = ActionDispatch::default();
+        let dismissed = Rc::new(Cell::new(false));
+        // Cancel: drop the dismiss routing without firing.
+        dispatch.register_dismiss(7, counting(&dismissed));
+        dispatch.drop_dismiss(7);
+        assert!(!dispatch.dispatch_user_dismiss(7));
+        // Replacement: the old generation retires silently.
+        dispatch.register_dismiss(7, counting(&dismissed));
+        dispatch.drop_notice(7);
+        assert!(!dispatch.dispatch_user_dismiss(7));
+        // A fresh post re-admits; a stale id for a retired resident
+        // and an unknown id never fire.
+        dispatch.register_dismiss(7, counting(&dismissed));
+        assert!(dispatch.dispatch_user_dismiss(7));
+        assert!(dismissed.get());
+        assert!(!dispatch.dispatch_user_dismiss(7));
+        assert!(!dispatch.dispatch_user_dismiss(4242));
+        // A resident with actions but no dismiss handler: pressing
+        // works, dismissing is a silent no-op (external notices).
+        let take = Rc::new(Cell::new(false));
+        dispatch.register(11, "take", counting(&take));
+        assert!(!dispatch.dispatch_user_dismiss(11));
+        assert!(dispatch.dispatch(11, "take"));
     }
 }
 

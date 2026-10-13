@@ -103,6 +103,11 @@ pub const SUPPORTED_BREAK_TYPES: &[&str] = &["eyesight", "movement"];
 pub const SCREEN_TIME_POLL: Duration = Duration::from_secs(30);
 /// Recommended break poll period for the shell timer.
 pub const BREAK_POLL: Duration = Duration::from_secs(2);
+/// Opt-in per-tick break diagnostics for the CI TAKE-LOCK gate. When the shell
+/// runs with `TUNA_WB_BREAK_DIAG=1`, every [`BREAK_POLL`] break tick logs one
+/// [`BreakManager::tick_diag`] line to stderr (the gate's `$LOG`); unset means
+/// zero lines and zero behavior change. Timeouts are untouched.
+pub const BREAK_DIAG_ENV: &str = "TUNA_WB_BREAK_DIAG";
 
 // Schema defaults at the 51.0 tag, used when a schema is not installed.
 pub const DEFAULT_HISTORY_ENABLED: bool = true;
@@ -1201,6 +1206,36 @@ impl BreakManager {
         }
         let _ = self.update(now);
     }
+
+    /// One-line per-tick snapshot for TAKE-LOCK diagnosis (see [`BREAK_DIAG_ENV`]).
+    /// Pure formatting over this tick's inputs and the resulting schedule; the
+    /// caller decides when to log it. Fields: wall `now`, compositor idle,
+    /// idle phase, manager state, selected configs (`type:interval/duration`),
+    /// per-type `last_end`, and the next due (`type@due remaining=`).
+    pub fn tick_diag(&self, now: i64, idle_secs: i64) -> String {
+        let cfg: Vec<String> = self
+            .configs
+            .iter()
+            .map(|(t, c)| format!("{}:{}/{}", t.id(), c.interval_secs, c.duration_secs))
+            .collect();
+        let last: Vec<String> = self
+            .last_end
+            .iter()
+            .map(|(t, e)| format!("{}:{e}", t.id()))
+            .collect();
+        let (due_type, due_at) = self.get_next_break_due(now);
+        let due = due_type.map_or_else(
+            || "none".to_string(),
+            |t| format!("{}@{due_at} remaining={}", t.id(), due_at - now),
+        );
+        format!(
+            "now={now} idle={idle_secs} phase={:?} state={:?} cfg=[{}] last_end=[{}] next_due={due}",
+            self.idle_phase,
+            self.state,
+            cfg.join(","),
+            last.join(","),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,7 +1345,9 @@ fn break_notice(
     }
 }
 
-/// Upcoming-break notice ("Movement/Eyesight Break Soon").
+/// Upcoming-break notice ("Movement/Eyesight Break Soon"). Skip is offered
+/// (GNOME `allowSkip: true`, breakManager.js:1109) but [`BreakManager::skip_break`]
+/// only restarts due breaks, so pressing it just closes the notice.
 pub fn upcoming_notice(break_type: BreakType, remaining_secs: i64, urgent: bool) -> Notice {
     let (span, _) = format_time_span(remaining_secs);
     let title = match break_type {
@@ -1328,6 +1365,11 @@ pub fn upcoming_notice(break_type: BreakType, remaining_secs: i64, urgent: bool)
 }
 
 /// Due-break notice ("Time for a Movement/an Eyesight Break").
+///
+/// GNOME 51 parity: Take + Delay, never a Skip button (`allowSkip: false`,
+/// breakManager.js:1238). Skipping a due break rides on dismissing the banner:
+/// GNOME's `_onDestroy` skips on `DISMISSED` (breakManager.js:1336-1340), routed
+/// here through [`route_resident_dismissal`].
 pub fn due_notice(break_type: BreakType, duration_secs: i64, urgent: bool) -> Notice {
     let (span, _) = format_time_span(duration_secs);
     let (title, body) = match break_type {
@@ -1346,6 +1388,9 @@ pub fn due_notice(break_type: BreakType, duration_secs: i64, urgent: bool) -> No
 }
 
 /// Overdue-break notice ("Break Overdue").
+///
+/// GNOME 51 parity: Take + Delay, never Skip (`allowSkip: false`,
+/// breakManager.js:1260); a due dismissal skips via [`route_resident_dismissal`].
 pub fn overdue_notice(due_ago_secs: i64, urgent: bool) -> Notice {
     let (span, _) = format_time_span(due_ago_secs);
     break_notice(
@@ -1832,6 +1877,10 @@ pub type DismissHook = Rc<dyn Fn(u64) -> bool>;
 pub type ActionRegisterHook = Rc<dyn Fn(u64, String, Rc<dyn Fn()>)>;
 /// Forget one notice's local callbacks (replacement/removal).
 pub type ActionDropHook = Rc<dyn Fn(u64)>;
+/// Register one notice's user-dismiss callback (banner close only).
+pub type DismissRegisterHook = Rc<dyn Fn(u64, Rc<dyn Fn()>)>;
+/// Forget one notice's user-dismiss callback.
+pub type DismissDropHook = Rc<dyn Fn(u64)>;
 /// One user-chosen break action, queued for the next break tick (the hook
 /// must not call back into the runtime; see [`ShellHooks`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1874,6 +1923,49 @@ pub fn notice_action_buttons(
     out
 }
 
+/// How the shell's resident break banner went away, from the surface's point
+/// of view. This mirrors GNOME 51's `NotificationDestroyedReason` split in
+/// `BreakNotification._onDestroy` (breakManager.js:1336-1340): only an explicit
+/// user dismiss acts; every shell-driven close retires silently.
+// Pending notification actions (user-dismiss routing); used by tests.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentDismissal {
+    /// The banner close button (a11y `Close`). GNOME `DISMISSED`: skip.
+    UserDismissed,
+    /// An action button already fired and enqueued its own kind; the banner
+    /// teardown is GNOME `SOURCE_CLOSED` (`_onTake/Delay/SkipAction` destroy
+    /// after acting, breakManager.js:1364,1386,1408).
+    ActionConsumed,
+    /// Replacement, programmatic dismiss, timeout expiry or list removal:
+    /// retire without acting.
+    Retired,
+}
+
+/// Route one resident dismissal to the action it owns, if any.
+///
+/// Returns `Some(BreakActionKind::Skip)` ONLY for a genuine user dismiss of
+/// the CURRENT resident. Every other combination returns `None`, so an action
+/// press, a due→overdue replacement and a programmatic dismiss can never
+/// double-Skip (GNOME only skips on `DISMISSED`, breakManager.js:1339-1340).
+/// [`BreakManager::skip_break`] is itself due-only, so routing an upcoming
+/// dismiss to Skip is a model no-op that just closes the notice — exactly
+/// GNOME's upcoming Skip.
+// User-dismiss routing contract: the Notify arm registers exactly this
+// decision as the resident's dismiss callback (live consumer below).
+pub fn route_resident_dismissal(
+    resident: Option<u64>,
+    dismissed: u64,
+    how: ResidentDismissal,
+) -> Option<BreakActionKind> {
+    match (how, resident) {
+        (ResidentDismissal::UserDismissed, Some(current)) if current == dismissed => {
+            Some(BreakActionKind::Skip)
+        }
+        _ => None,
+    }
+}
+
 /// Shell surfaces the wellbeing runtime drives. All hooks run on the GTK
 /// thread. A hook must not call back into the runtime: the runtime lends
 /// surfaces, it never borrows them back.
@@ -1887,6 +1979,8 @@ pub struct ShellHooks {
     pub dismiss_notice: DismissHook,
     pub on_notice_action: ActionRegisterHook,
     pub drop_notice_actions: ActionDropHook,
+    pub on_notice_dismiss: DismissRegisterHook,
+    pub drop_notice_dismiss: DismissDropHook,
     pub break_action: BreakActionHook,
     pub effect_hook: EffectHook,
 }
@@ -1982,6 +2076,7 @@ pub fn dispatch_break_ui(
                 if let Some(old) = resident.take() {
                     (hooks.dismiss_notice)(old);
                     (hooks.drop_notice_actions)(old);
+                    (hooks.drop_notice_dismiss)(old);
                 }
                 let buttons = notice_action_buttons(notice);
                 let posted = (hooks.post_action_notice)(
@@ -1997,6 +2092,23 @@ pub fn dispatch_break_ui(
                         let push = hooks.break_action.clone();
                         (hooks.on_notice_action)(id, key.to_string(), Rc::new(move || push(kind)));
                     }
+                    // The banner close button routes through the same
+                    // residency the router pins: the consumer only
+                    // fires this for the live resident, which is
+                    // exactly the (UserDismissed, Some(id)) case.
+                    let push = hooks.break_action.clone();
+                    (hooks.on_notice_dismiss)(
+                        id,
+                        Rc::new(move || {
+                            if let Some(kind) = route_resident_dismissal(
+                                Some(id),
+                                id,
+                                ResidentDismissal::UserDismissed,
+                            ) {
+                                push(kind);
+                            }
+                        }),
+                    );
                     *resident = Some(id);
                 }
             }
@@ -2004,6 +2116,7 @@ pub fn dispatch_break_ui(
                 if let Some(id) = resident.take() {
                     (hooks.dismiss_notice)(id);
                     (hooks.drop_notice_actions)(id);
+                    (hooks.drop_notice_dismiss)(id);
                 }
             }
             BreakUiEvent::StartCountdown {
@@ -2088,6 +2201,14 @@ struct Runtime {
     sent_effect: Option<EffectState>,
     screen_timer: Option<glib::SourceId>,
     stopped: bool,
+    break_diag: bool,
+}
+
+/// Whether per-tick break diagnostics are on (CI TAKE-LOCK gate only:
+/// [`BREAK_DIAG_ENV`]`=1` in the shell's environment; dev shells unset it).
+#[cfg(not(test))]
+fn break_diag_enabled() -> bool {
+    matches!(std::env::var(BREAK_DIAG_ENV).as_deref(), Ok("1"))
 }
 
 /// One screen-time poll: idle verdict from the compositor, history edges and
@@ -2172,6 +2293,14 @@ fn break_tick(rt: &Rc<RefCell<Runtime>>) {
                 BreakActionKind::Skip => r.breaks.skip_break(now),
             });
         }
+        // TAKE-LOCK diagnosis only: one greppable line per tick while the CI
+        // gate opts in. Read-only snapshot; poll cadence and timeouts unchanged.
+        if r.break_diag {
+            eprintln!(
+                "tuna-shell-gtk: wellbeing: break-diag {}",
+                r.breaks.manager.tick_diag(now, idle_secs)
+            );
+        }
         (r.hooks.clone(), r.effect, r.countdown, r.resident, events)
     };
     dispatch_break_ui(&hooks, &mut effect, &mut countdown, &mut resident, &events);
@@ -2226,6 +2355,7 @@ pub fn start(
         sent_effect: None,
         screen_timer: None,
         stopped: false,
+        break_diag: break_diag_enabled(),
     }));
     // Baseline first: the compositor starts from neutral even if a limit
     // is already reached (the first polls then send the actual pair).
@@ -2626,7 +2756,8 @@ mod tests {
         let events = service.poll(T0 + 100, 0);
         assert_eq!(service.manager.state(), BreakState::Active);
         assert!(!events.iter().any(|e| matches!(e, BreakUiEvent::Notify(_))));
-        // Due at T0+1200 with the exact GNOME strings and actions.
+        // Due at T0+1200 with the exact GNOME strings and actions
+        // (Take + Delay; GNOME has no due Skip button, breakManager.js:1238).
         let events = service.poll(T0 + 1200, 0);
         assert_eq!(service.manager.state(), BreakState::BreakDue);
         let notice = events
@@ -2642,9 +2773,17 @@ mod tests {
             "Take a break from the screen. Look at least 6 meters away for at least 20 seconds"
         );
         assert!(notice.urgent && notice.allow_delay && !notice.allow_skip && notice.allow_take);
-        // 60 s later the overdue notice replaces it (overdue toggle is on).
+        // 60 s later the overdue notice replaces it (overdue toggle is on),
+        // still Take + Delay with no Skip (breakManager.js:1260).
         let events = service.poll(T0 + 1261, 0);
-        assert!(has_title(&events, "Break Overdue"), "{events:?}");
+        let overdue = events
+            .iter()
+            .find_map(|e| match e {
+                BreakUiEvent::Notify(n) if n.title == "Break Overdue" => Some(n),
+                _ => None,
+            })
+            .expect("overdue notice");
+        assert!(overdue.allow_delay && !overdue.allow_skip && overdue.allow_take);
     }
 
     #[test]
@@ -2873,6 +3012,9 @@ mod tests {
         registered: Rc<RefCell<Vec<(u64, String)>>>,
         callbacks: Rc<RefCell<ActionCallbacks>>,
         dropped: Rc<RefCell<Vec<u64>>>,
+        dismiss_registered: Rc<RefCell<Vec<u64>>>,
+        dismiss_callbacks: Rc<RefCell<HashMap<u64, Rc<dyn Fn()>>>>,
+        dismiss_dropped: Rc<RefCell<Vec<u64>>>,
         queued: Rc<RefCell<Vec<BreakActionKind>>>,
         effect_sends: Rc<RefCell<Vec<(bool, bool)>>>,
     }
@@ -2888,6 +3030,9 @@ mod tests {
         let registered = recorded.registered.clone();
         let callbacks = recorded.callbacks.clone();
         let dropped = recorded.dropped.clone();
+        let dismiss_registered = recorded.dismiss_registered.clone();
+        let dismiss_callbacks = recorded.dismiss_callbacks.clone();
+        let dismiss_dropped = recorded.dismiss_dropped.clone();
         let queued = recorded.queued.clone();
         let effect_sends = recorded.effect_sends.clone();
         ShellHooks {
@@ -2922,11 +3067,23 @@ mod tests {
             }),
             drop_notice_actions: {
                 let callbacks = callbacks.clone();
+                let dismiss_callbacks = dismiss_callbacks.clone();
                 Rc::new(move |id| {
                     dropped.borrow_mut().push(id);
                     callbacks.borrow_mut().retain(|(known, _), _| *known != id);
+                    // Mirrors NotifyUi: drop_notice retires the
+                    // dismiss handler with the action keys.
+                    dismiss_callbacks.borrow_mut().remove(&id);
                 })
             },
+            on_notice_dismiss: Rc::new(move |id, handler| {
+                dismiss_registered.borrow_mut().push(id);
+                dismiss_callbacks.borrow_mut().insert(id, handler);
+            }),
+            drop_notice_dismiss: Rc::new(move |id| {
+                dismiss_dropped.borrow_mut().push(id);
+                dismiss_callbacks.borrow_mut().remove(&id);
+            }),
             break_action: Rc::new(move |kind| {
                 queued.borrow_mut().push(kind);
             }),
@@ -2952,6 +3109,9 @@ mod tests {
             registered: Rc::new(RefCell::new(Vec::new())),
             callbacks: Rc::new(RefCell::new(HashMap::new())),
             dropped: Rc::new(RefCell::new(Vec::new())),
+            dismiss_registered: Rc::new(RefCell::new(Vec::new())),
+            dismiss_callbacks: Rc::new(RefCell::new(HashMap::new())),
+            dismiss_dropped: Rc::new(RefCell::new(Vec::new())),
             queued: Rc::new(RefCell::new(Vec::new())),
             effect_sends: Rc::new(RefCell::new(Vec::new())),
         };
@@ -3151,6 +3311,105 @@ mod tests {
             .callbacks
             .borrow()
             .contains_key(&(42, "take".to_string())));
+    }
+
+    #[test]
+    fn dismiss_close_fires_skip_through_registered_callback() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        let mut resident = None;
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::Notify(due_notice(
+                BreakType::Movement,
+                20,
+                true,
+            ))],
+        );
+        assert_eq!(resident, Some(41));
+        // The Notify arm registers exactly one dismiss callback for
+        // the live resident, next to the take/delay actions.
+        assert_eq!(seen.dismiss_registered.borrow().as_slice(), &[41]);
+        // Fire it the way the banner close button does after a
+        // successful bus dismiss; it enqueues Skip through the
+        // router's (UserDismissed, Some(41)) decision.
+        seen.dismiss_callbacks.borrow()[&41]();
+        assert_eq!(seen.queued.borrow().as_slice(), &[BreakActionKind::Skip]);
+    }
+
+    #[test]
+    fn dismiss_notice_drops_dismiss_routing_without_firing() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        let mut resident = None;
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::Notify(due_notice(
+                BreakType::Movement,
+                20,
+                true,
+            ))],
+        );
+        assert_eq!(resident, Some(41));
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::DismissNotice],
+        );
+        assert_eq!(resident, None);
+        assert_eq!(seen.dismiss_dropped.borrow().as_slice(), &[41]);
+        // Stale control: no dismiss routing survives for the retired
+        // resident, and nothing was enqueued by the teardown.
+        assert!(seen.dismiss_callbacks.borrow().is_empty());
+        assert!(seen.queued.borrow().is_empty());
+    }
+
+    #[test]
+    fn replacement_drops_old_dismiss_routing_and_arms_the_new() {
+        let (hooks, seen) = recorded();
+        let mut effect = EffectState::default();
+        let mut countdown = None;
+        let mut resident = None;
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::Notify(due_notice(
+                BreakType::Movement,
+                20,
+                true,
+            ))],
+        );
+        dispatch_break_ui(
+            &hooks,
+            &mut effect,
+            &mut countdown,
+            &mut resident,
+            &[BreakUiEvent::Notify(due_notice(
+                BreakType::Eyesight,
+                20,
+                true,
+            ))],
+        );
+        assert_eq!(resident, Some(42));
+        // The replaced resident's dismiss routing is dropped with its
+        // action callbacks; only the new resident is armed.
+        assert_eq!(seen.dismiss_dropped.borrow().as_slice(), &[41]);
+        assert_eq!(seen.dismiss_registered.borrow().as_slice(), &[41, 42]);
+        assert!(!seen.dismiss_callbacks.borrow().contains_key(&41));
+        seen.dismiss_callbacks.borrow()[&42]();
+        assert_eq!(seen.queued.borrow().as_slice(), &[BreakActionKind::Skip]);
     }
 
     #[test]
@@ -3498,5 +3757,80 @@ mod tests {
         assert!(seen.posts.borrow().is_empty());
         assert!(!effect.grayscale);
         assert!(!dir.path().join("session-active-history.json").exists());
+    }
+
+    #[test]
+    fn resident_dismissal_routes_only_genuine_user_dismiss_to_skip() {
+        use ResidentDismissal::*;
+        // The one positive: a genuine user dismiss of the current resident
+        // owns Skip (GNOME `_onDestroy` on DISMISSED, breakManager.js:1339-1340).
+        assert_eq!(
+            route_resident_dismissal(Some(41), 41, UserDismissed),
+            Some(BreakActionKind::Skip)
+        );
+        // Double-skip negatives: every other (reason, residency) retires
+        // silently, so presses, replacements and programmatic closes never
+        // act twice.
+        for (resident, dismissed, how) in [
+            (Some(42), 41, UserDismissed),  // stale id: resident moved on
+            (None, 41, UserDismissed),      // no resident at all
+            (Some(41), 41, ActionConsumed), // Take/Delay/Skip press teardown
+            (Some(41), 41, Retired),        // replace/programmatic/expiry/list
+            (Some(42), 41, ActionConsumed),
+            (None, 41, Retired),
+        ] {
+            assert_eq!(
+                route_resident_dismissal(resident, dismissed, how),
+                None,
+                "{how:?} resident={resident:?} dismissed={dismissed}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_while_nothing_is_due_is_a_model_noop() {
+        // GNOME's upcoming Skip: `skipBreak` only restarts due breaks, so an
+        // upcoming dismiss just closes the notice (state and due unchanged).
+        let (t, mut cfg) = eyesight();
+        cfg.notify_upcoming = true;
+        let mut service = BreakService::new();
+        service.manager.set_selected(&[(t, cfg)], T0);
+        service.poll(T0 + 1080, 0); // upcoming notice showing, not due yet
+        assert_eq!(service.manager.state(), BreakState::Active);
+        let due_before = service.manager.next_break_due_time(T0 + 1080);
+        let events = service.skip_break(T0 + 1080);
+        assert_eq!(service.manager.state(), BreakState::Active);
+        assert_eq!(service.manager.next_break_due_time(T0 + 1080), due_before);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, BreakUiEvent::StateChanged(_))),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn break_tick_diag_reports_inputs_and_schedule() {
+        assert_eq!(BREAK_DIAG_ENV, "TUNA_WB_BREAK_DIAG");
+        let mut manager = BreakManager::new();
+        manager.set_selected(&[eyesight()], T0);
+        let line = manager.tick_diag(T0 + 100, 3);
+        for field in [
+            format!("now={}", T0 + 100),
+            "idle=3".to_string(),
+            "phase=Active".to_string(),
+            "state=Active".to_string(),
+            "cfg=[eyesight:1200/20]".to_string(),
+            format!("last_end=[eyesight:{T0}]"),
+            format!("next_due=eyesight@{} remaining=1100", T0 + 1200),
+        ] {
+            assert!(line.contains(field.as_str()), "{field} missing in {line}");
+        }
+        // Empty selection stays greppable (Disabled, no schedule).
+        manager.set_selected(&[], T0 + 100);
+        let line = manager.tick_diag(T0 + 100, 0);
+        for field in ["state=Disabled", "cfg=[]", "last_end=[]", "next_due=none"] {
+            assert!(line.contains(field), "{field} missing in {line}");
+        }
     }
 }

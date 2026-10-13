@@ -332,6 +332,8 @@ mod gtk_countdown_tests {
             dismiss_notice: Rc::new(|_| false),
             on_notice_action: Rc::new(|_, _, _| {}),
             drop_notice_actions: Rc::new(|_| {}),
+            on_notice_dismiss: Rc::new(|_, _| {}),
+            drop_notice_dismiss: Rc::new(|_| {}),
             break_action: Rc::new(|_| {}),
             effect_hook: Rc::new(|_, _| false),
         };

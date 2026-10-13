@@ -123,8 +123,8 @@
 #                  to 0.6; stale Take fails (#354)
 #   G-WELLBEING-ACTION-DELAY an actual Delay press moves the live due
 #                  by delay-seconds; stale Delay fails (#354)
-#   G-WELLBEING-ACTION-SKIP an actual Skip press restarts the
-#                  interval; stale Skip fails (#354)
+#   G-WELLBEING-ACTION-SKIP a GNOME-valid user dismiss (Close)
+#                  restarts the interval via Skip; stale Close fails (#354)
 #   G-WELLBEING-NEGATIVE neutral frames fail every effect assertion,
 #                  intermediates hold, stale presses fail (#354)
 #   G-SCREENSHOT   org.gnome.Shell.Screenshot saves the screen as a PNG
@@ -841,11 +841,13 @@ if [ "$SCREENSHOT_KEYS_ONLY" != 1 ]; then
 fi
 if [ -n "$PAM_ON" ]; then
     env IBUS_ADDRESS="unix:path=$ARTIFACTS/not-the-private-ibus" \
+        TUNA_WB_BREAK_DIAG=1 \
         LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
         PAM_WRAPPER_SERVICE_DIR="$ARTIFACTS/pam/services" \
         "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >>"$LOG" 2>&1 &
 else
     env IBUS_ADDRESS="unix:path=$ARTIFACTS/not-the-private-ibus" \
+        TUNA_WB_BREAK_DIAG=1 \
         "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >>"$LOG" 2>&1 &
 fi
 COMPOSITOR_PID=$!
@@ -5220,12 +5222,18 @@ while [ "$(date +%s)" -le "$end" ]; do
     if showing "$ARTIFACTS/a11y-wb-skip-due.json" "Time for an Eyesight Break"; then SKIPDUE=1; break; fi
 done
 [ -n "$SKIPDUE" ] || fail G-WELLBEING-ACTION-SKIP "no due banner to skip"
+# GNOME-valid due skip: the due banner carries no Skip button
+# (allowSkip=false), so the live press dismisses via the banner's
+# own Close control. --press takes the first showing non-label
+# match, so the Close must be unique before pressing it.
+[ "$(jq '[.[] | select(.name == "Close" and .showing)] | length' "$ARTIFACTS/a11y-wb-skip-due.json")" = "1" ] ||
+    fail G-WELLBEING-ACTION-SKIP "Close control not unique on the due banner"
 skip_press_epoch="$(date +%s)"
-wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-press.json" 20 --press "Skip" ||
-    fail G-WELLBEING-ACTION-SKIP "could not press Skip"
+wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-press.json" 20 --press "Close" ||
+    fail G-WELLBEING-ACTION-SKIP "could not press Close (user dismiss)"
 cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-before.json"
 stale_code=0
-wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-stale.json" 20 --press "Skip" >/dev/null 2>&1 || stale_code=$?
+wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-stale.json" 20 --press "Close" >/dev/null 2>&1 || stale_code=$?
 cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-after.json"
 # The retired dump is taken now (the redue banner is not showing yet);
 # the stale verdict waits for the redue so the interval restart the
@@ -5249,7 +5257,7 @@ while [ "$(date +%s)" -le "$end" ]; do
         break
     fi
 done
-[ -n "$SKIPREDUE" ] || fail G-WELLBEING-ACTION-SKIP "no redue banner after Skip"
+[ -n "$SKIPREDUE" ] || fail G-WELLBEING-ACTION-SKIP "no redue banner after dismiss"
 wb_capture_after_live_action skip-redue
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" skip \
     --press "$skip_press_epoch" --new-due "$skip_redue_epoch" --interval-secs 10 ||
@@ -5269,12 +5277,12 @@ wb_capture_after_live_action skip-redue
     --expect-nonce "$WB_NONCE" \
     --expect-seq "$skip_retired_seq" \
     --due-kind skip --due-old "$skip_press_epoch" --due-new "$skip_redue_epoch" --due-expect 10 ||
-    fail G-WELLBEING-ACTION-SKIP "a stale Skip press fired"
+    fail G-WELLBEING-ACTION-SKIP "a stale Close press fired"
 wb_break_cleanup
 gsettings set org.gnome.desktop.notifications show-banners false ||
     fail G-WELLBEING-ACTION-SKIP "could not restore DND"
 wb_provenance_finish
-pass G-WELLBEING-ACTION-SKIP "an actual Skip press restarts the interval and a stale Skip fails"
+pass G-WELLBEING-ACTION-SKIP "a user dismiss restarts the interval via Skip and a stale Close fails"
 
 # Negative controls: neutral frames FAIL the effect assertions (assertion
 # failure, same build, not source-identity failure); intermediate RGB is

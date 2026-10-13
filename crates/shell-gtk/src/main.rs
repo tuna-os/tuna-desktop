@@ -1846,6 +1846,8 @@ fn build(app: &adw::Application) {
         let dismiss_notices = notify.clone();
         let register_notices = notify.clone();
         let drop_notices = notify.clone();
+        let dismiss_register_notices = notify.clone();
+        let dismiss_drop_notices = notify.clone();
         let break_queue: Rc<RefCell<Vec<wellbeing::BreakActionKind>>> =
             Rc::new(RefCell::new(Vec::new()));
         let break_push = break_queue.clone();
@@ -1872,6 +1874,12 @@ fn build(app: &adw::Application) {
                 }),
                 drop_notice_actions: Rc::new(move |id: u64| {
                     drop_notices.drop_notification_actions(id);
+                }),
+                on_notice_dismiss: Rc::new(move |id: u64, handler: Rc<dyn Fn()>| {
+                    dismiss_register_notices.on_notice_dismiss(id, handler);
+                }),
+                drop_notice_dismiss: Rc::new(move |id: u64| {
+                    dismiss_drop_notices.drop_notice_dismiss(id);
                 }),
                 break_action: Rc::new(move |kind: wellbeing::BreakActionKind| {
                     break_push.borrow_mut().push(kind);
