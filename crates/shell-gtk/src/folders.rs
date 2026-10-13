@@ -235,22 +235,200 @@ pub fn create(apps: &[&AppEntry]) -> Option<String> {
     }
     let id = glib::uuid_string_random().to_string();
     let root = gio::Settings::new(SCHEMA);
+    let mut observation = FolderCreateObservation::from_proof_env(&id);
+    let created = create_with_settings(
+        apps,
+        &id,
+        &root,
+        || folder_settings(&id),
+        observation.as_mut(),
+    );
+    if let Some(observation) = observation {
+        observation.emit();
+    }
+    created
+}
+
+// The observer preserves this existing sequence and its ignored-result behavior.
+// Publication/failure semantics will be corrected in a separately reviewed change.
+fn create_with_settings(
+    apps: &[&AppEntry],
+    id: &str,
+    root: &gio::Settings,
+    make_child: impl FnOnce() -> gio::Settings,
+    mut observation: Option<&mut FolderCreateObservation>,
+) -> Option<String> {
     let mut children: Vec<String> = root
         .strv("folder-children")
         .iter()
         .map(|v| v.to_string())
         .collect();
-    children.push(id.clone());
+    children.push(id.to_owned());
     let refs: Vec<&str> = children.iter().map(String::as_str).collect();
-    let _ = root.set_strv("folder-children", refs.as_slice());
-    let s = folder_settings(&id);
+    let writable = observation
+        .as_ref()
+        .map(|_| root.is_writable("folder-children"));
+    let result = root.set_strv("folder-children", refs.as_slice()).is_ok();
+    if let Some(trace) = observation.as_deref_mut() {
+        trace.observe(
+            "root-children-write",
+            root,
+            None,
+            Some(writable.unwrap()),
+            Some(result),
+        );
+    }
+    let child = make_child();
     let name = best_folder_name(apps).unwrap_or_else(|| "Unnamed Folder".to_owned());
-    let _ = s.set_string("name", &name);
+    if let Some(trace) = observation.as_deref_mut() {
+        trace.expected_name = name.clone();
+    }
+    let writable = observation.as_ref().map(|_| child.is_writable("name"));
+    let result = child.set_string("name", &name).is_ok();
+    if let Some(trace) = observation.as_deref_mut() {
+        trace.observe(
+            "name-write",
+            root,
+            Some(&child),
+            Some(writable.unwrap()),
+            Some(result),
+        );
+    }
     let ids: Vec<String> = apps.iter().map(|a| desktop_id(&a.app_id)).collect();
-    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-    let _ = s.set_strv("apps", ids.as_slice());
+    if let Some(trace) = observation.as_deref_mut() {
+        trace.expected_apps = ids.clone();
+    }
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let writable = observation.as_ref().map(|_| child.is_writable("apps"));
+    let result = child.set_strv("apps", refs.as_slice()).is_ok();
+    if let Some(trace) = observation.as_deref_mut() {
+        trace.observe(
+            "apps-write",
+            root,
+            Some(&child),
+            Some(writable.unwrap()),
+            Some(result),
+        );
+    }
     gio::Settings::sync();
-    Some(id)
+    if let Some(trace) = observation {
+        trace.observe("after-sync", root, Some(&child), None, None);
+    }
+    Some(id.to_owned())
+}
+
+struct FolderCreateObservation {
+    id: String,
+    declared_source: String,
+    proof_config: Option<PathBuf>,
+    expected_name: String,
+    expected_apps: Vec<String>,
+    events: Vec<serde_json::Value>,
+}
+
+impl FolderCreateObservation {
+    fn from_proof_env(id: &str) -> Option<Self> {
+        if std::env::var("TUNA_FOLDER_CREATE_TRACE").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let source = std::env::var("TUNA_FOLDER_CREATE_SOURCE_COMMIT").ok()?;
+        if source.len() != 40 || !source.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Self {
+            id: id.to_owned(),
+            declared_source: source,
+            proof_config: std::env::var_os("TUNA_FOLDER_CREATE_PROOF_CONFIG").map(PathBuf::from),
+            expected_name: String::new(),
+            expected_apps: Vec::new(),
+            events: Vec::new(),
+        })
+    }
+
+    fn observe(
+        &mut self,
+        operation: &str,
+        root: &gio::Settings,
+        child: Option<&gio::Settings>,
+        writable: Option<bool>,
+        result: Option<bool>,
+    ) {
+        self.events.push(serde_json::json!({
+            "sequence": self.events.len(), "operation": operation,
+            "writable": writable, "setter_result": result,
+            "advertised": root.strv("folder-children").iter().any(|value| value.as_str() == self.id),
+            "cached_name": child.map(|s| s.string("name").to_string()),
+            "cached_apps": child.map(|s| s.strv("apps").iter().map(|v| v.to_string()).collect::<Vec<_>>()),
+            "file_sample": self.file_sample(),
+        }));
+    }
+
+    fn file_sample(&self) -> serde_json::Value {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        const LIMIT: u64 = 128 * 1024;
+        let read = || -> Result<serde_json::Value, &'static str> {
+            let config = self.proof_config.as_ref().ok_or("no-fixture-config")?;
+            if !config.is_absolute() {
+                return Err("relative-fixture-config");
+            }
+            let owner = unsafe { libc::getuid() };
+            let metadata =
+                std::fs::symlink_metadata(config).map_err(|_| "fixture-config-missing")?;
+            if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o077 != 0 {
+                return Err("fixture-config-not-private-owned");
+            }
+            let path = config.join("glib-2.0/settings/keyfile");
+            for ancestor in path.ancestors() {
+                if std::fs::symlink_metadata(ancestor)
+                    .map_err(|_| "fixture-path-missing")?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err("fixture-path-symlink");
+                }
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|_| "fixture-file-unreadable")?;
+            let metadata = file.metadata().map_err(|_| "fixture-file-metadata")?;
+            if !metadata.is_file() || metadata.uid() != owner || metadata.len() > LIMIT {
+                return Err("fixture-file-unowned-or-over-budget");
+            }
+            let mut bytes = Vec::new();
+            file.take(LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "fixture-file-read")?;
+            if bytes.len() as u64 > LIMIT {
+                return Err("fixture-file-over-budget");
+            }
+            let data = std::str::from_utf8(&bytes).map_err(|_| "fixture-file-not-utf8")?;
+            let keyfile = glib::KeyFile::new();
+            keyfile
+                .load_from_data(data, glib::KeyFileFlags::NONE)
+                .map_err(|_| "fixture-file-invalid")?;
+            let group = format!("org/gnome/desktop/app-folders/folders/{}", self.id);
+            Ok(
+                serde_json::json!({"kind":"physical-file-sample", "durability_proven":false,
+                "name_variant":keyfile.value(&group,"name").ok().map(|v|v.to_string()),
+                "apps_variant":keyfile.value(&group,"apps").ok().map(|v|v.to_string())}),
+            )
+        };
+        read().unwrap_or_else(|error|serde_json::json!({"kind":"unavailable", "reason":error, "durability_proven":false}))
+    }
+
+    fn emit(self) {
+        use std::io::Write;
+        let record = serde_json::json!({"kind":"folder-create-observation", "pid":std::process::id(),
+            "folder":self.id, "declared_source":self.declared_source,
+            "source_binding":"external proof admission required; not authenticated by this environment",
+            "expected_name":self.expected_name, "expected_apps":self.expected_apps,
+            "events":self.events, "scope":"cached readback and bounded physical samples; no durability or cross-process atomicity claim"});
+        let bytes = format!("FOLDER-CREATE {record}\n");
+        let _ = std::io::stderr().lock().write_all(bytes.as_bytes());
+    }
 }
 
 /// GNOME's `addApp`: put `app` in folder `id`.
@@ -555,6 +733,10 @@ mod tests {
 
     impl TestSchemas {
         fn new() -> Self {
+            Self::with_name_refusal(false)
+        }
+
+        fn with_name_refusal(refuse_name: bool) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "tuna-folder-schemas-{}",
                 glib::uuid_string_random()
@@ -571,7 +753,14 @@ mod tests {
 <key name="apps" type="as"><default>[]</default></key>
 <key name="categories" type="as"><default>[]</default></key>
 <key name="excluded-apps" type="as"><default>[]</default></key>
-</schema></schemalist>"#,
+</schema></schemalist>"#.replace(
+                    "<key name=\"name\" type=\"s\"><default>''</default></key>",
+                    if refuse_name {
+                        "<key name=\"name\" type=\"s\"><choices><choice value=\"\"/></choices><default>''</default></key>"
+                    } else {
+                        "<key name=\"name\" type=\"s\"><default>''</default></key>"
+                    },
+                ),
             )
             .unwrap();
             assert!(std::process::Command::new("glib-compile-schemas")
@@ -713,6 +902,166 @@ mod tests {
             assert_eq!(folders[0].apps, ["two.desktop"]);
         }).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn observed_keyfile_create(
+        refuse_name: bool,
+    ) -> (
+        TestSchemas,
+        FolderCreateObservation,
+        gio::Settings,
+        gio::Settings,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = TestSchemas::with_name_refusal(refuse_name);
+        let config = fixture.dir.join("config");
+        std::fs::create_dir_all(config.join("glib-2.0/settings")).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = config.join("glib-2.0/settings/keyfile");
+        let backend = gio::keyfile_settings_backend_new(file.to_str().unwrap(), "/", None);
+        let root = gio::Settings::new_full(
+            &fixture.source.lookup(SCHEMA, true).unwrap(),
+            Some(&backend),
+            None,
+        );
+        let child = gio::Settings::new_full(
+            &fixture.source.lookup(FOLDER_SCHEMA, true).unwrap(),
+            Some(&backend),
+            Some("/org/gnome/desktop/app-folders/folders/Live/"),
+        );
+        let mut trace = FolderCreateObservation {
+            id: "Live".to_owned(),
+            declared_source: "a".repeat(40),
+            proof_config: Some(config),
+            expected_name: String::new(),
+            expected_apps: Vec::new(),
+            events: Vec::new(),
+        };
+        let one = app("one", "One", &[]);
+        let two = app("two", "Two", &[]);
+        assert_eq!(
+            create_with_settings(
+                &[&one, &two],
+                "Live",
+                &root,
+                || child.clone(),
+                Some(&mut trace)
+            ),
+            Some("Live".to_owned())
+        );
+        (fixture, trace, root, child)
+    }
+
+    #[test]
+    fn create_observer_real_keyfile_records_each_actual_setter_and_file() {
+        let (_fixture, trace, _root, _child) = observed_keyfile_create(false);
+        assert_eq!(trace.expected_name, "Unnamed Folder");
+        assert_eq!(trace.expected_apps, ["one.desktop", "two.desktop"]);
+        assert_eq!(trace.events.len(), 4);
+        for (index, operation) in [
+            "root-children-write",
+            "name-write",
+            "apps-write",
+            "after-sync",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(trace.events[index]["operation"], *operation);
+            assert_eq!(trace.events[index]["sequence"], index);
+            if index < 3 {
+                assert_eq!(trace.events[index]["setter_result"], true);
+            }
+        }
+        let final_event = &trace.events[3];
+        assert_eq!(final_event["cached_name"], "Unnamed Folder");
+        assert_eq!(
+            final_event["file_sample"]["name_variant"],
+            "'Unnamed Folder'"
+        );
+        assert_eq!(
+            final_event["file_sample"]["apps_variant"],
+            "['one.desktop', 'two.desktop']"
+        );
+        assert_eq!(final_event["file_sample"]["durability_proven"], false);
+    }
+
+    #[test]
+    fn create_observer_real_gio_refusal_is_distinct_from_writable_and_late_loss() {
+        let (_fixture, trace, _root, _child) = observed_keyfile_create(true);
+        // Deliberately restrictive real schema: this is NOT the original CI cause.
+        assert_eq!(trace.events[1]["writable"], true);
+        assert_eq!(trace.events[1]["setter_result"], false);
+        assert_eq!(trace.events[2]["setter_result"], true);
+        assert_eq!(trace.events[3]["cached_name"], "");
+        assert_eq!(
+            trace.events[3]["file_sample"]["name_variant"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            trace.events[3]["file_sample"]["apps_variant"],
+            "['one.desktop', 'two.desktop']"
+        );
+        // Observation preserves the OLD unsafe publication, not a claimed fix.
+        assert_eq!(trace.events[0]["advertised"], true);
+    }
+
+    #[test]
+    fn create_observer_actual_file_replacement_distinguishes_later_loss() {
+        let (_fixture, mut trace, root, child) = observed_keyfile_create(false);
+        assert_eq!(trace.events[1]["setter_result"], true);
+        let path = trace
+            .proof_config
+            .as_ref()
+            .unwrap()
+            .join("glib-2.0/settings/keyfile");
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, "[org/gnome/desktop/app-folders]\nfolder-children=['Live']\n[org/gnome/desktop/app-folders/folders/Live]\napps=['one.desktop', 'two.desktop']\n").unwrap();
+        std::fs::rename(replacement, path).unwrap();
+        trace.observe(
+            "fixture-external-replacement",
+            &root,
+            Some(&child),
+            None,
+            None,
+        );
+        assert_eq!(
+            trace.events[3]["file_sample"]["name_variant"],
+            "'Unnamed Folder'"
+        );
+        assert_eq!(
+            trace.events[4]["file_sample"]["name_variant"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            trace.events[4]["file_sample"]["apps_variant"],
+            "['one.desktop', 'two.desktop']"
+        );
+        // A cached backend value is deliberately NOT called a durable file read.
+        assert_eq!(trace.events[4]["file_sample"]["durability_proven"], false);
+    }
+
+    #[test]
+    fn create_file_observation_refuses_symlink_and_excess_file_before_read() {
+        use std::os::unix::fs::symlink;
+        let (fixture, trace, _root, _child) = observed_keyfile_create(false);
+        let config = trace.proof_config.as_ref().unwrap();
+        let original = config.join("glib-2.0");
+        let moved = fixture.dir.join("moved");
+        std::fs::rename(&original, &moved).unwrap();
+        symlink(&moved, &original).unwrap();
+        assert_eq!(trace.file_sample()["reason"], "fixture-path-symlink");
+        std::fs::remove_file(&original).unwrap();
+        std::fs::rename(&moved, &original).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(original.join("settings/keyfile"))
+            .unwrap();
+        file.set_len(128 * 1024 + 1).unwrap();
+        assert_eq!(
+            trace.file_sample()["reason"],
+            "fixture-file-unowned-or-over-budget"
+        );
     }
 
     #[test]

@@ -517,6 +517,13 @@ fi
 GSETTINGS_BACKEND=keyfile
 XDG_CONFIG_HOME="$ARTIFACTS/config"
 export GSETTINGS_BACKEND XDG_CONFIG_HOME
+# Observation only; the existing folder gate still requires real persisted name/apps.
+mkdir -p "$XDG_CONFIG_HOME"
+chmod 700 "$XDG_CONFIG_HOME"
+TUNA_FOLDER_CREATE_TRACE=1
+TUNA_FOLDER_CREATE_SOURCE_COMMIT=${TUNA_PROOF_BINARY_SOURCE_COMMIT:-$(git -C "$ROOT" rev-parse HEAD)}
+TUNA_FOLDER_CREATE_PROOF_CONFIG=$XDG_CONFIG_HOME
+export TUNA_FOLDER_CREATE_TRACE TUNA_FOLDER_CREATE_SOURCE_COMMIT TUNA_FOLDER_CREATE_PROOF_CONFIG
 # GNOME Shell's own keys the shell reads (the dash, the grid's order),
 # for hosts without gnome-shell's schema.
 if ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.shell; then
