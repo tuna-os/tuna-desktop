@@ -1278,6 +1278,15 @@ mod gtk_action_lifecycle_tests {
             let count = fired.clone();
             ui.on_notification_action(id, key, Rc::new(move || count.set(count.get() + 1)));
         }
+        // NotifyUi dismiss pair: a registered-then-dropped dismiss
+        // handler never fires, and the surgical drop keeps the
+        // actions above live for the clicks below.
+        let dismissed = Rc::new(Cell::new(false));
+        let flag = dismissed.clone();
+        ui.on_notice_dismiss(id, Rc::new(move || flag.set(true)));
+        ui.drop_notice_dismiss(id);
+        assert!(!ui.dispatch_user_dismiss_local(id));
+        assert!(!dismissed.get());
         (
             id,
             button(&ui.banner_box, "Take"),

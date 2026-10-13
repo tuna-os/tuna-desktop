@@ -3000,6 +3000,7 @@ mod tests {
 
     type ActionPost = (String, String, Vec<(String, String)>, u64);
     type ActionCallbacks = HashMap<(u64, String), Rc<dyn Fn()>>;
+    type DismissCallbacks = HashMap<u64, Rc<dyn Fn()>>;
 
     struct Recorded {
         posts: Rc<RefCell<Vec<(String, String)>>>,
@@ -3013,7 +3014,7 @@ mod tests {
         callbacks: Rc<RefCell<ActionCallbacks>>,
         dropped: Rc<RefCell<Vec<u64>>>,
         dismiss_registered: Rc<RefCell<Vec<u64>>>,
-        dismiss_callbacks: Rc<RefCell<HashMap<u64, Rc<dyn Fn()>>>>,
+        dismiss_callbacks: Rc<RefCell<DismissCallbacks>>,
         dismiss_dropped: Rc<RefCell<Vec<u64>>>,
         queued: Rc<RefCell<Vec<BreakActionKind>>>,
         effect_sends: Rc<RefCell<Vec<(bool, bool)>>>,
