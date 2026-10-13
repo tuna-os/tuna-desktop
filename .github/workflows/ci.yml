@@ -50,6 +50,7 @@ jobs:
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
+      - run: python3 scripts/tests/test_wb_shell_contract.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
       - run: python3 scripts/lib/tuna-perf-repeatability-tests.py
       - run: python3 scripts/lib/native-constraint-tests.py
