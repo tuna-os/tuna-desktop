@@ -1561,6 +1561,7 @@ impl Runtime {
         self.cancel_invalid_unlock();
         let worker = self.unlock_worker.take().expect("matched owned worker");
         let denied = worker.denied;
+        let cancel_requested = worker.cancel.is_canceled();
         let joined = worker.worker.join();
         let joined_ok = joined.is_ok();
         let result = joined.unwrap_or(crate::pam_backend::Verification::Unretired);
@@ -1612,6 +1613,22 @@ impl Runtime {
                     "origin": attempt.origin.map(|origin| serde_json::json!({
                         "connection": origin.connection, "request": origin.request })),
                     "origin_live": live, "locked_after": self.is_locked()
+                })
+            );
+        }
+        if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+            eprintln!(
+                "tuna-compositor: lock authentication owned retirement {}",
+                serde_json::json!({
+                    "pid":std::process::id(), "joined_ok":joined_ok,
+                    "retired":matches!(result, crate::pam_backend::Verification::Retired { .. }),
+                    "authenticated":result.authenticated(), "denied":denied,
+                    "cancel_requested":cancel_requested,"reported_ok":reported_ok,"applied":applied,
+                    "attempt_serial":attempt.serial,"attempt_epoch":attempt.epoch,
+                    "current_epoch":self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                    "origin":attempt.origin.map(|origin| serde_json::json!({
+                        "connection":origin.connection,"request":origin.request })),
+                    "locked_after":self.is_locked()
                 })
             );
         }

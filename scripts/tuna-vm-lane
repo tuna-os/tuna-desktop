@@ -143,6 +143,97 @@ def stale_sleep_auth_retirement(trace, expected, current_epoch):
     return event
 
 
+
+AUTH_PROCESS_KEYS = {"pid", "uid", "ppid", "pgrp", "start_ticks", "executable", "exe_device", "exe_inode"}
+
+
+def checked_auth_process(value, executable):
+    if (type(value) is not dict or set(value) != AUTH_PROCESS_KEYS
+            or value["executable"] != executable
+            or not all(auth_uint(value[key]) for key in ("pid", "uid", "ppid", "pgrp", "start_ticks", "exe_inode"))
+            or type(value["exe_device"]) is not int or value["exe_device"] < 0):
+        raise ValueError("original authentication process identity invalid")
+    return value
+
+
+def sleep_auth_helper_observation(observed, snapshot):
+    """Admit the fixed held-self helper and its actual pam_exec sleep child."""
+    expected = sleep_auth_attempt(snapshot)
+    if type(observed) is not dict or set(observed) != {"real_pam_delay_running", "compositor", "helpers", "delays", "auth_owner"} or observed["real_pam_delay_running"] is not True:
+        raise ValueError("actual original PAM delay was not observed")
+    if json.dumps(observed["auth_owner"], sort_keys=True) != json.dumps(snapshot["state"]["auth_owner"], sort_keys=True):
+        raise ValueError("PAM observation belongs to a different attempt")
+    if type(observed["helpers"]) is not list or len(observed["helpers"]) != 1 or type(observed["delays"]) is not list or len(observed["delays"]) != 1:
+        raise ValueError("unique actual helper and delay required")
+    return checked_auth_method(observed["compositor"], observed["helpers"][0], observed["delays"][0], expected)
+
+
+def checked_auth_method(desktop, helper, delay, expected):
+    desktop = checked_auth_process(desktop, "tuna-compositor")
+    helper = checked_auth_process(helper, "tuna-compositor")
+    delay = checked_auth_process(delay, "sleep")
+    if (desktop["pid"], desktop["start_ticks"]) != (expected["pid"], expected["start_ticks"]):
+        raise ValueError("desktop identity changed before helper admission")
+    if (helper["pid"] == desktop["pid"] or helper["ppid"] != desktop["pid"] or helper["pgrp"] != helper["pid"]
+            or helper["uid"] != desktop["uid"] or helper["start_ticks"] < desktop["start_ticks"]
+            or (helper["exe_device"], helper["exe_inode"]) != (desktop["exe_device"], desktop["exe_inode"])
+            or delay["pid"] in (desktop["pid"], helper["pid"]) or delay["ppid"] != helper["pid"]
+            or delay["pgrp"] != helper["pid"] or delay["uid"] != desktop["uid"] or delay["start_ticks"] < helper["start_ticks"]):
+        raise ValueError("PAM helper/delay kernel ownership differs")
+    return {"compositor": desktop, "helper": helper, "delay": delay, "attempt": expected}
+
+
+def cancelled_sleep_auth_retirement(trace, expected, current_epoch, original, physical):
+    """Canceled owned helper: never accepted success or mere wrapper join."""
+    # Reuse the SAME original admission matcher: absence without a valid
+    # previously admitted helper/delay cannot qualify cancellation.
+    try:
+        if type(original) is not dict or set(original) != {"compositor", "helper", "delay", "attempt"}:
+            return None
+        admitted = checked_auth_method(original["compositor"], original["helper"], original["delay"], expected)
+        if json.dumps(admitted, sort_keys=True) != json.dumps(original, sort_keys=True):
+            return None
+    except (ValueError, TypeError, KeyError):
+        return None
+    if (type(physical) is not dict or set(physical) != {"helper_absent", "delay_absent", "owned_group_members", "original"}
+            or json.dumps(physical["original"], sort_keys=True) != json.dumps(original, sort_keys=True) or physical["helper_absent"] is not True
+            or physical["delay_absent"] is not True or physical["owned_group_members"] != []
+            or not auth_uint(current_epoch) or current_epoch <= expected["epoch"]):
+        return None
+    prefix = 'tuna-compositor: lock authentication owned retirement '
+    keys = {'pid', 'joined_ok', 'retired', 'authenticated', 'denied', 'cancel_requested', 'reported_ok',
+            'applied', 'attempt_serial', 'attempt_epoch', 'current_epoch', 'origin', 'locked_after'}
+    matches = []
+    for line in trace.splitlines():
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if (type(event) is not dict or set(event) != keys
+                or not all(type(event[key]) is bool for key in ['joined_ok', 'retired', 'authenticated', 'denied', 'cancel_requested', 'reported_ok', 'applied', 'locked_after'])
+                or not all(auth_uint(event[key]) for key in ['pid', 'attempt_serial', 'attempt_epoch', 'current_epoch'])):
+            return None
+        origin = event['origin']
+        if type(origin) is not dict or set(origin) != {'connection', 'request'} or not all(auth_uint(v) for v in origin.values()):
+            return None
+        if (event['pid'], event['attempt_serial'], event['attempt_epoch'], origin) == (
+                expected['pid'], expected['serial'], expected['epoch'], expected['origin']):
+            matches.append(event)
+    if len(matches) != 1:
+        return None
+    event = matches[0]
+    if not (event['joined_ok'] and event['retired'] and event['denied'] and event['cancel_requested']
+            and event['locked_after'] and not event['authenticated'] and not event['reported_ok'] and not event['applied']
+            and event['current_epoch'] == current_epoch):
+        return None
+    denial = re.compile(r'tuna-shell-gtk: lock command result applied=false request_id=([0-9]+)(?:\s|$)')
+    if not any(int(match.group(1)) == expected['origin']['request'] for match in denial.finditer(trace)):
+        return None
+    return event
+
+
 def log(msg):
     print(f"tuna-vm-lane: {msg}", flush=True)
 
@@ -942,8 +1033,9 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     # It combines plain and stale-auth wake checks with a prelocked session;
     # the main lifecycle lane separately qualified prepare-for-sleep locking
     # from an unlocked desktop. Keep fresh GPU upload and client repaint gates.
-    # Submit a correct password to a real delayed PAM stack before sleep.
-    # Its later success must not unlock the new sleep-lock generation.
+    # Admit an actual helper with a real delayed PAM stack before sleep.
+    # Sleep must cancel and physically retire it without unlocking. The separate
+    # controlled late-success epoch proof still tests queued accepted results.
     agent.run("delay-unlock")
     try:
         agent.run("lock")
@@ -956,12 +1048,23 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         stale_auth_offset = len(read_text(serial_path))
         qmp.keys("ret")
         deadline = time.monotonic() + 5
+        desktop = next(process for process in before["processes"] if process["executable"] == "tuna-compositor")
+        observation_index = 0
         while time.monotonic() < deadline:
-            if agent.run("delayed-auth-state")["real_pam_delay_running"]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("actual PAM delay admission deadline expired")
+            observed = agent.run("delayed-auth-state", desktop["pid"], desktop["start_ticks"],
+                                 timeout=remaining)
+            with open(os.path.join(evidence, f"sleep-auth-delay-{observation_index:02d}.json"), "w") as stream:
+                json.dump(observed, stream, indent=2)
+            observation_index += 1
+            if observed["real_pam_delay_running"]:
                 pending_auth = inventory("sleep-auth-owned-attempt")
                 if not same_apps(before, pending_auth):
                     raise RuntimeError("pre-sleep authentication replaced the session")
                 original_auth = sleep_auth_attempt(pending_auth)
+                original_method = sleep_auth_helper_observation(observed, pending_auth)
                 break
             time.sleep(0.1)
         else:
@@ -980,19 +1083,26 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         trace = read_text(serial_path)[stale_auth_offset:]
         owner = state["state"].get("auth_owner")
         current_epoch = owner.get("epoch") if type(owner) is dict else None
-        retirement = stale_sleep_auth_retirement(trace, original_auth, current_epoch)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        physical = agent.run("auth-retirement-state", json.dumps(original_method), timeout=remaining)
+        with open(os.path.join(evidence, "sleep-auth-physical-retirement.json"), "w") as stream:
+            json.dump(physical, stream, indent=2)
+        retirement = cancelled_sleep_auth_retirement(trace, original_auth, current_epoch, original_method, physical)
         stale_rejected = retirement is not None
         if stale_rejected:
             with open(os.path.join(evidence, "sleep-auth-retirement.json"), "w") as stream:
                 json.dump({"owned_attempt": original_auth, "retirement": retirement,
-                           "scope": "actual joined outer password wrapper and real S3 epoch; no PAM helper retirement"},
+                           "original_method": original_method, "physical": physical,
+                           "scope": "actual canceled PAM helper and owned delay retirement after real S3; unchanged locked desktop"},
                           stream, indent=2)
             break
         time.sleep(0.2)
     record("V-SLEEP-AUTH-FAIL-CLOSED", stale_rejected,
-           "real delayed PAM accepts correct pre-sleep password, but stale generation is refused and locked apps stay intact")
+           "original real delayed PAM helper is canceled and physically retired after real S3; no accepted stale success and locked apps stay intact")
     if not stale_rejected:
-        raise RuntimeError("actual successful pre-sleep PAM rejection was not observed")
+        raise RuntimeError("actual canceled pre-sleep PAM helper retirement was not observed")
     qmp.keys("ctrl", "a")
     qmp.type_text("tuna")
     qmp.keys("ret")

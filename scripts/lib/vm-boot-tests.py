@@ -30,7 +30,8 @@ class DeviceInventoryProjection(unittest.TestCase):
         scope = {"json": json, "STATE": SimpleNamespace(read_text=lambda: json.dumps(state)),
                  "pathlib": SimpleNamespace(Path=lambda _: SimpleNamespace(iterdir=lambda: [])),
                  "OWNER": SimpleNamespace(pw_uid=1000),
-                 "os": SimpleNamespace(geteuid=lambda: 0), "call": call}
+                 "os": SimpleNamespace(geteuid=lambda: 0), "call": call,
+                 "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), scope)
         return scope["inventory"]()
 
@@ -977,6 +978,138 @@ class SleepAuthRetirementTests(unittest.TestCase):
         for snapshot in snapshots:
             with self.assertRaises(ValueError):
                 lane.sleep_auth_attempt(snapshot)
+
+class PrivatePamSleepControls(unittest.TestCase):
+    def setUp(self):
+        self.legacy = SleepAuthRetirementTests()
+        self.legacy.setUp()
+        self.expected = self.legacy.expected
+        self.desktop = dict(pid=600, uid=1000, ppid=2, pgrp=2, start_ticks=1500,
+                            executable="tuna-compositor", exe_device=1, exe_inode=77)
+        self.helper = dict(self.desktop, pid=700, ppid=600, pgrp=700, start_ticks=1700)
+        self.delay = dict(self.helper, pid=701, ppid=700, start_ticks=1800, executable="sleep", exe_inode=78)
+        self.observed = {"real_pam_delay_running": True, "compositor": self.desktop,
+                         "helpers": [self.helper], "delays": [self.delay],
+                         "auth_owner": self.legacy.snapshot["state"]["auth_owner"]}
+        self.original = lane.sleep_auth_helper_observation(self.observed, self.legacy.snapshot)
+        self.physical = dict(helper_absent=True, delay_absent=True, owned_group_members=[], original=self.original)
+        self.event = dict(pid=600, joined_ok=True, retired=True, authenticated=False,
+                          denied=True, cancel_requested=True, reported_ok=False, applied=False,
+                          attempt_serial=9, attempt_epoch=7, current_epoch=8,
+                          origin=dict(connection=4, request=12), locked_after=True)
+
+    def trace(self, event=None, denial=None):
+        return 'tuna-compositor: lock authentication owned retirement ' + json.dumps(self.event if event is None else event) + '\n' + (self.legacy.denial if denial is None else denial)
+
+    def match(self, trace=None, original=None, physical=None, current=8):
+        return lane.cancelled_sleep_auth_retirement(self.trace() if trace is None else trace,
+            self.expected, current, self.original if original is None else original,
+            self.physical if physical is None else physical)
+
+    def test_original_helper_delay_and_canceled_actual_retired_false_positive(self):
+        self.assertEqual(self.match(), self.event)
+
+    def test_no_helper_arbitrary_sleep_or_wrong_original_attempt_refused(self):
+        import copy
+        changes = [dict(self.observed, real_pam_delay_running=False),
+                   dict(self.observed, helpers=[]), dict(self.observed, delays=[]),
+                   dict(self.observed, delays=[dict(self.delay, ppid=600)]),
+                   dict(self.observed, helpers=[dict(self.helper, exe_inode=78)]),
+                   dict(self.observed, helpers=[dict(self.helper, pgrp=600)]),
+                   dict(self.observed, helpers=[dict(self.helper, uid=1001)]),
+                   dict(self.observed, compositor=dict(self.desktop, start_ticks=1501)),
+                   dict(self.observed, helpers=[self.helper, self.helper]),
+                   dict(self.observed, delays=[dict(self.delay, pid=True)])]
+        changed = copy.deepcopy(self.observed); changed['auth_owner']['attempt']['serial'] = 10; changes.append(changed)
+        for value in changes:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                lane.sleep_auth_helper_observation(value, self.legacy.snapshot)
+        for original in ({}, dict(self.original, helper=None), dict(self.original, attempt={**self.expected, 'serial':10})):
+            self.assertIsNone(self.match(original=original))
+
+    def test_cancel_without_retirement_unretired_success_unlock_or_wrong_receipt_refused(self):
+        for key, value in [('joined_ok',False), ('retired',False), ('authenticated',True),
+                           ('denied',False), ('cancel_requested',False), ('reported_ok',True),
+                           ('applied',True), ('locked_after',False), ('attempt_serial',10),
+                           ('attempt_epoch',6), ('current_epoch',7), ('pid',601), ('retired',1),
+                           ('origin',{'connection':5,'request':12})]:
+            with self.subTest(key=key):
+                self.assertIsNone(self.match(trace=self.trace({**self.event,key:value})))
+        self.assertIsNone(self.match(current=9))
+        for physical in [dict(self.physical,helper_absent=False), dict(self.physical,delay_absent=False),
+                         dict(self.physical,owned_group_members=[dict(pid=702,start_ticks=1801)]),
+                         dict(self.physical,original=dict(self.original,helper=dict(self.helper,start_ticks=1800))), {},
+                         dict(self.physical,helper_absent=1)]:
+            self.assertIsNone(self.match(physical=physical))
+
+    def test_missing_malformed_duplicate_or_wrong_shell_denial_refused(self):
+        for trace in ['', self.legacy.trace(), self.trace()+ '\n'+self.trace(),
+                      'tuna-compositor: lock authentication owned retirement {broken',
+                      self.trace({**self.event,'extra':True}),
+                      self.trace({key:value for key,value in self.event.items() if key != 'retired'}),
+                      self.trace(denial=''), self.trace(denial=self.legacy.denial.replace('12','13')),
+                      self.trace(denial=self.legacy.denial.replace('false','true'))]:
+            self.assertIsNone(self.match(trace=trace))
+
+    def production(self):
+        source = Path(__file__).resolve().parents[2] / 'packaging/marlin/vm-lane/tuna-vm-lifecycle'
+        wanted = {'auth_process','public_auth_identity','classify_pam_helpers','pam_process_snapshot','delayed_auth_state','auth_retirement_state'}
+        nodes = [node for node in ast.parse(source.read_text()).body if isinstance(node,ast.FunctionDef) and node.name in wanted]
+        scope = dict(pathlib=__import__('pathlib'), os=__import__('os'), json=json,
+                     OWNER=SimpleNamespace(pw_uid=1000), PAM_HELPER_FLAG=b'--internal-pam-conversation')
+        exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),scope)
+        return scope
+
+    def test_actual_production_helper_classifier_rejects_wrong_fixed_flag_parent_inode_and_uid(self):
+        scope = self.production()
+        def private(row, flag=False):
+            return dict(row,_marked=flag,_private=flag,_state='S')
+        desktop, helper = private(self.desktop), private(self.helper,True)
+        self.assertEqual(scope['classify_pam_helpers']([desktop,helper]),(desktop,[helper]))
+        for bad in [dict(helper,_private=False), dict(helper,ppid=999), dict(helper,exe_inode=78),
+                    dict(helper,uid=1001), dict(helper,pgrp=600), dict(helper,_state='Z')]:
+            self.assertEqual(scope['classify_pam_helpers']([desktop,bad])[1],[])
+        self.assertEqual(scope['classify_pam_helpers']([desktop,dict(desktop,pid=601),helper]),(None,[]))
+
+    def test_actual_production_process_reader_and_absence_reject_pid_replacement_and_zombie(self):
+        import os, pathlib
+        scope = self.production()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root/'tuna-compositor'; binary.write_bytes(b'owned controlled file')
+            def process(pid,parent,group,ticks,args):
+                path=root/str(pid); path.mkdir()
+                fields=['S',str(parent),str(group)]+['0']*16+[str(ticks)]
+                (path/'stat').write_text(f'{pid} (controlled) '+ ' '.join(fields))
+                (path/'cmdline').write_bytes(args)
+                (path/'exe').symlink_to(binary)
+            process(600,2,2,1500,b'/usr/bin/tuna-compositor\0')
+            process(700,600,700,1700,b'/proc/self/fd/11\0--internal-pam-conversation\0')
+            def proc_path(path):
+                return root if path=='/proc' else root/str(path).split('/')[-1]
+            scope['pathlib']=SimpleNamespace(Path=proc_path)
+            scope['OWNER']=SimpleNamespace(pw_uid=os.getuid())
+            scope['auth_process'].__globals__['pathlib']=scope['pathlib']
+            desktop=scope['auth_process'](600); helper=scope['auth_process'](700)
+            self.assertFalse(desktop['_private']); self.assertTrue(helper['_private'])
+            expected=dict(compositor=scope['public_auth_identity'](desktop),helper=scope['public_auth_identity'](helper),delay=dict(self.delay),attempt=self.expected)
+            # A missing exe while /proc/<pid> still exists is not PID absence.
+            (root/'700/exe').unlink()
+            absent=scope['auth_retirement_state'](expected)
+            self.assertFalse(absent['helper_absent']); self.assertTrue(absent['owned_group_members'])
+            (root/'700/exe').symlink_to(binary)
+            (root/'700/stat').write_text('700 (controlled) '+ ' '.join(['S','600','700']+['0']*16+['1701']))
+            with self.assertRaisesRegex(RuntimeError,'PID was replaced'):
+                scope['auth_retirement_state'](expected)
+
+    def test_runtime_observer_is_typed_retired_and_legacy_accepted_epoch_control_preserved(self):
+        source=Path(__file__).resolve().parents[2]/'crates/compositor/src/runtime.rs'
+        text=source.read_text()
+        self.assertIn('let cancel_requested = worker.cancel.is_canceled();',text)
+        self.assertIn('"retired":matches!(result, crate::pam_backend::Verification::Retired { .. })',text)
+        self.assertIn('"cancel_requested":cancel_requested',text)
+        self.assertEqual(lane.stale_sleep_auth_retirement(self.legacy.trace(),self.expected,8),self.legacy.event)
+
 
 if __name__ == "__main__":
     unittest.main()
