@@ -16,6 +16,12 @@ from tuna_benchmark_footprint import image_footprints, disk_evidence
 from tuna_dense_decode import observe as dense_decode
 
 
+def discard_failed_disk(commands,disk):
+    """Never remove backing while any diagnostic process owner is uncertain."""
+    if not commands.process_cleanup_uncertain:
+        disk.unlink(missing_ok=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--profile', choices=['stock', 'diagnostic'], required=True)
@@ -157,8 +163,7 @@ def main():
         result_code = 0
     except Exception as error:
         receipt['error'] = str(error)
-        if not commands.process_cleanup_uncertain:
-            disk.unlink(missing_ok=True)
+        discard_failed_disk(commands,disk)
         print(error, file=sys.stderr)
         result_code = 1
     finally:
@@ -178,8 +183,7 @@ def main():
         except Exception as error:
             receipt.update(owned_scratch_removed=False, export_succeeded=False,
                            cleanup_error=str(error))
-            if not commands.process_cleanup_uncertain:
-                disk.unlink(missing_ok=True)
+            discard_failed_disk(commands,disk)
         receipt['command_deadlines'] = commands.events
         (artifacts/'manifest.json').write_text(json.dumps(receipt, indent=2)+'\n')
         if not receipt['owned_scratch_removed']:

@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Dense diagnostic contracts only. Actual decoder/cgroup observation belongs to CI."""
 import copy
+import ast
 import json
 from pathlib import Path
 import sys
@@ -54,7 +55,7 @@ class Dense(unittest.TestCase):
    with self.assertRaises(TimeoutError):worker.digest(p,0)
  def test_capacity_refusal_never_pulls_or_mutates_source_and_writes_receipt(self):
   class Commands:
-   def __init__(self):self.log=None;self.calls=[]
+   def __init__(self):self.log=None;self.calls=[];self.process_cleanup_uncertain=False
    def call(self,args,**kwargs):
     self.calls.append(args)
     if args[:2]==['sudo','python3']:
@@ -70,15 +71,6 @@ class Dense(unittest.TestCase):
    self.assertEqual(disk.read_bytes(),b'unchanged')
    self.assertEqual(len(commands.calls),2);self.assertTrue(all('pull' not in args for args in commands.calls))
    self.assertEqual(json.loads((artifacts/'dense-decode.json').read_text())['status'],'capacity-refused-before-pull')
- def test_unconfirmed_outer_owner_retains_original_export_backing(self):
-  with tempfile.TemporaryDirectory() as d:
-   base=Path(d);artifacts=base/'artifacts';artifacts.mkdir();scratch=base/'scratch';scratch.mkdir();disk=artifacts/'disk.qcow2';disk.write_bytes(b'original')
-   legacy=SimpleNamespace(process_cleanup_uncertain=False)
-   (artifacts/'dense-decode.json').write_text(json.dumps({'qualified':False,'owned_cleanup':False}))
-   with patch.object(host,'bounded_command',return_value={'owned_cleanup':False,'command_error':'retirement unknown','exit':None}):
-    result=host.observe(legacy,artifacts,scratch,disk,'a'*64,{}, {})
-   self.assertFalse(result['owned_cleanup']);self.assertTrue(legacy.process_cleanup_uncertain)
-   self.assertEqual(disk.read_bytes(),b'original')
  def test_production_guard_is_after_observer_and_unchanged(self):
   root=Path(__file__).resolve().parents[2]
   text=(root/'scripts/tuna-benchmark-disk-export').read_text()
@@ -86,6 +78,80 @@ class Dense(unittest.TestCase):
   self.assertLess(text.index("receipt['dense_decode'] = dense_decode"),text.index("receipt['storage'] = storage_receipt"))
   self.assertIn("receipt['storage'] = storage_receipt(info, mapping, disk.stat().st_size)",text)
   self.assertIn("require(receipt['dense_decode'].get('owned_cleanup', True)",text)
+
+class ReceiptOwnership(unittest.TestCase):
+ def setUp(self):
+  self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+  self.base=Path(self.temp.name);self.artifacts=self.base/'artifacts';self.artifacts.mkdir();self.scratch=self.base/'scratch';self.scratch.mkdir()
+  self.disk=self.artifacts/'disk.qcow2';self.disk.write_bytes(b'original')
+  self.legacy=SimpleNamespace(process_cleanup_uncertain=False)
+  self.source={'candidate_source_commit':'a'*40}
+ def matching_receipt(self):
+  return {'schema':1,'qualified':False,'owned_cleanup':True,'tool':host.TOOL,
+          'root_request_sha256':host.digest(self.artifacts/'dense-root-request.json'),
+          'source_provenance':self.source,'export_admission_changed':False,'node_or_vm_qualified':False}
+ def invoke(self,launcher,receipt=None,mutate=None):
+  def launch(*args,**kwargs):
+   self.assertTrue(self.legacy.process_cleanup_uncertain,'latch precedes launcher')
+   if isinstance(launcher,Exception):raise launcher
+   if receipt=='matching':
+    value=self.matching_receipt()
+    if mutate:mutate(value)
+    (self.artifacts/'dense-decode.json').write_text(json.dumps(value))
+   elif receipt is not None:(self.artifacts/'dense-decode.json').write_text(receipt)
+   return launcher
+  with patch.object(host,'bounded_command',side_effect=launch):
+   return host.observe(self.legacy,self.artifacts,self.scratch,self.disk,'b'*64,{},self.source)
+ def exporter_discard(self):
+  # Execute the actual production cleanup predicate without main/processes.
+  path=Path(__file__).resolve().parents[1]/'tuna-benchmark-disk-export'
+  tree=ast.parse(path.read_text());function=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='discard_failed_disk')
+  namespace={};exec(compile(ast.Module(body=[function],type_ignores=[]),str(path),'exec'),namespace)
+  namespace['discard_failed_disk'](self.legacy,self.disk)
+ def test_confirmed_matching_receipt_clears_only_own_uncertainty(self):
+  result=self.invoke({'owned_cleanup':True,'command_error':None,'exit':0},'matching')
+  self.assertTrue(result['owned_cleanup']);self.assertFalse(self.legacy.process_cleanup_uncertain)
+  self.assertFalse(result['qualified'],'capacity refusal may still be safely retired')
+ def test_preexisting_uncertainty_cannot_be_cleared(self):
+  self.legacy.process_cleanup_uncertain=True
+  self.invoke({'owned_cleanup':True,'command_error':None,'exit':0},'matching')
+  self.assertTrue(self.legacy.process_cleanup_uncertain);self.exporter_discard();self.assertEqual(self.disk.read_bytes(),b'original')
+ def test_malformed_truncated_missing_and_stale_receipts_retain_backing(self):
+  for receipt in ('{','[]',None,json.dumps({'schema':1,'qualified':True,'owned_cleanup':True,'root_request_sha256':'0'*64})):
+   with self.subTest(receipt=receipt):
+    self.setUp()
+    try:self.invoke({'owned_cleanup':True,'command_error':None,'exit':0},receipt)
+    except (ValueError,TypeError):pass
+    self.assertTrue(self.legacy.process_cleanup_uncertain);self.exporter_discard();self.assertEqual(self.disk.read_bytes(),b'original')
+ def test_launcher_exception_nonzero_or_unconfirmed_retirement_retain_backing(self):
+  for launcher in (RuntimeError('lost acknowledgement'),{'owned_cleanup':False,'command_error':None,'exit':0},
+                   {'owned_cleanup':True,'command_error':'timeout','exit':0},{'owned_cleanup':True,'command_error':None,'exit':1}):
+   with self.subTest(launcher=launcher):
+    self.setUp()
+    try:self.invoke(launcher,'matching')
+    except RuntimeError:pass
+    self.assertTrue(self.legacy.process_cleanup_uncertain);self.exporter_discard();self.assertEqual(self.disk.read_bytes(),b'original')
+ def test_altered_source_request_tool_or_cleanup_receipt_is_refused(self):
+  for key,value in [('source_provenance',{}),('root_request_sha256','0'*64),('tool','other'),('owned_cleanup',1),('export_admission_changed',True)]:
+   with self.subTest(key=key):
+    self.setUp()
+    with self.assertRaises(ValueError):self.invoke({'owned_cleanup':True,'command_error':None,'exit':0},'matching',lambda r:r.update({key:value}))
+    self.assertTrue(self.legacy.process_cleanup_uncertain)
+ def test_outer_receipt_write_failure_preserves_uncertainty(self):
+  with patch.object(host,'write_json',side_effect=OSError('write refused')):
+   with self.assertRaises(OSError):self.invoke({'owned_cleanup':True,'command_error':None,'exit':0},'matching')
+  self.assertTrue(self.legacy.process_cleanup_uncertain);self.exporter_discard();self.assertEqual(self.disk.read_bytes(),b'original')
+ def test_precontainer_command_uncertainty_cannot_claim_cleanup(self):
+  class Commands:
+   log=None;process_cleanup_uncertain=False;events=[]
+   def call(self,*args,**kwargs):
+    self.process_cleanup_uncertain=True
+    raise RuntimeError('podman info owner retirement unconfirmed')
+  result=host._observe(Commands(),self.artifacts,self.scratch,self.disk,'b'*64,{'virtual-size':host.VIRTUAL_BYTES,'format':'qcow2'},self.source)
+  self.assertFalse(result['owned_cleanup']);self.assertEqual(self.disk.read_bytes(),b'original')
+ def test_actual_exporter_deletion_allowed_only_without_uncertainty(self):
+  self.legacy.process_cleanup_uncertain=True;self.exporter_discard();self.assertTrue(self.disk.exists())
+  self.legacy.process_cleanup_uncertain=False;self.exporter_discard();self.assertFalse(self.disk.exists())
 
 class ProcessOwnership(unittest.TestCase):
  def test_successful_leader_and_escaped_cleared_env_child_retire(self):

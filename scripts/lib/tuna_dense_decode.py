@@ -51,11 +51,11 @@ def write_json(path,value):
  Path(path).write_text(json.dumps(value,indent=2)+'\n')
 
 
-def _observe(commands,artifacts,scratch,disk,raw_hash,info,source):
+def _observe(commands,artifacts,scratch,disk,raw_hash,info,source,*,root_request_sha256=None):
  """Never modifies source or changes export admission. Small receipt even on refusal."""
  artifacts,scratch,disk=map(Path,(artifacts,scratch,disk))
  result={'schema':1,'qualified':False,'tool':TOOL,'source_provenance':source,
-         'export_admission_changed':False,'node_or_vm_qualified':False}
+         'export_admission_changed':False,'node_or_vm_qualified':False,'root_request_sha256':root_request_sha256}
  receipt=artifacts/'dense-decode.json';worker=Path(__file__).with_name('tuna_dense_decode_worker.py')
  directory=None;container=None;target=None;owned=None
  previous_log=commands.log;commands.log=artifacts/'dense-decode-host.log'
@@ -145,10 +145,10 @@ def _observe(commands,artifacts,scratch,disk,raw_hash,info,source):
      code,_=commands.call(['sudo','podman','container','exists',container],check=False,timeout=30)
      require(code==1,'cleanup owner status unknown')
 
-    require(not commands.process_cleanup_uncertain,'container/process retirement unconfirmed')
     # exists exits1 only for absence; use returncode rather than error text.
     code,_=commands.call(['sudo','podman','container','exists',container],check=False,timeout=30)
     require(code==1,'owned container absence unconfirmed')
+   require(not commands.process_cleanup_uncertain,'container/process retirement unconfirmed')
    if target:
     value=target.lstat()
     require(not target.is_symlink() and (value.st_dev,value.st_ino)==owned and value.st_uid==107,'output directory identity changed')
@@ -168,26 +168,38 @@ def _observe(commands,artifacts,scratch,disk,raw_hash,info,source):
 def observe(_legacy_commands,artifacts,scratch,disk,raw_hash,info,source):
  """Private root scope; the old exporter executor never owns diagnostic commands."""
  artifacts,scratch,disk=map(Path,(artifacts,scratch,disk))
+ prior_uncertain=_legacy_commands.process_cleanup_uncertain
+ # Only a fresh matching cleanup receipt can release this conservative latch.
+ _legacy_commands.process_cleanup_uncertain=True
  request_path=artifacts/'dense-root-request.json'
  request={'artifacts':str(artifacts.resolve()),'scratch':str(scratch.resolve()),'disk':str(disk.resolve()),
           'raw_hash':raw_hash,'info':info,'source':source,'owner_uid':os.getuid(),
-          'deadline':time.monotonic()+1800}
+          'deadline':time.monotonic()+1800,'nonce':uuid.uuid4().hex}
  with request_path.open('x') as file:json.dump(request,file)
  os.chmod(request_path,0o600)
+ request_sha256=digest(request_path)
  launcher=bounded_command(['sudo','-n','/usr/bin/python3',str(Path(__file__).resolve()),'owned-observer',str(request_path.resolve())],
                           artifacts/'dense-root-launcher.log',request['deadline']+35,limit=1024*1024,cleanup_seconds=10)
  receipt=artifacts/'dense-decode.json'
- if receipt.is_file():result=json.loads(receipt.read_text())
- else:result={'qualified':False,'owned_cleanup':False,'error':'root observer receipt missing'}
+ launcher_confirmed=(launcher.get('owned_cleanup') is True and launcher.get('command_error') is None and type(launcher.get('exit')) is int and launcher['exit']==0)
+ result={'qualified':False,'owned_cleanup':False,'error':'root observer receipt missing'}
+ if receipt.is_file():
+  require(not receipt.is_symlink() and receipt.stat().st_size<=1024*1024,'bounded regular root receipt required')
+  result=json.loads(receipt.read_text())
+  require(isinstance(result,dict) and type(result.get('schema')) is int and result['schema']==1
+          and type(result.get('qualified')) is bool and type(result.get('owned_cleanup')) is bool
+          and result.get('root_request_sha256')==request_sha256
+          and result.get('source_provenance')==source and result.get('tool')==TOOL
+          and result.get('export_admission_changed') is False
+          and result.get('node_or_vm_qualified') is False,'fresh matching root receipt required')
  result['root_launcher']=launcher
- if not launcher['owned_cleanup'] or launcher['command_error'] or launcher['exit']!=0:
-  result.update(qualified=False,owned_cleanup=False)
- if not result.get('owned_cleanup',False):
-  # Retain original backing/source if any diagnostic owner is uncertain.
-  _legacy_commands.process_cleanup_uncertain=True
+ cleanup_confirmed=launcher_confirmed and result.get('owned_cleanup') is True
+ if not cleanup_confirmed:result.update(qualified=False,owned_cleanup=False)
  # Root receipt has mode644. Parent writes a separate launcher receipt.
  outer=artifacts/'dense-launcher-receipt.json';write_json(outer,result)
- return {'file':outer.name,'sha256':digest(outer),'qualified':result.get('qualified',False),
+ outer_sha256=digest(outer)
+ if cleanup_confirmed:_legacy_commands.process_cleanup_uncertain=prior_uncertain
+ return {'file':outer.name,'sha256':outer_sha256,'qualified':result.get('qualified',False),
          'owned_cleanup':result.get('owned_cleanup',False),'export_admission_changed':False}
 
 
@@ -201,5 +213,5 @@ if __name__=='__main__':
  require(path.parent==Path(request['artifacts']) and Path(request['disk']).parent==path.parent,'source/request artifact directory mismatch')
  require(0<request['deadline']-time.monotonic()<=1800,'bounded absolute operation deadline required')
  commands=DenseCommands(Path(request['artifacts'])/'dense-decode-host.log',request['deadline'])
- _observe(commands,request['artifacts'],request['scratch'],request['disk'],request['raw_hash'],request['info'],request['source'])
+ _observe(commands,request['artifacts'],request['scratch'],request['disk'],request['raw_hash'],request['info'],request['source'],root_request_sha256=digest(path))
  raise SystemExit(0)
