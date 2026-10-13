@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Publish or anonymously verify original qualified candidate tooling bytes.
+
+This does not publish Tuna Desktop, admit a node method, or run a benchmark.
+"""
+import argparse
+import ctypes
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+import zipfile
+
+sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
+import corral_node_publish as contract
+from corral_artifact import REPO
+
+
+def bounded_command(argv, path, deadline, *, data=None, limit=4*1024*1024, env=None):
+    """Linux single-owner command retirement, including orphaned descendants.
+
+    Require one thread and no preexisting children. A temporary subreaper scope
+    owns adopted descendants. Keep the session leader unreaped until group kill
+    so its PID cannot be reused. Adopted children are killed via pidfds and reaped.
+    Cleanup has a separate five-second budget; unconfirmed retirement fails closed.
+    Subreaper ownership lasts only while this process lives, not after CLI exit.
+    Spawn/kernel I/O stalls are not hard real-time guarantees.
+    """
+    def children():
+        return [int(value) for value in Path('/proc/self/task/'+str(os.getpid())+'/children').read_text().split()]
+    if len(list(Path('/proc/self/task').iterdir()))!=1 or children():
+        raise ValueError('command supervisor requires exclusive single-thread child ownership')
+    if deadline-time.monotonic()<=0:raise TimeoutError('absolute publisher deadline')
+    if data is not None and len(data)>4096:raise ValueError('credential stdin exceeds bound')
+    libc=ctypes.CDLL(None,use_errno=True)
+    prior=ctypes.c_int()
+    if libc.prctl(37,ctypes.byref(prior),0,0,0)!=0 or libc.prctl(36,1,0,0,0)!=0:
+        raise OSError('command subreaper setup failed')
+    proc=None;lingered=False;retired=False;primary=None
+    try:
+        with path.open('wb') as f:
+            proc=subprocess.Popen(argv,stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+                                  stdout=f,stderr=subprocess.DEVNULL,start_new_session=True,env=env)
+            if data is not None:
+                proc.stdin.write(data);proc.stdin.close()
+            while True:
+                # WNOWAIT preserves the owned leader PID until group retirement.
+                status=os.waitid(os.P_PID,proc.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+                if status is not None:break
+                if time.monotonic()>=deadline or f.tell()>limit:raise TimeoutError('publisher command bound')
+                time.sleep(.02)
+            if status.si_code!=os.CLD_EXITED or status.si_status!=0 or f.tell()>limit:
+                raise RuntimeError('publisher command failed: '+Path(argv[0]).name)
+    except BaseException as error:
+        primary=error
+    finally:
+        if proc is not None:
+            if proc.stdin is not None and not proc.stdin.closed:proc.stdin.close()
+            # The unreaped owned leader reserves the PGID even after exit.
+            # Always kill the group: a successful leader can leave writers alive.
+            try:
+                os.killpg(proc.pid,signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cleanup_deadline=time.monotonic()+5
+            while time.monotonic()<cleanup_deadline:
+                direct=children()
+                if not direct:
+                    retired=True;break
+                for pid in direct:
+                    if pid!=proc.pid:lingered=True
+                    try:
+                        fd=os.pidfd_open(pid)
+                    except ProcessLookupError:
+                        continue
+                    try:
+                        # Direct children cannot be stolen/reused without our
+                        # reaping; pidfd also binds the actual kernel process.
+                        signal.pidfd_send_signal(fd,signal.SIGKILL)
+                    finally:
+                        os.close(fd)
+                while True:
+                    try:pid,status=os.waitpid(-1,os.WNOHANG)
+                    except ChildProcessError:break
+                    if pid==0:break
+                    if pid==proc.pid:proc.returncode=os.waitstatus_to_exitcode(status)
+                time.sleep(.01)
+            if not retired and not children():retired=True
+        else:
+            retired=not children()
+        if retired:
+            if libc.prctl(36,prior.value,0,0,0)!=0:
+                raise OSError('command subreaper restore failed')
+        else:
+            # Keep ownership while this process lives; an ensuing CLI exit is not
+            # physical retirement or persistent quarantine proof.
+            raise RuntimeError('command retirement unconfirmed; publisher must abort') from primary
+    if primary is not None:raise primary
+    if lingered:raise RuntimeError('command left adopted descendants; retired and refused')
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    for name in ('build-run','closure-artifact','originals-artifact'):p.add_argument('--'+name,type=int,required=True)
+    for name in ('built-source','publisher-source'):p.add_argument('--'+name,required=True)
+    p.add_argument('--publisher-run',type=int,required=True)
+    p.add_argument('--out',type=Path,required=True)
+    p.add_argument('--verify-only',action='store_true')
+    a=p.parse_args()
+    if any(not re.fullmatch('[0-9a-f]{40}',s) for s in (a.built_source,a.publisher_source)) or min(a.build_run,a.closure_artifact,a.originals_artifact,a.publisher_run)<=0:
+        p.error('explicit original source and positive run/artifact identities required')
+    root=Path(__file__).resolve().parents[1]
+    a.out=a.out.resolve()
+    if a.out==root or root in a.out.parents:p.error('publisher artifacts must be outside checkout')
+    a.out.mkdir(mode=0o700,parents=True,exist_ok=False)
+    scratch=a.out.parent/(a.out.name+'-private')
+    scratch.mkdir(mode=0o700,exist_ok=False)
+    deadline=time.monotonic()+1500
+    receipt={'schema':1,'completed':False,'mode':'verify-only' if a.verify_only else 'publish',
+             'built_source_commit':a.built_source,'publisher_source_commit':a.publisher_source,
+             'build_run_id':a.build_run,'publisher_run_id':a.publisher_run,
+             'registry_published':False,'authenticated_copy_succeeded':False,
+             'node_method_qualified':False,'benchmark_qualified':False}
+    def run(argv, *, output=None, data=None, limit=4*1024*1024, env=None):
+        path=output or scratch/'command-output'
+        bounded_command(argv,path,deadline,data=data,limit=limit,env=env)
+        return None if output else path.read_bytes()
+    def gh(path):return json.loads(run(['gh','api','repos/'+REPO+'/'+path]))
+    try:
+        def current_source_admission():
+            current=gh('actions/runs/'+str(a.publisher_run))
+            if os.environ.get('GITHUB_RUN_ID')!=str(a.publisher_run):
+                raise ValueError('publisher run argument differs from current job')
+            attempt=os.environ.get('GITHUB_RUN_ATTEMPT','')
+            if not attempt.isdecimal():raise ValueError('current attempt missing')
+            jobs=gh('actions/runs/'+str(a.publisher_run)+'/attempts/'+attempt+'/jobs?per_page=100')
+            checkout={'head':run(['git','-C',str(root),'rev-parse','HEAD']).decode().strip(),
+                      'tree':run(['git','-C',str(root),'rev-parse','HEAD^{tree}']).decode().strip(),
+                      'clean':run(['git','-C',str(root),'status','--porcelain','--untracked-files=all'])==b''}
+            if Path(os.environ.get('GITHUB_WORKSPACE','/missing')).resolve()!=root:
+                raise ValueError('actual GitHub checkout root differs')
+            for filename in (Path(__file__).resolve(),Path(contract.__file__).resolve()):
+                if root not in filename.parents:raise ValueError('executing source is outside checkout')
+            blobs={name:gh('contents/'+name+'?ref='+a.publisher_source) for name in contract.publisher_sources()}
+            return contract.current_admission(current,jobs,os.environ,a.publisher_source,receipt['mode'],checkout,blobs,gh('git/commits/'+a.publisher_source))
+        receipt['current_publisher_admission']=current_source_admission()
+        build=gh('actions/runs/'+str(a.build_run))
+        closure_api=gh('actions/artifacts/'+str(a.closure_artifact))
+        originals_api=gh('actions/artifacts/'+str(a.originals_artifact))
+        for metadata,name,limit in ((closure_api,'corral-node-tool-closure',1024*1024),
+                                    (originals_api,'corral-node-tool-originals',2*1024**3)):
+            contract.artifact_contract(metadata,build,a.built_source,name,limit)
+        for metadata,path in ((closure_api,a.out/'build-closure.zip'),(originals_api,scratch/'originals.zip')):
+            run(['gh','api','repos/'+REPO+f'/actions/artifacts/{metadata["id"]}/zip'],
+                output=path,limit=metadata['size_in_bytes'])
+            contract.check_zip(path,metadata)
+        closure=contract.read_build_closure(a.out/'build-closure.zip')
+        contract.immutable_build(closure,a.built_source)
+        from corral_node_stage import tool_contract
+        tool_contract(closure,require_published=False)
+        for name,digest in closure['source_files_sha256'].items():
+            raw=run(['gh','api','-H','Accept: application/vnd.github.raw+json',
+                     'repos/'+REPO+'/contents/'+name+'?ref='+a.built_source])
+            if hashlib.sha256(raw).hexdigest()!=digest:raise ValueError('original built source bytes differ')
+        with zipfile.ZipFile(scratch/'originals.zip') as z:
+            names={'original-tools.oci.tar','smoke.json','rpm-inventory.txt','source-sha256.txt'}
+            entries=z.infolist()
+            if (len(entries)!=len(names) or {e.filename for e in entries}!=names
+                    or any(e.file_size>2*1024**3
+                           or ((e.external_attr>>16)&0o170000 not in (0,stat.S_IFREG))
+                           or (e.filename!='original-tools.oci.tar' and e.file_size>1024*1024) for e in entries)
+                    or sum(e.file_size for e in entries)>2*1024**3):
+                raise ValueError('bounded original tool ZIP members differ')
+            # ZIP read validates CRC. Only a regular owned original OCI is written.
+            with z.open('original-tools.oci.tar') as src,(scratch/'tool.oci.tar').open('xb') as dst:
+                while chunk:=src.read(1024*1024):
+                    if time.monotonic()>=deadline:raise TimeoutError('original OCI extraction deadline')
+                    dst.write(chunk)
+            original_smoke=json.loads(z.read('smoke.json').decode().splitlines()[-1])
+            if any(closure.get(key)!=value for key,value in original_smoke.items()):
+                raise ValueError('original smoke bytes differ from build closure')
+            for name in ('rpm-inventory.txt','source-sha256.txt'):z.read(name)
+        raw,config=contract.verify_oci(scratch/'tool.oci.tar',closure,deadline=deadline)
+        digest=closure['image'].split('@')[1]
+        receipt.update(image=closure['image'],original_oci_sha256=closure['oci_sha256'],
+                       original_manifest_sha256=hashlib.sha256(raw).hexdigest(),
+                       original_config_sha256=hashlib.sha256(config).hexdigest(),
+                       built_source_sha256=closure['source_files_sha256'],
+                       publisher_source_sha256=contract.publisher_sources())
+        empty=scratch/'anonymous-auth.json';empty.write_text('{"auths":{}}');empty.chmod(0o600)
+        env={k:v for k,v in os.environ.items() if k not in ('GH_TOKEN','GITHUB_TOKEN','REGISTRY_AUTH_FILE','NODE_TOOL_TOKEN')}
+        env['REGISTRY_AUTH_FILE']=str(empty)
+        receipt['skopeo_version']=run(['skopeo','--version'],env=env).decode().strip()
+        inspected=run(['skopeo','inspect','--raw','oci-archive:'+str(scratch/'tool.oci.tar')],env=env)
+        if inspected!=raw:raise ValueError('skopeo source manifest is not original bytes')
+        if not a.verify_only:
+            # Refresh API/job/source immediately before the first registry write.
+            receipt['current_publisher_admission']=current_source_admission()
+            auth=scratch/'destination-auth.json'
+            fd=os.open(auth,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'w') as private:private.write('{"auths":{}}')
+            token=os.environ.get('NODE_TOOL_TOKEN','')
+            if not token:raise ValueError('explicit publisher token missing')
+            run(['skopeo','login','--authfile',str(auth),'--username',os.environ['GITHUB_ACTOR'],
+                 '--password-stdin','ghcr.io'],data=token.encode(),env=env)
+            if auth.is_symlink() or stat.S_IMODE(auth.stat().st_mode)!=0o600:
+                raise ValueError('destination authfile lost private permissions')
+            receipt['current_publisher_admission']=current_source_admission()
+            run(['skopeo','copy','--preserve-digests','--dest-authfile',str(auth),
+                 '--digestfile',str(scratch/'pushed-digest'),'oci-archive:'+str(scratch/'tool.oci.tar'),
+                 'docker://'+contract.TARGET+':'+a.built_source],env=env)
+            if (scratch/'pushed-digest').read_text().strip()!=digest:raise ValueError('destination changed original manifest digest')
+            receipt['authenticated_copy_succeeded']=True
+            auth.unlink()
+        # No credentials on either anonymous request; full config/layers required.
+        inspected=run(['skopeo','inspect','--authfile',str(empty),'--no-creds','--raw','docker://'+closure['image']],env=env)
+        if inspected!=raw:raise ValueError('anonymous registry manifest differs')
+        destination=scratch/'anonymous'
+        run(['skopeo','copy','--preserve-digests','--src-authfile',str(empty),'--src-no-creds',
+             'docker://'+closure['image'],'dir:'+str(destination)],env=env)
+        receipt.update(anonymous_pull=contract.anonymous_copy(destination,raw,config,closure),
+                       registry_manifest_digest=digest,registry_published=True,completed=True)
+    except BaseException as error:
+        # Do not retain raw remote errors, argv, environment, or credentials.
+        receipt['error_type']=type(error).__name__
+        raise
+    finally:
+        import shutil
+        primary=sys.exc_info()[1]
+        cleanup_error=None
+        try:
+            shutil.rmtree(scratch)
+            receipt['private_scratch_removed']=True
+        except Exception as error:
+            cleanup_error=error
+            receipt.update(private_scratch_removed=False,completed=False,cleanup_error_type=type(error).__name__)
+        for name,metadata in (('build-artifact-api.json',locals().get('closure_api')),
+                              ('originals-artifact-api.json',locals().get('originals_api'))):
+            if metadata is not None:(a.out/name).write_text(json.dumps(metadata,indent=2)+'\n')
+        (a.out/'publication.json').write_text(json.dumps(receipt,indent=2)+'\n')
+        if primary is None and cleanup_error is not None:
+            raise RuntimeError('publisher private scratch cleanup failed') from None
+
+
+if __name__=='__main__':main()

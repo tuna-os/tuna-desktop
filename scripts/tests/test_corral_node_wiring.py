@@ -8,7 +8,7 @@ class Tests(unittest.TestCase):
         return (Path(__file__).resolve().parents[2]/'.github/workflows/corral-visual-tools.yml').read_text()
 
     def job(self):
-        return self.source().split('  node-tools-smoke:\n',1)[1]
+        return self.source().split('  node-tools-smoke:\n',1)[1].split('  node-tools-publish:\n',1)[0]
 
     def test_existing_manual_workflow_opt_in(self):
         source=self.source()

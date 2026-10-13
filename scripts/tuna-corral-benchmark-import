@@ -21,13 +21,13 @@ p.add_argument('--run-id',type=int,required=True);p.add_argument('--artifact-id'
 p.add_argument('--candidate-sha',required=True);p.add_argument('--package-run',type=int,required=True)
 p.add_argument('--namespace',default='corral-vms');p.add_argument('--out',type=Path,required=True)
 p.add_argument('--method',choices=('qcow2-upload','raw-upload','node-stage'),default='qcow2-upload');p.add_argument('--raw-probe',type=Path);p.add_argument('--raw-probe-sha')
-p.add_argument('--node-tool-closure',type=Path);p.add_argument('--node-tool-source-sha')
+p.add_argument('--node-tool-closure',type=Path,help='Original publication artifact ZIP and API receipt directory');p.add_argument('--node-tool-source-sha');p.add_argument('--node-tool-publisher-sha')
 p.add_argument('--node-method-proof',type=Path);p.add_argument('--node-method-proof-sha')
 p.add_argument('--start',action='store_true');a=p.parse_args();node_name(a.node)
 if a.method=='raw-upload' and (not a.raw_probe or not a.raw_probe_sha):p.error('RAW method requires original source-owned probe bundle and its SHA')
 if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}',a.namespace):p.error('invalid namespace')
 if a.method=='node-stage':
- if not all((a.node_tool_closure,a.node_tool_source_sha,a.node_method_proof,a.node_method_proof_sha)):
+ if not all((a.node_tool_closure,a.node_tool_source_sha,a.node_tool_publisher_sha,a.node_method_proof,a.node_method_proof_sha)):
   p.error('node-stage requires exact original tool closure and independent actual tiny method proof')
  if a.start:p.error('node-stage first leaf prepares a verified disk only; VM attachment/boot is separate')
 a.out.mkdir(parents=True,exist_ok=False);a.out.chmod(0o700)

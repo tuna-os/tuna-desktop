@@ -11,7 +11,7 @@ import zipfile
 from corral_artifact import gh_json, original_run, REPO
 from corral_perf import GIB
 
-TOOL_WORKFLOW = '.github/workflows/corral-node-tools.yml'
+TOOL_WORKFLOW = '.github/workflows/corral-visual-tools.yml'
 BASE_IMAGE = 'quay.io/kubevirt/virt-launcher@sha256:574fabe0ff9719fa1e3800dcca8530fa4e02fd71ef74109508e59800e13e8b5d'
 INSTALLER_IMAGE = 'registry.access.redhat.com/ubi9/ubi@sha256:ee3871c273cc65a2bd24970b47c15b90fbf962841bc2e41e4f915b1c4c0208e2'
 QEMU_SHA = '250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad'
@@ -22,13 +22,13 @@ def sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def tool_contract(closure):
+def tool_contract(closure, *, require_published=True):
     if (closure.get('schema') != 1 or closure.get('base_image') != BASE_IMAGE
             or closure.get('installer_image') != INSTALLER_IMAGE
             or closure.get('python_version', [])[:2] != [3, 12]
             or closure.get('qemu_before_sha256') != QEMU_SHA
             or closure.get('qemu_after_sha256') != QEMU_SHA
-            or closure.get('registry_published') is not True
+            or (require_published and closure.get('registry_published') is not True)
             or closure.get('smoke_passed') is not True
             or closure.get('uid') != 107
             or not re.fullmatch(r'ghcr.io/tuna-os/benchmark-node-tools@sha256:[0-9a-f]{64}', closure.get('image', ''))):
@@ -60,30 +60,40 @@ def tool_contract(closure):
     return total + GIB//2  # Config, extraction metadata and writable tool layer.
 
 
-def load_tool(directory, source):
-    """Bind a small original closure artifact to trusted manual source CI."""
-    directory = Path(directory)
-    receipt = json.loads((directory/'artifact-api.json').read_text())
-    run = gh_json('actions/runs/'+str(receipt['workflow_run']['id']))
-    original_run(run, source, TOOL_WORKFLOW)
-    remote = gh_json('actions/artifacts/'+str(receipt['id']))
-    if (remote != receipt or remote.get('expired') is not False
-            or remote.get('name') != 'corral-node-tool-closure'
-            or remote.get('workflow_run', {}).get('head_sha') != source
-            or not 0 < remote.get('size_in_bytes', 0) <= 1024*1024):
-        raise ValueError('original tool artifact identity differs')
-    archive = directory/'original-artifact.zip'
-    if archive.stat().st_size != remote['size_in_bytes'] or 'sha256:'+sha(archive) != remote['digest']:
-        raise ValueError('original tool artifact bytes differ')
-    with zipfile.ZipFile(archive) as z:
-        entries = z.infolist()
-        if len(entries) != 1 or entries[0].filename != 'tool-closure.json' or entries[0].file_size > 128*1024:
-            raise ValueError('bounded single tool manifest required')
-        closure = json.loads(z.read(entries[0]))
-    if closure.get('source_commit') != source:
-        raise ValueError('tool closure source differs')
-    tool_contract(closure)
-    return closure
+def load_tool(directory, source, publisher_source):
+    """Admit separate original build and registered anonymous publisher custody."""
+    import io
+    import corral_node_publish as publication
+    directory=Path(directory)
+    receipt=json.loads((directory/'artifact-api.json').read_text())
+    publisher_run=gh_json('actions/runs/'+str(receipt['workflow_run']['id']))
+    remote=gh_json('actions/artifacts/'+str(receipt['id']))
+    if remote!=receipt:raise ValueError('original publication artifact metadata differs')
+    publication.artifact_contract(remote,publisher_run,publisher_source,'corral-node-tool-publication',1024*1024)
+    archive=directory/'original-artifact.zip'
+    publication.check_zip(archive,remote)
+    members=publication.publication_members(archive)
+    envelope=json.loads(members['publication.json'])
+    build_api=json.loads(members['build-artifact-api.json'])
+    originals_api=json.loads(members['originals-artifact-api.json'])
+    build_run=gh_json('actions/runs/'+str(envelope['build_run_id']))
+    for api,name,limit in ((build_api,'corral-node-tool-closure',1024*1024),
+                           (originals_api,'corral-node-tool-originals',2*GIB)):
+        if gh_json('actions/artifacts/'+str(api['id']))!=api:
+            raise ValueError('original build artifact metadata differs')
+        publication.artifact_contract(api,build_run,source,name,limit)
+    data=members['build-closure.zip']
+    if len(data)!=build_api['size_in_bytes'] or 'sha256:'+hashlib.sha256(data).hexdigest()!=build_api['digest']:
+        raise ValueError('original nested build ZIP bytes differ')
+    closure=publication.read_build_closure(io.BytesIO(data))
+    publication.immutable_build(closure,source)
+    tool_contract(closure,require_published=False)
+    publication.publication_chain(envelope,build_run,publisher_run,source,publisher_source,closure,
+        publisher_commit=gh_json('git/commits/'+publisher_source),
+        publisher_jobs=gh_json('actions/runs/'+str(publisher_run['id'])+'/attempts/'+str(publisher_run['run_attempt'])+'/jobs?per_page=100'))
+    # Preserve the original built closure's false publication flag. Availability
+    # belongs to the independently verified envelope, never a rewritten build.
+    return {**closure,'publication_evidence':envelope,'publication_artifact':remote}
 
 
 def archive_contract(run, artifact, source, profile):
@@ -105,7 +115,7 @@ def storage_plan(archive, closure):
     # Until the authenticated ZIP central directory is available, reserve the
     # full existing safe-members expansion ceiling. Do not guess compressibility.
     stage = math.ceil((size + 3*GIB + GIB//2)/GIB)*GIB
-    layers = tool_contract(closure)
+    layers = tool_contract(closure, require_published=False)
     return {'method': 'node-stage', 'target_pvc_bytes': 20*GIB,
             'staging_pvc_bytes': stage, 'original_archive_bytes': size,
             'safe_expansion_ceiling_bytes': 3*GIB, 'tool_closure_allowance_bytes': layers,
@@ -292,7 +302,7 @@ def execute(args):
                 operation, *map(str, values)]
 
     try:
-        closure = load_tool(args.node_tool_closure, args.node_tool_source_sha)
+        closure = load_tool(args.node_tool_closure, args.node_tool_source_sha, getattr(args, "node_tool_publisher_sha", None))
         run = gh('actions/runs/'+str(args.run_id))
         artifact = gh('actions/artifacts/'+str(args.artifact_id))
         archive_contract(run, artifact, args.source_sha, args.profile)

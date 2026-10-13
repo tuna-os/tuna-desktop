@@ -6,6 +6,27 @@ on:
         description: Build and retain benchmark tool closure without registry publication
         type: boolean
         default: false
+      node_tool_registry_action:
+        description: Candidate tooling only; disabled by default
+        type: choice
+        options: [disabled, publish, verify-only]
+        default: disabled
+      node_tool_build_run:
+        description: Original successful manual tool build run ID
+        type: string
+        default: ''
+      node_tool_closure_artifact:
+        description: Original small build closure artifact ID
+        type: string
+        default: ''
+      node_tool_originals_artifact:
+        description: Original OCI artifact ID
+        type: string
+        default: ''
+      node_tool_built_source:
+        description: Exact original built source SHA (not publisher source)
+        type: string
+        default: ''
   pull_request:
     paths:
       - scripts/tuna-corral-visual-capture
@@ -75,3 +96,63 @@ jobs:
             ${{ runner.temp }}/node-tools/rpm-inventory.txt
             ${{ runner.temp }}/node-tools/source-sha256.txt
           if-no-files-found: warn
+  node-tools-publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.node_tool_registry_action == 'publish' && github.repository == 'tuna-os/tuna-desktop'
+    needs: focused
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Verify original custody and publish candidate tooling
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_TOOL_TOKEN: ${{ github.token }}
+          BUILD_RUN: ${{ inputs.node_tool_build_run }}
+          CLOSURE_ARTIFACT: ${{ inputs.node_tool_closure_artifact }}
+          ORIGINALS_ARTIFACT: ${{ inputs.node_tool_originals_artifact }}
+          BUILT_SOURCE: ${{ inputs.node_tool_built_source }}
+        run: |
+          python3 scripts/tuna-corral-node-tools-publish --build-run "$BUILD_RUN" --closure-artifact "$CLOSURE_ARTIFACT" --originals-artifact "$ORIGINALS_ARTIFACT" --built-source "$BUILT_SOURCE" --publisher-source "$GITHUB_SHA" --publisher-run "$GITHUB_RUN_ID" --out "$RUNNER_TEMP/node-tools-publication"
+      - name: Retain original small publication and failure receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: corral-node-tool-publication
+          path: ${{ runner.temp }}/node-tools-publication/
+          if-no-files-found: error
+  node-tools-anonymous-verify:
+    if: github.event_name == 'workflow_dispatch' && inputs.node_tool_registry_action == 'verify-only' && github.repository == 'tuna-os/tuna-desktop'
+    needs: focused
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Verify original custody and anonymously verify candidate tooling
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN: ${{ inputs.node_tool_build_run }}
+          CLOSURE_ARTIFACT: ${{ inputs.node_tool_closure_artifact }}
+          ORIGINALS_ARTIFACT: ${{ inputs.node_tool_originals_artifact }}
+          BUILT_SOURCE: ${{ inputs.node_tool_built_source }}
+        run: |
+          python3 scripts/tuna-corral-node-tools-publish --build-run "$BUILD_RUN" --closure-artifact "$CLOSURE_ARTIFACT" --originals-artifact "$ORIGINALS_ARTIFACT" --built-source "$BUILT_SOURCE" --publisher-source "$GITHUB_SHA" --publisher-run "$GITHUB_RUN_ID" --out "$RUNNER_TEMP/node-tools-publication" --verify-only
+      - name: Retain original small publication and failure receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: corral-node-tool-publication
+          path: ${{ runner.temp }}/node-tools-publication/
+          if-no-files-found: error
