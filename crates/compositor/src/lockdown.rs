@@ -368,7 +368,11 @@ pub fn read_lock_screen_key() -> Option<bool> {
 /// `timeout` (the child is killed); a bad exit, missing binary, or
 /// unparseable output yields `None` too. Never blocks past the bound
 /// plus one poll slice, and caps stdout so a rogue backend cannot grow
-/// the buffer.
+/// the buffer. The post-exit drain shares the same absolute deadline:
+/// the child is gone but an inherited writer (a forked grandchild
+/// holding the pipe) can keep EOF away forever, so the drain reads
+/// nonblocking in poll slices and gives up at the deadline — no helper
+/// thread.
 pub fn read_bool_via_command(program: &str, args: &[&str], timeout: Duration) -> Option<bool> {
     let mut child = std::process::Command::new(program)
         .args(args)
@@ -377,6 +381,7 @@ pub fn read_bool_via_command(program: &str, args: &[&str], timeout: Duration) ->
         .spawn()
         .ok()?;
     let start = std::time::Instant::now();
+    let deadline = start + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -386,8 +391,32 @@ pub fn read_bool_via_command(program: &str, args: &[&str], timeout: Duration) ->
                 let mut output = String::new();
                 if let Some(stdout) = child.stdout.take() {
                     use std::io::Read;
-                    let mut capped = stdout.take(1024);
-                    let _ = capped.read_to_string(&mut output);
+                    let mut stdout = stdout;
+                    if stdout.set_nonblocking(true).is_err() {
+                        return None;
+                    }
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 256];
+                    loop {
+                        if bytes.len() >= 1024 {
+                            break;
+                        }
+                        match stdout.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let room = 1024 - bytes.len();
+                                bytes.extend_from_slice(&chunk[..n.min(room)]);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                if std::time::Instant::now() >= deadline {
+                                    return None;
+                                }
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => return None,
+                        }
+                    }
+                    output = String::from_utf8_lossy(&bytes).into_owned();
                 }
                 return parse_gsettings_bool(&output);
             }
@@ -567,6 +596,22 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "hung backend must time out, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_writer_cannot_hold_the_post_exit_read_past_the_deadline() {
+        // The child exits 0 at once while a backgrounded grandchild
+        // inherits the pipe and never writes: the post-exit drain must
+        // give up at the remaining absolute deadline, not at EOF.
+        let timeout = Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let result = read_bool_via_command("sh", &["-c", "sleep 5 & exec true"], timeout);
+        let elapsed = start.elapsed();
+        assert_eq!(result, None);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "inherited writer must not hold the read past the deadline, took {elapsed:?}"
         );
     }
 
