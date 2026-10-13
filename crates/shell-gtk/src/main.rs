@@ -127,6 +127,107 @@ fn attach_control() -> Option<ControlClient> {
     None
 }
 
+/// Re-establish the control channel after a mid-session drop: connect and
+/// greet immediately (the compositor drops newcomers silent for a full
+/// round), then let the pump's Gap path resync from the handshake snapshot.
+/// Never blocks: the handshake reply arrives on a later pump.
+fn reconnect_control() -> Option<ControlClient> {
+    let path = std::env::var_os("TUNA_CONTROL_SOCKET")?;
+    let mut control = ControlClient::connect(std::path::Path::new(&path)).ok()?;
+    control.send_hello().ok()?;
+    Some(control)
+}
+
+/// Watch the live control client's socket for pump wakes: inlet for
+/// inbound frames plus an on-demand outlet installed through the client's
+/// write waker. Re-run after a reconnect; a previous source (if any) is
+/// destroyed by replacement.
+fn watch_control_transport(shell: &Rc<RefCell<Shell>>, ui_wake: &Rc<ui_wake::UiWake>) {
+    // The duplicated descriptor is owned by GSocket for the source's entire
+    // lifetime. Retire after the last drain on EOF/error, before descriptor
+    // reuse could turn this into a watch on an unrelated connection.
+    use std::os::fd::AsFd;
+    let socket = shell.borrow().control.as_ref().map(|control| {
+        gio::Socket::from_fd(
+            control
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("duplicate control fd"),
+        )
+        .expect("watch control socket")
+    });
+    if let Some(socket) = socket {
+        // Only register OUT while an accepted frame is pending. A permanently
+        // writable source would replace the old timer with a busy loop.
+        let output_active = Rc::new(Cell::new(false));
+        let output_socket = socket.clone();
+        let output_wake = Rc::downgrade(ui_wake);
+        let output_shell = Rc::downgrade(shell);
+        if let Some(control) = shell.borrow_mut().control.as_mut() {
+            control.set_write_waker(move || {
+                if output_active.replace(true) {
+                    return;
+                }
+                let Some(owner) = output_wake.upgrade() else {
+                    output_active.set(false);
+                    return;
+                };
+                let active = output_active.clone();
+                let weak_wake = output_wake.clone();
+                let weak_shell = output_shell.clone();
+                let source = ui_wake::watch_socket_conditions(
+                    &output_socket,
+                    glib::IOCondition::OUT | glib::IOCondition::HUP | glib::IOCondition::ERR,
+                    move |condition| {
+                        let keep = if let (Some(wake), Some(shell)) =
+                            (weak_wake.upgrade(), weak_shell.upgrade())
+                        {
+                            wake.dispatch();
+                            if condition.contains(glib::IOCondition::ERR) {
+                                shell.borrow_mut().control = None;
+                                wake.retire_transport();
+                            }
+                            let pending = shell
+                                .borrow()
+                                .control
+                                .as_ref()
+                                .is_some_and(|control| control.has_pending_write());
+                            pending
+                        } else {
+                            false
+                        };
+                        if !keep {
+                            active.set(false);
+                            if let Some(wake) = weak_wake.upgrade() {
+                                wake.retire_output_source();
+                            }
+                        }
+                        keep
+                    },
+                );
+                owner.own_output_source(source);
+            });
+        }
+        let weak_wake = Rc::downgrade(ui_wake);
+        let weak_shell = Rc::downgrade(shell);
+        let source = ui_wake::watch_socket(&socket, move |condition| {
+            let (Some(wake), Some(shell)) = (weak_wake.upgrade(), weak_shell.upgrade()) else {
+                return false;
+            };
+            wake.dispatch();
+            // ERR is terminal even if a nonblocking read returned WouldBlock.
+            // HUP drains all complete buffered frames before read_frame sees EOF.
+            if condition.contains(glib::IOCondition::ERR) {
+                shell.borrow_mut().control = None;
+                wake.retire_transport();
+            }
+            let connected = shell.borrow().control.is_some();
+            connected
+        });
+        ui_wake.own_input_source(source);
+    }
+}
+
 struct Shell {
     control: Option<ControlClient>,
     pills: Rc<ws_dots::Indicator>,
@@ -2243,6 +2344,7 @@ fn build(app: &adw::Application) {
                 .as_ref()
                 .is_some_and(|control| control.locked()),
         );
+        let last_reconnect_attempt = Cell::new(None::<Instant>);
         let dispatcher = Rc::downgrade(&ui_wake);
         ui_wake.install(move || {
             let Some(wake) = dispatcher.upgrade() else { return };
@@ -2332,6 +2434,29 @@ fn build(app: &adw::Application) {
             drop(shell);
             if disconnected {
                 wake.retire_transport();
+                // A dropped channel used to be terminal: the shell stayed
+                // disconnected forever (V-LIFECYCLE/V-LOCK hunt). Reconnect
+                // instead; the handshake snapshot resyncs the model through
+                // the existing Gap path. Throttled so a persistently
+                // failing channel cannot spin the main loop.
+                let now = Instant::now();
+                let attempt_due = match last_reconnect_attempt.get() {
+                    None => true,
+                    Some(last) => now.duration_since(last) >= Duration::from_millis(500),
+                };
+                if attempt_due {
+                    last_reconnect_attempt.set(Some(now));
+                    if let Some(control) = reconnect_control() {
+                        shell_rc.borrow_mut().control = Some(control);
+                        watch_control_transport(&shell_rc, &wake);
+                        eprintln!("tuna-shell-gtk: control reconnected; resyncing");
+                        wake.request();
+                    } else {
+                        wake.at(Some(now + Duration::from_millis(500)));
+                    }
+                } else if let Some(last) = last_reconnect_attempt.get() {
+                    wake.at(Some(last + Duration::from_millis(500)));
+                }
             }
             if locked {
                 notify.release_focus();
@@ -2411,89 +2536,7 @@ fn build(app: &adw::Application) {
         });
     }
 
-    // The duplicated descriptor is owned by GSocket for the source's entire
-    // lifetime. Retire after the last drain on EOF/error, before descriptor
-    // reuse could turn this into a watch on an unrelated connection.
-    use std::os::fd::AsFd;
-    let socket = shell.borrow().control.as_ref().map(|control| {
-        gio::Socket::from_fd(
-            control
-                .as_fd()
-                .try_clone_to_owned()
-                .expect("duplicate control fd"),
-        )
-        .expect("watch control socket")
-    });
-    if let Some(socket) = socket {
-        // Only register OUT while an accepted frame is pending. A permanently
-        // writable source would replace the old timer with a busy loop.
-        let output_active = Rc::new(Cell::new(false));
-        let output_socket = socket.clone();
-        let output_wake = Rc::downgrade(&ui_wake);
-        let output_shell = Rc::downgrade(&shell);
-        if let Some(control) = shell.borrow_mut().control.as_mut() {
-            control.set_write_waker(move || {
-                if output_active.replace(true) {
-                    return;
-                }
-                let Some(owner) = output_wake.upgrade() else {
-                    output_active.set(false);
-                    return;
-                };
-                let active = output_active.clone();
-                let weak_wake = output_wake.clone();
-                let weak_shell = output_shell.clone();
-                let source = ui_wake::watch_socket_conditions(
-                    &output_socket,
-                    glib::IOCondition::OUT | glib::IOCondition::HUP | glib::IOCondition::ERR,
-                    move |condition| {
-                        let keep = if let (Some(wake), Some(shell)) =
-                            (weak_wake.upgrade(), weak_shell.upgrade())
-                        {
-                            wake.dispatch();
-                            if condition.contains(glib::IOCondition::ERR) {
-                                shell.borrow_mut().control = None;
-                                wake.retire_transport();
-                            }
-                            let pending = shell
-                                .borrow()
-                                .control
-                                .as_ref()
-                                .is_some_and(|control| control.has_pending_write());
-                            pending
-                        } else {
-                            false
-                        };
-                        if !keep {
-                            active.set(false);
-                            if let Some(wake) = weak_wake.upgrade() {
-                                wake.retire_output_source();
-                            }
-                        }
-                        keep
-                    },
-                );
-                owner.own_output_source(source);
-            });
-        }
-        let weak_wake = Rc::downgrade(&ui_wake);
-        let weak_shell = Rc::downgrade(&shell);
-        let source = ui_wake::watch_socket(&socket, move |condition| {
-            let (Some(wake), Some(shell)) = (weak_wake.upgrade(), weak_shell.upgrade()) else {
-                return false;
-            };
-            wake.dispatch();
-            // ERR is terminal even if a nonblocking read returned WouldBlock.
-            // HUP drains all complete buffered frames before read_frame sees EOF.
-            if condition.contains(glib::IOCondition::ERR) {
-                shell.borrow_mut().control = None;
-                wake.retire_transport();
-            }
-            let connected = shell.borrow().control.is_some();
-            connected
-        });
-        ui_wake.own_input_source(source);
-    }
+    watch_control_transport(&shell, &ui_wake);
     window.present();
 }
 

@@ -1460,8 +1460,16 @@ impl ControlHub {
             if self.gate.admits(self.session_peers[i], uid) {
                 i += 1;
             } else {
+                let peer = self.session_peers[i];
                 self.sessions.swap_remove(i);
                 self.session_peers.swap_remove(i);
+                // Eviction closes the socket: the peer reads EOF. Name the
+                // cause here; silent drops are not diagnosable from the
+                // shell side (V-LIFECYCLE hunt).
+                eprintln!(
+                    "tuna-compositor: control session evicted by peer gate {:?} (peer {peer:?})",
+                    self.gate
+                );
             }
         }
         self.advance_pending(model);
@@ -1473,13 +1481,13 @@ impl ControlHub {
             let alive = {
                 let session = &mut self.sessions[i];
                 let before = model.focused();
-                let deltas_ok = session.emit_deltas(model).is_ok();
-                let cmd_ok = match session.handle_next(model) {
-                    Ok(_) => true,
-                    Err(ControlError::WouldBlock) => true,
-                    Err(_) => false,
+                let deltas_err = session.emit_deltas(model).err();
+                let cmd_err = match session.handle_next(model) {
+                    Ok(_) => None,
+                    Err(ControlError::WouldBlock) => None,
+                    Err(error) => Some(error),
                 };
-                if deltas_ok && cmd_ok {
+                if deltas_err.is_none() && cmd_err.is_none() {
                     if model.focused() != before {
                         outcome.activated.extend(model.focused());
                     }
@@ -1526,6 +1534,22 @@ impl ControlHub {
                     }
                     true
                 } else {
+                    // The drop closes the socket: the peer reads EOF. Name
+                    // the cause here; silent drops are not diagnosable
+                    // from the shell side (V-LIFECYCLE hunt).
+                    eprintln!(
+                        "tuna-compositor: control session dropped: deltas={} command={}",
+                        deltas_err
+                            .as_ref()
+                            .map(|e| e.to_string())
+                            .as_deref()
+                            .unwrap_or("ok"),
+                        cmd_err
+                            .as_ref()
+                            .map(|e| e.to_string())
+                            .as_deref()
+                            .unwrap_or("ok"),
+                    );
                     false
                 }
             };

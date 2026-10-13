@@ -1747,4 +1747,64 @@ mod tests {
             other => panic!("expected WouldBlock, got {other:?}"),
         }
     }
+
+    #[test]
+    fn reconnect_resyncs_after_peer_close() {
+        // V-LIFECYCLE hunt: the shell read EOF mid-tour ("control
+        // connection closed") and stayed disconnected forever. The fix
+        // reconnects; pin the recovery half here: a fresh client greets
+        // and applies the handshake snapshot, and a delta against its
+        // empty base raises Gap (which re-hellos).
+        let (mut client, peer) = pair();
+        drop(peer);
+        match client.poll() {
+            Err(ControlError::Unexpected(message)) => {
+                assert_eq!(message, "control connection closed");
+            }
+            other => panic!("expected EOF Unexpected, got {other:?}"),
+        }
+        // Reconnect: fresh client, immediate Hello, handshake snapshot.
+        let (mut client, mut peer) = pair();
+        assert!(client.needs_snapshot());
+        assert_eq!(client.revision(), None);
+        client.send_hello().expect("reconnect hello");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Hello {
+                version: CURRENT_VERSION
+            }
+        );
+        server_write(
+            &mut peer,
+            &Message::Hello {
+                version: CURRENT_VERSION,
+            },
+        );
+        server_write(&mut peer, &snapshot_rev7());
+        assert_eq!(client.poll().expect("hello"), Handled::Hello);
+        assert!(matches!(
+            client.poll().expect("snapshot"),
+            Handled::Snapshot { .. }
+        ));
+        assert!(!client.needs_snapshot());
+        assert_eq!(client.revision(), Some(7));
+        // A delta against a stale base raises Gap and re-hellos.
+        server_write(
+            &mut peer,
+            &Message::Changes {
+                from_revision: 99,
+                to_revision: 100,
+                ops: vec![],
+            },
+        );
+        assert!(matches!(client.poll().expect("gap"), Handled::Gap { .. }));
+        assert!(client.needs_snapshot());
+        client.request_snapshot().expect("re-hello");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Hello {
+                version: CURRENT_VERSION
+            }
+        );
+    }
 }
