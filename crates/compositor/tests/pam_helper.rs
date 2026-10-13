@@ -533,6 +533,7 @@ fn run_backend_cases() {
         ("repeat", "right-password", false),
         ("single", "right-password", true),
     ] {
+        println!("stable PAM creator case: {mode}");
         let ticket = backend
             .begin(
                 format!("private-{mode}"),
@@ -547,11 +548,18 @@ fn run_backend_cases() {
         } else {
             creator = Some(actual);
         }
+        let mut pending_count = 0;
         assert_eq!(
-            ticket.wait_retired(|| panic!("unexpected pending single-password case")),
+            ticket.wait_retired(|| pending_count += 1),
             Verification::Retired {
                 authenticated: accepted
-            }
+            },
+            "case {mode} requires an actual retired result"
+        );
+        assert_eq!(
+            pending_count,
+            usize::from(mode == "repeat"),
+            "only the unsupported second secret may emit one pending denial"
         );
     }
     // Busy admission cannot queue another credential. Caller/ticket cancellation
