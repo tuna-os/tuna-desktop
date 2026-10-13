@@ -118,6 +118,26 @@ pub fn wifi_message(ssid: &str) -> String {
     format!("Passwords or encryption keys are required to access the wireless network \u{201c}{ssid}\u{201d}")
 }
 
+/// Live visibility for an open secret entry under the policy (GNOME 51
+/// live-reset): deny hides a revealed password answer; lift never
+/// unhides — the prior state returns only through a fresh reveal.
+/// Non-password entries are untouched.
+pub fn live_entry_visibility(
+    password_field: bool,
+    currently_visible: bool,
+    reveal_allowed: bool,
+) -> bool {
+    currently_visible && (!password_field || reveal_allowed)
+}
+
+/// GSettings for the lockdown schema when installed; `None` keeps the
+/// shell running without it (same guard as the shell's `settings()`).
+fn lockdown_settings() -> Option<gio::Settings> {
+    let source = gio::SettingsSchemaSource::default()?;
+    source.lookup(crate::lockdown::SCHEMA, true)?;
+    Some(gio::Settings::new(crate::lockdown::SCHEMA))
+}
+
 struct Pending {
     invocation: gio::DBusMethodInvocation,
     connection: glib::Variant,
@@ -220,7 +240,40 @@ impl NetworkAgent {
             glib::Propagation::Proceed
         });
         agent.window.add_controller(keys);
+        // Administrative lockdown (#357 follow-up): live-reset open
+        // secret entries when `disable-show-password` flips (GNOME 51).
+        if let Some(lockdown) = lockdown_settings() {
+            let weak = Rc::downgrade(&agent);
+            lockdown.connect_changed(None, move |_, _| {
+                if let Some(a) = weak.upgrade() {
+                    a.apply_lockdown(&crate::lockdown::read().entry_visibility());
+                }
+            });
+            // Keep the settings object (and its signal) alive.
+            std::mem::forget(lockdown);
+        }
         agent
+    }
+
+    /// Apply the live `disable-show-password` policy to the open prompt
+    /// (GNOME 51 live-reset): deny hides revealed answers and drops the
+    /// toggle; lift restores the toggle with answers still hidden, so
+    /// the prior state returns only through a fresh reveal. Harmless
+    /// with no prompt open.
+    pub fn apply_lockdown(&self, visibility: &crate::lockdown::EntryVisibility) {
+        let pending = self.pending.borrow();
+        let Some(request) = pending.as_ref() else {
+            return;
+        };
+        for (field, entry) in request.fields.iter().zip(self.entries.borrow().iter()) {
+            entry.set_visibility(live_entry_visibility(
+                field.password,
+                entry.is_visible(),
+                visibility.password_reveal,
+            ));
+            let icon = crate::lockdown::password_reveal_icon(field.password, visibility);
+            entry.set_icon_from_icon_name(gtk::EntryIconPosition::Secondary, icon);
+        }
     }
 
     fn get_secrets(
@@ -347,14 +400,19 @@ impl NetworkAgent {
             // Administrative lockdown (#357): no reveal toggle while
             // `disable-show-password` denies (live read per prompt, so
             // lifting the policy restores the toggle on the next one).
+            // The toggle handler stays wired while denied (no icon to
+            // press), so the follow-up's live `apply_lockdown` restores
+            // reveal on the open prompt when the policy lifts.
+            if field.password {
+                entry.connect_icon_press(|e, _| {
+                    e.set_visibility(!gtk::prelude::EntryExt::is_visible(e))
+                });
+            }
             if let Some(icon) = crate::lockdown::password_reveal_icon(
                 field.password,
                 &crate::lockdown::read().entry_visibility(),
             ) {
                 entry.set_icon_from_icon_name(gtk::EntryIconPosition::Secondary, Some(icon));
-                entry.connect_icon_press(|e, _| {
-                    e.set_visibility(!gtk::prelude::EntryExt::is_visible(e))
-                });
             }
             let weak = Rc::downgrade(self);
             entry.connect_changed(move |_| {
@@ -705,6 +763,22 @@ mod tests {
         assert!(wep.valid("abcde"));
         assert!(!wep.valid("abc12"));
         assert!(!wep.valid("0123"));
+    }
+
+    #[test]
+    fn live_reset_hides_on_deny_and_needs_fresh_reveal_on_lift() {
+        // Negative: a revealed answer hides when the policy engages.
+        assert!(!live_entry_visibility(true, true, false));
+        // Lift keeps it hidden: only a fresh reveal restores it.
+        assert!(!live_entry_visibility(true, false, true));
+        // Allowed and visible stays (no deny ever hid it).
+        assert!(live_entry_visibility(true, true, true));
+        assert!(!live_entry_visibility(true, false, false));
+        // Non-password entries are untouched by the policy.
+        assert!(live_entry_visibility(false, true, false));
+        assert!(live_entry_visibility(false, true, true));
+        assert!(!live_entry_visibility(false, false, false));
+        assert!(!live_entry_visibility(false, false, true));
     }
 
     #[test]

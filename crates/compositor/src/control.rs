@@ -1220,6 +1220,11 @@ pub struct ControlHub {
     /// `Lock` commands deny under a restrictive key. Only the lock key
     /// is live here; the shell owns the rest of the surface.
     lockdown: LockdownPolicy,
+    /// Background policy reads (#357 follow-up): each refresh spawns
+    /// one reader thread reporting here; the tick drains completed
+    /// results without waiting, so a hung backend never stalls it.
+    lockdown_tx: std::sync::mpsc::Sender<Option<bool>>,
+    lockdown_rx: std::sync::mpsc::Receiver<Option<bool>>,
     /// Alt-Tab drive events awaiting broadcast. Unlike the overview
     /// intent (level), steps are discrete events: each one is sent to
     /// every live session exactly once, retained until all sends land.
@@ -1286,7 +1291,8 @@ impl ControlHub {
         listener.set_nonblocking(true)?;
         let readiness = crate::control_readiness::ControlReadiness::new(&listener)?;
         // Administrative lockdown (#357): constructed from the live
-        // key at startup; unreadable reads GNOME defaults (allowed).
+        // key at startup (bounded read); unreadable reads GNOME defaults
+        // (allowed).
         let lockdown = LockdownPolicy::from_reader(&|key| {
             if key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN {
                 crate::lockdown::read_lock_screen_key()
@@ -1294,6 +1300,7 @@ impl ControlHub {
                 None
             }
         });
+        let (lockdown_tx, lockdown_rx) = std::sync::mpsc::channel();
         Ok(Self {
             listener,
             readiness,
@@ -1305,6 +1312,8 @@ impl ControlHub {
             overview_sent: false,
             locked: std::rc::Rc::new(std::cell::Cell::new(false)),
             lockdown,
+            lockdown_tx,
+            lockdown_rx,
             switcher_queue: Vec::new(),
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
@@ -1453,18 +1462,34 @@ impl ControlHub {
         }
     }
 
-    /// Re-read the live `disable-lock-screen` key onto the hub and
-    /// every session. An unreadable key keeps the current value,
-    /// never resets. The runtime calls this on a slow tick (one
-    /// subprocess per call, skipped without a session bus).
+    /// Poll the live `disable-lock-screen` key without blocking: drain
+    /// completed background reads (latest wins; unreadable keeps the
+    /// cached value, never resets) and spawn the next reader. The
+    /// runtime calls this on a slow tick; a hung backend never stalls
+    /// it, and the shell enforces its own surface immediately, so this
+    /// backstop's lag fails safe.
     pub fn refresh_lockdown(&mut self) {
-        if let Some(value) = crate::lockdown::read_lock_screen_key() {
+        self.refresh_lockdown_with(crate::lockdown::read_lock_screen_key);
+    }
+
+    /// [`refresh_lockdown`](Self::refresh_lockdown) with an injectable
+    /// reader. Tests pass a hung double to prove the tick stays bounded;
+    /// production reads the live key on the background thread.
+    pub fn refresh_lockdown_with(
+        &mut self,
+        reader: impl FnOnce() -> Option<bool> + Send + 'static,
+    ) {
+        if let Some(Some(value)) = self.lockdown_rx.try_iter().last() {
             self.lockdown
                 .refresh(&|key| (key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN).then_some(value));
             for session in &mut self.sessions {
                 session.set_lockdown_policy(self.lockdown);
             }
         }
+        let tx = self.lockdown_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reader());
+        });
     }
 
     /// Set the session-lock flag; the next [`poll`](Self::poll) carries
