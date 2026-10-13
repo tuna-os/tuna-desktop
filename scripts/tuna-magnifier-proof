@@ -1,0 +1,328 @@
+#!/bin/sh
+# tuna-magnifier-proof — screen magnifier (#349) in the nested session.
+#
+# Usage:
+#   scripts/tuna-magnifier-proof [--display :N] [--artifacts DIR]
+#
+# Enables the magnifier through real GSettings writes, captures the
+# nested output through the shell's own screenshot UI (Print, Screen
+# mode, Return), and asserts actual magnified pixels:
+#   M-OFF      unmagnified baseline: panel strip and desktop background
+#   M-SETTINGS Settings writes reach the session snapshot the compositor reads
+#   M-ZOOM     2x zoom doubles a real panel edge; clamped ROI, bg elsewhere
+#   M-TRACK    moving the pointer moves the magnified view
+#   M-FOCUS    focused-window tracking centers the view with mouse tracking off
+#   M-DISABLE  disabling restores the unmagnified frame
+# Writes assertions.txt for the parity ledger.
+set -eu
+
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+fi
+unset CDPATH
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+DISPLAY_ARG=""
+ARTIFACTS="$ROOT/magnifier-artifacts"
+WIDTH=1280
+HEIGHT=800
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --display) DISPLAY_ARG="$2"; shift 2 ;;
+        --artifacts) ARTIFACTS="$2"; shift 2 ;;
+        --help|-h) sed -n '2,18p' "$0"; exit 0 ;;
+        *) echo "tuna-magnifier-proof: unknown argument $1" >&2; exit 1 ;;
+    esac
+done
+mkdir -p "$ARTIFACTS"
+ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
+LOG="$ARTIFACTS/nested.log"
+ASSERTIONS="$ARTIFACTS/assertions.txt"
+: >"$ASSERTIONS"
+CSTATE="$ARTIFACTS/compositor-state.json"
+HOME_PRIV="$ARTIFACTS/home"
+RUN_PRIV="$ARTIFACTS/run"
+PICS_PRIV="$ARTIFACTS/pictures"
+CONF_PRIV="$ARTIFACTS/config"
+mkdir -p "$HOME_PRIV" "$RUN_PRIV" "$PICS_PRIV/Screenshots" "$CONF_PRIV"
+chmod 700 "$RUN_PRIV"
+ORIG_HOME="$HOME"
+TUNA_COMPOSITOR_STATE="$CSTATE"
+XDG_RUNTIME_DIR="$RUN_PRIV"
+HOME="$HOME_PRIV"
+XDG_PICTURES_DIR="$PICS_PRIV"
+# keyfile (not dconf): GSettings writes stay in the private config dir
+# and propagate cross-process through file monitoring, never touching
+# the runner's own dconf database.
+GSETTINGS_BACKEND=keyfile
+XDG_CONFIG_HOME="$CONF_PRIV"
+export TUNA_COMPOSITOR_STATE XDG_RUNTIME_DIR HOME XDG_PICTURES_DIR GSETTINGS_BACKEND XDG_CONFIG_HOME
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
+
+OWNED_XVFB=""
+COMPOSITOR_PID=""
+CLIENT_PID=""
+cleanup() {
+    if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
+    if [ -n "$COMPOSITOR_PID" ]; then kill "$COMPOSITOR_PID" 2>/dev/null || true; fi
+    if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+}
+trap cleanup EXIT INT TERM
+pass() { echo "$1 pass $2" >>"$ASSERTIONS"; echo "tuna-magnifier-proof: $1 pass: $2"; }
+fail() {
+    echo "$1 fail $2" >>"$ASSERTIONS"
+    echo "tuna-magnifier-proof: $1 FAIL: $2" >&2
+    tail -20 "$LOG" >&2 || true
+    exit 1
+}
+px() {
+    ffmpeg -loglevel error -i "$1" -vf "crop=1:1:$2:$3" -f rawvideo -pix_fmt rgb24 - |
+        od -An -tu1 | tr -s ' ' | sed 's/^ //; s/ $//'
+}
+# near R G B R G B TOL: every channel within TOL.
+near() {
+    awk -v a="$1,$2,$3" -v b="$4,$5,$6" -v t="$7" 'BEGIN {
+        split(a, x, ","); split(b, y, ",");
+        for (i = 1; i <= 3; i++) if ((x[i]-y[i] > t) || (y[i]-x[i] > t)) exit 1;
+    }'
+}
+# far R G B R G B DIST: some channel differs by more than DIST.
+far() {
+    awk -v a="$1,$2,$3" -v b="$4,$5,$6" -v t="$7" 'BEGIN {
+        split(a, x, ","); split(b, y, ",");
+        for (i = 1; i <= 3; i++) if ((x[i]-y[i] > t) || (y[i]-x[i] > t)) exit 0;
+        exit 1;
+    }'
+}
+# blueish R G B: the test window's #3584e4 body (blue minus red >= 100).
+blueish() {
+    awk -v r="$1" -v b="$3" 'BEGIN { exit !(b >= 150 && b - r >= 100) }'
+}
+cstate() {
+    # Query, optional label, optional timeout: a numeric second
+    # argument is a timeout, a label means the default 20 seconds.
+    if [ $# -ge 3 ]; then timeout=$3
+    elif [ "${2:-20}" -eq "${2:-20}" ] 2>/dev/null; then timeout=$2
+    else timeout=20; fi
+    end=$(($(date +%s) + timeout))
+    while [ "$(date +%s)" -le "$end" ]; do
+        if [ -n "$COMPOSITOR_PID" ]; then
+            kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
+        fi
+        [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1 && return 0
+        sleep 0.3
+    done
+    cat "$CSTATE" >&2 2>/dev/null || true
+    return 1
+}
+# Fullscreen capture through the shell's own screenshot UI: Print opens
+# the overlay, C picks Screen mode, Return captures to XDG pictures.
+capture() {
+    label="$1"
+    sleep 1.2 # GNOME filenames have one-second resolution.
+    marker="$ARTIFACTS/cap-$label.marker"
+    touch "$marker"
+    xdotool key Print
+    cstate 'any(.layers[]; .namespace == "tuna-screenshot-ui")' 20 ||
+        fail "$2" "Print did not map the screenshot overlay for $label"
+    sleep 0.5
+    xdotool key --clearmodifiers c
+    sleep 0.5
+    xdotool key --clearmodifiers Return
+    end=$(($(date +%s) + 20))
+    newest=""
+    while [ "$(date +%s)" -le "$end" ]; do
+        newest="$(find "$PICS_PRIV/Screenshots" -name 'Screenshot From *.png' -newer "$marker" 2>/dev/null | head -1)"
+        [ -n "$newest" ] && break
+        sleep 0.3
+    done
+    [ -n "$newest" ] || fail "$2" "no capture saved for $label"
+    dims="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$newest")"
+    [ "$dims" = "$WIDTH,$HEIGHT" ] || fail "$2" "$label saved $dims, expected $WIDTH,$HEIGHT"
+    cp "$newest" "$ARTIFACTS/$label.png"
+    cstate 'all(.layers[]; .namespace != "tuna-screenshot-ui")' 20 ||
+        fail "$2" "screenshot overlay did not close after $label"
+}
+# Wait until the session snapshot carries the expected JSON predicate.
+snapshot() {
+    end=$(($(date +%s) + 20))
+    while [ "$(date +%s)" -le "$end" ]; do
+        if [ -s "$RUN_PRIV/tuna-magnifier.json" ] &&
+            jq -e "$1" "$RUN_PRIV/tuna-magnifier.json" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.3
+    done
+    cat "$RUN_PRIV/tuna-magnifier.json" >&2 2>/dev/null || true
+    return 1
+}
+
+if [ -x /usr/libexec/at-spi-bus-launcher ]; then
+    /usr/libexec/at-spi-bus-launcher --launch-immediately >"$ARTIFACTS/atspi.log" 2>&1 &
+fi
+[ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
+if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
+    Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
+        3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+    OWNED_XVFB=$!
+    for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+    [ -s "$ARTIFACTS/xvfb-display" ] || fail M-OFF "Xvfb did not allocate a display"
+    DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+    export DISPLAY
+    for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 1; done
+fi
+
+# The private HOME below hides the real toolchain config; point the
+# build at the invoking user's cargo/rustup homes explicitly.
+RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$ORIG_HOME/.cargo}" \
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk
+{
+    echo "source $(git -C "$ROOT" rev-parse HEAD) $(git -C "$ROOT" status --short | head -c 200)"
+    sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-shell-gtk"
+} >"$ARTIFACTS/manifest.txt" 2>&1 || fail M-OFF "build identity failed"
+RUST_BACKTRACE=1 "$BIN_DIR/tuna-compositor" --backend winit --socket "tuna-mag-proof-$$" \
+    --width "$WIDTH" --height "$HEIGHT" --shell-bin "$BIN_DIR/tuna-shell-gtk" >"$LOG" 2>&1 &
+COMPOSITOR_PID=$!
+WID=""
+for _ in $(seq 1 60); do
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail M-OFF "compositor exited during startup"
+    WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
+    [ -n "$WID" ] && break
+    sleep 1
+done
+[ -n "$WID" ] || fail M-OFF "no nested window"
+xdotool windowfocus --sync "$WID"
+cstate '.layers | any(.namespace == "tuna-panel" and .rect == [0, 0, 1280, 32])' "panel" 180 ||
+    fail M-OFF "the top bar never mapped"
+snapshot '.enabled == false' || fail M-OFF "no disabled magnifier snapshot at startup"
+sleep 1
+
+capture 01-off M-OFF
+# Self-calibrate: panel strip vs desktop background from the baseline.
+# shellcheck disable=SC2086
+# shellcheck disable=SC2046
+set -- $(px "$ARTIFACTS/01-off.png" 300 10); PANEL="$1 $2 $3"
+# shellcheck disable=SC2086
+# shellcheck disable=SC2046
+set -- $(px "$ARTIFACTS/01-off.png" 300 48); BELOW="$1 $2 $3"
+# shellcheck disable=SC2086
+# shellcheck disable=SC2046
+set -- $(px "$ARTIFACTS/01-off.png" 300 700); BG="$1 $2 $3"
+# shellcheck disable=SC2086
+set -- $PANEL; PR=$1 PG=$2 PB=$3
+# shellcheck disable=SC2086
+set -- $BELOW; BR=$1 BG2=$2 BB=$3
+# shellcheck disable=SC2086
+set -- $BG; GR=$1 GG=$2 GB=$3
+near "$BR" "$BG2" "$BB" "$GR" "$GG" "$GB" 12 ||
+    fail M-OFF "below-panel ($BELOW) is not the background ($BG)"
+far "$PR" "$PG" "$PB" "$GR" "$GG" "$GB" 60 ||
+    fail M-OFF "panel ($PANEL) is indistinguishable from the background ($BG)"
+pass M-OFF "baseline: panel ($PANEL) over background ($BG)"
+
+gsettings set org.gnome.desktop.a11y.magnifier mag-factor 2.0
+gsettings set org.gnome.desktop.a11y.magnifier mouse-tracking 'centered'
+gsettings set org.gnome.desktop.a11y.applications screen-magnifier-enabled true
+snapshot '.enabled == true and .mag_factor == 2.0' ||
+    fail M-SETTINGS "Settings writes never reached the session snapshot"
+pass M-SETTINGS "Settings enable reaches the compositor snapshot"
+
+xdotool mousemove --window "$WID" 640 200
+cstate '.pointer_position == [640, 200]' 10 ||
+    fail M-ZOOM "pointer never reached (640, 200)"
+capture 02-zoom M-ZOOM
+# ROI centers on (640,200): 640x400 source over the full viewport, so
+# (300,48) shows source (470,24), inside the doubled panel strip.
+# shellcheck disable=SC2086
+# shellcheck disable=SC2046
+set -- $(px "$ARTIFACTS/02-zoom.png" 300 48); ZR=$1 ZG=$2 ZB=$3
+near "$ZR" "$ZG" "$ZB" "$PR" "$PG" "$PB" 12 ||
+    fail M-ZOOM "(300,48) is $ZR $ZG $ZB, not the doubled panel ($PANEL)"
+# shellcheck disable=SC2086
+# shellcheck disable=SC2046
+set -- $(px "$ARTIFACTS/02-zoom.png" 100 700); ZR=$1 ZG=$2 ZB=$3
+near "$ZR" "$ZG" "$ZB" "$GR" "$GG" "$GB" 12 ||
+    fail M-ZOOM "(100,700) is $ZR $ZG $ZB, not background ($BG)"
+pass M-ZOOM "2x zoom doubles the panel edge and holds the background"
+
+xdotool mousemove --window "$WID" 640 600
+cstate '.pointer_position == [640, 600]' 10 ||
+    fail M-TRACK "pointer never reached (640, 600)"
+capture 03-tracked M-TRACK
+# ROI now centers on (640,600): the viewport top shows source row 405,
+# desktop background where the doubled panel was.
+# shellcheck disable=SC2086
+# shellcheck disable=SC2046
+set -- $(px "$ARTIFACTS/03-tracked.png" 300 10); TR=$1 TG=$2 TB=$3
+near "$TR" "$TG" "$TB" "$GR" "$GG" "$GB" 12 ||
+    fail M-TRACK "(300,10) is $TR $TG $TB, not the tracked background ($BG)"
+pass M-TRACK "the magnified view follows the pointer"
+
+gsettings set org.gnome.desktop.a11y.magnifier mouse-tracking 'none'
+gsettings set org.gnome.desktop.a11y.magnifier focus-tracking 'centered'
+snapshot '.mouse_tracking == "none" and .focus_tracking == "centered"' ||
+    fail M-FOCUS "tracking-mode writes never reached the snapshot"
+SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
+[ -n "$SOCKET_NAME" ] || fail M-FOCUS "no nested socket in the log"
+WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" Alpha "#3584e4" \
+    >"$ARTIFACTS/window-Alpha.log" 2>&1 &
+CLIENT_PID=$!
+cstate '.windows | any(.app_id == "tuna-test-alpha")' "window" ||
+    fail M-FOCUS "the test window never mapped"
+wrect() {
+    jq -r '.windows[] | select(.app_id == "tuna-test-alpha") | .rect | "\(.[0]) \(.[1]) \(.[2]) \(.[3])"' "$CSTATE"
+}
+# The first mapped size races the initial configure; wait for settle.
+sleep 2
+rect1="$(wrect)" && sleep 1 && rect2="$(wrect)"
+[ -n "$rect1" ] && [ "$rect1" = "$rect2" ] ||
+    fail M-FOCUS "window geometry never settled ($rect1 vs $rect2)"
+# shellcheck disable=SC2086
+set -- $rect2
+wx=$1 wy=$2 ww=$3 wh=$4
+[ "$wh" -ge 300 ] && [ "$wh" -le 600 ] ||
+    fail M-FOCUS "unexpected window height $wh (want the 420px test layout)"
+cx=$((wx + ww / 2)) cy=$((wy + wh / 2))
+xdotool mousemove --window "$WID" "$cx" "$cy" click 1
+sleep 1
+xdotool mousemove --window "$WID" 60 740
+cstate '.pointer_position == [60, 740]' 10 ||
+    fail M-FOCUS "pointer never parked at (60, 740)"
+capture 04-focus M-FOCUS
+# The view centers on the focused window, not the parked pointer. The
+# window's mid-row maps to viewport row 400; far from the centered
+# title text it shows the blue label body.
+if [ $((640 - ww + 15)) -ge 0 ]; then
+    edge=$((640 - ww + 15))
+    # shellcheck disable=SC2046
+    set -- $(px "$ARTIFACTS/04-focus.png" "$edge" 400); FR=$1 FG=$2 FB=$3
+    blueish "$FR" "$FG" "$FB" ||
+        fail M-FOCUS "($edge,400) is $FR $FG $FB, not the focused window blue"
+else
+    # Wide window: both flanks of the mid-row are blue body.
+    # shellcheck disable=SC2046
+    set -- $(px "$ARTIFACTS/04-focus.png" 100 400); FR=$1 FG=$2 FB=$3
+    blueish "$FR" "$FG" "$FB" ||
+        fail M-FOCUS "(100,400) is $FR $FG $FB, not the focused window blue"
+    # shellcheck disable=SC2046
+    set -- $(px "$ARTIFACTS/04-focus.png" 1180 400); FR=$1 FG=$2 FB=$3
+    blueish "$FR" "$FG" "$FB" ||
+        fail M-FOCUS "(1180,400) is $FR $FG $FB, not the focused window blue"
+fi
+pass M-FOCUS "focus tracking centers the magnified view on the focused window"
+
+gsettings set org.gnome.desktop.a11y.applications screen-magnifier-enabled false
+snapshot '.enabled == false' || fail M-DISABLE "disabling never reached the snapshot"
+capture 05-disable M-DISABLE
+# shellcheck disable=SC2086
+# shellcheck disable=SC2046
+set -- $(px "$ARTIFACTS/05-disable.png" 300 48); DR=$1 DG=$2 DB=$3
+near "$DR" "$DG" "$DB" "$GR" "$GG" "$GB" 12 ||
+    fail M-DISABLE "(300,48) is $DR $DG $DB after disable, not background ($BG)"
+pass M-DISABLE "disabling restores the unmagnified frame"
+
+cp "$CSTATE" "$ARTIFACTS/final-state.json"
+grep -qi panicked "$LOG" && fail M-NOPANIC "panic in nested log"
+echo "M-NOPANIC pass no panic in nested log" >>"$ASSERTIONS"
+echo "tuna-magnifier-proof: OK, artifacts in $ARTIFACTS"

@@ -60,6 +60,7 @@ pub mod ime;
 pub mod introspect;
 pub mod layer;
 pub mod lock;
+pub mod magnifier;
 pub mod monitors;
 pub mod mutter;
 #[cfg(feature = "drm")]

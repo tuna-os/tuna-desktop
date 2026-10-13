@@ -27,6 +27,7 @@ mod keybindings;
 mod live_apps;
 mod lock;
 mod logic;
+mod magnifier_sync;
 mod media_keys;
 mod motion;
 mod network_agent;
@@ -1030,6 +1031,7 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
 
 fn build(app: &adw::Application) {
     accessibility::start_focus_policy();
+    magnifier_sync::start_sync();
     let provider = gtk::CssProvider::new();
     // Shell CSS has GNOME's baseline face/size, but follows the user's font live.
     let apply_font = {

@@ -730,6 +730,20 @@ impl State {
             surface.set_location(local);
         }
     }
+
+    /// The text caret's rectangle in global logical pixels, for
+    /// magnifier caret tracking (#349). The bridge stores the
+    /// rectangle globally on receipt and refreshes it when the parent
+    /// moves; a dead popup clears the caret rather than reporting a
+    /// stale position.
+    pub(crate) fn ime_cursor_rect(&mut self) -> Option<Rectangle<i32, Logical>> {
+        let surface = self.protocols.bridge_cursor_popup.clone()?;
+        if !surface.alive() {
+            self.protocols.bridge_cursor_popup = None;
+            return None;
+        }
+        Some(surface.text_input_rectangle())
+    }
 }
 // Keep Smithay's manager/object state, but route the trusted bridge's
 // returned keys through the physical keyboard map. Smithay 0.7's virtual
