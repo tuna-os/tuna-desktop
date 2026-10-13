@@ -47,6 +47,7 @@ jobs:
       - run: python3 scripts/lib/tuna-perf-reference-tests.py
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
       - run: python3 scripts/lib/grid-target-settled-tests.py
+      - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
       - run: /usr/bin/python3 scripts/lib/media-completion-barrier-tests.py
@@ -71,8 +72,9 @@ jobs:
         run: |
           cargo fmt --manifest-path third-party/reis/Cargo.toml --all -- --check
           cargo test --manifest-path third-party/reis/Cargo.toml --lib roost_transport_bounds
-      - run: rustfmt --edition 2021 --check third-party/smithay/src/xwayland/xserver.rs third-party/smithay/src/backend/drm/surface/gbm.rs
+      - run: rustfmt --edition 2021 --check third-party/smithay/src/xwayland/xserver.rs third-party/smithay/src/backend/drm/surface/gbm.rs third-party/smithay/src/wayland/selection/data_device/dnd_grab.rs third-party/smithay/src/wayland/selection/data_device/mod.rs
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features xwayland,wayland_frontend prepared_socket
+      - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features xwayland,wayland_frontend --lib cancellation_tests
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # pam_wrapper runs the lock screen's PAM path for real (#62); it is
       # required here so the test can never silently skip.

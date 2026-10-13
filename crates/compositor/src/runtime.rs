@@ -643,6 +643,7 @@ pub struct Runtime {
     wellbeing_effects: crate::wellbeing_effects::Effects,
     /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
     input_aids: aids::RuntimeAids,
+    dnd_escape_held: bool,
     /// PipeWire, connected on the first screen cast (#61).
     pipewire: Option<crate::screencast::PipeWire>,
     /// Running screen casts.
@@ -1137,6 +1138,7 @@ impl Runtime {
             input_settings: Default::default(),
             wellbeing_effects: Default::default(),
             input_aids: aids::RuntimeAids::default(),
+            dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name),
             pipewire: None,
             casts: Vec::new(),
@@ -1484,6 +1486,27 @@ impl Runtime {
             // Activity cancels the idle shield; the wake event belongs to
             // that shield, not the previously focused application.
             return;
+        }
+        if let ManagerInput::Key {
+            keycode: ESCAPE_KEYCODE,
+            pressed,
+            ..
+        } = &input
+        {
+            if self.dnd_escape_held {
+                // Repeats and the matching release belong to the cancelled drag.
+                self.dnd_escape_held = *pressed;
+                self.manager.discard_key_input(&mut self.state, &input);
+                return;
+            }
+            if *pressed
+                && self.state.client_dnd_active()
+                && self.state.cancel_client_dnd(input_time(&input) as u32)
+            {
+                self.dnd_escape_held = true;
+                self.manager.discard_key_input(&mut self.state, &input);
+                return;
+            }
         }
         // Three-finger swipes are the shell's (GNOME 51): consumed here,
         // acted on at the end. Other swipes reach the client.
@@ -1835,6 +1858,8 @@ impl Runtime {
             "idle_blank_alpha": self.blank_alpha(),
             "overview_search": self.overview_search,
             "overview_app_grid": self.overview_app_grid,
+            // Diagnostic snapshot only, never expose drag state while locked.
+            "client_dnd_active": !self.is_locked() && self.state.client_dnd_active(),
             "keyboard": keyboard,
             "overview_open": overview_open,
             "animations_enabled": self.input_settings.motion.animations_enabled(),
