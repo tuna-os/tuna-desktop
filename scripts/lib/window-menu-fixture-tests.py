@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Workspace menu selection rejects arbitrary/replaced/X11 focus."""
 import copy
+import sys
 import unittest
+
+sys.dont_write_bytecode = True
 from tuna_window_menu_fixture import owner, target
 
 
@@ -28,6 +31,17 @@ class Fixture(unittest.TestCase):
 
     def test_original_native_alpha_accepted(self):
         self.assertEqual(target(self.scene, self.expected, self.process), (1,0,380,226))
+
+    def test_observed_closed_but_unsettled_alpha_refused_until_zero_progress(self):
+        # Exact18bf installed snapshot: original process/native IDs, focus,
+        # rect and workspace all matched; close was still104.127371ms in.
+        process = {'pid': 38552, 'uid': 1001, 'start_ticks': 161862}
+        expected = owner(self.scene, process)
+        self.scene.update(overview_open=False, overview_progress=0.3404611822619463)
+        with self.assertRaisesRegex(RuntimeError, 'not focused and mapped'):
+            target(self.scene, expected, process)
+        self.scene['overview_progress'] = 0
+        self.assertEqual(target(self.scene, expected, process), (1, 0, 380, 226))
 
     def test_observed_xeyes_focus_rejected(self):
         self.scene.update(focused=7, focused_app_id='XEyes', focused_rect=[565,366,150,100])

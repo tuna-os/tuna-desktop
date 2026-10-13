@@ -4212,7 +4212,7 @@ pick_alpha() {
     [ -n "$alpha" ] || return 1
     # shellcheck disable=SC2086
     xdotool mousemove --window "$WID" $alpha click 1
-    cstate '(.overview_open | not) and .focused_app_id == "tuna-test-alpha"' "alpha"
+    cstate '(.overview_open | not) and .overview_progress == 0 and .focused_app_id == "tuna-test-alpha"' "alpha"
 }
 window_menu() {
     header="$(jq -r '.focused_rect | "\(.[0] + 60) \(.[1] + 20)"' "$CSTATE")"
