@@ -302,7 +302,7 @@ fn greetd(listener: UnixListener, root: PathBuf, attempts: usize) {
         s.set_write_timeout(Some(LIMIT)).unwrap();
         assert!(matches!(
             Request::read_from(&mut s).unwrap(),
-            Request::CreateSession { username } if Some(username) == tuna_compositor::unlock::session_user()
+            Request::CreateSession { username } if Some(username.as_str()) == tuna_compositor::unlock::session_user().as_deref()
         ));
         Response::AuthMessage {
             auth_message_type: AuthMessageType::Secret,
