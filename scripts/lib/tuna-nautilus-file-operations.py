@@ -133,10 +133,11 @@ def snapshot(label):
     subprocess.run(['scrot', str(OUT / ('nautilus-' + label + '.png'))], check=True)
 
 
-def wait(predicate, description):
+def wait(predicate, description, *, startup=False):
+    guard = owned_unlocked if startup else focused
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        focused()
+        guard()
         if time.monotonic() >= deadline:
             break
         try:
@@ -145,24 +146,41 @@ def wait(predicate, description):
             if not removed_accessible(error):
                 raise
             accepted = None
-        # Both a retry and a positive result belong to the same actual owner
-        # and focus. An owner/lock/identity error must never become readiness.
-        focused()
+        # Both retry and positive result belong to the original unlocked
+        # owner; operation waits also retain strict focus throughout.
+        guard()
         if time.monotonic() >= deadline:
             break
         if accepted:
+            # Startup may wait for focus, but acceptance still requires it.
+            if startup:
+                focused()
+                if time.monotonic() >= deadline:
+                    break
             return accepted
         time.sleep(min(.05, max(0, deadline - time.monotonic())))
     raise RuntimeError('Files did not ' + description)
 
 
-def focused():
-    current = scene()
+def owned_unlocked():
+    current = scene()  # Retains the strict locked-desktop denial.
     if nautilus_identity() != identity:
         raise RuntimeError('Files original bus owner or installed process changed')
+    return current
+
+
+def focused():
+    current = owned_unlocked()
     if current.get('focused_app_id') != 'org.gnome.Nautilus':
         raise RuntimeError('Files lost actual compositor keyboard focus')
     return current
+
+
+def wait_for_initial_map(name):
+    # Only this first admission may observe no app focus yet. Every subsequent
+    # operation wait is strict; owner replacement/locking never become retries.
+    wait(lambda: scene().get('focused_app_id') == 'org.gnome.Nautilus' and cell(name) is not None,
+         'map its native window with the actual fixture contents', startup=True)
 
 
 def key(value):
@@ -275,8 +293,7 @@ try:
     seed.write_bytes(payload)
     run('nautilus', '--new-window', str(fixture))
     identity = nautilus_identity()
-    wait(lambda: scene().get('focused_app_id') == 'org.gnome.Nautilus' and cell(name) is not None,
-         'map its native window with the actual fixture contents')
+    wait_for_initial_map(name)
     browser_id = scene()['focused']
     snapshot('opened')
     stage = 'create-folder'
