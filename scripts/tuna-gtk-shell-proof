@@ -5198,7 +5198,11 @@ gsettings set org.gnome.desktop.notifications show-banners true ||
     fail G-WELLBEING-ACTION-SKIP "could not show banners"
 cstate '(.overview_open | not)' "no overview" ||
     fail G-WELLBEING-ACTION-SKIP "the overview is open"
-gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 65 ||
+# Interval 130: with remaining 130 at enable, the one-shot upcoming warning
+# posts ~10 s into the poll (first 2 s tick with remaining <= 120), mid-poll
+# with warm dumps. At 65 it posts on the select-breaks tick itself and its
+# 4 s fuse expires before the first dumps can see it (run 38467423094).
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 130 ||
     fail G-WELLBEING-ACTION-SKIP "could not set the break interval"
 gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 10 ||
     fail G-WELLBEING-ACTION-SKIP "could not set the break duration"
@@ -5215,9 +5219,9 @@ gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-ACTION-SKIP "could not select the eyesight break"
 skip_enable_epoch="$(date +%s)"
-skip_orig_due_epoch=$((skip_enable_epoch + 65))
+skip_orig_due_epoch=$((skip_enable_epoch + 130))
 SKIPUP=""
-end=$(($(date +%s) + 25))
+end=$(($(date +%s) + 30))
 while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
@@ -5246,7 +5250,7 @@ wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-retired.json" 20 ||
     fail G-WELLBEING-ACTION-SKIP "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 skip_retired_seq="$WB_DUMP_SEQ"
 SKIPDUE=""
-end=$(($(date +%s) + 90))
+end=$(($(date +%s) + 150))
 while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
