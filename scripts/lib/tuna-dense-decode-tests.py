@@ -79,6 +79,33 @@ class Dense(unittest.TestCase):
   self.assertIn("receipt['storage'] = storage_receipt(info, mapping, disk.stat().st_size)",text)
   self.assertIn("require(receipt['dense_decode'].get('owned_cleanup', True)",text)
 
+class DecoderRetirement(unittest.TestCase):
+ def test_terminal_exclusive_child_reaped_without_signal(self):
+  child=SimpleNamespace(pid=321,returncode=None);receipt={}
+  with patch.object(worker,'owned_children',return_value=(321,)), patch.object(worker.os,'waitid',return_value=object()), patch.object(worker.os,'wait4',return_value=(321,0,SimpleNamespace(ru_maxrss=42))) as reap, patch.object(worker.os,'killpg',side_effect=PermissionError('denied')) as kill:
+   self.assertTrue(worker.retire_decoder(child,receipt,time.monotonic()+1))
+  kill.assert_not_called();reap.assert_called_once_with(321,0)
+  self.assertTrue(receipt['decoder_descendants_absent']);self.assertEqual(receipt['qemu_peak_rss_bytes'],42*1024)
+ def test_terminal_leader_with_adopted_descendant_stays_reserved(self):
+  child=SimpleNamespace(pid=321,returncode=None);receipt={'qualified':False}
+  with patch.object(worker,'owned_children',return_value=(321,654)), patch.object(worker.os,'waitid',return_value=object()), patch.object(worker.os,'wait4') as reap, patch.object(worker.os,'killpg',side_effect=PermissionError('denied')):
+   self.assertFalse(worker.retire_decoder(child,receipt,time.monotonic()+.025))
+  reap.assert_not_called();self.assertTrue(receipt['decoder_retirement_unconfirmed']);self.assertIn('decoder_signal_denied',receipt)
+ def test_live_leader_is_not_reaped_even_when_only_child(self):
+  child=SimpleNamespace(pid=321,returncode=None);receipt={}
+  with patch.object(worker,'owned_children',return_value=(321,)), patch.object(worker.os,'waitid',return_value=None), patch.object(worker.os,'wait4') as reap, patch.object(worker.os,'killpg',side_effect=ProcessLookupError()):
+   self.assertFalse(worker.retire_decoder(child,receipt,time.monotonic()+.025))
+  reap.assert_not_called();self.assertFalse(receipt['qualified'])
+ def test_non_namespace_init_refused(self):
+  with patch.object(worker.os,'getpid',return_value=42):
+   with self.assertRaisesRegex(ValueError,'namespace init'):worker.owned_children()
+ def test_missing_leader_is_not_reaped(self):
+  child=SimpleNamespace(pid=321,returncode=None);receipt={}
+  with patch.object(worker,'owned_children',return_value=()), patch.object(worker.os,'waitid',return_value=object()), patch.object(worker.os,'wait4') as reap, patch.object(worker.os,'killpg',side_effect=ProcessLookupError()):
+   self.assertFalse(worker.retire_decoder(child,receipt,time.monotonic()+.025))
+  reap.assert_not_called();self.assertTrue(receipt['decoder_retirement_unconfirmed'])
+
+
 class ContainerIdentity(unittest.TestCase):
  def observation(self):
   return {'Id':'a'*64,'Name':'/owned','Image':'sha256:'+'b'*64,

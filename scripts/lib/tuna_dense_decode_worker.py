@@ -55,6 +55,36 @@ def validate_memory(before,after):
    raise ValueError('OOM or missing event observation')
 
 
+def owned_children():
+ # The private PID namespace init adopts every orphaned descendant. A held
+ # WNOWAIT leader prevents PID/group recycling until all children are gone.
+ if os.getpid()!=1:raise ValueError('private PID namespace init required')
+ return tuple(int(value) for value in Path('/proc/self/task/1/children').read_text().split())
+
+
+def retire_decoder(child,receipt,deadline):
+ """Reap only a terminal leader with no surviving adopted descendants."""
+ while time.monotonic()<deadline:
+  observed=os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+  children=owned_children()
+  if observed is not None and children==(child.pid,):
+   # No signal is needed for this zombie. In particular, a denied killpg
+   # must not mask a successful decoder or destroy the diagnostic receipt.
+   _,status,usage=os.wait4(child.pid,0)
+   child.returncode=os.waitstatus_to_exitcode(status)
+   receipt.update(decoder_exit=child.returncode,
+                  qemu_peak_rss_bytes=int(usage.ru_maxrss)*1024,
+                  decoder_rss_measured=True,decoder_descendants_absent=True)
+   return True
+  try:os.killpg(child.pid,signal.SIGKILL)
+  except ProcessLookupError:pass
+  except PermissionError as error:
+   receipt['decoder_signal_denied']=str(error)[:1024]
+  time.sleep(.02)
+ receipt.update(qualified=False,decoder_retirement_unconfirmed=True)
+ return False
+
+
 def main():
  target=Path('/target');request=json.loads(Path('/observer/request.json').read_text())
  receipt={'schema':1,'qualified':False,'scope':'dense CI decoder/readback only; no export/import/VM qualification',
@@ -62,6 +92,7 @@ def main():
  child=None;reaped=False
  try:
   if os.getuid()!=107 or os.getgid()!=107:raise ValueError('owned UID/GID107 required')
+  if os.getpid()!=1:raise ValueError('private PID namespace init required')
   if request['virtual_bytes']!=VIRTUAL_BYTES:raise ValueError('exact 18Gi source required')
   if sys.version_info[:3]!=(3,12,15):raise ValueError('admitted private Python version required')
   operation_deadline=request['operation_deadline_monotonic']
@@ -117,13 +148,9 @@ def main():
     status=os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
     if status is not None:break
     time.sleep(.05)
-   # Keep leader reserved through group kill, then collect ONLY its wait4 usage.
-   try:os.killpg(child.pid,signal.SIGKILL)
-   except ProcessLookupError:pass
-   _,status,usage=os.wait4(child.pid,0);reaped=True
-   child.returncode=os.waitstatus_to_exitcode(status)
-   receipt.update(decoder_exit=child.returncode,qemu_peak_rss_bytes=int(usage.ru_maxrss)*1024,
-                  decoder_rss_measured=True,decoder_elapsed_seconds=time.monotonic()-started)
+   reaped=retire_decoder(child,receipt,time.monotonic()+5)
+   if not reaped:raise ValueError('decoder retirement unconfirmed')
+   receipt['decoder_elapsed_seconds']=time.monotonic()-started
    if child.returncode!=0:raise ValueError('decoder failed')
    if stream.tell()>1024*1024:raise ValueError('decoder log bound')
   value=output.stat()
@@ -141,19 +168,11 @@ def main():
   receipt['error']=str(error)[:2048]
  finally:
   if child is not None and not reaped:
-   try:os.killpg(child.pid,signal.SIGKILL)
-   except ProcessLookupError:pass
-   # Hold the leader until actual exit is observable, with an independent
-   # cleanup budget. No blocking wait4 on a possibly live child.
-   cleanup_deadline=time.monotonic()+5
-   while time.monotonic()<cleanup_deadline:
-    observed=os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
-    if observed is not None:
-     _,status,usage=os.wait4(child.pid,0);child.returncode=os.waitstatus_to_exitcode(status);reaped=True
-     receipt.update(decoder_exit=child.returncode,qemu_peak_rss_bytes=int(usage.ru_maxrss)*1024,decoder_rss_measured=True)
-     break
-    time.sleep(.02)
-   if not reaped:receipt.update(qualified=False,decoder_retirement_unconfirmed=True)
+   try:
+    reaped=retire_decoder(child,receipt,time.monotonic()+5)
+   except Exception as error:
+    receipt.update(qualified=False,decoder_retirement_unconfirmed=True,
+                   decoder_cleanup_error=str(error)[:1024])
   receipt['owned_decoder_retired']=child is None or reaped
   try:
    receipt['memory_final']=memory(own_cgroup())
