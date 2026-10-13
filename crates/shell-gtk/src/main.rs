@@ -1895,8 +1895,8 @@ fn build(app: &adw::Application) {
         }
     }
 
-    // GNOME's input settings (#60): keymap, repeat, touchpad, mouse and
-    // hot corner, sent now and on every change.
+    // GNOME's input settings (#60): keymap, repeat, touchpad, mouse,
+    // graphics tablet (#344) and hot corner, sent now and on every change.
     {
         let schemas = [
             "org.gnome.desktop.input-sources",
@@ -1905,6 +1905,8 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.peripherals.mouse",
             INTERFACE_SCHEMA,
             A11Y_INTERFACE_SCHEMA,
+            "org.gnome.desktop.peripherals.tablet",
+            "org.gnome.desktop.peripherals.tablet.stylus",
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -1940,6 +1942,37 @@ fn build(app: &adw::Application) {
                     out.mouse_natural_scroll = mouse.boolean("natural-scroll");
                     out.mouse_speed_milli = (mouse.double("speed") * 1000.0).round() as i32;
                     out.mouse_left_handed = mouse.boolean("left-handed");
+                }
+                if let Some(tablet) = all[6].as_ref() {
+                    let output: Vec<String> = tablet
+                        .strv("output")
+                        .iter()
+                        .map(|o| o.to_string())
+                        .collect();
+                    out.tablet_output = logic::tablet_output(&output);
+                    out.tablet_mapping_relative =
+                        logic::tablet_mapping_relative(tablet.string("mapping").as_str());
+                    let area: Vec<f64> = tablet.value("area").get().unwrap_or_default();
+                    out.tablet_area_milli = logic::tablet_area_milli(&area);
+                    out.tablet_keep_aspect = tablet.boolean("keep-aspect");
+                    out.tablet_left_handed = tablet.boolean("left-handed");
+                }
+                if let Some(stylus) = all[7].as_ref() {
+                    let curve: Vec<i32> = stylus.value("pressure-curve").get().unwrap_or_default();
+                    out.tablet_pressure_curve = logic::tablet_pressure_curve(&curve);
+                    let eraser: Vec<i32> = stylus
+                        .value("eraser-pressure-curve")
+                        .get()
+                        .unwrap_or_default();
+                    out.tablet_eraser_pressure_curve = logic::tablet_pressure_curve(&eraser);
+                    out.tablet_button_action =
+                        logic::stylus_button_action(stylus.string("button-action").as_str());
+                    out.tablet_secondary_button_action = logic::stylus_button_action(
+                        stylus.string("secondary-button-action").as_str(),
+                    );
+                    out.tablet_tertiary_button_action = logic::stylus_button_action(
+                        stylus.string("tertiary-button-action").as_str(),
+                    );
                 }
                 out.touchpad_left_handed = logic::touchpad_left_handed(
                     all[2]

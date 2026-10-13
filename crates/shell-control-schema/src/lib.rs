@@ -159,9 +159,11 @@ impl ProtocolVersion {
     /// GNOME's three-state motion policy plus its slow-down factor.
     /// The positional postcard body changes, so both peers ship together.
     /// `0.29` appends private screenshot selection pointer movement.
+    /// `0.30` appends graphics tablet settings to InputSettings.
+    /// Both positional postcard peers ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 29,
+        minor: 30,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -743,6 +745,25 @@ pub struct PreviewInfo {
     pub height: i32,
 }
 
+/// A stylus barrel button's configured action
+/// (`org.gnome.desktop.peripherals.tablet.stylus ...-button-action`):
+/// GNOME's `default`, `middle`, `right`, `back` and `forward` nicks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StylusButtonAction {
+    /// The button's normal behavior (context click on the first barrel
+    /// button, matching the X11 driver's Button 3 default).
+    #[default]
+    Default,
+    /// Middle click.
+    Middle,
+    /// Right (context) click.
+    Right,
+    /// Browser back.
+    Back,
+    /// Browser forward.
+    Forward,
+}
+
 /// GNOME's input settings (`org.gnome.desktop.input-sources` and
 /// `org.gnome.desktop.peripherals.*`), flattened for the compositor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,6 +801,37 @@ pub struct InputSettings {
     /// GTK shell default text direction; corners and Activities follow it.
     #[serde(default)]
     pub right_to_left: bool,
+    /// Graphics tablet (`org.gnome.desktop.peripherals.tablet`): true
+    /// when `mapping` is `relative`, false for GNOME's default absolute.
+    #[serde(default)]
+    pub tablet_mapping_relative: bool,
+    /// EDID `[vendor, product, serial]` of the output the tablet maps
+    /// onto; all empty means GNOME's automatic mapping (the primary).
+    #[serde(default)]
+    pub tablet_output: [String; 3],
+    /// Tablet area calibration: dead padding around the active area in
+    /// thousandths of a percent, applied to left, right, top, bottom.
+    #[serde(default)]
+    pub tablet_area_milli: [i32; 4],
+    /// Restrict the tablet area to the output's aspect ratio.
+    #[serde(default)]
+    pub tablet_keep_aspect: bool,
+    /// Physically rotated tablet for left-handed setups.
+    #[serde(default)]
+    pub tablet_left_handed: bool,
+    /// Stylus and eraser pressure curves (`...tablet.stylus`): x1, y1,
+    /// x2, y2 control points in percent, `[0, 0, 100, 100]` linear.
+    #[serde(default)]
+    pub tablet_pressure_curve: [i32; 4],
+    #[serde(default)]
+    pub tablet_eraser_pressure_curve: [i32; 4],
+    /// Stylus barrel button actions, primary to tertiary.
+    #[serde(default)]
+    pub tablet_button_action: StylusButtonAction,
+    #[serde(default)]
+    pub tablet_secondary_button_action: StylusButtonAction,
+    #[serde(default)]
+    pub tablet_tertiary_button_action: StylusButtonAction,
 }
 
 impl Default for InputSettings {
@@ -803,6 +855,16 @@ impl Default for InputSettings {
             mouse_left_handed: false,
             touchpad_left_handed: false,
             right_to_left: false,
+            tablet_mapping_relative: false,
+            tablet_output: Default::default(),
+            tablet_area_milli: [0, 0, 0, 0],
+            tablet_keep_aspect: false,
+            tablet_left_handed: false,
+            tablet_pressure_curve: [0, 0, 100, 100],
+            tablet_eraser_pressure_curve: [0, 0, 100, 100],
+            tablet_button_action: StylusButtonAction::Default,
+            tablet_secondary_button_action: StylusButtonAction::Default,
+            tablet_tertiary_button_action: StylusButtonAction::Default,
         }
     }
 }
@@ -1239,8 +1301,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_29() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 29));
+    fn current_version_is_0_30() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 30));
     }
 
     #[test]
@@ -1308,6 +1370,36 @@ mod tests {
     }
 
     #[test]
+    fn tablet_settings_survive_the_positional_control_wire() {
+        for relative in [false, true] {
+            for action in [
+                StylusButtonAction::Default,
+                StylusButtonAction::Middle,
+                StylusButtonAction::Right,
+                StylusButtonAction::Back,
+                StylusButtonAction::Forward,
+            ] {
+                roundtrip(&Message::Command {
+                    id: 1,
+                    kind: CommandKind::SetInputSettings(InputSettings {
+                        tablet_mapping_relative: relative,
+                        tablet_output: ["GSM".to_owned(), "5b09".to_owned(), "31337".to_owned()],
+                        tablet_area_milli: [1000, 2000, 3000, 4000],
+                        tablet_keep_aspect: true,
+                        tablet_left_handed: true,
+                        tablet_pressure_curve: [10, 0, 90, 100],
+                        tablet_eraser_pressure_curve: [0, 10, 100, 90],
+                        tablet_button_action: action,
+                        tablet_secondary_button_action: action,
+                        tablet_tertiary_button_action: action,
+                        ..InputSettings::default()
+                    }),
+                });
+            }
+        }
+    }
+
+    #[test]
     fn version_compat_same_major_minor_not_newer() {
         let ours = ProtocolVersion::CURRENT;
         assert!(ours.is_compatible_with(&ours));
@@ -1341,7 +1433,8 @@ mod tests {
         assert!(ProtocolVersion::new(0, 27).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 28).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 29).is_compatible_with(&ours));
-        assert!(!ProtocolVersion::new(0, 30).is_compatible_with(&ours));
+        assert!(ProtocolVersion::new(0, 30).is_compatible_with(&ours));
+        assert!(!ProtocolVersion::new(0, 31).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 4).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 0).is_compatible_with(&ours));
     }

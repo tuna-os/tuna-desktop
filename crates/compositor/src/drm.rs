@@ -39,7 +39,9 @@ use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice,
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
+use smithay::wayland::tablet_manager::TabletDescriptor;
 
+use crate::tablet::TabletDeviceChange;
 use crate::windows::ManagerInput;
 
 /// Scanout surface type: GBM buffers on the DRM device, each queued
@@ -130,6 +132,19 @@ pub struct DrmBackend {
     /// libinput devices, for GNOME's touchpad and mouse settings (#60).
     devices: Vec<smithay::reexports::input::Device>,
     input_settings: tuna_shell_control::InputSettings,
+    /// Graphics tablets by backend id (#344): the manager owns seat
+    /// registration; this only attributes tool events to devices.
+    tablets: Vec<TabletRegistration>,
+    next_tablet_id: u32,
+    /// Tablet arrivals/departures the runtime drains to the manager.
+    tablet_changes: Vec<TabletDeviceChange>,
+}
+
+/// One known graphics tablet: backend id and device (tool event
+/// attribution).
+struct TabletRegistration {
+    id: u32,
+    device: smithay::reexports::input::Device,
 }
 
 /// Event sources the runtime installs on its loop.
@@ -405,6 +420,9 @@ impl DrmBackend {
                 alt: false,
                 devices: Vec::new(),
                 input_settings: Default::default(),
+                tablets: Vec::new(),
+                next_tablet_id: 0,
+                tablet_changes: Vec::new(),
                 corner_pressure: Default::default(),
                 hot_corner_active: true,
                 relative_motion_events: 0,
@@ -626,13 +644,29 @@ impl DrmBackend {
             }
             InputEvent::DeviceAdded { mut device } => {
                 apply_libinput(&self.input_settings, &mut device);
+                if device.has_capability(smithay::reexports::input::DeviceCapability::TabletTool) {
+                    self.register_tablet(&device);
+                }
                 self.devices.push(device);
                 Vec::new()
             }
             InputEvent::DeviceRemoved { device } => {
                 self.corner_pressure.reset();
+                self.unregister_tablet(&device);
                 self.devices.retain(|d| *d != device);
                 Vec::new()
+            }
+            InputEvent::TabletToolAxis { event } => {
+                self.translate_tablet_tool(InputEvent::TabletToolAxis { event })
+            }
+            InputEvent::TabletToolProximity { event } => {
+                self.translate_tablet_tool(InputEvent::TabletToolProximity { event })
+            }
+            InputEvent::TabletToolTip { event } => {
+                self.translate_tablet_tool(InputEvent::TabletToolTip { event })
+            }
+            InputEvent::TabletToolButton { event } => {
+                self.translate_tablet_tool(InputEvent::TabletToolButton { event })
             }
             // Touchpad swipes (#60): three fingers are the shell's.
             InputEvent::GestureSwipeBegin { event } => {
@@ -714,6 +748,79 @@ impl DrmBackend {
         for device in &mut self.devices {
             apply_libinput(settings, device);
         }
+    }
+
+    /// Drain tablet arrivals/departures for the manager.
+    pub fn poll_tablet_changes(&mut self) -> Vec<TabletDeviceChange> {
+        std::mem::take(&mut self.tablet_changes)
+    }
+
+    /// Backend id of the tablet `device` reports tools for, if known.
+    fn tablet_id_for(&self, device: &smithay::reexports::input::Device) -> Option<u32> {
+        self.tablets
+            .iter()
+            .find(|tablet| tablet.device == *device)
+            .map(|tablet| tablet.id)
+    }
+
+    /// Note an arriving tablet device, queueing its description for
+    /// the manager (which owns seat registration). Repeats (the same
+    /// device re-added) reuse the known id.
+    fn register_tablet(&mut self, device: &smithay::reexports::input::Device) {
+        if self.tablet_id_for(device).is_some() {
+            return;
+        }
+        let id = self.next_tablet_id;
+        self.next_tablet_id = self.next_tablet_id.wrapping_add(1);
+        self.tablets.push(TabletRegistration {
+            id,
+            device: device.clone(),
+        });
+        let size_mm = device.size().unwrap_or((0.0, 0.0));
+        self.tablet_changes.push(TabletDeviceChange::Added {
+            id,
+            tablet: TabletDescriptor::from(device),
+            size_mm,
+        });
+    }
+
+    /// Note a leaving tablet: the manager unregisters it on the next
+    /// drain.
+    fn unregister_tablet(&mut self, device: &smithay::reexports::input::Device) {
+        let Some(index) = self
+            .tablets
+            .iter()
+            .position(|tablet| tablet.device == *device)
+        else {
+            return;
+        };
+        let registration = self.tablets.remove(index);
+        self.tablet_changes.push(TabletDeviceChange::Removed {
+            id: registration.id,
+        });
+    }
+
+    /// Translate one tablet tool event: shared extraction plus the
+    /// backend's tablet attribution. Unregistered devices keep
+    /// [`UNKNOWN_TABLET`](crate::tablet::UNKNOWN_TABLET).
+    fn translate_tablet_tool(&self, event: InputEvent<LibinputInputBackend>) -> Vec<ManagerInput> {
+        let device = match &event {
+            InputEvent::TabletToolAxis { event } => event.device(),
+            InputEvent::TabletToolProximity { event } => event.device(),
+            InputEvent::TabletToolTip { event } => event.device(),
+            InputEvent::TabletToolButton { event } => event.device(),
+            _ => return Vec::new(),
+        };
+        let id = self
+            .tablet_id_for(&device)
+            .unwrap_or(crate::tablet::UNKNOWN_TABLET);
+        let mut inputs = crate::windows::translate_input(event, self.primary_size());
+        for input in &mut inputs {
+            if let ManagerInput::TabletTool { tablet, .. } = input {
+                *tablet = id;
+            }
+        }
+        inputs
     }
 
     /// Move the drawn cursor to where the window manager put the pointer.
@@ -807,6 +914,12 @@ fn apply_libinput(
         apply_handedness(device, settings.mouse_left_handed);
         let _ = device.config_scroll_set_natural_scroll_enabled(settings.mouse_natural_scroll);
         let _ = device.config_accel_set_speed(speed(settings.mouse_speed_milli));
+    }
+    if device.has_capability(smithay::reexports::input::DeviceCapability::TabletTool) {
+        // Tablets rotate their own coordinates in libinput for
+        // left-handed setups, as Mutter configures them (#344);
+        // mapping, area and aspect stay in the compositor's tablet math.
+        apply_handedness(device, settings.tablet_left_handed);
     }
 }
 

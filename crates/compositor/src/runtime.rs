@@ -749,6 +749,13 @@ impl Runtime {
                         for input in inputs {
                             rt.on_manager_input(input);
                         }
+                        // Tablet arrivals/departures reach the manager on
+                        // the same beat (#344).
+                        if let Backend::Drm(drm) = &mut rt.backend {
+                            for change in drm.poll_tablet_changes() {
+                                rt.manager.apply_tablet_device(&mut rt.state, change);
+                            }
+                        }
                         // The window manager has the final say (a locked
                         // pointer stays put): the drawn cursor follows it.
                         let pos = rt.manager.pointer_pos();
@@ -2854,6 +2861,7 @@ impl Runtime {
     fn apply_input_settings(&mut self, settings: tuna_shell_control::InputSettings) {
         self.manager
             .apply_keyboard_settings(&mut self.state, &settings);
+        self.manager.apply_tablet_settings(&settings);
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
         // Introspect's AnimationsEnabled is GNOME's enable-animations
@@ -4884,7 +4892,8 @@ fn input_time(input: &ManagerInput) -> u64 {
         | ManagerInput::Axis { time, .. }
         | ManagerInput::SwipeBegin { time, .. }
         | ManagerInput::SwipeUpdate { time, .. }
-        | ManagerInput::SwipeEnd { time, .. } => u64::from(time),
+        | ManagerInput::SwipeEnd { time, .. }
+        | ManagerInput::TabletTool { time, .. } => u64::from(time),
         ManagerInput::RelativeMotion { utime, .. } => utime / 1000,
     }
 }

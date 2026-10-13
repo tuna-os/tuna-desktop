@@ -890,6 +890,48 @@ pub fn xkb_from_sources(sources: &[(String, String)]) -> (String, String) {
     (layouts.join(","), variants)
 }
 
+/// Tablet output triple (`org.gnome.desktop.peripherals.tablet
+/// output`): the first three EDID strings; short reads pad with empty
+/// (automatic mapping).
+pub fn tablet_output(parts: &[String]) -> [String; 3] {
+    [0, 1, 2].map(|i| parts.get(i).cloned().unwrap_or_default())
+}
+
+/// Tablet mapping mode: GNOME's `relative` nick, else absolute.
+pub fn tablet_mapping_relative(mapping: &str) -> bool {
+    mapping == "relative"
+}
+
+/// Tablet area calibration: dead padding percents (left, right, top,
+/// bottom) as thousandths of a percent; short reads pad with zero
+/// (full area).
+pub fn tablet_area_milli(area: &[f64]) -> [i32; 4] {
+    [0, 1, 2, 3].map(|i| (area.get(i).copied().unwrap_or(0.0) * 1000.0).round() as i32)
+}
+
+/// Stylus pressure curve control points `[x1, y1, x2, y2]`: malformed
+/// reads fall back to GNOME's linear default.
+pub fn tablet_pressure_curve(points: &[i32]) -> [i32; 4] {
+    if points.len() == 4 {
+        [points[0], points[1], points[2], points[3]]
+    } else {
+        [0, 0, 100, 100]
+    }
+}
+
+/// Stylus button action from its GSettings nick; unknown nicks read
+/// as GNOME's `default`.
+pub fn stylus_button_action(nick: &str) -> tuna_shell_control::StylusButtonAction {
+    use tuna_shell_control::StylusButtonAction::*;
+    match nick {
+        "middle" => Middle,
+        "right" => Right,
+        "back" => Back,
+        "forward" => Forward,
+        _ => Default,
+    }
+}
+
 #[cfg(test)]
 mod input_tests {
     use super::*;
@@ -922,6 +964,34 @@ mod input_tests {
             xkb_from_sources(&[src("ibus", "anthy"), src("xkb", "fr+bepo")]),
             ("fr".into(), "bepo".into())
         );
+    }
+
+    #[test]
+    fn tablet_settings_parse_with_gnome_defaults_for_short_reads() {
+        use tuna_shell_control::StylusButtonAction::*;
+        let s = |v: &str| v.to_owned();
+        assert_eq!(
+            tablet_output(&[]),
+            [String::new(), String::new(), String::new()]
+        );
+        assert_eq!(
+            tablet_output(&[s("GSM"), s("5b09")]),
+            [s("GSM"), s("5b09"), String::new()]
+        );
+        assert!(!tablet_mapping_relative("absolute"));
+        assert!(tablet_mapping_relative("relative"));
+        assert!(!tablet_mapping_relative("sideways"));
+        assert_eq!(tablet_area_milli(&[]), [0, 0, 0, 0]);
+        assert_eq!(tablet_area_milli(&[1.5, 0.0, 10.0]), [1500, 0, 10000, 0]);
+        assert_eq!(tablet_pressure_curve(&[]), [0, 0, 100, 100]);
+        assert_eq!(tablet_pressure_curve(&[1, 2, 3]), [0, 0, 100, 100]);
+        assert_eq!(tablet_pressure_curve(&[10, 0, 90, 100]), [10, 0, 90, 100]);
+        assert_eq!(stylus_button_action("default"), Default);
+        assert_eq!(stylus_button_action("middle"), Middle);
+        assert_eq!(stylus_button_action("right"), Right);
+        assert_eq!(stylus_button_action("back"), Back);
+        assert_eq!(stylus_button_action("forward"), Forward);
+        assert_eq!(stylus_button_action("warp"), Default);
     }
 }
 

@@ -2,7 +2,7 @@
 
 All 429 keys from `gsettings-desktop-schemas-51.0-1.fc45.x86_64` in the GNOME 51 reference container. Source re-audit: main `44edb6aca704ef0ada32b8c6111383ea5c3c6afe` (2026-10-06). See [the control-center audit](gnome-settings-audit.md) for open implementation and qualification gaps. “Via GTK” means the GTK Wayland backend translates the key through its settings portal or direct GSettings fallback; it does not imply support by every application or the compositor. “Ignored” records a current limitation, not permission to disregard binding knowledge.
 
-Handedness follow-up: main `c822ab91abbb8c07fdd89ddde5c81a71f7843ff3`, after qualified #379. Mouse and touchpad dispositions below reflect the merged libinput consumers; tablet handedness remains unsupported.
+Handedness follow-up: main `c822ab91abbb8c07fdd89ddde5c81a71f7843ff3`, after qualified #379. Mouse and touchpad dispositions below reflect the merged libinput consumers; tablet handedness reaches libinput through the tablet lane (#344), with physical tablet qualification still open.
 
 Switcher follow-up: main `c387326d067a53b7b583aafb9e0206fba0fab59c` (2026-10-10). The six `switch-windows`, `cycle-windows`, and `cycle-group` forward/backward dispositions below already match the live `SetSwitcherKeys` registration in `crates/shell-gtk/src/keybindings.rs`. This review covers those six keys, not a fresh qualification of all 429 keys. The count checker checks completeness and duplicates only; an “Honored” disposition identifies a consumer and does not establish GNOME 51 behavioral parity. Legacy and app-owned contracts still require explicit enforcing-owner decisions and application/panel evidence under [#365](https://github.com/tuna-os/tuna-desktop/issues/365).
 
@@ -319,11 +319,11 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| area | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| keep-aspect | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| left-handed | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| mapping | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| output | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| area | Honored | Live calibration padding insets the mapped tablet area, including the hotplug path; physical tablet qualification remains open (#344) |
+| keep-aspect | Honored | Live aspect letterboxing against the tablet's physical size; physical tablet qualification remains open (#344) |
+| left-handed | Honored | Live rotation reaches libinput, including the hotplug path; physical tablet qualification remains open (#344) |
+| mapping | Honored | Live absolute/relative stylus mapping; physical tablet qualification remains open (#344) |
+| output | Honored | Automatic mapping takes the primary output and explicit triples match connector names; EDID-precise matching awaits EDID plumbing, and physical tablet qualification remains open (#344) |
 ## org.gnome.desktop.peripherals.tablet.deprecated
 
 | Key | Status | Reason |
@@ -333,25 +333,25 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| action | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| keybinding | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| action | Ignored | Pad buttons never arrive: Smithay 0.7 drops libinput pad events before any backend sees them, so no mapping can route (#344) |
+| keybinding | Ignored | Pad buttons never arrive: Smithay 0.7 drops libinput pad events before any backend sees them, so no mapping can route (#344) |
 ## org.gnome.desktop.peripherals.tablet.stylus
 
 | Key | Status | Reason |
 |---|---|---|
-| button-action | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| button-keybinding | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| eraser-button-action | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| eraser-button-keybinding | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| eraser-button-mode | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| eraser-pressure-curve | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| eraser-pressure-range | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| pressure-curve | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| pressure-range | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| secondary-button-action | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| secondary-button-keybinding | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| tertiary-button-action | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| tertiary-button-keybinding | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open (#344) |
+| button-keybinding | Ignored | Keybinding synthesis for stylus buttons is not implemented (#344) |
+| eraser-button-action | Ignored | Eraser button actions are not split from the stylus ones (#344) |
+| eraser-button-keybinding | Ignored | Keybinding synthesis for stylus buttons is not implemented (#344) |
+| eraser-button-mode | Ignored | Eraser button modes are not implemented (#344) |
+| eraser-pressure-curve | Honored | Live piecewise-linear curve through GNOME's control points reaches tool clients; Mutter's exact spline shape is unconfirmed, and physical tablet qualification remains open (#344) |
+| eraser-pressure-range | Ignored | Pressure range remapping is not implemented (#344) |
+| pressure-curve | Honored | Live piecewise-linear curve through GNOME's control points reaches tool clients; Mutter's exact spline shape is unconfirmed, and physical tablet qualification remains open (#344) |
+| pressure-range | Ignored | Pressure range remapping is not implemented (#344) |
+| secondary-button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open (#344) |
+| secondary-button-keybinding | Ignored | Keybinding synthesis for stylus buttons is not implemented (#344) |
+| tertiary-button-action | Honored | Live barrel-button actions synthesize clicks; physical tablet qualification remains open (#344) |
+| tertiary-button-keybinding | Ignored | Keybinding synthesis for stylus buttons is not implemented (#344) |
 ## org.gnome.desktop.peripherals.touchpad
 
 | Key | Status | Reason |

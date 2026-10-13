@@ -51,9 +51,9 @@ use smithay::{
     backend::allocator::{dmabuf::Dmabuf, Format},
     delegate_cursor_shape, delegate_dmabuf, delegate_fractional_scale, delegate_idle_inhibit,
     delegate_input_method_manager, delegate_pointer_constraints, delegate_pointer_gestures,
-    delegate_relative_pointer, delegate_single_pixel_buffer, delegate_text_input_manager,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_dialog, delegate_xdg_foreign,
-    delegate_xdg_system_bell, delegate_xdg_toplevel_tag,
+    delegate_relative_pointer, delegate_single_pixel_buffer, delegate_tablet_manager,
+    delegate_text_input_manager, delegate_viewporter, delegate_xdg_activation, delegate_xdg_dialog,
+    delegate_xdg_foreign, delegate_xdg_system_bell, delegate_xdg_toplevel_tag,
     input::pointer::PointerHandle,
     reexports::{
         wayland_protocols::{
@@ -84,7 +84,7 @@ use smithay::{
         relative_pointer::RelativePointerManagerState,
         shell::xdg::dialog::{XdgDialogHandler, XdgDialogState},
         single_pixel_buffer::SinglePixelBufferState,
-        tablet_manager::TabletSeatHandler,
+        tablet_manager::{TabletManagerState, TabletSeatHandler},
         text_input::TextInputManagerState,
         viewporter::ViewporterState,
         xdg_activation::{
@@ -113,6 +113,9 @@ pub(crate) struct Protocols {
     _fractional_scale: FractionalScaleManagerState,
     _single_pixel_buffer: SinglePixelBufferState,
     _cursor_shape: CursorShapeManagerState,
+    /// Held alive for the `zwp_tablet_manager_v2` global (#344):
+    /// tablets and tools register on the seat, not here.
+    _tablet_manager: TabletManagerState,
     _idle_inhibit: IdleInhibitManagerState,
     _text_input: TextInputManagerState,
     _input_method: InputMethodManagerState,
@@ -155,6 +158,7 @@ impl Protocols {
             _fractional_scale: FractionalScaleManagerState::new::<State>(dh),
             _single_pixel_buffer: SinglePixelBufferState::new::<State>(dh),
             _cursor_shape: CursorShapeManagerState::new::<State>(dh),
+            _tablet_manager: TabletManagerState::new::<State>(dh),
             _idle_inhibit: IdleInhibitManagerState::new::<State>(dh),
             _text_input: TextInputManagerState::new::<State>(dh),
             // Any client may become the input method, as on GNOME.
@@ -620,6 +624,7 @@ delegate_fractional_scale!(State);
 delegate_single_pixel_buffer!(State);
 
 impl TabletSeatHandler for State {}
+delegate_tablet_manager!(State);
 delegate_cursor_shape!(State);
 
 impl IdleInhibitHandler for State {

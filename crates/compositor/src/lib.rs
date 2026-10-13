@@ -97,6 +97,8 @@ mod x11_icons;
 #[cfg(feature = "xwayland")]
 pub mod x11_interop;
 pub mod xwayland;
+// Tablet input last: appended for #344 without reordering siblings.
+pub mod tablet;
 
 /// One compositor-tracked output: protocol handle plus geometry.
 /// The first entry is the primary output; single-output sessions hold
@@ -761,6 +763,33 @@ impl State {
     /// Seat for capability attachment and input routing.
     pub(crate) fn seat_mut(&mut self) -> &mut Seat<State> {
         &mut self.seat
+    }
+
+    /// Display handle for tablet device registration (the tablet seat
+    /// advertises arriving tablets against it).
+    pub(crate) fn display_handle(&self) -> DisplayHandle {
+        self.dh.clone()
+    }
+
+    /// Output inventory for tablet mapping: connector name, logical
+    /// rectangle and primary flag, including virtual test entries.
+    pub(crate) fn tablet_outputs(
+        &self,
+    ) -> Vec<(
+        String,
+        smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+        bool,
+    )> {
+        self.outputs
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    smithay::utils::Rectangle::new(entry.loc.into(), entry.size),
+                    entry.primary,
+                )
+            })
+            .collect()
     }
 
     /// Mirror keyboard focus into selection focus: the newly focused

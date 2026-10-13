@@ -84,6 +84,7 @@ and this page together.
 | xdg_toplevel_tag_manager_v1 | 1 | each window keeps its tag and description |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
+| zwp_tablet_manager_v2 | 1 | tablets register on the seat; the stylus moves the cursor and tools reach clients with pressure and tilt (#344) |
 
 ### xdg-activation policy
 
@@ -153,7 +154,7 @@ GNOME's version.
 | xdg_wm_base | 7 | 6 | Smithay 0.7 creates the global at 6 and implements nothing newer; bumps with Smithay (#89) |
 | wl_seat | 10 | 9 | Smithay 0.7 creates the seat at 9 and implements nothing newer; bumps with Smithay (#89) |
 | zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
-| zwp_tablet_manager_v2 | 2 | missing | Smithay 0.7 implements manager v1 only, and tablet events from libinput are not routed yet (the input path carries pointer, keys and swipes); needs the hardware lane (#68, #89) |
+| zwp_tablet_manager_v2 | 2 | 1 | Smithay 0.7 implements manager v1 only; bumps with Smithay. Pad buttons never arrive (pad events are dropped before any backend), and hardware qualification stays open (#344; #68, #89) |
 | zxdg_exporter_v1, zxdg_importer_v1 | 1 | missing | GTK3 exports with v1; Smithay 0.7 implements v2 only and keeps its handle table private, so a v1 handle could not be imported by the portal's v2 (#61) |
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
 | xdg_session_manager_v1 | 1 | missing | not in Smithay 0.7: window session save and restore is a subsystem of its own (Mutter 51's session management) (#89) |

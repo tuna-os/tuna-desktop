@@ -22,7 +22,9 @@ use smithay::xwayland::{xwm::WmWindowType, X11Surface};
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, ButtonState, Event as BackendEvent, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, ProximityState,
+        TabletToolButtonEvent, TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent,
+        TabletToolTipState,
     },
     desktop::{Window, WindowSurface},
     input::{
@@ -36,12 +38,14 @@ use smithay::{
         compositor::with_states,
         seat::WaylandFocus,
         shell::xdg::{ToplevelSurface, XdgToplevelSurfaceData},
+        tablet_manager::{TabletDescriptor, TabletHandle, TabletSeatTrait, TabletToolHandle},
     },
 };
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use crate::{
     state::{StateModel, WindowUpdate},
+    tablet::{TabletConfig, TabletDeviceChange, TabletToolId, TabletToolPhase, TabletToolSample},
     State, WindowRequest,
 };
 use tuna_shell_control::{switcher_keys, SwitcherAction, PANEL_HEIGHT};
@@ -209,6 +213,16 @@ pub fn resized(
     Rectangle::new((x, y).into(), (w, h).into())
 }
 
+/// One registered graphics tablet (#344): the seat descriptor
+/// (departures unregister by it), the protocol handle (tool proximity
+/// needs it) and the physical size in mm (keep-aspect letterboxing).
+#[derive(Debug, Clone)]
+struct TabletEntry {
+    descriptor: TabletDescriptor,
+    handle: TabletHandle,
+    size_mm: (f64, f64),
+}
+
 pub struct WindowManager {
     /// Active interactive move/resize, if any (#58).
     grab: Option<PointerGrab>,
@@ -233,6 +247,11 @@ pub struct WindowManager {
     keyboard: Option<KeyboardHandle<State>>,
     pointer: Option<PointerHandle<State>>,
     pointer_pos: Point<f64, Logical>,
+    /// Graphics tablet mapping settings (#344), rebuilt on every
+    /// `SetInputSettings`.
+    tablet_config: TabletConfig,
+    /// Registered tablets by hardware backend id.
+    tablets: HashMap<u32, TabletEntry>,
     /// org.gnome.Shell accelerator grabs (GrabAccelerators).
     accelerators: Vec<tuna_shell_control::Accelerator>,
     /// Keycodes whose press fired an accelerator: their release is
@@ -342,6 +361,8 @@ impl WindowManager {
             keyboard,
             pointer,
             pointer_pos: (0.0, 0.0).into(),
+            tablet_config: TabletConfig::default(),
+            tablets: HashMap::new(),
             accelerators: Vec::new(),
             accel_held: Vec::new(),
             accel_fired: Vec::new(),
@@ -2329,6 +2350,69 @@ impl WindowManager {
                 vertical,
                 time,
             } => self.pointer_axis(state, horizontal, vertical, time),
+            ManagerInput::TabletTool {
+                tablet,
+                tool,
+                phase,
+                pos,
+                area,
+                delta,
+                pressure,
+                tilt,
+                time,
+            } => {
+                // The lock screen hears the stylus as pointer motion
+                // and clicks (#344): map the sample, then re-enter as
+                // pointer inputs. Tool protocol events stay session-side.
+                let sample = TabletToolSample {
+                    tablet,
+                    tool,
+                    phase,
+                    pos,
+                    area,
+                    delta,
+                    pressure,
+                    tilt,
+                    time,
+                };
+                let Some(mapped) = self.tablet_pos(state, &sample) else {
+                    return;
+                };
+                self.lock_input(state, surface, ManagerInput::Motion { pos: mapped, time });
+                match phase {
+                    TabletToolPhase::TipDown => self.lock_input(
+                        state,
+                        surface,
+                        ManagerInput::Button {
+                            button: crate::tablet::TIP_BUTTON,
+                            pressed: true,
+                            time,
+                        },
+                    ),
+                    TabletToolPhase::TipUp => self.lock_input(
+                        state,
+                        surface,
+                        ManagerInput::Button {
+                            button: crate::tablet::TIP_BUTTON,
+                            pressed: false,
+                            time,
+                        },
+                    ),
+                    TabletToolPhase::Button { button, pressed } => {
+                        let action = crate::tablet::stylus_action(button, &self.tablet_config);
+                        self.lock_input(
+                            state,
+                            surface,
+                            ManagerInput::Button {
+                                button: crate::tablet::action_button(action),
+                                pressed,
+                                time,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -3659,6 +3743,27 @@ pub enum ManagerInput {
         cancelled: bool,
         time: u32,
     },
+    /// Graphics tablet tool sample (#344): plain `Copy` data so the
+    /// backend-typed event never crosses into the manager. The manager
+    /// maps it (absolute placement or relative steps), moves the
+    /// cursor, and forwards tool protocol events to tablet clients.
+    TabletTool {
+        /// Hardware backend's tablet id, or `UNKNOWN_TABLET` when the
+        /// backend could not attribute the sample to a device.
+        tablet: u32,
+        tool: TabletToolId,
+        phase: TabletToolPhase,
+        /// Absolute position across `area`.
+        pos: Point<f64, Logical>,
+        /// Logical size the absolute position maps onto.
+        area: Size<i32, Logical>,
+        /// Relative motion since the last sample.
+        delta: Point<f64, Logical>,
+        /// Raw pressure in `0..=1` (the manager applies the curve).
+        pressure: f64,
+        tilt: (f64, f64),
+        time: u32,
+    },
 }
 
 /// What a finished three-finger touchpad swipe does (GNOME 51).
@@ -3960,7 +4065,8 @@ impl TriggerState {
             ManagerInput::RelativeMotion { .. }
             | ManagerInput::SwipeBegin { .. }
             | ManagerInput::SwipeUpdate { .. }
-            | ManagerInput::SwipeEnd { .. } => TriggerAction::None,
+            | ManagerInput::SwipeEnd { .. }
+            | ManagerInput::TabletTool { .. } => TriggerAction::None,
         }
     }
 }
@@ -3997,6 +4103,213 @@ impl WindowManager {
         };
         keyboard.change_repeat_info(rate, settings.repeat_delay_ms as i32);
         self.repeat = (rate, settings.repeat_delay_ms as i32);
+    }
+
+    /// GNOME's tablet settings (#344): rebuild the tablet mapping
+    /// config (output, area, aspect, curves, button actions).
+    pub fn apply_tablet_settings(&mut self, settings: &tuna_shell_control::InputSettings) {
+        self.tablet_config = TabletConfig::new(settings);
+    }
+
+    /// Track a tablet device arriving or leaving, drained from the
+    /// hardware backend by the runtime. Arrivals register on the
+    /// tablet seat (repeats answer with the known handle);
+    /// departures unregister and drop the manager's handle.
+    pub fn apply_tablet_device(&mut self, state: &mut State, change: TabletDeviceChange) {
+        match change {
+            TabletDeviceChange::Added {
+                id,
+                tablet,
+                size_mm,
+            } => {
+                let seat = state.seat_mut().tablet_seat();
+                let dh = state.display_handle();
+                let handle = seat.add_tablet::<State>(&dh, &tablet);
+                self.tablets.insert(
+                    id,
+                    TabletEntry {
+                        descriptor: tablet,
+                        handle,
+                        size_mm,
+                    },
+                );
+            }
+            TabletDeviceChange::Removed { id } => {
+                // Smithay 0.7 drops the seat entry without sending
+                // `removed` (unlike tools): clients keep a stale
+                // tablet object until replug re-adds it.
+                if let Some(entry) = self.tablets.remove(&id) {
+                    state
+                        .seat_mut()
+                        .tablet_seat()
+                        .remove_tablet(&entry.descriptor);
+                }
+            }
+        }
+    }
+
+    /// Route one tablet tool sample (#344): the cursor follows the tool
+    /// (absolute mapping places it, relative mapping steps it), the tip
+    /// clicks, barrel buttons synthesize their configured actions, and
+    /// tool protocol events reach tablet clients. Samples from unknown
+    /// tablets still move the cursor; only their tool events wait.
+    pub fn tablet_tool(&mut self, state: &mut State, sample: TabletToolSample) {
+        let Some(pos) = self.tablet_pos(state, &sample) else {
+            return; // Nowhere to point: no outputs, no focus, no client.
+        };
+        use crate::tablet;
+        match sample.phase {
+            TabletToolPhase::ProximityIn | TabletToolPhase::Axis => {
+                self.pointer_motion(state, pos, sample.time);
+                self.tablet_motion(state, sample, pos);
+            }
+            TabletToolPhase::ProximityOut => {
+                if let Some((_, tool)) = self.tablet_handles(state, &sample) {
+                    tool.proximity_out(sample.time);
+                }
+            }
+            TabletToolPhase::TipDown => {
+                self.pointer_motion(state, pos, sample.time);
+                self.tablet_motion(state, sample, pos);
+                if let Some((_, tool)) = self.tablet_handles(state, &sample) {
+                    tool.tip_down(SERIAL_COUNTER.next_serial(), sample.time);
+                }
+                self.pointer_button(state, tablet::TIP_BUTTON, true, sample.time);
+            }
+            TabletToolPhase::TipUp => {
+                if let Some((_, tool)) = self.tablet_handles(state, &sample) {
+                    tool.tip_up(sample.time);
+                }
+                self.pointer_button(state, tablet::TIP_BUTTON, false, sample.time);
+            }
+            TabletToolPhase::Button { button, pressed } => {
+                self.pointer_motion(state, pos, sample.time);
+                self.tablet_motion(state, sample, pos);
+                if let Some((_, tool)) = self.tablet_handles(state, &sample) {
+                    let button_state = if pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Released
+                    };
+                    tool.button(
+                        button,
+                        button_state,
+                        SERIAL_COUNTER.next_serial(),
+                        sample.time,
+                    );
+                }
+                let action = tablet::stylus_action(button, &self.tablet_config);
+                self.pointer_button(state, tablet::action_button(action), pressed, sample.time);
+            }
+        }
+    }
+
+    /// Map one tablet sample to a cursor position: relative mapping
+    /// steps from the cursor (clamped into the outputs), absolute
+    /// mapping places from the tool position on the configured output.
+    /// `None` only when no outputs exist at all.
+    fn tablet_pos(&self, state: &State, sample: &TabletToolSample) -> Option<Point<f64, Logical>> {
+        use crate::tablet;
+        let outputs = state.tablet_outputs();
+        if self.tablet_config.relative {
+            return Some(tablet::clamp_to_outputs(
+                (
+                    self.pointer_pos.x + sample.delta.x,
+                    self.pointer_pos.y + sample.delta.y,
+                )
+                    .into(),
+                &outputs,
+            ));
+        }
+        let target = tablet::select_output(&outputs, &self.tablet_config)?;
+        let nx = sample.pos.x / f64::from(sample.area.w.max(1));
+        let ny = sample.pos.y / f64::from(sample.area.h.max(1));
+        let size = self
+            .tablets
+            .get(&sample.tablet)
+            .map(|entry| entry.size_mm)
+            .unwrap_or((0.0, 0.0));
+        Some(tablet::map_absolute(
+            nx,
+            ny,
+            &self.tablet_config,
+            size,
+            target,
+        ))
+    }
+
+    /// Forward motion-side tool protocol events for one sample: curved
+    /// pressure and tilt stage as pending axes, then one motion frame
+    /// carries them; Smithay opens, moves or closes proximity from the
+    /// focus. Unknown tablets skip silently (the cursor still moved).
+    fn tablet_motion(&self, state: &mut State, sample: TabletToolSample, pos: Point<f64, Logical>) {
+        let Some((tablet, tool)) = self.tablet_handles(state, &sample) else {
+            return;
+        };
+        tool.pressure(crate::tablet::apply_pressure_curve(
+            sample.pressure,
+            &self.tablet_config.curve_for(sample.tool.tool_type),
+        ));
+        tool.tilt(sample.tilt);
+        let focus = self.tablet_focus(state, pos);
+        tool.motion(
+            pos,
+            focus,
+            &tablet,
+            SERIAL_COUNTER.next_serial(),
+            sample.time,
+        );
+    }
+
+    /// Protocol handles for one sample: the tablet (registered on
+    /// arrival) and the tool (registered on first sight; the seat
+    /// answers repeats with the known handle). `None` for unknown
+    /// tablets only.
+    fn tablet_handles(
+        &self,
+        state: &mut State,
+        sample: &TabletToolSample,
+    ) -> Option<(TabletHandle, TabletToolHandle)> {
+        let tablet = self
+            .tablets
+            .get(&sample.tablet)
+            .map(|entry| entry.handle.clone())?;
+        let descriptor = sample.tool.descriptor();
+        let seat = state.seat_mut().tablet_seat();
+        let tool = seat.get_tool(&descriptor).unwrap_or_else(|| {
+            let dh = state.display_handle();
+            seat.add_tool::<State>(state, &dh, &descriptor)
+        });
+        Some((tablet, tool))
+    }
+
+    /// Tablet tool focus at a position: mirrors `pointer_motion`'s
+    /// focus order (popup, layer surface, window; never the overview's
+    /// previews) without grab interception — tool protocol events flow
+    /// by surface focus even while a pointer grab owns the cursor.
+    fn tablet_focus(
+        &self,
+        state: &State,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if let Some(popup) = self.popup_at(state, pos) {
+            return Some((popup.surface, popup.origin.to_f64()));
+        }
+        if let Some((surface, (ox, oy))) =
+            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
+        {
+            return Some((surface, (ox as f64, oy as f64).into()));
+        }
+        if self.overview_open {
+            return None;
+        }
+        let id = self
+            .window_at(pos)
+            .filter(|id| self.modal_target(*id) == *id)?;
+        let window = self.windows.get(&id)?;
+        let surface = window.surface.wl_surface()?.into_owned();
+        let origin = crate::popup::surface_origin(&surface, window.geometry.loc);
+        Some((surface, (origin.x as f64, origin.y as f64).into()))
     }
 
     /// The next input source (GNOME's Super+Space).
@@ -4275,6 +4588,30 @@ impl WindowManager {
                     pointer.frame(state);
                 }
             }
+            ManagerInput::TabletTool {
+                tablet,
+                tool,
+                phase,
+                pos,
+                area,
+                delta,
+                pressure,
+                tilt,
+                time,
+            } => self.tablet_tool(
+                state,
+                TabletToolSample {
+                    tablet,
+                    tool,
+                    phase,
+                    pos,
+                    area,
+                    delta,
+                    pressure,
+                    tilt,
+                    time,
+                },
+            ),
         }
     }
 
@@ -4961,7 +5298,60 @@ pub fn translate_input<B: InputBackend>(
         }
         InputEvent::TouchUp { event } => vec![touch_release((event.time() / 1000) as u32)],
         InputEvent::TouchCancel { event } => vec![touch_release((event.time() / 1000) as u32)],
+        InputEvent::TabletToolProximity { event } => {
+            let phase = if event.state() == ProximityState::In {
+                TabletToolPhase::ProximityIn
+            } else {
+                TabletToolPhase::ProximityOut
+            };
+            vec![tablet_tool_input(&event, phase, area)]
+        }
+        InputEvent::TabletToolAxis { event } => {
+            vec![tablet_tool_input(&event, TabletToolPhase::Axis, area)]
+        }
+        InputEvent::TabletToolTip { event } => {
+            let phase = if event.tip_state() == TabletToolTipState::Down {
+                TabletToolPhase::TipDown
+            } else {
+                TabletToolPhase::TipUp
+            };
+            vec![tablet_tool_input(&event, phase, area)]
+        }
+        InputEvent::TabletToolButton { event } => vec![tablet_tool_input(
+            &event,
+            TabletToolPhase::Button {
+                button: event.button(),
+                pressed: event.button_state() == ButtonState::Pressed,
+            },
+            area,
+        )],
         _ => Vec::new(),
+    }
+}
+
+/// Extract a tablet tool sample from any backend's tool event (#344).
+/// The absolute position maps across `area` (the nested window, or
+/// the primary output on hardware); the manager re-maps it onto the
+/// configured output, so backends never learn the Wacom settings.
+/// Device attribution stays [`UNKNOWN_TABLET`](crate::tablet::UNKNOWN_TABLET)
+/// here: only the hardware backend knows its tablets, and it stamps
+/// the id after this translation.
+fn tablet_tool_input<B: InputBackend, E: TabletToolEvent<B> + BackendEvent<B>>(
+    event: &E,
+    phase: TabletToolPhase,
+    area: Size<i32, Logical>,
+) -> ManagerInput {
+    let pos = event.position_transformed(area);
+    ManagerInput::TabletTool {
+        tablet: crate::tablet::UNKNOWN_TABLET,
+        tool: TabletToolId::from_descriptor(&event.tool()),
+        phase,
+        pos: (pos.x, pos.y).into(),
+        area,
+        delta: (event.delta_x(), event.delta_y()).into(),
+        pressure: event.pressure(),
+        tilt: (event.tilt_x(), event.tilt_y()),
+        time: (event.time() / 1000) as u32,
     }
 }
 
