@@ -35,14 +35,95 @@ class Tests(unittest.TestCase):
         self.guards = []
         self.ns = {'re': re, 'time': self.clock, 'GLib': SimpleNamespace(Error=Error),
                    'focused': lambda: self.guards.append(1)}
-        names = {'removed_accessible', 'wait', 'controls', 'cell', 'select'}
+        names = {'removed_accessible', 'wait', 'controls', 'cell', 'select',
+                 'owned_unlocked', 'focused', 'wait_for_initial_map'}
         functions = [node for node in ast.parse(SOURCE.read_text()).body
                      if isinstance(node, ast.FunctionDef) and node.name in names]
         self.assertEqual({node.name for node in functions}, names)
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), 'exec'), self.ns)
+        self.actual_focused = self.ns['focused']
+        self.ns['focused'] = lambda: self.guards.append(1)
 
     def wait(self, predicate):
         return self.ns['wait'](predicate, 'retain strict actual contents')
+
+    def startup(self, *, locked=False, changed=False, focus_at=.1):
+        original = {'owner': ':1.42', 'pid': 10}
+        def scene():
+            if locked:
+                raise RuntimeError('locked')
+            return {'focused_app_id': ('org.gnome.Nautilus'
+                                      if self.clock.now >= focus_at else None)}
+        self.ns.update(identity=original, scene=scene,
+                       nautilus_identity=lambda: ({'owner': ':1.43', 'pid': 11}
+                                                  if changed else original),
+                       focused=self.actual_focused, cell=lambda _: object())
+
+    def test_initial_map_waits_for_genuine_focus_then_admits(self):
+        self.startup()
+        self.ns['wait_for_initial_map']('seed.txt')
+        self.assertGreaterEqual(self.clock.now, .1)
+        self.assertLess(self.clock.now, 10)
+
+    def test_initial_map_locked_or_changed_owner_never_admits(self):
+        for options, message in [({'locked': True}, 'locked'),
+                                 ({'changed': True}, 'owner or installed process changed')]:
+            self.startup(**options)
+            with self.assertRaisesRegex(RuntimeError, message):
+                self.ns['wait_for_initial_map']('seed.txt')
+
+    def test_initial_owner_or_lock_change_during_cell_read_never_admits(self):
+        for failure in ('owner', 'lock'):
+            self.startup(focus_at=0)
+            original_scene, original_owner = self.ns['scene'], self.ns['nautilus_identity']
+            changed = [False]
+            def cell(_):
+                changed[0] = True
+                return object()
+            def scene():
+                if failure == 'lock' and changed[0]:
+                    raise RuntimeError('locked')
+                return original_scene()
+            self.ns.update(cell=cell, scene=scene,
+                nautilus_identity=lambda: ({'owner': ':1.99', 'pid': 99}
+                    if failure == 'owner' and changed[0] else original_owner()))
+            with self.assertRaises(RuntimeError):
+                self.ns['wait_for_initial_map']('seed.txt')
+
+    def test_initial_strict_final_focus_guard_cannot_finish_late(self):
+        self.startup(focus_at=0)
+        def late_focus():
+            current = self.actual_focused()
+            self.clock.now = 10.0
+            return current
+        self.ns['focused'] = late_focus
+        with self.assertRaisesRegex(RuntimeError, 'Files did not'):
+            self.ns['wait_for_initial_map']('seed.txt')
+
+    def test_initial_focus_never_arrives_keeps_original_deadline(self):
+        self.startup(focus_at=20)
+        with self.assertRaisesRegex(RuntimeError, 'Files did not'):
+            self.ns['wait_for_initial_map']('seed.txt')
+        self.assertEqual(self.clock.now, 10)
+
+    def test_initial_late_mapped_cell_never_admits(self):
+        self.startup(focus_at=0)
+        def cell(_):
+            self.clock.now = 10
+            return object()
+        self.ns['cell'] = cell
+        with self.assertRaisesRegex(RuntimeError, 'Files did not'):
+            self.ns['wait_for_initial_map']('seed.txt')
+
+    def test_initial_accepted_predicate_still_requires_strict_focus(self):
+        self.startup(focus_at=20)
+        with self.assertRaisesRegex(RuntimeError, 'keyboard focus'):
+            self.ns['wait'](lambda: True, 'map', startup=True)
+
+    def test_later_focus_loss_never_becomes_startup_readiness(self):
+        self.startup(focus_at=20)
+        with self.assertRaisesRegex(RuntimeError, 'keyboard focus'):
+            self.wait(lambda: True)
 
     def test_classifier_is_exact_domain_code_message_and_error_type(self):
         self.assertTrue(self.ns['removed_accessible'](removed()))
