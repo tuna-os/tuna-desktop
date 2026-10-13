@@ -113,6 +113,7 @@ def main():
             'scripts/tuna-benchmark-disk-export', 'scripts/lib/tuna_benchmark_disk.py',
             'scripts/lib/tuna_benchmark_esp.py', 'scripts/lib/tuna_benchmark_footprint.py',
             'scripts/lib/tuna_dense_decode.py', 'scripts/lib/tuna_dense_decode_worker.py',
+            'scripts/lib/tuna_dense_process.py', 'scripts/lib/tuna_dense_tool_identity.json',
             'packaging/marlin/perf/Containerfile.baseline', 'packaging/marlin/perf/Containerfile',
             'packaging/marlin/Containerfile']}
         receipt['gnome_version'] = output(['sudo', 'podman', 'run', '--rm', image, 'gnome-shell', '--version']).strip()

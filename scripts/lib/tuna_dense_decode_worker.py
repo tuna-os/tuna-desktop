@@ -64,18 +64,46 @@ def main():
   if os.getuid()!=107 or os.getgid()!=107:raise ValueError('owned UID/GID107 required')
   if request['virtual_bytes']!=VIRTUAL_BYTES:raise ValueError('exact 18Gi source required')
   if sys.version_info[:3]!=(3,12,15):raise ValueError('admitted private Python version required')
+  operation_deadline=request['operation_deadline_monotonic']
+  if type(operation_deadline) not in (int,float) or operation_deadline<=time.monotonic():raise ValueError('absolute operation budget required')
+  if digest('/observer/tool-identity.json')!=request['tool_identity_sha256'] or digest('/observer/worker.py')!=request['worker_sha256']:raise ValueError('observer source bytes changed')
+  identity=json.loads(Path('/observer/tool-identity.json').read_text())
+  if identity['image']!=request['tool'] or identity['qemu_after_sha256']!=QEMU_SHA:raise ValueError('admitted tool custody mismatch')
+  # Check every original closure file; observed Python ELF maps must stay private
+  # and match original custody. Other original modules need not all be loaded.
+  for name,expected in {**identity['python_libraries'],**identity['qemu_libraries']}.items():
+   if digest(name,min(operation_deadline,time.monotonic()+30))!=expected:raise ValueError('tool closure file changed')
+  mapped={}
+  for line in Path('/proc/self/maps').read_text().splitlines():
+   fields=line.split(None,5)
+   if len(fields)!=6 or not fields[5].startswith('/'):continue
+   if fields[5].endswith(' (deleted)'):raise ValueError('deleted Python mapping')
+   actual=Path(fields[5]).resolve(strict=True)
+   with actual.open('rb') as file:is_elf=file.read(4)==b'\x7fELF'
+   if is_elf:
+    if not actual.is_relative_to('/opt/tuna-python'):raise ValueError('Python mapped global ELF')
+    name=str(actual);mapped[name]=digest(actual,min(operation_deadline,time.monotonic()+30))
+  if not mapped or any(identity['python_libraries'].get(name)!=sha for name,sha in mapped.items()):raise ValueError('Python mapping differs from admitted custody')
+  if str(Path(sys.executable).resolve())!=identity['python_executable']:raise ValueError('private Python executable changed')
+  receipt['python_elf_mappings_sha256']=mapped
+  import subprocess
+  listing=subprocess.run(['/lib64/ld-linux-x86-64.so.2','--list','/usr/bin/qemu-img'],capture_output=True,timeout=min(10,max(.01,operation_deadline-time.monotonic())),check=True,text=True)
+  if len(listing.stdout)>65536:raise ValueError('QEMU loader output bound')
+  libraries={token:digest(token,min(operation_deadline,time.monotonic()+30)) for line in listing.stdout.splitlines() for token in line.split() if token.startswith('/')}
+  if libraries!=identity['qemu_libraries']:raise ValueError('QEMU actual required library closure changed')
+  receipt['qemu_required_libraries_sha256']=libraries
   qemu=Path('/usr/bin/qemu-img')
   if digest(qemu)!=QEMU_SHA:raise ValueError('admitted QEMU executable required')
   receipt['qemu_executable_sha256']=QEMU_SHA
   source=Path('/input/disk.qcow2');before_stat=source.stat()
-  if digest(source,time.monotonic()+900)!=request['qcow_sha256']:raise ValueError('source hash mismatch')
+  if digest(source,min(operation_deadline,time.monotonic()+900))!=request['qcow_sha256']:raise ValueError('source hash mismatch')
   group=own_cgroup();receipt['cgroup_path']=str(group);receipt['memory_before']=memory(group)
   if receipt['memory_before']['max_bytes']!=MEMORY_BYTES:raise ValueError('memory limit not enforced')
   if list(target.iterdir()):raise ValueError('new empty owned output directory required')
   output=target/'disk.raw';log=target/'decoder.log'
   if Path('/proc/self/task/'+str(os.getpid())+'/children').read_text().strip():raise ValueError('exclusive child ownership required')
   import subprocess
-  started=time.monotonic();deadline=started+900
+  started=time.monotonic();deadline=min(operation_deadline,started+900)
   with log.open('xb') as stream:
    child=subprocess.Popen([str(qemu),'convert','-f','qcow2','-O','raw','-S','4k',str(source),str(output)],
                           stdin=subprocess.DEVNULL,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True)
@@ -102,10 +130,10 @@ def main():
   if value.st_size!=VIRTUAL_BYTES:raise ValueError('raw virtual size mismatch')
   receipt['output_stat']={'virtual_bytes':value.st_size,'allocated_bytes':value.st_blocks*512,'uid':value.st_uid,'gid':value.st_gid}
   if value.st_uid!=107 or value.st_gid!=107:raise ValueError('output ownership changed')
-  receipt['raw_sha256']=digest(output,time.monotonic()+900)
+  receipt['raw_sha256']=digest(output,min(operation_deadline,time.monotonic()+900))
   if receipt['raw_sha256']!=request['raw_sha256']:raise ValueError('full readback hash mismatch')
   current=source.stat()
-  if digest(source,time.monotonic()+900)!=request['qcow_sha256'] or any(getattr(current,k)!=getattr(before_stat,k) for k in ('st_dev','st_ino','st_size','st_mtime_ns')):
+  if digest(source,min(operation_deadline,time.monotonic()+900))!=request['qcow_sha256'] or any(getattr(current,k)!=getattr(before_stat,k) for k in ('st_dev','st_ino','st_size','st_mtime_ns')):
    raise ValueError('source changed')
   receipt['memory_after']=memory(group);validate_memory(receipt['memory_before'],receipt['memory_after'])
   receipt['qualified']=True
@@ -115,9 +143,18 @@ def main():
   if child is not None and not reaped:
    try:os.killpg(child.pid,signal.SIGKILL)
    except ProcessLookupError:pass
-   # Container host supervisor has a separate bounded retirement budget.
-   _,status,usage=os.wait4(child.pid,0);child.returncode=os.waitstatus_to_exitcode(status)
-   receipt.update(decoder_exit=child.returncode,qemu_peak_rss_bytes=int(usage.ru_maxrss)*1024,decoder_rss_measured=True)
+   # Hold the leader until actual exit is observable, with an independent
+   # cleanup budget. No blocking wait4 on a possibly live child.
+   cleanup_deadline=time.monotonic()+5
+   while time.monotonic()<cleanup_deadline:
+    observed=os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+    if observed is not None:
+     _,status,usage=os.wait4(child.pid,0);child.returncode=os.waitstatus_to_exitcode(status);reaped=True
+     receipt.update(decoder_exit=child.returncode,qemu_peak_rss_bytes=int(usage.ru_maxrss)*1024,decoder_rss_measured=True)
+     break
+    time.sleep(.02)
+   if not reaped:receipt.update(qualified=False,decoder_retirement_unconfirmed=True)
+  receipt['owned_decoder_retired']=child is None or reaped
   try:
    receipt['memory_final']=memory(own_cgroup())
   except Exception as error:receipt['memory_observation_error']=str(error)[:1024];receipt['qualified']=False

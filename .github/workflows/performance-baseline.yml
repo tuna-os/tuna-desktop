@@ -13,6 +13,8 @@ on:
       - scripts/lib/tuna_benchmark_footprint.py
       - scripts/lib/tuna_dense_decode.py
       - scripts/lib/tuna_dense_decode_worker.py
+      - scripts/lib/tuna_dense_process.py
+      - scripts/lib/tuna_dense_tool_identity.json
       - scripts/lib/tuna-dense-decode-tests.py
       - scripts/tuna-perf-profile-pairs
       - scripts/tuna-frame-pacer-build
