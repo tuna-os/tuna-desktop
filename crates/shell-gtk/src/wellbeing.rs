@@ -3076,10 +3076,13 @@ mod tests {
                     dismiss_callbacks.borrow_mut().remove(&id);
                 })
             },
-            on_notice_dismiss: Rc::new(move |id, handler| {
-                dismiss_registered.borrow_mut().push(id);
-                dismiss_callbacks.borrow_mut().insert(id, handler);
-            }),
+            on_notice_dismiss: {
+                let dismiss_callbacks = dismiss_callbacks.clone();
+                Rc::new(move |id, handler| {
+                    dismiss_registered.borrow_mut().push(id);
+                    dismiss_callbacks.borrow_mut().insert(id, handler);
+                })
+            },
             drop_notice_dismiss: Rc::new(move |id| {
                 dismiss_dropped.borrow_mut().push(id);
                 dismiss_callbacks.borrow_mut().remove(&id);
