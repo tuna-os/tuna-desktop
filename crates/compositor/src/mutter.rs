@@ -373,6 +373,29 @@ impl NightLightColor {
         });
         self.share.set_disabled_until_tmw(set_at.flatten());
     }
+
+    /// Slider preview (#339): force the freshly written temperature
+    /// for `duration` seconds; the share expires it automatically and
+    /// the schedule resumes. Durations outside 1..=120 are rejected
+    /// as InvalidArgs without touching any live preview; a poisoned
+    /// share (nothing recorded) reports Failed instead. A gsettings
+    /// read failure falls back to the last published temperature.
+    fn night_light_preview(&self, duration: u32) -> fdo::Result<()> {
+        let temp = crate::night_light::load_from_gsettings()
+            .map(|config| config.temperature_k())
+            .unwrap_or_else(|_| self.share.temperature());
+        self.share.set_preview(temp, duration).map_err(|rejected| {
+            use crate::night_light::PreviewRejected;
+            match rejected {
+                PreviewRejected::InvalidDuration(_) => {
+                    fdo::Error::InvalidArgs("Duration is out of the range (0-120].".into())
+                }
+                PreviewRejected::Unavailable => {
+                    fdo::Error::Failed("night light preview unavailable".into())
+                }
+            }
+        })
+    }
 }
 
 #[interface(name = "org.gnome.Mutter.DisplayConfig")]

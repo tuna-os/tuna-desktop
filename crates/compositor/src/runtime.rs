@@ -1177,6 +1177,11 @@ impl Runtime {
         runtime.animation_clock =
             crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
         runtime.wallpaper.set_wake(&runtime.wake);
+        // Night Light (#339): D-Bus preview/clear/temp-disable
+        // records ping the already-registered wake above; its no-op
+        // callback plus the unconditional tick/render below serve
+        // them, so no second wake source or thread is needed.
+        night_light_share.set_wake(&runtime.wake);
         runtime.orca.set_wake(&runtime.wake);
         runtime.idle_monitor.set_wake(&runtime.wake);
         if let Some(ime) = &runtime.ime {
@@ -3497,6 +3502,11 @@ impl Runtime {
         if let Some(deadline) = self.wallpaper.maintenance_deadline() {
             schedule.at(deadline);
         }
+        // Night Light (#339): exact preview expiry (or its past-due
+        // restoring obligation) and the bounded settings re-read.
+        if let Some(deadline) = self.night_light.next_deadline() {
+            schedule.at(deadline);
+        }
         schedule.idle(
             self.lock.idle_ms(self.lock_now_ms()),
             (!self.is_locked()).then_some(self.lock.timeout_ms()),
@@ -5771,5 +5781,86 @@ fn input_time(input: &ManagerInput) -> u64 {
         | ManagerInput::SwipeUpdate { time, .. }
         | ManagerInput::SwipeEnd { time, .. } => u64::from(time),
         ManagerInput::RelativeMotion { utime, .. } => utime / 1000,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A preview record must ping an idle loop through the share's
+    /// connected wake (#339): real calloop, no sleeps — dispatch
+    /// returns on the ping itself.
+    #[test]
+    fn night_light_preview_record_wakes_idle_loop() {
+        let (wake, source) = crate::wake::Wake::new().unwrap();
+        let share = std::sync::Arc::new(crate::night_light::NightLightShare::default());
+        share.set_wake(&wake);
+        let mut loop_: EventLoop<usize> = EventLoop::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let mut count = 0;
+        share.set_preview(2000, 5).unwrap();
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 1, "preview record must ping an idle loop");
+        // No spin: a zero-wait dispatch with no new records observes
+        // nothing further.
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Clear and temp-disable records carry the same wake
+    /// obligation as preview records (#339).
+    #[test]
+    fn night_light_clear_and_temp_disable_wake_idle_loop() {
+        let (wake, source) = crate::wake::Wake::new().unwrap();
+        let share = std::sync::Arc::new(crate::night_light::NightLightShare::default());
+        share.set_wake(&wake);
+        let mut loop_: EventLoop<usize> = EventLoop::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let mut count = 0;
+        share.set_preview(2000, 5).unwrap();
+        share.clear_preview();
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 1, "clear must ping; coalesced with preview");
+        share.set_disabled_until_tmw(Some(1_700_000_000));
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 2, "temp-disable set must ping");
+        share.set_disabled_until_tmw(None);
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 3, "temp-disable clear must ping");
+    }
+
+    /// Without `set_wake` the share still records (fallback path),
+    /// but nothing is pinged: wiring the setup hunk is what makes
+    /// an idle loop responsive (#339).
+    #[test]
+    fn night_light_unconnected_share_records_without_ping() {
+        let (_wake, source) = crate::wake::Wake::new().unwrap();
+        let share = crate::night_light::NightLightShare::default();
+        let mut loop_: EventLoop<usize> = EventLoop::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let mut count = 0;
+        share.set_preview(2000, 5).unwrap();
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+        assert_eq!(count, 0, "unconnected share must not ping");
+        assert!(share.preview_temperature(std::time::Instant::now()).is_some());
     }
 }
