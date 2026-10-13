@@ -3982,6 +3982,24 @@ mod tests {
         }
     }
 
+    // Observation only: never selects a test branch or changes transport behavior.
+    fn emit_phase(phase: &str, measurements: serde_json::Value) {
+        let Ok(nonce) = std::env::var("TUNA_FPRINT_PHASE_NONCE") else {
+            return;
+        };
+        assert!(nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()));
+        let record = serde_json::json!({
+            "phase": phase, "nonce": nonce, "pid": std::process::id(),
+            "measurements": measurements, "driver_exit": "unobserved"
+        });
+        let bytes = format!("FPRINT-PHASE {record}\n");
+        // Diagnostic write errors must fail this specifically requested receipt.
+        std::io::stderr()
+            .lock()
+            .write_all(bytes.as_bytes())
+            .expect("phase receipt");
+    }
+
     /// Test A — a saturated send parks `close` until fd shutdown, on the
     /// SAME transport a real attempt uses. Phase 1 proves the socket
     /// physics (fill to `EAGAIN`, a blocked sender, shutdown release);
@@ -4042,8 +4060,9 @@ mod tests {
             done_rx.try_recv().is_err(),
             "send on a saturated transport must park"
         );
+        let parked_outq = test_outq(&a);
         assert!(
-            test_outq(&a) > 0,
+            parked_outq > 0,
             "transport still saturated while the sender parks"
         );
         a.shutdown(std::net::Shutdown::Both)
@@ -4056,6 +4075,14 @@ mod tests {
             "released send must error, not silently succeed"
         );
         sender.join().expect("sender joins");
+        emit_phase(
+            "A1",
+            serde_json::json!({
+                "scope": "synthetic_socketpair", "capacity": capacity,
+                "outq": parked_outq, "eagain": eagain, "send_parked": true,
+                "shutdown_released_error": sent.is_err(), "sender_joined": true
+            }),
+        );
 
         // Phase 2: the same shape through a real zbus send. The relay
         // forwards the handshake, Hello, and liveness probe, then
@@ -4112,18 +4139,18 @@ mod tests {
         // The send MUST fill the transport: 8MB past a frozen drain.
         // Poll to saturation (must-happen event, bounded wait).
         let fill_deadline = Instant::now() + Duration::from_secs(30);
-        loop {
+        let saturated_outq = loop {
             let outq = test_outq(&observe);
             assert!(outq >= 0, "SIOCOUTQ must stay measurable, got {outq}");
             if outq as usize >= capacity {
-                break;
+                break outq;
             }
             assert!(
                 Instant::now() < fill_deadline,
                 "saturating send must fill the transport (outq {outq}, capacity {capacity})"
             );
             std::thread::sleep(Duration::from_millis(10));
-        }
+        };
         // Parked, not complete: completion needs the full write, the
         // write needs a drain, and the relay froze — so the send cannot
         // have completed. (A signal has no reply to wait for instead.)
@@ -4188,6 +4215,17 @@ mod tests {
         let inq = stats.last_client_inq.load(TestOrdering::Acquire);
         assert_ne!(inq, usize::MAX, "relay must have served the client");
         assert!(inq > 0, "frozen peer must retain unread client output");
+        emit_phase(
+            "A2",
+            serde_json::json!({
+                "scope": "synthetic_zbus_signal", "capacity": capacity,
+                "outq": saturated_outq, "c2d": forwarded,
+                "d2c": stats.d2c_forwarded.load(TestOrdering::Acquire), "inq": inq,
+                "send_parked": true, "close_parked": true,
+                "shutdown_released_error": send_result.is_err(),
+                "sender_joined": true, "closer_joined": true
+            }),
+        );
     }
 
     /// Test B — public `verify` against a frozen peer: the attempt's
@@ -4252,6 +4290,12 @@ mod tests {
         // sampled while the peer was still frozen alive.
         let forwarded = stats.c2d_forwarded.load(TestOrdering::Acquire);
         let inq = stats.last_client_inq.load(TestOrdering::Acquire);
+        let relay_live = !relay.done.load(TestOrdering::Acquire)
+            && relay
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished());
+        let daemon_forwarded = stats.d2c_forwarded.load(TestOrdering::Acquire);
         drop(relay);
         assert!(
             forwarded >= 256,
@@ -4280,5 +4324,15 @@ mod tests {
                 "non-fill branch: outcome {outcome:?} with zero sampled backlog"
             );
         }
+        emit_phase(
+            "B",
+            serde_json::json!({
+                "scope": "public_verify", "branch": if inq > 0 { "pending" } else { "non_fill" },
+                "inq": inq, "c2d": forwarded, "d2c": daemon_forwarded,
+                "peer_live_at_retirement": relay_live, "claim_free_before_teardown": true,
+                "outcome": format!("{outcome:?}"), "elapsed_ms": elapsed.as_millis(),
+                "claims": stub.calls().claims.len()
+            }),
+        );
     }
 }

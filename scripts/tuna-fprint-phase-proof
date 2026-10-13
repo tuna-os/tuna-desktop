@@ -1,0 +1,148 @@
+#!/usr/bin/python3
+"""CI-only exact built fingerprint phase receipts, without live UI/hardware claims."""
+import argparse
+import ctypes
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+sys.dont_write_bytecode = True
+CHILD_TIMEOUT = 200
+ROOT = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location("contract", ROOT / "scripts/lib/fprint_phase_contract.py")
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+
+def owned_processes(token):
+    result = []
+    for directory in Path("/proc").iterdir():
+        if not directory.name.isdecimal():
+            continue
+        try:
+            if directory.stat().st_uid != os.getuid():
+                continue
+            if f"TUNA_FPRINT_PHASE_OWNER={token}".encode() not in (directory / "environ").read_bytes().split(b"\0"):
+                continue
+            start = (directory / "stat").read_text().rsplit(")", 1)[1].split()[19]
+            result.append((int(directory.name), start))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return result
+
+
+def cleanup_owned(child, token):
+    # This wrapper is a subreaper. Reap inherited proof descendants after its
+    # own session/group was terminated, including daemonized private services.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try: os.killpg(child.pid, sig)
+        except ProcessLookupError: pass
+        for pid, start in owned_processes(token):
+            try:
+                if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19] == start:
+                    os.kill(pid, sig)
+            except (FileNotFoundError, ProcessLookupError): pass
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0]: pass
+            except ChildProcessError: pass
+            try: os.killpg(child.pid, 0)
+            except ProcessLookupError:
+                if not owned_processes(token): return True
+            time.sleep(.05)
+    return False
+
+
+
+def verify_unchanged(admission):
+    if contract.source_tuple(ROOT) != admission["source"]:
+        raise ValueError("source changed")
+    for r in admission["files"].values():
+        if any(contract.digest(r[k]) != r["sha256"] for k in ("cargo_executable", "admitted_executable")):
+            raise ValueError("executable changed")
+
+
+def run_filter(work, admission, number, filter_name, phases):
+    verify_unchanged(admission)
+    nonce = uuid.uuid4().hex
+    home = work / f"home-{number}"
+    home.mkdir(mode=0o700)
+    for directory in ("config", "data", "cache"): (home / directory).mkdir(mode=0o700)
+    env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+               XDG_DATA_HOME=str(home / "data"), XDG_CACHE_HOME=str(home / "cache"),
+               TUNA_FPRINT_PHASE_NONCE=nonce, TUNA_FPRINT_PHASE_OWNER=nonce,
+               PYTHONDONTWRITEBYTECODE="1")
+    for name in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "AT_SPI_BUS_ADDRESS"):
+        env.pop(name, None)
+    path = work / f"output-{number}.txt"
+    argv = [admission["files"]["tuna_compositor"]["admitted_executable"],
+            filter_name, "--exact", "--nocapture", "--test-threads=1"]
+    with path.open("wb") as output:
+        child = subprocess.Popen(argv, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        try: status = child.wait(timeout=CHILD_TIMEOUT)
+        except subprocess.TimeoutExpired: status = 124
+        clean = cleanup_owned(child, nonce)
+        child.poll()  # Refresh Popen after subreaper cleanup may reap its leader.
+    receipt = {"filter": filter_name, "pid": child.pid, "nonce": nonce, "argv": argv,
+               "exit": status, "owned_cleanup": clean, "output_sha256": contract.digest(path)}
+    (work / f"child-{number}.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    verify_unchanged(admission)
+    if status != 0 or not clean: raise ValueError("child failed/timed out or leaked owned processes")
+    if path.stat().st_size > 1024 * 1024: raise ValueError("phase output exceeds budget")
+    return contract.phase_vectors(path.read_text(), nonce, child.pid, phases)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--artifacts", type=Path, required=True)
+    args = p.parse_args()
+    work = args.artifacts.resolve()
+    work.mkdir(parents=True, exist_ok=False)
+    if ctypes.CDLL(None, use_errno=True).prctl(36,1,0,0,0) != 0: raise OSError("subreaper unavailable")
+    ci = contract.current_identity(ROOT)
+    source = contract.source_tuple(ROOT)
+    (work / "api-admission.json").write_text(json.dumps(ci, indent=2) + "\n")
+    target = work / "target"
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target), CARGO_PROFILE_DEV_DEBUG="0", CARGO_INCREMENTAL="0")
+    messages = []
+    for i, command in enumerate((
+        ["cargo","test","--locked","-p","tuna-compositor","--lib","--no-run","--message-format=json"],
+        ["cargo","build","--locked","-p","tuna-compositor","--bin","tuna-compositor","--message-format=json"],
+    )):
+        if shutil.disk_usage(work).free < 3 * 1024**3: raise ValueError("insufficient reserved build capacity")
+        log = work / f"cargo-{i}.json"
+        with log.open("w") as out: subprocess.run(command,cwd=ROOT,env=env,stdout=out,check=True,timeout=1800)
+        if log.stat().st_size > 32 * 1024**2: raise ValueError("Cargo JSON budget exceeded")
+        messages.extend(json.loads(line) for line in log.read_text().splitlines())
+    files = contract.select_artifacts(messages, ROOT, target)
+    bins = work / "bin"
+    bins.mkdir()
+    for name, record in files.items():
+        copied = bins / name
+        shutil.copy2(record["cargo_executable"],copied)
+        record["admitted_executable"] = str(copied)
+    admission = {"ci":ci,"source":source,"files":files,
+                 "build_env":{k:env.get(k) for k in ("CARGO_TARGET_DIR","CARGO_PROFILE_DEV_DEBUG","CARGO_INCREMENTAL","RUSTFLAGS")},
+                 "scope":"test foundation only; compositor bin compiled/admitted, not executed; driver exit unobserved"}
+    (work / "build-admission.json").write_text(json.dumps(admission,indent=2)+"\n")
+    vectors = {}
+    for i, (name, phases) in enumerate((
+        ("saturated_send_parks_close_until_fd_shutdown", ("A1","A2")),
+        ("frozen_peer_leaves_attempt_output_pending_and_bounded", ("B",)),
+    )):
+        vectors.update(run_filter(work,admission,i,"fprintd::tests::"+name,phases))
+    (work / "measured-phases.json").write_text(json.dumps(vectors,indent=2)+"\n")
+    contract.positive(vectors)
+    verify_unchanged(admission)
+    (work / "qualification.json").write_text(json.dumps({"pending_output_qualified":True,"driver_exit":"unobserved","live_ui":False,"hardware":False})+"\n")
+
+
+if __name__ == "__main__":
+    main()
