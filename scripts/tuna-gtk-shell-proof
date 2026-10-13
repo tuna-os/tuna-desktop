@@ -4915,7 +4915,11 @@ wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-press.json" 20 --press "Take" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "could not press Take"
 cstate '.wellbeing_effects.brightness < 1' "fade started" 10 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "Take produced no fade"
-cstate '.wellbeing_effects.brightness == 0.6' "fade settled" 10 ||
+# The compositor stores effects as f32: settled brightness serializes as
+# 0.6000000238418579, which exact f64 equality can never match. Compare
+# within 1e-6 of the unchanged 0.6 target instead, and require the ramp
+# to have finished so a still-running pass near target cannot qualify.
+cstate '(.wellbeing_effects.animating == false) and ((.wellbeing_effects.brightness - 0.6 | if . < 0 then -. else . end) < 0.000001)' "fade settled" 10 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "the fade did not settle at 0.6"
 # Re-freeze the settled fade for its bracketed capture: progress already
 # reached 1, so freezing holds 0.6 instead of stalling a live ramp.

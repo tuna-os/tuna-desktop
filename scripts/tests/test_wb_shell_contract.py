@@ -10,7 +10,11 @@ captures inherit their gate freeze via wb_step_ramp (unchanged) and
 are out of scope here. Fail guards must use explicit if blocks: an
 `A && B || fail` chain trips CI shellcheck SC2015.
 """
+import json
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -87,6 +91,66 @@ class FailChainShape(unittest.TestCase):
             if re.search(r'&&[^;\n]*\|\|[^;\n]*\bfail\b', code):
                 bad.append(line.strip())
         self.assertEqual(bad, [])
+
+
+class FadeSettleFilter(unittest.TestCase):
+    """The take-fade settle filter must admit the actual f32 0.6 bytes.
+
+    The compositor stores effects as f32, so settled brightness
+    serializes as 0.6000000238418579; CI 38399013279 proved exact f64
+    equality rejects the settled frame forever (animating false, both
+    jobs). The filter below is extracted from the proof itself, not
+    copied, and must still reject genuinely unsettled values.
+    """
+    F32_06 = 0.6000000238418579
+
+    @classmethod
+    def setUpClass(cls):
+        jq = shutil.which('jq')
+        assert jq is not None, 'jq is required (GitHub ubuntu runners ship it)'
+        cls.jq = jq
+        match = re.search(r"cstate '([^']+)' \"fade settled\"",
+                          PROOF.read_text())
+        assert match is not None, 'fade-settled cstate line went missing'
+        cls.filt = match.group(1)
+
+    _MISSING = object()
+
+    def run_filter(self, brightness, animating=False):
+        effects = {'brightness': brightness}
+        if animating is not self._MISSING:
+            effects['animating'] = animating
+        with tempfile.NamedTemporaryFile('w', suffix='.json',
+                                         delete=True) as tmp:
+            json.dump({'wellbeing_effects': effects}, tmp)
+            tmp.flush()
+            proc = subprocess.run([self.jq, '-e', self.filt, tmp.name],
+                                  capture_output=True, text=True)
+        return proc.returncode
+
+    def test_settled_f32_admitted(self):
+        self.assertEqual(self.run_filter(self.F32_06, animating=False), 0)
+
+    def test_exact_f64_admitted(self):
+        self.assertEqual(self.run_filter(0.6, animating=False), 0)
+
+    def test_live_ramp_rejected(self):
+        for value in (0.9, 0.7, 0.61, 0.59, 1.0):
+            with self.subTest(brightness=value):
+                self.assertNotEqual(
+                    self.run_filter(value, animating=False), 0)
+
+    def test_running_ramp_at_target_rejected(self):
+        for value in (self.F32_06, 0.6):
+            with self.subTest(brightness=value):
+                self.assertNotEqual(
+                    self.run_filter(value, animating=True), 0)
+
+    def test_missing_animating_rejected(self):
+        for value in (self.F32_06, 0.6):
+            with self.subTest(brightness=value):
+                self.assertNotEqual(
+                    self.run_filter(value, animating=self._MISSING), 0)
 
 
 if __name__ == '__main__':
