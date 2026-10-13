@@ -39,6 +39,7 @@ jobs:
       - run: scripts/rename-to-tuna --check --no-cargo
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
+      - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
       - run: python3 scripts/lib/ledger-tests.py
@@ -48,6 +49,7 @@ jobs:
       - run: python3 scripts/lib/tuna-perf-payload-tests.py
       - run: python3 scripts/lib/tuna-perf-reference-tests.py
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
+      - run: python3 scripts/ibus-property-proof-tests.py
       - run: python3 scripts/lib/grid-target-settled-tests.py
       - run: python3 scripts/lib/tuna-a11y-dump-tests.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
@@ -65,6 +67,7 @@ jobs:
           python3 scripts/tests/test_auth_proof_process.py
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
+      - run: python3 scripts/tests/test_wb_shell_contract.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
       - run: python3 scripts/lib/tuna-perf-repeatability-tests.py
       - run: python3 scripts/lib/native-constraint-tests.py

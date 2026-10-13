@@ -43,6 +43,11 @@ impl Controller {
         if self.busy() {
             return Effect::Render;
         }
+        if self.model.wants_fingerprint() {
+            // No device verification is started by this typed submission path.
+            self.model.notice = Some(crate::model::FINGERPRINT_TYPED_NOTICE.into());
+            return Effect::Render;
+        }
         let command = if self.model.current_prompt().is_some() {
             Command::Answer(Some(answer))
         } else {
@@ -185,6 +190,46 @@ mod tests {
             description: "private service detail".into(),
         }
     }
+    #[test]
+    fn fingerprint_typed_submission_is_refused_and_cancel_still_retires_conversation() {
+        for style in [AuthMessageType::Secret, AuthMessageType::Visible] {
+            let mut c = Controller::default();
+            c.submit("ada", String::new(), Some(&session()));
+            assert!(matches!(
+                c.receive(Ok(Response::AuthMessage {
+                    auth_message_type: style,
+                    auth_message: "Place your finger on the fingerprint reader".into(),
+                })),
+                Effect::Render
+            ));
+            assert!(!c.busy());
+            assert!(c.model.wants_fingerprint());
+            assert!(matches!(
+                c.submit("ada", "must-not-be-sent".into(), Some(&session())),
+                Effect::Render
+            ));
+            assert!(!c.busy());
+            assert_eq!(
+                c.model.notice.as_deref(),
+                Some(crate::model::FINGERPRINT_TYPED_NOTICE)
+            );
+            assert!(matches!(c.cancel(), Effect::Send(Command::Cancel)));
+            assert!(matches!(c.receive(Ok(Response::Success)), Effect::Render));
+            assert!(c.model.pending.is_empty());
+            assert!(!c.busy());
+            // A fresh normal conversation can still accept a fresh typed value.
+            assert!(matches!(
+                c.submit("ada", String::new(), Some(&session())),
+                Effect::Send(Command::Create(_))
+            ));
+            c.receive(Ok(prompt()));
+            assert!(
+                matches!(c.submit("ada", "fresh-password".into(), Some(&session())),
+                Effect::Send(Command::Answer(Some(value))) if value == "fresh-password")
+            );
+        }
+    }
+
     #[test]
     fn launch_requires_success_reply_and_rejected_launch_resets_before_retry() {
         let mut c = Controller::default();

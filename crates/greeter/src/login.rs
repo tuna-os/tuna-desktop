@@ -68,7 +68,11 @@ fn render(state: &State) {
     let prompt = model.current_prompt();
     w.prompt
         .set_label(prompt.map_or("Username", |p| p.text.as_str()));
-    w.answer.set_visible(prompt.is_some());
+    let typed_supported = !model.wants_fingerprint();
+    if !typed_supported {
+        w.answer.set_text("");
+    }
+    w.answer.set_visible(prompt.is_some() && typed_supported);
     w.answer.set_visibility(!prompt.is_some_and(|p| p.secret));
     w.answer
         .set_input_purpose(if prompt.is_some_and(|p| p.secret) {
@@ -79,19 +83,25 @@ fn render(state: &State) {
     let idle = !state.controller.busy() && model.screen != Screen::Launching;
     w.username.set_sensitive(idle && prompt.is_none());
     w.sessions.set_sensitive(idle && prompt.is_none());
-    w.answer.set_sensitive(idle && prompt.is_some());
-    w.submit.set_sensitive(idle && !state.sessions.is_empty());
+    w.answer
+        .set_sensitive(idle && prompt.is_some() && typed_supported);
+    w.submit
+        .set_sensitive(idle && !state.sessions.is_empty() && typed_supported);
     w.cancel.set_sensitive(
         model.user.is_some() && model.screen != Screen::Launching && !state.controller.cancelling(),
     );
     w.notice.set_label(if state.controller.cancelling() {
         "Canceling…"
+    } else if !typed_supported {
+        crate::model::FINGERPRINT_TYPED_NOTICE
     } else {
         model.notice.as_deref().unwrap_or("")
     });
     w.notice.set_visible(!w.notice.text().is_empty());
     if idle {
-        if prompt.is_some() {
+        if !typed_supported {
+            w.cancel.grab_focus();
+        } else if prompt.is_some() {
             w.answer.grab_focus();
         } else {
             w.username.grab_focus();
@@ -246,7 +256,11 @@ pub fn build_login(
             let mut state = state.borrow_mut();
             let w = &state.widgets;
             let user = w.username.text().to_string();
-            let answer = w.answer.text().to_string();
+            let answer = if state.controller.model.wants_fingerprint() {
+                String::new()
+            } else {
+                w.answer.text().to_string()
+            };
             let selected = state.sessions.get(w.sessions.selected() as usize).cloned();
             let effect = state.controller.submit(&user, answer, selected.as_ref());
             // Clear only accepted submissions. Busy/refused activations retain

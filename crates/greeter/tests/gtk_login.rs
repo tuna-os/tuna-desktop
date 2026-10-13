@@ -97,6 +97,17 @@ fn live_greetd_gtk_prompt_cancel_retry_and_handoff() {
             auth(AuthMessageType::Secret, "Pending password:"),
         );
         exchange(&mut stream, "cancel", Response::Success);
+        // A marked device prompt cannot receive a typed answer, including
+        // programmatic activation of the real GTK callbacks.
+        exchange(
+            &mut stream,
+            "create",
+            auth(
+                AuthMessageType::Secret,
+                "Place your finger on the fingerprint reader",
+            ),
+        );
+        exchange(&mut stream, "cancel", Response::Success);
         // PAM informational/error messages acknowledge without a password.
         exchange(
             &mut stream,
@@ -283,6 +294,29 @@ fn live_greetd_gtk_prompt_cancel_retry_and_handoff() {
                     capture("pending-cancelled");
                     widgets.username.set_text("ada");
                     widgets.submit.emit_clicked();
+                    stage.set(32);
+                }
+                32 if prompt == "Place your finger on the fingerprint reader"
+                    && notice == tuna_greeter::model::FINGERPRINT_TYPED_NOTICE =>
+                {
+                    assert!(!ready);
+                    assert!(!gtk4::prelude::WidgetExt::is_visible(&widgets.answer));
+                    assert!(!widgets.answer.is_sensitive());
+                    assert!(widgets.cancel.is_sensitive());
+                    capture("fingerprint-typed-blocked");
+                    widgets.answer.set_text("must-not-send");
+                    widgets.submit.emit_clicked();
+                    assert!(widgets.answer.text().is_empty());
+                    widgets.answer.set_text("must-not-send");
+                    widgets.answer.emit_activate();
+                    assert!(widgets.answer.text().is_empty());
+                    assert!(!widgets.submit.is_sensitive());
+                    widgets.cancel.emit_clicked();
+                    stage.set(33);
+                }
+                33 if ready && prompt == "Username" && notice.is_empty() => {
+                    widgets.username.set_text("ada");
+                    widgets.submit.emit_clicked();
                     stage.set(5);
                 }
                 5 if notice == "Welcome notice" => {
@@ -358,5 +392,5 @@ fn live_greetd_gtk_prompt_cancel_retry_and_handoff() {
         "quit requires successful actual StartSession reply"
     );
     peer.join().unwrap();
-    std::fs::write(PathBuf::from(std::env::var_os("TUNA_GREETER_ARTIFACTS").unwrap()).join("assertions.txt"),"G-GREETER-GTK-PROMPTS PASS\nG-GREETER-CANCEL-RETRY PASS\nG-GREETER-START-REPLY PASS\nG-GREETER-WORKER-RESPONSIVE PASS\nG-GREETER-SECRET-WIDGET-CLEAR PASS\n").unwrap();
+    std::fs::write(PathBuf::from(std::env::var_os("TUNA_GREETER_ARTIFACTS").unwrap()).join("assertions.txt"),"G-GREETER-GTK-PROMPTS PASS\nG-GREETER-CANCEL-RETRY PASS\nG-GREETER-START-REPLY PASS\nG-GREETER-WORKER-RESPONSIVE PASS\nG-GREETER-SECRET-WIDGET-CLEAR PASS\nG-GREETER-FPRINT-TYPED-DENIAL PASS\n").unwrap();
 }

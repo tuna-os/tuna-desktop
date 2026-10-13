@@ -23,6 +23,7 @@ mod folder_dialog;
 mod folders;
 mod group_animation;
 mod ibus_panel;
+mod ibus_property_menu;
 mod kbd_a11y;
 mod keybindings;
 mod live_apps;
@@ -306,11 +307,13 @@ fn panel_menu_open(
     clock: &gtk::MenuButton,
     system: &gtk::MenuButton,
     a11y: &gtk::MenuButton,
+    input: &gtk::MenuButton,
     tray: &gtk::Box,
 ) -> bool {
     clock.is_active()
         || system.is_active()
         || a11y.is_active()
+        || input.is_active()
         || tray_menu_buttons(tray).iter().any(|b| b.is_active())
 }
 
@@ -322,10 +325,11 @@ fn close_panel_menus(
     clock: &gtk::MenuButton,
     system: &gtk::MenuButton,
     a11y: &gtk::MenuButton,
+    input: &gtk::MenuButton,
     tray: &gtk::Box,
     guard: &Cell<panel_focus::EscapeGuard>,
 ) {
-    let mut buttons = vec![clock.clone(), system.clone(), a11y.clone()];
+    let mut buttons = vec![clock.clone(), system.clone(), a11y.clone(), input.clone()];
     buttons.extend(tray_menu_buttons(tray));
     for button in buttons {
         if button.is_active() {
@@ -1415,6 +1419,12 @@ fn build(app: &adw::Application) {
     let end = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     end.append(&screencast::indicator(&recorder));
     let a11y = accessibility::menu();
+    let ibus_properties = ibus_property_menu::PropertyMenu::new({
+        let shell = shell.clone();
+        // No action while compositor identity/lock state is unavailable.
+        Rc::new(move || shell.borrow().control.as_ref().is_none_or(|c| c.locked()))
+    });
+    let input = ibus_properties.button.clone();
     // Escape inside a tray popover: the popover's grab delivers the key
     // to the popover, never to our window controller — each tray menu
     // calls this instead of closing natively, so the hold survives and
@@ -1426,12 +1436,13 @@ fn build(app: &adw::Application) {
             panel_held.clone(),
             panel_escape_guard.clone(),
         );
-        let (clock, system, a11y) = (clock.clone(), system.clone(), a11y.clone());
+        let (clock, system, a11y, input) =
+            (clock.clone(), system.clone(), a11y.clone(), input.clone());
         Rc::new(move |button: &gtk::MenuButton| {
             if !held.get() {
                 return glib::Propagation::Proceed;
             }
-            for other in [&clock, &system, &a11y] {
+            for other in [&clock, &system, &a11y, &input] {
                 if other.is_active() {
                     if let Some(popover) = other.popover() {
                         if popover.is_visible() {
@@ -1476,6 +1487,7 @@ fn build(app: &adw::Application) {
         )
     };
     end.append(&tray_box);
+    end.append(&input);
     end.append(&a11y);
     end.append(&system);
     bar.set_end_widget(Some(&end));
@@ -1483,7 +1495,7 @@ fn build(app: &adw::Application) {
     // A panel menu closing any other way (item activation, outside
     // click) returns focus to the client, as in GNOME. No-op unless
     // Ctrl+Alt+Tab holds the bar.
-    for button in [&clock, &system, &a11y] {
+    for button in [&clock, &system, &a11y, &input] {
         if let Some(popover) = button.popover() {
             // Cloned before the shadowing bindings below are moved
             // into the signal closures.
@@ -1492,10 +1504,11 @@ fn build(app: &adw::Application) {
                 panel_held.clone(),
                 panel_escape_guard.clone(),
             );
-            let (clock_e, system_e, a11y_e, tray_box_e) = (
+            let (clock_e, system_e, a11y_e, input_e, tray_box_e) = (
                 clock.clone(),
                 system.clone(),
                 a11y.clone(),
+                input.clone(),
                 tray_box.clone(),
             );
             let guard = panel_escape_guard.clone();
@@ -1529,7 +1542,14 @@ fn build(app: &adw::Application) {
                 if key != Key::Escape || !held_e.get() {
                     return glib::Propagation::Proceed;
                 }
-                close_panel_menus(&clock_e, &system_e, &a11y_e, &tray_box_e, &guard_e);
+                close_panel_menus(
+                    &clock_e,
+                    &system_e,
+                    &a11y_e,
+                    &input_e,
+                    &tray_box_e,
+                    &guard_e,
+                );
                 assert_panel_hold(&window_e, &held_e);
                 glib::Propagation::Stop
             });
@@ -1541,13 +1561,14 @@ fn build(app: &adw::Application) {
     // the overview (the pointer path stays the compositor's press
     // region); Left/Right walk the bar while no menu owns the arrows.
     {
-        let (window, bar, activities, clock, system, a11y, tray_box, held, guard) = (
+        let (window, bar, activities, clock, system, a11y, input, tray_box, held, guard) = (
             window.clone(),
             bar.clone(),
             activities.clone(),
             clock.clone(),
             system.clone(),
             a11y.clone(),
+            input.clone(),
             tray_box.clone(),
             panel_held.clone(),
             panel_escape_guard.clone(),
@@ -1569,10 +1590,10 @@ fn build(app: &adw::Application) {
                 Key::Escape => {
                     match panel_focus::escape(
                         true,
-                        panel_menu_open(&clock, &system, &a11y, &tray_box),
+                        panel_menu_open(&clock, &system, &a11y, &input, &tray_box),
                     ) {
                         panel_focus::EscapeOutcome::CloseMenus => {
-                            close_panel_menus(&clock, &system, &a11y, &tray_box, &guard);
+                            close_panel_menus(&clock, &system, &a11y, &input, &tray_box, &guard);
                             // Closing keeps panel focus by contract: the
                             // hold is re-asserted unconditionally (a no-op
                             // when the guard already held it), so the bar
@@ -1600,7 +1621,7 @@ fn build(app: &adw::Application) {
                 Key::Left | Key::Right
                     if panel_focus::arrows_walk_bar(
                         true,
-                        panel_menu_open(&clock, &system, &a11y, &tray_box),
+                        panel_menu_open(&clock, &system, &a11y, &input, &tray_box),
                     ) =>
                 {
                     bar.child_focus(if key == Key::Left {
@@ -1910,7 +1931,7 @@ fn build(app: &adw::Application) {
     network_agent::start(app.upcast_ref());
 
     // GNOME Shell is IBus's panel: it draws the candidate window.
-    ibus_panel::start(app.upcast_ref());
+    ibus_panel::start(app.upcast_ref(), ibus_properties.clone());
 
     // GNOME's workspace switcher popup.
     let workspace_popup = ws_popup::WorkspacePopup::new(app.upcast_ref());
@@ -2717,6 +2738,7 @@ fn build(app: &adw::Application) {
                 notify.release_focus();
                 release_panel_focus(&panel_focus_window, &panel_focus_held);
             }
+            ibus_properties.sync_lock();
             lock_ui.sync_connection_generation(auth_generation);
             if let Some(locked) = authoritative_lock {
                 lock_ui.sync(locked);

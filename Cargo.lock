@@ -4214,6 +4214,7 @@ dependencies = [
  "tempfile",
  "tuna-shell-control",
  "tuna-shell-host",
+ "unicode-segmentation",
  "xkbcommon 0.9.0",
 ]
 

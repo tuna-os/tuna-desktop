@@ -140,7 +140,6 @@ fn client() {
         },
     );
     result(&mut a, 2, false);
-    drop(a);
     let mut replacement = connect();
     send(
         &mut replacement,
@@ -150,12 +149,35 @@ fn client() {
         },
     );
     result(&mut replacement, 1, false);
-    std::fs::write(root.join("release-1"), b"1").unwrap();
-    wait(|| root.join("done-1").exists() && state(&root)["auth_owner"]["outer_pending"] == false);
+    let canceled = Instant::now();
+    drop(a);
+    if std::env::var(ROLE).as_deref() == Ok("3") {
+        let helper: u32 = std::fs::read_to_string(root.join("started-1"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        wait(|| {
+            !Path::new(&format!("/proc/{helper}")).exists()
+                && state(&root)["auth_owner"]["outer_pending"] == false
+        });
+        assert!(
+            canceled.elapsed() < Duration::from_secs(2),
+            "origin loss must wake the actual PAM read"
+        );
+        assert!(
+            !root.join("release-1").exists() && !root.join("done-1").exists(),
+            "retirement must not require releasing the hung module"
+        );
+    } else {
+        std::fs::write(root.join("release-1"), b"1").unwrap();
+        wait(|| {
+            root.join("done-1").exists() && state(&root)["auth_owner"]["outer_pending"] == false
+        });
+    }
     assert_eq!(
         state(&root)["locked"],
         true,
-        "late successful greetd result from closed origin cannot unlock"
+        "closed-origin completion cannot unlock"
     );
     loop {
         match replacement.read_frame() {
@@ -205,9 +227,12 @@ fn client() {
     std::fs::write(root.join("success.json"),serde_json::to_vec(&serde_json::json!({
         "supervised_client_pid":std::process::id(), "manual_epoch":1,"unlock_epoch":2,"idle_epoch":3,
         "concurrent_other_same_id_denied":true,"same_session_excess_denied":true,
-        "replacement_same_id_busy_denied":true,"late_closed_origin_success_denied":true,
+        "replacement_same_id_busy_denied":true,
+        "late_closed_origin_success_denied":std::env::var(ROLE).as_deref()!=Ok("3"),
+        "closed_origin_canceled_retired":std::env::var(ROLE).as_deref()==Ok("3"),
         "fresh_origin_success":true,
         "held_self_path_replaced":std::env::var(ROLE).as_deref()==Ok("3"),
+        "origin_loss_wakes_private_pam_without_fixture_release":std::env::var(ROLE).as_deref()==Ok("3"),
         "scope":if std::env::var(ROLE).as_deref()==Ok("3") { "actual main Runtime PAM: stable held image, old origin denied, actual retirement; not hardware/MFA/S3" } else { "actual nested outer-wrapper ownership; no PAM retirement" }
     })).unwrap()).unwrap();
     // Keep the supervised process alive until parent sends graceful termination.

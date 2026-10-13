@@ -5,6 +5,10 @@
 
 use greetd_ipc::{AuthMessageType, Response};
 
+/// This is a typed-input refusal, not a claim that a reader is available.
+pub const FINGERPRINT_TYPED_NOTICE: &str =
+    "Typed answers are unavailable for this prompt. Cancel to choose another sign-in method.";
+
 /// One auth question to render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
@@ -112,7 +116,7 @@ impl GreeterModel {
     }
 
     /// True when the current prompt asks for a fingerprint (#366):
-    /// the UI shows a touch hint and unlock must not answer it with
+    /// consumers block typed answers; unlock must not answer it with
     /// the typed password.
     pub fn wants_fingerprint(&self) -> bool {
         self.current_prompt().is_some_and(|p| p.fingerprint)

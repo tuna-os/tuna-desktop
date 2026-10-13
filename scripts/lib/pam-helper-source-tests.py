@@ -20,7 +20,16 @@ class SourceContracts(unittest.TestCase):
             self.assertNotIn(symbol, helper)
         backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
         self.assertIn('SelfImage::capture()', backend)
-        self.assertIn('image.spawn(identity, service, user, budget)', backend)
+        live = backend.split('pub fn live() -> Option<Self> {', 1)[1].split('/// Trusted Rust fixture seam,', 1)[0]
+        self.assertIn('let image = SelfImage::capture().ok()?;', live)
+        self.assertIn('move |identity, service, user, budget, cancel|', live)
+        self.assertIn('image.spawn_cancellable(identity, service, user, budget, cancel)', live)
+        self.assertNotIn('Supervisor::spawn', live)
+        self.assertNotIn('Cancellation::default()', live)
+        cancellable = helper.split('pub fn spawn_cancellable(', 1)[1].split('/// Blocking foundation API:', 1)[0]
+        self.assertIn('Supervisor::spawn_inner(', cancellable)
+        self.assertIn('Some(self.file.clone())', cancellable)
+        self.assertIn('Some(cancel)', cancellable)
         self.assertIn('File::open("/proc/self/exe")', helper)
         self.assertIn('self.file.as_raw_fd()', helper)
         self.assertIn('_source_image: source_image', helper)

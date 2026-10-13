@@ -63,7 +63,7 @@ class Admission(unittest.TestCase):
         (self.out/'test-epoch.log').write_text('auth owner probe sha256: '+r['executables'][str(self.probe)]+'\n')
         (self.out/'runtime-pam').mkdir(exist_ok=True)
         (self.out/'runtime-pam/success.json').write_text(json.dumps({
-            'late_closed_origin_success_denied': True, 'fresh_origin_success': True,
+            'closed_origin_canceled_retired': True, 'origin_loss_wakes_private_pam_without_fixture_release': True, 'fresh_origin_success': True,
             'held_self_path_replaced': True, 'compositor_sha256': r['executables'][str(self.bin)]}))
         (self.out/'test-pam.log').write_text('auth owner pam sha256: '+r['executables'][str(self.bin)]+'\n')
         return r
@@ -148,7 +148,7 @@ class Admission(unittest.TestCase):
 
 
     def test_actual_pam_receipt_false_or_wrong_image_refused(self):
-        for field, wrong in [('late_closed_origin_success_denied', False), ('fresh_origin_success', False),
+        for field, wrong in [('closed_origin_canceled_retired', False), ('origin_loss_wakes_private_pam_without_fixture_release', False), ('fresh_origin_success', False),
                              ('held_self_path_replaced', False), ('compositor_sha256', '0'*64)]:
             self.admit()
             path = self.out/'runtime-pam/success.json'

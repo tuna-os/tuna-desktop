@@ -20,6 +20,7 @@ pub mod extensions;
 pub use error::ShellHostError;
 pub mod favorites;
 pub mod ibus;
+pub mod ibus_properties;
 pub mod icons;
 pub mod intake;
 pub mod introspect;
