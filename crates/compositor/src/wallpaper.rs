@@ -1688,6 +1688,8 @@ mod tests {
         }
         let pixels: std::sync::Arc<[u8]> = pixels.into();
         wallpaper.loaded.push(Loaded {
+            paint: None,
+            epoch: None,
             uri: "test-image".into(),
             size: Some(output),
             pixels: Some(pixels.clone()),
@@ -1751,6 +1753,8 @@ mod tests {
         let synchronous_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut wallpaper = Wallpaper::new();
         wallpaper.loaded.push(Loaded {
+            paint: None,
+            epoch: None,
             uri: "timing-image".into(),
             size: Some(output),
             pixels: Some(pixels),
