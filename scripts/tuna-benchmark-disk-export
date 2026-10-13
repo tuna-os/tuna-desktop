@@ -14,6 +14,7 @@ from tuna_benchmark_disk import digest, provenance, require, storage_receipt, de
 from tuna_benchmark_esp import repair as repair_esp, Commands, retire_backing
 from tuna_benchmark_footprint import image_footprints, disk_evidence
 from tuna_dense_decode import observe as dense_decode
+import tuna_raw_gzip
 
 
 def discard_failed_disk(commands,disk):
@@ -24,6 +25,7 @@ def discard_failed_disk(commands,disk):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--format', choices=['qcow2', 'raw-gzip'], default='qcow2')
     p.add_argument('--profile', choices=['stock', 'diagnostic'], required=True)
     p.add_argument('--ssh-public-key-file', type=Path, required=True)
     p.add_argument('--artifacts', type=Path, default=Path('benchmark-disk'))
@@ -35,7 +37,7 @@ def main():
     artifacts.mkdir(parents=True)
     args.scratch.mkdir(parents=True, exist_ok=False)
     raw = args.scratch/'disk.raw'
-    disk = artifacts/'disk.qcow2'
+    disk = artifacts/('disk.raw.gz' if args.format == 'raw-gzip' else 'disk.qcow2')
     receipt = {'schema': 1, 'export_succeeded': False, 'performance_qualified': False}
     result_code = 1
     profile_root = ROOT/'perf-artifacts'
@@ -120,6 +122,7 @@ def main():
             'scripts/lib/tuna_benchmark_esp.py', 'scripts/lib/tuna_benchmark_kernel.py', 'scripts/lib/tuna_benchmark_footprint.py',
             'scripts/lib/tuna_dense_decode.py', 'scripts/lib/tuna_dense_decode_worker.py',
             'scripts/lib/tuna_dense_process.py', 'scripts/lib/tuna_dense_tool_identity.json',
+            'scripts/lib/tuna_raw_gzip.py',
             'packaging/marlin/perf/Containerfile.baseline', 'packaging/marlin/perf/Containerfile',
             'packaging/marlin/Containerfile']}
         receipt['gnome_version'] = output(['sudo', 'podman', 'run', '--rm', image, 'gnome-shell', '--version']).strip()
@@ -141,18 +144,27 @@ def main():
                        profile_root/'baseline-critical.sha256', receipt['esp_repair'],
                        artifacts/'esp-repair.log',expected_kernel_package=receipt['kernel_package'])
         receipt['raw_sha256'] = digest(raw)
-        run(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', '-c', str(raw), str(disk)], 'disk-convert')
-        run(['qemu-img', 'check', '-f', 'qcow2', str(disk)], 'disk-check')
-        info = json.loads(output(['qemu-img', 'info', '--output=json', str(disk)]))
-        mapping = json.loads(output(['qemu-img', 'map', '--output=json', str(disk)]))
-        receipt['storage_evidence_sha256'] = disk_evidence(artifacts, disk, raw, info, mapping)
-        receipt['dense_decode'] = dense_decode(commands, artifacts, args.scratch, disk, receipt['raw_sha256'], info, receipt)
-        require(receipt['dense_decode'].get('owned_cleanup', True), 'dense diagnostic cleanup unconfirmed')
-        try:
-            receipt['historical_compact_storage'] = storage_receipt(info, mapping, disk.stat().st_size)
-        except ValueError as historical_error:
-            receipt['historical_compact_storage_error'] = str(historical_error)
-        receipt['storage'] = dense_full_paired_storage_receipt(info, mapping, disk.stat().st_size)
+        if args.format == 'raw-gzip':
+            receipt['phase'] = 'raw-gzip-compress-and-verify'
+            raw_gzip = json.loads(commands.call([
+                sys.executable, str(ROOT/'scripts/lib/tuna_raw_gzip.py'), 'compress',
+                '--input', str(raw), '--output', str(disk), '--sha256', receipt['raw_sha256']],
+                timeout=900, max_output=1024*1024)[1])
+            receipt['raw_gzip'] = raw_gzip
+            receipt['storage'] = tuna_raw_gzip.storage(raw_gzip)
+        else:
+            run(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', '-c', str(raw), str(disk)], 'disk-convert')
+            run(['qemu-img', 'check', '-f', 'qcow2', str(disk)], 'disk-check')
+            info = json.loads(output(['qemu-img', 'info', '--output=json', str(disk)]))
+            mapping = json.loads(output(['qemu-img', 'map', '--output=json', str(disk)]))
+            receipt['storage_evidence_sha256'] = disk_evidence(artifacts, disk, raw, info, mapping)
+            receipt['dense_decode'] = dense_decode(commands, artifacts, args.scratch, disk, receipt['raw_sha256'], info, receipt)
+            require(receipt['dense_decode'].get('owned_cleanup', True), 'dense diagnostic cleanup unconfirmed')
+            try:
+                receipt['historical_compact_storage'] = storage_receipt(info, mapping, disk.stat().st_size)
+            except ValueError as historical_error:
+                receipt['historical_compact_storage_error'] = str(historical_error)
+            receipt['storage'] = dense_full_paired_storage_receipt(info, mapping, disk.stat().st_size)
         receipt['disk_sha256'] = digest(disk)
         receipt['evidence'] = {}
         for name in ['reference-image.json', 'baseline-critical.sha256', 'baseline-packages.txt',
@@ -160,10 +172,13 @@ def main():
             target = artifacts/name
             shutil.copy2(profile_root/name, target)
             receipt['evidence'][name] = digest(target)
-        (artifacts/'SHA256SUMS').write_text(receipt['disk_sha256']+'  disk.qcow2\n')
-        receipt.update(export_succeeded=True, phase='complete', disk_format='qcow2',
+        (artifacts/'SHA256SUMS').write_text(receipt['disk_sha256']+'  '+disk.name+'\n')
+        receipt.update(export_succeeded=True, phase='complete', disk_format=args.format,
+                       import_method=('raw-gzip-upload' if args.format == 'raw-gzip' else 'qcow2-upload'),
                        import_transport='authenticated CI artifact download/extract then owned CDI upload; artifact ZIP is not an HTTP qcow2 endpoint',
                        firmware='uefi', requested_pvc=DENSE_FULL_PAIRED_REQUESTED_PVC, node_storage_qualified=False)
+        if args.format == 'raw-gzip':
+            receipt['requested_pvc'] = '20Gi'
         result_code = 0
     except Exception as error:
         receipt['error'] = str(error)

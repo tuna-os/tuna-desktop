@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Owned tiny RAW.gzip CDI upload diagnostic. Never a benchmark/image qualification."""
+import argparse,hashlib,json,os
+from pathlib import Path
+import re,signal,subprocess,sys,time,uuid
+sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
+from corral_perf import kubectl,capacity_receipt,node_name,GIB
+from corral_session import owned_listener,readback_prefix
+import corral_owned
+import tuna_raw_gzip
+import corral_gzip
+import corral_gzip_supervisor
+import corral_ssh
+import zlib
+import shutil
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--context',required=True);p.add_argument('--node',required=True);p.add_argument('--namespace',default='corral-vms');p.add_argument('--out',type=Path,required=True);a=p.parse_args();node_name(a.node)
+if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}',a.namespace):p.error('invalid namespace')
+# The public entry point owns the complete child process tree under a private
+# one-context projection. Internal execution uses only that scoped routing file.
+if os.environ.get('TUNA_GZIP_PROBE_OWNER') != str(os.getppid()):
+ outer_deadline=time.monotonic()+600
+ if a.out.exists():raise ValueError('fresh probe output directory required')
+ with corral_ssh.projected_kubeconfig(a.context,deadline=outer_deadline) as env:
+  routing=json.loads(Path(env['KUBECONFIG']).read_bytes())
+  if any(u.get('user',{}).get('exec') or u.get('user',{}).get('auth-provider') for u in routing.get('users',[])):
+   raise ValueError('gzip probe refuses external credential plugin routing')
+  private_routing_path=Path(env['KUBECONFIG'])
+  namespace_log=a.out.with_name(a.out.name+'-namespace.json')
+  if namespace_log.exists():raise ValueError('fresh routing receipt required')
+  namespace_argv=['kubectl','--context',a.context,'get','namespace',a.namespace,'-o','json']
+  corral_gzip_supervisor.bounded_command(namespace_argv,namespace_log,min(outer_deadline,time.monotonic()+30),env=env)
+  namespace_before=json.loads(namespace_log.read_bytes())['metadata']['uid']
+  env['TUNA_GZIP_PROBE_OWNER']=str(os.getpid())
+  env['TUNA_GZIP_NAMESPACE_UID']=namespace_before
+  try:
+   corral_gzip_supervisor.bounded_command([sys.executable,str(Path(__file__).resolve()),*sys.argv[1:]],a.out.with_name(a.out.name+'-supervisor.log'),outer_deadline,env=env)
+  except BaseException:
+   # The complete process owner has retired before bounded API cleanup. Recover
+   # only UIDs durably recorded before any child operation can become ambiguous.
+   if a.out.exists():
+    cleanup_code='import json,sys;sys.path.insert(0,sys.argv[1]);import corral_gzip;print(json.dumps(corral_gzip.recover_probe_cleanup(sys.argv[2],sys.argv[3],sys.argv[4])))'
+    try:
+     corral_gzip_supervisor.bounded_command([sys.executable,'-c',cleanup_code,str(Path(__file__).parent/'lib'),a.context,a.namespace,str(a.out)],a.out/'outer-cleanup.json',time.monotonic()+130,env=env)
+    except BaseException as cleanup_error:
+     (a.out/'outer-cleanup-failure.json').write_text(json.dumps({'confirmed':False,'error_type':type(cleanup_error).__name__}))
+   raise
+  corral_gzip_supervisor.bounded_command(namespace_argv,namespace_log,min(outer_deadline,time.monotonic()+30),env=env)
+  namespace_after=json.loads(namespace_log.read_bytes())['metadata']['uid']
+  if namespace_before!=namespace_after:raise ValueError('gzip namespace replaced')
+ if private_routing_path.exists():raise ValueError('private projection retirement unconfirmed')
+ (a.out/'process-owner.json').write_text(json.dumps({'whole_command_retirement_confirmed':True,'private_context_projection_removed_on_close':True,'namespace_uid':namespace_before,'context':a.context,'source_sha256':hashlib.sha256((Path(__file__).parent/'lib/corral_gzip_supervisor.py').read_bytes()).hexdigest()},indent=2))
+ print('Tiny RAW.gzip probe completed; full-image qualification remains false')
+ raise SystemExit(0)
+a.out.mkdir(parents=True,exist_ok=False);a.out.chmod(0o700);name='tuna-v1-gzip-probe-'+uuid.uuid4().hex[:10];receipt={'schema':1,'name':name,'context':a.context,'namespace':a.namespace,'completed':False,'performance_qualified':False,'method':'raw-gzip-upload','full_image_import_qualified':False};proxy=None;upload=None;pvc_uid=None
+source_names=('tuna-corral-gzip-upload-probe','corral_gzip.py','tuna_raw_gzip.py','corral_session.py','corral_owned.py','corral_perf.py','corral_ssh.py','corral_gzip_supervisor.py')
+source=a.out/'source';source.mkdir()
+receipt['source_sha256']={}
+for name_source in source_names:
+ original=Path(__file__) if name_source==Path(__file__).name else Path(__file__).parent/'lib'/name_source
+ data=original.read_bytes();(source/name_source).write_bytes(data)
+ receipt['source_sha256'][name_source]=hashlib.sha256(data).hexdigest()
+owned=[];known_pvs={};nonce=uuid.uuid4().hex
+
+def run(args,**kw):return subprocess.run(args,check=True,timeout=45,**kw)
+def record(name,value):(a.out/name).write_text(json.dumps(value,indent=2))
+def register(*identity):
+ if identity not in owned:owned.append(identity)
+ record('owned-objects.json',owned)
+try:
+ node=kubectl(a.context,'get','node',a.node,'-o','json');stats=kubectl(a.context,'get','--raw','/api/v1/nodes/'+a.node+'/proxy/stats/summary')
+ receipt['node_uid']=node['metadata']['uid']
+ receipt['virtctl_sha256']=hashlib.sha256(Path(__import__('shutil').which('virtctl')).read_bytes()).hexdigest()
+ receipt['kubectl_sha256']=hashlib.sha256(Path(shutil.which('kubectl')).read_bytes()).hexdigest()
+ receipt['virtctl_version']=subprocess.check_output(['virtctl','version','--client'],timeout=10).decode()
+ config=kubectl(a.context,'get','configmap','local-path-config','-n','local-path-storage','-o','json');record('local-path-config.json',config)
+ receipt['local_path_config_sha256']=hashlib.sha256(json.dumps(config.get('data',{}),sort_keys=True).encode()).hexdigest()
+ cdi=kubectl(a.context,'get','cdi','-o','json');record('cdi.json',cdi)
+ receipt['cdi_versions']=[q.get('status',{}) for q in cdi['items']]
+ node,admission=corral_gzip.fresh_capacity(a.context,a.node,3*GIB);record('admission.json',admission)
+ if node['metadata']['uid']!=receipt['node_uid']:raise ValueError('gzip admission node replaced')
+ if kubectl(a.context,'get','namespace',a.namespace,'-o','json')['metadata']['uid']!=os.environ['TUNA_GZIP_NAMESPACE_UID']:raise ValueError('gzip namespace replaced before create')
+ if not admission['ready_for_disk_admission']:raise ValueError('tiny diagnostic storage admission refused')
+ require_cdi=cdi['items']
+ if len(require_cdi)!=1 or any(require_cdi[0].get('status',{}).get(k)!='v1.66.1' for k in ('targetVersion','observedVersion','operatorVersion')):raise ValueError('exact gzip CDI version required')
+ raw=a.out/'probe.raw'
+ with raw.open('xb') as f:f.write(b'TUNA_RAW_PROBE_V1');f.truncate(64*1024*1024)
+ with raw.open('rb') as f:receipt['raw_sha256']=hashlib.file_digest(f,'sha256').hexdigest()
+ compressed=a.out/'probe.raw.gz'
+ encoder=zlib.compressobj(6,zlib.DEFLATED,16+zlib.MAX_WBITS)
+ with raw.open('rb') as src,compressed.open('xb') as dest:
+  for block in iter(lambda:src.read(1024*1024),b''):
+   dest.write(encoder.compress(block))
+  dest.write(encoder.flush())
+ receipt['gzip']=tuna_raw_gzip.check_gzip(compressed,64*1024**2,receipt['raw_sha256'],timeout=10)
+ pvc={'apiVersion':'v1','kind':'PersistentVolumeClaim','metadata':{'name':name,'namespace':a.namespace,'labels':{'tuna-perf-owned':name},'annotations':{'volume.kubernetes.io/selected-node':a.node}},'spec':{'accessModes':['ReadWriteOnce'],'volumeMode':'Filesystem','storageClassName':'local-path','resources':{'requests':{'storage':'1Gi'}}}}
+ record('pvc-create.json',pvc)
+ created=corral_owned.create(a.context,a.namespace,'pvc',pvc,a.out/'pvc-create.json',nonce,register);pvc_uid=created['metadata']['uid'];receipt['pvc_uid']=pvc_uid;record('ownership.json',receipt)
+ log=(a.out/'proxy.log').open('wb');proxy=subprocess.Popen(['kubectl','--context',a.context,'-n','cdi','port-forward','--address','127.0.0.1','svc/cdi-uploadproxy',':443'],stdout=log,stderr=log,start_new_session=True)
+ deadline=time.monotonic()+20;port=None
+ while time.monotonic()<deadline and proxy.poll() is None:
+  match=re.search(r'Forwarding from 127\.0\.0\.1:(\d+) ->', (a.out/'proxy.log').read_text())
+  if match:port=int(match[1]);break
+  time.sleep(.1)
+ if not port or not owned_listener(proxy.pid,port):raise ValueError('authenticated owned uploadproxy tunnel unavailable')
+ uploadlog=(a.out/'upload.log').open('wb')
+ upload=subprocess.Popen(['virtctl','--context',a.context,'image-upload','pvc',name,'-n',a.namespace,'--no-create','--image-path',str(compressed),'--uploadproxy-url',f'https://127.0.0.1:{port}','--insecure','--wait-secs','120','--retry','1'],stdout=uploadlog,stderr=uploadlog,start_new_session=True)
+ deadline=time.monotonic()+180;observations=[]
+ while upload.poll() is None and time.monotonic()<deadline:
+  fresh=kubectl(a.context,'get','node',a.node,'-o','json',deadline=deadline)
+  cond={q['type']:q.get('status') for q in fresh.get('status',{}).get('conditions',[])}
+  if fresh['metadata']['uid']!=receipt['node_uid'] or cond.get('Ready')!='True' or cond.get('DiskPressure')!='False':raise ValueError('gzip node replaced or pressure unknown')
+  current=kubectl(a.context,'get','pvc',name,'-n',a.namespace,'-o','json',deadline=deadline)
+  if current['metadata']['uid']!=pvc_uid:raise ValueError('owned PVC replaced')
+  pods=kubectl(a.context,'get','pods','-n',a.namespace,'-o','json',deadline=deadline)['items']
+  for pod in pods:
+   if not any(o.get('uid')==pvc_uid for o in pod['metadata'].get('ownerReferences',[])):continue
+   if pod['status'].get('phase')!='Running':continue
+   observation=corral_gzip.uploader_observation(pod,pvc_uid,a.node)
+   if pod['status'].get('phase')=='Running':
+    result=subprocess.run(['kubectl','--context',a.context,'exec','-n',a.namespace,pod['metadata']['name'],'--','sh','-c','du -sk /scratch /data; ls -l /scratch /data'],capture_output=True,timeout=min(8,max(.01,deadline-time.monotonic())))
+    observation['directory_usage']=result.stdout.decode(errors='replace')[:4096];observation['directory_usage_returncode']=result.returncode
+   observations.append(observation)
+  stats=kubectl(a.context,'get','--raw','/api/v1/nodes/'+a.node+'/proxy/stats/summary',deadline=deadline)
+  fresh_checked,fresh_admission=corral_gzip.fresh_capacity(a.context,a.node,GIB,deadline=deadline)
+  if fresh_checked['metadata']['uid']!=receipt['node_uid']:raise ValueError('gzip fresh capacity node identity changed')
+  if not fresh_admission['ready_for_disk_admission']:raise ValueError('gzip runtime storage reserve exhausted')
+  placements=corral_owned.track_upload(a.context,a.namespace,pods,pvc_uid,a.node,register,deadline=deadline)
+  for placement in placements:
+   pv=placement['pv'];known_pvs[pv['metadata']['name']]=pv['metadata']['uid']
+  record('owned-pvs.json',known_pvs)
+  record('upload-observations.json',observations)
+  time.sleep(min(.2,max(0,deadline-time.monotonic())))
+ if upload.poll() is None:raise TimeoutError('tiny upload deadline')
+ if upload.returncode:raise RuntimeError('actual tiny gzip upload failed; inspect upload.log')
+ current=kubectl(a.context,'get','pvc',name,'-n',a.namespace,'-o','json');record('pvc-after-upload.json',current)
+ receipt['upload_annotations']=current['metadata'].get('annotations',{})
+ if current['metadata']['uid']!=pvc_uid or receipt['upload_annotations'].get('cdi.kubevirt.io/storage.pod.phase')!='Succeeded':raise ValueError('actual uploaded pod did not succeed')
+ receipt['readback']=readback_prefix(a.context,a.namespace,name,pvc_uid,a.node,64*1024*1024,receipt['raw_sha256'],a.out)
+ tuna_raw_gzip.check_gzip(compressed,64*1024**2,receipt['raw_sha256'],timeout=10)
+ receipt['completed']=True
+ receipt['limitation']='Synthetic 64 MiB RAW.gzip / 1 GiB target only. No full 18 GiB image, 20 GiB reservation, decoder RSS, VM boot or benchmark qualification.'
+except BaseException as error:
+ receipt['error_type']=type(error).__name__;receipt['error']=str(error)[:4096]
+ raise
+finally:
+ record('receipt.json',receipt)
+ for process in (upload,proxy):
+  if process and process.poll() is None:
+   os.killpg(process.pid,signal.SIGTERM)
+   try:process.wait(timeout=5)
+   except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
+ if owned:
+  try:
+   if kubectl(a.context,'get','namespace',a.namespace,'-o','json')['metadata']['uid']!=os.environ['TUNA_GZIP_NAMESPACE_UID']:raise ValueError('gzip namespace replaced before cleanup')
+   receipt['cleanup']=corral_owned.cleanup(a.context,a.namespace,owned)
+   cleanup_deadline=time.monotonic()+60
+   pending=dict(known_pvs)
+   while pending and time.monotonic()<cleanup_deadline:
+    items=kubectl(a.context,'get','pv','-o','json',deadline=cleanup_deadline)['items']
+    remaining={q['metadata']['name']:q['metadata']['uid'] for q in items}
+    pending={name:uid for name,uid in pending.items() if remaining.get(name)==uid}
+    if pending:time.sleep(min(.2,max(0,cleanup_deadline-time.monotonic())))
+   if pending:raise TimeoutError('original gzip owned PV reclamation unconfirmed')
+   if receipt['completed'] and len(known_pvs)<2:raise ValueError('original target and scratch PV identities were not observed')
+   receipt['cleanup']['original_owned_pvs_absent']=not pending and len(known_pvs)>=2
+  except BaseException as cleanup_error:
+   receipt['completed']=False;receipt['cleanup_error']=str(cleanup_error)[:4096]
+   record('receipt.json',receipt);raise
+ record('receipt.json',receipt)
+print(json.dumps(receipt,indent=2))

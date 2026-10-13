@@ -48,6 +48,7 @@ jobs:
       - run: /usr/bin/python3 scripts/lib/arch-audio-dependencies-tests.py
       - name: Check benchmark export provenance and owned resource cleanup
         run: |
+          /usr/bin/python3 scripts/tests/test_corral_gzip.py
           /usr/bin/python3 scripts/lib/tuna-benchmark-disk-tests.py
           /usr/bin/python3 scripts/lib/tuna-dense-policy-tests.py
           /usr/bin/python3 scripts/lib/tuna-benchmark-esp-tests.py

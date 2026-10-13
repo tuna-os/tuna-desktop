@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Acquire an original CI export and upload it into new owned KubeVirt storage.
+
+No on-node image build. No existing VM/disk adoption or overwrite. The conservative
+qcow2 target+scratch reservation applies until another method is proven.
+"""
+import argparse,datetime,hashlib,json,os
+from pathlib import Path
+import re,signal,subprocess,sys,time,uuid
+sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
+from corral_artifact import download,disk_plan
+from corral_perf import kubectl,capacity_receipt,node_name
+from corral_session import owned_listener,readback_prefix
+import corral_raw
+import corral_gzip
+import tuna_raw_gzip
+import corral_ssh
+import corral_owned
+p=argparse.ArgumentParser(description=__doc__)
+for name in ('context','node','source-sha','profile'):p.add_argument('--'+name,required=True)
+p.add_argument('--run-id',type=int,required=True);p.add_argument('--artifact-id',type=int,required=True)
+p.add_argument('--namespace',default='corral-vms');p.add_argument('--out',type=Path,required=True)
+p.add_argument('--method',choices=('qcow2-upload','raw-upload','raw-gzip-upload'),default='qcow2-upload');p.add_argument('--raw-probe',type=Path);p.add_argument('--raw-probe-sha')
+p.add_argument('--start',action='store_true');a=p.parse_args();node_name(a.node)
+if a.method in ('raw-upload','raw-gzip-upload') and (not a.raw_probe or not a.raw_probe_sha):p.error('RAW method requires original source-owned probe bundle and its SHA')
+if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}',a.namespace):p.error('invalid namespace')
+a.out.mkdir(parents=True,exist_ok=False);a.out.chmod(0o700)
+name='tuna-v1-bench-'+uuid.uuid4().hex[:12];disk_name=name+'-disk'
+receipt={'schema':1,'completed':False,'context':a.context,'namespace':a.namespace,'vm_name':name,'pvc_name':disk_name,'datavolume_name':disk_name,'performance_qualified':False}
+owned=[];proxy=None;upload=None;raw_image_seen=False;raw_scratch_seen=False;placement_history={}
+
+def record(filename,value):(a.out/filename).write_text(json.dumps(value,indent=2))
+nonce=uuid.uuid4().hex
+def register(kind,name,uid):
+ if (kind,name,uid) not in owned:owned.append((kind,name,uid))
+ record('owned-objects.json',owned)
+def create(kind,obj):
+ return corral_owned.create(a.context,a.namespace,kind,obj,a.out/(kind+'-create.json'),nonce,register)
+try:
+ receipt['phase']='authenticated-export-download';record('import-receipt.json',receipt)
+ export,manifest,acquisition=download(a.run_id,a.artifact_id,a.source_sha,a.profile,a.out/'original',method=a.method)
+ receipt['export_ssh']=corral_ssh.export_policy(manifest)
+ raw_proof=(corral_gzip.proof(a.raw_probe,a.context,a.node,a.raw_probe_sha) if a.method=='raw-gzip-upload' else corral_raw.proof(a.raw_probe,a.context,a.node,a.raw_probe_sha) if a.method=='raw-upload' else None)
+ plan=disk_plan(manifest,method=a.method,raw_proof=raw_proof);record('storage-plan.json',plan)
+ upload_path=export/('disk.raw.gz' if a.method=='raw-gzip-upload' else 'disk.qcow2')
+ if raw_proof and a.method=='raw-upload':
+  upload_path,raw_conversion=corral_raw.convert(export,manifest,a.out);record('raw-conversion.json',raw_conversion)
+  receipt.update(raw_conversion);receipt['raw_method_proof']=raw_proof
+ receipt['method']=a.method;receipt['transfer_sha256']=manifest['raw_sha256'] if a.method=='raw-upload' else acquisition['disk_sha256']
+ node=kubectl(a.context,'get','node',a.node,'-o','json');stats=kubectl(a.context,'get','--raw','/api/v1/nodes/'+a.node+'/proxy/stats/summary')
+ admission=capacity_receipt(node,stats,estimated_peak_bytes=plan['estimated_peak_bytes'])
+ if a.method=='raw-gzip-upload':node,admission=corral_gzip.fresh_capacity(a.context,a.node,plan['estimated_peak_bytes'])
+ record('admission.json',admission)
+ if not admission['ready_for_disk_admission']:raise ValueError('full target+scratch storage admission refused')
+ receipt.update(disk_sha256=acquisition['disk_sha256'],manifest_sha256=acquisition['manifest_sha256'],original_export_run_id=a.run_id,original_export_artifact_id=a.artifact_id)
+ expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=2)).isoformat().replace('+00:00','Z')
+ vm={'apiVersion':'kubevirt.io/v1','kind':'VirtualMachine','metadata':{'name':name,'namespace':a.namespace,'labels':{'corral.dev/ephemeral':'true','tuna-perf-owned':name},'annotations':{'corral.dev/expires-at':expiry}},'spec':{'runStrategy':'Halted','template':{'metadata':{'labels':{'kubevirt.io/domain':name}},'spec':{'nodeSelector':{'kubernetes.io/hostname':a.node},'domain':{'cpu':{'cores':4,'model':'host-passthrough'},'resources':{'requests':{'memory':'6Gi'}},'firmware':{'bootloader':{'efi':{'secureBoot':False}}},'devices':{'disks':[{'name':'rootdisk','disk':{'bus':'virtio'}}],'interfaces':[{'name':'default','masquerade':{}}]}},'networks':[{'name':'default','pod':{}}],'volumes':[{'name':'rootdisk','persistentVolumeClaim':{'claimName':disk_name}}]}}}}
+ actual=create('vm',vm);receipt['vm_uid']=actual['metadata']['uid']
+ owner={'apiVersion':'kubevirt.io/v1','kind':'VirtualMachine','name':name,'uid':receipt['vm_uid'],'controller':True,'blockOwnerDeletion':True}
+ dv={'apiVersion':'cdi.kubevirt.io/v1beta1','kind':'DataVolume','metadata':{'name':disk_name,'namespace':a.namespace,'labels':{'tuna-perf-owned':name},'ownerReferences':[owner]},'spec':{'source':{'upload':{}},'pvc':{'accessModes':['ReadWriteOnce'],'volumeMode':'Filesystem','storageClassName':'local-path','resources':{'requests':{'storage':manifest['requested_pvc']}}}}}
+ actual=create('dv',dv);receipt['datavolume_uid']=actual['metadata']['uid']
+ receipt['phase']='owned-pvc-node-binding';record('import-receipt.json',receipt)
+ deadline=time.monotonic()+60
+ while time.monotonic()<deadline:
+  result=subprocess.run(['kubectl','--context',a.context,'get','pvc',disk_name,'-n',a.namespace,'-o','json'],capture_output=True,timeout=min(15,max(.01,deadline-time.monotonic())))
+  if result.returncode==0:claim=json.loads(result.stdout);break
+  time.sleep(.25)
+ else:raise TimeoutError('owned CDI PVC unavailable')
+ if not any(o.get('uid')==receipt['datavolume_uid'] for o in claim['metadata'].get('ownerReferences',[])):raise ValueError('CDI PVC ownership differs')
+ receipt['pvc_uid']=claim['metadata']['uid'];register('pvc',disk_name,receipt['pvc_uid'])
+ operations=[{'op':'test','path':'/metadata/uid','value':receipt['pvc_uid']},{'op':'add','path':'/metadata/annotations/volume.kubernetes.io~1selected-node','value':a.node}]
+ subprocess.run(['kubectl','--context',a.context,'patch','pvc',disk_name,'-n',a.namespace,'--type=json','-p',json.dumps(operations)],check=True,timeout=30,stdout=subprocess.DEVNULL)
+ log=(a.out/'proxy.log').open('wb');proxy=subprocess.Popen(['kubectl','--context',a.context,'-n','cdi','port-forward','--address','127.0.0.1','svc/cdi-uploadproxy',':443'],stdout=log,stderr=log,start_new_session=True)
+ deadline=time.monotonic()+20;port=None
+ while time.monotonic()<deadline and proxy.poll() is None:
+  match=re.search(r'Forwarding from 127\.0\.0\.1:(\d+) ->',(a.out/'proxy.log').read_text())
+  if match:port=int(match[1]);break
+  time.sleep(.1)
+ if not port or not owned_listener(proxy.pid,port):raise ValueError('owned API uploadproxy tunnel unavailable')
+ if a.method=='raw-gzip-upload':
+  receipt['gzip_target_capacity']=corral_gzip.target_capacity(a.context,a.namespace,disk_name,receipt['pvc_uid'],a.node,a.out)
+ receipt['phase']='original-upload';record('import-receipt.json',receipt)
+ log=(a.out/'upload.log').open('wb');upload=subprocess.Popen(['virtctl','--context',a.context,'image-upload','dv',disk_name,'-n',a.namespace,'--no-create','--image-path',str(upload_path),'--uploadproxy-url',f'https://127.0.0.1:{port}','--insecure','--wait-secs','120','--retry','1'],stdout=log,stderr=log,start_new_session=True)
+ deadline=time.monotonic()+1800
+ while upload.poll() is None and time.monotonic()<deadline:
+  current_node=kubectl(a.context,'get','node',a.node,'-o','json',deadline=deadline)
+  conditions={c['type']:c.get('status') for c in current_node['status'].get('conditions',[])}
+  if current_node['metadata']['uid']!=node['metadata']['uid'] or conditions.get('Ready')!='True' or conditions.get('DiskPressure')!='False':raise ValueError('node identity/readiness/pressure changed during upload')
+  current_stats=kubectl(a.context,'get','--raw','/api/v1/nodes/'+a.node+'/proxy/stats/summary',deadline=deadline)
+  pressure=capacity_receipt(current_node,current_stats,estimated_peak_bytes=1024**3)
+  if a.method=='raw-gzip-upload':
+   checked_node,pressure=corral_gzip.fresh_capacity(a.context,a.node,1024**3,deadline=deadline)
+   if checked_node['metadata']['uid']!=node['metadata']['uid']:raise ValueError('gzip capacity observer node changed')
+  if not pressure['ready_for_disk_admission']:raise ValueError('runtime filesystem safety reserve exhausted')
+  record('upload-capacity.json',pressure)
+  pods=kubectl(a.context,'get','pods','-n',a.namespace,'-o','json',deadline=deadline)['items']
+  owned_pods=[q for q in pods if any(o.get('uid')==receipt['pvc_uid'] for o in q['metadata'].get('ownerReferences',[]))]
+  if any(q['spec'].get('nodeName') not in (None,a.node) for q in owned_pods):raise ValueError('upload scheduled on another node')
+  if raw_proof:
+   for q in owned_pods:
+    for c in q['status'].get('containerStatuses',[]):
+     if c.get('imageID') and c.get('imageID')!=corral_raw.UPLOAD_IMAGE:raise ValueError('RAW upload server image differs from qualified method')
+     if c.get('imageID')==corral_raw.UPLOAD_IMAGE:raw_image_seen=True
+    if q['status'].get('phase')=='Running':
+     if a.method=='raw-gzip-upload':
+      corral_gzip.uploader_observation(q,receipt['pvc_uid'],a.node)
+     usage=subprocess.run(['kubectl','--context',a.context,'exec','-n',a.namespace,q['metadata']['name'],'--','du','-sk','/scratch'],capture_output=True,timeout=min(10,max(.01,deadline-time.monotonic())))
+     if usage.returncode==0:
+      kib=int(usage.stdout.split()[0])
+      if kib>1024**2:raise ValueError('RAW scratch physical allocation exceeds reserved metadata allowance')
+      raw_scratch_seen=True
+  placements=corral_owned.track_upload(a.context,a.namespace,pods,receipt['pvc_uid'],a.node,register,deadline=deadline)
+  for placement in placements:placement_history[placement['pvc']['metadata']['uid']]=placement
+  record('upload-placements.json',list(placement_history.values()))
+  record('upload-pods.json',owned_pods);time.sleep(2)
+ if upload.poll() is None:raise TimeoutError('original upload deadline')
+ if upload.returncode:raise RuntimeError('original upload failed; inspect upload.log')
+ dv=kubectl(a.context,'get','dv',disk_name,'-n',a.namespace,'-o','json');claim=kubectl(a.context,'get','pvc',disk_name,'-n',a.namespace,'-o','json')
+ if dv['metadata']['uid']!=receipt['datavolume_uid'] or claim['metadata']['uid']!=receipt['pvc_uid'] or dv['status'].get('phase')!='Succeeded' or claim['status'].get('phase')!='Bound':raise ValueError('original upload completion/identity unavailable')
+ record('datavolume-completed.json',dv);record('pvc-completed.json',claim)
+ record('pv-completed.json',corral_owned.placement(a.context,a.namespace,claim,a.node))
+ if a.method=='raw-gzip-upload':
+  receipt['uploaded_raw_sha256']=manifest['raw_sha256']
+  receipt['raw_method_proof']=raw_proof
+ with (export/('disk.raw.gz' if a.method=='raw-gzip-upload' else 'disk.qcow2')).open('rb') as stream:
+  if hashlib.file_digest(stream,'sha256').hexdigest()!=receipt['disk_sha256']:raise ValueError('original upload bytes changed')
+ if raw_proof:
+  if not raw_image_seen or not raw_scratch_seen or receipt['pvc_uid'] not in placement_history or not any(uid!=receipt['pvc_uid'] for uid in placement_history):raise ValueError('actual RAW server/target/scratch placement evidence missing')
+  receipt['raw_scratch_observed_bounded']=True
+  receipt['raw_readback']=readback_prefix(a.context,a.namespace,disk_name,receipt['pvc_uid'],a.node,18*1024**3,manifest['raw_sha256'],a.out)
+ receipt['upload_completed']=True;receipt['phase']='uploaded';receipt['node_peak_qualified']=False
+ if a.start:
+  start_deadline=time.monotonic()+120
+  with corral_ssh.projected_kubeconfig(a.context,deadline=start_deadline) as env:
+   remaining=start_deadline-time.monotonic()
+   if remaining<=0:raise TimeoutError('owned VM start context deadline')
+   subprocess.run(['corral','--backend','kubevirt','--context',a.context,'start',name],env=env,check=True,timeout=remaining,stdout=(a.out/'start.log').open('wb'),stderr=subprocess.STDOUT)
+  receipt['start_succeeded']=True
+ receipt['completed']=True;receipt['phase']='complete';receipt['owned_resources_retained']=True
+except BaseException as error:
+ receipt['error_type']=type(error).__name__;receipt['error']=str(error)[:4096]
+ raise
+finally:
+ record('import-receipt.json',receipt)
+ for process in (upload,proxy):
+  if process and process.poll() is None:
+   os.killpg(process.pid,signal.SIGTERM)
+   try:process.wait(timeout=5)
+   except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
+ if not receipt['completed']:
+  try:
+   receipt['cleanup']=corral_owned.cleanup(a.context,a.namespace,owned)
+   receipt['owned_resources_retained']=False
+  except Exception as cleanup_error:
+   receipt['cleanup_error']=str(cleanup_error)[:4096]
+   record('import-receipt.json',receipt)
+   raise
+ record('import-receipt.json',receipt)
+print(json.dumps(receipt,indent=2))
