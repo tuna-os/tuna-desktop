@@ -2036,6 +2036,8 @@ mod auth_origin_tests {
 
     fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(is_private_dir(dir.path()));
         let hub = ControlHub::bind(
             dir.path().join("control"),
             std::rc::Rc::new(TokenStore::new()),
