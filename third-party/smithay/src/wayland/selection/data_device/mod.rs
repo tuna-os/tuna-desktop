@@ -110,7 +110,12 @@ use super::{
 };
 
 /// Whether a client drag owns either the pointer or touch grab (icons are optional).
-pub fn client_dnd_active<D: DataDeviceHandler + 'static>(seat: &Seat<D>) -> bool {
+pub fn client_dnd_active<D>(seat: &Seat<D>) -> bool
+where
+    D: DataDeviceHandler + 'static,
+    D::PointerFocus: WaylandFocus,
+    D::TouchFocus: WaylandFocus,
+{
     seat.get_pointer()
         .is_some_and(|p| p.with_grab(|_, g| g.is::<DnDGrab<D>>()).unwrap_or(false))
         || seat
