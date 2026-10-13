@@ -2,7 +2,9 @@
 
 /proc/stat semantics: https://docs.kernel.org/filesystems/proc.html
 Guest columns are already in user/nice (kernel/sched/cputime.c).
-I/O wait can regress; it is never silently clamped to zero.
+I/O wait can regress; it is never silently clamped to zero. CPU rows must
+match online IDs exactly; kernels exposing extra configured/offline rows are
+conservatively refused instead of inventing active CPU capacity.
 """
 import math
 import re
@@ -148,7 +150,7 @@ def collect_idle(session, out):
     """Host-only hook for the existing paired runner's guest idle markers.
 
     Caller must admit original image/key/reference/selected process first, then
-    apply its equal30s settle. Replace its idle sleep30 with this same collector
+    apply its equal 30 second settle. Replace its 30 second idle sleep with this same collector
     for BOTH desktops, bracketed by the existing guest clock phase markers.
     No references, input or expensive package hashing are performed in-window.
     """

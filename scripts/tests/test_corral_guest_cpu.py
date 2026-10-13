@@ -58,6 +58,8 @@ class GuestCpuTests(unittest.TestCase):
         for field in ['online_before', 'online_after']:
             bad=sample(1);bad[field]='0'
             with self.assertRaises(ValueError):parse_sample(bad)
+        bad=sample();bad['proc_stat']+='cpu2 1 0 0 1 0 0 0 0 0 0\n'
+        with self.assertRaises(ValueError):parse_sample(bad)
         before=parse_sample(sample());after=parse_sample(sample(1));after['core_ids']=[0]
         with self.assertRaises(ValueError):delta(before, after)
 

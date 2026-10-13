@@ -65,7 +65,7 @@ def selected_identity(desktop, selected, manifest, reference=None):
         validate_reference(reference, 'stock')
         principal = reference['principal']
         if (compositor['exe'], compositor['pid'], compositor['start_ticks'], compositor['sha256']) != ('/usr/bin/gnome-shell', principal['pid'], principal['start'], reference['shell_sha256']):
-            raise ValueError('selected stock GNOME51 process differs from admitted reference')
+            raise ValueError('selected stock GNOME 51 process differs from admitted reference')
 
 
 
@@ -81,7 +81,7 @@ def main():
     export = Path(args.export_dir)
     manifest = json.loads((export / 'manifest.json').read_text())
     candidate_intent(manifest, args.candidate_sha, args.package_run)
-    if manifest.get('gnome_profile') != 'stock':raise ValueError('aggregate comparison requires stock GNOME51 export')
+    if manifest.get('gnome_profile') != 'stock':raise ValueError('aggregate comparison requires stock GNOME 51 export')
     reference = validate_image(json.loads(Path(args.reference_image).read_text()), 'stock')
     admitted = admit_imported_disk(export, args.import_receipt, args.context, args.namespace, args.vm, args.reference_image, args.tuna_payload, args.tuna_selection)
     key = client_key(manifest, args.key, args.public_key or args.key + '.pub', 'root')
