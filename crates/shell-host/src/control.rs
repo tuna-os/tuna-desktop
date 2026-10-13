@@ -244,7 +244,7 @@ impl ControlClient {
             environment: Vec::new(),
             overview_previews: (Vec::new(), None),
             connection_generation: 0,
-            auth_needs_snapshot: false,
+            auth_needs_snapshot: true,
             wellbeing_applied: None,
             wellbeing_pending: None,
         })
@@ -961,12 +961,9 @@ impl ControlClient {
 
     /// Encode and write one frame. `WouldBlock` propagates to the caller.
     ///
-    /// A dead peer (the hub evicted and closed our session) reconnects
-    /// instead of failing: one redial over a fresh `Hello`, then the
-    /// original frame is resent once with its original request id (the
-    /// dead session never saw it, so no id is skipped). Every command
-    /// method funnels through here, so all of them inherit the recovery
-    /// with no call-site changes.
+    /// Existing NONCREDENTIAL recovery resends after one fresh Hello. Its
+    /// partial-write semantics need a separate audit. Credentials never use
+    /// this path and are explicitly refused before generic serialization.
     fn write_message(&mut self, msg: &Message) -> Result<(), ControlError> {
         if matches!(
             msg,
@@ -2005,6 +2002,42 @@ mod tests {
         (path, listener)
     }
 
+    fn initial_auth_snapshot(client: &mut ControlClient, peer: &mut UnixStream) {
+        client.send_hello().unwrap();
+        assert!(matches!(server_read(peer), Message::Hello { .. }));
+        server_write(
+            peer,
+            &Message::Snapshot {
+                revision: 1,
+                windows: vec![],
+                workspaces: vec![],
+                locked: true,
+            },
+        );
+        assert!(matches!(client.poll().unwrap(), Handled::Snapshot { .. }));
+    }
+    #[test]
+    fn initial_authentication_requires_authoritative_snapshot_before_credentials() {
+        let (mut client, mut peer) = pair();
+        peer.set_nonblocking(true).unwrap();
+        assert!(client.unlock("before-initial-snapshot".into()).is_err());
+        let mut byte = [0u8; 1];
+        assert!(matches!(peer.read(&mut byte),Err(e) if e.kind()==io::ErrorKind::WouldBlock));
+        peer.set_nonblocking(false).unwrap();
+        initial_auth_snapshot(&mut client, &mut peer);
+        let id = client
+            .unlock("explicit-after-initial-snapshot".into())
+            .unwrap();
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::Unlock {
+                    password: tuna_shell_control::Secret("explicit-after-initial-snapshot".into())
+                }
+            }
+        );
+    }
     fn auth_reconnect_only_hello(
         client: &mut ControlClient,
         listener: &std::os::unix::net::UnixListener,
@@ -2039,7 +2072,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, listener) = listener_at(&dir);
         let mut client = ControlClient::connect(&path).unwrap();
-        let (peer, _) = listener.accept().unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        initial_auth_snapshot(&mut client, &mut peer);
         drop(peer);
         assert!(client.unlock("old-controlled-secret".into()).is_err());
         assert_eq!(
@@ -2067,6 +2101,7 @@ mod tests {
         let (path, listener) = listener_at(&dir);
         let mut client = ControlClient::connect(&path).unwrap();
         let (mut old_peer, _) = listener.accept().unwrap();
+        initial_auth_snapshot(&mut client, &mut old_peer);
         rustix::net::sockopt::set_socket_send_buffer_size(&client.stream, 1024).unwrap();
         let password = "controlled-p".repeat(8192);
         let expected = tuna_shell_control::encode_unlock_frame(
@@ -2102,7 +2137,8 @@ mod tests {
     }
     #[test]
     fn uncertain_caller_stream_without_redial_path_stays_closed() {
-        let (mut client, peer) = pair();
+        let (mut client, mut peer) = pair();
+        initial_auth_snapshot(&mut client, &mut peer);
         drop(peer);
         assert!(client.unlock("controlled-input".into()).is_err());
         assert!(client

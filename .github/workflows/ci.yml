@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
@@ -51,7 +53,10 @@ jobs:
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
       - run: python3 scripts/tests/test_auth_owner_admission.py
-      - run: python3 scripts/tests/test_auth_no_replay_contract.py
+      - run: |
+          python3 scripts/tests/test_auth_no_replay_contract.py
+          python3 scripts/tests/test_auth_proof_identity.py
+          python3 scripts/tests/test_auth_proof_process.py
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
@@ -324,6 +329,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
@@ -406,6 +413,8 @@ jobs:
           scripts/tuna-gtk-accessibility-proof gtk-shell-artifacts/a11y/bin/gtk-tests "$(git rev-parse HEAD)" gtk-shell-artifacts/a11y
       - name: Prove GTK authentication transport reset callbacks
         run: python3 scripts/tuna-auth-no-replay-gtk-proof
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Prove real GTK notification action retirement
         run: |
           /usr/bin/python3 scripts/tests/test_notify_callback_contract.py
