@@ -544,6 +544,56 @@ fn hub_lockdown_policy_reaches_sessions_and_restores() {
     assert_locked_without_content(&client_read(&mut client));
 }
 
+/// Administrative lockdown (#357 follow-up): a hung settings backend
+/// never stalls the policy refresh — the tick stays bounded and the
+/// cached policy holds — while a healthy backend still applies and
+/// errors stay fail-safe.
+#[test]
+fn lockdown_refresh_never_blocks_on_hung_backend() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    assert!(hub.lock_screen_allowed(), "hub starts at GNOME defaults");
+
+    // Hung backend: the refresh returns promptly with policy unchanged.
+    // (The double returns the denied value so its late arrival cannot
+    // flip the assertions below; the detached thread dies with the test
+    // process.)
+    let hung = || {
+        std::thread::sleep(Duration::from_secs(5));
+        Some(true)
+    };
+    let start = std::time::Instant::now();
+    hub.refresh_lockdown_with(hung);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "hung backend must not stall the tick, took {elapsed:?}"
+    );
+    assert!(
+        hub.lock_screen_allowed(),
+        "cached policy holds during the hang"
+    );
+
+    // Healthy backend: a deny applies once the background read lands.
+    hub.refresh_lockdown_with(|| Some(true));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while hub.lock_screen_allowed() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        hub.refresh_lockdown_with(|| None);
+    }
+    assert!(
+        !hub.lock_screen_allowed(),
+        "deny applies once the read lands"
+    );
+
+    // Fail-safe: unreadable reads keep the cached (denied) value.
+    hub.refresh_lockdown_with(|| None);
+    std::thread::sleep(Duration::from_millis(100));
+    hub.refresh_lockdown_with(|| None);
+    assert!(!hub.lock_screen_allowed(), "errors keep the cached value");
+}
+
 /// The lock surface reuses the Overlay shape with an empty list: no
 /// window content or titles, and no frame content beneath it.
 #[test]

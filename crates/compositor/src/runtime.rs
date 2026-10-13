@@ -67,12 +67,13 @@ use crate::{ClientState, State};
 /// repaint replaces this provisional pacing in a later slice.
 const FRAME_BUDGET: Duration = Duration::from_millis(16);
 
-/// Administrative lockdown (#357): how often the tick re-reads the
-/// live `disable-lock-screen` key. One subprocess per interval at
-/// most, skipped without a session bus; the shell enforces its own
-/// surface immediately, so this backstop's short lag fails safe (an
-/// extra lock in the window still needs auth to unlock, and unlocks
-/// never come from policy).
+/// Administrative lockdown (#357): how often the tick polls the live
+/// `disable-lock-screen` key. Each poll spawns one background reader at
+/// most and drains completed reads without waiting (see
+/// `ControlHub::refresh_lockdown`), skipped without a session bus; the
+/// shell enforces its own surface immediately, so this backstop's short
+/// lag fails safe (an extra lock in the window still needs auth to
+/// unlock, and unlocks never come from policy).
 const LOCKDOWN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Wake the native loop for requests on already accepted Wayland clients.
@@ -3186,8 +3187,9 @@ impl Runtime {
             self.overview_search = false;
             self.overview_app_grid = false;
         }
-        // Administrative lockdown (#357): follow the live key on a
-        // slow tick; the shell maps it onto its idle sender too.
+        // Administrative lockdown (#357 follow-up): poll the live key
+        // on a slow tick without blocking (background read plus drain);
+        // the shell maps it onto its idle sender too.
         if self.lockdown_refresh_at.elapsed() >= LOCKDOWN_REFRESH_INTERVAL {
             self.control.refresh_lockdown();
             self.lockdown_refresh_at = Instant::now();

@@ -39,8 +39,15 @@
 //! GNOME defaults (everything allowed), exactly like GNOME with an
 //! unreachable dconf.
 
+use std::time::Duration;
+
 /// GSettings schema holding the lockdown keys.
 pub const SCHEMA: &str = "org.gnome.desktop.lockdown";
+/// Bound for one background `gsettings` read. The compositor tick never
+/// waits on the settings backend (see
+/// [`crate::control::ControlHub::refresh_lockdown`]); a read slower than
+/// this yields `None` and the cached policy holds.
+pub const LOCKDOWN_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// Run-command dialog gate (Alt+F2).
 pub const KEY_DISABLE_COMMAND_LINE: &str = "disable-command-line";
 /// Applications' Save As dialogs (app-owned).
@@ -335,27 +342,66 @@ impl LockdownPolicy {
     }
 }
 
-/// Live value of `disable-lock-screen`, if GSettings answers. `None`
-/// keeps the caller's current value under the refresh rule: a missing
-/// `gsettings` binary, schema, key, or session bus never restricts by
-/// accident (same fail-safe as the shell's missing-schema path).
+/// Live value of `disable-lock-screen`, if GSettings answers within
+/// [`LOCKDOWN_READ_TIMEOUT`]. `None` keeps the caller's cached value
+/// under the refresh rule: a missing binary, schema, key, or session
+/// bus, a slow backend, or garbage output never restricts by accident
+/// (same fail-safe as the shell's missing-schema path).
 ///
 /// The compositor owns no `gio` dependency, so this shells out to the
-/// `gsettings` CLI. Call sites are rare by construction (hub startup
-/// plus a slow tick and lock transitions, never the frame path): one
-/// subprocess per refresh, skipped entirely without a session bus.
+/// `gsettings` CLI. The slow-tick refresh runs this on a background
+/// thread (never the frame path); hub startup calls it directly,
+/// bounded by the same timeout.
 pub fn read_lock_screen_key() -> Option<bool> {
     if !session_bus_present() {
         return None;
     }
-    let output = std::process::Command::new("gsettings")
-        .args(["get", SCHEMA, KEY_DISABLE_LOCK_SCREEN])
-        .output()
+    read_bool_via_command(
+        "gsettings",
+        &["get", SCHEMA, KEY_DISABLE_LOCK_SCREEN],
+        LOCKDOWN_READ_TIMEOUT,
+    )
+}
+
+/// Run `program args` with a timeout, parsing stdout as a `gsettings`
+/// boolean (`true`/`false`). A hung backend yields `None` after
+/// `timeout` (the child is killed); a bad exit, missing binary, or
+/// unparseable output yields `None` too. Never blocks past the bound
+/// plus one poll slice, and caps stdout so a rogue backend cannot grow
+/// the buffer.
+pub fn read_bool_via_command(program: &str, args: &[&str], timeout: Duration) -> Option<bool> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut output = String::new();
+                if let Some(stdout) = child.stdout.take() {
+                    use std::io::Read;
+                    let mut capped = stdout.take(1024);
+                    let _ = capped.read_to_string(&mut output);
+                }
+                return parse_gsettings_bool(&output);
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
     }
-    parse_gsettings_bool(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Whether a session bus is plausibly reachable for a `gsettings` read.
@@ -493,6 +539,35 @@ mod tests {
         assert_eq!(parse_gsettings_bool(""), None);
         assert_eq!(parse_gsettings_bool("no such key\n"), None);
         assert_eq!(parse_gsettings_bool("1"), None);
+    }
+
+    #[test]
+    fn command_booleans_parse_and_hung_backend_times_out() {
+        let bound = Duration::from_secs(2);
+        // Fast backends parse.
+        assert_eq!(read_bool_via_command("echo", &["true"], bound), Some(true));
+        assert_eq!(
+            read_bool_via_command("echo", &["false"], bound),
+            Some(false)
+        );
+        // Bad exit, garbage, and a missing binary yield None (fail-safe).
+        assert_eq!(read_bool_via_command("false", &[], bound), None);
+        assert_eq!(read_bool_via_command("echo", &["bogus"], bound), None);
+        assert_eq!(
+            read_bool_via_command("tuna-no-such-backend", &[], bound),
+            None
+        );
+        // Hung backend: bounded, never the full hang.
+        let start = std::time::Instant::now();
+        assert_eq!(
+            read_bool_via_command("sleep", &["10"], Duration::from_millis(100)),
+            None
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "hung backend must time out, took {elapsed:?}"
+        );
     }
 
     #[test]
