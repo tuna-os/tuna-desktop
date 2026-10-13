@@ -651,7 +651,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           df -h / /mnt
-      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg
+      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core
       - name: Build the Marlin Tuna Desktop image and the VM test layer
         run: |
           cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst

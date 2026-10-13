@@ -600,5 +600,171 @@ class PointerEvidenceRetention(unittest.TestCase):
         self.assertEqual(overwritten, [])
 
 
+class TourRecorderTests(unittest.TestCase):
+    def recorder(self, directory, command, timeout=0.2):
+        return lane.Recorder(SimpleNamespace(cmd=command), directory, timeout=timeout)
+
+    def test_still_finishes_before_next_key_and_records_exact_frame(self):
+        events = []
+        def command(name, **args):
+            events.append(name)
+            if name == "screendump":
+                Path(args["filename"]).write_bytes(b"completed pixels")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, command)
+            recorder.still("overview")
+            recorder.qmp.cmd("send-key")
+            self.assertEqual(events, ["screendump", "send-key"])
+            self.assertEqual(recorder.stills, {"overview": 0})
+            self.assertEqual(recorder.n, 1)
+            self.assertEqual((Path(recorder.dir) / "f000000.png").read_bytes(), b"completed pixels")
+            recorder.close()
+
+    def test_periodic_and_still_frames_share_collision_free_indices(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def command(name, **args):
+            calls.append(args["filename"])
+            if len(calls) == 1:
+                entered.set()
+                self.assertTrue(release.wait(1))
+            Path(args["filename"]).write_bytes(str(len(calls)).encode())
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, command, timeout=1)
+            errors = []
+            def capture():
+                try:
+                    recorder._capture()
+                except BaseException as error:
+                    errors.append(error)
+            worker = threading.Thread(target=capture)
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            release.set()
+            recorder.still("calendar")
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(recorder.stills["calendar"], 1)
+            self.assertEqual(recorder.n, 2)
+            self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
+                             ["f000000.png", "f000001.png"])
+            recorder.close()
+
+    def test_failed_capture_has_no_still_or_reused_frame(self):
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(b"partial")
+            raise RuntimeError("QMP refused")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, command)
+            with self.assertRaisesRegex(RuntimeError, "QMP refused"):
+                recorder.still("lock")
+            self.assertEqual(recorder.stills, {})
+            self.assertEqual(recorder.n, 0)
+            self.assertEqual(list(Path(recorder.dir).iterdir()), [])
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                recorder.close()
+
+    def test_missing_frame_times_out_without_accepting_future_input(self):
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, lambda *args, **kwargs: None, timeout=0.03)
+            start = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                recorder.still("app-grid")
+            self.assertLess(time.monotonic() - start, 1)
+            with self.assertRaisesRegex(RuntimeError, "previously failed"):
+                recorder.qmp.cmd("send-key")
+            self.assertEqual(recorder.stills, {})
+            with self.assertRaises(RuntimeError):
+                recorder.close()
+
+    def test_stalled_real_socket_times_out_and_recorder_thread_stops(self):
+        import socket
+        import threading
+        left, right = socket.socketpair()
+        entered = threading.Event()
+        def command(*args, **kwargs):
+            entered.set()
+            return left.recv(1)
+        try:
+            qmp = SimpleNamespace(sock=left, cmd=command)
+            with tempfile.TemporaryDirectory() as directory:
+                recorder = lane.Recorder(qmp, directory, timeout=0.03)
+                recorder.thread.start()
+                self.assertTrue(entered.wait(1))
+                with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                    recorder.close()
+                self.assertFalse(recorder.thread.is_alive())
+                self.assertEqual(recorder.n, 0)
+                self.assertEqual(list(Path(recorder.dir).iterdir()), [])
+                self.assertIs(qmp.cmd, recorder.original_cmd)
+        finally:
+            left.close()
+            right.close()
+
+    def test_frame_identity_collision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, lambda *args, **kwargs: self.fail("must not overwrite"))
+            target = Path(recorder.dir) / "f000000.png"
+            target.write_bytes(b"existing")
+            with self.assertRaisesRegex(RuntimeError, "identity already exists"):
+                recorder.still("intro")
+            self.assertEqual(target.read_bytes(), b"existing")
+            self.assertEqual(recorder.stills, {})
+            with self.assertRaises(RuntimeError):
+                recorder.close()
+
+    def test_periodic_indexing_and_marks_have_no_future_frame_offset(self):
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(b"frame")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.recorder(directory, command)
+            recorder._capture()
+            recorder.mark("overview")
+            recorder.still("overview")
+            self.assertEqual(recorder.marks, [(1, "overview")])
+            self.assertEqual(recorder.stills, {"overview": 1})
+            self.assertEqual(recorder.n, 2)
+            self.assertEqual([frame["index"] for frame in recorder.frames], [0, 1])
+            self.assertEqual([frame["mode"] for frame in recorder.frames], ["periodic", "still"])
+            for frame in recorder.frames:
+                self.assertLessEqual(frame["requested_monotonic_ns"], frame["completed_monotonic_ns"])
+                self.assertEqual(frame["sha256"], lane.baseline.sha256(
+                    str(Path(recorder.dir) / f"f{frame['index']:06d}.png")))
+            recorder.close()
+        self.assertEqual(lane.TOUR_FPS, 2)
+        self.assertEqual(lane.PLAY_FPS, 4)
+
+    def test_failed_tour_capture_removes_owned_work_and_restores_command(self):
+        original = lane.Recorder
+        recorders = []
+        def construct(qmp, directory):
+            recorder = original(qmp, directory, timeout=0.02)
+            recorder.thread = SimpleNamespace(start=lambda: None, ident=None)
+            recorders.append(recorder)
+            return recorder
+        command = lambda *args, **kwargs: None
+        qmp = SimpleNamespace(cmd=command, keys=lambda *args, **kwargs: None)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(lane, "Recorder", construct), patch.object(lane.subprocess, "run"), \
+                    patch.object(lane.time, "sleep", lambda delay: None):
+                with self.assertRaises(TimeoutError):
+                    lane.run_tour(qmp, directory, "unused")
+            self.assertFalse((Path(directory) / "tour/.work").exists())
+            self.assertIs(qmp.cmd, command)
+            self.assertEqual(recorders[0].stills, {})
+
+    def test_tour_renders_current_cards_into_scratch_and_ci_has_dependencies(self):
+        source = Path(lane.__file__).read_text()
+        self.assertIn('os.path.join(CARDS, "render.py")', source)
+        self.assertIn('"--out", cards_dir', source)
+        self.assertIn('os.path.join(cards_dir, f"{card}.png")', source)
+        self.assertNotIn('os.path.join(CARDS, f"{card}.png")', source)
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
+        self.assertIn('qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core', workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
