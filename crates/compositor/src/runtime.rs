@@ -1454,7 +1454,7 @@ impl Runtime {
         let worker = std::thread::Builder::new()
             .name("tuna-unlock".into())
             .spawn(move || {
-                let _completion = wake.completion();
+                let _completion = wake.phase_completion(worker_phase.clone());
                 let result = verify(Box::new(move || {
                     pending_phase.store(1, std::sync::atomic::Ordering::Release);
                     let _ = pending_reply.send((attempt, UnlockEvent::Pending));
