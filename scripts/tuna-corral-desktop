@@ -1,0 +1,1772 @@
+#!/bin/sh
+# usage:begin
+# tuna-corral-desktop — bounded source-only desktop consumer for the Corral
+# one-liner VM flow.
+#
+# Flow: acquire a pinned Corral binary → render the immutable Tuna VM
+# manifest → check disk headroom → exec `corral launch` (verified QEMU boot)
+# → corral prints the noVNC console URL and opens the browser.
+#
+# Usage:
+#   scripts/tuna-corral-desktop [options]
+#
+# Guest selection:
+#   --arch amd64|arm64     Guest arch (default: host arch; a guest arch that
+#                          differs from the host needs --allow-cross-arch,
+#                          enforced here and again by corral itself)
+#
+# Launch pass-through (defaults mirror `corral launch` exactly):
+#   --name NAME             VM name (default: tuna-v1)
+#   --mem MEM               Memory allocation (default: 4G)
+#   --cpu N                 CPU cores (default: 2)
+#   --disk SIZE             Disk size (default: 20G)
+#   --web-port PORT         Loopback web port, 0 = any free port (default: 0)
+#   --vm-timeout SECONDS    Seconds to wait for VNC readiness (default: 300)
+#   --web-timeout SECONDS   Seconds to wait for web readiness (default: 30)
+#   --stop-vm               Stop the VM on exit (default: VM survives)
+#   --force                 Recreate the VM when it already exists
+#   --allow-emulation       Permit same-arch TCG fallback (reported emulated)
+#   --allow-cross-arch      Permit a guest arch that differs from the host
+#
+# Acquisition:
+#   --corral-bin PATH       Use an operator-supplied corral binary instead of
+#                           the pinned download. While no immutable Corral
+#                           release is admitted this also needs
+#                           --allow-unpinned-corral and prints an UNPINNED
+#                           notice (no pin metadata is recorded for an
+#                           unpinned binary); once a pin is admitted the
+#                           binary's bytes must match the pinned platform
+#                           digest BEFORE any execution, then its
+#                           `corral version` line must match too — a version
+#                           match alone never admits a binary.
+#   --allow-unpinned-corral Acknowledge unpinned acquisition (see above).
+#   --home DIR              Owned state dir (default:
+#                           ~/.local/share/tuna-corral-desktop, or
+#                           $TUNA_CORRAL_DESKTOP_HOME). Must be absolute;
+#                           must be fresh (created on first use) or already
+#                           owned (exact state marker); never your HOME, /,
+#                           a relative path, or a symlink. Existing
+#                           unmarked, foreign-owned, or world-writable
+#                           directories are refused, never adopted. No sudo,
+#                           no PATH mutation, no system writes.
+#
+# Inspection and lifecycle:
+#   --print-contract        Print the pinned Corral/Tuna selection and gate
+#                           status, then exit 0.
+#   --print-manifest        Render the guest manifest to stdout (fails closed
+#                           while the image is unadmitted), then exit 0.
+#   --check-prereqs         Check host prerequisites only (OS/arch, tools,
+#                           QEMU, opener/firmware advisories), then exit 0.
+#                           The contract gate status is reported, not gated.
+#   --clean                 Remove owned state inventory only (binary,
+#                           manifests, scratch, state marker). Refuses
+#                           without the exact state marker, while another
+#                           invocation holds the state lock (active use),
+#                           and never removes Corral VM/cache state or
+#                           foreign files, which are left in place with a
+#                           notice. Then exit 0.
+#   --help, -h              Print this help, then exit 0.
+#
+# Contract gates (see --print-contract): no immutable Corral binary release
+# is published today — the only binary release is the mutable rolling tag,
+# which this consumer refuses by design — and no release-qualified Tuna VM
+# image is admitted today (scripts/tuna-release builds the .deb only).
+# The Tuna gate binds the image bytes to their source, build, package,
+# and disk qualification identities: every one must be admitted before
+# any state is touched, anything is downloaded, or anything launches.
+# Until both gates clear, acquisition and manifest rendering fail closed
+# with the exact missing qualification. Nothing here presents a
+# nonexistent release asset as working.
+#
+# Corral itself is launched with HOME pointed at the owned state dir, so
+# its VM/cache storage (HOME/.local/share/corral/vms, corral's own
+# default) lands under --home and the headroom precheck measures that
+# real target. Setup probes (`corral version`, `launch --help`) run under
+# a finite bound; the final `corral launch` is intentionally long-running
+# and is never time-boxed.
+#
+# Reviewed capability only: `corral launch` flags, the manifest schema,
+# preflight rules, the xdg-open/open handoff, and the `corral version`
+# identity line are coordinated with the reviewed C4 sources — no guessed
+# commands, no invented artifact URLs, no rolling labels.
+# usage:end
+set -eu
+unset CDPATH
+PROG='tuna-corral-desktop'
+STATE_MARKER='tuna-corral-desktop-state 1'
+# Literal backslash for glob matches (built via octal so no in-pattern
+# escape confuses readers or checkers).
+_bs=$(printf '\134')
+
+# ---------------------------------------------------------------------------
+# Immutable Corral selection.
+#
+# Pinned version plus per-platform source/hash. Every value below is an
+# EXPLICIT pending-contract fixture until an immutable, versioned Corral
+# binary release is published with per-platform SHA256 digests: the
+# downloader refuses any PENDING value, so a nonexistent asset can never
+# be presented as working. When the release exists, fill in the tag plus
+# the four published URLs and digests verbatim — never derive them from
+# the rolling tag's naming shape, which a future release is free to break.
+# ---------------------------------------------------------------------------
+CORRAL_VERSION='PENDING-NO-IMMUTABLE-CORRAL-RELEASE'
+CORRAL_URL_linux_amd64='PENDING'
+CORRAL_SHA256_linux_amd64='PENDING'
+CORRAL_URL_linux_arm64='PENDING'
+CORRAL_SHA256_linux_arm64='PENDING'
+CORRAL_URL_darwin_amd64='PENDING'
+CORRAL_SHA256_darwin_amd64='PENDING'
+CORRAL_URL_darwin_arm64='PENDING'
+CORRAL_SHA256_darwin_arm64='PENDING'
+
+# ---------------------------------------------------------------------------
+# Immutable Tuna VM identities, per guest arch.
+#
+# manifest/source/build/image/package/disk: the manifest NAME is this
+# consumer's label and ARCH is structural per record; every other field is
+# an EXPLICIT pending-contract fixture until a release-qualified Tuna VM
+# image is admitted (URL, digest, exact byte size, firmware, format,
+# guest-visible virtual size, plus the source ref it is built from, the
+# build identity that produced it, the tuna-desktop package identity
+# inside it, and the disk artifact record). The renderer refuses any
+# PENDING value. virtual_size stays REQUIRED here (stricter than corral,
+# which allows it unstated) so the pre-download headroom check is exact
+# rather than a lower estimate.
+# ---------------------------------------------------------------------------
+TUNA_MANIFEST_NAME='tuna-v1'
+TUNA_IMAGE_URL_amd64='PENDING'
+TUNA_IMAGE_SHA256_amd64='PENDING'
+TUNA_IMAGE_SIZE_amd64='PENDING'
+TUNA_IMAGE_FIRMWARE_amd64='PENDING'
+TUNA_IMAGE_FORMAT_amd64='PENDING'
+TUNA_IMAGE_VIRTUAL_SIZE_amd64='PENDING'
+TUNA_SOURCE_amd64='PENDING'
+TUNA_BUILD_amd64='PENDING'
+TUNA_PACKAGE_amd64='PENDING'
+TUNA_DISK_amd64='PENDING'
+TUNA_IMAGE_URL_arm64='PENDING'
+TUNA_IMAGE_SHA256_arm64='PENDING'
+TUNA_IMAGE_SIZE_arm64='PENDING'
+TUNA_IMAGE_FIRMWARE_arm64='PENDING'
+TUNA_IMAGE_FORMAT_arm64='PENDING'
+TUNA_IMAGE_VIRTUAL_SIZE_arm64='PENDING'
+TUNA_SOURCE_arm64='PENDING'
+TUNA_BUILD_arm64='PENDING'
+TUNA_PACKAGE_arm64='PENDING'
+TUNA_DISK_arm64='PENDING'
+
+# Bounds owned by this consumer (documented here, not from corral): the
+# Corral binary download is capped in bytes and finite in time and retries;
+# setup probes (`corral version`, `launch --help`) run under a finite
+# deadline with exact-child retirement; state-lock acquisition waits a
+# finite time before failing instead of blocking forever. The final
+# `corral launch` is intentionally long-running and is never time-boxed.
+CORRAL_MAX_BYTES='268435456'
+CURL_CONNECT_TIMEOUT='30'
+CURL_MAX_TIME='1800'
+CURL_RETRIES='3'
+CORRAL_PROBE_TIMEOUT='15'
+LOCK_WAIT_SECS='30'
+# Largest JSON integer this consumer emits: int64 max. All emitted
+# integers are canonical decimal (no leading zeros) within explicit
+# ranges, so a claimed validated contract can never carry a token C4's
+# JSON parsing would reject.
+INT64_MAX='9223372036854775807'
+
+fail() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+    exit 1
+}
+
+warn() {
+    printf '%s: warning: %s\n' "$PROG" "$1" >&2
+}
+
+is_pending() {
+    case "$1" in
+        PENDING*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_digits() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_hex64_lower() {
+    [ "${#1}" -eq 64 ] || return 1
+    case "$1" in
+        *[!0-9a-f]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_canonical_int() {
+    # Canonical decimal: all digits, no leading zeros (exactly '0' allowed).
+    case "$1" in
+        '') return 1 ;;
+        '0') return 0 ;;
+        '0'*) return 1 ;;
+        *[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+int_le() {
+    # $1 <= $2 for canonical non-negative integers, without arithmetic
+    # and without locale-sensitive lexical operators: shorter is
+    # smaller; at equal length the first differing digit decides (a
+    # single digit can never overflow `[ -lt ]`).
+    if [ "${#1}" -ne "${#2}" ]; then
+        [ "${#1}" -lt "${#2}" ]
+        return $?
+    fi
+    _le_a="$1"; _le_b="$2"
+    while [ -n "$_le_a" ]; do
+        _le_ra="${_le_a#?}"
+        _le_rb="${_le_b#?}"
+        _le_da="${_le_a%"$_le_ra"}"
+        _le_db="${_le_b%"$_le_rb"}"
+        if [ "$_le_da" -ne "$_le_db" ]; then
+            [ "$_le_da" -lt "$_le_db" ]
+            return $?
+        fi
+        _le_a="$_le_ra"; _le_b="$_le_rb"
+    done
+    return 0
+}
+
+int_between() {
+    # $1 in [$2, $3] for canonical non-negative integers.
+    int_le "$2" "$1" && int_le "$1" "$3"
+}
+
+check_bounded_int() {
+    # $1 = value, $2 = min, $3 = max, $4 = field name. Fails closed on
+    # non-canonical form or out-of-range values.
+    if ! is_canonical_int "$1"; then
+        fail "$4 must be canonical decimal (digits, no leading zeros), got '$1'"
+    fi
+    if ! int_between "$1" "$2" "$3"; then
+        fail "$4 must be within $2..$3, got '$1'"
+    fi
+}
+
+file_owner() {
+    # Prints the numeric owner uid of $1 (GNU then BSD stat spelling).
+    stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null
+}
+
+file_mode() {
+    # Prints the permission bits of $1 in octal (GNU then BSD spelling).
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+path_is_world_writable() {
+    # True when the lowest permission digit of $1 carries the write bit.
+    _m="$(file_mode "$1")" || return 0
+    _m="${_m#"${_m%???}"}"
+    case "$_m" in
+        *[2376]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+seams_on() {
+    [ "${TUNA_CORRAL_DESKTOP_TEST_SEAMS:-0}" = '1' ]
+}
+
+provenance_token() {
+    # Receipt provenance for this run: fixture coordinates are never
+    # recorded as release qualification.
+    if seams_on; then
+        printf 'fixture\n'
+    else
+        printf 'release-pin\n'
+    fi
+}
+
+fixture_notice() {
+    # Visible non-release binding: any seam-influenced run says so.
+    if seams_on; then
+        warn 'FIXTURE MODE: TUNA_CORRAL_DESKTOP_TEST_SEAMS=1 — fixture coordinates active; not a release-qualified run'
+    fi
+}
+
+probe_timeout_secs() {
+    # Prints the probe deadline. Returns nonzero (instead of exiting, so
+    # callers in command substitutions can propagate the failure) on a
+    # malformed seam value.
+    if seams_on && [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_PROBE_TIMEOUT:-}" ]; then
+        _v="$TUNA_CORRAL_DESKTOP_FIXTURE_PROBE_TIMEOUT"
+        if ! is_canonical_int "$_v" || ! int_between "$_v" '1' '300'; then
+            printf '%s: fixture probe timeout must be canonical decimal within 1..300, got %s\n' "$PROG" "'$_v'" >&2
+            return 1
+        fi
+        printf '%s\n' "$_v"
+    else
+        printf '%s\n' "$CORRAL_PROBE_TIMEOUT"
+    fi
+}
+
+lock_wait_secs() {
+    # Prints the lock-wait budget. Returns nonzero on a malformed seam
+    # value (see probe_timeout_secs).
+    if seams_on && [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_LOCK_WAIT:-}" ]; then
+        _v="$TUNA_CORRAL_DESKTOP_FIXTURE_LOCK_WAIT"
+        if ! is_canonical_int "$_v" || ! int_between "$_v" '0' '300'; then
+            printf '%s: fixture lock wait must be canonical decimal within 0..300, got %s\n' "$PROG" "'$_v'" >&2
+            return 1
+        fi
+        printf '%s\n' "$_v"
+    else
+        printf '%s\n' "$LOCK_WAIT_SECS"
+    fi
+}
+
+# --- host matrix (OS/arch spellings mirror the reviewed installer) ---
+
+HOST_OS=''
+HOST_ARCH=''
+
+detect_host() {
+    _uname_s="$(uname -s 2>/dev/null || true)"
+    _uname_m="$(uname -m 2>/dev/null || true)"
+    if seams_on; then
+        if [ -n "${TUNA_CORRAL_DESKTOP_UNAME_S:-}" ]; then
+            _uname_s="$TUNA_CORRAL_DESKTOP_UNAME_S"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_UNAME_M:-}" ]; then
+            _uname_m="$TUNA_CORRAL_DESKTOP_UNAME_M"
+        fi
+    fi
+    case "$_uname_s" in
+        Linux) HOST_OS='linux' ;;
+        Darwin) HOST_OS='darwin' ;;
+        *) fail "unsupported host OS '$_uname_s' (Linux/macOS only)" ;;
+    esac
+    case "$_uname_m" in
+        x86_64|amd64) HOST_ARCH='amd64' ;;
+        aarch64|arm64) HOST_ARCH='arm64' ;;
+        *) fail "unsupported host arch '$_uname_m' (amd64/arm64 only)" ;;
+    esac
+}
+
+# --- tools ---
+
+SHA256_TOOL=''
+
+find_sha256_tool() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        SHA256_TOOL='sha256sum'
+    elif command -v shasum >/dev/null 2>&1; then
+        SHA256_TOOL='shasum -a 256'
+    else
+        fail 'need sha256sum or shasum -a 256 to verify downloads (refusing to acquire an unverifiable binary)'
+    fi
+}
+
+need_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        fail "need '$1' in PATH ($2)"
+    fi
+}
+
+check_tools() {
+    need_tool 'curl' 'install curl to download Corral'
+    find_sha256_tool
+    need_tool 'df' 'install coreutils/file-system tools to check disk headroom'
+    need_tool 'awk' 'install awk to check disk headroom'
+    need_tool 'sleep' 'install coreutils to bound setup probes'
+    need_tool 'stat' 'need stat to admit owned state (owner/mode checks)'
+    need_tool 'id' 'need id to admit owned state (owner check)'
+}
+
+sha256_of_file() {
+    # Prints the lowercase hex digest of $1. $SHA256_TOOL is set by find_sha256_tool.
+    if [ "$SHA256_TOOL" = 'sha256sum' ]; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# --- QEMU prerequisite (binary names and extra lookup dirs are corral's own) ---
+
+QEMU_EMULATOR=''
+
+find_in_extra_dirs() {
+    # $1 = file name; prints the first hit under corral's extra lookup dirs.
+    for _base in '/opt/homebrew/bin' '/usr/local/bin' '/usr/bin' '/home/linuxbrew/.linuxbrew/bin'; do
+        if [ -x "$_base/$1" ]; then
+            printf '%s\n' "$_base/$1"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_host_file() {
+    # $1 = file name; PATH first, then corral's extra lookup dirs.
+    _found="$(command -v "$1" 2>/dev/null || true)"
+    if [ -n "$_found" ]; then
+        printf '%s\n' "$_found"
+        return 0
+    fi
+    find_in_extra_dirs "$1"
+}
+
+check_qemu() {
+    # $1 = guest arch. Hard gate: corral preflight would refuse anyway, but
+    # failing here names the install action before any state is touched.
+    if [ "$1" = 'arm64' ]; then
+        QEMU_EMULATOR='qemu-system-aarch64'
+    else
+        QEMU_EMULATOR='qemu-system-x86_64'
+    fi
+    if ! find_host_file "$QEMU_EMULATOR" >/dev/null 2>&1; then
+        _have_img='no'
+        if find_host_file 'qemu-img' >/dev/null 2>&1; then
+            _have_img='yes'
+        fi
+        if [ "$HOST_OS" = 'darwin' ]; then
+            fail "QEMU for $1 not found ($QEMU_EMULATOR + qemu-img missing from PATH and Homebrew/system paths) — install: brew install qemu"
+        fi
+        fail "QEMU for $1 not found ($QEMU_EMULATOR + qemu-img missing from PATH and system paths; qemu-img present: $_have_img) — install your distro's QEMU system package (e.g. qemu-system on Debian/Ubuntu, qemu-kvm on Fedora)"
+    fi
+    if ! find_host_file 'qemu-img' >/dev/null 2>&1; then
+        if [ "$HOST_OS" = 'darwin' ]; then
+            fail 'qemu-img not found (missing from PATH and Homebrew/system paths) — install: brew install qemu'
+        fi
+        fail "qemu-img not found (missing from PATH and system paths) — install your distro's QEMU system package (e.g. qemu-system on Debian/Ubuntu, qemu-kvm on Fedora)"
+    fi
+}
+
+# --- browser opener advisory (corral prints the URL either way) ---
+
+check_opener() {
+    if [ "$HOST_OS" = 'darwin' ]; then
+        if ! command -v open >/dev/null 2>&1; then
+            warn "'open' not found in PATH — corral still prints the console URL; open it manually"
+            return 1
+        fi
+    else
+        if ! command -v xdg-open >/dev/null 2>&1; then
+            warn "'xdg-open' not found in PATH (install xdg-utils for one-click browser handoff) — corral still prints the console URL; open it manually"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# --- UEFI firmware advisory (exact candidate lists are corral's own;
+# corral preflight re-checks authoritatively, so this stays advisory) ---
+
+firmware_file_ok() {
+    [ -f "$1" ] && [ -s "$1" ]
+}
+
+check_firmware() {
+    # $1 = guest arch, $2 = manifest firmware. Advisory only; returns 1 when
+    # UEFI firmware is wanted but no candidate code file is visible.
+    if [ "$2" != 'uefi' ]; then
+        return 0
+    fi
+    if [ "$1" = 'arm64' ]; then
+        _suffix='ARM64'
+    else
+        _suffix='AMD64'
+    fi
+    # Operator overrides name exact files (corral honors CORRAL_OVMF_CODE
+    # plus the per-arch pair); a visible override satisfies the advisory.
+    for _ov in "CORRAL_OVMF_CODE_$_suffix" 'CORRAL_OVMF_CODE'; do
+        case "$_ov" in
+            CORRAL_OVMF_CODE_AMD64) _ov_path="${CORRAL_OVMF_CODE_AMD64:-}" ;;
+            CORRAL_OVMF_CODE_ARM64) _ov_path="${CORRAL_OVMF_CODE_ARM64:-}" ;;
+            *) _ov_path="${CORRAL_OVMF_CODE:-}" ;;
+        esac
+        if [ -n "$_ov_path" ] && firmware_file_ok "$_ov_path"; then
+            return 0
+        fi
+    done
+    if [ "$1" = 'arm64' ]; then
+        for _code in \
+            '/usr/share/qemu/edk2-aarch64-code.fd' \
+            '/usr/share/AAVMF/AAVMF_CODE.fd' \
+            '/usr/share/edk2-arm/aarch64/QEMU_EFI.fd' \
+            '/opt/homebrew/share/qemu/edk2-aarch64-code.fd' \
+            '/home/linuxbrew/.linuxbrew/share/qemu/edk2-aarch64-code.fd'; do
+            if firmware_file_ok "$_code"; then
+                return 0
+            fi
+        done
+    else
+        for _code in \
+            '/usr/share/qemu/edk2-x86_64-code.fd' \
+            '/usr/share/edk2/ovmf/OVMF_CODE.fd' \
+            '/usr/share/OVMF/OVMF_CODE_4M.fd' \
+            '/usr/share/OVMF/OVMF_CODE.fd' \
+            '/usr/share/edk2-ovmf/x64/OVMF_CODE.fd' \
+            '/usr/share/qemu/ovmf-x86_64-code.bin' \
+            '/home/linuxbrew/.linuxbrew/share/qemu/edk2-x86_64-code.fd' \
+            '/usr/local/share/qemu/edk2-x86_64-code.fd' \
+            '/opt/homebrew/share/qemu/edk2-x86_64-code.fd'; do
+            if firmware_file_ok "$_code"; then
+                return 0
+            fi
+        done
+    fi
+    warn "UEFI firmware for $1 guests not found on host (install edk2-ovmf or ovmf) — corral preflight re-checks authoritatively at launch"
+    return 1
+}
+
+# --- owned state ---
+#
+# Ownership is never minted over existing content: a state dir must be
+# fresh (created here) or already owned (exact marker, owned by our uid,
+# not world-writable, no symlinks on the home or its child dirs). An
+# existing unmarked, foreign, or unsafe directory is refused, never
+# adopted — so a failed startup can never promote an unrelated
+# directory into a later cleanup target.
+
+STATE_HOME=''
+STATE_TMP=''
+LOCK_HELD='no'
+
+strip_trailing_slashes() {
+    _s="$1"
+    while [ "${#_s}" -gt 1 ]; do
+        case "$_s" in
+            */) _s="${_s%/}" ;;
+            *) break ;;
+        esac
+    done
+    printf '%s\n' "$_s"
+}
+
+resolve_state_home() {
+    if [ -n "${OPT_HOME:-}" ]; then
+        STATE_HOME="$OPT_HOME"
+    elif [ -n "${TUNA_CORRAL_DESKTOP_HOME:-}" ]; then
+        STATE_HOME="$TUNA_CORRAL_DESKTOP_HOME"
+    else
+        if [ -z "${HOME:-}" ]; then
+            fail 'HOME is not set and no --home given (refusing to guess a state dir)'
+        fi
+        STATE_HOME="$HOME/.local/share/tuna-corral-desktop"
+    fi
+    case "$STATE_HOME" in
+        '/'|'') fail "refusing state dir '$STATE_HOME'" ;;
+    esac
+    case "$STATE_HOME" in
+        /*) ;;
+        *) fail "refusing state dir '$STATE_HOME': must be absolute (refusing a relative state dir)" ;;
+    esac
+    _norm="$(strip_trailing_slashes "$STATE_HOME")"
+    _home_norm="$(strip_trailing_slashes "${HOME:-}")"
+    if [ -n "$_home_norm" ] && [ "$_norm" = "$_home_norm" ]; then
+        fail "refusing state dir '$STATE_HOME': must not be your HOME (refusing to stamp a shared directory owned)"
+    fi
+}
+
+assert_state_marker() {
+    # The exact marker in a regular, non-symlink file: the only evidence
+    # of prior ownership. Re-checked under the state lock.
+    _marker="$STATE_HOME/tuna-corral-desktop.state"
+    if [ -L "$_marker" ]; then
+        fail "refusing state dir '$STATE_HOME': state marker is a symlink (refusing to follow)"
+    fi
+    if [ ! -f "$_marker" ]; then
+        fail "refusing state dir '$STATE_HOME': no $PROG state marker (not an owned state dir; refusing to adopt it)"
+    fi
+    if [ "$(cat "$_marker")" != "$STATE_MARKER" ]; then
+        fail "refusing state dir '$STATE_HOME': state marker mismatch (not an owned state dir)"
+    fi
+}
+
+assert_child_dirs() {
+    # Child boundaries are real directories we own, never symlinks.
+    for _child in bin manifests tmp; do
+        if [ -L "$STATE_HOME/$_child" ]; then
+            fail "refusing state dir '$STATE_HOME': '$_child' is a symlink (refusing to follow)"
+        fi
+        if [ -e "$STATE_HOME/$_child" ] && [ ! -d "$STATE_HOME/$_child" ]; then
+            fail "refusing state dir '$STATE_HOME': '$_child' is not a directory"
+        fi
+    done
+}
+
+admit_owned_state_home() {
+    # Full admission for an existing state dir: type, owner, mode,
+    # canonical path, marker, and child boundaries. No writes here.
+    if [ -L "$STATE_HOME" ]; then
+        fail "refusing state dir '$STATE_HOME': is a symlink (refusing to follow)"
+    fi
+    if [ ! -d "$STATE_HOME" ]; then
+        fail "refusing state dir '$STATE_HOME': not a directory"
+    fi
+    _euid="$(id -u)" || fail "cannot read our uid (refusing to admit state blind)"
+    _owner="$(file_owner "$STATE_HOME")" || _owner=''
+    if [ "$_owner" != "$_euid" ]; then
+        fail "refusing state dir '$STATE_HOME': owned by uid '${_owner:-unknown}', not by us (uid $_euid)"
+    fi
+    if path_is_world_writable "$STATE_HOME"; then
+        fail "refusing state dir '$STATE_HOME': is world-writable (anyone could plant binaries there)"
+    fi
+    _canon="$(cd "$STATE_HOME" 2>/dev/null && pwd -P 2>/dev/null || true)"
+    if [ -z "$_canon" ]; then
+        fail "refusing state dir '$STATE_HOME': cannot resolve its canonical path"
+    fi
+    _canon="$(strip_trailing_slashes "$_canon")"
+    _home_norm="$(strip_trailing_slashes "${HOME:-}")"
+    if [ "$_canon" = '/' ]; then
+        fail "refusing state dir '$STATE_HOME': resolves to /"
+    fi
+    if [ -n "$_home_norm" ] && [ "$_canon" = "$_home_norm" ]; then
+        fail "refusing state dir '$STATE_HOME': resolves to your HOME (refusing to stamp a shared directory owned)"
+    fi
+    assert_state_marker
+    assert_child_dirs
+}
+
+ensure_state_home() {
+    resolve_state_home
+    if [ -L "$STATE_HOME" ]; then
+        fail "refusing state dir '$STATE_HOME': is a symlink (refusing to follow)"
+    fi
+    _marker="$STATE_HOME/tuna-corral-desktop.state"
+    if [ -e "$STATE_HOME" ]; then
+        # Exists: it must already be owned. The marker is checked before
+        # any write, and an unmarked directory is refused, never adopted.
+        # One tolerance: a concurrent first-use may be between its mkdir
+        # and its marker write, so wait briefly for a marker to appear;
+        # a pre-existing foreign dir still refuses below.
+        if [ ! -f "$_marker" ]; then
+            _w=0
+            while [ "$_w" -lt 3 ] && [ ! -f "$_marker" ]; do
+                sleep 1
+                _w=$((_w + 1))
+            done
+        fi
+        admit_owned_state_home
+        mkdir -p "$STATE_HOME/bin" "$STATE_HOME/manifests" "$STATE_HOME/tmp" \
+            || fail "cannot create owned child dirs in '$STATE_HOME'"
+        assert_child_dirs
+    else
+        mkdir -p "$STATE_HOME/bin" "$STATE_HOME/manifests" "$STATE_HOME/tmp" \
+            || fail "cannot create state dir '$STATE_HOME'"
+        printf '%s\n' "$STATE_MARKER" >"$_marker" \
+            || fail "cannot write state marker in '$STATE_HOME'"
+        admit_owned_state_home
+    fi
+}
+
+acquire_state_lock() {
+    # $1 = seconds to wait (0 = fail fast). Serializes installation,
+    # rendering, and cleanup across invocations. A lock whose owner pid
+    # is dead is stale and is stolen; a live holder is waited on (flow)
+    # or refused (clean passes 0).
+    _wait="$1"
+    _n=0
+    _empty_seen=0
+    _lock="$STATE_HOME/.lock"
+    _owner=''
+    while :; do
+        if mkdir "$_lock" 2>/dev/null; then
+            printf '%s\n' "$$" >"$_lock/owner" \
+                || fail "cannot record state lock owner in '$_lock'"
+            _back="$(cat "$_lock/owner" 2>/dev/null || true)"
+            if [ "$_back" != "$$" ]; then
+                fail "state lock owner mismatch in '$_lock' (refusing to proceed on a contested lock)"
+            fi
+            LOCK_HELD='yes'
+            return 0
+        fi
+        _owner="$(cat "$_lock/owner" 2>/dev/null || true)"
+        if [ -n "$_owner" ]; then
+            if kill -0 "$_owner" 2>/dev/null; then
+                : # live holder: wait below
+            else
+                # Stale holder: stealing its lock is progress, not waiting,
+                # so the immediate retry is always allowed (a fail-fast
+                # clean still fails only on a live holder, below).
+                rm -rf "$_lock" 2>/dev/null || true
+                _n=$((_n + 1))
+                if [ "$_n" -gt "$((_wait + 1))" ]; then
+                    break
+                fi
+                continue
+            fi
+        else
+            # Missing/empty owner: a live holder populates it
+            # synchronously, so steal only if it persists across ticks
+            # (a holder killed between mkdir and its owner write).
+            _empty_seen=$((_empty_seen + 1))
+            if [ "$_empty_seen" -ge 2 ]; then
+                rm -rf "$_lock" 2>/dev/null || true
+                _empty_seen=0
+            fi
+            _n=$((_n + 1))
+            if [ "$_n" -gt "$_wait" ]; then
+                break
+            fi
+            sleep 1
+            continue
+        fi
+        _n=$((_n + 1))
+        if [ "$_n" -gt "$_wait" ]; then
+            break
+        fi
+        sleep 1
+    done
+    if [ "$_wait" -eq 0 ]; then
+        fail "state in use: another $PROG invocation holds the state lock for '$STATE_HOME' (owner pid ${_owner:-unknown}); refusing to clean active state"
+    fi
+    fail "cannot acquire state lock for '$STATE_HOME' after ${_wait}s (held by pid ${_owner:-unknown}); refusing to proceed on contested state"
+}
+
+release_state_lock() {
+    if [ "$LOCK_HELD" != 'yes' ]; then
+        return 0
+    fi
+    _lock="$STATE_HOME/.lock"
+    _owner="$(cat "$_lock/owner" 2>/dev/null || true)"
+    if [ "$_owner" = "$$" ]; then
+        rm -f "$_lock/owner" 2>/dev/null || true
+        rmdir "$_lock" 2>/dev/null \
+            || warn "could not remove owned state lock '$_lock'"
+    else
+        warn "state lock '$_lock' no longer owned by this invocation (owner ${_owner:-unknown}); leaving it in place"
+    fi
+    LOCK_HELD='no'
+}
+
+cleanup_tmp() {
+    if [ -n "$STATE_TMP" ] && [ -d "$STATE_TMP" ]; then
+        rm -rf "$STATE_TMP"
+    fi
+}
+
+ensure_tmp() {
+    if [ -z "$STATE_TMP" ]; then
+        STATE_TMP="$(mktemp -d "$STATE_HOME/tmp/work.XXXXXX")"
+    fi
+}
+
+clean_state() {
+    resolve_state_home
+    check_tools
+    if [ ! -e "$STATE_HOME" ]; then
+        fail "refusing to clean '$STATE_HOME': no $PROG state marker (not an owned state dir)"
+    fi
+    admit_owned_state_home
+    acquire_state_lock 0
+    assert_state_marker
+    # Owned inventory only: the binary cache, rendered manifests and
+    # qualification receipts, disposable scratch, and the marker itself.
+    # Foreign files and Corral VM/cache state (the scoped .local/ tree)
+    # are never listed here, so they can never be removed by clean.
+    rm -rf "${STATE_HOME:?}/bin" "${STATE_HOME:?}/manifests" \
+        "${STATE_HOME:?}/tmp" "${STATE_HOME:?}/tuna-corral-desktop.state"
+    release_state_lock
+    if rmdir "$STATE_HOME" 2>/dev/null; then
+        printf '%s: cleaned %s\n' "$PROG" "$STATE_HOME" >&2
+    else
+        printf '%s: cleaned owned inventory in %s; directory left in place (foreign or Corral VM/cache state preserved)\n' "$PROG" "$STATE_HOME" >&2
+    fi
+}
+
+on_cancel() {
+    # $1 = signal name (INT or TERM). A cancel terminates the run: stop
+    # any in-flight probe (the exact child and, when grouped, its
+    # descendants), release the state lock, drop scratch, and exit with
+    # the conventional status. EXIT keeps the plain scratch cleanup.
+    _sig="$1"
+    if [ -n "${RB_PID:-}" ]; then
+        kill -KILL "${RB_PID:-}" 2>/dev/null || true
+        if [ "${RB_GROUPED:-no}" = 'yes' ]; then
+            env kill -KILL -- "-${RB_PID:-}" 2>/dev/null || true
+        fi
+        wait "${RB_PID:-}" 2>/dev/null || true
+    fi
+    if [ -n "${RB_WATCH:-}" ]; then
+        kill -KILL "${RB_WATCH:-}" 2>/dev/null || true
+        wait "${RB_WATCH:-}" 2>/dev/null || true
+    fi
+    RB_PID=''
+    RB_WATCH=''
+    RB_GROUPED='no'
+    release_state_lock 2>/dev/null || true
+    cleanup_tmp
+    if [ "$_sig" = 'INT' ]; then
+        exit 130
+    fi
+    exit 143
+}
+
+# --- Corral selection ---
+
+corral_selection() {
+    # $1 = host OS, $2 = host arch. Prints version, url, sha256 on lines.
+    case "$1/$2" in
+        linux/amd64) _url="$CORRAL_URL_linux_amd64" _sha="$CORRAL_SHA256_linux_amd64" ;;
+        linux/arm64) _url="$CORRAL_URL_linux_arm64" _sha="$CORRAL_SHA256_linux_arm64" ;;
+        darwin/amd64) _url="$CORRAL_URL_darwin_amd64" _sha="$CORRAL_SHA256_darwin_amd64" ;;
+        darwin/arm64) _url="$CORRAL_URL_darwin_arm64" _sha="$CORRAL_SHA256_darwin_arm64" ;;
+        *) fail "no Corral selection for platform $1/$2" ;;
+    esac
+    _ver="$CORRAL_VERSION"
+    if seams_on; then
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_CORRAL_VERSION:-}" ]; then
+            _ver="$TUNA_CORRAL_DESKTOP_FIXTURE_CORRAL_VERSION"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_CORRAL_URL:-}" ]; then
+            _url="$TUNA_CORRAL_DESKTOP_FIXTURE_CORRAL_URL"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_CORRAL_SHA256:-}" ]; then
+            _sha="$TUNA_CORRAL_DESKTOP_FIXTURE_CORRAL_SHA256"
+        fi
+    fi
+    printf '%s\n%s\n%s\n' "$_ver" "$_url" "$_sha"
+}
+
+# --- shared admission matchers ---
+#
+# One matcher per gate, used both by --print-contract labels and by the
+# flow's fail-closed refusals, so a label can never claim an admission
+# the flow would refuse (or vice versa). Matchers never exit: they
+# return status and set _CHECK_WHY for the caller's message.
+
+_CHECK_WHY=''
+
+version_token_ok() {
+    # $1 = version token. Release versions are dotted tokens; anything
+    # missing, pending, or outside the charset is not admitted.
+    case "$1" in
+        ''|PENDING*) _CHECK_WHY='version is missing or pending'; return 1 ;;
+        *[!A-Za-z0-9._+-]*) _CHECK_WHY="version has unexpected characters: '$1'"; return 1 ;;
+        *) _CHECK_WHY=''; return 0 ;;
+    esac
+}
+
+corral_source_ok() {
+    # $1 = url, $2 = sha256. A pending or malformed value fails the pin.
+    if is_pending "$1" || is_pending "$2"; then
+        _CHECK_WHY='Corral source or digest is pending'
+        return 1
+    fi
+    case "$1" in
+        https://*|file://*) ;;
+        *) _CHECK_WHY="refusing Corral source with unexpected scheme: '$1' (https:// or file:// only)"; return 1 ;;
+    esac
+    if ! is_hex64_lower "$2"; then
+        _CHECK_WHY='refusing a malformed Corral digest pin (must be 64 lowercase hex)'
+        return 1
+    fi
+    _CHECK_WHY=''
+    return 0
+}
+
+string_renders_clean() {
+    # $1 = value. True when the value needs no JSON escaping, so a
+    # "%s" rendering below is exact.
+    case "$1" in
+        ''|*'"'*|*"$_bs"*|*[[:space:]]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+qual_identity_ok() {
+    # $1 = value, $2 = field name, $3 = guest arch. Qualification
+    # identities are printable, non-empty, non-pending tokens: no
+    # newlines or controls, so a stored receipt cannot smuggle lines.
+    if [ -z "$1" ] || is_pending "$1"; then
+        _CHECK_WHY="tuna $3 qualification $2 is missing or pending"
+        return 1
+    fi
+    case "$1" in
+        *[![:print:]]*) _CHECK_WHY="tuna $3 qualification $2 is malformed (non-printable characters refused)"; return 1 ;;
+        *) _CHECK_WHY=''; return 0 ;;
+    esac
+}
+
+tuna_arch_ok() {
+    # $1=arch $2=url $3=sha $4=size $5=firmware $6=format
+    # $7=virtual_size $8=source $9=build $10=package $11=disk.
+    # The full per-arch qualification record: the image bytes bound to
+    # their source, build, package, and disk receipts. Every identity
+    # must admit; image coordinates alone never suffice.
+    _a_arch="$1"; _a_url="$2"; _a_sha="$3"; _a_size="$4"; _a_fw="$5"
+    _a_fmt="$6"; _a_virt="$7"; _a_src="$8"; _a_bld="$9"
+    _a_pkg="${10}"; _a_dsk="${11}"
+    if is_pending "$_a_url" || is_pending "$_a_sha" || is_pending "$_a_size" \
+        || is_pending "$_a_fw" || is_pending "$_a_fmt" || is_pending "$_a_virt"; then
+        _CHECK_WHY="no release-qualified Tuna VM image is admitted for $_a_arch guests (image identity is PENDING) — gate clears when the image pipeline publishes URL, digest, size, firmware, format and virtual size"
+        return 1
+    fi
+    if is_pending "$_a_src" || is_pending "$_a_bld" || is_pending "$_a_pkg" || is_pending "$_a_dsk"; then
+        _CHECK_WHY="no release-qualified Tuna VM image is admitted for $_a_arch guests (qualification identity is PENDING: source, build, package and disk receipts must all be admitted) — gate clears with the full v1 qualification, not on image coordinates alone"
+        return 1
+    fi
+    case "$_a_url" in
+        https://*|file://*) ;;
+        *) _CHECK_WHY="manifest image.url must be https:// or file:// (got '$_a_url')"; return 1 ;;
+    esac
+    if ! string_renders_clean "$_a_url"; then
+        _CHECK_WHY="manifest image.url has characters this consumer will not render: '$_a_url'"
+        return 1
+    fi
+    if ! is_hex64_lower "$_a_sha"; then
+        _CHECK_WHY='manifest image.sha256 must be 64 lowercase hex characters'
+        return 1
+    fi
+    if ! is_canonical_int "$_a_size" || ! int_between "$_a_size" '1' "$INT64_MAX"; then
+        _CHECK_WHY="manifest image.size must be canonical decimal within 1..$INT64_MAX, got '$_a_size'"
+        return 1
+    fi
+    if ! is_canonical_int "$_a_virt" || ! int_between "$_a_virt" '1' "$INT64_MAX"; then
+        _CHECK_WHY="manifest image.virtual_size must be canonical decimal within 1..$INT64_MAX (this consumer requires it stated), got '$_a_virt'"
+        return 1
+    fi
+    case "$_a_arch" in
+        amd64|arm64) ;;
+        *) _CHECK_WHY="manifest image.arch must be amd64 or arm64, got '$_a_arch'"; return 1 ;;
+    esac
+    case "$_a_fw" in
+        uefi|bios) ;;
+        *) _CHECK_WHY="manifest image.firmware must be uefi or bios, got '$_a_fw'"; return 1 ;;
+    esac
+    case "$_a_fmt" in
+        qcow2|raw) ;;
+        *) _CHECK_WHY="manifest image.format must be qcow2 or raw, got '$_a_fmt'"; return 1 ;;
+    esac
+    if [ "$_a_arch" = 'arm64' ] && [ "$_a_fw" = 'bios' ]; then
+        _CHECK_WHY='preflight: arm64 guests require UEFI — the virt board has no BIOS boot contract'
+        return 1
+    fi
+    qual_identity_ok "$_a_src" 'source' "$_a_arch" || return 1
+    qual_identity_ok "$_a_bld" 'build' "$_a_arch" || return 1
+    qual_identity_ok "$_a_pkg" 'package' "$_a_arch" || return 1
+    qual_identity_ok "$_a_dsk" 'disk' "$_a_arch" || return 1
+    _CHECK_WHY=''
+    return 0
+}
+
+# --- bounded setup probes ---
+#
+# `corral version` and `launch --help` run under a finite deadline with
+# exact-child retirement: the direct child is waited on by pid, killed
+# on overrun (TERM, then KILL), and its exit status is honored — output
+# is captured to a file, never through a `head` pipeline that could
+# mask the child's fate. When the child runs in its own process group
+# (setsid where available, else monitor mode where the shell allows
+# it), a timeout also sweeps the group so hung descendants cannot
+# linger. A timeout is always a refusal, never a success receipt. The
+# final `corral launch` is intentionally long-running and is never
+# time-boxed.
+
+RB_PID=''
+RB_WATCH=''
+RB_GROUPED='no'
+RB_TIMED_OUT='no'
+
+run_bounded() {
+    # $1 = seconds, $2 = output file, $3 = timeout marker, $4+ = command.
+    # Returns the child status; sets RB_TIMED_OUT=yes when the deadline
+    # fired. Callers must use `||` (a bare call failing exits via set -e).
+    _rb_secs="$1"; _rb_out="$2"; _rb_mark="$3"; shift 3
+    RB_TIMED_OUT='no'
+    RB_GROUPED='no'
+    : >"$_rb_out" || fail "cannot write probe output to '$_rb_out'"
+    rm -f "$_rb_mark"
+    case "$-" in
+        *m*) _rb_had_m='yes' ;;
+        *) _rb_had_m='no' ;;
+    esac
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@" >"$_rb_out" 2>/dev/null &
+        RB_GROUPED='yes'
+    elif set -m 2>/dev/null && case "$-" in *m*) true ;; *) false ;; esac; then
+        "$@" >"$_rb_out" 2>/dev/null &
+        RB_GROUPED='yes'
+        if [ "$_rb_had_m" = 'no' ]; then
+            set +m 2>/dev/null || true
+        fi
+    else
+        if [ "$_rb_had_m" = 'no' ]; then
+            set +m 2>/dev/null || true
+        fi
+        "$@" >"$_rb_out" 2>/dev/null &
+        RB_GROUPED='no'
+    fi
+    RB_PID="$!"
+    # The watcher owns no stdio: if a cancel kills this subshell, its
+    # orphaned inner sleep must not hold our stdout/stderr open (a piped
+    # parent would block on EOF until the deadline).
+    ( sleep "$_rb_secs" || exit 0
+      if kill "$RB_PID" 2>/dev/null; then
+          : >"$_rb_mark" 2>/dev/null || true
+          sleep 2 || exit 0
+          kill -KILL "$RB_PID" 2>/dev/null || true
+      fi
+    ) >/dev/null 2>&1 &
+    RB_WATCH="$!"
+    _rb_status=0
+    wait "$RB_PID" || _rb_status="$?"
+    kill "$RB_WATCH" 2>/dev/null || true
+    wait "$RB_WATCH" 2>/dev/null || true
+    if [ -f "$_rb_mark" ]; then
+        RB_TIMED_OUT='yes'
+        if [ "$RB_GROUPED" = 'yes' ]; then
+            env kill -KILL -- "-$RB_PID" 2>/dev/null || true
+        fi
+    fi
+    RB_PID=''
+    RB_WATCH=''
+    rm -f "$_rb_mark"
+    return "$_rb_status"
+}
+
+corral_version_ok() {
+    # $1 = binary, $2 = pinned version. The `corral version` line has the
+    # reviewed shape `corral <ver> (commit ..., built ..., go...)`.
+    # Bounded: timeout, nonzero exit, empty output, and identity
+    # mismatch are all refusals.
+    if ! version_token_ok "$2"; then
+        fail "refusing to match a version pin with unexpected characters: '$2'"
+    fi
+    _vo_secs="$(probe_timeout_secs)" || exit 1
+    _vo_out="$STATE_TMP/probe-version.out"
+    _vo_mark="$STATE_TMP/probe-version.timeout"
+    _vo_status=0
+    run_bounded "$_vo_secs" "$_vo_out" "$_vo_mark" "$1" version || _vo_status="$?"
+    if [ "$RB_TIMED_OUT" = 'yes' ]; then
+        fail "'$1 version' timed out after ${_vo_secs}s (bounded probe; refusing a hung Corral binary)"
+    fi
+    if [ "$_vo_status" -ne 0 ]; then
+        fail "'$1 version' failed with status $_vo_status (refusing an unidentifiable Corral binary)"
+    fi
+    _got="$(head -n 1 "$_vo_out" 2>/dev/null || true)"
+    if [ -z "$_got" ]; then
+        fail "'$1 version' produced no output (refusing an unidentifiable Corral binary)"
+    fi
+    case "$_got" in
+        "corral $2 ("*) printf '%s\n' "$_got" ;;
+        *) fail "Corral identity mismatch: want 'corral $2 (...)', got '$_got'" ;;
+    esac
+}
+
+bounded_version_line() {
+    # $1 = binary. Best-effort version line for UNPINNED reporting only;
+    # never admits anything (timeout/failure/empty → unidentifiable).
+    _bv_secs="$(probe_timeout_secs)" || exit 1
+    _bv_out="$STATE_TMP/probe-version-unpinned.out"
+    _bv_mark="$STATE_TMP/probe-version-unpinned.timeout"
+    _bv_status=0
+    run_bounded "$_bv_secs" "$_bv_out" "$_bv_mark" "$1" version || _bv_status="$?"
+    if [ "$RB_TIMED_OUT" = 'yes' ]; then
+        printf 'unidentifiable (version probe timed out)\n'
+        return 0
+    fi
+    if [ "$_bv_status" -ne 0 ]; then
+        printf 'unidentifiable (version probe failed)\n'
+        return 0
+    fi
+    _bv_line="$(head -n 1 "$_bv_out" 2>/dev/null || true)"
+    printf '%s\n' "${_bv_line:-unidentifiable}"
+}
+
+probe_launch_command() {
+    # $1 = binary. The reviewed one-liner needs the `launch` command; a
+    # binary without it (stale, wrong build) fails here, not mid-flow.
+    # Bounded like every other setup probe.
+    _pl_secs="$(probe_timeout_secs)" || exit 1
+    _pl_out="$STATE_TMP/probe-launch.out"
+    _pl_mark="$STATE_TMP/probe-launch.timeout"
+    _pl_status=0
+    run_bounded "$_pl_secs" "$_pl_out" "$_pl_mark" "$1" launch --help || _pl_status="$?"
+    if [ "$RB_TIMED_OUT" = 'yes' ]; then
+        fail "'$1 launch --help' timed out after ${_pl_secs}s (bounded probe; refusing a hung Corral binary)"
+    fi
+    if [ "$_pl_status" -ne 0 ]; then
+        fail "'$1' has no working 'launch' command (need the reviewed one-liner-capable Corral build)"
+    fi
+}
+
+CORRAL_BIN_FINAL=''
+CORRAL_EXPECTED_SHA=''
+
+write_corral_receipts() {
+    # $1 = admitted digest, $2 = verified version line. Installed only
+    # for digest-admitted binaries; unpinned installs record nothing.
+    printf '%s\n' "$1" >"$STATE_HOME/bin/corral.sha256"
+    printf '%s\n' "$2" >"$STATE_HOME/bin/corral.version"
+    printf '%s\n' "$(provenance_token)" >"$STATE_HOME/bin/corral.provenance"
+}
+
+clear_corral_receipts() {
+    # An unpinned binary must never sit beside claimed pin metadata.
+    rm -f "$STATE_HOME/bin/corral.version" "$STATE_HOME/bin/corral.sha256" \
+        "$STATE_HOME/bin/corral.provenance"
+}
+
+acquire_operator_corral() {
+    # $1 = pinned version (seam-aware), $2 = pinned digest. Operator
+    # path: digest (and full identity) BEFORE any execution, operating
+    # on a private copy. A version match alone never admits a binary.
+    _op_ver="$1"; _op_sha="$2"
+    _cached="$STATE_HOME/bin/corral"
+    _op_copy="$STATE_TMP/corral-operator"
+    if [ ! -f "$OPT_CORRAL_BIN" ] || [ ! -x "$OPT_CORRAL_BIN" ]; then
+        fail "--corral-bin '$OPT_CORRAL_BIN' is not an executable file"
+    fi
+    if is_pending "$_op_ver"; then
+        if [ "${OPT_ALLOW_UNPINNED:-no}" != 'yes' ]; then
+            fail "no immutable Corral release is admitted (pin is $CORRAL_VERSION); pass --allow-unpinned-corral to run operator-supplied '$OPT_CORRAL_BIN' explicitly unpinned"
+        fi
+        cp "$OPT_CORRAL_BIN" "$_op_copy" \
+            || fail "cannot stage operator-supplied '$OPT_CORRAL_BIN'"
+        chmod 0755 "$_op_copy"
+        probe_launch_command "$_op_copy"
+        _line="$(bounded_version_line "$_op_copy")"
+        mv "$_op_copy" "$_cached"
+        clear_corral_receipts
+        printf '%s: UNPINNED corral: no immutable release admitted; running operator-supplied binary as %s (no pin metadata recorded)\n' "$PROG" "${_line:-unidentifiable}" >&2
+        CORRAL_BIN_FINAL="$_cached"
+        CORRAL_EXPECTED_SHA=''
+        return 0
+    fi
+    if ! version_token_ok "$_op_ver"; then
+        fail "refusing --corral-bin: admitted Corral version pin is malformed: '$_op_ver'"
+    fi
+    if is_pending "$_op_sha" || ! is_hex64_lower "$_op_sha"; then
+        fail "refusing --corral-bin: Corral version is pinned but no digest pin is admitted (a version match alone never admits a binary)"
+    fi
+    _op_actual="$(sha256_of_file "$OPT_CORRAL_BIN")"
+    if [ "$_op_actual" != "$_op_sha" ]; then
+        fail "--corral-bin '$OPT_CORRAL_BIN' digest mismatch: want $_op_sha, got $_op_actual (refusing to execute an unadmitted binary)"
+    fi
+    cp "$OPT_CORRAL_BIN" "$_op_copy" \
+        || fail "cannot stage operator-supplied '$OPT_CORRAL_BIN'"
+    chmod 0755 "$_op_copy"
+    if [ "$(sha256_of_file "$_op_copy")" != "$_op_sha" ]; then
+        rm -f "$_op_copy"
+        fail '--corral-bin private copy failed its digest recheck (refusing to execute)'
+    fi
+    probe_launch_command "$_op_copy"
+    _line="$(corral_version_ok "$_op_copy" "$_op_ver")"
+    mv "$_op_copy" "$_cached"
+    write_corral_receipts "$_op_sha" "$_line"
+    printf '%s: using operator-supplied corral %s (digest verified before execution)\n' "$PROG" "$_line" >&2
+    CORRAL_BIN_FINAL="$_cached"
+    CORRAL_EXPECTED_SHA="$_op_sha"
+}
+
+acquire_corral() {
+    ensure_state_home
+    ensure_tmp
+    assert_child_dirs
+    _cached="$STATE_HOME/bin/corral"
+    _sel="$(corral_selection "$HOST_OS" "$HOST_ARCH")"
+    _pin_ver="$(printf '%s\n' "$_sel" | head -n 1)"
+    _pin_url="$(printf '%s\n' "$_sel" | head -n 2 | tail -n 1)"
+    _pin_sha="$(printf '%s\n' "$_sel" | tail -n 1)"
+    if [ -n "${OPT_CORRAL_BIN:-}" ]; then
+        acquire_operator_corral "$_pin_ver" "$_pin_sha"
+        return 0
+    fi
+    if ! version_token_ok "$_pin_ver"; then
+        fail "no immutable Corral $HOST_OS/$HOST_ARCH release is admitted (version=$CORRAL_VERSION) — refusing the mutable rolling tag by design; gate clears when a versioned release with published digests exists"
+    fi
+    if ! corral_source_ok "$_pin_url" "$_pin_sha"; then
+        case "$_CHECK_WHY" in
+            'Corral source or digest is pending')
+                fail "no immutable Corral $HOST_OS/$HOST_ARCH release is admitted (version=$CORRAL_VERSION) — refusing the mutable rolling tag by design; gate clears when a versioned release with published digests exists" ;;
+            *) fail "$_CHECK_WHY" ;;
+        esac
+    fi
+    if [ -x "$_cached" ] && [ ! -L "$_cached" ] \
+        && [ -f "$STATE_HOME/bin/corral.sha256" ] && [ ! -L "$STATE_HOME/bin/corral.sha256" ] \
+        && [ -f "$STATE_HOME/bin/corral.provenance" ] && [ ! -L "$STATE_HOME/bin/corral.provenance" ]; then
+        if [ "$(cat "$STATE_HOME/bin/corral.provenance")" = "$(provenance_token)" ] \
+            && [ "$(cat "$STATE_HOME/bin/corral.sha256")" = "$_pin_sha" ] \
+            && [ "$(sha256_of_file "$_cached")" = "$_pin_sha" ]; then
+            _line="$(corral_version_ok "$_cached" "$_pin_ver")"
+            write_corral_receipts "$_pin_sha" "$_line"
+            printf '%s: reusing cached corral %s\n' "$PROG" "$_line" >&2
+            CORRAL_BIN_FINAL="$_cached"
+            CORRAL_EXPECTED_SHA="$_pin_sha"
+            return 0
+        fi
+    fi
+    _tmp="$STATE_TMP/corral-download"
+    if ! curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+        --retry "$CURL_RETRIES" --max-filesize "$CORRAL_MAX_BYTES" \
+        -o "$_tmp" "$_pin_url" 2>"$STATE_TMP/curl.err"; then
+        _err="$(head -n 3 "$STATE_TMP/curl.err" 2>/dev/null || true)"
+        fail "downloading pinned Corral failed: ${_err:-curl error} (finite retries exhausted; check network access to the release host)"
+    fi
+    _actual="$(sha256_of_file "$_tmp")"
+    if [ "$_actual" != "$_pin_sha" ]; then
+        rm -f "$_tmp"
+        fail "Corral checksum mismatch for $HOST_OS/$HOST_ARCH: want $_pin_sha, got $_actual (refusing to install)"
+    fi
+    chmod 0755 "$_tmp"
+    probe_launch_command "$_tmp"
+    _line="$(corral_version_ok "$_tmp" "$_pin_ver")"
+    mv "$_tmp" "$_cached"
+    write_corral_receipts "$_pin_sha" "$_line"
+    printf '%s: acquired corral %s (digest verified)\n' "$PROG" "$_line" >&2
+    CORRAL_BIN_FINAL="$_cached"
+    CORRAL_EXPECTED_SHA="$_pin_sha"
+}
+
+# --- Tuna image selection and manifest rendering ---
+# Validation mirrors corral's fail-closed manifest contract exactly:
+# version "1", https:// or file:// URL, 64 lowercase hex digest, positive
+# size, amd64|arm64 arch, uefi|bios firmware, qcow2|raw format — plus
+# corral preflight's arm64-requires-UEFI rule and this consumer's own
+# required virtual_size.
+
+image_selection() {
+    # $1 = guest arch. Prints url, sha256, size, firmware, format,
+    # virtual_size, one per line.
+    case "$1" in
+        amd64)
+            _i_url="$TUNA_IMAGE_URL_amd64" _i_sha="$TUNA_IMAGE_SHA256_amd64"
+            _i_size="$TUNA_IMAGE_SIZE_amd64" _i_fw="$TUNA_IMAGE_FIRMWARE_amd64"
+            _i_fmt="$TUNA_IMAGE_FORMAT_amd64" _i_virt="$TUNA_IMAGE_VIRTUAL_SIZE_amd64"
+            ;;
+        arm64)
+            _i_url="$TUNA_IMAGE_URL_arm64" _i_sha="$TUNA_IMAGE_SHA256_arm64"
+            _i_size="$TUNA_IMAGE_SIZE_arm64" _i_fw="$TUNA_IMAGE_FIRMWARE_arm64"
+            _i_fmt="$TUNA_IMAGE_FORMAT_arm64" _i_virt="$TUNA_IMAGE_VIRTUAL_SIZE_arm64"
+            ;;
+        *) fail "no Tuna image selection for guest arch '$1'" ;;
+    esac
+    if seams_on; then
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_URL:-}" ]; then
+            _i_url="$TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_URL"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_SHA256:-}" ]; then
+            _i_sha="$TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_SHA256"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_SIZE:-}" ]; then
+            _i_size="$TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_SIZE"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_FIRMWARE:-}" ]; then
+            _i_fw="$TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_FIRMWARE"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_FORMAT:-}" ]; then
+            _i_fmt="$TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_FORMAT"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_VIRTUAL_SIZE:-}" ]; then
+            _i_virt="$TUNA_CORRAL_DESKTOP_FIXTURE_IMAGE_VIRTUAL_SIZE"
+        fi
+    fi
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$_i_url" "$_i_sha" "$_i_size" "$_i_fw" "$_i_fmt" "$_i_virt"
+}
+
+json_string_safe() {
+    # $1 = value, $2 = field name. Refuses anything that would need JSON
+    # escaping, so rendering below with "%s" is exact.
+    string_renders_clean "$1" \
+        || fail "manifest $2 has characters this consumer will not render: '$1'"
+}
+
+validate_image_selection() {
+    # Reads the SEL_* globals set by load_image_selection and fails
+    # closed through the shared per-arch matcher — the same matcher
+    # --print-contract uses for its gate labels.
+    if ! tuna_arch_ok "$SEL_ARCH" "$SEL_URL" "$SEL_SHA" "$SEL_SIZE" \
+        "$SEL_FW" "$SEL_FMT" "$SEL_VIRT" \
+        "$SEL_QSRC" "$SEL_QBLD" "$SEL_QPKG" "$SEL_QDSK"; then
+        fail "$_CHECK_WHY"
+    fi
+}
+
+qual_selection() {
+    # $1 = guest arch. Prints the source, build, package, and disk
+    # qualification receipts, one per line. These bind the image bytes
+    # to their release qualification; they gate admission exactly like
+    # the image coordinates do.
+    case "$1" in
+        amd64)
+            _q_src="$TUNA_SOURCE_amd64" _q_bld="$TUNA_BUILD_amd64"
+            _q_pkg="$TUNA_PACKAGE_amd64" _q_dsk="$TUNA_DISK_amd64"
+            ;;
+        arm64)
+            _q_src="$TUNA_SOURCE_arm64" _q_bld="$TUNA_BUILD_arm64"
+            _q_pkg="$TUNA_PACKAGE_arm64" _q_dsk="$TUNA_DISK_arm64"
+            ;;
+        *) fail "no Tuna qualification selection for guest arch '$1'" ;;
+    esac
+    if seams_on; then
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_SOURCE:-}" ]; then
+            _q_src="$TUNA_CORRAL_DESKTOP_FIXTURE_SOURCE"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_BUILD:-}" ]; then
+            _q_bld="$TUNA_CORRAL_DESKTOP_FIXTURE_BUILD"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_PACKAGE:-}" ]; then
+            _q_pkg="$TUNA_CORRAL_DESKTOP_FIXTURE_PACKAGE"
+        fi
+        if [ -n "${TUNA_CORRAL_DESKTOP_FIXTURE_DISK:-}" ]; then
+            _q_dsk="$TUNA_CORRAL_DESKTOP_FIXTURE_DISK"
+        fi
+    fi
+    # Transport guard: these values travel as a line stream below, so an
+    # embedded newline would shift every later field past its matcher (a
+    # two-line build would admit as a clean build plus package). Refuse
+    # newlines here; pending and shape checks stay with the shared matcher.
+    _nl='
+'
+    case "$_q_src" in *"$_nl"*) fail "tuna $1 qualification source must be a single line (newline refused)" ;; esac
+    case "$_q_bld" in *"$_nl"*) fail "tuna $1 qualification build must be a single line (newline refused)" ;; esac
+    case "$_q_pkg" in *"$_nl"*) fail "tuna $1 qualification package must be a single line (newline refused)" ;; esac
+    case "$_q_dsk" in *"$_nl"*) fail "tuna $1 qualification disk must be a single line (newline refused)" ;; esac
+    printf '%s\n%s\n%s\n%s\n' "$_q_src" "$_q_bld" "$_q_pkg" "$_q_dsk"
+}
+
+SEL_ARCH=''
+SEL_URL=''
+SEL_SHA=''
+SEL_SIZE=''
+SEL_FW=''
+SEL_FMT=''
+SEL_VIRT=''
+SEL_QSRC=''
+SEL_QBLD=''
+SEL_QPKG=''
+SEL_QDSK=''
+
+load_image_selection() {
+    SEL_ARCH="$1"
+    _isel="$(image_selection "$1")"
+    SEL_URL="$(printf '%s\n' "$_isel" | head -n 1)"
+    SEL_SHA="$(printf '%s\n' "$_isel" | head -n 2 | tail -n 1)"
+    SEL_SIZE="$(printf '%s\n' "$_isel" | head -n 3 | tail -n 1)"
+    SEL_FW="$(printf '%s\n' "$_isel" | head -n 4 | tail -n 1)"
+    SEL_FMT="$(printf '%s\n' "$_isel" | head -n 5 | tail -n 1)"
+    SEL_VIRT="$(printf '%s\n' "$_isel" | tail -n 1)"
+    _qsel="$(qual_selection "$1")"
+    SEL_QSRC="$(printf '%s\n' "$_qsel" | head -n 1)"
+    SEL_QBLD="$(printf '%s\n' "$_qsel" | head -n 2 | tail -n 1)"
+    SEL_QPKG="$(printf '%s\n' "$_qsel" | head -n 3 | tail -n 1)"
+    SEL_QDSK="$(printf '%s\n' "$_qsel" | tail -n 1)"
+    validate_image_selection
+}
+
+render_qualification() {
+    # $1 = output path. The admitted qualification receipt: binds the
+    # image bytes to their source/build/package/disk records, with
+    # provenance. Our own sidecar format stored beside the manifest —
+    # never added C4 manifest fields, which stay exactly as reviewed.
+    {
+        printf '# tuna-corral-desktop qualification receipt (not read by corral)\n'
+        printf 'provenance=%s\n' "$(provenance_token)"
+        printf 'arch=%s\n' "$SEL_ARCH"
+        printf 'image.sha256=%s\n' "$SEL_SHA"
+        printf 'image.size=%s\n' "$SEL_SIZE"
+        printf 'source=%s\n' "$SEL_QSRC"
+        printf 'build=%s\n' "$SEL_QBLD"
+        printf 'package=%s\n' "$SEL_QPKG"
+        printf 'disk=%s\n' "$SEL_QDSK"
+    } >"$STATE_TMP/qualification.receipt"
+    mv -f "$STATE_TMP/qualification.receipt" "$1"
+}
+
+render_manifest() {
+    # $1 = output path. Renders the validated selection; never defaults.
+    # Written to per-invocation scratch, then renamed over the shared
+    # path, so a concurrent reader always sees complete bytes.
+    json_string_safe "$TUNA_MANIFEST_NAME" 'name'
+    {
+        printf '{\n'
+        printf '  "version": "1",\n'
+        printf '  "name": "%s",\n' "$TUNA_MANIFEST_NAME"
+        printf '  "image": {\n'
+        printf '    "url": "%s",\n' "$SEL_URL"
+        printf '    "sha256": "%s",\n' "$SEL_SHA"
+        printf '    "size": %s,\n' "$SEL_SIZE"
+        printf '    "arch": "%s",\n' "$SEL_ARCH"
+        printf '    "firmware": "%s",\n' "$SEL_FW"
+        printf '    "format": "%s",\n' "$SEL_FMT"
+        printf '    "virtual_size": %s\n' "$SEL_VIRT"
+        printf '  }\n'
+        printf '}\n'
+    } >"$STATE_TMP/manifest.json"
+    mv -f "$STATE_TMP/manifest.json" "$1"
+}
+
+# --- disk headroom (mirrors corral preflight's formula: the retained
+# cache copy costs the image size, the converted guest copy costs the
+# virtual size, plus 2 GiB headroom) ---
+
+corral_vm_home() {
+    # Corral's real VM/cache target under our scoped HOME: mirrors
+    # qemu.VMHome (HOME/.local/share/corral/vms) with HOME pointed at
+    # the owned state dir — see the scoped exec in run_flow. Cache
+    # (…/vms/cache/launcher) and guest dirs all live under this target,
+    # so the headroom precheck measures it, never the state dir itself.
+    printf '%s/.local/share/corral/vms\n' "$STATE_HOME"
+}
+
+disk_free_kb() {
+    if seams_on && [ -n "${TUNA_CORRAL_DESKTOP_DF_KB:-}" ]; then
+        printf '%s\n' "$TUNA_CORRAL_DESKTOP_DF_KB"
+        return 0
+    fi
+    _vmh="$(corral_vm_home)"
+    mkdir -p "$_vmh" 2>/dev/null \
+        || fail "cannot create Corral VM home '$_vmh' (refusing to launch blind)"
+    _free="$(df -k -P "$_vmh" 2>/dev/null | awk 'NR==2 {print $4}')"
+    if ! is_digits "$_free"; then
+        fail "cannot read free disk space at '$_vmh' (refusing to launch blind)"
+    fi
+    printf '%s\n' "$_free"
+}
+
+check_headroom() {
+    _vmh="$(corral_vm_home)"
+    _free_kb="$(disk_free_kb)"
+    if ! is_digits "$_free_kb"; then
+        fail "cannot read free disk space at '$_vmh' (refusing to launch blind)"
+    fi
+    _figs="$(awk -v free="$_free_kb" -v size="$SEL_SIZE" -v virt="$SEL_VIRT" '
+        BEGIN {
+            m = (virt > size) ? virt : size
+            need = size + m + 2147483648
+            needkb = int((need + 1023) / 1024)
+            if (free + 0 >= needkb) exit 0
+            printf "%.1f %.1f %.1f", need/1e9, size/1e9, free*1024/1e9
+            exit 1
+        }')" || {
+        # shellcheck disable=SC2086 # splitting the three awk-printed figures is intended
+        set -- $_figs
+        fail "preflight: need $1 GB free at '$_vmh' for the $2 GB image, its converted guest copy and 2 GB headroom, have $3 GB"
+    }
+    printf '%s: disk headroom ok (%s KB free at %s)\n' "$PROG" "$_free_kb" "$_vmh" >&2
+}
+
+# --- contract report ---
+
+release_corral_admitted() {
+    # Release-constant Corral gate through the shared matchers: the
+    # version plus every platform source must admit. Seam values never
+    # reach this label.
+    version_token_ok "$CORRAL_VERSION" || return 1
+    corral_source_ok "$CORRAL_URL_linux_amd64" "$CORRAL_SHA256_linux_amd64" || return 1
+    corral_source_ok "$CORRAL_URL_linux_arm64" "$CORRAL_SHA256_linux_arm64" || return 1
+    corral_source_ok "$CORRAL_URL_darwin_amd64" "$CORRAL_SHA256_darwin_amd64" || return 1
+    corral_source_ok "$CORRAL_URL_darwin_arm64" "$CORRAL_SHA256_darwin_arm64" || return 1
+    return 0
+}
+
+release_tuna_admitted() {
+    # Release-constant Tuna gate through the shared per-arch matcher:
+    # both arches' full qualification records must admit.
+    tuna_arch_ok 'amd64' "$TUNA_IMAGE_URL_amd64" "$TUNA_IMAGE_SHA256_amd64" \
+        "$TUNA_IMAGE_SIZE_amd64" "$TUNA_IMAGE_FIRMWARE_amd64" \
+        "$TUNA_IMAGE_FORMAT_amd64" "$TUNA_IMAGE_VIRTUAL_SIZE_amd64" \
+        "$TUNA_SOURCE_amd64" "$TUNA_BUILD_amd64" \
+        "$TUNA_PACKAGE_amd64" "$TUNA_DISK_amd64" || return 1
+    tuna_arch_ok 'arm64' "$TUNA_IMAGE_URL_arm64" "$TUNA_IMAGE_SHA256_arm64" \
+        "$TUNA_IMAGE_SIZE_arm64" "$TUNA_IMAGE_FIRMWARE_arm64" \
+        "$TUNA_IMAGE_FORMAT_arm64" "$TUNA_IMAGE_VIRTUAL_SIZE_arm64" \
+        "$TUNA_SOURCE_arm64" "$TUNA_BUILD_arm64" \
+        "$TUNA_PACKAGE_arm64" "$TUNA_DISK_arm64" || return 1
+    return 0
+}
+
+print_contract() {
+    printf 'tuna-corral-desktop contract\n'
+    printf 'corral.version: %s\n' "$CORRAL_VERSION"
+    printf 'corral.linux/amd64: url=%s sha256=%s\n' "$CORRAL_URL_linux_amd64" "$CORRAL_SHA256_linux_amd64"
+    printf 'corral.linux/arm64: url=%s sha256=%s\n' "$CORRAL_URL_linux_arm64" "$CORRAL_SHA256_linux_arm64"
+    printf 'corral.darwin/amd64: url=%s sha256=%s\n' "$CORRAL_URL_darwin_amd64" "$CORRAL_SHA256_darwin_amd64"
+    printf 'corral.darwin/arm64: url=%s sha256=%s\n' "$CORRAL_URL_darwin_arm64" "$CORRAL_SHA256_darwin_arm64"
+    for _arch in amd64 arm64; do
+        case "$_arch" in
+            amd64)
+                _u="$TUNA_IMAGE_URL_amd64" _s="$TUNA_IMAGE_SHA256_amd64"
+                _z="$TUNA_IMAGE_SIZE_amd64" _f="$TUNA_IMAGE_FIRMWARE_amd64"
+                _t="$TUNA_IMAGE_FORMAT_amd64" _v="$TUNA_IMAGE_VIRTUAL_SIZE_amd64"
+                _src="$TUNA_SOURCE_amd64" _bld="$TUNA_BUILD_amd64"
+                _pkg="$TUNA_PACKAGE_amd64" _dsk="$TUNA_DISK_amd64"
+                ;;
+            arm64)
+                _u="$TUNA_IMAGE_URL_arm64" _s="$TUNA_IMAGE_SHA256_arm64"
+                _z="$TUNA_IMAGE_SIZE_arm64" _f="$TUNA_IMAGE_FIRMWARE_arm64"
+                _t="$TUNA_IMAGE_FORMAT_arm64" _v="$TUNA_IMAGE_VIRTUAL_SIZE_arm64"
+                _src="$TUNA_SOURCE_arm64" _bld="$TUNA_BUILD_arm64"
+                _pkg="$TUNA_PACKAGE_arm64" _dsk="$TUNA_DISK_arm64"
+                ;;
+        esac
+        printf 'tuna.%s.manifest: name=%s\n' "$_arch" "$TUNA_MANIFEST_NAME"
+        printf 'tuna.%s.source: %s\n' "$_arch" "$_src"
+        printf 'tuna.%s.build: %s\n' "$_arch" "$_bld"
+        printf 'tuna.%s.image: url=%s sha256=%s size=%s\n' "$_arch" "$_u" "$_s" "$_z"
+        printf 'tuna.%s.package: %s\n' "$_arch" "$_pkg"
+        printf 'tuna.%s.disk: firmware=%s format=%s virtual_size=%s record=%s\n' "$_arch" "$_f" "$_t" "$_v" "$_dsk"
+    done
+    if release_corral_admitted; then
+        printf 'gate.corral: admitted (%s)\n' "$CORRAL_VERSION"
+    else
+        printf 'gate.corral: PENDING — no immutable Corral binary release published\n'
+    fi
+    if release_tuna_admitted; then
+        printf 'gate.tuna-image: admitted\n'
+    else
+        printf 'gate.tuna-image: PENDING — no release-qualified Tuna VM image admitted\n'
+    fi
+    if seams_on; then
+        printf 'mode: fixture (test seams active; not release-qualified)\n'
+    else
+        printf 'mode: release coordinates (no test seams)\n'
+    fi
+}
+
+# --- options ---
+
+OPT_ARCH=''
+OPT_NAME='tuna-v1'
+OPT_MEM='4G'
+OPT_CPU='2'
+OPT_DISK='20G'
+OPT_WEB_PORT='0'
+OPT_VM_TIMEOUT='300'
+OPT_WEB_TIMEOUT='30'
+OPT_STOP_VM='no'
+OPT_FORCE='no'
+OPT_ALLOW_EMULATION='no'
+OPT_ALLOW_CROSS_ARCH='no'
+OPT_CORRAL_BIN=''
+OPT_ALLOW_UNPINNED='no'
+OPT_HOME=''
+OPT_PRINT_CONTRACT='no'
+OPT_PRINT_MANIFEST='no'
+OPT_CHECK_PREREQS='no'
+OPT_CLEAN='no'
+
+need_arg() {
+    if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        fail "option $1 needs a value"
+    fi
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --arch) need_arg "$@"; OPT_ARCH="$2"; shift 2 ;;
+            --name) need_arg "$@"; OPT_NAME="$2"; shift 2 ;;
+            --mem) need_arg "$@"; OPT_MEM="$2"; shift 2 ;;
+            --cpu) need_arg "$@"; OPT_CPU="$2"; shift 2 ;;
+            --disk) need_arg "$@"; OPT_DISK="$2"; shift 2 ;;
+            --web-port) need_arg "$@"; OPT_WEB_PORT="$2"; shift 2 ;;
+            --vm-timeout) need_arg "$@"; OPT_VM_TIMEOUT="$2"; shift 2 ;;
+            --web-timeout) need_arg "$@"; OPT_WEB_TIMEOUT="$2"; shift 2 ;;
+            --stop-vm) OPT_STOP_VM='yes'; shift ;;
+            --force) OPT_FORCE='yes'; shift ;;
+            --allow-emulation) OPT_ALLOW_EMULATION='yes'; shift ;;
+            --allow-cross-arch) OPT_ALLOW_CROSS_ARCH='yes'; shift ;;
+            --corral-bin) need_arg "$@"; OPT_CORRAL_BIN="$2"; shift 2 ;;
+            --allow-unpinned-corral) OPT_ALLOW_UNPINNED='yes'; shift ;;
+            --home) need_arg "$@"; OPT_HOME="$2"; shift 2 ;;
+            --print-contract) OPT_PRINT_CONTRACT='yes'; shift ;;
+            --print-manifest) OPT_PRINT_MANIFEST='yes'; shift ;;
+            --check-prereqs) OPT_CHECK_PREREQS='yes'; shift ;;
+            --clean) OPT_CLEAN='yes'; shift ;;
+            --help|-h) sed -n '/^# usage:begin$/,/^# usage:end$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            --) shift; break ;;
+            -*) fail "unknown option $1 (see --help)" ;;
+            *) fail "unexpected argument $1 (see --help)" ;;
+        esac
+    done
+    if [ "$#" -gt 0 ]; then
+        fail "unexpected argument $1 (see --help)"
+    fi
+}
+
+validate_opts() {
+    case "$OPT_ARCH" in
+        ''|amd64|arm64) ;;
+        *) fail "--arch must be amd64 or arm64, got '$OPT_ARCH'" ;;
+    esac
+    check_bounded_int "$OPT_CPU" '0' "$INT64_MAX" '--cpu'
+    check_bounded_int "$OPT_WEB_PORT" '0' '65535' '--web-port'
+    check_bounded_int "$OPT_VM_TIMEOUT" '0' "$INT64_MAX" '--vm-timeout'
+    check_bounded_int "$OPT_WEB_TIMEOUT" '0' "$INT64_MAX" '--web-timeout'
+    for _pair in "name:$OPT_NAME" "mem:$OPT_MEM" "disk:$OPT_DISK"; do
+        _name="${_pair%%:*}"
+        _val="${_pair#*:}"
+        case "$_val" in
+            ''|*'"'*|*"$_bs"*) fail "--$_name must be non-empty without quotes or backslashes" ;;
+        esac
+    done
+    if [ -z "$OPT_ARCH" ]; then
+        OPT_ARCH="$HOST_ARCH"
+    fi
+    if [ "$OPT_ARCH" != "$HOST_ARCH" ] && [ "$OPT_ALLOW_CROSS_ARCH" != 'yes' ]; then
+        fail "guest $OPT_ARCH on host $HOST_ARCH needs --allow-cross-arch (cross-arch guests are always emulated)"
+    fi
+}
+
+# --- main ---
+
+run_check_prereqs() {
+    printf '%s: host %s/%s, guest %s\n' "$PROG" "$HOST_OS" "$HOST_ARCH" "$OPT_ARCH" >&2
+    check_tools
+    check_qemu "$OPT_ARCH"
+    printf '%s: QEMU ok (%s + qemu-img)\n' "$PROG" "$QEMU_EMULATOR" >&2
+    if check_opener; then
+        printf '%s: browser opener ok\n' "$PROG" >&2
+    fi
+    _isel="$(image_selection "$OPT_ARCH")"
+    _fw="$(printf '%s\n' "$_isel" | head -n 4 | tail -n 1)"
+    if is_pending "$_fw"; then
+        printf '%s: firmware: unknown (Tuna image unadmitted; corral preflight checks at launch)\n' "$PROG" >&2
+    elif check_firmware "$OPT_ARCH" "$_fw"; then
+        printf '%s: firmware ok\n' "$PROG" >&2
+    fi
+    _cg='PENDING'
+    _tg='PENDING'
+    if release_corral_admitted; then
+        _cg='admitted'
+    fi
+    if release_tuna_admitted; then
+        _tg='admitted'
+    fi
+    if seams_on; then
+        _fixt=' [fixture coordinates; not release-qualified]'
+    else
+        _fixt=''
+    fi
+    printf '%s: contract: corral gate %s, tuna-image gate %s (host prereqs pass; flow still gated%s)\n' "$PROG" "$_cg" "$_tg" "$_fixt" >&2
+}
+
+RECHECK_BIN_SHA=''
+RECHECK_MANIFEST_SHA=''
+RECHECK_SIDECAR_SHA=''
+
+record_recheck() {
+    # Snapshot the admitted bytes under the state lock, right after
+    # install/render, for the pre-exec recheck below.
+    RECHECK_BIN_SHA="$CORRAL_EXPECTED_SHA"
+    RECHECK_MANIFEST_SHA="$(sha256_of_file "$STATE_HOME/manifests/tuna-$OPT_ARCH.json")"
+    RECHECK_SIDECAR_SHA="$(sha256_of_file "$STATE_HOME/manifests/tuna-$OPT_ARCH.qualification")"
+}
+
+pre_exec_recheck() {
+    # Held admission recheck immediately before exec: the exact bytes
+    # about to launch must still be the admitted bytes. An unpinned
+    # binary has no digest to recheck against (that is what unpinned
+    # means); it is rechecked for presence, usability, and type only.
+    if [ -n "$RECHECK_BIN_SHA" ]; then
+        if [ "$(sha256_of_file "$CORRAL_BIN_FINAL")" != "$RECHECK_BIN_SHA" ]; then
+            fail 'pre-exec recheck failed: cached Corral binary no longer matches its admitted digest (refusing to launch)'
+        fi
+    else
+        if [ ! -x "$CORRAL_BIN_FINAL" ] || [ -L "$CORRAL_BIN_FINAL" ]; then
+            fail 'pre-exec recheck failed: unpinned Corral binary missing, unusable, or symlinked (refusing to launch)'
+        fi
+    fi
+    if [ "$(sha256_of_file "$STATE_HOME/manifests/tuna-$OPT_ARCH.json")" != "$RECHECK_MANIFEST_SHA" ]; then
+        fail 'pre-exec recheck failed: manifest changed after admission (refusing to launch)'
+    fi
+    if [ "$(sha256_of_file "$STATE_HOME/manifests/tuna-$OPT_ARCH.qualification")" != "$RECHECK_SIDECAR_SHA" ]; then
+        fail 'pre-exec recheck failed: qualification receipt changed after admission (refusing to launch)'
+    fi
+}
+
+run_flow() {
+    check_tools
+    check_qemu "$OPT_ARCH"
+    load_image_selection "$OPT_ARCH"
+    ensure_state_home
+    _lock_wait="$(lock_wait_secs)" || exit 1
+    acquire_state_lock "$_lock_wait"
+    assert_state_marker
+    fixture_notice
+    acquire_corral
+    ensure_tmp
+    render_manifest "$STATE_HOME/manifests/tuna-$OPT_ARCH.json"
+    render_qualification "$STATE_HOME/manifests/tuna-$OPT_ARCH.qualification"
+    mkdir -p "$(corral_vm_home)" 2>/dev/null \
+        || fail "cannot create Corral VM home '$(corral_vm_home)' (refusing to launch blind)"
+    check_headroom
+    if ! check_firmware "$OPT_ARCH" "$SEL_FW"; then
+        : # advisory; corral preflight is authoritative
+    fi
+    if ! check_opener; then
+        : # advisory; corral prints the console URL either way
+    fi
+    record_recheck
+    pre_exec_recheck
+    printf '%s: host %s/%s, guest %s (%s/%s, %s bytes)\n' \
+        "$PROG" "$HOST_OS" "$HOST_ARCH" "$OPT_ARCH" "$SEL_FW" "$SEL_FMT" "$SEL_SIZE" >&2
+    printf '%s: manifest %s\n' "$PROG" "$STATE_HOME/manifests/tuna-$OPT_ARCH.json" >&2
+    printf '%s: launching; corral prints the Console: URL and opens your browser\n' "$PROG" >&2
+    cleanup_tmp
+    STATE_TMP=''
+    RB_PID=''
+    RB_WATCH=''
+    RB_GROUPED='no'
+    release_state_lock
+    pre_exec_recheck
+    trap - EXIT INT TERM
+    set -- launch --manifest "$STATE_HOME/manifests/tuna-$OPT_ARCH.json" --name "$OPT_NAME" \
+        --mem "$OPT_MEM" --cpu "$OPT_CPU" --disk "$OPT_DISK" --web-port "$OPT_WEB_PORT" \
+        --vm-timeout "$OPT_VM_TIMEOUT" --web-timeout "$OPT_WEB_TIMEOUT"
+    if [ "$OPT_STOP_VM" = 'yes' ]; then set -- "$@" --stop-vm; fi
+    if [ "$OPT_FORCE" = 'yes' ]; then set -- "$@" --force; fi
+    if [ "$OPT_ALLOW_EMULATION" = 'yes' ]; then set -- "$@" --allow-emulation; fi
+    if [ "$OPT_ALLOW_CROSS_ARCH" = 'yes' ]; then set -- "$@" --allow-cross-arch; fi
+    # Scoped HOME: corral derives its VM/cache home from $HOME
+    # (qemu.VMHome: $HOME/.local/share/corral/vms), so the child sees
+    # the owned state dir as HOME and its storage lands under --home.
+    # This assignment affects the exec'd child only, never this shell.
+    HOME="$STATE_HOME" exec "$CORRAL_BIN_FINAL" "$@"
+}
+
+main() {
+    parse_args "$@"
+    trap 'cleanup_tmp' EXIT
+    trap 'on_cancel INT' INT
+    trap 'on_cancel TERM' TERM
+    if [ "$OPT_PRINT_CONTRACT" = 'yes' ]; then
+        print_contract
+        exit 0
+    fi
+    detect_host
+    validate_opts
+    if [ "$OPT_CLEAN" = 'yes' ]; then
+        clean_state
+        exit 0
+    fi
+    if [ "$OPT_PRINT_MANIFEST" = 'yes' ]; then
+        load_image_selection "$OPT_ARCH"
+        check_tools
+        ensure_state_home
+        ensure_tmp
+        _lock_wait="$(lock_wait_secs)" || exit 1
+        acquire_state_lock "$_lock_wait"
+        assert_state_marker
+        fixture_notice
+        render_manifest "$STATE_HOME/manifests/tuna-$OPT_ARCH.json"
+        render_qualification "$STATE_HOME/manifests/tuna-$OPT_ARCH.qualification"
+        release_state_lock
+        cat "$STATE_HOME/manifests/tuna-$OPT_ARCH.json"
+        exit 0
+    fi
+    if [ "$OPT_CHECK_PREREQS" = 'yes' ]; then
+        run_check_prereqs
+        exit 0
+    fi
+    run_flow
+}
+
+main "$@"
