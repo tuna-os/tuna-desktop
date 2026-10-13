@@ -4016,6 +4016,7 @@ impl Runtime {
                 .zip(self.shell.child_generation())
                 .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
         );
+        self.publish_auth_availability();
         let outcome = self.control.poll(self.manager.model_mut());
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
@@ -6243,9 +6244,14 @@ pub struct AuthOwnerStatus {
 }
 impl AuthOwnerProbe<'_> {
     /// Trusted CI-only profile; the live binary never calls this Rust seam.
-    pub fn admit_interactive_pam(&mut self, backend: crate::pam_backend::Backend) -> bool {
+    pub fn admit_interactive_pam(
+        &mut self,
+        backend: crate::pam_backend::Backend,
+        user: crate::unlock::SessionUser,
+    ) -> bool {
         self.admit_interactive_pam_policy(
             backend,
+            user,
             crate::pam_conversation::Policy {
                 backend_phase: Duration::from_secs(30),
                 total: Duration::from_secs(900),
@@ -6256,12 +6262,20 @@ impl AuthOwnerProbe<'_> {
     pub fn admit_interactive_pam_policy(
         &mut self,
         backend: crate::pam_backend::Backend,
+        user: crate::unlock::SessionUser,
         policy: crate::pam_conversation::Policy,
     ) -> bool {
-        if self.runtime.interactive_auth.is_some() || policy.validate().is_err() {
+        if self.runtime.interactive_auth.is_some()
+            || policy.validate().is_err()
+            || !user.matches_uid()
+        {
             return false;
         }
-        self.runtime.interactive_admission = Some(interactive_auth::Admission { backend, policy });
+        self.runtime.interactive_admission = Some(interactive_auth::Admission {
+            backend,
+            policy,
+            user,
+        });
         true
     }
     pub fn interactive_pending_for_test(&self) -> bool {

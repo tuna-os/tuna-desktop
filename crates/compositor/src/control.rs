@@ -303,6 +303,7 @@ pub struct Session<'a> {
     auth_owner: Option<AuthOwner>,
     auth_lease: Option<AuthLease>,
     peer_minor: u16,
+    last_auth_availability: Option<tuna_shell_control::auth::Availability>,
     auth_pending: Option<u64>,
     auth_last_start: u64,
     auth_requests: Vec<AuthRequest>,
@@ -408,6 +409,7 @@ impl<'a> Session<'a> {
             auth_owner: None,
             auth_lease: None,
             peer_minor: 0,
+            last_auth_availability: None,
             auth_pending: None,
             auth_last_start: 0,
             auth_requests: Vec::new(),
@@ -687,6 +689,7 @@ impl<'a> Session<'a> {
                         "authentication resync requires a new connection".into(),
                     ));
                 }
+                self.last_auth_availability = None;
                 self.peer_minor = version.minor.min(CURRENT_VERSION.minor);
                 self.conn.write_frame(&Message::Hello {
                     version: ProtocolVersion::new(CURRENT_VERSION.major, self.peer_minor),
@@ -989,6 +992,7 @@ impl<'a> Session<'a> {
             | Message::ScreenReader { .. }
             | Message::AuthState { .. }
             | Message::AuthChallenge { .. }
+            | Message::AuthAvailability(_)
             | Message::KeyboardAidToggled { .. }
             | Message::ShortcutConsent { .. }
             | Message::Error { .. } => {
@@ -1037,6 +1041,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::ScreenReader { .. } => "ScreenReader",
         Message::AuthState { .. } => "AuthState",
         Message::AuthChallenge { .. } => "AuthChallenge",
+        Message::AuthAvailability(_) => "AuthAvailability",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
     }
 }
@@ -1405,6 +1410,7 @@ pub struct ControlHub {
     gate: PeerGate,
     auth_owner: Option<AuthOwner>,
     auth_owner_configured: bool,
+    auth_availability: Option<tuna_shell_control::auth::Availability>,
     /// Peer pid per live session, index-aligned with `sessions`, so a
     /// gate change evicts sessions the new gate no longer admits.
     session_peers: Vec<Option<PeerCred>>,
@@ -1468,6 +1474,7 @@ impl ControlHub {
             gate: PeerGate::SameUser,
             auth_owner: None,
             auth_owner_configured: false,
+            auth_availability: None,
             session_peers: Vec::new(),
             pending_peers: Vec::new(),
             fresh_peers: Vec::new(),
@@ -1575,6 +1582,9 @@ impl ControlHub {
         true
     }
 
+    pub fn set_auth_availability(&mut self, availability: tuna_shell_control::auth::Availability) {
+        self.auth_availability = (availability.epoch != u64::MAX).then_some(availability);
+    }
     pub fn deny_auth_start(
         &mut self,
         origin: crate::auth_owner::Origin,
@@ -1840,7 +1850,9 @@ impl ControlHub {
         // including queues replayed after a newer session connects.
         if matches!(
             &message,
-            Message::AuthState { .. } | Message::AuthChallenge { .. }
+            Message::AuthState { .. }
+                | Message::AuthChallenge { .. }
+                | Message::AuthAvailability(_)
         ) {
             return;
         }
@@ -1912,7 +1924,28 @@ impl ControlHub {
                 let session = &mut self.sessions[i];
                 let before = model.focused();
                 let workspace_before = model.active_workspace();
-                let deltas_ok = session.emit_deltas(model).is_ok();
+                let mut deltas_ok = session.emit_deltas(model).is_ok();
+                if deltas_ok && session.peer_minor >= 36 && session.locked.get() {
+                    let owned = self.auth_owner.is_some_and(|owner| {
+                        session.auth_owner == Some(owner)
+                            && PeerGate::Pid(owner.pid).admits(self.session_peers[i], uid)
+                    });
+                    if owned {
+                        if let Some(availability) = self.auth_availability {
+                            if session.last_auth_availability != Some(availability) {
+                                deltas_ok = Self::write_auth(
+                                    session,
+                                    &Message::AuthAvailability(availability),
+                                );
+                                if deltas_ok {
+                                    session.last_auth_availability = Some(availability);
+                                }
+                            }
+                        }
+                    }
+                } else if !session.locked.get() {
+                    session.last_auth_availability = None;
+                }
                 let cmd_ok = match session.handle_next(model) {
                     Ok(_) => true,
                     Err(ControlError::WouldBlock) => true,
@@ -2849,6 +2882,129 @@ mod auth_origin_tests {
         // Old key cannot publish after retirement, even on the same socket.
         assert!(!hub.send_auth(lease, challenge(key, 1)));
         assert!(matches!(b.read_frame(), Err(ControlError::WouldBlock)));
+    }
+    #[test]
+    fn capability_requires_current_owned_locked_036_session_and_not_foreign_or_035() {
+        use tuna_shell_control::auth::Availability;
+        let (_dir, mut hub, mut model) = setup();
+        let owner = AuthOwner {
+            pid: std::process::id(),
+            generation: 1,
+        };
+        hub.set_auth_owner(Some(owner));
+        hub.set_peer_gate(PeerGate::Pid(owner.pid));
+        hub.set_auth_availability(Availability {
+            epoch: 7,
+            policy_available: false,
+            slot_idle: true,
+        });
+        let mut a = connect(&mut hub, &mut model);
+        assert!(
+            matches!(a.read_frame(), Err(ControlError::WouldBlock)),
+            "unlocked session receives no auth capability"
+        );
+        let mut legacy = ControlConn::new(UnixStream::connect(hub.socket_path()).unwrap()).unwrap();
+        legacy
+            .write_frame(&Message::Hello {
+                version: ProtocolVersion::new(0, 35),
+            })
+            .unwrap();
+        for _ in 0..3 {
+            hub.poll(&mut model);
+        }
+        drain(&mut legacy);
+        hub.set_locked(true);
+        hub.poll(&mut model);
+        assert!(matches!(
+            a.read_frame().unwrap(),
+            Message::Snapshot { locked: true, .. }
+        ));
+        assert_eq!(
+            a.read_frame().unwrap(),
+            Message::AuthAvailability(Availability {
+                epoch: 7,
+                policy_available: false,
+                slot_idle: true
+            })
+        );
+        assert!(matches!(
+            legacy.read_frame().unwrap(),
+            Message::Snapshot { locked: true, .. }
+        ));
+        assert!(matches!(legacy.read_frame(), Err(ControlError::WouldBlock)));
+        hub.set_auth_availability(Availability {
+            epoch: 7,
+            policy_available: true,
+            slot_idle: false,
+        });
+        hub.poll(&mut model);
+        assert_eq!(
+            a.read_frame().unwrap(),
+            Message::AuthAvailability(Availability {
+                epoch: 7,
+                policy_available: true,
+                slot_idle: false
+            })
+        );
+        // Same-stream resync has no live conversation. Unchanged capability
+        // must follow the newly accepted Hello/Snapshot, never precede it.
+        assert!(hub
+            .sessions
+            .iter()
+            .all(|session| session.auth_pending.is_none() && session.auth_lease.is_none()));
+        assert_eq!(
+            hub.auth_availability,
+            Some(Availability {
+                epoch: 7,
+                policy_available: true,
+                slot_idle: false
+            })
+        );
+        a.write_frame(&Message::Hello {
+            version: CURRENT_VERSION,
+        })
+        .unwrap();
+        hub.poll(&mut model);
+        assert!(matches!(a.read_frame().unwrap(), Message::Hello { .. }));
+        assert!(matches!(
+            a.read_frame().unwrap(),
+            Message::Snapshot { locked: true, .. }
+        ));
+        hub.poll(&mut model);
+        assert_eq!(
+            a.read_frame().unwrap(),
+            Message::AuthAvailability(Availability {
+                epoch: 7,
+                policy_available: true,
+                slot_idle: false,
+            })
+        );
+        hub.set_auth_owner(Some(AuthOwner {
+            generation: 2,
+            ..owner
+        }));
+        assert!(hub.sessions.is_empty());
+        // Standalone/foreign sessions have no trusted owner stamp even if a
+        // caller supplies a capability value. There is no same-user fallback.
+        hub.set_auth_owner(None);
+        hub.set_peer_gate(PeerGate::SameUser);
+        let mut foreign =
+            ControlConn::new(UnixStream::connect(hub.socket_path()).unwrap()).unwrap();
+        foreign
+            .write_frame(&Message::Hello {
+                version: CURRENT_VERSION,
+            })
+            .unwrap();
+        for _ in 0..3 {
+            hub.poll(&mut model);
+        }
+        loop {
+            match foreign.read_frame() {
+                Ok(message) => assert!(!matches!(message, Message::AuthAvailability(_))),
+                Err(ControlError::WouldBlock) => break,
+                Err(error) => panic!("unexpected foreign transport error: {error:?}"),
+            }
+        }
     }
     #[test]
     fn same_stream_hello_cannot_transfer_an_interactive_lease() {

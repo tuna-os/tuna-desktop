@@ -81,7 +81,9 @@ fn interactive() {
     let executable =
         PathBuf::from(std::env::var_os("TUNA_STAGEB_HELPER").expect("admitted compositor"));
     let expected = std::fs::metadata(&executable).unwrap();
-    let user = tuna_compositor::unlock::session_user().expect("uid-derived user");
+    let admission_user = tuna_compositor::unlock::SessionUser::resolve_uid()
+        .expect("uid-derived user before Runtime startup");
+    let user = admission_user.username().to_owned();
     let backend =
         Backend::with_trusted_factory(move |identity, service, actual_user, budget, cancel| {
             assert_eq!(service, tuna_compositor::pam::DEFAULT_SERVICE);
@@ -121,7 +123,7 @@ fn interactive() {
             "absolute controlled Runtime proof deadline"
         );
         if !admitted {
-            assert!(probe.admit_interactive_pam(backend.clone()));
+            assert!(probe.admit_interactive_pam(backend.clone(), admission_user.clone()));
             std::fs::write(root.join("profile-admitted"), b"controlled profile").unwrap();
             admitted = true;
         }
@@ -149,6 +151,7 @@ fn interactive() {
         {
             assert!(probe.admit_interactive_pam_policy(
                 backend.clone(),
+                admission_user.clone(),
                 Policy {
                     backend_phase: Duration::from_millis(250),
                     total: Duration::from_secs(120),

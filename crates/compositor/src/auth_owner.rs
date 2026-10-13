@@ -97,6 +97,9 @@ impl Slot {
         self.method = None;
         true
     }
+    pub fn occupied(&self) -> bool {
+        self.active.is_some()
+    }
     pub fn matches(&self, attempt: Attempt) -> bool {
         self.active == Some(attempt)
     }

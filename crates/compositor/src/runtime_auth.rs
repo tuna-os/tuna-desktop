@@ -16,6 +16,7 @@ use tuna_shell_control::{
 pub(super) struct Admission {
     pub backend: Backend,
     pub policy: Policy,
+    pub user: crate::unlock::SessionUser,
 }
 pub(super) struct Pending {
     challenge: Challenge,
@@ -48,6 +49,26 @@ impl Active {
     }
 }
 impl Runtime {
+    pub(super) fn publish_auth_availability(&mut self) {
+        let epoch = self
+            .unlock_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let policy_available = self
+            .interactive_admission
+            .as_ref()
+            .is_some_and(|admission| {
+                admission.policy.validate().is_ok()
+                    && admission.backend.conversation_available()
+                    && admission.user.matches_uid()
+            })
+            && crate::unlock::greetd_socket_path().is_none();
+        self.control
+            .set_auth_availability(tuna_shell_control::auth::Availability {
+                epoch,
+                policy_available,
+                slot_idle: !self.unlock_slot.occupied() && self.unlock_quarantined.is_none(),
+            });
+    }
     fn auth_live(&self, auth: &Active) -> bool {
         self.is_locked()
             && self.unlock_slot.matches(auth.attempt)
@@ -182,7 +203,12 @@ impl Runtime {
             self.control.deny_auth_start(origin, Phase::Unavailable);
             return;
         }
-        let Some(user) = crate::unlock::session_user() else {
+        let Some(user) = self
+            .interactive_admission
+            .as_ref()
+            .filter(|admission| admission.user.matches_uid())
+            .map(|admission| admission.user.username().to_owned())
+        else {
             self.control.deny_auth_start(origin, Phase::Unavailable);
             return;
         };

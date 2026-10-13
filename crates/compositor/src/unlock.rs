@@ -252,6 +252,48 @@ pub(crate) fn verify_owned_credential(
     }
 }
 
+/// Opaque fixed-UID identity admitted before interactive Runtime startup.
+/// NSS resolution may block; this controlled prerequisite is not production
+/// bounded initialization. No peer/environment username constructor exists.
+#[derive(Clone)]
+pub struct SessionUser {
+    uid: libc::uid_t,
+    user: String,
+}
+impl SessionUser {
+    pub fn resolve_uid() -> Option<Self> {
+        // SAFETY: getuid has no pointer arguments.
+        let uid = unsafe { libc::getuid() };
+        let user = session_user()?;
+        let identity = Self { uid, user };
+        identity.matches_uid().then_some(identity)
+    }
+    pub(crate) fn matches_uid(&self) -> bool {
+        // SAFETY: getuid has no pointer arguments. This does not perform NSS I/O.
+        self.uid == unsafe { libc::getuid() }
+    }
+    pub fn username(&self) -> &str {
+        &self.user
+    }
+}
+
+#[cfg(test)]
+mod admitted_session_user_tests {
+    use super::SessionUser;
+    #[test]
+    fn cached_session_user_is_fixed_to_current_uid_without_new_lookup() {
+        let own = SessionUser::resolve_uid().expect("CI session UID must resolve");
+        assert!(own.matches_uid());
+        assert!(!own.username().is_empty());
+        let foreign = SessionUser {
+            uid: own.uid.wrapping_add(1),
+            user: own.user.clone(),
+        };
+        assert!(!foreign.matches_uid());
+        assert!(own.clone().matches_uid());
+    }
+}
+
 /// The session's user name, for unlocking.
 pub fn session_user() -> Option<String> {
     // SAFETY: getpwuid returns a pointer into static storage, read at once.

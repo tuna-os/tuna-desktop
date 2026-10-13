@@ -382,6 +382,13 @@ impl Backend {
     }
     /// Internal challenge relay. The trusted runtime supplies its admitted common
     /// Slot identity; this starts verification only and never grants unlock.
+    /// Capability query only, never a grant or an admission reservation.
+    /// BUSY preserves policy support; new attempts still require FREE.
+    pub(crate) fn conversation_available(&self) -> bool {
+        !self.shutdown.load(Ordering::Acquire)
+            && self.state.load(Ordering::Acquire) != POISONED
+            && self.serial.load(Ordering::Acquire) != u64::MAX
+    }
     pub fn begin_conversation(
         &self,
         service: String,
@@ -649,6 +656,24 @@ fn supported_styles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conversation_capability_queries_do_not_spawn_and_busy_preserves_support() {
+        let backend = Backend::with_trusted_factory(|_, _, _, _, _| {
+            panic!("capability query must not dispatch")
+        })
+        .unwrap();
+        assert!(backend.conversation_available());
+        backend.state.store(BUSY, Ordering::Release);
+        assert!(
+            backend.conversation_available(),
+            "own active ticket does not revoke policy support"
+        );
+        backend.state.store(POISONED, Ordering::Release);
+        assert!(!backend.conversation_available());
+        backend.state.store(FREE, Ordering::Release);
+        backend.shutdown();
+        assert!(!backend.conversation_available());
+    }
     #[test]
     fn owned_reply_wake_observes_publication_disconnect_and_no_idle_spin() {
         let (notice, source) = crate::wake::Wake::new().unwrap();

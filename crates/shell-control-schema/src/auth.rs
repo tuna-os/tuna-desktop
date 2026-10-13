@@ -7,6 +7,14 @@ use std::fmt;
 pub const MAX_MESSAGES: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 4096;
 
+/// Policy support and start readiness are distinct: a busy common Slot does
+/// not revoke an already admitted conversation's exact key/lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Availability {
+    pub epoch: u64,
+    pub policy_available: bool,
+    pub slot_idle: bool,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Method {
     SessionStack,
@@ -290,6 +298,26 @@ mod tests {
         let reader = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(input);
         assert!(bounded::<_, u32>(reader).is_err());
         assert_eq!(calls.get(), 0);
+    }
+    #[test]
+    fn capability_is_appended_and_invalid_epoch_or_bool_are_refused() {
+        let message = Message::AuthAvailability(Availability {
+            epoch: 7,
+            policy_available: true,
+            slot_idle: false,
+        });
+        let golden = vec![4, 0, 0, 0, 20, 7, 1, 0];
+        assert_eq!(encode_frame(&message), golden);
+        assert_eq!(decode_frame(&golden).unwrap(), message);
+        assert!(
+            decode_frame(&encode_frame(&Message::AuthAvailability(Availability {
+                epoch: u64::MAX,
+                policy_available: false,
+                slot_idle: false
+            })))
+            .is_err()
+        );
+        assert!(decode_frame(&[4, 0, 0, 0, 20, 7, 2, 0]).is_err());
     }
     #[test]
     fn unknown_methods_styles_and_root_aliases_are_refused() {

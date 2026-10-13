@@ -790,6 +790,8 @@ pub enum Message {
         #[serde(deserialize_with = "auth::prompts")]
         messages: Vec<auth::Prompt>,
     },
+    /// Actual policy support, scoped to the negotiated current locked session.
+    AuthAvailability(auth::Availability),
 }
 
 /// The keyboard aids GNOME lets the keyboard itself switch.
@@ -1426,6 +1428,11 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
     }
 
     match msg {
+        Message::AuthAvailability(availability) if availability.epoch == u64::MAX => {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
         Message::Command {
             id,
             kind:
@@ -1559,6 +1566,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::ScreenReader { .. }
         | Message::AuthState { .. }
         | Message::AuthChallenge { .. }
+        | Message::AuthAvailability(_)
         | Message::KeyboardAidToggled { .. }
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }

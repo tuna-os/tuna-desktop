@@ -191,7 +191,8 @@ class InteractiveSourceContracts(unittest.TestCase):
         self.assertLess(runtime.index('self.control.poll('), runtime.index('self.poll_auth()'))
         consumer = (ROOT / 'crates/compositor/src/runtime_auth.rs').read_text()
         self.assertIn('crate::unlock::greetd_socket_path().is_none()', consumer)
-        self.assertIn('crate::unlock::session_user()', consumer)
+        self.assertIn('admission.user.username().to_owned()', consumer)
+        self.assertNotIn('crate::unlock::session_user()', consumer)
         self.assertIn('crate::pam::DEFAULT_SERVICE.into()', consumer)
         self.assertNotIn('std::env::var', consumer)
         self.assertIn('self.control.auth_lease_live(auth.lease)', consumer)
@@ -234,5 +235,61 @@ class InteractiveSourceContracts(unittest.TestCase):
         self.assertIn('TUNA_AUTH_OWNER_PROBE_BIN="$probe_executable"', wrapper)
         self.assertIn('services/tuna-lock', source)
         self.assertIn('controlled 250ms backend phase', (ROOT / 'crates/compositor/examples/native-auth-owner-probe.rs').read_text())
+
+class CapabilityTransportSourceContracts(unittest.TestCase):
+    """Wiring assertions, not an execution substitute for the real socket tests."""
+    def test_capability_is_036_append_and_runtime_queries_without_initializing(self):
+        schema = (ROOT/'crates/shell-control-schema/src/lib.rs').read_text()
+        message = schema.split('pub enum Message {', 1)[1].split('/// The keyboard aids', 1)[0]
+        self.assertLess(message.index('AuthChallenge'), message.index('AuthAvailability'))
+        self.assertIn('minor: 36,', schema)
+        self.assertNotIn('AuthAvailability', message.split('Snapshot {', 1)[1].split('}', 1)[0])
+        runtime = (ROOT/'crates/compositor/src/runtime_auth.rs').read_text()
+        query = runtime.split('fn publish_auth_availability(', 1)[1].split('fn auth_live(', 1)[0]
+        self.assertIn('admission.backend.conversation_available()', query)
+        self.assertIn('!self.unlock_slot.occupied()', query)
+        self.assertIn('greetd_socket_path().is_none()', query)
+        self.assertNotIn('Backend::live()', query)
+        self.assertNotIn('session_user()', query)
+        self.assertIn('admission.user.matches_uid()', query)
+        example = (ROOT / 'crates/compositor/examples/native-auth-owner-probe.rs').read_text()
+        self.assertLess(example.index('SessionUser::resolve_uid()'), example.index('run_auth_owner_probe(&session, move |probe|', example.index('fn interactive()')))
+        backend = (ROOT/'crates/compositor/src/pam_backend.rs').read_text()
+        query = backend.split('fn conversation_available(', 1)[1].split('pub fn begin_conversation(', 1)[0]
+        self.assertIn('!= POISONED', query)
+        self.assertNotIn('== FREE', query)
+        control = (ROOT/'crates/compositor/src/control.rs').read_text()
+        self.assertIn('session.peer_minor >= 36 && session.locked.get()', control)
+        self.assertIn('session.auth_owner == Some(owner)', control)
+
+    def test_corrective_lifetimes_have_production_gates_and_socket_controls(self):
+        host = (ROOT/'crates/shell-host/src/control_auth.rs').read_text()
+        for guard in ('cancel_requested', 'input_stopped', 'auth.phase == Phase::Verifying'):
+            self.assertIn(guard, host)
+        for case in ('cancel_ack_cannot_reopen_delayed_prompt_or_challenge_authority',
+                     'actual_socket_gap_or_decoded_error_cannot_recover_old_prompt_on_snapshot',
+                     'negative_answer_ack_never_reopens_server_cancelling_or_blocked_phase'):
+            self.assertIn(case, host)
+        hub = (ROOT/'crates/compositor/src/control.rs').read_text()
+        resync = hub.split('Message::Hello { version } => {', 1)[1].split('Message::Command', 1)[0]
+        self.assertIn('self.last_auth_availability = None;', resync)
+        client = (ROOT/'crates/shell-host/src/control.rs').read_text()
+        dispatch = client.split('pub fn poll(', 1)[1].split('/// Apply one already-decoded', 1)[0]
+        self.assertIn('if result.is_err()', dispatch)
+        self.assertIn('self.poison_interactive_auth()', dispatch)
+
+    def test_dedicated_transport_has_actual_reconnect_and_stale_controls(self):
+        source = (ROOT/'crates/shell-host/src/control_auth.rs').read_text()
+        writer = source.split('fn write_auth_once(', 1)[1].split('fn poison_interactive_auth(', 1)[0]
+        self.assertNotIn('reconnect', writer)
+        self.assertIn('write_all(bytes)', writer)
+        self.assertIn('self.poison_interactive_auth()', writer)
+        self.assertIn('encode_answer_frame(id, key, context.sequence, answers)', source)
+        self.assertIn('auth.context.epoch != availability.epoch', source)
+        for case in ['capabilities_before_hello_snapshot_or_locked_state_never_admit_start',
+                     'policy_and_common_slot_busy_are_distinct_from_owned_prompt_authority',
+                     'stale_epoch_generation_root_and_sequence_cannot_send_answer_or_cancel',
+                     'real_reconnect_receives_only_hello_and_requires_fresh_explicit_start']:
+            self.assertIn(case, source)
 
 if __name__ == '__main__': unittest.main()

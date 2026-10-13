@@ -46,6 +46,9 @@ use tuna_shell_control::{
 pub use tuna_shell_control::ControlError;
 
 use crate::model::{ShellModel, SnapshotView, WindowEntry};
+#[path = "control_auth.rs"]
+mod interactive;
+pub use interactive::{Context as AuthContext, Event as AuthEvent};
 
 /// First shell-chosen command request id.
 pub const INITIAL_REQUEST_ID: u64 = 1;
@@ -53,6 +56,7 @@ pub const INITIAL_REQUEST_ID: u64 = 1;
 /// What one handled inbound message meant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handled {
+    InteractiveAuth(AuthEvent),
     ScreenReader(tuna_shell_control::ScreenReaderState),
     /// Compositor greeted back (e.g. after a resnapshot re-hello); the
     /// awaited full snapshot still follows.
@@ -211,6 +215,10 @@ pub struct ControlClient {
     overview_previews: (Vec<tuna_shell_control::PreviewInfo>, Option<u64>),
     connection_generation: u64,
     auth_needs_snapshot: bool,
+    auth_peer_minor: Option<u16>,
+    auth_availability: Option<tuna_shell_control::auth::Availability>,
+    interactive_auth: Option<interactive::Active>,
+    auth_request_exhausted: bool,
     input_method_admission: InputMethodAdmission,
     wellbeing_applied: Option<(bool, bool)>,
     wellbeing_pending: Option<(u64, (bool, bool), Instant)>,
@@ -256,6 +264,10 @@ impl ControlClient {
             overview_previews: (Vec::new(), None),
             connection_generation: 0,
             auth_needs_snapshot: true,
+            auth_peer_minor: None,
+            auth_availability: None,
+            interactive_auth: None,
+            auth_request_exhausted: false,
             input_method_admission: InputMethodAdmission::AwaitHello,
             wellbeing_applied: None,
             wellbeing_pending: None,
@@ -345,7 +357,16 @@ impl ControlClient {
         self.input_method_admission = InputMethodAdmission::AwaitHello;
         match self.read_frame()? {
             Message::Hello { version } => {
+                if self.interactive_auth.is_some() {
+                    self.poison_interactive_auth();
+                    return Err(ControlError::Unexpected(
+                        "authentication greeting invalidated old authority".into(),
+                    ));
+                }
                 if version.is_compatible_with(&CURRENT_VERSION) {
+                    self.clear_interactive_auth();
+                    self.auth_peer_minor = Some(version.minor);
+                    self.auth_needs_snapshot = true;
                     self.input_method_admission = InputMethodAdmission::AwaitSnapshot;
                     Ok(())
                 } else {
@@ -691,7 +712,7 @@ impl ControlClient {
         let id = self.alloc_request_id();
         let frame =
             tuna_shell_control::encode_unlock_frame(id, tuna_shell_control::Secret(password))?;
-        if self.auth_needs_snapshot {
+        if self.auth_needs_snapshot || self.interactive_auth.is_some() {
             return Err(ControlError::Unexpected(
                 "authentication requires a fresh snapshot".into(),
             ));
@@ -750,11 +771,19 @@ impl ControlClient {
     /// redials are spaced by 250 ms; ordinary reads and sends never wait.
     pub fn poll(&mut self) -> Result<Handled, ControlError> {
         match self.read_frame() {
-            Ok(msg) => self.handle_message(msg),
+            Ok(msg) => {
+                let result = self.handle_message(msg);
+                if result.is_err() {
+                    self.poison_interactive_auth();
+                }
+                result
+            }
             Err(ControlError::Io(e))
                 if self.socket_path.is_some()
                     && (is_dead_peer(&e) || e.kind() == io::ErrorKind::UnexpectedEof) =>
             {
+                self.clear_interactive_auth();
+                self.auth_needs_snapshot = true;
                 self.input_method_admission = InputMethodAdmission::AwaitHello;
                 self.wellbeing_applied = None;
                 self.wellbeing_pending = None;
@@ -781,6 +810,8 @@ impl ControlClient {
                     || matches!(&e, ControlError::Io(error)
                         if error.kind() == io::ErrorKind::WouldBlock);
                 if !would_block {
+                    self.clear_interactive_auth();
+                    self.auth_needs_snapshot = true;
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                 }
                 Err(e)
@@ -792,7 +823,16 @@ impl ControlClient {
     fn handle_message(&mut self, msg: Message) -> Result<Handled, ControlError> {
         match msg {
             Message::Hello { version } => {
+                if self.interactive_auth.is_some() {
+                    self.poison_interactive_auth();
+                    return Err(ControlError::Unexpected(
+                        "authentication greeting invalidated old authority".into(),
+                    ));
+                }
                 if version.is_compatible_with(&CURRENT_VERSION) {
+                    self.clear_interactive_auth();
+                    self.auth_peer_minor = Some(version.minor);
+                    self.auth_needs_snapshot = true;
                     self.input_method_admission = InputMethodAdmission::AwaitSnapshot;
                     Ok(Handled::Hello)
                 } else {
@@ -821,6 +861,10 @@ impl ControlClient {
                 self.shadow_windows = windows;
                 self.shadow_workspaces = workspaces;
                 self.locked = locked;
+                if !locked {
+                    self.interactive_auth = None;
+                    self.auth_availability = None;
+                }
                 self.model.apply_snapshot_view(snapshot_view(
                     &self.shadow_windows,
                     &self.shadow_workspaces,
@@ -841,10 +885,15 @@ impl ControlClient {
                 if self.revision != Some(from_revision) {
                     // Resnapshot rule: never apply a delta onto the wrong
                     // base. Flag a fresh snapshot; the delta is dropped.
-                    self.needs_snapshot = true;
-                    return Ok(Handled::Gap {
-                        have: self.revision,
-                    });
+                    let have = self.revision;
+                    if self.interactive_auth.is_some() {
+                        self.poison_interactive_auth();
+                    } else {
+                        self.clear_interactive_auth();
+                        self.auth_needs_snapshot = true;
+                        self.needs_snapshot = true;
+                    }
+                    return Ok(Handled::Gap { have });
                 }
                 apply_ops(&mut self.shadow_windows, &mut self.shadow_workspaces, &ops);
                 self.model.apply_snapshot_view(snapshot_view(
@@ -855,6 +904,9 @@ impl ControlClient {
                 Ok(Handled::Changes { to_revision })
             }
             Message::CommandResult { id, status } => {
+                if let Some(event) = self.interactive_reply(id, &status) {
+                    return Ok(Handled::InteractiveAuth(event));
+                }
                 if let Some((pending_id, pair, _)) = self.wellbeing_pending {
                     if pending_id == id {
                         self.wellbeing_pending = None;
@@ -915,11 +967,17 @@ impl ControlClient {
                 Ok(Handled::PointerOutput)
             }
             Message::ShortcutConsent { request } => Ok(Handled::ShortcutConsent(request)),
-            // Stage C owns the no-replay UI consumer. No interactive command
-            // can use the generic writer before that consumer is installed.
-            Message::AuthState { .. } | Message::AuthChallenge { .. } => Err(
-                ControlError::Unexpected("interactive auth consumer unavailable".into()),
-            ),
+            Message::AuthState {
+                start_request,
+                key,
+                phase,
+            } => self.handle_auth_state(start_request, key, phase),
+            Message::AuthChallenge {
+                key,
+                sequence,
+                messages,
+            } => self.handle_auth_challenge(key, sequence, messages),
+            Message::AuthAvailability(availability) => self.handle_auth_availability(availability),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -986,6 +1044,12 @@ impl ControlClient {
                 Ok(Handled::Switcher { action, selection })
             }
             Message::Error { kind, message } => {
+                if self.interactive_auth.is_some() {
+                    self.poison_interactive_auth();
+                } else {
+                    self.clear_interactive_auth();
+                    self.auth_needs_snapshot = true;
+                }
                 if kind == ErrorKind::IncompatibleVersion {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                 }
@@ -1012,6 +1076,12 @@ impl ControlClient {
     /// partial-write semantics need a separate audit. Credentials never use
     /// this path and are explicitly refused before generic serialization.
     fn write_message(&mut self, msg: &Message) -> Result<(), ControlError> {
+        if matches!(msg, Message::Hello { .. }) && self.interactive_auth.is_some() {
+            self.poison_interactive_auth();
+            return Err(ControlError::Unexpected(
+                "authentication resync requires a fresh connection".into(),
+            ));
+        }
         if matches!(
             msg,
             Message::Command {
@@ -1048,6 +1118,10 @@ impl ControlClient {
     /// Uses a raw write for the greeting, never [`write_message`](Self::write_message):
     /// a redial that is itself dead must surface its error, not recurse.
     fn reconnect(&mut self) -> Result<(), ControlError> {
+        self.clear_interactive_auth();
+        let next_generation = self.connection_generation.checked_add(1).ok_or_else(|| {
+            ControlError::Unexpected("control connection generations exhausted".into())
+        })?;
         self.input_method_admission = InputMethodAdmission::AwaitHello;
         let path = self.socket_path.clone().ok_or_else(|| {
             ControlError::Unexpected("reconnect without a socket path".to_owned())
@@ -1055,7 +1129,7 @@ impl ControlClient {
         let stream = UnixStream::connect(&path)?;
         stream.set_nonblocking(true)?;
         self.stream = stream;
-        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.connection_generation = next_generation;
         self.auth_needs_snapshot = true;
         self.wellbeing_applied = None;
         self.wellbeing_pending = None;
@@ -1109,6 +1183,9 @@ impl ControlClient {
     /// Hand out the next shell-chosen request id (never zero).
     fn alloc_request_id(&mut self) -> u64 {
         let id = self.next_request_id;
+        if self.next_request_id == u64::MAX {
+            self.auth_request_exhausted = true;
+        }
         self.next_request_id = self.next_request_id.wrapping_add(1);
         if self.next_request_id == 0 {
             self.next_request_id = INITIAL_REQUEST_ID;
@@ -1153,6 +1230,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::AuthState { .. } => "AuthState",
         Message::AuthChallenge { .. } => "AuthChallenge",
+        Message::AuthAvailability(_) => "AuthAvailability",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
     }
 }
