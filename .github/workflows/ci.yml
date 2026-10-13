@@ -49,6 +49,9 @@ jobs:
       - run: python3 scripts/lib/grid-target-settled-tests.py
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
+      - run: /usr/bin/python3 scripts/lib/media-completion-barrier-tests.py
+      - run: /usr/bin/python3 scripts/lib/media-completion-proof-tests.py
+      - run: /usr/bin/python3 scripts/lib/media-completion-fixture-tests.py
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
@@ -427,6 +430,9 @@ jobs:
           if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or 'COUNTDOWN-OSD pass ' not in text:
               raise RuntimeError('actual admitted countdown OSD test did not pass')
           PY
+      - name: Prove real MediaKeys callback completion and forced clamp interleave
+        run: |
+          /usr/bin/python3 scripts/tuna-media-completion-proof --admission gtk-shell-artifacts/a11y/bin/build-admission.json --cargo-json "$RUNNER_TEMP/tuna-gtk-a11y-build.json" --artifacts gtk-shell-artifacts/media-completion
       # pam_wrapper backs G-UNLOCK, IBus G-IME and wayland-utils
       # G-WAYLAND-INFO; all required so no stage can silently skip.
       - run: python3 scripts/lib/cursor-proof-theme-tests.py

@@ -4027,7 +4027,49 @@ pass G-ACCEL "gnome-settings-daemon's grab fires on its key and its ShowOSD show
 touch "$TUNA_MEDIA_DIAGNOSTICS"
 media_mark() { "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" marker "$$" "$1"; }
 media_mark begin
-echo 0.40 >"$VOLUME_FILE"
+MEDIA_SHELL_PID="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk | head -1)"
+[ -n "$MEDIA_SHELL_PID" ] || fail G-MEDIA-VOLUME "owned shell is missing"
+"$PY" - "$MEDIA_SHELL_PID" "$ARTIFACTS/media-completion-owner.json" <<'PY_MEDIA_OWNER'
+import json, pathlib, sys
+pid = int(sys.argv[1])
+fields = (pathlib.Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+pathlib.Path(sys.argv[2]).write_text(json.dumps({'pid': pid, 'start_ticks': int(fields[19])}) + '\n')
+PY_MEDIA_OWNER
+MEDIA_SINCE=0
+MEDIA_KIND=idle
+media_wait() {
+    policy="$(gsettings get org.gnome.desktop.sound allow-volume-above-100-percent)"
+    "$PY" "$ROOT/scripts/lib/media-completion-barrier.py" --log "$LOG" \
+        --pid "$MEDIA_SHELL_PID" --owner "$ARTIFACTS/media-completion-owner.json" \
+        --since "$MEDIA_SINCE" --kind "$MEDIA_KIND" --policy "$policy" \
+        --receipt "$ARTIFACTS/media-completion-last.json" ||
+        fail G-MEDIA-VOLUME "actual owned key/clamp callbacks did not settle"
+}
+media_policy() {
+    old_policy="$(gsettings get org.gnome.desktop.sound allow-volume-above-100-percent)"
+    if [ "$old_policy" != "$1" ]; then
+        MEDIA_SINCE="$("$PY" -c 'import time; print(time.monotonic_ns())')"
+        MEDIA_KIND=idle
+    fi
+    gsettings set org.gnome.desktop.sound allow-volume-above-100-percent "$1"
+    media_wait
+}
+media_key() {
+    MEDIA_SINCE="$("$PY" -c 'import time; print(time.monotonic_ns())')"
+    MEDIA_KIND=key
+    xdotool key "$@"
+    media_wait
+}
+media_baseline() {
+    media_wait
+    echo "$1" >"$VOLUME_FILE"
+}
+# Force one real settings callback before the first baseline; no value/idle
+# inference and no dependency on incidental AudioUi monitor polling.
+original_policy="$(gsettings get org.gnome.desktop.sound allow-volume-above-100-percent)"
+if [ "$original_policy" = false ]; then media_policy true; else media_policy false; fi
+media_policy "$original_policy"
+media_baseline 0.40
 echo 0 >"$VOLUME_MUTED_FILE"
 media_volume() {
     expected=$1
@@ -4037,51 +4079,51 @@ media_volume() {
     done
     return 1
 }
-xdotool key XF86AudioRaiseVolume
+media_key XF86AudioRaiseVolume
 media_volume 0.4600 || fail G-MEDIA-VOLUME "volume up did not apply the 6% step"
-xdotool key XF86AudioLowerVolume
+media_key XF86AudioLowerVolume
 media_volume 0.4000 || fail G-MEDIA-VOLUME "volume down did not apply the 6% step"
-xdotool key shift+XF86AudioRaiseVolume
+media_key shift+XF86AudioRaiseVolume
 media_volume 0.4200 || fail G-MEDIA-VOLUME "precise volume up did not use 2%"
-xdotool key XF86AudioMute
+media_key XF86AudioMute
 for _ in $(seq 1 30); do [ "$(cat "$VOLUME_MUTED_FILE")" = 1 ] && break; sleep 0.1; done
 [ "$(cat "$VOLUME_MUTED_FILE")" = 1 ] || fail G-MEDIA-VOLUME "volume mute did not mute"
-xdotool key XF86AudioRaiseVolume
+media_key XF86AudioRaiseVolume
 for _ in $(seq 1 30); do [ "$(cat "$VOLUME_MUTED_FILE")" = 0 ] && break; sleep 0.1; done
 if [ "$(cat "$VOLUME_MUTED_FILE")" != 0 ] || [ "$(cat "$VOLUME_FILE")" != 0.4200 ]; then
     fail G-MEDIA-VOLUME "unmuting increased or lost the existing volume"
 fi
-xdotool key XF86AudioMicMute
+media_key XF86AudioMicMute
 for _ in $(seq 1 30); do [ "$(cat "$MIC_MUTED_FILE")" = 1 ] && break; sleep 0.1; done
 [ "$(cat "$MIC_MUTED_FILE")" = 1 ] || fail G-MEDIA-VOLUME "microphone mute did not mute"
-xdotool key XF86AudioMicMute
+media_key XF86AudioMicMute
 for _ in $(seq 1 30); do [ "$(cat "$MIC_MUTED_FILE")" = 0 ] && break; sleep 0.1; done
 [ "$(cat "$MIC_MUTED_FILE")" = 0 ] || fail G-MEDIA-VOLUME "microphone unmute did not unmute"
 # This headed fixture uses a wpctl stand-in; the native VM separately checks
 # actual HDA/PipeWire channel volume. Same live shell and real hardware keys.
 SOUND_SCHEMA=org.gnome.desktop.sound
-gsettings set "$SOUND_SCHEMA" allow-volume-above-100-percent false
+media_policy false
 sleep 0.3
-echo 0.98 >"$VOLUME_FILE"
-xdotool key XF86AudioRaiseVolume
+media_baseline 0.98
+media_key XF86AudioRaiseVolume
 media_volume 1.0000 || fail G-MEDIA-AMPLIFICATION "disabled amplification did not cap at 100%"
-gsettings set "$SOUND_SCHEMA" allow-volume-above-100-percent true
+media_policy true
 sleep 0.3
-echo 0.98 >"$VOLUME_FILE"
-xdotool key XF86AudioRaiseVolume
+media_baseline 0.98
+media_key XF86AudioRaiseVolume
 media_volume 1.0400 || fail G-MEDIA-AMPLIFICATION "live enabled amplification did not cross 100%"
-echo 1.50 >"$VOLUME_FILE"
-xdotool key XF86AudioRaiseVolume
+media_baseline 1.50
+media_key XF86AudioRaiseVolume
 media_volume 1.5252 || fail G-MEDIA-AMPLIFICATION "amplified key did not obey GNOME's +11dB limit"
-gsettings set "$SOUND_SCHEMA" allow-volume-above-100-percent false
+media_policy false
 sleep 0.3
-echo 0.98 >"$VOLUME_FILE"
-xdotool key XF86AudioRaiseVolume
+media_baseline 0.98
+media_key XF86AudioRaiseVolume
 media_volume 1.0000 || fail G-MEDIA-AMPLIFICATION "live disable did not restore the ordinary limit"
 media_mark amplification-reset-before
 gsettings reset "$SOUND_SCHEMA" allow-volume-above-100-percent
 media_mark amplification-reset-after
-echo 0.4200 >"$VOLUME_FILE"
+media_baseline 0.4200
 media_mark baseline-written
 pass G-MEDIA-AMPLIFICATION "same shell follows live opt-in and reset; native VM qualifies real PipeWire separately"
 
@@ -4102,13 +4144,16 @@ cp "$CSTATE" "$ARTIFACTS/media-after-disabled-key.json"
 gsettings set "$MEDIA_SCHEMA" volume-up "['F8']"
 gsettings set "$MEDIA_SCHEMA" volume-step 10
 sleep 0.7
+MEDIA_SINCE="$("$PY" -c 'import time; print(time.monotonic_ns())')"
+MEDIA_KIND=key
 fkey_tap "" ffc5 || fail G-MEDIA-VOLUME "F8 tap failed"
+media_wait
 media_volume 0.5200 || fail G-MEDIA-VOLUME "live rebound volume key ignored the configured step"
 gsettings reset "$MEDIA_SCHEMA" volume-up
 gsettings reset "$MEDIA_SCHEMA" volume-up-static
 gsettings reset "$MEDIA_SCHEMA" volume-step
 sleep 0.7
-echo 0.4200 >"$VOLUME_FILE"
+media_baseline 0.4200
 scrot "$ARTIFACTS/media-volume-osd.png" >/dev/null
 rm -f "$TUNA_MEDIA_DIAGNOSTICS"
 pass G-MEDIA-VOLUME "native volume/precise/mute/microphone keys mutate PipeWire state; unmute preserves the level"
