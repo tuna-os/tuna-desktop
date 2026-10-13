@@ -28,6 +28,7 @@ mod kbd_a11y;
 mod keybindings;
 mod live_apps;
 mod lock;
+mod lock_auth;
 mod logic;
 mod media_keys;
 mod motion;
@@ -1379,6 +1380,38 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    lock_ui.install_auth_hooks(lock_auth::Hooks {
+        start: {
+            let shell = shell.clone();
+            Rc::new(move || {
+                shell
+                    .borrow_mut()
+                    .control
+                    .as_mut()
+                    .and_then(|c| c.start_interactive_auth().ok())
+            })
+        },
+        answer: {
+            let shell = shell.clone();
+            Rc::new(move |context, answers| {
+                shell
+                    .borrow_mut()
+                    .control
+                    .as_mut()
+                    .is_some_and(|c| c.answer_interactive_auth(context, answers).is_ok())
+            })
+        },
+        cancel: {
+            let shell = shell.clone();
+            Rc::new(move |context| {
+                shell
+                    .borrow_mut()
+                    .control
+                    .as_mut()
+                    .is_some_and(|c| c.cancel_interactive_auth(context).is_ok())
+            })
+        },
+    });
     let qs = quick_settings_popover(
         &shell,
         &notify,
@@ -2670,6 +2703,7 @@ fn build(app: &adw::Application) {
         glib::timeout_add_local(Duration::from_millis(16), move || {
             let mut shell = shell.borrow_mut();
             let mut results = Vec::new();
+            let mut auth_events = Vec::new();
             let mut accelerators = Vec::new();
             let mut menus = Vec::new();
             let mut consent = None;
@@ -2678,6 +2712,7 @@ fn build(app: &adw::Application) {
             if let Some(control) = shell.control.as_mut() {
                 loop {
                     match control.poll() {
+                        Ok(Handled::InteractiveAuth(event)) => auth_events.push(event),
                         Ok(Handled::Gap { .. }) => {
                             let _ = control.request_snapshot();
                         }
@@ -2715,7 +2750,18 @@ fn build(app: &adw::Application) {
                 }
             }
             let locked = shell.control.as_ref().is_some_and(|c| c.locked());
-            let auth_generation = shell.control.as_ref().map(|c| c.connection_generation());
+            let auth_generation = shell
+                .control
+                .as_ref()
+                .and_then(|c| c.locked_auth_generation());
+            let auth_available = shell
+                .control
+                .as_ref()
+                .is_some_and(|c| c.interactive_auth_available());
+            let auth_start_ready = shell
+                .control
+                .as_ref()
+                .is_some_and(|c| c.interactive_auth_start_ready());
             let authoritative_lock = shell
                 .control
                 .as_ref()
@@ -2748,6 +2794,10 @@ fn build(app: &adw::Application) {
             lock_ui.sync_connection_generation(auth_generation);
             if let Some(locked) = authoritative_lock {
                 lock_ui.sync(locked);
+            }
+            lock_ui.sync_auth(auth_generation, auth_available, auth_start_ready);
+            for event in auth_events {
+                lock_ui.auth_event(event);
             }
             screensaver.sync(locked);
             if locked {

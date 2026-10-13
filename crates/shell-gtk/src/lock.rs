@@ -4,7 +4,9 @@
 //! draws the blurred, dimmed wallpaper underneath, and verifies the
 //! password. This module only draws GNOME's curtain (clock, date and
 //! "Click or press a key"), switches to the unlock prompt on a key or
-//! click, and sends what is typed in a redacted `Unlock` command. It
+//! click, and follows the admitted authentication transport. Existing password
+//! fallback sends a redacted `Unlock`; an available session stack supplies
+//! literal indexed fields for fresh password and OTP prompts. This UI
 //! releases its lock surfaces once the compositor's snapshot says the
 //! session is unlocked, never on its own.
 //!
@@ -34,6 +36,9 @@ struct Screen {
     date: gtk::Label,
     entry: gtk::PasswordEntry,
     message: gtk::Label,
+    password_box: gtk::Box,
+    auth_view: Rc<crate::lock_auth::View>,
+    auth_scroll: gtk::ScrolledWindow,
 }
 
 pub struct LockUi {
@@ -47,6 +52,7 @@ pub struct LockUi {
     pending: Cell<Option<u64>>,
     connection_generation: Cell<Option<u64>>,
     clock_format: Box<dyn Fn() -> logic::ClockFormat>,
+    auth: Rc<crate::lock_auth::AuthUi>,
 }
 
 impl LockUi {
@@ -64,12 +70,14 @@ impl LockUi {
             pending: Cell::new(None),
             connection_generation: Cell::new(None),
             clock_format,
+            auth: crate::lock_auth::AuthUi::new(),
         });
         {
             let weak = Rc::downgrade(&ui);
             ui.instance.connect_failed(move |_| {
                 eprintln!("tuna-shell-gtk: the compositor refused the session lock");
                 if let Some(ui) = weak.upgrade() {
+                    ui.auth.invalidate();
                     ui.screens.borrow_mut().clear();
                 }
             });
@@ -78,6 +86,7 @@ impl LockUi {
             let weak = Rc::downgrade(&ui);
             ui.instance.connect_unlocked(move |_| {
                 if let Some(ui) = weak.upgrade() {
+                    ui.auth.invalidate();
                     ui.screens.borrow_mut().clear();
                     ui.pending.set(None);
                 }
@@ -94,6 +103,42 @@ impl LockUi {
             });
         }
         ui
+    }
+
+    pub fn install_auth_hooks(&self, hooks: crate::lock_auth::Hooks) {
+        self.auth.install(hooks);
+    }
+    pub fn sync_auth(&self, generation: Option<u64>, available: bool, ready: bool) {
+        let newly_available = !self.auth.available() && available;
+        self.auth.sync(generation, available, ready);
+        if newly_available
+            && self
+                .screens
+                .borrow()
+                .iter()
+                .any(|screen| screen.stack.visible_child_name().as_deref() == Some("prompt"))
+        {
+            self.auth.start();
+        }
+        self.update_auth_mode();
+    }
+    pub fn auth_event(&self, event: tuna_shell_host::control::AuthEvent) {
+        self.auth.event(event);
+        self.update_auth_mode();
+    }
+    fn update_auth_mode(&self) {
+        let interactive = self.auth.available() || self.auth.active();
+        for screen in self.screens.borrow().iter() {
+            screen.password_box.set_visible(!interactive);
+            screen.auth_view.root.set_visible(interactive);
+            screen.auth_scroll.set_visible(interactive);
+            if interactive {
+                screen.entry.set_text("");
+            }
+            screen
+                .entry
+                .set_sensitive(!interactive && self.pending.get().is_none());
+        }
     }
 
     /// Follow the compositor's lock flag: lock when it says locked,
@@ -125,6 +170,7 @@ impl LockUi {
             self.tick();
         } else if !locked && self.requested.get() {
             self.requested.set(false);
+            self.auth.invalidate();
             self.instance.unlock();
         }
     }
@@ -135,6 +181,7 @@ impl LockUi {
         if !generation_changed(&self.connection_generation, generation) {
             return;
         }
+        self.auth.invalidate();
         self.pending.set(None);
         for screen in self.screens.borrow().iter() {
             screen.stack.set_visible_child_name("prompt");
@@ -286,6 +333,14 @@ impl LockUi {
         prompt.append(&button_box);
         prompt.append(&caps);
         prompt.append(&message);
+        let auth_view = self.auth.view();
+        let auth_scroll = gtk::ScrolledWindow::new();
+        auth_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        auth_scroll.set_propagate_natural_height(true);
+        auth_scroll.set_max_content_height(400);
+        auth_scroll.set_child(Some(&auth_view.root));
+        auth_scroll.set_visible(false);
+        prompt.append(&auth_scroll);
 
         let stack = gtk::Stack::new();
         stack.set_transition_type(gtk::StackTransitionType::Crossfade);
@@ -315,7 +370,8 @@ impl LockUi {
         // down (UnlockDialogLayout), which lands the 1280x800 clock at
         // y 275 and the prompt at y 205.
         {
-            let (clock_box, prompt) = (clock_box.clone(), prompt.clone());
+            let (clock_box, prompt, auth_scroll) =
+                (clock_box.clone(), prompt.clone(), auth_scroll.clone());
             let last = Cell::new(-1);
             window.add_tick_callback(move |w, _| {
                 let height = w.height();
@@ -324,6 +380,7 @@ impl LockUi {
                     let (clock_top, prompt_top) = logic::lock_offsets(height);
                     clock_box.set_margin_top(clock_top);
                     prompt.set_margin_top(prompt_top);
+                    auth_scroll.set_max_content_height((height - prompt_top - 160).max(100));
                 }
                 glib::ControlFlow::Continue
             });
@@ -334,11 +391,20 @@ impl LockUi {
         // prompt goes back to the curtain.
         let show_prompt = {
             let (stack, entry) = (stack.clone(), entry.clone());
+            let weak = Rc::downgrade(self);
             move || {
                 if stack.visible_child_name().as_deref() != Some("prompt") {
                     stack.set_visible_child_name("prompt");
                 }
-                entry.grab_focus();
+                if let Some(ui) = weak
+                    .upgrade()
+                    .filter(|ui| ui.auth.available() || ui.auth.active())
+                {
+                    ui.auth.start();
+                    ui.update_auth_mode();
+                } else {
+                    entry.grab_focus();
+                }
             }
         };
         let keys = gtk::EventControllerKey::new();
@@ -350,9 +416,14 @@ impl LockUi {
                 message.clone(),
                 show_prompt.clone(),
             );
+            let weak = Rc::downgrade(self);
             keys.connect_key_pressed(move |_, key, _, _| {
                 let on_prompt = stack.visible_child_name().as_deref() == Some("prompt");
                 if key == gtk::gdk::Key::Escape {
+                    if let Some(ui) = weak.upgrade().filter(|ui| ui.auth.active()) {
+                        ui.auth.cancel();
+                        return glib::Propagation::Stop;
+                    }
                     if on_prompt {
                         entry.set_text("");
                         message.set_label("");
@@ -384,7 +455,10 @@ impl LockUi {
                     return glib::Propagation::Proceed;
                 }
                 show_prompt();
-                if let Some(c) = key.to_unicode().filter(|c| !c.is_control()) {
+                let interactive = weak
+                    .upgrade()
+                    .is_some_and(|ui| ui.auth.available() || ui.auth.active());
+                if let Some(c) = key.to_unicode().filter(|c| !c.is_control() && !interactive) {
                     entry.set_text(&c.to_string());
                     entry.set_position(-1);
                 }
@@ -425,6 +499,9 @@ impl LockUi {
             let message = message.clone();
             entry.connect_activate(move |entry| {
                 let Some(ui) = weak.upgrade() else { return };
+                if ui.auth.available() || ui.auth.active() {
+                    return;
+                }
                 submit_password(entry, &message, &ui.pending, &ui.send);
             });
         }
@@ -451,6 +528,9 @@ impl LockUi {
             date,
             entry,
             message,
+            password_box: button_box,
+            auth_view,
+            auth_scroll,
         });
         window
     }
@@ -486,6 +566,7 @@ fn submit_password(
         eprintln!("tuna-shell-gtk: lock password submitted");
     }
     let password = entry.text().to_string();
+    entry.set_text("");
     message.set_label("");
     if let Some(root) = entry.root() {
         root.set_focus(gtk::Widget::NONE);
@@ -535,6 +616,11 @@ mod auth_transport_ui_tests {
         entry.set_text("controlled-only");
         entry.emit_by_name::<()>("activate", &[]);
         assert_eq!(pending.get(), Some(9));
+        assert_eq!(
+            entry.text(),
+            "",
+            "accepted legacy submission is cleared immediately"
+        );
         assert!(!entry.is_sensitive());
         assert_eq!(sends.get(), 2);
         entry.emit_by_name::<()>("activate", &[]);
