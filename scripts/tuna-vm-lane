@@ -317,15 +317,33 @@ def usb_bus_from_qtree(qtree):
     raise RuntimeError("no USB bus in qtree output")
 
 
+def s3_remaining(deadline):
+    """Refuse observations or acceptance at/after the unchanged phase budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("S3 authentication observation deadline expired")
+    return remaining
+
+
+def s3_observe(agent, action, *args, deadline):
+    result = agent.run(action, *args, timeout=s3_remaining(deadline))
+    s3_remaining(deadline)
+    return result
+
+
 def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None, strip_edge=False):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
     evidence = os.path.join(out, "lifecycle")
     os.makedirs(evidence, exist_ok=True)
 
-    def inventory(label):
-        state = agent.run("inventory")
+    def inventory(label, deadline=None):
+        # Other lifecycle callers retain their original default behavior.
+        state = (agent.run("inventory") if deadline is None else
+                 s3_observe(agent, "inventory", deadline=deadline))
         with open(os.path.join(evidence, f"{label}.json"), "w") as stream:
             json.dump(state, stream, indent=2)
+        if deadline is not None:
+            s3_remaining(deadline)
         return state
 
     def await_state(predicate, timeout=15, label=None):
@@ -1051,22 +1069,21 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         desktop = next(process for process in before["processes"] if process["executable"] == "tuna-compositor")
         observation_index = 0
         while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError("actual PAM delay admission deadline expired")
-            observed = agent.run("delayed-auth-state", desktop["pid"], desktop["start_ticks"],
-                                 timeout=remaining)
+            observed = s3_observe(agent, "delayed-auth-state", desktop["pid"],
+                                  desktop["start_ticks"], deadline=deadline)
             with open(os.path.join(evidence, f"sleep-auth-delay-{observation_index:02d}.json"), "w") as stream:
                 json.dump(observed, stream, indent=2)
             observation_index += 1
+            s3_remaining(deadline)
             if observed["real_pam_delay_running"]:
-                pending_auth = inventory("sleep-auth-owned-attempt")
+                pending_auth = inventory("sleep-auth-owned-attempt", deadline=deadline)
                 if not same_apps(before, pending_auth):
                     raise RuntimeError("pre-sleep authentication replaced the session")
                 original_auth = sleep_auth_attempt(pending_auth)
                 original_method = sleep_auth_helper_observation(observed, pending_auth)
+                s3_remaining(deadline)
                 break
-            time.sleep(0.1)
+            time.sleep(min(0.1, s3_remaining(deadline)))
         else:
             raise RuntimeError("actual PAM delay child did not start before suspend")
     finally:
@@ -1076,20 +1093,19 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     deadline = time.monotonic() + 25
     stale_rejected = False
     while time.monotonic() < deadline:
-        state = inventory("sleep-auth-pending")
+        state = inventory("sleep-auth-pending", deadline=deadline)
         if not state["state"]["locked"] or not same_apps(before, state):
             record("V-SLEEP-AUTH-FAIL-CLOSED", False, "pre-sleep PAM result exposed or replaced the session")
             raise RuntimeError("pre-sleep authentication unlocked the resumed session")
         trace = read_text(serial_path)[stale_auth_offset:]
         owner = state["state"].get("auth_owner")
         current_epoch = owner.get("epoch") if type(owner) is dict else None
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        physical = agent.run("auth-retirement-state", json.dumps(original_method), timeout=remaining)
+        physical = s3_observe(agent, "auth-retirement-state", json.dumps(original_method),
+                              deadline=deadline)
         with open(os.path.join(evidence, "sleep-auth-physical-retirement.json"), "w") as stream:
             json.dump(physical, stream, indent=2)
         retirement = cancelled_sleep_auth_retirement(trace, original_auth, current_epoch, original_method, physical)
+        s3_remaining(deadline)
         stale_rejected = retirement is not None
         if stale_rejected:
             with open(os.path.join(evidence, "sleep-auth-retirement.json"), "w") as stream:
@@ -1097,8 +1113,10 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                            "original_method": original_method, "physical": physical,
                            "scope": "actual canceled PAM helper and owned delay retirement after real S3; unchanged locked desktop"},
                           stream, indent=2)
+            s3_remaining(deadline)
             break
-        time.sleep(0.2)
+        time.sleep(min(0.2, s3_remaining(deadline)))
+    s3_remaining(deadline)
     record("V-SLEEP-AUTH-FAIL-CLOSED", stale_rejected,
            "original real delayed PAM helper is canceled and physically retired after real S3; no accepted stale success and locked apps stay intact")
     if not stale_rejected:

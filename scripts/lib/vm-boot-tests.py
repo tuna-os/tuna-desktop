@@ -1111,5 +1111,107 @@ class PrivatePamSleepControls(unittest.TestCase):
         self.assertEqual(lane.stale_sleep_auth_retirement(self.legacy.trace(),self.expected,8),self.legacy.event)
 
 
+
+class S3AbsoluteDeadline(unittest.TestCase):
+    def execute(self, phase, *, late_action=None, late_predicate=None, advance_action=None, deadline=5):
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        tree = ast.parse(source.read_text())
+        lifecycle = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_lifecycle")
+        inventory = next(n for n in lifecycle.body if isinstance(n, ast.FunctionDef) and n.name == "inventory")
+        helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("s3_remaining", "s3_observe")]
+        needle = 'delayed-auth-state' if phase == 'admission' else 'sleep-auth-pending'
+        loop = next(n for n in ast.walk(lifecycle) if isinstance(n, ast.While) and needle in ast.dump(n))
+        now = [0.0]
+        calls = []
+        class Agent:
+            def run(self, action, *args, **kwargs):
+                calls.append((action, kwargs))
+                if action == advance_action:
+                    now[0] += 1
+                if action == late_action:
+                    now[0] = deadline
+                if action == 'delayed-auth-state':
+                    return {'real_pam_delay_running': True}
+                if action == 'inventory':
+                    return {'state': {'locked': True, 'auth_owner': {'epoch': 8}}}
+                return {'helper_absent': True}
+        def predicate(name, result):
+            def run(*args):
+                if name == late_predicate: now[0] = deadline
+                return result
+            return run
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(time=SimpleNamespace(monotonic=lambda:now[0], sleep=lambda d:now.__setitem__(0, now[0]+d)),
+                         agent=Agent(), evidence=tmp, os=lane.os, json=json, deadline=deadline,
+                         desktop={'pid':1,'start_ticks':2}, observation_index=0,
+                         before={}, same_apps=predicate('same_apps', True),
+                         sleep_auth_attempt=predicate('attempt', {'serial':9}),
+                         sleep_auth_helper_observation=predicate('helper', {'helper':7}),
+                         cancelled_sleep_auth_retirement=predicate('retirement', {'retired':True}),
+                         read_text=lambda p:'actual serial', serial_path='serial', stale_auth_offset=0,
+                         original_method={}, original_auth={}, stale_rejected=False,
+                         record=lambda *args:None)
+            exec(compile(ast.Module(body=helpers+[inventory], type_ignores=[]),str(source),'exec'),scope)
+            try:
+                exec(compile(ast.Module(body=[loop], type_ignores=[]),str(source),'exec'),scope)
+            except RuntimeError as error:
+                self.assertIn('deadline expired', str(error))
+                return calls, False, Path(tmp,'sleep-auth-retirement.json').exists()
+            return calls, True, Path(tmp,'sleep-auth-retirement.json').exists()
+
+    def test_actual_admission_loop_clips_both_reads(self):
+        calls, accepted, receipt = self.execute('admission')
+        self.assertTrue(accepted)
+        self.assertEqual([action for action,_ in calls], ['delayed-auth-state','inventory'])
+        self.assertTrue(all(0 < kw['timeout'] <= 5 for _,kw in calls))
+        self.assertFalse(receipt)
+
+    def test_second_qga_operation_uses_recomputed_remaining_budget(self):
+        for phase, action, budget in [('admission','delayed-auth-state',5), ('retirement','inventory',25)]:
+            with self.subTest(phase=phase):
+                calls,accepted,_ = self.execute(phase,advance_action=action,deadline=budget)
+                self.assertTrue(accepted)
+                self.assertEqual(calls[0][1]['timeout'],budget)
+                self.assertEqual(calls[1][1]['timeout'],budget-1)
+
+    def test_actual_admission_rejects_late_read_and_validation(self):
+        for action in ('delayed-auth-state','inventory'):
+            with self.subTest(action=action):
+                _,accepted,_ = self.execute('admission',late_action=action)
+                self.assertFalse(accepted)
+        for name in ('same_apps','attempt','helper'):
+            with self.subTest(predicate=name):
+                _,accepted,_ = self.execute('admission',late_predicate=name)
+                self.assertFalse(accepted)
+
+    def test_actual_retirement_loop_clips_inventory_and_physical_reads(self):
+        calls,accepted,receipt = self.execute('retirement',deadline=25)
+        self.assertTrue(accepted); self.assertTrue(receipt)
+        self.assertEqual([action for action,_ in calls], ['inventory','auth-retirement-state'])
+        self.assertTrue(all(0 < kw['timeout'] <= 25 for _,kw in calls))
+
+    def test_actual_retirement_rejects_late_read_or_matcher_before_receipt(self):
+        for action in ('inventory','auth-retirement-state'):
+            with self.subTest(action=action):
+                _,accepted,receipt = self.execute('retirement',late_action=action,deadline=25)
+                self.assertFalse(accepted); self.assertFalse(receipt)
+        for name in ('same_apps','retirement'):
+            with self.subTest(predicate=name):
+                _,accepted,receipt = self.execute('retirement',late_predicate=name,deadline=25)
+                self.assertFalse(accepted); self.assertFalse(receipt)
+
+    def test_default_inventory_call_remains_unchanged(self):
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        lifecycle = next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='run_lifecycle')
+        inventory = next(n for n in lifecycle.body if isinstance(n,ast.FunctionDef) and n.name=='inventory')
+        calls=[]
+        with tempfile.TemporaryDirectory() as tmp:
+            scope=dict(agent=SimpleNamespace(run=lambda *a,**kw: calls.append((a,kw)) or {}),
+                       evidence=tmp,os=lane.os,json=json,
+                       s3_observe=lambda *a,**kw: (_ for _ in ()).throw(AssertionError('unexpected deadline path')))
+            exec(compile(ast.Module(body=[inventory],type_ignores=[]),str(source),'exec'),scope)
+            self.assertEqual(scope['inventory']('ordinary'),{})
+        self.assertEqual(calls,[(('inventory',),{})])
+
 if __name__ == "__main__":
     unittest.main()
