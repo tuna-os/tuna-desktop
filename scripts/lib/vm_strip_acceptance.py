@@ -273,29 +273,42 @@ class QmpDeadline:
                     raise
 
 
-def await_endpoint(read, original, predicate, *, deadline, previous=None):
+def await_endpoint(read, original, predicate, *, deadline, previous=None, evidence=None):
     """Three stable actual samples; invalid identity is terminal, partial readiness retries."""
     last = None
     stable = 0
     observations = []
+    if evidence is not None:
+        evidence.update(read_attempts=0, observations=[], qualified=False)
     while time.monotonic() < deadline:
+        if evidence is not None:
+            evidence['read_attempts'] += 1
         sample = read(deadline)
-        if time.monotonic() >= deadline:
-            raise TimeoutError('installed strip observation exceeded absolute deadline')
         if len(observations) >= 256 or len(json.dumps(sample).encode()) > 65536:
             raise RuntimeError('installed observation count/byte bound exceeded')
         observations.append(sample)
+        entry = {'sample': sample, 'status': 'unvalidated'}
+        if evidence is not None:
+            evidence['observations'].append(entry)
+        if time.monotonic() >= deadline:
+            entry['status'] = 'late-read-refused'
+            raise TimeoutError('installed strip observation exceeded absolute deadline')
         try:
             found = predicate(sample, original, previous)
             signature = json.dumps(found, sort_keys=True)
-        except NotReady:
+        except NotReady as error:
+            entry.update(status='not-ready', reason=str(error)[:512])
             stable, last = 0, None
         else:
             stable = stable + 1 if signature == last else 1
             last = signature
+            entry.update(status='candidate', stable_samples=stable)
             if stable >= 3:
                 if time.monotonic() >= deadline:
+                    entry['status'] = 'late-validation-refused'
                     raise TimeoutError('installed strip validation exceeded absolute deadline')
+                if evidence is not None:
+                    evidence['qualified'] = True
                 return sample, observations
         time.sleep(min(.05, max(0, deadline - time.monotonic())))
     raise TimeoutError('installed strip endpoint did not become ready before deadline')
@@ -332,6 +345,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
     original = None
     started = False
     primary = None
+    endpoint_sequence = 0
 
     def guest(action, *args, budget=12):
         remaining = min(budget, deadline - time.monotonic())
@@ -346,12 +360,25 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         return agent.run('strip-state', nonce, timeout=remaining)
 
     def ready(mode, previous=None, extra=lambda _sample, _found: True):
+        nonlocal endpoint_sequence
+        endpoint_sequence += 1
+        diagnostic = {'schema': 1, 'phase': endpoint_sequence, 'requested_mode': mode,
+                      'scope': 'actual bounded endpoint observations; no framebuffer or release qualification'}
         def predicate(sample, owner, old):
             found = endpoint(sample, owner, mode=mode, previous=old, edge=edge)
             if not extra(sample, found):
                 raise NotReady('specific actual input endpoint absent')
             return {role: {'id': item['id'], 'rect': item['rect']} for role, item in found.items()}
-        return await_endpoint(read, original, predicate, deadline=min(deadline, time.monotonic() + 15), previous=previous)[0]
+        try:
+            return await_endpoint(read, original, predicate,
+                                  deadline=min(deadline, time.monotonic() + 15),
+                                  previous=previous, evidence=diagnostic)[0]
+        except BaseException as error:
+            diagnostic['error_type'] = type(error).__name__
+            raise
+        finally:
+            (destination / ('endpoint-%02d.json' % endpoint_sequence)).write_text(
+                json.dumps(diagnostic, indent=2))
 
     def move(x, y):
         if not (0 <= x < 1280 and 0 <= y < 800):

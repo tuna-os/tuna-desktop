@@ -189,6 +189,73 @@ class Tests(unittest.TestCase):
         self.assertIn("'same_acquisition_qualified': False", source)
 
 
+class EndpointEvidence(unittest.TestCase):
+    def test_partial_reason_survives_later_transport_timeout(self):
+        from unittest.mock import patch
+        evidence = {}
+        values = iter([{'actual': 1}, TimeoutError('transport')])
+        def read(_):
+            value = next(values)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        def partial(*_):
+            raise proof.NotReady('actual GTK allocation/paint differs from compositor')
+        with patch.object(proof.time, 'monotonic', return_value=0), patch.object(proof.time, 'sleep'):
+            with self.assertRaises(TimeoutError):
+                proof.await_endpoint(read, None, partial, deadline=1, evidence=evidence)
+        self.assertEqual(evidence['read_attempts'], 2)
+        self.assertFalse(evidence['qualified'])
+        self.assertEqual(evidence['observations'], [{'sample': {'actual': 1}, 'status': 'not-ready',
+            'reason': 'actual GTK allocation/paint differs from compositor'}])
+
+    def test_three_stable_observations_are_required_for_evidence_qualification(self):
+        from unittest.mock import patch
+        evidence = {}
+        with patch.object(proof.time, 'monotonic', return_value=0), patch.object(proof.time, 'sleep'):
+            _, samples = proof.await_endpoint(lambda _: {'actual': 1}, None,
+                lambda *_: {'rect': [1, 2, 3, 4]}, deadline=1, evidence=evidence)
+        self.assertTrue(evidence['qualified'])
+        self.assertEqual(len(samples), 3)
+        self.assertEqual([entry['stable_samples'] for entry in evidence['observations']], [1, 2, 3])
+
+    def test_late_read_is_retained_without_validation_or_qualification(self):
+        from unittest.mock import patch
+        clock = [0]
+        evidence = {}
+        def read(_):
+            clock[0] = 2
+            return {'actual': 1}
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(TimeoutError, 'observation exceeded'):
+                proof.await_endpoint(read, None, lambda *_: self.fail('late sample validated'),
+                                     deadline=1, evidence=evidence)
+        self.assertFalse(evidence['qualified'])
+        self.assertEqual(evidence['observations'], [{'sample': {'actual': 1}, 'status': 'late-read-refused'}])
+
+    def test_terminal_identity_failure_is_not_labeled_readiness(self):
+        from unittest.mock import patch
+        evidence = {}
+        def invalid(*_):
+            raise RuntimeError('original identity changed')
+        with patch.object(proof.time, 'monotonic', return_value=0):
+            with self.assertRaisesRegex(RuntimeError, 'original identity changed'):
+                proof.await_endpoint(lambda _: {'actual': 1}, None, invalid, deadline=1, evidence=evidence)
+        self.assertFalse(evidence['qualified'])
+        self.assertEqual(evidence['read_attempts'], 1)
+        self.assertEqual(evidence['observations'][0]['status'], 'unvalidated')
+
+    def test_oversized_sample_is_not_retained(self):
+        from unittest.mock import patch
+        evidence = {}
+        with patch.object(proof.time, 'monotonic', return_value=0):
+            with self.assertRaisesRegex(RuntimeError, 'byte bound'):
+                proof.await_endpoint(lambda _: {'actual': 'x' * 65536}, None, lambda *_: {},
+                                     deadline=1, evidence=evidence)
+        self.assertEqual(evidence['observations'], [])
+        self.assertFalse(evidence['qualified'])
+
+
 class TransportAndCleanup(unittest.TestCase):
     def test_actual_qmp_event_and_partial_line_dribble_are_absolutely_bounded(self):
         loader = importlib.machinery.SourceFileLoader('installed_test_baseline',
