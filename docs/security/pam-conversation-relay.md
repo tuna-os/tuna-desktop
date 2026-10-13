@@ -47,6 +47,11 @@ cannot authenticate. The child receives the explicit total ceiling; it does
 not inherit the old budget of ten seconds for a password for an interactive conversation.
 Legacy constructors keep their ten-second limit.
 
+The initial Start write still has a separate bootstrap ceiling of ten seconds,
+clipped to the total. The supplied backend phase does not bound that write.
+The OS exec handshake also has no portable hard deadline. A later consumer
+must admit these residual startup limits before it enables a method.
+
 Each try at physical cleanup retains the existing 500 ms budget. Failure to
 retire leaves the Supervisor on the same creator thread in quarantine. Repeated
 tries at cleanup do not imply a finite bound on OS termination. Cancellation,
@@ -68,8 +73,9 @@ expiry, abandoned handles, bounded queues and the actual cancel fd.
 The existing required test for the PAM helper adds controlled relay cases.
 It uses the admitted compositor executable for two rounds with different
 answers. Controls include a wrong second answer, wrong origin and sequence,
-cancellation and a backend hang. They also check the stable creator and actual
-helper reap before Retired. Its original 45-second watchdog remains in place.
+cancellation, shutdown and a backend hang. They also check the stable creator and actual
+helper reap before Retired. The tests observe the owned thread in its blocked
+poll before they signal cancellation or shutdown. Its original 45-second watchdog remains in place.
 
 These tests have not run locally. CI must execute them. Six existing source contracts pass in Python. They check source only. They do
 not qualify runtime acceptance. The

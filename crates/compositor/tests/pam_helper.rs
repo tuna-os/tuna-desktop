@@ -757,7 +757,11 @@ fn run_interactive_relay_cases() {
             (expected.dev(), expected.ino())
         );
         created
-            .send((std::thread::current().id(), helper.pid()))
+            .send((
+                std::thread::current().id(),
+                unsafe { libc::syscall(libc::SYS_gettid) },
+                helper.pid(),
+            ))
             .unwrap();
         Ok(helper)
     })
@@ -767,10 +771,13 @@ fn run_interactive_relay_cases() {
         "fresh-multistep",
         "wrong-second",
         "wrong-origin",
+        "wrong-request",
+        "wrong-epoch",
         "wrong-sequence",
         "cancel-pending",
         "phase-hang",
         "fresh-multistep",
+        "shutdown-pending",
     ]
     .into_iter()
     .enumerate()
@@ -802,7 +809,7 @@ fn run_interactive_relay_cases() {
                 cancel.clone(),
             )
             .unwrap();
-        let (actual_creator, pid) = creators.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (actual_creator, tid, pid) = creators.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(*creator.get_or_insert(actual_creator), actual_creator);
         assert!(
             backend
@@ -835,24 +842,39 @@ fn run_interactive_relay_cases() {
                 [Style::Visible, Style::Secret, Style::Info, Style::Error]
             );
             match case {
-                "wrong-origin" => {
-                    assert!(challenge
-                        .response
-                        .submit(
-                            Binding {
-                                epoch: binding.epoch + 1,
-                                ..binding
+                "wrong-origin" | "wrong-request" | "wrong-epoch" => {
+                    let incoming = match case {
+                        "wrong-origin" => Binding {
+                            origin: Origin {
+                                connection: binding.origin.connection + 1,
+                                ..binding.origin
                             },
-                            1,
-                            answers(1)
-                        )
-                        .is_err());
+                            ..binding
+                        },
+                        "wrong-request" => Binding {
+                            origin: Origin {
+                                request: binding.origin.request + 1,
+                                ..binding.origin
+                            },
+                            ..binding
+                        },
+                        _ => Binding {
+                            epoch: binding.epoch + 1,
+                            ..binding
+                        },
+                    };
+                    assert!(challenge.response.submit(incoming, 1, answers(1)).is_err());
                 }
                 "wrong-sequence" => {
                     assert!(challenge.response.submit(binding, 2, answers(1)).is_err());
                 }
-                "cancel-pending" => {
-                    ticket.cancel();
+                "cancel-pending" | "shutdown-pending" => {
+                    wait_backend_idle_read(tid);
+                    if case == "shutdown-pending" {
+                        backend.shutdown();
+                    } else {
+                        ticket.cancel();
+                    }
                     assert!(challenge.response.submit(binding, 1, answers(1)).is_err());
                 }
                 _ => {

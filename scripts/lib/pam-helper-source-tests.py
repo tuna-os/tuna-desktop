@@ -60,7 +60,7 @@ class SourceContracts(unittest.TestCase):
         self.assertIn('deadline.min(self.total_deadline)', helper)
         actual = (ROOT / 'crates/compositor/tests/pam_helper.rs').read_text()
         self.assertIn('return run_interactive_relay_cases();', actual)
-        for case in ('fresh-multistep', 'wrong-second', 'wrong-origin', 'wrong-sequence', 'cancel-pending', 'phase-hang'):
+        for case in ('fresh-multistep', 'wrong-second', 'wrong-origin', 'wrong-request', 'wrong-epoch', 'wrong-sequence', 'cancel-pending', 'shutdown-pending', 'phase-hang'):
             self.assertIn('"' + case + '"', actual)
         self.assertIn('Duration::from_secs(45)', actual)
 

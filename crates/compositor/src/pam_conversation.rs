@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const INACTIVITY: Duration = Duration::from_secs(120);
@@ -57,7 +57,7 @@ impl std::fmt::Debug for Challenge {
     }
 }
 enum Input {
-    Answers(Binding, u32, Vec<Answer>),
+    Answers(Binding, u32, Vec<Answer>, Instant),
     Activity(Binding, u32, Instant),
 }
 pub struct ResponseHandle {
@@ -101,7 +101,7 @@ impl ResponseHandle {
         answers: Vec<Answer>,
     ) -> io::Result<()> {
         self.send(
-            Input::Answers(binding, sequence, answers),
+            Input::Answers(binding, sequence, answers, Instant::now()),
             binding,
             sequence,
         )?;
@@ -129,18 +129,54 @@ impl Drop for ResponseHandle {
         }
     }
 }
+/// Shared receipt clock: worker and receiver observe the SAME total Instant and
+/// latest admitted input. A queued successful result cannot outlive either.
+pub(crate) struct Timing {
+    total_deadline: Instant,
+    last_input: Mutex<Instant>,
+}
+impl Timing {
+    fn deadline_at(&self, now: Instant) -> Option<Instant> {
+        let last_input = *self.last_input.lock().ok()?;
+        let deadline = self.total_deadline.min(last_input + INACTIVITY);
+        (now < deadline).then_some(deadline)
+    }
+    fn input_at(&self, input: Instant) -> io::Result<()> {
+        let now = Instant::now();
+        let mut last = self
+            .last_input
+            .lock()
+            .map_err(|_| io::ErrorKind::PermissionDenied)?;
+        if now >= self.total_deadline || now >= *last + INACTIVITY {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        *last = (*last).max(input.min(now));
+        Ok(())
+    }
+}
 pub(crate) struct Relay {
     binding: Binding,
     policy: Policy,
-    total_deadline: Instant,
-    last_input: Instant,
+    timing: Arc<Timing>,
     challenges: mpsc::SyncSender<Challenge>,
     cancel: Cancellation,
 }
 pub struct Receiver {
     pub(crate) challenges: mpsc::Receiver<Challenge>,
+    timing: Arc<Timing>,
 }
 impl Receiver {
+    pub(crate) fn timely_at(&self, now: Instant) -> bool {
+        self.timing.deadline_at(now).is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn expire_idle_for_test(&self) {
+        *self.timing.last_input.lock().unwrap() = Instant::now() - INACTIVITY;
+    }
+    #[cfg(test)]
+    pub(crate) fn total_deadline_for_test(&self) -> Instant {
+        self.timing.total_deadline
+    }
     /// The actual runtime must recheck its live Slot/origin/epoch here. Merely
     /// receiving a backend challenge is not permission to show an old prompt.
     pub fn try_challenge(&self) -> Result<Challenge, mpsc::TryRecvError> {
@@ -158,17 +194,21 @@ pub(crate) fn channel(
     }
     let now = Instant::now();
     let (send, receive) = mpsc::sync_channel(1);
+    let timing = Arc::new(Timing {
+        total_deadline: now + policy.total,
+        last_input: Mutex::new(now),
+    });
     Ok((
         Relay {
             binding,
             policy,
-            total_deadline: now + policy.total,
-            last_input: now,
+            timing: timing.clone(),
             challenges: send,
             cancel,
         },
         Receiver {
             challenges: receive,
+            timing,
         },
     ))
 }
@@ -176,19 +216,19 @@ impl Relay {
     pub(crate) fn total(&self) -> Duration {
         self.policy.total
     }
+    pub(crate) fn total_deadline(&self) -> Instant {
+        self.timing.total_deadline
+    }
     pub(crate) fn phase(&self) -> io::Result<Instant> {
         let now = Instant::now();
-        if now >= self.total_deadline || now >= self.last_input + INACTIVITY {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        Ok((now + self.policy.backend_phase)
-            .min(self.total_deadline)
-            .min(self.last_input + INACTIVITY))
+        let deadline = self
+            .timing
+            .deadline_at(now)
+            .ok_or(io::ErrorKind::TimedOut)?;
+        Ok((now + self.policy.backend_phase).min(deadline))
     }
     pub(crate) fn timely(&self) -> bool {
-        !self.cancel.is_canceled()
-            && Instant::now() < self.total_deadline
-            && Instant::now() < self.last_input + INACTIVITY
+        !self.cancel.is_canceled() && self.timing.deadline_at(Instant::now()).is_some()
     }
     /// Runs only on the existing stable creator thread. No Supervisor is moved
     /// to a UI worker; cancellation/quarantine remains with that creator.
@@ -238,8 +278,11 @@ impl Relay {
         let mut wake = read;
         loop {
             let now = Instant::now();
-            let deadline = self.total_deadline.min(self.last_input + INACTIVITY);
-            if now >= deadline || self.cancel.is_canceled() {
+            let deadline = self
+                .timing
+                .deadline_at(now)
+                .ok_or(io::ErrorKind::TimedOut)?;
+            if self.cancel.is_canceled() {
                 return Err(io::ErrorKind::TimedOut.into());
             }
             let mut byte = [0; 64];
@@ -251,10 +294,10 @@ impl Relay {
                         return Err(io::ErrorKind::PermissionDenied.into());
                     }
                     activity_pending.store(false, Ordering::Release);
-                    self.last_input = self.last_input.max(input_at.min(Instant::now()));
+                    self.timing.input_at(input_at)?;
                     continue;
                 }
-                Ok(Input::Answers(binding, incoming, answers)) => {
+                Ok(Input::Answers(binding, incoming, answers, input_at)) => {
                     if binding != self.binding
                         || incoming != sequence
                         || !crate::pam_helper::valid_answers(styles, &answers)
@@ -266,7 +309,7 @@ impl Relay {
                         .iter()
                         .any(|style| matches!(style, Style::Visible | Style::Secret))
                     {
-                        self.last_input = Instant::now();
+                        self.timing.input_at(input_at)?;
                     }
                     return Ok(answers);
                 }
@@ -396,7 +439,7 @@ mod tests {
         let remaining = relay.phase().unwrap().duration_since(Instant::now());
         assert!(remaining <= policy.backend_phase);
         assert!(remaining > Duration::from_secs(10));
-        assert!(relay.total_deadline.duration_since(Instant::now()) > INACTIVITY);
+        assert!(relay.timing.total_deadline.duration_since(Instant::now()) > INACTIVITY);
         drop(handle);
     }
     #[test]
@@ -478,9 +521,9 @@ mod tests {
             let activity = handle.activity_pending.clone();
             handle.submit(binding(), 1, answers()).unwrap();
             if total {
-                relay.total_deadline = Instant::now();
+                Arc::get_mut(&mut relay.timing).unwrap().total_deadline = Instant::now();
             } else {
-                relay.last_input = Instant::now() - INACTIVITY;
+                *relay.timing.last_input.lock().unwrap() = Instant::now() - INACTIVITY;
             }
             assert!(relay
                 .wait_answers(
@@ -494,10 +537,33 @@ mod tests {
         }
     }
     #[test]
+    fn queued_typed_answer_resets_idle_at_input_not_later_worker_receipt() {
+        let (mut relay, read, receive, mut handle) = fixture();
+        let activity = handle.activity_pending.clone();
+        let input_at = Instant::now() - Duration::from_secs(60);
+        *relay.timing.last_input.lock().unwrap() = input_at - Duration::from_secs(10);
+        assert!(handle
+            .sender
+            .try_send(Input::Answers(binding(), 1, answers(), input_at))
+            .is_ok());
+        handle.submitted = true;
+        relay
+            .wait_answers(
+                &read,
+                &receive,
+                1,
+                &[Style::Secret, Style::Visible, Style::Info, Style::Error],
+                &activity,
+            )
+            .unwrap();
+        assert_eq!(*relay.timing.last_input.lock().unwrap(), input_at);
+    }
+
+    #[test]
     fn info_ack_never_extends_input_idle_and_phase_never_extends_total() {
         let (mut relay, read, receive, handle) = fixture();
         let activity = handle.activity_pending.clone();
-        let before = relay.last_input;
+        let before = *relay.timing.last_input.lock().unwrap();
         handle
             .submit(
                 binding(),
@@ -511,25 +577,70 @@ mod tests {
         relay
             .wait_answers(&read, &receive, 1, &[Style::Info], &activity)
             .unwrap();
-        assert_eq!(relay.last_input, before);
-        relay.total_deadline = Instant::now() + Duration::from_secs(2);
-        assert!(relay.phase().unwrap() <= relay.total_deadline);
+        assert_eq!(*relay.timing.last_input.lock().unwrap(), before);
+        Arc::get_mut(&mut relay.timing).unwrap().total_deadline =
+            Instant::now() + Duration::from_secs(2);
+        assert!(relay.phase().unwrap() <= relay.timing.total_deadline);
+    }
+    // Read only this owned thread's syscall. Its two-fd poll must already be
+    // blocked with no queued answer or ready wake before the negative stimulus.
+    fn wait_for_user_poll(tid: libc::c_long) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")).unwrap();
+            let fields: Vec<_> = state.split_whitespace().collect();
+            let syscall = fields
+                .first()
+                .and_then(|field| field.parse::<libc::c_long>().ok());
+            let polling = syscall == Some(libc::SYS_ppoll);
+            #[cfg(target_arch = "x86_64")]
+            let polling = polling || syscall == Some(libc::SYS_poll);
+            if polling && fields.get(2).copied() == Some("0x2") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual owned user wait never entered blocked poll"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
     #[test]
-    fn actual_bound_cancel_fd_wakes_user_wait_without_any_answer() {
-        let (mut relay, read, receive, handle) = fixture();
-        let activity = handle.activity_pending.clone();
-        let cancel = relay.cancel.clone();
-        let worker = std::thread::spawn(move || {
+    fn actual_bound_cancel_and_shutdown_fds_wake_blocked_user_wait_without_answer() {
+        for shutdown in [false, true] {
+            let (mut relay, read, receive, handle) = fixture();
+            let activity = handle.activity_pending.clone();
+            let cancel = relay.cancel.clone();
+            // A fresh dedicated bound wake exposes the SAME shutdown flag that
+            // production Backend::shutdown sets, without a pre-ready fd.
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let wake = WakeFd::new(shutdown_flag.clone()).unwrap();
+            let cancellation = Cancellation::default();
+            cancellation.bind(wake.clone()).unwrap();
+            relay.cancel = cancellation.clone();
+            let (send, entered) = mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                send.send(unsafe { libc::syscall(libc::SYS_gettid) })
+                    .unwrap();
+                relay
+                    .wait_answers(&read, &receive, 1, &[Style::Secret], &activity)
+                    .is_err()
+            });
+            let tid = entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            wait_for_user_poll(tid);
             let started = Instant::now();
-            assert!(relay
-                .wait_answers(&read, &receive, 1, &[Style::Secret], &activity)
-                .is_err());
-            started.elapsed()
-        });
-        std::thread::sleep(Duration::from_millis(10));
-        cancel.cancel();
-        assert!(worker.join().unwrap() < Duration::from_secs(1));
-        drop(handle);
+            if shutdown {
+                shutdown_flag.store(true, Ordering::Release);
+                wake.signal().unwrap();
+            } else {
+                cancellation.cancel();
+            }
+            assert!(worker.join().unwrap());
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(cancellation.is_canceled());
+            // The unrelated original handle's latch did not produce this wake.
+            assert!(!cancel.is_canceled());
+            drop(handle);
+        }
     }
 }
