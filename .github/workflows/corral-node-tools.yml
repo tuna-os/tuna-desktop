@@ -1,0 +1,66 @@
+name: Corral node tools
+on:
+  workflow_dispatch:
+    inputs:
+      publish_candidate_tools:
+        description: Publish only reviewed benchmark tooling to the dedicated GHCR repository
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  tools:
+    if: github.repository == 'tuna-os/tuna-desktop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Validate source and install CI tools
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_corral_node*.py' -v
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: Build exact tool image and exercise unprivileged runtime
+        run: |
+          mkdir -p "$RUNNER_TEMP/node-tools"
+          podman build --platform linux/amd64 -f packaging/benchmark/Containerfile.node-tools -t node-tools:qualified .
+          podman run --rm --user 107:107 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,size=256m,mode=1777 --memory 512m --cpus 1 node-tools:qualified /opt/tuna-tools/smoke.py > "$RUNNER_TEMP/node-tools/smoke.json"
+          podman run --rm --user 107:107 --cap-drop ALL --security-opt no-new-privileges --read-only node-tools:qualified -c 'from pathlib import Path; print(Path("/opt/tuna-tools/installed-packages.txt").read_text()); print(Path("/opt/tuna-tools/RPM-SHA256SUMS").read_text())' > "$RUNNER_TEMP/node-tools/rpm-inventory.txt"
+          podman save --format oci-archive -o "$RUNNER_TEMP/node-tools/original-tools.oci.tar" node-tools:qualified
+      - name: Publish reviewed candidate tooling only
+        if: inputs.publish_candidate_tools
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          podman push --format oci --digestfile "$RUNNER_TEMP/node-tools/published-digest" node-tools:qualified "docker://ghcr.io/tuna-os/benchmark-node-tools:$GITHUB_SHA"
+      - name: Retain exact closure
+        run: |
+          publish_args=()
+          if test -f "$RUNNER_TEMP/node-tools/published-digest"; then
+            publish_args=(--published-digest "$(cat "$RUNNER_TEMP/node-tools/published-digest")")
+          fi
+          python3 scripts/lib/corral-node-tool-closure.py "$RUNNER_TEMP/node-tools/original-tools.oci.tar" "$RUNNER_TEMP/node-tools/smoke.json" "$RUNNER_TEMP/node-tools/closure" --source "$GITHUB_SHA" "${publish_args[@]}"
+          sha256sum scripts/lib/corral_node_{stage,worker}.py packaging/benchmark/Containerfile.node-tools scripts/lib/corral-node-tool-{smoke,closure}.py > "$RUNNER_TEMP/node-tools/source-sha256.txt"
+      - name: Upload small original closure
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: corral-node-tool-closure
+          path: ${{ runner.temp }}/node-tools/closure/tool-closure.json
+          if-no-files-found: error
+      - name: Retain original tool bytes and failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: corral-node-tool-originals
+          path: |
+            ${{ runner.temp }}/node-tools/original-tools.oci.tar
+            ${{ runner.temp }}/node-tools/smoke.json
+            ${{ runner.temp }}/node-tools/rpm-inventory.txt
+            ${{ runner.temp }}/node-tools/source-sha256.txt
+          if-no-files-found: warn

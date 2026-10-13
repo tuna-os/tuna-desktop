@@ -1,0 +1,22 @@
+FROM registry.access.redhat.com/ubi9/ubi@sha256:ee3871c273cc65a2bd24970b47c15b90fbf962841bc2e41e4f915b1c4c0208e2 AS python-rpms
+RUN dnf install -y dnf-plugins-core && mkdir /rpms && \
+    dnf download --resolve --alldeps --destdir /rpms python3.12 && \
+    cd /rpms && rpm --checksig *.rpm && \
+    rpm -qp --queryformat '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' *.rpm > RPM-NEVRA.txt && \
+    sha256sum *.rpm > RPM-SHA256SUMS
+FROM quay.io/kubevirt/virt-launcher@sha256:574fabe0ff9719fa1e3800dcca8530fa4e02fd71ef74109508e59800e13e8b5d
+USER 0
+RUN test "$(sha256sum /usr/bin/qemu-img | cut -d' ' -f1)" = 250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad
+COPY --from=python-rpms /rpms /tmp/python-rpms
+RUN cd /tmp/python-rpms && sha256sum -c RPM-SHA256SUMS && \
+    rpm -Uvh --replacepkgs *.rpm && \
+    mkdir -p /opt/tuna-tools && cp RPM-SHA256SUMS RPM-NEVRA.txt /opt/tuna-tools/ && \
+    rpm -qa | sort > /opt/tuna-tools/installed-packages.txt && \
+    rm -rf /tmp/python-rpms && \
+    test "$(sha256sum /usr/bin/qemu-img | cut -d' ' -f1)" = 250b2b4ee552fdd96e1078525d12bb0b1f2557f33f153c282bfaea1ece5b3fad && \
+    /usr/bin/python3.12 -c 'import hashlib,json,zipfile,zlib,subprocess,pathlib'
+COPY scripts/lib/corral_node_worker.py /opt/tuna-tools/corral_node_worker.py
+COPY scripts/lib/corral-node-tool-smoke.py /opt/tuna-tools/smoke.py
+ENV PYTHONDONTWRITEBYTECODE=1
+USER 107:107
+ENTRYPOINT ["/usr/bin/python3.12"]
