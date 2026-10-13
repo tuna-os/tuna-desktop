@@ -65,7 +65,11 @@ def main():
     spec = importlib.util.spec_from_loader(loader.name, loader)
     profiler = importlib.util.module_from_spec(spec)
     loader.exec_module(profiler)
-    modules = profiler.mutter_libraries_provenance(pid)
+    # Stock-authorized provenance keyed to the exact reviewed reference:
+    # receipt['mutter_package'] was validated above by validate_image
+    # against COHERENT_STOCK_BASELINES, so the helper admits exactly the
+    # live package the reviewed pair authorizes — and nothing else.
+    modules = profiler.mutter_libraries_provenance(pid, stock_package=receipt['mutter_package'])
     critical = {}
     for row in protected('/usr/share/tuna-perf-baseline-critical.sha256', 16 * 1024 * 1024).decode().splitlines():
         digest, path = row.split('  ', 1)

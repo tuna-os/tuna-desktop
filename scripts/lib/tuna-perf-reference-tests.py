@@ -160,10 +160,14 @@ class ReferencePolicy(unittest.TestCase):
                                 BusType=SimpleNamespace(SESSION=1),DBusCallFlags=SimpleNamespace(NONE=0))
             glib=SimpleNamespace(Variant=Variant,VariantType=SimpleNamespace(new=lambda v:v))
             loader=SimpleNamespace(name='controlled-profiler')
+            authorized=[]
             def exec_module(module):
                 modules=copy.deepcopy(original['modules'])
                 if scenario=='changed-module':modules['core']['sha256']='e'*64
-                module.mutter_libraries_provenance=lambda pid:modules
+                def provenance(pid,stock_package=None):
+                    authorized.append(stock_package)
+                    return modules
+                module.mutter_libraries_provenance=provenance
             loader.exec_module=exec_module
             def output(args,**kwargs):
                 if args[:2]==['pacman','-Qqo']:return 'gnome-shell\n'
@@ -183,9 +187,54 @@ class ReferencePolicy(unittest.TestCase):
                 if scenario=='valid':
                     with redirect_stdout(stream):reference.main()
                     self.assertEqual(json.loads(stream.getvalue()),original)
+                    self.assertEqual(authorized,[original['image']['mutter_package']])
                 else:
                     with redirect_stdout(stream),self.assertRaises(ValueError):reference.main()
                     self.assertEqual(stream.getvalue(),'')
+
+    def test_stock_coherent_pairs_admit_reviewed_51_series_baselines(self):
+        pairs=(('mutter 51.0-1','gnome-shell 1:51.0-1'),('mutter 51.0-1.7','gnome-shell 1:51.0-2'),
+               ('mutter 51.1-1','gnome-shell 1:51.0-1'),('mutter 51.1-2','gnome-shell 51.0-1'))
+        for mutter,shell in pairs:
+            admitted=image();admitted['mutter_package']=mutter;admitted['shell_package']=shell
+            self.assertEqual(policy.validate_image(admitted,'stock'),admitted)
+        # The full process receipt follows the admitted mutter version; the
+        # shell did not move, so the Shell identity stays GNOME Shell 51.0.
+        upgraded=receipt();upgraded['image']['mutter_package']='mutter 51.1-1'
+        for module in upgraded['modules'].values():module['package']='mutter 51.1-1'
+        policy.validate_reference(upgraded,'stock')
+
+    def test_stock_unreviewed_or_out_of_bound_pairs_refused(self):
+        for mutter,shell in (('mutter 51.0-1','gnome-shell 1:51.1-1'),('mutter 51.1-1','gnome-shell 1:51.1-1')):
+            bad=image();bad['mutter_package']=mutter;bad['shell_package']=shell
+            with self.assertRaisesRegex(ValueError,'reference baseline pair incoherent'):
+                policy.validate_image(bad,'stock')
+        cases=(('mutter 51.2-1','gnome-shell 1:51.0-1','reference Mutter package refused'),
+               ('mutter 50.5-1','gnome-shell 1:51.0-1','reference Mutter package refused'),
+               ('mutter 51.1','gnome-shell 1:51.0-1','reference Mutter package refused'),
+               (None,'gnome-shell 1:51.0-1','reference Mutter package refused'),
+               ('mutter 51.1-1','gnome-shell 1:51.2-1','reference Shell package refused'),
+               ('mutter 51.1-1','gnome-shell 1:50.5-1','reference Shell package refused'),
+               ('mutter 51.1-1','gnome-shell 51.0','reference Shell package refused'),
+               ('mutter 51.1-1',None,'reference Shell package refused'))
+        for mutter,shell,message in cases:
+            bad=image();bad['mutter_package']=mutter;bad['shell_package']=shell
+            with self.assertRaisesRegex(ValueError,message):
+                policy.validate_image(bad,'stock')
+
+    def test_diagnostic_still_pinned_to_exact_510_17(self):
+        policy.validate_image(image('diagnostic'),'diagnostic')
+        for mutter in ('mutter 51.1-1','mutter 51.0-1','mutter 51.0-1.6'):
+            bad=image('diagnostic');bad['mutter_package']=mutter
+            with self.assertRaises(ValueError):policy.validate_image(bad,'diagnostic')
+
+    def test_baseline_stage_enforces_coherent_gnome_pair(self):
+        source=(ROOT/'packaging/marlin/perf/Containerfile.baseline').read_text()
+        stage=source.split('AS gnome-baseline',1)[1].split('AS stock-reference',1)[0]
+        self.assertIn("gnome-shell --version | grep -Eq '^GNOME Shell 51([. ]|$)'",stage)
+        expected='|'.join(f'{mutter}/{shell}' for mutter,shell in policy.COHERENT_STOCK_BASELINES)
+        self.assertIn(expected,stage)
+        self.assertIn('incoherent GNOME baseline',stage)
 
     def test_stock_stage_precedes_diagnostic_and_default_is_still_diagnostic(self):
         source=(ROOT/'packaging/marlin/perf/Containerfile.baseline').read_text()

@@ -7,6 +7,18 @@ import re
 
 PROFILES = ('diagnostic', 'stock')
 
+# Reviewed coherent stock GNOME baselines as (mutter, shell) upstream versions.
+# 51.0/51.0 is the original reviewed baseline. 51.1/51.0 is the coherent
+# 2026-10-13 upgrade (exporter CI run 38445343585/job 115462135813): one full
+# pacman -Syu moved mutter 51.0-1 to 51.1-1 while gnome-shell stayed 1:51.0-1
+# (gdm, xdg-desktop-portal-gnome stayed 51.0; gnome-keyring was already 51.1).
+# GNOME point releases move modules independently, so coherence is an explicit
+# pair table, never lockstep: each package is first range-bound (mutter 51.0
+# to 51.1, shell 51.0 to 51.1), then the pair must be reviewed here. Shell 51.1
+# is in range but has no reviewed pair yet, so any 51.1 shell mix is refused
+# until a coherent upgrade is observed and recorded.
+COHERENT_STOCK_BASELINES = (('51.0', '51.0'), ('51.1', '51.0'))
+
 
 def validate_image(value, profile):
     if profile not in PROFILES or type(value) is not dict or set(value) != {
@@ -14,10 +26,14 @@ def validate_image(value, profile):
         raise ValueError('reference image schema refused')
     if type(value['schema']) is not int or value['schema'] != 1 or value['profile'] != profile:
         raise ValueError('reference image profile mismatch')
-    if not isinstance(value['mutter_package'], str) or not re.fullmatch(r'mutter 51\.0-[A-Za-z0-9.+_]+', value['mutter_package']):
+    mutter = re.fullmatch(r'mutter (51\.[01])-([A-Za-z0-9.+_]+)', value['mutter_package']) if isinstance(value['mutter_package'], str) else None
+    if mutter is None:
         raise ValueError('reference Mutter package refused')
-    if not isinstance(value['shell_package'], str) or not re.fullmatch(r'gnome-shell (?:[0-9]+:)?51\.0-[A-Za-z0-9.+_]+', value['shell_package']):
+    shell = re.fullmatch(r'gnome-shell (?:([0-9]+):)?(51\.[01])-([A-Za-z0-9.+_]+)', value['shell_package']) if isinstance(value['shell_package'], str) else None
+    if shell is None:
         raise ValueError('reference Shell package refused')
+    if (mutter.group(1), shell.group(2)) not in COHERENT_STOCK_BASELINES:
+        raise ValueError('reference baseline pair incoherent')
     if profile == 'diagnostic' and value['mutter_package'] != 'mutter 51.0-1.7':
         raise ValueError('diagnostic package mismatch')
     for key in ('packages_sha256', 'critical_sha256'):

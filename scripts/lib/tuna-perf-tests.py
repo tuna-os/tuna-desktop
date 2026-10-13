@@ -316,6 +316,75 @@ class MutterLibraryIdentity(unittest.TestCase):
                 profiler.mapped_library_digest(str(path), identity.st_dev, identity.st_ino)
 
 
+class StockProvenanceAuthorization(unittest.TestCase):
+    """Stock-authorized provenance pathway: the REAL helper admits only
+    the exact reviewed reference value the caller validated upstream."""
+
+    def provenance(self, live, stock):
+        maps = "".join(f"1000-2000 r-xp 0 08:01 {42 + i} /usr/lib/{name}.so.0.0.0\n"
+                       for i, name in enumerate(profiler.MUTTER_MODULES.values()))
+
+        def fingerprint(path, device, inode, context=None):
+            return dict(path=path, device=device, inode=inode, uid=0, bytes=100,
+                        sha256="a" * 64)
+
+        def package(arguments, **unused):
+            return live + "\n" if arguments[1:3] == ["-Q", "mutter"] else "mutter\n"
+
+        with patch.object(profiler.Path, "open", mock_open(read_data=maps)), \
+                patch.object(profiler, "mapped_library_digest", side_effect=fingerprint), \
+                patch.object(profiler.subprocess, "check_output", side_effect=package):
+            return profiler.mutter_libraries_provenance(123, stock_package=stock)
+
+    def test_stock_reviewed_pair_values_admitted_exactly(self):
+        for live in ("mutter 51.1-1", "mutter 51.0-1"):
+            with self.subTest(live=live):
+                modules = self.provenance(live, live)
+                self.assertEqual(set(modules), {"core", "clutter", "cogl"})
+                for module in modules.values():
+                    self.assertEqual(module["package"], live)
+
+    def test_stock_mismatch_and_out_of_bound_authorizations_refused(self):
+        for live, stock, message in (
+                ("mutter 51.1-1", "mutter 51.0-1", "stock package mismatch"),
+                ("mutter 51.0-1", "mutter 51.1-1", "stock package mismatch"),
+                ("mutter 51.2-1", "mutter 51.2-1", "outside ABI-51 bound"),
+                ("mutter 50.0-1", "mutter 50.0-1", "outside ABI-51 bound"),
+                ("mutter 51.1-1", "mutter 51.1", "outside ABI-51 bound"),
+                ("mutter 51.1-1", 12345, "outside ABI-51 bound")):
+            with self.subTest(live=live, stock=stock):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.provenance(live, stock)
+
+    def test_default_pathway_still_requires_pinned_51_0(self):
+        with self.assertRaisesRegex(RuntimeError, "pinned ABI-51 package"):
+            self.provenance("mutter 51.1-1", None)
+
+    def test_stock_pathway_keeps_module_identity_guards(self):
+        maps = "".join(f"1000-2000 r-xp 0 08:01 {42 + i} /usr/lib/{name}.so.0.0.0\n"
+                       for i, name in enumerate(profiler.MUTTER_MODULES.values()))
+
+        def fingerprint(path, device, inode, context=None):
+            return dict(path=path, device=device, inode=inode, uid=0, bytes=100,
+                        sha256="a" * 64)
+
+        def package(arguments, **unused):
+            return "mutter 51.1-1\n" if arguments[1:3] == ["-Q", "mutter"] else "mutter\n"
+
+        with patch.object(profiler.Path, "open", mock_open(read_data=maps)), \
+                patch.object(profiler, "mapped_library_digest", side_effect=fingerprint), \
+                patch.object(profiler.subprocess, "check_output", side_effect=package):
+            with patch.object(profiler.subprocess, "check_output",
+                              side_effect=lambda arguments, **unused:
+                                  package(arguments) if arguments[1:3] == ["-Q", "mutter"] else "foreign\n"):
+                with self.assertRaisesRegex(RuntimeError, "different package"):
+                    profiler.mutter_libraries_provenance(123, stock_package="mutter 51.1-1")
+            with patch.object(profiler, "mapped_library_digest",
+                              side_effect=lambda *args, **kwargs: dict(fingerprint(*args, **kwargs), uid=1000)):
+                with self.assertRaisesRegex(RuntimeError, "not owned by root"):
+                    profiler.mutter_libraries_provenance(123, stock_package="mutter 51.1-1")
+
+
 class KernelBuildEvidence(unittest.TestCase):
     @staticmethod
     def note(name=b"GNU\0", descriptor=b"12345678901234567890", kind=3):

@@ -1,6 +1,8 @@
 # CI-only GNOME 51 baseline derived from the recorded Marlin image.
 # Arch stable currently ships GNOME 50.5; enable both testing repositories
 # together and perform a complete upgrade to avoid a partial Arch upgrade.
+# The upgrade result must be one reviewed coherent (mutter, shell) pair
+# (see COHERENT_STOCK_BASELINES); anything else fails the build here.
 ARG BASE_IMAGE=ghcr.io/tuna-os/marlin:gnome
 ARG COHERENT_BASE=gnome-baseline
 FROM ${BASE_IMAGE} AS gnome-baseline
@@ -19,6 +21,13 @@ RUN sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[
     done && \
     test "$kernel_count" -eq 1 && \
     gnome-shell --version | grep -Eq '^GNOME Shell 51([. ]|$)' && \
+    mutter_pkg=$(pacman -Q mutter) && shell_pkg=$(pacman -Q gnome-shell) && \
+    mutter_ver=$(printf '%s\n' "$mutter_pkg" | sed -nE 's/^mutter (51\.[01])-[A-Za-z0-9.+_]+$/\1/p') && \
+    shell_ver=$(printf '%s\n' "$shell_pkg" | sed -nE 's/^gnome-shell ([0-9]+:)?(51\.[01])-[A-Za-z0-9.+_]+$/\2/p') && \
+    case "$mutter_ver/$shell_ver" in \
+        51.0/51.0|51.1/51.0) ;; \
+        *) printf 'incoherent GNOME baseline: %s + %s\n' "$mutter_pkg" "$shell_pkg" >&2; exit 1;; \
+    esac && \
     pacman -Q > /tmp/tuna-baseline-packages.txt && \
     LC_ALL=C sort /tmp/tuna-baseline-packages.txt > /usr/share/tuna-perf-baseline-packages.txt && \
     rm /tmp/tuna-baseline-packages.txt

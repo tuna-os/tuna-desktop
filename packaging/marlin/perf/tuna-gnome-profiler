@@ -73,7 +73,14 @@ def mapped_library_digest(path, device, inode, context=None):
                 "sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def mutter_libraries_provenance(pid, context=None):
+def mutter_libraries_provenance(pid, context=None, stock_package=None):
+    """Provenance for the mapped ABI-51 Mutter modules. With stock_package
+    None (diagnostic/default callers: Start/Stop/failed-stop) the live
+    package must be the pinned 51.0 series exactly as before. With
+    stock_package set (stock admission only) the live package must EQUAL
+    that exact caller-supplied reviewed reference value, which itself
+    must be range-bound to ABI-51 stock; pair coherence stays enforced
+    at the reference layer that validated the receipt."""
     maps = Path(f"/proc/{pid}/maps")
 
     def mapping_identities():
@@ -95,8 +102,19 @@ def mutter_libraries_provenance(pid, context=None):
     package = subprocess.check_output(
         ["/usr/bin/pacman", "-Q", "mutter"], text=True, timeout=5).strip()
     if context is not None:context.stage="mutter-package-validation"
-    if not re.fullmatch(r"mutter 51\.0-[A-Za-z0-9.+_]+", package):
-        raise RuntimeError("mapped Mutter provenance requires the pinned ABI-51 package")
+    if stock_package is None:
+        if not re.fullmatch(r"mutter 51\.0-[A-Za-z0-9.+_]+", package):
+            raise RuntimeError("mapped Mutter provenance requires the pinned ABI-51 package")
+    else:
+        # Stock-authorized pathway: the authorization itself must be a
+        # well-formed ABI-51 stock package string, and the live package
+        # must equal it exactly. The caller binds the reviewed pair by
+        # passing its validated receipt value; nothing else is admitted.
+        if not isinstance(stock_package, str) or not re.fullmatch(
+                r"mutter 51\.[01]-[A-Za-z0-9.+_]+", stock_package):
+            raise RuntimeError("mapped Mutter provenance stock authorization outside ABI-51 bound")
+        if package != stock_package:
+            raise RuntimeError("mapped Mutter provenance stock package mismatch")
     modules = {}
     for component, identity in identities.items():
         if context is not None:context.public["component"]=component
