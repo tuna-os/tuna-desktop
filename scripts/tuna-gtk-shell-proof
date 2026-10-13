@@ -3477,6 +3477,29 @@ cstate '.keyboard.repeat_rate == 20' "repeat restored" ||
     fail G-A11Y-KEYMAP "repeat preferences did not restore"
 cp "$A11Y_KEYS" "$ARTIFACTS/a11y-keymap.json"
 pass G-A11Y-KEYMAP "repeat changes preserve a latch; semantic keymap replacement clears it; remapped physical Caps produces a real Control chord"
+# The private Xvfb/evdev input fixture uses X keycode108 for physical
+# RightAlt (evdev100). xdotool's Alt_R keysym lookup sends an additional
+# Alt_L64 on this host map, so tap the physical key through XTEST. Keep
+# exact guest latch assertions: US RightAlt is Alt, German RightAlt is
+# Level3. No host modifier clearing/filtering is performed.
+"$PY" "$ROOT/scripts/lib/xkeycode-tap-tests.py" >"$ARTIFACTS/a11y-physical-tap-tests.log" 2>&1 ||
+    fail G-A11Y-KEYMAP "physical key driver negative controls failed"
+a11y_right_alt_tap() {
+    "$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --keycode 108 ||
+        fail G-A11Y-KEYMAP "physical RightAlt XTEST tap failed"
+}
+"$PY" "$ROOT/scripts/lib/xkeysym-levels.py" "$DISPLAY" ffea fe03 >"$ARTIFACTS/a11y-host-rightalt-levels.log" 2>&1 ||
+    fail G-A11Y-KEYMAP "could not record the host RightAlt/Level3 keymap"
+cp "$CSTATE" "$ARTIFACTS/a11y-keymap-before-rightalt.json"
+mark="$(a11y_mark)"
+a11y_right_alt_tap
+cstate '.input_aids.latched == ["alt"]' "US physical RightAlt is Alt" ||
+    fail G-A11Y-KEYMAP "US physical RightAlt did not latch only Alt"
+xdotool key a
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,alt}] == [{\"keyval\":97,\"alt\":true}]" "US RightAlt actual chord" ||
+    fail G-A11Y-KEYMAP "US RightAlt was not delivered as a real Alt chord"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "US RightAlt spent" ||
+    fail G-A11Y-KEYMAP "US RightAlt remained held after its chord"
 # Actual German Level3 selector: an AltGr tap must affect exactly one
 # subsequent real client key, and be inert with Sticky Keys disabled.
 a11y_sources="$(gsettings get org.gnome.desktop.input-sources sources)"
@@ -3485,23 +3508,26 @@ cstate '.keyboard.layouts == ["German"] and .input_aids.latched == [] and .seat_
     fail G-A11Y-KEYMAP "German layout replacement did not clear held modifiers"
 gsettings set "$A11Y_KBD" stickykeys-enable false
 cstate '(.input_aids.sticky | not)' "German sticky off" || fail G-A11Y-KEYMAP "Sticky Keys off did not apply"
+cp "$CSTATE" "$ARTIFACTS/a11y-keymap-german-sticky-off.json"
 mark="$(a11y_mark)"
-xdotool key Alt_R q
-a11y_wait "[.presses[$mark:][] | select(.printable) | .keyval] == [113]" "plain German AltGr tap" ||
+a11y_right_alt_tap
+xdotool key q
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,alt}] == [{\"keyval\":113,\"alt\":false}]" "plain German AltGr tap" ||
     fail G-A11Y-KEYMAP "without Sticky Keys an AltGr tap changed the next q"
 gsettings set "$A11Y_KBD" stickykeys-enable true
 cstate '.input_aids.sticky and (.input_aids.shortcuts | not)' "German sticky without shortcuts" ||
     fail G-A11Y-KEYMAP "Sticky Keys must operate independently of shortcut enable"
 mark="$(a11y_mark)"
-xdotool key Alt_R
+a11y_right_alt_tap
 cstate '.input_aids.latched == ["level3"]' "German Level3 latched" ||
     fail G-A11Y-KEYMAP "the configured German AltGr selector did not latch Level3"
+cp "$CSTATE" "$ARTIFACTS/a11y-keymap-german-level3-latched.json"
 xdotool key q q
-a11y_wait "[.presses[$mark:][] | select(.printable) | .keyval] == [64,113]" "German Level3 spent once" ||
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,alt}] == [{\"keyval\":64,\"alt\":false},{\"keyval\":113,\"alt\":false}]" "German Level3 spent once" ||
     fail G-A11Y-KEYMAP "the real German client did not receive @ then plain q"
 cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "German latch released" ||
     fail G-A11Y-KEYMAP "German Level3 retained a synthetic hold"
-xdotool key Alt_R
+a11y_right_alt_tap
 cstate '.input_aids.latched == ["level3"]' "German pending latch before restore" ||
     fail G-A11Y-KEYMAP "German Level3 second latch was missing"
 gsettings set org.gnome.desktop.input-sources sources "$a11y_sources"

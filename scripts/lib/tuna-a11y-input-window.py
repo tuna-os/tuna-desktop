@@ -36,6 +36,7 @@ def pressed(_controller, keyval, keycode, mods):
         'printable': printable_keyval(keyval),
         'shift': bool(mods & Gdk.ModifierType.SHIFT_MASK),
         'ctrl': bool(mods & Gdk.ModifierType.CONTROL_MASK),
+        'alt': bool(mods & Gdk.ModifierType.ALT_MASK),
     })
     save()
     # Keep keys out of the entry: the recording is the whole point.

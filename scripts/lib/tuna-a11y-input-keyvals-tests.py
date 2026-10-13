@@ -51,6 +51,14 @@ class RecorderKeyvals(unittest.TestCase):
                              Gdk.KEY_ISO_Level5_Shift, Gdk.KEY_Return, Gdk.KEY_Tab)
         self.assertFalse(any(event['printable'] for event in events))
 
+    def test_alt_state_is_retained_for_opposite_modifier_control(self):
+        self.namespace['pressed'](None, Gdk.KEY_a, 38, Gdk.ModifierType.ALT_MASK)
+        event = self.namespace['state']['presses'][-1]
+        self.assertTrue(event['printable'])
+        self.assertTrue(event['alt'])
+        self.assertFalse(event['ctrl'])
+        self.assertFalse(event['shift'])
+
     def test_unicode_characters_above_old_cutoff_are_retained(self):
         unicode_euro = 0x010020ac
         self.assertGreater(unicode_euro, 65280)
