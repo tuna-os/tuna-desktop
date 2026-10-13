@@ -121,19 +121,23 @@ impl Runtime {
                         let binding = auth.binding();
                         let values = answers
                             .into_iter()
-                            .map(|answer| Answer {
-                                index: answer.index,
-                                text: answer.text.map(|text| {
-                                    let mut secret = text.into_secret();
-                                    AnswerText::new(std::mem::take(&mut secret.0))
-                                }),
+                            .map(|answer| {
+                                Some(Answer {
+                                    index: u16::try_from(answer.index).ok()?,
+                                    text: answer.text.map(|text| {
+                                        let mut secret = text.into_secret();
+                                        AnswerText::new(std::mem::take(&mut secret.0))
+                                    }),
+                                })
                             })
-                            .collect();
-                        pending
-                            .challenge
-                            .response
-                            .submit(binding, sequence, values)
-                            .is_ok()
+                            .collect::<Option<Vec<_>>>();
+                        values.is_some_and(|values| {
+                            pending
+                                .challenge
+                                .response
+                                .submit(binding, sequence, values)
+                                .is_ok()
+                        })
                     } else {
                         false
                     };
@@ -337,7 +341,7 @@ impl Runtime {
                         let messages = std::mem::take(&mut challenge.messages)
                             .into_iter()
                             .map(|message| Prompt {
-                                index: message.index,
+                                index: u32::from(message.index),
                                 style: match message.style {
                                     Style::Visible => WireStyle::Visible,
                                     Style::Secret => WireStyle::Secret,
