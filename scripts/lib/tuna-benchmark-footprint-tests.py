@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import textwrap
 import unittest
-from tuna_benchmark_disk import storage_receipt, GIB, VIRTUAL_BYTES
+from tuna_benchmark_disk import storage_receipt, GIB, VIRTUAL_BYTES, require
 from tuna_benchmark_footprint import PATHS, disk_evidence, image_footprints
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,10 +73,15 @@ class FootprintTests(unittest.TestCase):
         raw=self.out/'disk.raw'; raw.write_bytes(b'owned-raw')
         info={'format':'qcow2','virtual-size':VIRTUAL_BYTES,'actual-size':3*GIB}
         mapping=[{'start':0,'length':VIRTUAL_BYTES,'data':True,'zero':False}]
-        receipt={}
+        receipt={'raw_sha256':'a'*64}
+        observed_dense=[]
+        def dense_decode(*args):
+            observed_dense.append(args)
+            return {'qualified':False,'owned_cleanup':True}
         scope={'json':json,'output':lambda args:json.dumps(info if 'info' in args else mapping),
-               'disk_evidence':disk_evidence,'storage_receipt':storage_receipt,'disk':disk,'raw':raw,
-               'artifacts':self.out,'receipt':receipt}
+               'require':require,'disk_evidence':disk_evidence,'storage_receipt':storage_receipt,'disk':disk,'raw':raw,
+               'artifacts':self.out,'receipt':receipt,'dense_decode':dense_decode,
+               'commands':None,'args':type('Args',(),{'scratch':self.out})()}
         with self.assertRaisesRegex(ValueError, 'allocation exceeds'):exec(compile(sequence,'<actual-export-sequence>','exec'),scope)
         self.assertNotIn('storage',receipt)
         for name, wanted in receipt['storage_evidence_sha256'].items():
@@ -89,7 +94,7 @@ class FootprintTests(unittest.TestCase):
         self.assertIn('disk.unlink(missing_ok=True)',source)
         self.assertIn('storage_receipt(info, mapping, disk.stat().st_size)',sequence)
         old_sequence='\n'.join(line for line in sequence.splitlines() if "receipt['storage_evidence_sha256']" not in line)
-        scope['artifacts']=self.out/'old';scope['artifacts'].mkdir();scope['receipt']={}
+        scope['artifacts']=self.out/'old';scope['artifacts'].mkdir();scope['receipt']={'raw_sha256':'a'*64}
         with self.assertRaisesRegex(ValueError, 'allocation exceeds'):exec(compile(old_sequence,'<old-no-persist-sequence>','exec'),scope)
         self.assertEqual(list(scope['artifacts'].iterdir()),[])
         self.assertNotIn('storage_evidence_sha256',scope['receipt'])

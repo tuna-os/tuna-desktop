@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT/'scripts/lib'))
 from tuna_benchmark_disk import digest, provenance, require, storage_receipt, VIRTUAL_BYTES
 from tuna_benchmark_esp import repair as repair_esp, Commands, retire_backing
 from tuna_benchmark_footprint import image_footprints, disk_evidence
+from tuna_dense_decode import observe as dense_decode
 
 
 def main():
@@ -111,6 +112,7 @@ def main():
         receipt['exporter_source_sha256'] = {name: digest(ROOT/name) for name in [
             'scripts/tuna-benchmark-disk-export', 'scripts/lib/tuna_benchmark_disk.py',
             'scripts/lib/tuna_benchmark_esp.py', 'scripts/lib/tuna_benchmark_footprint.py',
+            'scripts/lib/tuna_dense_decode.py', 'scripts/lib/tuna_dense_decode_worker.py',
             'packaging/marlin/perf/Containerfile.baseline', 'packaging/marlin/perf/Containerfile',
             'packaging/marlin/Containerfile']}
         receipt['gnome_version'] = output(['sudo', 'podman', 'run', '--rm', image, 'gnome-shell', '--version']).strip()
@@ -137,6 +139,8 @@ def main():
         info = json.loads(output(['qemu-img', 'info', '--output=json', str(disk)]))
         mapping = json.loads(output(['qemu-img', 'map', '--output=json', str(disk)]))
         receipt['storage_evidence_sha256'] = disk_evidence(artifacts, disk, raw, info, mapping)
+        receipt['dense_decode'] = dense_decode(commands, artifacts, args.scratch, disk, receipt['raw_sha256'], info, receipt)
+        require(receipt['dense_decode'].get('owned_cleanup', True), 'dense diagnostic cleanup unconfirmed')
         receipt['storage'] = storage_receipt(info, mapping, disk.stat().st_size)
         receipt['disk_sha256'] = digest(disk)
         receipt['evidence'] = {}

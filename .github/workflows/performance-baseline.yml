@@ -11,6 +11,9 @@ on:
       - scripts/lib/tuna-benchmark-disk-tests.py
       - scripts/lib/tuna-benchmark-footprint-tests.py
       - scripts/lib/tuna_benchmark_footprint.py
+      - scripts/lib/tuna_dense_decode.py
+      - scripts/lib/tuna_dense_decode_worker.py
+      - scripts/lib/tuna-dense-decode-tests.py
       - scripts/tuna-perf-profile-pairs
       - scripts/tuna-frame-pacer-build
       - scripts/lib/tuna-frame-pacer.c
@@ -78,6 +81,7 @@ jobs:
       - run: python3 scripts/lib/tuna-perf-tests.py
       - run: python3 scripts/lib/tuna-benchmark-disk-tests.py
       - run: python3 scripts/lib/tuna-benchmark-footprint-tests.py
+      - run: python3 scripts/lib/tuna-dense-decode-tests.py
       - run: python3 scripts/lib/tuna-benchmark-esp-tests.py
       - run: /usr/bin/python3 scripts/lib/tuna-corral-ssh-export-tests.py
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
