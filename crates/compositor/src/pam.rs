@@ -249,14 +249,15 @@ impl crate::unlock::UnlockClient for PamClient {
     }
 
     fn answer(&mut self, text: Option<String>) -> Result<Response, CodecError> {
-        let (Some(user), Some(password)) = (self.user.as_deref(), text) else {
+        let password = text.map(tuna_shell_control::Secret);
+        let (Some(user), Some(password)) = (self.user.as_deref(), password) else {
             return Ok(Response::Error {
                 error_type: ErrorType::AuthError,
                 description: String::new(),
             });
         };
         let accepted = self.backend.as_ref().and_then(|backend| {
-            backend.begin(self.service.clone(), user.to_owned(), tuna_shell_control::Secret(password),
+            backend.begin(self.service.clone(), user.to_owned(), password,
                 Arc::new(AtomicBool::new(false))).ok()
         }).is_some_and(|mut ticket| {
             matches!(ticket.initial(), crate::pam_backend::Initial::Finished(result) if result.authenticated())
