@@ -28,6 +28,15 @@ fn release_version() -> &'static str {
 }
 
 fn main() -> ExitCode {
+    // Internal authentication process: never initialize a display or user directories.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(tuna_compositor::pam_helper::FLAG))
+    {
+        if std::env::args_os().count() != 2 {
+            return ExitCode::FAILURE;
+        }
+        return tuna_compositor::pam_helper::entry();
+    }
     // The old name's environment and per-user directories, for one release (#505).
     tuna_shell_control::legacy::import_env("tuna-compositor");
     tuna_shell_control::legacy::adopt_dirs("tuna-compositor");
