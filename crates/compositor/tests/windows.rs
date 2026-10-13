@@ -2248,7 +2248,11 @@ fn strip_terminal_frame_is_exact_without_another_input_or_tick() {
     let mut f = three_windows();
     assert!(f.manager.set_scroll(&mut f.comp.state, true));
     assert!(!f.manager.strip_animating());
-    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_c)));
+    // Entering scroll mode already lands on C. Moving to A must create
+    // a real target change before measuring or disabling its animation.
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    assert_ne!(f.manager.strip_view(), f.manager.strip_offset());
+    assert!(f.manager.strip_animating());
     let mut observed_terminal = false;
     for _ in 0..60 {
         let old_view = f.manager.strip_view();
@@ -2260,8 +2264,8 @@ fn strip_terminal_frame_is_exact_without_another_input_or_tick() {
             assert_ne!(old_view, f.manager.strip_offset());
             assert_eq!(f.manager.strip_view(), f.manager.strip_offset());
             assert_eq!(
-                f.manager.render_geometry(f.id_c),
-                f.manager.geometry(f.id_c)
+                f.manager.render_geometry(f.id_a),
+                f.manager.geometry(f.id_a)
             );
             observed_terminal = true;
             break;
@@ -2281,7 +2285,10 @@ fn strip_off_policy_lands_without_waiting_for_a_motion_timer() {
     let mut f = three_windows();
     assert!(f.manager.set_scroll(&mut f.comp.state, true));
     assert!(!f.manager.strip_animating());
-    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_c)));
+    // Entering scroll mode already lands on C. Moving to A must create
+    // a real target change before measuring or disabling its animation.
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    assert_ne!(f.manager.strip_view(), f.manager.strip_offset());
     assert!(f.manager.strip_animating());
     f.manager.set_motion_allowed(false);
     assert_eq!(f.manager.strip_view(), f.manager.strip_offset());
