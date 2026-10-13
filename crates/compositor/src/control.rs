@@ -2402,8 +2402,11 @@ mod auth_origin_tests {
         }));
         assert!(!hub.origin_pending_live(next_origin));
         assert!(!hub.auth_lease_live(next_lease));
-        crate::control_readiness::test_peer::wait_for_peer_close(&mut a, Duration::from_secs(1))
-            .unwrap();
+        crate::control_readiness::test_peer::wait_for_peer_close(
+            &mut a.stream,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         let mut b = connect(&mut hub, &mut model);
         submit(&mut b, 1);
         let (fresh_origin, _) = hub.poll(&mut model).unlock.unwrap();
