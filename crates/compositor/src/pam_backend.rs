@@ -84,9 +84,7 @@ impl Ticket {
             return Initial::Pending;
         };
         match self.reply.recv_timeout(remaining) {
-            Ok(Reply::Retired(authenticated)) => Initial::Finished(Verification::Retired {
-                authenticated: authenticated && !self.denied,
-            }),
+            Ok(Reply::Retired(authenticated)) => self.retired_at(authenticated, Instant::now()),
             Ok(Reply::Pending) | Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.denied = true;
                 self.cancel.store(true, Ordering::Release);
@@ -96,6 +94,17 @@ impl Ticket {
                 Initial::Finished(Verification::Unretired)
             }
         }
+    }
+    // Physical retirement and timely authentication are separate facts. The
+    // receiver can be descheduled across its deadline AFTER a reply is queued.
+    fn retired_at(&mut self, authenticated: bool, observed: Instant) -> Initial {
+        self.denied |= observed >= self.deadline;
+        if self.denied {
+            self.cancel.store(true, Ordering::Release);
+        }
+        Initial::Finished(Verification::Retired {
+            authenticated: authenticated && !self.denied,
+        })
     }
     /// Off the event loop: after denial, wait for actual retirement or poison.
     /// Receiver loss and a returned facade never release backend admission.
@@ -416,6 +425,55 @@ mod tests {
             }
         );
         assert_eq!(pending, 1);
+    }
+    #[test]
+    fn queued_retired_true_after_deadline_denies_but_preserves_physical_receipt() {
+        let (send, receive) = mpsc::channel();
+        send.send(Reply::Retired(true)).unwrap();
+        let mut ticket = ticket(receive);
+        ticket.deadline = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(ticket.initial(), Initial::Pending));
+        assert!(ticket.denied && ticket.cancel.load(Ordering::Acquire));
+        assert_eq!(
+            ticket.wait_retired(|| panic!("already latched denial")),
+            Verification::Retired {
+                authenticated: false
+            }
+        );
+    }
+    #[test]
+    fn received_retired_result_crossing_absolute_deadline_cannot_grant() {
+        let (_send, receive) = mpsc::channel();
+        let mut ticket = ticket(receive);
+        let deadline = ticket.deadline;
+        // Exact production acceptance branch, with deterministic before/at/after
+        // observation times. This models scheduler delay, not a clock override.
+        assert!(matches!(
+            ticket.retired_at(true, deadline - Duration::from_nanos(1)),
+            Initial::Finished(Verification::Retired {
+                authenticated: true
+            })
+        ));
+        assert!(matches!(
+            ticket.retired_at(true, deadline),
+            Initial::Finished(Verification::Retired {
+                authenticated: false
+            })
+        ));
+        assert!(ticket.denied);
+        assert!(matches!(
+            ticket.retired_at(true, deadline + Duration::from_nanos(1)),
+            Initial::Finished(Verification::Retired {
+                authenticated: false
+            })
+        ));
+        // Once denied, even an earlier-looking timestamp cannot undo the latch.
+        assert!(matches!(
+            ticket.retired_at(true, deadline - Duration::from_nanos(1)),
+            Initial::Finished(Verification::Retired {
+                authenticated: false
+            })
+        ));
     }
     #[test]
     fn disconnected_or_poisoned_owner_is_not_retired() {
