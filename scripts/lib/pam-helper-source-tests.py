@@ -2,6 +2,7 @@
 """Source integration guards; actual PAM execution is a separate CI Rust test."""
 from pathlib import Path
 import unittest
+import re
 ROOT = Path(__file__).resolve().parents[2]
 
 class SourceContracts(unittest.TestCase):
@@ -63,6 +64,10 @@ class SourceContracts(unittest.TestCase):
             self.assertIn('"' + case + '"', test)
         for token in ('PAM_PROMPT_ECHO_ON', 'PAM_PROMPT_ECHO_OFF', 'PAM_TEXT_INFO', 'PAM_ERROR_MSG', 'pam_set_data', 'fork()'):
             self.assertIn(token, fixture)
+        ci = (ROOT / '.github/workflows/ci.yml').read_text()
+        gtk = re.search(r'(?ms)^  gtk-shell:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)', ci)
+        self.assertIsNotNone(gtk)
+        self.assertIn('libpam-wrapper libpam0g-dev', gtk.group(1))
         for name in ('ci.yml', 'measured-coverage.yml'):
             self.assertIn('libpam0g-dev', (ROOT / '.github/workflows' / name).read_text())
 
