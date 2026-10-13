@@ -2067,7 +2067,7 @@ mod tests {
         let (path, listener) = listener_at(&dir);
         let mut client = ControlClient::connect(&path).unwrap();
         let (mut old_peer, _) = listener.accept().unwrap();
-        rustix::net::sockopt::set_socket_send_buffer(&client.stream, 1024).unwrap();
+        rustix::net::sockopt::set_socket_send_buffer_size(&client.stream, 1024).unwrap();
         let password = "controlled-p".repeat(8192);
         let expected = tuna_shell_control::encode_unlock_frame(
             1,
