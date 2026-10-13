@@ -4768,11 +4768,15 @@ fn strip_edge_fractional_admission_and_live_map_keep_world_targets_stable() {
 }
 
 fn start_fractional_strip_drag(f: &mut ThreeFixture, owner: u64) -> Point<f64, Logical> {
-    // A real smooth-axis input creates the fractional initial view. B fits
-    // that view, so the actual button focus path must not reset it to zero.
+    // Gamma maps last and entering scroll mode follows it to the far edge.
+    // Focus A to return to zero, then B which fits without moving that view.
+    // A real smooth-axis input creates the fractional initial view; the actual
+    // button focus path must preserve it when it selects B again.
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
     f.manager.focus(&mut f.comp.state, Some(owner));
     f.manager.set_motion_allowed(false);
     f.manager.step_strip_view(0.0);
+    assert_eq!(f.manager.strip_offset(), 0.0);
     axis(&mut f.manager, &mut f.comp, 0.7, 0.0);
     f.manager.step_strip_view(0.0);
     assert!((f.manager.strip_offset() - 0.7).abs() < 1e-8);
