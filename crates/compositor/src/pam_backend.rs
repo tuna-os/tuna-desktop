@@ -92,6 +92,33 @@ impl std::fmt::Debug for Credential {
         out.write_str("Credential(<redacted>)")
     }
 }
+/// Publish queue state before the owned per-conversation calloop wake. On
+/// unwind/receiver loss, sender closure precedes the disconnect notification.
+struct ReplyPublisher {
+    sender: Option<mpsc::Sender<Reply>>,
+    notice: Option<crate::wake::Wake>,
+}
+impl ReplyPublisher {
+    fn send(&self, reply: Reply) -> Result<(), mpsc::SendError<Reply>> {
+        let result = self
+            .sender
+            .as_ref()
+            .expect("owned reply publisher")
+            .send(reply);
+        if let Some(notice) = &self.notice {
+            notice.signal();
+        }
+        result
+    }
+}
+impl Drop for ReplyPublisher {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(notice) = &self.notice {
+            notice.signal();
+        }
+    }
+}
 struct Job {
     serial: u64,
     service: String,
@@ -99,7 +126,7 @@ struct Job {
     password: Credential,
     relay: Option<crate::pam_conversation::Relay>,
     cancel: Cancellation,
-    reply: mpsc::Sender<Reply>,
+    reply: ReplyPublisher,
 }
 enum Command {
     Attempt(Box<Job>),
@@ -129,6 +156,20 @@ pub struct ConversationTicket {
     outcome: Option<Verification>,
 }
 impl ConversationTicket {
+    /// Register this owned source once in the runtime loop. Queue publication
+    /// precedes its wake; the source is not an authorization or retirement proof.
+    pub fn take_notice_source(&mut self) -> Option<calloop::ping::PingSource> {
+        self.receiver.take_notice_source()
+    }
+    /// Real shared idle/total deadline. After cancellation, wait for the owned
+    /// terminal wake instead of scheduling the expired deadline forever.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        if self.outcome.is_some() || self.ticket.denied || self.ticket.cancel.is_canceled() {
+            None
+        } else {
+            self.receiver.next_deadline()
+        }
+    }
     pub fn serial(&self) -> u64 {
         self.ticket.serial
     }
@@ -399,6 +440,7 @@ impl Backend {
             || Instant::now() + crate::pam::DEADLINE,
             |relay| relay.total_deadline(),
         );
+        let notice = relay.as_ref().map(|relay| relay.notice());
         let job = Job {
             serial,
             service,
@@ -406,7 +448,10 @@ impl Backend {
             password,
             relay,
             cancel: cancel.clone(),
-            reply,
+            reply: ReplyPublisher {
+                sender: Some(reply),
+                notice,
+            },
         };
         if self
             .sender
@@ -598,6 +643,53 @@ fn supported_styles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_reply_wake_observes_publication_disconnect_and_no_idle_spin() {
+        let (notice, source) = crate::wake::Wake::new().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let publisher = ReplyPublisher {
+            sender: Some(sender),
+            notice: Some(notice),
+        };
+        let mut event_loop = calloop::EventLoop::<Vec<Option<Reply>>>::try_new().unwrap();
+        event_loop
+            .handle()
+            .insert_source(source, move |_, _, seen| match receiver.try_recv() {
+                Ok(reply) => seen.push(Some(reply)),
+                Err(mpsc::TryRecvError::Disconnected) => seen.push(None),
+                Err(mpsc::TryRecvError::Empty) => panic!("wake before publication"),
+            })
+            .unwrap();
+        let mut seen = Vec::new();
+        for reply in [Reply::Pending, Reply::Retired(false), Reply::Poisoned] {
+            publisher.send(reply).unwrap();
+            event_loop
+                .dispatch(Some(Duration::from_secs(2)), &mut seen)
+                .unwrap();
+            assert!(seen.last().unwrap().is_some());
+        }
+        assert!(matches!(
+            seen.as_slice(),
+            [
+                Some(Reply::Pending),
+                Some(Reply::Retired(false)),
+                Some(Reply::Poisoned)
+            ]
+        ));
+        drop(publisher);
+        event_loop
+            .dispatch(Some(Duration::from_secs(2)), &mut seen)
+            .unwrap();
+        assert!(
+            seen.last().unwrap().is_none(),
+            "sender must close before disconnect wake"
+        );
+        let count = seen.len();
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut seen)
+            .unwrap();
+        assert_eq!(seen.len(), count);
+    }
     fn observed_credential(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Credential {
         Credential {
             text: "owned-control-value".into(),
@@ -940,7 +1032,10 @@ mod tests {
             password: observed_credential(&counter),
             relay: None,
             cancel: Cancellation::default(),
-            reply,
+            reply: ReplyPublisher {
+                sender: Some(reply),
+                notice: None,
+            },
         };
         let (send, receive) = mpsc::sync_channel(1);
         assert!(send.send(Command::Attempt(Box::new(job))).is_ok());

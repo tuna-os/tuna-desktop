@@ -1592,7 +1592,11 @@ impl Runtime {
         let completion_live =
             self.unlock_slot
                 .completion_live(attempt, &self.unlock_generation, live);
-        if !self.unlock_slot.retire(attempt) {
+        if !self.unlock_slot.retire_pam_method(
+            attempt,
+            crate::auth_owner::MethodKind::Password,
+            result,
+        ) {
             return;
         }
         let applied = ok && completion_live && self.apply_verified_unlock(attempt.epoch);
@@ -3991,6 +3995,12 @@ impl Runtime {
             })
             .map(|output| output.name.clone());
         self.control.set_pointer_output(output);
+        self.control.set_auth_owner(
+            self.shell
+                .child_pid()
+                .zip(self.shell.child_generation())
+                .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
+        );
         let outcome = self.control.poll(self.manager.model_mut());
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
@@ -4210,6 +4220,12 @@ impl Runtime {
         // between restarts nobody may.
         self.capture_authority
             .publish(self.is_locked(), self.shell.child_pid());
+        self.control.set_auth_owner(
+            self.shell
+                .child_pid()
+                .zip(self.shell.child_generation())
+                .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
+        );
         self.control.set_peer_gate(match self.shell.child_pid() {
             Some(pid) => PeerGate::Pid(pid),
             None => PeerGate::Closed,

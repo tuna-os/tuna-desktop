@@ -253,6 +253,22 @@ pub type TokenValidator<'a> = Box<dyn Fn(&ActivationToken, Option<&str>) -> bool
 /// Per-window activation-token minter for snapshots and deltas.
 pub type TokenMinter = std::rc::Rc<dyn Fn(Option<&str>) -> String>;
 
+/// Current supervised process generation, never supplied by the shell wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthOwner {
+    pub pid: u32,
+    pub generation: u64,
+}
+/// A routing lease only: no authentication or physical-retirement authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthLease {
+    origin: crate::auth_owner::Origin,
+    serial: u64,
+    epoch: u64,
+    method: crate::auth_owner::MethodKind,
+    owner: AuthOwner,
+}
+
 /// Authenticated control session over a [`ControlConn`].
 ///
 /// The session owns the connection, the token-check hook, the per-window
@@ -265,6 +281,8 @@ pub type TokenMinter = std::rc::Rc<dyn Fn(Option<&str>) -> String>;
 /// starts from complete state.
 pub struct Session<'a> {
     connection_id: u64,
+    auth_owner: Option<AuthOwner>,
+    auth_lease: Option<AuthLease>,
     conn: ControlConn,
     validator: TokenValidator<'a>,
     minter: TokenMinter,
@@ -364,6 +382,8 @@ impl<'a> Session<'a> {
         let locked_sent = locked.get();
         let mut session = Self {
             connection_id: 0,
+            auth_owner: None,
+            auth_lease: None,
             conn,
             validator: Box::new(validator),
             minter,
@@ -1266,6 +1286,8 @@ pub struct ControlHub {
     /// Peer admission rule (#30); the runtime narrows it to the
     /// supervised shell's pid every tick.
     gate: PeerGate,
+    auth_owner: Option<AuthOwner>,
+    auth_owner_configured: bool,
     /// Peer pid per live session, index-aligned with `sessions`, so a
     /// gate change evicts sessions the new gate no longer admits.
     session_peers: Vec<Option<PeerCred>>,
@@ -1327,6 +1349,8 @@ impl ControlHub {
             store,
             seat: seat.to_owned(),
             gate: PeerGate::SameUser,
+            auth_owner: None,
+            auth_owner_configured: false,
             session_peers: Vec::new(),
             pending_peers: Vec::new(),
             fresh_peers: Vec::new(),
@@ -1338,6 +1362,100 @@ impl ControlHub {
     /// gate refuses are dropped on the next [`poll`](Self::poll).
     pub fn set_peer_gate(&mut self, gate: PeerGate) {
         self.gate = gate;
+    }
+
+    /// Auth authority follows the actual nonreused child generation. A change
+    /// closes old streams, including pending handshakes; inherited/reused PIDs
+    /// cannot continue an old auth lease. Standalone nonruntime hubs retain their
+    /// existing peer-gate behavior until this trusted owner API is configured.
+    pub fn set_auth_owner(&mut self, owner: Option<AuthOwner>) {
+        let owner = owner.filter(|owner| owner.pid != 0 && owner.generation != 0);
+        if self.auth_owner_configured && self.auth_owner == owner {
+            return;
+        }
+        self.auth_owner_configured = true;
+        self.auth_owner = owner;
+        self.sessions.clear();
+        self.session_peers.clear();
+        self.pending.clear();
+        self.pending_peers.clear();
+        self.fresh.clear();
+        self.fresh_peers.clear();
+    }
+    /// The trusted runtime must derive these values from its exact matched Slot.
+    /// This lease routes a conversation; it cannot grant unlock or free that Slot.
+    pub fn bind_auth_lease(
+        &mut self,
+        origin: crate::auth_owner::Origin,
+        serial: u64,
+        epoch: u64,
+        method: crate::auth_owner::MethodKind,
+    ) -> Option<AuthLease> {
+        let owner = self.auth_owner?;
+        if serial == 0 || epoch == u64::MAX || !self.origin_pending_live(origin) {
+            return None;
+        }
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.connection_id == origin.connection)?;
+        if session.auth_owner != Some(owner) || session.auth_lease.is_some() {
+            return None;
+        }
+        let lease = AuthLease {
+            origin,
+            serial,
+            epoch,
+            method,
+            owner,
+        };
+        session.auth_lease = Some(lease);
+        Some(lease)
+    }
+    /// Reply correlation may end before physical retirement. The routing lease
+    /// survives an early denial until explicit verified release or owner loss.
+    pub fn auth_lease_live(&self, lease: AuthLease) -> bool {
+        self.auth_owner == Some(lease.owner)
+            && self.sessions.iter().enumerate().any(|(index, session)| {
+                session.connection_id == lease.origin.connection
+                    && session.auth_lease == Some(lease)
+                    && session.auth_owner == Some(lease.owner)
+                    && PeerGate::Pid(lease.owner.pid).admits(self.session_peers[index], our_uid())
+                    && self.gate.admits(self.session_peers[index], our_uid())
+                    && session.conn.peer_live()
+            })
+    }
+    pub fn auth_lease_accepts(
+        &self,
+        lease: AuthLease,
+        origin: crate::auth_owner::Origin,
+        serial: u64,
+        epoch: u64,
+        method: crate::auth_owner::MethodKind,
+    ) -> bool {
+        lease.origin == origin
+            && lease.serial == serial
+            && lease.epoch == epoch
+            && lease.method == method
+            && self.auth_lease_live(lease)
+    }
+    /// A PAM receipt cannot release a fingerprint lease. Missing/old leases
+    /// produce no mutation; callers still own their exact method/Slot retirement.
+    pub fn retire_pam_auth_lease(
+        &mut self,
+        lease: AuthLease,
+        result: crate::pam_backend::Verification,
+    ) -> bool {
+        if lease.method == crate::auth_owner::MethodKind::Fingerprint || !result.may_retire() {
+            return false;
+        }
+        let Some(session) = self.sessions.iter_mut().find(|session| {
+            session.connection_id == lease.origin.connection && session.auth_lease == Some(lease)
+        }) else {
+            return false;
+        };
+        session.auth_lease = None;
+        true
     }
 
     /// Current admission rule.
@@ -1423,6 +1541,11 @@ impl ControlHub {
             session.connection_id == origin.connection
                 && session.unlock_pending == Some(origin.request)
                 && self.gate.admits(self.session_peers[i], our_uid())
+                && (!self.auth_owner_configured
+                    || self.auth_owner.is_some_and(|owner| {
+                        session.auth_owner == Some(owner)
+                            && PeerGate::Pid(owner.pid).admits(self.session_peers[i], our_uid())
+                    }))
                 && session.conn.peer_live()
         })
     }
@@ -1779,6 +1902,7 @@ impl ControlHub {
                     });
                 }
                 session.connection_id = connection_id;
+                session.auth_owner = self.auth_owner;
                 self.sessions.push(session);
                 self.session_peers.push(peer);
             }
@@ -2034,6 +2158,7 @@ mod auth_origin_tests {
     use crate::auth_owner::Origin;
     use std::net::Shutdown;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
         let dir = tempfile::tempdir().unwrap();
@@ -2167,6 +2292,179 @@ mod auth_origin_tests {
             ..origin
         }));
         hub.set_peer_gate(PeerGate::Closed);
+        assert!(!hub.origin_pending_live(origin));
+    }
+    #[test]
+    fn auth_lease_binds_socket_child_generation_and_retirement_not_reply() {
+        use crate::auth_owner::{MethodKind, Slot};
+        use crate::pam_backend::Verification;
+        let (_dir, mut hub, mut model) = setup();
+        let owner = AuthOwner {
+            pid: std::process::id(),
+            generation: 1,
+        };
+        hub.set_peer_gate(PeerGate::Pid(owner.pid));
+        hub.set_auth_owner(Some(owner));
+        let mut a = connect(&mut hub, &mut model);
+        submit(&mut a, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        let mut slot = Slot::default();
+        let attempt = slot
+            .begin_method(Some(origin), 7, MethodKind::PamConversation)
+            .unwrap();
+        let lease = hub
+            .bind_auth_lease(
+                origin,
+                attempt.serial,
+                attempt.epoch,
+                MethodKind::PamConversation,
+            )
+            .unwrap();
+        assert!(hub.auth_lease_accepts(
+            lease,
+            origin,
+            attempt.serial,
+            7,
+            MethodKind::PamConversation
+        ));
+        for (wrong_origin, serial, epoch, method) in [
+            (
+                Origin {
+                    connection: origin.connection + 1,
+                    ..origin
+                },
+                attempt.serial,
+                7,
+                MethodKind::PamConversation,
+            ),
+            (
+                Origin {
+                    request: 2,
+                    ..origin
+                },
+                attempt.serial,
+                7,
+                MethodKind::PamConversation,
+            ),
+            (origin, attempt.serial + 1, 7, MethodKind::PamConversation),
+            (origin, attempt.serial, 8, MethodKind::PamConversation),
+            (origin, attempt.serial, 7, MethodKind::Fingerprint),
+        ] {
+            assert!(!hub.auth_lease_accepts(lease, wrong_origin, serial, epoch, method));
+        }
+        hub.finish_unlock(origin, false);
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+        assert!(
+            hub.auth_lease_live(lease),
+            "early command reply cannot release method ownership"
+        );
+        assert!(!hub.retire_pam_auth_lease(lease, Verification::Unretired));
+        assert!(slot.matches(attempt));
+        assert!(hub.retire_pam_auth_lease(
+            lease,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        assert!(slot.retire_pam_method(
+            attempt,
+            MethodKind::PamConversation,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        submit(&mut a, 1);
+        let (next_origin, _) = hub.poll(&mut model).unlock.unwrap();
+        let next = slot
+            .begin_method(Some(next_origin), 7, MethodKind::PamConversation)
+            .unwrap();
+        let next_lease = hub
+            .bind_auth_lease(
+                next_origin,
+                next.serial,
+                next.epoch,
+                MethodKind::PamConversation,
+            )
+            .unwrap();
+        assert!(!hub.retire_pam_auth_lease(
+            lease,
+            Verification::Retired {
+                authenticated: true
+            }
+        ));
+        assert!(hub.auth_lease_live(next_lease));
+        hub.set_auth_owner(Some(AuthOwner {
+            generation: 2,
+            ..owner
+        }));
+        assert!(!hub.origin_pending_live(next_origin));
+        assert!(!hub.auth_lease_live(next_lease));
+        crate::control_readiness::test_peer::wait_for_peer_close(&mut a, Duration::from_secs(1))
+            .unwrap();
+        let mut b = connect(&mut hub, &mut model);
+        submit(&mut b, 1);
+        let (fresh_origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert_ne!(fresh_origin.connection, next_origin.connection);
+        // Origin loss is cancellation, not retirement: no newer slot yet.
+        assert!(slot
+            .begin_method(Some(fresh_origin), 7, MethodKind::Password)
+            .is_none());
+        assert!(slot.retire_pam_method(
+            next,
+            MethodKind::PamConversation,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        let fresh = slot
+            .begin_method(Some(fresh_origin), 7, MethodKind::PamConversation)
+            .unwrap();
+        let fresh_lease = hub
+            .bind_auth_lease(fresh_origin, fresh.serial, 7, MethodKind::PamConversation)
+            .unwrap();
+        assert!(!hub.retire_pam_auth_lease(
+            next_lease,
+            Verification::Retired {
+                authenticated: true
+            }
+        ));
+        assert!(hub.auth_lease_live(fresh_lease));
+        b.stream.shutdown(Shutdown::Write).unwrap();
+        assert!(!hub.auth_lease_live(fresh_lease));
+        hub.set_auth_owner(None);
+        assert!(!hub.origin_pending_live(fresh_origin));
+        assert!(slot.matches(fresh));
+    }
+    #[test]
+    fn missing_child_identity_cannot_bind_an_auth_lease() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut client = connect(&mut hub, &mut model);
+        submit(&mut client, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert!(hub
+            .bind_auth_lease(origin, 1, 7, crate::auth_owner::MethodKind::Password)
+            .is_none());
+        hub.set_auth_owner(Some(AuthOwner {
+            pid: std::process::id() + 1,
+            generation: 1,
+        }));
+        let mut wrong_peer = connect(&mut hub, &mut model);
+        submit(&mut wrong_peer, 1);
+        let (wrong_origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert!(
+            !hub.origin_pending_live(wrong_origin),
+            "SameUser gate cannot substitute for the current child credentials"
+        );
+        assert!(hub
+            .bind_auth_lease(wrong_origin, 1, 7, crate::auth_owner::MethodKind::Password)
+            .is_none());
+        hub.set_auth_owner(Some(AuthOwner {
+            pid: std::process::id(),
+            generation: 0,
+        }));
         assert!(!hub.origin_pending_live(origin));
     }
     #[test]

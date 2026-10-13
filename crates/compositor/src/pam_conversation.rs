@@ -1,7 +1,7 @@
 //! Internal, fresh-response PAM relay. This API never grants a lock transition.
 //! Its trusted runtime caller must retain the common auth Slot and validate the
 //! live origin/epoch before displaying a challenge or applying a retired result.
-pub use crate::auth_owner::Origin;
+pub use crate::auth_owner::{MethodKind, Origin};
 use crate::pam_cancel::Cancellation;
 use crate::pam_helper::{Answer, Message, Style, Supervisor};
 use std::io::{self, Write};
@@ -160,12 +160,28 @@ pub(crate) struct Relay {
     timing: Arc<Timing>,
     challenges: mpsc::SyncSender<Challenge>,
     cancel: Cancellation,
+    notice: crate::wake::Wake,
 }
 pub struct Receiver {
     pub(crate) challenges: mpsc::Receiver<Challenge>,
     timing: Arc<Timing>,
+    notice_source: Option<calloop::ping::PingSource>,
 }
 impl Receiver {
+    pub(crate) fn take_notice_source(&mut self) -> Option<calloop::ping::PingSource> {
+        self.notice_source.take()
+    }
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        Some(
+            self.timing
+                .last_input
+                .lock()
+                .ok()
+                .map_or_else(Instant::now, |last| {
+                    self.timing.total_deadline.min(*last + INACTIVITY)
+                }),
+        )
+    }
     pub(crate) fn timely_at(&self, now: Instant) -> bool {
         self.timing.deadline_at(now).is_some()
     }
@@ -193,6 +209,7 @@ pub(crate) fn channel(
         return Err(io::ErrorKind::InvalidInput.into());
     }
     let now = Instant::now();
+    let (notice, notice_source) = crate::wake::Wake::new()?;
     let (send, receive) = mpsc::sync_channel(1);
     let timing = Arc::new(Timing {
         total_deadline: now + policy.total,
@@ -205,14 +222,19 @@ pub(crate) fn channel(
             timing: timing.clone(),
             challenges: send,
             cancel,
+            notice,
         },
         Receiver {
             challenges: receive,
             timing,
+            notice_source: Some(notice_source),
         },
     ))
 }
 impl Relay {
+    pub(crate) fn notice(&self) -> crate::wake::Wake {
+        self.notice.clone()
+    }
     pub(crate) fn total(&self) -> Duration {
         self.policy.total
     }
@@ -260,6 +282,7 @@ impl Relay {
                 },
             })
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        self.notice.signal();
         let answers = self.wait_answers(&read, &receive, sequence, &styles, &activity_pending)?;
         // Fresh input authorizes only this response; it cannot extend the total
         // ceiling or bypass the separate bounded backend IPC phase.
@@ -295,6 +318,7 @@ impl Relay {
                     }
                     activity_pending.store(false, Ordering::Release);
                     self.timing.input_at(input_at)?;
+                    self.notice.signal();
                     continue;
                 }
                 Ok(Input::Answers(binding, incoming, answers, input_at)) => {
@@ -310,6 +334,7 @@ impl Relay {
                         .any(|style| matches!(style, Style::Visible | Style::Secret))
                     {
                         self.timing.input_at(input_at)?;
+                        self.notice.signal();
                     }
                     return Ok(answers);
                 }
@@ -349,6 +374,54 @@ mod tests {
     use crate::pam_cancel::WakeFd;
     use crate::pam_helper::AnswerText;
 
+    #[test]
+    fn owned_notice_source_and_current_shared_deadline_are_not_retirement() {
+        let cancel = Cancellation::default();
+        let (relay, mut receiver) = channel(
+            binding(),
+            Policy {
+                backend_phase: Duration::from_secs(30),
+                total: Duration::from_secs(900),
+            },
+            cancel.clone(),
+        )
+        .unwrap();
+        let source = receiver.take_notice_source().unwrap();
+        assert!(receiver.take_notice_source().is_none());
+        let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, seen| *seen += 1)
+            .unwrap();
+        let start = Instant::now();
+        *relay.timing.last_input.lock().unwrap() = start - Duration::from_secs(60);
+        let previous = receiver.next_deadline().unwrap();
+        relay.timing.input_at(start).unwrap();
+        relay.notice.signal();
+        assert!(receiver.next_deadline().unwrap() > previous);
+        assert_eq!(receiver.next_deadline(), Some(start + INACTIVITY));
+        let mut seen = 0;
+        event_loop
+            .dispatch(Some(Duration::from_secs(2)), &mut seen)
+            .unwrap();
+        assert_eq!(seen, 1);
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut seen)
+            .unwrap();
+        assert_eq!(seen, 1);
+        receiver.expire_idle_for_test();
+        assert!(
+            receiver.next_deadline().unwrap() <= Instant::now(),
+            "expired obligation must schedule denial, not vanish"
+        );
+        assert!(!receiver.timely_at(Instant::now()));
+        assert!(
+            relay.timing.input_at(Instant::now()).is_err(),
+            "late input cannot revive expired ownership"
+        );
+        cancel.cancel();
+        assert!(!relay.timely());
+    }
     fn binding() -> Binding {
         Binding {
             origin: Origin {

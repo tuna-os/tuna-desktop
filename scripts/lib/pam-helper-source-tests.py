@@ -64,6 +64,40 @@ class SourceContracts(unittest.TestCase):
             self.assertIn('"' + case + '"', actual)
         self.assertIn('Duration::from_secs(45)', actual)
 
+    def test_consumer_foundation_routes_child_identity_before_poll_and_retirement(self):
+        runtime = (ROOT / 'crates/compositor/src/runtime.rs').read_text()
+        self.assertEqual(runtime.count('self.control.set_auth_owner('), 2)
+        first = runtime.index('self.control.set_auth_owner(')
+        self.assertLess(first, runtime.index('let outcome = self.control.poll', first))
+        self.assertIn('self.shell\n                .child_pid()\n                .zip(self.shell.child_generation())', runtime)
+        self.assertIn('self.unlock_slot.retire_pam_method(', runtime)
+        owner = (ROOT / 'crates/compositor/src/auth_owner.rs').read_text()
+        self.assertIn('if self.active.is_some()', owner.split('pub fn grant(', 1)[1])
+        self.assertIn('method == MethodKind::Fingerprint', owner)
+        control = (ROOT / 'crates/compositor/src/control.rs').read_text()
+        for name in ('AuthLease', 'bind_auth_lease', 'auth_lease_accepts', 'retire_pam_auth_lease',
+                     'auth_lease_binds_socket_child_generation_and_retirement_not_reply'):
+            self.assertIn(name, control)
+        supervise = (ROOT / 'crates/compositor/src/supervise.rs').read_text()
+        reset = supervise.split('pub fn reset_budget(', 1)[1].split('}', 1)[0]
+        self.assertNotIn('child_generation', reset)
+        self.assertIn('generation.checked_add(1)', supervise)
+
+    def test_mailbox_publishes_then_wakes_and_closes_sender_before_disconnect_notice(self):
+        relay = (ROOT / 'crates/compositor/src/pam_conversation.rs').read_text()
+        challenge = relay.split('self.challenges\n', 1)[1].split('let answers =', 1)[0]
+        self.assertLess(challenge.index('try_send'), challenge.index('self.notice.signal()'))
+        backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
+        drop = backend.split('impl Drop for ReplyPublisher', 1)[1].split('struct Job', 1)[0]
+        self.assertLess(drop.index('self.sender.take()'), drop.index('notice.signal()'))
+        self.assertIn('self.outcome.is_some() || self.ticket.denied', backend)
+        actual = (ROOT / 'crates/compositor/tests/pam_helper.rs').read_text().split('fn run_interactive_relay_cases()', 1)[1]
+        self.assertIn('ticket.take_notice_source()', actual)
+        self.assertIn('event_loop', actual)
+        self.assertNotIn('std::thread::sleep', actual)
+        self.assertIn('if attempt == 0 { 30 } else { 2 }', actual)
+        self.assertIn('if attempt == 0 { 900 } else { 300 }', actual)
+
     def test_owned_credential_wrap_precedes_early_denials_and_moves_answer(self):
         backend = (ROOT / 'crates/compositor/src/pam_backend.rs').read_text()
         self.assertIn('impl Drop for Credential', backend)

@@ -1,4 +1,4 @@
-//! Outer password-wrapper ownership only. PAM's inner worker is not retired here.
+//! Common runtime method ownership. A method tag is not a verification receipt.
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,9 +12,17 @@ pub(crate) struct Attempt {
     pub serial: u64,
     pub epoch: u64,
 }
+/// Runtime-selected authority. Selecting a kind is not a verification result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodKind {
+    Password,
+    PamConversation,
+    Fingerprint,
+}
 #[derive(Default)]
 pub(crate) struct Slot {
     active: Option<Attempt>,
+    method: Option<MethodKind>,
     serial: u64,
     locked: bool,
 }
@@ -39,6 +47,14 @@ impl Slot {
         }
     }
     pub fn begin(&mut self, origin: Option<Origin>, epoch: u64) -> Option<Attempt> {
+        self.begin_method(origin, epoch, MethodKind::Password)
+    }
+    pub fn begin_method(
+        &mut self,
+        origin: Option<Origin>,
+        epoch: u64,
+        method: MethodKind,
+    ) -> Option<Attempt> {
         if self.active.is_some() || epoch == u64::MAX {
             return None;
         }
@@ -49,14 +65,36 @@ impl Slot {
             epoch,
         };
         self.active = Some(attempt);
+        self.method = Some(method);
         Some(attempt)
     }
     /// A callback can retire only its exact outer wrapper, never a newer one.
     pub fn retire(&mut self, attempt: Attempt) -> bool {
+        if self.method != Some(MethodKind::Password) {
+            return false;
+        }
+        self.retire_exact(attempt)
+    }
+    /// Only a PAM retirement result can release PAM/password ownership. This
+    /// cannot accept a fingerprint Match as a retirement receipt.
+    pub fn retire_pam_method(
+        &mut self,
+        attempt: Attempt,
+        method: MethodKind,
+        result: crate::pam_backend::Verification,
+    ) -> bool {
+        if method == MethodKind::Fingerprint || self.method != Some(method) || !result.may_retire()
+        {
+            return false;
+        }
+        self.retire_exact(attempt)
+    }
+    fn retire_exact(&mut self, attempt: Attempt) -> bool {
         if self.active != Some(attempt) {
             return false;
         }
         self.active = None;
+        self.method = None;
         true
     }
     pub fn matches(&self, attempt: Attempt) -> bool {
@@ -72,6 +110,9 @@ impl Slot {
     }
     /// Linearize success against immediate suspend invalidation.
     pub fn grant(&mut self, epoch: &AtomicU64, expected: u64) -> bool {
+        if self.active.is_some() {
+            return false;
+        }
         let Some(next) = expected.checked_add(1) else {
             return false;
         };
@@ -101,8 +142,9 @@ mod tests {
         assert!(!slot.grant(&epoch, old.epoch));
         assert!(slot.retire(old));
         let fresh = slot.begin(None, 2).unwrap();
-        assert!(slot.grant(&epoch, fresh.epoch));
+        assert!(!slot.grant(&epoch, fresh.epoch));
         assert!(slot.retire(fresh));
+        assert!(slot.grant(&epoch, fresh.epoch));
         slot.note_lock(&epoch);
         assert_eq!(epoch.load(Ordering::Acquire), 4);
     }
@@ -172,6 +214,87 @@ mod tests {
         assert!(slot.completion_live(fresh, &epoch, true));
         assert!(slot.retire(fresh));
         assert!(slot.grant(&epoch, fresh.epoch));
+    }
+    #[test]
+    fn method_owners_share_one_slot_and_only_exact_pam_retirement_releases_it() {
+        use crate::pam_backend::Verification;
+        let epoch = AtomicU64::new(7);
+        let mut slot = Slot::default();
+        let origin = Some(Origin {
+            connection: 1,
+            request: 9,
+        });
+        let pam = slot
+            .begin_method(origin, 7, MethodKind::PamConversation)
+            .unwrap();
+        for method in [
+            MethodKind::Password,
+            MethodKind::Fingerprint,
+            MethodKind::PamConversation,
+        ] {
+            assert!(slot.begin_method(origin, 7, method).is_none());
+        }
+        assert!(!slot.retire(pam));
+        assert!(!slot.grant(&epoch, 7));
+        assert!(!slot.retire_pam_method(pam, MethodKind::PamConversation, Verification::Unretired));
+        assert!(!slot.retire_pam_method(
+            pam,
+            MethodKind::Password,
+            Verification::Retired {
+                authenticated: true
+            }
+        ));
+        assert!(!slot.retire_pam_method(
+            Attempt { epoch: 8, ..pam },
+            MethodKind::PamConversation,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        assert!(slot.matches(pam));
+        assert!(slot.retire_pam_method(
+            pam,
+            MethodKind::PamConversation,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        let finger = slot
+            .begin_method(origin, 7, MethodKind::Fingerprint)
+            .unwrap();
+        assert!(!slot.retire_pam_method(
+            finger,
+            MethodKind::Fingerprint,
+            Verification::Retired {
+                authenticated: true
+            }
+        ));
+        assert!(!slot.retire_pam_method(
+            pam,
+            MethodKind::PamConversation,
+            Verification::RejectedBeforeSpawn
+        ));
+        assert!(!slot.grant(&epoch, 7));
+        assert!(
+            slot.matches(finger),
+            "Matched or PAM receipt cannot retire a fingerprint child"
+        );
+        let mut separate = Slot::default();
+        let refused = separate
+            .begin_method(origin, 7, MethodKind::PamConversation)
+            .unwrap();
+        assert!(separate.retire_pam_method(
+            refused,
+            MethodKind::PamConversation,
+            Verification::RejectedBeforeSpawn
+        ));
+        assert!(!separate.retire_pam_method(
+            refused,
+            MethodKind::PamConversation,
+            Verification::Retired {
+                authenticated: true
+            }
+        ));
     }
     #[test]
     fn overflow_is_permanently_fail_closed() {

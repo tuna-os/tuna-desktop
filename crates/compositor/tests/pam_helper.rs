@@ -713,7 +713,11 @@ fn run_interactive_relay_cases() {
     use tuna_compositor::pam_backend::{Backend, ConversationTicket, Verification};
     use tuna_compositor::pam_cancel::Cancellation;
     use tuna_compositor::pam_conversation::{Binding, Challenge, Origin, Policy};
-    fn next(ticket: &mut ConversationTicket) -> Challenge {
+    fn next(
+        ticket: &mut ConversationTicket,
+        event_loop: &mut calloop::EventLoop<usize>,
+        wakes: &mut usize,
+    ) -> Challenge {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if let Ok(challenge) = ticket.try_challenge() {
@@ -724,10 +728,20 @@ fn run_interactive_relay_cases() {
                 "unexpected retirement before challenge"
             );
             assert!(Instant::now() < deadline, "required challenge missing");
-            std::thread::sleep(Duration::from_millis(2));
+            event_loop
+                .dispatch(
+                    Some(deadline.saturating_duration_since(Instant::now())),
+                    wakes,
+                )
+                .unwrap();
         }
     }
-    fn finished(ticket: &mut ConversationTicket, accepted: bool) {
+    fn finished(
+        ticket: &mut ConversationTicket,
+        accepted: bool,
+        event_loop: &mut calloop::EventLoop<usize>,
+        wakes: &mut usize,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(4);
         loop {
             if let Some(result) = ticket.try_outcome() {
@@ -743,7 +757,12 @@ fn run_interactive_relay_cases() {
                 Instant::now() < deadline,
                 "required actual retirement missing"
             );
-            std::thread::sleep(Duration::from_millis(2));
+            event_loop
+                .dispatch(
+                    Some(deadline.saturating_duration_since(Instant::now())),
+                    wakes,
+                )
+                .unwrap();
         }
     }
     let (created, creators) = std::sync::mpsc::channel();
@@ -803,12 +822,26 @@ fn run_interactive_relay_cases() {
                 user(),
                 binding,
                 Policy {
-                    backend_phase: Duration::from_secs(2),
-                    total: Duration::from_secs(300),
+                    backend_phase: Duration::from_secs(if attempt == 0 { 30 } else { 2 }),
+                    total: Duration::from_secs(if attempt == 0 { 900 } else { 300 }),
                 },
                 cancel.clone(),
             )
             .unwrap();
+        let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+        let source = ticket
+            .take_notice_source()
+            .expect("owned conversation notice source");
+        assert!(
+            ticket.take_notice_source().is_none(),
+            "source cannot be duplicated"
+        );
+        assert!(ticket.next_deadline().is_some());
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, wakes| *wakes += 1)
+            .unwrap();
+        let mut wakes = 0;
         let (actual_creator, tid, pid) = creators.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(*creator.get_or_insert(actual_creator), actual_creator);
         assert!(
@@ -830,7 +863,7 @@ fn run_interactive_relay_cases() {
             "shared backend admission must remain busy"
         );
         if case != "phase-hang" {
-            let mut challenge = next(&mut ticket);
+            let mut challenge = next(&mut ticket, &mut event_loop, &mut wakes);
             assert_eq!(challenge.binding, binding);
             assert_eq!(challenge.sequence, 1);
             assert_eq!(
@@ -880,7 +913,7 @@ fn run_interactive_relay_cases() {
                 _ => {
                     challenge.response.note_user_input(binding, 1).unwrap();
                     challenge.response.submit(binding, 1, answers(1)).unwrap();
-                    let challenge = next(&mut ticket);
+                    let challenge = next(&mut ticket, &mut event_loop, &mut wakes);
                     assert_eq!(challenge.binding, binding);
                     assert_eq!(challenge.sequence, 2);
                     assert_eq!(challenge.messages.len(), 1);
@@ -897,7 +930,19 @@ fn run_interactive_relay_cases() {
                 }
             }
         }
-        finished(&mut ticket, case == "fresh-multistep");
+        finished(
+            &mut ticket,
+            case == "fresh-multistep",
+            &mut event_loop,
+            &mut wakes,
+        );
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut wakes)
+            .unwrap();
+        assert!(
+            wakes > 0,
+            "actual helper conversation must wake its owned consumer"
+        );
         assert!(
             !Path::new(&format!("/proc/{pid}")).exists(),
             "result must follow actual helper retirement"
