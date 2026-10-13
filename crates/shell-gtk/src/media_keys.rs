@@ -48,12 +48,11 @@ pub(crate) fn trace_enabled() -> bool {
 }
 
 pub(crate) fn media_subset(list: &[tuna_shell_control::Accelerator]) -> serde_json::Value {
-    serde_json::json!(
-        list.iter()
-            .filter(|a| matches!(a.keysym, 0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2))
-            .map(|a| serde_json::json!([a.action, a.keysym, a.mods, a.modes]))
-            .collect::<Vec<_>>()
-    )
+    serde_json::json!(list
+        .iter()
+        .filter(|a| matches!(a.keysym, 0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2))
+        .map(|a| serde_json::json!([a.action, a.keysym, a.mods, a.modes]))
+        .collect::<Vec<_>>())
 }
 
 pub fn sound_settings() -> Option<gio::Settings> {
@@ -698,12 +697,10 @@ mod completion_tests {
             std::env::var("TUNA_REQUIRE_MEDIA_COMPLETION").as_deref(),
             Ok("1")
         );
-        assert!(
-            Path::new(
-                &std::env::var_os("TUNA_MEDIA_DIAGNOSTICS").expect("diagnostic marker required")
-            )
-            .is_file()
-        );
+        assert!(Path::new(
+            &std::env::var_os("TUNA_MEDIA_DIAGNOSTICS").expect("diagnostic marker required")
+        )
+        .is_file());
         let fixture = Fixture::new();
         fixture.reset("0.40");
         let backend = gio::memory_settings_backend_new();
@@ -714,6 +711,20 @@ mod completion_tests {
         let settings = gio::Settings::new_full(&schema, Some(&backend), None);
         settings.set_boolean(AMPLIFIED_KEY, true).unwrap();
         let media = MediaKeys::with_sound(Rc::new(|_, _, _| {}), Some(settings.clone()));
+        fixture.idle(&media);
+
+        // A changed policy requires its own fresh clamp completion, not a
+        // scheduler-only idle snapshot or an unrelated earlier mutation.
+        fixture.reset("1.50");
+        let policy_since = stamp();
+        settings.set_boolean(AMPLIFIED_KEY, false).unwrap();
+        let policy_clamp = fixture.hold("exit", "set-volume");
+        assert!(!fixture.barrier(policy_since, "clamp", false).success());
+        policy_clamp.release();
+        fixture.idle(&media);
+        assert!(fixture.barrier(policy_since, "clamp", false).success());
+        assert!(!fixture.barrier(stamp(), "clamp", false).success());
+        settings.set_boolean(AMPLIFIED_KEY, true).unwrap();
         fixture.idle(&media);
 
         // Old predicate sees the clamp's1.0 while a real Raise is queued.

@@ -23,6 +23,27 @@ class Barrier(unittest.TestCase):
         return barrier.validate(data, OWNER, since, kind, policy)
     def test_actual_completed_then_scheduled_record(self):
         self.assertIsNotNone(self.validate(rows()))
+    def test_changed_policy_requires_its_fresh_clamp(self):
+        self.assertIsNone(self.validate([rows()[2]], kind='clamp'))
+        data=rows()
+        for row in data[:2]:row['details']['kind']='clamp'
+        self.assertIsNotNone(self.validate(data, kind='clamp'))
+        self.assertIsNone(self.validate(data, kind='clamp', since=21))
+        self.assertIsNone(self.validate([data[0],data[2]], kind='clamp'))
+    def test_policy_change_rejects_unexpected_key_intent(self):
+        with self.assertRaises(ValueError):self.validate(rows(), kind='clamp')
+    def test_preexisting_completion_requires_typed_kind(self):
+        data=rows();data.insert(1,{**copy.deepcopy(data[1]),'monotonic_ns':15,'details':{'instance':1,'token':4,'outcome':'success'}})
+        with self.assertRaises(ValueError):self.validate(data)
+    def test_acceptance_cannot_follow_its_completion(self):
+        data=rows();data[0]['monotonic_ns']=21;data=[data[1],data[0],data[2]]
+        with self.assertRaises(ValueError):self.validate(data)
+    def test_owner_and_intent_types_are_not_inferred_from_equality(self):
+        for field in ['pid','start_ticks']:
+            bad=copy.deepcopy(OWNER);bad[field]=True
+            with self.assertRaises(ValueError):barrier.validate(rows(),bad,1,'key',False)
+        for since,kind,policy in [(True,'key',False),(1,'unknown',False),(1,'key',0)]:
+            with self.assertRaises(ValueError):barrier.validate(rows(),OWNER,since,kind,policy)
     def test_child_or_volume_value_without_completion_never_passes(self):
         self.assertIsNone(self.validate([]))
         self.assertIsNone(self.validate([rows()[0],rows()[2]]))

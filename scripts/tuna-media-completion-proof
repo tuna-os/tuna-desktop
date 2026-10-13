@@ -51,11 +51,15 @@ def main():
     script=root/'scripts/lib/media-completion-fixture.py'
     (bin_dir/'wpctl').write_bytes(script.read_bytes());(bin_dir/'wpctl').chmod(0o700)
     marker=fixture/'diagnostics';marker.touch(mode=0o600)
+    for directory in ('runtime', 'config', 'cache', 'data'):
+        (fixture/directory).mkdir(mode=0o700)
     # Per-child environment only; no shared settings, bus or Python bytecode.
     env=dict(os.environ, PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],
              TUNA_MEDIA_FIXTURE_ROOT=str(fixture),TUNA_MEDIA_DIAGNOSTICS=str(marker),
              TUNA_MEDIA_BARRIER_HELPER=str(root/'scripts/lib/media-completion-barrier.py'),
-             TUNA_REQUIRE_MEDIA_COMPLETION='1',PYTHONDONTWRITEBYTECODE='1')
+             TUNA_REQUIRE_MEDIA_COMPLETION='1',PYTHONDONTWRITEBYTECODE='1',
+             XDG_RUNTIME_DIR=str(fixture/'runtime'), XDG_CONFIG_HOME=str(fixture/'config'),
+             XDG_CACHE_HOME=str(fixture/'cache'), XDG_DATA_HOME=str(fixture/'data'))
     env.pop('WAYLAND_DISPLAY',None);env.pop('WAYLAND_SOCKET',None)
     argv=['dbus-run-session','--',str(binary),FILTER,'--exact','--ignored','--test-threads=1','--nocapture']
     with (args.artifacts/'output.txt').open('w') as out:

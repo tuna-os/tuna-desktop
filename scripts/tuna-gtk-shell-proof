@@ -4027,8 +4027,9 @@ pass G-ACCEL "gnome-settings-daemon's grab fires on its key and its ShowOSD show
 touch "$TUNA_MEDIA_DIAGNOSTICS"
 media_mark() { "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" marker "$$" "$1"; }
 media_mark begin
-MEDIA_SHELL_PID="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk | head -1)"
-[ -n "$MEDIA_SHELL_PID" ] || fail G-MEDIA-VOLUME "owned shell is missing"
+mapfile -t MEDIA_SHELL_PIDS < <(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)
+[ "${#MEDIA_SHELL_PIDS[@]}" -eq 1 ] || fail G-MEDIA-VOLUME "expected exactly one owned shell"
+MEDIA_SHELL_PID="${MEDIA_SHELL_PIDS[0]}"
 "$PY" - "$MEDIA_SHELL_PID" "$ARTIFACTS/media-completion-owner.json" <<'PY_MEDIA_OWNER'
 import json, pathlib, sys
 pid = int(sys.argv[1])
@@ -4049,7 +4050,7 @@ media_policy() {
     old_policy="$(gsettings get org.gnome.desktop.sound allow-volume-above-100-percent)"
     if [ "$old_policy" != "$1" ]; then
         MEDIA_SINCE="$("$PY" -c 'import time; print(time.monotonic_ns())')"
-        MEDIA_KIND=idle
+        MEDIA_KIND=clamp
     fi
     gsettings set org.gnome.desktop.sound allow-volume-above-100-percent "$1"
     media_wait

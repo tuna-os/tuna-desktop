@@ -20,10 +20,18 @@ def integer(value, minimum=0):
 
 
 def validate(rows, expected_owner, since, kind, policy):
+    if (not isinstance(expected_owner, dict)
+            or not integer(expected_owner.get('pid'), 1)
+            or not integer(expected_owner.get('start_ticks'), 1)
+            or not integer(since) or kind not in {'key', 'clamp', 'idle'}
+            or type(policy) is not bool):
+        raise ValueError('malformed barrier intent or owner')
     relevant = []
     for row in rows:
         if row.get('stage') not in STAGES:
             continue
+        if not integer(row.get('pid'), 1) or not integer(row.get('start_ticks'), 1):
+            raise ValueError('malformed completion owner')
         if row.get('pid') != expected_owner['pid']:
             raise ValueError('unrelated shell completion producer')
         if row.get('start_ticks') != expected_owner['start_ticks']:
@@ -47,12 +55,15 @@ def validate(rows, expected_owner, since, kind, policy):
         d = r['details']
         if r['stage'] == 'media-accepted':
             token = d.get('token')
-            if not integer(token, 1) or token in accepted or d.get('kind') not in {'key', 'clamp'}:
+            if (not integer(token, 1) or token in accepted or token in completed
+                    or d.get('kind') not in {'key', 'clamp'}):
                 raise ValueError('invalid/duplicate accepted token')
             accepted[token] = d['kind']
         elif r['stage'] == 'media-complete':
             token = d.get('token')
-            if not integer(token, 1) or token in completed or d.get('outcome') not in {'success', 'failure', 'superseded'}:
+            if (not integer(token, 1) or token in completed
+                    or d.get('kind') not in {'key', 'clamp'}
+                    or d.get('outcome') not in {'success', 'failure', 'superseded'}):
                 raise ValueError('invalid/duplicate completion token')
             if token in accepted and d.get('kind') != accepted[token]:
                 raise ValueError('completion kind changed')
@@ -70,6 +81,12 @@ def validate(rows, expected_owner, since, kind, policy):
                 raise ValueError('malformed scheduler token list')
             snapshots.append(r)
     keys = [token for token, category in accepted.items() if category == 'key']
+    clamps = [token for token, category in accepted.items() if category == 'clamp']
+    if kind == 'clamp':
+        if keys:
+            raise ValueError('unexpected key intent during a policy change')
+        if not clamps:
+            return None
     if kind == 'key' and len(keys) != 1:
         if len(keys) > 1:
             raise ValueError('multiple key intents for one hardware press')
@@ -127,7 +144,7 @@ def main():
     parser.add_argument('--pid', type=int, required=True)
     parser.add_argument('--owner', type=Path, required=True)
     parser.add_argument('--since', type=int, required=True)
-    parser.add_argument('--kind', choices=('key', 'idle'), required=True)
+    parser.add_argument('--kind', choices=('key', 'clamp', 'idle'), required=True)
     parser.add_argument('--policy', choices=('true', 'false'), required=True)
     parser.add_argument('--receipt', type=Path, required=True)
     args = parser.parse_args()
