@@ -50,9 +50,115 @@ def walk(node, depth=0, budget=None):
             yield from walk(child, depth + 1, budget)
 
 
+def walk_with_ancestors(node, depth=0, budget=None, ancestors=()):
+    """Yield (node, root-first ancestor tuple) under the walk limits.
+
+    Ancestors are the traversal's own wrapper objects, so identity (`is`)
+    between a match and another match's ancestors proves an actual
+    parent/descendant chain without re-querying AT-SPI.
+    """
+    if budget is None:
+        budget = [4096]
+    budget[0] -= 1
+    if depth > 32 or budget[0] < 0:
+        raise RuntimeError("accessible depth limit")
+    yield node, ancestors
+    for i in range(node.get_child_count()):
+        child = node.get_child_at_index(i)
+        if child is not None:
+            yield from walk_with_ancestors(child, depth + 1, budget, ancestors + (node,))
+
+
 def validate_traffic(before, after, positive):
     if after != before + [positive]:
         raise RuntimeError("old property emitted traffic after engine change")
+
+
+def component_bounds(node):
+    """Screen extents of one accessible match, or None when unavailable."""
+    try:
+        component = node.get_component_iface()
+        if component is None:
+            return None
+        extents = component.get_extents(Atspi.CoordType.SCREEN)
+    except GLib.Error:
+        return None
+    return (extents.x, extents.y, extents.width, extents.height)
+
+
+def action_count(node):
+    """Exposed action count: 0 without an action interface, None when unreadable."""
+    try:
+        action = node.get_action_iface()
+        if action is None:
+            return 0
+        return action.get_n_actions()
+    except GLib.Error:
+        return None
+
+
+def collapse_known_menu_pair(records):
+    """Resolve ONLY the known MenuButton+inner-toggle exposed pair.
+
+    `records` holds one (node, bounds, role, n_actions, ancestors) tuple
+    per same-name showing non-label match from a single bounded
+    traversal; `ancestors` is that node's root-first ancestor tuple by
+    traversal identity. The caller pre-filters name/showing/label.
+
+    Returns [inner_toggle] only when the records are exactly two nodes
+    with equal positive extents where one ordering is the parent outer
+    button (role "button"/"push button", zero actions) above its actual
+    descendant inner toggle (role "toggle button", at least one action).
+    Both button spellings are the same outer widget across AT-SPI
+    versions (the harness already accepts both). Every other shape —
+    unknown bounds, non-positive extents, extra matches, unrelated
+    equal-bounds nodes, reversed or missing ancestry, duplicate, zero,
+    or unknown actions, other roles — returns all nodes unchanged so
+    downstream uniqueness checks still fail ambiguous.
+    """
+    parent_roles = ("button", "push button")
+    child_role = "toggle button"
+    nodes = [node for node, _bounds, _role, _actions, _ancestors in records]
+    if len(records) != 2:
+        return nodes
+    bounds0 = records[0][1]
+    bounds1 = records[1][1]
+    if bounds0 is None or bounds1 is None or bounds0 != bounds1:
+        return nodes
+    if len(bounds0) != 4 or bounds0[2] <= 0 or bounds0[3] <= 0:
+        return nodes
+    orders = ((records[0], records[1]), (records[1], records[0]))
+    for parent, child in orders:
+        parent_node, _pb, parent_role, parent_actions, _pa = parent
+        child_node, _cb, child_role_name, child_actions, child_ancestors = child
+        if parent_role not in parent_roles:
+            continue
+        if child_role_name != child_role:
+            continue
+        if parent_actions != 0:
+            continue
+        if child_actions is None or child_actions < 1:
+            continue
+        if not any(ancestor is parent_node for ancestor in child_ancestors):
+            continue
+        return [child_node]
+    return nodes
+
+
+def wait_until(predicate, deadline, clock, sleep):
+    """Poll until the predicate holds while the absolute deadline holds.
+
+    A predicate that turns true only after the deadline has passed is a
+    late positive and fails: the deadline is rechecked after every
+    success before returning. Raises RuntimeError on expiry.
+    """
+    while clock() < deadline:
+        if predicate():
+            if clock() >= deadline:
+                break
+            return
+        sleep(0.05)
+    raise RuntimeError("property traffic deadline")
 
 
 def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_log=None):
@@ -77,17 +183,21 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
         apps = [a for a in apps if a is not None and a.get_process_id() == pid]
         if len(apps) != 1:
             raise RuntimeError("GTK accessible application not unique")
-        matches = [n for n in walk(apps[0]) if n.get_name() == name
-                   and n.get_state_set().contains(Atspi.StateType.SHOWING)
-                   and n.get_role_name() != "label"]
-        return matches
+        records = []
+        for found, ancestors in walk_with_ancestors(apps[0]):
+            if found.get_name() != name:
+                continue
+            role = found.get_role_name()
+            if role == "label":
+                continue
+            if not found.get_state_set().contains(Atspi.StateType.SHOWING):
+                continue
+            records.append((found, component_bounds(found), role,
+                            action_count(found), ancestors))
+        return collapse_known_menu_pair(records)
 
     def wait(predicate):
-        while time.monotonic() < deadline:
-            if predicate():
-                return
-            time.sleep(.05)
-        raise RuntimeError("property traffic deadline")
+        wait_until(predicate, deadline, time.monotonic, time.sleep)
 
     def press(name):
         wait(lambda: len(node(name)) == 1)
