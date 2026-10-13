@@ -1362,10 +1362,7 @@ impl CupsClient {
                     match resolve_host_with_budget(host, *port, deadline, connect_timeout) {
                         Err(e) => Err(e),
                         Ok(addr) => {
-                            let budget = match remaining(deadline, connect_timeout) {
-                                Ok(b) => b,
-                                Err(e) => return Err(e),
-                            };
+                            let budget = remaining(deadline, connect_timeout)?;
                             std::net::TcpStream::connect_timeout(&addr, budget)
                                 .map_err(|e| e.to_string())
                                 .and_then(|s| {
