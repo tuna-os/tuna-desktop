@@ -24,6 +24,13 @@ native-client proof, following scripts/lib/tuna_window_menu_fixture.py:
 
 check additionally requires stable owned geometry (rect equality) and
 the unchanged native identity pair (id + application_window_id).
+
+Gatefix hardening (issue #354 stays OPEN): the enter handshake is
+fresh-only. The shell parks the pointer away (explicit leave),
+records the client-log byte offset, moves onto the bound center, and
+fresh_enter requires a NEW complete {"enter":...} line strictly after
+that offset; pre-seeded old enters never qualify and whole-log
+matching is gone.
 """
 import json
 import sys
@@ -91,6 +98,42 @@ def check(live_scene, expected, live_identity):
     return list(window['rect'])
 
 
+def fresh_enter(log_path, offset):
+    """A NEW complete enter strictly after the byte offset, or fail.
+
+    Old enters at or before the offset never qualify (a pre-seeded
+    log with no fresh enter FAILS); torn or non-JSON lines are
+    skipped, and only a complete {"enter": <int serial>} object
+    counts.
+    """
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise RuntimeError(f'fresh-enter offset must be a non-negative int, got {offset!r}')
+    try:
+        with open(log_path, 'rb') as stream:
+            stream.seek(offset)
+            tail = stream.read()
+    except FileNotFoundError:
+        raise RuntimeError(f'probe log missing: {log_path}')
+    except OSError as exc:
+        raise RuntimeError(f'probe log unreadable {log_path}: {exc}')
+    try:
+        text = tail.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f'probe log tail is not UTF-8 after {offset}: {exc}')
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and type(obj.get('enter')) is int:
+            return obj
+    raise RuntimeError(
+        f'no fresh pointer enter strictly after byte offset {offset} in {log_path}')
+
+
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
@@ -105,6 +148,9 @@ def main(argv=None):
     p.add_argument('--cstate', type=Path, required=True)
     p.add_argument('--owner', type=Path, required=True)
     p.add_argument('--pid', type=int, required=True)
+    p = sub.add_parser('fresh-enter')
+    p.add_argument('--log', type=Path, required=True)
+    p.add_argument('--offset', type=int, required=True)
     args = parser.parse_args(argv)
     if args.command == 'bind':
         before = json.loads(args.before.read_text())
@@ -120,6 +166,9 @@ def main(argv=None):
         rect = check(json.loads(args.cstate.read_text()), expected,
                      process_identity(expected['pid']))
         print(json.dumps({'id': expected['id'], 'rect': rect}))
+    elif args.command == 'fresh-enter':
+        entered = fresh_enter(args.log, args.offset)
+        print(json.dumps(entered))
 
 
 if __name__ == '__main__':

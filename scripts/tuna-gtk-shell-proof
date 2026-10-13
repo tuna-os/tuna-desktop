@@ -4051,17 +4051,36 @@ pass G-WELLBEING-BREAK "the 10 s break counts down, notifies due, and an idle ta
 # admitted build. Issue #354 stays OPEN; nested observation pending.
 WB_PROBE_PID=""
 WB_SHELL_PID=""
+WB_SHELL_START=""
 WB_GATE=""
+WB_NONCE=""
+WB_DUMP_SEQ=0
 WB_START=0
 WB_FROZEN=0
 WB_CAPS_JSONL=""
+WB_STATE_JSONL=""
 WB_WINDOWS_BEFORE=0
+
+wb_proc_start_ticks() {
+    "$PY" -c 'import sys
+pid = sys.argv[1]
+try:
+    stat = open("/proc/%s/stat" % pid).read().rsplit(")", 1)[1].split()
+    print(int(stat[19]))
+except Exception as exc:
+    print("cannot read start time of %s: %s" % (pid, exc))
+    raise SystemExit(1)' "$1"
+}
 
 wb_gate_begin() {
     WB_GATE="$1"
     WB_START="$(date +%s)"
+    WB_NONCE="$1-$(date +%s)-$$"
+    WB_DUMP_SEQ=0
     WB_CAPS_JSONL="$ARTIFACTS/wb-$WB_GATE-captures.jsonl"
     : >"$WB_CAPS_JSONL"
+    WB_STATE_JSONL="$ARTIFACTS/wb-$WB_GATE-state.jsonl"
+    : >"$WB_STATE_JSONL"
     [ -x "$ARTIFACTS/cursor-client/tuna-cursor-client" ] ||
         fail "$WB_GATE" "the cursor probe build is missing"
     [ -f "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" ] ||
@@ -4072,8 +4091,45 @@ wb_gate_begin() {
         fail "$WB_GATE" "the probe bind helper is missing"
     [ -n "$COMPOSITOR_PID" ] && kill -0 "$COMPOSITOR_PID" 2>/dev/null ||
         fail "$WB_GATE" "the compositor process went missing"
-    WB_SHELL_PID="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk | head -1)"
-    [ -n "$WB_SHELL_PID" ] || fail "$WB_GATE" "the shell process went missing"
+    wb_shell_matches="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk || true)"
+    [ -n "$wb_shell_matches" ] ||
+        fail "$WB_GATE" "no shell process under the compositor (expected exactly one)"
+    [ "$(printf '%s\n' "$wb_shell_matches" | wc -l)" -eq 1 ] ||
+        fail "$WB_GATE" "ambiguous shell processes under the compositor (expected exactly one)"
+    WB_SHELL_PID="$wb_shell_matches"
+    kill -0 "$WB_SHELL_PID" 2>/dev/null ||
+        fail "$WB_GATE" "the shell process went missing"
+    WB_SHELL_START="$(wb_proc_start_ticks "$WB_SHELL_PID")" ||
+        fail "$WB_GATE" "the shell start time is unreadable"
+    [ -n "$WB_SHELL_START" ] ||
+        fail "$WB_GATE" "the shell start time is unreadable"
+}
+
+wb_stamp_dump() {
+    wb_stamp_ticks="$(wb_proc_start_ticks "$WB_SHELL_PID")" || return 1
+    [ "$wb_stamp_ticks" = "$WB_SHELL_START" ] || return 1
+    jq -n --arg gate "$WB_GATE" --arg nonce "$WB_NONCE" \
+        --argjson seq "$WB_DUMP_SEQ" --argjson pid "$WB_SHELL_PID" \
+        --argjson start_ticks "$wb_stamp_ticks" \
+        --argjson epoch "$(date +%s)" \
+        '{gate:$gate,nonce:$nonce,seq:$seq,pid:$pid,start_ticks:$start_ticks,epoch:$epoch}' \
+        >"$1.stamp" || return 1
+}
+
+wb_dump_anchor() {
+    [ "$(jq -r '.[0].process_id // "null"' "$1" 2>/dev/null)" = "$WB_SHELL_PID" ] || return 1
+    jq -e 'any(.[]; .showing)' "$1" >/dev/null 2>&1 || return 1
+}
+
+wb_a11y_dump() {
+    wb_dump_out="$1"
+    wb_dump_timeout="$2"
+    shift 2
+    WB_DUMP_SEQ=$((WB_DUMP_SEQ + 1))
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk \
+        "$wb_dump_out" "$wb_dump_timeout" --pid "$WB_SHELL_PID" "$@" || return $?
+    wb_stamp_dump "$wb_dump_out" || return 1
+    wb_dump_anchor "$wb_dump_out" || return 1
 }
 
 wb_probe_ensure() {
@@ -4107,26 +4163,63 @@ wb_probe_ensure() {
             --after "$ARTIFACTS/wb-probe-after.json" --pid "$WB_PROBE_PID" \
             --app-id tuna-cursor-probe --out "$ARTIFACTS/wb-probe-owner.json" ||
             fail "$WB_GATE" "the owned probe map is ambiguous (decoy?) or not native"
-        # Owned-client handshake: only our client writes this log, so a
-        # pointer-enter line at the bound rect proves the compositor
-        # routes the bound surface to our owned client process.
+        # Fresh-enter handshake: only our client writes this log.
+        # Park away (explicit leave), record the log byte offset, move
+        # onto the bound center, then require a NEW enter strictly
+        # after the offset while the pointer sits inside the bound
+        # rect; bound geometry and the owned-client lifetime are
+        # pinned before and after. Whole-log matching is gone.
         probe_center="$(jq -r '.rect | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' \
             "$ARTIFACTS/wb-probe-owner.json")" ||
             fail "$WB_GATE" "the bound probe rect went missing"
         [ -n "$probe_center" ] && [ "$probe_center" != "null null" ] ||
             fail "$WB_GATE" "the bound probe rect went missing"
-        # shellcheck disable=SC2086 # two coordinates
+        xdotool mousemove --window "$WID" 20 $((HEIGHT - 20)) ||
+            fail "$WB_GATE" "could not park the pointer for a fresh enter"
+        sleep 0.5
+        kill -0 "$WB_PROBE_PID" 2>/dev/null ||
+            fail "$WB_GATE" "the owned probe client died before the enter handshake"
+        "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" check \
+            --cstate "$CSTATE" --owner "$ARTIFACTS/wb-probe-owner.json" \
+            --pid "$WB_PROBE_PID" ||
+            fail "$WB_GATE" "the owned probe binding broke before the enter handshake"
+        wb_probe_start_before="$(wb_proc_start_ticks "$WB_PROBE_PID")" ||
+            fail "$WB_GATE" "the owned probe start time is unreadable"
+        wb_enter_mark="$(wc -c <"$ARTIFACTS/wb-cursor-probe.log")" ||
+            fail "$WB_GATE" "the owned client log went missing"
+        # shellcheck disable=SC2086 # two coordinates, second move after leave
         xdotool mousemove --window "$WID" $probe_center ||
             fail "$WB_GATE" "could not move onto the bound probe"
+        wb_bound_x="$(jq -r '.rect[0]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_y="$(jq -r '.rect[1]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_w="$(jq -r '.rect[2]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_h="$(jq -r '.rect[3]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        cstate ".pointer_position != null and .pointer_position[0] >= $wb_bound_x and .pointer_position[1] >= $wb_bound_y and .pointer_position[0] < $((wb_bound_x + wb_bound_w)) and .pointer_position[1] < $((wb_bound_y + wb_bound_h))" "pointer inside the bound rect" 5 ||
+            fail "$WB_GATE" "the pointer did not land inside the bound rect"
         wb_entered=""
         for _ in $(seq 1 20); do
-            if grep -q enter "$ARTIFACTS/wb-cursor-probe.log" 2>/dev/null; then wb_entered=1; break; fi
-            xdotool mousemove_relative 1 0 ||
-                fail "$WB_GATE" "pointer nudge failed"
+            if tail -c +$((wb_enter_mark + 1)) "$ARTIFACTS/wb-cursor-probe.log" 2>/dev/null | grep -q '"enter"'; then wb_entered=1; break; fi
             sleep 0.25
         done
         [ -n "$wb_entered" ] ||
-            fail "$WB_GATE" "the owned client never saw the pointer enter its bound surface"
+            fail "$WB_GATE" "no fresh pointer enter after the offset on the bound surface"
+        "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" fresh-enter \
+            --log "$ARTIFACTS/wb-cursor-probe.log" --offset "$wb_enter_mark" ||
+            fail "$WB_GATE" "no fresh pointer enter strictly after the offset"
+        kill -0 "$WB_PROBE_PID" 2>/dev/null ||
+            fail "$WB_GATE" "the owned probe client died across the enter handshake"
+        "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" check \
+            --cstate "$CSTATE" --owner "$ARTIFACTS/wb-probe-owner.json" \
+            --pid "$WB_PROBE_PID" ||
+            fail "$WB_GATE" "the owned probe binding broke across the enter handshake"
+        wb_probe_start_after="$(wb_proc_start_ticks "$WB_PROBE_PID")" ||
+            fail "$WB_GATE" "the owned probe start time is unreadable"
+        [ "$wb_probe_start_after" = "$wb_probe_start_before" ] ||
+            fail "$WB_GATE" "the owned probe client was replaced across the enter handshake"
     fi
     owner_rect="$(jq -c '.rect' "$ARTIFACTS/wb-probe-owner.json")" ||
         fail "$WB_GATE" "the bound probe rect went missing"
@@ -4161,12 +4254,26 @@ wb_capture() {
     png="$ARTIFACTS/wb-$label.png"
     cstate_before="$ARTIFACTS/wb-$label-cstate-before.json"
     cstate_after="$ARTIFACTS/wb-$label-cstate-after.json"
+    proc_before_file="$ARTIFACTS/wb-$label-proc-before.json"
+    proc_after_file="$ARTIFACTS/wb-$label-proc-after.json"
     cp "$CSTATE" "$cstate_before" || fail "$WB_GATE" "compositor state missing before $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
+        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
+        >"$proc_before_file" ||
+        fail "$WB_GATE" "capture-time process snapshot failed before $label"
     scrot "$png" >/dev/null || fail "$WB_GATE" "scrot failed for $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
+        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
+        >"$proc_after_file" ||
+        fail "$WB_GATE" "capture-time process snapshot failed after $label"
     cp "$CSTATE" "$cstate_after" || fail "$WB_GATE" "compositor state missing after $label"
-    proc_json="$("$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
-        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID")" ||
-        fail "$WB_GATE" "capture-time process snapshot failed for $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-sandwich \
+        --before "$proc_before_file" --after "$proc_after_file" --label "$label" ||
+        fail "$WB_GATE" "a capture-time process was replaced across $label"
+    proc_json="$(cat "$proc_after_file")" ||
+        fail "$WB_GATE" "capture-time process snapshot unreadable for $label"
+    proc_before_json="$(cat "$proc_before_file")" ||
+        fail "$WB_GATE" "capture-time process snapshot unreadable for $label"
     clk="$(jq -r '.animation_clock_ms // "null"' "$cstate_after")" ||
         fail "$WB_GATE" "clock unreadable after $label"
     epoch="$(date +%s)"
@@ -4174,9 +4281,42 @@ wb_capture() {
     jq -n -c --arg label "$label" --arg image "$png" \
         --arg before "$cstate_before" --arg after "$cstate_after" \
         --argjson clock "$clk" --argjson epoch "$epoch" --arg iso "$iso" \
-        --argjson proc "$proc_json" \
-        '{label:$label,image:$image,cstate_before:$before,cstate_after:$after,clock_ms:$clock,epoch:$epoch,iso:$iso,proc:$proc}' \
+        --argjson proc "$proc_json" --argjson proc_before "$proc_before_json" \
+        '{label:$label,image:$image,cstate_before:$before,cstate_after:$after,clock_ms:$clock,epoch:$epoch,iso:$iso,proc:$proc,proc_before:$proc_before}' \
         >>"$WB_CAPS_JSONL" || fail "$WB_GATE" "could not record $label"
+}
+
+wb_state_capture() {
+    label="$1"
+    cstate_before="$ARTIFACTS/wb-$label-cstate-before.json"
+    cstate_after="$ARTIFACTS/wb-$label-cstate-after.json"
+    proc_before_file="$ARTIFACTS/wb-$label-proc-before.json"
+    proc_after_file="$ARTIFACTS/wb-$label-proc-after.json"
+    cp "$CSTATE" "$cstate_before" || fail "$WB_GATE" "compositor state missing before $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
+        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
+        >"$proc_before_file" ||
+        fail "$WB_GATE" "capture-time process snapshot failed before $label"
+    cp "$CSTATE" "$cstate_after" || fail "$WB_GATE" "compositor state missing after $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
+        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
+        >"$proc_after_file" ||
+        fail "$WB_GATE" "capture-time process snapshot failed after $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-sandwich \
+        --before "$proc_before_file" --after "$proc_after_file" --label "$label" ||
+        fail "$WB_GATE" "a capture-time process was replaced across $label"
+    proc_json="$(cat "$proc_after_file")" ||
+        fail "$WB_GATE" "capture-time process snapshot unreadable for $label"
+    proc_before_json="$(cat "$proc_before_file")" ||
+        fail "$WB_GATE" "capture-time process snapshot unreadable for $label"
+    epoch="$(date +%s)"
+    iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    jq -n -c --arg label "$label" \
+        --arg before "$cstate_before" --arg after "$cstate_after" \
+        --argjson epoch "$epoch" --arg iso "$iso" \
+        --argjson proc "$proc_json" --argjson proc_before "$proc_before_json" \
+        '{label:$label,cstate_before:$before,cstate_after:$after,epoch:$epoch,iso:$iso,proc:$proc,proc_before:$proc_before}' \
+        >>"$WB_STATE_JSONL" || fail "$WB_GATE" "could not record $label"
 }
 
 wb_provenance_finish() {
@@ -4193,17 +4333,22 @@ wb_provenance_finish() {
         '{compositor:$c,shell:$s,probe:$p,frame_helper:$f,action_helper:$a,bind_helper:$b}' \
         >"$ARTIFACTS/wb-$WB_GATE-binaries.json"
     jq -s '.' "$WB_CAPS_JSONL" >"$ARTIFACTS/wb-$WB_GATE-captures.json"
+    jq -s '.' "$WB_STATE_JSONL" >"$ARTIFACTS/wb-$WB_GATE-state-captures.json"
     commit="$(git -C "$ROOT" rev-parse HEAD)"
     [ -n "$commit" ] || fail "$WB_GATE" "source commit missing"
     "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" provenance \
         --gate "$WB_GATE" --source-commit "$commit" \
         --binaries "$ARTIFACTS/wb-$WB_GATE-binaries.json" \
         --captures "$ARTIFACTS/wb-$WB_GATE-captures.json" \
+        --state-captures "$ARTIFACTS/wb-$WB_GATE-state-captures.json" \
         --owner "$ARTIFACTS/wb-probe-owner.json" \
         --regions "$ARTIFACTS/wb-regions.json" \
         --gate-start "$WB_START" \
         --output "$ARTIFACTS/wb-$WB_GATE-provenance.json" ||
         fail "$WB_GATE" "provenance failed to close"
+    if [ -s "$WB_STATE_JSONL" ]; then
+        echo "tuna-gtk-shell-proof: $WB_GATE state-only evidence: $(jq -r '[.[].label] | join(", ")' "$ARTIFACTS/wb-$WB_GATE-state-captures.json")"
+    fi
 }
 
 wb_step_ramp() {
@@ -4220,11 +4365,11 @@ wb_step_ramp() {
 }
 
 wb_limit_cleanup() {
+    wb_mark="$(wc -c <"$LOG")"
     gsettings reset org.gnome.desktop.screen-time-limits daily-limit-enabled ||
         fail "$WB_GATE" "could not reset the daily limit"
     gsettings reset org.gnome.desktop.screen-time-limits daily-limit-seconds ||
         fail "$WB_GATE" "could not reset the limit seconds"
-    wb_mark="$(wc -c <"$LOG")"
     end=$(($(date +%s) + 15))
     until tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" ||
         [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
@@ -4248,13 +4393,13 @@ wb_break_cleanup() {
     gsettings reset org.gnome.desktop.break-reminders.eyesight lock-screen ||
         fail "$WB_GATE" "could not reset lock-screen"
     open_calendar
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-$WB_GATE-cleared.json" 20 --press "Clear" ||
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-$WB_GATE-cleared.json" 20 --press "Clear" ||
         fail "$WB_GATE" "could not press Clear"
     xdotool key Escape || fail "$WB_GATE" "could not close the calendar"
     xdotool mousemove --window "$WID" 20 $((HEIGHT - 20)) ||
         fail "$WB_GATE" "could not park the pointer"
     sleep 3
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-$WB_GATE-quiet.json" 20 ||
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-$WB_GATE-quiet.json" 20 ||
         fail "$WB_GATE" "quiet dump failed"
     if showing "$ARTIFACTS/a11y-wb-$WB_GATE-quiet.json" "Time for an Eyesight Break"; then
         fail "$WB_GATE" "a break banner outlived cleanup"
@@ -4285,13 +4430,13 @@ anim_clock 0
 cstate '.animation_clock_manual' "frozen clock" ||
     fail G-WELLBEING-PIXEL-GRAY "the clock file did not freeze animation time"
 WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
+gray_mark="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.screen-time-limits grayscale true ||
     fail G-WELLBEING-PIXEL-GRAY "could not set grayscale"
 gsettings set org.gnome.desktop.screen-time-limits daily-limit-seconds 10 ||
     fail G-WELLBEING-PIXEL-GRAY "could not set the daily limit"
 gsettings set org.gnome.desktop.screen-time-limits daily-limit-enabled true ||
     fail G-WELLBEING-PIXEL-GRAY "could not enable the daily limit"
-gray_mark="$(wc -c <"$LOG")"
 end=$(($(date +%s) + 25))
 until tail -c +"$((gray_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=false" ||
     [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
@@ -4355,6 +4500,7 @@ anim_clock 0
 cstate '.animation_clock_manual' "frozen clock" ||
     fail G-WELLBEING-PIXEL-FADE "the clock file did not freeze animation time"
 WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
+fade_mark="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
     fail G-WELLBEING-PIXEL-FADE "could not set the break interval"
 gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 60 ||
@@ -4367,7 +4513,6 @@ gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
     fail G-WELLBEING-PIXEL-FADE "could not clear lock-screen"
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-PIXEL-FADE "could not select the eyesight break"
-fade_mark="$(wc -c <"$LOG")"
 sleep 15
 end=$(($(date +%s) + 15))
 until tail -c +"$((fade_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=true" ||
@@ -4393,9 +4538,9 @@ jq -s '[.[] | select(.label | startswith("fade-ramp-"))]' "$WB_CAPS_JSONL" \
     --regions "$ARTIFACTS/wb-regions.json" \
     --desaturation 0 --brightness 0.6 ||
     fail G-WELLBEING-PIXEL-FADE "neutral passed the fade assertion (weak test)"
+fade_off_mark="$(wc -c <"$LOG")"
 gsettings reset org.gnome.desktop.break-reminders selected-breaks ||
     fail G-WELLBEING-PIXEL-FADE "could not deselect breaks"
-fade_off_mark="$(wc -c <"$LOG")"
 end=$(($(date +%s) + 15))
 until tail -c +"$((fade_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" ||
     [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
@@ -4440,13 +4585,13 @@ anim_clock 0
 cstate '.animation_clock_manual' "frozen clock" ||
     fail G-WELLBEING-PIXEL-BOTH "the clock file did not freeze animation time"
 WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
+both_gray_mark="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.screen-time-limits grayscale true ||
     fail G-WELLBEING-PIXEL-BOTH "could not set grayscale"
 gsettings set org.gnome.desktop.screen-time-limits daily-limit-seconds 10 ||
     fail G-WELLBEING-PIXEL-BOTH "could not set the daily limit"
 gsettings set org.gnome.desktop.screen-time-limits daily-limit-enabled true ||
     fail G-WELLBEING-PIXEL-BOTH "could not enable the daily limit"
-both_gray_mark="$(wc -c <"$LOG")"
 end=$(($(date +%s) + 25))
 until tail -c +"$((both_gray_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=false" ||
     [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
@@ -4465,6 +4610,7 @@ jq -s '[.[] | select(.label | startswith("both-gray-"))]' "$WB_CAPS_JSONL" \
     --gate-start "$WB_START" \
     --receipt "$ARTIFACTS/wb-both-gray-check.json" ||
     fail G-WELLBEING-PIXEL-BOTH "the gray phase diverged from 3s EASE_OUT_QUAD"
+both_fade_mark="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
     fail G-WELLBEING-PIXEL-BOTH "could not set the break interval"
 gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 60 ||
@@ -4477,7 +4623,6 @@ gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
     fail G-WELLBEING-PIXEL-BOTH "could not clear lock-screen"
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-PIXEL-BOTH "could not select the eyesight break"
-both_fade_mark="$(wc -c <"$LOG")"
 sleep 15
 end=$(($(date +%s) + 15))
 until tail -c +"$((both_fade_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=true" ||
@@ -4504,9 +4649,9 @@ jq -s '[.[] | select(.label | startswith("both-fade-"))]' "$WB_CAPS_JSONL" \
     --desaturation 1 --brightness 0.6 ||
     fail G-WELLBEING-PIXEL-BOTH "neutral passed the combined assertion (weak test)"
 wb_limit_cleanup
+both_off_mark="$(wc -c <"$LOG")"
 gsettings reset org.gnome.desktop.break-reminders selected-breaks ||
     fail G-WELLBEING-PIXEL-BOTH "could not deselect breaks"
-both_off_mark="$(wc -c <"$LOG")"
 end=$(($(date +%s) + 15))
 until tail -c +"$((both_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" ||
     [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
@@ -4609,23 +4754,23 @@ else
         xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
             fail G-WELLBEING-ACTION-TAKE-LOCK "keep-alive failed"
         sleep 1
-        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-take-lock-due.json" 20 >/dev/null 2>&1 || continue
+        wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-due.json" 20 >/dev/null 2>&1 || continue
         if showing "$ARTIFACTS/a11y-wb-take-lock-due.json" "Time for an Eyesight Break"; then TAKEDUE=1; break; fi
     done
     [ -n "$TAKEDUE" ] || fail G-WELLBEING-ACTION-TAKE-LOCK "no due banner to take"
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-take-lock-press.json" 20 --press "Take" ||
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-press.json" 20 --press "Take" ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "could not press Take"
     cstate '.locked' "locked" 10 ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "Take did not lock the session"
-    wb_capture take-lock-locked
+    wb_state_capture take-lock-locked
     "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" locked \
         "$ARTIFACTS/wb-take-lock-locked-cstate-after.json" --expect true ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "lock not observed in state"
     cp "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-before.json"
     stale_code=0
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-take-lock-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
     cp "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-after.json"
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-take-lock-retired.json" 20 --pid "$WB_SHELL_PID" ||
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-retired.json" 20 ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
     "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
         --exit-code "$stale_code" \
@@ -4634,7 +4779,12 @@ else
         --action Take \
         --dump "$ARTIFACTS/a11y-wb-take-lock-retired.json" \
         --title "Time for an Eyesight Break" \
-        --gate-start "$WB_START" ||
+        --gate-start "$WB_START" \
+        --expect-pid "$WB_SHELL_PID" \
+        --expect-start "$WB_SHELL_START" \
+        --stamp "$ARTIFACTS/a11y-wb-take-lock-retired.json.stamp" \
+        --expect-gate G-WELLBEING-ACTION-TAKE-LOCK \
+        --expect-nonce "$WB_NONCE" ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "a stale Take press fired"
     sleep 1
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1 ||
@@ -4649,7 +4799,7 @@ else
     gsettings set org.gnome.desktop.notifications show-banners false ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "could not restore DND"
     wb_provenance_finish
-    pass G-WELLBEING-ACTION-TAKE-LOCK "an actual Take press locks the session and a stale Take fails"
+    pass G-WELLBEING-ACTION-TAKE-LOCK "an actual Take press locks the session (state-only locked evidence) and a stale Take fails"
 fi
 
 # Take-with-fade: an ACTUAL Take press (lock off, fade on) produces a
@@ -4698,11 +4848,11 @@ while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-TAKE-FADE "keep-alive failed"
     sleep 1
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-take-fade-due.json" 20 >/dev/null 2>&1 || continue
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-due.json" 20 >/dev/null 2>&1 || continue
     if showing "$ARTIFACTS/a11y-wb-take-fade-due.json" "Time for an Eyesight Break"; then FADEDUE=1; break; fi
 done
 [ -n "$FADEDUE" ] || fail G-WELLBEING-ACTION-TAKE-FADE "no due banner to take"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-take-fade-press.json" 20 --press "Take" ||
+wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-press.json" 20 --press "Take" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "could not press Take"
 cstate '.wellbeing_effects.brightness < 1' "fade started" 10 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "Take produced no fade"
@@ -4725,9 +4875,9 @@ wb_capture take-fade-settled
     fail G-WELLBEING-ACTION-TAKE-FADE "no faded frame on the owned probe"
 cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-before.json"
 stale_code=0
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-take-fade-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
+wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
 cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-after.json"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-take-fade-retired.json" 20 --pid "$WB_SHELL_PID" ||
+wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-retired.json" 20 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
     --exit-code "$stale_code" \
@@ -4736,7 +4886,12 @@ cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-after.json"
     --action Take \
     --dump "$ARTIFACTS/a11y-wb-take-fade-retired.json" \
     --title "Time for an Eyesight Break" \
-    --gate-start "$WB_START" ||
+    --gate-start "$WB_START" \
+    --expect-pid "$WB_SHELL_PID" \
+    --expect-start "$WB_SHELL_START" \
+    --stamp "$ARTIFACTS/a11y-wb-take-fade-retired.json.stamp" \
+    --expect-gate G-WELLBEING-ACTION-TAKE-FADE \
+    --expect-nonce "$WB_NONCE" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "a stale Take press fired"
 wb_break_cleanup
 gsettings set org.gnome.desktop.notifications show-banners false ||
@@ -4777,7 +4932,7 @@ while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
     sleep 1
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-delay-due.json" 20 >/dev/null 2>&1 || continue
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-due.json" 20 >/dev/null 2>&1 || continue
     if showing "$ARTIFACTS/a11y-wb-delay-due.json" "Time for an Eyesight Break"; then
         delay_due_epoch="$(date +%s)"
         DELAYDUE=1
@@ -4785,16 +4940,16 @@ while [ "$(date +%s)" -le "$end" ]; do
     fi
 done
 [ -n "$DELAYDUE" ] || fail G-WELLBEING-ACTION-DELAY "no due banner to delay"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-delay-press.json" 20 --press "Delay" ||
+wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-press.json" 20 --press "Delay" ||
     fail G-WELLBEING-ACTION-DELAY "could not press Delay"
 cp "$CSTATE" "$ARTIFACTS/wb-delay-stale-before.json"
 stale_code=0
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-delay-stale.json" 20 --press "Delay" >/dev/null 2>&1 || stale_code=$?
+wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-stale.json" 20 --press "Delay" >/dev/null 2>&1 || stale_code=$?
 cp "$CSTATE" "$ARTIFACTS/wb-delay-stale-after.json"
 # The retired dump is taken now (the redue banner is not showing yet);
 # the stale verdict waits for the redue so the due schedule the live
 # press set is proven undisturbed by the stale press.
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-delay-retired.json" 20 --pid "$WB_SHELL_PID" ||
+wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-retired.json" 20 ||
     fail G-WELLBEING-ACTION-DELAY "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 DELAYREDUE=""
 end=$(($(date +%s) + 45))
@@ -4805,7 +4960,7 @@ while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
     sleep 1
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-delay-redue.json" 20 >/dev/null 2>&1 || continue
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-redue.json" 20 >/dev/null 2>&1 || continue
     if showing "$ARTIFACTS/a11y-wb-delay-redue.json" "Time for an Eyesight Break"; then
         delay_redue_epoch="$(date +%s)"
         DELAYREDUE=1
@@ -4825,6 +4980,11 @@ wb_capture delay-redue
     --dump "$ARTIFACTS/a11y-wb-delay-retired.json" \
     --title "Time for an Eyesight Break" \
     --gate-start "$WB_START" \
+    --expect-pid "$WB_SHELL_PID" \
+    --expect-start "$WB_SHELL_START" \
+    --stamp "$ARTIFACTS/a11y-wb-delay-retired.json.stamp" \
+    --expect-gate G-WELLBEING-ACTION-DELAY \
+    --expect-nonce "$WB_NONCE" \
     --due-kind delay --due-old "$delay_due_epoch" --due-new "$delay_redue_epoch" --due-expect 30 ||
     fail G-WELLBEING-ACTION-DELAY "a stale Delay press fired"
 wb_break_cleanup
@@ -4864,21 +5024,21 @@ while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
     sleep 1
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-skip-due.json" 20 >/dev/null 2>&1 || continue
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-due.json" 20 >/dev/null 2>&1 || continue
     if showing "$ARTIFACTS/a11y-wb-skip-due.json" "Time for an Eyesight Break"; then SKIPDUE=1; break; fi
 done
 [ -n "$SKIPDUE" ] || fail G-WELLBEING-ACTION-SKIP "no due banner to skip"
 skip_press_epoch="$(date +%s)"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-skip-press.json" 20 --press "Skip" ||
+wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-press.json" 20 --press "Skip" ||
     fail G-WELLBEING-ACTION-SKIP "could not press Skip"
 cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-before.json"
 stale_code=0
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-skip-stale.json" 20 --press "Skip" >/dev/null 2>&1 || stale_code=$?
+wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-stale.json" 20 --press "Skip" >/dev/null 2>&1 || stale_code=$?
 cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-after.json"
 # The retired dump is taken now (the redue banner is not showing yet);
 # the stale verdict waits for the redue so the interval restart the
 # live press set is proven undisturbed by the stale press.
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-skip-retired.json" 20 --pid "$WB_SHELL_PID" ||
+wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-retired.json" 20 ||
     fail G-WELLBEING-ACTION-SKIP "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 SKIPREDUE=""
 end=$(($(date +%s) + 30))
@@ -4889,7 +5049,7 @@ while [ "$(date +%s)" -le "$end" ]; do
     xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
     sleep 1
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-skip-redue.json" 20 >/dev/null 2>&1 || continue
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-redue.json" 20 >/dev/null 2>&1 || continue
     if showing "$ARTIFACTS/a11y-wb-skip-redue.json" "Time for an Eyesight Break"; then
         skip_redue_epoch="$(date +%s)"
         SKIPREDUE=1
@@ -4909,6 +5069,11 @@ wb_capture skip-redue
     --dump "$ARTIFACTS/a11y-wb-skip-retired.json" \
     --title "Time for an Eyesight Break" \
     --gate-start "$WB_START" \
+    --expect-pid "$WB_SHELL_PID" \
+    --expect-start "$WB_SHELL_START" \
+    --stamp "$ARTIFACTS/a11y-wb-skip-retired.json.stamp" \
+    --expect-gate G-WELLBEING-ACTION-SKIP \
+    --expect-nonce "$WB_NONCE" \
     --due-kind skip --due-old "$skip_press_epoch" --due-new "$skip_redue_epoch" --due-expect 10 ||
     fail G-WELLBEING-ACTION-SKIP "a stale Skip press fired"
 wb_break_cleanup
@@ -4959,9 +5124,9 @@ done
     fail G-WELLBEING-NEGATIVE "the fade 1500ms intermediate diverged from 0.7"
 cp "$CSTATE" "$ARTIFACTS/wb-negative-stale-before.json"
 stale_code=0
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-negative-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
+wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
 cp "$CSTATE" "$ARTIFACTS/wb-negative-stale-after.json"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wb-negative-retired.json" 20 --pid "$WB_SHELL_PID" ||
+wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-retired.json" 20 ||
     fail G-WELLBEING-NEGATIVE "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
     --exit-code "$stale_code" \
@@ -4970,7 +5135,12 @@ cp "$CSTATE" "$ARTIFACTS/wb-negative-stale-after.json"
     --action Take \
     --dump "$ARTIFACTS/a11y-wb-negative-retired.json" \
     --title "Time for an Eyesight Break" \
-    --gate-start "$WB_START" ||
+    --gate-start "$WB_START" \
+    --expect-pid "$WB_SHELL_PID" \
+    --expect-start "$WB_SHELL_START" \
+    --stamp "$ARTIFACTS/a11y-wb-negative-retired.json.stamp" \
+    --expect-gate G-WELLBEING-NEGATIVE \
+    --expect-nonce "$WB_NONCE" ||
     fail G-WELLBEING-NEGATIVE "a post-cleanup stale Take press fired"
 wb_capture negative-baseline
 wb_provenance_finish

@@ -134,8 +134,14 @@ class FrameMath(unittest.TestCase):
 
     def test_neutral_fixture_cannot_prove_desaturation(self):
         regions = [{'name': 'probe', 'kind': 'texture', 'rect': [0, 0, 16, 16]}]
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(mod.HarnessError):
             mod.verify_frame(solid((80, 80, 80)), solid((48, 48, 48)), regions, 1.0, 0.6)
+
+    def test_pixel_mismatch_is_effect_mismatch_assertion(self):
+        regions = [{'name': 'probe', 'kind': 'texture', 'rect': [8, 8, 16, 16]}]
+        self.assertTrue(issubclass(mod.EffectMismatch, AssertionError))
+        with self.assertRaises(mod.EffectMismatch):
+            mod.verify_frame(solid(PURPLE), solid(PURPLE), regions, 1.0, 1.0)
 
     def test_cursor_region_bypasses_effect(self):
         regions = [{'name': 'cursor', 'kind': 'cursor', 'rect': [0, 0, 16, 16]}]
@@ -407,9 +413,11 @@ class RampRules(unittest.TestCase):
             before, after = tmp / f'c{ms}-before.json', tmp / f'c{ms}-after.json'
             cstate(before, ms, d, b, anim)
             cstate(after, ms, d, b, anim)
+            snap = proc()
             caps.append({'label': f'c{ms}', 'image': str(png),
                          'cstate_before': str(before), 'cstate_after': str(after),
-                         'clock_ms': ms, 'epoch': time.time(), 'proc': proc()})
+                         'clock_ms': ms, 'epoch': time.time(), 'proc': snap,
+                         'proc_before': json.loads(json.dumps(snap))})
         caps_path = tmp / 'caps.json'
         caps_path.write_text(json.dumps(caps))
         return base, caps_path, regions
@@ -553,9 +561,11 @@ class RampRules(unittest.TestCase):
                 before, after = tmp / f's{ms}-before.json', tmp / f's{ms}-after.json'
                 cstate(before, ms, d, b, elapsed < 3000)
                 cstate(after, ms, d, b, elapsed < 3000)
+                snap = proc()
                 caps.append({'label': f's{ms}', 'image': str(png),
                              'cstate_before': str(before), 'cstate_after': str(after),
-                             'clock_ms': ms, 'epoch': time.time(), 'proc': proc()})
+                             'clock_ms': ms, 'epoch': time.time(), 'proc': snap,
+                             'proc_before': json.loads(json.dumps(snap))})
             caps_path = tmp / 'caps.json'
             caps_path.write_text(json.dumps(caps))
             receipt = mod.verify_ramp(base, caps_path, regions, 'settled', True, 20000,
@@ -672,7 +682,8 @@ class ProvenanceRules(unittest.TestCase):
         caps = [{'label': 's', 'image': str(img),
                  'cstate_before': str(before), 'cstate_after': str(after),
                  'clock_ms': 10000, 'epoch': time.time(), 'iso': 't',
-                 'proc': snap}]
+                 'proc': snap,
+                 'proc_before': json.loads(json.dumps(snap))}]
         binaries = {'compositor': str(blob), 'shell': str(blob),
                     'probe': str(blob)}
         return gate_start, binaries, caps
@@ -763,6 +774,345 @@ class ProvenanceRules(unittest.TestCase):
             caps[0]['cstate_after'] = str(open_ov)
             with self.assertRaises(AssertionError):
                 self.record(tmp, binaries, caps)
+
+    def test_provenance_receipt_is_labeled_live_self_consistency(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            _, binaries, caps = self.build(tmp)
+            receipt = self.record(tmp, binaries, caps)
+            self.assertEqual(receipt['attestation'], mod.ATTESTATION_LABEL)
+            self.assertIn('outer CI build admission', receipt['attestation'])
+            self.assertIn('never standalone attestation',
+                          receipt['attestation'])
+
+    def test_provenance_rejects_mid_capture_replacement(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            _, binaries, caps = self.build(tmp)
+            caps[0]['proc']['processes']['probe']['start_ticks'] = 999999
+            with self.assertRaises(AssertionError):
+                self.record(tmp, binaries, caps)
+
+    def test_provenance_rejects_capture_without_before_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            _, binaries, caps = self.build(tmp)
+            del caps[0]['proc_before']
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+
+class MismatchOnlyNeutral(unittest.TestCase):
+    REGIONS = [{'name': 'probe', 'kind': 'texture', 'rect': [8, 8, 16, 16]}]
+
+    def test_achromatic_baseline_is_invalid_fixture(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            gray = tmp / 'gray.png'
+            solid((80, 80, 80)).save(gray)
+            with self.assertRaises(mod.HarnessError):
+                mod.negative_neutral_must_fail(
+                    gray, gray, self.REGIONS, 1.0, 0.6)
+
+    def test_unowned_baseline_is_invalid_fixture(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            red = tmp / 'red.png'
+            solid(RED).save(red)
+            with self.assertRaises(mod.HarnessError):
+                mod.negative_neutral_must_fail(
+                    red, red, self.REGIONS, 1.0, 0.6)
+
+    def test_saturated_owned_neutral_still_fails_the_effect(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            base = tmp / 'base.png'
+            solid(PURPLE).save(base)
+            self.assertTrue(mod.negative_neutral_must_fail(
+                base, base, self.REGIONS, 1.0, 0.6))
+
+    def test_fixture_error_is_not_swallowed_as_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            gray = tmp / 'gray.png'
+            solid((80, 80, 80)).save(gray)
+            try:
+                mod.negative_neutral_must_fail(
+                    gray, gray, self.REGIONS, 1.0, 0.6)
+            except mod.EffectMismatch:
+                self.fail('invalid fixture must not report EffectMismatch')
+            except mod.HarnessError:
+                pass
+
+
+class BracketSchema(unittest.TestCase):
+    def docs(self, tmp):
+        before, after = tmp / 'b.json', tmp / 'a.json'
+        cstate(before, 10000, 0.0, 1.0, False)
+        cstate(after, 10000, 0.0, 1.0, False)
+        return json.loads(before.read_text()), json.loads(after.read_text())
+
+    def regions(self):
+        return [{'name': 'probe', 'kind': 'texture', 'rect': [8, 8, 16, 16]}]
+
+    def test_untyped_clock_is_harness_error_not_equal(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for manual, ms in ((None, None), ('true', 10000), (True, '10000'),
+                               (True, 10000.0), (1, 10000), (True, True),
+                               (True, -5)):
+                before, after = self.docs(tmp)
+                before['animation_clock_manual'] = manual
+                after['animation_clock_manual'] = manual
+                before['animation_clock_ms'] = ms
+                after['animation_clock_ms'] = ms
+                with self.assertRaises(mod.HarnessError,
+                                       msg=f'manual={manual!r} ms={ms!r}'):
+                    mod.check_bracket(before, after, owner(), self.regions(),
+                                      't')
+
+    def test_missing_clock_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            before, after = self.docs(tmp)
+            del before['animation_clock_ms']
+            with self.assertRaises(mod.HarnessError):
+                mod.check_bracket(before, after, owner(), self.regions(), 't')
+
+    def test_untyped_effect_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for key, bad in (('desaturation', 'none'), ('brightness', 'high'),
+                             ('desaturation', None), ('brightness', None),
+                             ('brightness', True), ('desaturation', False),
+                             ('brightness', float('nan')),
+                             ('desaturation', float('inf')),
+                             ('animating', 1), ('animating', 'yes')):
+                before, after = self.docs(tmp)
+                before['wellbeing_effects'][key] = bad
+                after['wellbeing_effects'][key] = bad
+                with self.assertRaises(mod.HarnessError,
+                                       msg=f'{key}={bad!r}'):
+                    mod.check_bracket(before, after, owner(), self.regions(),
+                                      't')
+
+    def test_missing_effect_field_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for key in ('desaturation', 'brightness', 'animating'):
+                before, after = self.docs(tmp)
+                del before['wellbeing_effects'][key]
+                del after['wellbeing_effects'][key]
+                with self.assertRaises(mod.HarnessError, msg=key):
+                    mod.check_bracket(before, after, owner(), self.regions(),
+                                      't')
+
+    def test_degenerate_geometry_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for bad_rect in ([0, 0, 1, 32], [0, 0, 32, 0], [0, 0, -4, 32],
+                             [0, 0, 32], 'rect', None, [0, 0, True, 32]):
+                before, after = self.docs(tmp)
+                before['windows'][0]['rect'] = bad_rect
+                after['windows'][0]['rect'] = bad_rect
+                with self.assertRaises(mod.HarnessError,
+                                       msg=f'rect={bad_rect!r}'):
+                    mod.check_bracket(before, after, owner(), self.regions(),
+                                      't')
+
+    def test_untyped_owner_rect_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            before, after = self.docs(tmp)
+            with self.assertRaises(mod.HarnessError):
+                mod.check_bracket(before, after, owner(rect=[0, 0, 1, 1]),
+                                  self.regions(), 't')
+
+    def test_typed_identical_bracket_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            before, after = self.docs(tmp)
+            mod.check_bracket(before, after, owner(), self.regions(), 't')
+
+
+class ProcSandwich(unittest.TestCase):
+    def test_held_sandwich_passes(self):
+        snap = proc()
+        self.assertTrue(mod.check_proc_sandwich(
+            json.loads(json.dumps(snap)), snap, 's'))
+
+    def test_mid_capture_replacement_fails(self):
+        with self.assertRaises(AssertionError):
+            mod.check_proc_sandwich(proc(start=777), proc(start=778), 's')
+
+    def test_mid_capture_exe_swap_fails(self):
+        with self.assertRaises(AssertionError):
+            mod.check_proc_sandwich(proc(exe='e' * 64), proc(exe='f' * 64),
+                                    's')
+
+    def test_mid_capture_boot_change_fails(self):
+        with self.assertRaises(AssertionError):
+            mod.check_proc_sandwich(proc(boot='boot-1'), proc(boot='boot-2'),
+                                    's')
+
+    def test_malformed_sandwich_is_harness_error(self):
+        with self.assertRaises(mod.HarnessError):
+            mod.check_proc_sandwich({}, proc(), 's')
+        with self.assertRaises(mod.HarnessError):
+            mod.check_proc_sandwich(proc(), {'boot_id': 'x'}, 's')
+
+    def test_sandwich_cli_holds_and_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            snap = proc()
+            held = tmp / 'held.json'
+            held.write_text(json.dumps(snap))
+            code = mod.main(['proc-sandwich', '--before', str(held),
+                             '--after', str(held), '--label', 's'])
+            self.assertEqual(code, 0)
+            swapped = tmp / 'swapped.json'
+            swapped.write_text(json.dumps(proc(exe='f' * 64)))
+            with self.assertRaises(AssertionError):
+                mod.main(['proc-sandwich', '--before', str(held),
+                          '--after', str(swapped), '--label', 's'])
+
+
+class StateOnlyLocked(unittest.TestCase):
+    REGIONS = [{'name': 'probe', 'kind': 'texture', 'rect': [8, 8, 16, 16]}]
+
+    def locked_doc(self, locked=True, pointer=None, cursor=None,
+                   brightness=1.0, wb=True):
+        doc = {'animation_clock_manual': False, 'animation_clock_ms': None,
+               'motion_policy': 'full', 'locked': locked,
+               'pointer_position': pointer, 'cursor': cursor,
+               'wellbeing_effects': {'desaturation': 0.0,
+                                     'brightness': brightness,
+                                     'animating': False}}
+        if not wb:
+            del doc['wellbeing_effects']
+        return doc
+
+    def build(self, tmp, before_doc=None, after_doc=None, extra_cap=None):
+        blob = tmp / 'bin'
+        blob.write_bytes(b'proof-binary')
+        snap = proc(exe=mod.digest(blob))
+        before = tmp / 'locked-before.json'
+        after = tmp / 'locked-after.json'
+        before.write_text(json.dumps(
+            self.locked_doc() if before_doc is None else before_doc))
+        after.write_text(json.dumps(
+            self.locked_doc() if after_doc is None else after_doc))
+        caps = [{'label': 'take-lock-locked',
+                 'cstate_before': str(before), 'cstate_after': str(after),
+                 'epoch': time.time(), 'iso': 't', 'proc': snap,
+                 'proc_before': json.loads(json.dumps(snap))}]
+        if extra_cap:
+            caps[0].update(extra_cap)
+        binaries = {'compositor': str(blob), 'shell': str(blob),
+                    'probe': str(blob)}
+        return binaries, caps
+
+    def record(self, tmp, binaries, state_caps, pixel_caps=None):
+        return mod.record_provenance(
+            'G-TEST', '0ac3ec7bce96', binaries,
+            [] if pixel_caps is None else pixel_caps,
+            owner(), self.REGIONS, tmp / 'prov.json', time.time() - 1,
+            state_captures=state_caps)
+
+    def test_locked_state_only_passes_without_pixels(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(tmp)
+            receipt = self.record(tmp, binaries, caps)
+            self.assertEqual(receipt['captures'], [])
+            self.assertEqual(len(receipt['state_only_captures']), 1)
+            entry = receipt['state_only_captures'][0]
+            self.assertEqual(entry['label'], 'take-lock-locked')
+            self.assertEqual(entry['evidence'], 'state-only')
+            self.assertEqual(entry['lock_schema_receipt'], 'PENDING')
+            self.assertNotIn('image', entry)
+            self.assertNotIn('clock_ms', entry)
+
+    def test_lock_schema_receipt_flagged_pending(self):
+        self.assertTrue(mod.LOCK_SCHEMA_RECEIPT_PENDING)
+
+    def test_unlocked_state_is_a_verdict_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(
+                tmp, after_doc=self.locked_doc(locked=False))
+            with self.assertRaises(AssertionError):
+                self.record(tmp, binaries, caps)
+
+    def test_untyped_locked_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(
+                tmp, after_doc=self.locked_doc(locked=1))
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_missing_effects_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(
+                tmp, after_doc=self.locked_doc(wb=False))
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_unredacted_pointer_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(
+                tmp, after_doc=self.locked_doc(pointer=[10, 10]))
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_unredacted_cursor_is_harness_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(
+                tmp, after_doc=self.locked_doc(cursor={'theme': 'x'}))
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_pixel_keys_forbidden_in_state_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(tmp, extra_cap={'image': 'x.png'})
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+            binaries, caps = self.build(tmp, extra_cap={'clock_ms': 3})
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_state_sandwich_break_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(tmp)
+            caps[0]['proc']['processes']['shell']['start_ticks'] = 424242
+            with self.assertRaises(AssertionError):
+                self.record(tmp, binaries, caps)
+
+    def test_state_capture_missing_before_snapshot_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            binaries, caps = self.build(tmp)
+            del caps[0]['proc_before']
+            with self.assertRaises(mod.HarnessError):
+                self.record(tmp, binaries, caps)
+
+    def test_no_captures_at_all_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            blob = tmp / 'bin'
+            blob.write_bytes(b'proof-binary')
+            binaries = {'compositor': str(blob), 'shell': str(blob),
+                        'probe': str(blob)}
+            with self.assertRaises(mod.HarnessError):
+                mod.record_provenance('G-TEST', '0ac3ec7bce96', binaries, [],
+                                      owner(), self.REGIONS, tmp / 'prov.json',
+                                      time.time() - 1, state_captures=[])
 
 
 if __name__ == '__main__':

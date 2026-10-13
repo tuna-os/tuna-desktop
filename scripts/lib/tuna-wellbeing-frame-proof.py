@@ -28,6 +28,21 @@ Hardening (w3-354pixel-proof4f):
   broken harness), never a pass and never a pixel verdict.
   Pixel/effect verdicts raise AssertionError (exit 1) as before.
 
+Gatefix hardening (issue #354 stays OPEN): pixel mismatches raise
+EffectMismatch (an AssertionError) and ONLY pixel mismatches do; an
+achromatic or unowned baseline is an invalid fixture (HarnessError),
+and the neutral control validates its saturated baseline and known
+ownership before any verdict. Brackets require a full typed finite
+clock/effect schema on BOTH states (no None == None). Every capture
+carries process snapshots from BEFORE and AFTER its scrot; any
+replacement or exe-swap across the sandwich fails. Provenance
+receipts are labeled live self-consistency under outer CI build
+admission, never standalone attestation. Locked captures travel a
+separate state-only + process evidence path (no pixels, no pixel
+bracket, no pixel label; state-only labels in gate output and
+receipt); unlocked gates keep full bracketing. The lock CSTATE
+schema receipt is PENDING (see LOCK_SCHEMA_RECEIPT_PENDING).
+
 Semantics match GNOME 51 source (docs/wellbeing-effect-protocol.md):
 gray entry eases DesaturateEffect factor 0->1.0 over 3000 ms
 EASE_OUT_QUAD; fade entry eases brightness 1.0->0.6 over 3000 ms
@@ -40,6 +55,7 @@ Pixel tolerance is fixed at 2 (no widening); logs never qualify.
 import argparse
 import hashlib
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -64,6 +80,23 @@ KINDS = ('texture', 'solid', 'cursor')
 
 class HarnessError(Exception):
     """Malformed geometry/image/capture input: broken harness, not a verdict."""
+
+
+class EffectMismatch(AssertionError):
+    """Pixel verdict: the frame differs from the expected effect (exit 1)."""
+
+
+ATTESTATION_LABEL = ('live self-consistency '
+                     '(outer CI build admission required; '
+                     'never standalone attestation)')
+
+# Lock-schema receipt status: PENDING. No exact current-schema locked
+# CSTATE receipt exists on disk (archived locked snapshots predate the
+# wellbeing_effects/animation_clock keys the current writer always
+# emits); the state-only separation below is implemented against the
+# source-validated redaction shape and flagged for nested-CI
+# observation. See require_locked_state.
+LOCK_SCHEMA_RECEIPT_PENDING = True
 
 
 def digest(path):
@@ -186,9 +219,14 @@ def verify_frame(baseline, current, regions, desaturation, brightness,
                     expected = transform(before, desaturation, brightness)
                 error = max(abs(a - e) for a, e in zip(after, expected))
                 max_error = max(error, max_error)
-                assert error <= TOLERANCE, (region['name'], px, py, before, after, expected, error)
+                if error > TOLERANCE:
+                    raise EffectMismatch(
+                        (region['name'], px, py, before, after, expected, error))
                 count += 1
-        assert chroma >= CHROMA_MIN, (region['name'], 'neutral fixture cannot prove desaturation')
+        if chroma < CHROMA_MIN:
+            raise HarnessError(
+                f"{region['name']}: neutral fixture cannot prove desaturation "
+                f'(baseline chroma {chroma} < {CHROMA_MIN}; invalid fixture)')
         results.append({'name': region['name'], 'kind': region['kind'],
                         'rect': region['rect'], 'pixels': count,
                         'maximum_error': max_error})
@@ -306,36 +344,82 @@ def bound_window(doc, owner, label):
     return window
 
 
+def require_bracket_rect(rect, label):
+    """Typed finite nondegenerate geometry (no None, no bools, no 1px husks)."""
+    if (not isinstance(rect, list) or len(rect) != 4
+            or not all(type(v) is int for v in rect)):
+        raise HarnessError(f'{label}: rect must be 4 ints: {rect!r:.80}')
+    if rect[2] < 2 or rect[3] < 2:
+        raise HarnessError(f'{label}: rect is degenerate: {rect!r}')
+    return list(rect)
+
+
+def require_bracket_state(doc, label, side):
+    """Full typed finite clock/effect schema for one bracket side.
+
+    Manual-clock bool, int ms, finite desaturation/brightness and bool
+    animating must all be present and typed on BOTH states before any
+    mid-bracket comparison; untyped, missing, NaN or infinite fields
+    are harness errors (None == None never passes).
+    """
+    if not isinstance(doc, dict):
+        raise HarnessError(f'{label}/{side}: cstate is not an object')
+    manual = doc.get('animation_clock_manual')
+    if type(manual) is not bool:
+        raise HarnessError(
+            f'{label}/{side}: animation_clock_manual must be a bool, '
+            f'got {manual!r}')
+    ms = doc.get('animation_clock_ms')
+    if type(ms) is not int or ms < 0:
+        raise HarnessError(
+            f'{label}/{side}: animation_clock_ms must be a non-negative int, '
+            f'got {ms!r}')
+    wb = doc.get('wellbeing_effects')
+    if not isinstance(wb, dict):
+        raise HarnessError(
+            f'{label}/{side}: wellbeing_effects missing or malformed')
+    for key in ('desaturation', 'brightness'):
+        value = wb.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value):
+            raise HarnessError(
+                f'{label}/{side}: wellbeing_effects.{key} must be a finite '
+                f'number, got {value!r}')
+    if type(wb.get('animating')) is not bool:
+        raise HarnessError(
+            f'{label}/{side}: wellbeing_effects.animating must be a bool, '
+            f'got {wb.get("animating")!r}')
+    return manual, ms, wb
+
+
 def check_bracket(before_doc, after_doc, owner, regions, label):
     """Identical manual clock + effect sample + owned geometry, or discard."""
     if not isinstance(owner, dict) or 'id' not in owner or 'rect' not in owner:
         raise HarnessError(f'{label}: bound owner record missing or malformed')
-    assert before_doc.get('animation_clock_manual') == after_doc.get('animation_clock_manual'), \
+    owner_rect = require_bracket_rect(owner['rect'], f'{label}: bound owner')
+    before_manual, before_ms, before_wb = require_bracket_state(
+        before_doc, label, 'before')
+    after_manual, after_ms, after_wb = require_bracket_state(
+        after_doc, label, 'after')
+    assert before_manual == after_manual, \
         (label, 'manual clock mode changed mid-bracket',
-         before_doc.get('animation_clock_manual'), after_doc.get('animation_clock_manual'))
-    assert before_doc.get('animation_clock_ms') == after_doc.get('animation_clock_ms'), \
-        (label, 'animation clock changed mid-bracket',
-         before_doc.get('animation_clock_ms'), after_doc.get('animation_clock_ms'))
+         before_manual, after_manual)
+    assert before_ms == after_ms, \
+        (label, 'animation clock changed mid-bracket', before_ms, after_ms)
     for key in ('desaturation', 'brightness', 'animating'):
-        before_wb = before_doc.get('wellbeing_effects') or {}
-        after_wb = after_doc.get('wellbeing_effects') or {}
-        if key not in before_wb or key not in after_wb:
-            raise HarnessError(f'{label}: wellbeing_effects.{key} missing mid-bracket')
         assert before_wb[key] == after_wb[key], \
             (label, f'effect sample {key} changed mid-bracket',
              before_wb[key], after_wb[key])
     before_window = bound_window(before_doc, owner, label)
     after_window = bound_window(after_doc, owner, label)
-    assert list(before_window['rect']) == list(after_window['rect']), \
-        (label, 'owned geometry changed mid-bracket',
-         before_window['rect'], after_window['rect'])
-    assert list(after_window['rect']) == list(owner['rect']), \
-        (label, 'owned geometry left the bound rect',
-         after_window['rect'], owner['rect'])
-    owner_rect = owner['rect']
-    if (not isinstance(owner_rect, list) or len(owner_rect) != 4
-            or not all(type(v) is int for v in owner_rect)):
-        raise HarnessError(f'{label}: bound owner rect malformed: {owner_rect!r:.80}')
+    before_rect = require_bracket_rect(
+        before_window.get('rect'), f'{label}/before: owned window')
+    after_rect = require_bracket_rect(
+        after_window.get('rect'), f'{label}/after: owned window')
+    assert before_rect == after_rect, \
+        (label, 'owned geometry changed mid-bracket', before_rect, after_rect)
+    assert after_rect == owner_rect, \
+        (label, 'owned geometry left the bound rect', after_rect, owner_rect)
     for sampled in region_rects(regions):
         if not rect_contains(owner_rect, sampled):
             raise HarnessError(
@@ -356,12 +440,14 @@ def check_fresh(path, gate_start_epoch, label):
 def validate_capture(cap):
     if not isinstance(cap, dict):
         raise HarnessError(f'capture must be an object: {cap!r:.120}')
-    for key in ('label', 'image', 'cstate_before', 'cstate_after', 'clock_ms', 'proc'):
+    for key in ('label', 'image', 'cstate_before', 'cstate_after', 'clock_ms',
+                'proc', 'proc_before'):
         if key not in cap:
             raise HarnessError(f'capture missing {key}: {cap!r:.120}')
     if type(cap['clock_ms']) is not int:
         raise HarnessError(f"capture {cap.get('label')}: clock_ms must be an int")
-    validate_proc_snapshot(cap['proc'], cap.get('label'))
+    validate_proc_snapshot(cap['proc'], f"{cap.get('label')}/after")
+    validate_proc_snapshot(cap['proc_before'], f"{cap.get('label')}/before")
 
 
 def validate_proc_snapshot(proc, label):
@@ -428,6 +514,24 @@ def check_proc_agreement(captures):
                           for name, e in first['processes'].items()}}
 
 
+def check_proc_sandwich(proc_before, proc_after, label):
+    """Lifetime sandwich: no replacement or exe-swap across one capture."""
+    validate_proc_snapshot(proc_before, f'{label}/before')
+    validate_proc_snapshot(proc_after, f'{label}/after')
+    assert proc_after['boot_id'] == proc_before['boot_id'], \
+        (label, 'boot id changed mid-capture')
+    assert set(proc_after['processes']) == set(proc_before['processes']), \
+        (label, 'capture-time process set changed mid-capture')
+    for name, entry in proc_before['processes'].items():
+        live = proc_after['processes'][name]
+        assert live['pid'] == entry['pid'] \
+            and live['start_ticks'] == entry['start_ticks'], \
+            (label, f'{name} lifetime changed mid-capture')
+        assert live['exe_sha256'] == entry['exe_sha256'], \
+            (label, f'{name} binary bytes changed mid-capture')
+    return True
+
+
 def verify_ramp(baseline_path, captures_path, regions, grayscale, fade,
                 start_clock_ms, owner, duration_ms=RAMP_MS, gate_start_epoch=0.0,
                 motion_required='full'):
@@ -445,6 +549,7 @@ def verify_ramp(baseline_path, captures_path, regions, grayscale, fade,
         'ramp needs baseline-adjacent entry, intermediate and endpoint captures'
     for cap in captures:
         validate_capture(cap)
+        check_proc_sandwich(cap['proc_before'], cap['proc'], cap['label'])
     ordered = sorted(captures, key=lambda c: c['clock_ms'])
     clocks = [c['clock_ms'] for c in ordered]
     assert clocks[0] == start_clock_ms, (clocks[0], start_clock_ms)
@@ -530,18 +635,96 @@ def verify_immediate_off(baseline_path, off_image, cstate_before, cstate_after,
     return result
 
 
+def baseline_chroma(baseline, regions):
+    """Strongest channel spread across the sampled baseline pixels."""
+    chroma = 0
+    for region in regions:
+        if region['kind'] == 'cursor':
+            continue
+        x, y, width, height = region['rect']
+        for py in range(y, y + height):
+            for px in range(x, x + width):
+                before = baseline.getpixel((px, py))[:3]
+                chroma = max(chroma, max(before) - min(before))
+    return chroma
+
+
 def negative_neutral_must_fail(baseline_path, neutral_path, regions, desaturation, brightness):
     baseline, current = open_pair(baseline_path, neutral_path)
     validate_regions(regions, baseline.width, baseline.height)
+    chroma = baseline_chroma(baseline, regions)
+    if chroma < CHROMA_MIN:
+        raise HarnessError(
+            f'negative control baseline is achromatic (chroma {chroma} < '
+            f'{CHROMA_MIN}): invalid fixture, cannot prove the assertion bites')
+    try:
+        check_owned_interior(baseline, regions)
+    except AssertionError as exc:
+        raise HarnessError(
+            f'negative control baseline is not the known owned interior: {exc}')
     try:
         verify_frame(baseline, current, regions, desaturation, brightness)
-    except AssertionError:
+    except EffectMismatch:
         return True
     raise AssertionError('negative control FAILED: neutral frame passed the effect assertion')
 
 
+def validate_state_capture(cap):
+    """State-only captures carry no pixels and no pixel bracket."""
+    if not isinstance(cap, dict):
+        raise HarnessError(f'state capture must be an object: {cap!r:.120}')
+    for key in ('label', 'cstate_before', 'cstate_after', 'proc', 'proc_before'):
+        if key not in cap:
+            raise HarnessError(f'state capture missing {key}: {cap!r:.120}')
+    for key in ('image', 'clock_ms'):
+        if key in cap:
+            raise HarnessError(
+                f"state capture {cap.get('label')}: {key!r} is pixel evidence, "
+                f'forbidden in the state-only path')
+    validate_proc_snapshot(cap['proc'], f"{cap.get('label')}/after")
+    validate_proc_snapshot(cap['proc_before'], f"{cap.get('label')}/before")
+
+
+def require_locked_state(doc, label):
+    """Locked CSTATE shape: locked true, typed effects, redacted pointers.
+
+    Implemented against the source-validated redaction shape (the
+    snapshot emitter always writes wellbeing_effects; cursor,
+    pointer_position, pointer_fullscreen_blocked and
+    wallpaper_diagnostics are null while locked). No exact
+    current-schema locked receipt has been observed yet
+    (LOCK_SCHEMA_RECEIPT_PENDING): nested-CI observation pending.
+    """
+    if not isinstance(doc, dict):
+        raise HarnessError(f'{label}: cstate is not an object')
+    locked = doc.get('locked')
+    if type(locked) is not bool:
+        raise HarnessError(f'{label}: locked must be an actual bool, got {locked!r}')
+    assert locked is True, (label, 'state-only locked capture is not locked')
+    wb = doc.get('wellbeing_effects')
+    if not isinstance(wb, dict):
+        raise HarnessError(f'{label}: wellbeing_effects missing or malformed')
+    for key in ('desaturation', 'brightness'):
+        value = wb.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value):
+            raise HarnessError(
+                f'{label}: wellbeing_effects.{key} must be a finite number, '
+                f'got {value!r}')
+    if type(wb.get('animating')) is not bool:
+        raise HarnessError(
+            f'{label}: wellbeing_effects.animating must be a bool, '
+            f'got {wb.get("animating")!r}')
+    for key in ('pointer_position', 'cursor'):
+        if key in doc and doc[key] is not None:
+            raise HarnessError(
+                f'{label}: locked snapshot must redact {key}, got {doc[key]!r:.60}')
+    return wb
+
+
 def record_provenance(gate, source_commit, binaries, captures, owner,
-                      regions, output, gate_start_epoch=0.0, extra=None):
+                      regions, output, gate_start_epoch=0.0, extra=None,
+                      state_captures=None):
     assert source_commit and len(source_commit) >= 12, 'source commit required'
     if not isinstance(owner, dict) or 'id' not in owner or 'rect' not in owner:
         raise HarnessError('provenance requires the bound owner record')
@@ -554,12 +737,20 @@ def record_provenance(gate, source_commit, binaries, captures, owner,
         assert Path(path).exists(), f'provenance binary missing: {name}={path}'
         hashes[name] = digest(path)
     assert hashes, 'at least one binary hash required'
-    if not isinstance(captures, list) or not captures:
+    if not isinstance(captures, list):
+        raise HarnessError('provenance captures must be a list')
+    state_captures = list(state_captures or [])
+    combined = captures + state_captures
+    if not combined:
         raise HarnessError('provenance needs at least one capture')
     for cap in captures:
         validate_capture(cap)
-    check_proc_agreement(captures)
-    live = captures[0]['proc']['processes']
+        check_proc_sandwich(cap['proc_before'], cap['proc'], cap['label'])
+    for cap in state_captures:
+        validate_state_capture(cap)
+        check_proc_sandwich(cap['proc_before'], cap['proc'], cap['label'])
+    check_proc_agreement(combined)
+    live = combined[0]['proc']['processes']
     for name in ('compositor', 'shell', 'probe'):
         assert name in live, f'capture-time {name} process missing from proc snapshot'
         assert name in hashes, f'admitted {name} binary missing from binaries'
@@ -586,10 +777,36 @@ def record_provenance(gate, source_commit, binaries, captures, owner,
                         'animation_clock_ms': after_doc.get('animation_clock_ms'),
                         'wellbeing_effects': after_wb,
                         'motion_policy': after_doc.get('motion_policy'),
-                        'proc': cap['proc']})
+                        'proc': cap['proc'],
+                        'proc_before': cap['proc_before']})
+    state_stamped = []
+    for cap in state_captures:
+        check_fresh(cap['cstate_before'], gate_start_epoch, cap['label'])
+        check_fresh(cap['cstate_after'], gate_start_epoch, cap['label'])
+        before_doc, _ = load_cstate(cap['cstate_before'])
+        after_doc, after_wb = load_cstate(cap['cstate_after'])
+        require_locked_state(before_doc, f"{cap['label']}/before")
+        require_locked_state(after_doc, f"{cap['label']}/after")
+        state_stamped.append({'label': cap['label'], 'evidence': 'state-only',
+                              'lock_schema_receipt': 'PENDING',
+                              'cstate_before': str(cap['cstate_before']),
+                              'cstate_before_sha256': digest(cap['cstate_before']),
+                              'cstate_after': str(cap['cstate_after']),
+                              'cstate_after_sha256': digest(cap['cstate_after']),
+                              'epoch': cap.get('epoch'), 'iso': cap.get('iso'),
+                              'animation_clock_manual':
+                                  after_doc.get('animation_clock_manual'),
+                              'animation_clock_ms':
+                                  after_doc.get('animation_clock_ms'),
+                              'wellbeing_effects': after_wb,
+                              'motion_policy': after_doc.get('motion_policy'),
+                              'proc': cap['proc'],
+                              'proc_before': cap['proc_before']})
     receipt = {'gate': gate, 'source_commit': source_commit,
+               'attestation': ATTESTATION_LABEL,
                'binary_sha256': hashes, 'gate_start_epoch': gate_start_epoch,
-               'recorded_epoch': time.time(), 'captures': stamped}
+               'recorded_epoch': time.time(), 'captures': stamped,
+               'state_only_captures': state_stamped}
     if extra:
         receipt.update(extra)
     Path(output).write_text(json.dumps(receipt, indent=2) + '\n')
@@ -657,6 +874,11 @@ def main(argv=None):
     p.add_argument('--compositor', type=int, required=True)
     p.add_argument('--shell', type=int, required=True)
 
+    p = sub.add_parser('proc-sandwich')
+    p.add_argument('--before', type=Path, required=True)
+    p.add_argument('--after', type=Path, required=True)
+    p.add_argument('--label', default='capture')
+
     p = sub.add_parser('provenance')
     p.add_argument('--gate', required=True)
     p.add_argument('--source-commit', required=True)
@@ -666,6 +888,7 @@ def main(argv=None):
     p.add_argument('--regions', type=Path, required=True)
     p.add_argument('--gate-start', type=float, default=0.0)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--state-captures', type=Path, default=None)
 
     args = parser.parse_args(argv)
     try:
@@ -747,14 +970,33 @@ def main(argv=None):
                                       'compositor': args.compositor,
                                       'shell': args.shell})
             print(json.dumps(snapshot))
+        elif args.command == 'proc-sandwich':
+            try:
+                before = json.loads(args.before.read_text())
+                after = json.loads(args.after.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise HarnessError(f'sandwich snapshot unreadable: {exc}')
+            check_proc_sandwich(before, after, args.label)
+            print(json.dumps({'label': args.label, 'sandwich': 'held'}))
         elif args.command == 'provenance':
+            state_caps = []
+            if args.state_captures is not None:
+                try:
+                    state_caps = json.loads(args.state_captures.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise HarnessError(
+                        f'state captures unreadable {args.state_captures}: {exc}')
             receipt = record_provenance(args.gate, args.source_commit,
                                         json.loads(args.binaries.read_text()),
                                         json.loads(args.captures.read_text()),
                                         json.loads(args.owner.read_text()),
                                         json.loads(args.regions.read_text()),
-                                        args.output, args.gate_start)
-            print(json.dumps({'gate': receipt['gate'], 'captures': len(receipt['captures'])}))
+                                        args.output, args.gate_start,
+                                        state_captures=state_caps)
+            print(json.dumps({'gate': receipt['gate'],
+                              'captures': len(receipt['captures']),
+                              'state_only_captures':
+                                  len(receipt['state_only_captures'])}))
     except HarnessError as exc:
         print(f'harness error: {exc}', file=sys.stderr)
         return 2
