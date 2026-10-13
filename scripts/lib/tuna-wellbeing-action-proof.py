@@ -4,16 +4,21 @@
 Predicates for ACTUAL banner presses (tuna-a11y-dump.py --press):
 Take-with-lock observes the session lock; Take-with-fade observes a
 faded frame; Delay observes a live due moved by delay-seconds; Skip
-observes an interval restart at the press time.
+observes the upcoming warning retired with the due schedule left
+undisturbed (GNOME 51 offers Skip only on the upcoming notice, where
+the press is a timer no-op, so the due banner must still arrive on
+the original schedule).
 
 Stale-press is NARROWED (w3-354pixel-proof4f decision, do not expand):
 a stale press of a retired resident must FAIL (nothing to press, no
 state change), and retired-UI-absence is asserted ONLY with a
 mandatory alive owned AT-SPI tree plus zero transport errors. A dead
 bus, a timed-out dump, or any transport-error node FAILS the gate;
-absence is never inferred from a missing or dead tree. Delay/Skip
+absence is never inferred from a missing or dead tree. Delay
 stale checks also assert the due schedule the live press set is
-undisturbed. Callback-retirement stays explicitly UNQUALIFIED at e2e
+undisturbed; Skip stale checks assert the original schedule the live
+press left alone is intact. Callback-retirement stays explicitly
+UNQUALIFIED at e2e
 (qualified at unit/GTK level elsewhere); no captured-callback
 evidence is claimed here.
 
@@ -47,6 +52,12 @@ sys.dont_write_bytecode = True
 
 TICK_TOLERANCE_SECS = 5.0
 PRESS_SETTLE_SECS = 1.5
+# Skip-on-upcoming anchors the original due at enable time (no live due is
+# observable before the press), so this bound covers the one-sided
+# enable->shell lag (settings propagation + the 2s break poll) plus the ~2s
+# arrival-detection cadence and 1s clock truncations. Fixed here, exactly
+# like TICK_TOLERANCE_SECS; missing epochs fail closed at the call sites.
+SKIP_SCHEDULE_TOLERANCE_SECS = 8.0
 
 
 class HarnessError(Exception):
@@ -346,6 +357,48 @@ def check_skip(press_epoch, new_due_epoch, interval_secs,
     return delta
 
 
+def check_skip_undisturbed(orig_due_epoch, due_arrival_epoch,
+                           tolerance=SKIP_SCHEDULE_TOLERANCE_SECS):
+    delta = due_arrival_epoch - orig_due_epoch
+    assert abs(delta) <= tolerance, \
+        (f'Skip on the upcoming notice must leave the due schedule '
+         f'undisturbed (drift 0s): got {delta:.1f}s')
+    return delta
+
+
+def pressable(nodes, label):
+    """Mirror tuna-a11y-dump.py press(): exact name, non-label role, showing.
+
+    (The AT-SPI action query itself is unobservable in dumps; the node the
+    press helper would target is the observable. Labels exposing a
+    do-nothing action never qualify, exactly as in press().)
+    """
+    return any(n.get('name') == label and n.get('role') != 'label'
+               and n.get('showing') is True for n in nodes)
+
+
+def notice_buttons(a11y_path, title, expect=(), reject=()):
+    """Pin one notice's offered actions: expected labels pressable, rejected absent.
+
+    State->button mapping (GNOME Shell 51.0, js/misc/breakManager.js at
+    2177bdf9624b2d285de7c1d34274073d3769d6b8): the upcoming notice carries
+    Delay+Skip without Take (lines 985-1023); due/overdue carry Delay+Take
+    without Skip (lines 1133-1162); in-progress and interrupted carry no
+    action buttons. Exact matching throughout: nothing here is a substring
+    or a case-fold.
+    """
+    nodes = require_producer_tree(load_nodes(a11y_path), a11y_path)
+    assert showing(nodes, title), \
+        f'no showing banner named {title!r} in {a11y_path}'
+    for label in expect:
+        assert pressable(nodes, label), \
+            f'banner {title!r} offers no pressable {label!r} in {a11y_path}'
+    for label in reject:
+        assert not pressable(nodes, label), \
+            f'banner {title!r} unexpectedly offers pressable {label!r} in {a11y_path}'
+    return True
+
+
 def require_effect_state(doc, label):
     """Presence-first typed effect state: bool locked + complete finite wb.
 
@@ -395,6 +448,10 @@ def check_stale_press_fails(press_exit_code, before_cstate, after_cstate,
             check_delay(old, new, expect)
         elif kind == 'skip':
             check_skip(old, new, expect)
+        elif kind == 'skip-undisturbed':
+            assert expect == 0, \
+                f'skip-undisturbed expects zero drift, got {expect!r}'
+            check_skip_undisturbed(old, new)
         else:
             raise HarnessError(f'unknown due kind {kind!r}')
     check_retired_absent(dump_path, title, gate_start_epoch,
@@ -436,6 +493,18 @@ def main(argv=None):
     p.add_argument('--new-due', type=float, required=True)
     p.add_argument('--interval-secs', type=float, required=True)
 
+    p = sub.add_parser('skip-undisturbed')
+    p.add_argument('--orig-due', type=float, required=True)
+    p.add_argument('--due-arrival', type=float, required=True)
+
+    p = sub.add_parser('notice-buttons')
+    p.add_argument('a11y', type=Path)
+    p.add_argument('--title', required=True)
+    p.add_argument('--expect', default='',
+                   help='comma-separated labels that must be pressable')
+    p.add_argument('--reject', default='',
+                   help='comma-separated labels that must be absent')
+
     p = sub.add_parser('stale-press')
     p.add_argument('--exit-code', type=int, required=True)
     p.add_argument('--before', type=Path, required=True)
@@ -450,7 +519,8 @@ def main(argv=None):
     p.add_argument('--expect-gate', required=True)
     p.add_argument('--expect-nonce', required=True)
     p.add_argument('--expect-seq', type=int, required=True)
-    p.add_argument('--due-kind', choices=('delay', 'skip'), default=None)
+    p.add_argument('--due-kind', choices=('delay', 'skip', 'skip-undisturbed'),
+                   default=None)
     p.add_argument('--due-old', type=float, default=None)
     p.add_argument('--due-new', type=float, default=None)
     p.add_argument('--due-expect', type=float, default=None)
@@ -475,6 +545,19 @@ def main(argv=None):
         elif args.command == 'skip':
             delta = check_skip(args.press, args.new_due, args.interval_secs)
             print(f'skip delta {delta:.1f}s for interval {args.interval_secs:g}')
+        elif args.command == 'skip-undisturbed':
+            delta = check_skip_undisturbed(args.orig_due, args.due_arrival)
+            print(f'skip drift {delta:.1f}s against the original due')
+        elif args.command == 'notice-buttons':
+            expect = [v for v in
+                      (s.strip() for s in args.expect.split(','))
+                      if v]
+            reject = [v for v in
+                      (s.strip() for s in args.reject.split(','))
+                      if v]
+            notice_buttons(args.a11y, args.title, expect, reject)
+            print(f'buttons pinned for {args.title}: '
+                  f'expect={expect} reject={reject}')
         elif args.command == 'stale-press':
             due_args = [args.due_kind, args.due_old, args.due_new, args.due_expect]
             if any(v is not None for v in due_args):
