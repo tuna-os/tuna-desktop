@@ -20,11 +20,16 @@ pub(crate) struct Slot {
 }
 /// Saturate instead of reusing an epoch. MAX permanently refuses new grants.
 pub(crate) fn advance_epoch(epoch: &AtomicU64) -> bool {
-    epoch
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            value.checked_add(1)
-        })
-        .is_ok()
+    let mut current = epoch.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            return false;
+        };
+        match epoch.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
 }
 impl Slot {
     pub fn note_lock(&mut self, epoch: &AtomicU64) {
