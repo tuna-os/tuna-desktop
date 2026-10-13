@@ -7,7 +7,7 @@ git rev-parse HEAD > "$out/source.txt"
 git rev-parse --show-toplevel > "$out/root.txt"
 git diff --quiet
 git diff --cached --quiet
-sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/main.rs crates/compositor/src/lib.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/sleep.rs crates/compositor/src/pam.rs crates/compositor/src/pam_backend.rs crates/compositor/src/pam_helper.rs crates/compositor/src/unlock.rs crates/compositor/tests/fixtures/pam_conversation.c crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
+sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/main.rs crates/compositor/src/lib.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/runtime_auth.rs crates/compositor/src/runtime/aids.rs crates/shell-control-schema/src/lib.rs crates/shell-control-schema/src/auth.rs crates/compositor/src/sleep.rs crates/compositor/src/pam.rs crates/compositor/src/pam_backend.rs crates/compositor/src/pam_helper.rs crates/compositor/src/unlock.rs crates/compositor/tests/fixtures/pam_conversation.c crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
 cargo metadata --locked --no-deps --format-version=1 > "$out/metadata.json"
 cargo test --locked -p tuna-compositor --test auth_owner_runtime --no-run --message-format=json > "$out/build.json"
 cargo build --locked -p tuna-compositor --example native-auth-owner-probe --message-format=json > "$out/probe-build.json"
@@ -54,6 +54,11 @@ DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFA
     "$test_executable" --exact actual_main_runtime_private_pam_retirement_and_held_self --nocapture 2>&1 | tee "$out/test-pam.log"
 grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test-pam.log"
 grep -q '^auth owner pam runtime receipt: ' "$out/test-pam.log"
+DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime-interactive" TUNA_AUTH_OWNER_PROBE_BIN="$probe_executable" \
+    timeout --kill-after=3s 50s \
+    "$test_executable" --exact actual_interactive_runtime_private_pam_batches_and_retirement --nocapture 2>&1 | tee "$out/test-interactive.log"
+grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test-interactive.log"
+grep -q '^interactive actual Runtime receipt: ' "$out/test-interactive.log"
 python3 - "$out" <<'PY'
 import hashlib,importlib.util,json,pathlib,sys
 sys.dont_write_bytecode=True
@@ -67,6 +72,8 @@ assert hashlib.sha256((out/'build.json').read_bytes()).hexdigest()==r['build_sha
 assert hashlib.sha256((out/'metadata.json').read_bytes()).hexdigest()==r['metadata_sha256'],'package metadata changed'
 assert hashlib.sha256((out/'probe-build.json').read_bytes()).hexdigest()==r['probe_build_sha256'],'probe build metadata changed'
 for path,wanted in r['executables'].items():assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==wanted,'binary changed'
+interactive=json.loads((out/'runtime-interactive/success.json').read_text())
+for key in ['mixed_styles','separate_pin','no_input_denied','foreign_denied','replay_denied','cancel_retired','epoch_denied','backend_phase_timeout','tagged_fingerprint_denied']:assert interactive[key] is True
 receipt=json.loads((out/'runtime/success.json').read_text());assert receipt['late_closed_origin_success_denied'] and receipt['fresh_origin_success']
 lines=[l.removeprefix('auth owner compositor sha256: ') for l in (out/'test.log').read_text().splitlines() if l.startswith('auth owner compositor sha256: ')]
 assert len(lines)==1 and lines[0] == r['executables'][r['compositor']],'actual compositor mismatched'

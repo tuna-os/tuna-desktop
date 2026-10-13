@@ -42,6 +42,11 @@ static void hung_cleanup(pam_handle_t *pamh, void *data, int status) {
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     (void)flags;
     const char *mode = argc ? argv[0] : "multi";
+    if (strcmp(mode, "fingerprint") == 0) {
+        struct pam_message tagged = { PAM_PROMPT_ECHO_OFF, "Fingerprint verification" };
+        const char *forbidden[] = { "must-never-be-submitted" };
+        return ask(pamh, 1, &tagged, forbidden);
+    }
     if (strcmp(mode, "hang") == 0) for (;;) pause();
     if (strcmp(mode, "crash") == 0) abort();
     if (strcmp(mode, "runtime-delay") == 0) {

@@ -167,4 +167,72 @@ class SourceContracts(unittest.TestCase):
         for name in ('ci.yml', 'measured-coverage.yml'):
             self.assertIn('libpam0g-dev', (ROOT / '.github/workflows' / name).read_text())
 
+class InteractiveSourceContracts(unittest.TestCase):
+    """Source/wiring controls only; the dedicated Rust CI test supplies execution."""
+    def test_036_is_append_only_and_snapshot_remains_credential_free(self):
+        schema = (ROOT / 'crates/shell-control-schema/src/lib.rs').read_text()
+        self.assertIn('minor: 36,', schema)
+        command = schema.split('pub enum CommandKind {', 1)[1].split('/// Window action', 1)[0]
+        self.assertLess(command.index('SetWellbeingEffects'), command.index('AuthStart'))
+        message = schema.split('pub enum Message {', 1)[1].split('/// The keyboard aids', 1)[0]
+        self.assertLess(message.index('KeyboardAidToggled'), message.index('AuthState'))
+        snapshot = message.split('Snapshot {', 1)[1].split('}', 1)[0]
+        for token in ('Auth', 'Secret', 'password', 'challenge'):
+            self.assertNotIn(token, snapshot)
+        bounded = (ROOT / 'crates/shell-control-schema/src/auth.rs').read_text()
+        self.assertIn('size > MAX_MESSAGES', bounded)
+        self.assertIn('d.deserialize_str(Text)', bounded)
+        self.assertIn('dedicated_answer_encoder_matches_postcard_and_wipes_owned_buffers', bounded)
+
+    def test_actual_consumer_has_fixed_authority_and_default_none(self):
+        runtime = (ROOT / 'crates/compositor/src/runtime.rs').read_text()
+        self.assertIn('interactive_admission: None', runtime)
+        self.assertIn('self.handle_auth_requests(outcome.auth_requests)', runtime)
+        self.assertLess(runtime.index('self.control.poll('), runtime.index('self.poll_auth()'))
+        consumer = (ROOT / 'crates/compositor/src/runtime_auth.rs').read_text()
+        self.assertIn('crate::unlock::greetd_socket_path().is_none()', consumer)
+        self.assertIn('crate::unlock::session_user()', consumer)
+        self.assertIn('crate::pam::DEFAULT_SERVICE.into()', consumer)
+        self.assertNotIn('std::env::var', consumer)
+        self.assertIn('self.control.auth_lease_live(auth.lease)', consumer)
+        self.assertIn('self.unlock_slot.retire_pam_method(', consumer)
+        self.assertIn('self.apply_verified_unlock(auth.attempt.epoch)', consumer)
+        self.assertIn('is_fingerprint_prompt(&message.text)', consumer)
+
+    def test_activity_is_recorded_only_at_native_backend_entry_not_aid_timers(self):
+        runtime = (ROOT / 'crates/compositor/src/runtime.rs').read_text()
+        aids = (ROOT / 'crates/compositor/src/runtime/aids.rs').read_text()
+        self.assertEqual(aids.count('self.record_auth_native_input(&input);'), 1)
+        native = aids.split('pub(super) fn on_backend_input(', 1)[1].split('pub(super) fn reset_input', 1)[0]
+        self.assertIn('self.record_auth_native_input(&input);', native)
+        manager = runtime.split('fn on_manager_input(', 1)[1].split('fn ', 1)[0]
+        self.assertNotIn('record_auth_input', manager)
+        timer = aids.split('pub(super) fn poll_input_aids(', 1)[1].split('pub(super) fn ', 1)[0]
+        self.assertNotIn('record_auth_native_input', timer)
+        remote = runtime.split('fn remote_input(', 1)[1].split('fn on_screencast_request', 1)[0]
+        self.assertNotIn('record_auth_native_input', remote)
+        self.assertIn('if self.is_locked()', remote)
+
+    def test_every_auth_command_is_refused_by_generic_host_writer(self):
+        source = (ROOT / 'crates/shell-host/src/control.rs').read_text()
+        writer = source.split('fn write_message(', 1)[1].split('fn reconnect(', 1)[0]
+        for kind in ['Unlock', 'AuthStart', 'AuthAnswer', 'AuthCancel']:
+            self.assertLess(writer.index('CommandKind::' + kind), writer.index('encode_frame'))
+        self.assertIn('generic_writer_refuses_every_auth_command_before_any_socket_byte', source)
+        control = (ROOT / 'crates/compositor/src/control.rs').read_text()
+        broadcast = control.split('pub fn queue_message(', 1)[1].split('/// Report', 1)[0]
+        self.assertLess(broadcast.index('Message::AuthChallenge'), broadcast.index('self.menu_queue.push'))
+
+    def test_real_runtime_fixture_is_required_by_admitted_binary_wrapper(self):
+        source = (ROOT / 'crates/compositor/tests/auth_owner_runtime.rs').read_text()
+        wrapper = (ROOT / 'scripts/tuna-auth-owner-ci-proof').read_text()
+        name = 'actual_interactive_runtime_private_pam_batches_and_retirement'
+        self.assertIn('fn ' + name + '()', source)
+        self.assertIn('--exact ' + name + ' --nocapture', wrapper)
+        self.assertIn('interactive actual Runtime receipt:', wrapper)
+        self.assertIn('1 passed; 0 failed; 0 ignored', wrapper)
+        self.assertIn('TUNA_AUTH_OWNER_PROBE_BIN="$probe_executable"', wrapper)
+        self.assertIn('services/tuna-lock', source)
+        self.assertIn('controlled 250ms backend phase', (ROOT / 'crates/compositor/examples/native-auth-owner-probe.rs').read_text())
+
 if __name__ == '__main__': unittest.main()

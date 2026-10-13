@@ -40,6 +40,7 @@ impl Runtime {
     /// aids first. Remote-desktop input does not come this way: GNOME's
     /// aids serve the person at the keyboard.
     pub(super) fn on_backend_input(&mut self, input: ManagerInput) {
+        self.record_auth_native_input(&input);
         if !self.input_aids.engine.active() {
             self.on_manager_input(input);
             return;

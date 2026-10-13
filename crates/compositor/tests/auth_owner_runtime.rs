@@ -695,3 +695,426 @@ fn chatty_control_peer_cannot_extend_absolute_receive_deadline() {
         "deadline applies to successful unrelated frame reads too"
     );
 }
+
+// Stage B: actual Runtime+ControlHub+private PAM, with a separately labelled
+// trusted Rust input seam. This is not GTK/native seat/installed policy proof.
+#[test]
+fn actual_interactive_runtime_private_pam_batches_and_retirement() {
+    match std::env::var(ROLE).ok().as_deref() {
+        Some("4") => return interactive_client(),
+        Some(_) => return,
+        None => {}
+    }
+    if std::env::var_os("DISPLAY").is_none() {
+        assert!(
+            std::env::var_os("TUNA_REQUIRE_AUTH_OWNER_RUNTIME").is_none(),
+            "dedicated Xvfb proof required"
+        );
+        return;
+    }
+    let probe =
+        PathBuf::from(std::env::var_os("TUNA_AUTH_OWNER_PROBE_BIN").expect("admitted example"));
+    let helper = Path::new(env!("CARGO_BIN_EXE_tuna-compositor"));
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _artifacts = Artifacts {
+        root: root.path().to_owned(),
+        out: std::env::var_os("TUNA_AUTH_OWNER_ARTIFACTS").map(PathBuf::from),
+    };
+    let module = root.path().join("controlled-pam.so");
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pam_conversation.c"))
+        .arg("-o")
+        .arg(&module)
+        .arg("-lpam")
+        .status()
+        .unwrap()
+        .success());
+    std::fs::create_dir(root.path().join("services")).unwrap();
+    std::fs::write(
+        root.path().join("services/tuna-lock"),
+        format!(
+            "auth required {} multi\naccount required {} multi\n",
+            module.display(),
+            module.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("module-path"),
+        module.as_os_str().as_encoded_bytes(),
+    )
+    .unwrap();
+    let log = std::fs::File::create(root.path().join("runtime.log")).unwrap();
+    let mut child = OwnedChild(
+        Command::new(&probe)
+            .env("TUNA_STAGEB_PROBE", "1")
+            .env("TUNA_STAGEB_HELPER", helper)
+            .env("TUNA_AUTH_OWNER_ROOT", root.path())
+            .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
+            .env(ROLE, "4")
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env("TUNA_XWAYLAND", "0")
+            .env_remove("GREETD_SOCK")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("LD_PRELOAD", "/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
+            .env("PAM_WRAPPER", "1")
+            .env("PAM_WRAPPER_SERVICE_DIR", root.path().join("services"))
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    use std::os::unix::fs::MetadataExt;
+    let expected_probe = std::fs::metadata(&probe).unwrap();
+    let actual_probe = std::fs::metadata(format!("/proc/{}/exe", child.0.id())).unwrap();
+    assert_eq!(
+        (expected_probe.dev(), expected_probe.ino()),
+        (actual_probe.dev(), actual_probe.ino()),
+        "admitted real Runtime example"
+    );
+    let end = Instant::now() + Duration::from_secs(40);
+    loop {
+        let ready = root.path().join("success.json").exists();
+        assert!(
+            Instant::now() < end,
+            "absolute interactive fixture deadline"
+        );
+        if ready {
+            break;
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "actual Runtime exited early"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("success.json")).unwrap()).unwrap();
+    let pid = receipt["supervised_client_pid"].as_u64().unwrap();
+    let actual = std::fs::metadata(format!("/proc/{pid}/exe")).unwrap();
+    let expected = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+    assert_eq!(
+        (actual.dev(), actual.ino()),
+        (expected.dev(), expected.ino())
+    );
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let fields: Vec<_> = stat
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        fields[1].parse::<u32>().unwrap(),
+        child.0.id(),
+        "actual supervised actor parent"
+    );
+    for name in [
+        "mixed_styles",
+        "separate_pin",
+        "no_input_denied",
+        "foreign_denied",
+        "replay_denied",
+        "cancel_retired",
+        "epoch_denied",
+        "backend_phase_timeout",
+        "tagged_fingerprint_denied",
+    ] {
+        assert_eq!(receipt[name], true, "missing actual phase {name}");
+    }
+    std::fs::write(root.path().join("stop-probe"), b"1").unwrap();
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = child.0.try_wait().unwrap();
+        assert!(Instant::now() < end, "owned Runtime retirement deadline");
+        if let Some(status) = status {
+            assert!(status.success());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    println!("interactive actual Runtime receipt: {}", receipt);
+}
+
+fn interactive_client() {
+    use tuna_shell_control::auth::{Answer, AnswerText, Key, Method, Phase, Style};
+    let root = PathBuf::from(std::env::var_os("TUNA_AUTH_OWNER_ROOT").unwrap());
+    let end = Instant::now() + Duration::from_secs(35);
+    let observe = |predicate: &mut dyn FnMut() -> bool| loop {
+        let ready = predicate();
+        assert!(
+            Instant::now() < end,
+            "interactive absolute observation deadline"
+        );
+        if ready {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let receive = |conn: &mut ControlConn, predicate: &mut dyn FnMut(&Message) -> bool| loop {
+        let message = conn.read_frame();
+        assert!(
+            Instant::now() < end,
+            "interactive absolute message deadline"
+        );
+        match message {
+            Ok(message) => {
+                let accepted = predicate(&message);
+                assert!(Instant::now() < end);
+                if accepted {
+                    return message;
+                }
+            }
+            Err(ControlError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => panic!("actual owned socket failed: {error:?}"),
+        }
+    };
+    let reply = |conn: &mut ControlConn, id: u64, success: bool| {
+        let message = receive(
+            conn,
+            &mut |message| matches!(message, Message::CommandResult { id: got, .. } if *got == id),
+        );
+        assert!(
+            matches!(
+                message,
+                Message::CommandResult {
+                    status: CommandStatus::Applied,
+                    ..
+                }
+            ) == success
+        );
+    };
+    let pending_empty =
+        || std::fs::read(root.join("interactive-pending")).is_ok_and(|bytes| bytes == b"0");
+    observe(&mut || root.join("profile-admitted").exists());
+    let mut a = connect();
+    let mut b = connect();
+    send(&mut a, 100, CommandKind::Lock);
+    reply(&mut a, 100, true);
+    send(
+        &mut a,
+        1,
+        CommandKind::AuthStart {
+            method: Method::SessionStack,
+        },
+    );
+    let first = receive(&mut a, &mut |m| {
+        matches!(m, Message::AuthChallenge { sequence: 1, .. })
+    });
+    let Message::AuthChallenge {
+        key,
+        sequence,
+        messages,
+    } = first
+    else {
+        panic!()
+    };
+    assert_eq!(
+        messages.iter().map(|m| m.style).collect::<Vec<_>>(),
+        [Style::Visible, Style::Secret, Style::Info, Style::Error]
+    );
+    let values = || {
+        vec![
+            Answer {
+                index: 0,
+                text: Some(AnswerText("visible-answer".into())),
+            },
+            Answer {
+                index: 1,
+                text: Some(AnswerText("first-secret".into())),
+            },
+            Answer {
+                index: 2,
+                text: None,
+            },
+            Answer {
+                index: 3,
+                text: None,
+            },
+        ]
+    };
+    let answer = |conn: &mut ControlConn, id, key: Key, sequence, values| {
+        let frame =
+            tuna_shell_control::auth::encode_answer_frame(id, key, sequence, values).unwrap();
+        // The proof client uses the same dedicated encoding and owns one write;
+        // transport/NoReplay UI implementation is Stage C, not qualified here.
+        conn.write_frame(&tuna_shell_control::decode_frame(frame.as_bytes()).unwrap())
+            .unwrap();
+    };
+    answer(&mut a, 2, key, sequence, values());
+    reply(&mut a, 2, false);
+    answer(&mut b, 3, key, sequence, values());
+    reply(&mut b, 3, false);
+    answer(
+        &mut a,
+        4,
+        Key {
+            epoch: key.epoch + 1,
+            ..key
+        },
+        sequence,
+        values(),
+    );
+    reply(&mut a, 4, false);
+    answer(&mut a, 5, key, sequence + 1, values());
+    reply(&mut a, 5, false);
+    send(
+        &mut b,
+        6,
+        CommandKind::AuthStart {
+            method: Method::SessionStack,
+        },
+    );
+    reply(&mut b, 6, false);
+    std::fs::write(root.join("input-1"), b"1").unwrap();
+    observe(&mut || root.join("input-admitted-1").exists());
+    let mut invalid = values();
+    invalid[2].text = Some(AnswerText("info must be None".into()));
+    answer(&mut a, 7, key, sequence, invalid);
+    reply(&mut a, 7, false);
+    answer(&mut a, 8, key, sequence, values());
+    reply(&mut a, 8, true);
+    let second = receive(&mut a, &mut |m| {
+        matches!(m, Message::AuthChallenge { sequence: 2, .. })
+    });
+    let Message::AuthChallenge {
+        key: second_key,
+        messages,
+        ..
+    } = second
+    else {
+        panic!()
+    };
+    assert_eq!(key, second_key);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].style, Style::Secret);
+    answer(&mut a, 9, key, 1, values());
+    reply(&mut a, 9, false);
+    std::fs::write(root.join("input-2"), b"1").unwrap();
+    observe(&mut || root.join("input-admitted-2").exists());
+    answer(
+        &mut a,
+        10,
+        key,
+        2,
+        vec![Answer {
+            index: 0,
+            text: Some(AnswerText("pin-secret".into())),
+        }],
+    );
+    reply(&mut a, 10, true);
+    reply(&mut a, 1, true);
+    receive(&mut a, &mut |m| {
+        matches!(m, Message::Snapshot { locked: false, .. })
+    });
+    observe(&mut || pending_empty());
+    send(&mut a, 101, CommandKind::Lock);
+    reply(&mut a, 101, true);
+    send(
+        &mut a,
+        11,
+        CommandKind::AuthStart {
+            method: Method::SessionStack,
+        },
+    );
+    let Message::AuthChallenge {
+        key: cancel_key, ..
+    } = receive(&mut a, &mut |m| matches!(m, Message::AuthChallenge { .. }))
+    else {
+        panic!()
+    };
+    send(
+        &mut a,
+        12,
+        CommandKind::AuthCancel {
+            start_request: 11,
+            key: Some(cancel_key),
+        },
+    );
+    reply(&mut a, 11, false);
+    reply(&mut a, 12, true);
+    observe(&mut || pending_empty());
+    send(
+        &mut a,
+        13,
+        CommandKind::AuthStart {
+            method: Method::SessionStack,
+        },
+    );
+    let Message::AuthChallenge { key: epoch_key, .. } =
+        receive(&mut a, &mut |m| matches!(m, Message::AuthChallenge { .. }))
+    else {
+        panic!()
+    };
+    std::fs::write(root.join("stageb-epoch"), b"1").unwrap();
+    observe(&mut || root.join("stageb-epoch-done").exists());
+    reply(&mut a, 13, false);
+    answer(&mut a, 14, epoch_key, 1, values());
+    reply(&mut a, 14, false);
+    observe(&mut || pending_empty());
+    let module = std::fs::read_to_string(root.join("module-path")).unwrap();
+    std::fs::write(
+        root.join("services/tuna-lock"),
+        format!("auth required {module} fingerprint\naccount required {module} fingerprint\n"),
+    )
+    .unwrap();
+    send(
+        &mut a,
+        15,
+        CommandKind::AuthStart {
+            method: Method::SessionStack,
+        },
+    );
+    let tagged = receive(&mut a, &mut |message| {
+        assert!(
+            !matches!(message, Message::AuthChallenge { key, .. } if key.start_request == 15),
+            "tagged hardware prompt must not become a typed challenge"
+        );
+        matches!(message, Message::CommandResult { id: 15, .. })
+    });
+    assert!(matches!(
+        tagged,
+        Message::CommandResult {
+            status: CommandStatus::Denied { .. },
+            ..
+        }
+    ));
+    observe(&mut || pending_empty());
+    std::fs::write(
+        root.join("services/tuna-lock"),
+        format!("auth required {module} hang\naccount required {module} hang\n"),
+    )
+    .unwrap();
+    std::fs::write(root.join("short-phase"), b"1").unwrap();
+    observe(&mut || root.join("short-phase-admitted").exists());
+    let started = Instant::now();
+    send(
+        &mut a,
+        16,
+        CommandKind::AuthStart {
+            method: Method::SessionStack,
+        },
+    );
+    receive(&mut a, &mut |m| {
+        matches!(
+            m,
+            Message::AuthState {
+                start_request: 16,
+                phase: Phase::Denied,
+                ..
+            }
+        )
+    });
+    reply(&mut a, 16, false);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    observe(&mut || pending_empty());
+    std::fs::write(root.join("success.json"), serde_json::to_vec(&serde_json::json!({
+        "supervised_client_pid": std::process::id(), "mixed_styles": true, "separate_pin": true,
+        "no_input_denied": true, "foreign_denied": true, "replay_denied": true,
+        "cancel_retired": true, "epoch_denied": true, "backend_phase_timeout": true, "tagged_fingerprint_denied": true,
+        "scope": "actual Runtime, sockets, private PAM; controlled input/epoch only; no GTK/native seat/installed policy"
+    })).unwrap()).unwrap();
+    observe(&mut || root.join("stop-probe").exists());
+}

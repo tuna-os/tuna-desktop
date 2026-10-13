@@ -196,6 +196,9 @@ pub struct NestedSession {
     pub startup_overview: bool,
 }
 
+#[path = "runtime_auth.rs"]
+mod interactive_auth;
+
 /// Which display backend a session runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendChoice {
@@ -716,6 +719,9 @@ pub struct Runtime {
     unlock_results: calloop::channel::Sender<(crate::auth_owner::Attempt, UnlockEvent)>,
     /// A password check is running.
     unlock_slot: crate::auth_owner::Slot,
+    interactive_admission: Option<interactive_auth::Admission>,
+    interactive_auth: Option<interactive_auth::Active>,
+    auth_notice: bool,
     unlock_worker: Option<UnlockWorker>,
     unlock_quarantined: Option<crate::auth_owner::Attempt>,
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1181,6 +1187,9 @@ impl Runtime {
             idle_since: Instant::now(),
             unlock_results,
             unlock_slot: crate::auth_owner::Slot::default(),
+            interactive_admission: None,
+            interactive_auth: None,
+            auth_notice: false,
             unlock_worker: None,
             unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3852,6 +3861,12 @@ impl Runtime {
         if let Some(deadline) = self.idle_monitor.next_deadline() {
             schedule.at(deadline);
         }
+        if self.auth_notice {
+            schedule.active();
+        }
+        if let Some(deadline) = self.auth_deadline() {
+            schedule.at(deadline);
+        }
         if let Some(deadline) = self.wallpaper.maintenance_deadline() {
             schedule.at(deadline);
         }
@@ -4135,6 +4150,7 @@ impl Runtime {
         if self.state.take_client_unlock() && self.is_locked() {
             eprintln!("tuna-compositor: lock client left while locked; staying locked");
         }
+        self.handle_auth_requests(outcome.auth_requests);
         // A lock-screen password: verified off the loop (PAM may stall
         // for seconds on a failure), one attempt at a time.
         if let Some((origin, password)) = outcome.unlock {
@@ -4241,6 +4257,7 @@ impl Runtime {
             self.finish_unlock(attempt, true);
         }
 
+        self.poll_auth();
         for event in self.shell.drain_events() {
             eprintln!("tuna-compositor: shell supervision: {event:?}");
         }
@@ -6213,7 +6230,8 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
 }
 
 /// Narrow, trusted Rust-only CI driver. The normal binary supplies no probe.
-/// No credential challenge, UI/configuration or IPC entry point is added.
+/// Admission is a trusted Rust seam, never a production configuration or IPC
+/// policy entry point. Interactive challenges are routed by the real Runtime.
 pub struct AuthOwnerProbe<'a> {
     runtime: &'a mut Runtime,
 }
@@ -6224,6 +6242,35 @@ pub struct AuthOwnerStatus {
     pub outer_pending: bool,
 }
 impl AuthOwnerProbe<'_> {
+    /// Trusted CI-only profile; the live binary never calls this Rust seam.
+    pub fn admit_interactive_pam(&mut self, backend: crate::pam_backend::Backend) -> bool {
+        self.admit_interactive_pam_policy(
+            backend,
+            crate::pam_conversation::Policy {
+                backend_phase: Duration::from_secs(30),
+                total: Duration::from_secs(900),
+            },
+        )
+    }
+    /// Explicit controlled policy; no UI/environment/IPC caller can reach this seam.
+    pub fn admit_interactive_pam_policy(
+        &mut self,
+        backend: crate::pam_backend::Backend,
+        policy: crate::pam_conversation::Policy,
+    ) -> bool {
+        if self.runtime.interactive_auth.is_some() || policy.validate().is_err() {
+            return false;
+        }
+        self.runtime.interactive_admission = Some(interactive_auth::Admission { backend, policy });
+        true
+    }
+    pub fn interactive_pending_for_test(&self) -> bool {
+        self.runtime.interactive_auth.is_some()
+    }
+    /// Controlled owner-input injection; not evidence of physical seat input.
+    pub fn interactive_input_for_test(&mut self, admitted: bool) -> bool {
+        self.runtime.record_auth_input(admitted)
+    }
     pub fn status(&self) -> AuthOwnerStatus {
         AuthOwnerStatus {
             locked: self.runtime.is_locked(),

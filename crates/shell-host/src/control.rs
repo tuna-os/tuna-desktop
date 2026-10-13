@@ -915,6 +915,11 @@ impl ControlClient {
                 Ok(Handled::PointerOutput)
             }
             Message::ShortcutConsent { request } => Ok(Handled::ShortcutConsent(request)),
+            // Stage C owns the no-replay UI consumer. No interactive command
+            // can use the generic writer before that consumer is installed.
+            Message::AuthState { .. } | Message::AuthChallenge { .. } => Err(
+                ControlError::Unexpected("interactive auth consumer unavailable".into()),
+            ),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1010,7 +1015,10 @@ impl ControlClient {
         if matches!(
             msg,
             Message::Command {
-                kind: CommandKind::Unlock { .. },
+                kind: CommandKind::Unlock { .. }
+                    | CommandKind::AuthStart { .. }
+                    | CommandKind::AuthAnswer { .. }
+                    | CommandKind::AuthCancel { .. },
                 ..
             }
         ) {
@@ -1143,6 +1151,8 @@ fn message_label(msg: &Message) -> &'static str {
         Message::ScreenReader { .. } => "ScreenReader",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
+        Message::AuthState { .. } => "AuthState",
+        Message::AuthChallenge { .. } => "AuthChallenge",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
     }
 }
@@ -1242,6 +1252,46 @@ mod tests {
         let (ours, peer) = UnixStream::pair().expect("socketpair");
         let client = ControlClient::new(ours).expect("nonblocking client");
         (client, peer)
+    }
+
+    #[test]
+    fn generic_writer_refuses_every_auth_command_before_any_socket_byte() {
+        use tuna_shell_control::auth::{Answer, AnswerText, Key, Method};
+        let (mut client, mut peer) = pair();
+        peer.set_nonblocking(true).unwrap();
+        let key = Key {
+            start_request: 1,
+            attempt_serial: 2,
+            epoch: 3,
+        };
+        for kind in [
+            CommandKind::Unlock {
+                password: tuna_shell_control::Secret("owned-test".into()),
+            },
+            CommandKind::AuthStart {
+                method: Method::SessionStack,
+            },
+            CommandKind::AuthAnswer {
+                key,
+                sequence: 1,
+                answers: vec![Answer {
+                    index: 0,
+                    text: Some(AnswerText("owned-test".into())),
+                }],
+            },
+            CommandKind::AuthCancel {
+                start_request: 1,
+                key: Some(key),
+            },
+        ] {
+            assert!(client
+                .write_message(&Message::Command { id: 4, kind })
+                .is_err());
+            assert_eq!(
+                peer.read(&mut [0u8; 1]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
     }
 
     /// Blocking one-frame read for the in-test fake server.

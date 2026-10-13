@@ -9,6 +9,7 @@
 //! followed by a postcard body. Frames larger than [`MAX_FRAME_BYTES`] are
 //! rejected before any postcard decoding happens.
 
+pub mod auth;
 pub mod background;
 pub mod legacy;
 pub mod motion;
@@ -165,9 +166,10 @@ impl ProtocolVersion {
     /// `0.33` appends cursor theme, size, locate-pointer and its keysym preference.
     /// `0.34` appends keyboard accessibility aids and toggle notifications.
     /// `0.35` appends atomic wellbeing scene effects.
+    /// `0.36` appends bounded server-bound interactive auth; snapshots unchanged.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 35,
+        minor: 36,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -385,15 +387,38 @@ pub enum CommandKind {
     },
     /// Preference from the authenticated supervised shell. Nested runtimes
     /// ignore it; the hardware compositor owns the actual Orca child.
-    SetScreenReader { enabled: bool },
+    SetScreenReader {
+        enabled: bool,
+    },
     /// GNOME screenshot keyboard selection cursor feedback. Coordinates are
     /// local to the mapped exclusive screenshot overlay in logical pixels,
     /// never global input.
-    MoveScreenshotPointer { x: i32, y: i32 },
+    MoveScreenshotPointer {
+        x: i32,
+        y: i32,
+    },
     /// Trusted shell dash icon bounds in global logical coordinates. Full replacement.
-    SetWindowIconGeometries { geometries: Vec<WindowIconGeometry> },
+    SetWindowIconGeometries {
+        geometries: Vec<WindowIconGeometry>,
+    },
     /// Atomic scene effects from the authenticated shell; cursor excluded.
-    SetWellbeingEffects { grayscale: bool, fade: bool },
+    SetWellbeingEffects {
+        grayscale: bool,
+        fade: bool,
+    },
+    AuthStart {
+        method: auth::Method,
+    },
+    AuthAnswer {
+        key: auth::Key,
+        sequence: u32,
+        #[serde(deserialize_with = "auth::answers")]
+        answers: Vec<auth::Answer>,
+    },
+    AuthCancel {
+        start_request: u64,
+        key: Option<auth::Key>,
+    },
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -753,6 +778,18 @@ pub enum Message {
     /// two modifiers at once) switched an aid; the shell saves the
     /// setting and confirms it as GNOME does.
     KeyboardAidToggled { aid: KeyboardAid, enabled: bool },
+    /// Sent only to the original 0.36 authentication session.
+    AuthState {
+        start_request: u64,
+        key: Option<auth::Key>,
+        phase: auth::Phase,
+    },
+    AuthChallenge {
+        key: auth::Key,
+        sequence: u32,
+        #[serde(deserialize_with = "auth::prompts")]
+        messages: Vec<auth::Prompt>,
+    },
 }
 
 /// The keyboard aids GNOME lets the keyboard itself switch.
@@ -1389,6 +1426,68 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
     }
 
     match msg {
+        Message::Command {
+            id,
+            kind:
+                CommandKind::AuthStart { .. }
+                | CommandKind::AuthAnswer { .. }
+                | CommandKind::AuthCancel { .. },
+        } if *id == 0 => {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ))
+        }
+        Message::Command {
+            id,
+            kind:
+                CommandKind::AuthAnswer {
+                    key,
+                    sequence,
+                    answers,
+                },
+            ..
+        } if *id == key.start_request
+            || !key.valid()
+            || *sequence == 0
+            || *sequence > 64
+            || !auth::valid_answers(answers) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ))
+        }
+        Message::Command {
+            id,
+            kind: CommandKind::AuthCancel { start_request, key },
+        } if *id == *start_request
+            || *start_request == 0
+            || key.is_some_and(|key| !key.valid() || key.start_request != *start_request) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ))
+        }
+        Message::AuthState {
+            start_request, key, ..
+        } if *start_request == 0
+            || key.is_some_and(|key| !key.valid() || key.start_request != *start_request) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ))
+        }
+        Message::AuthChallenge {
+            key,
+            sequence,
+            messages,
+        } if !key.valid() || *sequence == 0 || *sequence > 64 || !auth::valid_prompts(messages) => {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ))
+        }
+        _ => {}
+    }
+    match msg {
         Message::Snapshot { windows, .. } => {
             for w in windows {
                 check_window(w)?;
@@ -1458,6 +1557,8 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::WorkspacePopup { .. }
         | Message::PointerOutput { .. }
         | Message::ScreenReader { .. }
+        | Message::AuthState { .. }
+        | Message::AuthChallenge { .. }
         | Message::KeyboardAidToggled { .. }
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }
@@ -1645,8 +1746,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_35() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 35));
+    fn current_version_is_0_36() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 36));
     }
 
     #[test]

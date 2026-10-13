@@ -269,6 +269,25 @@ pub struct AuthLease {
     owner: AuthOwner,
 }
 
+/// A command's caller is always derived from its actual admitted session.
+#[derive(Debug)]
+pub enum AuthRequest {
+    Start {
+        origin: crate::auth_owner::Origin,
+    },
+    Answer {
+        origin: crate::auth_owner::Origin,
+        key: tuna_shell_control::auth::Key,
+        sequence: u32,
+        answers: Vec<tuna_shell_control::auth::Answer>,
+    },
+    Cancel {
+        origin: crate::auth_owner::Origin,
+        start_request: u64,
+        key: Option<tuna_shell_control::auth::Key>,
+    },
+}
+
 /// Authenticated control session over a [`ControlConn`].
 ///
 /// The session owns the connection, the token-check hook, the per-window
@@ -283,6 +302,10 @@ pub struct Session<'a> {
     connection_id: u64,
     auth_owner: Option<AuthOwner>,
     auth_lease: Option<AuthLease>,
+    peer_minor: u16,
+    auth_pending: Option<u64>,
+    auth_last_start: u64,
+    auth_requests: Vec<AuthRequest>,
     conn: ControlConn,
     validator: TokenValidator<'a>,
     minter: TokenMinter,
@@ -384,6 +407,10 @@ impl<'a> Session<'a> {
             connection_id: 0,
             auth_owner: None,
             auth_lease: None,
+            peer_minor: 0,
+            auth_pending: None,
+            auth_last_start: 0,
+            auth_requests: Vec::new(),
             conn,
             validator: Box::new(validator),
             minter,
@@ -444,8 +471,12 @@ impl<'a> Session<'a> {
             }));
         }
         // Same major line: accept any minor (lenient reader on our side).
+        session.peer_minor = version.minor.min(CURRENT_VERSION.minor);
         session.conn.write_frame(&Message::Hello {
-            version: CURRENT_VERSION,
+            version: tuna_shell_control::ProtocolVersion::new(
+                CURRENT_VERSION.major,
+                session.peer_minor,
+            ),
         })?;
         session.send_snapshot(model)?;
         Ok(session)
@@ -648,8 +679,17 @@ impl<'a> Session<'a> {
                         current: CURRENT_VERSION,
                     }));
                 }
+                // A new handshake cannot adopt an old interactive authority,
+                // even on the same stream. Cancel via real EOF/lease loss.
+                if self.auth_pending.is_some() || self.auth_lease.is_some() {
+                    let _ = self.conn.stream.shutdown(std::net::Shutdown::Both);
+                    return Err(ControlError::Unexpected(
+                        "authentication resync requires a new connection".into(),
+                    ));
+                }
+                self.peer_minor = version.minor.min(CURRENT_VERSION.minor);
                 self.conn.write_frame(&Message::Hello {
-                    version: CURRENT_VERSION,
+                    version: ProtocolVersion::new(CURRENT_VERSION.major, self.peer_minor),
                 })?;
                 let revision = self.send_snapshot(model)?;
                 Ok(Handled::HelloResync { revision })
@@ -752,13 +792,82 @@ impl<'a> Session<'a> {
                 })?;
                 Ok(Handled::CommandResult { id, applied: true })
             }
+            Message::Command { id, kind }
+                if matches!(
+                    &kind,
+                    CommandKind::AuthStart { .. }
+                        | CommandKind::AuthAnswer { .. }
+                        | CommandKind::AuthCancel { .. }
+                ) =>
+            {
+                let denied = self.peer_minor < 36 || self.auth_requests.len() >= 8;
+                let origin = crate::auth_owner::Origin {
+                    connection: self.connection_id,
+                    request: id,
+                };
+                let request = if denied {
+                    None
+                } else {
+                    match kind {
+                        CommandKind::AuthStart { .. } => {
+                            // Never reuse a root ID in this connection: a delayed
+                            // pre-key Cancel cannot affect a later same-ID attempt.
+                            let reused = id <= self.auth_last_start;
+                            self.auth_last_start = self.auth_last_start.max(id);
+                            if reused
+                                || self.auth_pending.is_some()
+                                || self.auth_lease.is_some()
+                                || self.unlock_pending.is_some()
+                            {
+                                None
+                            } else {
+                                self.auth_pending = Some(id);
+                                Some(AuthRequest::Start { origin })
+                            }
+                        }
+                        CommandKind::AuthAnswer {
+                            key,
+                            sequence,
+                            answers,
+                        } => Some(AuthRequest::Answer {
+                            origin,
+                            key,
+                            sequence,
+                            answers,
+                        }),
+                        CommandKind::AuthCancel { start_request, key } => {
+                            Some(AuthRequest::Cancel {
+                                origin,
+                                start_request,
+                                key,
+                            })
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+                if let Some(request) = request {
+                    self.auth_requests.push(request);
+                    Ok(Handled::CommandResult { id, applied: true })
+                } else {
+                    self.conn.write_frame(&Message::CommandResult {
+                        id,
+                        status: CommandStatus::Denied {
+                            reason: "authentication unavailable".into(),
+                        },
+                    })?;
+                    Ok(Handled::CommandResult { id, applied: false })
+                }
+            }
             Message::Command {
                 id,
                 kind: CommandKind::Unlock { password },
             } => {
                 // Verified off the event loop by the runtime; the result
                 // goes back as this id's CommandResult.
-                if self.unlock_pending.is_some() {
+                if self.unlock_pending.is_some()
+                    || self.auth_pending.is_some()
+                    || self.auth_lease.is_some()
+                {
                     self.conn.write_frame(&Message::CommandResult {
                         id,
                         status: CommandStatus::Denied {
@@ -878,6 +987,8 @@ impl<'a> Session<'a> {
             | Message::WorkspacePopup { .. }
             | Message::PointerOutput { .. }
             | Message::ScreenReader { .. }
+            | Message::AuthState { .. }
+            | Message::AuthChallenge { .. }
             | Message::KeyboardAidToggled { .. }
             | Message::ShortcutConsent { .. }
             | Message::Error { .. } => {
@@ -924,6 +1035,8 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ScreenReader { .. } => "ScreenReader",
+        Message::AuthState { .. } => "AuthState",
+        Message::AuthChallenge { .. } => "AuthChallenge",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
     }
 }
@@ -1093,6 +1206,9 @@ fn apply_command(
         | CommandKind::ShortcutConsent { .. }
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
+        | CommandKind::AuthStart { .. }
+        | CommandKind::AuthAnswer { .. }
+        | CommandKind::AuthCancel { .. }
         | CommandKind::SetWellbeingEffects { .. }
         | CommandKind::SetSwitcherThumbnails { .. }
         | CommandKind::SetSwitcherKeys { .. }
@@ -1119,6 +1235,7 @@ pub fn our_version() -> ProtocolVersion {
 /// (runtime sends the polite client close).
 #[derive(Debug, Default)]
 pub struct PollOutcome {
+    pub auth_requests: Vec<AuthRequest>,
     /// Windows to focus and raise.
     pub activated: Vec<u64>,
     /// Windows to ask to close.
@@ -1458,6 +1575,122 @@ impl ControlHub {
         true
     }
 
+    pub fn deny_auth_start(
+        &mut self,
+        origin: crate::auth_owner::Origin,
+        phase: tuna_shell_control::auth::Phase,
+    ) {
+        if self.origin_pending_live(origin) {
+            if let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|s| s.connection_id == origin.connection && s.peer_minor >= 36)
+            {
+                Self::write_auth(
+                    session,
+                    &Message::AuthState {
+                        start_request: origin.request,
+                        key: None,
+                        phase,
+                    },
+                );
+            }
+        }
+        self.finish_auth(origin, false);
+    }
+    fn write_auth(session: &mut Session<'_>, message: &Message) -> bool {
+        if session.conn.write_frame(message).is_ok() {
+            true
+        } else {
+            // Uncertain output poisons this stream; never continue a partial
+            // frame or borrow a newly reconnected session for an old key.
+            let _ = session.conn.stream.shutdown(std::net::Shutdown::Both);
+            false
+        }
+    }
+    pub fn auth_reply(&mut self, origin: crate::auth_owner::Origin, applied: bool) -> bool {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.connection_id == origin.connection && s.conn.peer_live())
+        else {
+            return false;
+        };
+        Self::write_auth(
+            session,
+            &Message::CommandResult {
+                id: origin.request,
+                status: if applied {
+                    CommandStatus::Applied
+                } else {
+                    CommandStatus::Denied {
+                        reason: "authentication refused".into(),
+                    }
+                },
+            },
+        )
+    }
+    pub fn finish_auth(&mut self, origin: crate::auth_owner::Origin, applied: bool) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| {
+            s.connection_id == origin.connection && s.auth_pending == Some(origin.request)
+        }) {
+            session.auth_pending = None;
+            Self::write_auth(
+                session,
+                &Message::CommandResult {
+                    id: origin.request,
+                    status: if applied {
+                        CommandStatus::Applied
+                    } else {
+                        CommandStatus::Denied {
+                            reason: "authentication refused".into(),
+                        }
+                    },
+                },
+            );
+        }
+    }
+    pub fn send_auth(&mut self, lease: AuthLease, message: Message) -> bool {
+        if !self.auth_lease_live(lease) {
+            return false;
+        }
+        let key_matches = match &message {
+            Message::AuthState {
+                start_request, key, ..
+            } => {
+                *start_request == lease.origin.request
+                    && key.is_none_or(|k| {
+                        k.attempt_serial == lease.serial
+                            && k.epoch == lease.epoch
+                            && k.start_request == lease.origin.request
+                    })
+            }
+            Message::AuthChallenge {
+                key,
+                sequence,
+                messages,
+            } => {
+                (1..=64).contains(sequence)
+                    && tuna_shell_control::auth::valid_prompts(messages)
+                    && key.attempt_serial == lease.serial
+                    && key.epoch == lease.epoch
+                    && key.start_request == lease.origin.request
+            }
+            _ => false,
+        };
+        if !key_matches {
+            return false;
+        }
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.connection_id == lease.origin.connection && s.peer_minor >= 36)
+        else {
+            return false;
+        };
+        Self::write_auth(session, &message)
+    }
+
     /// Current admission rule.
     pub fn peer_gate(&self) -> PeerGate {
         self.gate
@@ -1539,7 +1772,8 @@ impl ControlHub {
     pub fn origin_pending_live(&self, origin: crate::auth_owner::Origin) -> bool {
         self.sessions.iter().enumerate().any(|(i, session)| {
             session.connection_id == origin.connection
-                && session.unlock_pending == Some(origin.request)
+                && (session.unlock_pending == Some(origin.request)
+                    || session.auth_pending == Some(origin.request))
                 && self.gate.admits(self.session_peers[i], our_uid())
                 && (!self.auth_owner_configured
                     || self.auth_owner.is_some_and(|owner| {
@@ -1602,6 +1836,14 @@ impl ControlHub {
     }
 
     pub fn queue_message(&mut self, message: Message) {
+        // Interactive authentication must never enter a broadcast queue,
+        // including queues replayed after a newer session connects.
+        if matches!(
+            &message,
+            Message::AuthState { .. } | Message::AuthChallenge { .. }
+        ) {
+            return;
+        }
         self.menu_queue.push(message);
     }
 
@@ -1713,6 +1955,7 @@ impl ControlHub {
                     if let Some(active) = session.overview_app_grid.take() {
                         outcome.overview_app_grid = Some(active);
                     }
+                    outcome.auth_requests.append(&mut session.auth_requests);
                     if let Some(request) = session.unlock_request.take() {
                         let (request, password) = request;
                         let origin = crate::auth_owner::Origin {
@@ -2469,6 +2712,220 @@ mod auth_origin_tests {
             generation: 0,
         }));
         assert!(!hub.origin_pending_live(origin));
+    }
+    fn auth_start(client: &mut ControlConn, id: u64) {
+        client
+            .write_frame(&Message::Command {
+                id,
+                kind: CommandKind::AuthStart {
+                    method: tuna_shell_control::auth::Method::SessionStack,
+                },
+            })
+            .unwrap();
+    }
+    #[test]
+    fn interactive_messages_are_gated_for_035_and_hello_is_negotiated() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut client = ControlConn::new(UnixStream::connect(hub.socket_path()).unwrap()).unwrap();
+        client
+            .write_frame(&Message::Hello {
+                version: ProtocolVersion::new(0, 35),
+            })
+            .unwrap();
+        for _ in 0..3 {
+            hub.poll(&mut model);
+        }
+        assert!(
+            matches!(client.read_frame().unwrap(), Message::Hello { version } if version == ProtocolVersion::new(0,35))
+        );
+        drain(&mut client);
+        client
+            .write_frame(&Message::Hello {
+                version: ProtocolVersion::new(0, 35),
+            })
+            .unwrap();
+        hub.poll(&mut model);
+        assert!(
+            matches!(client.read_frame().unwrap(), Message::Hello { version } if version == ProtocolVersion::new(0,35))
+        );
+        drain(&mut client);
+        auth_start(&mut client, 1);
+        assert!(hub.poll(&mut model).auth_requests.is_empty());
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+    }
+    #[test]
+    fn interactive_lease_routes_only_origin_and_survives_denial_until_retirement() {
+        use crate::auth_owner::MethodKind;
+        use crate::pam_backend::Verification;
+        use tuna_shell_control::auth::{Key, Prompt, Style};
+        let (_dir, mut hub, mut model) = setup();
+        let owner = AuthOwner {
+            pid: std::process::id(),
+            generation: 1,
+        };
+        hub.set_peer_gate(PeerGate::Pid(owner.pid));
+        hub.set_auth_owner(Some(owner));
+        let mut a = connect(&mut hub, &mut model);
+        let mut b = connect(&mut hub, &mut model);
+        auth_start(&mut a, 1);
+        let requests = hub.poll(&mut model).auth_requests;
+        let [AuthRequest::Start { origin }] = requests.as_slice() else {
+            panic!("one actual start")
+        };
+        let origin = *origin;
+        let lease = hub
+            .bind_auth_lease(origin, 2, 3, MethodKind::PamConversation)
+            .unwrap();
+        let key = Key {
+            start_request: 1,
+            attempt_serial: 2,
+            epoch: 3,
+        };
+        let challenge = |key, sequence| Message::AuthChallenge {
+            key,
+            sequence,
+            messages: vec![Prompt {
+                index: 0,
+                style: Style::Secret,
+                text: "Controlled".into(),
+            }],
+        };
+        assert!(!hub.send_auth(
+            lease,
+            challenge(
+                Key {
+                    attempt_serial: 4,
+                    ..key
+                },
+                1
+            )
+        ));
+        assert!(!hub.send_auth(lease, challenge(key, 65)));
+        assert!(drain(&mut a).is_empty());
+        hub.queue_message(challenge(key, 1));
+        hub.poll(&mut model);
+        assert!(matches!(a.read_frame(), Err(ControlError::WouldBlock)));
+        assert!(matches!(b.read_frame(), Err(ControlError::WouldBlock)));
+        assert!(hub.send_auth(lease, challenge(key, 1)));
+        assert!(
+            matches!(a.read_frame().unwrap(), Message::AuthChallenge { key: got, sequence: 1, .. } if got == key)
+        );
+        assert!(matches!(b.read_frame(), Err(ControlError::WouldBlock)));
+        // Cancellation reply is not physical retirement or a new admission.
+        hub.finish_auth(origin, false);
+        assert!(hub.auth_lease_live(lease));
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+        auth_start(&mut a, 2);
+        assert!(hub.poll(&mut model).auth_requests.is_empty());
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [(2, CommandStatus::Denied { .. })]
+        ));
+        assert!(!hub.retire_pam_auth_lease(lease, Verification::Unretired));
+        assert!(hub.auth_lease_live(lease));
+        assert!(hub.retire_pam_auth_lease(
+            lease,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        auth_start(&mut a, 1);
+        assert!(
+            hub.poll(&mut model).auth_requests.is_empty(),
+            "retired root IDs must not be reused"
+        );
+        drain(&mut a);
+        auth_start(&mut a, 3);
+        let next = hub.poll(&mut model).auth_requests;
+        assert!(
+            matches!(next.as_slice(), [AuthRequest::Start { origin: next }] if next.request == 3)
+        );
+        // Old key cannot publish after retirement, even on the same socket.
+        assert!(!hub.send_auth(lease, challenge(key, 1)));
+        assert!(matches!(b.read_frame(), Err(ControlError::WouldBlock)));
+    }
+    #[test]
+    fn same_stream_hello_cannot_transfer_an_interactive_lease() {
+        use crate::auth_owner::MethodKind;
+        let (_dir, mut hub, mut model) = setup();
+        let owner = AuthOwner {
+            pid: std::process::id(),
+            generation: 1,
+        };
+        hub.set_peer_gate(PeerGate::Pid(owner.pid));
+        hub.set_auth_owner(Some(owner));
+        let mut a = connect(&mut hub, &mut model);
+        auth_start(&mut a, 1);
+        let requests = hub.poll(&mut model).auth_requests;
+        let [AuthRequest::Start { origin }] = requests.as_slice() else {
+            panic!()
+        };
+        let lease = hub
+            .bind_auth_lease(*origin, 2, 3, MethodKind::PamConversation)
+            .unwrap();
+        a.write_frame(&Message::Hello {
+            version: ProtocolVersion::new(0, 35),
+        })
+        .unwrap();
+        hub.poll(&mut model);
+        assert!(!hub.auth_lease_live(lease));
+        assert!(hub.sessions.is_empty());
+        crate::control_readiness::test_peer::wait_for_peer_close(
+            &mut a.stream,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn interactive_origin_eof_and_replacement_generation_invalidate_before_poll() {
+        use crate::auth_owner::MethodKind;
+        let (_dir, mut hub, mut model) = setup();
+        let owner = AuthOwner {
+            pid: std::process::id(),
+            generation: 1,
+        };
+        hub.set_peer_gate(PeerGate::Pid(owner.pid));
+        hub.set_auth_owner(Some(owner));
+        let mut a = connect(&mut hub, &mut model);
+        auth_start(&mut a, 1);
+        let requests = hub.poll(&mut model).auth_requests;
+        let [AuthRequest::Start { origin }] = requests.as_slice() else {
+            panic!()
+        };
+        let lease = hub
+            .bind_auth_lease(*origin, 2, 3, MethodKind::PamConversation)
+            .unwrap();
+        // Queued bytes must not conceal a half-closed original connection.
+        a.write_frame(&Message::Command {
+            id: 2,
+            kind: CommandKind::AuthCancel {
+                start_request: 1,
+                key: None,
+            },
+        })
+        .unwrap();
+        a.stream.shutdown(Shutdown::Write).unwrap();
+        assert!(!hub.auth_lease_live(lease));
+        assert!(!hub.origin_pending_live(*origin));
+        hub.set_auth_owner(Some(AuthOwner {
+            generation: 2,
+            ..owner
+        }));
+        assert!(!hub.auth_lease_live(lease));
+        let mut b = connect(&mut hub, &mut model);
+        auth_start(&mut b, 1);
+        let requests = hub.poll(&mut model).auth_requests;
+        let [AuthRequest::Start { origin: fresh }] = requests.as_slice() else {
+            panic!()
+        };
+        assert_ne!(fresh.connection, origin.connection);
+        assert!(hub.origin_pending_live(*fresh));
     }
     #[test]
     fn connection_id_overflow_refuses_future_peers_without_reuse() {
