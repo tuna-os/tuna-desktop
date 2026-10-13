@@ -2584,11 +2584,12 @@ done
 # Authorization end to end: a stored EXACT grant for an installed app
 # authorizes at the request; the ceiling clamps it; unknown apps and
 # unlisted known apps are denied.
-mkdir -p "$HOME/.local/share/applications"
+# Proof apps live in $XDG_DATA_HOME (the shell's user data dir), like
+# every other tuna-probe desktop file above.
 printf '[Desktop Entry]\nName=Proof Location App\nType=Application\nExec=/bin/true\n' \
-    >"$HOME/.local/share/applications/proof-location-app.desktop"
+    >"$XDG_DATA_HOME/applications/proof-location-app.desktop"
 printf '[Desktop Entry]\nName=Proof Location Stranger\nType=Application\nExec=/bin/true\n' \
-    >"$HOME/.local/share/applications/proof-location-stranger.desktop"
+    >"$XDG_DATA_HOME/applications/proof-location-stranger.desktop"
 gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore \
     --object-path /org/freedesktop/impl/portal/PermissionStore \
     --method org.freedesktop.impl.portal.PermissionStore.SetPermission \
@@ -2598,7 +2599,7 @@ auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
     fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -q "(true, 8)" ||
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
     fail G-QS-LOCATION "stored EXACT grant answered $auth, not (true, 8)"
 gsettings set org.gnome.system.location max-accuracy-level 'city' ||
     fail G-QS-LOCATION "could not lower the accuracy ceiling"
@@ -2606,7 +2607,7 @@ auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
     fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -q "(true, 4)" ||
+echo "$auth" | grep -qE "\(true, (uint32 )?4\)" ||
     fail G-QS-LOCATION "city ceiling answered $auth, not (true, 4)"
 gsettings set org.gnome.system.location max-accuracy-level 'exact' ||
     fail G-QS-LOCATION "could not restore the accuracy ceiling"
@@ -2614,13 +2615,13 @@ auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-stranger 8 2>&1) ||
     fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -q "(false, 0)" ||
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
     fail G-QS-LOCATION "unlisted app answered $auth, not denied"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp no-such-app-xyz 8 2>&1) ||
     fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -q "(false, 0)" ||
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
     fail G-QS-LOCATION "unknown app answered $auth, not denied"
 # Switching off denies live: the stored grant stops authorizing and the
 # indicator stays dark even while GeoClue reports in use.
@@ -2630,7 +2631,7 @@ auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
     fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -q "(false, 0)" ||
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
     fail G-QS-LOCATION "stored grant answered $auth with the switch off, not denied"
 gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
     --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
@@ -2682,7 +2683,7 @@ auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
     fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -q "(false, 0)" ||
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
     fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch off, not denied"
 gsettings set org.gnome.system.location enabled true ||
     fail G-QS-LOCATION-ABSENT "could not switch location back on"
@@ -2690,13 +2691,13 @@ auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
     fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -q "(true, 8)" ||
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
     fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch back on, not (true, 8)"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp no-such-app-xyz 8 2>&1) ||
     fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
-echo "$auth" | grep -q "(false, 0)" ||
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
     fail G-QS-LOCATION-ABSENT "unknown app answered $auth, not denied"
 gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
     --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent true >/dev/null ||
