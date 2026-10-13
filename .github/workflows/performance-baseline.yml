@@ -9,6 +9,8 @@ on:
       - scripts/lib/tuna-benchmark-esp-tests.py
       - scripts/lib/tuna_benchmark_disk.py
       - scripts/lib/tuna-benchmark-disk-tests.py
+      - scripts/lib/tuna-benchmark-footprint-tests.py
+      - scripts/lib/tuna_benchmark_footprint.py
       - scripts/tuna-perf-profile-pairs
       - scripts/tuna-frame-pacer-build
       - scripts/lib/tuna-frame-pacer.c
@@ -75,6 +77,7 @@ jobs:
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y python3-yaml
       - run: python3 scripts/lib/tuna-perf-tests.py
       - run: python3 scripts/lib/tuna-benchmark-disk-tests.py
+      - run: python3 scripts/lib/tuna-benchmark-footprint-tests.py
       - run: python3 scripts/lib/tuna-benchmark-esp-tests.py
       - run: /usr/bin/python3 scripts/lib/tuna-corral-ssh-export-tests.py
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
