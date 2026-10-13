@@ -2,16 +2,30 @@
 """Dump one application's AT-SPI accessible tree as JSON (#71).
 
 Usage: tuna-a11y-dump.py APP_NAME OUT.json [TIMEOUT_S] [--press NAME]
-                          [--set NAME VALUE]
+                          [--set NAME VALUE] [--pid PID] [--strict]
 
 With --press, also performs the first action (click) of the first
 showing node named NAME, as a screen-reader user would, then dumps.
 With --set, sets the value of the first showing node named NAME that
 has one (a slider), the way assistive technology moves it.
+With --pid, only dumps the tree whose application process matches PID
+(and stamps the root node with that process_id).
 
-Each node: role, name, description, depth, showing, and window-relative bounds.
+Each node: role, name, description, depth, showing, checked, selected,
+focused, and window-relative bounds (null when the node legitimately
+lacks a Component implementation).
 Waits up to TIMEOUT_S for the app
 to register on the accessibility bus. Exit 1 if it never appears.
+
+With --strict, detected traversal inconsistencies fail closed as
+error nodes instead of silently dropped subtrees: a None child for an
+advertised index, a malformed or drifting childCount, and
+state/read/query exceptions each surface an in-band {"role": "error"}
+record. Consumers must reject any tree containing an error node.
+Detection is best-effort, not atomic completeness: a constant-count
+child replacement mid-walk can still escape notice. Only a
+NotImplementedError from queryComponent keeps the legitimate
+null-bounds behavior.
 """
 import json
 import sys
@@ -49,10 +63,36 @@ def walk(acc, depth, out, strict=False):
             "focused": acc.getState().contains(pyatspi.STATE_FOCUSED),
             "bounds": bounds(acc, strict),
         })
-        for i in range(acc.childCount):
-            child = acc.getChildAtIndex(i)
-            if child is not None:
+        child_count = acc.childCount
+        if strict and (type(child_count) is not int or child_count < 0):
+            out.append({"role": "error",
+                        "name": f"malformed childCount {child_count!r} "
+                                f"at depth {depth}",
+                        "depth": depth, "showing": False})
+        else:
+            for i in range(child_count):
+                child = acc.getChildAtIndex(i)
+                if child is None:
+                    if strict:
+                        out.append({"role": "error",
+                                    "name": f"missing child {i} of "
+                                            f"{child_count} "
+                                            f"at depth {depth + 1}",
+                                    "depth": depth + 1, "showing": False})
+                    continue
                 walk(child, depth + 1, out, strict)
+            if strict:
+                end_count = acc.childCount
+                if type(end_count) is not int or end_count < 0:
+                    out.append({"role": "error",
+                                "name": f"malformed childCount {end_count!r} "
+                                        f"at depth {depth}",
+                                "depth": depth, "showing": False})
+                elif end_count != child_count:
+                    out.append({"role": "error",
+                                "name": f"childCount drifted {child_count} -> "
+                                        f"{end_count} at depth {depth}",
+                                "depth": depth, "showing": False})
     except Exception as exc:  # a node can die mid-walk; keep the rest
         out.append({"role": "error", "name": str(exc), "depth": depth, "showing": False})
 
