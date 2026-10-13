@@ -392,9 +392,10 @@ pub fn read_bool_via_command(program: &str, args: &[&str], timeout: Duration) ->
                 if let Some(stdout) = child.stdout.take() {
                     use std::io::Read;
                     let mut stdout = stdout;
-                    if stdout.set_nonblocking(true).is_err() {
-                        return None;
-                    }
+                    // `ChildStdout` has no `set_nonblocking`; flag the fd
+                    // directly (same rustix pair as the IME address probe).
+                    let flags = rustix::fs::fcntl_getfl(&stdout).ok()?;
+                    rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK).ok()?;
                     let mut bytes = Vec::new();
                     let mut chunk = [0u8; 256];
                     loop {
