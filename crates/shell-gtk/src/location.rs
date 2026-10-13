@@ -248,6 +248,20 @@ pub fn permission_entry(level: u32, unix_secs: u64) -> Vec<String> {
     vec![accuracy_name(level).to_owned(), unix_secs.to_string()]
 }
 
+/// The level a stored-grant read saves back: the stored grant itself
+/// (a timestamp refresh), never a ceiling-clamped downgrade. The store
+/// records the user's consent; the ceiling is separate policy, so a
+/// read under a lowered ceiling must not erase the grant.
+pub fn refresh_level(
+    perms: Option<&HashMap<String, Vec<String>>>,
+    desktop_id: &str,
+    fallback: u32,
+) -> u32 {
+    perms
+        .and_then(|p| stored_accuracy(p, desktop_id))
+        .unwrap_or(fallback)
+}
+
 /// The panel icon: shown only while location is on and in use.
 pub fn indicator_icon(enabled: bool, in_use: bool) -> Option<&'static str> {
     (enabled && in_use).then_some("location-services-active-symbolic")
@@ -477,7 +491,10 @@ impl LocationAgent {
                             LookupOutcome::Available(t) => Some(t),
                             LookupOutcome::Unavailable(_) => None,
                         };
-                        this.save_permission(table, &desktop_id, accuracy);
+                        // The reply is clamped; the saved row keeps the
+                        // stored grant (timestamp refresh only).
+                        let saved = refresh_level(table, &desktop_id, accuracy);
+                        this.save_permission(table, &desktop_id, saved);
                     }
                     invocation.return_value(Some(&auth_reply(accuracy).to_variant()));
                 }
@@ -553,20 +570,19 @@ impl LocationAgent {
         );
     }
 
-    /// One row back into the store, stamped with now. Rechecks the live
-    /// ceiling first: nothing is saved while Location is off, and the
-    /// saved level never exceeds the live ceiling.
+    /// One row back into the store, stamped with now. Rechecks the
+    /// live switch first: nothing is saved while Location is off. The
+    /// level arrives final (new decisions pre-clamped, stored grants
+    /// preserved), so this never downgrades a row on read.
     fn save_permission(
         &self,
         perms: Option<&HashMap<String, Vec<String>>>,
         desktop_id: &str,
         accuracy: u32,
     ) {
-        let live_max = self.max_accuracy_level();
-        if live_max == ACC_NONE {
+        if self.max_accuracy_level() == ACC_NONE {
             return;
         }
-        let accuracy = live_grant(accuracy, live_max);
         let Some(session) = self.session.borrow().clone() else {
             return;
         };
@@ -1061,5 +1077,33 @@ mod tests {
         assert_eq!(live_grant(ACC_EXACT, ACC_EXACT), ACC_EXACT);
         assert_eq!(live_grant(ACC_EXACT, ACC_CITY), ACC_CITY);
         assert_eq!(live_grant(ACC_NONE, ACC_EXACT), ACC_NONE);
+    }
+
+    #[test]
+    fn clamped_read_refreshes_but_never_downgrades_the_grant() {
+        let perms = HashMap::from([(
+            "proof-location-app".to_owned(),
+            vec!["EXACT".to_owned(), "1700000000".to_owned()],
+        )]);
+        // A read under a city ceiling replies CITY yet saves EXACT back.
+        assert_eq!(
+            authorize(ACC_CITY, Some(ACC_EXACT), false, true),
+            AuthDecision::Answer {
+                accuracy: ACC_CITY,
+                save: true
+            }
+        );
+        assert_eq!(
+            refresh_level(Some(&perms), "proof-location-app", ACC_CITY),
+            ACC_EXACT
+        );
+        assert_eq!(
+            refresh_level(None, "proof-location-app", ACC_CITY),
+            ACC_CITY
+        );
+        assert_eq!(
+            refresh_level(Some(&perms), "missing.app", ACC_CITY),
+            ACC_CITY
+        );
     }
 }
