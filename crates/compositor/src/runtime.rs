@@ -1835,6 +1835,7 @@ impl Runtime {
             "idle_blank_alpha": self.blank_alpha(),
             "overview_search": self.overview_search,
             "overview_app_grid": self.overview_app_grid,
+            "client_dnd_active": !self.is_locked() && self.state.client_dnd_active(),
             "keyboard": keyboard,
             "overview_open": overview_open,
             "animations_enabled": self.input_settings.motion.animations_enabled(),
