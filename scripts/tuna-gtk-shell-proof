@@ -5047,10 +5047,14 @@ pass G-SWIPE-REDUCED-MOTION "up/down gestures snap while held and settle correct
 # GNOME 51 eases the overview open with EASE_OUT_SINE and closed with
 # EASE_OUT_QUAD over 250 ms (#499). The compositor records the progress
 # of every frame it drew; each must sit on its own direction's curve,
-# with at least one sample strictly mid-transition each way.
+# with at least one sample strictly mid-transition each way. Leave a bounded
+# settled idle interval before each input; elapsed time before the request
+# must not be charged to the newly started transition (adaptive repaint).
+sleep 1
 xdotool key Super_L
 cstate '.overview_open and .overview_progress == 1' "eased open" ||
     fail G-OVERVIEW-EASING "the overview did not open"
+sleep 1
 xdotool key Escape
 cstate '(.overview_open | not) and .overview_progress == 0' "eased close" ||
     fail G-OVERVIEW-EASING "the overview did not close"
@@ -5060,6 +5064,7 @@ jq -e '
     def frac: (.[0] / 250) | if . > 1 then 1 else . end;
     .overview_motion.open as $o | .overview_motion.close as $c |
     $o.curve == "ease-out-sine" and $o.duration_ms == 250 and $o.from == 0 and $o.to == 1 and
+    $o.samples[0] == [0, 0] and $c.samples[0] == [0, 1] and
     $c.curve == "ease-out-quad" and $c.duration_ms == 250 and $c.from == 1 and $c.to == 0 and
     ([$o.samples[] | select(.[0] > 0 and .[0] < 250 and .[1] > 0 and .[1] < 1)] | length) > 0 and
     ([$c.samples[] | select(.[0] > 0 and .[0] < 250 and .[1] > 0 and .[1] < 1)] | length) > 0 and
