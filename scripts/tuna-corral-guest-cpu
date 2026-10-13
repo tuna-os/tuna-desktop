@@ -21,53 +21,8 @@ from corral_visual import candidate_intent
 from gnome_reference import validate_image, validate_reference, same_reference
 
 
-PROCESS_BYTES = r"""import hashlib,json,pathlib,pwd,os,sys
-selected=json.loads(sys.argv[1]);row=selected['compositor'];p=pathlib.Path('/proc')/str(row['pid'])
-boot=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-def check():
- if p.stat().st_uid!=pwd.getpwnam('tuna-test').pw_uid or os.readlink(p/'exe')!=row['exe'] or int((p/'stat').read_text().rsplit(')',1)[1].split()[19])!=row['start_ticks']:raise ValueError('selected running process changed')
-check()
-with (p/'exe').open('rb') as stream:actual=hashlib.file_digest(stream,'sha256').hexdigest()
-check()
-if actual!=row['sha256'] or boot!=selected['boot_id'] or pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()!=boot:raise ValueError('actual running executable or boot differs')
-print(json.dumps({'boot_id':boot,'pid':row['pid'],'running_exe_sha256':actual}))
-"""
-
-
-def fingerprint(path):
-    with Path(path).open('rb') as stream:return hashlib.file_digest(stream, 'sha256').hexdigest()
-
-
-def stock_reference(session):
-    result = session.python(PHASE, ['stock-reference'])
-    session.check_boot(result['transport_boot_id'])
-    if result.get('exitcode') != 0 or result.get('exited') is not True or result.get('out-truncated') is not False or result.get('err-truncated') is not False:
-        raise ValueError('stock GNOME reference probe failed or incomplete')
-    return validate_reference(json.loads(base64.b64decode(result['out-data'], validate=True))['stock_reference'], 'stock')
-
-
-def image_reference(session):
-    result = session.python(PHASE, ['reference-image'])
-    session.check_boot(result['transport_boot_id'])
-    if result.get('exitcode') != 0 or result.get('exited') is not True or result.get('out-truncated') is not False or result.get('err-truncated') is not False:
-        raise ValueError('guest image reference probe failed or incomplete')
-    return validate_image(json.loads(base64.b64decode(result['out-data'], validate=True))['reference_image'], 'stock')
-
-
-def selected_identity(desktop, selected, manifest, reference=None):
-    if selected.get('desktop') != desktop:raise ValueError('selected desktop mismatch')
-    compositor = selected['compositor']
-    if desktop == 'tuna':
-        expected = manifest['candidate_required_members']['usr/bin/tuna-compositor']['sha256']
-        if compositor['exe'] != '/usr/bin/tuna-compositor' or compositor['sha256'] != expected:
-            raise ValueError('selected Tuna bytes differ from original package')
-    else:
-        validate_reference(reference, 'stock')
-        principal = reference['principal']
-        if (compositor['exe'], compositor['pid'], compositor['start_ticks'], compositor['sha256']) != ('/usr/bin/gnome-shell', principal['pid'], principal['start'], reference['shell_sha256']):
-            raise ValueError('selected stock GNOME 51 process differs from admitted reference')
-
-
+from corral_guest_admission import (PROCESS_BYTES, fingerprint, stock_reference,
+                                   image_reference, selected_identity, AggregateAdmission)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -86,50 +41,27 @@ def main():
     admitted = admit_imported_disk(export, args.import_receipt, args.context, args.namespace, args.vm, args.reference_image, args.tuna_payload, args.tuna_selection)
     key = client_key(manifest, args.key, args.public_key or args.key + '.pub', 'root')
     root = Path(__file__).resolve().parent.parent
-    observer_commit = subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],timeout=10).decode().strip()
-    source_paths = ('scripts/tuna-corral-guest-cpu', 'scripts/lib/corral_guest_cpu.py',
-                    'scripts/lib/corral_session.py', 'scripts/lib/corral_perf.py',
-                    'scripts/lib/corral_ssh.py', 'scripts/lib/corral_visual.py', 'scripts/lib/gnome_reference.py')
-    for name in source_paths:
-        committed = subprocess.check_output(['git','-C',str(root),'show','HEAD:'+name],timeout=10)
-        if hashlib.sha256(committed).hexdigest() != fingerprint(root/name):raise ValueError('collector source differs from committed observer')
     out = Path(args.out).resolve()
     if out == root or root in out.parents:raise ValueError('collector evidence must be outside source checkout')
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     report = {'schema': 1, 'completed': False, 'context': args.context, 'namespace': args.namespace, 'vm': args.vm, 'desktop': args.desktop, 'candidate_source_commit': args.candidate_sha,
-              'collector_source_commit': observer_commit, 'export_observer_source_commit': manifest['observer_source_commit'],
+              'export_observer_source_commit': manifest['observer_source_commit'],
               'package_run': args.package_run, 'package_sha256': manifest['package_sha256'], 'fixture_image_id': manifest['fixture_image_id'],
               'reference': reference, 'original_import': admitted, 'client_key': key,
-              'source_sha256': {name: fingerprint(root/name) for name in source_paths},
+
               'scope': 'Independent read-only idle window; aggregate guest includes collector/SSH overhead; no completed-action or whole-host CPU claim.',
               'hardware_gpu_qualified': False, 'total_power_qualified': False, 'performance_qualified': False}
     session = None
     try:
         session = Session(args.context, args.namespace, args.vm, 'root', args.key, args.known_hosts, out)
         report['session'] = session.metadata
-        if image_reference(session) != reference:raise ValueError('guest image reference differs before idle window')
-        selected = session.desktop(args.desktop)
-        original = stock_reference(session) if args.desktop == 'gnome' else None
-        if original is not None and original['image'] != reference:raise ValueError('actual stock reference differs from original image')
-        selected_identity(args.desktop, selected, manifest, original)
-        running = session.python(PROCESS_BYTES, selected);session.check_boot(running['boot_id'])
-        report['selected_running_bytes_before'] = running
-        report['selected_before'] = selected;report['stock_reference_before'] = original
+        selected=session.desktop(args.desktop)
+        original=stock_reference(session) if args.desktop=='gnome' else None
+        admission=AggregateAdmission(session,vars(args),reference,selected,original)
+        report['admission']=admission.evidence
         time.sleep(30)  # Equal standalone settle; paired hook reuses its existing settle.
         report['aggregate'] = collect_idle(session, out)
-        session.verify()
-        final = session.desktop(args.desktop)
-        if final != selected:raise ValueError('selected compositor changed during idle window')
-        running_after = session.python(PROCESS_BYTES, final);session.check_boot(running_after['boot_id'])
-        if running_after != running:raise ValueError('running executable changed during idle window')
-        report['selected_running_bytes_after'] = running_after
-        if original is not None:
-            after = stock_reference(session);same_reference(original, after, 'stock')
-            report['stock_reference_after'] = after
-        if image_reference(session) != reference:raise ValueError('guest image reference differs after idle window')
-        if admit_imported_disk(export, args.import_receipt, args.context, args.namespace, args.vm, args.reference_image, args.tuna_payload, args.tuna_selection) != admitted:
-            raise ValueError('original import admission changed')
-        report['selected_after'] = final;report['session'] = session.metadata
+        report['admission']=admission.finish()
         report['completed'] = True
     except Exception as error:
         report['error'] = type(error).__name__ + ': ' + str(error)[:2000]

@@ -21,6 +21,12 @@ def sample(index=0):
     row = ' '.join(map(str, values));core = ' '.join(str(v//2) for v in values)
     return {'boot_id': BOOT, 'boot_after': BOOT, 'begin_monotonic_ns': 1_000_000_000+index*1_000_000_000,
             'cpu_monotonic_ns': 1_001_000_000+index*1_000_000_000, 'end_monotonic_ns': 1_002_000_000+index*1_000_000_000,
+            'begin_boottime_ns':6_000_000_000+index*1_000_000_000,
+            'cpu_boottime_ns':6_001_000_000+index*1_000_000_000,
+            'end_boottime_ns':6_001_999_999+index*1_000_000_000,
+            'begin_clock_after_monotonic_ns':1_000_000_001+index*1_000_000_000,
+            'cpu_clock_after_monotonic_ns':1_001_000_001+index*1_000_000_000,
+            'end_clock_before_monotonic_ns':1_001_999_999+index*1_000_000_000,
             'online_before': '0-1\n', 'online_after': '0,1\n', 'hz': 100,
             'proc_stat': 'cpu '+row+'\ncpu0 '+core+'\ncpu1 '+core+'\n',
             'meminfo': 'MemTotal: 4096 kB\nMemAvailable: 3000 kB\n'}
@@ -115,15 +121,15 @@ class GuestCpuTests(unittest.TestCase):
             return io.StringIO(files[path])
         def sleep(seconds):clock[0]+=seconds
         output=io.StringIO()
-        with patch('builtins.open',side_effect=read),patch('time.monotonic',side_effect=lambda:clock[0]),patch('time.monotonic_ns',side_effect=monotonic_ns),patch('time.sleep',side_effect=sleep),patch('os.sysconf',return_value=100),patch('sys.argv',['collector','{"seconds":30}']),contextlib.redirect_stdout(output):
+        with patch('builtins.open',side_effect=read),patch('time.monotonic',side_effect=lambda:clock[0]),patch('time.monotonic_ns',side_effect=monotonic_ns),patch('time.clock_gettime_ns',side_effect=lambda clockid:int(clock[0]*1e9)+calls[0]+5_000_000_000),patch('time.sleep',side_effect=sleep),patch('os.sysconf',return_value=100),patch('sys.argv',['collector','{"seconds":30}']),contextlib.redirect_stdout(output):
             exec(COLLECT,{})
         raw=json.loads(output.getvalue());self.assertEqual(len(raw),31)
-        self.assertAlmostEqual(summarize(raw,BOOT)['busy_guest_capacity_percent']['median'],15)
+        self.assertAlmostEqual(summarize(raw,BOOT)['busy_guest_capacity_percent']['median'],15,places=6)
         def stalled(path):
             if path=='/proc/stat':clock[0]+=35
             return read(path)
         clock[0]=1.0
-        with patch('builtins.open',side_effect=stalled),patch('time.monotonic',side_effect=lambda:clock[0]),patch('time.monotonic_ns',side_effect=monotonic_ns),patch('os.sysconf',return_value=100),patch('sys.argv',['collector','{"seconds":30}']):
+        with patch('builtins.open',side_effect=stalled),patch('time.monotonic',side_effect=lambda:clock[0]),patch('time.monotonic_ns',side_effect=monotonic_ns),patch('time.clock_gettime_ns',side_effect=lambda clockid:int(clock[0]*1e9)+calls[0]+5_000_000_000),patch('os.sysconf',return_value=100),patch('sys.argv',['collector','{"seconds":30}']):
             with self.assertRaises(TimeoutError):exec(COLLECT,{})
 
     def test_host_hook_retains_invalid_raw_and_uses_bounded_transport(self):
@@ -153,7 +159,7 @@ class GuestCpuTests(unittest.TestCase):
         for field,value in [('exe','/usr/bin/gnome-shell'),('sha256','b'*64)]:
             bad=copy.deepcopy(selected);bad['compositor'][field]=value
             with self.assertRaises(ValueError):module.selected_identity('tuna',bad,manifest)
-        source=path.read_text()
+        source=path.read_text()+Path(__file__).resolve().parents[1].joinpath('lib/corral_guest_admission.py').read_text()
         for token in ('candidate_intent(', 'admit_imported_disk(', 'client_key(', "gnome_profile') != 'stock'", 'same_reference(', 'session.verify()', "(p/'exe').open('rb')"):
             self.assertIn(token,source)
         compile(module.PROCESS_BYTES,'actual-exe-probe','exec')

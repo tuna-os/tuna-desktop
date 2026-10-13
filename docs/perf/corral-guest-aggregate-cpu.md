@@ -16,8 +16,12 @@ execution. A failed receipt has `completed:false` even if raw data was retained.
 
 ## Metrics and raw evidence
 
-The guest returns 31 raw reads, with monotonic nanosecond timestamps bracketing
-collection, online CPU IDs, USER_HZ, CPU counters and MemTotal/MemAvailable. The
+The guest returns 31 raw reads, with monotonic and CLOCK_BOOTTIME nanosecond
+timestamps bracketing collection, online CPU IDs, USER_HZ, CPU counters and
+MemTotal/MemAvailable. Each boot-time read is bracketed by monotonic reads. Their
+offset intervals must intersect throughout the collection; a suspend or clock
+relationship drift visible to these reads is refused. This is sampled clock
+evidence, not continuous observation between reads. The
 observer refuses missing/malformed counters, boot/HZ/topology drift, overlapping
 or nonpositive time intervals and counter resets. A guest timeout of 35 seconds,
 host budget of 42 seconds and kernel file limits bound the collector.
@@ -55,23 +59,31 @@ not prove action completion, smoothness, input latency or outperformance.
 
 ## Same phase for each paired desktop
 
-The existing Corral paired runner in PR #599 selects three alternating pairs with
-fresh boots and the same immutable image/domain/node. Its resource runner already
-performs an equal 30 second settle, then brackets a 30 second idle interval with guest
-clock markers before the 20 action workload.
+`scripts/tuna-corral-perf-pairs --guest-aggregate-cpu` selects three alternating
+pairs with fresh boots and the same admitted immutable image, VM, domain and
+node. The opt-in path requires `--profile stock`, root SSH, `--candidate-sha` and
+`--package-run`, plus the existing original export/import, package payload,
+selection, image reference, private key and owned known-hosts paths. The original
+exporter and its SSH/ESP contracts are unchanged. The importer retains the
+reviewed candidate/package intent check before creating any resources.
 
-The new host helper exposes `corral_guest_cpu.collect_idle(session,out)`. For
-both desktop cases, after original admission/selected-process checks and the
-existing equal settle, the runner should keep `guest_phases['idle_start']`, call
-this hook **in place of the 30 second idle sleep**, then keep `guest_phases['idle_end']`.
-Reference hashing and selected-process checks belong outside this window. It
-should retain the returned summary beside its existing UID/PSS metrics, check
-identical online core IDs/HZ across the six paired cases, and reject failed or
-missing aggregate receipts. The image's existing sampler continues supplying
-UID/PSS data over that same guest-clock interval.
+The wrapper invokes `scripts/tuna-vm-perf --guest-aggregate-cpu` for all six cases.
+Both desktops retain the existing equal 30 second settle and guest BOOTTIME idle
+start/end markers. The collector replaces the idle sleep; the image's existing
+UID sampler continues supplying CPU/RSS/PSS over that same phase. Every complete
+raw collection window must lie inside the markers. Reference hashing and actual
+running-process checks occur outside this measured window.
 
-This leaf supplies and tests the hook and standalone observer. It does not claim
-that PR #599's paired runner already calls it. The standalone CLI's additional
-settle must not be invoked inside the existing runner's measured idle interval.
-No image update is required: the bounded kernel-reading Python source is sent
-through the already authenticated SSH transport.
+Each case preserves raw bytes, their SHA-256 and the collector source hash. The
+paired validator re-derives the report from those bytes and requires all six
+cases in the original alternating order, unique boots and identical observer
+source, online core IDs and USER_HZ. Missing, changed, out-of-phase or invalid
+receipts refuse completion. The existing 20 real action observations and native
+completion validators remain separate; aggregate idle CPU does not qualify
+those actions.
+
+The standalone CLI supplies an additional equal settle and independent idle
+window. It is not invoked inside the paired runner's idle phase. No image update
+is required: bounded kernel-reading Python is sent through authenticated SSH.
+The workflow runs source tests and CLI admission checks only. Neither this leaf
+nor those checks have executed a VM comparison or qualified hardware GPU/power.
