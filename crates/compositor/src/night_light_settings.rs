@@ -627,13 +627,20 @@ mod tests {
             loop_.dispatch(Some(deadline - now), &mut count).unwrap();
         }
     }
-    fn retired(mut reader: Reader, events: &mpsc::Receiver<&'static str>) {
+    /// Harness-only retirement sync bound. The product failure bound stays
+    /// OPERATION_LIMIT: a blocked worker is quarantined after two seconds.
+    /// Observing its exit only synchronizes the test with a worker that is
+    /// already quarantined, so this wait tolerates CI process contention
+    /// without changing when quarantine fires.
+    const RETIRE_LIMIT: Duration = Duration::from_secs(10);
+    fn retired(mut reader: Reader, events: &mpsc::Receiver<&'static str>) -> Reader {
         reader.shared.quarantine();
         assert_eq!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(RETIRE_LIMIT).unwrap(),
             "retired"
         );
         reader.owner.take().unwrap().join().unwrap();
+        reader
     }
     #[test]
     fn actual_blocked_worker_quarantines_once_denies_late_cache_and_preview_without_replacement() {
@@ -658,7 +665,15 @@ mod tests {
         answers
             .send(Ok(RawSettings::schema_defaults().into_config()))
             .unwrap();
-        retired(reader, &events);
+        let reader = retired(reader, &events);
+        // Quarantine is permanent and stable across worker exit: joining the
+        // retired worker must not resurrect cache, deadlines, or admission.
+        assert_eq!(reader.status(), CacheStatus::Quarantined);
+        assert_eq!(reader.next_deadline(expiry), None);
+        assert!(matches!(
+            reader.preview(5, expiry),
+            Err(PreviewRejected::Unavailable)
+        ));
         assert_eq!(share.preview_temperature(Instant::now()), None);
         assert!(
             events.try_recv().is_err(),
