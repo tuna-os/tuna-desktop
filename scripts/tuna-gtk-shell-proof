@@ -5114,22 +5114,43 @@ gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
     fail G-WELLBEING-ACTION-DELAY "could not clear lock-screen"
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-ACTION-DELAY "could not select the eyesight break"
+# One due-poll pass: keeps the user present while the 10 s interval runs
+# out, then catches the live due banner. Sets DELAYDUE and
+# delay_due_epoch on the catch.
+wb_delay_poll_due() {
+    end=$(($(date +%s) + 25))
+    while [ "$(date +%s)" -le "$end" ]; do
+        xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
+            fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
+        sleep 1
+        xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
+            fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
+        sleep 1
+        wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-due.json" 20 >/dev/null 2>&1 || continue
+        if showing "$ARTIFACTS/a11y-wb-delay-due.json" "Time for an Eyesight Break"; then
+            delay_due_epoch="$(date +%s)"
+            DELAYDUE=1
+            break
+        fi
+    done
+}
 DELAYDUE=""
-end=$(($(date +%s) + 25))
-while [ "$(date +%s)" -le "$end" ]; do
-    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
-    sleep 1
-    xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
-    sleep 1
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-due.json" 20 >/dev/null 2>&1 || continue
-    if showing "$ARTIFACTS/a11y-wb-delay-due.json" "Time for an Eyesight Break"; then
-        delay_due_epoch="$(date +%s)"
-        DELAYDUE=1
-        break
-    fi
-done
+wb_delay_poll_due
+if [ -z "$DELAYDUE" ]; then
+    # One re-arm (journey runs 38489411792/38494022555): both misses
+    # polled a shell that never left Disabled (no break-state line in
+    # the session log, quiet 21-node dumps), so a missed poll means a
+    # lost enable, not a straddled banner. Disabling and re-enabling
+    # restarts the interval at now; the Delay press still moves the
+    # live due by delay-seconds from the caught banner, and a stale
+    # Delay still fails.
+    gsettings reset org.gnome.desktop.break-reminders selected-breaks ||
+        fail G-WELLBEING-ACTION-DELAY "could not deselect breaks for re-arm"
+    sleep 2
+    gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
+        fail G-WELLBEING-ACTION-DELAY "could not re-select the eyesight break"
+    wb_delay_poll_due
+fi
 [ -n "$DELAYDUE" ] || fail G-WELLBEING-ACTION-DELAY "no due banner to delay"
 wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-press.json" 20 --press "Delay" ||
     fail G-WELLBEING-ACTION-DELAY "could not press Delay"
