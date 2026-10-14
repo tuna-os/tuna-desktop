@@ -5194,6 +5194,10 @@ pass G-WELLBEING-ACTION-DELAY "an actual Delay press moves the live due by delay
 # original schedule. A stale Skip press must fail.
 wb_gate_begin G-WELLBEING-ACTION-SKIP
 wb_probe_ensure
+# Warm the accessibility path before the time-critical window: the upcoming
+# notice is one-shot with a 4 s banner fuse, so the first poll dump must not
+# pay AT-SPI activation latency (run 38475780955 journey).
+wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-warm.json" 20 >/dev/null 2>&1 || true
 gsettings set org.gnome.desktop.notifications show-banners true ||
     fail G-WELLBEING-ACTION-SKIP "could not show banners"
 cstate '(.overview_open | not)' "no overview" ||
@@ -5218,20 +5222,41 @@ gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
     fail G-WELLBEING-ACTION-SKIP "could not clear lock-screen"
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-ACTION-SKIP "could not select the eyesight break"
+# One upcoming-poll pass: tight cadence, since a slow dump iteration opens a
+# gap the 4 s one-shot fuse can fall through (a silent `|| continue`).
+# Sets SKIPUP when the live banner is caught.
+wb_skip_poll_upcoming() {
+    end=$(($(date +%s) + 30))
+    while [ "$(date +%s)" -le "$end" ]; do
+        xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
+            fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
+        sleep 0.25
+        xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
+            fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
+        sleep 0.25
+        wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-upcoming.json" 20 >/dev/null 2>&1 || continue
+        if showing "$ARTIFACTS/a11y-wb-skip-upcoming.json" "Eyesight Break Soon"; then SKIPUP=1; break; fi
+    done
+}
 skip_enable_epoch="$(date +%s)"
 skip_orig_due_epoch=$((skip_enable_epoch + 130))
 SKIPUP=""
-end=$(($(date +%s) + 30))
-while [ "$(date +%s)" -le "$end" ]; do
-    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
-    sleep 1
-    xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
-    sleep 1
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-upcoming.json" 20 >/dev/null 2>&1 || continue
-    if showing "$ARTIFACTS/a11y-wb-skip-upcoming.json" "Eyesight Break Soon"; then SKIPUP=1; break; fi
-done
+wb_skip_poll_upcoming
+if [ -z "$SKIPUP" ]; then
+    # One re-arm (run 38475780955 journey): the post is deterministic ~10 s
+    # after a fresh enable, so a missed poll means the fuse fell between
+    # dumps, not a missing post. Disabling and re-enabling restarts the
+    # interval at now; the enable epoch restarts with it, so the Skip press
+    # still retires the upcoming notice with the due schedule undisturbed.
+    gsettings reset org.gnome.desktop.break-reminders selected-breaks ||
+        fail G-WELLBEING-ACTION-SKIP "could not deselect breaks for re-arm"
+    sleep 2
+    gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
+        fail G-WELLBEING-ACTION-SKIP "could not re-select the eyesight break"
+    skip_enable_epoch="$(date +%s)"
+    skip_orig_due_epoch=$((skip_enable_epoch + 130))
+    wb_skip_poll_upcoming
+fi
 [ -n "$SKIPUP" ] || fail G-WELLBEING-ACTION-SKIP "no upcoming banner to skip"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" notice-buttons \
     "$ARTIFACTS/a11y-wb-skip-upcoming.json" --title "Eyesight Break Soon" \
