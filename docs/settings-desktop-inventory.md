@@ -377,8 +377,8 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| orientation-lock | Honored | Live gating of sensor-driven orientation; physical output rotation rendering remains open (#345) |
-| output | Honored | Automatic mapping takes the primary output and explicit triples match connector names; EDID-precise matching awaits EDID plumbing, and physical touchscreen qualification remains open (#345) |
+| orientation-lock | Honored | Live gating of sensor-driven orientation; physical output rotation rendering remains open; shell sends GNOME defaults until per-device settings land (#345) |
+| output | Honored | Automatic mapping takes the primary output and explicit triples match connector names; EDID-precise matching awaits EDID plumbing, and physical touchscreen qualification remains open; shell sends GNOME defaults until per-device settings land (#345) |
 ## org.gnome.desktop.peripherals.trackball
 
 | Key | Status | Reason |
