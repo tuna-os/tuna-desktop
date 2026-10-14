@@ -127,4 +127,6 @@ pathlib.Path(sys.argv[3]).write_text(json.dumps(manifest,indent=2)+'\n')
 PY
 "$TEST_BIN" accessibility::tests::live_menu_and_focus_settings --ignored --test-threads=1 --nocapture >"$ARTIFACTS/test.log" 2>&1
 cat "$ARTIFACTS/test.log"
+"$TEST_BIN" osd::tests::actual_gtk_osd_hide_keeps_window_mapped --ignored --test-threads=1 --nocapture >"$ARTIFACTS/test-osd.log" 2>&1
+cat "$ARTIFACTS/test-osd.log"
 cat "$TUNA_A11Y_RECEIPT"

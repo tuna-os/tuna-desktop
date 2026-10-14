@@ -35,6 +35,7 @@ pub struct OsdRequest {
 
 pub struct OsdUi {
     window: gtk::Window,
+    pill: gtk::Box,
     icon: gtk::Image,
     label: gtk::Label,
     level: gtk::DrawingArea,
@@ -44,17 +45,25 @@ pub struct OsdUi {
 
 impl OsdUi {
     pub fn new(app: &gtk::Application) -> Rc<Self> {
+        Self::build(app, true)
+    }
+
+    // The owned X11 GTK fixture exercises the real widget/timer code without
+    // claiming a Wayland layer-surface proof. Production always requests it.
+    fn build(app: &gtk::Application, layer_shell: bool) -> Rc<Self> {
         let window = gtk::Window::new();
         window.set_application(Some(app));
         window.add_css_class("tuna-osd");
         window.set_title(Some("On-Screen Display"));
-        window.init_layer_shell();
-        window.set_layer(Layer::Overlay);
-        window.set_namespace(Some(tuna_shell_control::OSD_NAMESPACE));
-        window.set_anchor(Edge::Bottom, true);
-        window.set_margin(Edge::Bottom, BOTTOM_MARGIN);
-        window.set_exclusive_zone(-1);
-        window.set_keyboard_mode(KeyboardMode::None);
+        if layer_shell {
+            window.init_layer_shell();
+            window.set_layer(Layer::Overlay);
+            window.set_namespace(Some(tuna_shell_control::OSD_NAMESPACE));
+            window.set_anchor(Edge::Bottom, true);
+            window.set_margin(Edge::Bottom, BOTTOM_MARGIN);
+            window.set_exclusive_zone(-1);
+            window.set_keyboard_mode(KeyboardMode::None);
+        }
         // Click-through, like GNOME's OSD (not reactive).
         window.connect_realize(|w| {
             if let Some(surface) = w.surface() {
@@ -90,6 +99,7 @@ impl OsdUi {
         window.set_child(Some(&pill));
         Rc::new(Self {
             window,
+            pill,
             icon,
             label,
             level,
@@ -100,6 +110,16 @@ impl OsdUi {
 
     /// Show `request` on every monitor's OSD (Tuna Desktop draws one), as
     /// GNOME's `showAll`. Without an icon nothing shows, as in GNOME.
+    ///
+    /// The window maps once, on the first show, and then stays mapped: the
+    /// hide timer hides the pill, never the window. Hiding the window
+    /// unmaps it, and every re-show then crosses a visible-but-unmapped
+    /// state; an AT-SPI client asking for the app's children in that state
+    /// makes GTK build an `(so)` reference with a NULL object path and
+    /// segfault the shell (`g_variant_new_object_path: assertion
+    /// 'g_variant_is_object_path (object_path)' failed`, then SIGSEGV in
+    /// `g_variant_builder_add_value`). The pill-hide keeps GNOME's 1.5 s
+    /// visible behavior with exactly one map transient per process.
     pub fn show(self: &Rc<Self>, request: &OsdRequest) {
         let Some(icon) = request
             .icon
@@ -108,6 +128,7 @@ impl OsdUi {
         else {
             return;
         };
+        self.pill.set_visible(true);
         self.icon.set_from_gicon(&icon);
         self.label.set_visible(request.label.is_some());
         self.label.set_label(request.label.as_deref().unwrap_or(""));
@@ -133,7 +154,9 @@ impl OsdUi {
         let id = glib::timeout_add_local_once(HIDE_AFTER, move || {
             if let Some(ui) = weak.upgrade() {
                 ui.hide.borrow_mut().take();
-                ui.window.set_visible(false);
+                // Hide the content, not the window: unmapping re-arms the
+                // visible-but-unmapped AT-SPI segfault on the next show.
+                ui.pill.set_visible(false);
             }
         });
         *self.hide.borrow_mut() = Some(id);
@@ -223,5 +246,52 @@ fn draw_bar_level(cr: &gtk::cairo::Context, width: f64, height: f64, value: f64,
             track
         });
         let _ = cr.fill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "requires a private X11 display without layer-shell"]
+    fn actual_gtk_osd_hide_keeps_window_mapped() {
+        gtk::init().expect("actual GTK display required");
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        assert!(std::env::var_os("WAYLAND_SOCKET").is_none());
+        let app = gtk::Application::builder()
+            .application_id("org.tuna.OsdMappedProof")
+            .build();
+        // Real widgets and the production hide timer; X11 does not
+        // implement Wayland layer-shell, so this is not a layer proof.
+        let ui = OsdUi::build(&app, false);
+        let request = OsdRequest {
+            icon: Some("audio-volume-high-symbolic".into()),
+            label: Some("Volume".into()),
+            level: Some(0.5),
+            max_level: Some(1.0),
+        };
+        ui.show(&request);
+        assert!(ui.window.is_visible());
+        assert!(ui.pill.is_visible());
+        assert!(ui.hide.borrow().is_some());
+        // Past the hide timeout: the content hides, the window stays
+        // mapped, so no re-show can cross visible-but-unmapped.
+        let end = Instant::now() + HIDE_AFTER + Duration::from_millis(500);
+        while Instant::now() < end {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ui.hide.borrow().is_none(), "hide timer must have fired");
+        assert!(
+            ui.window.is_visible(),
+            "hide must keep the OSD window mapped"
+        );
+        assert!(!ui.pill.is_visible(), "hide must hide the OSD content");
+        // A later show reuses the mapped window.
+        ui.show(&request);
+        assert!(ui.window.is_visible());
+        assert!(ui.pill.is_visible());
     }
 }
