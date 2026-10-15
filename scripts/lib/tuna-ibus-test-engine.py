@@ -137,6 +137,10 @@ class TunaTestEngine(IBus.Engine):
     def do_process_key_event(self, keyval, keycode, state):
         if state & IBus.ModifierType.RELEASE_MASK or state & BLOCKING:
             return False
+        # Like real composing engines (ibus-libpinyin, ibus-anthy), never
+        # compose into a password field: the lock entry must get the keys.
+        if self.get_content_type()[0] == IBus.InputPurpose.PASSWORD:
+            return False
         ch = IBus.keyval_to_unicode(keyval)
         if len(ch) == 1 and "a" <= ch <= "z":
             self.buffer += ch
