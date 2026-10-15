@@ -283,7 +283,7 @@ class OrcaReadChurn(unittest.TestCase):
             state = Path(directory, "state")
             state.write_text(json.dumps({k: None for k in (
                 "locked", "windows", "focused", "active_workspace", "overview_open",
-                "pointer_position", "native_relative_motion_count")}))
+                "pointer_position", "native_relative_motion_count", "input_devices")}))
             empty_proc = Path(directory, "proc")
             empty_proc.mkdir()
             scope = {"json": json, "STATE": state, "call": call, "os": lane.os,
