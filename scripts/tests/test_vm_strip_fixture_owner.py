@@ -114,6 +114,32 @@ class Tests(unittest.TestCase):
             scope['strip_stop_identity'](identity, os.getuid(), time.monotonic() - 1)
         self.assertIsNone(child.poll())
 
+    def test_exit_during_identity_read_is_retirement_not_failure(self):
+        # A launcher retires as soon as its client does: it can exit while
+        # its identity is read. That exit is cleanup, never a signal.
+        child = self.process()
+        scope = helper()
+        identity = scope['strip_identity'](child.pid, os.getuid())
+        def exiting(pid, uid):
+            child.kill()
+            child.wait(timeout=4)
+            raise RuntimeError('strip process changed during identity read')
+        scope['strip_identity'] = exiting
+        result = scope['strip_stop_identity'](identity, os.getuid(), time.monotonic() + 3)
+        self.assertTrue(result['retired'])
+        self.assertTrue(result['proc_absent'])
+
+    def test_failed_identity_read_of_a_live_process_still_refuses(self):
+        child = self.process()
+        scope = helper()
+        identity = scope['strip_identity'](child.pid, os.getuid())
+        def unreadable(pid, uid):
+            raise RuntimeError('strip process owner/liveness mismatch')
+        scope['strip_identity'] = unreadable
+        with self.assertRaisesRegex(RuntimeError, 'owner/liveness mismatch'):
+            scope['strip_stop_identity'](identity, os.getuid(), time.monotonic() + 2)
+        self.assertIsNone(child.poll())
+
     def test_actual_owned_process_argv_and_typed_mode_are_bound(self):
         scope = helper()
         with tempfile.TemporaryDirectory() as directory:

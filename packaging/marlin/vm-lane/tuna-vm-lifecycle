@@ -683,8 +683,19 @@ def strip_stop_identity(original, uid, deadline):
         # acquisition is accepted only when the original process is gone.
         poll = select.poll()
         poll.register(fd, select.POLLIN)
+        live = None
         if not poll.poll(0):
-            if strip_identity(pid, uid) != original:
+            try:
+                live = strip_identity(pid, uid)
+            except (OSError, RuntimeError):
+                # The launcher retires as soon as its client does, so it can
+                # exit under the read. The pidfd predates the read: readiness
+                # now means that process (the original, or a replacement of
+                # an original already gone) has exited; nothing is signalled.
+                if not poll.poll(0):
+                    raise
+        if live is not None:
+            if live != original:
                 raise RuntimeError("refuse to signal changed strip process identity")
             if time.monotonic() >= deadline:
                 raise TimeoutError("strip cleanup absolute deadline expired")

@@ -4375,6 +4375,24 @@ wb_probe_ensure() {
         WB_PROBE_PID=$!
         cstate 'any(.windows[]; .app_id == "tuna-cursor-probe")' "probe mapped" ||
             fail "$WB_GATE" "the owned probe window never mapped"
+        # A new window's first published rect can precede the client's
+        # own size (the idle loop writes state as soon as it maps): bind
+        # only once the same rect has been published three reads running.
+        wb_rect_last=""
+        wb_rect_same=0
+        wb_rect_end=$(($(date +%s) + 10))
+        while [ "$wb_rect_same" -lt 3 ]; do
+            [ "$(date +%s)" -le "$wb_rect_end" ] ||
+                fail "$WB_GATE" "the owned probe geometry never settled"
+            wb_rect_now="$(jq -c '[.windows[] | select(.app_id == "tuna-cursor-probe") | .rect]' "$CSTATE" 2>/dev/null)" || wb_rect_now=""
+            if [ -n "$wb_rect_now" ] && [ "$wb_rect_now" = "$wb_rect_last" ]; then
+                wb_rect_same=$((wb_rect_same + 1))
+            else
+                wb_rect_same=1
+                wb_rect_last="$wb_rect_now"
+            fi
+            sleep 0.3
+        done
         cp "$CSTATE" "$ARTIFACTS/wb-probe-after.json" ||
             fail "$WB_GATE" "compositor state missing after probe map"
         "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" bind \
