@@ -259,7 +259,11 @@ mod tests {
         assert!(emit_to(&"x".repeat(4097), &destination).is_err());
         assert!(emit_to("forged\nMESSAGE=other", &destination).is_err());
         assert!(emit_to("nul\0record", &destination).is_err());
+        // Remove the socket path, don't just drop the receiver: a test thread
+        // that forks a child concurrently briefly holds every open fd, which
+        // keeps a dropped receiver alive and lets the send succeed.
         drop(receiver);
+        std::fs::remove_file(&destination).unwrap();
         assert!(emit_to(&message, &destination).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
