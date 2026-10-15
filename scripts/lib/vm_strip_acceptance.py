@@ -482,7 +482,16 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         move(*exposed_point(alpha, [item['rect'] for role, item in found.items() if role != 'alpha']))
         button(True)
         button(False)
-        first = ready('gnome', extra=lambda sample, found: sample['inventory']['state']['focused'] == found['alpha']['id'])
+        try:
+            first = ready('gnome', extra=lambda sample, found: sample['inventory']['state']['focused'] == found['alpha']['id'])
+        except BaseException:
+            # Diagnostic only: what actually sat under the click when Alpha
+            # never gained focus. It cannot qualify anything.
+            try:
+                transport.command('screendump', filename=str(destination / 'focus-click-miss.png'), format='png')
+            except Exception as error:
+                receipt['focus_click_miss_screendump_error'] = type(error).__name__
+            raise
         initial_ids = {w['id']: w['workspace'] for w in first['inventory']['state']['windows']}
         initial_rects = {w['id']: w['rect'] for w in first['inventory']['state']['windows']}
         capture('01-floating', first)
