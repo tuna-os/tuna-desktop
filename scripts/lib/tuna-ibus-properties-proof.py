@@ -94,8 +94,15 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
 
     def wait(predicate):
         while time.monotonic() < deadline:
-            if predicate():
-                return
+            try:
+                if predicate():
+                    return
+            except GLib.Error:
+                # GTK rebuilds the menu on every property update; a walk can
+                # meet a child disposed under it ("The application no longer
+                # exists", gtk-shell 38757056152). node() rechecks the GTK
+                # process identity first, so a real exit still fails.
+                pass
             time.sleep(.05)
         raise RuntimeError("property traffic deadline")
 
