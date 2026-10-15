@@ -204,10 +204,17 @@ class Tests(unittest.TestCase):
             self.wait(lambda: True)
 
     def test_classifier_is_exact_domain_code_message_and_error_type(self):
-        self.assertTrue(self.ns['removed_accessible'](removed()))
+        unexported = Error('No such interface “org.a11y.atspi.Accessible” on object at path '
+                           '/org/gnome/Nautilus/a11y/d17719a5_2e1b_49e6_a14c_ae01f3051fd4')
+        for error in (removed(), unexported):
+            self.assertTrue(self.ns['removed_accessible'](error))
         for error in [Error('connection closed'), Error(removed().message, code=2),
                       Error(removed().message, domain='other'), RuntimeError(removed().message),
-                      Error(removed().message + ' and another failure')]:
+                      Error(removed().message + ' and another failure'),
+                      Error(unexported.message, code=2), Error(unexported.message, domain='other'),
+                      Error(unexported.message + ' and another failure'),
+                      Error('No such interface “org.freedesktop.DBus.Peer” on object at path /org/a11y'),
+                      Error('No such interface “org.a11y.atspi.Accessible” on object at path relative')]:
             self.assertFalse(self.ns['removed_accessible'](error))
 
     def test_known_removed_role_rewalks_and_revalidates_owner(self):

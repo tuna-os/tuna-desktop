@@ -53,10 +53,15 @@ def nautilus_identity():
 
 
 def removed_accessible(error):
-    """Only Nautilus/AT-SPI's concrete retired-object error is readiness."""
+    """Only Nautilus/AT-SPI's concrete retired-object error is readiness.
+
+    AT-SPI reports a retired object either itself or, once GTK has unexported
+    the object path, through GDBus's unknown-interface reply for that path."""
     return (isinstance(error, GLib.Error) and error.domain == 'atspi_error'
             and error.code == 1 and re.fullmatch(
-                r'Object does not exist at path (?:“/[^”\n\x00]+”|"/[^"\n\x00]+")',
+                r'Object does not exist at path (?:“/[^”\n\x00]+”|"/[^"\n\x00]+")'
+                r'|No such interface (?:“org\.a11y\.atspi\.[A-Za-z]+”|"org\.a11y\.atspi\.[A-Za-z]+")'
+                r' on object at path /[^\s\x00]+',
                 error.message) is not None)
 
 
