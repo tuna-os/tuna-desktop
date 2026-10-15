@@ -752,6 +752,14 @@ impl NotifyUi {
                         let Some(item) = weak.upgrade() else {
                             return;
                         };
+                        // Like add_item, animate only a list on screen: an
+                        // unmapped item gets no frames, so its zoom would never
+                        // finish and the removal (with the notice's callbacks)
+                        // would never run.
+                        if !item.is_mapped() {
+                            me.remove(&[id]);
+                            return;
+                        }
                         item.set_can_target(false);
                         let me = me.clone();
                         item.animate(
