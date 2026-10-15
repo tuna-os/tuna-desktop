@@ -9,8 +9,10 @@
 # synced databases, so they share the same snapshot. Changing this date changes
 # the baseline and requires an ADR (docs/roadmap.md change control).
 # Both testing repositories stay enabled from the same snapshot, as in the last
-# green derived baseline; -Syuu performs one complete transaction that also
-# downgrades packages the base image already took from newer mirrors.
+# green derived baseline. -yy forces a database refresh: the base image's core
+# and extra databases are newer than the snapshot, so a plain -y keeps them.
+# -uu then performs one complete transaction that also downgrades packages the
+# base image already took from newer mirrors.
 ARG BASE_IMAGE=ghcr.io/tuna-os/marlin:gnome
 ARG COHERENT_BASE=gnome-baseline
 ARG ARCH_ARCHIVE_SNAPSHOT=2026/10/13
@@ -18,7 +20,7 @@ FROM ${BASE_IMAGE} AS gnome-baseline
 ARG ARCH_ARCHIVE_SNAPSHOT
 RUN printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_ARCHIVE_SNAPSHOT" > /etc/pacman.d/mirrorlist && \
     sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra-testing]\nInclude = /etc/pacman.d/mirrorlist\n' /etc/pacman.conf && \
-    pacman -Syuu --noconfirm gnome-shell mutter gdm \
+    pacman -Syyuu --noconfirm gnome-shell mutter gdm \
         evolution-data-server gnome-keyring xdg-desktop-portal-gnome xdg-desktop-portal-gtk \
         gst-plugin-pipewire gst-plugins-good orca speech-dispatcher \
         python python-gobject wayland-utils qemu-guest-agent openssh gcc pkgconf wayland-protocols && \
