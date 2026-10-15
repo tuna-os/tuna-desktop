@@ -58,6 +58,8 @@ struct Shared {
     context: glib::MainContext,
     wake: Wake,
     share: Weak<NightLightShare>,
+    /// Admission deadline of every read: [`OPERATION_LIMIT`] in production.
+    operation_limit: Duration,
 }
 trait NativeReader {
     fn read(&mut self) -> Result<NightLightConfig, ReadError>;
@@ -87,9 +89,15 @@ impl Reader {
             Box::new(|shared| {
                 GioReader::new(shared).map(|reader| Box::new(reader) as Box<dyn NativeReader>)
             }),
+            OPERATION_LIMIT,
         )
     }
-    fn with_factory(share: &Arc<NightLightShare>, wake: &Wake, factory: Factory) -> Self {
+    fn with_factory(
+        share: &Arc<NightLightShare>,
+        wake: &Wake,
+        factory: Factory,
+        operation_limit: Duration,
+    ) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 next: 0,
@@ -104,6 +112,7 @@ impl Reader {
             context: glib::MainContext::new(),
             wake: wake.clone(),
             share: Arc::downgrade(share),
+            operation_limit,
         });
         let worker = shared.clone();
         let owner = std::thread::Builder::new()
@@ -264,7 +273,7 @@ impl Shared {
                 self.quarantine();
                 return;
             };
-            let Some(deadline) = now.checked_add(OPERATION_LIMIT) else {
+            let Some(deadline) = now.checked_add(self.operation_limit) else {
                 return;
             };
             state.next = id;
@@ -590,6 +599,14 @@ mod tests {
         mpsc::Sender<Result<NightLightConfig, ReadError>>,
         calloop::EventLoop<'static, usize>,
     );
+    /// Harness admission deadline and sync bound. Instrumented, parallel
+    /// CI runs can stall a worker thread for seconds before its first
+    /// dispatch or between steps; under the product's two-second
+    /// OPERATION_LIMIT that stall alone quarantines a correct worker. Every
+    /// quarantine/expiry assertion here drives its decision with the
+    /// recorded deadline instant, so a longer harness admission changes no
+    /// verdict, only how much contention a single read survives.
+    const HARNESS_LIMIT: Duration = Duration::from_secs(10);
     fn controlled() -> Harness {
         let (wake, source) = Wake::new().unwrap();
         let loop_ = calloop::EventLoop::try_new().unwrap();
@@ -608,15 +625,12 @@ mod tests {
                 creator: std::thread::current().id(),
             }))
         });
-        let reader = Reader::with_factory(&share, &wake, factory);
-        assert_eq!(
-            receive.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "entered"
-        );
+        let reader = Reader::with_factory(&share, &wake, factory, HARNESS_LIMIT);
+        assert_eq!(receive.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
         (share, reader, receive, send, loop_)
     }
     fn completed(reader: &Reader, loop_: &mut calloop::EventLoop<usize>) -> NightLightConfig {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         loop {
             if let Some(config) = reader.poll(Instant::now()) {
@@ -627,15 +641,11 @@ mod tests {
             loop_.dispatch(Some(deadline - now), &mut count).unwrap();
         }
     }
-    /// Harness-only retirement sync bound. The product failure bound stays
-    /// OPERATION_LIMIT: a blocked worker is quarantined after two seconds.
-    /// Observing its exit only synchronizes the test with a worker that is
-    /// already quarantined, so this wait tolerates CI process contention
-    /// without changing when quarantine fires.
-    const RETIRE_LIMIT: Duration = Duration::from_secs(10);
+    /// Observing a quarantined worker's exit only synchronizes the test with
+    /// it; quarantine itself already happened.
     fn retired(mut reader: Reader, events: &mpsc::Receiver<&'static str>) -> Reader {
         reader.shared.quarantine();
-        assert_eq!(events.recv_timeout(RETIRE_LIMIT).unwrap(), "retired");
+        assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "retired");
         reader.owner.take().unwrap().join().unwrap();
         reader
     }
@@ -703,10 +713,7 @@ mod tests {
         answers
             .send(Ok(RawSettings::schema_defaults().into_config()))
             .unwrap();
-        assert_eq!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "entered"
-        );
+        assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
         assert_eq!(
             newer.reply.lock().unwrap().result,
             None,
@@ -715,7 +722,7 @@ mod tests {
         let mut raw = RawSettings::schema_defaults();
         raw.temperature_k = 3200;
         answers.send(Ok(raw.into_config())).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         while newer.reply.lock().unwrap().result.is_none() {
             let now = Instant::now();
@@ -757,10 +764,7 @@ mod tests {
         old.temperature_k = 2000;
         answers.send(Ok(old.into_config())).unwrap();
         // The next actual read's entry proves the first completion was processed.
-        assert_eq!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "entered"
-        );
+        assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
         assert_eq!(
             future.reply.lock().unwrap().result,
             None,
@@ -775,7 +779,7 @@ mod tests {
         let mut fresh = RawSettings::schema_defaults();
         fresh.temperature_k = 3200;
         answers.send(Ok(fresh.into_config())).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         while future.reply.lock().unwrap().result.is_none() {
             let now = Instant::now();
@@ -825,10 +829,7 @@ mod tests {
         answers
             .send(Ok(RawSettings::schema_defaults().into_config()))
             .unwrap();
-        assert_eq!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "entered"
-        );
+        assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
         answers
             .send(Ok(RawSettings::schema_defaults().into_config()))
             .unwrap();
@@ -845,10 +846,7 @@ mod tests {
         answers
             .send(Err(ReadError("controlled failure".into())))
             .unwrap();
-        assert_eq!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "entered"
-        );
+        assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
         let mut raw = RawSettings::schema_defaults();
         raw.enabled = true;
         answers.send(Ok(raw.into_config())).unwrap();
@@ -876,14 +874,11 @@ mod tests {
         answers
             .send(Err(ReadError("controlled unavailable".into())))
             .unwrap();
-        assert_eq!(
-            events.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "entered"
-        );
+        assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
         answers
             .send(Err(ReadError("controlled unavailable".into())))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         loop {
             controller.poll_settings(Instant::now());
@@ -987,6 +982,7 @@ mod tests {
                     shared,
                 )?))
             }),
+            HARNESS_LIMIT,
         );
         assert_eq!(completed(&reader, &mut loop_).temperature_k(), 2700);
         let source = glib::idle_source_new(
@@ -1010,7 +1006,7 @@ mod tests {
         assert_eq!(completed(&reader, &mut loop_).temperature_k(), 3200);
         reader.shared.quarantine();
         // Tests may join only after the quit callback has actually executed.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + HARNESS_LIMIT;
         while !reader.owner.as_ref().unwrap().is_finished() {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
