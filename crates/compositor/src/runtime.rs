@@ -1092,8 +1092,18 @@ impl Runtime {
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         // The shell's idle-blank settings and wallpaper drop live in the
         // runtime dir: any change there wakes the loop, and the blank
-        // file is read again only when it changed.
-        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        // file is read again only when it changed. A state document the
+        // tick itself rewrites there would wake the loop on its own
+        // writes, so then the dir is not watched and the blank file is
+        // read on every tick.
+        let state_dir = runtime
+            .state_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|dir| state_dir.as_deref() != Some(std::path::Path::new(dir)))
+        {
             let watched = crate::wake::file_watch(std::path::Path::new(&dir))
                 .map_err(|e| e.to_string())
                 .and_then(|watch| {
@@ -3139,6 +3149,7 @@ impl Runtime {
             || self.overview_motion.animating()
             || self.manager.workspace_slide().running()
             || self.manager.strip_animating()
+            || self.manager.size_changes().in_flight()
             || self.shell_swipe.is_some()
             || self.overlay.visible
             || !self.casts.is_empty()
@@ -3152,7 +3163,7 @@ impl Runtime {
         let mut due = |after: Duration| wake = wake.min(after.max(FRAME_BUDGET));
         // An inhibited session neither blanks nor locks; its end is
         // handled by the tick that sees it.
-        if !self.state.idle_inhibited() {
+        if !self.idle_inhibited {
             let idle = self.lock.idle_ms(self.lock_now_ms());
             if !self.is_locked() && self.lock.timeout_ms() != u64::MAX {
                 due(Duration::from_millis(

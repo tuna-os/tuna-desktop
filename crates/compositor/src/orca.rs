@@ -95,11 +95,11 @@ impl Reader {
     }
 
     /// When [`poll`](Self::poll) next starts a reader by itself: the
-    /// restart gate of an enabled reader without a child. Child exits wake
+    /// restart gate of an enabled reader without a child (a departure
+    /// still in progress is checked again at the gate). Child exits wake
     /// the loop through SIGCHLD and watcher reports through the waker.
     pub fn next_deadline(&self) -> Option<Instant> {
-        (self.enabled && self.child.is_none() && self.attempts < 3 && self.departing.is_none())
-            .then_some(self.next_start)
+        (self.enabled && self.child.is_none() && self.attempts < 3).then_some(self.next_start)
     }
     fn stop(&mut self) {
         self.observed = None;
