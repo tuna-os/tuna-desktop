@@ -10,7 +10,8 @@ class NotifyCallbackContract(unittest.TestCase):
         source = (ROOT / 'crates/shell-gtk/src/notify.rs').read_text()
         constructor = source.split('pub fn new(app:', 1)[1].split('// Tests use', 1)[0]
         self.assertIn('NotificationCenter::load_system()', constructor)
-        self.assertIn('true,', constructor)
+        self.assertIn('Self::build(app, center, true)', constructor)
+        self.assertIn('set_policy(Arc::new(GioPolicyStore::new()))', constructor)
         self.assertIn('if layered {', source)
         self.assertIn('banner_window.init_layer_shell()', source)
 

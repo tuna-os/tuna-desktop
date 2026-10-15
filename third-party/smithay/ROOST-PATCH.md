@@ -48,3 +48,18 @@ roles from GNOME GetWindows while preserving Normal/Dialog/Utility. The
 isolated diff is retained in WINDOW-TYPE-API-PATCH.diff. This is a source API
 extension at pinned 0.7.0; no upstream match in the tree is exhaustive over
 these variants. Factory packaging must include the final patched source.
+
+Issue #655 additionally changes src/wayland/selection/data_device/dnd_grab.rs
+and mod.rs. Upstream offers no way to cancel a client drag: unsetting the
+DnDGrab runs its drop path, which still delivers wl_data_device.drop to an
+accepted offer. The additive client_dnd_active and cancel_client_dnd
+functions let Roost implement Mutter's drag grab, where Escape cancels the
+drag. Cancellation marks the offer inactive under the grab lock, then
+unsets the grab: the target gets leave, the source cancelled, and Accept,
+SetActions or Receive requests already in flight cannot revive the offer.
+A drop whose origin or source died is cancelled the same way, and the
+terminal path runs once. Real socketpair tests in
+crates/compositor/tests/data_device.rs cover pointer and touch drags, with
+and without an icon or a source, and a normal drop that can still Finish.
+The isolated diff is retained in DND-CANCEL-API-PATCH.diff; the pinned
+version stays 0.7.0.

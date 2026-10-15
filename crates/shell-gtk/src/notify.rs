@@ -25,6 +25,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::intake::NotificationBus;
+use tuna_shell_host::notification_policy::GioPolicyStore;
 use tuna_shell_host::notifications::{
     Notification, NotificationAction, NotificationCenter, Urgency,
 };
@@ -427,15 +428,20 @@ fn source_icon(icon: &str) -> Option<gio::Icon> {
 impl NotifyUi {
     /// Build the surfaces and claim the bus.
     pub fn new(app: &gtk::Application) -> Rc<Self> {
-        Self::build(
-            app,
-            Arc::new(Mutex::new(NotificationCenter::load_system())),
-            true,
-        )
+        let center = Arc::new(Mutex::new(NotificationCenter::load_system()));
+        // GNOME Settings' notification policy, read live on every
+        // arrival (#348); a restart drops whatever an app disabled
+        // since it was filed.
+        if let Ok(mut filed) = center.lock() {
+            filed.set_policy(Arc::new(GioPolicyStore::new()));
+            filed.enforce_policy();
+        }
+        Self::build(app, center, true)
     }
 
     // Tests use an in-memory center and ordinary GTK window. Production
-    // always retains the layer-shell surface and persisted notification store.
+    // always retains the layer-shell surface, persisted notification store
+    // and GNOME's notification policy.
     fn build(
         app: &gtk::Application,
         center: Arc<Mutex<NotificationCenter>>,

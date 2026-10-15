@@ -27,6 +27,7 @@ pub mod introspect;
 pub mod keyboard;
 pub mod lockdown;
 pub mod model;
+pub mod notification_policy;
 pub mod notifications;
 pub mod overview;
 pub mod panel;

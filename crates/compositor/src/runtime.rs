@@ -659,6 +659,8 @@ pub struct Runtime {
     wellbeing_effects: crate::wellbeing_effects::Effects,
     /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
     input_aids: aids::RuntimeAids,
+    /// An Escape press cancelled a client drag; its repeats and release
+    /// belong to that cancel, not to the overview or a client.
     dnd_escape_held: bool,
     /// PipeWire, connected on the first screen cast (#61).
     pipewire: Option<crate::screencast::PipeWire>,
@@ -1733,6 +1735,9 @@ impl Runtime {
                 .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
         }
         if self.is_locked() {
+            // The lock takes the keyboard: a held Escape's release
+            // never comes back to the drag cancel below.
+            self.dnd_escape_held = false;
             // Only the lock screen hears input; with none up (shell
             // gone), nothing does.
             let surface = self
@@ -1756,6 +1761,9 @@ impl Runtime {
             // that shield, not the previously focused application.
             return;
         }
+        // Mutter's drag grab: Escape cancels a client drag-and-drop and
+        // is consumed, so the overview stays open and the release can
+        // no longer drop (a Wayland drag owns the pointer, not the keys).
         if let ManagerInput::Key {
             keycode: ESCAPE_KEYCODE,
             pressed,
