@@ -230,6 +230,12 @@ pub struct SwitcherUi {
     selected_since: Cell<Option<(u64, Instant)>>,
     /// The tiles by representative window, to place the thumbnails.
     tiles: RefCell<Vec<(u64, gtk::Box)>>,
+    /// Runs on every frame while the switcher is open: the popups'
+    /// layout, the thumbnails' half-second delay and the strip's scroll
+    /// all move with time, not with the compositor's messages.
+    frame_hook: RefCell<Option<Rc<dyn Fn()>>>,
+    open: Rc<Cell<bool>>,
+    ticking: Rc<Cell<bool>>,
 }
 
 impl SwitcherUi {
@@ -295,6 +301,9 @@ impl SwitcherUi {
             window_frames: Default::default(),
             selected_since: Cell::new(None),
             tiles: Default::default(),
+            frame_hook: RefCell::new(None),
+            open: Default::default(),
+            ticking: Default::default(),
         })
     }
 
@@ -346,6 +355,34 @@ impl SwitcherUi {
             *self.shown.borrow_mut() = now.clone();
         }
         self.sync_thumbnails(model, &now);
+        self.open.set(!now.items.is_empty());
+        self.tick_while_open();
+    }
+
+    /// Run `hook` on every frame while the switcher is open (the shell's
+    /// state sync, for [`SwitcherUi::thumbnail_frames`] and the
+    /// thumbnails' delay).
+    pub fn on_frame(&self, hook: impl Fn() + 'static) {
+        *self.frame_hook.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    fn tick_while_open(&self) {
+        if !self.open.get() || self.ticking.get() {
+            return;
+        }
+        let Some(hook) = self.frame_hook.borrow().clone() else {
+            return;
+        };
+        self.ticking.set(true);
+        let (open, ticking) = (self.open.clone(), self.ticking.clone());
+        self.window.add_tick_callback(move |_, _| {
+            if !open.get() {
+                ticking.set(false);
+                return gtk::glib::ControlFlow::Break;
+            }
+            hook();
+            gtk::glib::ControlFlow::Continue
+        });
     }
 
     /// GNOME's thumbnails: shown while they hold the focus, or once an

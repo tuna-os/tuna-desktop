@@ -9,9 +9,11 @@
 //!
 //! The core ([`NotificationCenter`], queueing, paint) is wire-free. This
 //! D-Bus edge mirrors [`WatcherBus`](crate::watcher::WatcherBus): the
-//! panel's slow tick calls [`NotificationBus::ensure`], and a taken
+//! owner calls [`NotificationBus::ensure`] until it connects, and a taken
 //! name (or no bus) reads as no intake — never a hang. Method calls
-//! dispatch on zbus worker threads straight into the shared center.
+//! dispatch on zbus worker threads straight into the shared center, then
+//! run the [`NotificationBus::on_change`] callback so the owner can
+//! redraw without polling the center.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -91,13 +93,24 @@ fn sound_hints(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Sound {
     }
 }
 
+/// Run after a wire call changed the center (on a zbus thread).
+pub type OnChange = Arc<dyn Fn() + Send + Sync>;
+
 /// The `org.freedesktop.Notifications` object: wire calls become
 /// center mutations. Banner-side presses never arrive here as method
 /// calls — they go through [`NotificationBus`], which mutates and
 /// then emits the matching signal.
-#[derive(Debug)]
 struct Notifications {
     center: Arc<Mutex<NotificationCenter>>,
+    on_change: Option<OnChange>,
+}
+
+impl Notifications {
+    fn changed(&self) {
+        if let Some(on_change) = &self.on_change {
+            on_change();
+        }
+    }
 }
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
@@ -130,10 +143,13 @@ impl Notifications {
             desktop_entry: string_hint(&hints, "desktop-entry"),
             sound: sound_hints(&hints),
         };
-        self.center
+        let id = self
+            .center
             .lock()
             .map(|mut center| center.deliver(incoming))
-            .unwrap_or(0) as u32
+            .unwrap_or(0) as u32;
+        self.changed();
+        id
     }
 
     /// Close a notification by id. Unknown ids are ignored: the
@@ -143,6 +159,7 @@ impl Notifications {
             .center
             .lock()
             .map(|mut center| center.dismiss(id as u64));
+        self.changed();
     }
 
     /// Server capabilities: banner actions plus queue persistence.
@@ -176,13 +193,30 @@ impl Notifications {
 pub struct NotificationBus {
     conn: Option<zbus::blocking::Connection>,
     center: Arc<Mutex<NotificationCenter>>,
+    on_change: Option<OnChange>,
 }
 
 impl NotificationBus {
     /// Disconnected edge over a shared center;
     /// [`NotificationBus::ensure`] connects.
     pub fn new(center: Arc<Mutex<NotificationCenter>>) -> Self {
-        Self { conn: None, center }
+        Self {
+            conn: None,
+            center,
+            on_change: None,
+        }
+    }
+
+    /// Run `on_change` (on a zbus thread) after every wire call that
+    /// changed the center. Set before [`NotificationBus::ensure`]: the
+    /// served object takes it when it connects.
+    pub fn on_change(&mut self, on_change: impl Fn() + Send + Sync + 'static) {
+        self.on_change = Some(Arc::new(on_change));
+    }
+
+    /// Whether the edge is connected and owns the notifications name.
+    pub fn connected(&self) -> bool {
+        self.conn.is_some()
     }
 
     /// The shared center behind the edge (the panel paints from it).
@@ -218,6 +252,7 @@ impl NotificationBus {
         };
         let notifications = Notifications {
             center: self.center.clone(),
+            on_change: self.on_change.clone(),
         };
         let conn = match builder.serve_at(NOTIFICATIONS_PATH, notifications) {
             Ok(conn) => conn,
@@ -473,7 +508,10 @@ mod tests {
             center: Arc<Mutex<NotificationCenter>>,
             address: &str,
         ) -> Option<NotificationBus> {
-            let mut bus = NotificationBus::new(center);
+            owned_bus_with(NotificationBus::new(center), address)
+        }
+
+        fn owned_bus_with(mut bus: NotificationBus, address: &str) -> Option<NotificationBus> {
             for _ in 0..50 {
                 if bus.connect(Some(address)) {
                     return Some(bus);
@@ -540,7 +578,16 @@ mod tests {
                 return;
             };
             let center = shared_center();
-            let Some(bus) = owned_bus(center.clone(), &address) else {
+            let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut bus = NotificationBus::new(center.clone());
+            {
+                let changes = changes.clone();
+                bus.on_change(move || {
+                    changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            assert!(!bus.connected());
+            let Some(bus) = owned_bus_with(bus, &address) else {
                 let _ = daemon.kill();
                 eprintln!("SKIP live notification test: private bus refused connections");
                 return;
@@ -562,6 +609,12 @@ mod tests {
 
             let id = stub_notify(&proxy, vec!["default".to_owned(), "Open".to_owned()]);
             assert_ne!(id, 0, "intake returns a live notification id");
+            assert_eq!(
+                changes.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "a wire Notify wakes the owner"
+            );
+            assert!(bus.connected());
             let banners = center
                 .lock()
                 .expect("center lock")
@@ -587,6 +640,11 @@ mod tests {
                 center.lock().expect("center lock").history().len(),
                 1,
                 "dismiss keeps history"
+            );
+            assert_eq!(
+                changes.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "a wire CloseNotification wakes the owner"
             );
 
             let _ = daemon.kill();
