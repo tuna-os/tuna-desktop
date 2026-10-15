@@ -47,6 +47,8 @@ pub struct LockUi {
     pending: Cell<Option<u64>>,
     connection_generation: Cell<Option<u64>>,
     clock_format: Box<dyn Fn() -> logic::ClockFormat>,
+    /// Wakes the clock on the minute while the lock screens are up.
+    wall_clock: RefCell<Option<crate::wall_clock::WallClock>>,
 }
 
 impl LockUi {
@@ -64,6 +66,7 @@ impl LockUi {
             pending: Cell::new(None),
             connection_generation: Cell::new(None),
             clock_format,
+            wall_clock: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -71,6 +74,7 @@ impl LockUi {
                 eprintln!("tuna-shell-gtk: the compositor refused the session lock");
                 if let Some(ui) = weak.upgrade() {
                     ui.screens.borrow_mut().clear();
+                    ui.wall_clock.take();
                 }
             });
         }
@@ -79,18 +83,9 @@ impl LockUi {
             ui.instance.connect_unlocked(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     ui.screens.borrow_mut().clear();
+                    ui.wall_clock.take();
                     ui.pending.set(None);
                 }
-            });
-        }
-        {
-            let weak = Rc::downgrade(&ui);
-            glib::timeout_add_seconds_local(1, move || match weak.upgrade() {
-                Some(ui) => {
-                    ui.tick();
-                    glib::ControlFlow::Continue
-                }
-                None => glib::ControlFlow::Break,
             });
         }
         ui
@@ -122,7 +117,14 @@ impl LockUi {
                 self.instance.assign_window_to_monitor(&window, &monitor);
                 window.present();
             }
-            self.tick();
+            self.refresh_clock();
+            let weak = Rc::downgrade(self);
+            *self.wall_clock.borrow_mut() =
+                Some(crate::wall_clock::WallClock::new(false, move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.refresh_clock();
+                    }
+                }));
         } else if !locked && self.requested.get() {
             self.requested.set(false);
             self.instance.unlock();
@@ -163,8 +165,9 @@ impl LockUi {
         }
     }
 
-    /// Clock and date, as GNOME's UnlockDialogClock shows them.
-    fn tick(&self) {
+    /// Clock and date, as GNOME's UnlockDialogClock shows them (on each
+    /// minute while locked, and when the clock format changes).
+    pub fn refresh_clock(&self) {
         let now = jiff::Zoned::now().datetime();
         let time = logic::lock_clock_text(&now, (self.clock_format)());
         let date = logic::lock_date_text(now.date());

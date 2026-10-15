@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
+use gtk4::subclass::prelude::ObjectSubclassIsExt;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::apps::AppEntry;
 
@@ -1336,17 +1337,18 @@ fn grid_hover(widget: &impl IsA<gtk::Widget>, target: String, reflow: Rc<GridRef
     let motion = gtk::DropControllerMotion::new();
     {
         let hover = hover.clone();
-        motion.connect_enter(move |motion, x, _| {
+        motion.connect_enter(move |motion, _, _| {
             hover.generation.set(hover.generation.get() + 1);
             let generation = hover.generation.get();
+            let x = drop_enter_x(motion);
+            let width = motion.widget().map_or(0, |w| w.width());
             if std::env::var_os("TUNA_GRID_TRACE").is_some() {
-                eprintln!(
-                    "tuna-shell-gtk: grid hover entered x={x} width={}",
-                    motion.widget().map_or(0, |w| w.width())
-                );
+                eprintln!("tuna-shell-gtk: grid hover entered x={x:?} width={width}");
             }
-            let edge =
-                crate::logic::drop_edge(x, f64::from(motion.widget().map_or(0, |w| w.width())));
+            // Until the position is known, no edge: motion supplies it.
+            let edge = x.map_or(crate::logic::DropEdge::OnIcon, |x| {
+                crate::logic::drop_edge(x, f64::from(width))
+            });
             hover.motion(edge);
             if let Some(drop) = motion.drop() {
                 let hover = hover.clone();
@@ -1395,39 +1397,94 @@ fn grid_hover(widget: &impl IsA<gtk::Widget>, target: String, reflow: Rc<GridRef
 /// flipped by the wheel, a swipe, PageUp/PageDown, the side arrows or
 /// the indicators; arrows and indicators only with more than one page.
 mod page_hint {
+    use std::cell::RefCell;
+
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use gtk4 as gtk;
 
+    /// Children at explicit positions, like GtkFixed, measured by the
+    /// size request alone. GtkFixed's layout manager measures its
+    /// children's extents and overrides any measure vfunc, so actors
+    /// sliding in from outside the clip widened the 10% hint across the
+    /// grid, where it caught the pointer and turned the page.
     #[derive(Default)]
-    pub struct PageHint;
+    pub struct PageHint {
+        pub(super) children: RefCell<Vec<(gtk::Widget, f64, f64)>>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for PageHint {
         const NAME: &'static str = "TunaPageHint";
         type Type = super::PageHint;
-        type ParentType = gtk::Fixed;
+        type ParentType = gtk::Widget;
     }
-    impl ObjectImpl for PageHint {}
-    impl WidgetImpl for PageHint {
-        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
-            if orientation == gtk::Orientation::Horizontal {
-                // Animated actors begin outside the clip. Their FixedLayout
-                // extents must never enlarge the 10% navigation hint.
-                let width = self.obj().width_request().max(0);
-                (width, width, -1, -1)
-            } else {
-                self.parent_measure(orientation, for_size)
+    impl ObjectImpl for PageHint {
+        fn dispose(&self) {
+            for (child, _, _) in self.children.take() {
+                child.unparent();
             }
         }
     }
-    impl FixedImpl for PageHint {}
+    impl WidgetImpl for PageHint {
+        fn measure(&self, _: gtk::Orientation, _: i32) -> (i32, i32, i32, i32) {
+            // GTK raises both sizes to the size request.
+            (0, 0, -1, -1)
+        }
+
+        fn size_allocate(&self, _: i32, _: i32, _: i32) {
+            for (child, x, y) in self.children.borrow().iter() {
+                let (_, natural) = child.preferred_size();
+                let at = gtk::graphene::Point::new(*x as f32, *y as f32);
+                child.allocate(
+                    natural.width(),
+                    natural.height(),
+                    -1,
+                    Some(gtk::gsk::Transform::new().translate(&at)),
+                );
+            }
+        }
+    }
 }
 
 glib::wrapper! {
     pub struct PageHint(ObjectSubclass<page_hint::PageHint>)
-        @extends gtk::Fixed, gtk::Widget,
+        @extends gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl PageHint {
+    fn put(&self, child: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+        child.set_parent(self);
+        self.imp()
+            .children
+            .borrow_mut()
+            .push((child.clone().upcast(), x, y));
+        self.queue_allocate();
+    }
+
+    fn move_(&self, child: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+        let child = child.upcast_ref::<gtk::Widget>();
+        if let Some(entry) = self
+            .imp()
+            .children
+            .borrow_mut()
+            .iter_mut()
+            .find(|(widget, _, _)| widget == child)
+        {
+            (entry.1, entry.2) = (x, y);
+        }
+        self.queue_allocate();
+    }
+
+    fn remove(&self, child: &impl IsA<gtk::Widget>) {
+        let child = child.upcast_ref::<gtk::Widget>();
+        self.imp()
+            .children
+            .borrow_mut()
+            .retain(|(widget, _, _)| widget != child);
+        child.unparent();
+    }
 }
 
 fn paged_grid(
@@ -1609,10 +1666,14 @@ fn paged_grid(
     let motion = gtk::DropControllerMotion::new();
     {
         let pager = pager.clone();
-        motion.connect_enter(move |m, x, _| {
+        motion.connect_enter(move |m, _, _| {
             let width = m.widget().map_or(0, |w| w.width());
             pager.begin(width);
-            pager.motion(x, width);
+            // A drag entering at an edge bumps it at once, as a motion
+            // there would; never at the (0, 0) GTK reports for enter.
+            if let Some(x) = drop_enter_x(m) {
+                pager.motion(x, width);
+            }
         });
     }
     {
@@ -1947,6 +2008,23 @@ fn guard_drag_source(source: &gtk::DragSource, dragging: &Rc<Cell<bool>>) {
     source.connect_drag_begin(move |_, _| active.set(true));
     let active = dragging.clone();
     source.connect_drag_end(move |_, _, _| active.set(false));
+}
+
+/// The pointer's x in the widget of `motion` when a drag enters it.
+/// GDK emits every drag-enter event at (0, 0) (`gdk_drop_emit_enter_event`),
+/// so DropControllerMotion's enter coordinates are not the pointer's;
+/// read the drop device's position, which Wayland's wl_data_device.enter
+/// set. `None` while that position belongs to another surface.
+fn drop_enter_x(motion: &gtk::DropControllerMotion) -> Option<f64> {
+    let widget = motion.widget()?;
+    let native = widget.native()?;
+    let (surface, x, y) = motion.drop()?.device().surface_at_position();
+    if surface? != native.surface()? {
+        return None;
+    }
+    let (dx, dy) = native.surface_transform();
+    let point = gtk::graphene::Point::new((x - dx) as f32, (y - dy) as f32);
+    Some(f64::from(native.compute_point(&widget, &point)?.x()))
 }
 
 /// Make `widget` a drag source of `text`, the widget itself as the

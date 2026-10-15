@@ -1665,6 +1665,32 @@ grid_edge() { grid_point "$1" "$2" 4; }
 grid_shown() {
     jq -e --arg name "$2" --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" --argjson width "$WIDTH" --argjson height "$HEIGHT" 'any(.[]; .showing and (.role == "push button" or .role == "button") and .name == $name and .bounds[2] > 0 and .bounds[3] > 0 and .bounds[0] + $ox < $width and .bounds[0] + $ox + .bounds[2] > 0 and .bounds[1] + $oy < $height and .bounds[1] + $oy + .bounds[3] > 0)' "$1" >/dev/null
 }
+# A grid drag starts once GTK sees the held pointer pass its threshold,
+# and pages and hints slide on GTK's clock: poll the shell's tree for
+# the state instead of sleeping. a11y_until dumps into $1 until the jq
+# filter $2 holds; a11y_settled until the jq expression $2 is non-empty
+# and unchanged across two dumps in a row. Both give up after ${3:-10} s.
+a11y_until() {
+    a11y_end=$(($(date +%s) + ${3:-10}))
+    until "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$1" 20 >/dev/null &&
+        jq -e "$2" "$1" >/dev/null 2>&1; do
+        [ "$(date +%s)" -lt "$a11y_end" ] || return 1
+        sleep 0.1
+    done
+}
+a11y_settled() {
+    a11y_end=$(($(date +%s) + ${3:-10}))
+    a11y_last=""
+    while :; do
+        if "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$1" 20 >/dev/null; then
+            a11y_now="$(jq -c "$2" "$1" 2>/dev/null)" || a11y_now=""
+            [ -n "$a11y_now" ] && [ "$a11y_now" = "$a11y_last" ] && return 0
+            a11y_last="$a11y_now"
+        fi
+        [ "$(date +%s)" -lt "$a11y_end" ] || return 1
+        sleep 0.1
+    done
+}
 
 # Bind this drag proof to the one supervised GTK child, never a same-name peer.
 grid_cancel_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" || fail G-GRID-DRAG-CANCEL "GTK child absent"
@@ -1741,12 +1767,17 @@ for step in $(seq 1 6); do
     sleep 0.05
 done
 # Keep the actual button held, but leave timed page hints and tile hover
-# targets before slow AT-SPI/screenshot/state acquisition. No extra sleep.
+# targets before slow AT-SPI/screenshot/state acquisition. GTK shows the
+# hint once it hears the drag: poll the bound child's tree, no fixed sleep.
 xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
-sleep 0.25
-grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" || fail G-GRID-DRAG-CANCEL "folder preview dump failed"
+grid_peek_end=$(($(date +%s) + 10))
+until grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" &&
+    showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview"; do
+    [ "$(date +%s)" -lt "$grid_peek_end" ] ||
+        fail G-GRID-DRAG-CANCEL "real local folder drag has no neighboring-page hint"
+    sleep 0.1
+done
 scrot "$ARTIFACTS/11h-folder-page-peek.png" >/dev/null
-showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview" || fail G-GRID-DRAG-CANCEL "real local folder drag has no neighboring-page hint"
 cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" || fail G-GRID-DRAG-CANCEL "native client drag never acquired grab"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
 "$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" neutral-check \
@@ -1846,11 +1877,17 @@ for step in $(seq 1 6); do
     xdotool mousemove --window "$WID" $((page_source_x + step * 10)) "$page_source_y"
     sleep 0.05
 done
-sleep 0.25
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page-peek.json" 20 || fail G-GRID-PAGE-PEEK "preview dump failed"
+# Wait for the drag's hint, then for its icons to finish sliding in.
+a11y_settled "$ARTIFACTS/a11y-grid-page-peek.json" 'select(any(.[]; .showing and .name == "Next page preview")) | [.[] | select(.showing and .role == "image" and (.name | startswith("Tuna Page App"))) | .bounds] | select(length > 0)' ||
+    fail G-GRID-PAGE-PEEK "next page hint missing or never settled during drag"
 scrot "$ARTIFACTS/11h-grid-page-peek.png" >/dev/null
 showing "$ARTIFACTS/a11y-grid-page-peek.json" "Next page preview" || fail G-GRID-PAGE-PEEK "next page hint missing during drag"
 jq -e 'any(.[]; .showing and .role == "image" and (.name | startswith("Tuna Page App")))' "$ARTIFACTS/a11y-grid-page-peek.json" >/dev/null || fail G-GRID-PAGE-PEEK "neighboring page icons did not enter the hint"
+# GNOME's hint is a tenth of the grid; wider, it covers tiles and turns
+# the page under a pointer that is only crossing them.
+grid_layer_width="$(jq '.layers[] | select(.namespace == "tuna-shell-appgrid") | .rect[2]' "$CSTATE")"
+jq -e --argjson grid "$grid_layer_width" 'all(.[] | select(.showing and (.name | endswith("page preview"))); .bounds[2] > 0 and .bounds[2] <= ($grid / 10 | floor))' "$ARTIFACTS/a11y-grid-page-peek.json" >/dev/null ||
+    fail G-GRID-PAGE-PEEK "the page hint is wider than a tenth of the grid"
 peek_rect="$(jq -r --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" '.[] | select(.showing and .name == "Next page preview") | .bounds | "\(.[0] + $ox) \(.[1] + $oy) \(.[2]) \(.[3])"' "$ARTIFACTS/a11y-grid-page-peek.json" | head -1)"
 # shellcheck disable=SC2086
 set -- $peek_rect
@@ -2034,8 +2071,9 @@ printf '[Desktop Entry]\nName=ZZZ Rebuild Probe\nExec=true\nType=Application\n' 
 sleep 1.5
 xdotool key super+a
 cstate '.overview_open and .overview_app_grid' "short page setup" || fail G-GRID-SHORT-PAGES "app grid missing"
-sleep 1
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-short-before.json" 20 || fail G-GRID-SHORT-PAGES "setup dump failed"
+# The probe in the tree proves the rebuild that read the saved pages.
+a11y_settled "$ARTIFACTS/a11y-grid-short-before.json" 'select(any(.[]; .name == "ZZZ Rebuild Probe")) | [.[] | select(.showing and (.role == "push button" or .role == "button") and .name == "AAA Move Three")][0].bounds | select(. != null)' ||
+    fail G-GRID-SHORT-PAGES "setup grid never settled"
 grid_origin
 grid_shown "$ARTIFACTS/a11y-grid-short-before.json" "AAA Move Three" || fail G-GRID-SHORT-PAGES "source missing from first page"
 if grid_shown "$ARTIFACTS/a11y-grid-short-before.json" "AAA Move Two"; then fail G-GRID-SHORT-PAGES "saved second page was flattened"; fi
@@ -2052,7 +2090,10 @@ for step in $(seq 1 6); do
     xdotool mousemove --window "$WID" $((source_x + step * 10)) "$source_y"
     sleep 0.05
 done
-sleep 0.25
+# The drag starts once GTK sees the held pointer pass its threshold, which
+# a loaded runner can deliver after these steps: bump the edge only then.
+a11y_until "$ARTIFACTS/a11y-grid-short-drag.json" 'any(.[]; .showing and .name == "Next page preview")' ||
+    fail G-GRID-SHORT-PAGES "the drag did not start"
 xdotool mousemove --window "$WID" $((WIDTH - 6)) 330
 # Observe the owned target while keeping the drag at the page edge. A
 # merely visible tile can still move 21px before release, turning +4px
@@ -2072,13 +2113,22 @@ EOF
 xdotool mousemove --window "$WID" "$target_x" "$target_y"
 sleep 0.35
 xdotool mouseup 1
-sleep 1.5
-"$PY" -c 'from gi.repository import Gio; import json; pages=Gio.Settings.new("org.gnome.shell").get_value("app-picker-layout").unpack(); print(json.dumps([sorted(page, key=lambda key: page[key]["position"]) for page in pages]))' >"$ARTIFACTS/grid-short-pages.json"
-jq -e '.[0] == ["tuna-move-One.desktop"] and .[1][0:2] == ["tuna-move-Three.desktop", "tuna-move-Two.desktop"]' "$ARTIFACTS/grid-short-pages.json" >/dev/null || fail G-GRID-SHORT-PAGES "cross-page move did not leave the source short"
-# Another installed entry forces a complete grid rebuild.
+short_end=$(($(date +%s) + 10))
+until "$PY" -c 'from gi.repository import Gio; import json; pages=Gio.Settings.new("org.gnome.shell").get_value("app-picker-layout").unpack(); print(json.dumps([sorted(page, key=lambda key: page[key]["position"]) for page in pages]))' >"$ARTIFACTS/grid-short-pages.json" &&
+    jq -e '.[0] == ["tuna-move-One.desktop"] and .[1][0:2] == ["tuna-move-Three.desktop", "tuna-move-Two.desktop"]' "$ARTIFACTS/grid-short-pages.json" >/dev/null; do
+    [ "$(date +%s)" -lt "$short_end" ] || fail G-GRID-SHORT-PAGES "cross-page move did not leave the source short"
+    sleep 0.2
+done
+# Another installed entry changes the catalog. The grid lists the catalog
+# as the overview opens, so reopen it and wait for the entry: a rebuild
+# that must keep the saved short page.
 printf '[Desktop Entry]\nName=ZZZ Rebuild Probe Two\nExec=true\nType=Application\n' >"$XDG_DATA_HOME/applications/tuna-grid-rebuild-two.desktop"
-sleep 1.5
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-short-rebuilt.json" 20 || fail G-GRID-SHORT-PAGES "rebuild dump failed"
+xdotool key Escape
+cstate '.overview_open | not' "short grid closed for the rebuild" || fail G-GRID-SHORT-PAGES "overview stayed open"
+xdotool key super+a
+cstate '.overview_open and .overview_app_grid' "short grid reopened" || fail G-GRID-SHORT-PAGES "app grid missing after reopening"
+a11y_settled "$ARTIFACTS/a11y-grid-short-rebuilt.json" 'select(any(.[]; .name == "ZZZ Rebuild Probe Two")) | [.[] | select(.showing and (.role == "push button" or .role == "button") and .name == "AAA Move One")][0].bounds | select(. != null)' ||
+    fail G-GRID-SHORT-PAGES "the rebuilt grid never showed the new entry"
 grid_shown "$ARTIFACTS/a11y-grid-short-rebuilt.json" "AAA Move One" || fail G-GRID-SHORT-PAGES "short first page lost its item"
 if grid_shown "$ARTIFACTS/a11y-grid-short-rebuilt.json" "AAA Move Two" || grid_shown "$ARTIFACTS/a11y-grid-short-rebuilt.json" "AAA Move Three"; then fail G-GRID-SHORT-PAGES "rebuilding filled the short first page"; fi
 pass G-GRID-SHORT-PAGES "a cross-page drag leaves its source short and the saved boundary survives a catalog rebuild"

@@ -10,6 +10,7 @@ name = "tuna-shell-gtk"
 path = "src/main.rs"
 
 [dependencies]
+async-channel = "2"
 xkbcommon.workspace = true
 gtk4 = { workspace = true, features = ["v4_12"] }
 libadwaita.workspace = true

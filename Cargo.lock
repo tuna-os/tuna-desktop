@@ -4201,6 +4201,7 @@ dependencies = [
 name = "tuna-shell-gtk"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "gio",
  "glib",
  "glib-build-tools",

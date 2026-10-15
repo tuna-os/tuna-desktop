@@ -70,7 +70,7 @@ the gap in the sequence is explained rather than silently skipped.
 ## 4. If the bad build reached a Marlin image
 
 A signed Marlin image promotion is a separate, heavier-weight publish than
-the `.deb` (see item 3 in [ROADMAP.md](../ROADMAP.md) — update/rollback
+the `.deb` (see item 3 in [the public roadmap](roadmap.md#public-roadmap) — update/rollback
 evidence for the admitted image is explicitly tracked as still-open
 qualification work, not yet a solved problem). If a bad Tuna Desktop
 package made it into a promoted Marlin image digest:
@@ -109,4 +109,4 @@ package made it into a promoted Marlin image digest:
   having published the wrong build in the first place.
 - The Debian/Ubuntu package `.deb` rollback above does not apply to the
   Marlin bootc image's own update/rollback mechanism, which is tracked
-  separately (ROADMAP item 3) and not yet qualified end to end.
+  separately (public roadmap item 3) and not yet qualified end to end.

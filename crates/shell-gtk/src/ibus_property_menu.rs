@@ -580,15 +580,6 @@ impl PropertyMenu {
         self.render();
         Ok(())
     }
-    pub fn poll(self: &Rc<Self>) {
-        let conn = self.conn.borrow().clone();
-        if conn
-            .as_ref()
-            .is_some_and(|c| !self.current(c, self.generation.get()))
-        {
-            self.reset();
-        }
-    }
     pub fn sync_lock(self: &Rc<Self>) {
         let locked = (self.locked)();
         if locked != self.was_locked.replace(locked) {

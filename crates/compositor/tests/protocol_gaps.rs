@@ -378,8 +378,12 @@ fn a_frame_request_without_pixel_damage_keeps_native_refresh_work_pending() {
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
     assert!(
-        tuna_compositor::frame_timing::pending_output_work(&roots, &[]),
+        tuna_compositor::frame_timing::pending_output_work(&roots, &[], &[]),
         "callback-only pacing remains owed even without visible presentation"
+    );
+    assert!(
+        !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
+        "a hidden window's callback waits for its beat, not a scanout"
     );
     assert_eq!(peer.client.frames, 0);
     let output = comp.state.primary_output().unwrap();
@@ -447,7 +451,7 @@ fn a_hidden_window_keeps_its_feedback_until_drawn() {
     let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
     assert!(
-        !tuna_compositor::frame_timing::pending_output_work(&roots, &[]),
+        !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &[]),
         "hidden presentation must not keep an unchanged output repainting"
     );
     let drawn: Vec<_> = tuna_compositor::frame_timing::drawn_roots(&comp.state, &manager, false)
@@ -455,7 +459,7 @@ fn a_hidden_window_keeps_its_feedback_until_drawn() {
         .map(|(surface, _)| surface)
         .collect();
     assert!(
-        tuna_compositor::frame_timing::pending_output_work(&roots, &drawn),
+        tuna_compositor::frame_timing::pending_output_work(&roots, &drawn, &[]),
         "revealing the actual window owes a real submission"
     );
     assert_eq!(
@@ -495,6 +499,10 @@ fn fifo_holds_a_waiting_commit_until_the_next_refresh() {
     // then releases the barrier.
     let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
+    assert!(
+        tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
+        "a hidden window's FIFO barrier still advances on each refresh"
+    );
     tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 1);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(peer.client.fates.get(&2), None, "held behind the barrier");
