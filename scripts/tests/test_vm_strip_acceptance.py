@@ -451,6 +451,39 @@ class TransportAndCleanup(unittest.TestCase):
                          [('original', 'strip-start'), ('cleanup', 'strip-stop'), ('cleanup', 'close')])
         self.assertFalse(records[-1][1])
 
+    def test_healthy_primary_stream_cleans_up_without_a_second_stream(self):
+        # QEMU's guest agent socket serves one client at a time; a second
+        # stream beside a healthy primary never synchronizes (marlin-vm
+        # 38757056152). An exit-code failure leaves the primary unpoisoned.
+        root = Path(__file__).resolve().parents[2]
+        image = {'schema': 1, 'commit': 'a' * 40, 'image_id': 'sha256:' + 'b' * 64,
+                 'base_image': 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'c' * 64,
+                 'package_sha256': 'd' * 64, 'member_sha256': {
+                     '/usr/libexec/' + name: hashlib.sha256((root / 'packaging/marlin/vm-lane' / name).read_bytes()).hexdigest()
+                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}}
+        original_error = RuntimeError('guest lifecycle strip-start failed (exit=1)')
+        calls = []
+        class Original:
+            poisoned = False
+            def run(self, action, *args, timeout):
+                calls.append(action)
+                if action == 'strip-start':
+                    raise original_error
+                return {'cleanup_confirmed': True}
+            def close(self):
+                calls.append('close')
+        def reconnect():
+            raise AssertionError('a second guest-agent stream beside a healthy primary')
+        with tempfile.TemporaryDirectory() as scratch:
+            with self.assertRaises(RuntimeError) as caught:
+                proof.prove_installed_strip(SimpleNamespace(cmd=lambda *_a, **_k: None),
+                    Original(), reconnect, scratch, image, lambda _: None, lambda *_values: None)
+            self.assertIs(caught.exception, original_error)
+            receipt = json.loads((Path(scratch) / 'strip-acceptance/receipt.json').read_text())
+            self.assertTrue(receipt['cleanup_confirmed'])
+            self.assertNotIn('cleanup_error_type', receipt)
+        self.assertEqual(calls, ['strip-start', 'strip-stop'])
+
 
 if __name__ == '__main__':
     unittest.main()

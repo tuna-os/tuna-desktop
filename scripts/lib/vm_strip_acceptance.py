@@ -666,9 +666,15 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         if started:
             cleanup_agent = None
             try:
-                # Always use an independently synchronized cleanup stream,
-                # never reuse a timed-out stream's buffered replies.
-                cleanup_agent = reconnect()
+                # Never reuse a failed stream's buffered replies: every
+                # transport failure poisons (closes) it, so clean up on an
+                # independently synchronized stream then. A healthy primary
+                # has no stale replies, and it must be used: QEMU's guest
+                # agent socket serves one client at a time, so a second
+                # stream beside it never synchronizes (marlin-vm
+                # 38757056152 timed out cleaning up a fully passing run).
+                primary_healthy = getattr(agent, 'poisoned', True) is False
+                cleanup_agent = agent if primary_healthy else reconnect()
                 cleanup = cleanup_agent.run('strip-stop', nonce, timeout=10)
                 receipt['cleanup'] = cleanup
                 receipt['cleanup_confirmed'] = cleanup.get('cleanup_confirmed') is True
@@ -680,7 +686,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                 if primary is None:
                     primary = error
             finally:
-                if cleanup_agent is not None:
+                if cleanup_agent is not None and cleanup_agent is not agent:
                     cleanup_agent.close()
         (destination / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     if primary is not None:
