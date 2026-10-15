@@ -21,10 +21,11 @@ class CleanInstallTests(unittest.TestCase):
         self.bin.mkdir()
         self.log = self.root / 'engine.json'
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
-                        ENGINE_LOG=str(self.log), BAD_OWNER='0', ENGINE_FAILURE='0')
+                        ENGINE_LOG=str(self.log), BAD_OWNER='0', ENGINE_FAILURE='0',
+                        FIXTURE_VERSION='0.1.0-1')
         self.tool('dpkg-deb', '''#!/bin/sh
 case "$1" in
-  -f) printf '0.1.0-1\\n' ;;
+  -f) printf '%s\\n' "$FIXTURE_VERSION" ;;
   -c) owner=root/root; [ "$BAD_OWNER" = 0 ] || owner=1000/1000
       printf 'drwxr-xr-x %s 0 2026-10-12 20:00 ./\\n' "$owner"
       printf '%s %s 10 2026-10-12 20:00 ./usr/bin/tuna-shell-gtk\\n' '-rwxr-xr-x' "$owner" ;;
@@ -60,6 +61,18 @@ sys.exit(int(os.environ['ENGINE_FAILURE']))
         self.assertIn('ldd "$path"', body)
         self.assertIn('"$path" --version', body)
         self.assertNotIn('-dev', body)
+        self.assertIn('BIN_VERSION=0.1.0-1', argv)
+        self.assertIn('= "$bin $BIN_VERSION"', body)
+
+    def test_prerelease_package_expects_semver_binaries(self):
+        # tuna-release maps a SemVer prerelease's hyphen to "~" in the package
+        # Version; the binaries keep reporting the SemVer form.
+        self.env['FIXTURE_VERSION'] = '0.2.0~beta.1'
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = json.loads(self.log.read_text())
+        self.assertIn('PKG_VERSION=0.2.0~beta.1', argv)
+        self.assertIn('BIN_VERSION=0.2.0-beta.1', argv)
 
     def test_native_audio_runtime_is_a_hard_dependency_and_checked_without_recommends(self):
         release = SCRIPT.with_name('tuna-release').read_text()
