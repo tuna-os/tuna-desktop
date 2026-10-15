@@ -17,7 +17,7 @@ This change consumes properties from the IBus panel. It does not close issue #59
 
 The host parser limits each value to 64 KiB, 128 properties, eight levels, and 512 bytes per consumed text. It rejects unknown types, invalid states, duplicate nonempty keys, malformed text, and children on a leaf. The parser supports the current shape and the explicit legacy shape.
 
-The GTK menu shows the active IBus engine and its visible properties. It supports actions, toggles, radio groups at each menu level, separators, and submenus. InputMode symbols with one or two grapheme clusters can replace the indicator text. GTK provides labels for controls, plus sensitivity and checked state. Submenus use GTK expanders; the appearance of GNOME submenus remains unmeasured.
+The GTK menu shows the active IBus engine and its visible properties. It supports actions, toggles, radio groups at each menu level, separators, and submenus. InputMode symbols with one or two grapheme clusters can replace the indicator text. GTK provides labels for controls, plus sensitivity and checked state. GTK's AT-SPI bridge exports no Action for check buttons, so each toggle and radio carries a widget-local `property.toggle` action that clicks it; GTK withholds the action while the control is insensitive. Submenus use GTK expanders; the appearance of GNOME submenus remains unmeasured.
 
 The expected `ibus-daemon` is the first executable found on PATH. The consumer resolves symlinks and holds its file descriptor. It compares device/inode identity with the executable of the socket peer, checks the peer UID, and pins process start time. Actions and async responses recheck these identities.
 

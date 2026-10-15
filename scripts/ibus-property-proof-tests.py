@@ -105,6 +105,13 @@ class Controls(unittest.TestCase):
         self.assertIn('!self.owned.get()', gtk)
         self.assertIn('(self.locked)()', gtk)
 
+    def test_property_toggles_expose_an_accessible_action(self):
+        # GTK's AT-SPI bridge exports no Action for GtkCheckButton, so the
+        # proof's press("Input Mode") needs the widget-local action group.
+        gtk = (ROOT / "crates/shell-gtk/src/ibus_property_menu.rs").read_text()
+        self.assertIn('expose_toggle_action(&button);', gtk)
+        self.assertIn('button.insert_action_group("property", Some(&actions));', gtk)
+
 
 if __name__ == "__main__":
     unittest.main()

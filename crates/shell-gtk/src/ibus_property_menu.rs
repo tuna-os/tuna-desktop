@@ -867,6 +867,7 @@ impl PropertyMenu {
                     button.set_inconsistent(p.state == 2);
                     button.set_sensitive(p.sensitive);
                     button.set_tooltip_text(Some(&p.tooltip));
+                    expose_toggle_action(&button);
                     let radio = p.kind == Kind::Radio;
                     button.connect_toggled(move |button| {
                         if radio && !button.is_active() {
@@ -958,6 +959,24 @@ fn same_owner(
 
 fn trusted_sender(peer: Option<&Peer>, sender: Option<&str>) -> bool {
     sender == Some(DIRECT_SENDER) && peer.is_some_and(Peer::live)
+}
+
+/// GTK's AT-SPI bridge gives GtkCheckButton no Action (only GtkButton,
+/// GtkSwitch, GtkExpander and entries get one), so assistive technology could
+/// read these toggles but not operate them. A widget-local action group is
+/// what GTK exports for any other widget; its one action clicks the button,
+/// and GTK withholds it while the button is insensitive.
+fn expose_toggle_action(button: &gtk::CheckButton) {
+    let toggle = gio::SimpleAction::new("toggle", None);
+    let weak = button.downgrade();
+    toggle.connect_activate(move |_, _| {
+        if let Some(button) = weak.upgrade() {
+            button.activate();
+        }
+    });
+    let actions = gio::SimpleActionGroup::new();
+    actions.add_action(&toggle);
+    button.insert_action_group("property", Some(&actions));
 }
 
 #[cfg(test)]
