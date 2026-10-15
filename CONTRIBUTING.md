@@ -1,7 +1,7 @@
 # Contributing to Tuna Desktop
 
 Tuna Desktop (formerly Roost) is in active implementation as a nested developer preview (see
-[README.md](README.md) and [ROADMAP.md](ROADMAP.md)). A Smithay compositor
+[README.md](README.md) and [the roadmap](docs/roadmap.md#public-roadmap)). A Smithay compositor
 supervises a GTK4/libadwaita shell, session supervisor, greetd greeter, and
 versioned control protocol, tested across nested graphical journeys, AT-SPI
 accessibility, and Marlin VM lanes.

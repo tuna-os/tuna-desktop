@@ -104,4 +104,4 @@ requirement traceability.
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 
-The [public roadmap](ROADMAP.md) records priorities through October 2027, current release limits and contribution opportunities.
+The [public roadmap](docs/roadmap.md#public-roadmap) records priorities through October 2027, current release limits and contribution opportunities.
