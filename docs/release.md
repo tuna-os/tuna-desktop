@@ -46,6 +46,22 @@ not provide Marlin or physical hardware qualification.
 The package version, the binaries' `--version` output, and the notes must
 agree — the release script enforces the first two by construction.
 
+## Prereleases (betas and release candidates)
+
+Tag a prerelease with a SemVer suffix: `vX.Y.Z-beta.N`, then `vX.Y.Z-rc.N`.
+Every checklist step above applies unchanged, including the filled
+`docs/reviews/vX.Y.Z-beta.N.md`. The binaries report `X.Y.Z-beta.N`; the
+package versions are mapped so the final `X.Y.Z` always upgrades over them:
+
+| Tag | `--version` | Debian `Version` | Arch `pkgver` (`_semver` in `packaging/arch/PKGBUILD`) |
+|---|---|---|---|
+| `v1.0.0-beta.1` | `1.0.0-beta.1` | `1.0.0~beta.1` | `1.0.0beta.1` |
+| `v1.0.0` | `1.0.0` | `1.0.0` | `1.0.0` |
+
+Publish it as a GitHub prerelease (`gh release create vX.Y.Z-beta.N
+--prerelease`) and list every open release gate under "Known limitations":
+a beta does not claim the gates in the [roadmap](roadmap.md#global-decision-gates).
+
 ## Upgrade and uninstall
 
 Upgrading installs the newer package over the older one; user configuration
