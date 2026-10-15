@@ -1559,16 +1559,16 @@ done
 a11y_until "$ARTIFACTS/a11y-folder-page-peek.json" 'any(.[]; .showing and .name == "Next page preview")' ||
     fail G-GRID-DRAG-CANCEL "real local folder drag has no neighboring-page hint"
 scrot "$ARTIFACTS/11h-folder-page-peek.png" >/dev/null
+cstate '.client_dnd_active' "folder drag" || fail G-GRID-DRAG-CANCEL "the folder drag never took the pointer"
 xdotool key Escape
+# Escape cancels the drag as Mutter's drag grab does, with the button still
+# held: the overview stays open and the release has nothing to drop.
+cstate '(.client_dnd_active | not) and .overview_open and .overview_app_grid' "drag cancelled" ||
+    fail G-GRID-DRAG-CANCEL "Escape did not cancel the drag with the grid open"
+a11y_until "$ARTIFACTS/a11y-folder-page-escaped.json" 'any(.[]; .showing and .name == "Next Page") and (any(.[]; .showing and (.name | endswith("page preview"))) | not)' ||
+    fail G-GRID-DRAG-CANCEL "the shell kept the drag's hints after the cancel"
 xdotool mouseup 1
-sleep 1
-# Escape may cancel DnD or close the overview; either route must release
-# the old pager, and reopening must show a clean first page.
-if ! jq -e '.overview_open and .overview_app_grid' "$CSTATE" >/dev/null; then
-    xdotool key super+a
-    cstate '.overview_open and .overview_app_grid' "app grid" || fail G-GRID-DRAG-CANCEL "grid did not reopen after cancellation"
-    sleep 1
-fi
+# Resting at the edge past the 1 s dwell: no stale timer may turn the page.
 xdotool mousemove --window "$WID" $((WIDTH - 6)) "$folder_source_y"
 sleep 1.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-page-cancelled.json" 20 || fail G-GRID-DRAG-CANCEL "cancelled dump failed"
@@ -1579,7 +1579,7 @@ for name in "Previous Page" "Next page preview" "Previous page preview"; do
     fi
 done
 [ "$(gsettings get org.gnome.shell app-picker-layout)" = "$folder_layout_before" ] || fail G-GRID-DRAG-CANCEL "cancelled folder drag changed the saved layout"
-pass G-GRID-DRAG-CANCEL "real local folder drag shows hints; Escape restores arrows, stops edge paging and preserves layout"
+pass G-GRID-DRAG-CANCEL "real local folder drag shows hints; Escape cancels it with the grid open, restores arrows, stops edge paging and preserves layout"
 # Restore page two for the existing app-drag proof's Previous Page action.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-page-next.json" 20 \
     --press "Next Page" || fail G-GRID-DRAG-CANCEL "could not return to page two"

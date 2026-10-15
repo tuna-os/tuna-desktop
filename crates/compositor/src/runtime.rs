@@ -603,6 +603,9 @@ pub struct Runtime {
     scale: f64,
     /// GNOME's input settings as last applied (#60).
     input_settings: tuna_shell_control::InputSettings,
+    /// An Escape press cancelled a client drag; its repeats and release
+    /// belong to that cancel, not to the overview or a client.
+    dnd_escape_held: bool,
     /// PipeWire, connected on the first screen cast (#61).
     pipewire: Option<crate::screencast::PipeWire>,
     /// Running screen casts.
@@ -1040,6 +1043,7 @@ impl Runtime {
             animation_clock: crate::animation_clock::AnimationClock::real(),
             scale: clamp_scale(session.scale),
             input_settings: Default::default(),
+            dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name),
             pipewire: None,
             casts: Vec::new(),
@@ -1304,6 +1308,9 @@ impl Runtime {
         self.idle_monitor.activity();
         self.active_at = Instant::now();
         if self.is_locked() {
+            // The lock takes the keyboard: a held Escape's release
+            // never comes back to the drag cancel below.
+            self.dnd_escape_held = false;
             // Only the lock screen hears input; with none up (shell
             // gone), nothing does.
             let surface = self
@@ -1326,6 +1333,30 @@ impl Runtime {
             // Activity cancels the idle shield; the wake event belongs to
             // that shield, not the previously focused application.
             return;
+        }
+        // Mutter's drag grab: Escape cancels a client drag-and-drop and
+        // is consumed, so the overview stays open and the release can
+        // no longer drop (a Wayland drag owns the pointer, not the keys).
+        if let ManagerInput::Key {
+            keycode: ESCAPE_KEYCODE,
+            pressed,
+            ..
+        } = &input
+        {
+            if self.dnd_escape_held {
+                // Repeats and the matching release belong to the cancelled drag.
+                self.dnd_escape_held = *pressed;
+                self.manager.discard_key_input(&mut self.state, &input);
+                return;
+            }
+            if *pressed
+                && self.state.client_dnd_active()
+                && self.state.cancel_client_dnd(input_time(&input) as u32)
+            {
+                self.dnd_escape_held = true;
+                self.manager.discard_key_input(&mut self.state, &input);
+                return;
+            }
         }
         // Three-finger swipes are the shell's (GNOME 51): consumed here,
         // acted on at the end. Other swipes reach the client.
@@ -1821,6 +1852,10 @@ impl Runtime {
         doc["pointer_fullscreen_blocked"] = serde_json::json!(
             (!self.is_locked()).then(|| self.manager.fullscreen_at(self.manager.pointer_pos()))
         );
+        // Whether a client drag-and-drop holds the pointer (the shell's
+        // grid drags), so proofs can wait for a drag's start and cancel.
+        doc["client_dnd_active"] =
+            serde_json::Value::Bool(!self.is_locked() && self.state.client_dnd_active());
         let doc = doc.to_string();
         if doc == self.state_last {
             return;
