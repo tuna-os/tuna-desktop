@@ -1839,10 +1839,16 @@ until "$PY" -c 'from gi.repository import Gio; import json; pages=Gio.Settings.n
     [ "$(date +%s)" -lt "$short_end" ] || fail G-GRID-SHORT-PAGES "cross-page move did not leave the source short"
     sleep 0.2
 done
-# Another installed entry forces a complete grid rebuild.
+# Another installed entry changes the catalog. The grid lists the catalog
+# as the overview opens, so reopen it and wait for the entry: a rebuild
+# that must keep the saved short page.
 printf '[Desktop Entry]\nName=ZZZ Rebuild Probe Two\nExec=true\nType=Application\n' >"$XDG_DATA_HOME/applications/tuna-grid-rebuild-two.desktop"
-a11y_until "$ARTIFACTS/a11y-grid-short-rebuilt.json" 'any(.[]; .name == "ZZZ Rebuild Probe Two")' ||
-    fail G-GRID-SHORT-PAGES "the catalog rebuild never showed the new entry"
+xdotool key Escape
+cstate '.overview_open | not' "short grid closed for the rebuild" || fail G-GRID-SHORT-PAGES "overview stayed open"
+xdotool key super+a
+cstate '.overview_open and .overview_app_grid' "short grid reopened" || fail G-GRID-SHORT-PAGES "app grid missing after reopening"
+a11y_settled "$ARTIFACTS/a11y-grid-short-rebuilt.json" 'select(any(.[]; .name == "ZZZ Rebuild Probe Two")) | [.[] | select(.showing and (.role == "push button" or .role == "button") and .name == "AAA Move One")][0].bounds | select(. != null)' ||
+    fail G-GRID-SHORT-PAGES "the rebuilt grid never showed the new entry"
 grid_shown "$ARTIFACTS/a11y-grid-short-rebuilt.json" "AAA Move One" || fail G-GRID-SHORT-PAGES "short first page lost its item"
 if grid_shown "$ARTIFACTS/a11y-grid-short-rebuilt.json" "AAA Move Two" || grid_shown "$ARTIFACTS/a11y-grid-short-rebuilt.json" "AAA Move Three"; then fail G-GRID-SHORT-PAGES "rebuilding filled the short first page"; fi
 pass G-GRID-SHORT-PAGES "a cross-page drag leaves its source short and the saved boundary survives a catalog rebuild"
