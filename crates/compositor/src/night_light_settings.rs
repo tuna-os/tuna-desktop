@@ -635,10 +635,7 @@ mod tests {
     const RETIRE_LIMIT: Duration = Duration::from_secs(10);
     fn retired(mut reader: Reader, events: &mpsc::Receiver<&'static str>) -> Reader {
         reader.shared.quarantine();
-        assert_eq!(
-            events.recv_timeout(RETIRE_LIMIT).unwrap(),
-            "retired"
-        );
+        assert_eq!(events.recv_timeout(RETIRE_LIMIT).unwrap(), "retired");
         reader.owner.take().unwrap().join().unwrap();
         reader
     }
