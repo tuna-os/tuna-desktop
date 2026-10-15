@@ -119,24 +119,30 @@ pub fn pending_output_work(
 /// Whether any surface tree in `roots` holds an unsent frame callback.
 pub(crate) fn pending_callbacks(roots: &[WlSurface]) -> bool {
     use smithay::wayland::compositor::SurfaceAttributes;
-    let mut pending = false;
+    let pending = std::cell::Cell::new(false);
     for root in roots {
         with_surface_tree_downward(
             root,
             (),
             |_, _, _| TraversalAction::DoChildren(()),
             |_, states, _| {
-                pending |= !states
+                if !states
                     .cached_state
                     .get::<SurfaceAttributes>()
                     .current()
                     .frame_callbacks
-                    .is_empty();
+                    .is_empty()
+                {
+                    pending.set(true);
+                }
             },
-            |_, _, _| !pending,
+            |_, _, _| !pending.get(),
         );
+        if pending.get() {
+            return true;
+        }
     }
-    pending
+    false
 }
 
 fn pending_work(roots: &[WlSurface], include_callbacks: bool, include_presentation: bool) -> bool {
