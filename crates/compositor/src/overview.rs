@@ -811,6 +811,20 @@ impl OverviewMotion {
         self.search.value() >= 1.0
     }
 
+    /// Whether any of the overview's tweens still moves. The loop keeps
+    /// the frame cadence until they all settle (#503).
+    pub fn animating(&self) -> bool {
+        !self.progress.done()
+            || !self.search.done()
+            || !self.drag_shrink.done()
+            || self
+                .morph
+                .as_ref()
+                .is_some_and(|(_, tween, _)| !tween.done())
+            || self.revert.as_ref().is_some_and(|(_, tween)| !tween.done())
+            || self.hover.iter().any(|(_, tween)| !tween.done())
+    }
+
     /// Jump everything to its end state (motion turned off).
     pub fn snap(&mut self, open: bool) {
         self.progress = Tween::settled(if open { 1.0 } else { 0.0 });

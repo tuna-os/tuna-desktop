@@ -147,6 +147,9 @@ pub struct Wallpaper {
     card_pending: Vec<PendingCard>,
     /// The lock screen's blurred, dimmed copy, by URI and output size.
     locked: Vec<(String, Size<i32, Logical>, MemoryRenderBuffer)>,
+    /// Wakes the compositor loop when a worker finishes, so its result
+    /// is collected without the loop polling for it (#503).
+    waker: Option<calloop::ping::Ping>,
 }
 
 impl std::fmt::Debug for CardCache {
@@ -181,6 +184,13 @@ struct Pending {
 /// covering the common multi-output case.
 const MAX_WALLPAPER_SLOTS: usize = 4;
 
+/// Tell the compositor loop a worker result is ready.
+fn wake(waker: Option<calloop::ping::Ping>) {
+    if let Some(waker) = waker {
+        waker.ping();
+    }
+}
+
 #[derive(Debug)]
 struct IdentitySnapshot {
     uri: String,
@@ -198,6 +208,11 @@ impl Wallpaper {
     #[cfg(feature = "drm")]
     pub(crate) fn card_counts(&self) -> (usize, usize) {
         (self.cards.len(), self.card_pending.len())
+    }
+
+    /// Wake `waker` whenever an identity, decode or card worker finishes.
+    pub fn set_waker(&mut self, waker: calloop::ping::Ping) {
+        self.waker = Some(waker);
     }
 
     /// Bounded in-memory observations only. Never inspect an arbitrary source
@@ -280,10 +295,12 @@ impl Wallpaper {
         {
             let (send, result) = std::sync::mpsc::channel();
             let path = uri.to_owned();
+            let waker = self.waker.clone();
             if std::thread::Builder::new()
                 .name("tuna-wallpaper-identity".into())
                 .spawn(move || {
                     let _ = send.send(FileIdentity::for_uri(&path));
+                    wake(waker);
                 })
                 .is_ok()
             {
@@ -321,6 +338,7 @@ impl Wallpaper {
             }
             let (send, result) = std::sync::mpsc::channel();
             let job = uri.to_owned();
+            let waker = self.waker.clone();
             let spawned = std::thread::Builder::new()
                 .name("tuna-wallpaper".into())
                 .spawn(move || {
@@ -338,6 +356,7 @@ impl Wallpaper {
                         started.elapsed().as_millis()
                     );
                     let _ = send.send(pixels);
+                    wake(waker);
                 });
             if spawned.is_ok() {
                 self.pending.push(Pending {
@@ -736,6 +755,7 @@ impl Wallpaper {
             return None;
         }
         let (send, result) = std::sync::mpsc::channel();
+        let waker = self.waker.clone();
         if std::thread::Builder::new()
             .name("tuna-wallpaper-card".into())
             .spawn(move || {
@@ -756,6 +776,7 @@ impl Wallpaper {
                     },
                 );
                 let _ = send.send(card);
+                wake(waker);
             })
             .is_ok()
         {
