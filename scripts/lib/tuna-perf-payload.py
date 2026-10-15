@@ -110,16 +110,33 @@ def latest_run(response, repository):
             "scope": "newest creation time in original bounded workflow API page"}
 
 
-def metadata(run, artifact, selected_run):
+def metadata(run, artifact, selected_run, expected_repository=None, expected_sha=None):
     require(isinstance(run, dict) and isinstance(artifact, dict),
             "run and artifact API metadata must be objects")
     owner = artifact.get("workflow_run", {})
     repository = run.get("repository", {})
     require(isinstance(owner, dict) and isinstance(repository, dict),
             "workflow run and repository API metadata must be objects")
-    require(run.get("id") == selected_run and run.get("head_branch") == "main"
-            and run.get("event") == "push" and run.get("conclusion") == "success",
-            "original run is not successful trusted MAIN push")
+    if expected_repository is None and expected_sha is None:
+        require(run.get("id") == selected_run and run.get("head_branch") == "main"
+                and run.get("event") == "push" and run.get("conclusion") == "success",
+                "original run is not successful trusted MAIN push")
+    else:
+        require(isinstance(expected_repository, str)
+                and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", expected_repository)
+                and isinstance(expected_sha, str) and re.fullmatch('[0-9a-f]{40}', expected_sha),
+                "candidate exact source/repository required")
+        head_repository = run.get("head_repository", {})
+        require(type(selected_run) is int and selected_run > 0 and run.get("id") == selected_run
+                and run.get("event") == "workflow_dispatch" and run.get("status") == "completed"
+                and run.get("conclusion") == "success" and run.get("path") == ".github/workflows/ci.yml"
+                and run.get("head_sha") == expected_sha and repository.get("full_name") == expected_repository
+                and isinstance(head_repository, dict) and head_repository.get("full_name") == expected_repository
+                and type(repository.get("id")) is int and repository["id"] > 0
+                and head_repository.get("id") == repository.get("id")
+                and type(artifact.get("id")) is int and artifact["id"] > 0
+                and isinstance(run.get("head_branch"), str) and run["head_branch"],
+                "candidate is not successful exact-source original-repository dispatched ci")
     head = run.get("head_sha", "")
     require(isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head),
             "original run head is missing")
@@ -129,15 +146,21 @@ def metadata(run, artifact, selected_run):
             and 0 < artifact["size_in_bytes"] <= MAX_PACKAGE,
             "artifact identity or lifetime is invalid")
     require(owner.get("id") == selected_run and owner.get("head_sha") == head
-            and owner.get("head_branch") == "main"
+            and owner.get("head_branch") == run.get("head_branch")
             and owner.get("repository_id") == repository.get("id")
             and isinstance(owner.get("repository_id"), int),
             "artifact does not belong to original selected run/head/repository")
     digest = artifact.get("digest")
     require(digest is None or (isinstance(digest, str)
             and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)), "artifact digest malformed")
-    return {"run_id": selected_run, "head_sha": head, "artifact_id": artifact["id"],
-            "artifact_size": artifact["size_in_bytes"], "artifact_digest": digest}
+    result = {"run_id": selected_run, "head_sha": head, "artifact_id": artifact["id"],
+              "artifact_size": artifact["size_in_bytes"], "artifact_digest": digest}
+    if expected_sha is not None:
+        require(isinstance(digest, str), "candidate artifact requires API SHA256 digest")
+        result.update(acquisition_mode="explicit-dispatched-candidate", release_qualified=False,
+                      repository=expected_repository, head_branch=run["head_branch"],
+                      workflow_path=run['path'], event=run['event'])
+    return result
 
 
 def elf(data):
@@ -345,10 +368,11 @@ def runtime(directory, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("latest-run", "select", "archive", "copy", "installed", "runtime"))
+    parser.add_argument("action", choices=("latest-run", "select", "select-candidate", "archive", "copy", "installed", "runtime"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--runs", type=Path)
     parser.add_argument("--repository")
+    parser.add_argument("--expected-sha")
     parser.add_argument("--run", type=Path)
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--run-id", type=int)
@@ -367,6 +391,10 @@ def main():
             result.update(latest_run(load(args.runs), args.repository))
         elif args.action == "select":
             result.update(metadata(load(args.run), load(args.artifact), args.run_id))
+        elif args.action == "select-candidate":
+            require(args.repository is not None and args.expected_sha is not None, "candidate exact source/repository required")
+            result.update(metadata(load(args.run), load(args.artifact), args.run_id,
+                                   args.repository, args.expected_sha))
         elif args.action == "archive":
             result["artifact"] = regular(args.zip, MAX_PACKAGE)[1]
             result.update(unpack(args.zip, args.package, load(args.report)))
@@ -388,7 +416,7 @@ def main():
         args.out.write_text(json.dumps(result, indent=2) + "\n")
     if args.action == "latest-run":
         print(result["run_id"])
-    elif args.action == "select":
+    elif args.action in ("select", "select-candidate"):
         print(result["artifact_id"])
 
 

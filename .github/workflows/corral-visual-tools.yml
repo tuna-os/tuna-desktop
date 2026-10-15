@@ -1,0 +1,29 @@
+name: Corral visual tooling
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/tuna-corral-visual-capture
+      - scripts/tuna-corral-guest-cpu
+      - scripts/tuna-vm-perf
+      - scripts/tuna-corral-perf-pairs
+      - scripts/tuna-corral-benchmark-import
+      - scripts/lib/corral_*.py
+      - scripts/tests/test_corral_*.py
+      - .github/workflows/corral-visual-tools.yml
+permissions:
+  contents: read
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: python3 -m unittest discover -s scripts/tests -p 'test_corral_*.py' -v
+      - run: python3 scripts/tuna-corral-visual-capture --help
+      - run: python3 scripts/tuna-corral-guest-cpu --help
+      - run: python3 scripts/tuna-corral-perf-pairs --help && python3 scripts/tuna-corral-benchmark-import --help && python3 scripts/tuna-vm-perf --help
+      - run: python3 scripts/lib/tuna-perf-tests.py
+      - run: python3 scripts/lib/tuna-perf-repeatability-tests.py
+      - run: python3 scripts/lib/tuna-perf-vm-lifetime-tests.py

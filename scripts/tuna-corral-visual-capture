@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Capture six installed fixture states with observed consumer and source identity.
+
+Does not import/create VMs, install guest packages, restart sessions, or qualify a
+shipping image. Requires an already active Tuna GTK Wayland session and GI Atspi.
+"""
+import argparse
+import json
+from pathlib import Path
+import re
+import shlex
+import sys
+import time
+sys.dont_write_bytecode=True
+sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
+from corral_session import Session,admit_imported_disk
+from corral_ssh import client_key
+from corral_visual import candidate_intent,guest_source,observation_pair,png,sha,wait_state,STATES,identity_pair
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    for key in ('context','vm','key','known-hosts','reference-image','tuna-payload','tuna-selection','export-dir','import-receipt','candidate-sha','out'):
+        p.add_argument('--'+key,required=True)
+    p.add_argument('--namespace',default='corral-vms')
+    p.add_argument('--package-run',required=True,type=int)
+    p.add_argument('--public-key')
+    a=p.parse_args()
+    if not re.fullmatch('[0-9a-f]{40}',a.candidate_sha) or a.package_run<=0:p.error('exact candidate SHA and positive package run required')
+    export=Path(a.export_dir)
+    manifest=json.loads((export/'manifest.json').read_text())
+    candidate_intent(manifest,a.candidate_sha,a.package_run)
+    imported=admit_imported_disk(export,a.import_receipt,a.context,a.namespace,a.vm,a.reference_image,a.tuna_payload,a.tuna_selection)
+    key=client_key(manifest,a.key,a.public_key or a.key+'.pub','root')
+    out=Path(a.out);out.mkdir(parents=True,exist_ok=False);out.chmod(0o700)
+    receipt={'schema':1,'candidate_source_commit':a.candidate_sha,'package_run':a.package_run,
+             'observer_source_commit':manifest['observer_source_commit'],'package_sha256':manifest['package_sha256'],
+             'reference':manifest['reference'],'import':imported,'client_key':key,
+             'export_manifest_sha256':sha((export/'manifest.json').read_bytes()),
+             'runner_sha256':sha(Path(__file__).read_bytes()),
+             'helper_sha256':sha(Path(__file__).with_name('lib').joinpath('corral_visual.py').read_bytes()),
+             'states':{name:{'status':'unobserved','frame_current':False} for name in STATES},'shipping_image_qualified':False,'whole_capability_qualified':False,
+             'scope':'paired CI fixture; native binaries; stills require independent visual review',
+             'unsupported':['greeter','typed-login','logout','PAM-unlock','multi-output','hotplug','hardware','motion-pairing','remaining-capabilities'],
+             'completed':False}
+    def save():(out/'manifest.json').write_text(json.dumps(receipt,indent=2)+'\n')
+    save();session=None
+    try:
+        members={name:value['sha256'] for name,value in manifest['candidate_required_members'].items()
+                 if name.startswith('usr/bin/')}
+        if 'usr/bin/tuna-shell-gtk' not in members:raise ValueError('GTK installed member receipt missing')
+        source=guest_source(members)
+        session=Session(a.context,a.namespace,a.vm,'root',a.key,a.known_hosts,out)
+        selected=session.desktop('tuna')
+        initial=session.python(source,{})
+        session.check_boot(initial['boot_id'])
+        if selected['compositor']['pid']!=initial['native_backend']['compositor_pid'] or str(selected['compositor']['start_ticks'])!=initial['native_backend']['compositor_start_ticks']:
+            raise ValueError('selected desktop compositor differs from native consumer receipt')
+        receipt['selected_desktop']=selected
+        receipt['native_backend']=initial['native_backend']
+        if initial.get('locked') is not False or initial.get('wayland_session') is not True:
+            raise ValueError('capture requires an already unlocked active Wayland session')
+        display=session.connect_display().rfb
+        receipt['session']=session.metadata
+        def observe(remaining):
+            command='/usr/bin/timeout --signal=TERM --kill-after=2s '+str(min(remaining,30))+'s python3 -c '+shlex.quote(source)+' '+shlex.quote('{}')
+            return json.loads(session.remote(command,timeout=min(remaining,30)))
+        for name in STATES:
+            state={'status':'unobserved','frame_current':False};receipt['states'][name]=state;save()
+            try:
+                session.verify()
+                if name=='desktop-return' and receipt['states']['app-grid']['status']!='observed':
+                    raise ValueError('return requires the preceding app-grid capture to be observed')
+                display.keys(0xff1b);display.keys(0xff1b)
+                if name=='overview':display.keys(0xffeb)
+                if name=='quick-settings':session.python(source,{'press':'System'})
+                if name=='calendar':session.python(source,{'press':'Date and Time'})
+                if name=='app-grid':
+                    display.keys(0xffeb)
+                    wait_state('overview', observe, initial)
+                    session.python(source,{'press':'Show Apps'})
+                # desktop-return is deliberately reached from the preceding
+                # observed app-grid using real Escape input, never a duplicate
+                # desktop still masquerading as a distinct state.
+                before=wait_state(name, observe, initial)
+                session.check_boot(before['boot_id'])
+                w,h,pixels=display.snapshot()
+                after=session.python(source,{})
+                session.check_boot(after['boot_id']);session.verify()
+                identity_pair(initial,after)
+                observed=json.dumps({'before':before,'after':after},indent=2).encode()
+                (out/(name+'-observation.json')).write_bytes(observed)
+                state.update(observation=name+'-observation.json',observation_sha256=sha(observed))
+                observation_pair(name,before,after)
+                image=png(w,h,pixels)
+                if len(set(pixels[0::4]))<2 and len(set(pixels[1::4]))<2 and len(set(pixels[2::4]))<2:
+                    raise ValueError('uniform framebuffer requires investigation')
+                if name!='desktop-return' and any(s.get('frame_sha256')==sha(image) for s in receipt['states'].values()):
+                    raise ValueError('different named states have duplicate framebuffer bytes')
+                (out/(name+'.png')).write_bytes(image)
+                state.update(status='observed',frame_current=True,frame=name+'.png',frame_sha256=sha(image),
+                             width=w,height=h,observation=name+'-observation.json',observation_sha256=sha(observed),
+                             boot_id=session.boot_id,vm_identity=session.identity,source_commit=a.candidate_sha,
+                             package_sha256=manifest['package_sha256'],fixture_image_id=manifest['fixture_image_id'],
+                             captured_unix_ns=time.time_ns(),visual_review='required',capability_qualified=False)
+            except Exception as error:
+                state.update(status='unobserved',error=str(error)[:2000],frame_current=False)
+            save()
+        receipt['completed']=all(s['status']=='observed' for s in receipt['states'].values())
+    except Exception as error:
+        receipt['error']=str(error)[:2000]
+    finally:
+        if session:
+            try:session.close()
+            except Exception as error:
+                receipt['completed']=False;receipt['close_error']=str(error)[:2000]
+                for state in receipt['states'].values():state['frame_current']=False;state['status']='stale'
+        save()
+    return 0 if receipt['completed'] else 1
+
+
+if __name__=='__main__':raise SystemExit(main())
