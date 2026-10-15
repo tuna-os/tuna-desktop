@@ -2991,9 +2991,55 @@ impl WindowManager {
     pub fn pointer_button(&mut self, state: &mut State, button: u32, pressed: bool, time: u32) {
         let trace = std::env::var_os("TUNA_POINTER_TRACE").is_some();
         if trace {
+            // Everything that decides where a press lands, before it acts:
+            // the hit-tested layer (by namespace), popup and window, the
+            // manager and seat grabs and the current pointer focus.
+            let pos = self.pointer_pos;
+            let layer =
+                crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
+                    .map(|(surface, (x, y))| {
+                        let namespace = state
+                            .panel_surfaces
+                            .iter()
+                            .find(|record| record.surface == surface)
+                            .map_or("unknown", |record| record.namespace.as_str());
+                        format!("{namespace}@{x},{y}")
+                    });
+            let (seat_grab, focused) = self.pointer.as_ref().map_or((false, false), |pointer| {
+                (pointer.is_grabbed(), pointer.current_focus().is_some())
+            });
+            let active = self.model.active_workspace();
+            let stack: Vec<String> = self
+                .presentation_order()
+                .into_iter()
+                .map(|id| {
+                    let workspace = self.model.window(id).map(|entry| entry.workspace);
+                    match self.windows.get(&id) {
+                        Some(w) => {
+                            let g = self.shifted(id, w.geometry);
+                            format!(
+                                "{id}:{},{},{}x{}:ws{workspace:?}/{active}{}",
+                                g.loc.x,
+                                g.loc.y,
+                                g.size.w,
+                                g.size.h,
+                                if w.minimized { ":min" } else { "" }
+                            )
+                        }
+                        None => format!("{id}:absent"),
+                    }
+                })
+                .collect();
             eprintln!(
-                "tuna-compositor: pointer trace: manager button received popup_grab={} move_modifier={}",
-                state.popup_grab_active(), self.super_held
+                "tuna-compositor: pointer trace: manager button received popup_grab={} move_modifier={} pressed={pressed} pos=({:.1},{:.1}) layer={layer:?} popup={} window={:?} overview={} grab={:?} seat_grab={seat_grab} focused={focused} stack={stack:?}",
+                state.popup_grab_active(),
+                self.super_held,
+                pos.x,
+                pos.y,
+                self.popup_at(state, pos).is_some(),
+                self.window_at(pos),
+                self.overview_open,
+                self.grab,
             );
         }
         // Release ends a move/resize grab. It is still delivered (unless
