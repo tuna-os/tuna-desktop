@@ -1,5 +1,4 @@
 """Explicit synthetic validator controls; no guest or framebuffer qualification."""
-import ast
 import copy
 import hashlib
 import importlib.machinery
@@ -41,29 +40,36 @@ def sample():
 
 class Tests(unittest.TestCase):
     def test_initial_focus_point_avoids_observed_staggered_fixture_overlap(self):
-        # Recorded rectangles from exact 9c CI: synthetic geometry control,
-        # not a replacement for actual focus/input/framebuffer qualification.
-        rects = {'alpha': [630, 446, 320, 240], 'beta': [580, 396, 320, 240],
-                 'gamma': [480, 296, 320, 240], 'delta': [530, 346, 320, 240]}
-        source = Path(proof.__file__).read_text()
-        tree = ast.parse(source)
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Name) and n.func.id == 'move'
-                 and any(isinstance(k, ast.Name) and k.id == 'alpha'
-                         for arg in n.args for k in ast.walk(arg))]
-        initial = min(calls, key=lambda n: n.lineno)
-        point = tuple(eval(compile(ast.Expression(arg), '<actual-focus-expression>', 'eval'),
-                           {'__builtins__': {}}, {'alpha': rects['alpha']})
-                      for arg in initial.args)
+        # Recorded rectangles from exact CI runs (9c, and run 38471211286
+        # where Delta covered Alpha's lower-right): synthetic geometry
+        # controls, not a replacement for actual focus/input/framebuffer
+        # qualification.
+        layouts = [
+            {'alpha': [630, 446, 320, 240], 'beta': [580, 396, 320, 240],
+             'gamma': [480, 296, 320, 240], 'delta': [530, 346, 320, 240]},
+            {'alpha': [580, 396, 320, 240], 'beta': [530, 346, 320, 240],
+             'gamma': [480, 296, 320, 240], 'delta': [630, 446, 320, 240]},
+        ]
         def inside(point, rect):
             x, y, w, h = rect
             return x <= point[0] < x + w and y <= point[1] < y + h
-        self.assertTrue(inside(point, rects['alpha']))
-        self.assertTrue(0 <= point[0] < 1280 and 0 <= point[1] < 800)
-        for role in ('beta', 'gamma', 'delta'):
-            self.assertFalse(inside(point, rects[role]), role)
-        old = (rects['alpha'][0] + 12, rects['alpha'][1] + 20)
-        self.assertTrue(inside(old, rects['delta']))
+        for rects in layouts:
+            covers = [rect for role, rect in rects.items() if role != 'alpha']
+            point = proof.exposed_point(rects['alpha'], covers)
+            self.assertTrue(inside(point, rects['alpha']))
+            self.assertTrue(0 <= point[0] < 1280 and 0 <= point[1] < 800)
+            for role in ('beta', 'gamma', 'delta'):
+                self.assertFalse(inside(point, rects[role]), role)
+        # Both fixed corners are covered in one of the recorded layouts.
+        old = (layouts[0]['alpha'][0] + 12, layouts[0]['alpha'][1] + 20)
+        self.assertTrue(inside(old, layouts[0]['delta']))
+        alpha = layouts[1]['alpha']
+        old = (alpha[0] + alpha[2] - 12, alpha[1] + alpha[3] - 20)
+        self.assertTrue(inside(old, layouts[1]['delta']))
+        with self.assertRaisesRegex(RuntimeError, 'no exposed actual client point'):
+            proof.exposed_point(alpha, [[0, 0, 1280, 800]])
+        source = Path(proof.__file__).read_text()
+        self.assertIn("move(*exposed_point(alpha,", source)
         self.assertIn("sample['inventory']['state']['focused'] == found['alpha']['id']", source)
 
     def test_shared_application_id_never_substitutes_for_unique_role_map(self):

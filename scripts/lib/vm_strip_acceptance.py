@@ -202,6 +202,23 @@ def await_stationary_edge(read, original, before, *, deadline):
     raise TimeoutError('actual stationary edge never reached a settled terminal')
 
 
+def exposed_point(rect, covers, *, inset=12):
+    """First actual client point of `rect` outside every later-mapped fixture rect.
+
+    The staggered floating map order is not fixed: a later fixture window can
+    cover any corner of Alpha. Only geometry is chosen here; the caller still
+    requires the actual compositor to report Alpha focused after the click."""
+    x, y, w, h = rect
+    def inside(px, py, other):
+        ox, oy, ow, oh = other
+        return ox <= px < ox + ow and oy <= py < oy + oh
+    for py in range(y + h - 1 - inset, y + inset - 1, -4):
+        for px in range(x + inset, x + w - inset, 4):
+            if 0 <= px < 1280 and 0 <= py < 800 and not any(inside(px, py, other) for other in covers):
+                return px, py
+    raise RuntimeError('no exposed actual client point for the initial focus click')
+
+
 def colored_frame(image, rect, color):
     """Strict actual viewport pixels; never accept a model rectangle alone."""
     width, height, pixels = image
@@ -458,10 +475,11 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         first = ready('gnome')
         found = windows(first, original, edge=edge)
         alpha = found['alpha']['rect']
-        # The actual staggered floating map can cover Alpha's titlebar with
-        # later fixture windows. Click its lower-right client interior; the
-        # following endpoint still requires the actual Alpha ID to gain focus.
-        move(alpha[0] + alpha[2] - 12, alpha[1] + alpha[3] - 20)
+        # The actual staggered floating map can cover any part of Alpha with
+        # later fixture windows, in a run-dependent order. Click a point no
+        # other fixture window covers; the following endpoint still requires
+        # the actual Alpha ID to gain focus.
+        move(*exposed_point(alpha, [item['rect'] for role, item in found.items() if role != 'alpha']))
         button(True)
         button(False)
         first = ready('gnome', extra=lambda sample, found: sample['inventory']['state']['focused'] == found['alpha']['id'])
