@@ -1,11 +1,24 @@
-# CI-only GNOME 51 baseline derived from the recorded Marlin image.
-# Arch stable currently ships GNOME 50.5; enable both testing repositories
-# together and perform a complete upgrade to avoid a partial Arch upgrade.
+# CI-only GNOME 51.0 baseline derived from the recorded Marlin image.
+# The declared baseline is GNOME 51.0 (ADR 0007), but Arch and the published
+# Marlin tag have moved on to the 51.1 point release. Resolve every Arch
+# repository from one dated Arch Linux Archive snapshot instead of the moving
+# mirrors. ARCH_ARCHIVE_SNAPSHOT is the last daily snapshot in which extra
+# carries gnome-shell 1:51.0-1 together with Mutter 51.0 (the next day's
+# snapshot already moved Mutter to 51.1). The Mutter profiler build, the shared
+# preview and the Tuna payload's dependencies all resolve from this image's
+# synced databases, so they share the same snapshot. Changing this date changes
+# the baseline and requires an ADR (docs/roadmap.md change control).
+# Both testing repositories stay enabled from the same snapshot, as in the last
+# green derived baseline; -Syuu performs one complete transaction that also
+# downgrades packages the base image already took from newer mirrors.
 ARG BASE_IMAGE=ghcr.io/tuna-os/marlin:gnome
 ARG COHERENT_BASE=gnome-baseline
+ARG ARCH_ARCHIVE_SNAPSHOT=2026/10/13
 FROM ${BASE_IMAGE} AS gnome-baseline
-RUN sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra-testing]\nInclude = /etc/pacman.d/mirrorlist\n' /etc/pacman.conf && \
-    pacman -Syu --noconfirm gnome-shell mutter gdm \
+ARG ARCH_ARCHIVE_SNAPSHOT
+RUN printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_ARCHIVE_SNAPSHOT" > /etc/pacman.d/mirrorlist && \
+    sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra-testing]\nInclude = /etc/pacman.d/mirrorlist\n' /etc/pacman.conf && \
+    pacman -Syuu --noconfirm gnome-shell mutter gdm \
         evolution-data-server gnome-keyring xdg-desktop-portal-gnome xdg-desktop-portal-gtk \
         gst-plugin-pipewire gst-plugins-good orca speech-dispatcher \
         python python-gobject wayland-utils qemu-guest-agent openssh gcc pkgconf wayland-protocols && \
@@ -18,7 +31,8 @@ RUN sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[
         depmod "$kernel" && dracut --force "$module_dir/initramfs.img" "$kernel" || exit 1; \
     done && \
     test "$kernel_count" -eq 1 && \
-    gnome-shell --version | grep -Eq '^GNOME Shell 51([. ]|$)' && \
+    gnome-shell --version | grep -qx 'GNOME Shell 51.0' && \
+    pacman -Q mutter | grep -Eqx 'mutter 51\.0-[0-9]+' && \
     pacman -Q > /tmp/tuna-baseline-packages.txt && \
     LC_ALL=C sort /tmp/tuna-baseline-packages.txt > /usr/share/tuna-perf-baseline-packages.txt && \
     rm /tmp/tuna-baseline-packages.txt
