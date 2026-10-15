@@ -631,6 +631,11 @@ pub struct Runtime {
     /// Cloned from the owned event loop at launch; `'static`
     /// because the loop outlives the runtime in `run`.
     loop_handle: LoopHandle<'static, Runtime>,
+    /// A hardware button release that would end a direct strip move or
+    /// resize, held until the current dispatch finishes (see the input
+    /// source in `launch`).
+    #[cfg(feature = "drm")]
+    strip_release_held: Option<ManagerInput>,
     /// XWayland server client awaiting its `Ready` event, after
     /// which the X11 window manager starts against it (xwayland
     /// feature only).
@@ -818,6 +823,22 @@ impl Runtime {
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 handle
                     .insert_source(sources.input, |event, _, rt: &mut Runtime| {
+                        // A VT switch revokes the evdev fds before libseat's
+                        // PauseSession reaches us; libinput answers by
+                        // releasing every held button and then removing the
+                        // device, in one dispatch. That release must roll a
+                        // direct strip move/resize back, never commit it, so
+                        // a strip-owning release waits for the dispatch to
+                        // end and a device removal meanwhile cancels the grab
+                        // (marlin-vm 38732705939 committed a column move).
+                        if rt.strip_release_held.is_some()
+                            && matches!(
+                                event,
+                                smithay::backend::input::InputEvent::DeviceRemoved { .. }
+                            )
+                        {
+                            rt.manager.cancel_strip_pointer(&mut rt.state);
+                        }
                         let corners_active = !rt.is_locked()
                             && !rt.manager.pointer_constraint_owns_motion(&rt.state)
                             && !rt.overlay.visible
@@ -832,6 +853,24 @@ impl Runtime {
                             Backend::Winit(_) => Vec::new(),
                         };
                         for input in inputs {
+                            if let ManagerInput::Button {
+                                button,
+                                pressed: false,
+                                ..
+                            } = input
+                            {
+                                if rt.strip_release_held.is_none()
+                                    && rt.manager.strip_grab_button() == Some(button)
+                                {
+                                    rt.strip_release_held = Some(input);
+                                    rt.loop_handle.insert_idle(|rt| {
+                                        if let Some(input) = rt.strip_release_held.take() {
+                                            rt.on_backend_input(input);
+                                        }
+                                    });
+                                    continue;
+                                }
+                            }
                             rt.on_backend_input(input);
                         }
                         // The window manager has the final say (a locked
@@ -1135,6 +1174,8 @@ impl Runtime {
             }),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
+            #[cfg(feature = "drm")]
+            strip_release_held: None,
             #[cfg(feature = "xwayland")]
             pending_x11_client: None,
             #[cfg(feature = "xwayland")]

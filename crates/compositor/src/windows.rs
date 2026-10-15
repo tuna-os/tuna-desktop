@@ -2471,6 +2471,13 @@ impl WindowManager {
         self.column_animations.clear();
     }
 
+    /// The button that holds a direct strip move or resize, if one does.
+    pub fn strip_grab_button(&self) -> Option<u32> {
+        self.grab
+            .and_then(Self::strip_grab_owner)
+            .map(|owner| owner.button)
+    }
+
     /// Cancel only strip pointer ownership. Existing floating grabs keep
     /// their previous behavior; dead actors are never reinserted.
     pub fn cancel_strip_pointer(&mut self, state: &mut State) -> bool {
