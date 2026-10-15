@@ -87,6 +87,7 @@ pub mod spring;
 pub mod state;
 pub mod supervise;
 pub mod unlock;
+mod wake;
 pub mod wallpaper;
 pub mod window_icons;
 pub mod window_lifecycle;

@@ -21,16 +21,18 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    pub fn start(generation: Arc<AtomicU64>) -> zbus::Result<Self> {
+    /// `waker` wakes the compositor loop after each notification.
+    pub fn start(generation: Arc<AtomicU64>, waker: calloop::ping::Ping) -> zbus::Result<Self> {
         let connection = zbus::blocking::connection::Builder::system()?
             .method_timeout(Duration::from_secs(5))
             .build()?;
-        Self::from_connection(connection, generation)
+        Self::from_connection(connection, generation, waker)
     }
 
     fn from_connection(
         connection: zbus::blocking::Connection,
         generation: Arc<AtomicU64>,
+        waker: calloop::ping::Ping,
     ) -> zbus::Result<Self> {
         let proxy = zbus::blocking::Proxy::new(
             &connection,
@@ -58,7 +60,10 @@ impl Monitor {
                     } else if prepared {
                         prepared = false;
                         worker_pending.wake.store(true, Ordering::Release);
+                    } else {
+                        continue;
                     }
+                    waker.ping();
                 }
             })?;
         Ok(Self {
@@ -125,7 +130,8 @@ mod tests {
         owner.request_name("org.freedesktop.login1").unwrap();
         let attacker = connect();
         let generation = Arc::new(AtomicU64::new(0));
-        let monitor = Monitor::from_connection(connect(), generation.clone()).unwrap();
+        let (waker, _wakeups) = calloop::ping::make_ping().unwrap();
+        let monitor = Monitor::from_connection(connect(), generation.clone(), waker).unwrap();
         let emit = |connection: &zbus::blocking::Connection, sleeping: bool| {
             connection
                 .emit_signal(

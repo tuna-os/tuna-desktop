@@ -43,6 +43,7 @@ pub struct Reader {
     sent: State,
     attempts: u8,
     next_start: Instant,
+    waker: Option<calloop::ping::Ping>,
 }
 impl Reader {
     pub fn new(display: &str) -> Self {
@@ -56,6 +57,7 @@ impl Reader {
             sent: State::Disabled,
             attempts: 0,
             next_start: Instant::now(),
+            waker: None,
         }
     }
     pub fn pid(&self) -> Option<u32> {
@@ -85,6 +87,20 @@ impl Reader {
             self.state = State::Disabled;
         }
     }
+
+    /// Wake the compositor loop whenever a watcher thread reports, so
+    /// [`poll`](Self::poll) runs on demand rather than every frame (#503).
+    pub fn set_waker(&mut self, waker: calloop::ping::Ping) {
+        self.waker = Some(waker);
+    }
+
+    /// When [`poll`](Self::poll) next starts a reader by itself: the
+    /// restart gate of an enabled reader without a child (a departure
+    /// still in progress is checked again at the gate). Child exits wake
+    /// the loop through SIGCHLD and watcher reports through the waker.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        (self.enabled && self.child.is_none() && self.attempts < 3).then_some(self.next_start)
+    }
     fn stop(&mut self) {
         self.observed = None;
         if let Some(mut child) = self.child.take() {
@@ -111,12 +127,16 @@ impl Reader {
     fn await_departure(&mut self, pid: u32) {
         let (sender, receiver) = mpsc::channel();
         self.departing = Some(receiver);
+        let waker = self.waker.clone();
         std::thread::spawn(move || {
             let until = Instant::now() + DEPARTURE_BOUND;
             while departing_owner(pid, &bus_call) && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(50));
             }
             let _ = sender.send(());
+            if let Some(waker) = waker {
+                waker.ping();
+            }
         });
     }
     /// True while a stopped child may still hold an Orca name.
@@ -226,8 +246,15 @@ impl Reader {
                         receiver,
                         cancel: cancel.clone(),
                     });
+                    let waker = self.waker.clone();
                     std::thread::spawn(move || {
-                        let report = |state, reason| sender.send((pid, state, reason)).is_ok();
+                        let report = |state, reason| {
+                            let sent = sender.send((pid, state, reason)).is_ok();
+                            if let Some(waker) = &waker {
+                                waker.ping();
+                            }
+                            sent
+                        };
                         watch_orca_name(pid, &bus_call, &cancel, READINESS_GRACE, report)
                     });
                 }
