@@ -24,7 +24,7 @@ class DeviceInventoryProjection(unittest.TestCase):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
         fn = next(n for n in ast.parse(source.read_text()).body
                   if isinstance(n, ast.FunctionDef) and n.name == "inventory")
-        def call(*args):
+        def call(*args, check=True):
             if args[1] == "list-sessions":
                 return "1 1000 tuna-test seat0 tty1"
             return "Id=1\nVTNr=1\nUser=1000\nService=greetd\nType=wayland\nClass=user"
@@ -288,7 +288,8 @@ class OrcaReadChurn(unittest.TestCase):
             empty_proc.mkdir()
             scope = {"json": json, "STATE": state, "call": call, "os": lane.os,
                      "OWNER": SimpleNamespace(pw_uid=1000),
-                     "pathlib": SimpleNamespace(Path=lambda path: empty_proc)}
+                     "pathlib": SimpleNamespace(Path=lambda path: empty_proc),
+                     "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
             result = self.load("inventory", scope)()
         self.assertEqual(result["session"]["Id"], "2")
 
