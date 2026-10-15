@@ -1,0 +1,259 @@
+diff --git a/src/wayland/selection/data_device/dnd_grab.rs b/src/wayland/selection/data_device/dnd_grab.rs
+index 8a909569..88c4c0c8 100644
+--- a/src/wayland/selection/data_device/dnd_grab.rs
++++ b/src/wayland/selection/data_device/dnd_grab.rs
+@@ -1,5 +1,5 @@
+ use std::{
+-    cell::RefCell,
++    cell::{Cell, RefCell},
+     fmt,
+     os::unix::io::{AsFd, OwnedFd},
+     sync::{Arc, Mutex},
+@@ -35,6 +35,8 @@ use super::{with_source_metadata, ClientDndGrabHandler, DataDeviceHandler};
+ 
+ /// Grab during a client-initiated DnD operation.
+ pub struct DnDGrab<D: SeatHandler> {
++    cancelled: Cell<bool>,
++    terminal: Cell<bool>,
+     dh: DisplayHandle,
+     pointer_start_data: Option<PointerGrabStartData<D>>,
+     touch_start_data: Option<TouchGrabStartData<D>>,
+@@ -65,6 +67,18 @@ impl<D: SeatHandler + 'static> fmt::Debug for DnDGrab<D> {
+ }
+ 
+ impl<D: SeatHandler> DnDGrab<D> {
++    /// Invalidate the offer while holding the grab lock, before releasing it.
++    /// Terminal protocol events are emitted only by the subsequent unset.
++    pub(crate) fn prepare_cancel(&self) {
++        if self.terminal.get() {
++            return;
++        }
++        self.cancelled.set(true);
++        if let Some(offer) = &self.offer_data {
++            offer.lock().unwrap().cancel();
++        }
++    }
++
+     pub(crate) fn new_pointer(
+         dh: &DisplayHandle,
+         start_data: PointerGrabStartData<D>,
+@@ -74,6 +88,8 @@ impl<D: SeatHandler> DnDGrab<D> {
+         icon: Option<WlSurface>,
+     ) -> Self {
+         Self {
++            cancelled: Cell::new(false),
++            terminal: Cell::new(false),
+             dh: dh.clone(),
+             pointer_start_data: Some(start_data),
+             touch_start_data: None,
+@@ -96,6 +112,8 @@ impl<D: SeatHandler> DnDGrab<D> {
+         icon: Option<WlSurface>,
+     ) -> Self {
+         Self {
++            cancelled: Cell::new(false),
++            terminal: Cell::new(false),
+             dh: dh.clone(),
+             pointer_start_data: None,
+             touch_start_data: Some(start_data),
+@@ -224,7 +242,22 @@ where
+         }
+     }
+ 
++    fn prepare_cancel_offer(&self) {
++        self.cancelled.set(true);
++        if let Some(offer) = &self.offer_data {
++            offer.lock().unwrap().cancel();
++        }
++    }
++
+     fn drop(&mut self, data: &mut D) {
++        // Pointer/touch teardown can converge here more than once. A successful
++        // offer stays alive for Receive/Finish; only cancelled offers retire now.
++        if self.terminal.replace(true) {
++            return;
++        }
++        if !self.origin.alive() || self.data_source.as_ref().is_some_and(|s| !s.alive()) {
++            self.prepare_cancel_offer();
++        }
+         // the user dropped, proceed to the drop
+         let seat_data = self
+             .seat
+@@ -234,7 +267,7 @@ where
+             .borrow_mut();
+         let validated = if let Some(ref data) = self.offer_data {
+             let data = data.lock().unwrap();
+-            data.accepted && (!data.chosen_action.is_empty())
++            !self.cancelled.get() && data.valid_drop()
+         } else {
+             false
+         };
+@@ -255,7 +288,7 @@ where
+                 data.active = false;
+             }
+         }
+-        if let Some(ref source) = self.data_source {
++        if let Some(source) = self.data_source.as_ref().filter(|s| s.alive()) {
+             if !validated {
+                 source.cancelled();
+             } else if source.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE {
+@@ -465,7 +498,7 @@ where
+         handle: &mut crate::input::touch::TouchInnerHandle<'_, D>,
+         _seq: crate::utils::Serial,
+     ) {
+-        // TODO: should we cancel something here?
++        self.prepare_cancel();
+         handle.unset_grab(self, data);
+     }
+ 
+@@ -505,6 +538,18 @@ struct OfferData {
+     chosen_action: DndAction,
+ }
+ 
++impl OfferData {
++    fn cancel(&mut self) {
++        self.active = false;
++        self.accepted = false;
++        self.chosen_action = DndAction::empty();
++    }
++
++    fn valid_drop(&self) -> bool {
++        self.active && !self.dropped && !self.finished && self.accepted && !self.chosen_action.is_empty()
++    }
++}
++
+ #[derive(Debug)]
+ struct DndDataOffer {
+     offer_data: Arc<Mutex<OfferData>>,
+@@ -551,6 +596,9 @@ where
+     let mut data = data.offer_data.lock().unwrap();
+     match request {
+         Request::Accept { mime_type, .. } => {
++            if !data.active {
++                return;
++            }
+             if let Some(mtype) = mime_type {
+                 if let Err(crate::utils::UnmanagedResource) = with_source_metadata(source, |meta| {
+                     data.accepted = meta.mime_types.contains(&mtype);
+@@ -613,6 +661,9 @@ where
+             dnd_actions,
+             preferred_action,
+         } => {
++            if !data.active {
++                return;
++            }
+             let dnd_actions = dnd_actions.into_result().unwrap_or(DndAction::None);
+             let preferred_action = preferred_action.into_result().unwrap_or(DndAction::None);
+ 
+@@ -642,3 +693,43 @@ where
+         _ => unreachable!(),
+     }
+ }
++
++#[cfg(test)]
++mod cancellation_tests {
++    use super::*;
++
++    fn accepted_offer() -> OfferData {
++        OfferData {
++            active: true,
++            dropped: false,
++            accepted: true,
++            finished: false,
++            chosen_action: DndAction::Move,
++        }
++    }
++
++    #[test]
++    fn cancellation_invalidates_an_accepted_offer_idempotently() {
++        let mut offer = accepted_offer();
++        assert!(offer.valid_drop());
++        offer.cancel();
++        offer.cancel();
++        assert!(!offer.valid_drop());
++        assert!(!offer.active);
++        assert!(!offer.accepted);
++        assert!(!offer.dropped);
++        assert!(offer.chosen_action.is_empty());
++    }
++
++    #[test]
++    fn successful_drop_keeps_offer_active_until_finish() {
++        let mut offer = accepted_offer();
++        assert!(offer.valid_drop());
++        offer.dropped = true;
++        assert!(offer.active);
++        assert!(!offer.valid_drop());
++        offer.finished = true;
++        offer.active = false;
++        assert!(!offer.valid_drop());
++    }
++}
+diff --git a/src/wayland/selection/data_device/mod.rs b/src/wayland/selection/data_device/mod.rs
+index 4a7ff741..fcef788f 100644
+--- a/src/wayland/selection/data_device/mod.rs
++++ b/src/wayland/selection/data_device/mod.rs
+@@ -109,6 +109,64 @@ use super::{
+     SelectionTarget,
+ };
+ 
++/// Whether a client drag owns either the pointer or touch grab (icons are optional).
++pub fn client_dnd_active<D>(seat: &Seat<D>) -> bool
++where
++    D: DataDeviceHandler + 'static,
++    D::PointerFocus: WaylandFocus,
++    D::TouchFocus: WaylandFocus,
++{
++    seat.get_pointer()
++        .is_some_and(|p| p.with_grab(|_, g| g.is::<DnDGrab<D>>()).unwrap_or(false))
++        || seat
++            .get_touch()
++            .is_some_and(|t| t.with_grab(|_, g| g.is::<DnDGrab<D>>()).unwrap_or(false))
++}
++
++/// Cancel only client DnD grabs. Mark offers invalid under the grab lock, then
++/// unset outside that lock: unset runs the terminal callback and acquires it again.
++pub fn cancel_client_dnd<D>(seat: &Seat<D>, data: &mut D, serial: Serial, time: u32) -> bool
++where
++    D: DataDeviceHandler + 'static,
++    D::PointerFocus: WaylandFocus,
++    D::TouchFocus: WaylandFocus,
++{
++    let mut cancelled = false;
++    if let Some(pointer) = seat.get_pointer() {
++        let marked = pointer
++            .with_grab(|_, grab| {
++                if let Some(dnd) = grab.downcast_ref::<DnDGrab<D>>() {
++                    dnd.prepare_cancel();
++                    true
++                } else {
++                    false
++                }
++            })
++            .unwrap_or(false);
++        if marked {
++            pointer.unset_grab(data, serial, time);
++            cancelled = true;
++        }
++    }
++    if let Some(touch) = seat.get_touch() {
++        let marked = touch
++            .with_grab(|_, grab| {
++                if let Some(dnd) = grab.downcast_ref::<DnDGrab<D>>() {
++                    dnd.prepare_cancel();
++                    true
++                } else {
++                    false
++                }
++            })
++            .unwrap_or(false);
++        if marked {
++            touch.unset_grab(data);
++            cancelled = true;
++        }
++    }
++    cancelled
++}
++
+ /// Events that are generated by interactions of the clients with the data device
+ #[allow(unused_variables)]
+ pub trait DataDeviceHandler: Sized + SelectionHandler + ClientDndGrabHandler + ServerDndGrabHandler {
