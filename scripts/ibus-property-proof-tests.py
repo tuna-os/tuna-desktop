@@ -8,10 +8,18 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "scripts/lib/tuna-ibus-properties-proof.py"
 module = ast.parse(SOURCE.read_text(), filename=str(SOURCE))
-functions = [n for n in module.body if isinstance(n, ast.FunctionDef)
-             and n.name in {"validate_traffic", "walk"}]
-namespace = {}
-exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), namespace)
+selected = [n for n in module.body if (isinstance(n, ast.FunctionDef)
+            and n.name in {"validate_traffic", "walk", "matching"})
+            or (isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "INDICATOR" for t in n.targets))]
+
+
+class Atspi:
+    class StateType:
+        SHOWING = "showing"
+
+
+namespace = {"Atspi": Atspi}
+exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
 
 
 class Controls(unittest.TestCase):
@@ -38,6 +46,28 @@ class Controls(unittest.TestCase):
         node = Node()
         for _ in range(33): node = Node([node])
         with self.assertRaises(RuntimeError): list(namespace["walk"](node))
+
+    def test_indicator_selects_the_showing_inner_toggle_of_the_menu_button(self):
+        class Node:
+            def __init__(self, role, name, showing=True):
+                self.role, self.name, self.showing = role, name, showing
+            def get_name(self): return self.name
+            def get_role_name(self): return self.role
+            def get_state_set(self):
+                showing = self.showing
+                class States:
+                    def contains(self, state): return state == "showing" and showing
+                return States()
+        # Shape of a gtk::MenuButton in the shell's a11y dumps (Date and Time,
+        # System): an outer "button" and an inner "toggle button", same name.
+        outer, inner = Node("button", "中"), Node("toggle button", "中")
+        tree = [outer, inner, Node("label", "中"), Node("toggle button", "中", showing=False),
+                Node("toggle button", "Date and Time")]
+        self.assertEqual(namespace["matching"](tree, "中"), [outer, inner])
+        self.assertEqual(namespace["matching"](tree, *namespace["INDICATOR"]), [inner])
+        helper = SOURCE.read_text()
+        self.assertNotIn('press("中")', helper)
+        self.assertEqual(helper.count('press(*INDICATOR)'), 3)
 
     def test_harness_has_external_blocking_call_bound_and_expected_executable(self):
         harness = (ROOT / "scripts/tuna-gtk-shell-proof").read_text()

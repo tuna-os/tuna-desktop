@@ -55,6 +55,19 @@ def validate_traffic(before, after, positive):
         raise RuntimeError("old property emitted traffic after engine change")
 
 
+# gtk::MenuButton exposes an outer "button" wrapping an inner "toggle button",
+# both carrying the indicator's name (the clock and System menus have the same
+# shape); the inner toggle button is the actionable control.
+INDICATOR = ("中", "toggle button")
+
+
+def matching(nodes, name, role=None):
+    return [n for n in nodes if n.get_name() == name
+            and n.get_state_set().contains(Atspi.StateType.SHOWING)
+            and n.get_role_name() != "label"
+            and (role is None or n.get_role_name() == role)]
+
+
 def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_log=None):
     expected_hash = file_hash(expected_shell)
     origin = identity(pid)
@@ -69,7 +82,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
     deadline = time.monotonic() + (70 if phase_file else 30)
     seen = []
 
-    def node(name):
+    def node(name, role=None):
         if identity(pid, False) != basic_origin:
             raise RuntimeError("GTK process changed")
         desktop = Atspi.get_desktop(0)
@@ -77,10 +90,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
         apps = [a for a in apps if a is not None and a.get_process_id() == pid]
         if len(apps) != 1:
             raise RuntimeError("GTK accessible application not unique")
-        matches = [n for n in walk(apps[0]) if n.get_name() == name
-                   and n.get_state_set().contains(Atspi.StateType.SHOWING)
-                   and n.get_role_name() != "label"]
-        return matches
+        return matching(walk(apps[0]), name, role)
 
     def wait(predicate):
         while time.monotonic() < deadline:
@@ -89,9 +99,9 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             time.sleep(.05)
         raise RuntimeError("property traffic deadline")
 
-    def press(name):
-        wait(lambda: len(node(name)) == 1)
-        selected = node(name)
+    def press(name, role=None):
+        wait(lambda: len(node(name, role)) == 1)
+        selected = node(name, role)
         if len(selected) != 1:
             raise RuntimeError("ambiguous property action")
         action = selected[0].get_action_iface()
@@ -129,7 +139,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
                     if line.startswith("tuna-shell-gtk: ibus properties applied ")]
         def fresh_menu():
             if not node("Input Mode"):
-                press("中")
+                press(*INDICATOR)
             wait(lambda: len(node("Input Mode")) == 1)
         def stale_call(action):
             try:
@@ -246,7 +256,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
                 "same_engine_instance": original_instance, "other_panel_not_replaced": bool(challenger),
                 "traffic": traffic(), "consumer_trace": trace()[before_trace:]})
         if node("Input Mode"):
-            press("中")
+            press(*INDICATOR)
             wait(lambda: not node("Input Mode"))
         if (identity(pid) != origin or file_hash(expected_shell) != expected_hash
                 or identity(daemon_origin["pid"]) != daemon_origin
@@ -259,7 +269,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             "installed_or_all_ime_qualified": False}, indent=2) + "\n")
         return
 
-    press("中")
+    press(*INDICATOR)
     wait(lambda: len(node("Input Mode")) == 1)
     if node("Proof Hidden"):
         raise RuntimeError("hidden property exposed")
