@@ -305,6 +305,10 @@ def reference(style):
 
 
 SHOT_W, SHOT_H = 1280, 800
+# Desktop probe pixel. The compositor draws its own pointer into the frame
+# (#342) and Xvfb starts the pointer at the screen center, so the probe sits
+# in a solid wallpaper region clear of the cursor and the top panel.
+PROBE_X, PROBE_Y = 320, 600
 
 def frame_owners():
     """Shell bus owner/pid plus compositor pid/exe/start, re-read live."""
@@ -472,10 +476,10 @@ def observe(style,label,required=None):
             data=pb.get_pixels()
             if len(data)!=pb.get_height()*pb.get_rowstride():
                 raise RuntimeError('screenshot pixel buffer does not match rowstride geometry')
-            offset=400*pb.get_rowstride()+640*channels
+            offset=PROBE_Y*pb.get_rowstride()+PROBE_X*channels
             actual=tuple(data[offset:offset+3])
             if len(actual)!=3:
-                raise RuntimeError('center sample fell outside the pixel buffer')
+                raise RuntimeError('probe sample fell outside the pixel buffer')
             first_name=Path(first).stem
             last_name=Path(last).stem if last else None
             ca=COLORS[first_name];cb=COLORS[last_name] if last else ca
@@ -585,7 +589,7 @@ if PHASE=='initial':
             data=pb.get_pixels()
             if len(data)!=pb.get_height()*pb.get_rowstride():
                 return False
-            offset=400*pb.get_rowstride()+640*pb.get_n_channels()
+            offset=PROBE_Y*pb.get_rowstride()+PROBE_X*pb.get_n_channels()
             actual=tuple(data[offset:offset+3])
             if len(actual)!=3:
                 return False
