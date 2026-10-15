@@ -6,6 +6,7 @@ import io
 import ast
 import base64
 import json
+import shlex
 import tempfile
 from pathlib import Path
 import unittest
@@ -176,6 +177,117 @@ class OrcaReadFailure(unittest.TestCase):
             with patch.object(actor, "command", side_effect=[{"pid": 10}, {**failed, "out-data": output}]):
                 with self.assertRaisesRegex(RuntimeError, r"guest lifecycle orca-read failed \(exit=1\)"):
                     actor.run("orca-read")
+
+
+class OrcaActivationCleanup(unittest.TestCase):
+    def test_reset_failure_keeps_observations_and_original_error(self):
+        observations = [{"enabled": True, "ready": False, "pid": 57}]
+        original = RuntimeError("original activation failure")
+        actor = SimpleNamespace(run=lambda action: (_ for _ in ()).throw(RuntimeError("private reset output")))
+        with tempfile.TemporaryDirectory() as out:
+            with self.assertRaises(RuntimeError) as caught:
+                try:
+                    raise original
+                finally:
+                    lane.finish_orca_activation(actor, out, observations)
+            self.assertIs(caught.exception, original)
+            self.assertEqual(json.loads((Path(out) / "orca-activation.json").read_text()), observations)
+            receipt = (Path(out) / "orca-activation-cleanup.json").read_text()
+            self.assertNotIn("private", receipt)
+            self.assertEqual(json.loads(receipt), {"primary_error_type": "RuntimeError",
+                "cleanup_errors": [{"action": "orca-reset", "exception_type": "RuntimeError"}]})
+
+    def test_reset_failure_without_activation_error_still_fails(self):
+        actor = SimpleNamespace(run=lambda action: (_ for _ in ()).throw(RuntimeError("private output")))
+        with tempfile.TemporaryDirectory() as out:
+            with self.assertRaisesRegex(RuntimeError, "Orca activation cleanup failed"):
+                lane.finish_orca_activation(actor, out, [])
+            self.assertEqual(json.loads((Path(out) / "orca-activation.json").read_text()), [])
+
+    def test_success_retains_observations_and_clean_reset_receipt(self):
+        calls = []
+        actor = SimpleNamespace(run=lambda action: calls.append(action))
+        with tempfile.TemporaryDirectory() as out:
+            lane.finish_orca_activation(actor, out, [])
+            self.assertEqual(calls, ["orca-reset"])
+            self.assertEqual(json.loads((Path(out) / "orca-activation-cleanup.json").read_text()),
+                             {"primary_error_type": None, "cleanup_errors": []})
+
+    def test_unwritable_evidence_does_not_replace_original_failure(self):
+        original = RuntimeError("original failure")
+        actor = SimpleNamespace(run=lambda action: None)
+        with tempfile.TemporaryDirectory() as out:
+            blocked = Path(out) / "not-a-directory"
+            blocked.write_text("file")
+            with self.assertRaises(RuntimeError) as caught:
+                try:
+                    raise original
+                finally:
+                    lane.finish_orca_activation(actor, str(blocked), [])
+            self.assertIs(caught.exception, original)
+            with self.assertRaisesRegex(RuntimeError, "orca-evidence-retention"):
+                lane.finish_orca_activation(actor, str(blocked), [])
+class OrcaReadChurn(unittest.TestCase):
+    """Transient guest churn during Orca start/stop is not a read failure (#543)."""
+    SOURCE = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+
+    def load(self, name, scope):
+        fn = next(n for n in ast.parse(self.SOURCE.read_text()).body
+                  if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(self.SOURCE), "exec"), scope)
+        return scope[name]
+
+    def test_inventory_skips_runuser_session_that_closed_mid_listing(self):
+        def call(*args, check=True):
+            if args[1] == "list-sessions":
+                return "2 1000 tuna-test seat0 tty1\n73 1000 tuna-test - -"
+            if args[2] == "73":
+                if check:
+                    raise lane.subprocess.CalledProcessError(1, list(args))
+                return ""
+            return "Id=2\nVTNr=1\nUser=1000\nType=wayland\nService=greetd\nClass=user"
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, "state")
+            state.write_text(json.dumps({k: None for k in (
+                "locked", "windows", "focused", "active_workspace", "overview_open",
+                "pointer_position", "native_relative_motion_count")}))
+            empty_proc = Path(directory, "proc")
+            empty_proc.mkdir()
+            scope = {"json": json, "STATE": state, "call": call, "os": lane.os,
+                     "OWNER": SimpleNamespace(pw_uid=1000),
+                     "pathlib": SimpleNamespace(Path=lambda path: empty_proc)}
+            result = self.load("inventory", scope)()
+        self.assertEqual(result["session"]["Id"], "2")
+
+    def observe(self, owner_after_failure):
+        def call(*args, user=False, check=True):
+            if "GetNameOwner" in args:
+                observe.lookups += 1
+                if args[-1] != "org.gnome.Orca1.Service":
+                    return ""
+                return 's ":1.9"' if observe.lookups <= 2 else owner_after_failure
+            if args[0] == "gsettings":
+                return "true"
+            return "orca 51.0-2"
+        def owned(*_):
+            raise lane.subprocess.CalledProcessError(1, ["busctl"])
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, "state")
+            state.write_text(json.dumps({"screen_reader_pid": 41, "screen_reader_state": "starting"}))
+            scope = {"json": json, "STATE": state, "call": call, "shlex": shlex,
+                     "subprocess": lane.subprocess, "owned_orca_observation": owned,
+                     "orca_child_diagnostic": lambda *_: {"status": "observed"}}
+            observe = self.load("orca_observation", scope)
+            observe.lookups = 0
+            return observe()
+
+    def test_owner_vanishing_mid_read_is_an_unready_snapshot(self):
+        result = self.observe("")
+        self.assertEqual((result["ready"], result["owner"], result["owner_changed"]), (False, None, True))
+
+    def test_failure_against_unchanged_owner_still_errors(self):
+        with self.assertRaises(lane.subprocess.CalledProcessError):
+            self.observe('s ":1.9"')
 
 
 class ConstraintProofCleanup(unittest.TestCase):
@@ -449,6 +561,28 @@ class PciCapabilities(unittest.TestCase):
 
     def test_capability_cycle_is_bounded(self):
         self.assertTrue(self.probe(8, cycle=True)["no_soft_reset"])
+
+
+class InterleavedShellStartup(unittest.TestCase):
+    # Run 38102898073 repeat-04: serial/journal interleaving sheared the
+    # shell's keybindings payload onto later records, leaving a bare
+    # `tuna-shell-gtk: keybindings:` line that the old trailing-space
+    # SHELL_RE missed (900 s harness hang; artifact 11689550567).
+    FIXTURE = Path(__file__).resolve().parent / "fixtures" / "vm-lane-interleaved-shell-startup.log"
+
+    def test_split_startup_prefix_is_recognized(self):
+        text = self.FIXTURE.read_text()
+        self.assertIsNotNone(lane.SHELL_RE.search(text))
+
+    def test_unsplit_startup_line_still_matches(self):
+        text = "tuna-shell-gtk: keybindings: 82 grabs, maximize on [\"<Super>Up\"]\n"
+        self.assertIsNotNone(lane.SHELL_RE.search(text))
+
+    def test_supervision_exhausted_still_rejects(self):
+        text = self.FIXTURE.read_text() + lane.EXHAUSTED + "\n"
+        shell = lane.SHELL_RE.search(text)
+        self.assertTrue(shell)
+        self.assertFalse(bool(shell) and lane.EXHAUSTED not in text)
 
 
 if __name__ == "__main__":
