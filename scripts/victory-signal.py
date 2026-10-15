@@ -15,7 +15,9 @@ import sys
 from datetime import datetime, timezone
 
 REPO = os.environ.get("VICTORY_REPO", "tuna-os/tuna-desktop")
-STATUSES = ("pass", "partial", "missing", "deviation", "untested")
+# Ledger status vocabulary. "pass (nested)" rows pass in the nested session
+# only; they count toward the total but not toward the pass fraction.
+STATUSES = ("pass", "pass (nested)", "partial", "missing", "deviation", "untested")
 
 
 def ledger_counts(path):
@@ -81,7 +83,9 @@ def main():
     summary = [
         "## Victory signal",
         "",
-        f"- Ledger: {ledger['pass']}/{total} pass",
+        f"- Ledger: {ledger['pass']}/{total} pass ("
+        + ", ".join(f"{count} {status}" for status, count in ledger.items() if count)
+        + ")",
         f"- Open gaps: {gaps if gaps >= 0 else 'unknown'}",
         "- Perf verdict: pending (#547)",
         "- Image verdict: pending (#273)",

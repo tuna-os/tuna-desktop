@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import stat
 import tempfile
 from contextlib import contextmanager
@@ -21,6 +22,7 @@ LEDGER_FIXTURE = """\
 | --- | --- | --- |
 | shell | overview | pass |
 | shell | `search` | pass |
+| shell | app grid | pass (nested) |
 | input | ime | partial |
 | capture | screencast | missing |
 | perf | p95 | deviation |
@@ -49,7 +51,9 @@ def test_ledger_counts_parses_statuses_and_ignores_noise():
         ledger = Path(tmp) / "ledger.md"
         ledger.write_text(LEDGER_FIXTURE)
         counts, note = V.ledger_counts(str(ledger))
-    assert counts == {"pass": 2, "partial": 1, "missing": 1, "deviation": 1, "untested": 1}, counts
+    assert counts == {
+        "pass": 2, "pass (nested)": 1, "partial": 1, "missing": 1, "deviation": 1, "untested": 1,
+    }, counts
     assert note == "", note
 
 
@@ -99,9 +103,9 @@ def test_main_end_to_end_writes_signal():
                 else:
                     os.environ["VICTORY_ROOT"] = old_root
     assert signal["ledger"]["rows"] == {
-        "pass": 2, "partial": 1, "missing": 1, "deviation": 1, "untested": 1,
+        "pass": 2, "pass (nested)": 1, "partial": 1, "missing": 1, "deviation": 1, "untested": 1,
     }, signal["ledger"]
-    assert signal["ledger"]["pass_fraction"] == 2 / 6, signal["ledger"]
+    assert signal["ledger"]["pass_fraction"] == 2 / 7, signal["ledger"]
     assert signal["gaps"]["open"] == 2, signal["gaps"]
     assert signal["perf"]["status"] == "pending", signal["perf"]
     assert signal["image"]["status"] == "pending", signal["image"]
@@ -134,6 +138,23 @@ def test_ledger_regression_visibly_breaks_signal():
     assert signal["gaps"]["open"] == 5, signal["gaps"]
 
 
+def test_real_ledger_rows_all_have_a_counted_status():
+    # Every ledger row (ID like P-OV-01) must land in a counted status, so
+    # a new status word cannot silently shrink the signal's denominator.
+    ledger = SCRIPT.parents[1] / "docs" / "parity-ledger.md"
+    rows = []
+    for line in ledger.read_text(encoding="utf-8").splitlines():
+        cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+        if line.startswith("|") and len(cells) >= 3 and re.fullmatch(r"P(-[A-Z0-9]+)+", cells[0]):
+            rows.append(cells[2])
+    counts, note = V.ledger_counts(str(ledger))
+    assert note == "", note
+    assert rows, "expected ledger rows in docs/parity-ledger.md"
+    uncounted = sorted({status for status in rows if status not in V.STATUSES})
+    assert not uncounted, f"ledger statuses not counted: {uncounted}"
+    assert sum(counts.values()) == len(rows), (counts, len(rows))
+
+
 TESTS = [
     test_ledger_counts_parses_statuses_and_ignores_noise,
     test_ledger_counts_empty_input_reports_note,
@@ -141,6 +162,7 @@ TESTS = [
     test_open_gaps_parses_gh_count_and_survives_failure,
     test_main_end_to_end_writes_signal,
     test_ledger_regression_visibly_breaks_signal,
+    test_real_ledger_rows_all_have_a_counted_status,
 ]
 
 
