@@ -3700,11 +3700,8 @@ impl Runtime {
                         .map(|(surface, _)| surface.clone())
                         .chain(lock_surface.clone())
                         .collect();
-                    let timing_work = crate::frame_timing::pending_output_work(
-                        &timing_roots,
-                        &mine,
-                        &throttled,
-                    );
+                    let timing_work =
+                        crate::frame_timing::pending_output_work(&timing_roots, &mine, &throttled);
                     if !crate::native_repaint::needs_repaint(
                         out.last_frame.as_ref(),
                         &signature,

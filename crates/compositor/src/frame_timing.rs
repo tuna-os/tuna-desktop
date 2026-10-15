@@ -105,14 +105,15 @@ pub fn pending_frame_work(roots: &[WlSurface]) -> bool {
 /// repaint at the display rate while one waits (#503). Their FIFO
 /// barriers and commit timers still advance on each refresh cycle.
 #[doc(hidden)]
-pub fn pending_output_work(roots: &[WlSurface], drawn: &[WlSurface], throttled: &[WlSurface]) -> bool {
-    roots.iter().any(|root| {
-        pending_work(
-            std::slice::from_ref(root),
-            !throttled.contains(root),
-            false,
-        )
-    }) || pending_work(drawn, true, true)
+pub fn pending_output_work(
+    roots: &[WlSurface],
+    drawn: &[WlSurface],
+    throttled: &[WlSurface],
+) -> bool {
+    roots
+        .iter()
+        .any(|root| pending_work(std::slice::from_ref(root), !throttled.contains(root), false))
+        || pending_work(drawn, true, true)
 }
 
 /// Whether any surface tree in `roots` holds an unsent frame callback.
