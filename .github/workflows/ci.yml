@@ -48,7 +48,6 @@ jobs:
       - run: python3 scripts/lib/tuna-perf-repeatability-tests.py
       - run: python3 scripts/lib/native-constraint-tests.py
       - run: python3 scripts/lib/tuna-pipewire-dump-tests.py
-      - run: python3 scripts/lib/victory-signal-tests.py
       - run: scripts/tuna-settings-inventory-check
       - run: cargo fmt --all -- --check
       - name: Check bounded EIS transport regression tests
@@ -69,6 +68,7 @@ jobs:
       # the ledger's cargo:<name> references against this list.
       - run: cargo test --workspace -q -- --list --format terse > test-list.txt
       - run: scripts/tuna-test-strategy --test-list test-list.txt --report test-strategy-report.md
+      - run: python3 scripts/lib/victory-signal-tests.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
