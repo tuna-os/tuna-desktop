@@ -219,6 +219,29 @@ def exposed_point(rect, covers, *, inset=12):
     raise RuntimeError('no exposed actual client point for the initial focus click')
 
 
+def beta_gap(sample, original, *, edge=False):
+    """Beta's actual strip column minus Alpha's; 1 means Beta is Alpha's right neighbor.
+
+    Strip columns follow stacking, not map order, so the focus click that
+    raises Alpha also makes it the last column. Columns are read from the
+    actual laid-out rectangles of Alpha's workspace."""
+    found = windows(sample, original, edge=edge)
+    workspace = found['alpha'].get('workspace')
+    order = [w['id'] for w in sorted(
+        (w for w in sample['inventory']['state']['windows'] if w.get('workspace') == workspace),
+        key=lambda w: w['rect'][0])]
+    return order.index(found['beta']['id']) - order.index(found['alpha']['id'])
+
+
+def gap_after_move(gap, step):
+    """beta_gap after one actual Super+Shift column move of Alpha (step -1 left, +1 right)."""
+    if step not in (-1, 1) or gap == 0:
+        raise RuntimeError('invalid strip column move')
+    after = gap - step
+    # Swapping with Beta itself jumps Alpha to Beta's other side.
+    return -gap if after == 0 else after
+
+
 def colored_frame(image, rect, color):
     """Strict actual viewport pixels; never accept a model rectangle alone."""
     width, height, pixels = image
@@ -500,6 +523,21 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         if {w['id']: w['workspace'] for w in strip['inventory']['state']['windows']} != initial_ids:
             raise RuntimeError('mode toggle changed actual window/workspace identities')
         capture('02-strip-enabled', strip)
+        # The steps below need Beta as Alpha's right neighbor, but the focus
+        # click raised Alpha to the last column. Carry it with the actual
+        # Super+Shift+arrow column move, one observed slot at a time.
+        for _ in range(len(strip['inventory']['state']['windows'])):
+            gap = beta_gap(strip, original, edge=edge)
+            if gap == 1:
+                break
+            step = -1 if gap < 1 else 1
+            chord('meta_l', 'shift', 'left' if step < 0 else 'right')
+            want = gap_after_move(gap, step)
+            strip = ready('scroll', strip, extra=lambda sample, found, want=want: (
+                beta_gap(sample, original, edge=edge) == want
+                and sample['inventory']['state']['focused'] == found['alpha']['id']))
+        if beta_gap(strip, original, edge=edge) != 1:
+            raise RuntimeError('actual column moves did not make Beta the right neighbor of Alpha')
         # Actual preset input must resize this same client's allocated/painted buffer.
         before_width = windows(strip, original, edge=edge)['alpha']['rect'][2]
         chord('meta_l', 'r')

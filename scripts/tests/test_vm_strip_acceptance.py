@@ -235,6 +235,37 @@ class Tests(unittest.TestCase):
         self.assertIn("colored_frame((png_image.width, png_image.height, png_image.tobytes())", source)
         self.assertIn("'same_acquisition_qualified': False", source)
 
+    def test_alpha_is_carried_left_of_beta_by_observed_column_moves(self):
+        # Recorded run 38714427347 strip order: Beta, Gamma(, Delta) and the
+        # raised Alpha last (stacking order), here with the baseline roles.
+        value = sample()
+        state = value['inventory']['state']
+        ids = {w['app_id'].rsplit('.', 1)[1]: w['id'] for w in state['windows']}
+        order = [ids[role] for role in proof.ROLES[1:]] + [ids['alpha']]
+        def lay(columns):
+            for slot, window_id in enumerate(columns):
+                next(w for w in state['windows'] if w['id'] == window_id)['rect'][0] = -1000 + slot * 256
+        lay(order)
+        gap = proof.beta_gap(value, value['owner'])
+        self.assertEqual(gap, -(len(proof.ROLES) - 1))
+        while gap != 1:
+            index = order.index(ids['alpha'])
+            order[index - 1], order[index] = order[index], order[index - 1]
+            lay(order)
+            want = proof.gap_after_move(gap, -1)
+            gap = proof.beta_gap(value, value['owner'])
+            self.assertEqual(gap, want)
+        self.assertEqual(order, [ids[role] for role in proof.ROLES])
+        # Moving right past Beta swaps sides; zero is never a column gap.
+        self.assertEqual(proof.gap_after_move(1, 1), -1)
+        self.assertEqual(proof.gap_after_move(3, 1), 2)
+        for bad in [(0, -1), (2, 0), (2, 2)]:
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                proof.gap_after_move(*bad)
+        source = Path(proof.__file__).read_text()
+        self.assertIn("chord('meta_l', 'shift', 'left' if step < 0 else 'right')", source)
+        self.assertIn("beta_gap(sample, original, edge=edge) == want", source)
+
 
 class EndpointEvidence(unittest.TestCase):
     def test_storage_failure_preserves_exact_primary_endpoint_exception(self):

@@ -12,7 +12,10 @@ input. The observer requires original process/start/boot identities, genuine
 configure/allocation/paint observations, stable native geometry, and actual
 framebuffer color controls. Eight endpoint captures cover floating, strip enable,
 width preset, navigation, continuous pointer width, pointer reorder, actual VT
-cancellation, and independent floating geometry restoration. Endpoint captures
+cancellation, and independent floating geometry restoration. Strip columns
+follow stacking, so the focus click leaves Alpha last; after strip enable, actual
+Super+Shift+arrow column moves carry it, one observed slot at a time, until Beta
+is its right neighbor. Endpoint captures
 are not kernel presentation or completed-action latency measurements.
 
 This source does not yet establish the full issue #582 acceptance: stacked rows,
