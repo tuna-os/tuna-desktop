@@ -1,10 +1,32 @@
 # Running tests locally
 
 How to run, on your own machine, the checks the `ci` workflow
-(`.github/workflows/ci.yml`) runs on every pull request. For what each
+(`.github/workflows/ci.yml`) runs. For what each
 verification layer must prove, see [the test strategy](test-strategy.md).
 Install the packages listed under [Prerequisites](development.md#prerequisites)
 first; each proof below names anything extra it needs.
+
+## Which lanes a pull request runs
+
+Every push to `main`, the nightly schedule and `workflow_dispatch` run
+every job. A pull request always runs `check`; the first step of `check`
+(`scripts/ci-select-lanes`) diffs the PR against its base and picks the
+proof lanes the change can affect:
+
+- `ci.yml`, `scripts/ci-*`, `Cargo.toml`, `Cargo.lock`, `third-party/` or
+  `scripts/tuna-nested`: every lane.
+- docs, other workflows, `fuzz/` and the script self-tests: `check` only.
+- a lane's own proof script, reference fixtures or packaging: that lane
+  (plus the lanes whose artifacts it needs).
+- anything else (crates, `share/`, other scripts): `gtk-shell` plus a
+  round-robin slice of the other end-to-end lanes, rotated by run number.
+  The slice size is the repository variable `CI_ROUND_ROBIN_SIZE`
+  (default 2); each push to a PR covers a different slice and `main` runs
+  them all after merge.
+
+The step summary of `check` names the chosen lanes and why. `ci-gate`
+reports one status for the run: it fails when any job failed or was
+cancelled. To run every lane on a branch, dispatch `ci` on it.
 
 ## Before opening a PR
 
