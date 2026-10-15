@@ -323,7 +323,7 @@ impl Wallpaper {
             "list_limit": MAX_WALLPAPER_SLOTS,
             "identity_count": self.identities.len(),
             "identities": self.identities.iter().take(MAX_WALLPAPER_SLOTS).map(|item| serde_json::json!({
-                "uri": text(&item.uri), "identity": text(&format!("{:?}", item.value)),
+                "uri": text(&item.uri), "identity": text(&format!("{:?}", item.value.identity)),
                 "age_ms": item.observed.elapsed().as_millis(),
             })).collect::<Vec<_>>(),
             "identity_pending_count": self.identity_pending.len(),
