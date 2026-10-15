@@ -7,6 +7,7 @@ import os
 import base64
 import hashlib
 import io
+import re
 import subprocess
 import sys
 from contextlib import contextmanager, redirect_stdout
@@ -1072,7 +1073,12 @@ class PinnedBaselinePackageGuards(unittest.TestCase):
             for line in (ROOT / name).read_text().replace("\\\n", "").splitlines():
                 if line.startswith("RUN "):
                     with self.subTest(containerfile=name, run=line):
-                        result = subprocess.run(["bash", "-n"], input=line[4:], text=True,
+                        # Dockerfile RUN options (for example BuildKit
+                        # --mount=type=secret) are parsed by the frontend,
+                        # not by the shell. Check only the command body.
+                        body = re.sub(r"^RUN\s+(?:--[^\s]+\s+)*", "", line, count=1)
+                        self.assertTrue(body, "RUN instruction has a shell body")
+                        result = subprocess.run(["bash", "-n"], input=body, text=True,
                                                 capture_output=True)
                         self.assertEqual(result.returncode, 0, result.stderr)
 

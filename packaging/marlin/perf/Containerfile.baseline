@@ -8,7 +8,7 @@ RUN sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[
     pacman -Syu --noconfirm gnome-shell mutter gdm \
         evolution-data-server gnome-keyring xdg-desktop-portal-gnome xdg-desktop-portal-gtk \
         gst-plugin-pipewire gst-plugins-good orca speech-dispatcher \
-        python python-gobject wayland-utils qemu-guest-agent gcc pkgconf wayland-protocols && \
+        python python-gobject wayland-utils qemu-guest-agent openssh gcc pkgconf wayland-protocols && \
     kernel_count=0 && \
     for module_dir in /usr/lib/modules/*; do \
         test -d "$module_dir" || continue; \

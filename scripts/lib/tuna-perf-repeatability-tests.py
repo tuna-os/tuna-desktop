@@ -170,12 +170,12 @@ class Repeatability(unittest.TestCase):
         for guard in ('tuna-perf-payload.py archive', 'tuna-perf-payload.py installed', 'tuna-perf-payload.py runtime', 'reference-image.json', 'chmod 0444'):
             self.assertIn(guard,build)
         stock = source.split('      - name: Measure three alternating stock pairs\n',1)[1].split('      - uses:',1)[0]
-        self.assertIn("if: ${{ !cancelled() && steps.shared_payload.outcome == 'success' }}",stock)
+        self.assertIn("if: ${{ !cancelled() && !inputs.export_only && steps.shared_payload.outcome == 'success' }}",stock)
         self.assertNotIn('continue-on-error',source)
         # Explicit GitHub condition truth table; original child shells execute in
         # other tests. This does not pretend to execute the Actions service.
-        for cancelled,outcome,expected in ((False,'success',True),(True,'success',False),(False,'failure',False),(False,'skipped',False)):
-            self.assertEqual(not cancelled and outcome=='success',expected)
+        for cancelled,export_only,outcome,expected in ((False,False,'success',True),(True,False,'success',False),(False,False,'failure',False),(False,False,'skipped',False),(False,True,'success',False)):
+            self.assertEqual(not cancelled and not export_only and outcome=='success',expected)
 
     def test_each_success_receipt_requires_all_six_original_commands(self):
         result,rows,artifacts,statuses=self.execute()

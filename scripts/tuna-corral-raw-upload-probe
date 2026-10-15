@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Owned tiny raw CDI upload diagnostic. Never a benchmark/image qualification."""
+import argparse,hashlib,json,os
+from pathlib import Path
+import re,signal,subprocess,sys,time,uuid
+sys.path.insert(0,str(Path(__file__).resolve().parent/'lib'))
+from corral_perf import kubectl,capacity_receipt,node_name,GIB
+from corral_session import owned_listener,readback_prefix
+import corral_owned
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--context',required=True);p.add_argument('--node',required=True);p.add_argument('--namespace',default='corral-vms');p.add_argument('--out',type=Path,required=True);a=p.parse_args();node_name(a.node)
+if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}',a.namespace):p.error('invalid namespace')
+a.out.mkdir(parents=True,exist_ok=False);a.out.chmod(0o700);name='tuna-v1-raw-probe-'+uuid.uuid4().hex[:10];receipt={'schema':1,'name':name,'context':a.context,'namespace':a.namespace,'completed':False,'performance_qualified':False};proxy=None;upload=None;pvc_uid=None
+receipt['source_sha256']=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+receipt['helper_sha256']={n:hashlib.sha256((Path(__file__).parent/'lib'/n).read_bytes()).hexdigest() for n in ('corral_session.py','corral_owned.py','corral_perf.py')}
+owned=[];nonce=uuid.uuid4().hex
+
+def run(args,**kw):return subprocess.run(args,check=True,timeout=45,**kw)
+def record(name,value):(a.out/name).write_text(json.dumps(value,indent=2))
+try:
+ node=kubectl(a.context,'get','node',a.node,'-o','json');stats=kubectl(a.context,'get','--raw','/api/v1/nodes/'+a.node+'/proxy/stats/summary')
+ receipt['node_uid']=node['metadata']['uid']
+ receipt['virtctl_sha256']=hashlib.sha256(Path(__import__('shutil').which('virtctl')).read_bytes()).hexdigest()
+ receipt['virtctl_version']=subprocess.check_output(['virtctl','version','--client'],timeout=10).decode()
+ config=kubectl(a.context,'get','configmap','local-path-config','-n','local-path-storage','-o','json');record('local-path-config.json',config)
+ receipt['local_path_config_sha256']=hashlib.sha256(json.dumps(config.get('data',{}),sort_keys=True).encode()).hexdigest()
+ cdi=kubectl(a.context,'get','cdi','-o','json');record('cdi.json',cdi)
+ receipt['cdi_versions']=[q.get('status',{}) for q in cdi['items']]
+ admission=capacity_receipt(node,stats,estimated_peak_bytes=3*GIB);record('admission.json',admission)
+ if not admission['ready_for_disk_admission']:raise ValueError('tiny diagnostic storage admission refused')
+ raw=a.out/'probe.raw'
+ with raw.open('xb') as f:f.write(b'TUNA_RAW_PROBE_V1');f.truncate(64*1024*1024)
+ with raw.open('rb') as f:receipt['raw_sha256']=hashlib.file_digest(f,'sha256').hexdigest()
+ pvc={'apiVersion':'v1','kind':'PersistentVolumeClaim','metadata':{'name':name,'namespace':a.namespace,'labels':{'tuna-perf-owned':name},'annotations':{'volume.kubernetes.io/selected-node':a.node}},'spec':{'accessModes':['ReadWriteOnce'],'volumeMode':'Filesystem','storageClassName':'local-path','resources':{'requests':{'storage':'1Gi'}}}}
+ record('pvc-create.json',pvc)
+ created=corral_owned.create(a.context,a.namespace,'pvc',pvc,a.out/'pvc-create.json',nonce,lambda *x:owned.append(x));pvc_uid=created['metadata']['uid'];receipt['pvc_uid']=pvc_uid;record('ownership.json',receipt)
+ log=(a.out/'proxy.log').open('wb');proxy=subprocess.Popen(['kubectl','--context',a.context,'-n','cdi','port-forward','--address','127.0.0.1','svc/cdi-uploadproxy',':443'],stdout=log,stderr=log,start_new_session=True)
+ deadline=time.monotonic()+20;port=None
+ while time.monotonic()<deadline and proxy.poll() is None:
+  match=re.search(r'Forwarding from 127\.0\.0\.1:(\d+) ->', (a.out/'proxy.log').read_text())
+  if match:port=int(match[1]);break
+  time.sleep(.1)
+ if not port or not owned_listener(proxy.pid,port):raise ValueError('authenticated owned uploadproxy tunnel unavailable')
+ uploadlog=(a.out/'upload.log').open('wb')
+ upload=subprocess.Popen(['virtctl','--context',a.context,'image-upload','pvc',name,'-n',a.namespace,'--no-create','--image-path',str(raw),'--uploadproxy-url',f'https://127.0.0.1:{port}','--insecure','--wait-secs','120','--retry','1'],stdout=uploadlog,stderr=uploadlog,start_new_session=True)
+ deadline=time.monotonic()+180;observations=[]
+ while upload.poll() is None and time.monotonic()<deadline:
+  current=kubectl(a.context,'get','pvc',name,'-n',a.namespace,'-o','json')
+  if current['metadata']['uid']!=pvc_uid:raise ValueError('owned PVC replaced')
+  pods=kubectl(a.context,'get','pods','-n',a.namespace,'-o','json')['items']
+  for pod in pods:
+   if not any(o.get('uid')==pvc_uid for o in pod['metadata'].get('ownerReferences',[])):continue
+   observation={'pod':pod['metadata']['name'],'pod_uid':pod['metadata']['uid'],'node':pod['spec'].get('nodeName'),'phase':pod['status'].get('phase'),'volumes':pod['spec'].get('volumes'),'container_statuses':pod['status'].get('containerStatuses',[])}
+   if pod['status'].get('phase')=='Running':
+    result=subprocess.run(['kubectl','--context',a.context,'exec','-n',a.namespace,pod['metadata']['name'],'--','sh','-c','du -sk /scratch /data; ls -l /scratch /data'],capture_output=True,timeout=8)
+    observation['directory_usage']=result.stdout.decode(errors='replace')[:4096];observation['directory_usage_returncode']=result.returncode
+   observations.append(observation)
+  record('upload-observations.json',observations)
+  time.sleep(.2)
+ if upload.poll() is None:raise TimeoutError('tiny upload deadline')
+ if upload.returncode:raise RuntimeError('actual tiny raw upload failed; inspect upload.log')
+ current=kubectl(a.context,'get','pvc',name,'-n',a.namespace,'-o','json');record('pvc-after-upload.json',current)
+ receipt['upload_annotations']=current['metadata'].get('annotations',{})
+ if receipt['upload_annotations'].get('cdi.kubevirt.io/storage.pod.phase')!='Succeeded':raise ValueError('actual uploaded pod did not succeed')
+ receipt['readback']=readback_prefix(a.context,a.namespace,name,pvc_uid,a.node,64*1024*1024,receipt['raw_sha256'],a.out)
+ receipt['completed']=True
+ receipt['limitation']='Diagnostic64Mi raw/1Gi target; scratch PVC existence and data path must be inspected. No18Gi Marlin import or performance claim.'
+except BaseException as error:
+ receipt['error_type']=type(error).__name__;receipt['error']=str(error)[:4096]
+ raise
+finally:
+ record('receipt.json',receipt)
+ for process in (upload,proxy):
+  if process and process.poll() is None:
+   os.killpg(process.pid,signal.SIGTERM)
+   try:process.wait(timeout=5)
+   except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
+ if owned:receipt['cleanup']=corral_owned.cleanup(a.context,a.namespace,owned)
+ record('receipt.json',receipt)
+print(json.dumps(receipt,indent=2))
