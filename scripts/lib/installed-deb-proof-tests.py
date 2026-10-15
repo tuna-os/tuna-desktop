@@ -162,6 +162,29 @@ class InstalledPolicy(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'companion-source-contract'):
                 M.preflight()
 
+    def _preflight_with(self, deb_version, reported):
+        def command(args):
+            if args == ['dpkg', '--verify', 'tuna-desktop']:
+                return ''
+            if args[0] == 'git':
+                return 'a' * 40
+            if args[0].startswith('/usr/bin/tuna-'):
+                return Path(args[0]).name + ' ' + reported
+            return deb_version
+        with patch.object(os, 'getuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(M, 'run', side_effect=command), patch.object(M, 'owner', return_value={'name': 'tuna-desktop', 'version': deb_version}), patch.object(M, 'digest', return_value={'sha256': '0' * 64}), patch.object(M, 'bounded_json', return_value={'commit': 'b' * 40, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}):
+            M.preflight()
+
+    def test_prerelease_package_accepts_semver_binaries(self):
+        # 1.0.0~beta.1 is the Debian form of the binaries' 1.0.0-beta.1; the
+        # binary contract passes and the next check (companions) decides.
+        with self.assertRaisesRegex(ValueError, 'companion-source-contract'):
+            self._preflight_with('1.0.0~beta.1', '1.0.0-beta.1')
+
+    def test_prerelease_package_rejects_mismatched_binaries(self):
+        for reported in ('1.0.0~beta.1', '1.0.0', '1.0.0-beta.2'):
+            with self.subTest(reported=reported), self.assertRaisesRegex(ValueError, 'installed-binary-contract'):
+                self._preflight_with('1.0.0~beta.1', reported)
+
     def test_original_session_and_replacement_contract(self):
         base = {'files': {}}
         compositor = {'pid': 100, 'exe': '/usr/bin/tuna-compositor'}
