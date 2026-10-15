@@ -1755,6 +1755,7 @@ cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
     "$ARTIFACTS/a11y-folder-page-source.json" "$ARTIFACTS/grid-cancel-neutral-admission.json" || fail G-GRID-DRAG-CANCEL "active neutral pointer or first page not observed"
 [ "$(gsettings get org.gnome.shell app-picker-layout)" = "$folder_layout_before" ] || fail G-GRID-DRAG-CANCEL "preview already committed layout"
 grid_cancel_before_frame="$(jq -er .rendered_frames "$ARTIFACTS/grid-cancel-before-escape.json")" || fail G-GRID-DRAG-CANCEL "drag frame missing"
+grid_cancel_before_keys="$(jq -er .seat_pressed_key_count "$ARTIFACTS/grid-cancel-before-escape.json")" || fail G-GRID-DRAG-CANCEL "held-key baseline missing"
 xdotool key Escape
 if [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ]; then
     # Test-only old-source discriminator. The default/full gate NEVER accepts
@@ -1777,10 +1778,23 @@ PY_GRID_OLD
 fi
 # The source must retire while the button is STILL held. Overview close/reopen
 # cannot stand in for cancellation, and mouseup must not complete an old offer.
-cstate ".client_dnd_active == false and .overview_open and .overview_app_grid and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame)" "folder cancellation before release" || fail G-GRID-DRAG-CANCEL "Escape failed to cancel native drag while keeping grid open"
+# xdotool's Escape release reaches the seat after its press cancels the drag,
+# so wait for the held-key count to return to its baseline too.
+cstate ".client_dnd_active == false and .overview_open and .overview_app_grid and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame) and (.seat_pressed_key_count == $grid_cancel_before_keys)" "folder cancellation before release" || fail G-GRID-DRAG-CANCEL "Escape failed to cancel native drag while keeping grid open"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-release.json"
 scrot "$ARTIFACTS/grid-cancel-before-release.png" >/dev/null
-grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" || fail G-GRID-DRAG-CANCEL "fresh cancellation tree missing"
+# GTK hears the compositor's cancel asynchronously; poll its tree (button
+# still held) rather than sampling once right after the compositor state.
+end=$(($(date +%s) + 5))
+while :; do
+    grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" || fail G-GRID-DRAG-CANCEL "fresh cancellation tree missing"
+    if showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" &&
+        ! showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; then
+        break
+    fi
+    [ "$(date +%s)" -le "$end" ] || break
+    sleep 0.3
+done
 showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" || fail G-GRID-DRAG-CANCEL "GTK drag cleanup did not restore arrow before release"
 if showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; then fail G-GRID-DRAG-CANCEL "GTK drag preview remains before release"; fi
 xdotool mouseup 1
@@ -4262,6 +4276,30 @@ wb_a11y_dump() {
     wb_dump_anchor "$wb_dump_out" || return 1
 }
 
+# Wait up to SECONDS for a wellbeing banner titled TITLE and press its BUTTON
+# in the same AT-SPI pass that saw it (OUT is that pre-press tree). GNOME
+# times a banner out 4 s after it shows to an active user, or 2 s after an
+# away user's next input, and the shell retires its actions on expiry. A
+# separate dump-then-press round trip with keep-alive input in between could
+# press a banner that had already expired, so one keep-alive move per short
+# step keeps the user active and the press within about a second of the
+# banner showing. Waits 1.5 s after the press, like --press alone.
+wb_press_banner() {
+    local gate="$1" out="$2" title="$3" button="$4" until=$(($(date +%s) + $5)) step=0
+    while [ "$(date +%s)" -le "$until" ]; do
+        xdotool mousemove --window "$WID" $((WIDTH / 3 + step % 2 * 40)) $((HEIGHT / 2)) ||
+            fail "$gate" "keep-alive failed"
+        step=$((step + 1))
+        sleep 0.5
+        if wb_a11y_dump "$out" 20 --when-showing "$title" --press "$button" >/dev/null 2>&1; then
+            WB_PRESS_EPOCH="$(date +%s)"
+            sleep 1.5
+            return 0
+        fi
+    done
+    return 1
+}
+
 wb_probe_ensure() {
     if [ -n "$WB_PROBE_PID" ] && kill -0 "$WB_PROBE_PID" 2>/dev/null; then
         cstate 'any(.windows[]; .app_id == "tuna-cursor-probe")' "probe mapped" 5 ||
@@ -4930,21 +4968,9 @@ else
         fail G-WELLBEING-ACTION-TAKE-LOCK "could not set lock-screen"
     gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "could not select the eyesight break"
-    TAKEDUE=""
-    end=$(($(date +%s) + 25))
-    while [ "$(date +%s)" -le "$end" ]; do
-        xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
-            fail G-WELLBEING-ACTION-TAKE-LOCK "keep-alive failed"
-        sleep 1
-        xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
-            fail G-WELLBEING-ACTION-TAKE-LOCK "keep-alive failed"
-        sleep 1
-        wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-due.json" 20 >/dev/null 2>&1 || continue
-        if showing "$ARTIFACTS/a11y-wb-take-lock-due.json" "Time for an Eyesight Break"; then TAKEDUE=1; break; fi
-    done
-    [ -n "$TAKEDUE" ] || fail G-WELLBEING-ACTION-TAKE-LOCK "no due banner to take"
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-press.json" 20 --press "Take" ||
-        fail G-WELLBEING-ACTION-TAKE-LOCK "could not press Take"
+    wb_press_banner G-WELLBEING-ACTION-TAKE-LOCK "$ARTIFACTS/a11y-wb-take-lock-due.json" \
+        "Time for an Eyesight Break" Take 25 ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "no due banner to take"
     cstate '.locked' "locked" 10 ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "Take did not lock the session"
     wb_state_capture take-lock-locked
@@ -5039,21 +5065,9 @@ gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
     fail G-WELLBEING-ACTION-TAKE-FADE "could not clear lock-screen"
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "could not select the eyesight break"
-FADEDUE=""
-end=$(($(date +%s) + 25))
-while [ "$(date +%s)" -le "$end" ]; do
-    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-TAKE-FADE "keep-alive failed"
-    sleep 1
-    xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-TAKE-FADE "keep-alive failed"
-    sleep 1
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-due.json" 20 >/dev/null 2>&1 || continue
-    if showing "$ARTIFACTS/a11y-wb-take-fade-due.json" "Time for an Eyesight Break"; then FADEDUE=1; break; fi
-done
-[ -n "$FADEDUE" ] || fail G-WELLBEING-ACTION-TAKE-FADE "no due banner to take"
-wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-press.json" 20 --press "Take" ||
-    fail G-WELLBEING-ACTION-TAKE-FADE "could not press Take"
+wb_press_banner G-WELLBEING-ACTION-TAKE-FADE "$ARTIFACTS/a11y-wb-take-fade-due.json" \
+    "Time for an Eyesight Break" Take 25 ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "no due banner to take"
 cstate '.wellbeing_effects.brightness < 1' "fade started" 10 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "Take produced no fade"
 # The compositor stores effects as f32: settled brightness serializes as
@@ -5137,25 +5151,10 @@ gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
     fail G-WELLBEING-ACTION-DELAY "could not clear lock-screen"
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-ACTION-DELAY "could not select the eyesight break"
-DELAYDUE=""
-end=$(($(date +%s) + 25))
-while [ "$(date +%s)" -le "$end" ]; do
-    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
-    sleep 1
-    xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
-    sleep 1
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-due.json" 20 >/dev/null 2>&1 || continue
-    if showing "$ARTIFACTS/a11y-wb-delay-due.json" "Time for an Eyesight Break"; then
-        delay_due_epoch="$(date +%s)"
-        DELAYDUE=1
-        break
-    fi
-done
-[ -n "$DELAYDUE" ] || fail G-WELLBEING-ACTION-DELAY "no due banner to delay"
-wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-press.json" 20 --press "Delay" ||
-    fail G-WELLBEING-ACTION-DELAY "could not press Delay"
+wb_press_banner G-WELLBEING-ACTION-DELAY "$ARTIFACTS/a11y-wb-delay-due.json" \
+    "Time for an Eyesight Break" Delay 25 ||
+    fail G-WELLBEING-ACTION-DELAY "no due banner to delay"
+delay_due_epoch="$WB_PRESS_EPOCH"
 cp "$CSTATE" "$ARTIFACTS/wb-delay-stale-before.json"
 stale_code=0
 wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-stale.json" 20 --press "Delay" >/dev/null 2>&1 || stale_code=$?
@@ -5243,25 +5242,13 @@ gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" |
     fail G-WELLBEING-ACTION-SKIP "could not select the eyesight break"
 skip_enable_epoch="$(date +%s)"
 skip_orig_due_epoch=$((skip_enable_epoch + 130))
-SKIPUP=""
-end=$(($(date +%s) + 30))
-while [ "$(date +%s)" -le "$end" ]; do
-    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
-    sleep 1
-    xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
-    sleep 1
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-upcoming.json" 20 >/dev/null 2>&1 || continue
-    if showing "$ARTIFACTS/a11y-wb-skip-upcoming.json" "Eyesight Break Soon"; then SKIPUP=1; break; fi
-done
-[ -n "$SKIPUP" ] || fail G-WELLBEING-ACTION-SKIP "no upcoming banner to skip"
+wb_press_banner G-WELLBEING-ACTION-SKIP "$ARTIFACTS/a11y-wb-skip-upcoming.json" \
+    "Eyesight Break Soon" Skip 30 ||
+    fail G-WELLBEING-ACTION-SKIP "no upcoming banner to skip"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" notice-buttons \
     "$ARTIFACTS/a11y-wb-skip-upcoming.json" --title "Eyesight Break Soon" \
     --expect Delay,Skip --reject Take ||
     fail G-WELLBEING-ACTION-SKIP "the upcoming banner does not offer Delay+Skip without Take"
-wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-press.json" 20 --press "Skip" ||
-    fail G-WELLBEING-ACTION-SKIP "could not press Skip"
 cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-before.json"
 stale_code=0
 wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-stale.json" 20 --press "Skip" >/dev/null 2>&1 || stale_code=$?

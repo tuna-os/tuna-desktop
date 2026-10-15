@@ -2,10 +2,14 @@
 """Dump one application's AT-SPI accessible tree as JSON (#71).
 
 Usage: tuna-a11y-dump.py APP_NAME OUT.json [TIMEOUT_S] [--press NAME]
-                          [--set NAME VALUE] [--pid PID] [--strict]
+                          [--when-showing NAME] [--set NAME VALUE]
+                          [--pid PID] [--strict]
 
 With --press, also performs the first action (click) of the first
 showing node named NAME, as a screen-reader user would, then dumps.
+With --when-showing NAME (requires --press), dumps first and presses in
+the same pass only if a node named NAME is showing; otherwise exits 3
+without pressing. The dump is the tree the press acted on.
 With --set, sets the value of the first showing node named NAME that
 has one (a slider), the way assistive technology moves it.
 With --pid, only dumps the tree whose application process matches PID
@@ -148,6 +152,14 @@ def main():
         i = args.index("--press")
         target = args[i + 1]
         del args[i:i + 2]
+    when = None
+    if "--when-showing" in args:
+        i = args.index("--when-showing")
+        when = args[i + 1]
+        del args[i:i + 2]
+        if target is None:
+            print("tuna-a11y-dump: --when-showing needs --press", file=sys.stderr)
+            return 2
     if "--set" in args:
         i = args.index("--set")
         setting = (args[i + 1], float(args[i + 2]))
@@ -162,6 +174,21 @@ def main():
             if app is not None and app.name == name:
                 if expected_pid is not None and app.get_process_id() != expected_pid:
                     continue
+                if when is not None:
+                    nodes = []
+                    walk(app, 0, nodes, strict)
+                    if expected_pid is not None:
+                        nodes[0]["process_id"] = app.get_process_id()
+                    with open(path, "w") as fh:
+                        json.dump(nodes, fh, indent=1)
+                    print(f"tuna-a11y-dump: {len(nodes)} nodes from {name}")
+                    if not any(n.get("name") == when and n.get("showing") for n in nodes):
+                        print(f"tuna-a11y-dump: {when} not showing; nothing pressed", file=sys.stderr)
+                        return 3
+                    if not press(app, target):
+                        print(f"tuna-a11y-dump: nothing named {target} to press", file=sys.stderr)
+                        return 1
+                    return 0
                 if target is not None:
                     if not press(app, target):
                         print(f"tuna-a11y-dump: nothing named {target} to press", file=sys.stderr)

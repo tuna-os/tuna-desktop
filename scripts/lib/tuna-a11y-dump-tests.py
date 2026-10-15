@@ -358,5 +358,54 @@ class PidBinding(unittest.TestCase):
             self.assertFalse(out.exists())
 
 
+class _Action:
+    def __init__(self, presses, name):
+        self.nActions = 1
+        self._presses, self._name = presses, name
+
+    def doAction(self, index):
+        self._presses.append((self._name, index))
+
+
+class WhenShowing(unittest.TestCase):
+    run_main = PidBinding.run_main
+
+    def tree(self, title_showing, presses):
+        take = button('Take')
+        take.queryAction = lambda: _Action(presses, 'Take')
+        title = FakeAccessible('Time for a Break', role='label',
+                               states=(SHOWING,) if title_showing else ())
+        _FAKE.Registry.desktop = FakeAccessible(
+            'desktop', role='desktop', children=[app_node(title, take)])
+
+    def test_presses_in_the_pass_that_saw_the_title(self):
+        with tempfile.TemporaryDirectory() as td:
+            out, presses = Path(td) / 'dump.json', []
+            self.tree(True, presses)
+            code, clock = self.run_main([APP, str(out), '5', '--pid', '4242',
+                                         '--when-showing', 'Time for a Break',
+                                         '--press', 'Take'])
+            self.assertEqual(code, 0)
+            self.assertEqual(presses, [('Take', 0)])
+            # The dump is the pre-press tree; no post-press wait.
+            self.assertIn('Time for a Break', [n['name'] for n in json.loads(out.read_text())])
+            self.assertEqual(clock.sleeps, [])
+
+    def test_hidden_title_dumps_without_pressing(self):
+        with tempfile.TemporaryDirectory() as td:
+            out, presses = Path(td) / 'dump.json', []
+            self.tree(False, presses)
+            code, _ = self.run_main([APP, str(out), '5', '--pid', '4242',
+                                     '--when-showing', 'Time for a Break',
+                                     '--press', 'Take'])
+            self.assertEqual(code, 3)
+            self.assertEqual(presses, [])
+            self.assertTrue(out.exists())
+
+    def test_requires_press(self):
+        code, _ = self.run_main([APP, '/nonexistent', '5', '--when-showing', 'X'])
+        self.assertEqual(code, 2)
+
+
 if __name__ == '__main__':
     unittest.main()
