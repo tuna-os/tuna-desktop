@@ -1213,5 +1213,28 @@ class S3AbsoluteDeadline(unittest.TestCase):
             self.assertEqual(scope['inventory']('ordinary'),{})
         self.assertEqual(calls,[(('inventory',),{})])
 
+
+class InterleavedShellStartup(unittest.TestCase):
+    # Run 38102898073 repeat-04: serial/journal interleaving sheared the
+    # shell's keybindings payload onto later records, leaving a bare
+    # `tuna-shell-gtk: keybindings:` line that the old trailing-space
+    # SHELL_RE missed (900 s harness hang; artifact 11689550567).
+    FIXTURE = Path(__file__).resolve().parent / "fixtures" / "vm-lane-interleaved-shell-startup.log"
+
+    def test_split_startup_prefix_is_recognized(self):
+        text = self.FIXTURE.read_text()
+        self.assertIsNotNone(lane.SHELL_RE.search(text))
+
+    def test_unsplit_startup_line_still_matches(self):
+        text = "tuna-shell-gtk: keybindings: 82 grabs, maximize on [\"<Super>Up\"]\n"
+        self.assertIsNotNone(lane.SHELL_RE.search(text))
+
+    def test_supervision_exhausted_still_rejects(self):
+        text = self.FIXTURE.read_text() + lane.EXHAUSTED + "\n"
+        shell = lane.SHELL_RE.search(text)
+        self.assertTrue(shell)
+        self.assertFalse(bool(shell) and lane.EXHAUSTED not in text)
+
+
 if __name__ == "__main__":
     unittest.main()
