@@ -131,7 +131,6 @@ const MAX_CARDS: usize = 4;
 #[derive(Debug, Default)]
 pub struct Wallpaper {
     wake: crate::wake::Wake,
-    drop_signal: Option<crate::runtime_signal::CachedSignal>,
     current_uris: Vec<String>,
     loaded: Vec<Loaded>,
     /// Journey-only observation of the last attempted refresh, not a paint claim.
@@ -264,39 +263,14 @@ impl Wallpaper {
                 let deadline = item.observed + std::time::Duration::from_secs(1);
                 let now = std::time::Instant::now();
                 // An unsupported render size must not spin on a deadline that
-                // refresh could not service. Retain bounded active retry.
+                // refresh could not service: retry one display frame later.
                 if deadline <= now {
-                    now + crate::idle_schedule::ACTIVE_INTERVAL
+                    now + std::time::Duration::from_millis(16)
                 } else {
                     deadline
                 }
             })
             .min()
-    }
-
-    pub(crate) fn install_drop_watch(
-        &mut self,
-    ) -> std::io::Result<Option<calloop::generic::Generic<std::os::fd::OwnedFd>>> {
-        let signal =
-            crate::runtime_signal::CachedSignal::new_bounded(wallpaper_drop_path(), 16 * 1024);
-        let source = signal.source();
-        self.drop_signal = Some(signal);
-        source
-    }
-    pub(crate) fn refresh_drop_watch(&mut self) -> bool {
-        self.drop_signal
-            .as_mut()
-            .is_some_and(|signal| signal.refresh())
-    }
-    pub(crate) fn disable_drop_watch(&mut self) {
-        if let Some(signal) = self.drop_signal.as_mut() {
-            signal.disable();
-        }
-    }
-    pub(crate) fn watch_fallback(&self) -> bool {
-        self.drop_signal
-            .as_ref()
-            .is_none_or(|signal| !signal.watched())
     }
 
     /// Empty wallpaper (solid clear until a drop file appears).
@@ -677,11 +651,7 @@ impl Wallpaper {
         }
         self.current_uris.clear();
         self.refresh_stage = Some("drop-open");
-        let text = if let Some(signal) = self.drop_signal.as_mut() {
-            signal.text().to_owned()
-        } else {
-            crate::runtime_signal::read_bounded(&wallpaper_drop_path(), 16 * 1024).ok()?
-        };
+        let text = crate::runtime_signal::read_bounded(&wallpaper_drop_path(), 16 * 1024).ok()?;
         self.refresh_stage = Some("drop-parse-metadata");
         let mut lines = text.lines();
         let mut uri = lines.next().unwrap_or_default().trim().to_owned();

@@ -1,68 +1,49 @@
 # Compositor idle wake scheduling
 
-The compositor waits for the earliest real obligation or a registered event.
-An idle session can block without the former unconditional 16 ms tick.
-Active animations, refresh protocol obligations, buffered control work and
-failed watches retain the existing 16 ms service cap. This is source behavior,
-not evidence of a measured CPU, GPU, power or GNOME performance advantage.
+The native loop (#503, #678) sleeps until an event source fires or
+`Runtime::next_wake` says something time-driven is due, at most 500 ms
+(`IDLE_WAKE`). While anything moves it ticks at the 16 ms display rate
+(`FRAME_BUDGET`), and it keeps that pace for 500 ms (`ACTIVITY_LINGER`) after
+the last queued frame or input event. The nested (winit) backend and
+proof-instrumented sessions (an animation-clock or synthetic-swipe file with a
+state document) always run at 16 ms. This is source behavior, not evidence of a
+measured CPU, GPU, power or GNOME performance advantage.
 
-## Sources and deadlines
+## Event sources
 
-| Obligation | Wake or deadline |
+| Producer | Source |
 | --- | --- |
 | Native and nested Wayland clients | Listening socket and accepted-client display epoll descriptor |
-| Shell control | Hub epoll listener/accepted sockets; bounded continuation for handshake phases, complete buffered frames, dirty broadcasts and model changes |
-| Owned shell, Orca, IBus/XIM, bell player | Owned unreaped-child pidfds; readable source removes itself; failed observation or deferred reap retains active fallback |
-| Sleep monitor | Coalesced ping after publishing lock/wake flags; unlock generation invalidates before the lock flag |
-| Orca observation, IBus address probe, wallpaper identity/decode/card, X11 icons | Coalesced worker result/disconnect ping; result sender retires before final completion ping, including unwind |
-| IdleMonitor D-Bus | Registration/removal ping and earliest unfired idle interval; active watches wait for real input |
-| Shell/IME/Orca/Xwayland restart | Existing retry deadline and attempt budget, no timer for exhausted/disabled supervision |
-| Wallpaper source identity | Existing one-second observation interval for the current source, excluded while its worker is pending |
-| X11 icons | Existing 500 ms probe interval while XWM is ready, bounded full-queue retry |
-| Lock and idle blank | Actual idle threshold; 16 ms only during blank fade; held inhibitors suppress deadlines and their removal resets the input clock anchor |
-| Overview, strip/column, workspace, size change, window lifecycle, modal parent brightness, tile preview, screenshot flash/reply | Active motion cap on real animation time; held workspace swipe waits for input; manual proof time waits for its file source |
-| Workspace grace and explicit leases | Earliest real monotonic expiry; leases retire before drag-paused reconciliation; startup identities wait for producer events |
-| Bell visuals/player timeout | Real-time visual service and existing five-second player limit, independent of a manual animation clock |
-| Cast | Existing 33 ms streaming cadence; failed/no-buffer capture uses active bounded retry; PipeWire and revocation sources already wake calloop |
-| Frame callbacks, FIFO/commit timer obligations | Existing refresh service cap, with release still performed only by the existing drawn-frame / KMS pageflip paths |
-| KMS presentation | Registered DRM pageflip source; pending output scanout is never fabricated or overwritten by this scheduler |
-| Shutdown | signal-hook nonblocking self-pipe plus atomic flag; handlers unregister with their runtime |
+| Shell control | Hub epoll set (`control_readiness`): listener and every accepted socket from accept on |
+| Child exits (shell, IME/XIM, Orca, XWayland, bell player), SIGTERM, SIGINT | One signal-hook socket pair (`wake::signal_source`) |
+| Idle-blank file, wallpaper drop | inotify on `XDG_RUNTIME_DIR` (`wake::file_watch`); not watched when the state document is written there, then the blank file is read every tick |
+| Worker threads: IdleMonitor registrations, Orca watchers and departures, wallpaper identity/decode/card, Night Light, IME address probe, X11 icons, PAM, logind sleep | One per-runtime coalesced `wake::Wake` ping; completion wakes fire after the result is published, including on unwind |
+| KMS presentation | DRM page-flip source |
 
-Client keyboard repeats remain governed by wl_keyboard.repeat_info. The
-scheduler does not invent a compositor repeat timer or release a presentation
-barrier merely because wall time passed. Hidden/pending protocol obligations
-can conservatively retain refresh service rather than being treated as an
-unconditionally idle scene.
+## Time-driven wakes (`next_wake`)
 
-## File watches and fallback
+Frame pace while: activity linger, overview/strip/workspace/size-change/window
+lifecycle/modal-dim motion, cursor or wellbeing-effect animation, screenshot
+flash or pending reply, tile preview, bell visual, shell swipe, overlay, screen
+casts, or a PAM worker that has not published its terminal phase.
 
-Idle-blank, wallpaper, and instrumented animation-clock/swipe files use
-parent-directory inotify watches. Target edits, atomic rename, deletion,
-recreation and metadata changes rescan the cache. Overflow rescans; directory
-move/removal, watch loss, read errors, or the bounded callback cap retire the
-source and restore active polling. The callback cap deliberately invalidates
-the cache because a prefetched later watch-loss event cannot safely be lost.
+Otherwise the earliest of, never sooner than one frame: the lock timeout and
+idle-blank threshold (16 ms during the blank fade; none while an inhibitor is
+held), IdleMonitor and Orca deadlines, workspace leases, wallpaper source
+re-observation, Night Light preview expiry, bell player limit, XWayland restart
+backoff, X11 icon probe, IME restart gates (not while locked), the hidden-window
+frame beat, shell restart backoff, and the control hub's `next_poll` (at once
+for a buffered frame, 16 ms while a handshake or broadcast is owed).
 
-Reads reject symlinks, special files, oversize and invalid UTF-8. Small proof
-and idle signals keep their 4096-byte limit; wallpaper retains its existing
-16 KiB contract. The wire schema and writer contracts do not change.
+The end of an idle inhibitor restarts the idle clock, so a session that slept
+through the inhibited stretch never locks the moment it ends. Hidden windows'
+frame callbacks wait for the hidden beat and never force a repaint.
 
 ## Qualification
 
-Focused source tests cover deadline ordering/manual time/inhibition removal,
-worker completion and failure publication order, real child pidfd exit/removal,
-signal wake/drain, control buffered frames/phases, IdleMonitor registration,
-wallpaper identity eligibility, and watch rename/delete/loss/flood fallback.
-They do not establish runtime rendering or performance equivalence.
-Workspace deadline tests additionally cover earliest dialog/explicit expiry,
-manual animation-clock independence and expired-lease retirement. Startup and
-explicit lease APIs still need their genuine producer connections; a timer
-hook does not claim that missing integration.
-
-Run the compositor library suite and strict Clippy for both supported feature
-sets, then build and freeze exact-source binaries under the shared build guard.
-Re-run matched native delivered input/control, manual animation clock, lock/
-blank/inhibitor, screenshot feedback, casts, sleep/auth generation and shell
-restart proofs. GTK retains its separate allocation/reconciliation polling;
-this batch makes no GTK idle optimization claim. Finally run a matched native
-paired CPU/power benchmark with valid counters and presentation receipts.
+Source tests cover the signal source, directory watch, worker completion
+ordering, control readiness and buffered frames, IdleMonitor registration,
+workspace lease expiry and wallpaper identity eligibility. They do not establish
+runtime rendering or performance equivalence; run the native input/control,
+lock/blank/inhibitor, screenshot, cast, sleep and shell-restart proofs, then a
+matched native CPU/power benchmark.

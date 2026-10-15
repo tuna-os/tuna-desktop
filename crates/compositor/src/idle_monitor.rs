@@ -85,6 +85,20 @@ impl Inner {
         }
         fired
     }
+
+    /// When the next unfired idle watch is due.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.watches
+            .iter()
+            .filter_map(|w| match w.kind {
+                Kind::Idle {
+                    interval,
+                    fired: false,
+                } => Some(self.last_activity + interval),
+                _ => None,
+            })
+            .min()
+    }
 }
 
 /// The runtime's handle: feed it input and ticks.
@@ -98,21 +112,6 @@ pub struct IdleMonitor {
 impl IdleMonitor {
     pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
         self.wake.connect(wake);
-    }
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.inner.lock().ok().and_then(|inner| {
-            inner
-                .watches
-                .iter()
-                .filter_map(|watch| match watch.kind {
-                    Kind::Idle {
-                        interval,
-                        fired: false,
-                    } => inner.last_activity.checked_add(interval),
-                    _ => None,
-                })
-                .min()
-        })
     }
 
     /// The user did something.
@@ -138,6 +137,12 @@ impl IdleMonitor {
             let _ = self.fire.send(id);
         }
     }
+
+    /// When [`tick`](Self::tick) next has a watch to fire; the loop sleeps
+    /// until then (#503). A watch added over D-Bus wakes the loop.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.inner.lock().ok().and_then(|i| i.next_deadline())
+    }
 }
 
 struct Core {
@@ -161,15 +166,14 @@ impl Core {
                 "an idle watch needs a positive interval".into(),
             ));
         }
-        let mut inner = self
+        let id = self
             .inner
             .lock()
-            .map_err(|_| zbus::fdo::Error::Failed("idle monitor poisoned".into()))?;
-        let id = inner.add(Kind::Idle {
-            interval: Duration::from_millis(interval),
-            fired: false,
-        });
-        drop(inner);
+            .map_err(|_| zbus::fdo::Error::Failed("idle monitor poisoned".into()))?
+            .add(Kind::Idle {
+                interval: Duration::from_millis(interval),
+                fired: false,
+            });
         self.wake.signal();
         Ok(id)
     }

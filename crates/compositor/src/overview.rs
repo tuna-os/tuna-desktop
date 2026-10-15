@@ -806,6 +806,8 @@ impl Default for OverviewMotion {
 }
 
 impl OverviewMotion {
+    /// Whether any of the overview's tweens still moves (or a motion is
+    /// pending). The loop keeps the frame cadence until they settle (#503).
     pub(crate) fn animating(&self) -> bool {
         !self.progress.done()
             || !self.search.done()

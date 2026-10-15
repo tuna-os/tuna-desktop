@@ -1016,70 +1016,6 @@ pub(crate) fn presented_surface(
         .then(|| surface.clone())
 }
 
-/// Scheduler admission mirrors the renderer's mapped surface-tree positions,
-/// without importing textures. Test each node separately: a bounding box spanning
-/// an output can contain only empty space between two off-output subsurfaces.
-pub(crate) fn surface_visible_on_output(
-    what: &Pointer,
-    pointer: Point<f64, Logical>,
-    output_location: Point<i32, Logical>,
-    scale: f64,
-    bounds: Rectangle<i32, Physical>,
-) -> bool {
-    use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
-    use smithay::wayland::compositor::{with_states, with_surface_tree_downward, TraversalAction};
-    let Pointer::Surface(surface) = what else {
-        return false;
-    };
-    let hotspot = with_states(surface, |states| {
-        states
-            .data_map
-            .get::<CursorImageSurfaceData>()
-            .and_then(|data| data.lock().ok().map(|data| data.hotspot))
-    })
-    .unwrap_or_default();
-    let origin = (pointer - hotspot.to_f64() - output_location.to_f64())
-        .to_physical(scale)
-        .to_i32_round::<i32>()
-        .to_f64();
-    let mut visible = false;
-    with_surface_tree_downward(
-        surface,
-        origin,
-        |_, states, location| {
-            let view = states
-                .data_map
-                .get::<RendererSurfaceStateUserData>()
-                .and_then(|data| data.lock().ok().and_then(|data| data.view()));
-            if let Some(view) = view {
-                let location = *location + view.offset.to_f64().to_physical(scale);
-                let geometry = surface_geometry(location, view.dst, scale);
-                visible |= visible_geometry(geometry, bounds);
-                TraversalAction::DoChildren(location)
-            } else {
-                TraversalAction::SkipChildren
-            }
-        },
-        |_, _, _| {},
-        |_, _, _| true,
-    );
-    visible
-}
-
-fn surface_geometry(
-    location: Point<f64, Physical>,
-    size: smithay::utils::Size<i32, Logical>,
-    scale: f64,
-) -> Rectangle<i32, Physical> {
-    // Match WaylandSurfaceRenderElement::size: round both endpoints, not
-    // the size alone, so fractional scale and subsurface offsets agree.
-    let end = (location + size.to_f64().to_physical(scale).to_point()).to_i32_round();
-    Rectangle::new(
-        location.to_i32_round(),
-        (end - location.to_i32_round()).to_size(),
-    )
-}
-
 fn visible_geometry(geometry: Rectangle<i32, Physical>, bounds: Rectangle<i32, Physical>) -> bool {
     geometry
         .intersection(bounds)
@@ -1883,58 +1819,6 @@ mod tests {
         assert_eq!(grab_icon(Some(2 | 8)), CursorIcon::SeResize);
         assert_eq!(grab_icon(Some(8)), CursorIcon::EResize);
         assert_eq!(grab_icon(Some(1)), CursorIcon::NResize);
-    }
-
-    #[test]
-    fn hidden_and_off_output_cursor_demand_does_not_schedule_frames() {
-        let bounds = Rectangle::from_size((1280, 800).into());
-        let pending_callback = true;
-        let geometries = [
-            Rectangle::new((-32, 0).into(), (32, 32).into()),
-            Rectangle::new((1280, 0).into(), (32, 32).into()),
-        ];
-        let admit = |selected: bool, geometry: &[Rectangle<i32, Physical>]| {
-            let mut schedule = crate::idle_schedule::Schedule::default();
-            if selected && pending_callback && geometry.iter().any(|g| visible_geometry(*g, bounds))
-            {
-                schedule.active();
-            }
-            schedule.wait()
-        };
-        assert_eq!(
-            admit(true, &geometries),
-            None,
-            "off-output trees remain idle; do not merge their gap"
-        );
-        let visible_child = surface_geometry((1279.4, 10.2).into(), (2, 2).into(), 1.5);
-        assert_eq!(
-            admit(false, &[visible_child]),
-            None,
-            "hidden, locked or overridden cursor requests remain pending"
-        );
-        assert_eq!(
-            admit(true, &[visible_child]),
-            Some(crate::idle_schedule::ACTIVE_INTERVAL),
-            "an intersecting subsurface retains full callback service"
-        );
-        assert!(!surface_visible_on_output(
-            &Pointer::Hidden,
-            (0.0, 0.0).into(),
-            (0, 0).into(),
-            1.0,
-            bounds
-        ));
-        assert!(!surface_visible_on_output(
-            &Pointer::Named(CursorIcon::Default, "grab"),
-            (0.0, 0.0).into(),
-            (0, 0).into(),
-            1.0,
-            bounds
-        ));
-        assert_eq!(
-            surface_geometry((0.4, 0.4).into(), (1, 1).into(), 1.5).size,
-            (2, 2).into()
-        );
     }
 
     #[test]

@@ -66,7 +66,6 @@ pub mod drm;
 pub mod fprintd;
 pub mod frame_timing;
 pub mod idle_monitor;
-mod idle_schedule;
 pub mod ime;
 pub mod input_aids;
 pub mod introspect;
@@ -94,7 +93,6 @@ pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;
 pub mod popup;
-mod process_wake;
 pub mod protocols;
 pub mod runtime;
 mod runtime_signal;
@@ -105,7 +103,6 @@ pub mod screenshot_flash;
 pub mod session_lock;
 pub mod session_restore;
 pub mod session_services;
-mod shutdown_wake;
 pub mod size_change;
 #[cfg(feature = "drm")]
 pub mod sleep;

@@ -63,10 +63,21 @@ use crate::{ClientState, State};
 
 mod aids;
 
-/// Maximum loop rate: dispatch blocks up to this long waiting for events,
-/// so the loop never spins, and repaint stays near 60 Hz. Damage-tracked
-/// repaint replaces this provisional pacing in a later slice.
+/// Display-rate loop pacing: while anything moves, dispatch blocks at
+/// most this long, so animations step near 60 Hz and the loop never
+/// spins. The nested (winit) backend always runs at this pace.
 const FRAME_BUDGET: Duration = Duration::from_millis(16);
+
+/// Longest the native loop sleeps with nothing due (#503). Producers
+/// without an event source of their own (the XWayland supervisor's
+/// backoff, the X11 icon reader, a stalled client flush) are still
+/// served at least this often.
+const IDLE_WAKE: Duration = Duration::from_millis(500);
+
+/// Display-rate ticks continue this long after the last queued frame or
+/// input event (#503): an animation whose first steps draw nothing new
+/// still advances.
+const ACTIVITY_LINGER: Duration = Duration::from_millis(500);
 
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
@@ -89,23 +100,16 @@ mod display_readiness_tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
-    fn modal_parent_fades_need_real_timer_work_but_not_manual_clock_ticks() {
+    fn modal_parent_fades_run_until_settled() {
         let mut dim = crate::modal_dim::ModalDim::default();
         let alive = std::collections::HashSet::from([1]);
         let policy = tuna_shell_control::motion::MotionPolicy::default();
         dim.step(&alive, &alive, Duration::ZERO, policy, true);
+        // A running fade keeps next_wake at the frame pace; a settled one
+        // lets the loop sleep.
         assert!(dim.running());
-        let mut schedule = crate::idle_schedule::Schedule::default();
-        schedule.motion(false, dim.running());
-        assert_eq!(schedule.wait(), Some(FRAME_BUDGET));
-        let mut manual = crate::idle_schedule::Schedule::default();
-        manual.motion(true, dim.running());
-        assert_eq!(manual.wait(), None);
         dim.step(&alive, &alive, Duration::from_secs(1), policy, true);
         assert!(!dim.running());
-        let mut settled = crate::idle_schedule::Schedule::default();
-        settled.motion(false, dim.running());
-        assert_eq!(settled.wait(), None);
     }
 
     #[test]
@@ -616,13 +620,9 @@ pub struct Runtime {
     blank: crate::lock::IdleBlank,
     screenshot_flashes: crate::screenshot_flash::Flashes,
     screenshot_replies: Vec<PendingScreenshotReply>,
-    idle_blank_signal: Option<crate::runtime_signal::CachedSignal>,
+    /// Worker threads (idle watches, Orca, wallpaper, Night Light, IME,
+    /// X11 icons, PAM, logind) ping the loop through this (#503).
     wake: crate::wake::Wake,
-    proof_signals: Vec<crate::runtime_signal::CachedSignal>,
-    child_sources: std::collections::HashMap<u32, calloop::RegistrationToken>,
-    child_watch_failed: bool,
-    exited_children: std::collections::HashSet<u32>,
-    was_inhibited: bool,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -710,6 +710,22 @@ pub struct Runtime {
     /// When hidden windows last got their throttled frame callbacks
     /// ([`HIDDEN_FRAME_INTERVAL`](crate::occlusion::HIDDEN_FRAME_INTERVAL)).
     hidden_beat: Option<Instant>,
+    /// Hidden windows hold frame callbacks for the next beat (#503).
+    hidden_waiting: bool,
+    /// The last queued frame or input event; see [`ACTIVITY_LINGER`].
+    active_at: Instant,
+    /// Whether an idle inhibitor was live at the last tick (#503).
+    idle_inhibited: bool,
+    /// `tuna-idle-blank` changed since it was last read.
+    blank_stale: bool,
+    /// The runtime dir is watched: `blank_stale` reports every change.
+    /// Without the watch the file is read on every tick.
+    blank_watched: bool,
+    /// Backoff left before the shell supervisor restarts the shell.
+    shell_retry_ms: Option<u64>,
+    /// A proof harness drives this session through files polled every
+    /// pass (animation clock, synthetic swipes): keep display-rate ticks.
+    proof_polling: bool,
     /// Reserved X11 display, advertised before XWayland starts (#219).
     /// Actual window-manager readiness is independently state.xwm.is_some().
     x11_display: Option<u32>,
@@ -1140,7 +1156,8 @@ impl Runtime {
                 }
             })
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-
+        // Worker threads ping the loop when they have something for the
+        // tick (#503); the ping only wakes it.
         let (wake, wake_source) =
             crate::wake::Wake::new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         event_loop
@@ -1165,16 +1182,6 @@ impl Runtime {
             screenshot_flashes: Default::default(),
             screenshot_replies: Vec::new(),
             wake,
-            proof_signals: Vec::new(),
-            child_sources: Default::default(),
-            child_watch_failed: false,
-            exited_children: Default::default(),
-            was_inhibited: false,
-            idle_blank_signal: std::env::var_os("XDG_RUNTIME_DIR").map(|dir| {
-                crate::runtime_signal::CachedSignal::new(
-                    std::path::PathBuf::from(dir).join("tuna-idle-blank"),
-                )
-            }),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
             #[cfg(feature = "drm")]
@@ -1200,6 +1207,13 @@ impl Runtime {
             switcher_thumbnails: Vec::new(),
             frame_costs: std::collections::BTreeMap::new(),
             hidden_beat: None,
+            hidden_waiting: false,
+            active_at: Instant::now(),
+            idle_inhibited: false,
+            blank_stale: true,
+            blank_watched: false,
+            shell_retry_ms: None,
+            proof_polling: false,
             shell_swipe: None,
             overview_motion: Default::default(),
             overview_progress_at: Duration::ZERO,
@@ -1240,29 +1254,6 @@ impl Runtime {
             #[cfg(feature = "drm")]
             performance_trace: crate::performance_trace::Trace::from_env(),
         };
-        if let Some(signal) = runtime.idle_blank_signal.as_mut() {
-            runtime.blank = crate::lock::IdleBlank::parse(signal.text());
-            match signal.source() {
-                Ok(Some(source)) => {
-                    runtime
-                        .loop_handle
-                        .insert_source(source, |_, _, rt: &mut Runtime| {
-                            let Some(signal) = rt.idle_blank_signal.as_mut() else {
-                                return Ok(calloop::PostAction::Remove);
-                            };
-                            let valid = signal.refresh();
-                            rt.blank = crate::lock::IdleBlank::parse(signal.text());
-                            Ok(if valid {
-                                calloop::PostAction::Continue
-                            } else {
-                                calloop::PostAction::Remove
-                            })
-                        })
-                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-                }
-                Ok(None) | Err(_) => signal.disable(),
-            }
-        }
         runtime.animation_clock =
             crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
         runtime.wallpaper.set_wake(&runtime.wake);
@@ -1279,56 +1270,48 @@ impl Runtime {
         }
         #[cfg(feature = "xwayland")]
         runtime.x11_icon_reader.set_wake(&runtime.wake);
-        match runtime.wallpaper.install_drop_watch() {
-            Ok(Some(source)) => {
-                runtime
-                    .loop_handle
-                    .insert_source(source, |_, _, rt: &mut Runtime| {
-                        Ok(if rt.wallpaper.refresh_drop_watch() {
-                            calloop::PostAction::Continue
-                        } else {
-                            calloop::PostAction::Remove
-                        })
-                    })
-                    .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-            }
-            _ => runtime.wallpaper.disable_drop_watch(),
-        }
-        let mut proof_paths = Vec::new();
-        if let Some(path) = runtime.animation_clock.watch_path() {
-            proof_paths.push(path);
-        }
-        if runtime.state_path.is_some() {
-            if let Some(path) = std::env::var_os("TUNA_PROOF_SWIPE_INPUT")
-                .map(std::path::PathBuf::from)
-                .filter(|path| path.is_absolute())
-            {
-                proof_paths.push(path);
-            }
-        }
-        for path in proof_paths {
-            let mut signal = crate::runtime_signal::CachedSignal::new(path);
-            let index = runtime.proof_signals.len();
-            match signal.source() {
-                Ok(Some(source)) => {
-                    runtime
-                        .loop_handle
-                        .insert_source(source, move |_, _, rt: &mut Runtime| {
-                            Ok(if rt.proof_signals[index].refresh() {
-                                calloop::PostAction::Continue
-                            } else {
-                                calloop::PostAction::Remove
-                            })
-                        })
-                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-                }
-                _ => signal.disable(),
-            }
-            runtime.proof_signals.push(signal);
-        }
         let started = runtime.animation_clock.now();
         runtime.overview_progress_at = started;
         runtime.strip_view_at = started;
+        runtime.proof_polling = runtime.state_path.is_some()
+            && [crate::animation_clock::CLOCK_ENV, "TUNA_PROOF_SWIPE_INPUT"]
+                .iter()
+                .any(|key| std::env::var_os(key).is_some());
+        // The shell's idle-blank settings and wallpaper drop live in the
+        // runtime dir: any change there wakes the loop, and the blank
+        // file is read again only when it changed. A state document the
+        // tick itself rewrites there would wake the loop on its own
+        // writes, so then the dir is not watched and the blank file is
+        // read on every tick.
+        let state_dir = runtime
+            .state_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|dir| state_dir.as_deref() != Some(std::path::Path::new(dir)))
+        {
+            let watched = crate::wake::file_watch(std::path::Path::new(&dir))
+                .map_err(|e| e.to_string())
+                .and_then(|watch| {
+                    event_loop
+                        .handle()
+                        .insert_source(watch, |_, fd, rt: &mut Runtime| {
+                            let blank = std::ffi::OsStr::new(crate::wake::IDLE_BLANK_FILE);
+                            if crate::wake::changed(&*fd, &[blank]) {
+                                rt.blank_stale = true;
+                            }
+                            Ok(calloop::PostAction::Continue)
+                        })
+                        .map_err(|e| e.to_string())
+                });
+            match watched {
+                Ok(_) => runtime.blank_watched = true,
+                Err(error) => {
+                    eprintln!("tuna-compositor: runtime dir watch unavailable: {error}")
+                }
+            }
+        }
         // Reserve and advertise sockets, but spawn only when a real X11
         // client connects. Native clients do not start a compatibility process.
         #[cfg(feature = "xwayland")]
@@ -1716,6 +1699,7 @@ impl Runtime {
         self.lock.note_input(input_time(&input));
         self.idle_since = Instant::now();
         self.idle_monitor.activity();
+        self.active_at = Instant::now();
         if self.is_locked() {
             self.cursor.locate.reset_keys();
         } else {
@@ -3821,208 +3805,132 @@ impl Runtime {
         self.introspect.publish(windows);
     }
 
-    /// Watch only unreaped children owned by this runtime. Their pid cannot be
-    /// reused before try_wait consumes the exit; no arbitrary /proc selection.
-    fn sync_child_sources(&mut self) {
-        let mut pids: Vec<u32> = [
-            self.shell.child_pid(),
-            self.orca.pid(),
-            self.state.protocols.bell.player_pid(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if let Some(ime) = &self.ime {
-            pids.extend(ime.child_pids());
+    /// How long the loop may sleep before the next [`tick`](Self::tick)
+    /// (#503). Wayland clients, input, page flips, the control socket,
+    /// signals, runtime files and worker threads wake it earlier through
+    /// their event sources; this covers what only time moves.
+    fn next_wake(&self) -> Duration {
+        #[cfg(feature = "drm")]
+        let native = matches!(self.backend, Backend::Drm(_));
+        #[cfg(not(feature = "drm"))]
+        let native = false;
+        // The nested backend has no Wayland readiness source.
+        if !native || self.proof_polling {
+            return FRAME_BUDGET;
         }
-        pids.sort_unstable();
-        pids.dedup();
-        self.child_sources.retain(|pid, token| {
-            if pids.contains(pid) {
-                true
-            } else {
-                self.loop_handle.remove(*token);
-                false
-            }
-        });
-        self.exited_children.retain(|pid| pids.contains(pid));
-        self.child_watch_failed = !self.exited_children.is_empty();
-        for pid in pids {
-            if self.child_sources.contains_key(&pid) || self.exited_children.contains(&pid) {
-                continue;
-            }
-            let source = match crate::process_wake::source(pid) {
-                Ok(source) => source,
-                Err(_) => {
-                    self.child_watch_failed = true;
-                    continue;
-                }
-            };
-            match self
-                .loop_handle
-                .insert_source(source, move |_, _, rt: &mut Runtime| {
-                    rt.child_sources.remove(&pid);
-                    rt.exited_children.insert(pid);
-                    Ok(calloop::PostAction::Remove)
-                }) {
-                Ok(token) => {
-                    self.child_sources.insert(pid, token);
-                }
-                Err(_) => self.child_watch_failed = true,
-            }
-        }
-    }
-
-    /// Every deadline is an existing obligation. The previous active cap is
-    /// retained for motion, frame protocol service, and failed readiness.
-    fn next_wait(&self) -> Option<Duration> {
-        let mut schedule = crate::idle_schedule::Schedule::default();
-        let system_now = crate::state::system_millis();
-        if self.child_watch_failed
+        let now = Instant::now();
+        let clock = self.animation_clock.now();
+        if now.saturating_duration_since(self.active_at) < ACTIVITY_LINGER
+            || self.overview_motion.animating()
+            || self.manager.workspace_slide().running()
+            || self.manager.strip_animating()
+            || self.manager.size_changes().in_flight()
+            || self.manager.window_lifecycle().running()
+            || self.manager.modal_dim().running()
+            || self.cursor.animating(clock)
+            || self.wellbeing_effects.animating(clock)
+            || self.screenshot_flashes.running()
+            || !self.screenshot_replies.is_empty()
+            || self.tile_animation.as_ref().is_some_and(|(_, _, start)| {
+                clock.saturating_sub(*start).as_secs_f64()
+                    < 0.2 * self.input_settings.motion.slowdown()
+            })
+            || self.state.protocols.bell.visual(now).is_some()
+            || self.shell_swipe.is_some()
+            || self.overlay.visible
+            || !self.casts.is_empty()
+            // A running PAM worker publishes its terminal phase before
+            // its wake; anything else is collected on the frame pace.
             || self
                 .unlock_worker
                 .as_ref()
                 .is_some_and(|worker| worker.phase.load(std::sync::atomic::Ordering::Acquire) != 1)
-            || self.control.needs_continuation(self.manager.model())
-            || self
-                .idle_blank_signal
-                .as_ref()
-                .is_some_and(|signal| !signal.watched())
-            || self.proof_signals.iter().any(|signal| !signal.watched())
-            || self.wallpaper.watch_fallback()
         {
-            schedule.active();
+            return FRAME_BUDGET;
         }
-        if let Some(delay) = self.shell.next_delay_ms(system_now) {
-            schedule.after(Duration::from_millis(delay));
-        }
-        if let Some(deadline) = self.orca.next_deadline() {
-            schedule.at(deadline);
-        }
-        if !self.is_locked() {
-            if let Some(delay) = self.ime.as_ref().and_then(|ime| ime.next_delay(system_now)) {
-                schedule.after(delay);
+        // Timed producers are served no more often than the display
+        // rate: a gate that is due but cannot act yet (the IME bridge
+        // while locked, say) costs what the fixed loop did, never a spin.
+        let mut wake = IDLE_WAKE;
+        let mut due = |after: Duration| wake = wake.min(after.max(FRAME_BUDGET));
+        // An inhibited session neither blanks nor locks; its end is
+        // handled by the tick that sees it.
+        if !self.idle_inhibited {
+            let idle = self.lock.idle_ms(self.lock_now_ms());
+            if !self.is_locked() && self.lock.timeout_ms() != u64::MAX {
+                due(Duration::from_millis(
+                    self.lock.timeout_ms().saturating_sub(idle),
+                ));
             }
+            if self.blank.idle_ms > 0 {
+                if idle < self.blank.idle_ms {
+                    due(Duration::from_millis(self.blank.idle_ms - idle));
+                } else if idle < self.blank.idle_ms.saturating_add(self.blank.fade_ms) {
+                    due(FRAME_BUDGET);
+                }
+            }
+        }
+        for deadline in [
+            self.idle_monitor.next_deadline(),
+            self.orca.next_deadline(),
+            self.manager.workspace_lease_deadline(),
+            self.wallpaper.maintenance_deadline(),
+            // Night Light (#339): exact preview expiry (or its past-due
+            // restoring obligation) and the bounded settings re-read.
+            self.night_light.next_deadline(),
+            self.state.protocols.bell.player_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            due(deadline.saturating_duration_since(now));
         }
         #[cfg(feature = "xwayland")]
         {
+            let system_now = crate::state::system_millis();
             if !self.x11_failed {
-                if let Some(delay) = self.xwayland.next_delay_ms(system_now) {
-                    schedule.after(Duration::from_millis(delay));
+                if let Some(ms) = self.xwayland.next_delay_ms(system_now) {
+                    due(Duration::from_millis(ms));
                 }
             }
             if self.state.xwm.is_some() {
-                schedule.at(self.x11_icon_reader.next_deadline());
+                due(self
+                    .x11_icon_reader
+                    .next_deadline()
+                    .saturating_duration_since(now));
             }
         }
-        if let Some(deadline) = self.manager.workspace_lease_deadline() {
-            schedule.at(deadline);
-        }
-        if let Some(deadline) = self.idle_monitor.next_deadline() {
-            schedule.at(deadline);
-        }
-        if let Some(deadline) = self.wallpaper.maintenance_deadline() {
-            schedule.at(deadline);
-        }
-        // Night Light (#339): exact preview expiry (or its past-due
-        // restoring obligation) and the bounded settings re-read.
-        if let Some(deadline) = self.night_light.next_deadline() {
-            schedule.at(deadline);
-        }
-        schedule.idle(
-            self.lock.idle_ms(self.lock_now_ms()),
-            (!self.is_locked()).then_some(self.lock.timeout_ms()),
-            (self.blank.idle_ms, self.blank.fade_ms),
-            self.was_inhibited,
-        );
-        schedule.motion(
-            self.animation_clock.is_manual(),
-            self.overview_motion.animating()
-                || self.manager.strip_animating()
-                || (self.manager.workspace_slide().running()
-                    && !self.manager.workspace_slide().following())
-                || self.manager.size_changes().in_flight()
-                || self.manager.window_lifecycle().running()
-                || self.manager.modal_dim().running()
-                || self.cursor.animating(self.animation_clock.now())
-                || self.wellbeing_effects.animating(self.animation_clock.now())
-                || self.screenshot_flashes.running()
-                || !self.screenshot_replies.is_empty()
-                || self.tile_animation.as_ref().is_some_and(|(_, _, start)| {
-                    self.animation_clock
-                        .now()
-                        .saturating_sub(*start)
-                        .as_secs_f64()
-                        < 0.2 * self.input_settings.motion.slowdown()
-                }),
-        );
-        if self.state.protocols.bell.visual(Instant::now()).is_some() {
-            schedule.active();
-        }
-        if let Some(deadline) = self.state.protocols.bell.player_deadline() {
-            schedule.at(deadline);
-        }
-        // Preserve refresh-cycle authority: these timers only request work;
-        // the existing drawn frame / KMS flip paths release protocol barriers.
-        let mut roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
-        if let smithay::input::pointer::CursorImageStatus::Surface(surface) =
-            &self.state.cursor_image
+        if let Some(ms) = self
+            .ime
+            .as_ref()
+            .filter(|_| !self.is_locked())
+            .and_then(|ime| ime.next_wake_ms(crate::state::system_millis()))
         {
-            roots.retain(|root| root != surface);
-            let what = if !self.is_locked() && self.blank_alpha() < 1.0 {
-                crate::cursor::Pointer::resolve(
-                    &self.state.cursor_image,
-                    self.manager.grab_cursor(),
-                    self.state.pointer_focused(),
-                )
-            } else {
-                crate::cursor::Pointer::Hidden
-            };
-            let visible = match &self.backend {
-                Backend::Winit(backend) => crate::cursor::surface_visible_on_output(
-                    &what,
-                    self.manager.pointer_pos(),
-                    (0, 0).into(),
-                    self.scale,
-                    Rectangle::from_size(backend.window_size()),
-                ),
-                #[cfg(feature = "drm")]
-                Backend::Drm(drm) => {
-                    drm.scanout_ready()
-                        && drm.outputs.iter().any(|output| {
-                            crate::cursor::surface_visible_on_output(
-                                &what,
-                                drm.pointer(),
-                                output.loc.into(),
-                                output.scale,
-                                Rectangle::from_size(
-                                    crate::orientation::smithay_transform(output.transform)
-                                        .transform_size(output.size),
-                                ),
-                            )
-                        })
-                }
-            };
-            if visible {
-                roots.push(surface.clone());
-            }
+            due(Duration::from_millis(ms));
         }
-        if crate::frame_timing::pending_frame_work(&roots) {
-            schedule.active();
+        if self.hidden_waiting {
+            due(self.hidden_beat.map_or(Duration::ZERO, |last| {
+                (last + crate::occlusion::HIDDEN_FRAME_INTERVAL).saturating_duration_since(now)
+            }));
         }
-        for cast in &self.casts {
-            if let Some(delay) = cast.next_delay() {
-                // A failed/no-buffer capture must not busy-loop on a past due
-                // timestamp. Keep the old active retry cap for that case.
-                schedule.after(if delay.is_zero() { FRAME_BUDGET } else { delay });
-            }
+        if let Some(ms) = self.shell_retry_ms {
+            due(Duration::from_millis(ms));
         }
-        schedule.wait()
+        // A command frame already buffered is applied on the next pass.
+        match self.control.next_poll(self.manager.model()) {
+            Some(after) => wake.min(after),
+            None => wake,
+        }
     }
 
     fn tick(&mut self) -> Result<bool, RuntimeError> {
-        if let Some(signal) = self.idle_blank_signal.as_mut() {
-            self.blank = crate::lock::IdleBlank::parse(signal.text());
+        if self.blank_stale || !self.blank_watched {
+            self.blank_stale = false;
+            if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+                let path = std::path::PathBuf::from(dir).join(crate::wake::IDLE_BLANK_FILE);
+                let text = crate::runtime_signal::read(&path).unwrap_or_default();
+                self.blank = crate::lock::IdleBlank::parse(&text);
+            }
         }
         self.display
             .dispatch_clients(&mut self.state)
@@ -4240,15 +4148,18 @@ impl Runtime {
         }
         self.idle_monitor.tick();
         // Idle timeout from input timestamps: lock the untouched session.
-        // A live idle inhibitor (video, presentation) counts as activity.
+        // A live idle inhibitor (video, presentation) counts as activity,
+        // and so does its end: the loop may have slept through the
+        // inhibited stretch, so the idle clock restarts when it ends
+        // instead of the session locking at once (#503).
         let inhibited = self.state.idle_inhibited();
         if self
             .lock
-            .inhibitor_activity(self.was_inhibited, inhibited, self.lock_now_ms())
+            .inhibitor_activity(self.idle_inhibited, inhibited, self.lock_now_ms())
         {
             self.idle_since = Instant::now();
         }
-        self.was_inhibited = inhibited;
+        self.idle_inhibited = inhibited;
         if !self.is_locked() && self.lock.check_timeout(self.lock_now_ms()) {
             self.engage_lock();
         }
@@ -4268,6 +4179,10 @@ impl Runtime {
         // Reap and restart the supervised lock UI even while locked.
         // Supervision is nonblocking and cannot clear the lock flag.
         let shell_status = self.shell.poll(crate::state::system_millis());
+        self.shell_retry_ms = match shell_status {
+            ShellStatus::Waiting { delay_ms } => Some(delay_ms),
+            _ => None,
+        };
         // While locked the overlay stays up with its empty list no
         // matter what the shell does: a shell restart while locked
         // keeps the lock screen up.
@@ -4411,6 +4326,9 @@ impl Runtime {
             self.publish_state();
         }
         self.screencast_tick();
+        // Send what this tick queued for the shell now, not at the next
+        // wake, which may be far off (#503).
+        self.control.flush(self.manager.model());
         #[cfg(feature = "drm")]
         if matches!(self.backend, Backend::Drm(_)) {
             // Rendering queues callbacks only for a submitted scanout. Send
@@ -4419,7 +4337,6 @@ impl Runtime {
                 .flush_clients()
                 .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         }
-        self.sync_child_sources();
         Ok(!self.exit)
     }
 
@@ -5030,6 +4947,7 @@ impl Runtime {
                         crate::cursor::Cursor::frame_done(&cursor_what, cursor_now);
                     }
                     self.stats.frames += 1;
+                    self.active_at = Instant::now();
                 }
                 queued
             }
@@ -5058,9 +4976,11 @@ impl Runtime {
         throttled: &[smithay::reexports::wayland_server::protocol::wl_surface::WlSurface],
     ) {
         let now = Instant::now();
-        if self.hidden_beat.is_some_and(|last| {
-            now.saturating_duration_since(last) < crate::occlusion::HIDDEN_FRAME_INTERVAL
-        }) || !crate::frame_timing::pending_callbacks(throttled)
+        self.hidden_waiting = crate::frame_timing::pending_callbacks(throttled);
+        if !self.hidden_waiting
+            || self.hidden_beat.is_some_and(|last| {
+                now.saturating_duration_since(last) < crate::occlusion::HIDDEN_FRAME_INTERVAL
+            })
         {
             return;
         }
@@ -5074,6 +4994,7 @@ impl Runtime {
             });
         }
         self.hidden_beat = Some(now);
+        self.hidden_waiting = false;
     }
 }
 
@@ -6398,6 +6319,8 @@ fn run_loop(
     };
     #[cfg(feature = "drm")]
     let sleep_monitor = if matches!(runtime.backend, Backend::Drm(_)) {
+        // The logind thread wakes the loop so lock-on-suspend and resume
+        // are handled at once, not at the next timed wake.
         match crate::sleep::Monitor::start(runtime.unlock_generation.clone()) {
             Ok(monitor) => Some(monitor),
             Err(error) => {
@@ -6418,36 +6341,33 @@ fn run_loop(
     // the shell on a dead socket. The flag write is the only work done
     // in the handler; the loop observes it below.
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (signal_source, _signal_handlers) = crate::shutdown_wake::source(
-        &[signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT],
-        &shutdown,
-    )
-    .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(signal, std::sync::Arc::clone(&shutdown))
+            .map_err(|e| RuntimeError::Loop(format!("signal handler failed: {e}")))?;
+    }
+    // The same signals, and child exits for the shell, IME and XWayland
+    // supervisors, wake a loop that may be sleeping (#503).
+    let signals = crate::wake::signal_source(&[
+        signal_hook::consts::SIGCHLD,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+    ])
+    .map_err(|e| RuntimeError::Loop(format!("signal source failed: {e}")))?;
     event_loop
         .handle()
-        .insert_source(signal_source, |_, stream, rt: &mut Runtime| {
-            use std::io::Read;
-            let mut stream = &**stream;
-            let mut bytes = [0; 64];
-            loop {
-                match stream.read(&mut bytes) {
-                    Ok(0) => break,
-                    Ok(_) => rt.exit = true,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
+        .insert_source(signals, |_, stream, _: &mut Runtime| {
+            crate::wake::drain_signals(stream.as_ref());
             Ok(calloop::PostAction::Continue)
         })
         .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-    let mut wait = Some(Duration::ZERO);
+    let mut wait = Duration::ZERO;
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             restore_env(prev_env);
             return Ok(runtime.stats);
         }
         let dispatched = event_loop
-            .dispatch(wait, &mut runtime)
+            .dispatch(Some(wait), &mut runtime)
             .map_err(|e| RuntimeError::Loop(e.to_string()));
         #[cfg(feature = "drm")]
         if let Some(monitor) = &sleep_monitor {
@@ -6469,10 +6389,10 @@ fn run_loop(
         });
         match ticked {
             Ok(true) => {
-                wait = runtime.next_wait();
+                wait = runtime.next_wake();
                 if let Some(delay) = probe_delay {
-                    let delay = delay.clamp(Duration::from_millis(1), Duration::from_millis(100));
-                    wait = Some(wait.map_or(delay, |runtime_delay| runtime_delay.min(delay)));
+                    wait =
+                        wait.min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100)));
                 }
                 continue;
             }

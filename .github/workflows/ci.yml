@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly full run, so drift in archlinux:latest, the Marlin base image
+  # and runner images surfaces even on days nothing merges.
+  schedule:
+    - cron: "7 2 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -16,10 +20,32 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    outputs:
+      lanes: ${{ steps.lanes.outputs.lanes }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The exact head is checked out; lane selection diffs it against
+          # the pull request's base below.
+          fetch-depth: 0
+      # Which proof lanes this run executes (scripts/ci-select-lanes):
+      # every lane on main, nightly and dispatch; on a pull request only
+      # what the change can affect, with a rotating slice of the
+      # end-to-end lanes for code changes (repo variable
+      # CI_ROUND_ROBIN_SIZE, default 2).
+      - name: Select proof lanes
+        id: lanes
+        env:
+          CI_ROUND_ROBIN_SIZE: ${{ vars.CI_ROUND_ROBIN_SIZE }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            git fetch --no-tags --quiet origin "$BASE_SHA"
+            git diff --name-only "$BASE_SHA...HEAD" | scripts/ci-select-lanes --changed - >> "$GITHUB_OUTPUT"
+          else
+            scripts/ci-select-lanes >> "$GITHUB_OUTPUT"
+          fi
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
@@ -47,6 +73,7 @@ jobs:
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
       - run: python3 scripts/lib/ledger-tests.py
+      - run: python3 scripts/lib/ci-select-lanes-tests.py
       - run: python3 scripts/lib/marlin-kernel-tests.py
       - run: python3 scripts/lib/gnome-drained-tests.py
       - run: python3 scripts/lib/mutter-profiler-integrity-tests.py
@@ -155,6 +182,7 @@ jobs:
     # Required measured transport phases; not a live UI/hardware qualification.
     runs-on: ubuntu-latest
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'fprint-phase-proof')
     timeout-minutes: 45
     permissions:
       actions: read
@@ -185,6 +213,7 @@ jobs:
   journey:
     runs-on: ubuntu-26.04
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'journey')
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -270,6 +299,7 @@ jobs:
   app-content:
     runs-on: ubuntu-latest
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'app-content')
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -296,6 +326,7 @@ jobs:
   scroll-proof:
     runs-on: ubuntu-latest
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'scroll-proof')
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -325,6 +356,7 @@ jobs:
     # vkms) alone can take ~20 min on a cold runner cache.
     runs-on: ubuntu-latest
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'drm-smoke')
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -356,6 +388,7 @@ jobs:
     # Source-only real headed old/fixed comparison; the full GTK journey stays required.
     runs-on: ubuntu-latest
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'grid-cancel-comparison')
     permissions:
       actions: read
       contents: read
@@ -404,6 +437,7 @@ jobs:
     # qualification; failure in either job still blocks release admission.
     runs-on: ubuntu-26.04
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'greeter')
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -439,6 +473,7 @@ jobs:
     # surface), and the AT-SPI tree a screen reader sees (#71).
     runs-on: ubuntu-latest
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'gtk-shell')
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -632,7 +667,8 @@ jobs:
           retention-days: 14
 
   portal-security:
-    needs: arch-package
+    needs: [check, arch-package]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'portal-security')
     runs-on: ubuntu-26.04
     timeout-minutes: 25
     steps:
@@ -662,7 +698,8 @@ jobs:
           retention-days: 90
 
   remote-security:
-    needs: arch-package
+    needs: [check, arch-package]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'remote-security')
     runs-on: ubuntu-26.04
     timeout-minutes: 25
     steps:
@@ -691,7 +728,8 @@ jobs:
 
   niri-parity:
     runs-on: ubuntu-26.04
-    needs: [arch-package]
+    needs: [check, arch-package]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'niri-parity')
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -721,6 +759,7 @@ jobs:
     # package in a clean archlinux container (#69).
     runs-on: ubuntu-latest
     needs: [check]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'arch-package')
     timeout-minutes: 40
     container: archlinux:latest
     steps:
@@ -745,9 +784,11 @@ jobs:
 
   marlin-image:
     # Tuna Desktop layered on ghcr.io/tuna-os/marlin:gnome (GNOME 51 baseline
-    # image) as a nested preview. Built on every PR, pushed from main.
+    # image) as a nested preview. Built when selected (every main run),
+    # pushed from main.
     runs-on: ubuntu-latest
-    needs: [arch-package]
+    needs: [check, arch-package]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'marlin-image')
     timeout-minutes: 40
     permissions:
       contents: read
@@ -795,7 +836,8 @@ jobs:
     # rebuilt rootful here (bootc install reads it from root's storage),
     # in parallel with marlin-image rather than after it.
     runs-on: ubuntu-26.04
-    needs: [arch-package]
+    needs: [check, arch-package]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'marlin-vm')
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -905,6 +947,7 @@ jobs:
     # passed in this run.
     runs-on: ubuntu-latest
     needs: [check, journey, greeter, gtk-shell, drm-smoke, marlin-vm]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'parity-ledger')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -942,7 +985,8 @@ jobs:
 
   docs-shots:
     runs-on: ubuntu-latest
-    needs: [journey, app-content, scroll-proof]
+    needs: [check, journey, app-content, scroll-proof]
+    if: contains(fromJSON(needs.check.outputs.lanes), 'docs-shots')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Curate a screenshot set out of this run's own proof artifacts
@@ -970,3 +1014,16 @@ jobs:
           name: docs-shots
           path: /tmp/tuna-docs/shots/
           retention-days: 90
+
+  ci-gate:
+    # One stable status for the run: lanes the selection skipped report
+    # skipped, any failed or cancelled job fails the gate.
+    if: always()
+    needs: [check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, greeter, gtk-shell, portal-security, remote-security, niri-parity, arch-package, marlin-image, marlin-vm, parity-ledger, docs-shots]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$RESULTS"
+          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<<"$RESULTS" >/dev/null

@@ -3,10 +3,6 @@
 #![allow(dead_code)]
 #[path = "../src/bell.rs"]
 mod bell;
-// bell.rs reads `crate::idle_schedule::ACTIVE_INTERVAL`; declare the
-// self-contained module locally so the example root resolves it.
-#[path = "../src/idle_schedule.rs"]
-mod idle_schedule;
 
 fn main() {
     let mode = std::env::args().nth(1).expect("mode required");
@@ -26,10 +22,8 @@ fn main() {
     assert_eq!(bell.rings, 1);
     assert!(bell.visual(std::time::Instant::now()).is_none());
     bell.clear_visual();
-    // Scheduler introspection stays linked: the audio proof never
-    // schedules, but the example must keep compiling against the full
-    // `Bell` surface (and `ACTIVE_INTERVAL` through it) so a signature
-    // drift breaks loudly instead of rotting silently.
-    let _player = bell.player_pid();
+    // The loop's deadline stays linked: the audio proof never schedules,
+    // but the example must keep compiling against the full `Bell`
+    // surface so a signature drift breaks loudly instead of rotting.
     let _deadline = bell.player_deadline();
 }

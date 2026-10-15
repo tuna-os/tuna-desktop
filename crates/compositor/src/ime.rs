@@ -43,27 +43,6 @@ impl ImeBridge {
     pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
         self.wake.connect(wake);
     }
-    pub(crate) fn child_pids(&self) -> Vec<u32> {
-        [&self.child, &self.xim, &self.retired_xim]
-            .into_iter()
-            .filter_map(|child| child.as_ref().map(Child::id))
-            .collect()
-    }
-    pub(crate) fn next_delay(&self, now: u64) -> Option<Duration> {
-        let native = (self.child.is_none() && self.starts <= MAX_RESTARTS)
-            .then_some(self.next_ms.saturating_sub(now));
-        let xim = (self.x11_display.is_some()
-            && self.xim.is_none()
-            && self.retired_xim.is_none()
-            && self.xim_address_probe.is_none()
-            && self.xim_starts <= MAX_RESTARTS)
-            .then_some(self.xim_next_ms.saturating_sub(now));
-        native
-            .into_iter()
-            .chain(xim)
-            .min()
-            .map(Duration::from_millis)
-    }
 
     /// The bridge to run for this session, if any: `TUNA_IBUS=0` turns
     /// it off; otherwise it runs when IBus is installed (`ibus-daemon`
@@ -135,6 +114,24 @@ impl ImeBridge {
         }
     }
 
+    /// Milliseconds until [`poll`](Self::poll) next has work of its own:
+    /// a bridge or XIM restart gate, or (16 ms) an XIM address probe in
+    /// flight. Child exits wake the loop through SIGCHLD (#503).
+    pub fn next_wake_ms(&self, now_ms: u64) -> Option<u64> {
+        let bridge = (self.child.is_none() && self.starts <= MAX_RESTARTS)
+            .then(|| self.next_ms.saturating_sub(now_ms));
+        let xim = if self.xim_address_probe.is_some() {
+            Some(16)
+        } else {
+            (self.x11_display.is_some()
+                && self.xim.is_none()
+                && self.retired_xim.is_none()
+                && self.xim_starts <= MAX_RESTARTS)
+                .then(|| self.xim_next_ms.saturating_sub(now_ms))
+        };
+        bridge.into_iter().chain(xim).min()
+    }
+
     /// The XIM helper may connect only after the compositor's XWM is ready.
     /// Advertising reserved sockets alone must not activate XWayland.
     pub fn set_ready_x11_display(&mut self, display: Option<u32>) {
@@ -193,7 +190,10 @@ impl ImeBridge {
             ])
             .find(|path| path.is_file());
         let Some(bin) = bin else {
-            self.xim_next_ms = now_ms + RESTART_DELAY_MS;
+            // No XIM helper installed: nothing to start this session, and
+            // no restart gate to come back for.
+            self.xim_starts = MAX_RESTARTS + 1;
+            self.xim_address_probe = None;
             return;
         };
         // A single worker owns the private address lookup and its pipe. The

@@ -63,9 +63,6 @@ impl Reader {
     pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
         self.wake.connect(wake);
     }
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        (self.enabled && self.child.is_none() && self.attempts < 3).then_some(self.next_start)
-    }
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
     }
@@ -93,6 +90,14 @@ impl Reader {
             self.state = State::Disabled;
         }
     }
+
+    /// When [`poll`](Self::poll) next starts a reader by itself: the
+    /// restart gate of an enabled reader without a child (a departure
+    /// still in progress is checked again at the gate). Child exits wake
+    /// the loop through SIGCHLD and watcher reports through the [`Wake`](crate::wake::Wake).
+    pub fn next_deadline(&self) -> Option<Instant> {
+        (self.enabled && self.child.is_none() && self.attempts < 3).then_some(self.next_start)
+    }
     fn stop(&mut self) {
         self.observed = None;
         if let Some(mut child) = self.child.take() {
@@ -119,12 +124,14 @@ impl Reader {
     fn await_departure(&mut self, pid: u32) {
         let (sender, receiver) = mpsc::channel();
         self.departing = Some(receiver);
+        let wake = self.wake.clone();
         std::thread::spawn(move || {
             let until = Instant::now() + DEPARTURE_BOUND;
             while departing_owner(pid, &bus_call) && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(50));
             }
             let _ = sender.send(());
+            wake.signal();
         });
     }
     /// True while a stopped child may still hold an Orca name.

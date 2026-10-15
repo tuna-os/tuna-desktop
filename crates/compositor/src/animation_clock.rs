@@ -38,9 +38,6 @@ pub struct AnimationClock {
 }
 
 impl AnimationClock {
-    pub(crate) fn watch_path(&self) -> Option<PathBuf> {
-        self.path.clone()
-    }
     /// Real time, starting at zero.
     pub fn real() -> Self {
         Self {

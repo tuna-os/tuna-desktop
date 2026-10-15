@@ -22,6 +22,8 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    /// Each notification wakes the compositor loop through the
+    /// [`Wake`](crate::wake::Wake) connected by [`set_wake`](Self::set_wake).
     pub fn start(generation: Arc<AtomicU64>) -> zbus::Result<Self> {
         let connection = zbus::blocking::connection::Builder::system()?
             .method_timeout(Duration::from_secs(5))

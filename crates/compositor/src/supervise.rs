@@ -418,14 +418,6 @@ impl ShellDriver {
         self.env.push((name.to_owned(), value.to_owned()));
     }
 
-    /// Non-blocking supervision step at `now_ms`. Never blocks the
-    /// compositor tick: spawn failures and dead children report as
-    /// values, and every outcome is also appended as a
-    /// [`SupervisorEvent`] for [`drain_events`](Self::drain_events).
-    pub(crate) fn next_delay_ms(&self, now_ms: u64) -> Option<u64> {
-        (self.supervisor.child_pid().is_none() && self.supervisor.exhaust().is_ok())
-            .then(|| self.supervisor.backoff_remaining_ms(now_ms))
-    }
     pub fn poll(&mut self, now_ms: u64) -> ShellStatus {
         let supervisor = &mut self.supervisor;
         let bin = &self.bin;
