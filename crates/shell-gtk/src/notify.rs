@@ -255,8 +255,11 @@ pub struct NotifyUi {
     user_watch: Cell<UserWatch>,
     user_watch_signal: RefCell<Option<gio::SignalSubscription>>,
     /// Told when Do Not Disturb turns on or off.
-    dnd_changed: RefCell<Vec<Box<dyn Fn(bool)>>>,
+    dnd_changed: RefCell<Vec<DndListener>>,
 }
+
+/// Told when Do Not Disturb turns on or off.
+type DndListener = Box<dyn Fn(bool)>;
 
 /// One notification as GNOME 51 draws it (messageList.js
 /// NotificationMessage): a header with the source icon, app name, time

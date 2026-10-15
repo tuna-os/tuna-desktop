@@ -2197,7 +2197,7 @@ fn build(app: &adw::Application) {
         let last_frames: RefCell<Vec<tuna_shell_control::SwitcherThumbnail>> = RefCell::default();
         // A later re-sync, however often it is asked for before it runs
         // (filled in below, once `sync` exists).
-        let resync: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::default();
+        let resync = Rc::new(RefCell::new(None::<Rc<dyn Fn()>>));
         let resync_pending: Rc<Cell<bool>> = Rc::default();
         let resync_after = {
             let (resync, pending) = (resync.clone(), resync_pending.clone());

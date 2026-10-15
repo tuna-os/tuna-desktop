@@ -249,6 +249,8 @@ pub struct CandidatePopup {
     state: RefCell<State>,
     conn: RefCell<Option<gio::DBusConnection>>,
     connecting: Cell<bool>,
+    /// The address file changed while a connection attempt was running.
+    missed: Cell<bool>,
     log_pending: Cell<bool>,
     /// IBus's address directory, whose changes mean a daemon (re)started.
     address_monitor: RefCell<Option<gio::FileMonitor>>,
@@ -335,6 +337,7 @@ impl CandidatePopup {
             state: RefCell::default(),
             conn: RefCell::new(None),
             connecting: Cell::new(false),
+            missed: Cell::new(false),
             log_pending: Cell::new(false),
             address_monitor: RefCell::new(None),
             retry: RefCell::new(None),
@@ -634,8 +637,11 @@ impl CandidatePopup {
             move |result| {
                 let Some(ui) = weak.upgrade() else { return };
                 ui.connecting.set(false);
+                let missed = ui.missed.replace(false);
                 match result {
                     Ok(conn) => ui.serve(conn),
+                    // The address file changed mid-attempt: use the new one.
+                    Err(_) if missed => ui.connect(),
                     // A stale address (the daemon gone): try again later.
                     Err(_) => ui.retry_later(),
                 }
@@ -707,6 +713,7 @@ impl CandidatePopup {
                     | gio::FileMonitorEvent::Renamed
             );
             if let Some(ui) = weak.upgrade().filter(|_| written) {
+                ui.missed.set(ui.connecting.get());
                 ui.connect();
             }
         });
@@ -764,11 +771,13 @@ impl CandidatePopup {
                 Err(e) => eprintln!("tuna-shell-gtk: IBus panel: RequestName: {e}"),
             },
         );
+        // GDBus emits `closed` on this (the main) thread's context.
         let weak = Rc::downgrade(self);
-        conn.connect_closed(move |_, _, _| {
+        conn.connect_local("closed", false, move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.closed();
             }
+            None
         });
         let gone = conn.is_closed();
         self.conn.replace(Some(conn));
