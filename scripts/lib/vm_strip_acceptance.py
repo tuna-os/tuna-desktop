@@ -556,9 +556,12 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         delta = 53 if x + 53 < 1270 else -53
         move(x, y)
         button(True)
-        # Genuine initial movement also crosses GTK's gesture threshold.
-        move(x + (12 if delta > 0 else -12), y)
+        # The virtual tablet reports position and buttons together, so a move
+        # queued right behind the press can carry it to the later point: run
+        # 38726161191 pressed at x+12, in the gap past Alpha's edge. GTK's drag
+        # begins on the press itself; see it land before moving.
         pressed = ready('scroll', extra=lambda sample, found: sample['fixture']['windows']['alpha']['resize_requests'] > owner['fixture']['windows']['alpha']['resize_requests'])
+        move(x + (12 if delta > 0 else -12), y)
         move(x + delta, y)
         resized = ready('scroll', pressed, extra=lambda sample, found: found['alpha']['rect'][2] == rect[2] + delta)
         button(False)

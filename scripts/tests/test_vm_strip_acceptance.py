@@ -266,6 +266,15 @@ class Tests(unittest.TestCase):
         self.assertIn("chord('meta_l', 'shift', 'left' if step < 0 else 'right')", source)
         self.assertIn("beta_gap(sample, original, edge=edge) == want", source)
 
+    def test_grip_press_is_observed_before_any_drag_motion(self):
+        # Run 38726161191: the tablet carried the press to the next queued
+        # point (x+12), past Alpha's edge, so GTK never saw the grip press.
+        source = Path(proof.__file__).read_text()
+        press = source.index("move(x, y)\n        button(True)")
+        pressed = source.index("pressed = ready('scroll'", press)
+        motion = source.index("move(x + (12 if delta > 0 else -12), y)", press)
+        self.assertLess(pressed, motion)
+
 
 class EndpointEvidence(unittest.TestCase):
     def test_storage_failure_preserves_exact_primary_endpoint_exception(self):
