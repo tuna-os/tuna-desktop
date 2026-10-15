@@ -199,6 +199,13 @@ impl PreviewChrome {
             surface.set_input_region(Some(&region));
         }
     }
+
+    /// Forget what the overlay drew, so the next [`PreviewChrome::update`]
+    /// looks every window's title and icon up again (the app list
+    /// changed). The hover stays, so nothing fades in again.
+    pub fn forget_windows(&self) {
+        self.shown.borrow_mut().0.clear();
+    }
 }
 
 #[cfg(test)]

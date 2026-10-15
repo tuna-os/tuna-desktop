@@ -10,7 +10,12 @@
 //! Transport behavior mirrors the server side: the stream is put in
 //! nonblocking mode at construction and `WouldBlock` is always surfaced
 //! to the caller (as [`ControlError::Io`]), never hidden behind a retry
-//! loop, so the panel event loop stays responsive.
+//! loop, so the panel event loop stays responsive. The socket is
+//! exposed through [`AsFd`] so the caller can watch it for readability
+//! and drain [`ControlClient::poll`] only when bytes arrive; frames
+//! already read into the buffer show in
+//! [`ControlClient::has_buffered_frame`], and a dead connection in
+//! [`ControlClient::is_closed`].
 //!
 //! Resnapshot rule (ADR 0002): the protocol has no dedicated
 //! snapshot-request opcode, so re-sending `Hello` via
@@ -30,6 +35,7 @@
 //! wiring, not transport.
 
 use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use tuna_shell_control::{
@@ -173,6 +179,9 @@ pub struct ControlClient {
     environment: Vec<(String, String)>,
     /// Overview previews and the hovered one, from the compositor.
     overview_previews: (Vec<tuna_shell_control::PreviewInfo>, Option<u64>),
+    /// The read half reached end-of-file or failed: nothing more will
+    /// arrive on this connection.
+    closed: bool,
 }
 
 impl ControlClient {
@@ -203,6 +212,7 @@ impl ControlClient {
             pointer_output: None,
             environment: Vec::new(),
             overview_previews: (Vec::new(), None),
+            closed: false,
         })
     }
 
@@ -228,6 +238,26 @@ impl ControlClient {
     /// cleared except by applying a `Snapshot`.
     pub fn needs_snapshot(&self) -> bool {
         self.needs_snapshot
+    }
+
+    /// Whether the read half ended (the compositor closed the socket)
+    /// or failed with something other than `WouldBlock`. A closed client
+    /// keeps its last state; [`ControlClient::poll`] only errors from
+    /// here on.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Whether a complete frame (or an oversize prefix, which
+    /// [`ControlClient::poll`] rejects) already sits in the read buffer.
+    /// The socket does not report these as readable, so a caller that
+    /// waits for readability drains them first.
+    pub fn has_buffered_frame(&self) -> bool {
+        let Some(prefix) = self.read_buf.first_chunk::<4>() else {
+            return false;
+        };
+        let len = u32::from_le_bytes(*prefix) as usize;
+        len > MAX_FRAME_BYTES || self.read_buf.len() >= 4 + len
     }
 
     /// Session-lock display value from the latest snapshot (false before
@@ -830,12 +860,21 @@ impl ControlClient {
             let mut chunk = [0u8; 8192];
             match self.stream.read(&mut chunk) {
                 Ok(0) => {
+                    self.closed = true;
                     return Err(ControlError::Unexpected(
                         "control connection closed".to_owned(),
                     ));
                 }
                 Ok(n) => self.read_buf.extend_from_slice(&chunk[..n]),
-                Err(e) => return Err(ControlError::Io(e)),
+                Err(e) => {
+                    if !matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) {
+                        self.closed = true;
+                    }
+                    return Err(ControlError::Io(e));
+                }
             }
         }
     }
@@ -848,6 +887,20 @@ impl ControlClient {
             self.next_request_id = INITIAL_REQUEST_ID;
         }
         id
+    }
+}
+
+/// The connected socket, for a readability watch in the caller's event
+/// loop (the stream stays owned, and nonblocking, here).
+impl AsFd for ControlClient {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+impl AsRawFd for ControlClient {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 }
 
@@ -1566,5 +1619,50 @@ mod tests {
             }
             other => panic!("expected WouldBlock, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn frames_read_ahead_show_as_buffered_until_polled() {
+        let (mut client, mut peer) = handshook();
+        // Two frames in one write: the first read takes both off the
+        // socket, so only the buffer still holds the second.
+        let mut both = encode_frame(&snapshot_rev7());
+        both.extend_from_slice(&encode_frame(&Message::Overview { open: true }));
+        peer.write_all(&both).expect("server write");
+        assert!(!client.has_buffered_frame());
+        assert_eq!(
+            client.poll().expect("snapshot"),
+            Handled::Snapshot { revision: 7 }
+        );
+        assert!(client.has_buffered_frame());
+        assert_eq!(
+            client.poll().expect("overview"),
+            Handled::Overview { open: true }
+        );
+        assert!(!client.has_buffered_frame());
+        // Half a frame is not a frame.
+        let frame = encode_frame(&Message::Overview { open: false });
+        peer.write_all(&frame[..frame.len() - 1])
+            .expect("server write");
+        assert!(client.poll().is_err());
+        assert!(!client.has_buffered_frame());
+        assert!(!client.is_closed());
+    }
+
+    #[test]
+    fn a_hung_up_peer_marks_the_client_closed() {
+        let (mut client, peer) = handshook();
+        assert!(client.poll().is_err());
+        assert!(!client.is_closed(), "WouldBlock is not a hang-up");
+        drop(peer);
+        assert!(matches!(client.poll(), Err(ControlError::Unexpected(_))));
+        assert!(client.is_closed());
+    }
+
+    #[test]
+    fn the_socket_is_exposed_for_a_readability_watch() {
+        let (client, _peer) = pair();
+        assert_eq!(client.as_fd().as_raw_fd(), client.as_raw_fd());
+        assert!(client.as_raw_fd() >= 0);
     }
 }
