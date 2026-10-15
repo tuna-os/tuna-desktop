@@ -4451,6 +4451,17 @@ wb_pixel_preconditions() {
         fail "$WB_GATE" "effects are not neutral at gate start"
 }
 
+# The shell logs its effect request before the compositor applies it, so an
+# off capture taken on the log line alone can bracket the change (gtk-shell
+# 38732705939: brightness 0.6 -> 1.0 across both-off). The animation clock is
+# frozen here, so any fade-out would hold an intermediate value and never
+# reach neutral: waiting for neutral keeps the immediacy proof intact.
+wb_await_off() {
+    cstate '.wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1 and .wellbeing_effects.animating == false' \
+        "compositor applied the disable" 5 ||
+        fail "$1" "the compositor never reached neutral on the frozen clock (fade-out found)"
+}
+
 wb_capture() {
     label="$1"
     cstate '.animation_clock_manual == true and (.animation_clock_ms | type) == "number" and .animation_clock_ms >= 0 and .animation_clock_ms == (.animation_clock_ms | floor)' "manual capture clock" ||
@@ -4680,6 +4691,7 @@ jq -s '[.[] | select(.label | startswith("gray-ramp-"))]' "$WB_CAPS_JSONL" \
     --desaturation 1 --brightness 1 ||
     fail G-WELLBEING-PIXEL-GRAY "neutral passed the gray assertion (weak test)"
 wb_limit_cleanup
+wb_await_off G-WELLBEING-PIXEL-GRAY
 wb_capture gray-off
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" immediate-off \
     --baseline "$ARTIFACTS/wb-gray-baseline.png" \
@@ -4766,6 +4778,7 @@ until tail -c +"$((fade_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect gray
     [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
 tail -c +"$((fade_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" ||
     fail G-WELLBEING-PIXEL-FADE "no unfade after deselect"
+wb_await_off G-WELLBEING-PIXEL-FADE
 wb_capture fade-off
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" immediate-off \
     --baseline "$ARTIFACTS/wb-fade-baseline.png" \
@@ -4879,6 +4892,7 @@ until tail -c +"$((both_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect gray
     [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
 tail -c +"$((both_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" ||
     fail G-WELLBEING-PIXEL-BOTH "no combined unfade after reset"
+wb_await_off G-WELLBEING-PIXEL-BOTH
 wb_capture both-off
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" immediate-off \
     --baseline "$ARTIFACTS/wb-both-baseline.png" \
