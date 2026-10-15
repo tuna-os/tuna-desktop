@@ -6,9 +6,11 @@
 //! the service tiles; a press opens the item's dbusmenu as a popup.
 //!
 //! The core ([`IndicatorHost`], layout, paint) is wire-free. The
-//! D-Bus edge ([`WatcherBus`]) polls on the panel's slow tick — the
-//! same degradation shape as settings and tiles: no bus, or a taken
-//! watcher name, reads as an empty host, never a hang.
+//! D-Bus edge ([`WatcherBus`]) polls on the panel's slow tick, or, once
+//! [`WatcherBus::watch`] is set up, reports registrations, item change
+//! signals and vanished items as they happen — the same degradation
+//! shape as settings and tiles: no bus, or a taken watcher name, reads
+//! as an empty host, never a hang.
 
 use std::sync::{Arc, Mutex};
 
@@ -301,6 +303,12 @@ pub fn split_service(service: &str) -> (String, String) {
     }
 }
 
+/// Whether a `NameOwnerChanged(name, _, new_owner)` means one of the
+/// registered `items` lost its bus name (the item went away).
+fn vanished_item(items: &[String], name: &str, new_owner: &str) -> bool {
+    new_owner.is_empty() && items.iter().any(|item| split_service(item).0 == name)
+}
+
 /// An item's `Menu` property. The spec types it as an object path
 /// (`o`); some items send a plain string, so both are accepted.
 fn menu_path(item: &zbus::blocking::Proxy<'_>) -> Option<String> {
@@ -396,6 +404,16 @@ fn parse_menu_node(node: &zbus::zvariant::OwnedValue) -> Option<MenuEntry> {
     })
 }
 
+/// Called when the hosted items may have changed ([`WatcherBus::watch`]).
+#[derive(Clone)]
+struct Wake(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Wake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Wake")
+    }
+}
+
 /// Shared watcher registrations (the interface object and the poll
 /// path read the same state).
 #[derive(Debug, Default)]
@@ -404,6 +422,8 @@ struct WatcherState {
     items: Vec<String>,
     /// Registered host services.
     hosts: Vec<String>,
+    /// Told about new registrations, once [`WatcherBus::watch`] ran.
+    wake: Option<Wake>,
 }
 
 /// The `org.kde.StatusNotifierWatcher` object: registration methods
@@ -418,10 +438,15 @@ struct Watcher {
 impl Watcher {
     /// Register an item service (`bus name` or `bus name/path`).
     fn register_status_notifier_item(&mut self, service: String) {
-        if let Ok(mut state) = self.state.lock() {
-            if !state.items.contains(&service) {
-                state.items.push(service);
+        let wake = self.state.lock().ok().and_then(|mut state| {
+            if state.items.contains(&service) {
+                return None;
             }
+            state.items.push(service);
+            state.wake.clone()
+        });
+        if let Some(Wake(wake)) = wake {
+            wake();
         }
     }
 
@@ -542,6 +567,84 @@ impl WatcherBus {
             .lock()
             .map(|state| state.items.clone())
             .unwrap_or_default()
+    }
+
+    /// Call `wake` whenever the hosted items may have changed: a new
+    /// registration, any item's change signal (`NewIcon`, `NewStatus`,
+    /// `NewTitle`...), or a registered item's bus name losing its owner.
+    /// The caller re-reads ([`WatcherBus::registered`],
+    /// [`WatcherBus::prune_vanished`], [`WatcherBus::fetch_info`]) then,
+    /// instead of on a timer. The two signal listeners block on their
+    /// own threads for the connection's life; `wake` runs on those and
+    /// on zbus's. Returns false without a connection
+    /// ([`WatcherBus::ensure`] first) or when the bus refuses the match
+    /// rules, so the caller keeps polling.
+    pub fn watch(&self, wake: impl Fn() + Send + Sync + 'static) -> bool {
+        let Some(conn) = self.conn.as_ref() else {
+            return false;
+        };
+        let rules = (|| -> zbus::Result<_> {
+            let items = zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .interface("org.kde.StatusNotifierItem")?
+                .build();
+            let owners = zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender("org.freedesktop.DBus")?
+                .interface("org.freedesktop.DBus")?
+                .member("NameOwnerChanged")?
+                .build();
+            Ok([
+                (
+                    zbus::blocking::MessageIterator::for_match_rule(items, conn, None)?,
+                    false,
+                ),
+                (
+                    zbus::blocking::MessageIterator::for_match_rule(owners, conn, None)?,
+                    true,
+                ),
+            ])
+        })();
+        let listeners = match rules {
+            Ok(listeners) => listeners,
+            Err(e) => {
+                eprintln!("tuna-shell-host: indicator signals unavailable: {e}");
+                return false;
+            }
+        };
+        let wake = Wake(Arc::new(wake));
+        if let Ok(mut state) = self.state.lock() {
+            state.wake = Some(wake.clone());
+        }
+        for (messages, owners) in listeners {
+            let (wake, state) = (wake.clone(), self.state.clone());
+            let spawned = std::thread::Builder::new()
+                .name("tuna-tray-signals".into())
+                .spawn(move || {
+                    for message in messages {
+                        let Ok(message) = message else {
+                            continue;
+                        };
+                        if owners {
+                            let Ok((name, _, new_owner)) =
+                                message.body().deserialize::<(String, String, String)>()
+                            else {
+                                continue;
+                            };
+                            let items = state.lock().map(|s| s.items.clone()).unwrap_or_default();
+                            if !vanished_item(&items, &name, &new_owner) {
+                                continue;
+                            }
+                        }
+                        (wake.0)();
+                    }
+                });
+            if let Err(e) = spawned {
+                eprintln!("tuna-shell-host: indicator signal thread: {e}");
+                return false;
+            }
+        }
+        true
     }
 
     /// Raw item properties for icon selection. The caller decides
@@ -802,6 +905,20 @@ mod tests {
                 "/StatusNotifierItem".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn only_a_registered_item_losing_its_name_counts_as_vanished() {
+        let items = vec![
+            ":1.42".to_owned(),
+            "org.example.Item/StatusNotifierItem".to_owned(),
+        ];
+        assert!(vanished_item(&items, ":1.42", ""));
+        assert!(vanished_item(&items, "org.example.Item", ""));
+        // A new owner is not a vanishing, and other names are not ours.
+        assert!(!vanished_item(&items, "org.example.Item", ":1.50"));
+        assert!(!vanished_item(&items, ":1.7", ""));
+        assert!(!vanished_item(&[], ":1.42", ""));
     }
 
     #[test]
