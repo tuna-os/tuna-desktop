@@ -25,6 +25,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::intake::NotificationBus;
+use tuna_shell_host::notification_policy::GioPolicyStore;
 use tuna_shell_host::notifications::{Notification, NotificationCenter, Urgency};
 
 /// How long a normal or low banner stays up (GNOME: about 4 s).
@@ -359,6 +360,13 @@ impl NotifyUi {
     /// Build the surfaces and claim the bus.
     pub fn new(app: &gtk::Application) -> Rc<Self> {
         let center = Arc::new(Mutex::new(NotificationCenter::load_system()));
+        // GNOME Settings' notification policy, read live on every
+        // arrival (#348); a restart drops whatever an app disabled
+        // since it was filed.
+        if let Ok(mut filed) = center.lock() {
+            filed.set_policy(Arc::new(GioPolicyStore::new()));
+            filed.enforce_policy();
+        }
         let mut bus = NotificationBus::new(center.clone());
         // Wire arrivals (on zbus threads) wake the main loop; a wake
         // already queued covers any that follow it.
