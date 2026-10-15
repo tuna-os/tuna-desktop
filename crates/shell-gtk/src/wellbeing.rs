@@ -2202,10 +2202,7 @@ pub fn start(
         read_screen_time_settings(),
         HistoryStore::new(history_path()),
     );
-    let mut breaks = BreakService::new();
-    breaks
-        .manager
-        .set_selected(&read_selected_breaks(), wall_now());
+    let breaks = BreakService::new();
     let rt = Rc::new(RefCell::new(Runtime {
         hooks,
         tracker,
@@ -2230,10 +2227,6 @@ pub fn start(
     // Baseline first: the compositor starts from neutral even if a limit
     // is already reached (the first polls then send the actual pair).
     (rt.borrow().hooks.effect_hook)(false, false);
-    // The first polls run now so the startup edge, the limit state and any
-    // due break apply immediately instead of a tick late.
-    screen_tick(&rt);
-    break_tick(&rt);
     {
         let rt = rt.clone();
         glib::timeout_add_local(BREAK_POLL, move || {
@@ -2271,6 +2264,23 @@ pub fn start(
             break_tick(&rt);
         });
     }
+    // Read the live values only after every retained subscription is
+    // connected: a write landing before the connect emits nothing we could
+    // observe, so an earlier read would keep a stale selection for good.
+    {
+        let mut r = rt.borrow_mut();
+        if let Some(settings) = r.screen_settings.clone() {
+            r.tracker
+                .set_settings(read_screen_time_settings_from(&settings));
+        }
+        r.breaks
+            .manager
+            .set_selected(&read_selected_breaks(), wall_now());
+    }
+    // The first polls run now so the startup edge, the limit state and any
+    // due break apply immediately instead of a tick late.
+    screen_tick(&rt);
+    break_tick(&rt);
     {
         let rt = rt.clone();
         app.connect_shutdown(move |_| {

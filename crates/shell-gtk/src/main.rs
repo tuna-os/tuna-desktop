@@ -1049,8 +1049,15 @@ fn quick_settings_popover(
         dnd.connect_toggled(move |t| {
             notify.set_dnd(t.is_active());
             // This closure retains Settings and its external-change subscription.
+            // Write only a user-originated change. An external show-banners
+            // flip reaches this toggle through the 250 ms sync below; echoing
+            // it back makes the keyfile backend rewrite its whole cached file
+            // and can revert other keys written meanwhile (lost break enable).
             if let Some(notes) = notes_settings.as_ref() {
-                let _ = notes.set_boolean("show-banners", !t.is_active());
+                let banners = !t.is_active();
+                if notes.boolean("show-banners") != banners {
+                    let _ = notes.set_boolean("show-banners", banners);
+                }
             }
         });
     }
