@@ -94,20 +94,30 @@ pub fn take_feedback(roots: &[WlSurface], output: &Output) -> OutputPresentation
 /// Include callbacks, presentation, FIFO barriers and deferred commit timers.
 #[doc(hidden)]
 pub fn pending_frame_work(roots: &[WlSurface]) -> bool {
-    pending_work(roots, true)
+    pending_work(roots, true, true)
 }
 
 /// Refresh obligations apply to all mapped surfaces, but only presentation
 /// requests belonging to this output's drawn surfaces can require scanout.
 /// A hidden request stays pending until that surface is actually drawn.
+/// Frame callbacks of `throttled` roots (hidden windows) are paid by the
+/// hidden-window beat, not by a scanout: an unchanged output must not
+/// repaint at the display rate while one waits (#503). Their FIFO
+/// barriers and commit timers still advance on each refresh cycle.
 #[doc(hidden)]
-pub fn pending_output_work(roots: &[WlSurface], drawn: &[WlSurface]) -> bool {
-    pending_work(roots, false) || pending_work(drawn, true)
+pub fn pending_output_work(roots: &[WlSurface], drawn: &[WlSurface], throttled: &[WlSurface]) -> bool {
+    roots.iter().any(|root| {
+        pending_work(
+            std::slice::from_ref(root),
+            !throttled.contains(root),
+            false,
+        )
+    }) || pending_work(drawn, true, true)
 }
 
-fn pending_work(roots: &[WlSurface], include_presentation: bool) -> bool {
+/// Whether any surface tree in `roots` holds an unsent frame callback.
+pub(crate) fn pending_callbacks(roots: &[WlSurface]) -> bool {
     use smithay::wayland::compositor::SurfaceAttributes;
-    use smithay::wayland::presentation::PresentationFeedbackCachedState;
     let mut pending = false;
     for root in roots {
         with_surface_tree_downward(
@@ -120,7 +130,31 @@ fn pending_work(roots: &[WlSurface], include_presentation: bool) -> bool {
                     .get::<SurfaceAttributes>()
                     .current()
                     .frame_callbacks
-                    .is_empty()
+                    .is_empty();
+            },
+            |_, _, _| !pending,
+        );
+    }
+    pending
+}
+
+fn pending_work(roots: &[WlSurface], include_callbacks: bool, include_presentation: bool) -> bool {
+    use smithay::wayland::compositor::SurfaceAttributes;
+    use smithay::wayland::presentation::PresentationFeedbackCachedState;
+    let mut pending = false;
+    for root in roots {
+        with_surface_tree_downward(
+            root,
+            (),
+            |_, _, _| TraversalAction::DoChildren(()),
+            |_, states, _| {
+                pending |= (include_callbacks
+                    && !states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .frame_callbacks
+                        .is_empty())
                     || (include_presentation
                         && !states
                             .cached_state
