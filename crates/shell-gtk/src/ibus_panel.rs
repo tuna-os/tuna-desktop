@@ -92,7 +92,7 @@ const XML: &str = r#"<node>
     <signal name="CursorDown"/>
     <signal name="PageUp"/>
     <signal name="PageDown"/>
-    <signal name="PropertyActivate"><arg type="s"/><arg type="i"/></signal>
+    <signal name="PropertyActivate"><arg type="s"/><arg type="u"/></signal>
     <signal name="PropertyShow"><arg type="s"/></signal>
     <signal name="PropertyHide"><arg type="s"/></signal>
     <signal name="CandidateClicked"><arg type="u"/><arg type="u"/><arg type="u"/></signal>

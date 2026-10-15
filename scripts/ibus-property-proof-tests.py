@@ -112,6 +112,14 @@ class Controls(unittest.TestCase):
         self.assertIn('expose_toggle_action(&button);', gtk)
         self.assertIn('button.insert_action_group("property", Some(&actions));', gtk)
 
+    def test_property_activate_state_is_unsigned(self):
+        # ibus-daemon reads PropertyActivate as (&su); an (si) body reaches
+        # the engine as a NULL key (journey 38726161191).
+        host = (ROOT / "crates/shell-host/src/ibus_properties.rs").read_text()
+        panel = (ROOT / "crates/shell-gtk/src/ibus_panel.rs").read_text()
+        self.assertIn('pub fn activate(&mut self, token: &Token) -> Vec<(String, u32)>', host)
+        self.assertIn('<signal name="PropertyActivate"><arg type="s"/><arg type="u"/></signal>', panel)
+
 
 if __name__ == "__main__":
     unittest.main()

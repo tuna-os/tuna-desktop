@@ -278,7 +278,10 @@ impl Properties {
             key: key.into(),
         }
     }
-    pub fn activate(&mut self, token: &Token) -> Vec<(String, i32)> {
+    /// `(key, state)` pairs for `PropertyActivate`. The state is `u32`
+    /// because ibus-daemon reads the signal as `(&su)`; an `(si)` body
+    /// leaves it a NULL key and the engine an unknown activation.
+    pub fn activate(&mut self, token: &Token) -> Vec<(String, u32)> {
         if self.exhausted
             || token.epoch != self.epoch
             || self.engine.is_none()
@@ -286,17 +289,17 @@ impl Properties {
         {
             return vec![];
         }
-        fn activate(items: &mut [Property], key: &str) -> Vec<(String, i32)> {
+        fn activate(items: &mut [Property], key: &str) -> Vec<(String, u32)> {
             if let Some(index) = items.iter().position(|p| p.key == key) {
                 let p = &mut items[index];
                 if !p.visible || !p.sensitive {
                     return vec![];
                 }
                 match p.kind {
-                    Kind::Action => return vec![(p.key.clone(), p.state as i32)],
+                    Kind::Action => return vec![(p.key.clone(), p.state)],
                     Kind::Toggle => {
                         p.state = u32::from(p.state != 1);
-                        return vec![(p.key.clone(), p.state as i32)];
+                        return vec![(p.key.clone(), p.state)];
                     }
                     Kind::Radio if p.state != 1 => {
                         return items
@@ -305,7 +308,7 @@ impl Properties {
                             .filter(|(_, p)| p.kind == Kind::Radio && p.visible)
                             .map(|(i, p)| {
                                 p.state = u32::from(i == index);
-                                (p.key.clone(), p.state as i32)
+                                (p.key.clone(), p.state)
                             })
                             .collect();
                     }
