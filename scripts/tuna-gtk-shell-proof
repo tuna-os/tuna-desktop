@@ -4285,13 +4285,14 @@ wb_a11y_dump() {
 # step keeps the user active and the press within about a second of the
 # banner showing. Waits 1.5 s after the press, like --press alone.
 wb_press_banner() {
-    local gate="$1" out="$2" title="$3" button="$4" until=$(($(date +%s) + $5)) step=0
-    while [ "$(date +%s)" -le "$until" ]; do
-        xdotool mousemove --window "$WID" $((WIDTH / 3 + step % 2 * 40)) $((HEIGHT / 2)) ||
-            fail "$gate" "keep-alive failed"
-        step=$((step + 1))
+    wbpb_gate="$1" wbpb_out="$2" wbpb_title="$3" wbpb_button="$4"
+    wbpb_until=$(($(date +%s) + $5)) wbpb_step=0
+    while [ "$(date +%s)" -le "$wbpb_until" ]; do
+        xdotool mousemove --window "$WID" $((WIDTH / 3 + wbpb_step % 2 * 40)) $((HEIGHT / 2)) ||
+            fail "$wbpb_gate" "keep-alive failed"
+        wbpb_step=$((wbpb_step + 1))
         sleep 0.5
-        if wb_a11y_dump "$out" 20 --when-showing "$title" --press "$button" >/dev/null 2>&1; then
+        if wb_a11y_dump "$wbpb_out" 20 --when-showing "$wbpb_title" --press "$wbpb_button" >/dev/null 2>&1; then
             WB_PRESS_EPOCH="$(date +%s)"
             sleep 1.5
             return 0
