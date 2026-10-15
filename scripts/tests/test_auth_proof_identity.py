@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Production API identity matcher negatives; no network required."""
 import copy
+import json
 import importlib.util
 from pathlib import Path
 import sys
@@ -33,4 +34,21 @@ class Identity(unittest.TestCase):
    elif mode=='duplicate':j.append(copy.deepcopy(j[1]))
    else:j[1]['conclusion']='failure'
    with self.assertRaises(ValueError):self.validate(r,j,c)
+ def test_queued_run_requires_exact_running_job_and_green_check(self):
+  r,j,c=self.fixtures();r['status']='queued'
+  self.assertEqual(self.validate(r,j,c)['job_id'],1)
+  for index,key,value in [(0,'status','queued'),(0,'status','completed'),(0,'conclusion','success'),(1,'status','queued'),(1,'conclusion',None),(1,'conclusion','failure')]:
+   with self.subTest(index=index,key=key,value=value):
+    jobs=copy.deepcopy(j);jobs[index][key]=value
+    with self.assertRaises(ValueError):self.validate(r,jobs,c)
+  for status in ('completed','waiting','pending','requested',None):
+   with self.subTest(status=status),self.assertRaises(ValueError):self.validate(dict(r,status=status),j,c)
+ def test_mismatch_preserves_observed_public_fields_without_extra_payload(self):
+  r,j,c=self.fixtures();r.update(status='completed',private_payload='excluded fixture value')
+  with self.assertRaises(ValueError) as error:self.validate(r,j,c)
+  receipt=json.loads(str(error.exception).split(': ',1)[1])
+  self.assertEqual(receipt['expected']['status'],['in_progress','queued'])
+  self.assertEqual(receipt['observed']['status'],'completed')
+  self.assertEqual(receipt['observed']['commit_sha'],'a'*40)
+  self.assertNotIn('private_payload',receipt['observed'])
 if __name__=='__main__':unittest.main()

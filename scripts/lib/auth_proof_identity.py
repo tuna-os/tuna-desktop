@@ -47,9 +47,23 @@ def validate_identity(run, jobs, commit, expected_sha, run_id, attempt, event):
             or run.get("repository", {}).get("full_name") != REPO
             or run.get("head_sha") != expected_sha or run.get("path") != WORKFLOW
             or run.get("event") != event or event not in ("workflow_dispatch", "pull_request", "push")
-            or run.get("status") != "in_progress" or run.get("conclusion") is not None
+            or run.get("status") not in ("in_progress", "queued") or run.get("conclusion") is not None
             or commit.get("sha") != expected_sha):
-        raise ValueError("CI repository/run/attempt/source/event/workflow mismatch")
+        # Retain the actual public identity fields and allowed run statuses
+        # when refusing. A later API poll cannot reconstruct
+        # the values seen by this invocation.
+        observed = {key: run.get(key) for key in
+                    ("id", "run_attempt", "head_sha", "path", "event", "status", "conclusion")}
+        observed["repository"] = run.get("repository", {}).get("full_name")
+        observed["commit_sha"] = commit.get("sha")
+        expected = {"id": run_id, "run_attempt": attempt, "head_sha": expected_sha,
+                    "path": WORKFLOW, "event": event, "status": ["in_progress", "queued"],
+                    "conclusion": None, "repository": REPO, "commit_sha": expected_sha}
+        raise ValueError("CI repository/run/attempt/source/event/workflow mismatch: " +
+                         json.dumps({"expected": expected, "observed": observed}, sort_keys=True))
+    # The aggregate run may report queued while this exact job is running.
+    # Admission still requires this exact job running and its exact green
+    # prerequisite, with matching source/run/attempt for both below.
     current = [j for j in jobs if j.get("name") == JOB]
     check = [j for j in jobs if j.get("name") == "check"]
     if (len(current) != 1 or current[0].get("status") != "in_progress"
