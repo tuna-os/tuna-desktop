@@ -76,3 +76,10 @@ serial-quality flag, block count and SHA-256 of the exact kernel EDID bytes).
 The metadata is read once at connector discovery and never confers authority
 or restore admission. Decoding rejects more than 64 records and malformed
 vendor/product/serial text.
+
+`CommandKind::SetAcceleratorGrabs { grabs: Vec<AcceleratorGrab> }` and
+`Message::AcceleratorDeactivated { action, time, mode }` follow in 0.37:
+atomic grab replacement with GNOME's `IGNORE_AUTOREPEAT` and
+`TRIGGER_RELEASE` flags (`SUPPORTED_GRAB_FLAGS`; anything else, or more than
+`MAX_ACCELERATORS`, fails decoding), and the release of a `TRIGGER_RELEASE`
+grab's press. The legacy `SetAccelerators` body is unchanged.
