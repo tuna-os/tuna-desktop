@@ -19,10 +19,14 @@ The change bounds that same GTK layer to the union of its children's natural
 sizes. It keeps the existing widgets, CSS, fractional output coordinates,
 200ms hover fade, keyboard mode, exclusive-zone policy and 32px close input
 region. A 12px bleed retains the CSS 4px-blur/2px-offset shadows. The layer is
-anchored top/left at the union's origin; both children and the input region
-are translated by that same integer origin. Explicit natural-size requests
-allow the buffer to shrink after a larger hovered layout. Empty chrome maps
-no surface. There is still one surface, not one window per icon.
+anchored top/left before the union's origin, snapped down to a 120-logical-pixel
+grid. Fractional-scale protocol values use 120ths, so this keeps the layer
+origin on the physical pixel grid at every advertised fractional scale.
+The bounded extra padding is less than 120 logical pixels per leading edge.
+Both children and the input region are translated by that same integer
+origin. Explicit natural-size requests allow the buffer to shrink after a
+larger hovered layout. Empty chrome maps no surface. There is still one
+surface, not one window per icon.
 
 No shader fast path was selected: Smithay's current texture shader multiplies
 sampled color by a runtime alpha, while the inspected Mesa llvmpipe linear

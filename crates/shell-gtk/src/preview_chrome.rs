@@ -25,6 +25,10 @@ const OVERLAY_FADE_MS: f64 = 200.0;
 /// Leave room for the icon and close button's 4px blurred, 2px-offset
 /// shadows (style.css), including their antialiased fringe.
 const CHROME_BLEED: f64 = 12.0;
+/// Fractional output scales are advertised in 120ths. An origin on
+/// this logical grid is an integral physical pixel at every such scale,
+/// so rebasing the GTK buffer cannot shift its subpixel rasterization.
+const ORIGIN_QUANTUM: f64 = 120.0;
 
 /// Bound the widgets in output coordinates, retaining fractional placement.
 /// The old full-output surface clipped anything above/left of the output.
@@ -45,8 +49,11 @@ fn chrome_bounds(
     if !left.is_finite() {
         return None;
     }
-    let x = (left - CHROME_BLEED).floor().max(0.0) as i32;
-    let y = (top - CHROME_BLEED).floor().max(0.0) as i32;
+    let origin = |start: f64| {
+        (((start - CHROME_BLEED) / ORIGIN_QUANTUM).floor() * ORIGIN_QUANTUM).max(0.0) as i32
+    };
+    let x = origin(left);
+    let y = origin(top);
     Some(gtk::cairo::RectangleInt::new(
         x,
         y,
@@ -295,8 +302,8 @@ mod tests {
     fn bounds_include_shadow_bleed_without_rounding_widget_positions() {
         let bounds =
             chrome_bounds([(200.5, 400.2, 64, 64), (100.0, 500.2, 300, 32)].into_iter()).unwrap();
-        assert_eq!((bounds.x(), bounds.y()), (88, 388));
-        assert_eq!((bounds.width(), bounds.height()), (324, 157));
+        assert_eq!((bounds.x(), bounds.y()), (0, 360));
+        assert_eq!((bounds.width(), bounds.height()), (412, 185));
         // Translating to the layer and back preserves the original subpixel position.
         assert_eq!(200.5 - f64::from(bounds.x()) + f64::from(bounds.x()), 200.5);
         assert_eq!(400.2 - f64::from(bounds.y()) + f64::from(bounds.y()), 400.2);
@@ -308,6 +315,15 @@ mod tests {
         assert_eq!((bounds.x(), bounds.y()), (0, 0));
         assert_eq!((bounds.width(), bounds.height()), (36, 28));
         assert!(chrome_bounds(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn bounds_origins_preserve_the_physical_grid_for_fractional_protocol_scales() {
+        let bounds = chrome_bounds([(521.5, 297.2, 383, 64)].into_iter()).unwrap();
+        for scale_120 in 60..=480 {
+            assert_eq!(bounds.x() * scale_120 % 120, 0);
+            assert_eq!(bounds.y() * scale_120 % 120, 0);
+        }
     }
 
     #[test]
