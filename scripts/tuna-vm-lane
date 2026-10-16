@@ -69,6 +69,14 @@ DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
 # stable prefix so startup is still recognized (run 38102898073 r04).
 SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings:")
 EXHAUSTED = "shell supervision: BudgetExhausted"
+# Startup watchdog (the llvmpipe startup hang of run 38890516197): when
+# the keybindings line is still missing SHELL_STACK_AFTER seconds after the
+# shell's first output, or SHELL_STACK_UNPRINTED seconds after the DRM
+# output line while the shell has printed nothing, the guest dumps every
+# shell thread's kernel wait site and user stack into the lane artifacts.
+SHELL_OUTPUT_RE = re.compile(r"tuna-shell-gtk: ")
+SHELL_STACK_AFTER = (20, 60)
+SHELL_STACK_UNPRINTED = 40
 # tuna-vm-health activation probes on the session user's bus; the capture
 # pair proves tuna-portals.conf routes Screenshot and ScreenCast.
 PORTAL_PROBES = ("calendar", "portal", "portal-gnome", "portal-screenshot", "portal-screencast")
@@ -1550,6 +1558,22 @@ def greeter_list_ok(greeter):
     return True, f"gtkgreet picker lists {sessions} with {GREETER_SESSION_NAME!r} preselected"
 
 
+def dump_shell_stack(agent_path, path):
+    """Write the guest's shell-stack diagnostics (or why there are none) to path."""
+    agent = None
+    try:
+        agent = guest_agent.GuestAgent(agent_path)
+        result = agent.run("shell-stack", timeout=120)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        result = {"error": str(error)}
+    finally:
+        if agent is not None:
+            agent.close()
+    with open(path, "w") as stream:
+        json.dump(result, stream, indent=2)
+    log(f"shell startup watchdog: no keybindings line; stacks in {os.path.basename(path)}")
+
+
 def greetd_login(qmp, agent_path, out, record):
     """Drive the shipped graphical greeter, never an initial/autologin session."""
     agent = None
@@ -2352,10 +2376,20 @@ def main():
                 record("V-GREETD-LOGIN", False, str(error))
                 login_ok = False
         n = 0
+        drm_at = output_at = None
+        stacks = 0
         while login_ok and time.time() - start < a.timeout and vm.poll() is None:
             text = read_text(serial_path)
             drm = drm or DRM_RE.search(text)
             shell = shell or SHELL_RE.search(text)
+            now = time.time()
+            drm_at = drm_at or (now if drm else None)
+            output_at = output_at or (now if SHELL_OUTPUT_RE.search(text) else None)
+            armed_at = output_at or (drm_at + SHELL_STACK_UNPRINTED - SHELL_STACK_AFTER[0] if drm_at else None)
+            if (not shell and armed_at is not None and stacks < len(SHELL_STACK_AFTER)
+                    and time.time() - armed_at >= SHELL_STACK_AFTER[stacks]):
+                stacks += 1
+                dump_shell_stack(agent_path, os.path.join(out, f"shell-startup-stack-{stacks}.json"))
             if n % 3 == 0:
                 qmp.frame(os.path.join(out, f"boot-{n // 3:03d}.png"))
             n += 1

@@ -65,6 +65,76 @@ class DeviceInventoryProjection(unittest.TestCase):
         self.assertIsNone(projected["input_devices"])
 
 
+class ShellStartupDiagnostics(unittest.TestCase):
+    def test_transport_failure_is_retained_and_closed(self):
+        agent = unittest.mock.Mock()
+        agent.run.side_effect = TimeoutError("bounded capture expired")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "stack.json"
+            with patch.object(lane.guest_agent, "GuestAgent", return_value=agent):
+                lane.dump_shell_stack("socket", destination)
+            self.assertEqual(json.loads(destination.read_text()),
+                             {"error": "bounded capture expired"})
+            agent.run.assert_called_once_with("shell-stack", timeout=120)
+            agent.close.assert_called_once()
+
+    def test_backtraces_survive_transport(self):
+        agent = unittest.mock.Mock()
+        observed = {"shells": [{"pid": 1234, "threads": [], "backtraces": "stack"}]}
+        agent.run.return_value = observed
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "stack.json"
+            with patch.object(lane.guest_agent, "GuestAgent", return_value=agent):
+                lane.dump_shell_stack("socket", destination)
+            self.assertEqual(json.loads(destination.read_text()), observed)
+            agent.close.assert_called_once()
+
+    def probe(self, gdb_error=None):
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        function = next(node for node in ast.parse(source.read_text()).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "shell_stack")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for pid, executable in ((1234, "tuna-shell-gtk"), (1235, "unrelated")):
+                process = root / str(pid)
+                process.mkdir()
+                (process / "exe").symlink_to("/usr/bin/" + executable)
+                task = process / "task" / str(pid)
+                task.mkdir(parents=True)
+                for name, text in (("comm", executable), ("wchan", "futex_wait"),
+                                   ("stack", "kernel wait"), ("syscall", "202"),
+                                   ("stat", f"{pid} ({executable}) S")):
+                    (task / name).write_text(text)
+            run = unittest.mock.Mock(return_value=SimpleNamespace(stdout="#0 futex_wait", stderr=""))
+            if gdb_error:
+                run.side_effect = gdb_error
+            scope = {"pathlib": SimpleNamespace(Path=lambda path: root if path == "/proc" else Path(path)),
+                     "os": os,
+                     "OWNER": SimpleNamespace(pw_uid=os.getuid()), "SHELL_GTK": "tuna-shell-gtk",
+                     "subprocess": SimpleNamespace(run=run, TimeoutExpired=lane.subprocess.TimeoutExpired)}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), scope)
+            result = scope["shell_stack"]()
+            run.assert_called_once()
+            command = run.call_args.args[0]
+            self.assertEqual(command[-2:], ["-p", "1234"])
+            self.assertIn("thread apply all bt", command)
+            self.assertIn("set print frame-arguments none", command)
+            self.assertEqual(run.call_args.kwargs["timeout"], 90)
+            return result["shells"][0]
+
+    def test_only_session_shell_is_attached_and_every_thread_is_retained(self):
+        result = self.probe()
+        self.assertEqual(result["pid"], 1234)
+        self.assertEqual(result["threads"][0]["wait_site"], "futex_wait")
+        self.assertEqual(result["threads"][0]["state"], "S")
+        self.assertEqual(result["backtraces"], "#0 futex_wait")
+
+    def test_gdb_failure_preserves_kernel_wait_information(self):
+        result = self.probe(lane.subprocess.TimeoutExpired("gdb", 90))
+        self.assertEqual(result["threads"][0]["wait_site"], "futex_wait")
+        self.assertEqual(result["backtraces"], "unavailable: TimeoutExpired")
+
+
 class OrcaUnreadyDiagnostic(unittest.TestCase):
     def run_probe(self, *, locked=False, changed=False, executable="/usr/bin/python3.14",
                   uid=1000, package="python", oversized=False, replaced=False):
