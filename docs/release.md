@@ -43,14 +43,16 @@ not provide Marlin or physical hardware qualification.
    is not feature proof.
    Review every still before uploading. Diff against the prior release's
    stills when available; missing old media is not comparison evidence.
-8. Attach the `.deb`, the notes, and the twelve media files
-   (`<segment>.mp4` + `<segment>.png` per segment) to the release,
-   e.g. `gh release upload vX.Y.Z walkthrough-media/*.mp4
-   walkthrough-media/*.png`.
-9. Render the walkthrough page:
+8. Render the release media index:
    `scripts/tuna-capture --artifacts walkthrough-media --render-walkthrough vX.Y.Z`
-   writes `docs/walkthrough.md` with versioned release-asset links;
-   commit it so the docs site shows the new tour.
+   writes `walkthrough-media/walkthrough.md` with versioned release-asset
+   links. It does not replace the manifest-generated `docs/walkthrough.md`.
+9. Attach the `.deb`, the notes, the media index, and the twelve media files
+   (`<segment>.mp4` + `<segment>.png` per segment) to the release,
+   e.g. `gh release upload vX.Y.Z walkthrough-media/walkthrough.md
+   walkthrough-media/*.mp4 walkthrough-media/*.png`.
+   Link the media index from the release notes. Refresh the canonical feature
+   walkthrough only through its [visual capture workflow](visual-capture-refresh.md).
 
 The package version, the binaries' `--version` output, and the notes must
 agree — the release script enforces the first two by construction.

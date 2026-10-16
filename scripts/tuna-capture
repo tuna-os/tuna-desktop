@@ -6,8 +6,8 @@
 #   scripts/tuna-capture --render-walkthrough vX.Y.Z [--artifacts DIR]
 #
 # --render-walkthrough stamps docs/walkthrough-template.md into
-# docs/walkthrough.md for the given release tag (run by the release
-# checklist after uploading the media bundle as release assets).
+# ARTIFACTS/walkthrough.md for the release tag, to upload with its media.
+# The canonical docs/walkthrough.md belongs to scripts/tuna-walkthrough.
 #
 # Drives the GTK shell through each core-tour feature (overview, app-launch,
 # tiling-scroll, quick-settings, notifications, lock-screen) under Xvfb,
@@ -88,10 +88,10 @@ if [ -n "$RENDER_TAG" ]; then
         -e "s/@QUICK_SETTINGS_BLURB@/$QUICK_SETTINGS_BLURB/g" \
         -e "s/@NOTIFICATIONS_BLURB@/$NOTIFICATIONS_BLURB/g" \
         -e "s/@LOCK_BLURB@/$LOCK_BLURB/g" \
-        "$ROOT/docs/walkthrough-template.md" >"$ROOT/docs/walkthrough.md"
+        "$ROOT/docs/walkthrough-template.md" >"$ARTIFACTS/walkthrough.md"
     check_walkthrough
-    check_rendered "$ROOT/docs/walkthrough.md"
-    echo "tuna-capture: rendered docs/walkthrough.md for $RENDER_TAG"
+    check_rendered "$ARTIFACTS/walkthrough.md"
+    echo "tuna-capture: rendered $ARTIFACTS/walkthrough.md for $RENDER_TAG"
     exit 0
 fi
 
