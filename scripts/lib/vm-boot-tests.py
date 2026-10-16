@@ -190,13 +190,23 @@ class OrcaReadFailure(unittest.TestCase):
 
 class OrcaObservationRetry(unittest.TestCase):
     def test_transient_guest_read_failure_is_retried_until_state_arrives(self):
-        actual = {"enabled": True, "ready": True, "state": "active", "pid": 57, "owner": ":1.7"}
+        actual = {"enabled": True, "ready": True, "state": "active", "pid": 57, "owner": ":1.7",
+                  "package": "orca 51.0-1"}
         agent = SimpleNamespace(run=unittest.mock.Mock(side_effect=[RuntimeError("bus not ready"), actual]))
         observations = []
         with patch.object(lane.time, "monotonic", side_effect=[0, 0, 1]), patch.object(lane.time, "sleep"):
             self.assertIs(lane.wait_for_orca_state(agent, True, observations), actual)
         self.assertEqual(agent.run.call_count, 2)
         self.assertEqual(observations, [actual])
+
+    def test_missing_orca_package_fails_immediately(self):
+        missing = {"enabled": False, "ready": False, "state": "disabled", "pid": 0, "owner": None,
+                   "package": None}
+        agent = SimpleNamespace(run=unittest.mock.Mock(return_value=missing))
+        with patch.object(lane.time, "monotonic", return_value=0), patch.object(lane.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "ships no distribution Orca package"):
+                lane.wait_for_orca_state(agent, False, [])
+        self.assertEqual(agent.run.call_count, 1)
 
     def test_repeated_guest_read_failure_still_times_out(self):
         agent = SimpleNamespace(run=unittest.mock.Mock(side_effect=RuntimeError("bus not ready")))
