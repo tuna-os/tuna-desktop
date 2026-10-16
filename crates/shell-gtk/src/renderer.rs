@@ -5,8 +5,9 @@
 //! fallback chain takes the same llvmpipe GL renderer anyway
 //! (`gskrenderer.c`: the GL fallback precedes cairo). On llvmpipe every
 //! new shader variant is compiled through LLVM, and the shell's
-//! surfaces keep producing new ones: on the Marlin VM the shell spent
-//! 1.5–2 CPU-seconds on each overview search, most of it in LLVM. The
+//! surfaces keep producing new ones: on the Marlin benchmark VM the
+//! shell spent about 4 CPU-seconds on three overview searches, and a
+//! local replica put three quarters of the first one in LLVM. The
 //! cairo renderer draws the same nodes on the CPU without a compiler,
 //! so the shell takes it whenever OpenGL is a software rasterizer.
 //! `GSK_RENDERER`, when set, still decides.
