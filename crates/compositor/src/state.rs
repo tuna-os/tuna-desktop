@@ -464,11 +464,14 @@ impl StateModel {
                 changed = true;
             }
         }
+        if let Some(on_all_workspaces) = patch.on_all_workspaces {
+            if window.on_all_workspaces != on_all_workspaces {
+                window.on_all_workspaces = on_all_workspaces;
+                changed = true;
+            }
+        }
         if !changed {
             return true;
-        }
-        if let Some(on_all_workspaces) = patch.on_all_workspaces {
-            window.on_all_workspaces = on_all_workspaces;
         }
         let window = window.clone();
         if let Some(workspace) = patch.workspace {
