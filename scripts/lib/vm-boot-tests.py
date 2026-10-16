@@ -1516,6 +1516,29 @@ class PredatingGuestQualification(unittest.TestCase):
         owner = {"epoch": 1}
         self.assertFalse(lane.sleep_auth_qualifies(True, {**self.CURRENT_STATE, "auth_owner": owner}))
 
+    def test_sheared_lock_result_record_reassembles(self):
+        # Run 38855306157 serial: one shell eprintln! split across records.
+        serial = "\n".join([
+            "[  330.422991] tuna-vm-session[1104]: tuna-shell-gtk: lock password submitted",
+            "[  330.424643] tuna-vm-session[1108]: tuna-ibus-bridge: text field left",
+            "[  330.439349] tuna-vm-session[1104]: tuna-shell-gtk: lock command result applied=",
+            "[  330.441502] tuna-vm-session[957]: tuna-compositor: lock authentication retired",
+            "[  330.443201] tuna-vm-session[1104]: false",
+            '[  330.444105] tuna-vm-session[957]: {"',
+            "[  330.444875] tuna-vm-session[1104]:  request_id=",
+            "[  330.445852] tuna-vm-session[957]: applied",
+            "[  330.446000] tuna-vm-session[1104]: 55",
+        ])
+        records = lane.session_records(serial)
+        self.assertIn("tuna-shell-gtk: lock command result applied=false request_id=55", records)
+        self.assertIn("tuna-shell-gtk: lock password submitted", records)
+        self.assertIn("tuna-compositor: lock authentication retired{\"applied", records)
+
+    def test_unsheared_true_result_never_reads_as_refusal(self):
+        records = lane.session_records(
+            "[ 1.0] tuna-vm-session[1104]: tuna-shell-gtk: lock command result applied=true request_id=7")
+        self.assertFalse(any("applied=false" in line for line in records))
+
     def test_media_volume_strict_sequence_passes(self):
         ok, detail = self.verdict(self.STRICT_SERIAL, self.CURRENT_STATE)
         self.assertTrue(ok)

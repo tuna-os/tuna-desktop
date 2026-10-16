@@ -365,9 +365,9 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             outcomes.append({"edge": "lock-unlock-" + case, "old_action": result,
                 "same_engine_instance": original_instance, "other_panel_not_replaced": bool(challenger),
                 "traffic": traffic(), "consumer_trace": trace()[before_trace:]})
-        if node("Input Mode"):
-            press(*INDICATOR)
-            wait(lambda: not node("Input Mode"))
+        # The menu stays open: pressing the indicator's toggle while its own
+        # popover is open never matched a unique showing node (gtk-shell
+        # 116828879015). The harness closes it with real Escape afterward.
         if (identity(pid) != origin or file_hash(expected_shell) != expected_hash
                 or identity(daemon_origin["pid"]) != daemon_origin
                 or identity(engine_pid) != engine_origin

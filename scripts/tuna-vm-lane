@@ -78,6 +78,32 @@ PLAY_FPS = 4        # encoded frame rate, not a uniform real-time capture clock
 CARD_HOLD = 10      # frames a title card is held (2.5 s at PLAY_FPS)
 OVMF = ("/usr/share/ovmf/OVMF.fd", "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/qemu/OVMF.fd")
 
+SESSION_RECORD_RE = re.compile(r"tuna-vm-session\[(\d+)\]: (.*)")
+
+
+def session_records(text):
+    """Reassemble session stderr records that serial interleaving sheared.
+
+    Concurrent shell and compositor writes can split one eprintln! across
+    console records (run 38855306157: `lock command result applied=`, then
+    `false`, then ` request_id=` from the same PID). A fragment from a PID
+    continues that PID's previous record unless it opens a new `tuna-`
+    component record. Returns whole records in serial order.
+    """
+    records, open_by_pid = [], {}
+    for line in text.splitlines():
+        match = SESSION_RECORD_RE.search(line)
+        if match is None:
+            continue
+        pid, fragment = match.groups()
+        if pid in open_by_pid and not fragment.startswith("tuna-"):
+            records[open_by_pid[pid]] += fragment
+        else:
+            open_by_pid[pid] = len(records)
+            records.append(fragment)
+    return records
+
+
 
 def auth_uint(value):
     return type(value) is int and 0 < value <= (1 << 64) - 1
@@ -1414,9 +1440,9 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         qmp.keys("ret")
         time.sleep(12)
         denied = inventory("pam-denied")
-        auth_trace = read_text(serial_path)[auth_offset:]
-        attempted = ("tuna-shell-gtk: lock password submitted" in auth_trace
-                     and "tuna-shell-gtk: lock command result applied=false" in auth_trace)
+        auth_records = session_records(read_text(serial_path)[auth_offset:])
+        attempted = (any("tuna-shell-gtk: lock password submitted" in line for line in auth_records)
+                     and any("tuna-shell-gtk: lock command result applied=false" in line for line in auth_records))
         record("V-AUTH-FAIL-CLOSED", attempted and denied["state"]["locked"] and same_apps(before, denied),
                "fresh submitted/refused milestones: real pam_deny service rejects the correct fixture password; apps remain inaccessible")
     finally:

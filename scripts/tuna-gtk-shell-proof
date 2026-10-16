@@ -6349,6 +6349,17 @@ PY_IBUS_PHASE
             fail G-IME-PROPERTIES-LIFECYCLE "private PAM fixture did not unlock"
     done
     wait "$property_driver_pid" || fail G-IME-PROPERTIES-LIFECYCLE "context/owner/lock property proof failed"
+    # The observer leaves the property menu open; close it with real Escape
+    # (the G-IME-ESCAPE path) and require it gone before XIM.
+    property_menu_closed=
+    for _ in 1 2 3; do
+        xdotool key Escape
+        sleep 0.5
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-ime-properties-closed.json" 20 ||
+            fail G-IME-PROPERTIES-LIFECYCLE "post-Escape shell dump failed"
+        if ! showing "$ARTIFACTS/a11y-ime-properties-closed.json" "Input Mode"; then property_menu_closed=1; break; fi
+    done
+    [ -n "$property_menu_closed" ] || fail G-IME-PROPERTIES-LIFECYCLE "Escape did not close the property menu"
     pass G-IME-PROPERTIES-LIFECYCLE "fresh unchanged-engine unlock; old context/lock actions have no effect; other panel is not replaced"
     # XIM talks to the session's XWayland, never the outer Xvfb display.
     x11_display="$(jq -r .x11_display "$CSTATE")"
