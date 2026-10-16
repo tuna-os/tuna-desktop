@@ -12,14 +12,15 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.36).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.37).
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
-  `InputSettings`, `WindowId`, `WorkspaceId`, `dynamic_workspace_count`.
+  `NativeOutputInfo`, `InputSettings`, `WindowId`, `WorkspaceId`,
+  `dynamic_workspace_count`.
 - Tokens and secrets: `ActivationToken`, `TokenMeta`, `Secret`.
 - Switcher and keybindings: `SwitcherAction`, `SwitcherKey`,
   `SwitcherThumbnail`, `WindowAction`, `Accelerator`, and the `MOD_*` and
@@ -57,3 +58,13 @@ appended after `keyboard_aids`; `CommandKind::SetDwellClickType` is appended
 for the hover-click chooser, and the compositor reports
 `Message::DwellClickType` and `Message::PointerTimeout` (pie timer) as the
 last two message variants. Positional: both peers ship together.
+
+## Native output inventory (0.37)
+
+`Message::NativeOutputInventory { outputs: Vec<NativeOutputInfo> }` appends
+the compositor-owned DRM connector identity (char-device rdev, connector
+object ID and canonical sysfs object) for each lit native output. `OutputInfo`
+and the `Outputs` message are byte-for-byte unchanged. The compositor sends it
+only to peers advertising minor 37 or later; an empty list explicitly revokes
+earlier authority, and nested sessions never send a non-empty one. Decoding
+rejects more than 64 records (`DecodeError::CollectionTooLong`).
