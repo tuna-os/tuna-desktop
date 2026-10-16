@@ -846,13 +846,13 @@ fn quick_settings_popover(
             eprintln!("tuna-shell-gtk: opening settings is disabled by your administrator.");
             return;
         }
-        let _ = gio::AppInfo::launch_default_for_uri("settings://", None::<&gio::AppLaunchContext>)
-            .or_else(|_| {
-                std::process::Command::new("gnome-control-center")
-                    .spawn()
-                    .map(|_| ())
-                    .map_err(|e| glib::Error::new(gio::IOErrorEnum::Failed, &e.to_string()))
-            });
+        let context = tuna_shell_host::apps::application_launch_context();
+        let _ = gio::AppInfo::launch_default_for_uri("settings://", Some(&context)).or_else(|_| {
+            tuna_shell_host::apps::application_command("gnome-control-center")
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| glib::Error::new(gio::IOErrorEnum::Failed, &e.to_string()))
+        });
     });
     {
         let shell = shell.clone();
@@ -3296,7 +3296,7 @@ fn main() -> glib::ExitCode {
     tuna_shell_control::legacy::import_env("tuna-shell-gtk");
     glib::set_prgname(Some("tuna-shell-gtk"));
     // GTK and libadwaita must not block startup on portal activation.
-    let portals = std::cell::Cell::new(Some(portal_opt_out::disable()));
+    portal_opt_out::disable();
     // Before any window is realized, so GSK's first renderer follows it.
     if gtk::init().is_ok() {
         if let Some(display) = gtk::gdk::Display::default() {
@@ -3307,12 +3307,6 @@ fn main() -> glib::ExitCode {
         .application_id("org.tuna.Shell")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    // The class handlers (GTK, then libadwaita) ran first.
-    app.connect_startup(move |_| {
-        if let Some(saved) = portals.take() {
-            saved.restore();
-        }
-    });
     privacy_portal::start(&app);
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])

@@ -341,6 +341,20 @@ echo '["org.tuna.ProofNoFavorite.desktop"]' >"$XDG_DATA_HOME/tuna-shell/favorite
 # Exec leaves a marker, proving search-to-launch end to end.
 PROBE_MARKER="$ARTIFACTS/probe-marker"
 rm -f "$PROBE_MARKER"
+# pyatspi ships with the distro Python, which a user-local Python
+# (Homebrew, pyenv) may shadow on PATH.
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+
+# The shell keeps portal opt-outs privately for its whole lifetime; a
+# desktop-entry child must see exactly the caller's original flag values.
+cat >"$ARTIFACTS/launch-environment.py" <<'PYENV'
+import json, os, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    key: os.environ.get(key) for key in ("GDK_DEBUG", "ADW_DISABLE_PORTAL")
+}, sort_keys=True))
+PYENV
+"$PY" "$ARTIFACTS/launch-environment.py" "$ARTIFACTS/launch-environment-expected.json"
 mkdir -p "$XDG_DATA_HOME/applications"
 # The test windows are apps with (hidden) desktop entries, as most apps
 # are: windows no entry claims would each be an app of their own.
@@ -351,7 +365,7 @@ done
 cat >"$XDG_DATA_HOME/applications/tuna-probe.desktop" <<EOF
 [Desktop Entry]
 Name=Tuna Probe
-Exec=touch $PROBE_MARKER
+Exec=$PY $ARTIFACTS/launch-environment.py $PROBE_MARKER
 Icon=applications-system
 Type=Application
 EOF
@@ -534,11 +548,6 @@ cstate() {
 }
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
-
-# pyatspi ships with the distro Python, which a user-local Python
-# (Homebrew, pyenv) may shadow on PATH.
-PY=/usr/bin/python3
-[ -x "$PY" ] || PY=python3
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -1700,8 +1709,10 @@ xdotool key Return
 end=$(($(date +%s) + 15))
 until [ -f "$PROBE_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 [ -f "$PROBE_MARKER" ] || fail G-OV-LAUNCH "Enter did not launch the top result"
+cmp -s "$PROBE_MARKER" "$ARTIFACTS/launch-environment-expected.json" ||
+    fail G-OV-LAUNCH "desktop-entry launch inherited shell-private portal flags"
 cstate '.overview_open | not' "closed" || fail G-OV-LAUNCH "overview stayed open after launch"
-pass G-OV-LAUNCH "Enter launches the top result and closes the overview"
+pass G-OV-LAUNCH "Enter launches the top result with the caller's portal flags and closes the overview"
 
 # An app installed while the shell runs is searchable at once (GNOME
 # watches the application directories too).
@@ -2025,16 +2036,15 @@ fi
 cstate ".client_dnd_active == false and .overview_open and .overview_app_grid and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame) and (.seat_pressed_key_count == $grid_cancel_before_keys)" "folder cancellation before release" || fail G-GRID-DRAG-CANCEL "Escape failed to cancel native drag while keeping grid open"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-release.json"
 scrot "$ARTIFACTS/grid-cancel-before-release.png" >/dev/null
-# GTK hears the compositor's cancel asynchronously; poll its tree (button
-# still held) rather than sampling once right after the compositor state.
+# GTK hears cancel asynchronously and removes preview widgets during traversal.
+# Reject an inconsistent tree, then wait for a fresh complete owner-bound tree
+# within the existing budget, with the pointer button still held.
 end=$(($(date +%s) + 5))
-while :; do
-    grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" || fail G-GRID-DRAG-CANCEL "fresh cancellation tree missing"
-    if showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" &&
-        ! showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; then
-        break
-    fi
-    [ "$(date +%s)" -le "$end" ] || break
+until grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" &&
+    showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" &&
+    ! showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; do
+    [ "$(date +%s)" -le "$end" ] ||
+        fail G-GRID-DRAG-CANCEL "complete cancellation tree did not restore arrow before release"
     sleep 0.3
 done
 showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" || fail G-GRID-DRAG-CANCEL "GTK drag cleanup did not restore arrow before release"

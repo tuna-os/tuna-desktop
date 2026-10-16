@@ -66,6 +66,14 @@ and writes frames, logs, and usually an `assertions.txt` into the
 artifacts directory. A nonzero exit is a failure; the frames are for human
 review. CI shellchecks each script before running it.
 
+The native grid-drag cancellation proof holds the pointer button until both
+the compositor reports cancellation and a fresh, complete, owner-bound AT-SPI
+tree restores the normal page arrow without a drag preview. Widget removal
+can invalidate a traversal while GTK processes cancellation; that snapshot
+is rejected, and the existing five-second polling budget must still obtain
+a valid tree. Persistent transport errors, wrong owners and incomplete trees
+cannot satisfy the gate.
+
 | CI job | Command | Extra packages | What it asserts |
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |
