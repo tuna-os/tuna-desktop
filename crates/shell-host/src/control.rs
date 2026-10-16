@@ -665,6 +665,16 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// GNOME's `show-desktop` key (#347). Returns the request id.
+    pub fn toggle_show_desktop(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::ToggleShowDesktop,
+        })?;
+        Ok(id)
+    }
+
     /// Replace global logical minimize targets published by the dash.
     pub fn set_window_icon_geometries(
         &mut self,

@@ -2245,6 +2245,19 @@ impl Runtime {
         });
         // Overdraw per output for the last drawn frame (#503).
         doc["workspaces"] = serde_json::json!(model.workspaces());
+        // GNOME's focus and window-key policy in force (#347).
+        let policy = self.manager.focus_policy();
+        doc["wm"] = serde_json::json!({
+            "focus_mode": format!("{:?}", policy.focus_mode).to_lowercase(),
+            "focus_new_windows": format!("{:?}", policy.focus_new_windows).to_lowercase(),
+            "auto_raise": policy.auto_raise,
+            "auto_raise_delay_ms": policy.auto_raise_delay_ms,
+            "raise_on_click": policy.raise_on_click,
+            "mouse_button_modifier": policy.mouse_button_modifier,
+            "resize_with_right_button": policy.resize_with_right_button,
+        });
+        doc["showing_desktop"] = serde_json::json!(self.manager.showing_desktop());
+        doc["stacking"] = serde_json::json!(self.manager.stacking_order());
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
         doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
@@ -3562,6 +3575,7 @@ impl Runtime {
         self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
             .apply_workspace_policy(&mut self.state, settings.workspace_policy);
+        self.manager.apply_focus_policy(settings.focus_policy);
         // Release delayed/synthetic input under the OLD map. An unrelated
         // preference change must not reinstall the map or lose held state.
         if aids::keymap_changed(&self.input_settings, &settings) {
@@ -3956,6 +3970,8 @@ impl Runtime {
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        // Focus-follows-mouse timers (pointer rest, auto-raise).
+        self.manager.tick_hover(&mut self.state);
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
@@ -4048,6 +4064,9 @@ impl Runtime {
                 self.animation_clock.now(),
                 self.input_settings.motion,
             );
+        }
+        for _ in 0..outcome.show_desktop_toggles {
+            self.manager.toggle_show_desktop(&mut self.state);
         }
         if let Some((x, y)) = outcome.screenshot_pointer {
             self.move_screenshot_pointer(x, y);

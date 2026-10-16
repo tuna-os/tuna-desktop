@@ -88,6 +88,19 @@ pub enum Action {
     Workspace(Target),
     /// Move the focused window there and follow it.
     MoveToWorkspace(Target),
+    /// GNOME 51's remaining window keys (#347) on the focused window.
+    ToggleFullscreen,
+    ToggleAbove,
+    ToggleOnAllWorkspaces,
+    Raise,
+    Lower,
+    RaiseOrLower,
+    MaximizeVertically,
+    MaximizeHorizontally,
+    MoveToMonitor(tuna_shell_control::Direction),
+    MoveTo(tuna_shell_control::Gravity),
+    /// Hide every window on the workspace, or bring them back.
+    ShowDesktop,
 }
 
 /// A workspace a key goes to.
@@ -97,6 +110,8 @@ pub enum Target {
     Last,
     Left,
     Right,
+    /// The nth workspace, 0-based (`switch-to-workspace-2` is 1).
+    Index(u32),
 }
 
 impl Target {
@@ -118,6 +133,8 @@ impl Target {
             Target::Last => Some(last),
             Target::Left => (active > first).then(|| active - 1),
             Target::Right => Some(active + 1),
+            // Mutter has no workspace past the last one: no switch.
+            Target::Index(n) => (n <= last).then_some(n),
         }
     }
 }
@@ -483,6 +500,90 @@ fn specs() -> Vec<Spec> {
             ],
         ),
     ]);
+    // GNOME 51's remaining window keys (#347). Only move-to-monitor has
+    // a default chord in gsettings-desktop-schemas; the rest are unbound
+    // until set. GNOME's workspaces lie in one row, so the up/down
+    // workspace keys (Mutter: no neighbor) stay unregistered.
+    {
+        use tuna_shell_control::{Direction, Gravity};
+        specs.extend([
+            wm("toggle-fullscreen", Action::ToggleFullscreen, vec![]),
+            wm("toggle-above", Action::ToggleAbove, vec![]),
+            wm(
+                "toggle-on-all-workspaces",
+                Action::ToggleOnAllWorkspaces,
+                vec![],
+            ),
+            wm("raise", Action::Raise, vec![]),
+            wm("lower", Action::Lower, vec![]),
+            wm("raise-or-lower", Action::RaiseOrLower, vec![]),
+            wm("maximize-vertically", Action::MaximizeVertically, vec![]),
+            wm(
+                "maximize-horizontally",
+                Action::MaximizeHorizontally,
+                vec![],
+            ),
+            wm(
+                "move-to-monitor-left",
+                Action::MoveToMonitor(Direction::Left),
+                vec!["<Super><Shift>Left"],
+            ),
+            wm(
+                "move-to-monitor-right",
+                Action::MoveToMonitor(Direction::Right),
+                vec!["<Super><Shift>Right"],
+            ),
+            wm(
+                "move-to-monitor-up",
+                Action::MoveToMonitor(Direction::Up),
+                vec!["<Super><Shift>Up"],
+            ),
+            wm(
+                "move-to-monitor-down",
+                Action::MoveToMonitor(Direction::Down),
+                vec!["<Super><Shift>Down"],
+            ),
+            wm(
+                "move-to-corner-nw",
+                Action::MoveTo(Gravity::NorthWest),
+                vec![],
+            ),
+            wm(
+                "move-to-corner-ne",
+                Action::MoveTo(Gravity::NorthEast),
+                vec![],
+            ),
+            wm(
+                "move-to-corner-sw",
+                Action::MoveTo(Gravity::SouthWest),
+                vec![],
+            ),
+            wm(
+                "move-to-corner-se",
+                Action::MoveTo(Gravity::SouthEast),
+                vec![],
+            ),
+            wm("move-to-side-n", Action::MoveTo(Gravity::North), vec![]),
+            wm("move-to-side-s", Action::MoveTo(Gravity::South), vec![]),
+            wm("move-to-side-e", Action::MoveTo(Gravity::East), vec![]),
+            wm("move-to-side-w", Action::MoveTo(Gravity::West), vec![]),
+            wm("move-to-center", Action::MoveTo(Gravity::Center), vec![]),
+            wm("show-desktop", Action::ShowDesktop, vec![]),
+        ]);
+    }
+    // Numbered workspaces 2–12 (1 has its own chord above).
+    for n in 2..=12u32 {
+        specs.push(wm(
+            &format!("switch-to-workspace-{n}"),
+            Action::Workspace(Target::Index(n - 1)),
+            vec![],
+        ));
+        specs.push(wm(
+            &format!("move-to-workspace-{n}"),
+            Action::MoveToWorkspace(Target::Index(n - 1)),
+            vec![],
+        ));
+    }
     for n in 1..=9u8 {
         specs.push(Spec {
             schema: Schema::Shell,
@@ -685,6 +786,60 @@ mod tests {
         assert_eq!(Target::Right.resolve(2, &ws, &[0]), Some(3));
         // Everything on the first workspace: Last is the empty one after.
         assert_eq!(Target::Last.resolve(0, &[0], &[0]), Some(1));
+    }
+
+    #[test]
+    fn numbered_workspaces_stop_at_the_last_one() {
+        // Windows on 0 and 1: workspaces 0..=2 exist (2 the empty one).
+        let ws = [0, 1];
+        assert_eq!(Target::Index(1).resolve(0, &ws, &[0, 1]), Some(1));
+        assert_eq!(Target::Index(2).resolve(0, &ws, &[0, 1]), Some(2));
+        assert_eq!(Target::Index(3).resolve(0, &ws, &[0, 1]), None);
+    }
+
+    #[test]
+    fn gnome_51_window_keys_register_with_their_defaults() {
+        use tuna_shell_control::{Direction, Gravity};
+        let all = bindings(None, None, None, None);
+        let find = |action| {
+            all.iter()
+                .filter(|b| b.action == action)
+                .map(|b| b.accelerator.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            find(Action::MoveToMonitor(Direction::Left)),
+            ["<Super><Shift>Left"]
+        );
+        assert_eq!(
+            find(Action::MoveToMonitor(Direction::Down)),
+            ["<Super><Shift>Down"]
+        );
+        // Unbound by default in GNOME 51: registered, no chord.
+        assert!(find(Action::ShowDesktop).is_empty());
+        assert!(find(Action::ToggleFullscreen).is_empty());
+        assert!(find(Action::MoveTo(Gravity::Center)).is_empty());
+        assert!(find(Action::Workspace(Target::Index(11))).is_empty());
+        let keys: Vec<String> = specs().into_iter().map(|s| s.key).collect();
+        for key in [
+            "toggle-fullscreen",
+            "toggle-above",
+            "toggle-on-all-workspaces",
+            "raise",
+            "lower",
+            "raise-or-lower",
+            "maximize-vertically",
+            "maximize-horizontally",
+            "move-to-corner-nw",
+            "move-to-side-e",
+            "move-to-center",
+            "show-desktop",
+            "switch-to-workspace-2",
+            "switch-to-workspace-12",
+            "move-to-workspace-12",
+        ] {
+            assert!(keys.iter().any(|k| k == key), "{key} is not registered");
+        }
     }
 
     #[test]

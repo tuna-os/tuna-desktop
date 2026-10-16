@@ -118,6 +118,7 @@ pub mod wellbeing_effects;
 pub mod window_icons;
 pub mod window_lifecycle;
 pub mod windows;
+pub mod wm_prefs;
 pub mod workspace_policy;
 pub mod workspace_slide;
 pub mod workspace_tracker;

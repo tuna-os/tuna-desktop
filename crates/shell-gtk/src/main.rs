@@ -2233,7 +2233,17 @@ fn build(app: &adw::Application) {
                     | Action::TileLeft
                     | Action::TileRight
                     | Action::BeginMove
-                    | Action::BeginResize => {
+                    | Action::BeginResize
+                    | Action::ToggleFullscreen
+                    | Action::ToggleAbove
+                    | Action::ToggleOnAllWorkspaces
+                    | Action::Raise
+                    | Action::Lower
+                    | Action::RaiseOrLower
+                    | Action::MaximizeVertically
+                    | Action::MaximizeHorizontally
+                    | Action::MoveToMonitor(_)
+                    | Action::MoveTo(_) => {
                         use tuna_shell_control::WindowAction as W;
                         let what = match action {
                             Action::WindowMenu => W::ShowMenu,
@@ -2244,6 +2254,16 @@ fn build(app: &adw::Application) {
                             Action::TileLeft => W::ToggleTiledLeft,
                             Action::TileRight => W::ToggleTiledRight,
                             Action::BeginMove => W::Move,
+                            Action::ToggleFullscreen => W::ToggleFullscreen,
+                            Action::ToggleAbove => W::ToggleAbove,
+                            Action::ToggleOnAllWorkspaces => W::ToggleSticky,
+                            Action::Raise => W::Raise,
+                            Action::Lower => W::Lower,
+                            Action::RaiseOrLower => W::RaiseOrLower,
+                            Action::MaximizeVertically => W::MaximizeVertically,
+                            Action::MaximizeHorizontally => W::MaximizeHorizontally,
+                            Action::MoveToMonitor(direction) => W::MoveToMonitor { direction },
+                            Action::MoveTo(gravity) => W::MoveTo { gravity },
                             _ => W::Resize,
                         };
                         let mut shell = shell.borrow_mut();
@@ -2257,6 +2277,11 @@ fn build(app: &adw::Application) {
                             if let Some(id) = focused {
                                 let _ = control.window_action(id, what);
                             }
+                        }
+                    }
+                    Action::ShowDesktop => {
+                        if let Some(control) = shell.borrow_mut().control.as_mut() {
+                            let _ = control.toggle_show_desktop();
                         }
                     }
                     Action::Workspace(target) | Action::MoveToWorkspace(target) => {
@@ -2655,6 +2680,10 @@ fn build(app: &adw::Application) {
                         if schema.has_key("edge-tiling") {
                             out.workspace_policy.edge_tiling = mutter.boolean("edge-tiling");
                         }
+                        if schema.has_key("focus-change-on-pointer-rest") {
+                            out.focus_policy.focus_change_on_pointer_rest =
+                                mutter.boolean("focus-change-on-pointer-rest");
+                        }
                     }
                 }
                 motion::set(out.motion);
@@ -2663,6 +2692,20 @@ fn build(app: &adw::Application) {
                     out.bell.audible = wm.boolean("audible-bell");
                     out.bell.visual = wm.boolean("visual-bell");
                     out.bell.frame_flash = wm.string("visual-bell-type") == "frame-flash";
+                    // GNOME's focus and mouse-button policy (#347).
+                    let focus = &mut out.focus_policy;
+                    focus.focus_mode =
+                        tuna_shell_control::FocusMode::from_nick(&wm.string("focus-mode"));
+                    focus.focus_new_windows = tuna_shell_control::FocusNewWindows::from_nick(
+                        &wm.string("focus-new-windows"),
+                    );
+                    focus.auto_raise = wm.boolean("auto-raise");
+                    focus.auto_raise_delay_ms =
+                        u32::try_from(wm.int("auto-raise-delay")).unwrap_or(0);
+                    focus.raise_on_click = wm.boolean("raise-on-click");
+                    focus.mouse_button_modifier =
+                        logic::mouse_button_modifier_bits(&wm.string("mouse-button-modifier"));
+                    focus.resize_with_right_button = wm.boolean("resize-with-right-button");
                 }
                 if let Some(sound) = all[7].as_ref() {
                     out.bell.event_sounds = sound.boolean("event-sounds");

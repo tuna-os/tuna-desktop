@@ -224,6 +224,18 @@
 #   G-SWITCHER  Alt+Tab shows the switcher with every app (GNOME's
 #               switch-applications; the three test windows are three apps), and
 #               releasing Alt focuses the highlighted one
+#   G-FOCUS-MOUSE click holds focus; sloppy follows without raising;
+#               mouse drops focus over the panel; auto-raise raises
+#               after its delay, off leaves the stack (#347)
+#   G-RAISE-ON-CLICK raise-on-click off focuses without raising; on, a
+#               click raises even the focused window (#347)
+#   G-MOUSE-MODIFIER mouse-button-modifier: Super+drag moves by default;
+#               with <Alt> Super is inert, Alt+drag moves and
+#               Alt+middle resizes (#347)
+#   G-WM-EXTRA-KEYS show-desktop, fullscreen, vertical maximize, corner and
+#               center moves and numbered workspace keys bind live (#347)
+#   G-WS-KEYS-REBIND switch-to-workspace-right and -1 rebind live: the
+#               old chords stop and resetting restores them (#347)
 # Frames and accessibility dumps land in the artifacts dir; assertions in
 # assertions.txt for the parity ledger.
 set -eu
@@ -6055,6 +6067,355 @@ sleep 1
 gsettings reset org.gnome.desktop.wm.keybindings switch-applications
 sleep 1
 pass G-SWITCHER-REBIND "GNOME's switch-applications rebinds: Ctrl+J steps and commits, Alt+Tab goes to apps"
+
+# GNOME's window-manager focus policy and window keys, live (#347).
+overview_pick() {
+    # Focus $2 through its overview preview (works under any overlap).
+    if ! cstate '.overview_open | not' "closed" 3; then
+        xdotool key Escape
+        cstate '.overview_open | not' "closed" || fail "$1" "the overview would not close"
+    fi
+    xdotool key Super_L
+    cstate ".overview_open and any(.previews[]; .app_id == \"$2\")" "overview $2" ||
+        fail "$1" "the overview has no preview of $2"
+    sleep 1
+    pick_xy="$(jq -r ".previews[] | select(.app_id == \"$2\") | .rect | \"\(.[0] + .[2] / 2 | floor) \(.[1] + .[3] / 2 | floor)\"" "$CSTATE")"
+    [ -n "$pick_xy" ] || fail "$1" "no live preview center for $2"
+    # shellcheck disable=SC2086
+    xdotool mousemove --window "$WID" $pick_xy click 1
+    cstate "(.overview_open | not) and .focused_app_id == \"$2\"" "picked $2" ||
+        fail "$1" "clicking $2's preview did not focus it and close the overview"
+}
+glide() {
+    # Glide the pointer from $1,$2 to $3,$4 in $5 steps: hover focus
+    # follows crossings, not jumps.
+    glide_n=${5:-8}
+    glide_i=1
+    while [ "$glide_i" -le "$glide_n" ]; do
+        xdotool mousemove --window "$WID" \
+            $(($1 + ($3 - $1) * glide_i / glide_n)) $(($2 + ($4 - $2) * glide_i / glide_n))
+        sleep 0.05
+        glide_i=$((glide_i + 1))
+    done
+}
+modifier_drag() {
+    # Hold $1 (a keysym, or "none"), press button $2 at $3,$4 and glide
+    # by $5,$6 before releasing.
+    [ "$1" = none ] || xdotool keydown "$1"
+    sleep 0.2
+    xdotool mousemove --window "$WID" "$3" "$4"
+    sleep 0.2
+    xdotool mousedown "$2"
+    sleep 0.3
+    glide "$3" "$4" $(($3 + $5)) $(($4 + $6)) 10
+    sleep 0.3
+    xdotool mouseup "$2"
+    sleep 0.2
+    [ "$1" = none ] || xdotool keyup "$1"
+    sleep 0.5
+}
+regrabs_settled() {
+    # $2 marks the log: wait for the shell's fresh keybindings line,
+    # then two quiet seconds (a burst of rebinds lands as a burst).
+    regrab_end=$(($(date +%s) + 30))
+    while [ "$(date +%s)" -le "$regrab_end" ]; do
+        if [ "$(wc -c <"$LOG")" -gt "$2" ] && tail -c +"$(($2 + 1))" "$LOG" | grep -q "tuna-shell-gtk: keybindings:"; then
+            break
+        fi
+        sleep 0.3
+    done
+    tail -c +"$(($2 + 1))" "$LOG" | grep -q "tuna-shell-gtk: keybindings:" ||
+        fail "$1" "the shell never re-grabbed the rebound keys"
+    regrab_quiet=0
+    regrab_previous=$(grep -c 'tuna-shell-gtk: keybindings:' "$LOG")
+    for _ in $(seq 1 30); do
+        sleep 1
+        regrab_current=$(grep -c 'tuna-shell-gtk: keybindings:' "$LOG")
+        if [ "$regrab_current" = "$regrab_previous" ]; then regrab_quiet=$((regrab_quiet + 1)); else regrab_quiet=0; fi
+        regrab_previous=$regrab_current
+        [ "$regrab_quiet" -ge 2 ] && break
+    done
+}
+window_rect() {
+    jq -r ".windows[] | select(.app_id == \"$1\") | .rect | \"\(.[0]) \(.[1]) \(.[2]) \(.[3])\"" "$CSTATE"
+}
+
+# Focus mode and auto-raise, live: click keeps focus on click alone;
+# sloppy follows the pointer without raising; mouse drops focus over
+# the panel; auto-raise raises the hovered window after its delay, and
+# with auto-raise off the stack stays put.
+cstate '.overview_open | not' "overview closed" 3 || { xdotool key Escape; sleep 1; }
+cstate '.wm.focus_mode == "click" and (.wm.auto_raise | not) and .wm.raise_on_click' "click default" ||
+    fail G-FOCUS-MOUSE "focus policy is not click/no-raise/raise-on-click before the test"
+cstate '.active_workspace == 0 and all(.windows[]; .workspace == 0)' "all home" ||
+    fail G-FOCUS-MOUSE "windows are not all on workspace 0 before the test"
+read -r beta_fx beta_fy beta_fw beta_fh <<EOF2
+$(window_rect tuna-test-beta)
+EOF2
+read -r gamma_fx gamma_fy gamma_fw gamma_fh <<EOF2
+$(window_rect tuna-test-gamma)
+EOF2
+[ -n "$beta_fx" ] && [ "$beta_fx" != "null" ] && [ -n "$gamma_fx" ] && [ "$gamma_fx" != "null" ] ||
+    fail G-FOCUS-MOUSE "beta/gamma window rects went missing"
+beta_id="$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .id' "$CSTATE")"
+gamma_id="$(jq -r '.windows[] | select(.app_id == "tuna-test-gamma") | .id' "$CSTATE")"
+overview_pick G-FOCUS-MOUSE tuna-test-beta
+xdotool key super+Right
+cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect == [$((WIDTH / 2)), 32, $((WIDTH / 2)), $((HEIGHT - 32))]" "beta right" ||
+    fail G-FOCUS-MOUSE "Super+Right did not tile Beta right"
+overview_pick G-FOCUS-MOUSE tuna-test-gamma
+xdotool key super+Left
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [0, 32, $((WIDTH / 2)), $((HEIGHT - 32))]" "gamma left" ||
+    fail G-FOCUS-MOUSE "Super+Left did not tile Gamma left"
+xdotool mousemove --window "$WID" $((WIDTH * 3 / 4)) $((HEIGHT / 2))
+glide $((WIDTH * 3 / 4)) $((HEIGHT / 2)) $((WIDTH / 4)) $((HEIGHT / 2))
+sleep 1
+cstate ".focused == $gamma_id and .stacking[-1] == $gamma_id" "click holds" ||
+    fail G-FOCUS-MOUSE "hovering Gamma moved focus or the stack in click mode"
+gsettings set org.gnome.desktop.wm.preferences focus-mode 'sloppy'
+cstate '.wm.focus_mode == "sloppy"' "sloppy live" ||
+    fail G-FOCUS-MOUSE "focus-mode sloppy did not reach the compositor"
+[ "$(gsettings get org.gnome.desktop.wm.preferences focus-mode)" = "'sloppy'" ] ||
+    fail G-FOCUS-MOUSE "focus-mode sloppy did not persist"
+glide $((WIDTH / 4)) $((HEIGHT / 2)) $((WIDTH * 3 / 4)) $((HEIGHT / 2))
+sleep 1
+cstate ".focused == $beta_id and .stacking[-1] == $gamma_id" "sloppy follows" ||
+    fail G-FOCUS-MOUSE "sloppy focus did not follow the pointer without raising"
+glide $((WIDTH * 3 / 4)) $((HEIGHT / 2)) $((WIDTH / 4)) $((HEIGHT / 2))
+sleep 1
+cstate ".focused == $gamma_id and .stacking[-1] == $gamma_id" "sloppy back" ||
+    fail G-FOCUS-MOUSE "sloppy focus did not follow the pointer back"
+gsettings set org.gnome.desktop.wm.preferences focus-mode 'mouse'
+cstate '.wm.focus_mode == "mouse"' "mouse live" ||
+    fail G-FOCUS-MOUSE "focus-mode mouse did not reach the compositor"
+glide $((WIDTH / 4)) $((HEIGHT / 2)) $((WIDTH / 2)) 16
+sleep 1
+cstate '.focused == null' "mouse unfocus" ||
+    fail G-FOCUS-MOUSE "mouse focus did not drop over the panel"
+xdotool mousemove --window "$WID" $((WIDTH / 4)) $((HEIGHT / 2)) click 1
+cstate ".focused == $gamma_id" "click refocus" ||
+    fail G-FOCUS-MOUSE "clicking Gamma did not refocus it"
+gsettings set org.gnome.desktop.wm.preferences focus-mode 'sloppy'
+gsettings set org.gnome.desktop.wm.preferences auto-raise true
+gsettings set org.gnome.desktop.wm.preferences auto-raise-delay 100
+cstate '.wm.focus_mode == "sloppy" and .wm.auto_raise and .wm.auto_raise_delay_ms == 100' "raise live" ||
+    fail G-FOCUS-MOUSE "auto-raise did not reach the compositor"
+[ "$(gsettings get org.gnome.desktop.wm.preferences auto-raise-delay)" = 100 ] ||
+    fail G-FOCUS-MOUSE "auto-raise-delay 100 did not persist"
+glide $((WIDTH / 4)) $((HEIGHT / 2)) $((WIDTH * 3 / 4)) $((HEIGHT / 2))
+sleep 1
+cstate ".focused == $beta_id and .stacking[-1] == $beta_id" "raised" ||
+    fail G-FOCUS-MOUSE "auto-raise did not raise the hovered window"
+gsettings set org.gnome.desktop.wm.preferences auto-raise false
+cstate '(.wm.auto_raise | not)' "raise off" ||
+    fail G-FOCUS-MOUSE "auto-raise false did not reach the compositor"
+xdotool mousemove --window "$WID" $((WIDTH / 4)) $((HEIGHT / 2)) click 1
+cstate ".focused == $gamma_id and .stacking[-1] == $gamma_id" "gamma top" ||
+    fail G-FOCUS-MOUSE "clicking Gamma did not focus and raise it"
+glide $((WIDTH / 4)) $((HEIGHT / 2)) $((WIDTH * 3 / 4)) $((HEIGHT / 2))
+sleep 1
+cstate ".focused == $beta_id and .stacking[-1] == $gamma_id" "no raise" ||
+    fail G-FOCUS-MOUSE "hovering Beta raised it with auto-raise off"
+gsettings reset org.gnome.desktop.wm.preferences focus-mode
+gsettings reset org.gnome.desktop.wm.preferences auto-raise
+gsettings reset org.gnome.desktop.wm.preferences auto-raise-delay
+cstate '.wm.focus_mode == "click" and (.wm.auto_raise | not)' "click restored" ||
+    fail G-FOCUS-MOUSE "resetting the focus policy did not restore click/no-raise"
+cp "$CSTATE" "$ARTIFACTS/wm-focus-mouse.json"
+pass G-FOCUS-MOUSE "click holds focus on click alone; sloppy follows the pointer without raising; mouse drops focus over the panel; auto-raise raises after its delay and off leaves the stack"
+
+# raise-on-click: off, a click focuses without raising; on, a click
+# raises even the window that already has focus.
+xdotool mousemove --window "$WID" $((WIDTH / 4)) $((HEIGHT / 2)) click 1
+cstate ".focused == $gamma_id and .stacking[-1] == $gamma_id" "gamma top again" ||
+    fail G-RAISE-ON-CLICK "clicking Gamma did not focus and raise it"
+gsettings set org.gnome.desktop.wm.preferences raise-on-click false
+cstate '(.wm.raise_on_click | not)' "raise-on-click off" ||
+    fail G-RAISE-ON-CLICK "raise-on-click false did not reach the compositor"
+xdotool mousemove --window "$WID" $((WIDTH * 3 / 4)) $((HEIGHT / 2)) click 1
+cstate ".focused == $beta_id and .stacking[-1] == $gamma_id" "focus without raise" ||
+    fail G-RAISE-ON-CLICK "with raise-on-click off a click raised Beta or did not focus it"
+gsettings set org.gnome.desktop.wm.preferences raise-on-click true
+cstate '.wm.raise_on_click' "raise-on-click on" ||
+    fail G-RAISE-ON-CLICK "raise-on-click true did not reach the compositor"
+xdotool mousemove --window "$WID" $((WIDTH * 3 / 4)) $((HEIGHT / 2)) click 1
+cstate ".focused == $beta_id and .stacking[-1] == $beta_id" "click raises focused" ||
+    fail G-RAISE-ON-CLICK "with raise-on-click on a click did not raise the focused Beta"
+gsettings reset org.gnome.desktop.wm.preferences raise-on-click
+cp "$CSTATE" "$ARTIFACTS/wm-raise-on-click.json"
+pass G-RAISE-ON-CLICK "raise-on-click off focuses without raising; on, a click raises even the focused window"
+
+xdotool key super+Right
+cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect == [$beta_fx, $beta_fy, $beta_fw, $beta_fh]" "beta floating" ||
+    fail G-RAISE-ON-CLICK "Super+Right did not restore Beta's floating rect"
+overview_pick G-RAISE-ON-CLICK tuna-test-gamma
+xdotool key super+Left
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [$gamma_fx, $gamma_fy, $gamma_fw, $gamma_fh]" "gamma floating" ||
+    fail G-RAISE-ON-CLICK "Super+Left did not restore Gamma's floating rect"
+
+# mouse-button-modifier: Super (GNOME's default) plus the left button
+# moves the window under the pointer; with <Alt> Super no longer drags
+# and Alt does, and Alt plus the middle button resizes from the nearest
+# corner. The moves are undone so later gates see the same layout.
+gx=$((gamma_fx + gamma_fw / 2))
+gy=$((gamma_fy + gamma_fh / 2))
+cstate ".wm.mouse_button_modifier == 64 and .focused == $gamma_id" "super modifier" ||
+    fail G-MOUSE-MODIFIER "mouse-button-modifier is not Super with Gamma focused before the test"
+modifier_drag Super_L 1 "$gx" "$gy" 120 0
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [$((gamma_fx + 120)), $gamma_fy, $gamma_fw, $gamma_fh]" "super moved" ||
+    fail G-MOUSE-MODIFIER "Super+drag did not move Gamma by 120 px"
+cstate '.overview_open | not' "no overview" 2 ||
+    fail G-MOUSE-MODIFIER "releasing Super after the drag opened the overview"
+modifier_drag Super_L 1 $((gx + 120)) "$gy" -120 0
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [$gamma_fx, $gamma_fy, $gamma_fw, $gamma_fh]" "super back" ||
+    fail G-MOUSE-MODIFIER "Super+drag did not move Gamma back"
+gsettings set org.gnome.desktop.wm.preferences mouse-button-modifier '<Alt>'
+cstate '.wm.mouse_button_modifier == 8' "alt modifier" ||
+    fail G-MOUSE-MODIFIER "mouse-button-modifier <Alt> did not reach the compositor"
+modifier_drag Super_L 1 "$gx" "$gy" 120 0
+if ! cstate '.overview_open | not' "closed after super" 2; then
+    xdotool key Escape
+    cstate '.overview_open | not' "overview closed" || fail G-MOUSE-MODIFIER "the overview would not close"
+fi
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [$gamma_fx, $gamma_fy, $gamma_fw, $gamma_fh]" "super inert" ||
+    fail G-MOUSE-MODIFIER "Super+drag still moved Gamma with the modifier on Alt"
+cstate ".focused == $gamma_id" "gamma focused" || overview_pick G-MOUSE-MODIFIER tuna-test-gamma
+modifier_drag Alt_L 1 "$gx" "$gy" 120 0
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [$((gamma_fx + 120)), $gamma_fy, $gamma_fw, $gamma_fh]" "alt moved" ||
+    fail G-MOUSE-MODIFIER "Alt+drag did not move Gamma with the modifier on Alt"
+modifier_drag Alt_L 1 $((gx + 120)) "$gy" -120 0
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [$gamma_fx, $gamma_fy, $gamma_fw, $gamma_fh]" "alt back" ||
+    fail G-MOUSE-MODIFIER "Alt+drag did not move Gamma back"
+corner_x=$((gamma_fx + gamma_fw * 5 / 6))
+corner_y=$((gamma_fy + gamma_fh * 5 / 6))
+modifier_drag Alt_L 2 "$corner_x" "$corner_y" 60 40
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [$gamma_fx, $gamma_fy, $((gamma_fw + 60)), $((gamma_fh + 40))]" "alt resized" ||
+    fail G-MOUSE-MODIFIER "Alt+middle drag did not grow Gamma from its bottom-right corner"
+scrot "$ARTIFACTS/24p-mouse-modifier-resize.png" >/dev/null
+modifier_drag Alt_L 2 $((corner_x + 60)) $((corner_y + 40)) -60 -40
+cstate ".windows[] | select(.app_id == \"tuna-test-gamma\") | .rect == [$gamma_fx, $gamma_fy, $gamma_fw, $gamma_fh]" "alt resized back" ||
+    fail G-MOUSE-MODIFIER "Alt+middle drag did not shrink Gamma back"
+gsettings reset org.gnome.desktop.wm.preferences mouse-button-modifier
+cstate '.wm.mouse_button_modifier == 64' "super again" ||
+    fail G-MOUSE-MODIFIER "resetting mouse-button-modifier did not restore Super"
+cp "$CSTATE" "$ARTIFACTS/wm-mouse-modifier.json"
+pass G-MOUSE-MODIFIER "Super+drag moves by default; with <Alt> Super is inert, Alt+drag moves and Alt+middle resizes from the nearest corner; reset restores Super"
+
+# GNOME's remaining window keys, bound live: Show Desktop hides and
+# restores the workspace, fullscreen, vertical maximize and the corner
+# and center moves toggle and place the focused window, and numbered
+# workspace keys go only to workspaces that exist.
+cstate ".focused == $gamma_id" "gamma focused" || overview_pick G-WM-EXTRA-KEYS tuna-test-gamma
+grab_mark="$(wc -c <"$LOG")"
+gsettings set org.gnome.desktop.wm.keybindings show-desktop "['<Super>F9']"
+gsettings set org.gnome.desktop.wm.keybindings toggle-fullscreen "['<Super>F7']"
+gsettings set org.gnome.desktop.wm.keybindings maximize-vertically "['<Super>F2']"
+gsettings set org.gnome.desktop.wm.keybindings move-to-corner-nw "['<Super>F8']"
+gsettings set org.gnome.desktop.wm.keybindings move-to-center "['<Super>F12']"
+gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-2 "['<Super>F5']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-3 "['<Super>F6']"
+regrabs_settled G-WM-EXTRA-KEYS "$grab_mark"
+shown_before="$(jq '[.windows[] | select(.workspace == 0)] | length' "$CSTATE")"
+fkey_tap Super_L ffc6 || fail G-WM-EXTRA-KEYS "Super+F9 tap failed"
+cstate '.showing_desktop and .focused == null' "desktop shown" ||
+    fail G-WM-EXTRA-KEYS "show-desktop did not hide the windows and drop focus"
+scrot "$ARTIFACTS/24p-show-desktop.png" >/dev/null
+fkey_tap Super_L ffc6 || fail G-WM-EXTRA-KEYS "Super+F9 tap failed"
+cstate "(.showing_desktop | not) and .focused == $gamma_id and ([.windows[] | select(.workspace == 0)] | length) == $shown_before" "desktop back" ||
+    fail G-WM-EXTRA-KEYS "show-desktop again did not bring the windows and Gamma's focus back"
+fkey_tap Super_L ffc4 || fail G-WM-EXTRA-KEYS "Super+F7 tap failed"
+cstate ".windows[] | select(.id == $gamma_id) | .rect == [0, 0, $WIDTH, $HEIGHT]" "fullscreen" ||
+    fail G-WM-EXTRA-KEYS "toggle-fullscreen did not fill the output"
+fkey_tap Super_L ffc4 || fail G-WM-EXTRA-KEYS "Super+F7 tap failed"
+cstate ".windows[] | select(.id == $gamma_id) | .rect == [$gamma_fx, $gamma_fy, $gamma_fw, $gamma_fh]" "unfullscreen" ||
+    fail G-WM-EXTRA-KEYS "toggle-fullscreen again did not restore Gamma"
+fkey_tap Super_L ffbf || fail G-WM-EXTRA-KEYS "Super+F2 tap failed"
+cstate ".windows[] | select(.id == $gamma_id) | .rect == [$gamma_fx, 32, $gamma_fw, $((HEIGHT - 32))]" "vertical" ||
+    fail G-WM-EXTRA-KEYS "maximize-vertically did not fill the work area's height"
+fkey_tap Super_L ffbf || fail G-WM-EXTRA-KEYS "Super+F2 tap failed"
+cstate ".windows[] | select(.id == $gamma_id) | .rect == [$gamma_fx, $gamma_fy, $gamma_fw, $gamma_fh]" "vertical back" ||
+    fail G-WM-EXTRA-KEYS "maximize-vertically again did not restore Gamma"
+fkey_tap Super_L ffc5 || fail G-WM-EXTRA-KEYS "Super+F8 tap failed"
+cstate ".windows[] | select(.id == $gamma_id) | .rect == [0, 32, $gamma_fw, $gamma_fh]" "corner nw" ||
+    fail G-WM-EXTRA-KEYS "move-to-corner-nw did not move Gamma to the work area's corner"
+fkey_tap Super_L ffc9 || fail G-WM-EXTRA-KEYS "Super+F12 tap failed"
+cstate ".windows[] | select(.id == $gamma_id) | .rect == [$(((WIDTH - gamma_fw) / 2)), $((32 + (HEIGHT - 32 - gamma_fh) / 2)), $gamma_fw, $gamma_fh]" "center" ||
+    fail G-WM-EXTRA-KEYS "move-to-center did not center Gamma in the work area"
+read -r cx cy _ _ <<EOF2
+$(window_rect tuna-test-gamma)
+EOF2
+modifier_drag Super_L 1 $((cx + gamma_fw / 2)) $((cy + gamma_fh / 2)) $((gamma_fx - cx)) $((gamma_fy - cy))
+cstate ".windows[] | select(.id == $gamma_id) | .rect == [$gamma_fx, $gamma_fy, $gamma_fw, $gamma_fh]" "placed back" ||
+    fail G-WM-EXTRA-KEYS "Super+drag did not put Gamma back"
+cstate '.workspaces == [0]' "one occupied workspace" 3 ||
+    fail G-WM-EXTRA-KEYS "expected every window on workspace 0, workspaces $(jq -c .workspaces "$CSTATE")"
+fkey_tap Super_L ffc3 || fail G-WM-EXTRA-KEYS "Super+F6 tap failed"
+sleep 1.5
+cstate '.active_workspace == 0' "no workspace 3" 3 ||
+    fail G-WM-EXTRA-KEYS "switch-to-workspace-3 went to a workspace that does not exist"
+fkey_tap Super_L ffc2 || fail G-WM-EXTRA-KEYS "Super+F5 tap failed"
+cstate ".active_workspace == 1 and (.windows[] | select(.id == $gamma_id) | .workspace == 1) and .focused == $gamma_id" "moved to 2" ||
+    fail G-WM-EXTRA-KEYS "move-to-workspace-2 did not move Gamma to workspace 2 and follow it"
+xdotool key super+Home
+cstate '.active_workspace == 0' "home" || fail G-WM-EXTRA-KEYS "Super+Home did not come back to workspace 1"
+fkey_tap Super_L ffc3 || fail G-WM-EXTRA-KEYS "Super+F6 tap failed"
+cstate '.active_workspace == 2' "workspace 3" ||
+    fail G-WM-EXTRA-KEYS "switch-to-workspace-3 did not reach the trailing workspace"
+xdotool key super+Page_Up
+cstate ".active_workspace == 1 and .focused == $gamma_id" "back to gamma" ||
+    fail G-WM-EXTRA-KEYS "Super+Page_Up did not return to Gamma's workspace"
+xdotool key super+shift+Home
+cstate ".active_workspace == 0 and all(.windows[]; .workspace == 0)" "gamma home" ||
+    fail G-WM-EXTRA-KEYS "Super+Shift+Home did not bring Gamma home"
+grab_mark="$(wc -c <"$LOG")"
+for wm_key in show-desktop toggle-fullscreen maximize-vertically move-to-corner-nw move-to-center move-to-workspace-2 switch-to-workspace-3; do
+    gsettings reset org.gnome.desktop.wm.keybindings "$wm_key"
+done
+regrabs_settled G-WM-EXTRA-KEYS "$grab_mark"
+fkey_tap Super_L ffc6 || fail G-WM-EXTRA-KEYS "Super+F9 tap failed"
+sleep 1.5
+cstate '.showing_desktop | not' "unbound" 3 ||
+    fail G-WM-EXTRA-KEYS "Super+F9 still showed the desktop after show-desktop reset"
+cp "$CSTATE" "$ARTIFACTS/wm-window-keys.json"
+pass G-WM-EXTRA-KEYS "show-desktop, toggle-fullscreen, maximize-vertically, move-to-corner-nw, move-to-center, move-to-workspace-2 and switch-to-workspace-3 bind live, act on the focused window, stop at missing workspaces and unbind on reset"
+
+# GNOME's workspace keys rebind live: with switch-to-workspace-right
+# and -1 moved, the old chords stop switching and the new ones switch;
+# resetting restores GNOME's chords.
+cstate '.active_workspace == 0' "start home" 3 ||
+    fail G-WS-KEYS-REBIND "expected to start on workspace 0"
+rebind_start="$(jq -r '.active_workspace' "$CSTATE")"
+rebind_first="$(jq -r '.workspaces | min' "$CSTATE")"
+grab_mark="$(wc -c <"$LOG")"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-right "['<Super>F10']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-1 "['<Super>F11']"
+regrabs_settled G-WS-KEYS-REBIND "$grab_mark"
+xdotool key super+Page_Down
+sleep 1.5
+cstate ".active_workspace == $rebind_start" "old right dead" 3 ||
+    fail G-WS-KEYS-REBIND "Super+Page_Down still switched after switch-to-workspace-right moved"
+fkey_tap Super_L ffc7 || fail G-WS-KEYS-REBIND "Super+F10 tap failed"
+cstate ".active_workspace == $((rebind_start + 1))" "new right works" ||
+    fail G-WS-KEYS-REBIND "Super+F10 did not switch to the next workspace"
+xdotool key super+Home
+sleep 1.5
+cstate ".active_workspace == $((rebind_start + 1))" "old 1 dead" 3 ||
+    fail G-WS-KEYS-REBIND "Super+Home still switched after switch-to-workspace-1 moved"
+fkey_tap Super_L ffc8 || fail G-WS-KEYS-REBIND "Super+F11 tap failed"
+cstate ".active_workspace == $rebind_first" "new 1 works" ||
+    fail G-WS-KEYS-REBIND "Super+F11 did not switch to the first workspace"
+grab_mark="$(wc -c <"$LOG")"
+gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-right
+gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-1
+regrabs_settled G-WS-KEYS-REBIND "$grab_mark"
+xdotool key super+Page_Down
+cstate ".active_workspace != $rebind_first" "defaults back" ||
+    fail G-WS-KEYS-REBIND "resetting did not restore Super+Page_Down"
+xdotool key super+Page_Up
+cstate ".active_workspace == $rebind_start" "home again" ||
+    fail G-WS-KEYS-REBIND "Super+Page_Up did not come home"
+cp "$CSTATE" "$ARTIFACTS/wm-workspace-rebind.json"
+pass G-WS-KEYS-REBIND "switch-to-workspace-right and -1 rebind live: the old chords stop, Super+F10/F11 switch, and resetting restores GNOME's chords"
 
 # GNOME's input methods: IBus composes in a GTK app, with
 # tuna-ibus-bridge as IBus's client (GNOME Shell's part). A test engine

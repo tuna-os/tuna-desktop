@@ -75,6 +75,8 @@ through its settings key (`org.gnome.shell.keybindings`,
 | Super+1..9 / Super+Ctrl+1..9 | Dash app: switch-or-launch / open a new window |
 | Super+N | Focus the notification banner's buttons; Escape releases |
 | Print / Shift+Print / Alt+Print | Screenshot UI / fullscreen shot / window shot (S/C/W pick, Enter captures, Escape closes) |
+| Super+Shift+Left/Right/Up/Down | Move the focused floating window to the neighboring monitor (`move-to-monitor-*`, #347) |
+| Super+drag / Super+middle-drag / Super+right-click | Move / resize from the nearest corner / window menu (`mouse-button-modifier`, `resize-with-right-button`, #347) |
 
 While the bar holds keyboard focus, NORMAL/OVERVIEW chords pause
 (the compositor's exclusive-popup mode); volume, brightness and

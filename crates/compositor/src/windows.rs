@@ -76,6 +76,8 @@ use crate::{
 };
 use tuna_shell_control::{switcher_keys, SwitcherAction, PANEL_HEIGHT};
 
+mod prefs;
+
 /// Default floating size for a newly mapped window.
 const DEFAULT_WIDTH: i32 = 800;
 const DEFAULT_HEIGHT: i32 = 600;
@@ -386,6 +388,17 @@ pub struct WindowManager {
     workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
     modal_dim: crate::modal_dim::ModalDim,
     icon_geometries: HashMap<u64, Rectangle<i32, Logical>>,
+    /// GNOME's focus and mouse-button policy (#347).
+    focus_policy: tuna_shell_control::FocusPolicy,
+    /// Focus-follows-mouse state (sloppy and mouse focus modes).
+    hover: crate::wm_prefs::HoverFocus,
+    /// Focus without raising (hover focus, `raise-on-click` off).
+    hold_stacking: bool,
+    /// Geometry to give back on the next axis-maximize toggle, per
+    /// window and axis (`true` vertical).
+    axis_restore: HashMap<(u64, bool), Rectangle<i32, Logical>>,
+    /// Windows Show Desktop hid, to bring back on the next press.
+    showing_desktop: Vec<u64>,
 }
 
 impl WindowManager {
@@ -601,6 +614,11 @@ impl WindowManager {
             workspace_tracker: Default::default(),
             modal_dim: Default::default(),
             icon_geometries: Default::default(),
+            focus_policy: Default::default(),
+            hover: Default::default(),
+            hold_stacking: false,
+            axis_restore: HashMap::new(),
+            showing_desktop: Vec::new(),
         }
     }
 
@@ -1570,6 +1588,13 @@ impl WindowManager {
         if self.overview_held.is_some() {
             self.focus_parked(Some(id));
         }
+        // GNOME's `focus-new-windows` strict policy leaves focus where
+        // it is and opens the window just below the focused one.
+        if !self.new_window_takes_focus(id) {
+            self.stack_below_focus(id);
+            self.configure(id, false);
+            return;
+        }
         self.apply_focus(state, Some(id));
     }
 
@@ -2197,7 +2222,7 @@ impl WindowManager {
             // Floating stacks raise focus to the top; the strip keeps
             // column order independent of focus (niri shape), so focus
             // never reorders in scroll mode.
-            if self.mode == SessionMode::Gnome {
+            if self.mode == SessionMode::Gnome && !self.hold_stacking {
                 self.raise_family(id);
             }
         }
@@ -2960,7 +2985,10 @@ impl WindowManager {
         }
         // Pointer focus is the window under the pointer, or nothing over
         // the bare desktop. Keyboard focus and stacking change only on a
-        // click (GNOME's default click-to-focus), never on motion.
+        // click under GNOME's default click-to-focus; the sloppy and
+        // mouse focus modes move keyboard focus here too, never raising.
+        let hovered = self.hover_target(pos);
+        self.hover_motion(state, hovered, pos);
         let Some(pointer) = self.pointer.clone() else {
             return;
         };
@@ -3083,23 +3111,18 @@ impl WindowManager {
                 }
             }
         }
-        // Super+press on a window starts a move (GNOME's Super+drag).
-        if pressed && self.super_held && !self.overview_open && !strip_owned {
+        // GNOME's `mouse-button-modifier` (Super by default) plus a
+        // button on a window: move, resize or the window menu.
+        if pressed && !self.overview_open && !strip_owned {
             let pos = self.pointer_pos;
             if crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
                 .is_none()
                 && self.popup_at(state, pos).is_none()
+                && self.modifier_press(state, button)
             {
-                if let Some(id) = self.window_at(pos) {
-                    self.apply_focus(state, Some(id));
-                    // The trigger machine already disarmed the Super tap on
-                    // this press, so releasing Super will not open the
-                    // overview.
-                    self.begin_move_owned(state, id, pos, Some(button));
-                    // The press is not delivered, so neither is its release.
-                    self.swallowed_button = Some(button);
-                    return;
-                }
+                // The press is not delivered, so neither is its release.
+                self.swallowed_button = Some(button);
+                return;
             }
         }
         let on_popup = self.popup_at(state, self.pointer_pos).is_some();
@@ -3145,9 +3168,7 @@ impl WindowManager {
                     .keyboard
                     .as_ref()
                     .is_none_or(|keyboard| keyboard.current_focus() == self.surface_of(id));
-                if self.model.focused() != Some(id) || !keyboard_matches {
-                    self.apply_focus(state, Some(id));
-                }
+                self.click_focus(state, id, keyboard_matches);
             }
         }
         // Mapping, closing or restacking a surface can change what lies
@@ -3529,6 +3550,14 @@ impl WindowManager {
                 self.keep_above_on_top();
                 true
             }
+            WindowAction::ToggleFullscreen
+            | WindowAction::Raise
+            | WindowAction::Lower
+            | WindowAction::RaiseOrLower
+            | WindowAction::MaximizeVertically
+            | WindowAction::MaximizeHorizontally
+            | WindowAction::MoveToMonitor { .. }
+            | WindowAction::MoveTo { .. } => self.extra_window_action(state, id, action),
             WindowAction::MoveToWorkspaceLeft | WindowAction::MoveToWorkspaceRight => {
                 let Some(current) = self.model.window(id).map(|e| e.workspace) else {
                     return false;

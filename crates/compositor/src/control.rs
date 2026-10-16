@@ -340,6 +340,8 @@ pub struct Session<'a> {
     wellbeing_effects: Option<(bool, bool)>,
     icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     screen_reader: Option<bool>,
+    /// `ToggleShowDesktop` presses, drained by the hub (#347).
+    show_desktop_toggles: u32,
     screenshot_pointer: Option<(i32, i32)>,
     /// Input-source switches the shell asked for (`true` backward).
     input_source_switches: Vec<bool>,
@@ -431,6 +433,7 @@ impl<'a> Session<'a> {
             wellbeing_effects: None,
             icon_geometries: None,
             screen_reader: None,
+            show_desktop_toggles: 0,
             screenshot_pointer: None,
             input_source_switches: Vec::new(),
             switcher_thumbnails: None,
@@ -706,6 +709,17 @@ impl<'a> Session<'a> {
                 kind: CommandKind::SetScreenReader { enabled },
             } => {
                 self.screen_reader = Some(enabled);
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::ToggleShowDesktop,
+            } => {
+                self.show_desktop_toggles = self.show_desktop_toggles.saturating_add(1);
                 self.conn.write_frame(&Message::CommandResult {
                     id,
                     status: CommandStatus::Applied,
@@ -1125,6 +1139,7 @@ fn apply_command(
         | CommandKind::SetSwitcherKeys { .. }
         | CommandKind::MoveScreenshotPointer { .. }
         | CommandKind::SetScreenReader { .. }
+        | CommandKind::ToggleShowDesktop
         | CommandKind::SetInputSettings(_) => (CommandStatus::Applied, None),
         CommandKind::Lock => {
             // Manual lock from the shell (session-lock set path):
@@ -1166,6 +1181,8 @@ pub struct PollOutcome {
     pub wellbeing_effects: Option<(bool, bool)>,
     pub icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     pub screen_reader: Option<bool>,
+    /// How many times the shell pressed `show-desktop`.
+    pub show_desktop_toggles: u32,
     pub screenshot_pointer: Option<(i32, i32)>,
     /// Accelerator grabs the shell sent, if they changed.
     pub accelerators: Option<Vec<tuna_shell_control::Accelerator>>,
@@ -1780,6 +1797,9 @@ impl ControlHub {
                     if let Some(enabled) = session.screen_reader.take() {
                         outcome.screen_reader = Some(enabled);
                     }
+                    outcome.show_desktop_toggles = outcome
+                        .show_desktop_toggles
+                        .saturating_add(std::mem::take(&mut session.show_desktop_toggles));
                     reply_ok
                 } else {
                     false
