@@ -50,6 +50,8 @@ use smithay::{
     },
 };
 
+pub mod a11y_keyboard;
+mod a11y_shadow;
 pub mod animation;
 pub mod animation_clock;
 mod auth_owner;

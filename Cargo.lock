@@ -4176,6 +4176,7 @@ dependencies = [
  "wayland-scanner",
  "wayland-server",
  "xcursor",
+ "xkbcommon 0.9.0",
  "zbus",
 ]
 

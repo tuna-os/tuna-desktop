@@ -835,6 +835,11 @@ jobs:
     # the Tuna Desktop hardware session on the DRM/KMS backend. The image is
     # rebuilt rootful here (bootc install reads it from root's storage),
     # in parallel with marlin-image rather than after it.
+    name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        orca: [distribution, upstream51]
     runs-on: ubuntu-26.04
     needs: [check, arch-package]
     if: contains(fromJSON(needs.check.outputs.lanes), 'marlin-vm')
@@ -866,6 +871,16 @@ jobs:
             -t localhost/marlin-tuna-preview:ci .
           sudo podman build -f packaging/marlin/vm-lane/Containerfile \
             -t localhost/marlin-tuna-vm:ci .
+          if [[ '${{ matrix.orca }}' == upstream51 ]]; then
+            sudo podman build -f packaging/marlin/vm-lane/orca51/Containerfile \
+              -t localhost/marlin-tuna-vm-orca51:ci .
+            sudo podman tag localhost/marlin-tuna-vm-orca51:ci localhost/marlin-tuna-vm:ci
+            mkdir -p orca51-package-provenance
+            probe_container=$(sudo podman create localhost/marlin-tuna-vm:ci /usr/bin/true)
+            sudo podman cp "$probe_container:/usr/share/tuna-vm-orca51/." orca51-package-provenance/
+            sudo podman rm "$probe_container"
+            sudo chown -R "$(id -u):$(id -g)" orca51-package-provenance
+          fi
           sudo podman image inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
@@ -919,7 +934,7 @@ jobs:
       # through QMP input and records it to tour/tuna-tour.webm.
       - name: Boot the disk, assert the Tuna Desktop hardware session, record the tour
         run: >-
-          scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour
+          scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour --orca-contract ${{ matrix.orca }}
           --strip-image vm-lane-artifacts/strip-image.json --strip-edge
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
@@ -928,7 +943,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: marlin-vm
+          name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
           path: |
             vm-lane-artifacts/
             !vm-lane-artifacts/tour/
@@ -936,10 +951,18 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: tuna-tour
+          name: ${{ matrix.orca == 'distribution' && 'tuna-tour' || 'tuna-tour-orca51' }}
           path: vm-lane-artifacts/tour/
           if-no-files-found: ignore
           retention-days: 30
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always() && matrix.orca == 'upstream51'
+        with:
+          name: orca51-package-provenance
+          path: orca51-package-provenance/
+          if-no-files-found: error
+          retention-days: 14
 
   parity-ledger:
     # GNOME 51 parity ledger gate (#66): every row marked pass must cite

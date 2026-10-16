@@ -606,6 +606,7 @@ pub struct Runtime {
     control: ControlHub,
     shell: ShellDriver,
     orca: crate::orca::Reader,
+    a11y_keyboard: Option<crate::a11y_keyboard::Monitor>,
     /// The IBus bridge, when IBus is installed.
     ime: Option<crate::ime::ImeBridge>,
     overlay: Overlay,
@@ -1175,6 +1176,12 @@ impl Runtime {
             .handle()
             .insert_source(wake_source, |_, _, _: &mut Runtime| {})
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+
+        #[cfg(feature = "drm")]
+        let a11y_keyboard =
+            matches!(backend, Backend::Drm(_)).then(crate::a11y_keyboard::Monitor::start);
+        #[cfg(not(feature = "drm"))]
+        let a11y_keyboard = None;
         let loop_handle = event_loop.handle();
         let mut runtime = Runtime {
             display,
@@ -1236,7 +1243,8 @@ impl Runtime {
             wellbeing_effects: Default::default(),
             input_aids: aids::RuntimeAids::default(),
             dnd_escape_held: false,
-            orca: crate::orca::Reader::new(&session.socket_name),
+            orca: crate::orca::Reader::new(&session.socket_name, a11y_keyboard.clone()),
+            a11y_keyboard,
             pipewire: None,
             casts: Vec::new(),
             cast_outputs,
@@ -1407,6 +1415,9 @@ impl Runtime {
         #[cfg(feature = "drm")]
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
+        if let Some(monitor) = &self.a11y_keyboard {
+            monitor.set_locked(true);
+        }
         self.lock.lock();
         self.cursor.on_lock();
         self.control.set_locked(true);
@@ -1584,6 +1595,9 @@ impl Runtime {
             return false;
         }
         self.reset_input_aid_ownership();
+        if let Some(monitor) = &self.a11y_keyboard {
+            monitor.set_locked(false);
+        }
         self.lock.unlock(self.lock_now_ms());
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
@@ -1692,6 +1706,21 @@ impl Runtime {
     /// breaking Super-combos); only Escape-closes is consumed, so a
     /// closing keypress never double-acts on client UI.
     fn on_manager_input(&mut self, input: ManagerInput) {
+        if let Some(monitor) = &self.a11y_keyboard {
+            monitor.set_locked(self.is_locked());
+            if self
+                .manager
+                .accessibility_input(&mut self.state, monitor, &input)
+            {
+                // Activity still wakes/feeds idle; consumed keys never enter
+                // real seat XKB, WM shortcuts, overview or focused clients.
+                self.lock.note_input(input_time(&input));
+                self.idle_since = Instant::now();
+                self.idle_monitor.activity();
+                self.active_at = Instant::now();
+                return;
+            }
+        }
         // A Super+L release can arrive after the lock takes ownership, or
         // before its surface maps. Consumed input must still clear modifier
         // holds, otherwise an ordinary post-unlock click becomes Super+drag.
@@ -2300,6 +2329,10 @@ impl Runtime {
             .diagnostics(self.animation_clock.now(), self.is_locked());
         doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());
         doc["screen_reader_state"] = serde_json::json!(self.orca.state());
+        doc["a11y_keyboard"] = self
+            .a11y_keyboard
+            .as_ref()
+            .map_or(serde_json::Value::Null, |monitor| monitor.snapshot());
         // Keep backend-specific observations outside the large scene macro so
         // its expansion remains below the compiler's default recursion limit.
         // These values keep the same flat JSON fields and suppress lock input.

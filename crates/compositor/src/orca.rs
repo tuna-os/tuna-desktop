@@ -40,13 +40,17 @@ pub struct Reader {
     /// Pending until the last stopped child's bus names have vanished; a new
     /// Orca started earlier would lose the name race to its own predecessor.
     departing: Option<Receiver<()>>,
+    /// Killed child still awaiting its non-blocking reap in poll().
+    reaping: bool,
     state: State,
     sent: State,
     attempts: u8,
     next_start: Instant,
+    keyboard: Option<crate::a11y_keyboard::Monitor>,
+    keyboard_deadline: Instant,
 }
 impl Reader {
-    pub fn new(display: &str) -> Self {
+    pub fn new(display: &str, keyboard: Option<crate::a11y_keyboard::Monitor>) -> Self {
         Self {
             display: display.into(),
             wake: Default::default(),
@@ -54,10 +58,13 @@ impl Reader {
             child: None,
             observed: None,
             departing: None,
+            reaping: false,
             state: State::Disabled,
             sent: State::Disabled,
             attempts: 0,
             next_start: Instant::now(),
+            keyboard,
+            keyboard_deadline: Instant::now() + Duration::from_secs(10),
         }
     }
     pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
@@ -85,6 +92,7 @@ impl Reader {
         self.enabled = enabled;
         self.attempts = 0;
         self.next_start = Instant::now();
+        self.keyboard_deadline = Instant::now() + Duration::from_secs(10);
         if !enabled {
             self.stop();
             self.state = State::Disabled;
@@ -99,26 +107,17 @@ impl Reader {
         (self.enabled && self.child.is_none() && self.attempts < 3).then_some(self.next_start)
     }
     fn stop(&mut self) {
+        if let Some(keyboard) = &self.keyboard {
+            keyboard.revoke_reader();
+        }
         self.observed = None;
-        if let Some(mut child) = self.child.take() {
-            // This unreaped Child handle is authority over precisely our process.
-            // It cannot designate a recycled PID or another display's reader.
-            let pid = child.id();
+        if let Some(child) = self.child.as_mut() {
+            // Keep this unreaped Child as process authority (never a recycled
+            // PID or another display's reader) until poll() reaps it on its
+            // SIGCHLD wake and starts the bus departure watch. Never
+            // sleep/wait on the active compositor frame path.
             let _ = child.kill();
-            let until = Instant::now() + Duration::from_secs(1);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < until => {
-                        std::thread::sleep(Duration::from_millis(10))
-                    }
-                    _ => {
-                        eprintln!("tuna-compositor: owned Orca reap deadline exceeded");
-                        break;
-                    }
-                }
-            }
-            self.await_departure(pid);
+            self.reaping = true;
         }
     }
     fn await_departure(&mut self, pid: u32) {
@@ -147,6 +146,16 @@ impl Reader {
     }
     pub fn poll(&mut self, diagnostics_visible: bool) -> Option<State> {
         let mut observed_running = false;
+        if !self.reaping
+            && self.child.is_some()
+            && self.keyboard.as_ref().is_some_and(|keyboard| {
+                keyboard.availability() != crate::a11y_keyboard::Availability::Ready
+            })
+        {
+            self.stop();
+            self.state = State::Unavailable;
+            self.attempts = 3;
+        }
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -154,16 +163,22 @@ impl Reader {
                         eprintln!("TUNA_ORCA_DIAGNOSTIC stage=child-exit pid={} attempt={} code={} signal={}", child.id(), self.attempts, status.code().unwrap_or(-1), status.signal().unwrap_or(0));
                     }
                     let pid = child.id();
+                    if let Some(keyboard) = &self.keyboard {
+                        keyboard.revoke_reader();
+                    }
                     self.child = None;
                     self.observed = None;
                     self.await_departure(pid);
-                    self.state = State::Unavailable;
-                    // Startup exit 1 includes the genuine singleton conflict.
-                    // Do not repeatedly race another session for its reader.
-                    if status.code() == Some(1) {
-                        self.attempts = 3;
+                    // A reap after our own stop() keeps the state stop() chose.
+                    if !std::mem::take(&mut self.reaping) {
+                        self.state = State::Unavailable;
+                        // Startup exit 1 includes the genuine singleton conflict.
+                        // Do not repeatedly race another session for its reader.
+                        if status.code() == Some(1) {
+                            self.attempts = 3;
+                        }
+                        self.next_start = Instant::now() + Duration::from_secs(2);
                     }
-                    self.next_start = Instant::now() + Duration::from_secs(2);
                 }
                 Err(error) => {
                     if diagnostics_visible {
@@ -219,6 +234,29 @@ impl Reader {
             && Instant::now() >= self.next_start
             && !self.departure_pending()
         {
+            if let Some(keyboard) = &self.keyboard {
+                match keyboard.availability() {
+                    crate::a11y_keyboard::Availability::Ready => {}
+                    crate::a11y_keyboard::Availability::Pending
+                        if Instant::now() < self.keyboard_deadline =>
+                    {
+                        return None
+                    }
+                    state => {
+                        self.state = if state == crate::a11y_keyboard::Availability::Conflict {
+                            State::Conflict
+                        } else {
+                            State::Unavailable
+                        };
+                        self.attempts = 3;
+                        if self.sent != self.state {
+                            self.sent = self.state;
+                            return Some(self.state);
+                        }
+                        return None;
+                    }
+                }
+            }
             self.attempts += 1;
             let mut command = Command::new("/usr/bin/orca");
             command
@@ -234,7 +272,11 @@ impl Reader {
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit());
             parent_lifetime(&mut command);
-            match command.spawn() {
+            let spawned = match &self.keyboard {
+                Some(keyboard) => keyboard.spawn(&mut command),
+                None => command.spawn(),
+            };
+            match spawned {
                 Ok(child) => {
                     let pid = child.id();
                     let (sender, receiver) = mpsc::channel();
@@ -280,6 +322,17 @@ impl Reader {
 impl Drop for Reader {
     fn drop(&mut self) {
         self.stop();
+        // Only final teardown may wait boundedly for an owned child. Normal
+        // preference changes and conflicts retain/reap it through poll().
+        if let Some(child) = self.child.as_mut() {
+            let until = Instant::now() + Duration::from_secs(1);
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if let Some(keyboard) = &self.keyboard {
+            keyboard.shutdown();
+        }
     }
 }
 
@@ -331,6 +384,7 @@ fn bus_call(method: &str, arg: &str) -> Result<String, &'static str> {
     bus_call_command(command)
 }
 fn bus_call_command(mut command: Command) -> Result<String, &'static str> {
+    parent_lifetime(&mut command);
     let mut child = command.spawn().map_err(|_| "bus-spawn")?;
     let until = Instant::now() + Duration::from_secs(2);
     loop {
@@ -549,10 +603,17 @@ mod tests {
     fn disable_reaps_only_owned_child() {
         let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let mut other = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let mut reader = Reader::new("test-display");
+        let mut reader = Reader::new("test-display", None);
         reader.enabled = true;
         reader.child = Some(child);
         reader.set_enabled(false);
+        // stop never drops the unreaped Child or waits for it on a frame.
+        assert!(reader.pid().is_some());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while reader.pid().is_some() && Instant::now() < deadline {
+            reader.poll(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(reader.pid().is_none());
         assert!(other.try_wait().unwrap().is_none());
         other.kill().unwrap();
@@ -648,7 +709,7 @@ mod tests {
     #[test]
     fn no_new_child_while_predecessor_departs() {
         let (sender, receiver) = mpsc::channel();
-        let mut reader = Reader::new("test-display");
+        let mut reader = Reader::new("test-display", None);
         reader.enabled = true;
         reader.departing = Some(receiver);
         reader.poll(false);
@@ -665,7 +726,7 @@ mod wake_tests {
     use super::*;
     #[test]
     fn broken_observer_stops_bounded_retry_and_never_leaves_a_stale_deadline() {
-        let mut reader = Reader::new("isolated-test");
+        let mut reader = Reader::new("isolated-test", None);
         let (send, receive) = mpsc::channel();
         drop(send);
         reader.observed = Some(Observation {

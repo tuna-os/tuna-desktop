@@ -45,6 +45,7 @@ mod preview_chrome;
 mod privacy;
 mod privacy_portal;
 mod providers;
+mod public_search_diagnostic;
 mod renderer;
 mod screencast;
 mod screensaver;
@@ -237,6 +238,15 @@ struct Shell {
 struct ShellActions(Rc<RefCell<Shell>>);
 
 impl overview::OverviewActions for ShellActions {
+    fn public_navigation_unlocked(&self) -> bool {
+        self.0.try_borrow().ok().is_some_and(|shell| {
+            shell
+                .control
+                .as_ref()
+                .is_some_and(|control| !control.locked())
+        })
+    }
+
     fn set_window_icon_geometries(&self, geometries: Vec<tuna_shell_control::WindowIconGeometry>) {
         if let Some(control) = self.0.borrow_mut().control.as_mut() {
             let _ = control.set_window_icon_geometries(geometries);
