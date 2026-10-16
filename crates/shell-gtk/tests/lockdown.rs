@@ -20,7 +20,9 @@ use lockdown::{apply_entry_visibility, read, read_from, LockdownPolicy, SCHEMA};
 
 /// Every key round-trips through a private memory backend: set all,
 /// read all, clear all, read defaults. Skips the value assertions when
-/// the lockdown schema is not installed (fail-safe path instead).
+/// the lockdown schema is not installed (fail-safe path instead),
+/// unless `TUNA_REQUIRE_LOCKDOWN_SCHEMA` is set, as CI does so the
+/// round trip can never silently skip.
 #[test]
 fn policy_round_trips_through_memory_backend() {
     let source = gio::SettingsSchemaSource::default();
@@ -28,6 +30,10 @@ fn policy_round_trips_through_memory_backend() {
         .as_ref()
         .is_some_and(|source| source.lookup(SCHEMA, true).is_some());
     if !installed {
+        assert!(
+            std::env::var_os("TUNA_REQUIRE_LOCKDOWN_SCHEMA").is_none(),
+            "TUNA_REQUIRE_LOCKDOWN_SCHEMA is set but {SCHEMA} is not installed"
+        );
         assert_eq!(read(), LockdownPolicy::default());
         return;
     }
