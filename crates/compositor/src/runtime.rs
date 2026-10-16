@@ -796,6 +796,15 @@ impl Drop for Runtime {
     }
 }
 
+/// `(reported_ok, ok)` for a joined unlock worker. `reported_ok` is what the
+/// PAM worker itself returned: a cancelled or failed verification never
+/// reports OK (the tick path used to claim OK for every finished attempt).
+/// A denial (stale epoch, lost origin, cancel) leaves a real success visible
+/// for the trace but never lets it unlock.
+fn unlock_outcome(authenticated: bool, denied: bool) -> (bool, bool) {
+    (authenticated, authenticated && !denied)
+}
+
 impl Runtime {
     /// Build the session: display plus globals, output, backend window,
     /// and private socket. Does not run the loop (see [`run`]).
@@ -1584,7 +1593,7 @@ impl Runtime {
 
     /// Actual helper retirement is required in addition to the joined wrapper.
     /// A poisoned owner denies permanently; it cannot release this slot.
-    fn finish_unlock(&mut self, attempt: crate::auth_owner::Attempt, reported_ok: bool) {
+    fn finish_unlock(&mut self, attempt: crate::auth_owner::Attempt) {
         if !self.unlock_slot.matches(attempt) {
             return;
         }
@@ -1602,7 +1611,7 @@ impl Runtime {
         let joined_ok = joined.is_ok();
         let result = joined.unwrap_or(crate::pam_backend::Verification::Unretired);
         let backend_accepted = result.authenticated();
-        let ok = backend_accepted && reported_ok && !denied;
+        let (reported_ok, ok) = unlock_outcome(backend_accepted, denied);
         let live = attempt
             .origin
             .is_some_and(|origin| self.control.origin_pending_live(origin));
@@ -4235,7 +4244,7 @@ impl Runtime {
             .as_ref()
             .and_then(|worker| worker.worker.is_finished().then_some(worker.attempt));
         if let Some(attempt) = completed {
-            self.finish_unlock(attempt, true);
+            self.finish_unlock(attempt);
         }
 
         for event in self.shell.drain_events() {
@@ -6433,6 +6442,16 @@ fn input_time(input: &ManagerInput) -> u64 {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn unlock_outcome_reports_only_what_the_worker_returned() {
+        // S3 cancellation: the cancelled verification is denied and failed.
+        assert_eq!(unlock_outcome(false, true), (false, false));
+        assert_eq!(unlock_outcome(false, false), (false, false));
+        // Superseded epoch: the worker succeeded, but a denied attempt never applies.
+        assert_eq!(unlock_outcome(true, true), (true, false));
+        assert_eq!(unlock_outcome(true, false), (true, true));
+    }
 
     /// A preview record must ping an idle loop through the share's
     /// connected wake (#339): real calloop, no sleeps — dispatch
