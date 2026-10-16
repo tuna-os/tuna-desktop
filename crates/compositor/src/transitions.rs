@@ -322,6 +322,8 @@ pub struct Transitions {
     curtain: Curtain,
     ripples: Option<(Point<i32, Logical>, bool, Duration)>,
     revealed: Option<Duration>,
+    /// The startup cover was skipped (see [`Transitions::skip_startup`]).
+    startup_skipped: bool,
     screen: Option<(Vec<Snapshot>, Duration)>,
     ripple_textures: [Option<MemoryRenderBuffer>; 2],
     cover: Id,
@@ -352,6 +354,7 @@ impl Transitions {
             curtain: Curtain::default(),
             ripples: None,
             revealed: None,
+            startup_skipped: false,
             screen: None,
             ripple_textures: [None, None],
             cover: Id::new(),
@@ -483,7 +486,19 @@ impl Transitions {
         self.stats[SCREEN].started += 1;
     }
 
+    /// Drop the startup cover before it is revealed: a frozen proof
+    /// clock would hold it black, as nothing would move it.
+    pub fn skip_startup(&mut self) {
+        if self.revealed.is_none() {
+            self.revealed = Some(self.now);
+            self.startup_skipped = true;
+        }
+    }
+
     fn startup_cover(&self) -> Option<f32> {
+        if self.startup_skipped {
+            return None;
+        }
         match self.revealed {
             None => Some(1.0),
             Some(_) if !self.policy.allows_fades() => None,
@@ -795,6 +810,12 @@ mod tests {
         fx.set_policy(policy(MotionLevel::Off));
         fx.advance(at(t, 10), false, false, true);
         assert!(fx.startup_cover().is_none(), "instant with animations off");
+        let mut fx = Transitions::new(t);
+        fx.skip_startup();
+        fx.advance(at(t, 10), false, false, false);
+        assert!(fx.startup_cover().is_none(), "a frozen clock skips it");
+        assert_eq!(fx.stats[STARTUP].started, 0);
+        assert!(!fx.running());
     }
 
     #[test]

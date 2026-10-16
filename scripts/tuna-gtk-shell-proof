@@ -1016,8 +1016,11 @@ desk="$(px "$ARTIFACTS/01-panel.png" 300 200)"
 [ "$strip" = "0 0 0" ] || fail G-PANEL "panel strip is '$strip', not black"
 [ "$desk" != "0 0 0" ] || fail G-PANEL "desktop below the panel is black too"
 pass G-PANEL "GTK panel mapped as a black top strip"
-tsettled startup 0 0 || fail G-STARTUP-REVEAL "the startup cover did not fade out and settle"
-pass G-STARTUP-REVEAL "the desktop fades in from GNOME's startup cover, then nothing animates"
+# The comparison slice runs old binaries that predate the transitions.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    tsettled startup 0 0 || fail G-STARTUP-REVEAL "the startup cover did not fade out and settle"
+    pass G-STARTUP-REVEAL "the desktop fades in from GNOME's startup cover, then nothing animates"
+fi
 for label in "Activities" "Date and Time" "System"; do
     jq -e --arg n "$label" 'any(.[]; .name == $n)' "$ARTIFACTS/a11y-panel.json" >/dev/null ||
         fail A11Y-PANEL "no accessible control named '$label'"
@@ -1049,57 +1052,59 @@ while :; do
     [ "$(date +%s)" -ge "$end" ] && fail G-WALLPAPER-URI "escaped filename did not paint blue (double-decode decoy is red): $rgb"
     sleep 0.3
 done
-# GNOME's background swap keeps both pictures while the old one fades
-# out over 1000 ms, then nothing animates; with animations off it is
-# instant. Red is the decoy's colour; it must replace the blue.
-wait_wallpaper_rgb() {
-    want=$1
-    end=$(($(date +%s) + 15))
-    while :; do
-        scrot -o "$ARTIFACTS/01c-wallpaper-crossfade.png" >/dev/null
-        # shellcheck disable=SC2046 # three RGB channels
-        set -- $(px "$ARTIFACTS/01c-wallpaper-crossfade.png" 10 $((HEIGHT - 10)))
-        case "$want" in
-            red) [ "${1:-0}" -gt 220 ] && [ "${3:-255}" -lt 20 ] && return 0 ;;
-            blue) [ "${1:-255}" -lt 20 ] && [ "${3:-0}" -gt 220 ] && return 0 ;;
-        esac
-        [ "$(date +%s)" -ge "$end" ] && return 1
-        sleep 0.3
-    done
-}
-decoy_uri=$("$PY" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' "$wallpaper_decoy")
-fade_started=$(tval wallpaper_crossfade started)
-fade_frames=$(tval wallpaper_crossfade animated_frames)
-anim_clock 0
-cstate '.animation_clock_manual' "frozen wallpaper clock" ||
-    fail G-WALLPAPER-CROSSFADE "the clock file did not freeze animation time"
-gsettings set org.gnome.desktop.background picture-uri "$decoy_uri"
-gsettings set org.gnome.desktop.background picture-uri-dark "$decoy_uri"
-cstate ".transitions.wallpaper_crossfade.started > $fade_started and .transitions.wallpaper_crossfade.active" "crossfade began" ||
-    fail G-WALLPAPER-CROSSFADE "the new background did not start a crossfade"
-tvalue wallpaper_crossfade 1 || fail G-WALLPAPER-CROSSFADE "the old picture was not fully shown at the start"
-anim_clock 500
-tvalue wallpaper_crossfade 0.25 || fail G-WALLPAPER-CROSSFADE "the old picture was not at ease-out-quad 25% 500 ms in"
-scrot -o "$ARTIFACTS/01d-wallpaper-crossfade-500ms.png" >/dev/null
-anim_clock 1000
-tsettled wallpaper_crossfade "$fade_started" "$fade_frames" ||
-    fail G-WALLPAPER-CROSSFADE "the new background did not crossfade and settle"
-real_clock || fail G-WALLPAPER-CROSSFADE "removing the clock file did not resume real time"
-wait_wallpaper_rgb red || fail G-WALLPAPER-CROSSFADE "the crossfade did not end on the new picture"
-gsettings set org.gnome.desktop.interface enable-animations false
-cstate '(.animations_enabled | not)' "still wallpaper" ||
-    fail G-WALLPAPER-CROSSFADE "enable-animations false did not reach the compositor"
-fade_started=$(tval wallpaper_crossfade started)
-fade_frames=$(tval wallpaper_crossfade animated_frames)
-gsettings set org.gnome.desktop.background picture-uri "$wallpaper_uri"
-gsettings set org.gnome.desktop.background picture-uri-dark "$wallpaper_uri"
-tsettled wallpaper_crossfade "$fade_started" "$fade_frames" same ||
-    fail G-WALLPAPER-CROSSFADE "with animations off the swap was not instant"
-wait_wallpaper_rgb blue || fail G-WALLPAPER-CROSSFADE "the instant swap did not show the new picture"
-gsettings set org.gnome.desktop.interface enable-animations true
-cstate '.animations_enabled' "wallpaper motion restored" ||
-    fail G-WALLPAPER-CROSSFADE "enable-animations true did not reach the compositor"
-pass G-WALLPAPER-CROSSFADE "a new background crossfades over the old one, then nothing animates; instant with animations off"
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    # GNOME's background swap keeps both pictures while the old one fades
+    # out over 1000 ms, then nothing animates; with animations off it is
+    # instant. Red is the decoy's colour; it must replace the blue.
+    wait_wallpaper_rgb() {
+        want=$1
+        end=$(($(date +%s) + 15))
+        while :; do
+            scrot -o "$ARTIFACTS/01c-wallpaper-crossfade.png" >/dev/null
+            # shellcheck disable=SC2046 # three RGB channels
+            set -- $(px "$ARTIFACTS/01c-wallpaper-crossfade.png" 10 $((HEIGHT - 10)))
+            case "$want" in
+                red) [ "${1:-0}" -gt 220 ] && [ "${3:-255}" -lt 20 ] && return 0 ;;
+                blue) [ "${1:-255}" -lt 20 ] && [ "${3:-0}" -gt 220 ] && return 0 ;;
+            esac
+            [ "$(date +%s)" -ge "$end" ] && return 1
+            sleep 0.3
+        done
+    }
+    decoy_uri=$("$PY" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' "$wallpaper_decoy")
+    fade_started=$(tval wallpaper_crossfade started)
+    fade_frames=$(tval wallpaper_crossfade animated_frames)
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen wallpaper clock" ||
+        fail G-WALLPAPER-CROSSFADE "the clock file did not freeze animation time"
+    gsettings set org.gnome.desktop.background picture-uri "$decoy_uri"
+    gsettings set org.gnome.desktop.background picture-uri-dark "$decoy_uri"
+    cstate ".transitions.wallpaper_crossfade.started > $fade_started and .transitions.wallpaper_crossfade.active" "crossfade began" ||
+        fail G-WALLPAPER-CROSSFADE "the new background did not start a crossfade"
+    tvalue wallpaper_crossfade 1 || fail G-WALLPAPER-CROSSFADE "the old picture was not fully shown at the start"
+    anim_clock 500
+    tvalue wallpaper_crossfade 0.25 || fail G-WALLPAPER-CROSSFADE "the old picture was not at ease-out-quad 25% 500 ms in"
+    scrot -o "$ARTIFACTS/01d-wallpaper-crossfade-500ms.png" >/dev/null
+    anim_clock 1000
+    tsettled wallpaper_crossfade "$fade_started" "$fade_frames" ||
+        fail G-WALLPAPER-CROSSFADE "the new background did not crossfade and settle"
+    real_clock || fail G-WALLPAPER-CROSSFADE "removing the clock file did not resume real time"
+    wait_wallpaper_rgb red || fail G-WALLPAPER-CROSSFADE "the crossfade did not end on the new picture"
+    gsettings set org.gnome.desktop.interface enable-animations false
+    cstate '(.animations_enabled | not)' "still wallpaper" ||
+        fail G-WALLPAPER-CROSSFADE "enable-animations false did not reach the compositor"
+    fade_started=$(tval wallpaper_crossfade started)
+    fade_frames=$(tval wallpaper_crossfade animated_frames)
+    gsettings set org.gnome.desktop.background picture-uri "$wallpaper_uri"
+    gsettings set org.gnome.desktop.background picture-uri-dark "$wallpaper_uri"
+    tsettled wallpaper_crossfade "$fade_started" "$fade_frames" same ||
+        fail G-WALLPAPER-CROSSFADE "with animations off the swap was not instant"
+    wait_wallpaper_rgb blue || fail G-WALLPAPER-CROSSFADE "the instant swap did not show the new picture"
+    gsettings set org.gnome.desktop.interface enable-animations true
+    cstate '.animations_enabled' "wallpaper motion restored" ||
+        fail G-WALLPAPER-CROSSFADE "enable-animations true did not reach the compositor"
+    pass G-WALLPAPER-CROSSFADE "a new background crossfades over the old one, then nothing animates; instant with animations off"
+fi
 gsettings set org.gnome.desktop.background picture-uri "$wallpaper_before_uri"
 gsettings set org.gnome.desktop.background picture-uri-dark "$wallpaper_before_dark"
 gsettings set org.gnome.desktop.background picture-options "$wallpaper_before_options"

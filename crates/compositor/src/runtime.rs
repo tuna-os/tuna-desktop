@@ -4499,6 +4499,9 @@ impl Runtime {
         let shell_ready = !crate::layer::layer_layout(&self.state).is_empty();
         // Animation time, so proofs can sample transitions at exact delays.
         let now = self.animation_clock.now();
+        if self.animation_clock.is_manual() {
+            self.transitions.skip_startup();
+        }
         self.wallpaper.set_time(now);
         self.transitions
             .advance(now, locked, lock_ready, shell_ready);
