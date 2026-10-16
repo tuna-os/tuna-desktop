@@ -93,6 +93,7 @@ pub mod pam_conversation;
 pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;
+pub mod pointer_aids;
 pub mod popup;
 pub mod protocols;
 pub mod runtime;

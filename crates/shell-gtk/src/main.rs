@@ -40,6 +40,7 @@ mod orca;
 mod osd;
 mod overview;
 mod panel_focus;
+mod pointer_a11y;
 mod polkit;
 mod portal_opt_out;
 mod power;
@@ -120,7 +121,21 @@ struct Drained {
     consent: Option<Option<(u64, String)>>,
     popups: Vec<(u32, u32)>,
     aid_switches: Vec<(tuna_shell_control::KeyboardAid, bool)>,
+    /// The click the next hover click makes, when the compositor changed it.
+    dwell_click: Option<tuna_shell_control::DwellClick>,
+    /// Pointer accessibility timeouts for the pie timer, in order.
+    pointer_timeouts: Vec<PointerTimeout>,
 }
+
+/// One pointer accessibility timeout report: kind, duration when it
+/// started, whether it clicked when it stopped, and where.
+type PointerTimeout = (
+    tuna_shell_control::PointerTimeoutKind,
+    Option<u32>,
+    bool,
+    i32,
+    i32,
+);
 
 /// The control connection after a drain.
 enum Link {
@@ -184,6 +199,16 @@ fn drain(
                 }
             }
             Handled::KeyboardAidToggled { aid, enabled } => out.aid_switches.push((aid, enabled)),
+            Handled::DwellClickType(click) => out.dwell_click = Some(click),
+            Handled::PointerTimeout {
+                kind,
+                duration_ms,
+                clicked,
+                x,
+                y,
+            } => out
+                .pointer_timeouts
+                .push((kind, duration_ms, clicked, x, y)),
             Handled::WorkspacePopup { index, count } => out.popups.push((index, count)),
             Handled::Accelerator { action, time, mode } => {
                 out.accelerators.push((action, time, mode));
@@ -1567,6 +1592,16 @@ fn build(app: &adw::Application) {
     // whenever it lands (G-PANEL-FOCUS).
     let panel_held: Rc<Cell<bool>> = Rc::default();
     let panel_escape_guard: Rc<Cell<panel_focus::EscapeGuard>> = Rc::default();
+    // GNOME's hover-click chooser (dwellClick.js), before the system
+    // indicators.
+    let dwell_chooser = {
+        let shell = shell.clone();
+        pointer_a11y::DwellChooser::new(Rc::new(move |click| {
+            if let Some(control) = shell.borrow_mut().control.as_mut() {
+                let _ = control.set_dwell_click_type(click);
+            }
+        }))
+    };
     let bar = gtk::CenterBox::new();
     bar.set_start_widget(Some(&activities));
     bar.set_center_widget(Some(&clock));
@@ -1647,6 +1682,7 @@ fn build(app: &adw::Application) {
             on_tray_escape.clone(),
         )
     };
+    end.append(&dwell_chooser.button);
     end.append(&tray_box);
     end.append(&input);
     end.append(&a11y);
@@ -2638,6 +2674,7 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.sound",
             "org.gnome.mutter",
             kbd_a11y::SCHEMA,
+            pointer_a11y::SCHEMA,
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -2730,6 +2767,7 @@ fn build(app: &adw::Application) {
                     out.bell.theme = sound.string("theme-name").to_string();
                 }
                 out.keyboard_aids = kbd_a11y::read(all[9].as_ref());
+                out.pointer_aids = pointer_a11y::read(all[10].as_ref());
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }
@@ -2846,6 +2884,7 @@ fn build(app: &adw::Application) {
         )
     };
     let kbd_a11y_dialog = kbd_a11y::KbdA11yDialog::new(app.upcast_ref());
+    let pie_timer = pointer_a11y::PieTimer::new(app.upcast_ref());
     // Compositor state: the control socket is drained whenever it is
     // readable, then mirrored into the views. Nothing runs while the
     // session idles: the views re-sync after the compositor said
@@ -2909,6 +2948,8 @@ fn build(app: &adw::Application) {
                     consent,
                     popups,
                     aid_switches,
+                    dwell_click,
+                    pointer_timeouts,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -2966,6 +3007,12 @@ fn build(app: &adw::Application) {
                 }
                 for (aid, enabled) in aid_switches {
                     kbd_a11y_dialog.switched(aid, enabled, locked);
+                }
+                if let Some(click) = dwell_click {
+                    dwell_chooser.set_click_type(click);
+                }
+                for (kind, duration_ms, clicked, x, y) in pointer_timeouts {
+                    pointer_a11y::on_timeout(&pie_timer, kind, duration_ms, clicked, x, y);
                 }
                 if locked {
                     kbd_a11y_dialog.dismiss();
