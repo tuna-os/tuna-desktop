@@ -29,6 +29,7 @@ mod kbd_a11y;
 mod keybindings;
 mod live_apps;
 mod lock;
+mod lockdown;
 mod logic;
 mod media_keys;
 mod motion;
@@ -39,6 +40,7 @@ mod orca;
 mod osd;
 mod overview;
 mod panel_focus;
+mod pointer_a11y;
 mod polkit;
 mod portal_opt_out;
 mod power;
@@ -119,7 +121,21 @@ struct Drained {
     consent: Option<Option<(u64, String)>>,
     popups: Vec<(u32, u32)>,
     aid_switches: Vec<(tuna_shell_control::KeyboardAid, bool)>,
+    /// The click the next hover click makes, when the compositor changed it.
+    dwell_click: Option<tuna_shell_control::DwellClick>,
+    /// Pointer accessibility timeouts for the pie timer, in order.
+    pointer_timeouts: Vec<PointerTimeout>,
 }
+
+/// One pointer accessibility timeout report: kind, duration when it
+/// started, whether it clicked when it stopped, and where.
+type PointerTimeout = (
+    tuna_shell_control::PointerTimeoutKind,
+    Option<u32>,
+    bool,
+    i32,
+    i32,
+);
 
 /// The control connection after a drain.
 enum Link {
@@ -183,6 +199,16 @@ fn drain(
                 }
             }
             Handled::KeyboardAidToggled { aid, enabled } => out.aid_switches.push((aid, enabled)),
+            Handled::DwellClickType(click) => out.dwell_click = Some(click),
+            Handled::PointerTimeout {
+                kind,
+                duration_ms,
+                clicked,
+                x,
+                y,
+            } => out
+                .pointer_timeouts
+                .push((kind, duration_ms, clicked, x, y)),
             Handled::WorkspacePopup { index, count } => out.popups.push((index, count)),
             Handled::Accelerator { action, time, mode } => {
                 out.accelerators.push((action, time, mode));
@@ -676,10 +702,11 @@ impl QsMenu {
         list
     }
 
-    fn separator(&self) {
+    fn separator(&self) -> gtk::Separator {
         let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
         separator.add_css_class("qs-menu-separator");
         self.section.append(&separator);
+        separator
     }
 }
 
@@ -809,6 +836,12 @@ fn quick_settings_popover(
         });
     }
     settings_btn.connect_clicked(|_| {
+        // Administrative lockdown (#357): shell-opened handlers stay
+        // closed while `disable-application-handlers` denies.
+        if !lockdown::handlers_allowed() {
+            eprintln!("tuna-shell-gtk: opening settings is disabled by your administrator.");
+            return;
+        }
         let _ = gio::AppInfo::launch_default_for_uri("settings://", None::<&gio::AppLaunchContext>)
             .or_else(|_| {
                 std::process::Command::new("gnome-control-center")
@@ -822,6 +855,13 @@ fn quick_settings_popover(
         let popover = popover.clone();
         lock.connect_clicked(move |_| {
             popover.popdown();
+            // Administrative lockdown (#357): a disabled lock screen
+            // refuses the click (live read per activation, so no stale
+            // shell path can bypass the policy).
+            if !lockdown::read().entry_visibility().lock_screen {
+                eprintln!("tuna-shell-gtk: lock refused by administrator policy");
+                return;
+            }
             if let Some(control) = shell.borrow_mut().control.as_mut() {
                 if let Err(e) = control.lock() {
                     eprintln!("tuna-shell-gtk: lock failed: {e}");
@@ -833,6 +873,10 @@ fn quick_settings_popover(
     // Power: GNOME's shutdown menu (status/system.js ShutdownItem), a
     // quick toggle menu opening in place under the top row.
     let power_menu_box = QsMenu::new("system-shutdown-symbolic", "Power Off");
+    // Kept for the lockdown watcher below, which hides the Log Out row
+    // (and its separator) while `disable-log-out` denies.
+    let mut log_out_row: Option<gtk::Button> = None;
+    let mut log_out_separator: Option<gtk::Separator> = None;
     for action in power_ui.actions() {
         let label = match action {
             power::Action::Suspend => "Suspend",
@@ -843,9 +887,12 @@ fn quick_settings_popover(
         // GNOME's menu always separates the session actions, even when
         // no power action sits above them.
         if *action == power::Action::LogOut {
-            power_menu_box.separator();
+            log_out_separator = Some(power_menu_box.separator());
         }
         let (item, _) = power_menu_box.item(None, label);
+        if *action == power::Action::LogOut {
+            log_out_row = Some(item.clone());
+        }
         let (power_ui, popover, action) = (power_ui.clone(), popover.clone(), *action);
         item.connect_clicked(move |_| {
             popover.popdown();
@@ -871,6 +918,32 @@ fn quick_settings_popover(
         let menu = power_menu.clone();
         popover.connect_closed(move |_| menu.set_visible(false));
     }
+    // Administrative lockdown (#357): the lock and settings buttons
+    // and the Log Out row follow the live policy; a nested session
+    // with no rows shows no power menu at all.
+    {
+        let actions = power_ui.actions().to_vec();
+        let apply: Rc<dyn Fn(lockdown::EntryVisibility)> =
+            Rc::new(move |visible: lockdown::EntryVisibility| {
+                lock.set_visible(visible.lock_screen);
+                lockdown::apply_settings_visibility(&visible, &settings_btn);
+                if let Some(row) = log_out_row.as_ref() {
+                    row.set_visible(visible.log_out);
+                }
+                if let Some(separator) = log_out_separator.as_ref() {
+                    separator.set_visible(visible.log_out);
+                }
+                power.set_visible(power::power_menu_visible_for(&actions, visible.log_out));
+            });
+        apply(lockdown::read().entry_visibility());
+        if let Some(lockdown_settings) = settings(lockdown::SCHEMA) {
+            lockdown_settings.connect_changed(None, move |_, _| {
+                apply(lockdown::read().entry_visibility());
+            });
+            // Keep the settings object (and its signal) alive.
+            std::mem::forget(lockdown_settings);
+        }
+    }
 
     // Volume: mute button plus slider (PipeWire via wpctl).
     let volume_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -890,9 +963,8 @@ fn quick_settings_popover(
     sound_menu_ui.separator();
     let (sound_settings, _) = sound_menu_ui.item(None, "Sound Settings");
     sound_settings.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center")
-            .arg("sound")
-            .spawn();
+        // Administrative lockdown (#357) applies inside the helper.
+        lockdown::open_settings_panel(Some("sound"));
     });
     let sound_arrow = gtk::ToggleButton::new();
     sound_arrow.set_icon_name("go-next-symbolic");
@@ -944,9 +1016,8 @@ fn quick_settings_popover(
     wifi_menu_ui.separator();
     let (all_networks, _) = wifi_menu_ui.item(None, "All Networks");
     all_networks.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center")
-            .arg("wifi")
-            .spawn();
+        // Administrative lockdown (#357) applies inside the helper.
+        lockdown::open_settings_panel(Some("wifi"));
     });
     {
         let wifi_menu = wifi_menu.clone();
@@ -962,9 +1033,8 @@ fn quick_settings_popover(
     wired_menu_ui.separator();
     let (wired_settings, _) = wired_menu_ui.item(None, "Wired Settings");
     wired_settings.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center")
-            .arg("network")
-            .spawn();
+        // Administrative lockdown (#357) applies inside the helper.
+        lockdown::open_settings_panel(Some("network"));
     });
     let wired = qs_menu_tile("network-wired-symbolic", "Wired", None, &wired_menu_ui);
     wired_menu.set_tile(wired.clone());
@@ -980,9 +1050,8 @@ fn quick_settings_popover(
     bt_menu_ui.separator();
     let (bt_settings, _) = bt_menu_ui.item(None, "Bluetooth Settings");
     bt_settings.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center")
-            .arg("bluetooth")
-            .spawn();
+        // Administrative lockdown (#357) applies inside the helper.
+        lockdown::open_settings_panel(Some("bluetooth"));
     });
     let bluetooth = qs_menu_tile("bluetooth-active-symbolic", "Bluetooth", None, &bt_menu_ui);
     bt_menu.set_tile(bluetooth.clone());
@@ -1001,9 +1070,8 @@ fn quick_settings_popover(
     power_menu_ui.separator();
     let (power_settings, _) = power_menu_ui.item(None, "Power Settings");
     power_settings.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center")
-            .arg("power")
-            .spawn();
+        // Administrative lockdown (#357) applies inside the helper.
+        lockdown::open_settings_panel(Some("power"));
     });
     let power_mode = qs_menu_tile(
         "power-profile-balanced-symbolic",
@@ -1458,6 +1526,11 @@ fn build(app: &adw::Application) {
         power::PowerUi::new(
             app.upcast_ref(),
             Rc::new(move || {
+                // Administrative lockdown (#357): a disabled lock
+                // screen suspends unlocked, as in a GNOME kiosk.
+                if !lockdown::read().entry_visibility().lock_screen {
+                    return;
+                }
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.lock();
                 }
@@ -1519,6 +1592,16 @@ fn build(app: &adw::Application) {
     // whenever it lands (G-PANEL-FOCUS).
     let panel_held: Rc<Cell<bool>> = Rc::default();
     let panel_escape_guard: Rc<Cell<panel_focus::EscapeGuard>> = Rc::default();
+    // GNOME's hover-click chooser (dwellClick.js), before the system
+    // indicators.
+    let dwell_chooser = {
+        let shell = shell.clone();
+        pointer_a11y::DwellChooser::new(Rc::new(move |click| {
+            if let Some(control) = shell.borrow_mut().control.as_mut() {
+                let _ = control.set_dwell_click_type(click);
+            }
+        }))
+    };
     let bar = gtk::CenterBox::new();
     bar.set_start_widget(Some(&activities));
     bar.set_center_widget(Some(&clock));
@@ -1599,6 +1682,7 @@ fn build(app: &adw::Application) {
             on_tray_escape.clone(),
         )
     };
+    end.append(&dwell_chooser.button);
     end.append(&tray_box);
     end.append(&input);
     end.append(&a11y);
@@ -1952,6 +2036,11 @@ fn build(app: &adw::Application) {
         {
             let shell = shell.clone();
             Rc::new(move || {
+                // Administrative lockdown (#357): a disabled lock
+                // screen refuses screensaver and D-Bus lock requests.
+                if !lockdown::read().entry_visibility().lock_screen {
+                    return Err("lock screen disabled by administrator");
+                }
                 let mut shell = shell.borrow_mut();
                 let control = shell.control.as_mut().ok_or("compositor disconnected")?;
                 control
@@ -2138,6 +2227,13 @@ fn build(app: &adw::Application) {
                 }
                 match action {
                     Action::LockScreen => {
+                        // Administrative lockdown (#357): the keybinding
+                        // refuses too, so no alternate shell path bypasses
+                        // the hidden button.
+                        if !lockdown::read().entry_visibility().lock_screen {
+                            eprintln!("tuna-shell-gtk: lock refused by administrator policy");
+                            return;
+                        }
                         if let Some(control) = shell.borrow_mut().control.as_mut() {
                             if let Err(e) = control.lock() {
                                 eprintln!("tuna-shell-gtk: lock failed: {e}");
@@ -2597,6 +2693,7 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.sound",
             "org.gnome.mutter",
             kbd_a11y::SCHEMA,
+            pointer_a11y::SCHEMA,
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -2707,6 +2804,7 @@ fn build(app: &adw::Application) {
                     out.bell.theme = sound.string("theme-name").to_string();
                 }
                 out.keyboard_aids = kbd_a11y::read(all[9].as_ref());
+                out.pointer_aids = pointer_a11y::read(all[10].as_ref());
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }
@@ -2727,6 +2825,7 @@ fn build(app: &adw::Application) {
         let screensaver = settings(SCREENSAVER_SCHEMA);
         let interface = settings(INTERFACE_SCHEMA);
         let a11y = settings(A11Y_INTERFACE_SCHEMA);
+        let lockdown_settings = settings(lockdown::SCHEMA);
         let send: Rc<dyn Fn()> = {
             let (shell, session, screensaver, interface, a11y) = (
                 shell.clone(),
@@ -2750,6 +2849,14 @@ fn build(app: &adw::Application) {
                     .adjust_ms(logic::IDLE_FADE_MS as f64)
                     .round() as u64;
                 let ms = logic::idle_lock_ms(idle, enabled, delay, fade_ms);
+                // Administrative lockdown (#357): a disabled lock screen
+                // never locks on idle (the compositor backstops this
+                // mapping by denying `Lock` and idle engagement itself).
+                let ms = if lockdown::read().entry_visibility().lock_screen {
+                    ms
+                } else {
+                    0
+                };
                 if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
                     let dir = std::path::PathBuf::from(dir);
                     let temporary = dir.join(".tuna-idle-blank.tmp");
@@ -2764,7 +2871,7 @@ fn build(app: &adw::Application) {
             })
         };
         send();
-        for settings in [session, screensaver, interface, a11y]
+        for settings in [session, screensaver, interface, a11y, lockdown_settings]
             .into_iter()
             .flatten()
         {
@@ -2814,6 +2921,7 @@ fn build(app: &adw::Application) {
         )
     };
     let kbd_a11y_dialog = kbd_a11y::KbdA11yDialog::new(app.upcast_ref());
+    let pie_timer = pointer_a11y::PieTimer::new(app.upcast_ref());
     // Compositor state: the control socket is drained whenever it is
     // readable, then mirrored into the views. Nothing runs while the
     // session idles: the views re-sync after the compositor said
@@ -2877,6 +2985,8 @@ fn build(app: &adw::Application) {
                     consent,
                     popups,
                     aid_switches,
+                    dwell_click,
+                    pointer_timeouts,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -2934,6 +3044,12 @@ fn build(app: &adw::Application) {
                 }
                 for (aid, enabled) in aid_switches {
                     kbd_a11y_dialog.switched(aid, enabled, locked);
+                }
+                if let Some(click) = dwell_click {
+                    dwell_chooser.set_click_type(click);
+                }
+                for (kind, duration_ms, clicked, x, y) in pointer_timeouts {
+                    pointer_a11y::on_timeout(&pie_timer, kind, duration_ms, clicked, x, y);
                 }
                 if locked {
                     kbd_a11y_dialog.dismiss();

@@ -43,6 +43,7 @@ use tuna_shell_control::{
     CURRENT_VERSION, MAX_FRAME_BYTES,
 };
 
+use crate::lockdown::{LockdownPolicy, RestrictedAction};
 use crate::state::{StateChange, StateModel, TokenStore, WindowEntry};
 
 /// How soon the hub wants another [`ControlHub::poll`] while a handshake
@@ -341,6 +342,8 @@ pub struct Session<'a> {
     icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     screen_reader: Option<bool>,
     screenshot_pointer: Option<(i32, i32)>,
+    /// The hover-click chooser's latest pick, drained by the hub.
+    dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Input-source switches the shell asked for (`true` backward).
     input_source_switches: Vec<bool>,
     /// `ToggleShowDesktop` requests, drained by the hub.
@@ -349,6 +352,11 @@ pub struct Session<'a> {
     switcher_thumbnails: Option<Vec<tuna_shell_control::SwitcherThumbnail>>,
     /// The shell's switcher keys, until the runtime drains them.
     switcher_keys: Option<Vec<tuna_shell_control::SwitcherKey>>,
+    /// Administrative lockdown (#357): the hub's policy at accept,
+    /// refreshed onto every session by [`ControlHub::refresh_lockdown`].
+    /// `Lock` commands consult it; a restrictive key denies them with
+    /// the administrator's reason instead of engaging the lock.
+    lockdown: LockdownPolicy,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -434,10 +442,12 @@ impl<'a> Session<'a> {
             icon_geometries: None,
             screen_reader: None,
             screenshot_pointer: None,
+            dwell_click: None,
             input_source_switches: Vec::new(),
             show_desktop_toggles: 0,
             switcher_thumbnails: None,
             switcher_keys: None,
+            lockdown: LockdownPolicy::default(),
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -520,6 +530,18 @@ impl<'a> Session<'a> {
     /// The latest `SetIdleTimeout` the shell sent, once (#63).
     pub fn take_idle_timeout(&mut self) -> Option<u64> {
         self.idle_timeout.take()
+    }
+
+    /// Replace this session's lockdown policy (#357). The hub pushes
+    /// its live policy here on accept and refresh; tests inject a
+    /// restrictive policy to prove `Lock` denies under it.
+    pub fn set_lockdown_policy(&mut self, policy: LockdownPolicy) {
+        self.lockdown = policy;
+    }
+
+    /// This session's lockdown policy.
+    pub fn lockdown_policy(&self) -> LockdownPolicy {
+        self.lockdown
     }
 
     /// Window-menu actions the shell sent since the last call.
@@ -703,6 +725,17 @@ impl<'a> Session<'a> {
                     },
                 })?;
                 Ok(Handled::CommandResult { id, applied: valid })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::SetDwellClickType { click },
+            } => {
+                self.dwell_click = Some(click);
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
             }
             Message::Command {
                 id,
@@ -895,6 +928,37 @@ impl<'a> Session<'a> {
                 })?;
                 Ok(Handled::CommandResult { id, applied: true })
             }
+            Message::Command {
+                id,
+                kind: CommandKind::Lock,
+            } => {
+                // Administrative lockdown (#357): a disabled lock
+                // screen denies the command instead of engaging the
+                // lock. Denying never weakens verification and never
+                // unlocks; it only refuses to lock.
+                if !self.lockdown.lock_screen_allowed() {
+                    let status = CommandStatus::Denied {
+                        reason: RestrictedAction::LockScreen.denial().to_owned(),
+                    };
+                    self.conn
+                        .write_frame(&Message::CommandResult { id, status })?;
+                    return Ok(Handled::CommandResult { id, applied: false });
+                }
+                let (status, closed) = apply_command(
+                    model,
+                    &self.validator,
+                    &self.overview,
+                    &self.locked,
+                    &CommandKind::Lock,
+                );
+                if let Some(window) = closed {
+                    self.closed.push(window);
+                }
+                let applied = matches!(status, CommandStatus::Applied);
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
             Message::Command { id, kind } => {
                 let (status, closed) =
                     apply_command(model, &self.validator, &self.overview, &self.locked, &kind);
@@ -920,6 +984,8 @@ impl<'a> Session<'a> {
             | Message::PointerOutput { .. }
             | Message::ScreenReader { .. }
             | Message::KeyboardAidToggled { .. }
+            | Message::DwellClickType { .. }
+            | Message::PointerTimeout { .. }
             | Message::ShortcutConsent { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
@@ -966,6 +1032,8 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ScreenReader { .. } => "ScreenReader",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
+        Message::DwellClickType { .. } => "DwellClickType",
+        Message::PointerTimeout { .. } => "PointerTimeout",
     }
 }
 
@@ -1139,6 +1207,7 @@ fn apply_command(
         | CommandKind::SetSwitcherKeys { .. }
         | CommandKind::MoveScreenshotPointer { .. }
         | CommandKind::SetScreenReader { .. }
+        | CommandKind::SetDwellClickType { .. }
         | CommandKind::ToggleShowDesktop
         | CommandKind::SetInputSettings(_) => (CommandStatus::Applied, None),
         CommandKind::Lock => {
@@ -1182,6 +1251,8 @@ pub struct PollOutcome {
     pub icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     pub screen_reader: Option<bool>,
     pub screenshot_pointer: Option<(i32, i32)>,
+    /// The hover-click chooser's pick, if the shell sent one.
+    pub dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Accelerator grabs the shell sent, if they changed.
     pub accelerators: Option<Vec<tuna_shell_control::Accelerator>>,
     /// Window-menu actions to carry out.
@@ -1269,6 +1340,13 @@ pub fn is_private_dir(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Bound on concurrent background lockdown readers (#357 fd3): one slow
+/// backend may overlap one fresh poll, but a hung backend never stacks a
+/// thread per tick. Production ticks 2 s apart with a 500 ms reader bound,
+/// so steady state holds one; the headroom keeps a slow poll from
+/// suppressing its successor.
+const LOCKDOWN_MAX_READERS: usize = 2;
+
 /// Live control-plane driver: accepts shell connections, handshakes them
 /// into [`Session`]s against one [`TokenStore`], emits deltas, and applies
 /// commands — one nonblocking round per [`poll`](Self::poll), so slow or
@@ -1302,6 +1380,23 @@ pub struct ControlHub {
     /// the runtime (idle timeout) or `Lock` commands, shared with every
     /// live session so snapshots carry it; the shell never owns it.
     locked: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Administrative lockdown (#357): read live at bind, refreshed by
+    /// [`ControlHub::refresh_lockdown`], pushed onto every session so
+    /// `Lock` commands deny under a restrictive key. Only the lock key
+    /// is live here; the shell owns the rest of the surface.
+    lockdown: LockdownPolicy,
+    /// Background policy reads (#357 follow-up): each refresh spawns
+    /// one reader thread reporting here (up to
+    /// [`LOCKDOWN_MAX_READERS`] concurrent); the tick drains
+    /// completed results without waiting, so a hung backend never
+    /// stalls it.
+    lockdown_tx: std::sync::mpsc::Sender<Option<bool>>,
+    lockdown_rx: std::sync::mpsc::Receiver<Option<bool>>,
+    /// Readers currently running (#357 fd3): refreshes while this many
+    /// run skip spawning (single-flight bound), so a hung backend
+    /// cannot stack a thread per tick; the drain still applies every
+    /// landed result with last-valid-wins.
+    lockdown_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Alt-Tab drive events awaiting broadcast. Unlike the overview
     /// intent (level), steps are discrete events: each one is sent to
     /// every live session exactly once, retained until all sends land.
@@ -1369,6 +1464,18 @@ impl ControlHub {
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         let readiness = crate::control_readiness::ControlReadiness::new(&listener)?;
+        // Administrative lockdown (#357): constructed from the live
+        // key at startup (bounded read); unreadable reads GNOME defaults
+        // (allowed).
+        let lockdown = LockdownPolicy::from_reader(&|key| {
+            if key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN {
+                crate::lockdown::read_lock_screen_key()
+            } else {
+                None
+            }
+        });
+        let (lockdown_tx, lockdown_rx) = std::sync::mpsc::channel();
+        let lockdown_inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Ok(Self {
             listener,
             readiness,
@@ -1380,6 +1487,10 @@ impl ControlHub {
             overview: std::rc::Rc::new(std::cell::Cell::new(false)),
             overview_sent: false,
             locked: std::rc::Rc::new(std::cell::Cell::new(false)),
+            lockdown,
+            lockdown_tx,
+            lockdown_rx,
+            lockdown_inflight,
             switcher_queue: Vec::new(),
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
@@ -1631,6 +1742,69 @@ impl ControlHub {
         self.locked.get()
     }
 
+    /// Whether the lock screen is currently allowed by policy (#357).
+    pub fn lock_screen_allowed(&self) -> bool {
+        self.lockdown.lock_screen_allowed()
+    }
+
+    /// Replace the hub's lockdown policy and push it onto every live
+    /// session; newcomers clone it at accept. Tests inject a
+    /// restrictive policy to prove the lock paths deny under it.
+    pub fn set_lockdown_policy(&mut self, policy: LockdownPolicy) {
+        self.lockdown = policy;
+        for session in &mut self.sessions {
+            session.set_lockdown_policy(policy);
+        }
+    }
+
+    /// Poll the live `disable-lock-screen` key without blocking: drain
+    /// completed background reads (last valid wins; unreadable keeps the
+    /// cached value, never resets) and spawn the next reader unless
+    /// enough already run. The runtime calls this on a slow tick; a hung
+    /// backend never stalls it, and the shell enforces its own surface
+    /// immediately, so this backstop's lag fails safe.
+    pub fn refresh_lockdown(&mut self) {
+        self.refresh_lockdown_with(crate::lockdown::read_lock_screen_key);
+    }
+
+    /// [`refresh_lockdown`](Self::refresh_lockdown) with an injectable
+    /// reader. Tests pass a hung double to prove the tick stays bounded;
+    /// production reads the live key on the background thread.
+    pub fn refresh_lockdown_with(
+        &mut self,
+        reader: impl FnOnce() -> Option<bool> + Send + 'static,
+    ) {
+        // Last-valid-wins: overlapping readers land delayed results as one
+        // batch, and a trailing unreadable result must not wipe the live
+        // restriction (or restoration) the batch's valid result carries.
+        if let Some(value) = self.lockdown_rx.try_iter().flatten().last() {
+            self.lockdown
+                .refresh(&|key| (key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN).then_some(value));
+            for session in &mut self.sessions {
+                session.set_lockdown_policy(self.lockdown);
+            }
+        }
+        // Single-flight bound: skip spawning while enough readers run, so
+        // a hung backend cannot stack a thread per tick. The drain above
+        // still runs, so landed results always apply.
+        if self
+            .lockdown_inflight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            >= LOCKDOWN_MAX_READERS
+        {
+            self.lockdown_inflight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let tx = self.lockdown_tx.clone();
+        let inflight = self.lockdown_inflight.clone();
+        std::thread::spawn(move || {
+            let result = reader();
+            let _ = tx.send(result);
+            inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
     /// Set the session-lock flag; the next [`poll`](Self::poll) carries
     /// it to every live session as a (possibly content-stripped)
     /// [`Message::Snapshot`]. Idempotent. Unlock clears through session
@@ -1800,6 +1974,9 @@ impl ControlHub {
                     if let Some(enabled) = session.screen_reader.take() {
                         outcome.screen_reader = Some(enabled);
                     }
+                    if let Some(click) = session.dwell_click.take() {
+                        outcome.dwell_click = Some(click);
+                    }
                     reply_ok
                 } else {
                     false
@@ -1955,6 +2132,8 @@ impl ControlHub {
             if let Ok(mut session) =
                 Session::handshake_with(conn, model, validator, minter, overview, locked)
             {
+                // Newcomers join the hub's live lockdown policy (#357).
+                session.set_lockdown_policy(self.lockdown);
                 // Newcomers join mid-state: tell them the intent and the
                 // inventory now (best-effort; the poll broadcast covers
                 // the rest). An empty inventory means unknown — never

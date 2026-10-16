@@ -88,17 +88,17 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| click-type-window-visible | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-click-enabled | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-gesture-double | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-gesture-drag | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-gesture-secondary | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-gesture-single | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-mode | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-threshold | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-time | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| secondary-click-enabled | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| secondary-click-time | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| click-type-window-visible | Ignored | GNOME Shell 51 does not read it either: the chooser follows dwell-click-enabled and dwell-mode |
+| dwell-click-enabled | Honored | Hover click in the compositor's input pipeline, with GNOME's pie timer and panel chooser (G-A11Y-DWELL) |
+| dwell-gesture-double | Honored | Gesture direction for a double click |
+| dwell-gesture-drag | Honored | Gesture direction for a drag |
+| dwell-gesture-secondary | Honored | Gesture direction for a secondary click (G-A11Y-DWELL) |
+| dwell-gesture-single | Honored | Gesture direction for a single click |
+| dwell-mode | Honored | `window` shows the panel's click-type chooser; `gesture` picks the click by direction (G-A11Y-DWELL) |
+| dwell-threshold | Honored | Motion that cancels a dwell or a held secondary click, and a gesture's minimum (G-A11Y-DWELL) |
+| dwell-time | Honored | Live dwell and gesture timeout (G-A11Y-DWELL) |
+| secondary-click-enabled | Honored | A held primary button becomes a secondary click on release (G-A11Y-SECONDARY) |
+| secondary-click-time | Honored | Live hold time (G-A11Y-SECONDARY) |
 ## org.gnome.desktop.app-folders
 
 | Key | Status | Reason |
@@ -251,17 +251,17 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| disable-application-handlers | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-command-line | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-lock-screen | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-log-out | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-print-setup | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-printing | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-save-to-disk | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-show-password | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| disable-user-switching | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| mount-removable-storage-devices-as-read-only | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
-| user-administration-disabled | Ignored | Tuna Desktop has no GNOME lockdown policy consumer; system authorization remains daemon-owned |
+| disable-application-handlers | Honored | Shell-opened Settings/handlers blocked live while denied (#357) |
+| disable-command-line | Ignored | No run-command dialog ships, so nothing to restrict; visibility gate unit-tested for its landing |
+| disable-lock-screen | Honored | Shell hides and guards all lock paths; compositor denies Lock, idle and Wayland locks (#357) |
+| disable-log-out | Honored | Power menu Log Out row hidden live; nested sessions show no menu (#357) |
+| disable-print-setup | Ignored | App-owned: applications' Print Setup dialogs; the shell exposes no print path |
+| disable-printing | Ignored | App-owned: applications' Print dialogs; the shell exposes no print path |
+| disable-save-to-disk | Ignored | App-owned: applications' Save dialogs; shell-owned savers out of scope as in GNOME |
+| disable-show-password | Honored | Network secret reveal toggle omitted live while denied (#357) |
+| disable-user-switching | Ignored | No user-switch row ships, so nothing to restrict; visibility gate unit-tested for its landing |
+| mount-removable-storage-devices-as-read-only | Ignored | Daemon-owned: removable mounts (udisks2); Tuna ships no mount agent |
+| user-administration-disabled | Ignored | Daemon-owned: user administration (accountsservice/polkit); Tuna ships no Users panel |
 ## org.gnome.desktop.media-handling
 
 | Key | Status | Reason |

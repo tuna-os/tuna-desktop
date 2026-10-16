@@ -79,6 +79,15 @@ const IDLE_WAKE: Duration = Duration::from_millis(500);
 /// still advances.
 const ACTIVITY_LINGER: Duration = Duration::from_millis(500);
 
+/// Administrative lockdown (#357): how often the tick polls the live
+/// `disable-lock-screen` key. Each poll spawns one background reader at
+/// most and drains completed reads without waiting (see
+/// `ControlHub::refresh_lockdown`), skipped without a session bus; the
+/// shell enforces its own surface immediately, so this backstop's short
+/// lag fails safe (an extra lock in the window still needs auth to
+/// unlock, and unlocks never come from policy).
+const LOCKDOWN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
 /// client epoll set; a duplicate keeps calloop's source lifetime independent.
@@ -623,6 +632,8 @@ pub struct Runtime {
     /// Worker threads (idle watches, Orca, wallpaper, Night Light, IME,
     /// X11 icons, PAM, logind) ping the loop through this (#503).
     wake: crate::wake::Wake,
+    /// Last live lockdown refresh (see [`LOCKDOWN_REFRESH_INTERVAL`]).
+    lockdown_refresh_at: Instant,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -1193,6 +1204,7 @@ impl Runtime {
             screenshot_flashes: Default::default(),
             screenshot_replies: Vec::new(),
             wake,
+            lockdown_refresh_at: Instant::now(),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
             #[cfg(feature = "drm")]
@@ -3589,7 +3601,7 @@ impl Runtime {
         }
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
-        self.configure_input_aids(&settings.keyboard_aids);
+        self.configure_input_aids(&settings.keyboard_aids, &settings.pointer_aids);
         self.cursor
             .set_theme(&settings.cursor_theme, settings.cursor_size);
         self.cursor.set_locate_pointer(settings.locate_pointer);
@@ -4063,6 +4075,9 @@ impl Runtime {
         if let Some(settings) = outcome.input_settings {
             self.apply_input_settings(settings);
         }
+        if let Some(click) = outcome.dwell_click {
+            self.set_dwell_click_type(click);
+        }
         if let Some((grayscale, fade)) = outcome.wellbeing_effects {
             self.wellbeing_effects.set(
                 grayscale,
@@ -4126,6 +4141,13 @@ impl Runtime {
             self.overview_search = false;
             self.overview_app_grid = false;
         }
+        // Administrative lockdown (#357 follow-up): poll the live key
+        // on a slow tick without blocking (background read plus drain);
+        // the shell maps it onto its idle sender too.
+        if self.lockdown_refresh_at.elapsed() >= LOCKDOWN_REFRESH_INTERVAL {
+            self.control.refresh_lockdown();
+            self.lockdown_refresh_at = Instant::now();
+        }
         // GNOME's idle and lock settings, from the shell (#63).
         if let Some(ms) = outcome.idle_timeout {
             self.lock.set_timeout(if ms == 0 { u64::MAX } else { ms });
@@ -4145,14 +4167,19 @@ impl Runtime {
                 (pid, self.shell.child_pid()),
                 (Some(pid), Some(child)) if u32::try_from(pid).ok() == Some(child)
             );
-            if ours {
+            // Administrative lockdown (#357): a disabled lock screen
+            // refuses even our own shell's locker (no Wayland bypass).
+            let approved = ours && self.control.lock_screen_allowed();
+            if approved {
                 if !self.is_locked() {
                     self.engage_lock();
                 }
+            } else if ours {
+                eprintln!("tuna-compositor: session lock refused by administrator policy");
             } else {
                 eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
             }
-            self.state.resolve_lock_request(locker, ours);
+            self.state.resolve_lock_request(locker, approved);
         }
         // A lock client's unlock_and_destroy never unlocks by itself:
         // only a verified password clears the flag.
@@ -4203,7 +4230,14 @@ impl Runtime {
         }
         self.idle_inhibited = inhibited;
         if !self.is_locked() && self.lock.check_timeout(self.lock_now_ms()) {
-            self.engage_lock();
+            // Administrative lockdown (#357): a disabled lock screen
+            // never engages on idle; restart the stretch instead so no
+            // surprise lock fires when the policy lifts.
+            if self.control.lock_screen_allowed() {
+                self.engage_lock();
+            } else {
+                self.lock.unlock(self.lock_now_ms());
+            }
         }
         // XIM is an X11 client itself: keep it off merely advertised sockets,
         // and retire the helper on server loss even while the session is locked.

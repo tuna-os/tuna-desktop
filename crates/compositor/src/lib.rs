@@ -71,6 +71,7 @@ pub mod input_aids;
 pub mod introspect;
 pub mod layer;
 pub mod lock;
+pub mod lockdown;
 pub mod minimize;
 pub mod modal_dim;
 pub mod monitors;
@@ -92,6 +93,7 @@ pub mod pam_conversation;
 pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;
+pub mod pointer_aids;
 pub mod popup;
 pub mod protocols;
 pub mod runtime;

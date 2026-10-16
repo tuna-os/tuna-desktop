@@ -12,7 +12,7 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.32).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.36).
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
@@ -49,3 +49,11 @@ and strict trailing-byte rejection remain intact. Both booleans are required;
 postcard rejects values other than 0/1. The authenticated shell sends the full
 pair initially and whenever wellbeing state changes. The compositor owns the
 three-second entry animation and immediate exit; the cursor is excluded.
+
+## Pointer accessibility aids (0.36)
+
+`InputSettings::pointer_aids` (GNOME's `org.gnome.desktop.a11y.mouse`) is
+appended after `keyboard_aids`; `CommandKind::SetDwellClickType` is appended
+for the hover-click chooser, and the compositor reports
+`Message::DwellClickType` and `Message::PointerTimeout` (pie timer) as the
+last two message variants. Positional: both peers ship together.
