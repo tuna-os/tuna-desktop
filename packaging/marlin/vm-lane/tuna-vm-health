@@ -20,6 +20,11 @@ probe() {
 probe calendar --dest org.gnome.Shell.CalendarServer --object-path /org/gnome/Shell/CalendarServer --method org.freedesktop.DBus.Properties.Get org.gnome.Shell.CalendarServer HasCalendars || exit 1
 probe portal --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop --method org.freedesktop.portal.Settings.Read org.freedesktop.appearance color-scheme || exit 1
 probe portal-gnome --dest org.freedesktop.impl.portal.desktop.gnome --object-path /org/freedesktop/portal/desktop --method org.freedesktop.DBus.Peer.Ping || exit 1
+# The frontend exports an interface only when tuna-portals.conf routes it to
+# a backend that implements it; Screenshot and ScreenCast must both resolve.
+# Not fatal, so audio and lock observation below still run when they fail.
+probe portal-screenshot --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop --method org.freedesktop.DBus.Properties.Get org.freedesktop.portal.Screenshot version
+probe portal-screencast --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop --method org.freedesktop.DBus.Properties.Get org.freedesktop.portal.ScreenCast AvailableSourceTypes
 # The lane provides a real virtual HDA output. Establish a known level
 # only in this CI guest, then observe hardware-key mutations through
 # PipeWire itself, independent of the shell's OSD.

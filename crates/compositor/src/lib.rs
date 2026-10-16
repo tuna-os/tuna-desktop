@@ -87,6 +87,7 @@ pub mod spring;
 pub mod state;
 pub mod supervise;
 pub mod unlock;
+mod wake;
 pub mod wallpaper;
 pub mod window_icons;
 pub mod window_lifecycle;
@@ -758,6 +759,21 @@ impl State {
             .map_or(0, |keyboard| keyboard.pressed_keys().len())
     }
 
+    /// Query real client DnD ownership, independently of optional icon lifetime.
+    pub(crate) fn client_dnd_active(&self) -> bool {
+        smithay::wayland::selection::data_device::client_dnd_active(&self.seat)
+    }
+
+    pub(crate) fn cancel_client_dnd(&mut self, time: u32) -> bool {
+        let seat = self.seat.clone();
+        smithay::wayland::selection::data_device::cancel_client_dnd(
+            &seat,
+            self,
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            time,
+        )
+    }
+
     /// Seat for capability attachment and input routing.
     pub(crate) fn seat_mut(&mut self) -> &mut Seat<State> {
         &mut self.seat
@@ -1198,6 +1214,21 @@ impl TestCompositor {
     pub fn pump(&mut self) {
         self.display.dispatch_clients(&mut self.state).unwrap();
         self.display.flush_clients().unwrap();
+    }
+
+    /// Seat capability handles for native protocol fixtures.
+    pub fn test_seat(&self) -> Seat<State> {
+        self.state.seat.clone()
+    }
+
+    /// Inspect native client-DnD ownership in socketpair protocol tests.
+    pub fn client_dnd_active(&self) -> bool {
+        self.state.client_dnd_active()
+    }
+
+    /// Cancel native client DnD through the production seat path.
+    pub fn cancel_client_dnd(&mut self, time: u32) -> bool {
+        self.state.cancel_client_dnd(time)
     }
 
     /// Build a [`windows::WindowManager`] attached to the test seat, for

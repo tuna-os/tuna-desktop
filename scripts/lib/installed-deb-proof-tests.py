@@ -18,6 +18,17 @@ spec.loader.exec_module(M)
 
 
 class InstalledPolicy(unittest.TestCase):
+    def test_release_keeps_single_versioned_gtk_and_sound_dependencies(self):
+        source = (ROOT / 'scripts/tuna-release').read_text()
+        depends = next(line for line in source.splitlines() if line.startswith('Depends: '))
+        fields = depends[len('Depends: '):].split(', ')
+        for name, floor in [('libgtk-4-1', '(>= 4.12)'), ('libadwaita-1-0', '(>= 1.0)'), ('libgtk4-layer-shell0', '(>= 1.1)')]:
+            matches = [field for field in fields if field.split()[0] == name]
+            self.assertEqual(matches, [name + ' ' + floor])
+        for name in ['gnome-session-canberra', 'libcanberra-pulse', 'sound-theme-freedesktop']:
+            self.assertEqual(fields.count(name), 1)
+        self.assertTrue(fields[0].startswith('$SHLIBS'))
+
     def process_case(self, inode=20, replacement=None, changed_field=None):
         original = {'sha256': 'a' * 64, 'dev': 1, 'ino': 20, 'size': 100}
         executed = SimpleNamespace(st_dev=1, st_ino=inode, st_size=100,
@@ -150,6 +161,29 @@ class InstalledPolicy(unittest.TestCase):
         with patch.object(os, 'getuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(M, 'run', side_effect=command), patch.object(M, 'owner', return_value={'name': 'tuna-desktop', 'version': '0.1.0'}), patch.object(M, 'digest', return_value={'sha256': '0' * 64}), patch.object(M, 'bounded_json', return_value={'commit': 'b' * 40, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}):
             with self.assertRaisesRegex(ValueError, 'companion-source-contract'):
                 M.preflight()
+
+    def _preflight_with(self, deb_version, reported):
+        def command(args):
+            if args == ['dpkg', '--verify', 'tuna-desktop']:
+                return ''
+            if args[0] == 'git':
+                return 'a' * 40
+            if args[0].startswith('/usr/bin/tuna-'):
+                return Path(args[0]).name + ' ' + reported
+            return deb_version
+        with patch.object(os, 'getuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(M, 'run', side_effect=command), patch.object(M, 'owner', return_value={'name': 'tuna-desktop', 'version': deb_version}), patch.object(M, 'digest', return_value={'sha256': '0' * 64}), patch.object(M, 'bounded_json', return_value={'commit': 'b' * 40, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}):
+            M.preflight()
+
+    def test_prerelease_package_accepts_semver_binaries(self):
+        # 1.0.0~beta.1 is the Debian form of the binaries' 1.0.0-beta.1; the
+        # binary contract passes and the next check (companions) decides.
+        with self.assertRaisesRegex(ValueError, 'companion-source-contract'):
+            self._preflight_with('1.0.0~beta.1', '1.0.0-beta.1')
+
+    def test_prerelease_package_rejects_mismatched_binaries(self):
+        for reported in ('1.0.0~beta.1', '1.0.0', '1.0.0-beta.2'):
+            with self.subTest(reported=reported), self.assertRaisesRegex(ValueError, 'installed-binary-contract'):
+                self._preflight_with('1.0.0~beta.1', reported)
 
     def test_original_session_and_replacement_contract(self):
         base = {'files': {}}

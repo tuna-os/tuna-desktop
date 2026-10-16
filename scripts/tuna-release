@@ -9,9 +9,13 @@
 # login-screen session entry), generates the package metadata from the same
 # stamp, and produces tuna-desktop_<version>_amd64.deb via dpkg-deb.
 #
-# The tree must be clean and HEAD must carry a vX.Y.Z tag unless --allow-dirty
-# is given (dev builds; the version is still stamped from the tag or falls
-# back to the crate version when no tag resolves).
+# Release tags are vX.Y.Z or SemVer prereleases such as vX.Y.Z-beta.N. The
+# binaries report the SemVer version; the package Version maps the prerelease
+# hyphen to "~" (X.Y.Z~beta.N) so dpkg orders it before the final X.Y.Z.
+#
+# The tree must be clean and HEAD must carry a v-prefixed release tag unless
+# --allow-dirty is given (dev builds; the version is still stamped from the
+# nearest release tag or falls back to the crate version when none resolves).
 set -eu
 
 unset CDPATH
@@ -30,7 +34,7 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         --help | -h)
-            sed -n '2,13p' "$0"
+            sed -n '2,18p' "$0"
             exit 0
             ;;
         *)
@@ -48,7 +52,7 @@ if [ "$ALLOW_DIRTY" != "yes" ]; then
     # Recorded human visual review (#67): a release tag needs a filled
     # docs/reviews/<tag>.md comparing Tuna Desktop frames against the GNOME 51
     # baseline bundle.
-    RELEASE_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+    RELEASE_TAG="$(git describe --tags --exact-match --match 'v[0-9]*' HEAD 2>/dev/null || true)"
     if [ -n "$RELEASE_TAG" ]; then
         REVIEW="docs/reviews/$RELEASE_TAG.md"
         if [ ! -f "$REVIEW" ]; then
@@ -62,11 +66,13 @@ if [ "$ALLOW_DIRTY" != "yes" ]; then
     fi
 fi
 
-TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+TAG="$(git describe --tags --exact-match --match 'v[0-9]*' HEAD 2>/dev/null || true)"
 if [ -z "$TAG" ]; then
-    TAG="$(git describe --tags 2>/dev/null || true)"
+    TAG="$(git describe --tags --match 'v[0-9]*' 2>/dev/null || true)"
 fi
-VERSION="$(printf '%s' "$TAG" | sed -e 's/^v//' -e 's/-.*//')"
+# Drop the leading v and any git-describe distance suffix (-N-gHASH); keep a
+# SemVer prerelease (-beta.N) so the binaries report it.
+VERSION="$(printf '%s' "$TAG" | sed -e 's/^v//' -e 's/-[0-9][0-9]*-g[0-9a-f][0-9a-f]*$//')"
 if [ -z "$VERSION" ]; then
     echo "tuna-release: no tag found and no version given; crate fallback applies" >&2
 fi
@@ -128,16 +134,18 @@ SHLIBS="$(cd "$STAGE" && dpkg-shlibdeps -O -eusr/bin/tuna-compositor -eusr/bin/t
 case "$SHLIBS" in shlibs:Depends=*) SHLIBS="${SHLIBS#shlibs:Depends=}" ;; *) echo "tuna-release: missing ELF dependency closure" >&2; exit 1 ;; esac
 [ -n "$SHLIBS" ] || exit 1
 rm -r "$STAGE/debian"
+# Debian orders "~" before everything, so X.Y.Z~beta.N < X.Y.Z.
+DEB_VERSION="$(printf '%s' "$VERSION" | sed 's/-/~/')"
 cat >"$STAGE/DEBIAN/control" <<EOF
 Package: tuna-desktop
-Version: $VERSION
+Version: $DEB_VERSION
 Replaces: $LEGACY_PACKAGE
 Conflicts: $LEGACY_PACKAGE
 Provides: $LEGACY_PACKAGE
 Section: x11
 Priority: optional
 Architecture: amd64
-Depends: $SHLIBS, libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, libsecret-tools, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1, libgbm1, libseat1, libinput10, libudev1, libdrm2, libgtk-4-1, libadwaita-1-0, libpipewire-0.3-0t64 | libpipewire-0.3-0, libglib2.0-0t64 | libglib2.0-0
+Depends: $SHLIBS, gnome-session-canberra, libcanberra-pulse, sound-theme-freedesktop, libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, libsecret-tools, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1, libgbm1, libseat1, libinput10, libudev1, libdrm2, libpipewire-0.3-0t64 | libpipewire-0.3-0, libglib2.0-0t64 | libglib2.0-0
 Recommends: ibus, gstreamer1.0-tools, gstreamer1.0-pipewire, gstreamer1.0-plugins-good
 Maintainer: Tuna Desktop Developers <tuna@example.invalid>
 Description: Tuna Desktop Wayland desktop session
@@ -149,6 +157,6 @@ Description: Tuna Desktop Wayland desktop session
 EOF
 
 mkdir -p "$OUT"
-PKG="$OUT/tuna-desktop_${VERSION}_amd64.deb"
+PKG="$OUT/tuna-desktop_${DEB_VERSION}_amd64.deb"
 dpkg-deb --root-owner-group --build "$STAGE" "$PKG" >/dev/null
 echo "tuna-release: wrote $PKG"

@@ -108,6 +108,24 @@ impl ImeBridge {
         }
     }
 
+    /// Milliseconds until [`poll`](Self::poll) next has work of its own:
+    /// a bridge or XIM restart gate, or (16 ms) an XIM address probe in
+    /// flight. Child exits wake the loop through SIGCHLD (#503).
+    pub fn next_wake_ms(&self, now_ms: u64) -> Option<u64> {
+        let bridge = (self.child.is_none() && self.starts <= MAX_RESTARTS)
+            .then(|| self.next_ms.saturating_sub(now_ms));
+        let xim = if self.xim_address_probe.is_some() {
+            Some(16)
+        } else {
+            (self.x11_display.is_some()
+                && self.xim.is_none()
+                && self.retired_xim.is_none()
+                && self.xim_starts <= MAX_RESTARTS)
+                .then(|| self.xim_next_ms.saturating_sub(now_ms))
+        };
+        bridge.into_iter().chain(xim).min()
+    }
+
     /// The XIM helper may connect only after the compositor's XWM is ready.
     /// Advertising reserved sockets alone must not activate XWayland.
     pub fn set_ready_x11_display(&mut self, display: Option<u32>) {
@@ -165,7 +183,13 @@ impl ImeBridge {
                 PathBuf::from("/usr/lib64/ibus/ibus-x11"),
             ])
             .find(|path| path.is_file());
-        let Some(bin) = bin else { return };
+        let Some(bin) = bin else {
+            // No XIM helper installed: nothing to start this session, and
+            // no restart gate to come back for.
+            self.xim_starts = MAX_RESTARTS + 1;
+            self.xim_address_probe = None;
+            return;
+        };
         // A single worker owns the private address lookup and its pipe. The
         // compositor tick only receives a bounded result without waiting.
         let Some(probe) = &self.xim_address_probe else {

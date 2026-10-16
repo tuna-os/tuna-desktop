@@ -37,6 +37,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 
+use rustix::event::epoll;
 use tuna_shell_control::{
     decode_frame, encode_frame, ActivationToken, CommandKind, CommandStatus, DecodeError,
     ErrorKind, Message, OutputInfo, ProtocolVersion, StateOp, SwitcherAction, WorkspaceInfo,
@@ -44,6 +45,10 @@ use tuna_shell_control::{
 };
 
 use crate::state::{StateChange, StateModel, TokenStore, WindowEntry};
+
+/// How soon the hub wants another [`ControlHub::poll`] while a handshake
+/// is due or a broadcast is owed after backpressure (one display frame).
+pub const RETRY: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Transport and protocol failures, shared with the shell-host endpoint.
 ///
@@ -149,6 +154,25 @@ impl ControlConn {
             }
         }
         Ok(())
+    }
+
+    /// Whether the next [`read_frame`](Self::read_frame) can answer from
+    /// the buffer alone: a whole frame (or an oversize prefix, which fails
+    /// at once) already arrived. The socket is then not readable, so the
+    /// loop must come back without waiting for it.
+    pub fn has_buffered_frame(&self) -> bool {
+        if self.rbuf.len() < 4 {
+            return false;
+        }
+        let len =
+            u32::from_le_bytes([self.rbuf[0], self.rbuf[1], self.rbuf[2], self.rbuf[3]]) as usize;
+        len > MAX_FRAME_BYTES || self.rbuf.len() >= 4 + len
+    }
+}
+
+impl std::os::fd::AsFd for ControlConn {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.stream.as_fd()
     }
 }
 
@@ -285,6 +309,18 @@ impl std::fmt::Debug for Session<'_> {
 }
 
 impl<'a> Session<'a> {
+    /// Whether a whole command frame waits in this session's buffer
+    /// (see [`ControlConn::has_buffered_frame`]).
+    pub fn has_buffered_frame(&self) -> bool {
+        self.conn.has_buffered_frame()
+    }
+
+    /// Whether [`emit_deltas`](Self::emit_deltas) has something to send:
+    /// the lock flag flipped or the model moved since the last emit.
+    pub fn owes_deltas(&self, model: &StateModel) -> bool {
+        self.locked.get() != self.locked_sent || model.revision() != self.last_revision
+    }
+
     /// Server-side handshake: expect `Hello` first, reply `Hello` with
     /// [`CURRENT_VERSION`], then send a full snapshot. A stale major gets a
     /// typed `IncompatibleVersion` error and the connection is refused
@@ -1117,6 +1153,9 @@ pub fn is_private_dir(dir: &std::path::Path) -> bool {
 /// only mutates the model.
 pub struct ControlHub {
     listener: UnixListener,
+    /// Epoll set of the listener and every live session's stream; see
+    /// [`wake_fd`](Self::wake_fd). A closed session leaves it by itself.
+    readiness: std::os::fd::OwnedFd,
     socket_path: std::path::PathBuf,
     sessions: Vec<Session<'static>>,
     /// Peers accepted in an earlier round: their `Hello` is due now.
@@ -1201,8 +1240,16 @@ impl ControlHub {
         let listener = UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let readiness = epoll::create(epoll::CreateFlags::CLOEXEC)?;
+        epoll::add(
+            &readiness,
+            &listener,
+            epoll::EventData::new_u64(0),
+            epoll::EventFlags::IN,
+        )?;
         Ok(Self {
             listener,
+            readiness,
             socket_path,
             sessions: Vec::new(),
             pending: Vec::new(),
@@ -1244,6 +1291,34 @@ impl ControlHub {
     /// Connections refused so far (gate or pending cap).
     pub fn refused_count(&self) -> u64 {
         self.refused
+    }
+
+    /// A handle on the hub's readiness: readable while a peer waits to
+    /// connect or a live session has bytes (or a hangup) to read. The
+    /// runtime adds it to its event loop so the shell wakes the
+    /// compositor instead of being polled.
+    pub fn wake_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        Ok(rustix::io::fcntl_dupfd_cloexec(&self.readiness, 0)?)
+    }
+
+    /// When [`poll`](Self::poll) must run again although no socket is
+    /// readable: at once for a command frame already buffered (one is
+    /// applied per poll), and after [`RETRY`] while a handshake is due
+    /// or a broadcast is still owed after backpressure. `None` when
+    /// only new socket input can change anything.
+    pub fn next_poll(&self, model: &StateModel) -> Option<std::time::Duration> {
+        if self.sessions.iter().any(Session::has_buffered_frame) {
+            return Some(std::time::Duration::ZERO);
+        }
+        let owed = self.overview.get() != self.overview_sent
+            || self.environment != self.environment_sent
+            || self.previews != self.previews_sent
+            || self.outputs != self.outputs_sent
+            || !self.switcher_queue.is_empty()
+            || !self.accelerator_queue.is_empty()
+            || !self.menu_queue.is_empty()
+            || self.sessions.iter().any(|s| s.owes_deltas(model));
+        (owed || self.pending_count() > 0).then_some(RETRY)
     }
 
     /// Accepted peers still waiting for their handshake round.
@@ -1464,6 +1539,28 @@ impl ControlHub {
                 self.session_peers.swap_remove(i);
             }
         }
+        self.broadcast();
+        outcome
+    }
+
+    /// Send what the runtime queued or changed since the last
+    /// [`poll`](Self::poll) without reading commands: model deltas, the
+    /// lock flag, and every pending broadcast. The runtime calls this at
+    /// the end of each loop iteration so nothing waits for the next wake.
+    pub fn flush(&mut self, model: &StateModel) {
+        let mut i = 0;
+        while i < self.sessions.len() {
+            if self.sessions[i].emit_deltas(model).is_ok() {
+                i += 1;
+            } else {
+                self.sessions.swap_remove(i);
+                self.session_peers.swap_remove(i);
+            }
+        }
+        self.broadcast();
+    }
+
+    fn broadcast(&mut self) {
         // Broadcast overview flips (002 R1): best-effort per session,
         // staying dirty until every live session holds the intent.
         if self.overview.get() != self.overview_sent {
@@ -1548,7 +1645,6 @@ impl ControlHub {
                 let _ = session.send_window_menu(&menu);
             }
         }
-        outcome
     }
 
     /// Try each aged peer's handshake once. Peers were accepted a full
@@ -1598,6 +1694,13 @@ impl ControlHub {
                         name: self.pointer_output.clone(),
                     });
                 }
+                // Level-triggered: readable while bytes or a hangup wait.
+                let _ = epoll::add(
+                    &self.readiness,
+                    &session.conn,
+                    epoll::EventData::new_u64(0),
+                    epoll::EventFlags::IN,
+                );
                 self.sessions.push(session);
                 self.session_peers.push(peer);
             }

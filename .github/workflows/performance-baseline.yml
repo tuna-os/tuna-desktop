@@ -4,6 +4,11 @@ on:
     paths:
       - .github/workflows/performance-baseline.yml
       - scripts/tuna-vm-perf
+      - scripts/tuna-benchmark-disk-export
+      - scripts/lib/tuna_benchmark_esp.py
+      - scripts/lib/tuna-benchmark-esp-tests.py
+      - scripts/lib/tuna_benchmark_disk.py
+      - scripts/lib/tuna-benchmark-disk-tests.py
       - scripts/tuna-perf-profile-pairs
       - scripts/tuna-frame-pacer-build
       - scripts/lib/tuna-frame-pacer.c
@@ -17,32 +22,85 @@ on:
   workflow_dispatch:
     inputs:
       package_run:
-        description: Successful main ci run containing tuna-arch (empty selects latest)
+        description: Successful ci run containing tuna-arch (empty selects latest main only)
         required: false
         type: string
+      package_source:
+        description: Trusted main package or explicitly dispatched exact-source candidate
+        required: false
+        type: choice
+        default: main
+        options: [main, candidate]
+      export_disk:
+        description: Export one compact external Corral/CDI benchmark disk
+        required: false
+        type: choice
+        default: none
+        options: [none, stock, diagnostic]
+      candidate_commit:
+        description: Exact main or explicitly dispatched candidate package source SHA
+        required: false
+        type: string
+      benchmark_ssh_public_key:
+        description: One Ed25519 public key for the owned Corral benchmark guest
+        required: false
+        type: string
+      export_only:
+        description: Build/export the selected disk without running local QEMU measurements
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   compare:
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Validate compact disk export request
+        env:
+          EXPORT_ONLY: ${{ inputs.export_only }}
+          EXPORT_DISK: ${{ inputs.export_disk }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+        run: |
+          if [[ "$EXPORT_ONLY" == true && ( "$EXPORT_DISK" != stock && "$EXPORT_DISK" != diagnostic ) ]]; then
+            echo 'export_only requires one explicit stock or diagnostic profile' >&2
+            exit 2
+          fi
+          if [[ "$EXPORT_DISK" == stock || "$EXPORT_DISK" == diagnostic ]]; then
+            [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo 'disk export requires exact candidate_commit' >&2; exit 2; }
+          fi
+      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y python3-yaml
       - run: python3 scripts/lib/tuna-perf-tests.py
+      - run: python3 scripts/lib/tuna-benchmark-disk-tests.py
+      - run: python3 scripts/lib/tuna-benchmark-esp-tests.py
+      - run: /usr/bin/python3 scripts/lib/tuna-corral-ssh-export-tests.py
       - run: python3 scripts/lib/tuna-overview-receipt-tests.py
       - run: python3 scripts/lib/tuna-perf-repeatability-tests.py
       - run: python3 scripts/lib/tuna-perf-vm-lifetime-tests.py
       - run: python3 scripts/lib/tuna-perf-reference-tests.py
       - run: python3 scripts/lib/tuna-kernel-trace-tests.py
-      - name: Select a successful trusted main package
+      - name: Select an explicitly qualified package source
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_SOURCE: ${{ inputs.package_source }}
+          WORKFLOW_EVENT: ${{ github.event_name }}
           PACKAGE_RUN: ${{ inputs.package_run }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
         run: |
           set -euo pipefail
           mkdir -p perf-artifacts
           run="$PACKAGE_RUN"
+          if [[ "$PACKAGE_SOURCE" == candidate ]]; then
+            [[ "$WORKFLOW_EVENT" == workflow_dispatch && "$run" =~ ^[0-9]+$ && "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo 'candidate requires explicit dispatched run and source SHA' >&2; exit 2; }
+          fi
           if [[ -z "$run" ]]; then
             gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=20" > perf-artifacts/package-candidates-api.json
             run=$(python3 scripts/lib/tuna-perf-payload.py latest-run --runs perf-artifacts/package-candidates-api.json --repository "$GITHUB_REPOSITORY" --out perf-artifacts/package-candidate-selection.json)
@@ -50,15 +108,27 @@ jobs:
           [[ "$run" =~ ^[0-9]+$ ]]
           printf '%s\n' "$run" > perf-artifacts/selected-package-run
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" > perf-artifacts/package-run.json
-          jq -e '.head_branch == "main" and .event == "push" and .conclusion == "success"' perf-artifacts/package-run.json
+          if [[ "$PACKAGE_SOURCE" != candidate ]]; then
+            jq -e '.head_branch == "main" and .event == "push" and .conclusion == "success"' perf-artifacts/package-run.json
+          fi
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?name=tuna-arch&per_page=100" > perf-artifacts/package-artifacts-api.json
           jq -e '.total_count <= 100 and (.artifacts | length) == .total_count and ([.artifacts[] | select(.name == "tuna-arch" and .expired == false)] | length) == 1' perf-artifacts/package-artifacts-api.json
           artifact=$(jq -r '.artifacts[] | select(.name == "tuna-arch" and .expired == false) | .id' perf-artifacts/package-artifacts-api.json)
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact" > perf-artifacts/package-artifact-api.json
-          python3 scripts/lib/tuna-perf-payload.py select --run-id "$run" --run perf-artifacts/package-run.json --artifact perf-artifacts/package-artifact-api.json --out perf-artifacts/package-selection.json
+          if [[ "$PACKAGE_SOURCE" == candidate ]]; then
+            python3 scripts/lib/tuna-perf-payload.py select-candidate --repository "$GITHUB_REPOSITORY" --expected-sha "$CANDIDATE_COMMIT" --run-id "$run" --run perf-artifacts/package-run.json --artifact perf-artifacts/package-artifact-api.json --out perf-artifacts/package-selection.json
+          else
+            python3 scripts/lib/tuna-perf-payload.py select --run-id "$run" --run perf-artifacts/package-run.json --artifact perf-artifacts/package-artifact-api.json --out perf-artifacts/package-selection.json
+          fi
+          if [[ -n "$CANDIDATE_COMMIT" ]]; then
+            [[ "$(jq -r '.head_sha' perf-artifacts/package-selection.json)" == "$CANDIDATE_COMMIT" ]] || { echo 'selected package does not match requested candidate source' >&2; exit 2; }
+          fi
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > perf-artifacts/package-artifact.zip
-      - name: Prepare KVM and disk space
+      - name: Prepare disk space and optional measurement KVM
+        env:
+          EXPORT_ONLY: ${{ inputs.export_only }}
         run: |
+          if [[ "$EXPORT_ONLY" != true ]]; then
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
@@ -66,6 +136,7 @@ jobs:
           sudo chmod 0666 /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
+          fi
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
           sudo mkdir -p /mnt/perf && sudo chown "$(id -u):$(id -g)" /mnt/perf
           sudo apt-get -o Acquire::Retries=3 update -qq
@@ -74,6 +145,9 @@ jobs:
           python3 scripts/lib/tuna-perf-payload-tests.py
       - name: Build one shared preview payload
         id: shared_payload
+        env:
+          EXPORT_ONLY: ${{ inputs.export_only }}
+          EXPORT_DISK: ${{ inputs.export_disk }}
         run: |
           # Evidence redirects intentionally belong to the unprivileged runner.
           # shellcheck disable=SC2024
@@ -88,7 +162,9 @@ jobs:
           sudo podman build -f packaging/marlin/perf/Containerfile.baseline --target gnome-baseline -t localhost/marlin-gnome51-coherent:base . 2>&1 | tee perf-artifacts/coherent-build.log
           coherent_image=$(sudo podman inspect localhost/marlin-gnome51-coherent:base --format '{{.Id}}')
           printf '%s\n' "$coherent_image" > perf-artifacts/coherent-image-id
-          for profile in diagnostic stock; do
+          profiles="diagnostic stock"
+          if [[ "$EXPORT_ONLY" == true ]]; then profiles="$EXPORT_DISK"; fi
+          for profile in $profiles; do
             profile_artifacts=perf-artifacts
             if [[ "$profile" == stock ]]; then profile_artifacts=perf-artifacts/stock; fi
             mkdir -p "$profile_artifacts"
@@ -139,12 +215,34 @@ jobs:
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" cat /usr/share/tuna-perf-reference.json > "$profile_artifacts/reference-image.json"
             chmod 0444 "$profile_artifacts/reference-image.json"
           done
+      - name: Export bounded compact paired benchmark disk
+        if: ${{ inputs.export_disk == 'stock' || inputs.export_disk == 'diagnostic' }}
+        env:
+          EXPORT_DISK: ${{ inputs.export_disk }}
+          BENCHMARK_SSH_PUBLIC_KEY: ${{ inputs.benchmark_ssh_public_key }}
+        run: |
+          python3 - <<'PYKEY'
+          import os
+          from pathlib import Path
+          os.umask(0o077)
+          Path('/mnt/perf/benchmark-ssh-key.pub').write_text(os.environ['BENCHMARK_SSH_PUBLIC_KEY'].strip() + '\n')
+          PYKEY
+          scripts/tuna-benchmark-disk-export --profile "$EXPORT_DISK" --ssh-public-key-file /mnt/perf/benchmark-ssh-key.pub
+      - name: Upload compact benchmark disk and provenance
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: ${{ always() && (inputs.export_disk == 'stock' || inputs.export_disk == 'diagnostic') }}
+        with:
+          name: marlin-benchmark-disk-${{ inputs.export_disk }}
+          path: benchmark-disk/
+          compression-level: 0
+          retention-days: 7
       - name: Measure three alternating diagnostic pairs
+        if: ${{ !inputs.export_only }}
         run: scripts/tuna-perf-profile-pairs diagnostic
       - name: Measure three alternating stock pairs
         # A rejected diagnostic capture stays a failed step. Stock still runs
         # from its separately guarded immutable image on this original host.
-        if: ${{ !cancelled() && steps.shared_payload.outcome == 'success' }}
+        if: ${{ !cancelled() && !inputs.export_only && steps.shared_payload.outcome == 'success' }}
         run: scripts/tuna-perf-profile-pairs stock
       - name: Upload performance artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

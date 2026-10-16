@@ -9,16 +9,20 @@
 //!
 //! The core ([`NotificationCenter`], queueing, paint) is wire-free. This
 //! D-Bus edge mirrors [`WatcherBus`](crate::watcher::WatcherBus): the
-//! panel's slow tick calls [`NotificationBus::ensure`], and a taken
+//! owner calls [`NotificationBus::ensure`] until it connects, and a taken
 //! name (or no bus) reads as no intake — never a hang. Method calls
-//! dispatch on zbus worker threads straight into the shared center.
+//! dispatch on zbus worker threads straight into the shared center, then
+//! run the [`NotificationBus::on_change`] callback so the owner can
+//! redraw without polling the center.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use zbus::object_server::SignalEmitter;
 
-use crate::notifications::{NotificationAction, NotificationCenter, NotificationError, Urgency};
+use crate::notifications::{
+    Incoming, NotificationAction, NotificationCenter, NotificationError, Sound, Urgency,
+};
 
 /// Well-known notifications name (freedesktop Desktop Notifications).
 pub const NOTIFICATIONS_NAME: &str = "org.freedesktop.Notifications";
@@ -41,12 +45,25 @@ fn pair_actions(actions: &[String]) -> Vec<NotificationAction> {
         .collect()
 }
 
+/// A hint's value with D-Bus's variant layer removed. `a{sv}` wraps
+/// every value once, and converting the wrapper directly misreads it
+/// as a mistype — which silently dropped every desktop-entry, urgency
+/// and sound hint on real notifications.
+fn hint_value(
+    hints: &HashMap<String, zbus::zvariant::OwnedValue>,
+    key: &str,
+) -> Option<zbus::zvariant::Value<'static>> {
+    let value = zbus::zvariant::Value::from(hints.get(key)?.clone());
+    match value {
+        zbus::zvariant::Value::Value(inner) => Some(*inner),
+        value => Some(value),
+    }
+}
+
 /// Urgency from the `urgency` hint byte (0 low, 1 normal, 2
 /// critical). A missing or mistyped hint reads as normal.
 fn urgency_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Urgency {
-    let level: Option<u8> = hints
-        .get("urgency")
-        .and_then(|hint| u8::try_from(hint).ok());
+    let level: Option<u8> = hint_value(hints, "urgency").and_then(|v| u8::try_from(v).ok());
     match level {
         Some(0) => Urgency::Low,
         Some(2..=u8::MAX) => Urgency::Critical,
@@ -54,13 +71,46 @@ fn urgency_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Urgency 
     }
 }
 
+/// A string hint, empty when absent or mistyped.
+fn string_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str) -> String {
+    hint_value(hints, key)
+        .and_then(|v| String::try_from(v).ok())
+        .unwrap_or_default()
+}
+
+/// The sound a notification asks for: `sound-name` or `sound-file`,
+/// nothing when `suppress-sound` is set.
+fn sound_hints(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Sound {
+    let suppressed = hint_value(hints, "suppress-sound")
+        .and_then(|v| bool::try_from(v).ok())
+        .unwrap_or(false);
+    if suppressed {
+        return Sound::default();
+    }
+    Sound {
+        name: string_hint(hints, "sound-name"),
+        file: string_hint(hints, "sound-file"),
+    }
+}
+
+/// Run after a wire call changed the center (on a zbus thread).
+pub type OnChange = Arc<dyn Fn() + Send + Sync>;
+
 /// The `org.freedesktop.Notifications` object: wire calls become
 /// center mutations. Banner-side presses never arrive here as method
 /// calls — they go through [`NotificationBus`], which mutates and
 /// then emits the matching signal.
-#[derive(Debug)]
 struct Notifications {
     center: Arc<Mutex<NotificationCenter>>,
+    on_change: Option<OnChange>,
+}
+
+impl Notifications {
+    fn changed(&self) {
+        if let Some(on_change) = &self.on_change {
+            on_change();
+        }
+    }
 }
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
@@ -80,26 +130,26 @@ impl Notifications {
         hints: HashMap<String, zbus::zvariant::OwnedValue>,
         _expire_timeout: i32,
     ) -> u32 {
-        let replaces = (replaces_id != 0).then_some(replaces_id as u64);
-        let desktop_entry = hints
-            .get("desktop-entry")
-            .and_then(|v| String::try_from(v.clone()).ok())
-            .unwrap_or_default();
-        self.center
+        // The source's notification policy (GNOME Settings) decides
+        // whether it is filed at all, its banner and its sound.
+        let incoming = Incoming {
+            app: app_name,
+            icon: app_icon,
+            title: summary,
+            body,
+            actions: pair_actions(&actions),
+            urgency: urgency_hint(&hints),
+            replaces_id: (replaces_id != 0).then_some(replaces_id as u64),
+            desktop_entry: string_hint(&hints, "desktop-entry"),
+            sound: sound_hints(&hints),
+        };
+        let id = self
+            .center
             .lock()
-            .map(|mut center| {
-                let id = center.notify(
-                    &app_name,
-                    &summary,
-                    &body,
-                    pair_actions(&actions),
-                    urgency_hint(&hints),
-                    replaces,
-                );
-                center.set_source(id, &app_icon, &desktop_entry);
-                id
-            })
-            .unwrap_or(0) as u32
+            .map(|mut center| center.deliver(incoming))
+            .unwrap_or(0) as u32;
+        self.changed();
+        id
     }
 
     /// Close a notification by id. Unknown ids are ignored: the
@@ -109,6 +159,7 @@ impl Notifications {
             .center
             .lock()
             .map(|mut center| center.dismiss(id as u64));
+        self.changed();
     }
 
     /// Server capabilities: banner actions plus queue persistence.
@@ -142,13 +193,30 @@ impl Notifications {
 pub struct NotificationBus {
     conn: Option<zbus::blocking::Connection>,
     center: Arc<Mutex<NotificationCenter>>,
+    on_change: Option<OnChange>,
 }
 
 impl NotificationBus {
     /// Disconnected edge over a shared center;
     /// [`NotificationBus::ensure`] connects.
     pub fn new(center: Arc<Mutex<NotificationCenter>>) -> Self {
-        Self { conn: None, center }
+        Self {
+            conn: None,
+            center,
+            on_change: None,
+        }
+    }
+
+    /// Run `on_change` (on a zbus thread) after every wire call that
+    /// changed the center. Set before [`NotificationBus::ensure`]: the
+    /// served object takes it when it connects.
+    pub fn on_change(&mut self, on_change: impl Fn() + Send + Sync + 'static) {
+        self.on_change = Some(Arc::new(on_change));
+    }
+
+    /// Whether the edge is connected and owns the notifications name.
+    pub fn connected(&self) -> bool {
+        self.conn.is_some()
     }
 
     /// The shared center behind the edge (the panel paints from it).
@@ -184,6 +252,7 @@ impl NotificationBus {
         };
         let notifications = Notifications {
             center: self.center.clone(),
+            on_change: self.on_change.clone(),
         };
         let conn = match builder.serve_at(NOTIFICATIONS_PATH, notifications) {
             Ok(conn) => conn,
@@ -332,6 +401,48 @@ mod tests {
         assert_eq!(urgency_hint(&mistyped), Urgency::Normal);
     }
 
+    /// Hints as D-Bus delivers them: every `a{sv}` value wrapped once
+    /// in a variant. The readers must see through the wrapper, or real
+    /// notifications lose urgency, app identity and sound.
+    fn wrapped_hints(
+        pairs: &[(&str, zbus::zvariant::Value<'static>)],
+    ) -> HashMap<String, zbus::zvariant::OwnedValue> {
+        use zbus::zvariant::Value;
+
+        pairs
+            .iter()
+            .map(|(key, value)| {
+                let wrapped = Value::Value(Box::new(value.clone()))
+                    .try_to_owned()
+                    .expect("hint value");
+                (key.to_string(), wrapped)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hints_read_through_the_dbus_variant_layer() {
+        use zbus::zvariant::Value;
+
+        let hints = wrapped_hints(&[
+            ("urgency", Value::U8(2)),
+            ("desktop-entry", Value::from("tuna-proof-notes")),
+            ("sound-name", Value::from("message-new-instant")),
+            ("suppress-sound", Value::Bool(true)),
+        ]);
+        assert_eq!(urgency_hint(&hints), Urgency::Critical);
+        assert_eq!(string_hint(&hints, "desktop-entry"), "tuna-proof-notes");
+        // Suppressed wins over a named sound, as on the bus.
+        assert!(sound_hints(&hints).is_empty());
+
+        let hints = wrapped_hints(&[("sound-name", Value::from("message-new-instant"))]);
+        assert_eq!(sound_hints(&hints).name, "message-new-instant");
+
+        let hints = wrapped_hints(&[("urgency", Value::U8(0))]);
+        assert_eq!(urgency_hint(&hints), Urgency::Low);
+        assert_eq!(string_hint(&hints, "desktop-entry"), "");
+    }
+
     /// Live stubs over a private session bus: a stub client speaks
     /// the freedesktop `Notify` shape to the real [`NotificationBus`]
     /// edge and listens for its signals. Each test owns its daemon
@@ -397,7 +508,10 @@ mod tests {
             center: Arc<Mutex<NotificationCenter>>,
             address: &str,
         ) -> Option<NotificationBus> {
-            let mut bus = NotificationBus::new(center);
+            owned_bus_with(NotificationBus::new(center), address)
+        }
+
+        fn owned_bus_with(mut bus: NotificationBus, address: &str) -> Option<NotificationBus> {
             for _ in 0..50 {
                 if bus.connect(Some(address)) {
                     return Some(bus);
@@ -464,7 +578,16 @@ mod tests {
                 return;
             };
             let center = shared_center();
-            let Some(bus) = owned_bus(center.clone(), &address) else {
+            let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut bus = NotificationBus::new(center.clone());
+            {
+                let changes = changes.clone();
+                bus.on_change(move || {
+                    changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            assert!(!bus.connected());
+            let Some(bus) = owned_bus_with(bus, &address) else {
                 let _ = daemon.kill();
                 eprintln!("SKIP live notification test: private bus refused connections");
                 return;
@@ -486,6 +609,12 @@ mod tests {
 
             let id = stub_notify(&proxy, vec!["default".to_owned(), "Open".to_owned()]);
             assert_ne!(id, 0, "intake returns a live notification id");
+            assert_eq!(
+                changes.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "a wire Notify wakes the owner"
+            );
+            assert!(bus.connected());
             let banners = center
                 .lock()
                 .expect("center lock")
@@ -511,6 +640,11 @@ mod tests {
                 center.lock().expect("center lock").history().len(),
                 1,
                 "dismiss keeps history"
+            );
+            assert_eq!(
+                changes.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "a wire CloseNotification wakes the owner"
             );
 
             let _ = daemon.kill();

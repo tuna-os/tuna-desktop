@@ -9,8 +9,13 @@
 //! first, one group per app (GNOME 51's NotificationMessageGroup: a
 //! collapsed stack that expands on click); Do Not Disturb keeps banners
 //! away (critical ones still show) while history keeps filling.
+//!
+//! Nothing here runs on a period: wire arrivals wake the main loop
+//! through the bus's change callback, each banner's expiry is a one-shot
+//! timeout re-armed after every update, and a banner waiting for an away
+//! user wakes on the IdleMonitor's user-active watch.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -20,6 +25,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::intake::NotificationBus;
+use tuna_shell_host::notification_policy::GioPolicyStore;
 use tuna_shell_host::notifications::{Notification, NotificationCenter, Urgency};
 
 /// How long a normal or low banner stays up (GNOME: about 4 s).
@@ -29,6 +35,14 @@ pub const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
 pub const AWAY_AFTER: Duration = Duration::from_secs(1);
 /// How long a banner stays once an away user comes back.
 pub const BACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// While the notifications name is not ours, how often to try again.
+const BUS_RETRY: Duration = Duration::from_secs(2);
+/// Without a user-active watch, how often to look for an away user's
+/// return while their banner waits.
+const AWAY_RECHECK: Duration = Duration::from_millis(250);
+/// Mutter's idle monitor (the compositor serves it).
+const IDLE_MONITOR: &str = "org.gnome.Mutter.IdleMonitor";
+const IDLE_MONITOR_CORE: &str = "/org/gnome/Mutter/IdleMonitor/Core";
 
 /// One banner's expiry, as GNOME's message tray times it: four seconds
 /// when it appears to an active user; when the user is away it stays
@@ -64,6 +78,63 @@ impl BannerTimer {
         }
         self.deadline.is_some_and(|d| now >= d)
     }
+
+    /// When the banner goes; `None` while it waits for an away user.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+}
+
+/// What the banner timers ask for at one moment.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Due {
+    /// Banners due to go now.
+    pub expired: Vec<u64>,
+    /// The earliest deadline still ahead.
+    pub next: Option<Instant>,
+    /// A banner waits for an away user to come back.
+    pub away: bool,
+}
+
+/// Advance each banner's timer to `now` and collect what they ask for:
+/// which banners go, when the next one is due, and whether one waits on
+/// the user's return.
+pub fn due<'a>(
+    timers: impl IntoIterator<Item = (u64, &'a mut BannerTimer)>,
+    now: Instant,
+    idle: Option<Duration>,
+) -> Due {
+    let mut due = Due::default();
+    for (id, timer) in timers {
+        if timer.expired(now, idle) {
+            due.expired.push(id);
+            continue;
+        }
+        match timer.deadline() {
+            Some(d) => due.next = Some(due.next.map_or(d, |n| n.min(d))),
+            None => due.away = true,
+        }
+    }
+    due
+}
+
+/// A one-shot timeout after `delay`, in whole milliseconds rounded up so
+/// it never fires before `delay` has passed.
+fn timeout_after(delay: Duration, func: impl FnOnce() + 'static) -> glib::SourceId {
+    let ms = delay.as_micros().div_ceil(1000) as u64;
+    glib::timeout_add_local_once(Duration::from_millis(ms), func)
+}
+
+/// The IdleMonitor's user-active watch for an away user's banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserWatch {
+    Off,
+    /// AddUserActiveWatch sent, no reply yet.
+    Pending,
+    /// Fires `WatchFired(id)` on the next input.
+    Armed(u32),
+    /// The idle monitor has no such watch: recheck on a short timeout.
+    Unavailable,
 }
 
 /// The session's idle time from org.gnome.Mutter.IdleMonitor, or `None`
@@ -72,9 +143,9 @@ fn idle_time() -> Option<Duration> {
     let conn = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
     let reply = conn
         .call_sync(
-            Some("org.gnome.Mutter.IdleMonitor"),
-            "/org/gnome/Mutter/IdleMonitor/Core",
-            "org.gnome.Mutter.IdleMonitor",
+            Some(IDLE_MONITOR),
+            IDLE_MONITOR_CORE,
+            IDLE_MONITOR,
             "GetIdletime",
             None,
             Some(glib::VariantTy::new("(t)").ok()?),
@@ -161,6 +232,9 @@ pub struct NotifyUi {
     bus: RefCell<NotificationBus>,
     banner_window: gtk::ApplicationWindow,
     banner_box: gtk::Box,
+    /// Drops banners in and slides them out (`messageTray.js`).
+    banner_bin: crate::transient::MotionBin,
+    banner_motion: crate::transient::Player,
     /// The calendar popover's left pane.
     pane: gtk::Box,
     list: gtk::Box,
@@ -175,8 +249,18 @@ pub struct NotifyUi {
     expanded: RefCell<HashSet<String>>,
     group_widgets: RefCell<HashMap<String, Rc<crate::group_animation::Group>>>,
     shown: RefCell<Shown>,
-    last_bus_try: RefCell<Option<Instant>>,
+    /// The next banner expiry (a one-shot timeout).
+    deadline: RefCell<Option<glib::SourceId>>,
+    /// The next try at the bus while it is not ours.
+    bus_retry: RefCell<Option<glib::SourceId>>,
+    user_watch: Cell<UserWatch>,
+    user_watch_signal: RefCell<Option<gio::SignalSubscription>>,
+    /// Told when Do Not Disturb turns on or off.
+    dnd_changed: RefCell<Vec<DndListener>>,
 }
+
+/// Told when Do Not Disturb turns on or off.
+type DndListener = Box<dyn Fn(bool)>;
 
 /// One notification as GNOME 51 draws it (messageList.js
 /// NotificationMessage): a header with the source icon, app name, time
@@ -273,10 +357,23 @@ fn source_icon(icon: &str) -> Option<gio::Icon> {
 }
 
 impl NotifyUi {
-    /// Build the surfaces; the bus is claimed on the first tick.
+    /// Build the surfaces and claim the bus.
     pub fn new(app: &gtk::Application) -> Rc<Self> {
         let center = Arc::new(Mutex::new(NotificationCenter::load_system()));
-        let bus = NotificationBus::new(center.clone());
+        // GNOME Settings' notification policy, read live on every
+        // arrival (#348); a restart drops whatever an app disabled
+        // since it was filed.
+        if let Ok(mut filed) = center.lock() {
+            filed.set_policy(Arc::new(GioPolicyStore::new()));
+            filed.enforce_policy();
+        }
+        let mut bus = NotificationBus::new(center.clone());
+        // Wire arrivals (on zbus threads) wake the main loop; a wake
+        // already queued covers any that follow it.
+        let (wake, woken) = async_channel::bounded::<()>(1);
+        bus.on_change(move || {
+            let _ = wake.try_send(());
+        });
 
         let banner_window = gtk::ApplicationWindow::new(app);
         banner_window.add_css_class("tuna-banners");
@@ -302,7 +399,8 @@ impl NotifyUi {
         banner_window.add_controller(keys);
         banner_window.set_title(Some("Notifications"));
         let banner_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        banner_window.set_child(Some(&banner_box));
+        let banner_bin = crate::transient::MotionBin::new(&banner_box);
+        banner_window.set_child(Some(&banner_bin));
 
         // Calendar pane, GNOME 51's CalendarMessageList: the placeholder
         // overlaid on the list, and a controls row holding only Clear (Do
@@ -349,6 +447,8 @@ impl NotifyUi {
             bus: RefCell::new(bus),
             banner_window,
             banner_box,
+            banner_bin,
+            banner_motion: crate::transient::Player::new("banner"),
             pane,
             list,
             empty,
@@ -361,8 +461,23 @@ impl NotifyUi {
                 banners: vec![u64::MAX],
                 ..Default::default()
             }),
-            last_bus_try: RefCell::new(None),
+            deadline: RefCell::new(None),
+            bus_retry: RefCell::new(None),
+            user_watch: Cell::new(UserWatch::Off),
+            user_watch_signal: RefCell::new(None),
+            dnd_changed: RefCell::new(Vec::new()),
         });
+        {
+            let weak = Rc::downgrade(&ui);
+            glib::spawn_future_local(async move {
+                while woken.recv().await.is_ok() {
+                    let Some(ui) = weak.upgrade() else {
+                        break;
+                    };
+                    ui.update();
+                }
+            });
+        }
         {
             let me = ui.clone();
             ui.clear.connect_clicked(move |_| {
@@ -372,7 +487,7 @@ impl NotifyUi {
                 me.refresh();
             });
         }
-        ui.refresh();
+        ui.update();
         ui
     }
 
@@ -383,7 +498,7 @@ impl NotifyUi {
             let id = center.notify(app, summary, body, Vec::new(), Urgency::Normal, None);
             center.set_source(id, icon, "");
         }
-        self.refresh();
+        self.update();
     }
 
     /// The calendar popover's notification pane.
@@ -391,18 +506,33 @@ impl NotifyUi {
         &self.pane
     }
 
-    /// Turn Do Not Disturb on or off (the quick-settings toggle).
-    pub fn set_dnd(&self, on: bool) {
-        if let Ok(mut center) = self.center.lock() {
-            if center.dnd() != on {
+    /// Turn Do Not Disturb on or off (the quick-settings toggle and the
+    /// show-banners key).
+    pub fn set_dnd(self: &Rc<Self>, on: bool) {
+        let changed = match self.center.lock() {
+            Ok(mut center) if center.dnd() != on => {
                 center.set_dnd(on);
+                true
             }
+            _ => false,
+        };
+        if !changed {
+            return;
+        }
+        self.update();
+        for f in self.dnd_changed.borrow().iter() {
+            f(on);
         }
     }
 
     /// Whether Do Not Disturb is on.
     pub fn dnd(&self) -> bool {
         self.center.lock().map(|c| c.dnd()).unwrap_or(false)
+    }
+
+    /// Call `f` with the new state whenever Do Not Disturb changes.
+    pub fn connect_dnd(&self, f: impl Fn(bool) + 'static) {
+        self.dnd_changed.borrow_mut().push(Box::new(f));
     }
 
     /// GNOME's Super+N gives the current banner keyboard focus.
@@ -423,18 +553,14 @@ impl NotifyUi {
         self.banner_window.set_focus_visible(false);
     }
 
-    /// Periodic work: claim the bus, expire banners, redraw on change.
-    pub fn tick(self: &Rc<Self>) {
-        let retry = self
-            .last_bus_try
-            .borrow()
-            .is_none_or(|t| t.elapsed() > Duration::from_secs(2));
-        if retry {
-            *self.last_bus_try.borrow_mut() = Some(Instant::now());
-            self.bus.borrow_mut().ensure();
-        }
+    /// Claim the bus (retrying every [`BUS_RETRY`] while it is not
+    /// ours), expire banners, redraw on change, and arm the next wake:
+    /// the earliest banner deadline, or an away user's return. Runs on
+    /// every change to the notifications, never on a period.
+    fn update(self: &Rc<Self>) {
+        self.ensure_bus();
         // Expire non-critical banners.
-        let expired: Vec<u64> = {
+        let due = {
             let Ok(center) = self.center.lock() else {
                 return;
             };
@@ -450,19 +576,132 @@ impl NotifyUi {
                 .collect();
             // Ask for idle time only while a banner is timing.
             let idle = if timed.is_empty() { None } else { idle_time() };
-            timed
-                .into_iter()
-                .filter(|id| {
-                    seen.entry(*id)
-                        .or_insert_with(|| BannerTimer::new(now, idle))
-                        .expired(now, idle)
-                })
-                .collect()
+            for id in &timed {
+                seen.entry(*id)
+                    .or_insert_with(|| BannerTimer::new(now, idle));
+            }
+            due(
+                seen.iter_mut()
+                    .filter(|(id, _)| timed.contains(id))
+                    .map(|(id, timer)| (*id, timer)),
+                now,
+                idle,
+            )
         };
-        for id in expired {
-            let _ = self.bus.borrow().dismiss_banner(id as u32, REASON_EXPIRED);
+        for id in &due.expired {
+            let _ = self.bus.borrow().dismiss_banner(*id as u32, REASON_EXPIRED);
         }
         self.refresh();
+        let mut next = due.next;
+        if due.away {
+            if self.user_watch.get() == UserWatch::Unavailable {
+                let recheck = Instant::now() + AWAY_RECHECK;
+                next = Some(next.map_or(recheck, |n| n.min(recheck)));
+            } else {
+                self.watch_user_active();
+            }
+        }
+        self.arm_deadline(next);
+    }
+
+    /// Connect the bus unless it is ours or a retry is already pending;
+    /// on failure, try again after [`BUS_RETRY`].
+    fn ensure_bus(self: &Rc<Self>) {
+        if self.bus.borrow().connected() || self.bus_retry.borrow().is_some() {
+            return;
+        }
+        if self.bus.borrow_mut().ensure() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(BUS_RETRY, move || {
+            if let Some(me) = weak.upgrade() {
+                me.bus_retry.take();
+                me.update();
+            }
+        });
+        *self.bus_retry.borrow_mut() = Some(id);
+    }
+
+    /// Wake at `at` (replacing any earlier wake), or not at all.
+    fn arm_deadline(self: &Rc<Self>, at: Option<Instant>) {
+        if let Some(id) = self.deadline.take() {
+            id.remove();
+        }
+        let Some(at) = at else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let id = timeout_after(at.saturating_duration_since(Instant::now()), move || {
+            if let Some(me) = weak.upgrade() {
+                me.deadline.take();
+                me.update();
+            }
+        });
+        *self.deadline.borrow_mut() = Some(id);
+    }
+
+    /// Ask the idle monitor to say when the away user next does
+    /// something (GNOME's message tray waits on the same watch); its
+    /// `WatchFired` runs [`NotifyUi::update`], which starts the banner's
+    /// two seconds.
+    fn watch_user_active(self: &Rc<Self>) {
+        if self.user_watch.get() != UserWatch::Off {
+            return;
+        }
+        let Ok(conn) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+            self.user_watch.set(UserWatch::Unavailable);
+            return;
+        };
+        if self.user_watch_signal.borrow().is_none() {
+            let weak = Rc::downgrade(self);
+            let subscription = conn.subscribe_to_signal(
+                Some(IDLE_MONITOR),
+                Some(IDLE_MONITOR),
+                Some("WatchFired"),
+                Some(IDLE_MONITOR_CORE),
+                None,
+                gio::DBusSignalFlags::NONE,
+                move |signal| {
+                    let Some(me) = weak.upgrade() else {
+                        return;
+                    };
+                    let Some((id,)) = signal.parameters.get::<(u32,)>() else {
+                        return;
+                    };
+                    if me.user_watch.get() == UserWatch::Armed(id) {
+                        me.user_watch.set(UserWatch::Off);
+                        me.update();
+                    }
+                },
+            );
+            *self.user_watch_signal.borrow_mut() = Some(subscription);
+        }
+        self.user_watch.set(UserWatch::Pending);
+        let weak = Rc::downgrade(self);
+        conn.call(
+            Some(IDLE_MONITOR),
+            IDLE_MONITOR_CORE,
+            IDLE_MONITOR,
+            "AddUserActiveWatch",
+            None,
+            glib::VariantTy::new("(u)").ok(),
+            gio::DBusCallFlags::NO_AUTO_START,
+            1000,
+            gio::Cancellable::NONE,
+            move |reply| {
+                let Some(me) = weak.upgrade() else {
+                    return;
+                };
+                match reply.ok().and_then(|r| r.get::<(u32,)>()) {
+                    Some((id,)) => me.user_watch.set(UserWatch::Armed(id)),
+                    None => me.user_watch.set(UserWatch::Unavailable),
+                }
+                // Input between reading the idle time and arming the
+                // watch would not fire it: look again now.
+                me.update();
+            },
+        );
     }
 
     fn refresh(self: &Rc<Self>) {
@@ -486,9 +725,14 @@ impl NotifyUi {
         if *self.shown.borrow() == now {
             return;
         }
-        // Banners.
-        while let Some(child) = self.banner_box.first_child() {
-            self.banner_box.remove(&child);
+        let before = std::mem::take(&mut *self.shown.borrow_mut());
+        // Banners. The last ones stay up while they slide away (and are
+        // cleared once they have).
+        let leaving = now.banners.is_empty() && !before.banners.is_empty();
+        if !now.banners.is_empty() {
+            while let Some(child) = self.banner_box.first_child() {
+                self.banner_box.remove(&child);
+            }
         }
         for n in center.banners() {
             let (c, close) = card(n);
@@ -533,8 +777,15 @@ impl NotifyUi {
         }
         if now.banners.is_empty() {
             self.banner_window.set_keyboard_mode(KeyboardMode::None);
+            if leaving {
+                self.leave_banners();
+            }
+        } else if now.banners.iter().any(|id| !before.banners.contains(id))
+            || !self.banner_bin.can_target()
+        {
+            // A new banner (or one returning mid-slide) drops in.
+            self.enter_banners();
         }
-        self.banner_window.set_visible(!now.banners.is_empty());
 
         // History list.
         self.group_widgets.borrow_mut().clear();
@@ -551,9 +802,23 @@ impl NotifyUi {
                 // A group of one is just its card.
                 [n] => {
                     let (c, close) = card(n);
-                    let (me, id) = (self.clone(), n.id);
-                    close.connect_clicked(move |_| me.remove(&[id]));
-                    self.list.append(&c);
+                    let item = crate::transient::MotionBin::new(&c);
+                    let (me, id, weak) = (self.clone(), n.id, item.downgrade());
+                    close.connect_clicked(move |_| {
+                        // GNOME zooms the message out, then removes it.
+                        let Some(item) = weak.upgrade() else {
+                            return;
+                        };
+                        item.set_can_target(false);
+                        let me = me.clone();
+                        item.animate(
+                            &crate::transient::Player::new("message"),
+                            crate::transient::MESSAGE_MS,
+                            |_, t| crate::transient::message(t, false),
+                            move || me.remove(&[id]),
+                        );
+                    });
+                    self.add_item(&item, !before.history.contains(&n.id));
                 }
                 _ => {
                     let group = crate::group_animation::Group::new(
@@ -561,7 +826,12 @@ impl NotifyUi {
                         &self.expanded_group(key, &members),
                         now.expanded.contains(key),
                     );
-                    self.list.append(&group.widget);
+                    let item = crate::transient::MotionBin::new(&group.widget);
+                    // A group is new when none of its cards were listed.
+                    self.add_item(
+                        &item,
+                        members.iter().all(|n| !before.history.contains(&n.id)),
+                    );
                     self.group_widgets.borrow_mut().insert(key.clone(), group);
                 }
             }
@@ -577,6 +847,54 @@ impl NotifyUi {
         self.clear.set_sensitive(any);
         drop(center);
         *self.shown.borrow_mut() = now;
+    }
+
+    /// Append a list item, zooming it in when it is new and the list is
+    /// on screen (`_addMessage`).
+    fn add_item(&self, item: &crate::transient::MotionBin, new: bool) {
+        self.list.append(item);
+        if new && self.list.is_mapped() {
+            item.animate(
+                &crate::transient::Player::new("message"),
+                crate::transient::MESSAGE_MS,
+                |_, t| crate::transient::message(t, true),
+                || {},
+            );
+        }
+    }
+
+    /// Drop the banners in: fade, slide down and grow from 90%.
+    fn enter_banners(&self) {
+        self.banner_bin.set_can_target(true);
+        self.banner_window.set_visible(true);
+        self.banner_bin.animate(
+            &self.banner_motion,
+            crate::transient::BANNER_MS,
+            |bin, t| crate::transient::banner_enter(t, f64::from(bin.height())),
+            || {},
+        );
+    }
+
+    /// Slide the last banners back up, then hide their surface.
+    fn leave_banners(self: &Rc<Self>) {
+        self.banner_bin.set_can_target(false);
+        let weak = Rc::downgrade(self);
+        self.banner_bin.animate(
+            &self.banner_motion,
+            crate::transient::BANNER_MS,
+            |bin, t| crate::transient::banner_leave(t, f64::from(bin.height())),
+            move || {
+                let Some(me) = weak.upgrade() else {
+                    return;
+                };
+                me.banner_window.set_visible(false);
+                while let Some(child) = me.banner_box.first_child() {
+                    me.banner_box.remove(&child);
+                }
+                me.banner_bin.set_frame(crate::transient::Frame::REST);
+                me.banner_bin.set_can_target(true);
+            },
+        );
     }
 
     /// Close notifications from the list (and any banner they hold).
@@ -602,7 +920,7 @@ impl NotifyUi {
         let group = self.group_widgets.borrow().get(key).cloned();
         if let Some(group) = group {
             group.set_expanded(on);
-            // Prevent the refresh ticker rebuilding the group mid-animation.
+            // Keep the next refresh from rebuilding the group mid-animation.
             let mut expanded: Vec<_> = self.expanded.borrow().iter().cloned().collect();
             expanded.sort();
             self.shown.borrow_mut().expanded = expanded;
@@ -756,5 +1074,46 @@ mod timer_tests {
         // No idle monitor: the user counts as active.
         let mut t = BannerTimer::new(t0, None);
         assert!(t.expired(t0 + s(4), None));
+    }
+
+    #[test]
+    fn due_collects_expiries_the_next_deadline_and_away_banners() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let active = Some(Duration::from_millis(200));
+        let mut early = BannerTimer::new(t0, active);
+        let mut late = BannerTimer::new(t0 + s(3), active);
+        // Nothing due yet: wake when the first banner goes.
+        assert_eq!(
+            due([(1, &mut early), (2, &mut late)], t0 + s(1), active),
+            Due {
+                expired: Vec::new(),
+                next: Some(t0 + s(4)),
+                away: false,
+            }
+        );
+        // The first goes; wake for the second.
+        assert_eq!(
+            due([(1, &mut early), (2, &mut late)], t0 + s(4), Some(s(4))),
+            Due {
+                expired: vec![1],
+                next: Some(t0 + s(7)),
+                away: false,
+            }
+        );
+        // A banner shown to an away user has no deadline until they
+        // come back, then two seconds from their input.
+        let mut waiting = BannerTimer::new(t0, Some(s(30)));
+        let away = due([(3, &mut waiting)], t0 + s(5), Some(s(35)));
+        assert_eq!(away.next, None);
+        assert!(away.away && away.expired.is_empty());
+        let back = due(
+            [(3, &mut waiting)],
+            t0 + s(6),
+            Some(Duration::from_millis(500)),
+        );
+        assert_eq!(back.next, Some(t0 + Duration::from_millis(7_500)));
+        assert!(!back.away);
+        assert_eq!(due(std::iter::empty(), t0, None), Due::default());
     }
 }

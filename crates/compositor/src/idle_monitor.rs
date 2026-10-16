@@ -85,6 +85,20 @@ impl Inner {
         }
         fired
     }
+
+    /// When the next unfired idle watch is due.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.watches
+            .iter()
+            .filter_map(|w| match w.kind {
+                Kind::Idle {
+                    interval,
+                    fired: false,
+                } => Some(self.last_activity + interval),
+                _ => None,
+            })
+            .min()
+    }
 }
 
 /// The runtime's handle: feed it input and ticks.
@@ -118,10 +132,18 @@ impl IdleMonitor {
             let _ = self.fire.send(id);
         }
     }
+
+    /// When [`tick`](Self::tick) next has a watch to fire; the loop sleeps
+    /// until then (#503). A watch added over D-Bus wakes the loop.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.inner.lock().ok().and_then(|i| i.next_deadline())
+    }
 }
 
 struct Core {
     inner: Arc<Mutex<Inner>>,
+    /// Wakes the compositor loop to recompute its deadline.
+    waker: calloop::ping::Ping,
 }
 
 #[interface(name = "org.gnome.Mutter.IdleMonitor")]
@@ -140,14 +162,16 @@ impl Core {
                 "an idle watch needs a positive interval".into(),
             ));
         }
-        let mut inner = self
+        let id = self
             .inner
             .lock()
-            .map_err(|_| zbus::fdo::Error::Failed("idle monitor poisoned".into()))?;
-        Ok(inner.add(Kind::Idle {
-            interval: Duration::from_millis(interval),
-            fired: false,
-        }))
+            .map_err(|_| zbus::fdo::Error::Failed("idle monitor poisoned".into()))?
+            .add(Kind::Idle {
+                interval: Duration::from_millis(interval),
+                fired: false,
+            });
+        self.waker.ping();
+        Ok(id)
     }
 
     fn add_user_active_watch(&self) -> zbus::fdo::Result<u32> {
@@ -168,8 +192,9 @@ impl Core {
     async fn watch_fired(emitter: &SignalEmitter<'_>, id: u32) -> zbus::Result<()>;
 }
 
-/// Serve the idle monitor on the session bus from a thread.
-pub fn start() -> IdleMonitor {
+/// Serve the idle monitor on the session bus from a thread. `waker`
+/// wakes the compositor loop when a new idle watch moves its deadline.
+pub fn start(waker: calloop::ping::Ping) -> IdleMonitor {
     let inner = Arc::new(Mutex::new(Inner {
         last_activity: Instant::now(),
         next_id: 0,
@@ -178,6 +203,7 @@ pub fn start() -> IdleMonitor {
     let (fire, fired) = mpsc::channel::<u32>();
     let core = Core {
         inner: inner.clone(),
+        waker,
     };
     let _ = std::thread::Builder::new()
         .name("tuna-idle-monitor".into())

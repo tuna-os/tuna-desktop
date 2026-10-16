@@ -61,8 +61,15 @@ _guest_loader.exec_module(guest_agent)
 
 WIDTH, HEIGHT = baseline.WIDTH, baseline.HEIGHT
 DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
-SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings: ")
+# The shell emits this as one eprintln!, but serial/journal interleaving
+# with the compositor's stderr can shear the payload off onto later
+# records, leaving a bare `tuna-shell-gtk: keybindings:` line. Match the
+# stable prefix so startup is still recognized (run 38102898073 r04).
+SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings:")
 EXHAUSTED = "shell supervision: BudgetExhausted"
+# tuna-vm-health activation probes on the session user's bus; the capture
+# pair proves tuna-portals.conf routes Screenshot and ScreenCast.
+PORTAL_PROBES = ("calendar", "portal", "portal-gnome", "portal-screenshot", "portal-screencast")
 CARDS = os.path.join(HERE, "lib", "vm-tour-cards")
 TOUR_FPS = 2        # frames captured per second during the tour
 PLAY_FPS = 4        # playback rate: the tour plays at 2x
@@ -220,8 +227,11 @@ def wait_for_orca_state(agent, enabled, observations, timeout=20):
                          and actual["state"] == "disabled"))):
             return actual
         time.sleep(0.2)
-    suffix = f" (last observation error: {last_error})" if last_error else ""
-    raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca" + suffix)
+    last = observations[-1] if observations else {}
+    suffix = f", last observation error: {last_error}" if last_error else ""
+    raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca "
+                       f"(enabled={enabled}, last state={last.get('state')!r}, "
+                       f"pid={last.get('pid')}, owner={'set' if last.get('owner') else 'none'}{suffix})")
 
 
 def run_lifecycle(qmp, agent, out, serial_path, record):
@@ -388,7 +398,12 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
     orca_observations = []
     def await_orca(enabled):
-        return wait_for_orca_state(agent, enabled, orca_observations)
+        # Returns on the reader's own signal: the credential-verified bus owner
+        # appearing, or the stopped child's owner vanishing. Like GNOME's
+        # autostart, the compositor no longer abandons a cold Orca after 10 s,
+        # so this bound only catches a wedged session.
+        return wait_for_orca_state(agent, enabled, orca_observations, timeout=45)
+
     def await_reaped(identity):
         # The bus name is released while the stopped instance is still
         # exiting; starting the next Orca first loses the restart name race
@@ -1091,6 +1106,21 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     record("V-LIFECYCLE", True, "all lifecycle operations completed; individual assertions remain mandatory")
 
 
+GREETER_SESSION_NAME = "Tuna Desktop"
+
+
+def greeter_list_ok(greeter):
+    """gtkgreet's picker shows any -c command, then each
+    /etc/greetd/environments line verbatim, and preselects the first one.
+    The user must read the session's name there, not its command (tunaOS#3110)."""
+    sessions = greeter.get("sessions", [])
+    if greeter.get("greeter_command_override", True):
+        return False, f"gtkgreet command override precedes the picker list {sessions}"
+    if not sessions or sessions[0] != GREETER_SESSION_NAME:
+        return False, f"gtkgreet picker lists {sessions}, expected {GREETER_SESSION_NAME!r} preselected"
+    return True, f"gtkgreet picker lists {sessions} with {GREETER_SESSION_NAME!r} preselected"
+
+
 def greetd_login(qmp, agent_path, out, record):
     """Drive the shipped graphical greeter, never an initial/autologin session."""
     agent = None
@@ -1122,6 +1152,8 @@ def greetd_login(qmp, agent_path, out, record):
             json.dump(greeter, stream, indent=2)
         time.sleep(5)
         qmp.frame(os.path.join(out, "V-GREETD.png"))
+        ok, detail = greeter_list_ok(greeter)
+        record("V-GREETER-LIST", ok, detail)
         # Upstream gtkgreet focuses its username entry, then the PAM secret
         # entry. The public fixture values go only to QMP keyboard delivery.
         qmp.type_text("tuna")
@@ -1535,8 +1567,6 @@ def repeat_boots(args):
             if name not in manifest["assertions"]:
                 combined[name] = False
                 coverage[name]["missing_boots"].append(index)
-        if result.returncode:
-            break
     successful_boots = sum(result["returncode"] == 0 for result in boot_results)
     combined["V-REPEAT"] = successful_boots == args.boots and all(combined.values())
     with open(os.path.join(out, "repeat-manifest.json"), "w") as stream:
@@ -1702,7 +1732,7 @@ def main():
         deadline = time.time() + 180
         while drm and shell and time.time() < deadline:
             text = read_text(serial_path)
-            if all(f"tuna-vm-health: {name} ready" in text for name in ("calendar", "portal", "portal-gnome")):
+            if all(f"tuna-vm-health: {name} ready" in text for name in PORTAL_PROBES):
                 break
             time.sleep(2)
         qmp.cmd("quit")
@@ -1729,7 +1759,7 @@ def main():
                               + (" to a GDM greeter session" if greeter else ""))
     record("V-DISPLAY-MANAGER", manager_ready,
            "real logind greetd session and non-root compositor UID verified; intentional lifecycle VT pauses are permitted")
-    for name in ("calendar", "portal", "portal-gnome"):
+    for name in PORTAL_PROBES:
         record(f"V-{name.upper()}", f"tuna-vm-health: {name} ready" in text and (name != "portal" or "tuna-vm-health: portal-gnome ready" in text),
                f"guest user bus {name} activation responds")
     if a.tour:
