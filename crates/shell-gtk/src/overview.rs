@@ -306,6 +306,17 @@ impl OverviewUi {
                 Rc::new(crate::folders::rename),
             ),
         }));
+        // A folder setting change applies without waiting for the
+        // compositor, which sends nothing while its state is unchanged.
+        {
+            let weak = Rc::downgrade(&ui);
+            ui.borrow().folder_watch.on_change(move || {
+                if let Some(ui) = weak.upgrade() {
+                    let open = ui.borrow().open;
+                    Self::set_open(&ui, open);
+                }
+            });
+        }
         {
             let dash = ui.borrow().dash.clone();
             let weak = Rc::downgrade(&ui);
