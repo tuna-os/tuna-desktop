@@ -368,6 +368,9 @@ impl NotifyUi {
             filed.enforce_policy();
         }
         let mut bus = NotificationBus::new(center.clone());
+        // The policy store reads and registers through GSettings: file
+        // wire arrivals on the GTK main loop, never a zbus thread.
+        bus.deliver_in(glib::MainContext::default());
         // Wire arrivals (on zbus threads) wake the main loop; a wake
         // already queued covers any that follow it.
         let (wake, woken) = async_channel::bounded::<()>(1);

@@ -917,7 +917,11 @@ impl ShellHost {
         if let Ok(mut filed) = center.lock() {
             filed.set_policy(Arc::new(GioPolicyStore::new()));
         }
-        let notifications = NotificationBus::new(center.clone());
+        let mut notifications = NotificationBus::new(center.clone());
+        // The policy store uses GSettings: file wire arrivals where the
+        // slow tick pumps the GLib context (`TileSet::refresh`), never
+        // on a zbus thread.
+        notifications.deliver_in(gio::glib::MainContext::default());
         Self {
             model: ShellModel::new(),
             panel,
