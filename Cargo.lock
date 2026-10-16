@@ -4167,6 +4167,7 @@ dependencies = [
  "smithay",
  "tempfile",
  "tuna-greeter",
+ "tuna-magnifier",
  "tuna-shell-control",
  "tuna-wallpaper",
  "wayland-client",
@@ -4186,6 +4187,16 @@ dependencies = [
  "greetd_ipc",
  "gtk4",
  "libadwaita",
+ "tempfile",
+]
+
+[[package]]
+name = "tuna-magnifier"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -4214,6 +4225,7 @@ dependencies = [
  "pipewire",
  "serde_json",
  "tempfile",
+ "tuna-magnifier",
  "tuna-shell-control",
  "tuna-shell-host",
  "unicode-segmentation",
