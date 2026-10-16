@@ -221,6 +221,8 @@ def wait_for_orca_state(agent, enabled, observations, timeout=20):
             time.sleep(0.2)
             continue
         observations.append(actual)
+        if not actual.get("package"):
+            raise RuntimeError("the image under test ships no distribution Orca package")
         if (actual["enabled"] is enabled
                 and ((enabled and actual["ready"] and actual["state"] == "active")
                      or (not enabled and actual["pid"] == 0 and actual["owner"] is None
@@ -416,6 +418,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
             time.sleep(0.2)
         raise RuntimeError("stopped Orca instance did not exit before restart")
 
+    orca_failure = None
     if older_guest:
         # The predating shell never manages Orca from this key, so the live
         # start/stop proof cannot run; no Orca probe is attempted either.
@@ -425,24 +428,30 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
             json.dump({"predates_instrumentation": True}, stream, indent=2)
     else:
         try:
-            first_orca = None
-            stopped_identity = None
-            for enabled in (False, True, False, True, False):
-                if enabled and stopped_identity is not None:
-                    await_reaped(stopped_identity)
-                    stopped_identity = None
-                agent.run("orca-on" if enabled else "orca-off")
-                actual = await_orca(enabled)
-                if enabled:
-                    identity = (actual["pid"], actual["start_ticks"])
-                    if first_orca == identity:
-                        raise RuntimeError("Orca retained the stopped process identity")
-                    first_orca = identity
-                    stopped_identity = identity
-            record("V-ORCA-ACTIVATION", True,
-                   "live GNOME key starts/stops genuine distribution Orca; bus PID/UID, package hash, compositor parent and display verified")
-        finally:
-            finish_orca_activation(agent, evidence, orca_observations)
+            try:
+                first_orca = None
+                stopped_identity = None
+                for enabled in (False, True, False, True, False):
+                    if enabled and stopped_identity is not None:
+                        await_reaped(stopped_identity)
+                        stopped_identity = None
+                    agent.run("orca-on" if enabled else "orca-off")
+                    actual = await_orca(enabled)
+                    if enabled:
+                        identity = (actual["pid"], actual["start_ticks"])
+                        if first_orca == identity:
+                            raise RuntimeError("Orca retained the stopped process identity")
+                        first_orca = identity
+                        stopped_identity = identity
+                record("V-ORCA-ACTIVATION", True,
+                       "live GNOME key starts/stops genuine distribution Orca; bus PID/UID, package hash, compositor parent and display verified")
+            finally:
+                finish_orca_activation(agent, evidence, orca_observations)
+        except RuntimeError as error:
+            # A failed screen reader must not hide the lock, sleep and logout
+            # checks after it; V-ORCA-ACTIVATION still fails the run.
+            orca_failure = str(error)
+            record("V-ORCA-ACTIVATION", False, orca_failure)
 
     # Real GNOME sound preference and virtual HDA/PipeWire data, not OSD state.
     amplified_observations = []
@@ -1059,6 +1068,10 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
         departing_orca = None
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
             json.dump({"predates_instrumentation": True}, stream, indent=2)
+    elif orca_failure:
+        departing_orca = None
+        with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
+            json.dump({"not_exercised": orca_failure}, stream, indent=2)
     else:
         agent.run("orca-on")
         departing_orca = await_orca(True)
@@ -1068,19 +1081,31 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
     deadline = time.monotonic() + 30
     greeter = {}
     greeter_visible = False
+    # The published lane keeps the greeter frame that preceded login. Its
+    # shipped stylesheet paints the variant wallpaper, so the repainted
+    # greeter must match that frame; the CI image's own stylesheet has a
+    # #222226 window background with light controls/text instead. Process
+    # startup, a black scanout or a uniform fill can pass neither.
+    reference_path = os.path.join(out, "greeter-before-login.ppm")
+    reference = read_ppm(reference_path) if os.path.exists(reference_path) else None
     while time.monotonic() < deadline:
         greeter = agent.run("greeter")
         if greeter["greetd_active"] and greeter["greeter_pids"] and not greeter["compositor_pids"]:
-            width, height, pixels = frame("logout-greeter")
-            # The CI greeter stylesheet has a #222226 window background.
-            # Require that painted surface plus visible light controls/text;
-            # process startup, a black scanout or a uniform fill cannot pass.
-            background = sum(all(abs(pixels[i + channel] - value) <= 4
-                                 for channel, value in enumerate((34, 34, 38)))
-                             for i in range(0, len(pixels), 3)) / (width * height)
-            light = sum(min(pixels[i:i + 3]) > 160 for i in range(0, len(pixels), 3))
-            greeter["paint"] = {"background_fraction": background, "light_pixels": light}
-            greeter_visible = background > 0.25 and light >= 100
+            image = frame("logout-greeter")
+            width, height, pixels = image
+            colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+                      for y in range(0, height, 8) for x in range(0, width, 8)}
+            if reference is not None:
+                changed = difference(reference, image)
+                greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": len(colors)}
+                greeter_visible = changed < 0.05 and len(colors) >= 8
+            else:
+                background = sum(all(abs(pixels[i + channel] - value) <= 4
+                                     for channel, value in enumerate((34, 34, 38)))
+                                 for i in range(0, len(pixels), 3)) / (width * height)
+                light = sum(min(pixels[i:i + 3]) > 160 for i in range(0, len(pixels), 3))
+                greeter["paint"] = {"background_fraction": background, "light_pixels": light}
+                greeter_visible = background > 0.25 and light >= 100
             if greeter_visible:
                 break
         time.sleep(0.5)
@@ -1093,6 +1118,8 @@ def run_lifecycle(qmp, agent, out, serial_path, record):
             json.dump({"predates_instrumentation": True}, stream, indent=2)
         record("V-ORCA-LOGOUT", True,
                "guest predates shell Screen Reader management; logout Orca lifecycle covered by the current-build lane")
+    elif orca_failure:
+        record("V-ORCA-LOGOUT", False, f"not exercised: Screen Reader activation failed ({orca_failure})")
     else:
         closed_orca = agent.run("orca-departed", departing_orca["pid"], departing_orca["start_ticks"])
         with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:
@@ -1152,6 +1179,8 @@ def greetd_login(qmp, agent_path, out, record):
             json.dump(greeter, stream, indent=2)
         time.sleep(5)
         qmp.frame(os.path.join(out, "V-GREETD.png"))
+        # The logout check compares the repainted greeter with this frame.
+        qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
         ok, detail = greeter_list_ok(greeter)
         record("V-GREETER-LIST", ok, detail)
         # Upstream gtkgreet focuses its username entry, then the PAM secret

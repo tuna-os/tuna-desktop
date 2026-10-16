@@ -301,7 +301,9 @@ def orca_observation():
     result = {"enabled": call("gsettings", "get", "org.gnome.desktop.a11y.applications",
                               "screen-reader-enabled", user=True) == "true",
               "state": state.get("screen_reader_state"), "pid": pid, "owner": owner,
-              "package": call("pacman", "-Q", "orca"), "ready": False}
+              # None when the image ships no Orca: the lane reports that as
+              # the failure instead of a bare probe exit.
+              "package": call("pacman", "-Q", "orca", check=False) or None, "ready": False}
     if not owner:
         result["unready_child_diagnostic"] = orca_child_diagnostic(state, pid)
     if pid == 0 or not owner:
