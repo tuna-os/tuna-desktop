@@ -619,3 +619,45 @@ fn screenshot_pointer_command_rejects_negative_local_coordinates() {
         assert_eq!(matches!(status, CommandStatus::Applied), valid);
     }
 }
+
+#[test]
+fn native_owner_inventory_is_minor_gated_and_empty_revocation_is_real_wire() {
+    let owner = tuna_shell_control::NativeOutputInfo {
+        name: "eDP-1".into(),
+        drm_device: libc::makedev(226, 0),
+        connector_id: 39,
+        connector_sysfs: "/sys/devices/drm/card0/card0-eDP-1".into(),
+        connector_device: 1,
+        connector_inode: 2,
+    };
+    for minor in [35, 36, 37] {
+        let (conn, mut client) = pair();
+        client_write(
+            &mut client,
+            &Message::Hello {
+                version: ProtocolVersion::new(CURRENT_VERSION.major, minor),
+            },
+        );
+        let mut session = Session::handshake(conn, &StateModel::new()).unwrap();
+        assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+        assert!(matches!(client_read(&mut client), Message::Snapshot { .. }));
+        session
+            .send_native_outputs(std::slice::from_ref(&owner))
+            .unwrap();
+        session.send_native_outputs(&[]).unwrap();
+        session.send_overview(true).unwrap();
+        if minor >= 37 {
+            assert_eq!(
+                client_read(&mut client),
+                Message::NativeOutputInventory {
+                    outputs: vec![owner.clone()]
+                }
+            );
+            assert_eq!(
+                client_read(&mut client),
+                Message::NativeOutputInventory { outputs: vec![] }
+            );
+        }
+        assert_eq!(client_read(&mut client), Message::Overview { open: true });
+    }
+}

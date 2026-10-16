@@ -753,6 +753,10 @@ echo 1000 >"$BACKLIGHT/max_brightness"
 echo 500 >"$BACKLIGHT/brightness"
 TUNA_BACKLIGHT_ROOT="$ARTIFACTS/backlight"
 export TUNA_BACKLIGHT_ROOT
+TUNA_BACKLIGHT_TEST_CONNECTORS="$ARTIFACTS/controlled-brightness-connectors.json"
+export TUNA_BACKLIGHT_TEST_CONNECTORS
+printf '[]\n' >"$TUNA_BACKLIGHT_TEST_CONNECTORS"
+echo platform >"$BACKLIGHT/type"
 VOLUME_FILE="$ARTIFACTS/volume"
 echo 0.80 >"$VOLUME_FILE"
 VOLUME_MUTED_FILE="$ARTIFACTS/volume-muted"
@@ -8152,13 +8156,25 @@ ln -s "$ARTIFACTS/devices/card0-tuna-0" "$BACKLIGHT/device"
 ln -s "$ARTIFACTS/devices/card0-other" "$ARTIFACTS/backlight/aaa-other/device"
 echo 1000 >"$ARTIFACTS/backlight/aaa-other/max_brightness"
 echo 700 >"$ARTIFACTS/backlight/aaa-other/brightness"
-echo 500 >"$BACKLIGHT/brightness"
+echo 1010 >"$BACKLIGHT/max_brightness"
+echo raw >"$BACKLIGHT/type"
+"$PY" - "$ARTIFACTS/devices/card0-tuna-0" "$TUNA_BACKLIGHT_TEST_CONNECTORS" <<'PYFIXTURE'
+import json,os,pathlib,sys
+path=pathlib.Path(sys.argv[1]).resolve()
+for name,value in [('connector_id','1'),('status','connected'),('enabled','enabled')]:
+    (path/name).write_text(value+'\n')
+metadata=path.stat()
+pathlib.Path(sys.argv[2]).write_text(json.dumps([dict(name='tuna-0',drm_device=0,connector_id=1,
+    connector_sysfs=str(path),connector_device=metadata.st_dev,connector_inode=metadata.st_ino)]))
+PYFIXTURE
+echo 510 >"$BACKLIGHT/brightness"
 # The per-monitor actions stay on their GNOME defaults
 # (Shift+XF86MonBrightness*): custom chords are covered by
 # SWITCHER-REBIND, and startup grabs avoid mid-run re-grab races.
 sleep 1.5
 xdotool mousemove --window "$WID" 600 450
-for spec in 'XF86MonBrightnessUp:550' 'XF86MonBrightnessDown:500' 'XF86MonBrightnessCycle:550'; do
+# Real GNOME floor..max normalization: 10..1010 gives twenty exact 50-unit steps.
+for spec in 'XF86MonBrightnessUp:560' 'XF86MonBrightnessDown:510' 'XF86MonBrightnessCycle:560'; do
     # One press can land before a grab reaches the compositor; press
     # until the file moves, at most one step per press.
     end=$(($(date +%s) + 15))
@@ -8169,7 +8185,7 @@ for spec in 'XF86MonBrightnessUp:550' 'XF86MonBrightnessDown:500' 'XF86MonBright
     [ "$(cat "$BACKLIGHT/brightness")" = "${spec#*:}" ] || fail G-MONITOR-BRIGHTNESS-KEYS "${spec%%:*} did not set ${spec#*:} on the pointer's monitor"
     [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" = 700 ] || fail G-MONITOR-BRIGHTNESS-KEYS "a different monitor's backlight changed"
 done
-echo 1000 >"$BACKLIGHT/brightness"
+echo 1010 >"$BACKLIGHT/brightness"
 # Cycle through the default chord like up/down above: the custom Super+F3
 # this step used to tap is no longer bound (see the loop comment).
 end=$(($(date +%s) + 15))
@@ -8183,12 +8199,32 @@ done
 for key in screen-brightness-up-monitor screen-brightness-down-monitor screen-brightness-cycle-monitor; do
     gsettings reset org.gnome.shell.keybindings "$key"
 done
+# Controlled backlight/logind policy test; no physical brightness claim.
+# Close whatever the monitor-key sequence left open (the corner click
+# toggles), then open quick settings so the Brightness slider is showing.
+xdotool key Escape
+sleep 1
+open_qs
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-brightness-policy.json" 20 \
+    --set Brightness 50 || fail G-BRIGHTNESS-CONTRACT "could not set associated user brightness"
+end=$(($(date +%s) + 10))
+until [ "$(cat "$BACKLIGHT/brightness")" = 510 ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+[ "$(cat "$BACKLIGHT/brightness")" = 510 ] || fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing"
+"$PY" "$ROOT/scripts/lib/gnome-brightness-proof.py" --out "$ARTIFACTS/brightness-controlled.json" \
+    --controlled-root "$ARTIFACTS/backlight" --device tuna-bl \
+    --shell-executable "${TUNA_PROOF_SHELL_BIN:-$ROOT/target/debug/tuna-shell-gtk}" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||
+    fail G-BRIGHTNESS-CONTRACT "controlled policy/readback contract rejected; see retained JSON/log"
+pass G-BRIGHTNESS-CONTRACT "actual original shell wire schema and controlled associated dim/restore/auto/reset readbacks; synthetic sysfs/logind only"
 rm -rf "$ARTIFACTS/backlight/aaa-other"
 pass G-MONITOR-BRIGHTNESS-KEYS "bound monitor up/down/cycle change only the connector under the pointer; cycle wraps"
 # A rebound notification key focuses the active banner's real button.
 # The earlier DND proof intentionally leaves banners disabled. Restore
 # them through the actual quick-settings control before testing focus.
 if [ "$(gsettings get org.gnome.desktop.notifications show-banners)" = false ]; then
+    # The brightness sequence leaves quick settings open, and the corner
+    # click toggles: close anything first so open_qs genuinely reopens.
+    xdotool key Escape
+    sleep 1
     open_qs
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notification-enable.json" 20 --press "Do Not Disturb" || fail G-NOTIFICATION-FOCUS-KEY "could not turn off Do Not Disturb"
     xdotool key Escape
