@@ -178,7 +178,8 @@ def checked_auth_method(desktop, helper, delay, expected):
             or helper["uid"] != desktop["uid"] or helper["start_ticks"] < desktop["start_ticks"]
             or (helper["exe_device"], helper["exe_inode"]) != (desktop["exe_device"], desktop["exe_inode"])
             or delay["pid"] in (desktop["pid"], helper["pid"]) or delay["ppid"] != helper["pid"]
-            or delay["pgrp"] != helper["pid"] or delay["uid"] != desktop["uid"] or delay["start_ticks"] < helper["start_ticks"]):
+            # pam_exec's child calls setsid() before exec: its own group.
+            or delay["pgrp"] != delay["pid"] or delay["uid"] != desktop["uid"] or delay["start_ticks"] < helper["start_ticks"]):
         raise ValueError("PAM helper/delay kernel ownership differs")
     return {"compositor": desktop, "helper": helper, "delay": delay, "attempt": expected}
 

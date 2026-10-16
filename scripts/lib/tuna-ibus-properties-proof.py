@@ -4,6 +4,7 @@
 Run inside the existing private GTK proof session. The parent timeout bounds
 AT-SPI calls as well as polling. No unrelated desktop tree is accepted.
 """
+import faulthandler
 import hashlib
 import json
 import os
@@ -11,7 +12,10 @@ import sys
 import shutil
 import re
 import time
-from pathlib import Path
+import signal
+# The harness's own phase deadline can expire while this driver still waits;
+# its SIGTERM then dumps where it waited into the lifecycle log.
+faulthandler.register(signal.SIGTERM, chain=True)
 import gi
 
 gi.require_version("Atspi", "2.0")

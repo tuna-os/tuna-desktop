@@ -135,10 +135,12 @@ def delayed_auth_state(pid, start_ticks):
     if desktop is None or (desktop["pid"], desktop["start_ticks"]) != (pid, start_ticks):
         raise RuntimeError("original desktop identity missing or replaced")
     sleep_inode = pathlib.Path("/usr/bin/sleep").stat()
+    # pam_exec forks the command and calls setsid() before exec, so the
+    # delay is the helper's direct child leading its own session and group.
     delays = [row for row in rows if row["executable"] == "sleep" and row["_state"] not in ("Z", "X")
               and (row["exe_device"], row["exe_inode"]) == (sleep_inode.st_dev, sleep_inode.st_ino)
               and any(row["uid"] == helper["uid"] and row["ppid"] == helper["pid"]
-                      and row["pgrp"] == helper["pid"] and row["start_ticks"] >= helper["start_ticks"]
+                      and row["pgrp"] == row["pid"] and row["start_ticks"] >= helper["start_ticks"]
                       for helper in helpers)]
     owner = json.loads(STATE.read_text()).get("auth_owner")
     pending = type(owner) is dict and owner.get("outer_pending") is True
@@ -161,14 +163,16 @@ def auth_retirement_state(record):
         if current is not None and public_auth_identity(current) != record[role]:
             raise RuntimeError("original method PID was replaced")
         presence[role + "_absent"] = current is None and not pathlib.Path(f"/proc/{record[role]['pid']}").exists()
-    # Absence of two PIDs alone is not absence of other owned group descendants.
+    # Absence of two PIDs alone is not absence of other owned group descendants:
+    # the helper's group, and the session pam_exec's setsid() gave the delay.
+    groups = {record["helper"]["pid"], record["delay"]["pid"]}
     members = []
     for path in pathlib.Path("/proc").iterdir():
         if not path.name.isdigit():
             continue
         try:
             fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
-            if int(fields[2]) == record["helper"]["pid"]:
+            if int(fields[2]) in groups:
                 members.append({"pid": int(path.name), "start_ticks": int(fields[19])})
         except (FileNotFoundError, ProcessLookupError):
             continue

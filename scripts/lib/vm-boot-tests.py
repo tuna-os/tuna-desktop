@@ -1073,7 +1073,8 @@ class PrivatePamSleepControls(unittest.TestCase):
         self.desktop = dict(pid=600, uid=1000, ppid=2, pgrp=2, start_ticks=1500,
                             executable="tuna-compositor", exe_device=1, exe_inode=77)
         self.helper = dict(self.desktop, pid=700, ppid=600, pgrp=700, start_ticks=1700)
-        self.delay = dict(self.helper, pid=701, ppid=700, start_ticks=1800, executable="sleep", exe_inode=78)
+        # pam_exec's child calls setsid() before exec: it leads its own group.
+        self.delay = dict(self.helper, pid=701, ppid=700, pgrp=701, start_ticks=1800, executable="sleep", exe_inode=78)
         self.observed = {"real_pam_delay_running": True, "compositor": self.desktop,
                          "helpers": [self.helper], "delays": [self.delay],
                          "auth_owner": self.legacy.snapshot["state"]["auth_owner"]}
@@ -1100,6 +1101,7 @@ class PrivatePamSleepControls(unittest.TestCase):
         changes = [dict(self.observed, real_pam_delay_running=False),
                    dict(self.observed, helpers=[]), dict(self.observed, delays=[]),
                    dict(self.observed, delays=[dict(self.delay, ppid=600)]),
+                   dict(self.observed, delays=[dict(self.delay, pgrp=700)]),
                    dict(self.observed, helpers=[dict(self.helper, exe_inode=78)]),
                    dict(self.observed, helpers=[dict(self.helper, pgrp=600)]),
                    dict(self.observed, helpers=[dict(self.helper, uid=1001)]),
