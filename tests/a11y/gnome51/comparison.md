@@ -41,7 +41,7 @@ GNOME: 136 visible nodes; 9 named controls. Tuna Desktop: 15 named nodes in the 
 
 ## quick-settings
 
-GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 25 named nodes in the proof golden.
+GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 27 named nodes in the proof golden.
 
 | GNOME named control | Tuna Desktop named node |
 | --- | --- |
@@ -65,6 +65,8 @@ GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 25 named nodes in the p
 | — | toggle button: Wired Menu |
 | — | toggle button: Bluetooth |
 | — | toggle button: Bluetooth Menu |
+| — | toggle button: Printers |
+| — | toggle button: Printers Menu |
 | — | toggle button: Power Mode |
 | — | toggle button: Power Mode Menu |
 | — | toggle button: Night Light |
@@ -81,5 +83,6 @@ GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 25 named nodes in the p
 - Lock Screen in GNOME maps to Lock in Tuna Desktop. Open power profiles menu maps to Power Mode Menu. The shared screenshot, settings and power menu actions remain named.
 - GNOME’s Power Mode, Dark Style and Do Not Disturb toggles use visible label children instead of a name on the toggle. Tuna Desktop names the toggles directly. The native fixture retains those label children.
 - Tuna Desktop’s network, Bluetooth, volume and brightness controls are present because its live proof supplies those services. The GNOME headless reference has no usable network adapter, audio server or hardware backlight.
+- Tuna Desktop adds a Printers tile and menu for the CUPS queue (#362); GNOME 51 has no quick-settings printers control.
 
 This comparison describes visible accessible structure and labels. The live Tuna Desktop proof checks actions, focus and slider operation; it does not claim a spoken Orca end-to-end test.
