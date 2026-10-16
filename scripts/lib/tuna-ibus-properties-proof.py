@@ -184,6 +184,11 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
                 # exists", gtk-shell 38757056152). node() rechecks the GTK
                 # process identity first, so a real exit still fails.
                 last_error = str(error)
+            except GLib.Error as error:
+                # Bus predicates in this process, e.g. the panel name briefly
+                # unowned between the challenger's release and our reclaim
+                # (journey 116793877779: NameHasNoOwner).
+                last_error = error.message
             time.sleep(.05)
         raise RuntimeError(f"property traffic deadline after presses {seen}; "
                            f"last AT-SPI error: {last_error}")

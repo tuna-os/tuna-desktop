@@ -15,8 +15,11 @@ def process_alive(pid):
         return False
 
 
+# Xvfb writes -displayfd only after its keymap compile; on a runner still busy
+# with the preceding build that took longer than 5 s (gtk-shell 116756962331,
+# 116793877912: the token landed after the deadline). Admission rules unchanged.
 def wait_display(path, pid, *, clock=time.monotonic, pause=time.sleep,
-                 alive=process_alive, read=None, budget=5.0):
+                 alive=process_alive, read=None, budget=30.0):
     deadline = clock() + budget
     observed = b""
     def read_file():
