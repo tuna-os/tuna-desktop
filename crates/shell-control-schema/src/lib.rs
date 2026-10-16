@@ -171,13 +171,13 @@ impl ProtocolVersion {
     /// command and the compositor-to-shell `DwellClickType` and
     /// `PointerTimeout` messages (hover click's chooser and GNOME's pie
     /// timer). Positional: both peers ship together.
-    /// `0.37` appends GNOME's window-manager focus and mouse preferences
+    /// `0.38` appends GNOME's window-manager focus and mouse preferences
     /// to `InputSettings`, the `ToggleShowDesktop` command, and the
     /// fullscreen, raise/lower, axis-maximize, monitor and placement keys
     /// to `WindowAction` (#347), all last.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 37,
+        minor: 38,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -994,7 +994,7 @@ pub struct InputSettings {
     /// GNOME's pointer accessibility aids.
     #[serde(default)]
     pub pointer_aids: PointerAids,
-    /// GNOME window-manager focus and mouse preferences (0.37, #347).
+    /// GNOME window-manager focus and mouse preferences (0.38, #347).
     #[serde(default)]
     pub wm_preferences: WmPreferences,
 }
@@ -1890,8 +1890,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_37() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 37));
+    fn current_version_is_0_38() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 38));
     }
 
     #[test]
