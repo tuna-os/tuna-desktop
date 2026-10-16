@@ -2452,6 +2452,11 @@ mod tests {
 
         // The hub evicts and closes our session (spec R6): the shell
         // sees EOF on its next poll, then EPIPE on its next send.
+        // A concurrently forked test child can retain a copy until exec;
+        // explicitly hang up the socket so that copy cannot delay EPIPE.
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("evicted peer shutdown");
         drop(server1);
         let id = client.toggle_overview().expect("resend after reconnect");
 
