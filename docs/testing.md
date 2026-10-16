@@ -145,6 +145,17 @@ The manifest records the base image digest, the test image ID, the Tuna Desktop
 package, and the QEMU version. If the run fails or times out (15
 minutes), the script prints the relevant serial lines before exiting.
 
+When the shell has printed but has not logged `keybindings:` within
+20 seconds, a bounded startup watchdog captures
+`shell-startup-stack-1.json` in that boot's artifact directory. It captures
+again at 60 seconds if startup is still stalled. If the shell prints
+nothing, the first capture is 40 seconds after the DRM output appears.
+The CI-only guest layer installs gdb; the dump includes every session
+shell thread's kernel wait site/stack and user backtrace, without frame
+arguments, locals, or debuginfod downloads. Guest transport/debugger errors
+are retained in the JSON instead of hiding the startup failure. This
+diagnostic does not restart the shell or relax any readiness gate.
+
 After the assertions pass, `--tour` records a feature tour. The script
 sends keys and pointer clicks through QMP to open the overview and search,
 the app grid, quick settings, and the calendar. It then opens Disks,

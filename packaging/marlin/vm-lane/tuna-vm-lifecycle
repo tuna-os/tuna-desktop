@@ -848,8 +848,8 @@ def strip_stop_error(error):
 
 
 def shell_stack():
-    """Each session shell's threads: name, state, kernel wait and stack, and
-    gdb's user backtraces (no debuginfo, so no argument values)."""
+    """Each session shell's threads: name, state, kernel wait and stack,
+    plus user backtraces without arguments, locals or debuginfod traffic."""
     shells = []
     for path in pathlib.Path("/proc").iterdir():
         if not path.name.isdigit():
@@ -877,6 +877,8 @@ def shell_stack():
             threads.append(thread)
         try:
             gdb = subprocess.run(["gdb", "-nx", "-batch", "-iex", "set debuginfod enabled off",
+                                  "-iex", "set print frame-arguments none",
+                                  "-iex", "set print entry-values no",
                                   "-ex", "info threads", "-ex", "thread apply all bt",
                                   "-p", path.name],
                                  capture_output=True, text=True, timeout=90)
