@@ -4176,6 +4176,7 @@ dependencies = [
  "signal-hook",
  "smithay",
  "tempfile",
+ "tuna-backlight",
  "tuna-greeter",
  "tuna-magnifier",
  "tuna-shell-control",

@@ -1,7 +1,4 @@
-//! GNOME 51 brightness policy for associated, compositor-tracked backlights.
-//! A sysfs fixture tests this policy; it is not evidence of physical hardware.
-//! Hardware reads use the shared `tuna-backlight` implementation.
-
+//! GNOME51 brightness policy; hardware reads use the unchanged shared implementation.
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -88,7 +85,7 @@ struct Reading {
     applied: u32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Model {
     pub policy: Policy,
     readings: BTreeMap<String, Reading>,
@@ -103,6 +100,81 @@ impl Model {
             .values()
             .any(|r| output.is_none_or(|o| r.device.output == o))
     }
+    /// Import original compositor intent without a hardware write. Current
+    /// effective readings stay distinct from user intent and retired bindings
+    /// never match a new panel merely by connector text.
+    pub fn import_journal(
+        &mut self,
+        state: &tuna_shell_control::BrightnessJournalSnapshot,
+        devices: Vec<Device>,
+    ) -> Result<(), String> {
+        let generation = state
+            .native_generation
+            .ok_or("native brightness unavailable")?;
+        if state.readings.len() != devices.len() {
+            return Err("original brightness panel inventory changed".into());
+        }
+        let mut readings = BTreeMap::new();
+        let mut factors = BTreeMap::new();
+        for device in devices {
+            let row = state
+                .readings
+                .iter()
+                .find(|r| {
+                    r.binding.ownership_generation == generation
+                        && Some(&r.binding.output) == device.owner.as_ref()
+                        && r.binding.backlight == device.name
+                        && r.binding.device == device.dev
+                        && r.binding.inode == device.inode
+                        && r.binding.minimum == device.minimum()
+                        && r.binding.maximum == device.max
+                })
+                .ok_or("original brightness import binding missing")?;
+            if row.user < device.minimum()
+                || row.user > device.max
+                || row.applied > device.max
+                || !row.ratio.is_finite()
+                || !(0.0..=1.0).contains(&row.ratio)
+            {
+                return Err("invalid original brightness import".into());
+            }
+            // UI/model arithmetic uses the original admitted restoration cap,
+            // while the compositor alone retains whether it is User intent.
+            let user = if row.user_known {
+                row.user
+            } else if let Some(measured) = row.measured_restoration.filter(|v| {
+                state
+                    .provider
+                    .as_ref()
+                    .is_some_and(|p| p.epoch == v.provider_epoch)
+            }) {
+                measured.level
+            } else {
+                row.applied.max(device.minimum())
+            };
+            if user > device.max {
+                return Err("invalid measured brightness import".into());
+            }
+            factors.insert(device.name.clone(), row.ratio);
+            readings.insert(
+                device.name.clone(),
+                Reading {
+                    device,
+                    user,
+                    applied: row.applied,
+                },
+            );
+        }
+        self.readings = readings;
+        self.factors = factors;
+        self.policy = Policy {
+            dimming: state.policy.dimming.unwrap_or(false),
+            auto: state.policy.automatic.unwrap_or(-1.0),
+            idle: state.policy.idle,
+        };
+        Ok(())
+    }
+
     /// Refresh actual readings. External hardware changes end dimming, as GNOME
     /// does; policy writes retain the user baseline through their actual receipt.
     pub fn refresh(&mut self, devices: Vec<Device>) -> bool {
@@ -238,6 +310,28 @@ impl Model {
         r.device.current = actual;
         Ok(())
     }
+    /// Stage every original helper receipt before committing ANY User intent.
+    /// Actual partial observations are retained separately by observe_failure.
+    pub fn acknowledge_batch(
+        &mut self,
+        receipts: &[(Device, u32, u32, Option<u32>)],
+    ) -> Result<f64, String> {
+        if receipts.is_empty() || receipts.len() > 64 {
+            return Err("invalid backlight receipt count".into());
+        }
+        let mut staged = self.clone();
+        let mut names = std::collections::BTreeSet::new();
+        let mut level = 0.0f64;
+        for (device, target, actual, user) in receipts {
+            if !names.insert(&device.name) {
+                return Err("duplicate backlight receipt".into());
+            }
+            level = level.max(staged.acknowledge(device, *target, *actual, *user)?);
+        }
+        *self = staged;
+        Ok(level)
+    }
+
     /// Called only after successful logind completion and exact sysfs readback.
     /// A failed/removed/replaced device never becomes an acknowledged user value.
     pub fn acknowledge(
@@ -619,5 +713,27 @@ mod tests {
         assert_eq!(pending[0].0.name, "b");
         assert_eq!(pending[0].0.current, 307);
         assert_eq!(pending[0].1, 700);
+    }
+    #[test]
+    fn partial_batch_never_commits_first_successful_user_receipt() {
+        let mut model = Model::default();
+        let a = device("a", "eDP-1", 700);
+        let b = device("b", "eDP-2", 800);
+        model.refresh(vec![a.clone(), b.clone()]);
+        model.observe_failure(&a, 200).unwrap();
+        model.observe_failure(&b, 300).unwrap();
+        let receipts = vec![
+            (a.clone(), 200, 200, Some(900)),
+            (b.clone(), 200, 300, Some(900)),
+        ];
+        assert!(model.acknowledge_batch(&receipts).is_err());
+        assert_eq!(model.readings["a"].user, 700);
+        assert_eq!(model.readings["b"].user, 800);
+        assert_eq!(model.readings["a"].applied, 200);
+        assert_eq!(model.readings["b"].applied, 300);
+        let receipts = vec![(a, 200, 200, Some(900)), (b, 200, 200, Some(900))];
+        model.acknowledge_batch(&receipts).unwrap();
+        assert_eq!(model.readings["a"].user, 900);
+        assert_eq!(model.readings["b"].user, 900);
     }
 }
