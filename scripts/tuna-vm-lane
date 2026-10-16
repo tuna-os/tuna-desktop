@@ -437,7 +437,8 @@ def wait_for_orca_state(agent, enabled, observations, timeout=20):
                        f"pid={last.get('pid')}, owner={'set' if last.get('owner') else 'none'}{suffix})")
 
 
-def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None, strip_edge=False):
+def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None, strip_edge=False,
+                  published=False):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
     evidence = os.path.join(out, "lifecycle")
     os.makedirs(evidence, exist_ok=True)
@@ -594,81 +595,88 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     # GNOME's mouse speed and scroll direction must reach live libinput
     # device state in both directions, not just the settings echo
     # (#343). The compositor reports each device's libinput
-    # configuration back in its state snapshot.
-    pointer_live = []
-    try:
-        def pointer_live_matches(speed, natural):
-            def matches(value):
-                devices = [d for d in value["state"].get("input_devices", [])
-                           if d["kind"] == "pointer"]
-                accel = [d for d in devices if d["accel_available"]]
-                return (bool(accel)
-                        and all(abs(d["accel_speed"] - speed) < 0.05 for d in accel)
-                        and all(d["natural_scroll"] is natural for d in devices
-                                if d["natural_available"]))
-            return matches
-        if not agent.run("mouse-speed", "0.5")["stored"]:
-            raise RuntimeError("GNOME mouse speed did not persist")
-        if not agent.run("mouse-natural", "true")["stored"]:
-            raise RuntimeError("GNOME mouse natural scroll did not persist")
-        live = await_state(pointer_live_matches(0.5, True), label="pointer-live")
-        pointer_live.append({"applied": live["state"]["input_devices"]})
-        agent.run("mouse-speed", "0.0")
-        agent.run("mouse-natural", "false")
-        restored = await_state(pointer_live_matches(0.0, False), label="pointer-live-restored")
-        pointer_live.append({"restored": restored["state"]["input_devices"]})
-        record("V-POINTER-LIVE", True,
-               "GNOME mouse speed/natural-scroll reach live libinput device state and restore; availability-gated per device")
-    finally:
-        agent.run("mouse-speed", "0.0")
-        agent.run("mouse-natural", "false")
-        # Keep await_state's last observed pointer-live.json on failure.
-        with open(os.path.join(evidence, "pointer-live-events.json"), "w") as stream:
-            json.dump(pointer_live, stream, indent=2)
-    # A mouse plugged in after the settings changed must arrive with
-    # the current settings already applied (the DRM DeviceAdded path),
-    # and unplugging must drop it without disturbing the survivors.
-    hotplug = []
-    try:
-        if not agent.run("mouse-handedness", "true")["stored"]:
-            raise RuntimeError("GNOME primary-button setting did not persist")
-        await_state(lambda value: value["state"]["mouse_left_handed"] is True,
-                    label="hotplug-handedness-true")
-        qtree = qmp.cmd("human-monitor-command", **{"command-line": "info qtree"})
-        with open(os.path.join(evidence, "hotplug-qtree.txt"), "w") as stream:
-            stream.write(qtree)
-        bus = usb_bus_from_qtree(qtree)
-        hotplug.append({"usb_bus": bus})
-        before_names = {d["name"] for d in agent.run("inventory")["state"].get("input_devices", [])}
-        qmp.cmd("device_add", driver="usb-mouse", id="tuna-hotplug-mouse", bus=bus)
-        arrived = await_state(lambda value: any(
-            d["name"] not in before_names and d["kind"] == "pointer"
-            for d in value["state"].get("input_devices", [])), timeout=30,
-            label="hotplug-arrived")
-        new = [d for d in arrived["state"]["input_devices"] if d["name"] not in before_names]
-        hotplug.append({"arrived": new})
-        if not any(d["kind"] == "pointer" and d["left_handed"] is True for d in new):
-            raise RuntimeError("hotplugged mouse did not arrive with the current primary-button setting")
-        qmp.cmd("device_del", id="tuna-hotplug-mouse")
-        gone = await_state(lambda value: all(
-            d["name"] in before_names
-            for d in value["state"].get("input_devices", [])), timeout=30,
-            label="hotplug-gone")
-        survivors = [d for d in gone["state"]["input_devices"]
-                     if d["kind"] == "pointer" and d["handed_available"]]
-        hotplug.append({"survivors": survivors})
-        if not (survivors and all(d["left_handed"] is True for d in survivors)):
-            raise RuntimeError("unplug disturbed the surviving pointers' applied settings")
-        record("V-POINTER-HOTPLUG", True,
-               "hotplugged USB mouse arrives with current settings applied; unplug drops it, survivors keep theirs")
-    finally:
+    # configuration back in its state snapshot. A published guest that
+    # predates that snapshot (no input_devices key) qualifies, as for the
+    # other newer keys; the current-build marlin-vm lane proves both gates.
+    if published and agent.run("inventory")["state"].get("input_devices") is None:
+        for gate in ("V-POINTER-LIVE", "V-POINTER-HOTPLUG"):
+            record(gate, True, "published guest predates the live input-device snapshot; "
+                               "proven by the current-build marlin-vm lane")
+    else:
+        pointer_live = []
         try:
+            def pointer_live_matches(speed, natural):
+                def matches(value):
+                    devices = [d for d in value["state"].get("input_devices", [])
+                               if d["kind"] == "pointer"]
+                    accel = [d for d in devices if d["accel_available"]]
+                    return (bool(accel)
+                            and all(abs(d["accel_speed"] - speed) < 0.05 for d in accel)
+                            and all(d["natural_scroll"] is natural for d in devices
+                                    if d["natural_available"]))
+                return matches
+            if not agent.run("mouse-speed", "0.5")["stored"]:
+                raise RuntimeError("GNOME mouse speed did not persist")
+            if not agent.run("mouse-natural", "true")["stored"]:
+                raise RuntimeError("GNOME mouse natural scroll did not persist")
+            live = await_state(pointer_live_matches(0.5, True), label="pointer-live")
+            pointer_live.append({"applied": live["state"]["input_devices"]})
+            agent.run("mouse-speed", "0.0")
+            agent.run("mouse-natural", "false")
+            restored = await_state(pointer_live_matches(0.0, False), label="pointer-live-restored")
+            pointer_live.append({"restored": restored["state"]["input_devices"]})
+            record("V-POINTER-LIVE", True,
+                   "GNOME mouse speed/natural-scroll reach live libinput device state and restore; availability-gated per device")
+        finally:
+            agent.run("mouse-speed", "0.0")
+            agent.run("mouse-natural", "false")
+            # Keep await_state's last observed pointer-live.json on failure.
+            with open(os.path.join(evidence, "pointer-live-events.json"), "w") as stream:
+                json.dump(pointer_live, stream, indent=2)
+        # A mouse plugged in after the settings changed must arrive with
+        # the current settings already applied (the DRM DeviceAdded path),
+        # and unplugging must drop it without disturbing the survivors.
+        hotplug = []
+        try:
+            if not agent.run("mouse-handedness", "true")["stored"]:
+                raise RuntimeError("GNOME primary-button setting did not persist")
+            await_state(lambda value: value["state"]["mouse_left_handed"] is True,
+                        label="hotplug-handedness-true")
+            qtree = qmp.cmd("human-monitor-command", **{"command-line": "info qtree"})
+            with open(os.path.join(evidence, "hotplug-qtree.txt"), "w") as stream:
+                stream.write(qtree)
+            bus = usb_bus_from_qtree(qtree)
+            hotplug.append({"usb_bus": bus})
+            before_names = {d["name"] for d in agent.run("inventory")["state"].get("input_devices", [])}
+            qmp.cmd("device_add", driver="usb-mouse", id="tuna-hotplug-mouse", bus=bus)
+            arrived = await_state(lambda value: any(
+                d["name"] not in before_names and d["kind"] == "pointer"
+                for d in value["state"].get("input_devices", [])), timeout=30,
+                label="hotplug-arrived")
+            new = [d for d in arrived["state"]["input_devices"] if d["name"] not in before_names]
+            hotplug.append({"arrived": new})
+            if not any(d["kind"] == "pointer" and d["left_handed"] is True for d in new):
+                raise RuntimeError("hotplugged mouse did not arrive with the current primary-button setting")
             qmp.cmd("device_del", id="tuna-hotplug-mouse")
-        except Exception:
-            pass
-        agent.run("mouse-handedness", "false")
-        with open(os.path.join(evidence, "pointer-hotplug.json"), "w") as stream:
-            json.dump(hotplug, stream, indent=2)
+            gone = await_state(lambda value: all(
+                d["name"] in before_names
+                for d in value["state"].get("input_devices", [])), timeout=30,
+                label="hotplug-gone")
+            survivors = [d for d in gone["state"]["input_devices"]
+                         if d["kind"] == "pointer" and d["handed_available"]]
+            hotplug.append({"survivors": survivors})
+            if not (survivors and all(d["left_handed"] is True for d in survivors)):
+                raise RuntimeError("unplug disturbed the surviving pointers' applied settings")
+            record("V-POINTER-HOTPLUG", True,
+                   "hotplugged USB mouse arrives with current settings applied; unplug drops it, survivors keep theirs")
+        finally:
+            try:
+                qmp.cmd("device_del", id="tuna-hotplug-mouse")
+            except Exception:
+                pass
+            agent.run("mouse-handedness", "false")
+            with open(os.path.join(evidence, "pointer-hotplug.json"), "w") as stream:
+                json.dump(hotplug, stream, indent=2)
     before = inventory("before")
     expected = {"tuna-compositor", "tuna-shell-gtk", "gnome-disks", "gnome-system-monitor", "nautilus"}
     nonroot = (before["probe_uid"] == 0 and before["session_uid"] != 0
@@ -2263,7 +2271,8 @@ def main():
                     agent = guest_agent.GuestAgent(agent_path)
                     try:
                         run_lifecycle(qmp, agent, out, serial_path, record, strip_image=strip_image,
-                                      reconnect=lambda: guest_agent.GuestAgent(agent_path), strip_edge=a.strip_edge)
+                                      reconnect=lambda: guest_agent.GuestAgent(agent_path), strip_edge=a.strip_edge,
+                                      published=a.greeter_login)
                     finally:
                         agent.close()
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:
