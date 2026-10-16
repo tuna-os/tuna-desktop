@@ -683,6 +683,9 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             except BaseException as error:
                 receipt['completed'] = False
                 receipt['cleanup_error_type'] = type(error).__name__
+                # The guest agent's error carries strip-stop's own bounded
+                # failure record (exception, message, stage); keep it here.
+                receipt['cleanup_error'] = str(error)[:2048]
                 if primary is None:
                     primary = error
             finally:

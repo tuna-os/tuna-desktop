@@ -37,6 +37,26 @@ def identity(pid, with_hash=True):
     return value
 
 
+def live(node):
+    """A reference libatspi can still query.
+
+    libatspi disposes an application object when a NameOwnerChanged names its
+    bus name as the old owner, but keeps the disposed object in its process-wide
+    table: every later reference resolved through it fails for the rest of this
+    process ('The application no longer exists', with 'hash_table != NULL'
+    warnings). gtk-shell 116720252865 retried such a walk until its deadline.
+    A defunct reference is not part of the live tree. The owned shell's own
+    exit or replacement still fails through identity() and the unique live
+    application check in node().
+    """
+    try:
+        node.get_role()
+        node.get_child_count()
+        return True
+    except GLib.Error:
+        return False
+
+
 def walk(node, depth=0, budget=None):
     if budget is None:
         budget = [4096]
@@ -46,7 +66,7 @@ def walk(node, depth=0, budget=None):
     yield node
     for i in range(node.get_child_count()):
         child = node.get_child_at_index(i)
-        if child is not None:
+        if child is not None and live(child):
             yield from walk(child, depth + 1, budget)
 
 
@@ -87,24 +107,26 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             raise RuntimeError("GTK process changed")
         desktop = Atspi.get_desktop(0)
         apps = [desktop.get_child_at_index(i) for i in range(desktop.get_child_count())]
-        apps = [a for a in apps if a is not None and a.get_process_id() == pid]
+        apps = [a for a in apps if a is not None and live(a) and a.get_process_id() == pid]
         if len(apps) != 1:
-            raise RuntimeError("GTK accessible application not unique")
+            raise RuntimeError(f"GTK accessible application not unique ({len(apps)} live)")
         return matching(walk(apps[0]), name, role)
 
     def wait(predicate):
+        last_error = None
         while time.monotonic() < deadline:
             try:
                 if predicate():
                     return
-            except GLib.Error:
+            except GLib.Error as error:
                 # GTK rebuilds the menu on every property update; a walk can
                 # meet a child disposed under it ("The application no longer
                 # exists", gtk-shell 38757056152). node() rechecks the GTK
                 # process identity first, so a real exit still fails.
-                pass
+                last_error = error.message
             time.sleep(.05)
-        raise RuntimeError("property traffic deadline")
+        raise RuntimeError(f"property traffic deadline after presses {seen}; "
+                           f"last AT-SPI error: {last_error}")
 
     def press(name, role=None):
         wait(lambda: len(node(name, role)) == 1)

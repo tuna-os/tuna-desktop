@@ -689,10 +689,16 @@ def strip_stop_identity(original, uid, deadline):
                 live = strip_identity(pid, uid)
             except (OSError, RuntimeError):
                 # The launcher retires as soon as its client does, so it can
-                # exit under the read. The pidfd predates the read: readiness
-                # now means that process (the original, or a replacement of
+                # exit under the read. An exiting process drops its executable
+                # mapping (exit_mm) before the kernel marks it exited
+                # (exit_notify) and its pidfd turns readable, so the read can
+                # fail a moment before readiness: marlin-vm 116724301628 saw
+                # runuser close its PAM session and strip-stop fail at once.
+                # The pidfd predates the read: readiness within this short
+                # bound means that process (the original, or a replacement of
                 # an original already gone) has exited; nothing is signalled.
-                if not poll.poll(0):
+                remaining = min(1.0, max(0.0, deadline - time.monotonic()))
+                if not poll.poll(int(remaining * 1000)):
                     raise
         if live is not None:
             if live != original:
@@ -760,11 +766,18 @@ def strip_client(action, nonce):
         deadline = time.monotonic() + 6
         records = []
         client = owner.get("client")
+        stages = []
         if client is not None:
             identity = {key: value for key, value in client.items() if key != "script_sha256"}
-            records.append(strip_stop_identity(identity, OWNER.pw_uid, deadline))
+            stages.append(("client", identity, OWNER.pw_uid))
         if owner.get("launcher") is not None:
-            records.append(strip_stop_identity(owner["launcher"], 0, deadline))
+            stages.append(("launcher", owner["launcher"], 0))
+        for stage, identity, uid in stages:
+            try:
+                records.append(strip_stop_identity(identity, uid, deadline))
+            except Exception as error:
+                error.strip_stage = stage
+                raise
         if owner.get("launch_state") != "known" or client is None:
             raise RuntimeError("unknown fixture launch prevents confirmed cleanup")
         return {"nonce": nonce, "boot_id": owner["boot_id"], "owned_processes": records,
@@ -786,6 +799,21 @@ def strip_client(action, nonce):
             "native_window_kernel_pid_join_qualified": False}
 
 
+def strip_stop_error(error):
+    """Bounded strip-stop failure record for the lane's failure record.
+
+    Strip cleanup carries no credentials: its messages are this helper's own
+    fixed strings or OS errors on /proc paths. QGA's stderr stays discarded.
+    """
+    result = {"exception_type": type(error).__name__,
+              "message": "".join(c for c in str(error)[:512] if c.isprintable())}
+    if isinstance(error, OSError) and type(error.errno) is int:
+        result["errno"] = error.errno
+    if getattr(error, "strip_stage", None) in ("client", "launcher"):
+        result["stage"] = error.strip_stage
+    return result
+
+
 def main():
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
@@ -801,7 +829,13 @@ def main():
     elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-stop"):
         if len(sys.argv) != 3:
             raise ValueError("strip action requires exactly one nonce")
-        result = strip_client(action.removeprefix("strip-"), sys.argv[2])
+        try:
+            result = strip_client(action.removeprefix("strip-"), sys.argv[2])
+        except Exception as error:
+            if action != "strip-stop":
+                raise
+            print(json.dumps({"strip_stop_error": strip_stop_error(error)}))
+            raise SystemExit(1) from None
     elif action == "orca-departed":
         pid, ticks = int(sys.argv[2]), int(sys.argv[3])
         try:

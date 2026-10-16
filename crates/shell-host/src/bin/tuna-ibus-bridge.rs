@@ -269,8 +269,22 @@ impl IbusContext {
     /// A call libibus makes without waiting for a reply (FocusIn,
     /// FocusOut, SetCapabilities); the daemon need not send one.
     fn send(&self, method: &str, args: Option<glib::Variant>) {
+        self.send_to(CONTEXT, method, args);
+    }
+
+    /// The field's content type. IBus takes it as the input context's
+    /// write-only `ContentType` property, as libibus's
+    /// `ibus_input_context_set_content_type` sets it: ibus-daemon has no
+    /// `SetContentType` method and drops such a call unanswered, so engines
+    /// never learned a field was a password.
+    fn set_content_type(&self, purpose: u32, hints: u32) {
+        let (interface, member, args) = content_type_call(purpose, hints);
+        self.send_to(interface, member, Some(args));
+    }
+
+    fn send_to(&self, interface: &str, method: &str, args: Option<glib::Variant>) {
         let message =
-            gio::DBusMessage::new_method_call(Some(IBUS), &self.path, Some(CONTEXT), method);
+            gio::DBusMessage::new_method_call(Some(IBUS), &self.path, Some(interface), method);
         if let Some(args) = args {
             message.set_body(&args);
         }
@@ -367,8 +381,9 @@ fn delete_lengths(surrounding: &Surrounding, offset: i32, nchars: u32) -> Option
     Some(((cursor - start) as u32, (end - cursor) as u32))
 }
 
-/// text-input-v3's content type as IBus's (`SetContentType(purpose,
-/// hints)`, GTK's input purposes and hints, as GNOME Shell passes).
+/// text-input-v3's content type as IBus's (purpose, hints) for the
+/// `ContentType` property: GTK's input purposes and hints, as GNOME Shell
+/// passes them.
 fn ibus_content_type(hint: u32, purpose: u32) -> (u32, u32) {
     // Purposes normal..pin share numbers; date, time and datetime have
     // no IBus purpose; terminal is IBus's 10.
@@ -390,6 +405,15 @@ fn ibus_content_type(hint: u32, purpose: u32) -> (u32, u32) {
     .filter(|(bit, _)| hint & bit != 0)
     .fold(0, |bits, (_, ibus)| bits | ibus);
     (purpose, hints)
+}
+
+/// `org.freedesktop.DBus.Properties.Set(InputContext, "ContentType", <(uu)>)`.
+fn content_type_call(purpose: u32, hints: u32) -> (&'static str, &'static str, glib::Variant) {
+    (
+        "org.freedesktop.DBus.Properties",
+        "Set",
+        (CONTEXT, "ContentType", (purpose, hints).to_variant()).to_variant(),
+    )
 }
 
 /// Forward a visible composition update, or exactly one clear after it.
@@ -586,7 +610,7 @@ impl Bridge {
             return;
         };
         if let Some((purpose, hints)) = self.pending_content_type.take() {
-            context.send("SetContentType", Some((purpose, hints).to_variant()));
+            context.set_content_type(purpose, hints);
         }
         if let Some(surrounding) = self.pending_surrounding.take() {
             if self.surrounding.as_ref() != Some(&surrounding) {
@@ -906,5 +930,16 @@ mod tests {
         // Terminal, and date (no IBus purpose).
         assert_eq!(ibus_content_type(0, 13), (10, 0));
         assert_eq!(ibus_content_type(0, 10), (0, 0));
+    }
+
+    #[test]
+    fn content_type_is_set_as_the_input_context_property() {
+        let (interface, member, args) = content_type_call(8, 2048);
+        assert_eq!((interface, member), ("org.freedesktop.DBus.Properties", "Set"));
+        assert_eq!(args.type_().as_str(), "(ssv)");
+        assert_eq!(args.child_value(0).str(), Some(CONTEXT));
+        assert_eq!(args.child_value(1).str(), Some("ContentType"));
+        let value = args.child_value(2).as_variant().unwrap();
+        assert_eq!(value.get::<(u32, u32)>(), Some((8, 2048)));
     }
 }

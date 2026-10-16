@@ -447,6 +447,7 @@ class TransportAndCleanup(unittest.TestCase):
             self.assertFalse(receipt['completed'])
             self.assertFalse(receipt['cleanup_confirmed'])
             self.assertEqual(receipt['cleanup_error_type'], 'RuntimeError')
+            self.assertEqual(receipt['cleanup_error'], 'owned fixture cleanup unconfirmed')
         self.assertEqual([item[:2] for item in calls],
                          [('original', 'strip-start'), ('cleanup', 'strip-stop'), ('cleanup', 'close')])
         self.assertFalse(records[-1][1])

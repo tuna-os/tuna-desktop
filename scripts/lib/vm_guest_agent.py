@@ -37,6 +37,31 @@ def valid_orca_read_error(value):
     return True
 
 
+def valid_strip_stop_error(value):
+    types = {"RuntimeError", "TimeoutError", "ValueError", "KeyError", "TypeError",
+             "OSError", "FileNotFoundError", "ProcessLookupError", "PermissionError",
+             "ChildProcessError", "JSONDecodeError", "UnicodeDecodeError"}
+    if not isinstance(value, dict) or not {"exception_type", "message"} <= set(value) or not set(value) <= {"exception_type", "message", "errno", "stage"}:
+        return False
+    if not isinstance(value["exception_type"], str) or value["exception_type"] not in types:
+        return False
+    message = value["message"]
+    if not isinstance(message, str) or len(message) > 512 or any(not c.isprintable() for c in message):
+        return False
+    if "errno" in value and (type(value["errno"]) is not int or not 0 <= value["errno"] <= 4095
+                             or value["exception_type"] not in {"OSError", "FileNotFoundError", "ProcessLookupError", "PermissionError", "ChildProcessError", "TimeoutError"}):
+        return False
+    if "stage" in value and value["stage"] not in {"client", "launcher"}:
+        return False
+    return True
+
+
+# Lifecycle actions whose failure prints one bounded, validated record on
+# stdout; any other action's output (and every stderr) stays private.
+FAILURE_RECORDS = {"orca-read": ("orca_read_error", valid_orca_read_error),
+                   "strip-stop": ("strip_stop_error", valid_strip_stop_error)}
+
+
 class GuestAgent:
     """One owned QGA stream; deadline failure poisons it instead of accepting stale replies.
 
@@ -182,20 +207,21 @@ class GuestAgent:
                 self.pending_guest_pid = None
                 self.guest_exec_state = "none"
                 if status.get("exitcode") != 0 or status.get("out-truncated") or status.get("err-truncated"):
-                    if action == "orca-read" and not status.get("out-truncated"):
+                    if action in FAILURE_RECORDS and not status.get("out-truncated"):
+                        key, valid = FAILURE_RECORDS[action]
                         try:
                             encoded = status.get("out-data", "")
                             if not isinstance(encoded, str) or len(encoded) > 5464:
-                                raise ValueError("read diagnostic exceeds transport bound")
+                                raise ValueError("failure record exceeds transport bound")
                             output = base64.b64decode(encoded, validate=True)
                             if len(output) <= 4096:
-                                diagnostic = json.loads(output).get("orca_read_error")
+                                diagnostic = json.loads(output).get(key)
                             else:
                                 diagnostic = None
                         except (binascii.Error, ValueError, UnicodeDecodeError, AttributeError, TypeError):
                             diagnostic = None
-                        if valid_orca_read_error(diagnostic):
-                            raise RuntimeError(f"guest lifecycle orca-read failed (exit={status.get('exitcode')}): {json.dumps(diagnostic)}")
+                        if valid(diagnostic):
+                            raise RuntimeError(f"guest lifecycle {action} failed (exit={status.get('exitcode')}): {json.dumps(diagnostic)}")
                     raise RuntimeError(f"guest lifecycle {action} failed (exit={status.get('exitcode')})")
                 return json.loads(base64.b64decode(status.get("out-data", ""), validate=True))
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))

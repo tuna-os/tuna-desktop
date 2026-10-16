@@ -211,6 +211,29 @@ class OrcaReadFailure(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, r"guest lifecycle orca-read failed \(exit=1\)"):
                     actor.run("orca-read")
 
+    def test_strip_stop_failure_record_reaches_the_lane_error(self):
+        actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        record = {"exception_type": "FileNotFoundError", "errno": 2, "stage": "launcher",
+                  "message": "[Errno 2] No such file or directory: '/proc/11088/exe'"}
+        failed = {"exited": True, "exitcode": 1,
+                  "out-data": base64.b64encode(json.dumps({"strip_stop_error": record}).encode()).decode(),
+                  "err-data": base64.b64encode(b"private arbitrary traceback").decode()}
+        with patch.object(actor, "command", side_effect=[{"pid": 10}, failed]):
+            with self.assertRaises(RuntimeError) as caught:
+                actor.run("strip-stop", "a" * 32)
+        message = str(caught.exception)
+        self.assertIn("guest lifecycle strip-stop failed (exit=1): ", message)
+        self.assertIn('"stage": "launcher"', message)
+        self.assertNotIn("private arbitrary traceback", message)
+        for invalid in ({**record, "stage": "other"}, {**record, "message": "x" * 513},
+                        {**record, "message": "a\x00b"}, {**record, "exception_type": "SystemExit"},
+                        {**record, "extra": 1}, {"exception_type": "RuntimeError"}):
+            output = base64.b64encode(json.dumps({"strip_stop_error": invalid}).encode()).decode()
+            with patch.object(actor, "command", side_effect=[{"pid": 10}, {**failed, "out-data": output}]):
+                with self.assertRaises(RuntimeError) as caught:
+                    actor.run("strip-stop", "a" * 32)
+            self.assertEqual(str(caught.exception), "guest lifecycle strip-stop failed (exit=1)")
+
 
 class OrcaActivationCleanup(unittest.TestCase):
     def test_reset_failure_keeps_observations_and_original_error(self):

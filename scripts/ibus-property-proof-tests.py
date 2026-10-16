@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "scripts/lib/tuna-ibus-properties-proof.py"
 module = ast.parse(SOURCE.read_text(), filename=str(SOURCE))
 selected = [n for n in module.body if (isinstance(n, ast.FunctionDef)
-            and n.name in {"validate_traffic", "walk", "matching"})
+            and n.name in {"validate_traffic", "live", "walk", "matching"})
             or (isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "INDICATOR" for t in n.targets))]
 
 
@@ -18,7 +18,12 @@ class Atspi:
         SHOWING = "showing"
 
 
-namespace = {"Atspi": Atspi}
+class GLib:
+    class Error(Exception):
+        pass
+
+
+namespace = {"Atspi": Atspi, "GLib": GLib}
 exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
 
 
@@ -38,6 +43,7 @@ class Controls(unittest.TestCase):
     def test_accessible_walk_node_and_depth_limits(self):
         class Node:
             def __init__(self, children=()): self.children = children
+            def get_role(self): return "panel"
             def get_child_count(self): return len(self.children)
             def get_child_at_index(self, i): return self.children[i]
         self.assertEqual(len(list(namespace["walk"](Node([Node()])))), 2)
@@ -46,6 +52,22 @@ class Controls(unittest.TestCase):
         node = Node()
         for _ in range(33): node = Node([node])
         with self.assertRaises(RuntimeError): list(namespace["walk"](node))
+
+    def test_defunct_reference_is_skipped_not_retried_forever(self):
+        # libatspi keeps a disposed application: every query through it fails
+        # ("The application no longer exists") for the process's life.
+        class Node:
+            def __init__(self, children=()): self.children = children
+            def get_role(self): return "panel"
+            def get_child_count(self): return len(self.children)
+            def get_child_at_index(self, i): return self.children[i]
+        class Defunct(Node):
+            def get_role(self): raise GLib.Error("The application no longer exists")
+        live = Node()
+        root = Node([Defunct([Node()]), live])
+        self.assertEqual(list(namespace["walk"](root)), [root, live])
+        self.assertFalse(namespace["live"](Defunct()))
+        self.assertTrue(namespace["live"](live))
 
     def test_indicator_selects_the_showing_inner_toggle_of_the_menu_button(self):
         class Node:

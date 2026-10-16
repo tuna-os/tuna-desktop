@@ -140,6 +140,42 @@ class Tests(unittest.TestCase):
             scope['strip_stop_identity'](identity, os.getuid(), time.monotonic() + 2)
         self.assertIsNone(child.poll())
 
+    def test_read_failing_just_before_exit_readiness_is_retirement(self):
+        # An exiting process loses /proc/PID/exe (exit_mm) before its pidfd
+        # turns readable (exit_notify): marlin-vm 116724301628 failed in that
+        # window right after runuser closed its PAM session.
+        child = self.process()
+        scope = helper()
+        identity = scope['strip_identity'](child.pid, os.getuid())
+        def exiting(pid, uid):
+            threading.Timer(0.2, child.kill).start()
+            raise FileNotFoundError(2, 'No such file or directory', f'/proc/{pid}/exe')
+        scope['strip_identity'] = exiting
+        reaper = threading.Thread(target=lambda: child.wait(timeout=4))
+        reaper.start()
+        try:
+            result = scope['strip_stop_identity'](identity, os.getuid(), time.monotonic() + 3)
+        finally:
+            reaper.join(4)
+        self.assertTrue(result['retired'])
+        self.assertTrue(result['proc_absent'])
+
+    def test_strip_stop_failure_record_is_bounded_and_staged(self):
+        record = helper()['strip_stop_error']
+        error = RuntimeError('refuse to signal changed strip process identity\n' + 'x' * 1024)
+        error.strip_stage = 'launcher'
+        result = record(error)
+        self.assertEqual(result['exception_type'], 'RuntimeError')
+        self.assertEqual(result['stage'], 'launcher')
+        self.assertEqual(len(result['message']), 511)
+        self.assertNotIn('\n', result['message'])
+        missing = record(FileNotFoundError(2, 'No such file or directory', '/proc/7/exe'))
+        self.assertEqual(missing['errno'], 2)
+        self.assertNotIn('stage', missing)
+        error = RuntimeError('x')
+        error.strip_stage = 'other'
+        self.assertNotIn('stage', record(error))
+
     def test_actual_owned_process_argv_and_typed_mode_are_bound(self):
         scope = helper()
         with tempfile.TemporaryDirectory() as directory:
