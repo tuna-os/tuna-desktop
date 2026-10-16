@@ -172,31 +172,65 @@ fn from_crate_entry(entry: &CrateEntry) -> Option<AppEntry> {
     from_crate_entry_for_launch(entry, false)
 }
 
+// Desktop values are unescaped before Exec tokenization. The desktop-entry
+// crate deliberately keeps Exec raw, but its parse_exec splits quoted words.
+fn exec_argv(entry: &CrateEntry) -> Option<Vec<OsString>> {
+    let raw = entry.exec()?;
+    let decoded;
+    let command = if raw.contains('\\') {
+        let keyfile = gio::glib::KeyFile::new();
+        keyfile
+            .load_from_data(
+                &format!("[Desktop Entry]\nExec={raw}\n"),
+                gio::glib::KeyFileFlags::NONE,
+            )
+            .ok()?;
+        decoded = keyfile.string("Desktop Entry", "Exec").ok()?;
+        decoded.as_str()
+    } else {
+        raw
+    };
+    let words = gio::glib::shell_parse_argv(command).ok()?;
+    let mut argv = Vec::with_capacity(words.len());
+    for word in words {
+        match word.to_str()? {
+            // No documents or URLs were supplied by this launcher.
+            "%f" | "%F" | "%u" | "%U" | "%d" | "%D" | "%n" | "%N" | "%v" | "%m" => {}
+            "%i" => {
+                if let Some(icon) = entry.icon() {
+                    argv.push(OsString::from("--icon"));
+                    argv.push(OsString::from(icon));
+                }
+            }
+            "%c" => argv.push(OsString::from(entry.name::<&str>(&[])?.as_ref())),
+            "%k" => argv.push(entry.path.as_os_str().to_owned()),
+            text if text.contains('%') => {
+                // %% is literal. Unknown or embedded field codes are invalid.
+                let mut chars = text.chars();
+                let mut expanded = String::with_capacity(text.len());
+                while let Some(ch) = chars.next() {
+                    if ch == '%' && chars.next() != Some('%') {
+                        return None;
+                    }
+                    expanded.push(ch);
+                }
+                argv.push(OsString::from(expanded));
+            }
+            _ => argv.push(word),
+        }
+    }
+    let executable = argv.first()?.to_str()?;
+    if executable.is_empty() || executable.contains('=') {
+        return None;
+    }
+    Some(argv)
+}
+
 fn from_crate_entry_for_launch(entry: &CrateEntry, allow_no_display: bool) -> Option<AppEntry> {
     if entry.hidden() || (!allow_no_display && entry.no_display()) {
         return None;
     }
-    entry.exec()?;
-    let argv: Vec<OsString> = entry
-        .parse_exec()
-        .ok()?
-        .into_iter()
-        .map(|arg| {
-            // The Exec parser splits on whitespace but leaves the
-            // spec's double-quote grouping in place, so a quoted
-            // argument arrives with its quotes attached. Strip one
-            // surrounding pair per argument; without this a probe like
-            // Exec=touch "<marker>" touches a quote-named file.
-            arg.strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-                .unwrap_or(&arg)
-                .to_owned()
-        })
-        .map(OsString::from)
-        .collect();
-    if argv.is_empty() {
-        return None;
-    }
+    let argv = exec_argv(entry)?;
     let app_id = entry.id().to_owned();
     let name = entry
         .name::<&str>(&[])
@@ -570,14 +604,12 @@ mod tests {
 
     #[test]
     fn quoted_exec_arg_survives_discovery_unquoted() {
-        // Probe shape from the CI journey: Exec=touch "<abs marker>".
-        // The desktop-entry spec quotes Exec arguments; argv must not
-        // carry the quote characters into the spawn.
+        // Quoting groups spaces without passing quote characters to the child.
         let dir = tempfile::tempdir().expect("tempdir");
         write_entry(
             dir.path(),
             "probe.desktop",
-            "[Desktop Entry]\nName=Tunaterm Probe\nExec=touch \"/tmp/tuna-marker\"\nType=Application\n",
+            "[Desktop Entry]\nName=Tunaterm Probe\nExec=touch \"/tmp/tuna marker\"\nType=Application\n",
         );
         let apps = discover(&[dir.path().to_owned()]);
         let app = apps
@@ -586,9 +618,35 @@ mod tests {
             .expect("probe");
         assert_eq!(
             app.argv,
-            vec![OsString::from("touch"), OsString::from("/tmp/tuna-marker")],
+            vec![OsString::from("touch"), OsString::from("/tmp/tuna marker")],
             "quoted Exec arg keeps its quotes: {:?}",
             app.argv
+        );
+    }
+
+    #[test]
+    fn exec_expands_fields_after_grouping_without_shell_expansion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_entry(
+            dir.path(),
+            "probe.desktop",
+            "[Desktop Entry]\nName=Two Words\nIcon=example\nExec=/bin/echo \"a b\" \"\" \"$HOME\" %c %i %k %U %%\nType=Application\n",
+        );
+        let apps = discover(&[dir.path().to_owned()]);
+        let entry = apps.iter().find(|a| a.name == "Two Words").unwrap();
+        assert_eq!(
+            entry.argv,
+            vec![
+                OsString::from("/bin/echo"),
+                OsString::from("a b"),
+                OsString::new(),
+                OsString::from("$HOME"),
+                OsString::from("Two Words"),
+                OsString::from("--icon"),
+                OsString::from("example"),
+                dir.path().join("probe.desktop").into_os_string(),
+                OsString::from("%"),
+            ]
         );
     }
 

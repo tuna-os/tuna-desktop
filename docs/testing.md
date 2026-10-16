@@ -58,6 +58,12 @@ TUNA_REQUIRE_PAM_WRAPPER=1 cargo test --workspace
 Run one crate with `cargo test -p <package>` (package names are in each
 crate's `README.md`, for example `cargo test -p tuna-compositor`).
 
+Desktop-entry launch coverage lives in `tuna-shell-host`:
+`cargo test --locked -p tuna-shell-host --lib apps::`.
+It checks quoted multiword and empty arguments, field-code expansion after
+argument grouping, and literal `$HOME` handling. Desktop `Exec` commands are
+parsed as an argument vector, never evaluated by a shell.
+
 ## Nested proofs
 
 Each proof job builds the workspace, runs the nested compositor on a
