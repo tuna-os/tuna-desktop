@@ -22,6 +22,38 @@ const CLOSE_SIZE: i32 = 32;
 /// The hovered preview's caption and close button fade in
 /// (`WINDOW_OVERLAY_FADE_TIME`, ease-out-quad).
 const OVERLAY_FADE_MS: f64 = 200.0;
+/// Leave room for the icon and close button's 4px blurred, 2px-offset
+/// shadows (style.css), including their antialiased fringe.
+const CHROME_BLEED: f64 = 12.0;
+
+/// Bound the widgets in output coordinates, retaining fractional placement.
+/// The old full-output surface clipped anything above/left of the output.
+fn chrome_bounds(
+    widgets: impl Iterator<Item = (f64, f64, i32, i32)>,
+) -> Option<gtk::cairo::RectangleInt> {
+    let (left, top, right, bottom) = widgets.fold(
+        (f64::INFINITY, f64::INFINITY, 0.0_f64, 0.0_f64),
+        |(left, top, right, bottom), (x, y, width, height)| {
+            (
+                left.min(x),
+                top.min(y),
+                right.max(x + f64::from(width)),
+                bottom.max(y + f64::from(height)),
+            )
+        },
+    );
+    if !left.is_finite() {
+        return None;
+    }
+    let x = (left - CHROME_BLEED).floor().max(0.0) as i32;
+    let y = (top - CHROME_BLEED).floor().max(0.0) as i32;
+    Some(gtk::cairo::RectangleInt::new(
+        x,
+        y,
+        ((right + CHROME_BLEED).ceil() as i32 - x).max(1),
+        ((bottom + CHROME_BLEED).ceil() as i32 - y).max(1),
+    ))
+}
 
 /// Overlay opacity `elapsed_ms` into the fade under `policy`: a fade,
 /// so fade-only keeps it; the slow-down factor stretches it.
@@ -93,7 +125,7 @@ impl PreviewChrome {
         window.init_layer_shell();
         window.set_layer(Layer::Top);
         window.set_namespace(Some(tuna_shell_control::PREVIEW_CHROME_NAMESPACE));
-        for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+        for edge in [Edge::Top, Edge::Left] {
             window.set_anchor(edge, true);
         }
         // Output coordinates, as the compositor sends them: ignore the
@@ -188,11 +220,46 @@ impl PreviewChrome {
                 fade_in(vec![row.upcast(), close.upcast()]);
             }
         }
+        // A transparent full-output buffer still shades every pixel on
+        // transition frames. Keep the same widgets and output positions,
+        // but allocate only their union, including CSS shadows.
+        let children = std::iter::successors(self.fixed.first_child(), |w| w.next_sibling());
+        let bounds = chrome_bounds(children.map(|child| {
+            let (x, y) = self.fixed.child_position(&child);
+            let (_, width, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+            let (_, height, _, _) = child.measure(gtk::Orientation::Vertical, width);
+            (x, y, width, height)
+        }));
+        let Some(bounds) = bounds else {
+            self.window.set_visible(false);
+            return;
+        };
+        let mut child = self.fixed.first_child();
+        while let Some(widget) = child {
+            let (x, y) = self.fixed.child_position(&widget);
+            self.fixed.move_(
+                &widget,
+                x - f64::from(bounds.x()),
+                y - f64::from(bounds.y()),
+            );
+            child = widget.next_sibling();
+        }
+        self.fixed.set_size_request(bounds.width(), bounds.height());
+        // As with the switcher's thumbnail layer, explicitly request a
+        // fresh natural size so a previously larger surface can shrink.
+        self.window.set_default_size(1, 1);
+        self.window.set_margin(Edge::Left, bounds.x());
+        self.window.set_margin(Edge::Top, bounds.y());
         self.window.set_visible(true);
         // Clicks fall through to the compositor's previews except on
         // the close button.
         let region = match input {
-            Some(rect) => gtk::cairo::Region::create_rectangle(&rect),
+            Some(rect) => gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(
+                rect.x() - bounds.x(),
+                rect.y() - bounds.y(),
+                rect.width(),
+                rect.height(),
+            )),
             None => gtk::cairo::Region::create(),
         };
         if let Some(surface) = self.window.surface() {
@@ -210,8 +277,27 @@ impl PreviewChrome {
 
 #[cfg(test)]
 mod tests {
-    use super::overlay_opacity;
+    use super::{chrome_bounds, overlay_opacity};
     use tuna_shell_control::{MotionLevel, MotionPolicy};
+
+    #[test]
+    fn bounds_include_shadow_bleed_without_rounding_widget_positions() {
+        let bounds = chrome_bounds([(200.5, 400.2, 64, 64), (100.0, 500.2, 300, 32)].into_iter())
+            .unwrap();
+        assert_eq!((bounds.x(), bounds.y()), (88, 388));
+        assert_eq!((bounds.width(), bounds.height()), (324, 157));
+        // Translating to the layer and back preserves the original subpixel position.
+        assert_eq!(200.5 - f64::from(bounds.x()) + f64::from(bounds.x()), 200.5);
+        assert_eq!(400.2 - f64::from(bounds.y()) + f64::from(bounds.y()), 400.2);
+    }
+
+    #[test]
+    fn bounds_keep_output_edge_clipping_and_empty_chrome_has_no_surface() {
+        let bounds = chrome_bounds([(-8.5, -16.0, 32, 32)].into_iter()).unwrap();
+        assert_eq!((bounds.x(), bounds.y()), (0, 0));
+        assert_eq!((bounds.width(), bounds.height()), (36, 28));
+        assert!(chrome_bounds(std::iter::empty()).is_none());
+    }
 
     #[test]
     fn the_hover_overlay_fades_in_over_200_ms_ease_out_quad() {
