@@ -4373,8 +4373,8 @@ impl Runtime {
                 .zip(self.shell.child_generation())
                 .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
         );
-        let mut outcome = self.control.poll(self.manager.model_mut());
-        self.poll_brightness(std::mem::take(&mut outcome.brightness));
+        let outcome = self.control.poll(self.manager.model_mut());
+        self.poll_brightness(outcome.brightness);
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
         }
