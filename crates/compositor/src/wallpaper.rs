@@ -1341,6 +1341,7 @@ fn load_static_wallpaper(
             }
         }
     }
+    let mut cacheable = true;
     let image = if settings.placement == tuna_shell_control::background::Placement::None {
         None
     } else if let Some(expected) = expected {
@@ -1366,6 +1367,9 @@ fn load_static_wallpaper(
         {
             return None;
         }
+        // A native SVG render also depends on the installed loader and
+        // fonts, which this source-file key does not identify.
+        cacheable = tuna_wallpaper::is_raster(&bytes);
         tuna_wallpaper::decode(&bytes).map(|im| im.to_rgba8())
     } else {
         None
@@ -1374,7 +1378,7 @@ fn load_static_wallpaper(
     if FileIdentity::for_uri(uri) != original_identity {
         return None;
     }
-    if let Some(path) = cache {
+    if let Some(path) = cache.filter(|_| cacheable) {
         let tmp = path.with_extension("tmp");
         if path
             .parent()

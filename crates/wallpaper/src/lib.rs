@@ -7,6 +7,7 @@
 //! wallpapers are 4096x4096 JPEG XL files.
 
 pub mod background;
+pub mod svg;
 
 use image::GenericImageView;
 use image::ImageDecoder;
@@ -64,15 +65,30 @@ pub fn decode_cover_argb(bytes: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     Some(argb)
 }
 
+/// Whether a raster codec (JPEG XL or one `image` recognizes by its
+/// signature) owns `bytes`. Everything else goes to the native SVG
+/// loader, whose output also depends on installed loaders and fonts:
+/// only raster decodes may be persisted under a source-file key.
+pub fn is_raster(bytes: &[u8]) -> bool {
+    is_jxl(bytes) || image::guess_format(bytes).is_ok()
+}
+
 /// Decode any format `image` reads, plus JPEG XL (gnome-backgrounds'
-/// adwaita-l.jxl and adwaita-d.jxl). Header dimensions gate the
-/// decode (strict reader limits reject oversized headers before any
-/// pixel allocation); the decoded dimensions are re-verified
-/// afterwards because decoder limit support is best-effort, so a
-/// returned image always admits its own RGBA conversion.
+/// adwaita-l.jxl and adwaita-d.jxl) and, for content no raster codec
+/// recognizes, SVG/SVGZ through the isolated GNOME loader helper
+/// ([`svg`]). Header dimensions gate the raster decode (strict reader
+/// limits reject oversized headers before any pixel allocation); the
+/// decoded dimensions are re-verified afterwards because decoder limit
+/// support is best-effort, so a returned image always admits its own
+/// RGBA conversion.
 pub fn decode(bytes: &[u8]) -> Option<image::DynamicImage> {
     if is_jxl(bytes) {
         return decode_jxl(bytes);
+    }
+    if !is_raster(bytes) {
+        // The native loader accepts declarations/comments, UTF BOMs and
+        // SVGZ, so no prefix recognizer here: let it reject non-SVG input.
+        return svg::decode(bytes);
     }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader.limits(strict_limits());

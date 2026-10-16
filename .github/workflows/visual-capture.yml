@@ -50,7 +50,7 @@ jobs:
               sudo sed -i 's|https\?://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
             fi
           done
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols python3-pil
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols python3-pil
       - run: scripts/ci-install-gtk4-layer-shell
       - run: shellcheck -x scripts/tuna-visual-capture scripts/tuna-walkthrough && python3 -m py_compile scripts/lib/tuna-visual-label.py scripts/lib/tuna-visual-finalize.py
       - run: scripts/tuna-visual-capture --check-matrix
