@@ -122,7 +122,7 @@ state records its state observation next to its stills and clips.
 | P-IN-05 | Graphics tablets and Wacom settings | `missing-product` | No adequate capture | tablet protocol and routing absent |
 | P-IN-06 | Input-source policy, Num Lock, custom shortcuts | `nonvisual` | No adequate capture | live sources/repeat in CI proofs; per-window/NumLock/custom keys have no consumer |
 | P-NT-03 | Per-app notification prefs, lock privacy | `missing-product` | No adequate capture | global banners/DND captured under P-NT-02; per-app and lock-screen keys have no consumer |
-| P-A11Y-03 | Magnifier and on-screen keyboard | `missing-product` | No adequate capture | magnifier and OSK keys ignored |
+| P-A11Y-03 | Magnifier and on-screen keyboard | `missing-product` | No adequate capture | magnifier applies to captures only (no live on-screen zoom); OSK keys ignored |
 | P-A11Y-04 | Sticky/slow/bounce keys, Mouse Keys, dwell | `missing-product` | No adequate capture | seat-level input policy absent |
 | P-A11Y-05 | Reduced motion, focus visibility, a11y menu | stage:settings-a11y `partial` | No adequate capture | a11y indicator/menu still; motion-preference transition variants unproven |
 | P-A11Y-06 | Orca activation and spoken navigation | `unsupported-in-nested` | No adequate capture | complete spoken Orca journey needs Corral |
