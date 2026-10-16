@@ -6312,7 +6312,7 @@ if command -v ibus-daemon >/dev/null 2>&1 &&
     property_phase="$ARTIFACTS/ibus-properties-lifecycle-phase.json"
     rm -f "$property_phase"
     env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
-        TUNA_PROOF_SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD)" timeout --kill-after=2s 80s \
+        TUNA_PROOF_SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD)" timeout --kill-after=2s 160s \
         "$PY" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" "$property_shell_pid" "$ENGINE_LOG" \
         "$ARTIFACTS/ibus-properties-lifecycle-receipt.json" "$privacy_expected_shell" \
         "$property_engine_pid" "$property_phase" "$LOG" \

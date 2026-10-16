@@ -110,7 +110,8 @@ def atspi_child(pid, op, name, role):
     """
     def describe(n):
         states = n.get_state_set()
-        return {"bus": n.app.bus_name, "path": n.path,
+        return {"bus": n.app.bus_name, "path": n.path, "role": n.get_role_name(),
+                "showing": states.contains(Atspi.StateType.SHOWING),
                 "checked": states.contains(Atspi.StateType.CHECKED),
                 "sensitive": states.contains(Atspi.StateType.SENSITIVE)}
     try:
@@ -164,7 +165,10 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
         raise RuntimeError("engine process is not the owned fixture")
     engine_fixture_hash = file_hash(engine_fixture)
     basic_origin = {k: v for k, v in origin.items() if k != "exe_sha256"}
-    deadline = time.monotonic() + (70 if phase_file else 30)
+    # The lifecycle drives two real lock/PAM unlock cycles (each phase is also
+    # bounded by the harness); with a fresh AT-SPI process per query the whole
+    # proof ran past 70 s at its final close (gtk-shell 116808314378).
+    deadline = time.monotonic() + (150 if phase_file else 30)
     seen = []
 
     def node(name, role=None):
