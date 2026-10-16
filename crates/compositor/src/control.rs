@@ -45,6 +45,10 @@ use tuna_shell_control::{
 
 use crate::state::{StateChange, StateModel, TokenStore, WindowEntry};
 
+/// How soon the hub wants another [`ControlHub::poll`] while a handshake
+/// is due or a broadcast is owed after backpressure (one display frame).
+pub const RETRY: std::time::Duration = std::time::Duration::from_millis(16);
+
 /// Transport and protocol failures, shared with the shell-host endpoint.
 ///
 /// Defined in [`tuna_shell_control`] so both endpoints name the same type;
@@ -135,6 +139,35 @@ impl ControlConn {
         }
     }
 
+    /// Observe half/full closure without consuming queued command bytes.
+    fn peer_live(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let fd = self.stream.as_raw_fd();
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, 0) } < 0
+            || poll.revents & (libc::POLLHUP | libc::POLLRDHUP | libc::POLLERR | libc::POLLNVAL)
+                != 0
+        {
+            return false;
+        }
+        let mut byte = 0u8;
+        let count = unsafe {
+            libc::recv(
+                fd,
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        count > 0
+            || (count < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock)
+    }
+
     /// Write one message as a single frame. Returns
     /// [`ControlError::WouldBlock`] on backpressure; per the module docs the
     /// connection must then be dropped (a partial frame may be on the wire).
@@ -149,6 +182,25 @@ impl ControlConn {
             }
         }
         Ok(())
+    }
+
+    /// Whether the next [`read_frame`](Self::read_frame) can answer from
+    /// the buffer alone: a whole frame (or an oversize prefix, which fails
+    /// at once) already arrived. The socket is then not readable, so the
+    /// loop must come back without waiting for it.
+    pub fn has_buffered_frame(&self) -> bool {
+        if self.rbuf.len() < 4 {
+            return false;
+        }
+        let len =
+            u32::from_le_bytes([self.rbuf[0], self.rbuf[1], self.rbuf[2], self.rbuf[3]]) as usize;
+        len > MAX_FRAME_BYTES || self.rbuf.len() >= 4 + len
+    }
+}
+
+impl std::os::fd::AsFd for ControlConn {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.stream.as_fd()
     }
 }
 
@@ -216,6 +268,22 @@ pub type TokenValidator<'a> = Box<dyn Fn(&ActivationToken, Option<&str>) -> bool
 /// Per-window activation-token minter for snapshots and deltas.
 pub type TokenMinter = std::rc::Rc<dyn Fn(Option<&str>) -> String>;
 
+/// Current supervised process generation, never supplied by the shell wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthOwner {
+    pub pid: u32,
+    pub generation: u64,
+}
+/// A routing lease only: no authentication or physical-retirement authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthLease {
+    origin: crate::auth_owner::Origin,
+    serial: u64,
+    epoch: u64,
+    method: crate::auth_owner::MethodKind,
+    owner: AuthOwner,
+}
+
 /// Authenticated control session over a [`ControlConn`].
 ///
 /// The session owns the connection, the token-check hook, the per-window
@@ -227,6 +295,9 @@ pub type TokenMinter = std::rc::Rc<dyn Fn(Option<&str>) -> String>;
 /// handshake sends our `Hello` plus a full snapshot, so every (re)connect
 /// starts from complete state.
 pub struct Session<'a> {
+    connection_id: u64,
+    auth_owner: Option<AuthOwner>,
+    auth_lease: Option<AuthLease>,
     conn: ControlConn,
     validator: TokenValidator<'a>,
     minter: TokenMinter,
@@ -266,7 +337,10 @@ pub struct Session<'a> {
     unlock_pending: Option<u64>,
     /// Latest `SetInputSettings` from the shell, drained by the hub.
     input_settings: Option<tuna_shell_control::InputSettings>,
+    wellbeing_effects: Option<(bool, bool)>,
+    icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     screen_reader: Option<bool>,
+    screenshot_pointer: Option<(i32, i32)>,
     /// Input-source switches the shell asked for (`true` backward).
     input_source_switches: Vec<bool>,
     /// The switcher's thumbnail frames, when the shell sent new ones.
@@ -284,6 +358,18 @@ impl std::fmt::Debug for Session<'_> {
 }
 
 impl<'a> Session<'a> {
+    /// Whether a whole command frame waits in this session's buffer
+    /// (see [`ControlConn::has_buffered_frame`]).
+    pub fn has_buffered_frame(&self) -> bool {
+        self.conn.has_buffered_frame()
+    }
+
+    /// Whether [`emit_deltas`](Self::emit_deltas) has something to send:
+    /// the lock flag flipped or the model moved since the last emit.
+    pub fn owes_deltas(&self, model: &StateModel) -> bool {
+        self.locked.get() != self.locked_sent || model.revision() != self.last_revision
+    }
+
     /// Server-side handshake: expect `Hello` first, reply `Hello` with
     /// [`CURRENT_VERSION`], then send a full snapshot. A stale major gets a
     /// typed `IncompatibleVersion` error and the connection is refused
@@ -322,6 +408,9 @@ impl<'a> Session<'a> {
     ) -> Result<Self, ControlError> {
         let locked_sent = locked.get();
         let mut session = Self {
+            connection_id: 0,
+            auth_owner: None,
+            auth_lease: None,
             conn,
             validator: Box::new(validator),
             minter,
@@ -339,7 +428,10 @@ impl<'a> Session<'a> {
             unlock_request: None,
             unlock_pending: None,
             input_settings: None,
+            wellbeing_effects: None,
+            icon_geometries: None,
             screen_reader: None,
+            screenshot_pointer: None,
             input_source_switches: Vec::new(),
             switcher_thumbnails: None,
             switcher_keys: None,
@@ -496,6 +588,13 @@ impl<'a> Session<'a> {
         }
         match model.changes_since(self.last_revision) {
             Ok(entries) => {
+                if entries
+                    .iter()
+                    .any(|(_, change)| matches!(change, StateChange::WorkspacesChanged))
+                {
+                    let revision = self.send_snapshot(model)?;
+                    return Ok(Emitted::Snapshot { revision });
+                }
                 let ops: Vec<StateOp> = entries
                     .iter()
                     .filter_map(|(_, c)| state_op(c, &*self.minter))
@@ -584,6 +683,26 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::MoveScreenshotPointer { x, y },
+            } => {
+                let valid = x >= 0 && y >= 0;
+                if valid {
+                    self.screenshot_pointer = Some((x, y));
+                }
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: if valid {
+                        CommandStatus::Applied
+                    } else {
+                        CommandStatus::Denied {
+                            reason: "invalid screenshot pointer coordinates".into(),
+                        }
+                    },
+                })?;
+                Ok(Handled::CommandResult { id, applied: valid })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::SetScreenReader { enabled },
             } => {
                 self.screen_reader = Some(enabled);
@@ -595,10 +714,32 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+            } => {
+                self.wellbeing_effects = Some((grayscale, fade));
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::SetInputSettings(settings),
             } => {
                 // Session-level settings for the runtime (seat, libinput).
-                self.input_settings = Some(settings);
+                self.input_settings = Some(*settings);
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::SetWindowIconGeometries { geometries },
+            } => {
+                self.icon_geometries = Some(geometries);
                 self.conn.write_frame(&Message::CommandResult {
                     id,
                     status: CommandStatus::Applied,
@@ -644,6 +785,15 @@ impl<'a> Session<'a> {
             } => {
                 // Verified off the event loop by the runtime; the result
                 // goes back as this id's CommandResult.
+                if self.unlock_pending.is_some() {
+                    self.conn.write_frame(&Message::CommandResult {
+                        id,
+                        status: CommandStatus::Denied {
+                            reason: "authentication failed".into(),
+                        },
+                    })?;
+                    return Ok(Handled::CommandResult { id, applied: false });
+                }
                 self.unlock_request = Some((id, password));
                 self.unlock_pending = Some(id);
                 Ok(Handled::CommandResult { id, applied: true })
@@ -755,6 +905,7 @@ impl<'a> Session<'a> {
             | Message::WorkspacePopup { .. }
             | Message::PointerOutput { .. }
             | Message::ScreenReader { .. }
+            | Message::KeyboardAidToggled { .. }
             | Message::ShortcutConsent { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
@@ -800,6 +951,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ScreenReader { .. } => "ScreenReader",
+        Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
     }
 }
 
@@ -844,6 +996,7 @@ fn window_to_wire(
     mint: &dyn Fn(Option<&str>) -> String,
 ) -> tuna_shell_control::WindowInfo {
     tuna_shell_control::WindowInfo {
+        on_all_workspaces: w.on_all_workspaces,
         icon: w.icon.clone(),
         id: w.id,
         title: w.title.clone(),
@@ -868,7 +1021,7 @@ fn state_op(change: &StateChange, mint: &dyn Fn(Option<&str>) -> String) -> Opti
             Some(StateOp::WindowOpened(window_to_wire(window, mint)))
         }
         StateChange::FocusChanged { focused: Some(id) } => Some(StateOp::WindowFocused { id: *id }),
-        StateChange::FocusChanged { focused: None } => None,
+        StateChange::FocusChanged { focused: None } | StateChange::WorkspacesChanged => None,
         // Active is exclusive shell-side (applying active:true clears
         // the rest), so one op carries the switch.
         StateChange::ActiveWorkspaceChanged { active, .. } => {
@@ -929,8 +1082,16 @@ fn apply_command(
                     None,
                 );
             };
-            model.set_active_workspace(workspace);
-            (CommandStatus::Applied, None)
+            if model.set_active_workspace(workspace) {
+                (CommandStatus::Applied, None)
+            } else {
+                (
+                    CommandStatus::Denied {
+                        reason: "workspace outside fixed range".to_owned(),
+                    },
+                    None,
+                )
+            }
         }
         CommandKind::ToggleOverview => {
             // Flip the hub-shared intent; the hub broadcasts the new
@@ -958,8 +1119,11 @@ fn apply_command(
         | CommandKind::WindowAction { .. }
         | CommandKind::ShortcutConsent { .. }
         | CommandKind::SwitchInputSource { .. }
+        | CommandKind::SetWindowIconGeometries { .. }
+        | CommandKind::SetWellbeingEffects { .. }
         | CommandKind::SetSwitcherThumbnails { .. }
         | CommandKind::SetSwitcherKeys { .. }
+        | CommandKind::MoveScreenshotPointer { .. }
         | CommandKind::SetScreenReader { .. }
         | CommandKind::SetInputSettings(_) => (CommandStatus::Applied, None),
         CommandKind::Lock => {
@@ -986,6 +1150,9 @@ pub struct PollOutcome {
     pub activated: Vec<u64>,
     /// Windows to ask to close.
     pub closed: Vec<u64>,
+    /// Workspaces left by shell focus commands; the window manager keeps
+    /// these alive through the next dynamic-workspace reconciliation.
+    pub departed_workspaces: Vec<u32>,
     /// Idle-lock timeout the shell asked for (`0` never), if any.
     pub idle_timeout: Option<u64>,
     /// Whether overview search is showing results, if the shell said.
@@ -993,10 +1160,13 @@ pub struct PollOutcome {
     /// Whether the overview shows the app grid, if the shell said.
     pub overview_app_grid: Option<bool>,
     /// A lock-screen password to verify, with its request id.
-    pub unlock: Option<(u64, tuna_shell_control::Secret)>,
+    pub unlock: Option<(crate::auth_owner::Origin, tuna_shell_control::Secret)>,
     /// GNOME input settings the shell sent, if any.
     pub input_settings: Option<tuna_shell_control::InputSettings>,
+    pub wellbeing_effects: Option<(bool, bool)>,
+    pub icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     pub screen_reader: Option<bool>,
+    pub screenshot_pointer: Option<(i32, i32)>,
     /// Accelerator grabs the shell sent, if they changed.
     pub accelerators: Option<Vec<tuna_shell_control::Accelerator>>,
     /// Window-menu actions to carry out.
@@ -1093,8 +1263,10 @@ pub fn is_private_dir(dir: &std::path::Path) -> bool {
 /// only mutates the model.
 pub struct ControlHub {
     listener: UnixListener,
+    readiness: crate::control_readiness::ControlReadiness,
     socket_path: std::path::PathBuf,
     sessions: Vec<Session<'static>>,
+    next_connection: Option<u64>,
     /// Peers accepted in an earlier round: their `Hello` is due now.
     pending: Vec<UnixStream>,
     /// Peers accepted this round: handshake next round, once their
@@ -1141,6 +1313,8 @@ pub struct ControlHub {
     /// Peer admission rule (#30); the runtime narrows it to the
     /// supervised shell's pid every tick.
     gate: PeerGate,
+    auth_owner: Option<AuthOwner>,
+    auth_owner_configured: bool,
     /// Peer pid per live session, index-aligned with `sessions`, so a
     /// gate change evicts sessions the new gate no longer admits.
     session_peers: Vec<Option<PeerCred>>,
@@ -1177,10 +1351,13 @@ impl ControlHub {
         let listener = UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let readiness = crate::control_readiness::ControlReadiness::new(&listener)?;
         Ok(Self {
             listener,
+            readiness,
             socket_path,
             sessions: Vec::new(),
+            next_connection: Some(1),
             pending: Vec::new(),
             fresh: Vec::new(),
             overview: std::rc::Rc::new(std::cell::Cell::new(false)),
@@ -1199,6 +1376,8 @@ impl ControlHub {
             store,
             seat: seat.to_owned(),
             gate: PeerGate::SameUser,
+            auth_owner: None,
+            auth_owner_configured: false,
             session_peers: Vec::new(),
             pending_peers: Vec::new(),
             fresh_peers: Vec::new(),
@@ -1212,6 +1391,100 @@ impl ControlHub {
         self.gate = gate;
     }
 
+    /// Auth authority follows the actual nonreused child generation. A change
+    /// closes old streams, including pending handshakes; inherited/reused PIDs
+    /// cannot continue an old auth lease. Standalone nonruntime hubs retain their
+    /// existing peer-gate behavior until this trusted owner API is configured.
+    pub fn set_auth_owner(&mut self, owner: Option<AuthOwner>) {
+        let owner = owner.filter(|owner| owner.pid != 0 && owner.generation != 0);
+        if self.auth_owner_configured && self.auth_owner == owner {
+            return;
+        }
+        self.auth_owner_configured = true;
+        self.auth_owner = owner;
+        self.sessions.clear();
+        self.session_peers.clear();
+        self.pending.clear();
+        self.pending_peers.clear();
+        self.fresh.clear();
+        self.fresh_peers.clear();
+    }
+    /// The trusted runtime must derive these values from its exact matched Slot.
+    /// This lease routes a conversation; it cannot grant unlock or free that Slot.
+    pub fn bind_auth_lease(
+        &mut self,
+        origin: crate::auth_owner::Origin,
+        serial: u64,
+        epoch: u64,
+        method: crate::auth_owner::MethodKind,
+    ) -> Option<AuthLease> {
+        let owner = self.auth_owner?;
+        if serial == 0 || epoch == u64::MAX || !self.origin_pending_live(origin) {
+            return None;
+        }
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.connection_id == origin.connection)?;
+        if session.auth_owner != Some(owner) || session.auth_lease.is_some() {
+            return None;
+        }
+        let lease = AuthLease {
+            origin,
+            serial,
+            epoch,
+            method,
+            owner,
+        };
+        session.auth_lease = Some(lease);
+        Some(lease)
+    }
+    /// Reply correlation may end before physical retirement. The routing lease
+    /// survives an early denial until explicit verified release or owner loss.
+    pub fn auth_lease_live(&self, lease: AuthLease) -> bool {
+        self.auth_owner == Some(lease.owner)
+            && self.sessions.iter().enumerate().any(|(index, session)| {
+                session.connection_id == lease.origin.connection
+                    && session.auth_lease == Some(lease)
+                    && session.auth_owner == Some(lease.owner)
+                    && PeerGate::Pid(lease.owner.pid).admits(self.session_peers[index], our_uid())
+                    && self.gate.admits(self.session_peers[index], our_uid())
+                    && session.conn.peer_live()
+            })
+    }
+    pub fn auth_lease_accepts(
+        &self,
+        lease: AuthLease,
+        origin: crate::auth_owner::Origin,
+        serial: u64,
+        epoch: u64,
+        method: crate::auth_owner::MethodKind,
+    ) -> bool {
+        lease.origin == origin
+            && lease.serial == serial
+            && lease.epoch == epoch
+            && lease.method == method
+            && self.auth_lease_live(lease)
+    }
+    /// A PAM receipt cannot release a fingerprint lease. Missing/old leases
+    /// produce no mutation; callers still own their exact method/Slot retirement.
+    pub fn retire_pam_auth_lease(
+        &mut self,
+        lease: AuthLease,
+        result: crate::pam_backend::Verification,
+    ) -> bool {
+        if lease.method == crate::auth_owner::MethodKind::Fingerprint || !result.may_retire() {
+            return false;
+        }
+        let Some(session) = self.sessions.iter_mut().find(|session| {
+            session.connection_id == lease.origin.connection && session.auth_lease == Some(lease)
+        }) else {
+            return false;
+        };
+        session.auth_lease = None;
+        true
+    }
+
     /// Current admission rule.
     pub fn peer_gate(&self) -> PeerGate {
         self.gate
@@ -1220,6 +1493,26 @@ impl ControlHub {
     /// Connections refused so far (gate or pending cap).
     pub fn refused_count(&self) -> u64 {
         self.refused
+    }
+
+    /// When [`poll`](Self::poll) must run again although no socket is
+    /// readable: at once for a command frame already buffered (one is
+    /// applied per poll), and after [`RETRY`] while a handshake is due
+    /// or a broadcast is still owed after backpressure. `None` when
+    /// only new socket input can change anything.
+    pub fn next_poll(&self, model: &StateModel) -> Option<std::time::Duration> {
+        if self.sessions.iter().any(Session::has_buffered_frame) {
+            return Some(std::time::Duration::ZERO);
+        }
+        let owed = self.overview.get() != self.overview_sent
+            || self.environment != self.environment_sent
+            || self.previews != self.previews_sent
+            || self.outputs != self.outputs_sent
+            || !self.switcher_queue.is_empty()
+            || !self.accelerator_queue.is_empty()
+            || !self.menu_queue.is_empty()
+            || self.sessions.iter().any(|s| s.owes_deltas(model));
+        (owed || self.pending_count() > 0).then_some(RETRY)
     }
 
     /// Accepted peers still waiting for their handshake round.
@@ -1274,22 +1567,40 @@ impl ControlHub {
 
     /// Answer a lock-screen password: `Applied` when it unlocked the
     /// session, `Denied` when it did not.
-    pub fn finish_unlock(&mut self, request: u64, unlocked: bool) {
-        let status = if unlocked {
-            CommandStatus::Applied
-        } else {
-            CommandStatus::Denied {
-                reason: "authentication failed".to_owned(),
-            }
+    pub fn origin_pending_live(&self, origin: crate::auth_owner::Origin) -> bool {
+        self.sessions.iter().enumerate().any(|(i, session)| {
+            session.connection_id == origin.connection
+                && session.unlock_pending == Some(origin.request)
+                && self.gate.admits(self.session_peers[i], our_uid())
+                && (!self.auth_owner_configured
+                    || self.auth_owner.is_some_and(|owner| {
+                        session.auth_owner == Some(owner)
+                            && PeerGate::Pid(owner.pid).admits(self.session_peers[i], our_uid())
+                    }))
+                && session.conn.peer_live()
+        })
+    }
+    pub fn finish_unlock(&mut self, origin: crate::auth_owner::Origin, unlocked: bool) {
+        let Some(index) = self.sessions.iter().position(|s| {
+            s.connection_id == origin.connection && s.unlock_pending == Some(origin.request)
+        }) else {
+            return;
         };
-        for session in &mut self.sessions {
-            if session.unlock_pending == Some(request) {
-                session.unlock_pending = None;
-                let _ = session.conn.write_frame(&Message::CommandResult {
-                    id: request,
-                    status: status.clone(),
-                });
-            }
+        let session = &mut self.sessions[index];
+        session.unlock_pending = None;
+        let sent = session.conn.write_frame(&Message::CommandResult {
+            id: origin.request,
+            status: if unlocked {
+                CommandStatus::Applied
+            } else {
+                CommandStatus::Denied {
+                    reason: "authentication failed".to_owned(),
+                }
+            },
+        });
+        if sent.is_err() {
+            self.sessions.swap_remove(index);
+            self.session_peers.swap_remove(index);
         }
     }
 
@@ -1342,6 +1653,12 @@ impl ControlHub {
         std::mem::take(&mut session.closed)
     }
 
+    pub(crate) fn readiness_source(
+        &self,
+    ) -> std::io::Result<calloop::generic::Generic<std::os::fd::OwnedFd>> {
+        self.readiness.source()
+    }
+
     /// One nonblocking round: accept waiting peers, advance pending
     /// handshakes, catch live sessions up, and apply one command frame
     /// per session. Returns the model ids of windows the shell activated
@@ -1357,7 +1674,10 @@ impl ControlHub {
                 self.refused += 1;
                 continue;
             }
-            let _ = stream.set_nonblocking(true);
+            if stream.set_nonblocking(true).is_err() || self.readiness.add(&stream).is_err() {
+                self.refused += 1;
+                continue;
+            }
             self.fresh.push(stream);
             self.fresh_peers.push(cred);
         }
@@ -1380,6 +1700,7 @@ impl ControlHub {
             let alive = {
                 let session = &mut self.sessions[i];
                 let before = model.focused();
+                let workspace_before = model.active_workspace();
                 let deltas_ok = session.emit_deltas(model).is_ok();
                 let cmd_ok = match session.handle_next(model) {
                     Ok(_) => true,
@@ -1387,6 +1708,13 @@ impl ControlHub {
                     Err(_) => false,
                 };
                 if deltas_ok && cmd_ok {
+                    let mut reply_ok = true;
+                    if model.active_workspace() != workspace_before {
+                        // FocusWorkspace changes the model directly; preserve
+                        // every departed slot so rapid commands cannot be
+                        // compacted into a snap-back.
+                        outcome.departed_workspaces.push(workspace_before);
+                    }
                     if model.focused() != before {
                         outcome.activated.extend(model.focused());
                     }
@@ -1417,15 +1745,42 @@ impl ControlHub {
                         outcome.overview_app_grid = Some(active);
                     }
                     if let Some(request) = session.unlock_request.take() {
-                        outcome.unlock = Some(request);
+                        let (request, password) = request;
+                        let origin = crate::auth_owner::Origin {
+                            connection: session.connection_id,
+                            request,
+                        };
+                        if outcome.unlock.is_none() {
+                            outcome.unlock = Some((origin, password));
+                        } else {
+                            session.unlock_pending = None;
+                            reply_ok = session
+                                .conn
+                                .write_frame(&Message::CommandResult {
+                                    id: request,
+                                    status: CommandStatus::Denied {
+                                        reason: "authentication failed".into(),
+                                    },
+                                })
+                                .is_ok();
+                        }
+                    }
+                    if let Some(geometries) = session.icon_geometries.take() {
+                        outcome.icon_geometries = Some(geometries);
+                    }
+                    if let Some(effects) = session.wellbeing_effects.take() {
+                        outcome.wellbeing_effects = Some(effects);
                     }
                     if let Some(settings) = session.input_settings.take() {
                         outcome.input_settings = Some(settings);
                     }
+                    if let Some(pos) = session.screenshot_pointer.take() {
+                        outcome.screenshot_pointer = Some(pos);
+                    }
                     if let Some(enabled) = session.screen_reader.take() {
                         outcome.screen_reader = Some(enabled);
                     }
-                    true
+                    reply_ok
                 } else {
                     false
                 }
@@ -1437,6 +1792,28 @@ impl ControlHub {
                 self.session_peers.swap_remove(i);
             }
         }
+        self.broadcast();
+        outcome
+    }
+
+    /// Send what the runtime queued or changed since the last
+    /// [`poll`](Self::poll) without reading commands: model deltas, the
+    /// lock flag, and every pending broadcast. The runtime calls this at
+    /// the end of each loop iteration so nothing waits for the next wake.
+    pub fn flush(&mut self, model: &StateModel) {
+        let mut i = 0;
+        while i < self.sessions.len() {
+            if self.sessions[i].emit_deltas(model).is_ok() {
+                i += 1;
+            } else {
+                self.sessions.swap_remove(i);
+                self.session_peers.swap_remove(i);
+            }
+        }
+        self.broadcast();
+    }
+
+    fn broadcast(&mut self) {
         // Broadcast overview flips (002 R1): best-effort per session,
         // staying dirty until every live session holds the intent.
         if self.overview.get() != self.overview_sent {
@@ -1521,7 +1898,6 @@ impl ControlHub {
                 let _ = session.send_window_menu(&menu);
             }
         }
-        outcome
     }
 
     /// Try each aged peer's handshake once. Peers were accepted a full
@@ -1550,6 +1926,12 @@ impl ControlHub {
             let overview = self.overview.clone();
             let locked = self.locked.clone();
             let open = overview.get();
+            let Some(connection_id) = self.next_connection else {
+                self.refused += 1;
+                continue;
+            };
+            // Reserve before handshake, so failed admissions cannot reuse an ID.
+            self.next_connection = connection_id.checked_add(1);
             if let Ok(mut session) =
                 Session::handshake_with(conn, model, validator, minter, overview, locked)
             {
@@ -1571,6 +1953,8 @@ impl ControlHub {
                         name: self.pointer_output.clone(),
                     });
                 }
+                session.connection_id = connection_id;
+                session.auth_owner = self.auth_owner;
                 self.sessions.push(session);
                 self.session_peers.push(peer);
             }
@@ -1583,5 +1967,584 @@ impl Drop for ControlHub {
     /// (which also removes it first).
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    #[test]
+    fn buffered_complete_frames_require_continuation_but_partial_frames_wait_for_io() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut conn = ControlConn::new(stream).unwrap();
+        conn.rbuf = vec![1, 0, 0];
+        assert!(!conn.has_buffered_frame());
+        conn.rbuf = vec![2, 0, 0, 0, 1];
+        assert!(!conn.has_buffered_frame());
+        conn.rbuf.push(2);
+        assert!(conn.has_buffered_frame());
+        conn.rbuf = (MAX_FRAME_BYTES as u32 + 1).to_le_bytes().to_vec();
+        assert!(
+            conn.has_buffered_frame(),
+            "invalid buffered header must be rejected without another socket edge"
+        );
+    }
+    #[test]
+    fn partial_buffer_and_unread_kernel_bytes_rewake_without_a_new_write() {
+        use std::os::fd::AsRawFd;
+
+        for old_edge in [true, false] {
+            let (receiver, mut sender) = UnixStream::pair().unwrap();
+            let mut conn = ControlConn::new(receiver).unwrap();
+            let readiness = if old_edge {
+                crate::control_readiness::ControlReadiness::old_edge_fixture(&conn.stream)
+            } else {
+                crate::control_readiness::ControlReadiness::new(&conn.stream)
+            }
+            .unwrap();
+            let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+            event_loop
+                .handle()
+                .insert_source(readiness.source().unwrap(), |_, fd, wakes| {
+                    crate::control_readiness::drain(fd).unwrap();
+                    *wakes += 1;
+                    Ok(calloop::PostAction::Continue)
+                })
+                .unwrap();
+            let first = Message::Command {
+                id: 1,
+                kind: CommandKind::SetIdleTimeout { ms: 10 },
+            };
+            // A valid maximum-count session command with multi-byte postcard
+            // integers spans the actual 8192-byte ControlConn read boundary.
+            let second = Message::Command {
+                id: 2,
+                kind: CommandKind::SetAccelerators {
+                    accelerators: vec![
+                        tuna_shell_control::Accelerator {
+                            action: u32::MAX,
+                            keysym: u32::MAX,
+                            mods: u32::MAX,
+                            modes: u32::MAX,
+                        };
+                        tuna_shell_control::MAX_ACCELERATORS
+                    ],
+                },
+            };
+            let first_frame = encode_frame(&first);
+            let second_frame = encode_frame(&second);
+            assert!(second_frame.len() > 8192 && second_frame.len() < MAX_FRAME_BYTES);
+            assert_eq!(decode_frame(&second_frame).unwrap(), second);
+            let bytes = [first_frame.as_slice(), second_frame.as_slice()].concat();
+            assert_eq!(
+                sender.write(&bytes).unwrap(),
+                bytes.len(),
+                "one bounded socket write"
+            );
+            let mut wakes = 0;
+            event_loop
+                .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+                .unwrap();
+            assert_eq!(wakes, 1);
+            assert_eq!(conn.read_frame().unwrap(), first);
+            assert_eq!(conn.rbuf.len(), 8192 - first_frame.len());
+            assert!(
+                !conn.has_buffered_frame(),
+                "partial userspace frame does not request continuation"
+            );
+            let mut unread: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(conn.stream.as_raw_fd(), libc::FIONREAD, &mut unread) },
+                0
+            );
+            assert!(
+                unread > 0,
+                "remaining bytes are already in the kernel, no future write needed"
+            );
+
+            // No sender write, external input, animation or runtime timer here.
+            event_loop
+                .dispatch(Some(Duration::ZERO), &mut wakes)
+                .unwrap();
+            assert_eq!(
+                wakes,
+                if old_edge { 1 } else { 2 },
+                "old inner edge loses the wake; fixed inner level preserves it"
+            );
+            let before_close = wakes;
+            assert_eq!(
+                conn.read_frame().unwrap(),
+                second,
+                "frame bytes and decode unchanged"
+            );
+            assert!(matches!(conn.read_frame(), Err(ControlError::WouldBlock)));
+            event_loop
+                .dispatch(Some(Duration::ZERO), &mut wakes)
+                .unwrap();
+            assert_eq!(
+                wakes, before_close,
+                "fully drained idle socket must not spin"
+            );
+
+            drop(sender);
+            event_loop
+                .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+                .unwrap();
+            assert_eq!(
+                wakes,
+                before_close + 1,
+                "peer closure must wake the registered receiver"
+            );
+            assert!(matches!(
+                conn.read_frame(),
+                Err(ControlError::Unexpected(_))
+            ));
+            drop(conn);
+            event_loop
+                .dispatch(Some(Duration::ZERO), &mut wakes)
+                .unwrap();
+            assert_eq!(
+                wakes,
+                before_close + 1,
+                "closed original socket must retire interest without a duplicate"
+            );
+        }
+    }
+
+    #[test]
+    fn hub_listener_hello_commands_and_peer_eviction_use_real_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("control.sock");
+        let mut hub = ControlHub::bind(
+            path.clone(),
+            std::rc::Rc::new(TokenStore::new()),
+            crate::SEAT_NAME,
+        )
+        .unwrap();
+        let mut model = StateModel::new();
+        let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+        event_loop
+            .handle()
+            .insert_source(hub.readiness_source().unwrap(), |_, fd, wakes| {
+                crate::control_readiness::drain(fd).unwrap();
+                *wakes += 1;
+                Ok(calloop::PostAction::Continue)
+            })
+            .unwrap();
+        let mut wakes = 0;
+        let mut client = UnixStream::connect(&path).unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 1, "listener must wake before a periodic tick");
+        hub.poll(&mut model);
+        assert!(
+            hub.next_poll(&model).is_some(),
+            "accepted Hello phase needs a bounded continuation"
+        );
+        client
+            .write_all(&encode_frame(&Message::Hello {
+                version: CURRENT_VERSION,
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 2, "accepted peer must wake for its Hello");
+        hub.poll(&mut model);
+        assert_eq!(hub.sessions.len(), 1);
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 2, "drained control must not spin");
+        client
+            .write_all(&encode_frame(&Message::Command {
+                id: 1,
+                kind: CommandKind::ToggleOverview,
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 3);
+        hub.poll(&mut model);
+        assert!(hub.overview_open());
+        client
+            .write_all(&encode_frame(&Message::Command {
+                id: 2,
+                kind: CommandKind::FocusWorkspace { workspace: 1 },
+            }))
+            .unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 4);
+        let outcome = hub.poll(&mut model);
+        assert_eq!(model.active_workspace(), 1);
+        assert_eq!(outcome.departed_workspaces, [0]);
+        hub.set_peer_gate(PeerGate::Closed);
+        hub.poll(&mut model);
+        assert!(hub.sessions.is_empty());
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut wakes)
+            .unwrap();
+        assert_eq!(wakes, 4, "evicted socket interest must retire");
+        // Concurrent forked test children may briefly inherit the peer until
+        // exec closes it. Still reject a persistent duplicate: WouldBlock is
+        // never closure, and queued replies are drained before checking EOF.
+        crate::control_readiness::test_peer::wait_for_peer_close(
+            &mut client,
+            Duration::from_secs(1),
+        )
+        .expect("readiness source must not retain a duplicate peer socket");
+    }
+}
+
+#[cfg(test)]
+mod auth_origin_tests {
+    use super::*;
+    use crate::auth_owner::Origin;
+    use std::net::Shutdown;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(is_private_dir(dir.path()));
+        let hub = ControlHub::bind(
+            dir.path().join("control"),
+            std::rc::Rc::new(TokenStore::new()),
+            crate::SEAT_NAME,
+        )
+        .unwrap();
+        (dir, hub, StateModel::new())
+    }
+    fn connect(hub: &mut ControlHub, model: &mut StateModel) -> ControlConn {
+        let mut client = ControlConn::new(UnixStream::connect(hub.socket_path()).unwrap()).unwrap();
+        client
+            .write_frame(&Message::Hello {
+                version: CURRENT_VERSION,
+            })
+            .unwrap();
+        for _ in 0..3 {
+            hub.poll(model);
+        }
+        drain(&mut client);
+        client
+    }
+    fn drain(client: &mut ControlConn) -> Vec<(u64, CommandStatus)> {
+        let mut out = Vec::new();
+        loop {
+            match client.read_frame() {
+                Ok(Message::CommandResult { id, status }) => out.push((id, status)),
+                Ok(_) => {}
+                Err(ControlError::WouldBlock) => return out,
+                Err(error) => panic!("unexpected control error {error:?}"),
+            }
+        }
+    }
+    fn submit(client: &mut ControlConn, id: u64) {
+        client
+            .write_frame(&Message::Command {
+                id,
+                kind: CommandKind::Unlock {
+                    password: tuna_shell_control::Secret("fixture-only".into()),
+                },
+            })
+            .unwrap();
+    }
+    #[test]
+    fn same_wire_id_routes_only_to_origin_and_all_excess_requests_are_denied() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut a = connect(&mut hub, &mut model);
+        let mut b = connect(&mut hub, &mut model);
+        submit(&mut a, 1);
+        submit(&mut b, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert!(hub.origin_pending_live(origin));
+        assert!(drain(&mut a).is_empty());
+        assert!(matches!(
+            drain(&mut b).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+        hub.finish_unlock(origin, true);
+        assert_eq!(drain(&mut a), [(1, CommandStatus::Applied)]);
+        assert!(drain(&mut b).is_empty());
+        submit(&mut a, 4);
+        let (first, _) = hub.poll(&mut model).unlock.unwrap();
+        submit(&mut a, 5);
+        assert!(hub.poll(&mut model).unlock.is_none());
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [(5, CommandStatus::Denied { .. })]
+        ));
+        assert!(hub.origin_pending_live(first));
+        hub.finish_unlock(first, false);
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [(4, CommandStatus::Denied { .. })]
+        ));
+    }
+    #[test]
+    fn eof_with_unread_bytes_compaction_reconnect_and_reused_ids_do_not_transfer_owner() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut a = connect(&mut hub, &mut model);
+        let mut b = connect(&mut hub, &mut model);
+        submit(&mut a, 1);
+        let (old, _) = hub.poll(&mut model).unlock.unwrap();
+        // Peer half-close must be observed even with unread commands ahead of EOF.
+        a.write_frame(&Message::Command {
+            id: 9,
+            kind: CommandKind::ToggleOverview,
+        })
+        .unwrap();
+        a.stream.shutdown(Shutdown::Write).unwrap();
+        assert!(!hub.origin_pending_live(old));
+        drop(a);
+        hub.poll(&mut model);
+        hub.poll(&mut model);
+        assert_eq!(hub.sessions.len(), 1);
+        submit(&mut b, 1);
+        let (other, _) = hub.poll(&mut model).unlock.unwrap();
+        assert_ne!(other.connection, old.connection);
+        assert!(hub.origin_pending_live(other));
+        let mut replacement = connect(&mut hub, &mut model);
+        submit(&mut replacement, 1);
+        let (fresh, _) = hub.poll(&mut model).unlock.unwrap();
+        assert_ne!(fresh.connection, old.connection);
+        assert_ne!(fresh.connection, other.connection);
+        hub.finish_unlock(old, true);
+        assert!(drain(&mut b).is_empty());
+        assert!(drain(&mut replacement).is_empty());
+        hub.finish_unlock(other, false);
+        hub.finish_unlock(fresh, false);
+        assert!(matches!(
+            drain(&mut b).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+        assert!(matches!(
+            drain(&mut replacement).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+    }
+    #[test]
+    fn changed_gate_and_unknown_connection_cannot_authorize_before_poll() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut client = connect(&mut hub, &mut model);
+        submit(&mut client, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert!(hub.origin_pending_live(origin));
+        assert!(!hub.origin_pending_live(Origin {
+            connection: origin.connection + 1,
+            ..origin
+        }));
+        hub.set_peer_gate(PeerGate::Closed);
+        assert!(!hub.origin_pending_live(origin));
+    }
+    #[test]
+    fn auth_lease_binds_socket_child_generation_and_retirement_not_reply() {
+        use crate::auth_owner::{MethodKind, Slot};
+        use crate::pam_backend::Verification;
+        let (_dir, mut hub, mut model) = setup();
+        let owner = AuthOwner {
+            pid: std::process::id(),
+            generation: 1,
+        };
+        hub.set_peer_gate(PeerGate::Pid(owner.pid));
+        hub.set_auth_owner(Some(owner));
+        let mut a = connect(&mut hub, &mut model);
+        submit(&mut a, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        let mut slot = Slot::default();
+        let attempt = slot
+            .begin_method(Some(origin), 7, MethodKind::PamConversation)
+            .unwrap();
+        let lease = hub
+            .bind_auth_lease(
+                origin,
+                attempt.serial,
+                attempt.epoch,
+                MethodKind::PamConversation,
+            )
+            .unwrap();
+        assert!(hub.auth_lease_accepts(
+            lease,
+            origin,
+            attempt.serial,
+            7,
+            MethodKind::PamConversation
+        ));
+        for (wrong_origin, serial, epoch, method) in [
+            (
+                Origin {
+                    connection: origin.connection + 1,
+                    ..origin
+                },
+                attempt.serial,
+                7,
+                MethodKind::PamConversation,
+            ),
+            (
+                Origin {
+                    request: 2,
+                    ..origin
+                },
+                attempt.serial,
+                7,
+                MethodKind::PamConversation,
+            ),
+            (origin, attempt.serial + 1, 7, MethodKind::PamConversation),
+            (origin, attempt.serial, 8, MethodKind::PamConversation),
+            (origin, attempt.serial, 7, MethodKind::Fingerprint),
+        ] {
+            assert!(!hub.auth_lease_accepts(lease, wrong_origin, serial, epoch, method));
+        }
+        hub.finish_unlock(origin, false);
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [(1, CommandStatus::Denied { .. })]
+        ));
+        assert!(
+            hub.auth_lease_live(lease),
+            "early command reply cannot release method ownership"
+        );
+        assert!(!hub.retire_pam_auth_lease(lease, Verification::Unretired));
+        assert!(slot.matches(attempt));
+        assert!(hub.retire_pam_auth_lease(
+            lease,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        assert!(slot.retire_pam_method(
+            attempt,
+            MethodKind::PamConversation,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        submit(&mut a, 1);
+        let (next_origin, _) = hub.poll(&mut model).unlock.unwrap();
+        let next = slot
+            .begin_method(Some(next_origin), 7, MethodKind::PamConversation)
+            .unwrap();
+        let next_lease = hub
+            .bind_auth_lease(
+                next_origin,
+                next.serial,
+                next.epoch,
+                MethodKind::PamConversation,
+            )
+            .unwrap();
+        assert!(!hub.retire_pam_auth_lease(
+            lease,
+            Verification::Retired {
+                authenticated: true
+            }
+        ));
+        assert!(hub.auth_lease_live(next_lease));
+        hub.set_auth_owner(Some(AuthOwner {
+            generation: 2,
+            ..owner
+        }));
+        assert!(!hub.origin_pending_live(next_origin));
+        assert!(!hub.auth_lease_live(next_lease));
+        crate::control_readiness::test_peer::wait_for_peer_close(
+            &mut a.stream,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut b = connect(&mut hub, &mut model);
+        submit(&mut b, 1);
+        let (fresh_origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert_ne!(fresh_origin.connection, next_origin.connection);
+        // Origin loss is cancellation, not retirement: no newer slot yet.
+        assert!(slot
+            .begin_method(Some(fresh_origin), 7, MethodKind::Password)
+            .is_none());
+        assert!(slot.retire_pam_method(
+            next,
+            MethodKind::PamConversation,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
+        let fresh = slot
+            .begin_method(Some(fresh_origin), 7, MethodKind::PamConversation)
+            .unwrap();
+        let fresh_lease = hub
+            .bind_auth_lease(fresh_origin, fresh.serial, 7, MethodKind::PamConversation)
+            .unwrap();
+        assert!(!hub.retire_pam_auth_lease(
+            next_lease,
+            Verification::Retired {
+                authenticated: true
+            }
+        ));
+        assert!(hub.auth_lease_live(fresh_lease));
+        b.stream.shutdown(Shutdown::Write).unwrap();
+        assert!(!hub.auth_lease_live(fresh_lease));
+        hub.set_auth_owner(None);
+        assert!(!hub.origin_pending_live(fresh_origin));
+        assert!(slot.matches(fresh));
+    }
+    #[test]
+    fn missing_child_identity_cannot_bind_an_auth_lease() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut client = connect(&mut hub, &mut model);
+        submit(&mut client, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert!(hub
+            .bind_auth_lease(origin, 1, 7, crate::auth_owner::MethodKind::Password)
+            .is_none());
+        hub.set_auth_owner(Some(AuthOwner {
+            pid: std::process::id() + 1,
+            generation: 1,
+        }));
+        let mut wrong_peer = connect(&mut hub, &mut model);
+        submit(&mut wrong_peer, 1);
+        let (wrong_origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert!(
+            !hub.origin_pending_live(wrong_origin),
+            "SameUser gate cannot substitute for the current child credentials"
+        );
+        assert!(hub
+            .bind_auth_lease(wrong_origin, 1, 7, crate::auth_owner::MethodKind::Password)
+            .is_none());
+        hub.set_auth_owner(Some(AuthOwner {
+            pid: std::process::id(),
+            generation: 0,
+        }));
+        assert!(!hub.origin_pending_live(origin));
+    }
+    #[test]
+    fn connection_id_overflow_refuses_future_peers_without_reuse() {
+        let (_dir, mut hub, mut model) = setup();
+        hub.next_connection = Some(u64::MAX);
+        let mut a = connect(&mut hub, &mut model);
+        submit(&mut a, 1);
+        let (origin, _) = hub.poll(&mut model).unlock.unwrap();
+        assert_eq!(origin.connection, u64::MAX);
+        let mut b = UnixStream::connect(hub.socket_path()).unwrap();
+        b.write_all(&encode_frame(&Message::Hello {
+            version: CURRENT_VERSION,
+        }))
+        .unwrap();
+        for _ in 0..3 {
+            hub.poll(&mut model);
+        }
+        crate::control_readiness::test_peer::wait_for_peer_close(
+            &mut b,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(hub.sessions.len(), 1);
+        assert!(hub.next_connection.is_none());
+        assert!(hub.refused_count() > 0);
     }
 }

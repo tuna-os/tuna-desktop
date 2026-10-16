@@ -19,6 +19,8 @@ pids="$!"
 for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.2; done
 tuna-compositor --version >/out/version.txt
 rpm -q niri gtk4 libadwaita mesa-dri-drivers >/out/runtime-versions.txt
+python3 /nref/check-runtime.py >/out/runtime-admission.json
+xdotool getdisplaygeometry >/dev/null 2>&1 || { echo 'candidate Xvfb is unavailable' >&2; exit 1; }
 tuna-compositor --backend winit --width 1280 --height 800 --socket tuna-scroll-compare --shell-bin /candidate/usr/bin/tuna-shell-gtk >/out/tuna.log 2>&1 &
 pids="$pids $!"
 wid=""

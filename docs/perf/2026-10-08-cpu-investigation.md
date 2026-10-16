@@ -111,8 +111,23 @@ At idle this costs only about 62 wakeups/s and is invisible (0.48% idle mean). A
 | R3 | Keep multi-rectangle damage (finding 4) | Large for scattered small updates (clock plus app). | No, but needs careful tests. |
 | R4 | Change-driven `tick()` (finding 5): cache the drop file by inotify or identity, skip scene build when nothing committed, dirty-flag `publish_cast_outputs` | Scales with wakeup rate. Moderate under busy clients. | Small. |
 | R5 | Profile and fix the shell's per-window/per-frame work (finding 6) | Up to 22% during window churn. | Needs a profile first. |
-| R6 | Replace shell 16/100/250 ms polling timers with fd and signal sources | Wakeups and power more than CPU. | No. |
+| R6 | Replace shell 16/100/250 ms polling timers with fd and signal sources (done since: the control socket, notifications, DND, clock, tray and IBus panel wait on fds, signals and one-shot deadlines) | Wakeups and power more than CPU. | No. |
 | R7 | Throttle frame callbacks for windows on inactive workspaces or fully occluded | Stops hidden animating clients driving frames. | Needs a policy decision (GNOME parity). |
+
+## Before numbers for these fixes (2026-10-08)
+
+[Paired run 37788482241](https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241) was dispatched from this branch. As the lane requires, it measured the latest trusted main package (run 37713271797, source `c9be27dd`), not these fixes. It uses three fresh VM pairs per profile:
+
+| Profile, pair | GNOME CPU p50 / p95 | Tuna CPU p50 / p95 | GNOME overview p50 / p95 (ms) | Tuna overview p50 / p95 (ms) |
+|---|---:|---:|---:|---:|
+| diagnostic, 1 | 17.0 / 63.0 | 50.9 / 98.0 | 166 / 503 | 428 / 781 |
+| diagnostic, 2 | 17.9 / 65.0 | 51.0 / 96.0 | 161 / 394 | 353 / 783 |
+| diagnostic, 3 | 18.0 / 60.0 | 52.0 / 95.0 | 167 / 652 | 356 / 616 |
+| stock, 1 | 18.0 / 68.0 | 53.0 / 93.0 | 211 / 495 | 395 / 658 |
+| stock, 2 | 18.0 / 70.0 | 53.0 / 93.0 | 167 / 489 | 339 / 500 |
+| stock, 3 | 19.0 / 64.0 | 51.0 / 91.0 | 165 / 547 | 409 / 656 |
+
+CPU is whole-run user CPU in percent of one core, including startup and workload. Overview figures are QMP-observed upper bounds. Current main uses about 3× GNOME's median CPU, down from 8× in the run quoted in #503. The overview median stays about 2.2× GNOME's, which is consistent with finding 1.
 
 ## Verification still needed
 

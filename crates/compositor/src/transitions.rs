@@ -1,14 +1,14 @@
 //! GNOME 51's desktop-level transitions, drawn at render time: the lock
-//! curtain (`screenShield.js`), the screenshot flash (`screenshot.js`
-//! `Flashspot`), the hot-corner ripples (`ripples.js`), the startup
-//! reveal (`layout.js` `_startupAnimation`) and the monitor-change
-//! transition (`layout.js` `ScreenTransition`).
+//! curtain (`screenShield.js`), the hot-corner ripples (`ripples.js`),
+//! the startup reveal (`layout.js` `_startupAnimation`) and the
+//! monitor-change transition (`layout.js` `ScreenTransition`).
 //!
 //! Each effect is a pure function of the time since it started, sampled
 //! once per frame, and is dropped the moment it ends: an idle desktop
 //! holds no effect, so the native backend's frame signature is unchanged
 //! and nothing repaints. The wallpaper crossfade lives with the
-//! wallpaper (`crate::wallpaper`), which owns both textures.
+//! wallpaper (`crate::wallpaper`), which owns both textures; the
+//! screenshot flash is `crate::screenshot_flash`.
 //!
 //! The curtain never decides what may show: content stays hidden for as
 //! long as the session is locked ([`crate::lock::content_visible`]).
@@ -30,18 +30,13 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::Color32F;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
+use crate::cursor::{ripple_ring, ripples_end_ms, RIPPLES};
 use crate::runtime::View;
 
 /// Clutter's `EASE_OUT_QUAD` over `t` in 0..1.
 pub fn ease_out_quad(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t) * (1.0 - t)
-}
-
-/// Clutter's `EASE_IN_QUAD` over `t` in 0..1.
-pub fn ease_in_quad(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    t * t
 }
 
 fn ms(since: Duration) -> f64 {
@@ -206,45 +201,9 @@ impl Curtain {
     }
 }
 
-/// GNOME's `FLASHSPOT_ANIMATION_OUT_TIME`.
-pub const FLASH_MS: f64 = 500.0;
-
-/// White over the captured area, easing out (`.flashspot`).
-pub fn flash_alpha(elapsed_ms: f64) -> Option<f32> {
-    (elapsed_ms < FLASH_MS).then(|| (1.0 - ease_out_quad(elapsed_ms / FLASH_MS)) as f32)
-}
-
-/// `ripples.js`: three rings, each `(delay, duration, start scale,
-/// start opacity, final scale)`.
-pub const RIPPLES: [(f64, f64, f64, f64, f64); 3] = [
-    (0.0, 830.0, 0.25, 1.0, 1.5),
-    (50.0, 1000.0, 0.0, 0.7, 1.25),
-    (350.0, 1000.0, 0.0, 0.3, 1.0),
-];
-/// `.ripple-box`: 50px plus its 2px border.
+/// `.ripple-box`: 50px plus its 2px border. The rings' timing is
+/// `ripples.js`'s, shared with locate-pointer (`crate::cursor::RIPPLES`).
 pub const RIPPLE_SIZE: i32 = 52;
-
-/// One ring's `(scale, opacity)` `elapsed_ms` after the corner fired,
-/// or `None` once it has finished. A ring shows at its start values
-/// through its delay (GNOME sets them before easing).
-pub fn ripple_ring(ring: usize, elapsed_ms: f64) -> Option<(f64, f64)> {
-    let (delay, duration, start_scale, start_opacity, final_scale) = *RIPPLES.get(ring)?;
-    if elapsed_ms >= delay + duration {
-        return None;
-    }
-    let p = ((elapsed_ms - delay) / duration).clamp(0.0, 1.0);
-    let opacity = start_opacity.sqrt() * (1.0 - ease_in_quad(p));
-    let scale = start_scale + (final_scale - start_scale) * ease_out_quad(p);
-    Some((scale, opacity))
-}
-
-/// The longest ring's end.
-fn ripples_end() -> f64 {
-    RIPPLES
-        .iter()
-        .map(|(delay, duration, ..)| delay + duration)
-        .fold(0.0, f64::max)
-}
 
 /// `.ripple-box` as premultiplied ARGB8888: white at 20% in a quarter
 /// disc whose corner sits at the top-left (`mirrored`: top-right), with
@@ -361,20 +320,18 @@ pub struct Transitions {
     now: Duration,
     born: Duration,
     curtain: Curtain,
-    flash: Option<(Rectangle<i32, Logical>, Duration)>,
     ripples: Option<(Point<i32, Logical>, bool, Duration)>,
     revealed: Option<Duration>,
     screen: Option<(Vec<Snapshot>, Duration)>,
     ripple_textures: [Option<MemoryRenderBuffer>; 2],
-    ids: [Id; 2],
-    stats: [Counter; 5],
+    cover: Id,
+    stats: [Counter; 4],
 }
 
 const CURTAIN: usize = 0;
-const FLASH: usize = 1;
-const RIPPLE: usize = 2;
-const STARTUP: usize = 3;
-const SCREEN: usize = 4;
+const RIPPLE: usize = 1;
+const STARTUP: usize = 2;
+const SCREEN: usize = 3;
 
 impl std::fmt::Debug for Transitions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -393,13 +350,12 @@ impl Transitions {
             now,
             born: now,
             curtain: Curtain::default(),
-            flash: None,
             ripples: None,
             revealed: None,
             screen: None,
             ripple_textures: [None, None],
-            ids: [Id::new(), Id::new()],
-            stats: [Counter::default(); 5],
+            cover: Id::new(),
+            stats: [Counter::default(); 4],
         }
     }
 
@@ -407,7 +363,6 @@ impl Transitions {
     pub fn set_policy(&mut self, policy: MotionPolicy) {
         self.policy = policy;
         if !policy.allows_fades() {
-            self.flash = None;
             self.screen = None;
         }
         if !policy.allows_motion() {
@@ -441,20 +396,11 @@ impl Transitions {
         let cover = self.startup_cover();
         let startup = cover.is_some_and(|a| a < 1.0 && a > 0.0);
         self.stats[STARTUP].sample(startup, cover.map(f64::from));
-        if self
-            .flash
-            .is_some_and(|(_, at)| flash_alpha(self.elapsed(at)).is_none())
-        {
-            self.flash = None;
-        }
-        let flash = self
-            .flash
-            .and_then(|(_, at)| flash_alpha(self.elapsed(at)))
-            .map(f64::from);
-        self.stats[FLASH].sample(self.flash.is_some(), flash);
-        if self
-            .ripples
-            .is_some_and(|(_, _, at)| self.elapsed(at) >= ripples_end())
+        // Ripples are chrome: never over a lock.
+        if locked
+            || self
+                .ripples
+                .is_some_and(|(_, _, at)| self.elapsed(at) >= ripples_end_ms())
         {
             self.ripples = None;
         }
@@ -485,13 +431,16 @@ impl Transitions {
         self.curtain.frame(self.now)
     }
 
-    /// Flash `area` (global logical) white, as GNOME does when a
-    /// screenshot asks for it. Nothing when animations are off.
-    pub fn flash(&mut self, area: Rectangle<i32, Logical>) {
-        if self.policy.allows_fades() && !area.is_empty() {
-            self.flash = Some((area, self.now));
-            self.stats[FLASH].started += 1;
-        }
+    /// Whether an effect still needs frames (as of the last
+    /// [`advance`](Self::advance)): a slide, its wait for the lock
+    /// surface, the startup cover, ripples or the old screen. The frame
+    /// after one ends draws without it.
+    pub fn running(&self) -> bool {
+        self.curtain.waiting.is_some()
+            || self.curtain.leg.is_some()
+            || self.startup_cover().is_some()
+            || self.ripples.is_some()
+            || self.screen.is_some()
     }
 
     /// Ripple out of the hot corner at `corner` (global logical);
@@ -559,27 +508,10 @@ impl Transitions {
         let whole = Rectangle::from_size(size);
         if let Some(alpha) = self.startup_cover() {
             overlay.solids.push(solid(
-                &self.ids[0],
+                &self.cover,
                 whole,
                 Color32F::new(0.0, 0.0, 0.0, alpha),
             ));
-        }
-        if let Some((area, at)) = self.flash {
-            if let Some(alpha) = flash_alpha(self.elapsed(at)) {
-                let loc = view.physical(f64::from(area.loc.x), f64::from(area.loc.y));
-                let end = view.physical(
-                    f64::from(area.loc.x + area.size.w),
-                    f64::from(area.loc.y + area.size.h),
-                );
-                let rect = Rectangle::new(loc, (end.x - loc.x, end.y - loc.y).into());
-                if let Some(rect) = rect.intersection(whole) {
-                    overlay.solids.push(solid(
-                        &self.ids[1],
-                        rect,
-                        Color32F::new(alpha, alpha, alpha, alpha),
-                    ));
-                }
-            }
         }
         if let Some((snapshots, at)) = self.screen.as_ref().filter(|_| !locked) {
             let alpha = screen_alpha(self.elapsed(*at));
@@ -660,7 +592,6 @@ impl Transitions {
         curtain["alpha"] = serde_json::json!(self.curtain().map(|c| c.alpha));
         serde_json::json!({
             "lock_curtain": curtain,
-            "screenshot_flash": self.stats[FLASH].json(),
             "hot_corner_ripples": self.stats[RIPPLE].json(),
             "startup": self.stats[STARTUP].json(),
             "monitor_change": self.stats[SCREEN].json(),
@@ -690,9 +621,7 @@ mod tests {
     #[test]
     fn curves_match_clutter() {
         assert_eq!(ease_out_quad(0.5), 0.75);
-        assert_eq!(ease_in_quad(0.5), 0.25);
         assert_eq!(ease_out_quad(2.0), 1.0);
-        assert_eq!(ease_in_quad(-1.0), 0.0);
     }
 
     #[test]
@@ -774,26 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn flash_eases_out_over_500_ms() {
-        assert_eq!(flash_alpha(0.0), Some(1.0));
-        assert_eq!(flash_alpha(250.0), Some(0.25));
-        assert_eq!(flash_alpha(500.0), None);
-    }
-
-    #[test]
-    fn ripples_follow_gnome_rings() {
-        // Ring one starts at a quarter size, full opacity.
-        assert_eq!(ripple_ring(0, 0.0), Some((0.25, 1.0)));
-        // Ring three waits 350 ms at its start values.
-        assert_eq!(ripple_ring(2, 100.0), Some((0.0, 0.3f64.sqrt())));
-        let (scale, opacity) = ripple_ring(1, 550.0).unwrap();
-        assert!((scale - (0.0 + 1.25 * 0.75)).abs() < 1e-9);
-        assert!((opacity - 0.7f64.sqrt() * 0.75).abs() < 1e-9);
-        assert_eq!(ripple_ring(0, 830.0), None);
-        assert_eq!(ripples_end(), 1350.0);
-    }
-
-    #[test]
     fn ripple_box_is_a_translucent_quarter_disc() {
         let px = ripple_pixels(52, false);
         let alpha = |x: u32, y: u32| px[((y * 52 + x) * 4 + 3) as usize];
@@ -831,22 +740,19 @@ mod tests {
         let t = Duration::ZERO;
         let mut fx = Transitions::new(t);
         fx.advance(t, false, false, true);
-        fx.flash(Rectangle::new((0, 0).into(), (10, 10).into()));
         fx.ripple((0, 0).into(), false);
         fx.advance(at(t, 100), false, false, true);
-        assert!(fx.stats[FLASH].active && fx.stats[RIPPLE].active);
+        assert!(fx.stats[RIPPLE].active);
+        assert!(fx.running());
         fx.advance(at(t, 2000), false, false, true);
-        assert!(
-            fx.flash.is_none() && fx.ripples.is_none(),
-            "idle holds no effect"
-        );
+        assert!(fx.ripples.is_none(), "idle holds no effect");
         assert!(fx.startup_cover().is_none());
+        assert!(!fx.running(), "an idle desktop needs no frames");
         fx.set_policy(policy(MotionLevel::Off));
-        fx.flash(Rectangle::new((0, 0).into(), (10, 10).into()));
         fx.ripple((0, 0).into(), false);
         assert!(!fx.wants_screen_snapshot());
-        assert!(fx.flash.is_none() && fx.ripples.is_none());
-        assert_eq!(fx.stats[FLASH].started, 1);
+        assert!(fx.ripples.is_none());
+        assert_eq!(fx.stats[RIPPLE].started, 1);
     }
 
     #[test]
@@ -855,18 +761,18 @@ mod tests {
         let mut fx = Transitions::new(t);
         fx.set_policy(policy(MotionLevel::FadeOnly));
         fx.advance(t, false, false, true);
-        fx.flash(Rectangle::new((0, 0).into(), (10, 10).into()));
+        fx.screen_changed(vec![(None, 2, 2, vec![0; 16])]);
         fx.ripple((0, 0).into(), false);
-        assert!(fx.flash.is_some(), "the flash is a fade");
+        assert!(fx.screen.is_some(), "the monitor change is a fade");
         assert!(fx.ripples.is_none(), "ripples are motion");
         let mut fx = Transitions::new(t);
         fx.set_policy(MotionPolicy::new(MotionLevel::Full, 2.0));
         fx.advance(t, false, false, true);
-        fx.flash(Rectangle::new((0, 0).into(), (10, 10).into()));
-        fx.advance(at(t, 999), false, false, true);
-        assert!(fx.flash.is_some(), "500 ms at factor 2 lasts 1000 ms");
-        fx.advance(at(t, 1000), false, false, true);
-        assert!(fx.flash.is_none());
+        fx.screen_changed(vec![(None, 2, 2, vec![0; 16])]);
+        fx.advance(at(t, 1499), false, false, true);
+        assert!(fx.screen.is_some(), "750 ms at factor 2 lasts 1500 ms");
+        fx.advance(at(t, 1500), false, false, true);
+        assert!(fx.screen.is_none());
         let mut curtain = Curtain::default();
         curtain.observe(true, true, t, MotionPolicy::new(MotionLevel::Full, 2.0));
         assert!((curtain.leg.unwrap().duration - 500.0).abs() < 1e-9);
@@ -892,13 +798,14 @@ mod tests {
     }
 
     #[test]
-    fn the_old_screen_never_shows_over_a_lock() {
+    fn the_old_screen_and_ripples_never_show_over_a_lock() {
         let t = Duration::ZERO;
         let mut fx = Transitions::new(t);
         fx.advance(t, false, false, true);
         fx.screen_changed(vec![(None, 2, 2, vec![0; 16])]);
-        assert!(fx.screen.is_some());
+        fx.ripple((0, 0).into(), false);
+        assert!(fx.screen.is_some() && fx.ripples.is_some());
         fx.advance(at(t, 100), true, false, true);
-        assert!(fx.screen.is_none());
+        assert!(fx.screen.is_none() && fx.ripples.is_none());
     }
 }

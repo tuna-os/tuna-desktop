@@ -47,7 +47,7 @@ fn full_sign_in_walkthrough() {
                 },
                 Step::Exchange {
                     expect_kind: "start",
-                    reply: None,
+                    reply: Some(Response::Success),
                 },
             ],
         )

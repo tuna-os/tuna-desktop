@@ -69,7 +69,9 @@ use crate::favorites::Favorites;
 use crate::icons::Artwork;
 use crate::intake::NotificationBus;
 use crate::keyboard::{KeyAction, XkbFeed};
+use crate::lockdown::LockdownBus;
 use crate::model::ShellModel;
+use crate::notification_policy::GioPolicyStore;
 use crate::notifications::{NotificationAction, NotificationCenter, Urgency};
 use crate::overview::{
     banner_hit, banner_strip_height, blit_glyph, glyph_index, overview_press, paint_panel,
@@ -161,7 +163,21 @@ impl fmt::Display for PanelError {
     }
 }
 
-impl std::error::Error for PanelError {}
+impl std::error::Error for PanelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect(err) => Some(err),
+            Self::Registry(err) => Some(err),
+            Self::NoCompositor(err) => Some(err),
+            Self::NoLayerShell(err) => Some(err),
+            Self::NoShm(err) => Some(err),
+            Self::NoSeat(err) => Some(err),
+            Self::Dispatch(err) => Some(err),
+            Self::Control(err) => Some(err),
+            Self::Flush(_) => None,
+        }
+    }
+}
 
 /// Application state driven by the Wayland event queue.
 pub struct ShellHost {
@@ -278,6 +294,8 @@ pub struct ShellHost {
     watcher: WatcherBus,
     /// D-Bus edge behind the notification center.
     notifications: NotificationBus,
+    /// D-Bus edge behind the portal lockdown publisher.
+    lockdown: LockdownBus,
     /// Resolved icon artwork keyed (theme, name, size). Cleared
     /// wholesale when the snapshot theme changes.
     icon_cache: std::collections::HashMap<(String, String, u32), Artwork>,
@@ -897,7 +915,16 @@ impl ShellHost {
             apps.clone() as Arc<dyn crate::search::SearchProvider>,
         ]);
         let center = Arc::new(Mutex::new(NotificationCenter::new()));
-        let notifications = NotificationBus::new(center.clone());
+        // GNOME Settings' notification policy, read live on every
+        // arrival (#348).
+        if let Ok(mut filed) = center.lock() {
+            filed.set_policy(Arc::new(GioPolicyStore::new()));
+        }
+        let mut notifications = NotificationBus::new(center.clone());
+        // The policy store uses GSettings: file wire arrivals where the
+        // slow tick pumps the GLib context (`TileSet::refresh`), never
+        // on a zbus thread.
+        notifications.deliver_in(gio::glib::MainContext::default());
         Self {
             model: ShellModel::new(),
             panel,
@@ -948,6 +975,7 @@ impl ShellHost {
             pending_presses: Vec::new(),
             watcher: WatcherBus::new(),
             notifications,
+            lockdown: LockdownBus::new(),
             icon_cache: std::collections::HashMap::new(),
             icon_theme: crate::settings::DEFAULT_ICON_THEME.to_owned(),
             pending_dock: Vec::new(),
@@ -1749,6 +1777,7 @@ impl ShellHost {
             self.sync_icon_theme();
             self.poll_indicators();
             self.poll_notifications();
+            self.poll_lockdown();
             // Extension scripts run here, off the paint and event
             // paths: the drive reloads changed scripts and refreshes
             // cached outputs, queued presses drain into handlers,
@@ -3292,6 +3321,22 @@ impl ShellHost {
     /// the tick only ensures the name. Silent no-op without a bus.
     fn poll_notifications(&mut self) {
         self.notifications.ensure();
+    }
+
+    /// Publish the privacy kill-switches to the portal bus: take the
+    /// Tuna backend role when free, then re-sync from GSettings and
+    /// broadcast whatever moved. Silent no-op without a bus.
+    fn poll_lockdown(&mut self) {
+        self.lockdown.ensure();
+        self.lockdown_with(&crate::settings::GioBackend);
+    }
+
+    /// [`poll_lockdown`](Self::poll_lockdown) against an explicit
+    /// backend (tests substitute a fake; the tick passes the
+    /// platform backend). Split out so the settings leg is testable
+    /// without a bus.
+    fn lockdown_with(&mut self, backend: &dyn crate::settings::SettingsBackend) {
+        self.lockdown.poll(backend);
     }
 
     /// Open an indicator's menu, fetching its rows first. An empty
@@ -8498,6 +8543,8 @@ mod tests {
                 icon_pixmap: Vec::new(),
                 attention_name: String::new(),
                 attention_pixmap: Vec::new(),
+                tooltip_title: String::new(),
+                tooltip_body: String::new(),
             }
         }
 

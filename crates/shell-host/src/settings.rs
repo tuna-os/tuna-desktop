@@ -70,6 +70,18 @@ pub trait SettingsBackend {
     /// key, or bus is unavailable. The caller keeps its snapshot on
     /// `false` — never reset, never panic.
     fn set_string(&self, schema: &str, key: &str, value: &str) -> bool;
+    /// Read boolean `key` from `schema`, or `None` when absent,
+    /// unreadable, or not a boolean. Defaults to unsupported so
+    /// string-only test doubles keep compiling unchanged.
+    fn boolean(&self, _schema: &str, _key: &str) -> Option<bool> {
+        None
+    }
+    /// Write boolean `value` to `key` in `schema`: `false` when the
+    /// schema, key, or bus is unavailable. Defaults to refused, like
+    /// an unreachable service.
+    fn set_boolean(&self, _schema: &str, _key: &str, _value: bool) -> bool {
+        false
+    }
 }
 
 /// Platform settings backend over `gio::Settings`.
@@ -112,6 +124,30 @@ impl SettingsBackend for GioBackend {
         }
         settings.set_string(key, value).is_ok()
     }
+
+    fn boolean(&self, schema: &str, key: &str) -> Option<bool> {
+        let settings = Self::settings_for(schema)?;
+        let known = settings.settings_schema()?.has_key(key);
+        if !known {
+            return None;
+        }
+        // A non-boolean key reads through its variant instead of
+        // logging a critical from the typed getter.
+        settings.value(key).get::<bool>()
+    }
+
+    fn set_boolean(&self, schema: &str, key: &str, value: bool) -> bool {
+        let Some(settings) = Self::settings_for(schema) else {
+            return false;
+        };
+        let known = settings
+            .settings_schema()
+            .is_some_and(|schema| schema.has_key(key));
+        if !known {
+            return false;
+        }
+        settings.set_boolean(key, value).is_ok()
+    }
 }
 
 /// In-memory backend for tests. Interior mutability keeps the
@@ -145,6 +181,26 @@ impl SettingsBackend for MapBackend {
     }
 
     fn set_string(&self, schema: &str, key: &str, value: &str) -> bool {
+        self.values
+            .borrow_mut()
+            .insert((schema.to_string(), key.to_string()), value.to_string());
+        true
+    }
+
+    fn boolean(&self, schema: &str, key: &str) -> Option<bool> {
+        match self
+            .values
+            .borrow()
+            .get(&(schema.to_string(), key.to_string()))
+            .map(|value| value.trim())
+        {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        }
+    }
+
+    fn set_boolean(&self, schema: &str, key: &str, value: bool) -> bool {
         self.values
             .borrow_mut()
             .insert((schema.to_string(), key.to_string()), value.to_string());
@@ -191,6 +247,59 @@ pub fn write_wallpaper_uri(backend: &dyn SettingsBackend, uri: &str) -> bool {
         return false;
     }
     backend.set_string(BACKGROUND_SCHEMA, PICTURE_URI_KEY, uri)
+}
+
+/// Privacy device-policy schema: GNOME's own kill-switches, all
+/// defaulting to `false` (allowed). Tuna enforces them; see
+/// [`crate::lockdown`] (portal denial) and the shell's PipeWire
+/// graph enforcer.
+pub const PRIVACY_SCHEMA: &str = "org.gnome.desktop.privacy";
+/// Master camera switch (GNOME also gates per-app camera rows on it).
+pub const DISABLE_CAMERA_KEY: &str = "disable-camera";
+/// Master microphone switch (no GNOME enforcer; Tuna mutes sources).
+pub const DISABLE_MICROPHONE_KEY: &str = "disable-microphone";
+/// Master sound-output switch (no GNOME enforcer; Tuna mutes sinks).
+pub const DISABLE_SOUND_OUTPUT_KEY: &str = "disable-sound-output";
+
+/// Snapshot of the three device kill-switches. `false` everywhere is
+/// the GNOME default: everything allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrivacyPolicy {
+    /// Camera access denied (portal + capture graph).
+    pub camera_disabled: bool,
+    /// Microphone capture denied (sources muted).
+    pub microphone_disabled: bool,
+    /// Sound output denied (sinks muted).
+    pub sound_output_disabled: bool,
+}
+
+/// Refresh a privacy snapshot from a backend. Unknown or absent
+/// values keep their current settings — never reset, never panic.
+pub fn refresh_privacy(policy: &mut PrivacyPolicy, backend: &dyn SettingsBackend) {
+    if let Some(disabled) = backend.boolean(PRIVACY_SCHEMA, DISABLE_CAMERA_KEY) {
+        policy.camera_disabled = disabled;
+    }
+    if let Some(disabled) = backend.boolean(PRIVACY_SCHEMA, DISABLE_MICROPHONE_KEY) {
+        policy.microphone_disabled = disabled;
+    }
+    if let Some(disabled) = backend.boolean(PRIVACY_SCHEMA, DISABLE_SOUND_OUTPUT_KEY) {
+        policy.sound_output_disabled = disabled;
+    }
+}
+
+/// Write the camera kill-switch. `false` keeps the caller's snapshot.
+pub fn write_disable_camera(backend: &dyn SettingsBackend, disabled: bool) -> bool {
+    backend.set_boolean(PRIVACY_SCHEMA, DISABLE_CAMERA_KEY, disabled)
+}
+
+/// Write the microphone kill-switch. `false` keeps the caller's snapshot.
+pub fn write_disable_microphone(backend: &dyn SettingsBackend, disabled: bool) -> bool {
+    backend.set_boolean(PRIVACY_SCHEMA, DISABLE_MICROPHONE_KEY, disabled)
+}
+
+/// Write the sound-output kill-switch. `false` keeps the caller's snapshot.
+pub fn write_disable_sound_output(backend: &dyn SettingsBackend, disabled: bool) -> bool {
+    backend.set_boolean(PRIVACY_SCHEMA, DISABLE_SOUND_OUTPUT_KEY, disabled)
 }
 
 /// Refresh a snapshot from a backend. Unknown or absent values keep
@@ -330,6 +439,113 @@ mod tests {
                 .as_deref(),
             Some("file:///next.png")
         );
+    }
+
+    #[test]
+    fn privacy_policy_defaults_to_everything_allowed() {
+        assert_eq!(
+            PrivacyPolicy::default(),
+            PrivacyPolicy {
+                camera_disabled: false,
+                microphone_disabled: false,
+                sound_output_disabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_privacy_applies_known_keys_and_keeps_unknown() {
+        let backend = MapBackend::with_values(&[
+            (PRIVACY_SCHEMA, DISABLE_CAMERA_KEY, "true"),
+            (PRIVACY_SCHEMA, DISABLE_MICROPHONE_KEY, "false"),
+            (PRIVACY_SCHEMA, DISABLE_SOUND_OUTPUT_KEY, "bogus"),
+        ]);
+        let mut policy = PrivacyPolicy {
+            sound_output_disabled: true,
+            ..PrivacyPolicy::default()
+        };
+        refresh_privacy(&mut policy, &backend);
+        assert!(policy.camera_disabled);
+        assert!(!policy.microphone_disabled);
+        // A non-boolean value keeps the previous setting.
+        assert!(policy.sound_output_disabled);
+
+        // Absent keys keep everything.
+        refresh_privacy(&mut policy, &MapBackend::default());
+        assert!(policy.camera_disabled);
+        assert!(!policy.microphone_disabled);
+        assert!(policy.sound_output_disabled);
+    }
+
+    #[test]
+    fn privacy_writes_round_trip_through_the_backend() {
+        let backend = MapBackend::default();
+        assert!(write_disable_camera(&backend, true));
+        assert!(write_disable_microphone(&backend, true));
+        assert!(write_disable_sound_output(&backend, false));
+        let mut policy = PrivacyPolicy::default();
+        refresh_privacy(&mut policy, &backend);
+        assert_eq!(
+            policy,
+            PrivacyPolicy {
+                camera_disabled: true,
+                microphone_disabled: true,
+                sound_output_disabled: false,
+            }
+        );
+        // Explicit restore flips the same keys back.
+        assert!(write_disable_camera(&backend, false));
+        assert!(write_disable_microphone(&backend, false));
+        refresh_privacy(&mut policy, &backend);
+        assert_eq!(policy, PrivacyPolicy::default());
+    }
+
+    #[test]
+    fn string_only_backends_read_privacy_as_absent_and_refuse_writes() {
+        struct StringsOnly;
+        impl SettingsBackend for StringsOnly {
+            fn string(&self, _schema: &str, _key: &str) -> Option<String> {
+                None
+            }
+            fn set_string(&self, _schema: &str, _key: &str, _value: &str) -> bool {
+                false
+            }
+        }
+        let backend = StringsOnly;
+        assert_eq!(backend.boolean(PRIVACY_SCHEMA, DISABLE_CAMERA_KEY), None);
+        assert!(!write_disable_camera(&backend, true));
+        let mut policy = PrivacyPolicy::default();
+        refresh_privacy(&mut policy, &backend);
+        assert_eq!(policy, PrivacyPolicy::default());
+    }
+
+    #[test]
+    fn gio_backend_reads_booleans_and_refuses_unknown_keys() {
+        // Read-only against the installed schemas: never writes.
+        // Skips (loudly) where the privacy schema is not installed.
+        let source = gio::SettingsSchemaSource::default();
+        let installed = source.is_some_and(|source| source.lookup(PRIVACY_SCHEMA, true).is_some());
+        if !installed {
+            eprintln!("SKIP gio boolean test: {PRIVACY_SCHEMA} schema not installed");
+            return;
+        }
+        let backend = GioBackend;
+        // The key exists, so the read resolves (whatever the value).
+        assert!(backend
+            .boolean(PRIVACY_SCHEMA, DISABLE_CAMERA_KEY)
+            .is_some());
+        assert!(backend
+            .boolean(PRIVACY_SCHEMA, DISABLE_MICROPHONE_KEY)
+            .is_some());
+        assert!(backend
+            .boolean(PRIVACY_SCHEMA, DISABLE_SOUND_OUTPUT_KEY)
+            .is_some());
+        // A string key is not a boolean; unknown names stay silent.
+        assert_eq!(backend.boolean(INTERFACE_SCHEMA, CLOCK_FORMAT_KEY), None);
+        assert_eq!(backend.boolean(PRIVACY_SCHEMA, "no-such-key"), None);
+        assert_eq!(backend.boolean("no.such.schema", DISABLE_CAMERA_KEY), None);
+        assert!(!backend.set_boolean(PRIVACY_SCHEMA, "no-such-key", true));
+        assert!(!backend.set_boolean("no.such.schema", DISABLE_CAMERA_KEY, true));
     }
 
     #[test]

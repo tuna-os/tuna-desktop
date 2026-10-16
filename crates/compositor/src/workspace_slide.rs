@@ -126,6 +126,26 @@ pub fn swipe_release(
     velocity: f64,
     cancelled: bool,
 ) -> (f64, f64) {
+    swipe_release_over(
+        progress,
+        initial,
+        slots,
+        velocity,
+        cancelled,
+        TOUCHPAD_BASE_WIDTH,
+    )
+}
+
+/// [`swipe_release`] for a gesture whose whole step is `distance`
+/// touchpad units (the overview's vertical `TOUCHPAD_BASE_HEIGHT`).
+pub fn swipe_release_over(
+    progress: f64,
+    initial: f64,
+    slots: usize,
+    velocity: f64,
+    cancelled: bool,
+    distance: f64,
+) -> (f64, f64) {
     let last = slots.saturating_sub(1) as f64;
     let closest = |p: f64| p.round().clamp(0.0, last);
     let (low, high) = ((initial - 1.0).max(0.0), (initial + 1.0).min(last));
@@ -156,7 +176,7 @@ pub fn swipe_release(
             closest(pos)
         }
     };
-    let mut speed = velocity / TOUCHPAD_BASE_WIDTH;
+    let mut speed = velocity / distance.max(1.0);
     if (end - progress) * speed <= 0.0 {
         speed = ANIMATION_BASE_VELOCITY;
     }
@@ -397,9 +417,8 @@ impl WorkspaceSlide {
             }
             return;
         }
-        if self.following() {
-            return;
-        }
+        // A changed active workspace retargets even while fingers hold
+        // the strip (a key press mid-swipe); unchanged stays with them.
         let Some(previous) = previous.filter(|p| *p != active) else {
             return;
         };
@@ -430,7 +449,7 @@ impl WorkspaceSlide {
         };
         let from = match (&self.phase, self.last_value) {
             (Phase::Easing { to: heading, .. }, _) if *heading == to => return,
-            (Phase::Easing { .. }, Some(shown)) => shown,
+            (Phase::Easing { .. } | Phase::Following { .. }, Some(shown)) => shown,
             _ => self.slot(previous).unwrap_or(to),
         };
         let duration = scaled(policy, SWITCH_MS);
@@ -828,5 +847,71 @@ mod tests {
         slide.begin_swipe(1, &[0, 1], 1000, on, mid);
         assert!((slide.value(mid).unwrap() - shown).abs() < 1e-9);
         assert!(slide.following());
+    }
+
+    #[test]
+    fn a_press_mid_swipe_retargets_from_the_drawn_offset() {
+        // Direct observe() coverage in this tree's test style (the
+        // WindowManager fixed-count driver lives on the feature stack;
+        // production reaches observe once per tick via
+        // Runtime::step_workspace_slide).
+        let t0 = Duration::from_secs(10);
+        let on = MotionPolicy::default();
+        let mut slide = WorkspaceSlide::default();
+
+        // The first press starts an easing slide 0 -> 1.
+        slide.observe(0, &[0], 1000, on, false, t0);
+        slide.step(t0);
+        slide.observe(1, &[0, 1], 1000, on, false, t0);
+        slide.step(t0);
+        assert!(slide.running());
+        assert!(!slide.following());
+
+        // Fingers catch the switch mid-flight and drag it partway. An
+        // unchanged frame while following stays with the fingers.
+        let mid = t0 + ms(60);
+        slide.observe(1, &[0, 1], 1000, on, false, mid);
+        slide.step(mid);
+        slide.begin_swipe(1, &[0, 1], 1000, on, mid);
+        slide.update_swipe(-100.0, 1000);
+        let dragged = slide.value(mid).unwrap();
+        slide.observe(1, &[0, 1], 1000, on, false, mid);
+        slide.step(mid);
+        assert!(slide.following());
+        assert_eq!(slide.value(mid), Some(dragged));
+
+        // A rapid second press retargets from the drawn offset instead
+        // of being swallowed by the following early return.
+        slide.observe(2, &[0, 1, 2], 1000, on, false, mid);
+        slide.step(mid);
+        assert!(!slide.following());
+        assert!((slide.value(mid).unwrap() - dragged).abs() < 1e-9);
+        let record = slide.snapshot(mid)["in_flight"]["record"].clone();
+        assert_eq!(record["to"], 2);
+        assert_eq!(record["retargets"], 2);
+
+        // A third rapid press retargets again from further along.
+        let later = mid + ms(60);
+        slide.observe(2, &[0, 1, 2], 1000, on, false, later);
+        slide.step(later);
+        slide.observe(3, &[0, 1, 2, 3], 1000, on, false, later);
+        slide.step(later);
+        let record = slide.snapshot(later)["in_flight"]["record"].clone();
+        assert_eq!(record["to"], 3);
+        assert_eq!(record["retargets"], 3);
+
+        // The motion runs to completion without ever moving backwards.
+        // (Unchanged observes are no-ops, so step() alone advances it.)
+        for step in 1..=40 {
+            slide.step(later + ms(step * 10));
+        }
+        assert!(!slide.running());
+        let done = later + ms(400);
+        let history = slide.snapshot(done)["history"].clone();
+        assert_eq!(history[0]["from"], 0);
+        assert_eq!(history[0]["to"], 3);
+        assert_eq!(history[0]["retargets"], 3);
+        assert_eq!(history[0]["gesture"], true);
+        assert_eq!(history[0]["reversed"], false);
     }
 }

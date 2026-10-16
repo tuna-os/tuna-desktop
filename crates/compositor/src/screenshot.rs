@@ -26,8 +26,6 @@ pub enum Request {
         filename: PathBuf,
         /// The focused window alone (`ScreenshotWindow`), not the screen.
         window: bool,
-        /// Flash the captured area white once it is taken (GNOME's
-        /// `Flashspot`).
         flash: bool,
         reply: mpsc::Sender<Option<PathBuf>>,
     },
@@ -36,6 +34,11 @@ pub enum Request {
     Windows {
         directory: PathBuf,
         reply: mpsc::Sender<Vec<WindowShot>>,
+    },
+    /// Authorized screenshot feedback without a new capture (the shell UI).
+    Flash {
+        area: [i32; 4],
+        reply: mpsc::Sender<bool>,
     },
 }
 
@@ -133,6 +136,34 @@ impl WindowsService {
 
 #[zbus::interface(name = "org.gnome.Shell.Screenshot")]
 impl Service {
+    async fn flash_area(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.authority.authenticate(conn, &header).await?;
+        self.authority
+            .unlocked()
+            .map_err(|_| zbus::fdo::Error::Failed("session locked".into()))?;
+        let (reply, answer) = mpsc::channel();
+        self.to_loop
+            .send(Request::Flash {
+                area: [x, y, width, height],
+                reply,
+            })
+            .map_err(|_| zbus::fdo::Error::Failed("compositor gone".into()))?;
+        match answer.recv_timeout(DEADLINE) {
+            Ok(true) => Ok(()),
+            _ => Err(zbus::fdo::Error::Failed(
+                "invalid area or unavailable feedback".into(),
+            )),
+        }
+    }
+
     /// GNOME Shell's signature: `(include_cursor, flash, filename) ->
     /// (success, filename_used)`.
     async fn screenshot(

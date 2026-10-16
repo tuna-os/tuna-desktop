@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 from PIL import Image, ImageChops
+from tuna_strip_endpoint import endpoint, capture_receipt
 
 root = Path(sys.argv[1])
 reference = root / 'reference'
@@ -13,6 +14,10 @@ for stage, width in [('01-strip-rest', 616), ('02-strip-preset', 826),
                      ('04-strip-scroll-settled', 616)]:
     actual = json.loads((candidate / (stage + '.json')).read_text())
     expected = json.loads((reference / (stage + '.json')).read_text())
+    capture_stage = 'view-800' if stage == '04-strip-scroll-settled' else stage
+    bracket = json.loads((candidate / (capture_stage + '.capture-state.json')).read_text())
+    capture_receipt(bracket, actual, width, (candidate / (stage + '.png')).read_bytes(), capture_stage)
+    assert endpoint(actual, width), actual
     assert actual['session_mode'] == 'scroll', actual
     focused = next(w for w in actual['windows'] if w['id'] == actual['focused'])
     focused_ref = next(w for w in expected if w['is_focused'])

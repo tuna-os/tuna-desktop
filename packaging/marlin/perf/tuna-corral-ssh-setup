@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+test "$#" -eq 1
+ssh-keygen -lf "$1" >/dev/null
+install -d -m0700 /etc/ssh/authorized_keys
+install -m0600 "$1" /etc/ssh/authorized_keys/root
+# An unusable password hash permits key authentication without a password.
+usermod -p '*' root
+cat > /etc/ssh/tuna-corral.conf <<'CONFIG'
+Port 22
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+UsePAM yes
+AllowUsers root
+CONFIG
+mkdir -p /etc/systemd/system/sshd.service.d
+cat > /etc/systemd/system/sshd.service.d/00-tuna-corral.conf <<'UNIT'
+[Unit]
+Requires=tuna-corral-ssh-hostkeys.service
+After=tuna-corral-ssh-hostkeys.service
+[Service]
+ExecStartPre=
+ExecStartPre=/usr/bin/sshd -t -f /etc/ssh/tuna-corral.conf
+ExecStart=
+ExecStart=/usr/bin/sshd -D -f /etc/ssh/tuna-corral.conf
+UNIT
+cat > /usr/lib/systemd/system/tuna-corral-ssh-hostkeys.service <<'UNIT'
+[Unit]
+Description=Generate this Corral benchmark guest's SSH host keys
+Before=sshd.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+RemainAfterExit=yes
+UNIT
+systemctl enable sshd.service

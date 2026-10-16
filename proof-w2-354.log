@@ -1,0 +1,37 @@
+   Compiling tuna-shell-gtk v0.1.0 (/tmp/tuna-v1-muse-w2-354/crates/shell-gtk)
+    Finished `test` profile [unoptimized] target(s) in 50.63s
+     Running tests/wellbeing.rs (target/debug/deps/wellbeing-1d34d2da86cc733e)
+
+running 29 tests
+test break_service_public_flow ... ok
+test documented_constants_and_error_strings ... ok
+test history_file_round_trip_restart_and_permissions ... ok
+test retention_and_corrupt_files_behave ... ok
+test gsettings_fixture_defaults_and_selection ... ok
+test wellbeing::tests::active_time_counts_open_and_partial_intervals ... ok
+test wellbeing::tests::break_flows_from_due_through_overdue ... ok
+test wellbeing::tests::break_upcoming_countdown_and_take_cycle ... ok
+test wellbeing::tests::corrupt_history_is_reported_and_not_fabricated ... ok
+test wellbeing::tests::day_boundary_is_3am_local ... ok
+test wellbeing::tests::delay_and_skip_push_the_due_time ... ok
+test wellbeing::tests::disabling_history_deletes_the_file_and_stops_recording ... ok
+test wellbeing::tests::equal_time_cancelling_pairs_collapse_like_gnome ... ok
+test scripted_day_warns_reaches_and_resets ... ok
+test wellbeing::tests::history_rejects_malformed_entries ... ok
+test wellbeing::tests::history_round_trip_matches_gnome_field_names ... ok
+test wellbeing::tests::helpers_tolerate_a_schema_less_session_bus_less_host ... ok
+test wellbeing::tests::idle_break_fades_completes_and_sounds ... ok
+test wellbeing::tests::limit_reached_at_pins_the_crossing_second ... ok
+test wellbeing::tests::lock_screen_toggle_beats_fade_and_quiet_breaks_stay_in_tray ... ok
+test wellbeing::tests::longest_due_break_wins_and_unknown_ids_are_ignored ... ok
+test wellbeing::tests::retention_drops_future_and_ancient_entries_but_keeps_newest ... ok
+test wellbeing::tests::limit_warns_then_reaches_then_resets_next_day ... ok
+test wellbeing::tests::suspend_gap_is_backdated_to_inactive ... ok
+test wellbeing::tests::small_clock_step_adjusts_stored_times ... ok
+test wellbeing::tests::time_spans_use_gnome_units ... ok
+test wellbeing::tests::take_break_fades_and_limit_time_tracks_state ... ok
+test wellbeing::tests::user_active_follows_idle_delay ... ok
+test wellbeing::tests::tracker_records_startup_idle_and_shutdown_edges ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+

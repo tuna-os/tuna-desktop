@@ -6,16 +6,20 @@
 # TUNA_LOCAL_SRC to a checkout instead:
 #   TUNA_LOCAL_SRC="$PWD" makepkg -f --dir packaging/arch   (or cd there)
 # The version is stamped from the tag exactly like scripts/tuna-release,
-# so every binary's --version matches pkgver.
+# so every binary's --version matches _semver. Set _semver to the release
+# tag minus its v (X.Y.Z or a prerelease X.Y.Z-beta.N). pacman forbids "-" in
+# pkgver, so a prerelease becomes X.Y.Zbeta.N, which vercmp orders before
+# X.Y.Z (a "." or "_" before the letters would order it after).
 
 pkgname=tuna-desktop
 # Upgrades the package's former name in place (#505).
 replaces=('roost')  # tuna-rename: keep
 conflicts=('roost')  # tuna-rename: keep
 provides=('roost')  # tuna-rename: keep
-pkgver=0.1.0
+_semver=1.0.0-beta.1
+pkgver=${_semver/-/}
 pkgrel=1
-pkgdesc='Tuna Desktop: GNOME-style Wayland desktop session in Rust (nested developer preview)'
+pkgdesc='Tuna Desktop: GNOME-style Wayland desktop session in Rust (v1 beta)'
 arch=('x86_64')
 url='https://github.com/tuna-os/tuna-desktop'
 license=('GPL-3.0-or-later')
@@ -25,6 +29,7 @@ depends=(
     'gtk4'
     'gtk4-layer-shell'
     'libadwaita'
+    'libcanberra'
     'libdrm'
     'libinput'
     'libsecret'
@@ -33,6 +38,7 @@ depends=(
     'mesa'
     'pipewire'
     'seatd'
+    'sound-theme-freedesktop'
     'systemd-libs'
     'wayland'
 )
@@ -54,7 +60,7 @@ if [[ -n "${TUNA_LOCAL_SRC:-}" ]]; then
     source=()
     sha256sums=()
 else
-    source=("tuna::git+${url}.git#tag=v${pkgver}")
+    source=("tuna::git+${url}.git#tag=v${_semver}")
     sha256sums=('SKIP')
 fi
 
@@ -76,7 +82,7 @@ build() {
     cd "$(_srcroot)"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
-    export TUNA_VERSION="v${pkgver}"
+    export TUNA_VERSION="v${_semver}"
     cargo build --frozen --release \
         -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk -p tuna-greeter
 }
@@ -86,8 +92,8 @@ check() {
     for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-greeter; do
         local reported
         reported="$("${CARGO_TARGET_DIR:-$srcdir/target}/release/$bin" --version | awk '{print $NF}')"
-        if [[ "$reported" != "$pkgver" ]]; then
-            echo "$bin reports $reported, expected $pkgver" >&2
+        if [[ "$reported" != "$_semver" ]]; then
+            echo "$bin reports $reported, expected $_semver" >&2
             return 1
         fi
     done
@@ -104,6 +110,13 @@ package() {
         "$pkgdir/usr/share/wayland-sessions/tuna.desktop"
     install -Dm0644 "$root/share/systemd/user/tuna-session.target" \
         "$pkgdir/usr/lib/systemd/user/tuna-session.target"
+    install -Dm0644 "$root/share/xdg-desktop-portal/portals/tuna.portal" \
+        "$pkgdir/usr/share/xdg-desktop-portal/portals/tuna.portal"
+    install -Dm0644 "$root/packaging/marlin/tuna-portals.conf" \
+        "$pkgdir/usr/share/xdg-desktop-portal/tuna-portals.conf"
+    # Private GNOME51 scalable cursor fallback; no system Adwaita file conflicts.
+    install -d "$pkgdir/usr/share/tuna-desktop/icons"
+    cp -a "$root/share/tuna-desktop/icons/." "$pkgdir/usr/share/tuna-desktop/icons/"
     # Lock-screen PAM service (#62): unlock under GDM, where no greetd runs.
     install -Dm0644 "$root/share/pam.d/tuna-lock" "$pkgdir/etc/pam.d/tuna-lock"
     # One release of compatibility with the former name (#505): the old

@@ -34,6 +34,7 @@ BLOCKING = (
 
 
 class TunaTestEngine(IBus.Engine):
+    proof_engine = "tuna-test"
     __gtype_name__ = "TunaTestEngine"
 
     def __init__(self):
@@ -42,6 +43,42 @@ class TunaTestEngine(IBus.Engine):
         self.surrounding = None
         self.table = IBus.LookupTable.new(5, 0, True, False)
         self.choices = []
+        self.properties = IBus.PropList()
+        def prop(key, label, kind, state=0, children=None, sensitive=True, visible=True):
+            return IBus.Property(key=key, prop_type=kind,
+                label=IBus.Text.new_from_string(label), icon="",
+                tooltip=IBus.Text.new_from_string(label), sensitive=sensitive,
+                visible=visible, state=state, sub_props=children or IBus.PropList())
+        self.input_mode = prop("InputMode", "Input Mode", IBus.PropType.TOGGLE)
+        self.input_mode.set_symbol(IBus.Text.new_from_string("中"))
+        self.properties.append(self.input_mode)
+        self.radio_a = prop("proof-radio-a", "Proof Radio A", IBus.PropType.RADIO, 1)
+        self.radio_b = prop("proof-radio-b", "Proof Radio B", IBus.PropType.RADIO)
+        self.properties.append(self.radio_a)
+        self.properties.append(prop("proof-separator", "", IBus.PropType.SEPARATOR))
+        self.properties.append(self.radio_b)
+        children = IBus.PropList()
+        children.append(prop("proof-action", "Proof Action", IBus.PropType.NORMAL))
+        self.properties.append(prop("proof-menu", "Proof Submenu", IBus.PropType.MENU, children=children))
+        self.properties.append(prop("proof-disabled", "Proof Disabled", IBus.PropType.NORMAL, sensitive=False))
+        self.properties.append(prop("proof-hidden", "Proof Hidden", IBus.PropType.NORMAL, visible=False))
+
+    def do_focus_in(self):
+        self.register_properties(self.properties)
+        print("tuna-ibus-test-engine: properties registered", flush=True)
+
+    def do_enable(self):
+        self.register_properties(self.properties)
+
+    def do_property_activate(self, key, state):
+        if key not in {"InputMode", "proof-radio-a", "proof-radio-b", "proof-action"}:
+            raise RuntimeError("unexpected property activation")
+        print(f"tuna-ibus-test-engine: property instance engine={self.proof_engine} path={self.get_object_path()}", flush=True)
+        print(f"tuna-ibus-test-engine: property activated {key} {state} engine={self.proof_engine}", flush=True)
+        for p in (self.input_mode, self.radio_a, self.radio_b):
+            if p.get_key() == key:
+                p.set_state(state)
+                self.update_property(p)
 
     def do_set_surrounding_text(self, text, cursor_pos, anchor_pos):
         self.surrounding = (text.get_text(), cursor_pos)
@@ -100,6 +137,10 @@ class TunaTestEngine(IBus.Engine):
     def do_process_key_event(self, keyval, keycode, state):
         if state & IBus.ModifierType.RELEASE_MASK or state & BLOCKING:
             return False
+        # Like real composing engines (ibus-libpinyin, ibus-anthy), never
+        # compose into a password field: the lock entry must get the keys.
+        if self.get_content_type()[0] == IBus.InputPurpose.PASSWORD:
+            return False
         ch = IBus.keyval_to_unicode(keyval)
         if len(ch) == 1 and "a" <= ch <= "z":
             self.buffer += ch
@@ -130,6 +171,11 @@ class TunaTestEngine(IBus.Engine):
         self.show()
 
 
+class TunaAlternateTestEngine(TunaTestEngine):
+    __gtype_name__ = "TunaAlternateTestEngine"
+    proof_engine = "tuna-test-alternate"
+
+
 def main():
     IBus.init()
     bus = IBus.Bus()
@@ -137,6 +183,7 @@ def main():
         raise SystemExit("tuna-ibus-test-engine: no ibus-daemon")
     factory = IBus.Factory.new(bus.get_connection())
     factory.add_engine("tuna-test", GObject.type_from_name("TunaTestEngine"))
+    factory.add_engine("tuna-test-alternate", GObject.type_from_name("TunaAlternateTestEngine"))
     component = IBus.Component(
         name="org.tuna.TestEngine",
         description="Tuna Desktop IME proof engine",
@@ -159,6 +206,9 @@ def main():
             layout="us",
         )
     )
+    component.add_engine(IBus.EngineDesc(name="tuna-test-alternate",
+        longname="Tuna Alternate Test", description="Owned engine-change negative",
+        language="zh", license="MIT", author="Tuna Desktop", icon="", layout="us"))
     bus.register_component(component)
 
     # Async: the daemon creates the engine through this process's

@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -30,7 +30,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-          sudo apt-get install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev pkg-config libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev libpam-wrapper meson ninja-build libwayland-dev wayland-protocols
+          sudo apt-get install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev pkg-config libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev libpam-wrapper libpam0g-dev meson ninja-build libwayland-dev wayland-protocols
           scripts/ci-install-gtk4-layer-shell
       - run: python3 scripts/lib/tuna-coverage-tests.py
       - run: python3 scripts/lib/tuna-security-artifact-tests.py

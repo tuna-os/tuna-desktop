@@ -15,12 +15,15 @@ struct Pending {
 }
 
 pub struct Monitor {
+    wake: crate::wake::Wake,
     connection: zbus::blocking::Connection,
     pending: Arc<Pending>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Monitor {
+    /// Each notification wakes the compositor loop through the
+    /// [`Wake`](crate::wake::Wake) connected by [`set_wake`](Self::set_wake).
     pub fn start(generation: Arc<AtomicU64>) -> zbus::Result<Self> {
         let connection = zbus::blocking::connection::Builder::system()?
             .method_timeout(Duration::from_secs(5))
@@ -39,11 +42,14 @@ impl Monitor {
             "org.freedesktop.login1.Manager",
         )?;
         let signals = proxy.receive_signal("PrepareForSleep")?;
+        let wake = crate::wake::Wake::default();
+        let worker_wake = wake.clone();
         let pending = Arc::new(Pending::default());
         let worker_pending = pending.clone();
         let worker = std::thread::Builder::new()
             .name("tuna-logind-sleep".into())
             .spawn(move || {
+                let _completion = worker_wake.completion();
                 let mut prepared = false;
                 for signal in signals {
                     let Ok((sleeping,)) = signal.body().deserialize::<(bool,)>() else {
@@ -52,16 +58,19 @@ impl Monitor {
                     if sleeping {
                         // Invalidate old PAM results on the signal thread,
                         // before the compositor can dequeue their callbacks.
-                        generation.fetch_add(1, Ordering::AcqRel);
+                        crate::auth_owner::advance_epoch(&generation);
                         prepared = true;
                         worker_pending.lock.store(true, Ordering::Release);
+                        worker_wake.signal();
                     } else if prepared {
                         prepared = false;
                         worker_pending.wake.store(true, Ordering::Release);
+                        worker_wake.signal();
                     }
                 }
             })?;
         Ok(Self {
+            wake,
             connection,
             pending,
             worker: Some(worker),
@@ -69,6 +78,9 @@ impl Monitor {
     }
 
     /// Coalesce notifications; the caller locks before processing a wake.
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
     pub fn take(&self) -> (bool, bool) {
         (
             self.pending.lock.swap(false, Ordering::AcqRel),
