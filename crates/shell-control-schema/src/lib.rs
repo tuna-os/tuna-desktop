@@ -2815,11 +2815,14 @@ mod accelerator_release_wire_tests {
         }
     }
     #[test]
-    fn appended_variants_follow_the_0_35_positions() {
+    fn appended_variants_follow_the_0_36_positions() {
         let index = |message: &Message| encode_frame(message)[4];
-        let last = index(&Message::KeyboardAidToggled {
-            aid: KeyboardAid::StickyKeys,
-            enabled: true,
+        let last = index(&Message::PointerTimeout {
+            kind: PointerTimeoutKind::Dwell,
+            duration_ms: None,
+            clicked: false,
+            x: 0,
+            y: 0,
         });
         for (offset, message) in [
             Message::NativeOutputInventory {
@@ -2845,9 +2848,8 @@ mod accelerator_release_wire_tests {
         };
         assert_eq!(
             command(CommandKind::SetAcceleratorGrabs { grabs: Vec::new() }),
-            command(CommandKind::SetWellbeingEffects {
-                grayscale: false,
-                fade: false,
+            command(CommandKind::SetDwellClickType {
+                click: DwellClick::Primary,
             }) + 1
         );
     }
