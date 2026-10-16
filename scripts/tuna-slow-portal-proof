@@ -1,0 +1,140 @@
+#!/bin/sh
+# tuna-slow-portal-proof: the shell starts while portal activation hangs.
+#
+# Usage:
+#   scripts/tuna-slow-portal-proof [--display :N] [--artifacts DIR] [--bin-dir DIR]
+#
+# Runs the nested compositor and tuna-shell-gtk on a private dbus-daemon
+# session bus that can activate org.freedesktop.portal.Desktop, but whose
+# activation never finishes (a service that sleeps and never claims the
+# name). This is how dbus-daemon behaves when the GNOME portal is activated
+# before graphical-session.target exists: callers wait out the D-Bus
+# timeout (25 s each) instead of failing fast as on dbus-broker.
+#   P-SLOW-PORTAL  the fake portal really hangs: a version probe times out
+#   P-SHELL-NAME   the shell still owns org.gnome.Shell within 15 s. GTK
+#                  before 4.17 always creates an auto-starting
+#                  inhibit-portal proxy in GtkApplication's startup when no
+#                  GNOME session manager runs (no opt-out exists), so there
+#                  the bar is that one 25 s timeout plus 15 s; the unfixed
+#                  shell also waited on every libadwaita settings read
+#   P-NO-PORTAL    the shell never waited on GDK's portal checks (no GTK
+#                  portal timeout warnings)
+# Writes assertions.txt.
+set -eu
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
+    services="$(mktemp -d /tmp/tuna-slow-portal.XXXXXX)"
+    mkdir -p "$services/dbus-1/services"
+    # Never claims the name; outlives dbus-daemon's 120 s activation limit
+    # without holding the caller's output open.
+    cat >"$services/dbus-1/services/org.freedesktop.portal.Desktop.service" <<'SERVICE'
+[D-BUS Service]
+Name=org.freedesktop.portal.Desktop
+Exec=/bin/sh -c "exec sleep 150 </dev/null >/dev/null 2>&1"
+SERVICE
+    XDG_DATA_DIRS="$services:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    TUNA_PROOF_PRIVATE_BUS=1
+    export XDG_DATA_DIRS TUNA_PROOF_PRIVATE_BUS
+    status=0
+    dbus-run-session -- "$0" "$@" || status=$?
+    rm -rf "$services"
+    exit "$status"
+fi
+unset CDPATH
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+DISPLAY_ARG=""
+ARTIFACTS="$ROOT/slow-portal-artifacts"
+BIN_DIR=""
+WIDTH=1280
+HEIGHT=800
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --display) DISPLAY_ARG="$2"; shift 2 ;;
+        --artifacts) ARTIFACTS="$2"; shift 2 ;;
+        --bin-dir) BIN_DIR="$2"; shift 2 ;;
+        --help|-h) sed -n '2,22p' "$0"; exit 0 ;;
+        *) echo "tuna-slow-portal-proof: unknown argument $1" >&2; exit 1 ;;
+    esac
+done
+mkdir -p "$ARTIFACTS"
+ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
+LOG="$ARTIFACTS/nested.log"
+ASSERTIONS="$ARTIFACTS/assertions.txt"
+: >"$ASSERTIONS"
+
+OWNED_XVFB=""
+COMPOSITOR_PID=""
+cleanup() {
+    if [ -n "$COMPOSITOR_PID" ]; then kill "$COMPOSITOR_PID" 2>/dev/null || true; fi
+    if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+}
+trap cleanup EXIT INT TERM
+pass() { echo "$1 pass $2" >>"$ASSERTIONS"; echo "tuna-slow-portal-proof: $1 pass: $2"; }
+fail() {
+    echo "$1 fail $2" >>"$ASSERTIONS"
+    echo "tuna-slow-portal-proof: $1 FAIL: $2" >&2
+    tail -20 "$LOG" >&2 2>/dev/null || true
+    exit 1
+}
+# Milliseconds since the epoch.
+now_ms() { date +%s%3N; }
+
+# Start the hanging activation exactly as GTK's version check does.
+started="$(now_ms)"
+if gdbus call --session --timeout 3 --dest org.freedesktop.portal.Desktop \
+    --object-path /org/freedesktop/portal/desktop \
+    --method org.freedesktop.DBus.Properties.Get \
+    org.freedesktop.portal.Settings version >"$ARTIFACTS/portal-probe.txt" 2>&1; then
+    fail P-SLOW-PORTAL "the fake portal answered"
+fi
+probe_ms=$(($(now_ms) - started))
+grep -q "Timeout was reached" "$ARTIFACTS/portal-probe.txt" ||
+    fail P-SLOW-PORTAL "the probe failed fast: $(cat "$ARTIFACTS/portal-probe.txt")"
+pass P-SLOW-PORTAL "activation of org.freedesktop.portal.Desktop hangs (probe timed out after ${probe_ms} ms)"
+
+[ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
+if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
+    Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
+        3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+    OWNED_XVFB=$!
+    for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+    [ -s "$ARTIFACTS/xvfb-display" ] || fail P-SHELL-NAME "Xvfb did not allocate a display"
+    DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+    export DISPLAY
+    for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 1; done
+fi
+
+if [ -z "$BIN_DIR" ]; then
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk
+    BIN_DIR="$ROOT/target/debug"
+fi
+started="$(now_ms)"
+"$BIN_DIR/tuna-compositor" --backend winit --socket "tuna-slow-portal-$$" \
+    --shell-bin "$BIN_DIR/tuna-shell-gtk" >"$LOG" 2>&1 &
+COMPOSITOR_PID=$!
+# Measure past the bar so a slow shell's actual delay is recorded.
+owned_ms=""
+while [ $(($(now_ms) - started)) -lt 90000 ]; do
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail P-SHELL-NAME "compositor exited during startup"
+    if gdbus call --session --timeout 1 --dest org.freedesktop.DBus \
+        --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetNameOwner org.gnome.Shell >/dev/null 2>&1; then
+        owned_ms=$(($(now_ms) - started))
+        break
+    fi
+    sleep 0.2
+done
+[ -n "$owned_ms" ] || fail P-SHELL-NAME "the shell did not own org.gnome.Shell within 90 s"
+echo "$owned_ms" >"$ARTIFACTS/shell-name-ms.txt"
+gtk="$(pkg-config --modversion gtk4 2>/dev/null || echo unknown)"
+bar_ms=15000
+case "$gtk" in
+    4.[0-9].*|4.1[0-6].*) bar_ms=40000 ;;
+esac
+[ "$owned_ms" -le "$bar_ms" ] ||
+    fail P-SHELL-NAME "the shell owned org.gnome.Shell only after ${owned_ms} ms (GTK $gtk, bar ${bar_ms} ms)"
+pass P-SHELL-NAME "the shell owned org.gnome.Shell ${owned_ms} ms after launch (GTK $gtk, bar ${bar_ms} ms)"
+
+if grep -E "Cannot get portal|Settings portal not found" "$LOG" >"$ARTIFACTS/portal-warnings.txt"; then
+    fail P-NO-PORTAL "the shell waited on the portal: $(head -1 "$ARTIFACTS/portal-warnings.txt")"
+fi
+pass P-NO-PORTAL "no portal call in the shell's startup"
