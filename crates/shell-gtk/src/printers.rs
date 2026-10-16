@@ -211,26 +211,37 @@ fn unix_connect_with_timeout(
             bytes.len(),
         );
     }
-    let ret = unsafe {
-        libc::connect(
-            fd,
-            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
+    let deadline = Instant::now() + timeout;
+    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "unix connect timed out");
+    'connect: loop {
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            break;
+        }
         let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EAGAIN) {
+            // Full listen backlog on a nonblocking Unix socket: no
+            // attempt is pending, so retry the connect itself until
+            // the budget ends.
+            if Instant::now() >= deadline {
+                return close_and(timed_out());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         if err.raw_os_error() != Some(libc::EINPROGRESS) {
             return close_and(err);
         }
-        let deadline = Instant::now() + timeout;
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return close_and(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "unix connect timed out",
-                ));
+                return close_and(timed_out());
             }
             let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
             let mut pfd = libc::pollfd {
@@ -240,10 +251,7 @@ fn unix_connect_with_timeout(
             };
             let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
             if ready == 0 {
-                return close_and(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "unix connect timed out",
-                ));
+                return close_and(timed_out());
             }
             if ready < 0 {
                 let err = std::io::Error::last_os_error();
@@ -269,7 +277,7 @@ fn unix_connect_with_timeout(
             if so_error != 0 {
                 return close_and(std::io::Error::from_raw_os_error(so_error));
             }
-            break;
+            break 'connect;
         }
     }
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -4482,11 +4490,11 @@ mod tests {
             interim_dribble.len() > 50,
             "interim dribble must be many chunks"
         );
+        // One plan only: the retry runs against a fresh server
+        // below, so a second plan here would wait out its accept
+        // timeout for a connection that never comes.
         let (endpoint, server) = start_dribble(
-            vec![
-                (interim_dribble, 1, Duration::from_millis(200)),
-                (http_ok(&ok_printers_body(2)), usize::MAX, Duration::ZERO),
-            ],
+            vec![(interim_dribble, 1, Duration::from_millis(200))],
             Duration::from_secs(10),
         );
         let client = CupsClient::single(endpoint);
@@ -4575,11 +4583,9 @@ mod tests {
         let io_timeout = Duration::from_millis(600);
         let exchange_timeout = Duration::from_millis(1500);
         let dribble = http_ok(&ok_printers_body(1));
+        // One plan only: the retry runs against a fresh server below.
         let (endpoint, server) = start_dribble(
-            vec![
-                (dribble, 1, Duration::from_millis(200)),
-                (http_ok(&ok_printers_body(2)), usize::MAX, Duration::ZERO),
-            ],
+            vec![(dribble, 1, Duration::from_millis(200))],
             Duration::from_secs(10),
         );
         let client = CupsClient::single(endpoint);
