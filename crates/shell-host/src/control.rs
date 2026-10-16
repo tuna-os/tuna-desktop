@@ -2590,6 +2590,11 @@ mod tests {
         let (mut client, peer) = handshook();
         assert!(client.poll().is_err());
         assert!(!client.is_closed(), "WouldBlock is not a hang-up");
+        // Shut the peer down instead of only dropping it: a test thread that
+        // forks a child concurrently holds a copy of every fd until exec,
+        // which keeps a merely dropped peer open.
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         assert!(matches!(client.poll(), Err(ControlError::Io(e))
             if e.kind() == io::ErrorKind::UnexpectedEof));
