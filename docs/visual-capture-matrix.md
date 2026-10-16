@@ -69,7 +69,7 @@ state records its state observation next to its stills and clips.
 | stage:notifications | P-NT-01, P-NT-02 | walkthrough:banner, walkthrough:notification-list, walkthrough:do-not-disturb, walkthrough:notification-group, walkthrough:notification-group-expanded |
 | stage:input | P-IN-01 | walkthrough:ime, walkthrough:ime-candidates |
 | stage:system | P-SY-05, P-SY-07, P-LK-01, P-SY-03 | walkthrough:screenshot-ui, walkthrough:polkit, walkthrough:end-session, walkthrough:lock, walkthrough:unlock, walkthrough:scale |
-| stage:settings-a11y | P-ST-01, P-ST-08, P-A11Y-05, P-AN-01 | (no walkthrough states; newer capabilities) |
+| stage:settings-a11y | P-ST-01, P-ST-08, P-A11Y-05, P-A11Y-07, P-AN-01 | (no walkthrough states; newer capabilities) |
 | stage:transitions | P-AN-01, P-AN-02, P-AN-04, P-AN-05, P-AN-07, P-AN-09 | (clips; no walkthrough states) |
 
 ## Parity rows
@@ -126,6 +126,7 @@ state records its state observation next to its stills and clips.
 | P-A11Y-04 | Sticky/slow/bounce keys, Mouse Keys, dwell | `missing-product` | No adequate capture | seat-level input policy absent |
 | P-A11Y-05 | Reduced motion, focus visibility, a11y menu | stage:settings-a11y `partial` | No adequate capture | a11y indicator/menu still; motion-preference transition variants unproven |
 | P-A11Y-06 | Orca activation and spoken navigation | `unsupported-in-nested` | No adequate capture | complete spoken Orca journey needs Corral |
+| P-A11Y-07 | Simulated secondary and hover click, click-type chooser | stage:settings-a11y `partial` | No adequate capture | `dwell-chooser` collects the real hover-click chooser; pie-timer intermediate frames and native pointer input remain outside these stills |
 | P-SN-01 | Sound prefs, over-amplification, bell | stage:quick-settings `partial` | No adequate capture | volume OSD captured; overdrive/feedback/audible-visual bell unproven |
 | P-ST-02 | Wellbeing, screen time, breaks | `missing-product` | No adequate capture | no consumer and no history file |
 | P-ST-03 | Power panel and policies | stage:quick-settings `partial` | No adequate capture | logind backlight/OSD captured; Brightness interface and PowerSaveMode need installed-image Corral |
