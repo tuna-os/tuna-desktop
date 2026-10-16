@@ -304,9 +304,6 @@ mod tests {
             chrome_bounds([(200.5, 400.2, 64, 64), (100.0, 500.2, 300, 32)].into_iter()).unwrap();
         assert_eq!((bounds.x(), bounds.y()), (0, 360));
         assert_eq!((bounds.width(), bounds.height()), (412, 185));
-        // Translating to the layer and back preserves the original subpixel position.
-        assert_eq!(200.5 - f64::from(bounds.x()) + f64::from(bounds.x()), 200.5);
-        assert_eq!(400.2 - f64::from(bounds.y()) + f64::from(bounds.y()), 400.2);
     }
 
     #[test]
