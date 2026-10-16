@@ -3877,7 +3877,21 @@ impl Runtime {
                         cards,
                         locked,
                     );
-                    use crate::native_repaint::{ElementSignature, FrameSignature};
+                    use crate::native_repaint::{FrameSignature, Tracked};
+                    // Bottom to top, each pass at the scale it draws with.
+                    let passes = [
+                        Tracked::pass(&paper, 1.0),
+                        Tracked::pass(&previews, view.scale),
+                        Tracked::pass(&elements.elements, view.scale),
+                        Tracked::pass(&elements.tile, 1.0),
+                        Tracked::pass(&elements.top, view.scale),
+                        elements
+                            .snapshots
+                            .iter()
+                            .rev()
+                            .map(|(_, e)| Tracked::new(e, 1.0))
+                            .collect(),
+                    ];
                     let signature = FrameSignature {
                         size: (size.w, size.h),
                         location: out.loc,
@@ -3889,36 +3903,7 @@ impl Runtime {
                         pointer: (!locked && blank_alpha < 1.0).then_some((pointer.x, pointer.y)),
                         decor: decor.clone(),
                         above: elements.above,
-                        groups: vec![
-                            paper
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            previews
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .elements
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .tile
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            elements
-                                .top
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .snapshots
-                                .iter()
-                                .map(|(_, e)| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                        ],
+                        groups: FrameSignature::groups(&passes),
                     };
                     let mine: Vec<_> = drawn
                         .iter()
@@ -3961,7 +3946,7 @@ impl Runtime {
                     let damage = crate::native_repaint::damage_region(
                         tracker,
                         if reset { 0 } else { usize::from(age) },
-                        &signature,
+                        &passes,
                     )
                     .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     let cost;
