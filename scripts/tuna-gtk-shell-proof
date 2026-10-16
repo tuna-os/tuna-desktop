@@ -7804,7 +7804,7 @@ until [ "$(cat "$BACKLIGHT/brightness")" = 510 ] || [ "$(date +%s)" -gt "$end" ]
 [ "$(cat "$BACKLIGHT/brightness")" = 510 ] || fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing"
 "$PY" "$ROOT/scripts/lib/gnome-brightness-proof.py" --out "$ARTIFACTS/brightness-controlled.json" \
     --controlled-root "$ARTIFACTS/backlight" --device tuna-bl \
-    --shell-executable "${TUNA_PROOF_SHELL_BIN:-$ROOT/target/debug/tuna-shell-gtk}" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||
+    --shell-executable "$privacy_expected_shell" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||
     fail G-BRIGHTNESS-CONTRACT "controlled policy/readback contract rejected; see retained JSON/log"
 pass G-BRIGHTNESS-CONTRACT "actual original shell wire schema and controlled associated dim/restore/auto/reset readbacks; synthetic sysfs/logind only"
 rm -rf "$ARTIFACTS/backlight/aaa-other"
