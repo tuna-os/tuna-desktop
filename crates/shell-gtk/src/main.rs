@@ -22,6 +22,8 @@ mod events;
 mod fd_watch;
 mod folder_dialog;
 mod folders;
+mod grid_animation;
+mod grid_pager;
 mod group_animation;
 mod ibus_panel;
 mod ibus_property_menu;
