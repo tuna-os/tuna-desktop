@@ -163,6 +163,25 @@ class Controls(unittest.TestCase):
                   if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
         self.assertEqual(loaded - bound, set())
 
+    def test_every_atspi_query_and_press_runs_in_a_fresh_process(self):
+        # A long-lived driver's libatspi keeps a disposed application object
+        # (gtk-shell 116769499648: 'not unique (0 live)' right after the
+        # popover opened). Only the per-call child may touch libatspi.
+        functions = {n.name: n for n in module.body if isinstance(n, ast.FunctionDef)}
+        def atspi_uses(fn):
+            return [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == "Atspi"]
+        self.assertEqual(atspi_uses(functions["run"]), [])
+        self.assertEqual(atspi_uses(functions["atspi"]), [])
+        self.assertTrue(atspi_uses(functions["atspi_child"]))
+        source = SOURCE.read_text()
+        self.assertIn('[sys.executable, __file__, "--atspi", str(pid), op, name, role or ""]', source)
+        self.assertIn('return atspi(pid, "query", name, role)', source)
+        self.assertIn('atspi(pid, "press", name, role)', source)
+        # Assertions the child must still enforce.
+        for message in ("GTK accessible application not unique", "ambiguous property action",
+                        "accessible action rejected"):
+            self.assertIn(message, ast.get_source_segment(source, functions["atspi_child"]))
+
 
 if __name__ == "__main__":
     unittest.main()

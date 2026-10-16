@@ -14,6 +14,7 @@ import re
 import time
 from pathlib import Path
 import signal
+import subprocess
 # The harness's own phase deadline can expire while this driver still waits;
 # its SIGTERM then dumps where it waited into the lifecycle log.
 faulthandler.register(signal.SIGTERM, chain=True)
@@ -47,12 +48,15 @@ def live(node):
 
     libatspi disposes an application object when a NameOwnerChanged names its
     bus name as the old owner, but keeps the disposed object in its process-wide
-    table: every later reference resolved through it fails for the rest of this
+    table: every later reference resolved through it fails for the rest of that
     process ('The application no longer exists', with 'hash_table != NULL'
-    warnings). gtk-shell 116720252865 retried such a walk until its deadline.
-    A defunct reference is not part of the live tree. The owned shell's own
-    exit or replacement still fails through identity() and the unique live
-    application check in node().
+    warnings). gtk-shell 116720252865 retried such a walk until its deadline,
+    and gtk-shell 116769499648 saw the shell's own application disposed this
+    way right after the popover opened. So every query and press runs in a
+    fresh short-lived process (atspi_child), like tuna-a11y-dump.py, and this
+    long-lived driver never holds libatspi state. A defunct reference is not
+    part of the live tree. The owned shell's own exit or replacement still
+    fails through identity() and the unique live application check.
     """
     try:
         node.get_role()
@@ -93,6 +97,62 @@ def matching(nodes, name, role=None):
             and (role is None or n.get_role_name() == role)]
 
 
+class Transient(Exception):
+    """An AT-SPI walk met a node disposed under it; the caller may retry."""
+
+
+def atspi_child(pid, op, name, role):
+    """One fresh-process AT-SPI query or press against the owned GTK app.
+
+    Prints one JSON object. `matches` are the showing nodes named `name`
+    (any node for op "named"), each with its accessible address so the parent
+    can later call a held, possibly stale action over the bus directly.
+    """
+    def describe(n):
+        states = n.get_state_set()
+        return {"bus": n.app.bus_name, "path": n.path,
+                "checked": states.contains(Atspi.StateType.CHECKED),
+                "sensitive": states.contains(Atspi.StateType.SENSITIVE)}
+    try:
+        desktop = Atspi.get_desktop(0)
+        apps = [desktop.get_child_at_index(i) for i in range(desktop.get_child_count())]
+        apps = [a for a in apps if a is not None and live(a) and a.get_process_id() == pid]
+        if len(apps) != 1:
+            return {"error": f"GTK accessible application not unique ({len(apps)} live)"}
+        if op == "named":
+            found = [n for n in walk(apps[0]) if n.get_name() == name]
+        else:
+            found = matching(walk(apps[0]), name, role)
+        result = {"matches": [describe(n) for n in found]}
+        if op == "press":
+            if len(found) != 1:
+                return {"error": "ambiguous property action"}
+            action = found[0].get_action_iface()
+            if action is None or action.get_n_actions() < 1 or not action.do_action(0):
+                return {"error": "accessible action rejected"}
+        return result
+    except GLib.Error as error:
+        return {"transient": error.message}
+
+
+def atspi(pid, op, name, role=None):
+    try:
+        done = subprocess.run(
+            [sys.executable, __file__, "--atspi", str(pid), op, name, role or ""],
+            capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        raise Transient(f"AT-SPI {op} {name!r} timed out")
+    try:
+        reply = json.loads(done.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        raise RuntimeError(f"AT-SPI child {op} {name!r} exit={done.returncode}: {done.stderr[-2000:]}")
+    if "transient" in reply:
+        raise Transient(reply["transient"])
+    if "error" in reply:
+        raise RuntimeError(reply["error"])
+    return reply["matches"]
+
+
 def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_log=None):
     expected_hash = file_hash(expected_shell)
     origin = identity(pid)
@@ -110,12 +170,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
     def node(name, role=None):
         if identity(pid, False) != basic_origin:
             raise RuntimeError("GTK process changed")
-        desktop = Atspi.get_desktop(0)
-        apps = [desktop.get_child_at_index(i) for i in range(desktop.get_child_count())]
-        apps = [a for a in apps if a is not None and live(a) and a.get_process_id() == pid]
-        if len(apps) != 1:
-            raise RuntimeError(f"GTK accessible application not unique ({len(apps)} live)")
-        return matching(walk(apps[0]), name, role)
+        return atspi(pid, "query", name, role)
 
     def wait(predicate):
         last_error = None
@@ -123,24 +178,21 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             try:
                 if predicate():
                     return
-            except GLib.Error as error:
+            except Transient as error:
                 # GTK rebuilds the menu on every property update; a walk can
                 # meet a child disposed under it ("The application no longer
                 # exists", gtk-shell 38757056152). node() rechecks the GTK
                 # process identity first, so a real exit still fails.
-                last_error = error.message
+                last_error = str(error)
             time.sleep(.05)
         raise RuntimeError(f"property traffic deadline after presses {seen}; "
                            f"last AT-SPI error: {last_error}")
 
     def press(name, role=None):
         wait(lambda: len(node(name, role)) == 1)
-        selected = node(name, role)
-        if len(selected) != 1:
-            raise RuntimeError("ambiguous property action")
-        action = selected[0].get_action_iface()
-        if action is None or action.get_n_actions() < 1 or not action.do_action(0):
-            raise RuntimeError("accessible action rejected")
+        if identity(pid, False) != basic_origin:
+            raise RuntimeError("GTK process changed")
+        atspi(pid, "press", name, role)
         seen.append(name)
 
     def heard(line):
@@ -165,6 +217,26 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
                           "org.freedesktop.DBus", "GetNameOwner",
                           GLib.Variant("(s)", ("org.freedesktop.IBus.Panel",)),
                           GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+    # The same bus libatspi resolves: AT_SPI_BUS_ADDRESS, else org.a11y.Bus.
+    a11y_address = os.environ.get("AT_SPI_BUS_ADDRESS") or Gio.bus_get_sync(
+        Gio.BusType.SESSION, None).call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus",
+        "GetAddress", None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 2000,
+        None).unpack()[0]
+    a11y = Gio.DBusConnection.new_for_address_sync(a11y_address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+        | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+
+    def stale_call(held):
+        # The held address's own Action, as a held libatspi reference would
+        # call it; no lookup can redirect it to the fresh menu.
+        try:
+            returned = a11y.call_sync(held["bus"], held["path"], "org.a11y.atspi.Action",
+                "DoAction", GLib.Variant("(i)", (0,)), GLib.VariantType.new("(b)"),
+                Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+            return {"returned": bool(returned), "error": None}
+        except GLib.Error as exc:
+            return {"returned": None, "error": type(exc).__name__}
+
     if phase_file is not None:
         def traffic():
             return [line for line in log_path.read_text().splitlines() if "property activated" in line]
@@ -175,11 +247,6 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             if not node("Input Mode"):
                 press(*INDICATOR)
             wait(lambda: len(node("Input Mode")) == 1)
-        def stale_call(action):
-            try:
-                return {"returned": bool(action.do_action(0)), "error": None}
-            except GLib.Error as exc:
-                return {"returned": None, "error": type(exc).__name__}
         def ordered_fresh(before):
             fresh_menu()
             press("Proof Submenu")
@@ -233,7 +300,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
         context.focus_in()
         wait(lambda: registered(before_trace))
         fresh_menu()
-        held = node("Input Mode")[0].get_action_iface()
+        held = node("Input Mode")[0]
         before = traffic(); before_trace = len(trace())
         context.focus_out(); context.focus_in()
         wait(lambda: registered(before_trace))
@@ -246,8 +313,8 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
         fresh_menu()
 
         for case in ("normal", "other-panel"):
-            held = node("Input Mode")[0].get_action_iface()
-            checked = node("Input Mode")[0].get_state_set().contains(Atspi.StateType.CHECKED)
+            held = node("Input Mode")[0]
+            checked = held["checked"]
             before = traffic(); before_trace = len(trace())
             screensaver("Lock"); wait(active)
             if node("中") or node("Input Mode"):
@@ -282,7 +349,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
                     raise RuntimeError("challenger release not confirmed")
                 wait(lambda: panel_owner() == owner)
             fresh_menu(); ordered_fresh(before)
-            if node("Input Mode")[0].get_state_set().contains(Atspi.StateType.CHECKED) != checked:
+            if node("Input Mode")[0]["checked"] != checked:
                 raise RuntimeError("old action mutated restored checked state")
             if instance() != original_instance:
                 raise RuntimeError("lock recovery recreated or changed the engine")
@@ -308,7 +375,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
     if node("Proof Hidden"):
         raise RuntimeError("hidden property exposed")
     disabled = node("Proof Disabled")
-    if len(disabled) != 1 or disabled[0].get_state_set().contains(Atspi.StateType.SENSITIVE):
+    if len(disabled) != 1 or disabled[0]["sensitive"]:
         raise RuntimeError("disabled property is actionable")
     press("Input Mode")
     wait(lambda: heard("tuna-ibus-test-engine: property activated InputMode 1 engine=tuna-test"))
@@ -335,9 +402,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
     stale = node("Input Mode")
     if len(stale) != 1:
         raise RuntimeError("old property control missing")
-    stale_action = stale[0].get_action_iface()
-    if stale_action is None:
-        raise RuntimeError("old property action missing")
+    stale_action = stale[0]
     before = [line for line in log_path.read_text().splitlines() if "property activated" in line]
 
     def engine(name):
@@ -354,20 +419,14 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             raise RuntimeError("engine switch did not complete")
 
     engine("tuna-test-alternate")
-    wait(lambda: any(n.get_name() == "tuna-test-alternate" for n in walk(
-        next(a for a in [Atspi.get_desktop(0).get_child_at_index(i)
-            for i in range(Atspi.get_desktop(0).get_child_count())]
-            if a is not None and a.get_process_id() == pid))))
+    wait(lambda: bool(atspi(pid, "named", "tuna-test-alternate")))
     # The old handler may report handled even though its epoch gate suppresses
     # effects. Follow it with a fresh action through the SAME actual GTK action
     # producer and await the daemon engine's ordered callback/log, not an
     # unrelated D-Bus round trip or an arbitrary quiet sleep.
-    stale_result = None
-    stale_error = None
-    try:
-        stale_result = bool(stale_action.do_action(0))
-    except GLib.Error as exc:
-        stale_error = type(exc).__name__
+    stale_result = stale_call(stale_action)
+    stale_error = stale_result["error"]
+    stale_result = stale_result["returned"]
     press("Proof Submenu")
     press("Proof Action")
     positive = "tuna-ibus-test-engine: property activated proof-action 0 engine=tuna-test-alternate"
@@ -375,7 +434,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
     after = [line for line in log_path.read_text().splitlines() if "property activated" in line]
     validate_traffic(before, after, positive)
     current = node("Input Mode")
-    if len(current) != 1 or current[0].get_state_set().contains(Atspi.StateType.CHECKED):
+    if len(current) != 1 or current[0]["checked"]:
         raise RuntimeError("old property mutated current context state")
     engine("tuna-test")
     if (identity(pid) != origin or file_hash(expected_shell) != expected_hash
@@ -398,6 +457,9 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
 
 
 if __name__ == "__main__":
+    if sys.argv[1] == "--atspi":
+        print(json.dumps(atspi_child(int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] or None)))
+        sys.exit(0)
     run(int(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), int(sys.argv[5]),
         Path(sys.argv[6]) if len(sys.argv) > 6 else None,
         Path(sys.argv[7]) if len(sys.argv) > 7 else None)
