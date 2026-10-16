@@ -3942,10 +3942,7 @@ impl Runtime {
             due(Duration::from_millis(ms));
         }
         // Focus-follows-mouse pointer rest and auto-raise (#347).
-        if let Some(ms) = self
-            .manager
-            .hover_wake_ms(crate::state::system_millis())
-        {
+        if let Some(ms) = self.manager.hover_wake_ms(crate::state::system_millis()) {
             due(Duration::from_millis(ms));
         }
         if self.hidden_waiting {
