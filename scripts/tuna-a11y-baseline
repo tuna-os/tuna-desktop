@@ -53,7 +53,8 @@ def comparison():
               '- Dash app names depend on the installed favorites and window fixtures. Show Apps is a toggle button on both sides. GNOME’s preview buttons are unnamed in the native tree; Tuna Desktop’s hovered-preview golden names the Close action.',
               '- Lock Screen in GNOME maps to Lock in Tuna Desktop. Open power profiles menu maps to Power Mode Menu. The shared screenshot, settings and power menu actions remain named.',
               '- GNOME’s Power Mode, Dark Style and Do Not Disturb toggles use visible label children instead of a name on the toggle. Tuna Desktop names the toggles directly. The native fixture retains those label children.',
-              '- Tuna Desktop’s network, Bluetooth, volume and brightness controls are present because its live proof supplies those services. The GNOME headless reference has no usable network adapter, audio server or hardware backlight.', '',
+              '- Tuna Desktop’s network, Bluetooth, volume and brightness controls are present because its live proof supplies those services. The GNOME headless reference has no usable network adapter, audio server or hardware backlight.',
+              '- Tuna Desktop adds a Printers tile and menu for the CUPS queue (#362); GNOME 51 has no quick-settings printers control.', '',
               'This comparison describes visible accessible structure and labels. '
               'The live Tuna Desktop proof checks actions, focus and slider operation; it does not claim '
               'a spoken Orca end-to-end test.', '']
