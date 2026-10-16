@@ -495,7 +495,7 @@ jobs:
           done
       - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libsecret-tools gnome-keyring fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk
       - run: scripts/ci-install-gtk4-layer-shell
-      - run: shellcheck -x scripts/tuna-gtk-shell-proof scripts/tuna-walkthrough scripts/tuna-gtk-accessibility-proof scripts/lib/tuna-fade-match
+      - run: shellcheck -x scripts/tuna-gtk-shell-proof scripts/tuna-walkthrough scripts/tuna-gtk-accessibility-proof scripts/tuna-slow-portal-proof scripts/lib/tuna-fade-match
       # docs/walkthrough.md must match its manifest (docs/walkthrough.tsv).
       - run: scripts/tuna-walkthrough check
       - name: Prove password origin and epoch ownership in the actual nested runtime
@@ -637,6 +637,9 @@ jobs:
           done
           mkdir -p gtk-shell-artifacts/scale
           cat gtk-shell-artifacts/scale-*/assertions.txt > gtk-shell-artifacts/scale/assertions.txt
+      # dbus-daemon semantics: portal activation hangs instead of failing
+      # fast, and the shell must still own org.gnome.Shell promptly.
+      - run: scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal
       # Keep runnable binaries even when a later live proof assertion fails.
       - if: always()
         run: |
