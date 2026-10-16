@@ -293,6 +293,19 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaises(payload.Refusal):
             payload.runtime(self.root, report)
 
+    def test_prerelease_runtime_version_matches_its_pacman_pkgver(self):
+        report = self.inspect()
+        report["pkginfo"]["pkgver"] = "1.0.0beta.1-1"
+        for name in payload.BINS:
+            binary = name.rsplit("/", 1)[1]
+            (self.root / (binary + ".version")).write_text(binary + " 1.0.0-beta.1\n")
+            (self.root / (binary + ".status")).write_text("0\n")
+        self.assertEqual(len(payload.runtime(self.root, report)), 6)
+        for version in ("1.0.0-beta.2", "1.0.0", "1.0.0beta.1-1"):
+            (self.root / "tuna-shell-gtk.version").write_text("tuna-shell-gtk " + version + "\n")
+            with self.assertRaises(payload.Refusal):
+                payload.runtime(self.root, report)
+
     def test_actual_container_hash_guard_refuses_before_mutation_in_and_context(self):
         container = Path(__file__).resolve().parents[2] / "packaging/marlin/Containerfile"
         guard = container.read_text().split("RUN set -eux; \\\n", 1)[1].split(

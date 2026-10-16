@@ -1,0 +1,96 @@
+#!/usr/bin/python3
+"""Exact admitted CI-only real MediaKeys test; private child fixture and watchdog."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+
+FILTER = 'media_keys::completion_tests::actual_media_keys_clamp_key_completion_barrier'
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def verdict(status, unchanged, output):
+    return (status == 0 and unchanged and 'running 1 test' in output
+            and re.search(r'1 passed; 0 failed; 0 ignored;', output) is not None
+            and 'MEDIA-COMPLETION pass old=0.4800 guarded=0.4200 callback-scheduler failure timeout' in output)
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--admission', type=Path, required=True)
+    parser.add_argument('--cargo-json', type=Path, required=True)
+    parser.add_argument('--artifacts', type=Path, required=True)
+    args=parser.parse_args()
+    root=Path(__file__).resolve().parent.parent
+    admission=json.loads(args.admission.read_text())
+    expected={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
+              'cargo_lock_sha256':digest(root/'Cargo.lock'),'run_id':os.environ['GITHUB_RUN_ID'],
+              'run_attempt':os.environ['GITHUB_RUN_ATTEMPT']}
+    if any(admission.get(k)!=v for k,v in expected.items()):raise ValueError('source/lock/run/attempt admission mismatch')
+    messages=[json.loads(line) for line in args.cargo_json.read_text().splitlines()]
+    artifacts=[m for m in messages if m.get('reason')=='compiler-artifact' and m.get('profile',{}).get('test')
+               and m.get('target',{}).get('name')=='tuna-shell-gtk' and m.get('target',{}).get('kind')==['bin'] and m.get('executable')]
+    if (len(artifacts)!=1 or re.search(r'#tuna-shell-gtk@[0-9]+\.[0-9]+\.[0-9]+$', artifacts[0].get('package_id','')) is None
+            or Path(artifacts[0]['target'].get('src_path','')).resolve()!=root/'crates/shell-gtk/src/main.rs'):
+        raise ValueError('named GTK package/test target/source required')
+    binary=Path(admission['admitted_executable']).resolve()
+    if (str(Path(artifacts[0]['executable']).resolve())!=str(Path(admission['cargo_executable']).resolve())
+            or digest(binary)!=admission['executable_sha256'] or digest(artifacts[0]['executable'])!=admission['executable_sha256']):
+        raise ValueError('Cargo artifact/admitted executable bytes changed')
+    subprocess.run(['git','diff','--quiet'],cwd=root,check=True)
+    args.artifacts.mkdir(parents=True, exist_ok=False)
+    fixture=(args.artifacts/'fixture').resolve();fixture.mkdir(mode=0o700)
+    bin_dir=fixture/'bin';bin_dir.mkdir(mode=0o700)
+    script=root/'scripts/lib/media-completion-fixture.py'
+    (bin_dir/'wpctl').write_bytes(script.read_bytes());(bin_dir/'wpctl').chmod(0o700)
+    marker=fixture/'diagnostics';marker.touch(mode=0o600)
+    for directory in ('runtime', 'config', 'cache', 'data'):
+        (fixture/directory).mkdir(mode=0o700)
+    # Per-child environment only; no shared settings, bus or Python bytecode.
+    env=dict(os.environ, PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],
+             TUNA_MEDIA_FIXTURE_ROOT=str(fixture),TUNA_MEDIA_DIAGNOSTICS=str(marker),
+             TUNA_MEDIA_BARRIER_HELPER=str(root/'scripts/lib/media-completion-barrier.py'),
+             TUNA_REQUIRE_MEDIA_COMPLETION='1',PYTHONDONTWRITEBYTECODE='1',
+             XDG_RUNTIME_DIR=str(fixture/'runtime'), XDG_CONFIG_HOME=str(fixture/'config'),
+             XDG_CACHE_HOME=str(fixture/'cache'), XDG_DATA_HOME=str(fixture/'data'))
+    env.pop('WAYLAND_DISPLAY',None);env.pop('WAYLAND_SOCKET',None)
+    argv=['dbus-run-session','--',str(binary),FILTER,'--exact','--ignored','--test-threads=1','--nocapture']
+    with (args.artifacts/'output.txt').open('w') as out:
+        child=subprocess.Popen(argv,env=env,stdin=subprocess.DEVNULL,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
+        try:status=child.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            status=124
+            os.killpg(child.pid,signal.SIGTERM)
+            try:child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid,signal.SIGKILL);child.wait(timeout=3)
+    text=(args.artifacts/'output.txt').read_text()
+    after_source=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+    unchanged=(digest(binary)==admission['executable_sha256'] and digest(artifacts[0]['executable'])==admission['executable_sha256']
+               and after_source==expected['source_commit'] and digest(root/'Cargo.lock')==expected['cargo_lock_sha256']
+               and subprocess.run(['git','diff','--quiet'],cwd=root).returncode==0)
+    owned_group_gone=False
+    try:os.killpg(child.pid,0)
+    except ProcessLookupError:owned_group_gone=True
+    if not owned_group_gone:
+        os.killpg(child.pid,signal.SIGTERM)
+        import time
+        time.sleep(.1)
+        try:os.killpg(child.pid,signal.SIGKILL)
+        except ProcessLookupError:pass
+        status=125
+    receipt={'build_admission':admission,'cargo_artifact':artifacts[0],'filter':FILTER,'argv':argv,'exit_status':status,
+             'source_lock_executable_unchanged':unchanged,'owned_group_gone':owned_group_gone,'output_sha256':digest(args.artifacts/'output.txt'),
+             'scope':'actual production MediaKeys/GSettings/GLib/subprocess interleave, owned simulated wpctl; actual hardware routing and installed audio qualification separate'}
+    (args.artifacts/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+    if not verdict(status,unchanged,text):raise RuntimeError('exact real MediaKeys test did not execute/pass')
+
+
+if __name__=='__main__':main()

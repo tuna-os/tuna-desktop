@@ -13,6 +13,7 @@ import statistics
 import subprocess
 import sys
 import time
+sys.dont_write_bytecode=True
 
 HERE = Path(__file__).resolve().parent
 loader = importlib.machinery.SourceFileLoader("vm_lane", str(HERE / "tuna-vm-lane"))
@@ -21,6 +22,7 @@ lane = importlib.util.module_from_spec(spec)
 loader.exec_module(lane)
 sys.path.insert(0, str(HERE / "lib"))
 from gnome_reference import validate_image, validate_reference, same_reference, trace_required, idle_pss, idle_memory, read_image
+from tuna_overview_receipts import validate_capture as validate_tuna_overview
 from vm_guest_agent import GuestAgent  # noqa: E402
 from perf_trace_diagnostics import decode as decode_trace_failure, MAX_BYTES as TRACE_FAILURE_BYTES
 from gnome_failed_capture import validate_receipt as validate_failed_capture, validate_chunk as validate_failed_chunk
@@ -34,7 +36,7 @@ def guest_probe(agent, action, index=None, out=None):
                       "gnome-trace-stop", "gnome-trace-read",
                       "gnome-trace-failed-stop", "gnome-trace-failed-stop-read",
                       "kernel-trace-stop", "kernel-trace-read", "kernel-formats-read",
-                      "kernel-discovery-read"):
+                      "kernel-discovery-read", "tuna-overview-start", "tuna-overview-stop"):
         raise ValueError("unsupported performance probe")
     arguments = [action]
     if action == "notify":
@@ -401,18 +403,80 @@ def changed(before, after):
     return sum(abs(x-y) > 24 for x, y in zip(before[32*1280*3:], after[32*1280*3:])) > 1280*800*3*.10
 
 
+def overview_response_summary(observations):
+    """A broad pixel change is first response, not completed-card evidence."""
+    response = distribution([row["upper_s"] for row in observations])
+    return {
+        # Preserve the legacy field as a first-response alias for old reports.
+        "overview_observed_upper_s": response,
+        "overview_first_response_upper_s": response,
+        "overview_card_complete_scanout": {
+            "status": "unavailable",
+            "qualifies_completed_overview": False,
+            "reason": "native card readiness and associated primary presentation receipts not acquired",
+            "pre_input_preparation": "unobserved",
+            "startup_accounting": "unchanged whole-run CPU/RSS/PSS samples include preparation",
+        },
+    }
+
+
+def retain_tuna_overview(agent, out, original, image, payload_path, selection_path, meta):
+    """Retain raw native evidence; a refused acquisition never qualifies pixels."""
+    unavailable = overview_response_summary([])['overview_card_complete_scanout']
+    try:
+        receipt = guest_probe(agent, 'tuna-overview-stop')['tuna_overview']
+        (out / 'tuna-overview-native.json').write_text(json.dumps(receipt, indent=2))
+        payload = json.loads(Path(payload_path).read_text())
+        selection = json.loads(Path(selection_path).read_text())
+        image_ids = [item.split('=', 1)[1] for item in meta if item.startswith('fixture_image_id=')]
+        if len(image_ids) != 1:
+            raise ValueError('missing original fixture image identity')
+        if any(receipt.get(field) != original.get(field) for field in ('after_id', 'cursor', 'boundary_journal_sha256')):
+            raise ValueError('workload boundary changed')
+        result = validate_tuna_overview(receipt, original['process'], image,
+            payload['required_members']['usr/bin/tuna-compositor']['sha256'],
+            selection['head_sha'], image_ids[0])
+        result['input_to_card_complete_scanout_s'] = distribution([
+            row['input_to_card_complete_scanout_s'] for row in result['samples']])
+        result['opening_input_to_card_complete_scanout_s'] = distribution([
+            row['input_to_card_complete_scanout_s'] for row in result['samples'] if row['action'] == 'overview-open'])
+        return result
+    except (ValueError, TypeError, KeyError, OSError, RuntimeError, RecursionError):
+        return dict(unavailable, status='refused', reason='native acquisition or original identity validation refused')
+
+
 def main():
     from perf_vm_lifetime import Handoff, cleanup_owned_vm
     ap = argparse.ArgumentParser()
-    ap.add_argument("--disk", required=True)
+    ap.add_argument("--disk")
+    ap.add_argument("--corral-vm")
+    ap.add_argument("--corral-context")
+    ap.add_argument("--corral-namespace",default="corral-vms")
+    ap.add_argument("--corral-user",default="tuna-bench")
+    ap.add_argument("--corral-key")
+    ap.add_argument("--corral-known-hosts")
+    ap.add_argument("--guest-aggregate-cpu", action="store_true")
+    ap.add_argument("--corral-export-dir")
+    ap.add_argument("--corral-import-receipt")
+    ap.add_argument("--corral-candidate-sha")
+    ap.add_argument("--corral-package-run", type=int)
+    ap.add_argument("--corral-public-key")
     ap.add_argument("--desktop", required=True, choices=("gnome", "tuna"))
     ap.add_argument("--gnome-profile", choices=("diagnostic", "stock"), default="diagnostic")
     ap.add_argument("--reference-image", help="original host-retained image receipt; required by paired CI")
+    ap.add_argument("--tuna-payload", help="original package member hash receipt for native overview qualification")
+    ap.add_argument("--tuna-selection", help="original successful MAIN source/artifact selection receipt")
     ap.add_argument("--out", required=True)
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--meta", action="append", default=[])
     ap.add_argument("--owned-vm-handoff", action="store_true", help="paired CI original child departure receipt")
     args = ap.parse_args()
+    if bool(args.disk)==bool(args.corral_vm):ap.error('exactly one of --disk or --corral-vm is required')
+    if args.corral_vm and (not all((args.corral_context,args.corral_key,args.corral_known_hosts,args.reference_image)) or args.owned_vm_handoff):
+        ap.error('Corral requires explicit context, key, owned known_hosts and original reference; QEMU handoff is unsupported')
+    if args.guest_aggregate_cpu and (not args.corral_vm or args.gnome_profile!='stock' or args.corral_user!='root' or
+            not all((args.corral_export_dir,args.corral_import_receipt,args.corral_candidate_sha,args.corral_package_run,args.tuna_payload,args.tuna_selection))):
+        ap.error('guest aggregate requires original stock Corral image/package/import/key intent')
     expected_image = read_image(args.reference_image, args.gnome_profile) if args.reference_image else None
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -425,23 +489,34 @@ def main():
             raise RuntimeError('original paired acquisition repeat required')
         handoff = Handoff(out, args.gnome_profile, args.desktop, int(repeats[0]))
     vm = None
+    corral = None
     observations, phases, guest_phases, notifications = [], {}, {}, []
     agent = None
     gnome_trace_active = False
     gnome_trace_summary = None
+    tuna_overview_original = None
+    tuna_overview_summary = None
     primary = None
     try:
-        vm, qmp_path, serial_path, kvm, agent_path = lane.boot(
-            os.path.abspath(args.disk), str(out), str(scratch), args.timeout, guest_agent=True)
+        if args.corral_vm:
+            from corral_session import Session
+            corral = Session(args.corral_context,args.corral_namespace,args.corral_vm,args.corral_user,
+                             args.corral_key,args.corral_known_hosts,out)
+            qmp=corral.connect_display();agent=corral;kvm=True
+            def read_serial():return corral.samples()
+        else:
+            vm, qmp_path, serial_path, kvm, agent_path = lane.boot(
+                os.path.abspath(args.disk), str(out), str(scratch), args.timeout, guest_agent=True)
+            qmp = lane.baseline.Qmp(qmp_path)
+            def read_serial():return lane.read_text(serial_path)
         started = time.monotonic()
         if handoff is not None:
             handoff.attach(vm)
         if not kvm:
             raise RuntimeError("paired performance comparison requires actual KVM")
-        qmp = lane.baseline.Qmp(qmp_path)
         ready = False
-        while time.monotonic()-started < args.timeout and vm.poll() is None:
-            if raw_samples(lane.read_text(serial_path)):
+        while time.monotonic()-started < args.timeout and (vm is None or vm.poll() is None):
+            if raw_samples(read_serial()):
                 qmp.keys("esc")
                 time.sleep(2)
                 path = scratch / "ready.ppm"
@@ -453,8 +528,10 @@ def main():
         if not ready:
             raise RuntimeError("the guest never displayed its desktop panel")
         panel_upper_s = time.monotonic()-started
+        if corral is not None:
+            corral.metadata['desktop_before']=corral.desktop(args.desktop)
         qmp.frame(str(out / "panel.png"))
-        agent = GuestAgent(agent_path)
+        if corral is None:agent = GuestAgent(agent_path)
         reference_image = validate_image(guest_probe(agent, 'reference-image')['reference_image'], args.gnome_profile)
         if expected_image is not None and reference_image != expected_image:
             raise ValueError('guest reference differs from original host image')
@@ -465,12 +542,29 @@ def main():
             if original_reference['image'] != reference_image:
                 raise ValueError('stock process image differs from shared reference')
             (out / 'stock-reference-before.json').write_text(json.dumps(original_reference, indent=2))
+        aggregate_admission=None;guest_aggregate=None
+        if args.guest_aggregate_cpu:
+            from corral_guest_admission import AggregateAdmission
+            from corral_guest_cpu import collect_idle,bind_idle_phase
+            options={'context':args.corral_context,'namespace':args.corral_namespace,'vm':args.corral_vm,
+                     'key':args.corral_key,'public_key':args.corral_public_key,'desktop':args.desktop,
+                     'export_dir':args.corral_export_dir,'import_receipt':args.corral_import_receipt,
+                     'candidate_sha':args.corral_candidate_sha,'package_run':args.corral_package_run,
+                     'reference_image':args.reference_image,'tuna_payload':args.tuna_payload,'tuna_selection':args.tuna_selection}
+            aggregate_admission=AggregateAdmission(corral,options,reference_image,corral.metadata['desktop_before'],original_reference)
         time.sleep(30)  # Equal post-panel settle, before the idle measurement.
         phases["idle_start"] = time.clock_gettime(time.CLOCK_BOOTTIME)
         guest_phases["idle_start"] = guest_probe(agent, "clock")["boottime_s"]
-        time.sleep(30)
+        if args.guest_aggregate_cpu:
+            guest_aggregate=collect_idle(corral,out)
+        else:
+            time.sleep(30)
         guest_phases["idle_end"] = guest_probe(agent, "clock")["boottime_s"]
         phases["idle_end"] = time.clock_gettime(time.CLOCK_BOOTTIME)
+        if args.guest_aggregate_cpu:
+            guest_aggregate=bind_idle_phase(guest_aggregate,out,corral.boot_id,
+                {'idle_start':guest_phases['idle_start'],'idle_end':guest_phases['idle_end']})
+            aggregate_admission.finish()
         presentation = guest_probe(agent, "frames")["presentation"]
         (out / "presentation.json").write_text(json.dumps(presentation, indent=2))
         pacing = presentation_summary(presentation)
@@ -485,6 +579,13 @@ def main():
             guest_probe(agent, "gnome-trace-start", out=out)
             gnome_trace_active = True
             time.sleep(1)  # Preserve pre-input scopes after the actual drained boundary.
+        if args.desktop == 'tuna':
+            try:
+                tuna_overview_original = guest_probe(agent, 'tuna-overview-start')['tuna_overview']
+                (out / 'tuna-overview-boundary.json').write_text(json.dumps(tuna_overview_original, indent=2))
+            except (ValueError, TypeError, KeyError, RuntimeError):
+                tuna_overview_summary = dict(overview_response_summary([])['overview_card_complete_scanout'],
+                    status='refused', reason='native original process/workload boundary unavailable')
         phases["workload_start"] = time.clock_gettime(time.CLOCK_BOOTTIME)
         for index in range(20):
             before = frame(qmp, scratch / "before.ppm")
@@ -498,7 +599,8 @@ def main():
                 if changed(before, after):
                     observations.append({"index": index, "action": "overview-open" if index % 2 == 0 else "overview-close",
                                          "lower_s": previous_start-start, "upper_s": poll_end-start,
-                                         "capture_s": poll_end-poll_start})
+                                         "capture_s": poll_end-poll_start,
+                                         "scope": "broad-first-response", "card_completion_verified": False})
                     qmp.frame(str(out / f"overview-{index:02d}.png"))
                     break
                 previous_start = poll_start
@@ -506,6 +608,10 @@ def main():
             else:
                 raise RuntimeError(f"overview input {index} produced no broad visible response")
             time.sleep(1)
+        if tuna_overview_original is not None:
+            tuna_overview_summary = retain_tuna_overview(agent, out, tuna_overview_original,
+                reference_image, args.tuna_payload, args.tuna_selection, args.meta)
+            (out / 'tuna-overview-acquisition.json').write_text(json.dumps(tuna_overview_summary, indent=2))
         if gnome_trace_active:
             metadata = guest_probe(agent, "gnome-trace-stop", out=out)["gnome_trace"]
             gnome_trace_active = False
@@ -533,7 +639,12 @@ def main():
             same_reference(original_reference, final_reference, 'stock')
         if validate_image(guest_probe(agent, 'reference-image')['reference_image'], args.gnome_profile) != reference_image:
             raise ValueError('reference image changed during workload')
-        serial = lane.read_text(serial_path)
+        serial = read_serial()
+        (out / "sampler-journal.txt").write_text(serial)
+        if corral is not None:
+            corral.verify()
+            if corral.desktop(args.desktop)!=corral.metadata['desktop_before']:
+                raise ValueError('selected desktop compositor changed during acquisition')
         samples = raw_samples(serial)
         if not samples or any(s["unreadable"] for s in samples):
             raise RuntimeError("resource samples are missing or incomplete; inspect raw serial")
@@ -550,9 +661,10 @@ def main():
         # provenance, and summarize guest samples only by their guest timestamps.
         report = {"desktop": args.desktop, "gnome_profile": args.gnome_profile, "reference_image": reference_image, "reference_image_admitted_from_host": expected_image is not None,
                   "trace_availability": "required-diagnostic" if trace_required(args.desktop, args.gnome_profile) else "unavailable-stock-profile" if args.gnome_profile == "stock" else "not-gnome", "vm_profile": {"memory_mib":6144,"vcpus":4,"resolution":[1280,800],"kvm":kvm,
-                      "gpu_profile":lane.baseline.GPU_PROFILE,"gpu_devices":lane.baseline.gpu_devices()},
+                      "gpu_profile":lane.baseline.GPU_PROFILE,"gpu_devices":lane.baseline.gpu_devices()} if corral is None else corral.metadata,
                   "meta": args.meta, "host": {"kernel":os.uname().release,"cpu":Path("/proc/cpuinfo").read_text(),
-                                              "qemu":subprocess.check_output(["qemu-system-x86_64","--version"],text=True)},
+                                              "qemu":subprocess.check_output(["qemu-system-x86_64","--version"],text=True) if corral is None else None,
+                                              "scope":"local QEMU host" if corral is None else "SSH/RFB observer host; not AWS hypervisor"},
                   "panel_observed_upper_s":panel_upper_s,"host_phases_boottime_s":phases,
                   "idle_user_pss_kib": distribution(idle_pss(samples, guest_phases["idle_start"], guest_phases["idle_end"])),
                   "idle_user_rss_kib": distribution(idle_memory(samples, guest_phases["idle_start"], guest_phases["idle_end"], "rss_kib")),
@@ -565,19 +677,30 @@ def main():
                   "drm_memory": drm_memory_summary(samples),
                   "presentation_cadence": pacing,
                   "gnome_overview_sysprof": gnome_trace_summary,
-                  "overview_observed_upper_s":distribution([s["upper_s"] for s in observations]),
-                  "limitations":["QMP observations are bounded host-visible response times, not compositor input-to-frame tracing.",
+                  **overview_response_summary(observations),
+                  **({'overview_card_complete_scanout': tuna_overview_summary} if tuna_overview_summary is not None else {}),
+                  "limitations":["QMP observations measure broad first response only. A changed shell/dark background can precede async wallpaper cards; these observations do not qualify completed overview latency.",
                                  "CPU counts surviving sampled processes; exited processes can consume unobserved CPU.",
                                  "RSS sums process resident sets and can double-count shared pages. PSS covers the test UID and excludes the observer and its descendants; root/GDM shared services are outside this scope.",
                                  "App search followed by fixed eight-second waits does not measure or prove application launch/readiness.",
                                  "Whole-run summaries include startup and workload. Idle PSS and CPU uses guest-clock markers and only intervals wholly within the idle phase.",
                                  "DRM memory is optional driver-provided client accounting, not unique physical GPU allocation; unavailable samples are explicit.",
-                                 "Notification IDs prove service acceptance, not notification input-to-frame latency. Presentation cadence is a native client workload; compositor input tracing, multiple cold/warm boots and 24-hour soak remain open.",
+                                 "Notification IDs prove service acceptance, not notification input-to-frame latency. Tuna native receipts cover current-layout wallpaper cards at primary scanout, not animation or GTK completion; equivalent GNOME card-readiness evidence, multiple cold/warm boots and 24-hour soak remain open.",
                                  "No release threshold or claim of within-10-percent parity is introduced."]}
+        if corral is not None:
+            report['limitations'] += ['RFB capture bounds broad first response only; native completion remains separately validated.',
+              'Cloud GPU/total-power counters unavailable; no physical hardware or whole-session performance qualification.',
+              'Sampler journal is attributed to exact guest boot/unit. SSH observer transport and cloud scheduling affect capture bounds.']
+            report['corral_session'] = corral.metadata
+            if args.guest_aggregate_cpu:
+                report['guest_aggregate_idle']=guest_aggregate
+                report['guest_aggregate_admission']=aggregate_admission.evidence
         (out / "report.json").write_text(json.dumps(report, indent=2))
         print(json.dumps({"desktop":args.desktop,"samples":len(samples),"observations":len(observations)}))
     except BaseException as error:
         primary = error
+        (out / 'acquisition-failure.json').write_text(json.dumps({'backend':'corral-kubevirt' if args.corral_vm else 'qemu',
+            'error_type':type(error).__name__,'message':str(error)[:4096],'performance_qualified':False},indent=2))
         raise
     finally:
         cleanup_error = None
@@ -597,6 +720,8 @@ def main():
                     print(f"Kernel observer cleanup/acquisition failed: {error}", file=sys.stderr)
         finally:
             try:
+                if corral is not None:
+                    corral.close()
                 if vm is not None:
                     cleanup_owned_vm(vm, agent, handoff)
             except BaseException as error:

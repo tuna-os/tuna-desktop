@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
+use gtk4::subclass::prelude::ObjectSubclassIsExt;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::apps::AppEntry;
 
@@ -37,6 +38,8 @@ pub trait OverviewActions {
         None
     }
     fn running(&self) -> Vec<(u64, Option<String>)>;
+    fn set_window_icon_geometries(&self, _geometries: Vec<tuna_shell_control::WindowIconGeometry>) {
+    }
     /// Search results are showing (or not): the compositor hides the
     /// workspace view meanwhile.
     fn set_search(&self, active: bool);
@@ -49,11 +52,14 @@ pub trait OverviewActions {
 
 /// One dash item (`#dash .overview-tile`): the 64px icon in a 76px
 /// rounded tile, with GNOME's running dot under it.
-fn dash_tile(entry: &AppEntry, running: bool) -> gtk::Button {
+fn dash_tile(entry: &AppEntry, running: bool) -> (gtk::Button, gtk::Image) {
     let tile = gtk::Overlay::new();
     let icon = gtk::Box::new(gtk::Orientation::Vertical, 0);
     icon.add_css_class("overview-icon");
-    icon.append(&app_icon(entry, 64));
+    let image = app_icon(entry, 64);
+    image.set_halign(gtk::Align::Center);
+    image.set_valign(gtk::Align::Center);
+    icon.append(&image);
     tile.set_child(Some(&icon));
     if running {
         let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -68,7 +74,7 @@ fn dash_tile(entry: &AppEntry, running: bool) -> gtk::Button {
         button.add_css_class("running");
     }
     button.update_property(&[gtk::accessible::Property::Label(&entry.name)]);
-    button
+    (button, image)
 }
 
 fn app_icon(entry: &AppEntry, size: i32) -> gtk::Image {
@@ -148,9 +154,16 @@ pub struct OverviewUi {
     dash: gtk::ApplicationWindow,
     dash_row: gtk::Box,
     dash_signature: Vec<(u64, Option<String>, Option<String>)>,
+    dash_icons: Vec<(Vec<u64>, gtk::Image)>,
+    dash_layout: Option<(gtk::gdk::Surface, gtk::glib::SignalHandlerId)>,
+    icon_publication_pending: Rc<std::cell::Cell<bool>>,
+    published_icons: Vec<tuna_shell_control::WindowIconGeometry>,
     grid: gtk::ApplicationWindow,
     apps: Rc<LiveApps>,
     favorites: Vec<String>,
+    folder_watch: crate::folders::FolderWatch,
+    grid_dragging: Rc<Cell<bool>>,
+    grid_external_dragging: Rc<Cell<bool>>,
     actions: Rc<dyn OverviewActions>,
     open: bool,
     /// Open on the app grid once the overview opens (ShowApplications).
@@ -283,9 +296,16 @@ impl OverviewUi {
             dash,
             dash_row,
             dash_signature: Vec::new(),
+            dash_icons: Vec::new(),
+            dash_layout: None,
+            icon_publication_pending: Rc::new(std::cell::Cell::new(false)),
+            published_icons: Vec::new(),
             grid,
             apps,
             favorites,
+            folder_watch: crate::folders::FolderWatch::new(),
+            grid_dragging: Rc::new(Cell::new(false)),
+            grid_external_dragging: Rc::new(Cell::new(false)),
             actions,
             open: false,
             want_apps: std::cell::Cell::new(false),
@@ -297,6 +317,35 @@ impl OverviewUi {
             apps_shown: Cell::new(false),
             grid_fade: Rc::new(crate::grid_animation::Slot::default()),
         }));
+        {
+            let dash = ui.borrow().dash.clone();
+            let weak = Rc::downgrade(&ui);
+            dash.connect_map(move |dash| {
+                let weak = weak.clone();
+                let dash = dash.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Some((surface, handler)) = ui.borrow_mut().dash_layout.take() {
+                        surface.disconnect(handler);
+                    }
+                    if let Some(surface) = dash.surface() {
+                        let weak = Rc::downgrade(&ui);
+                        let handler = surface.connect_layout(move |_, _, _| {
+                            let weak = weak.clone();
+                            gtk::glib::idle_add_local_once(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    Self::publish_dash_icons(&ui);
+                                }
+                            });
+                        });
+                        ui.borrow_mut().dash_layout = Some((surface, handler));
+                    }
+                    Self::publish_dash_icons(&ui);
+                });
+            });
+        }
         // An app dragged out of a folder's dialog leaves the folder.
         {
             let weak = Rc::downgrade(&ui);
@@ -434,8 +483,80 @@ impl OverviewUi {
         }
     }
 
-    fn rebuild_dash(ui: &Rc<RefCell<Self>>) {
+    /// One bounded layout observer per rebuild; steady state has no frame callback.
+    fn publish_dash_icons(ui: &Rc<RefCell<Self>>) {
         let me = ui.borrow();
+        if me.icon_publication_pending.replace(true) {
+            return;
+        }
+        let pending = me.icon_publication_pending.clone();
+        let dash = me.dash.clone();
+        drop(me);
+        let weak = Rc::downgrade(ui);
+        let attempts = std::cell::Cell::new(0usize);
+        dash.add_tick_callback(move |dash, _| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            let Some(ui) = weak.upgrade() else {
+                pending.set(false);
+                return gtk::glib::ControlFlow::Break;
+            };
+            let Ok(mut me) = ui.try_borrow_mut() else {
+                return if attempt < 30 {
+                    gtk::glib::ControlFlow::Continue
+                } else {
+                    pending.set(false);
+                    gtk::glib::ControlFlow::Break
+                };
+            };
+            // Tick precedes allocation; allow a completed frame before sampling.
+            if attempt < 2 {
+                return gtk::glib::ControlFlow::Continue;
+            }
+            let monitor = dash.surface().and_then(|surface| {
+                gtk::prelude::WidgetExt::display(dash).monitor_at_surface(&surface)
+            });
+            let Some(monitor) = monitor else {
+                if attempt < 30 {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                pending.set(false);
+                return gtk::glib::ControlFlow::Break;
+            };
+            let monitor = monitor.geometry();
+            let mut geometries = Vec::new();
+            for (ids, image) in &me.dash_icons {
+                let Some(bounds) = image.compute_bounds(dash) else {
+                    continue;
+                };
+                if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+                    continue;
+                }
+                for id in ids {
+                    geometries.push(tuna_shell_control::WindowIconGeometry {
+                        window: *id,
+                        x: monitor.x() + bounds.x().round() as i32,
+                        y: monitor.y() + monitor.height() - dash.height() - 12
+                            + bounds.y().round() as i32,
+                        width: bounds.width().round() as i32,
+                        height: bounds.height().round() as i32,
+                    });
+                }
+            }
+            geometries.sort_by_key(|g| g.window);
+            geometries.truncate(tuna_shell_control::MAX_WINDOW_ICON_GEOMETRIES);
+            if geometries != me.published_icons {
+                me.actions.set_window_icon_geometries(geometries.clone());
+                me.published_icons = geometries;
+            }
+            pending.set(false);
+            gtk::glib::ControlFlow::Break
+        });
+    }
+
+    fn rebuild_dash(ui: &Rc<RefCell<Self>>) {
+        let mut me = ui.borrow_mut();
+        me.dash_icons.clear();
         while let Some(child) = me.dash_row.first_child() {
             me.dash_row.remove(&child);
         }
@@ -444,7 +565,8 @@ impl OverviewUi {
         // Running apps in the order their windows appeared.
         let mut running = me.actions.running();
         running.sort_by_key(|(id, _)| *id);
-        let apps = me.apps.get();
+        let live_apps = me.apps.clone();
+        let apps = live_apps.get();
         let window_of = |entry: &AppEntry| {
             running
                 .iter()
@@ -486,7 +608,15 @@ impl OverviewUi {
                 me.dash_row.append(&separator);
             }
             let window = window_of(entry);
-            let button = dash_tile(entry, window.is_some());
+            let (button, image) = dash_tile(entry, window.is_some());
+            let ids = running
+                .iter()
+                .filter(|(_, app)| {
+                    app.as_deref() == Some(entry.app_id.trim_end_matches(".desktop"))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            me.dash_icons.push((ids, image));
             let entry = entry.clone();
             let actions = me.actions.clone();
             button.connect_clicked(move |_| match window {
@@ -521,7 +651,8 @@ impl OverviewUi {
                     .or_else(|| Some("application-x-executable".to_owned())),
                 categories: Vec::new(),
             };
-            let button = dash_tile(&entry, true);
+            let (button, image) = dash_tile(&entry, true);
+            me.dash_icons.push((vec![window], image));
             let actions = me.actions.clone();
             button.connect_clicked(move |_| {
                 actions.activate_window(window);
@@ -545,14 +676,25 @@ impl OverviewUi {
         {
             let ui = ui.clone();
             show_apps.connect_toggled(move |t| {
-                let me = ui.borrow();
-                me.fade_grid(t.is_active());
-                me.actions.set_app_grid(t.is_active());
+                let active = t.is_active();
+                {
+                    let me = ui.borrow();
+                    me.fade_grid(active);
+                    me.actions.set_app_grid(active);
+                }
+                // GSettings is also edited by tools outside this process.
+                // Reload the folder/app arrangement whenever the grid is
+                // opened so a settings change made after shell startup is
+                // visible on the next Show Apps action.
+                if active {
+                    Self::rebuild_grid(&ui);
+                }
             });
         }
         me.dash_row.append(&show_apps);
         drop(apps);
         drop(me);
+        Self::publish_dash_icons(ui);
         Self::rebuild_grid(ui);
     }
 
@@ -591,7 +733,8 @@ impl OverviewUi {
         // alphabetical grid; a folder opens its apps in a popover.
         let apps = me.apps.get();
         crate::folders::ensure_defaults(apps.apps());
-        let folders = crate::folders::load();
+        me.folder_watch.take_dirty();
+        let folders = me.folder_watch.load();
         let (filled, loose) = crate::folders::arrange(&folders, apps.apps(), &me.favorites);
         enum Item<'a> {
             Folder(crate::folders::Folder, Vec<&'a AppEntry>),
@@ -798,6 +941,7 @@ impl OverviewUi {
                         let actions = me.actions.clone();
                         let members: Vec<AppEntry> = members.iter().map(|e| (*e).clone()).collect();
                         let (id, name) = (folder.id.clone(), folder.name.clone());
+                        let dragging = me.grid_dragging.clone();
                         button.connect_clicked(move |button| {
                             let tiles = members
                                 .iter()
@@ -805,7 +949,11 @@ impl OverviewUi {
                                     let tile = app_button(entry, 96, true);
                                     tile.add_css_class("folder-tile");
                                     // Dragged out onto the shade, it leaves.
-                                    drag_source(&tile, format!("folder-app:{id}:{}", entry.app_id));
+                                    let source = drag_source(
+                                        &tile,
+                                        format!("folder-app:{id}:{}", entry.app_id),
+                                    );
+                                    guard_drag_source(&source, &dragging);
                                     let (entry, actions, dialog) =
                                         (entry.clone(), actions.clone(), dialog.clone());
                                     tile.connect_clicked(move |tile| {
@@ -837,7 +985,18 @@ impl OverviewUi {
                 }
             }
         }
-        me.grid.set_child(Some(&paged_grid(pages, reflow)));
+        let content = paged_grid(
+            pages,
+            reflow,
+            me.grid_dragging.clone(),
+            me.grid_external_dragging.clone(),
+        );
+        // A rebuild during the grid's fade keeps the fade's opacity.
+        if let Some(old) = me.grid.child() {
+            content.set_opacity(old.opacity());
+            content.set_can_target(old.can_target());
+        }
+        me.grid.set_child(Some(&content));
     }
 
     /// Who to tell when the folder dialog shades the overview.
@@ -911,6 +1070,19 @@ impl OverviewUi {
 
     /// Follow the compositor's overview state.
     pub fn set_open(ui: &Rc<RefCell<Self>>, open: bool) {
+        // Changes never rebuild the dash or reset search/visibility. Retain
+        // dirty state during a drag so its live source tree survives until end.
+        let refresh_folders = {
+            let me = ui.borrow();
+            me.folder_watch.reconcile();
+            me.folder_watch.take_dirty_if(
+                open && me.open,
+                me.grid_dragging.get() || me.grid_external_dragging.get(),
+            )
+        };
+        if refresh_folders {
+            Self::rebuild_grid(ui);
+        }
         let signature = {
             let me = ui.borrow();
             me.actions
@@ -986,15 +1158,16 @@ impl OverviewUi {
             self.grid.set_visible(true);
         }
         content.set_can_target(shown);
+        // The grid's content, not this one: a rebuild mid-fade swaps it.
         let step = {
-            let content = content.downgrade();
+            let grid = self.grid.downgrade();
             move |elapsed: f64| {
-                if let Some(content) = content.upgrade() {
+                if let Some(content) = grid.upgrade().and_then(|grid| grid.child()) {
                     content.set_opacity(anim::lerp(from, to, timing.at(elapsed, policy)));
                 }
             }
         };
-        let (grid, content) = (self.grid.downgrade(), content.downgrade());
+        let grid = self.grid.downgrade();
         self.grid_fade.start(
             &self.grid,
             if shown {
@@ -1007,7 +1180,7 @@ impl OverviewUi {
             move || {
                 if let (false, Some(grid)) = (shown, grid.upgrade()) {
                     grid.set_visible(false);
-                    if let Some(content) = content.upgrade() {
+                    if let Some(content) = grid.child() {
                         content.set_opacity(1.0);
                         content.set_can_target(true);
                     }
@@ -1334,17 +1507,18 @@ fn grid_hover(widget: &impl IsA<gtk::Widget>, target: String, reflow: Rc<GridRef
     let motion = gtk::DropControllerMotion::new();
     {
         let hover = hover.clone();
-        motion.connect_enter(move |motion, x, _| {
+        motion.connect_enter(move |motion, _, _| {
             hover.generation.set(hover.generation.get() + 1);
             let generation = hover.generation.get();
+            let x = drop_enter_x(motion);
+            let width = motion.widget().map_or(0, |w| w.width());
             if std::env::var_os("TUNA_GRID_TRACE").is_some() {
-                eprintln!(
-                    "tuna-shell-gtk: grid hover entered x={x} width={}",
-                    motion.widget().map_or(0, |w| w.width())
-                );
+                eprintln!("tuna-shell-gtk: grid hover entered x={x:?} width={width}");
             }
-            let edge =
-                crate::logic::drop_edge(x, f64::from(motion.widget().map_or(0, |w| w.width())));
+            // Until the position is known, no edge: motion supplies it.
+            let edge = x.map_or(crate::logic::DropEdge::OnIcon, |x| {
+                crate::logic::drop_edge(x, f64::from(width))
+            });
             hover.motion(edge);
             if let Some(drop) = motion.drop() {
                 let hover = hover.clone();
@@ -1393,42 +1567,102 @@ fn grid_hover(widget: &impl IsA<gtk::Widget>, target: String, reflow: Rc<GridRef
 /// flipped by the wheel, a swipe, PageUp/PageDown, the side arrows or
 /// the indicators; arrows and indicators only with more than one page.
 mod page_hint {
+    use std::cell::RefCell;
+
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use gtk4 as gtk;
 
+    /// Children at explicit positions, like GtkFixed, measured by the
+    /// size request alone. GtkFixed's layout manager measures its
+    /// children's extents and overrides any measure vfunc, so actors
+    /// sliding in from outside the clip widened the 10% hint across the
+    /// grid, where it caught the pointer and turned the page.
     #[derive(Default)]
-    pub struct PageHint;
+    pub struct PageHint {
+        pub(super) children: RefCell<Vec<(gtk::Widget, f64, f64)>>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for PageHint {
         const NAME: &'static str = "TunaPageHint";
         type Type = super::PageHint;
-        type ParentType = gtk::Fixed;
+        type ParentType = gtk::Widget;
     }
-    impl ObjectImpl for PageHint {}
-    impl WidgetImpl for PageHint {
-        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
-            if orientation == gtk::Orientation::Horizontal {
-                // Animated actors begin outside the clip. Their FixedLayout
-                // extents must never enlarge the 10% navigation hint.
-                let width = self.obj().width_request().max(0);
-                (width, width, -1, -1)
-            } else {
-                self.parent_measure(orientation, for_size)
+    impl ObjectImpl for PageHint {
+        fn dispose(&self) {
+            for (child, _, _) in self.children.take() {
+                child.unparent();
             }
         }
     }
-    impl FixedImpl for PageHint {}
+    impl WidgetImpl for PageHint {
+        fn measure(&self, _: gtk::Orientation, _: i32) -> (i32, i32, i32, i32) {
+            // GTK raises both sizes to the size request.
+            (0, 0, -1, -1)
+        }
+
+        fn size_allocate(&self, _: i32, _: i32, _: i32) {
+            for (child, x, y) in self.children.borrow().iter() {
+                let (_, natural) = child.preferred_size();
+                let at = gtk::graphene::Point::new(*x as f32, *y as f32);
+                child.allocate(
+                    natural.width(),
+                    natural.height(),
+                    -1,
+                    Some(gtk::gsk::Transform::new().translate(&at)),
+                );
+            }
+        }
+    }
 }
 
 glib::wrapper! {
     pub struct PageHint(ObjectSubclass<page_hint::PageHint>)
-        @extends gtk::Fixed, gtk::Widget,
+        @extends gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
-fn paged_grid(pages: Vec<gtk::FlowBox>, reflow: Rc<GridReflow>) -> gtk::Widget {
+impl PageHint {
+    fn put(&self, child: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+        child.set_parent(self);
+        self.imp()
+            .children
+            .borrow_mut()
+            .push((child.clone().upcast(), x, y));
+        self.queue_allocate();
+    }
+
+    fn move_(&self, child: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+        let child = child.upcast_ref::<gtk::Widget>();
+        if let Some(entry) = self
+            .imp()
+            .children
+            .borrow_mut()
+            .iter_mut()
+            .find(|(widget, _, _)| widget == child)
+        {
+            (entry.1, entry.2) = (x, y);
+        }
+        self.queue_allocate();
+    }
+
+    fn remove(&self, child: &impl IsA<gtk::Widget>) {
+        let child = child.upcast_ref::<gtk::Widget>();
+        self.imp()
+            .children
+            .borrow_mut()
+            .retain(|(widget, _, _)| widget != child);
+        child.unparent();
+    }
+}
+
+fn paged_grid(
+    pages: Vec<gtk::FlowBox>,
+    reflow: Rc<GridReflow>,
+    dragging: Rc<Cell<bool>>,
+    external_dragging: Rc<Cell<bool>>,
+) -> gtk::Widget {
     let carousel = crate::grid_pager::GridPager::new();
     *reflow.carousel.borrow_mut() = Some(carousel.downgrade());
     let n = pages.len();
@@ -1439,6 +1673,34 @@ fn paged_grid(pages: Vec<gtk::FlowBox>, reflow: Rc<GridReflow>) -> gtk::Widget {
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&carousel));
     column.append(&overlay);
+    // Track local sources on single-page grids too (they have no pager).
+    for page in &pages {
+        let mut pending = vec![page.clone().upcast::<gtk::Widget>()];
+        while let Some(widget) = pending.pop() {
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                child = next.next_sibling();
+                pending.push(next);
+            }
+            let controllers = widget.observe_controllers();
+            for i in 0..controllers.n_items() {
+                let Some(source) = controllers.item(i).and_downcast::<gtk::DragSource>() else {
+                    continue;
+                };
+                guard_drag_source(&source, &dragging);
+            }
+        }
+    }
+    let motion = gtk::DropControllerMotion::new();
+    let active = external_dragging.clone();
+    motion.connect_enter(move |_, _, _| active.set(true));
+    let active = external_dragging.clone();
+    motion.connect_motion(move |_, _, _| active.set(true));
+    motion.connect_leave(move |_| external_dragging.set(false));
+    // The local source guard remains true when a drag leaves this overlay.
+    // External drag presence is independent of the pager's hint lifetime.
+    // Leave ends only external presence, never an active local drag.
+    overlay.add_controller(motion);
     if n <= 1 {
         return column.upcast();
     }
@@ -1569,10 +1831,14 @@ fn paged_grid(pages: Vec<gtk::FlowBox>, reflow: Rc<GridReflow>) -> gtk::Widget {
     let motion = gtk::DropControllerMotion::new();
     {
         let pager = pager.clone();
-        motion.connect_enter(move |m, x, _| {
+        motion.connect_enter(move |m, _, _| {
             let width = m.widget().map_or(0, |w| w.width());
             pager.begin(width);
-            pager.motion(x, width);
+            // A drag entering at an edge bumps it at once, as a motion
+            // there would; never at the (0, 0) GTK reports for enter.
+            if let Some(x) = drop_enter_x(m) {
+                pager.motion(x, width);
+            }
         });
     }
     {
@@ -1647,6 +1913,12 @@ impl DragPager {
         let before = page > 0;
         let after = page + 1 < self.carousel.n_pages();
         let dragging = self.dragging.get();
+        if std::env::var_os("TUNA_GRID_TRACE").is_some() {
+            eprintln!(
+                "tuna-grid: pager sync page={page} pages={} dragging={dragging} before={before} after={after}",
+                self.carousel.n_pages()
+            );
+        }
         let [previous, next, previous_hint, next_hint] = &self.fades;
         fade_visible(
             self.previous.upcast_ref(),
@@ -1790,6 +2062,12 @@ impl DragPager {
         if std::env::var_os("TUNA_GRID_TRACE").is_some() {
             eprintln!("tuna-shell-gtk: grid pager drag entered width={width}");
         }
+        // The pager's own swipes and wheel paging would compete with
+        // the drag pager during a tile DnD, moving to the neighboring
+        // page while the user is only dragging across tiles and
+        // changing which hint is shown. They return once the drag ends;
+        // edge paging while dragging is owned by this pager below.
+        self.carousel.set_interactive(false);
         // A tenth of the grid each (PAGE_PREVIEW_RATIO / 2).
         let w = (f64::from(width) * 0.1) as i32;
         self.previous_hint.set_size_request(w, -1);
@@ -1804,6 +2082,7 @@ impl DragPager {
         }
         self.reset();
         self.dragging.set(false);
+        self.carousel.set_interactive(true);
         self.previous_hint.remove_css_class("dnd");
         self.next_hint.remove_css_class("dnd");
         self.sync(self.page());
@@ -1849,9 +2128,9 @@ impl DragPager {
             if last >= 0.0 && (last - x).abs() > DRAG_EDGE_PX {
                 self.reset();
             }
-        } else if self.overshoot.get() < 0.0 {
+        } else if let Some(step) = drag_edge_transition(self.overshoot.get(), x, width) {
             self.reset();
-            self.turn_and_repeat(if x <= DRAG_EDGE_PX { -1 } else { 1 });
+            self.turn_and_repeat(step);
             self.overshoot.set(x);
             return;
         } else {
@@ -1893,6 +2172,50 @@ impl DragPager {
     }
 }
 
+// Motion events may jump directly between edges. In that case the old
+// repeating timer must change direction even without an interior event.
+fn drag_edge_transition(previous: f64, x: f64, width: f64) -> Option<i32> {
+    let edge = |position: f64| {
+        if position <= DRAG_EDGE_PX {
+            Some(-1)
+        } else if position >= width - DRAG_EDGE_PX {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    let next = edge(x)?;
+    if previous < 0.0 || edge(previous) != Some(next) {
+        Some(next)
+    } else {
+        None
+    }
+}
+
+/// Shared local-drag ownership includes tiles created in the folder dialog.
+fn guard_drag_source(source: &gtk::DragSource, dragging: &Rc<Cell<bool>>) {
+    let active = dragging.clone();
+    source.connect_drag_begin(move |_, _| active.set(true));
+    let active = dragging.clone();
+    source.connect_drag_end(move |_, _, _| active.set(false));
+}
+
+/// The pointer's x in the widget of `motion` when a drag enters it.
+/// GDK emits every drag-enter event at (0, 0) (`gdk_drop_emit_enter_event`),
+/// so DropControllerMotion's enter coordinates are not the pointer's;
+/// read the drop device's position, which Wayland's wl_data_device.enter
+/// set. `None` while that position belongs to another surface.
+fn drop_enter_x(motion: &gtk::DropControllerMotion) -> Option<f64> {
+    let widget = motion.widget()?;
+    let native = widget.native()?;
+    let (surface, x, y) = motion.drop()?.device().surface_at_position();
+    if surface? != native.surface()? {
+        return None;
+    }
+    let (dx, dy) = native.surface_transform();
+    let point = gtk::graphene::Point::new((x - dx) as f32, (y - dy) as f32);
+    Some(f64::from(native.compute_point(&widget, &point)?.x()))
+}
 /// Make `widget` a drag source of `text`, the widget itself as the
 /// icon (GNOME drags the tile).
 fn drag_source(widget: &impl IsA<gtk::Widget>, text: String) -> gtk::DragSource {
@@ -2014,4 +2337,29 @@ fn on_drop(
         true
     });
     widget.add_controller(target);
+}
+
+#[cfg(test)]
+mod drag_edge_tests {
+    use super::drag_edge_transition;
+
+    #[test]
+    fn direct_opposite_edge_motion_retargets_the_repeat() {
+        assert_eq!(drag_edge_transition(0.0, 1274.0, 1280.0), Some(1));
+        assert_eq!(drag_edge_transition(1274.0, 0.0, 1280.0), Some(-1));
+    }
+
+    #[test]
+    fn first_edge_starts_once_and_same_edge_keeps_its_timer() {
+        assert_eq!(drag_edge_transition(-1.0, 0.0, 1280.0), Some(-1));
+        assert_eq!(drag_edge_transition(-1.0, 1274.0, 1280.0), Some(1));
+        assert_eq!(drag_edge_transition(0.0, 6.0, 1280.0), None);
+        assert_eq!(drag_edge_transition(1274.0, 1279.0, 1280.0), None);
+    }
+
+    #[test]
+    fn interior_motion_does_not_start_edge_paging() {
+        assert_eq!(drag_edge_transition(-1.0, 640.0, 1280.0), None);
+        assert_eq!(drag_edge_transition(0.0, 640.0, 1280.0), None);
+    }
 }

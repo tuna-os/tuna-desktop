@@ -13,17 +13,21 @@
 //! The compositor runs one supervised shell; select this one with
 //! `TUNA_SHELL_BIN=tuna-shell-gtk` while it grows to parity.
 
+mod accessibility;
 mod audio_state;
 mod background_settings;
 mod bt_menu;
 mod calendar;
 mod events;
+mod fd_watch;
 mod folder_dialog;
 mod folders;
 mod grid_animation;
 mod grid_pager;
 mod group_animation;
 mod ibus_panel;
+mod ibus_property_menu;
+mod kbd_a11y;
 mod keybindings;
 mod live_apps;
 mod lock;
@@ -36,10 +40,14 @@ mod notify;
 mod orca;
 mod osd;
 mod overview;
+mod panel_focus;
 mod polkit;
 mod power;
 mod preview_chrome;
+mod privacy;
+mod privacy_portal;
 mod providers;
+mod renderer;
 mod screencast;
 mod screensaver;
 mod screenshot_selection;
@@ -47,15 +55,20 @@ mod screenshot_ui;
 mod services;
 mod shell_dbus;
 mod shortcut_consent;
+mod sound_feedback;
 mod switcher;
+mod transient;
 mod tray;
+mod wall_clock;
+mod wellbeing;
 mod wifi;
 mod window_menu;
 mod wired;
 mod ws_dots;
 mod ws_popup;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -90,8 +103,98 @@ fn settings(schema: &str) -> Option<gio::Settings> {
     Some(gio::Settings::new(schema))
 }
 
+/// Nothing to read now: the socket would block, or the client deferred
+/// (or just made) a redial whose answer is still on its way.
 fn is_would_block(e: &ControlError) -> bool {
-    matches!(e, ControlError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock)
+    matches!(e, ControlError::WouldBlock)
+        || matches!(e, ControlError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+/// What one drain of the control socket brought that the views act on
+/// once the model is current.
+#[derive(Default)]
+struct Drained {
+    results: Vec<(u64, bool)>,
+    accelerators: Vec<(u32, u32, u32)>,
+    menus: Vec<tuna_shell_host::control::WindowMenuRequest>,
+    consent: Option<Option<(u64, String)>>,
+    popups: Vec<(u32, u32)>,
+    aid_switches: Vec<(tuna_shell_control::KeyboardAid, bool)>,
+}
+
+/// The control connection after a drain.
+enum Link {
+    /// Frames arrive on `fd`, the stream of this connection generation.
+    Open {
+        generation: u64,
+        fd: std::os::fd::RawFd,
+    },
+    /// The compositor hung up: the client redials on its next poll.
+    Redial,
+    /// Nothing more can be read: no client, or a frame that cannot be
+    /// decoded.
+    Lost,
+}
+
+/// Handle every frame the control socket holds. Returns whether any
+/// arrived, and whether the connection is still usable: not once it
+/// closed, nor after a frame that cannot be decoded (it never leaves
+/// the buffer, so reading on would spin). Either is logged once.
+fn drain(
+    control: &mut ControlClient,
+    notify: &Rc<notify::NotifyUi>,
+    out: &mut Drained,
+) -> (bool, bool) {
+    let mut handled = false;
+    loop {
+        let message = match control.poll() {
+            Ok(message) => message,
+            Err(e) if is_would_block(&e) => {
+                // A reply written while handling a frame can block too;
+                // frames already read still wait in the buffer.
+                if control.has_buffered_frame() {
+                    continue;
+                }
+                return (handled, true);
+            }
+            Err(e) => {
+                eprintln!("tuna-shell-gtk: control error: {e}");
+                if control.is_closed() || matches!(e, ControlError::Decode(_)) {
+                    return (handled, false);
+                }
+                // The frame was read (an unexpected message, a failed
+                // reply): go on with the rest.
+                continue;
+            }
+        };
+        handled = true;
+        match message {
+            Handled::Gap { .. } => {
+                let _ = control.request_snapshot();
+            }
+            Handled::WindowMenu(request) => out.menus.push(request),
+            Handled::ShortcutConsent(request) => out.consent = Some(request),
+            Handled::ScreenReader(state) => {
+                if matches!(
+                    state,
+                    tuna_shell_control::ScreenReaderState::Unavailable
+                        | tuna_shell_control::ScreenReaderState::Conflict
+                ) {
+                    notify.post("Screen Reader", "preferences-desktop-accessibility-symbolic", "Screen Reader unavailable", "Orca could not start for this session. Check its installation and other active sessions.");
+                }
+            }
+            Handled::KeyboardAidToggled { aid, enabled } => out.aid_switches.push((aid, enabled)),
+            Handled::WorkspacePopup { index, count } => out.popups.push((index, count)),
+            Handled::Accelerator { action, time, mode } => {
+                out.accelerators.push((action, time, mode));
+            }
+            Handled::CommandResult { id, status } => out.results.push((
+                id,
+                matches!(status, tuna_shell_control::CommandStatus::Applied),
+            )),
+            _ => {}
+        }
+    }
 }
 
 /// Connect, greet, and wait (bounded) for the first snapshot.
@@ -136,6 +239,11 @@ struct Shell {
 struct ShellActions(Rc<RefCell<Shell>>);
 
 impl overview::OverviewActions for ShellActions {
+    fn set_window_icon_geometries(&self, geometries: Vec<tuna_shell_control::WindowIconGeometry>) {
+        if let Some(control) = self.0.borrow_mut().control.as_mut() {
+            let _ = control.set_window_icon_geometries(geometries);
+        }
+    }
     fn close_overview(&self) {
         if let Some(control) = self.0.borrow_mut().control.as_mut() {
             if control.model().is_overview_open() {
@@ -230,7 +338,20 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
 
     fn set_accelerators(&self, accelerators: Vec<tuna_shell_control::Accelerator>) {
         if let Some(control) = self.shell.borrow_mut().control.as_mut() {
-            let _ = control.set_accelerators(accelerators);
+            let locked = control.locked();
+            let subset =
+                media_keys::trace_enabled().then(|| media_keys::media_subset(&accelerators));
+            let result = control.set_accelerators(accelerators);
+            if let Some(subset) = subset {
+                media_keys::trace(
+                    "accelerators-send",
+                    serde_json::json!({
+                        "request_id": result.as_ref().ok(), "write_ok": result.is_ok(),
+                        "media": subset,
+                    }),
+                    locked,
+                );
+            }
         }
     }
 }
@@ -262,15 +383,116 @@ fn panel_menu_button(
             window.set_focus_visible(false);
         }
     });
+    // GNOME's BoxPointer fades a panel menu in (150 ms).
+    transient::fade_in_popover(popover);
     button
+}
+
+/// The panel's live tray menu buttons, in strip order.
+fn tray_menu_buttons(tray: &gtk::Box) -> Vec<gtk::MenuButton> {
+    let mut buttons = Vec::new();
+    let mut child = tray.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(button) = widget.downcast::<gtk::MenuButton>() {
+            buttons.push(button);
+        }
+    }
+    buttons
+}
+
+/// Whether any panel menu (clock, system, accessibility, tray) is open.
+fn panel_menu_open(
+    clock: &gtk::MenuButton,
+    system: &gtk::MenuButton,
+    a11y: &gtk::MenuButton,
+    input: &gtk::MenuButton,
+    tray: &gtk::Box,
+) -> bool {
+    clock.is_active()
+        || system.is_active()
+        || a11y.is_active()
+        || input.is_active()
+        || tray_menu_buttons(tray).iter().any(|b| b.is_active())
+}
+
+/// Close every open panel menu; a button that owned one keeps focus.
+/// Each popdown of a visible popover banks one guard credit before
+/// the popdown, so the matching `closed` signal keeps the hold
+/// whenever it lands (G-PANEL-FOCUS).
+fn close_panel_menus(
+    clock: &gtk::MenuButton,
+    system: &gtk::MenuButton,
+    a11y: &gtk::MenuButton,
+    input: &gtk::MenuButton,
+    tray: &gtk::Box,
+    guard: &Cell<panel_focus::EscapeGuard>,
+) {
+    let mut buttons = vec![clock.clone(), system.clone(), a11y.clone(), input.clone()];
+    buttons.extend(tray_menu_buttons(tray));
+    for button in buttons {
+        if button.is_active() {
+            if let Some(popover) = button.popover() {
+                if popover.is_visible() {
+                    let mut state = guard.get();
+                    state.note_escape_close();
+                    guard.set(state);
+                }
+            }
+            button.popdown();
+            button.grab_focus();
+        }
+    }
+}
+
+/// Give the panel's Ctrl+Alt+Tab keyboard back to the client.
+fn release_panel_focus(window: &gtk::ApplicationWindow, held: &Rc<Cell<bool>>) {
+    held.set(false);
+    window.set_keyboard_mode(KeyboardMode::OnDemand);
+}
+
+/// The panel owns exclusive keyboard (idempotent: layer-shell ignores
+/// an unchanged mode, so re-asserting a live hold is a no-op).
+fn assert_panel_hold(window: &gtk::ApplicationWindow, held: &Rc<Cell<bool>>) {
+    window.set_keyboard_mode(KeyboardMode::Exclusive);
+    held.set(true);
+}
+
+/// Ctrl+Alt+Tab (`switch-panels`): the panel takes exclusive keyboard
+/// and the first (forward) or last (backward) control takes GTK focus.
+fn focus_panel(
+    window: &gtk::ApplicationWindow,
+    activities: &gtk::Button,
+    system: &gtk::MenuButton,
+    held: &Rc<Cell<bool>>,
+    backward: bool,
+) {
+    assert_panel_hold(window, held);
+    window.present();
+    window.set_focus_visible(true);
+    match panel_focus::focus_end(backward) {
+        panel_focus::FocusEnd::First => activities.grab_focus(),
+        panel_focus::FocusEnd::Last => system.grab_focus(),
+    };
 }
 
 fn render_pills(shell: &mut Shell) {
     let wanted = match shell.control.as_ref() {
         Some(control) => {
             let model = control.model();
-            let occupied: Vec<u32> = model.windows().iter().map(|w| w.workspace).collect();
-            logic::workspace_pills(model.workspaces(), model.active_workspace(), &occupied)
+            if let Some(count) = model.fixed_workspace_count() {
+                (0..count)
+                    .map(|workspace| workspace == model.active_workspace())
+                    .collect()
+            } else {
+                let occupied: Vec<u32> = model
+                    .windows()
+                    .iter()
+                    .filter(|w| !w.on_all_workspaces)
+                    .map(|w| w.workspace)
+                    .collect();
+                logic::workspace_pills(model.workspaces(), model.active_workspace(), &occupied)
+            }
         }
         None => vec![true],
     };
@@ -361,8 +583,8 @@ fn qs_menu_tile(icon: &str, title: &str, subtitle: Option<&str>, menu: &QsMenu) 
     arrow.update_property(&[gtk::accessible::Property::Label(&format!("{title} Menu"))]);
     outer.append(&arrow);
     {
-        let revealer = menu.revealer.clone();
-        arrow.connect_toggled(move |a| revealer.set_visible(a.is_active()));
+        let motion = menu.motion.clone();
+        arrow.connect_toggled(move |a| motion.set_open(a.is_active()));
     }
     {
         let arrow = arrow.clone();
@@ -393,7 +615,11 @@ fn qs_menu_tile(icon: &str, title: &str, subtitle: Option<&str>, menu: &QsMenu) 
 /// icon and title, then a section of items. Shown in place, spanning
 /// the grid under its toggle's row.
 struct QsMenu {
+    /// The menu's open state: visible while open (or closing).
     revealer: gtk::Box,
+    /// Grows and fades the menu open and closed (GNOME 51's
+    /// QuickToggleMenu).
+    motion: Rc<transient::Submenu>,
     header_icon: gtk::Image,
     section: gtk::Box,
 }
@@ -401,8 +627,12 @@ struct QsMenu {
 impl QsMenu {
     fn new(icon: &str, title: &str) -> Self {
         let revealer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        revealer.add_css_class("qs-menu");
         revealer.set_visible(false);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        body.add_css_class("qs-menu");
+        let bin = transient::MotionBin::new(&body);
+        revealer.append(&bin);
+        let motion = transient::Submenu::new(&revealer, &bin);
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         header.add_css_class("qs-menu-header");
         let header_icon = gtk::Image::from_icon_name(icon);
@@ -412,11 +642,12 @@ impl QsMenu {
         let label = gtk::Label::new(Some(title));
         label.add_css_class("qs-menu-title");
         header.append(&label);
-        revealer.append(&header);
+        body.append(&header);
         let section = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        revealer.append(&section);
+        body.append(&section);
         Self {
             revealer,
+            motion,
             header_icon,
             section,
         }
@@ -624,8 +855,8 @@ fn quick_settings_popover(
     }
     let power_menu = power_menu_box.revealer.clone();
     {
-        let menu = power_menu.clone();
-        power.connect_clicked(move |_| menu.set_visible(!menu.is_visible()));
+        let motion = power_menu_box.motion.clone();
+        power.connect_clicked(move |_| motion.set_open(!motion.is_open()));
     }
     {
         let popover = popover.clone();
@@ -670,8 +901,8 @@ fn quick_settings_popover(
     sound_arrow.update_property(&[gtk::accessible::Property::Label("Open sound output menu")]);
     sound_arrow.set_visible(false);
     {
-        let revealer = sound_menu_ui.revealer.clone();
-        sound_arrow.connect_toggled(move |a| revealer.set_visible(a.is_active()));
+        let motion = sound_menu_ui.motion.clone();
+        sound_arrow.connect_toggled(move |a| motion.set_open(a.is_active()));
     }
     {
         let arrow = sound_arrow.clone();
@@ -926,21 +1157,28 @@ fn quick_settings_popover(
         dnd.connect_toggled(move |t| {
             notify.set_dnd(t.is_active());
             // This closure retains Settings and its external-change subscription.
+            // Write only a user-originated change. An external show-banners
+            // flip reaches this toggle through the DND listener below; echoing
+            // it back makes the keyfile backend rewrite its whole cached file
+            // and can revert other keys written meanwhile (lost break enable).
             if let Some(notes) = notes_settings.as_ref() {
-                let _ = notes.set_boolean("show-banners", !t.is_active());
+                let banners = !t.is_active();
+                if notes.boolean("show-banners") != banners {
+                    let _ = notes.set_boolean("show-banners", banners);
+                }
             }
         });
     }
     {
         // Keep the tile, and the panel's DND icon, in step when DND
-        // changes elsewhere.
-        let (dnd, notify, dnd_icon) = (dnd.clone(), notify.clone(), icons.dnd.clone());
-        glib::timeout_add_local(Duration::from_millis(250), move || {
-            if dnd.is_active() != notify.dnd() {
-                dnd.set_active(notify.dnd());
+        // changes elsewhere (GNOME's show-banners key).
+        let (dnd, dnd_icon) = (dnd.clone(), icons.dnd.clone());
+        dnd_icon.set_visible(notify.dnd());
+        notify.connect_dnd(move |on| {
+            if dnd.is_active() != on {
+                dnd.set_active(on);
             }
-            dnd_icon.set_visible(notify.dnd());
-            glib::ControlFlow::Continue
+            dnd_icon.set_visible(on);
         });
     }
 
@@ -1030,6 +1268,7 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
 }
 
 fn build(app: &adw::Application) {
+    accessibility::start_focus_policy();
     let provider = gtk::CssProvider::new();
     // Shell CSS has GNOME's baseline face/size, but follows the user's font live.
     let apply_font = {
@@ -1180,13 +1419,6 @@ fn build(app: &adw::Application) {
     let activities = panel_button(&pills, "Activities");
 
     let notify = notify::NotifyUi::new(app.upcast_ref());
-    {
-        let notify = notify.clone();
-        glib::timeout_add_local(Duration::from_millis(250), move || {
-            notify.tick();
-            glib::ControlFlow::Continue
-        });
-    }
     let clock_label = gtk::Label::new(None);
     let (cal_popover, calendar_ui) = calendar_popover(notify.pane());
     // GNOME's calendar events through its calendar server.
@@ -1282,44 +1514,298 @@ fn build(app: &adw::Application) {
     };
     screencast::serve(recorder.clone());
 
+    // Ctrl+Alt+Tab panel focus (P-A11Y-02): `held` while the bar
+    // owns exclusive keyboard; `escape_guard` banks one credit per
+    // Escape popdown so the matching `closed` signal keeps focus
+    // whenever it lands (G-PANEL-FOCUS).
+    let panel_held: Rc<Cell<bool>> = Rc::default();
+    let panel_escape_guard: Rc<Cell<panel_focus::EscapeGuard>> = Rc::default();
     let bar = gtk::CenterBox::new();
     bar.set_start_widget(Some(&activities));
     bar.set_center_widget(Some(&clock));
     // AppIndicator items sit left of the system indicators.
     let end = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     end.append(&screencast::indicator(&recorder));
-    end.append(&tray::tray());
+    let a11y = accessibility::menu();
+    let ibus_properties = ibus_property_menu::PropertyMenu::new({
+        let shell = shell.clone();
+        // No action while compositor identity/lock state is unavailable.
+        Rc::new(move || {
+            shell
+                .borrow()
+                .control
+                .as_ref()
+                .is_none_or(|c| !c.input_method_actions_allowed())
+        })
+    });
+    let input = ibus_properties.button.clone();
+    // Escape inside a tray popover: the popover's grab delivers the key
+    // to the popover, never to our window controller — each tray menu
+    // calls this instead of closing natively, so the hold survives and
+    // focus returns to the tray button (G-PANEL-FOCUS). Other menus
+    // cannot be open under the grab, but the built-ins close too.
+    let on_tray_escape = {
+        let (window, held, guard) = (
+            window.clone(),
+            panel_held.clone(),
+            panel_escape_guard.clone(),
+        );
+        let (clock, system, a11y, input) =
+            (clock.clone(), system.clone(), a11y.clone(), input.clone());
+        Rc::new(move |button: &gtk::MenuButton| {
+            if !held.get() {
+                return glib::Propagation::Proceed;
+            }
+            for other in [&clock, &system, &a11y, &input] {
+                if other.is_active() {
+                    if let Some(popover) = other.popover() {
+                        if popover.is_visible() {
+                            let mut state = guard.get();
+                            state.note_escape_close();
+                            guard.set(state);
+                        }
+                    }
+                    other.popdown();
+                }
+            }
+            if let Some(popover) = button.popover() {
+                if popover.is_visible() {
+                    let mut state = guard.get();
+                    state.note_escape_close();
+                    guard.set(state);
+                }
+            }
+            button.popdown();
+            button.grab_focus();
+            assert_panel_hold(&window, &held);
+            glib::Propagation::Stop
+        })
+    };
+    let tray_box = {
+        let (window, held, guard) = (
+            window.clone(),
+            panel_held.clone(),
+            panel_escape_guard.clone(),
+        );
+        tray::tray(
+            Rc::new(move || {
+                let mut state = guard.get();
+                let release = state.closed(held.get());
+                guard.set(state);
+                if release {
+                    release_panel_focus(&window, &held);
+                }
+            }),
+            panel_escape_guard.clone(),
+            on_tray_escape.clone(),
+        )
+    };
+    end.append(&tray_box);
+    end.append(&input);
+    end.append(&a11y);
     end.append(&system);
     bar.set_end_widget(Some(&end));
     window.set_child(Some(&bar));
+    // A panel menu closing any other way (item activation, outside
+    // click) returns focus to the client, as in GNOME. No-op unless
+    // Ctrl+Alt+Tab holds the bar.
+    for button in [&clock, &system, &a11y, &input] {
+        if let Some(popover) = button.popover() {
+            // Cloned before the shadowing bindings below are moved
+            // into the signal closures.
+            let (window_e, held_e, guard_e) = (
+                window.clone(),
+                panel_held.clone(),
+                panel_escape_guard.clone(),
+            );
+            let (clock_e, system_e, a11y_e, input_e, tray_box_e) = (
+                clock.clone(),
+                system.clone(),
+                a11y.clone(),
+                input.clone(),
+                tray_box.clone(),
+            );
+            let guard = panel_escape_guard.clone();
+            popover.connect_show(move |_| {
+                let mut state = guard.get();
+                state.note_shown();
+                guard.set(state);
+            });
+            let (window, held, guard) = (
+                window.clone(),
+                panel_held.clone(),
+                panel_escape_guard.clone(),
+            );
+            popover.connect_closed(move |_| {
+                let mut state = guard.get();
+                let release = state.closed(held.get());
+                guard.set(state);
+                if release {
+                    release_panel_focus(&window, &held);
+                }
+            });
+            // Escape inside the popover: its grab delivers the key here,
+            // never to our window controller — intercept it or the menu
+            // closes natively, the hold is lost, and focus leaves the
+            // bar (G-PANEL-FOCUS). Without the hold, Proceed: normal
+            // popover behavior is unchanged.
+            let escape_keys = gtk::EventControllerKey::new();
+            escape_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            escape_keys.connect_key_pressed(move |_, key, _, _| {
+                use gtk::gdk::Key;
+                if key != Key::Escape || !held_e.get() {
+                    return glib::Propagation::Proceed;
+                }
+                close_panel_menus(
+                    &clock_e,
+                    &system_e,
+                    &a11y_e,
+                    &input_e,
+                    &tray_box_e,
+                    &guard_e,
+                );
+                assert_panel_hold(&window_e, &held_e);
+                glib::Propagation::Stop
+            });
+            popover.add_controller(escape_keys);
+        }
+    }
+    // Panel-focus keys: Escape unwinds the open panel menu, then
+    // returns focus to the client; Enter/Space on Activities toggles
+    // the overview (the pointer path stays the compositor's press
+    // region); Left/Right walk the bar while no menu owns the arrows.
+    {
+        let (window, bar, activities, clock, system, a11y, input, tray_box, held, guard) = (
+            window.clone(),
+            bar.clone(),
+            activities.clone(),
+            clock.clone(),
+            system.clone(),
+            a11y.clone(),
+            input.clone(),
+            tray_box.clone(),
+            panel_held.clone(),
+            panel_escape_guard.clone(),
+        );
+        let shell = shell.clone();
+        let keys = gtk::EventControllerKey::new();
+        // Fallback for Escape with no popover shown (no grab in the
+        // way): unwind or release. An open popover's grab delivers
+        // Escape to the popover instead, which carries its own
+        // interceptor above — this controller never sees those keys.
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let window_keys = window.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            use gtk::gdk::Key;
+            if !held.get() {
+                return glib::Propagation::Proceed;
+            }
+            match key {
+                Key::Escape => {
+                    match panel_focus::escape(
+                        true,
+                        panel_menu_open(&clock, &system, &a11y, &input, &tray_box),
+                    ) {
+                        panel_focus::EscapeOutcome::CloseMenus => {
+                            close_panel_menus(&clock, &system, &a11y, &input, &tray_box, &guard);
+                            // Closing keeps panel focus by contract: the
+                            // hold is re-asserted unconditionally (a no-op
+                            // when the guard already held it), so the bar
+                            // keeps exclusive keyboard on every path out
+                            // of this branch (G-PANEL-FOCUS).
+                            assert_panel_hold(&window_keys, &held);
+                            glib::Propagation::Stop
+                        }
+                        panel_focus::EscapeOutcome::Release => {
+                            release_panel_focus(&window_keys, &held);
+                            glib::Propagation::Stop
+                        }
+                        panel_focus::EscapeOutcome::Ignore => glib::Propagation::Proceed,
+                    }
+                }
+                Key::Return | Key::KP_Enter | Key::space
+                    if gtk::prelude::GtkWindowExt::focus(&window_keys).as_ref()
+                        == Some(activities.upcast_ref()) =>
+                {
+                    if let Some(control) = shell.borrow_mut().control.as_mut() {
+                        let _ = control.toggle_overview();
+                    }
+                    glib::Propagation::Stop
+                }
+                Key::Left | Key::Right
+                    if panel_focus::arrows_walk_bar(
+                        true,
+                        panel_menu_open(&clock, &system, &a11y, &input, &tray_box),
+                    ) =>
+                {
+                    bar.child_focus(if key == Key::Left {
+                        gtk::DirectionType::TabBackward
+                    } else {
+                        gtk::DirectionType::TabForward
+                    });
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        window.add_controller(keys);
+    }
 
-    // Clock: GNOME's panel text, refreshed every second.
+    // Clock: GNOME's panel text, redrawn on each minute (each second
+    // with clock-show-seconds), after any wall-clock change, and when
+    // its settings change.
     let interface = settings(INTERFACE_SCHEMA);
     let clock_button = clock.clone();
-    let tick = move || {
-        let now = jiff::Zoned::now().datetime();
-        let format = interface
-            .as_ref()
-            .map(|s| ClockFormat::from_setting(&s.string("clock-format")))
-            .unwrap_or(ClockFormat::TwentyFourHour);
-        // GNOME's clock keys; without the schema, weekday and date.
-        let parts = interface
-            .as_ref()
-            .map(|s| logic::ClockParts {
-                weekday: s.boolean("clock-show-weekday"),
-                date: s.boolean("clock-show-date"),
-                seconds: s.boolean("clock-show-seconds"),
-            })
-            .unwrap_or_default();
-        let text = logic::clock_text(&now, format, parts);
-        clock_label.set_label(&text);
-        clock.update_property(&[gtk::accessible::Property::Description(&text)]);
-        calendar_ui.set_clock_format(format);
-        calendar_ui.set_today(now.date());
-        glib::ControlFlow::Continue
+    let refresh_clock: Rc<dyn Fn()> = {
+        let interface = interface.clone();
+        let shown = RefCell::new(String::new());
+        Rc::new(move || {
+            let now = jiff::Zoned::now().datetime();
+            let format = interface
+                .as_ref()
+                .map(|s| ClockFormat::from_setting(&s.string("clock-format")))
+                .unwrap_or(ClockFormat::TwentyFourHour);
+            // GNOME's clock keys; without the schema, weekday and date.
+            let parts = interface
+                .as_ref()
+                .map(|s| logic::ClockParts {
+                    weekday: s.boolean("clock-show-weekday"),
+                    date: s.boolean("clock-show-date"),
+                    seconds: s.boolean("clock-show-seconds"),
+                })
+                .unwrap_or_default();
+            let text = logic::clock_text(&now, format, parts);
+            if *shown.borrow() != text {
+                clock_label.set_label(&text);
+                clock.update_property(&[gtk::accessible::Property::Description(&text)]);
+                *shown.borrow_mut() = text;
+            }
+            calendar_ui.set_clock_format(format);
+            calendar_ui.set_today(now.date());
+        })
     };
-    tick();
-    glib::timeout_add_seconds_local(1, tick);
+    refresh_clock();
+    let wall_clock = {
+        let seconds = interface
+            .as_ref()
+            .is_some_and(|s| s.boolean("clock-show-seconds"));
+        let refresh_clock = refresh_clock.clone();
+        Rc::new(wall_clock::WallClock::new(seconds, move || refresh_clock()))
+    };
+    if let Some(interface) = interface {
+        let (wall_clock, lock_ui) = (wall_clock.clone(), lock_ui.clone());
+        interface.connect_changed(None, move |s, key| {
+            if key.starts_with("clock-") {
+                wall_clock.set_seconds(s.boolean("clock-show-seconds"));
+                refresh_clock();
+                lock_ui.refresh_clock();
+            }
+        });
+        // `refresh_clock` holds the settings, so the handler lives as
+        // long as the shell.
+    }
+    // The clock ticks for the shell's life.
+    std::mem::forget(wall_clock);
 
     // Overview search, dash, and app grid (#54, #57).
     let favorites = {
@@ -1356,6 +1842,50 @@ fn build(app: &adw::Application) {
         Rc::new(ShellActions(shell.clone())),
     );
     let switcher_ui = switcher::SwitcherUi::new(app.upcast_ref(), apps.clone());
+    // Keep both switcher policies live, including while a popup is open.
+    {
+        let app_settings = settings("org.gnome.shell.app-switcher");
+        let window_settings = settings("org.gnome.shell.window-switcher");
+        let apply: Rc<dyn Fn()> = {
+            let shell = shell.clone();
+            let app_settings = app_settings.clone();
+            let window_settings = window_settings.clone();
+            Rc::new(move || {
+                let defaults = tuna_shell_host::model::SwitcherWorkspacePolicy::default();
+                let read = |settings: &Option<gio::Settings>, fallback| {
+                    settings
+                        .as_ref()
+                        .filter(|settings| {
+                            settings
+                                .settings_schema()
+                                .is_some_and(|schema| schema.has_key("current-workspace-only"))
+                        })
+                        .map(|settings| settings.boolean("current-workspace-only"))
+                        .unwrap_or(fallback)
+                };
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    control.set_switcher_workspace_policy(
+                        tuna_shell_host::model::SwitcherWorkspacePolicy {
+                            applications_current_workspace_only: read(
+                                &app_settings,
+                                defaults.applications_current_workspace_only,
+                            ),
+                            windows_current_workspace_only: read(
+                                &window_settings,
+                                defaults.windows_current_workspace_only,
+                            ),
+                        },
+                    );
+                }
+            })
+        };
+        apply();
+        for settings in [app_settings, window_settings].into_iter().flatten() {
+            let apply = apply.clone();
+            settings.connect_changed(Some("current-workspace-only"), move |_, _| apply());
+            std::mem::forget(settings);
+        }
+    }
     // GNOME's WindowTracker: a window belongs to the desktop entry its
     // app id names (as the switcher finds its icon), shown in the grid
     // or not; a window no desktop file claims is an app of its own.
@@ -1436,6 +1966,81 @@ fn build(app: &adw::Application) {
             Rc::new(move || shell.borrow().control.as_ref().is_some_and(|c| c.locked()))
         },
     );
+    // Wellbeing (#354): screen-time history/limits and break reminders.
+    // The module owns its timers and settings watches; the shell only
+    // lends it the message list, the OSD countdown and the lock action.
+    // Test builds compile the module for its unit tests but never start
+    // the live runtime (it owns process timers and the real history file).
+    // The 0.35 control client reconciles effects with Applied responses.
+    #[cfg(not(test))]
+    {
+        let notices = notify.clone();
+        let (show_countdown, hide_countdown) = osd_ui.countdown_hooks();
+        let lock_shell = shell.clone();
+        let effect_shell = shell.clone();
+        let action_notices = notify.clone();
+        let dismiss_notices = notify.clone();
+        let register_notices = notify.clone();
+        let drop_notices = notify.clone();
+        let break_queue: Rc<RefCell<Vec<wellbeing::BreakActionKind>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let break_push = break_queue.clone();
+        wellbeing::start(
+            app.upcast_ref(),
+            wellbeing::ShellHooks {
+                post_notice: Rc::new(move |title: String, body: String| {
+                    notices.post("Wellbeing", "alarm-symbolic", &title, &body);
+                }),
+                post_action_notice: Rc::new(
+                    move |title: String, body: String, actions: Vec<(String, String)>| {
+                        action_notices.post_with_actions(
+                            "Wellbeing",
+                            "alarm-symbolic",
+                            &title,
+                            &body,
+                            &actions,
+                        )
+                    },
+                ),
+                dismiss_notice: Rc::new(move |id: u64| dismiss_notices.dismiss_notification(id)),
+                on_notice_action: Rc::new(move |id: u64, key: String, handler: Rc<dyn Fn()>| {
+                    register_notices.on_notification_action(id, &key, handler);
+                }),
+                drop_notice_actions: Rc::new(move |id: u64| {
+                    drop_notices.drop_notification_actions(id);
+                }),
+                break_action: Rc::new(move |kind: wellbeing::BreakActionKind| {
+                    break_push.borrow_mut().push(kind);
+                }),
+                // Reconcile on every wellbeing tick. ControlClient bounds
+                // outstanding sends, correlates Applied, and invalidates the
+                // pair when it replaces a dead connection.
+                effect_hook: Rc::new(move |grayscale: bool, fade: bool| {
+                    if let Some(control) = effect_shell.borrow_mut().control.as_mut() {
+                        match control.reconcile_wellbeing_effects(grayscale, fade) {
+                            Ok(applied) => applied,
+                            Err(e) => {
+                                eprintln!("tuna-shell-gtk: wellbeing: effects send failed: {e}");
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                }),
+                show_countdown,
+                hide_countdown,
+                lock: Rc::new(move || {
+                    if let Some(control) = lock_shell.borrow_mut().control.as_mut() {
+                        if let Err(e) = control.lock() {
+                            eprintln!("tuna-shell-gtk: wellbeing: lock failed: {e}");
+                        }
+                    }
+                }),
+            },
+            break_queue,
+        );
+    }
     let gnome_shell = shell_dbus::start(Rc::new(GnomeShellDbus {
         osd: osd_ui.clone(),
         overview: overview_ui.clone(),
@@ -1446,6 +2051,7 @@ fn build(app: &adw::Application) {
     let screenshot_ui = {
         let notify_shot = notify.clone();
         let notify_post = notify.clone();
+        let pointer_shell = shell.clone();
         screenshot_ui::ScreenshotUi::new(
             app.upcast_ref(),
             Rc::new(move || take_screenshot(true, notify_shot.clone())),
@@ -1453,6 +2059,11 @@ fn build(app: &adw::Application) {
                 notify_post.post("Screenshot", "screenshot-recorded-symbolic", summary, body);
             }),
             recorder.clone(),
+            Rc::new(move |(x, y)| {
+                if let Some(control) = pointer_shell.borrow_mut().control.as_mut() {
+                    let _ = control.move_screenshot_pointer(x, y);
+                }
+            }),
         )
     };
 
@@ -1462,14 +2073,14 @@ fn build(app: &adw::Application) {
     network_agent::start(app.upcast_ref());
 
     // GNOME Shell is IBus's panel: it draws the candidate window.
-    ibus_panel::start(app.upcast_ref());
+    ibus_panel::start(app.upcast_ref(), ibus_properties.clone());
 
     // GNOME's workspace switcher popup.
     let workspace_popup = ws_popup::WorkspacePopup::new(app.upcast_ref());
 
     // GNOME Shell's own keybindings (org.gnome.shell.keybindings).
     {
-        let run: Rc<dyn Fn(keybindings::Action)> = {
+        let run: Rc<dyn Fn(keybindings::Action, u32)> = {
             let (shell, overview_ui, clock, system) = (
                 shell.clone(),
                 overview_ui.clone(),
@@ -1479,8 +2090,15 @@ fn build(app: &adw::Application) {
             let (apps, notify, osd_ui) = (apps.clone(), notify.clone(), osd_ui.clone());
             let screenshot_ui = screenshot_ui.clone();
             let workspace_popup_keys = workspace_popup.clone();
-            Rc::new(move |action| {
+            let (panel_window_keys, activities_keys, panel_held_keys) =
+                (window.clone(), activities.clone(), panel_held.clone());
+            Rc::new(move |action, mode| {
                 use keybindings::Action;
+                // Ctrl+Alt+Tab owns the keyboard while held: a session
+                // chord that fires then is spurious (G-PANEL-FOCUS).
+                if panel_held_keys.get() && !keybindings::runs_while_panel_held(action, mode) {
+                    return;
+                }
                 let toggle = |button: &gtk::MenuButton| {
                     if button.is_active() {
                         button.popdown();
@@ -1498,6 +2116,27 @@ fn build(app: &adw::Application) {
                     let id = id.trim_end_matches(".desktop");
                     apps.get().entry(id).cloned()
                 };
+                if media_keys::trace_enabled()
+                    && matches!(
+                        action,
+                        Action::VolumeUp { .. }
+                            | Action::VolumeDown { .. }
+                            | Action::VolumeUpQuiet
+                            | Action::VolumeDownQuiet
+                            | Action::VolumeMute
+                            | Action::VolumeMuteQuiet
+                            | Action::MicrophoneMute
+                    )
+                {
+                    let locked = shell.borrow().control.as_ref().is_some_and(|c| c.locked());
+                    media_keys::trace(
+                        "media-action",
+                        serde_json::json!({
+                            "action": format!("{action:?}"), "mode": mode,
+                        }),
+                        locked,
+                    );
+                }
                 match action {
                     Action::LockScreen => {
                         if let Some(control) = shell.borrow_mut().control.as_mut() {
@@ -1523,6 +2162,15 @@ fn build(app: &adw::Application) {
                     }
                     Action::ToggleMessageTray => toggle(&clock),
                     Action::ToggleQuickSettings => toggle(&system),
+                    Action::FocusPanel { backward } => {
+                        focus_panel(
+                            &panel_window_keys,
+                            &activities_keys,
+                            &system,
+                            &panel_held_keys,
+                            backward,
+                        );
+                    }
                     Action::SwitchToApplication(n) => {
                         let Some(entry) = dash_entry(n) else { return };
                         // Its newest window when it runs, else a launch;
@@ -1619,12 +2267,27 @@ fn build(app: &adw::Application) {
                             return;
                         };
                         let model = control.model();
-                        let occupied: Vec<u32> =
-                            model.windows().iter().map(|w| w.workspace).collect();
+                        let occupied: Vec<u32> = model
+                            .windows()
+                            .iter()
+                            .filter(|w| !w.on_all_workspaces)
+                            .map(|w| w.workspace)
+                            .collect();
                         let Some(workspace) =
                             target.resolve(model.active_workspace(), model.workspaces(), &occupied)
                         else {
                             return;
+                        };
+                        let workspace = if let Some(count) = model.fixed_workspace_count() {
+                            if target == keybindings::Target::Last {
+                                count - 1
+                            } else if workspace >= count {
+                                return;
+                            } else {
+                                workspace
+                            }
+                        } else {
+                            workspace
                         };
                         let focused = model.windows().iter().find(|w| w.active).map(|w| w.id);
                         if matches!(action, Action::MoveToWorkspace(_)) {
@@ -1653,12 +2316,24 @@ fn build(app: &adw::Application) {
                                 .max();
                             workspace_popup_keys.display(
                                 workspace,
-                                tuna_shell_control::dynamic_workspace_count(occupied, workspace),
+                                control.model().fixed_workspace_count().unwrap_or_else(|| {
+                                    tuna_shell_control::dynamic_workspace_count(occupied, workspace)
+                                }),
                             );
                         }
                     }
-                    Action::VolumeUp { precise } | Action::VolumeDown { precise } => {
-                        let up = matches!(action, Action::VolumeUp { .. });
+                    Action::VolumeUp { .. }
+                    | Action::VolumeDown { .. }
+                    | Action::VolumeUpQuiet
+                    | Action::VolumeDownQuiet => {
+                        let up = matches!(action, Action::VolumeUp { .. } | Action::VolumeUpQuiet);
+                        let precise = matches!(
+                            action,
+                            Action::VolumeUp { precise: true }
+                                | Action::VolumeDown { precise: true }
+                        );
+                        let quiet =
+                            matches!(action, Action::VolumeUpQuiet | Action::VolumeDownQuiet);
                         let step = if precise {
                             2.0
                         } else {
@@ -1672,13 +2347,15 @@ fn build(app: &adw::Application) {
                             },
                             step,
                             false,
+                            quiet,
                         );
                     }
-                    Action::VolumeMute | Action::MicrophoneMute => {
+                    Action::VolumeMute | Action::VolumeMuteQuiet | Action::MicrophoneMute => {
                         media_keys.change(
                             media_keys::VolumeKey::Mute,
                             0.0,
                             action == Action::MicrophoneMute,
+                            action == Action::VolumeMuteQuiet,
                         );
                     }
                     Action::BrightnessUp
@@ -1772,9 +2449,9 @@ fn build(app: &adw::Application) {
                 let run = run.clone();
                 gnome_shell.set_internal(
                     &accels,
-                    Rc::new(move |i| {
+                    Rc::new(move |i, mode| {
                         if let Some(action) = actions.get(i) {
-                            run(*action);
+                            run(*action, mode);
                         }
                     }),
                 );
@@ -1898,6 +2575,10 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.peripherals.mouse",
             INTERFACE_SCHEMA,
             A11Y_INTERFACE_SCHEMA,
+            "org.gnome.desktop.wm.preferences",
+            "org.gnome.desktop.sound",
+            "org.gnome.mutter",
+            kbd_a11y::SCHEMA,
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -1944,10 +2625,52 @@ fn build(app: &adw::Application) {
                 );
                 if let Some(iface) = all[4].as_ref() {
                     out.hot_corners = iface.boolean("enable-hot-corners");
+                    // GNOME's cursor and locate-pointer keys (#342): the
+                    // compositor draws its own cursors from them.
+                    out.cursor_theme = iface.string("cursor-theme").to_string();
+                    out.cursor_size = u32::try_from(iface.int("cursor-size")).unwrap_or(0);
+                    out.locate_pointer = iface.boolean("locate-pointer");
                 }
                 out.right_to_left = gtk::Widget::default_direction() == gtk::TextDirection::Rtl;
                 out.motion = motion::from_settings(all[4].as_ref(), all[5].as_ref());
+                if let Some(mutter) = all[8].as_ref() {
+                    if mutter
+                        .settings_schema()
+                        .is_some_and(|schema| schema.has_key("attach-modal-dialogs"))
+                    {
+                        out.attach_modal_dialogs = mutter.boolean("attach-modal-dialogs");
+                    }
+                }
+                if let Some(mutter) = all[8].as_ref() {
+                    if let Some(schema) = mutter.settings_schema() {
+                        if schema.has_key("locate-pointer-key") {
+                            out.locate_pointer_key =
+                                mutter.string("locate-pointer-key").to_string();
+                        }
+                        if schema.has_key("dynamic-workspaces") {
+                            out.workspace_policy.dynamic = mutter.boolean("dynamic-workspaces");
+                        }
+                        if schema.has_key("workspaces-only-on-primary") {
+                            out.workspace_policy.only_on_primary =
+                                mutter.boolean("workspaces-only-on-primary");
+                        }
+                        if schema.has_key("edge-tiling") {
+                            out.workspace_policy.edge_tiling = mutter.boolean("edge-tiling");
+                        }
+                    }
+                }
                 motion::set(out.motion);
+                if let Some(wm) = all[6].as_ref() {
+                    out.workspace_policy.fixed_count = wm.int("num-workspaces").clamp(1, 36) as u32;
+                    out.bell.audible = wm.boolean("audible-bell");
+                    out.bell.visual = wm.boolean("visual-bell");
+                    out.bell.frame_flash = wm.string("visual-bell-type") == "frame-flash";
+                }
+                if let Some(sound) = all[7].as_ref() {
+                    out.bell.event_sounds = sound.boolean("event-sounds");
+                    out.bell.theme = sound.string("theme-name").to_string();
+                }
+                out.keyboard_aids = kbd_a11y::read(all[9].as_ref());
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }
@@ -2054,13 +2777,22 @@ fn build(app: &adw::Application) {
             }),
         )
     };
-    // Compositor state: drain the control socket every frame.
+    let kbd_a11y_dialog = kbd_a11y::KbdA11yDialog::new(app.upcast_ref());
+    // Compositor state: the control socket is drained whenever it is
+    // readable, then mirrored into the views. Nothing runs while the
+    // session idles: the views re-sync after the compositor said
+    // something, on every frame while the switcher is open (its layout
+    // and thumbnail delay move with time), and when the app list or the
+    // icon theme changes what the overview shows.
     {
         let shell = shell.clone();
         let notify = notify.clone();
         let overview_ui = overview_ui.clone();
         let switcher_ui = switcher_ui.clone();
         let panel_window = window.clone();
+        let panel_focus_window = window.clone();
+        let panel_focus_held = panel_held.clone();
+        let last_open = Cell::new(false);
         let chrome = {
             let shell = shell.clone();
             preview_chrome::PreviewChrome::new(
@@ -2076,144 +2808,298 @@ fn build(app: &adw::Application) {
         let shell_rc = shell.clone();
         let activities_button = activities.clone();
         let last_frames: RefCell<Vec<tuna_shell_control::SwitcherThumbnail>> = RefCell::default();
-        glib::timeout_add_local(Duration::from_millis(16), move || {
-            let mut shell = shell.borrow_mut();
-            let mut results = Vec::new();
-            let mut accelerators = Vec::new();
-            let mut menus = Vec::new();
-            let mut consent = None;
-            let mut popups = Vec::new();
-            if let Some(control) = shell.control.as_mut() {
-                loop {
-                    match control.poll() {
-                        Ok(Handled::Gap { .. }) => {
-                            let _ = control.request_snapshot();
-                        }
-                        Ok(Handled::WindowMenu(request)) => menus.push(request),
-                        Ok(Handled::ShortcutConsent(request)) => consent = Some(request),
-                        Ok(Handled::ScreenReader(state)) => {
-                            if matches!(
-                                state,
-                                tuna_shell_control::ScreenReaderState::Unavailable
-                                    | tuna_shell_control::ScreenReaderState::Conflict
-                            ) {
-                                notify.post("Screen Reader", "preferences-desktop-accessibility-symbolic", "Screen Reader unavailable", "Orca could not start for this session. Check its installation and other active sessions.");
-                            }
-                        }
-                        Ok(Handled::WorkspacePopup { index, count }) => {
-                            popups.push((index, count));
-                        }
-                        Ok(Handled::Accelerator { action, time, mode }) => {
-                            accelerators.push((action, time, mode));
-                        }
-                        Ok(Handled::CommandResult { id, status }) => results.push((
-                            id,
-                            matches!(status, tuna_shell_control::CommandStatus::Applied),
-                        )),
-                        Ok(_) => {}
-                        Err(e) if is_would_block(&e) => break,
-                        Err(e) => {
-                            eprintln!("tuna-shell-gtk: control error: {e}");
-                            break;
+        // A later re-sync, however often it is asked for before it runs
+        // (filled in below, once `sync` exists).
+        let resync = Rc::new(RefCell::new(None::<Rc<dyn Fn()>>));
+        let resync_pending: Rc<Cell<bool>> = Rc::default();
+        let resync_after = {
+            let (resync, pending) = (resync.clone(), resync_pending.clone());
+            move |delay: Duration| {
+                if pending.replace(true) {
+                    return;
+                }
+                let (resync, pending) = (resync.clone(), pending.clone());
+                glib::timeout_add_local_once(delay, move || {
+                    pending.set(false);
+                    let sync = resync.borrow().clone();
+                    if let Some(sync) = sync {
+                        sync();
+                    }
+                });
+            }
+        };
+        let sync: Rc<dyn Fn(Drained)> = {
+            let (chrome, notify, switcher_ui) =
+                (chrome.clone(), notify.clone(), switcher_ui.clone());
+            let shell_rc = shell_rc.clone();
+            let resync_after = resync_after.clone();
+            Rc::new(move |drained: Drained| {
+                let Drained {
+                    results,
+                    accelerators,
+                    menus,
+                    consent,
+                    popups,
+                    aid_switches,
+                } = drained;
+                let mut shell = shell.borrow_mut();
+                let locked = shell.control.as_ref().is_some_and(|c| c.locked());
+                let auth_generation = shell.control.as_ref().map(|c| c.connection_generation());
+                let authoritative_lock = shell
+                    .control
+                    .as_ref()
+                    .filter(|c| !c.needs_snapshot())
+                    .map(|c| c.locked());
+                render_pills(&mut shell);
+                if let Some(control) = shell.control.as_ref() {
+                    switcher_ui.sync(control.model());
+                }
+                // The switcher's window thumbnails: the compositor draws the
+                // windows into the frames, sent whenever they move.
+                let frames = switcher_ui.thumbnail_frames();
+                if *last_frames.borrow() != frames {
+                    if let Some(control) = shell.control.as_mut() {
+                        match control.set_switcher_thumbnails(frames.clone()) {
+                            Ok(_) => *last_frames.borrow_mut() = frames,
+                            // The socket is full: try again a frame later.
+                            Err(e) if is_would_block(&e) => resync_after(Duration::from_millis(16)),
+                            Err(_) => {}
                         }
                     }
                 }
-            }
-            let locked = shell.control.as_ref().is_some_and(|c| c.locked());
-            render_pills(&mut shell);
-            if let Some(control) = shell.control.as_ref() {
-                switcher_ui.sync(control.model());
-            }
-            // The switcher's window thumbnails: the compositor draws the
-            // windows into the frames, sent whenever they move.
-            let frames = switcher_ui.thumbnail_frames();
-            if *last_frames.borrow() != frames {
-                if let Some(control) = shell.control.as_mut() {
-                    if control.set_switcher_thumbnails(frames.clone()).is_ok() {
-                        *last_frames.borrow_mut() = frames;
+                let open = shell
+                    .control
+                    .as_ref()
+                    .is_some_and(|c| c.model().is_overview_open());
+                drop(shell);
+                if locked {
+                    notify.release_focus();
+                    release_panel_focus(&panel_focus_window, &panel_focus_held);
+                }
+                ibus_properties.sync_lock();
+                lock_ui.sync_connection_generation(auth_generation);
+                if let Some(locked) = authoritative_lock {
+                    lock_ui.sync(locked);
+                }
+                screensaver.sync(locked);
+                if locked {
+                    shortcut_consent.dismiss();
+                } else if let Some(request) = consent {
+                    shortcut_consent.sync(request);
+                }
+                for (action, time, mode) in accelerators {
+                    gnome_shell.accelerator_activated(action, time, mode);
+                }
+                for request in menus {
+                    window_menu.open(&request);
+                }
+                for (index, count) in popups {
+                    workspace_popup.display(index, count);
+                }
+                for (aid, enabled) in aid_switches {
+                    kbd_a11y_dialog.switched(aid, enabled, locked);
+                }
+                if locked {
+                    kbd_a11y_dialog.dismiss();
+                }
+                for (id, applied) in results {
+                    // Receipt of Applied precedes the runtime manager replacement.
+                    media_keys::trace(
+                        "control-ack-not-runtime-application",
+                        serde_json::json!({
+                            "request_id": id, "applied": applied,
+                        }),
+                        locked,
+                    );
+                    lock_ui.command_result(id, applied);
+                }
+                // The bar goes see-through and Activities shows as checked
+                // while the overview is open, as GNOME draws them.
+                if open {
+                    panel_window.add_css_class("overview");
+                    activities_button.add_css_class("checked");
+                } else {
+                    panel_window.remove_css_class("overview");
+                    activities_button.remove_css_class("checked");
+                }
+                overview::OverviewUi::set_open(&overview_ui, open);
+                if open != last_open.replace(open) {
+                    // Panel focus follows the overview: opening hands the
+                    // keyboard over; closing releases a hold that never won
+                    // it (the overview kept the keyboard), while a hold the
+                    // bar actually won survives.
+                    if open || !panel_focus_window.is_active() {
+                        release_panel_focus(&panel_focus_window, &panel_focus_held);
                     }
                 }
-            }
-            let open = shell
-                .control
-                .as_ref()
-                .is_some_and(|c| c.model().is_overview_open());
-            drop(shell);
-            if locked {
-                notify.release_focus();
-            }
-            lock_ui.sync(locked);
-            screensaver.sync(locked);
-            if locked {
-                shortcut_consent.dismiss();
-            } else if let Some(request) = consent {
-                shortcut_consent.sync(request);
-            }
-            for (action, time, mode) in accelerators {
-                gnome_shell.accelerator_activated(action, time, mode);
-            }
-            for request in menus {
-                window_menu.open(&request);
-            }
-            for (index, count) in popups {
-                workspace_popup.display(index, count);
-            }
-            for (id, applied) in results {
-                lock_ui.command_result(id, applied);
-            }
-            // The bar goes see-through and Activities shows as checked
-            // while the overview is open, as GNOME draws them.
-            if open {
-                panel_window.add_css_class("overview");
-                activities_button.add_css_class("checked");
-            } else {
-                panel_window.remove_css_class("overview");
-                activities_button.remove_css_class("checked");
-            }
-            overview::OverviewUi::set_open(&overview_ui, open);
-            // GNOME's preview chrome over the compositor's previews.
-            let shell = shell_rc.borrow();
-            if let Some(control) = shell.control.as_ref() {
-                let (previews, hovered) = control.overview_previews();
-                let model = control.model();
-                let apps = chrome_apps.get();
-                let lookup = |id: u64| {
-                    let window = model.windows().iter().find(|w| w.id == id)?;
-                    let icon = window
-                        .app_id
-                        .as_deref()
-                        .and_then(|app| providers::provider_app(&apps, app))
-                        .and_then(|entry| entry.icon.clone())
-                        .or_else(|| {
-                            window
-                                .app_id
-                                .as_deref()
-                                .and_then(|app| providers::provider_app(&apps, app))
-                                .is_none()
-                                .then(|| {
-                                    window.icon.clone().filter(|icon| usable_window_icon(icon))
-                                })
-                                .flatten()
+                // GNOME's preview chrome over the compositor's previews.
+                let shell = shell_rc.borrow();
+                if let Some(control) = shell.control.as_ref() {
+                    let (previews, hovered) = control.overview_previews();
+                    let model = control.model();
+                    let apps = chrome_apps.get();
+                    let lookup = |id: u64| {
+                        let window = model.windows().iter().find(|w| w.id == id)?;
+                        let icon = window
+                            .app_id
+                            .as_deref()
+                            .and_then(|app| providers::provider_app(&apps, app))
+                            .and_then(|entry| entry.icon.clone())
+                            .or_else(|| {
+                                window
+                                    .app_id
+                                    .as_deref()
+                                    .and_then(|app| providers::provider_app(&apps, app))
+                                    .is_none()
+                                    .then(|| {
+                                        window.icon.clone().filter(|icon| usable_window_icon(icon))
+                                    })
+                                    .flatten()
+                            })
+                            .map(|icon| -> gio::Icon {
+                                if icon.starts_with('/') {
+                                    gio::FileIcon::new(&gio::File::for_path(&icon)).upcast()
+                                } else {
+                                    gio::ThemedIcon::new(&icon).upcast()
+                                }
+                            })
+                            .unwrap_or_else(|| {
+                                gio::ThemedIcon::new("application-x-executable").upcast()
+                            });
+                        Some(preview_chrome::PreviewWindow {
+                            title: window.title.clone(),
+                            icon,
                         })
-                        .map(|icon| -> gio::Icon {
-                            if icon.starts_with('/') {
-                                gio::FileIcon::new(&gio::File::for_path(&icon)).upcast()
-                            } else {
-                                gio::ThemedIcon::new(&icon).upcast()
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            gio::ThemedIcon::new("application-x-executable").upcast()
-                        });
-                    Some(preview_chrome::PreviewWindow {
-                        title: window.title.clone(),
-                        icon,
-                    })
-                };
-                chrome.update(previews, hovered, &lookup);
-            }
-            glib::ControlFlow::Continue
+                    };
+                    chrome.update(previews, hovered, &lookup);
+                }
+            })
+        };
+        *resync.borrow_mut() = Some({
+            let sync = sync.clone();
+            Rc::new(move || sync(Drained::default()))
         });
+        {
+            let sync = sync.clone();
+            switcher_ui.on_frame(move || sync(Drained::default()));
+        }
+        // The overview's dash and preview chrome look icons up in the app
+        // list and the icon theme.
+        {
+            let resync_after = resync_after.clone();
+            apps.connect_changed(move || {
+                chrome.forget_windows();
+                resync_after(Duration::ZERO);
+            });
+        }
+        if let Some(display) = gtk::gdk::Display::default() {
+            let resync_after = resync_after.clone();
+            gtk::IconTheme::for_display(&display).connect_changed(move |_| {
+                resync_after(Duration::ZERO);
+            });
+        }
+        sync(Drained::default());
+        // Every frame the socket holds, then what the connection is now.
+        let pump = {
+            let (shell, notify, sync) = (shell_rc.clone(), notify.clone(), sync.clone());
+            move || {
+                let mut drained = Drained::default();
+                let mut shell = shell.borrow_mut();
+                let Some(control) = shell.control.as_mut() else {
+                    return Link::Lost;
+                };
+                let (before, was_closed) = (control.connection_generation(), control.is_closed());
+                let (handled, usable) = drain(control, &notify, &mut drained);
+                let (generation, closed) = (control.connection_generation(), control.is_closed());
+                let link = if closed {
+                    Link::Redial
+                } else if usable {
+                    Link::Open {
+                        generation,
+                        fd: control.as_raw_fd(),
+                    }
+                } else {
+                    Link::Lost
+                };
+                drop(shell);
+                // A hang-up or a redial changes what the views may trust
+                // (lock authority, input-method admission) without a frame.
+                if handled || generation != before || closed != was_closed {
+                    sync(drained);
+                }
+                link
+            }
+        };
+        // One readability watch on the current stream. A redial (a poll
+        // after the compositor hung up, or a send that met a dead peer)
+        // replaces the stream and its descriptor: the old watch ends and
+        // the new stream gets its own. While the compositor is gone, a
+        // one-shot timeout redials on the client's spacing. The watch
+        // lives as long as the shell.
+        let watched: Rc<Cell<Option<u64>>> = Rc::default();
+        let redial_pending: Rc<Cell<bool>> = Rc::default();
+        let tend = Rc::new(RefCell::new(None::<Rc<dyn Fn(Link)>>));
+        let pump: Rc<dyn Fn() -> Link> = Rc::new(pump);
+        *tend.borrow_mut() = Some({
+            let (pump, tend) = (pump.clone(), tend.clone());
+            Rc::new(move |link: Link| match link {
+                Link::Open { generation, fd } => {
+                    if watched.replace(Some(generation)) == Some(generation) {
+                        return;
+                    }
+                    let (pump, tend, watched) = (pump.clone(), tend.clone(), watched.clone());
+                    let hangup = glib::IOCondition::HUP | glib::IOCondition::ERR;
+                    fd_watch::add_local(fd, glib::IOCondition::IN | hangup, move |_, condition| {
+                        if watched.get() != Some(generation) {
+                            // A newer stream has its own watch.
+                            return glib::ControlFlow::Break;
+                        }
+                        let link = pump();
+                        if matches!(link, Link::Open { generation: now, .. } if now == generation) {
+                            if !condition.intersects(hangup) {
+                                return glib::ControlFlow::Continue;
+                            }
+                            eprintln!("tuna-shell-gtk: control error: the socket hung up");
+                            watched.set(None);
+                            return glib::ControlFlow::Break;
+                        }
+                        watched.set(None);
+                        let next = tend.borrow().clone();
+                        if let Some(next) = next {
+                            next(link);
+                        }
+                        glib::ControlFlow::Break
+                    });
+                }
+                Link::Redial => {
+                    watched.set(None);
+                    if redial_pending.replace(true) {
+                        return;
+                    }
+                    let (pump, tend, pending) =
+                        (pump.clone(), tend.clone(), redial_pending.clone());
+                    glib::timeout_add_local_once(
+                        tuna_shell_host::control::REDIAL_INTERVAL,
+                        move || {
+                            pending.set(false);
+                            let link = pump();
+                            let next = tend.borrow().clone();
+                            if let Some(next) = next {
+                                next(link);
+                            }
+                        },
+                    );
+                }
+                Link::Lost => watched.set(None),
+            })
+        });
+        // The handshake may have read frames past the first snapshot: the
+        // socket will not report those as readable.
+        let link = pump();
+        let first = tend.borrow().clone();
+        if let Some(first) = first {
+            first(link);
+        }
     }
 
     window.present();
@@ -2235,10 +3121,17 @@ fn main() -> glib::ExitCode {
     // The old name's environment, for one release (#505).
     tuna_shell_control::legacy::import_env("tuna-shell-gtk");
     glib::set_prgname(Some("tuna-shell-gtk"));
+    // Before any window is realized, so GSK's first renderer follows it.
+    if gtk::init().is_ok() {
+        if let Some(display) = gtk::gdk::Display::default() {
+            renderer::prefer_cairo_on_software_gl(&display);
+        }
+    }
     let app = adw::Application::builder()
         .application_id("org.tuna.Shell")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    privacy_portal::start(&app);
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
 }

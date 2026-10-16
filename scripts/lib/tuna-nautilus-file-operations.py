@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -51,28 +52,57 @@ def nautilus_identity():
     return {'owner': owner, 'pid': pid, 'uid': uid, 'exe': str(executable)}
 
 
+def removed_accessible(error):
+    """Only Nautilus/AT-SPI's concrete retired-object error is readiness.
+
+    AT-SPI reports a retired object either itself or, once GTK has unexported
+    the object path, through GDBus's unknown-interface reply for that path."""
+    return (isinstance(error, GLib.Error) and error.domain == 'atspi_error'
+            and error.code == 1 and re.fullmatch(
+                r'Object does not exist at path (?:“/[^”\n\x00]+”|"/[^"\n\x00]+")'
+                r'|No such interface (?:“org\.a11y\.atspi\.[A-Za-z]+”|"org\.a11y\.atspi\.[A-Za-z]+")'
+                r' on object at path /[^\s\x00]+',
+                error.message) is not None)
+
+
+class IncompleteTree(Exception):
+    """A None child invalidated the entire owned walk; transient readiness only."""
+
+
 def controls():
     while GLib.MainContext.default().pending():
         GLib.MainContext.default().iteration(False)
     result = []
 
     def walk(node):
-        try:
-            node.clear_cache()
-            if node.getState().contains(pyatspi.STATE_SHOWING):
-                result.append(node)
-            for index in range(node.childCount):
-                walk(node.getChildAtIndex(index))
-        except Exception:
-            pass
+        # A disappearing owner-tree object invalidates this entire walk. The
+        # original bounded waiter may retry it, never a captured stale action.
+        # DISTINCT from the retired-object (2bc) path: a None child means the
+        # tree was transiently incomplete. Discard this entire walk; only the
+        # original budget/guard path may re-resolve, never a partial list.
+        if node is None:
+            raise IncompleteTree('transient incomplete accessibility tree: missing child')
+        node.clear_cache()
+        if node.getState().contains(pyatspi.STATE_SHOWING):
+            result.append(node)
+        for index in range(node.childCount):
+            child = node.getChildAtIndex(index)
+            if child is None:
+                raise IncompleteTree('transient incomplete accessibility tree: missing child')
+            walk(child)
 
     desktop = pyatspi.Registry.getDesktop(0)
     for index in range(desktop.childCount):
         app = desktop.getChildAtIndex(index)
+        if app is None:
+            raise IncompleteTree('transient incomplete accessibility tree: missing child')
         try:
             app_pid = app.get_process_id()
-        except Exception:
-            # Earlier picker callers may disappear between accessibility reads.
+        except GLib.Error as error:
+            # Earlier unrelated picker callers may disappear. No other
+            # transport or accessibility failure is accepted as absence.
+            if not removed_accessible(error):
+                raise
             continue
         if identity is not None and app_pid == identity['pid']:
             walk(app)
@@ -100,7 +130,20 @@ def snapshot(label):
     before = focused()
     nodes = []
     disappeared = 0
-    for node in controls():
+    pending = None
+    for _ in range(3):
+        try:
+            pending = controls()
+            break
+        except IncompleteTree:
+            # Transient incomplete tree: re-validate the original owner/focus
+            # before one bounded re-resolution. Never a partial snapshot,
+            # never an action retry, never a stale reuse.
+            focused()
+            continue
+    if pending is None:
+        raise RuntimeError('Files snapshot observed transient incomplete accessibility tree')
+    for node in pending:
         try:
             nodes.append({'name': node.name, 'role': node.getRoleName(),
                           'selected': node.getState().contains(pyatspi.STATE_SELECTED),
@@ -110,7 +153,7 @@ def snapshot(label):
         except GLib.Error as error:
             # A removed file cell can disappear after the accessibility walk.
             # Keep this specific observation explicit; other errors still fail.
-            if error.domain != 'atspi_error' or 'Object does not exist at path' not in error.message:
+            if not removed_accessible(error):
                 raise
             disappeared += 1
     after = focused()
@@ -122,22 +165,102 @@ def snapshot(label):
     subprocess.run(['scrot', str(OUT / ('nautilus-' + label + '.png'))], check=True)
 
 
-def wait(predicate, description):
+def wait(predicate, description, *, startup=False):
+    guard = owned_unlocked if startup else focused
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(.05)
+        guard()
+        if time.monotonic() >= deadline:
+            break
+        try:
+            accepted = predicate()
+        except IncompleteTree:
+            # DISTINCT from the retired-object (2bc) path: a None child made
+            # this walk incomplete. Explicit readiness only; the original
+            # budget/guard loop re-resolves. Never a partial positive, never
+            # an action retry, never a stale reuse, never a broad catch.
+            accepted = None
+        except GLib.Error as error:
+            if not removed_accessible(error):
+                raise
+            accepted = None
+        # Both retry and positive result belong to the original unlocked
+        # owner; operation waits also retain strict focus throughout.
+        guard()
+        if time.monotonic() >= deadline:
+            break
+        if accepted:
+            # Startup may wait for focus, but acceptance still requires it.
+            if startup:
+                focused()
+                if time.monotonic() >= deadline:
+                    break
+            return accepted
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
     raise RuntimeError('Files did not ' + description)
 
 
-def focused():
-    current = scene()
+def owned_unlocked():
+    current = scene()  # Retains the strict locked-desktop denial.
     if nautilus_identity() != identity:
         raise RuntimeError('Files original bus owner or installed process changed')
+    return current
+
+
+def focused():
+    current = owned_unlocked()
     if current.get('focused_app_id') != 'org.gnome.Nautilus':
         raise RuntimeError('Files lost actual compositor keyboard focus')
     return current
+
+
+def wait_for_initial_map(name):
+    # Only this first admission may observe no app focus yet. Every subsequent
+    # operation wait is strict; owner replacement/locking never become retries.
+    wait(lambda: scene().get('focused_app_id') == 'org.gnome.Nautilus' and cell(name) is not None,
+         'map its native window with the actual fixture contents', startup=True)
+
+
+def wait_for_browser_close(browser_id):
+    """Observe this original window's removal, allowing the resulting focus loss.
+
+    While it remains mapped, retain the original bus/process/focus checks.
+    After removal the app may exit; absence proves window closure only.
+    Never send another close action or admit a late observation.
+    """
+    if type(browser_id) is not int or browser_id <= 0:
+        raise RuntimeError('Files close requires its original positive window ID')
+    deadline = time.monotonic() + 10
+    def absent(current):
+        return all(window['id'] != browser_id for window in current['windows'])
+    while time.monotonic() < deadline:
+        current = scene()  # Locking remains a terminal failure, even after close.
+        if absent(current):
+            after = scene()
+            if time.monotonic() >= deadline:
+                break
+            if not absent(after):
+                raise RuntimeError('Files original browser window reappeared during close admission')
+            return
+        try:
+            focused()
+        except RuntimeError as error:
+            # The same close may complete between the scene read and focus
+            # guard. Only this exact focus failure may observe final removal;
+            # owner/lock/transport failures remain terminal.
+            if str(error) != 'Files lost actual compositor keyboard focus':
+                raise
+            after = scene()
+            if time.monotonic() >= deadline or not absent(after):
+                raise
+            final = scene()
+            if time.monotonic() >= deadline or not absent(final):
+                raise
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    raise RuntimeError('Files did not close its native browser window')
 
 
 def key(value):
@@ -159,9 +282,12 @@ def cell(name):
 
 
 def select(name):
-    wait(lambda: cell(name) is not None, 'show the actual file cell ' + name)
-    node = cell(name)
-    bounds = node.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
+    def target():
+        node = cell(name)
+        if node is None:
+            return None
+        return node.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
+    bounds = wait(target, 'show the actual file cell ' + name)
     current = focused()
     fx, fy, fw, fh = current['focused_rect']
     if (bounds.width <= 0 or bounds.height <= 0 or bounds.x < 0 or bounds.y < 0
@@ -169,8 +295,10 @@ def select(name):
         raise RuntimeError('Files cell is outside its actual focused surface')
     run('xdotool', 'mousemove', '--window', host,
         str(fx + bounds.x + bounds.width // 2), str(fy + bounds.y + bounds.height // 2), 'click', '1')
-    wait(lambda: cell(name) is not None and cell(name).getState().contains(pyatspi.STATE_SELECTED),
-         'select the actual file ' + name)
+    def selected():
+        node = cell(name)
+        return node is not None and node.getState().contains(pyatspi.STATE_SELECTED)
+    wait(selected, 'select the actual file ' + name)
 
 
 def navigate(path):
@@ -245,8 +373,7 @@ try:
     seed.write_bytes(payload)
     run('nautilus', '--new-window', str(fixture))
     identity = nautilus_identity()
-    wait(lambda: scene().get('focused_app_id') == 'org.gnome.Nautilus' and cell(name) is not None,
-         'map its native window with the actual fixture contents')
+    wait_for_initial_map(name)
     browser_id = scene()['focused']
     snapshot('opened')
     stage = 'create-folder'
@@ -308,8 +435,7 @@ try:
                     'scope': 'ordinary native app in the reference container; final shipped image remains untested'})
     stage = 'close'
     key('ctrl+w')
-    wait(lambda: all(window['id'] != browser_id for window in scene()['windows']),
-         'close its native browser window')
+    wait_for_browser_close(browser_id)
     (OUT / 'nautilus-operations.json').write_text(json.dumps(records, indent=2))
     print('Nautilus genuine native file operations passed: create/copy/rename/move/trash/undo/close')
 except Exception as error:

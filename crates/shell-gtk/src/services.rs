@@ -729,6 +729,51 @@ struct AudioUi {
     process: RefCell<Option<gio::Subprocess>>,
     stopping: Cell<bool>,
     sound: Option<gio::Settings>,
+    privacy: Option<gio::Settings>,
+    enforcer: RefCell<crate::privacy::Tracker>,
+    last_actions: RefCell<Vec<crate::privacy::Action>>,
+    last_unclassified_video_sources: RefCell<Vec<u64>>,
+    queue: RefCell<crate::privacy::ActionQueue>,
+    drain_pending: Cell<bool>,
+}
+
+/// Dispatch budget per enforcement tick. Graphs are small; on a
+/// pathological one the remainder stays queued and drains on later
+/// ticks instead of being dropped.
+const MAX_PRIVACY_ACTIONS: usize = 64;
+
+/// The privacy kill-switches, when the schema is installed. Missing
+/// schemas (or keys) read as no settings object, and enforcement
+/// then plans nothing — like an unreachable service.
+fn privacy_settings() -> Option<gio::Settings> {
+    let source = gio::SettingsSchemaSource::default()?;
+    source.lookup("org.gnome.desktop.privacy", true)?;
+    Some(gio::Settings::new("org.gnome.desktop.privacy"))
+}
+
+/// One kill-switch without a critical log when an older schema
+/// lacks the key.
+fn privacy_bool(settings: &gio::Settings, key: &str) -> bool {
+    if settings
+        .settings_schema()
+        .is_none_or(|schema| !schema.has_key(key))
+    {
+        return false;
+    }
+    settings.boolean(key)
+}
+
+/// Current kill-switch policy (all-allowed without settings).
+fn privacy_policy(settings: Option<&gio::Settings>) -> tuna_shell_host::settings::PrivacyPolicy {
+    use tuna_shell_host::settings::PrivacyPolicy;
+    let Some(settings) = settings else {
+        return PrivacyPolicy::default();
+    };
+    PrivacyPolicy {
+        camera_disabled: privacy_bool(settings, "disable-camera"),
+        microphone_disabled: privacy_bool(settings, "disable-microphone"),
+        sound_output_disabled: privacy_bool(settings, "disable-sound-output"),
+    }
 }
 
 impl AudioUi {
@@ -751,6 +796,11 @@ impl AudioUi {
     }
 
     fn update(self: &Rc<Self>, snapshot: crate::audio_state::Snapshot) {
+        crate::sound_feedback::set_sink_running(snapshot.sink_running);
+        crate::sound_feedback::set_own_playing(
+            crate::sound_feedback::feedback_process_id()
+                .is_some_and(|pid| self.state.borrow().default_sink_has_running_process(pid)),
+        );
         if *self.last.borrow() == snapshot {
             return;
         }
@@ -860,6 +910,96 @@ impl AudioUi {
         *self.last.borrow_mut() = snapshot;
     }
 
+    /// Enforce the privacy kill-switches against the latest graph:
+    /// mute what the policy requires, destroy camera nodes, and
+    /// unmute on explicit restore. Runs on every graph event and on
+    /// every settings change, so a bypass attempt (or a respawning
+    /// node) is answered within one event. Each tick dispatches at
+    /// most [`MAX_PRIVACY_ACTIONS`] steps through the bounded async
+    /// helpers; the rest stays queued and drains on later ticks, and
+    /// failed steps schedule a retry — the tracker retains restore
+    /// ownership until the graph observes the unmute, so deferred or
+    /// failed work is never forgotten. Only a changed step set is
+    /// logged, so a steady state stays silent.
+    fn enforce_privacy(self: &Rc<Self>) {
+        let policy = privacy_policy(self.privacy.as_ref());
+        let scan = self.state.borrow().privacy_scan(&policy);
+        if !scan.authoritative || scan.cookie.is_none() {
+            // A retry cleared the cache or its initial dump is incomplete.
+            // Preserve both restore ownership and queued intent until the
+            // restarted monitor publishes a complete graph baseline.
+            return;
+        }
+        if scan.unclassified_video_sources != *self.last_unclassified_video_sources.borrow() {
+            if !scan.unclassified_video_sources.is_empty() {
+                eprintln!("tuna-shell-gtk: camera policy left unclassified video sources intact: {:?}; provider provenance unavailable", scan.unclassified_video_sources);
+            }
+            *self.last_unclassified_video_sources.borrow_mut() =
+                scan.unclassified_video_sources.clone();
+        }
+        let planned = self.enforcer.borrow_mut().plan(&scan);
+        if planned != *self.last_actions.borrow() {
+            if !planned.is_empty() {
+                eprintln!("tuna-shell-gtk: privacy enforcement {planned:?}");
+            }
+            *self.last_actions.borrow_mut() = planned.clone();
+        }
+        let batch = {
+            let mut queue = self.queue.borrow_mut();
+            queue.offer(planned);
+            queue.take(MAX_PRIVACY_ACTIONS)
+        };
+        let cookie = scan.cookie.expect("validated Core cookie");
+        for action in batch {
+            self.enforcer.borrow_mut().dispatched(&action);
+            let Some(serial) = scan.serials.get(&action.node()).copied() else {
+                self.queue.borrow_mut().report(&action, false);
+                continue;
+            };
+            let weak = Rc::downgrade(self);
+            crate::privacy::run_async(action, cookie, serial, move |ok| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.enforcer
+                        .borrow_mut()
+                        .completed_for(&action, Some(cookie), serial, ok);
+                    let current = ui
+                        .state
+                        .borrow()
+                        .privacy_scan(&privacy_policy(ui.privacy.as_ref()));
+                    let replaced = crate::privacy::completion_needs_replan(
+                        &current,
+                        action.node(),
+                        cookie,
+                        serial,
+                    );
+                    if ui.queue.borrow_mut().report(&action, ok) || replaced {
+                        ui.schedule_drain();
+                    }
+                }
+            });
+        }
+        if !self.queue.borrow().is_empty() {
+            self.schedule_drain();
+        }
+    }
+
+    /// Run enforcement again shortly, coalesced: at most one drain
+    /// tick is ever pending, and it re-plans from the live graph, so
+    /// queued work drains without depending on future graph events.
+    fn schedule_drain(self: &Rc<Self>) {
+        if self.drain_pending.get() {
+            return;
+        }
+        self.drain_pending.set(true);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.drain_pending.set(false);
+                ui.enforce_privacy();
+            }
+        });
+    }
+
     fn retry(self: &Rc<Self>) {
         if let Some(process) = self.process.borrow_mut().take() {
             process.force_exit();
@@ -935,6 +1075,7 @@ impl AudioUi {
                     Ok(true) => {
                         let snapshot = ui.state.borrow().snapshot();
                         ui.update(snapshot);
+                        ui.enforce_privacy();
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -988,7 +1129,21 @@ fn audio(w: &Rc<Widgets>) {
         process: RefCell::new(None),
         stopping: Cell::new(false),
         sound: crate::media_keys::sound_settings(),
+        privacy: privacy_settings(),
+        enforcer: RefCell::default(),
+        last_actions: RefCell::default(),
+        last_unclassified_video_sources: RefCell::default(),
+        queue: RefCell::default(),
+        drain_pending: Cell::new(false),
     });
+    if let Some(privacy) = ui.privacy.as_ref() {
+        let weak = Rc::downgrade(&ui);
+        privacy.connect_changed(None::<&str>, move |_, _| {
+            if let Some(ui) = weak.upgrade() {
+                ui.enforce_privacy();
+            }
+        });
+    }
     ui.refresh_volume_limit();
     if let Some(sound) = ui.sound.as_ref() {
         let weak = Rc::downgrade(&ui);
@@ -1002,7 +1157,14 @@ fn audio(w: &Rc<Widgets>) {
         let ui = ui.clone();
         slider.connect_value_changed(move |s| {
             if !ui.syncing.get() {
-                wpctl(
+                let value = s.value();
+                let changed = ui
+                    .last
+                    .borrow()
+                    .sink
+                    .is_some_and(|(old, _)| (old - value).abs() > 0.01);
+                let muted = value <= 0.0;
+                crate::media_keys::wpctl(
                     &[
                         "set-volume",
                         node,
@@ -1015,7 +1177,30 @@ fn audio(w: &Rc<Widgets>) {
                             logic::wpctl_volume_arg(s.value())
                         },
                     ],
-                    |_| {},
+                    move |result| {
+                        if node == SINK && result.is_some() {
+                            crate::media_keys::wpctl(
+                                &["set-mute", SINK, if muted { "1" } else { "0" }],
+                                move |result| {
+                                    if result.is_some() {
+                                        crate::media_keys::wpctl(
+                                            &["get-volume", SINK],
+                                            move |result| {
+                                                if let Some((_, muted)) = result
+                                                    .as_deref()
+                                                    .and_then(crate::media_keys::parse_volume)
+                                                {
+                                                    crate::sound_feedback::volume(
+                                                        false, changed, muted,
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                    },
                 );
             }
         });

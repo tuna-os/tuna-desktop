@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +19,17 @@ spec.loader.exec_module(M)
 
 
 class InstalledPolicy(unittest.TestCase):
+    def test_release_keeps_single_versioned_gtk_and_sound_dependencies(self):
+        source = (ROOT / 'scripts/tuna-release').read_text()
+        depends = next(line for line in source.splitlines() if line.startswith('Depends: '))
+        fields = depends[len('Depends: '):].split(', ')
+        for name, floor in [('libgtk-4-1', '(>= 4.12)'), ('libadwaita-1-0', '(>= 1.0)'), ('libgtk4-layer-shell0', '(>= 1.1)')]:
+            matches = [field for field in fields if field.split()[0] == name]
+            self.assertEqual(matches, [name + ' ' + floor])
+        for name in ['gnome-session-canberra', 'libcanberra-pulse', 'sound-theme-freedesktop']:
+            self.assertEqual(fields.count(name), 1)
+        self.assertTrue(fields[0].startswith('$SHLIBS'))
+
     def process_case(self, inode=20, replacement=None, changed_field=None):
         original = {'sha256': 'a' * 64, 'dev': 1, 'ino': 20, 'size': 100}
         executed = SimpleNamespace(st_dev=1, st_ino=inode, st_size=100,
@@ -151,6 +163,29 @@ class InstalledPolicy(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'companion-source-contract'):
                 M.preflight()
 
+    def _preflight_with(self, deb_version, reported):
+        def command(args):
+            if args == ['dpkg', '--verify', 'tuna-desktop']:
+                return ''
+            if args[0] == 'git':
+                return 'a' * 40
+            if args[0].startswith('/usr/bin/tuna-'):
+                return Path(args[0]).name + ' ' + reported
+            return deb_version
+        with patch.object(os, 'getuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(M, 'run', side_effect=command), patch.object(M, 'owner', return_value={'name': 'tuna-desktop', 'version': deb_version}), patch.object(M, 'digest', return_value={'sha256': '0' * 64}), patch.object(M, 'bounded_json', return_value={'commit': 'b' * 40, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}):
+            M.preflight()
+
+    def test_prerelease_package_accepts_semver_binaries(self):
+        # 1.0.0~beta.1 is the Debian form of the binaries' 1.0.0-beta.1; the
+        # binary contract passes and the next check (companions) decides.
+        with self.assertRaisesRegex(ValueError, 'companion-source-contract'):
+            self._preflight_with('1.0.0~beta.1', '1.0.0-beta.1')
+
+    def test_prerelease_package_rejects_mismatched_binaries(self):
+        for reported in ('1.0.0~beta.1', '1.0.0', '1.0.0-beta.2'):
+            with self.subTest(reported=reported), self.assertRaisesRegex(ValueError, 'installed-binary-contract'):
+                self._preflight_with('1.0.0~beta.1', reported)
+
     def test_original_session_and_replacement_contract(self):
         base = {'files': {}}
         compositor = {'pid': 100, 'exe': '/usr/bin/tuna-compositor'}
@@ -174,6 +209,15 @@ class InstalledPolicy(unittest.TestCase):
                 self.assertEqual(M.observe(100, 'owned', base, prior, True)['shell']['pid'], 102)
 
 
+def copy_shipped_icons(destination):
+    # Local worktrees may use a group-writable checkout umask. Build an
+    # immutable fixture payload with the same bytes/symlinks as the CI source.
+    shutil.copytree(ROOT / 'share/tuna-desktop/icons', destination, symlinks=True)
+    for path in destination.rglob('*'):
+        if path.is_file() and not path.is_symlink():
+            path.chmod(path.stat().st_mode & ~0o022)
+
+
 class PackagePolicy(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -192,11 +236,14 @@ class PackagePolicy(unittest.TestCase):
             p = self.stage / name
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('fixture\n')
+        # Use the real shipped private theme and its integrity manifest rather
+        # than bypassing asset admission in these controlled package fixtures.
+        copy_shipped_icons(self.stage / 'usr/share/tuna-desktop/icons')
         self.env = dict(os.environ, PATH=str(self.tools) + ':' + os.environ['PATH'], FIXTURE=str(self.stage))
         self.tool('dpkg-deb', '''case "$1" in
 -c) find "$FIXTURE" -type f | while read -r path; do echo "-rwxr-xr-x $path"; done ;;
 -f) case "$3" in Version) echo 0.1.0 ;; Depends) echo 'libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas' ;; Replaces|Conflicts|Provides) echo roost ;; esac ;;  # tuna-rename: keep
--x) cp -R "$FIXTURE/." "$3/" ;;
+-x) cp -pR "$FIXTURE/." "$3/" ;;
 --ctrl-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./conffiles ;;
 --fsys-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./usr ./etc ;;
 esac''')
@@ -221,6 +268,29 @@ esac''')
 
     def test_positive_controlled_tool_policy(self):
         self.assertEqual(self.check(), 0)
+
+    def test_missing_shipped_cursor_asset_is_rejected(self):
+        theme = self.stage / 'usr/share/tuna-desktop/icons/Adwaita'
+        manifest = json.loads((theme / 'UPSTREAM.json').read_text())
+        entry = next(item for item in manifest['entries'] if item['path'].endswith('.svg'))
+        (theme / entry['path']).unlink()
+        self.assertNotEqual(self.check(), 0)
+
+    def test_group_writable_shipped_cursor_asset_is_rejected(self):
+        theme = self.stage / 'usr/share/tuna-desktop/icons/Adwaita'
+        manifest = json.loads((theme / 'UPSTREAM.json').read_text())
+        entry = next(item for item in manifest['entries'] if item['path'].endswith('.svg'))
+        path = theme / entry['path']
+        path.chmod(path.stat().st_mode | 0o020)
+        # dpkg-deb extraction preserves archive modes. The mock must do the
+        # same under both the CI umask and a group-writable local checkout.
+        for mask in (0o022, 0o002):
+            with self.subTest(umask=oct(mask)):
+                previous = os.umask(mask)
+                try:
+                    self.assertNotEqual(self.check(), 0)
+                finally:
+                    os.umask(previous)
 
     def test_compatibility_names_required(self):
         # tuna-rename: keep-begin
@@ -275,9 +345,13 @@ esac''')
         result = subprocess.run(['sh', str(ROOT / 'scripts/lib/tuna-proof-session-launch'), '1', str(ROOT), 'owned'], env=dict(self.env, TUNA_SHELL_BIN='/tmp/wrong'), timeout=5)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_supplied_source_binaries_denied_in_installed_launcher(self):
+        result = subprocess.run(['sh', str(ROOT / 'scripts/lib/tuna-proof-session-launch'), '1', str(ROOT), 'owned'], env=dict(self.env, TUNA_PROOF_BIN_DIR='/tmp/source-binaries'), timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+
 
 class ReleaseDelegatePolicy(unittest.TestCase):
-    def run_release(self, failure='', version_exit=0):
+    def run_release(self, failure='', version_exit=0, missing_cursor=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             tools = root / 'tools'
@@ -295,7 +369,7 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('#!/bin/sh\necho "' + name + ' 0.1.0"\nexit ' + str(version_exit if name == 'tuna-shell-gtk' else 0) + '\n')
                 path.chmod(0o755)
-            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock'):
+            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf'):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
@@ -303,6 +377,15 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
+            copy_shipped_icons(root / 'share/tuna-desktop/icons')
+            checker = root / 'scripts/tuna-cursor-assets-check'
+            checker.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / 'scripts/tuna-cursor-assets-check', checker)
+            if missing_cursor:
+                theme = root / 'share/tuna-desktop/icons/Adwaita'
+                manifest = json.loads((theme / 'UPSTREAM.json').read_text())
+                entry = next(item for item in manifest['entries'] if item['path'].endswith('.svg'))
+                (theme / entry['path']).unlink()
             output = root / 'control'
             result = subprocess.run(['sh', str(ROOT / 'scripts/tuna-release'), '--allow-dirty', '--out', str(root/'out')], cwd=root, env=dict(os.environ, PATH=str(tools)+':'+os.environ['PATH'], OUTPUT=str(output)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             return result.returncode, output.read_text() if output.exists() else None
@@ -318,6 +401,11 @@ class ReleaseDelegatePolicy(unittest.TestCase):
         self.assertIn('libpam0g', depends)
         self.assertIn('gsettings-desktop-schemas', depends)
         self.assertNotIn('libpam0', depends)
+
+    def test_release_rejects_missing_private_cursor_asset(self):
+        status, control = self.run_release(missing_cursor=True)
+        self.assertNotEqual(status, 0)
+        self.assertIsNone(control)
 
     def test_shlibs_failure_or_unknown_output_cannot_package(self):
         for failure in ('shlibs', 'malformed'):

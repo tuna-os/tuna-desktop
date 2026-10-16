@@ -1,0 +1,72 @@
+#!/bin/sh
+# tuna-fade-match — match a shell fade line in a shared-log segment.
+#
+# The compositor and the shell share nested.log, and each emits a log line
+# in several write()s, so two lines written at once can interleave mid-line
+# (ci.yml run 38293527173, journey job 114960925690: the Reduced Motion
+# gate's animated=true popup-out fade was split by a compositor modifier
+# line and the exact grep missed it, failing G-ANIMATIONS-OFF). Each
+# process's own pieces stay contiguous (one write() each under O_APPEND),
+# so match the shell's pieces in order, allowing the other writer's
+# fragments only between them.
+#
+# SOUNDNESS (fail closed): merged bytes are unattributable in general — the
+# observed interleave carries the compositor's "false" and the shell's
+# "true" in one line, so a greedy animated=.*VALUE query exits 0 for BOTH
+# policies. This matcher therefore refuses ambiguous segments instead of
+# guessing:
+#   * "start VALUE" exits 0 only when the text after "animated=" runs to
+#     end-of-line and equals VALUE exactly. Any pollution (e.g. "falsetrue")
+#     refuses BOTH policies (exit 1). Same bytes can never confirm
+#     opposite states.
+#   * "settled" exits 0 when one line holds the shell prefix + NAME +
+#     " settled". Sound because all three tokens are shell-exclusive
+#     vocabulary (sole emitters: switcher.rs:169/174/192; no compositor log
+#     macro emits "switcher fade", "start animated", " settled",
+#     "popup-out" or "thumbnails-in"), and one merged line holds pieces of
+#     at most one shell line (each shell line ends with its own \n piece).
+#   * Mid-token splits (a write boundary inside NAME itself) are refused:
+#     failing closed, never fuzzy.
+# Positive evidence from value-polluted interleaves needs atomic shell
+# event writes (switcher.rs, owned by the GTK wake lane) or separate
+# compositor/shell log streams — not a cleverer merged-bytes reconstruction.
+#
+# Usage: tuna-fade-match NAME start true|false < segment
+#        tuna-fade-match NAME settled < segment
+# Exits 0 on a confirmed match, 1 on none/ambiguous, 2 on bad arguments.
+set -eu
+
+usage() {
+    echo "usage: tuna-fade-match NAME start true|false; tuna-fade-match NAME settled" >&2
+}
+
+[ "$#" = 2 ] || [ "$#" = 3 ] || { usage; exit 2; }
+case "$1" in
+    *[!a-z-]*) usage; exit 2 ;;
+    "") usage; exit 2 ;;
+esac
+prefix='tuna-shell-gtk: switcher fade '
+case "$2" in
+    start)
+        [ "$#" = 3 ] || { usage; exit 2; }
+        case "$3" in
+            true | false) ;;
+            *) usage; exit 2 ;;
+        esac
+        # First line carrying the shell's fade-start tokens; the value is
+        # the exact rest-of-line after "animated=" (compositor never logs
+        # "animated=", so the marker itself is shell-attributed).
+        line=$(grep -F "$prefix" | grep -F "$1" | grep -F " start animated=" | head -n 1 || true)
+        [ -n "$line" ] || exit 1
+        rest=${line##*animated=}
+        [ "$rest" = "$3" ] || exit 1
+        exit 0
+        ;;
+    settled)
+        [ "$#" = 2 ] || { usage; exit 2; }
+        line=$(grep -F "$prefix" | grep -F "$1" | grep -F " settled" | head -n 1 || true)
+        [ -n "$line" ] || exit 1
+        exit 0
+        ;;
+    *) usage; exit 2 ;;
+esac

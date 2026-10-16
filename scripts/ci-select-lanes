@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""ci-select-lanes — choose which ci.yml proof lanes a run executes.
+
+Usage:
+  scripts/ci-select-lanes [--event NAME] [--run-number N] [--size K] [--changed FILE|-]
+
+Prints `lanes=<JSON array>` for $GITHUB_OUTPUT; the reason goes to
+stderr and, when set, $GITHUB_STEP_SUMMARY. The `check` job always runs
+and is not a lane.
+
+push, schedule and workflow_dispatch run every lane. A pull_request runs
+what its changed files (`git diff --name-only HEAD^1 HEAD` on the merge
+commit, or --changed) can affect:
+
+- shared CI inputs (this script, ci.yml, the Cargo workspace manifests,
+  vendored third-party crates, the nested-session launcher) run every lane;
+- docs and other non-runtime files add no lane;
+- a lane's own proof script, fixtures or packaging runs that lane;
+- anything else (crates, share/, other scripts) runs gtk-shell plus a
+  round-robin slice of ROTATION: K lanes starting at
+  (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
+  or 2. Every rotated lane runs on main after merge either way.
+
+Lanes that consume another lane's artifacts pull in their producers.
+"""
+import argparse
+import fnmatch
+import json
+import os
+import subprocess
+import sys
+
+# ci.yml job ids, in workflow order. scripts/lib/ci-select-lanes-tests.py
+# keeps this list and the workflow's lane conditions identical.
+LANES = [
+    "fprint-phase-proof", "journey", "app-content", "scroll-proof", "drm-smoke",
+    "grid-cancel-comparison", "greeter", "gtk-shell",
+    "portal-security", "remote-security", "niri-parity", "arch-package",
+    "marlin-image", "marlin-vm", "parity-ledger", "docs-shots",
+]
+
+# Every code change runs the GTK shell proof: it drives the compositor and
+# the preferred shell together and is what most changes touch. The
+# fingerprint phase, grid-cancel comparison and greeter proofs are short
+# and cover authentication and drag paths no rotated lane does.
+CORE = ["fprint-phase-proof", "grid-cancel-comparison", "greeter", "gtk-shell"]
+
+# Interchangeable end-to-end coverage of the same build, rotated per run.
+ROTATION = [
+    "journey", "app-content", "scroll-proof", "drm-smoke", "portal-security",
+    "remote-security", "niri-parity", "marlin-image", "marlin-vm",
+]
+
+# Lanes that download other lanes' artifacts.
+NEEDS = {
+    "portal-security": ["arch-package"],
+    "remote-security": ["arch-package"],
+    "niri-parity": ["arch-package"],
+    "marlin-image": ["arch-package"],
+    "marlin-vm": ["arch-package"],
+    "parity-ledger": ["journey", "greeter", "gtk-shell", "drm-smoke", "marlin-vm"],
+    "docs-shots": ["journey", "app-content", "scroll-proof"],
+}
+
+# fnmatch patterns: `*` also matches `/`. First matching rule wins.
+FULL = [
+    ".github/workflows/ci.yml",
+    "scripts/ci-*",
+    "Cargo.toml",
+    "Cargo.lock",
+    "third-party/*",
+    "scripts/tuna-nested",
+]
+
+PACKAGE_CONSUMERS = ["arch-package", "portal-security", "remote-security",
+                     "niri-parity", "marlin-image", "marlin-vm"]
+
+OWNED = [
+    ("scripts/tuna-gtk-shell-proof", ["gtk-shell", "journey"]),
+    ("scripts/tuna-scale-proof", ["gtk-shell"]),
+    ("scripts/tuna-walkthrough", ["gtk-shell"]),
+    ("scripts/tuna-gtk-accessibility-proof", ["gtk-shell"]),
+    ("scripts/tuna-a11y-golden", ["gtk-shell"]),
+    ("scripts/tuna-wayland-info-compare", ["gtk-shell"]),
+    ("scripts/lib/tuna-a11y-proof-guard.py", ["gtk-shell"]),
+    ("docs/walkthrough*", ["gtk-shell"]),
+    ("scripts/tuna-journey", ["journey"]),
+    ("scripts/tuna-release", ["journey"]),
+    ("scripts/check-release-package", ["journey"]),
+    ("scripts/check-deb-clean-install", ["journey"]),
+    ("scripts/lib/installed-deb-proof.py", ["journey"]),
+    ("scripts/lib/release-deb-ownership.py", ["journey"]),
+    ("scripts/tuna-app-content", ["app-content"]),
+    ("scripts/tuna-scroll-proof", ["scroll-proof"]),
+    ("scripts/tuna-drm-smoke", ["drm-smoke"]),
+    ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
+    ("scripts/lib/tuna-frame-pacer.c", ["drm-smoke"]),
+    ("scripts/tuna-portal-security", ["portal-security"]),
+    ("scripts/lib/tuna-portal-artifact*", ["portal-security"]),
+    ("tests/portal-reference/*", ["portal-security"]),
+    ("scripts/tuna-remote-security", ["remote-security"]),
+    ("tests/remote-desktop-reference/*", ["remote-security"]),
+    ("scripts/tuna-niri-*", ["niri-parity"]),
+    ("tests/niri-reference/*", ["niri-parity"]),
+    ("packaging/arch/*", PACKAGE_CONSUMERS),
+    ("docs/nested-session.md", ["arch-package"]),
+    ("packaging/marlin/*", ["marlin-image", "marlin-vm"]),
+    ("scripts/tuna-vm-lane", ["marlin-vm"]),
+    ("scripts/tuna-ledger", ["parity-ledger"]),
+    ("docs/parity-ledger.md", ["parity-ledger"]),
+    ("scripts/tuna-docs-shots", ["docs-shots"]),
+]
+
+# Checked by the always-on check job, or not CI runtime input at all.
+NO_LANE = [
+    "docs/*",
+    "*.md",
+    "LICENSE",
+    "renovate.json",
+    ".github/*",
+    ".spektacular/*",
+    "fuzz/*",
+    "scripts/tests/*",
+    "scripts/lib/*-tests.py",
+]
+
+
+def matches(path, patterns):
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def rotation(run_number, size):
+    size = max(0, min(size, len(ROTATION)))
+    start = (run_number * size) % len(ROTATION)
+    return [ROTATION[(start + i) % len(ROTATION)] for i in range(size)]
+
+
+def select(event, run_number, size, changed):
+    """Return (lanes in LANES order, human-readable reason)."""
+    if event != "pull_request":
+        return list(LANES), f"{event}: every lane"
+    chosen, reasons, code = set(), [], []
+    for path in changed:
+        if matches(path, FULL):
+            return list(LANES), f"{path} is shared CI input: every lane"
+        owned = next((lanes for pattern, lanes in OWNED
+                      if fnmatch.fnmatchcase(path, pattern)), None)
+        if owned is not None:
+            chosen.update(owned)
+            reasons.append(f"{path} -> {', '.join(owned)}")
+        elif not matches(path, NO_LANE):
+            code.append(path)
+    if code:
+        rotated = rotation(run_number, size)
+        chosen.update(CORE + rotated)
+        reasons.append(f"{len(code)} code path(s), e.g. {code[0]} -> "
+                       f"{', '.join(CORE)} + round-robin {rotated or 'none'} "
+                       f"(run {run_number}, size {size})")
+    pending = list(chosen)
+    while pending:
+        for need in NEEDS.get(pending.pop(), []):
+            if need not in chosen:
+                chosen.add(need)
+                pending.append(need)
+    if not reasons:
+        reasons.append("docs/non-runtime changes only: check job only")
+    return [lane for lane in LANES if lane in chosen], "; ".join(reasons)
+
+
+def changed_files(source):
+    if source == "-":
+        return [line for line in sys.stdin.read().splitlines() if line]
+    if source:
+        with open(source, encoding="utf-8") as handle:
+            return [line for line in handle.read().splitlines() if line]
+    out = subprocess.run(["git", "diff", "--name-only", "-z", "HEAD^1", "HEAD"],
+                         check=True, capture_output=True, text=True).stdout
+    return [path for path in out.split("\0") if path]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "pull_request"))
+    parser.add_argument("--run-number", type=int, default=int(os.environ.get("GITHUB_RUN_NUMBER", "0")))
+    parser.add_argument("--size", type=int,
+                        default=int(os.environ.get("CI_ROUND_ROBIN_SIZE") or "2"))
+    parser.add_argument("--changed", help="file of changed paths, - for stdin "
+                        "(default: git diff HEAD^1 HEAD on pull_request)")
+    args = parser.parse_args()
+    changed = changed_files(args.changed) if args.event == "pull_request" else []
+    lanes, reason = select(args.event, args.run_number, args.size, changed)
+    print("lanes=" + json.dumps(lanes, separators=(",", ":")))
+    message = f"ci lanes: {', '.join(lanes) or 'none'}\nreason: {reason}\n"
+    sys.stderr.write(message)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write("### CI lane selection\n\n```\n" + message + "```\n")
+
+
+if __name__ == "__main__":
+    main()

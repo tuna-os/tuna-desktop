@@ -5,6 +5,10 @@
 
 use greetd_ipc::{AuthMessageType, Response};
 
+/// This is a typed-input refusal, not a claim that a reader is available.
+pub const FINGERPRINT_TYPED_NOTICE: &str =
+    "Typed answers are unavailable for this prompt. Cancel to choose another sign-in method.";
+
 /// One auth question to render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
@@ -12,6 +16,32 @@ pub struct Prompt {
     pub text: String,
     /// Whether the answer must be masked during input.
     pub secret: bool,
+    /// Whether the text asks for a fingerprint (fprintd/PAM strings,
+    /// #366): the UI may show a touch hint alongside the field, and
+    /// unlock must never answer it with the typed password.
+    pub fingerprint: bool,
+}
+
+/// True when `text` asks for a fingerprint rather than a typed secret.
+///
+/// Matches fprintd's `pam/fingerprint-strings.h` English source strings
+/// ("Place your finger on the fingerprint reader", "Swipe your finger
+/// across ...", "Swipe your finger again", "Swipe was too short, try
+/// again", per-finger variants) plus the generic "fingerprint"/"fprint"
+/// words. A bare "swipe" counts on its own: typed secrets are never
+/// swiped. Localized strings do not match; that gap is recorded, not
+/// guessed at.
+pub fn is_fingerprint_prompt(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("fingerprint") || lower.contains("fprint") || lower.contains("swipe") {
+        return true;
+    }
+    if !lower.contains("finger") {
+        return false;
+    }
+    ["place", "scan", "reader", "touch", "sensor"]
+        .iter()
+        .any(|word| lower.contains(word))
 }
 
 /// What the model needs next after absorbing a daemon response.
@@ -85,6 +115,13 @@ impl GreeterModel {
         self.pending.last()
     }
 
+    /// True when the current prompt asks for a fingerprint (#366):
+    /// consumers block typed answers; unlock must not answer it with
+    /// the typed password.
+    pub fn wants_fingerprint(&self) -> bool {
+        self.current_prompt().is_some_and(|p| p.fingerprint)
+    }
+
     /// Absorb one daemon response; the caller acts on the event.
     pub fn apply_response(&mut self, response: &Response) -> ModelEvent {
         match response {
@@ -96,6 +133,7 @@ impl GreeterModel {
                     let prompt = Prompt {
                         text: auth_message.clone(),
                         secret: false,
+                        fingerprint: is_fingerprint_prompt(auth_message),
                     };
                     self.pending.push(prompt.clone());
                     ModelEvent::NeedAnswer { prompt }
@@ -104,6 +142,7 @@ impl GreeterModel {
                     let prompt = Prompt {
                         text: auth_message.clone(),
                         secret: true,
+                        fingerprint: is_fingerprint_prompt(auth_message),
                     };
                     self.pending.push(prompt.clone());
                     ModelEvent::NeedAnswer { prompt }
@@ -159,6 +198,7 @@ mod tests {
                 prompt: Prompt {
                     text: "Password:".to_string(),
                     secret: true,
+                    fingerprint: false,
                 }
             }
         );
@@ -231,6 +271,47 @@ mod tests {
         assert!(model.pending.is_empty());
         model.mark_session_starting();
         assert_eq!(model.screen, Screen::Launching);
+    }
+
+    #[test]
+    fn fingerprint_prompts_are_flagged_not_answered_with_password() {
+        for text in [
+            "Place your finger on the fingerprint reader",
+            "Swipe your finger across the fingerprint reader",
+            "Swipe your right index finger across the fingerprint reader",
+            "Place your left thumb on the fingerprint reader",
+            "Swipe your finger again",
+            "Place your finger on the reader again",
+            "Swipe was too short, try again",
+            "Verify fingerprint:",
+        ] {
+            assert!(is_fingerprint_prompt(text), "missed: {text}");
+            let mut model = GreeterModel::new();
+            model.begin_user("ada");
+            let event = model.apply_response(&secret_msg(text));
+            assert!(
+                matches!(event, ModelEvent::NeedAnswer { ref prompt } if prompt.fingerprint),
+                "not flagged: {text}"
+            );
+            assert!(model.wants_fingerprint());
+        }
+    }
+
+    #[test]
+    fn password_and_pin_prompts_are_not_fingerprints() {
+        for text in [
+            "Password:",
+            "PIN:",
+            "Token:",
+            "Username:",
+            "Verification code:",
+        ] {
+            assert!(!is_fingerprint_prompt(text), "false hit: {text}");
+        }
+        let mut model = GreeterModel::new();
+        model.begin_user("ada");
+        model.apply_response(&secret_msg("Password:"));
+        assert!(!model.wants_fingerprint());
     }
 
     #[test]

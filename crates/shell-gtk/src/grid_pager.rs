@@ -34,6 +34,9 @@ mod imp {
         pub page: Cell<u32>,
         pub slot: Rc<Slot>,
         pub can_scroll: Cell<bool>,
+        /// Whether the wheel, touchpad and touch turn pages (Carousel's
+        /// `interactive`).
+        pub interactive: Cell<bool>,
         pub smooth_dy: Cell<f64>,
         /// A swipe in progress: the position it started from.
         pub swipe: Cell<Option<f64>>,
@@ -51,6 +54,7 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             self.can_scroll.set(true);
+            self.interactive.set(true);
             let obj = self.obj();
             obj.set_overflow(gtk::Overflow::Hidden);
             obj.set_hexpand(true);
@@ -182,6 +186,16 @@ impl GridPager {
         self.scroll_to(target as u32, true);
     }
 
+    /// Let the wheel, touchpad and touch turn pages, or not (as
+    /// adw::Carousel's `interactive`); turning it off settles a swipe.
+    pub fn set_interactive(&self, interactive: bool) {
+        let imp = self.imp();
+        if imp.interactive.replace(interactive) && !interactive {
+            imp.smooth_dy.set(0.0);
+            self.swipe_end();
+        }
+    }
+
     /// Go to page `index`: GNOME's goToPage, eased unless unmapped.
     pub fn scroll_to(&self, index: u32, animate: bool) {
         let imp = self.imp();
@@ -273,6 +287,9 @@ impl GridPager {
                 return glib::Propagation::Proceed;
             };
             let imp = pager.imp();
+            if !imp.interactive.get() {
+                return glib::Propagation::Proceed;
+            }
             let rtl = pager.direction() == gtk::TextDirection::Rtl;
             if controller.unit() == gtk::gdk::ScrollUnit::Surface {
                 // A touchpad: sideways follows the fingers, up and down
@@ -307,7 +324,7 @@ impl GridPager {
         {
             let (weak, origin) = (self.downgrade(), origin.clone());
             drag.connect_drag_begin(move |_, _, _| {
-                if let Some(pager) = weak.upgrade() {
+                if let Some(pager) = weak.upgrade().filter(|p| p.imp().interactive.get()) {
                     pager.swipe_begin();
                     origin.set(pager.imp().position.get());
                 }
@@ -316,7 +333,7 @@ impl GridPager {
         {
             let weak = self.downgrade();
             drag.connect_drag_update(move |_, dx, _| {
-                if let Some(pager) = weak.upgrade() {
+                if let Some(pager) = weak.upgrade().filter(|p| p.imp().interactive.get()) {
                     let width = f64::from(pager.width().max(1));
                     pager.set_position(origin.get() - dx / width);
                 }
