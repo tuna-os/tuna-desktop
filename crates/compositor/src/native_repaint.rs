@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn global_drawing_and_opacity_changes_reset_buffer_history() {
+    fn global_drawing_pass_order_and_opacity_changes_reset_buffer_history() {
         let id = Id::new();
         let capture = |x, commit| {
             let mut next = scene();
