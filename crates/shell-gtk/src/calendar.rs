@@ -372,29 +372,169 @@ impl CalendarUi {
     }
 }
 
-/// Resolve the preferred calendar handler; an absent handler is a quiet no-op.
+/// Launch the preferred calendar handler for `day`, unless the live
+/// `disable-application-handlers` policy denies shell-opened handlers.
+/// The policy is re-read on every activation, so a flip between two
+/// clicks changes the next launch; an absent handler stays a quiet
+/// no-op (only denial is logged here).
 fn launch_calendar(day: Date) -> bool {
+    let policy = crate::lockdown::read();
+    let launched = launch_calendar_for_policy(day, &policy, &resolve_calendar_entry, &|entry| {
+        tuna_shell_host::apps::launch(entry).is_ok()
+    });
+    if !launched && !policy.entry_visibility().url_handlers {
+        eprintln!("tuna-shell-gtk: opening the calendar is disabled by your administrator.");
+    }
+    launched
+}
+
+/// Testable core of [`launch_calendar`]: the invocation-time policy gates
+/// resolution and launch (denial short-circuits before either runs).
+/// Callers pass the live [`crate::lockdown::read`] policy; tests inject
+/// restrictive policies with recording resolve/launch doubles.
+fn launch_calendar_for_policy(
+    day: Date,
+    policy: &crate::lockdown::LockdownPolicy,
+    resolve: &dyn Fn(Date) -> Option<tuna_shell_host::apps::AppEntry>,
+    launch: &dyn Fn(&tuna_shell_host::apps::AppEntry) -> bool,
+) -> bool {
+    if !policy.entry_visibility().url_handlers {
+        return false;
+    }
+    let Some(entry) = resolve(day) else {
+        return false;
+    };
+    launch(&entry)
+}
+
+/// Resolve the preferred calendar handler entry for `day`: the default
+/// `calendar` MIME handler (launched with `calendar:///<date>`), or GNOME
+/// Calendar with `--date`. `None` when no handler is installed.
+fn resolve_calendar_entry(day: Date) -> Option<tuna_shell_host::apps::AppEntry> {
     let info = gio::AppInfo::default_for_type("x-scheme-handler/calendar", false)
         .or_else(|| gio::AppInfo::default_for_type("text/calendar", false));
     let id = info
         .as_ref()
         .and_then(|info| info.id())
         .unwrap_or_else(|| "org.gnome.Calendar.desktop".into());
-    let Some(path) = tuna_shell_host::apps::default_app_dirs()
+    let path = tuna_shell_host::apps::default_app_dirs()
         .iter()
         .map(|dir| dir.join(id.as_str()))
-        .find(|path| path.is_file())
-    else {
-        return false;
-    };
-    let Some(mut entry) = tuna_shell_host::apps::handler_entry_from_file(&path) else {
-        return false;
-    };
+        .find(|path| path.is_file())?;
+    let mut entry = tuna_shell_host::apps::handler_entry_from_file(&path)?;
     if entry.app_id == "org.gnome.Calendar.desktop" {
         entry.argv.push("--date".into());
         entry.argv.push(day.to_string().into());
     } else if info.is_some() {
         entry.argv.push(format!("calendar:///{}", day).into());
     }
-    tuna_shell_host::apps::launch(&entry).is_ok()
+    Some(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_entry() -> tuna_shell_host::apps::AppEntry {
+        tuna_shell_host::apps::AppEntry {
+            app_id: "org.example.Calendar.desktop".into(),
+            name: "Calendar".into(),
+            generic_name: None,
+            keywords: vec![],
+            argv: vec!["calendar".into()],
+            icon: None,
+            categories: vec![],
+        }
+    }
+
+    fn denied_policy() -> crate::lockdown::LockdownPolicy {
+        crate::lockdown::LockdownPolicy {
+            disable_application_handlers: true,
+            ..crate::lockdown::LockdownPolicy::default()
+        }
+    }
+
+    #[test]
+    fn calendar_launch_denied_short_circuits_before_resolve_and_launch() {
+        use std::cell::Cell;
+        let day = jiff::civil::date(2026, 10, 13);
+        let resolved = Cell::new(0);
+        let launched = Cell::new(0);
+        let resolve = |_: Date| {
+            resolved.set(resolved.get() + 1);
+            Some(fake_entry())
+        };
+        let launch = |_: &tuna_shell_host::apps::AppEntry| {
+            launched.set(launched.get() + 1);
+            true
+        };
+        assert!(!launch_calendar_for_policy(
+            day,
+            &denied_policy(),
+            &resolve,
+            &launch
+        ));
+        assert_eq!(resolved.get(), 0, "denied policy must not resolve");
+        assert_eq!(launched.get(), 0, "denied policy must not launch");
+    }
+
+    #[test]
+    fn calendar_launch_allowed_denied_restored_across_policy_toggle() {
+        use std::cell::Cell;
+        let day = jiff::civil::date(2026, 10, 13);
+        let launched = Cell::new(0);
+        let resolve = |_: Date| Some(fake_entry());
+        let launch = |_: &tuna_shell_host::apps::AppEntry| {
+            launched.set(launched.get() + 1);
+            true
+        };
+        let allowed = crate::lockdown::LockdownPolicy::default();
+        // Allowed: the click launches.
+        assert!(launch_calendar_for_policy(day, &allowed, &resolve, &launch));
+        assert_eq!(launched.get(), 1);
+        // Policy flips to deny between registration and invocation: the
+        // next click checks at invocation time and stays closed.
+        assert!(!launch_calendar_for_policy(
+            day,
+            &denied_policy(),
+            &resolve,
+            &launch
+        ));
+        assert_eq!(launched.get(), 1, "toggle to deny blocks the launch");
+        // Flip back: the launch restores without rewiring.
+        assert!(launch_calendar_for_policy(day, &allowed, &resolve, &launch));
+        assert_eq!(launched.get(), 2, "toggle back restores the launch");
+    }
+
+    #[test]
+    fn calendar_launch_ignores_unrelated_keys_and_missing_handlers() {
+        use std::cell::Cell;
+        let day = jiff::civil::date(2026, 10, 13);
+        let launched = Cell::new(0);
+        let launch = |_: &tuna_shell_host::apps::AppEntry| {
+            launched.set(launched.get() + 1);
+            true
+        };
+        // Unrelated keys never block the launch.
+        let unrelated = crate::lockdown::LockdownPolicy {
+            disable_lock_screen: true,
+            disable_log_out: true,
+            ..crate::lockdown::LockdownPolicy::default()
+        };
+        assert!(launch_calendar_for_policy(
+            day,
+            &unrelated,
+            &|_| Some(fake_entry()),
+            &launch
+        ));
+        assert_eq!(launched.get(), 1);
+        // An absent handler stays a quiet no-op under an allowed policy.
+        assert!(!launch_calendar_for_policy(
+            day,
+            &crate::lockdown::LockdownPolicy::default(),
+            &|_| None,
+            &launch
+        ));
+        assert_eq!(launched.get(), 1, "missing handler launches nothing");
+    }
 }

@@ -115,6 +115,12 @@ pub fn menu() -> gtk::MenuButton {
     column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let settings_button = gtk::Button::with_label("Accessibility Settings");
     settings_button.connect_clicked(|_| {
+        // Administrative lockdown (#357): shell-opened handlers stay
+        // closed while `disable-application-handlers` denies.
+        if !crate::lockdown::handlers_allowed() {
+            eprintln!("tuna-shell-gtk: accessibility settings are disabled by your administrator.");
+            return;
+        }
         if let Err(error) = std::process::Command::new("gnome-control-center")
             .arg("universal-access")
             .spawn()
