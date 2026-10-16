@@ -190,3 +190,44 @@ The compositor column subtracts gnome-shell, because gnome-shell does the work o
 The next step for both owners is the in-guest `perf record` proposed in the 2026-10-08 report. Run it on the overview, notification and final-settle phases (compositor) and on the first search (shell-gtk).
 
 For local measurement on this shared 2-core host, run the CI-built `tuna-deb` inside `localhost/cpuparity-measure:base` (an Ubuntu 26.04 image with the package's dependencies installed) against vkms. Host release builds did not finish within an hour under a load average of 35.
+
+## Compositor phases: profile and fixes (#696)
+
+The benchmark fixture has no in-guest `perf record` for Tuna, so the workload was reproduced locally: release `tuna-compositor` and `tuna-shell-gtk` (frame pointers, line tables) on vkms at 1024x768 through the DRM backend with llvmpipe, as on the Marlin VM's virtio-vga. A uinput keyboard drives 20 Super toggles 1.7 s apart. Ten `Notify` calls match `tuna-perf-phase`. Disks, System Monitor (Resources tab, as in the Marlin screenshots) and Files are open, with System Monitor partly visible behind Files. `perf record -g -F 999 -p <compositor>` ran per phase. `TUNA_PERF_TRACE=1` was set as in `tuna-perf-session`, and `TUNA_COMPOSITOR_STATE` was not set, because its state-file writes would add their own cost.
+
+### Hotspots before the fixes (main `e670b4f4`), share of compositor CPU
+
+| Phase | llvmpipe rasterization (JIT and libgallium) | Compositor thread: Rust | Compositor thread: kernel and libc | Top frames |
+|---|---:|---:|---:|---|
+| Overview toggles | 79% | 10% | 6% | Fragment shading of full-output transition frames; `TokenStore::issue` 2.7%; `StateModel::changes_since` 0.4% |
+| Notifications | 81% | 9% | 5% | Fragment shading of System Monitor's whole visible area per commit; `TokenStore::issue` 3.5% |
+| Final settle | 80% | 10% | 5% | Same as notifications; `TokenStore::issue` 3.6% |
+
+A per-frame draw trace (temporary instrumentation in `draw_scene`) showed where the shaded pixels came from:
+
+- **Whole-surface damage.** The damage tracker saw elements through captured signatures whose `damage_since` damaged the whole element on any commit. System Monitor's graphs commit about 10 times a second with small damage, and each commit repainted the window's whole visible area plus every surface over it. Any element appearing or leaving (a banner, a popup, a wallpaper card) also reset the buffer history to a full-output repaint.
+- **Occluded window at display rate.** With System Monitor fully covered by Files, 96% of the settle frames (1692 of 1757) were 1x1 timing-only repaints with page flips. `pending_output_work` excluded throttled windows' callbacks for mapped roots but counted them again for drawn roots, and an occluded window on the active workspace is a drawn root.
+- **A delta per window per tick.** `WindowManager::reconcile` syncs every title into the state model on every tick, and `StateModel::update` logged `WindowUpdated` even when nothing changed. Each tick, for each window, the hub minted an activation token, serialized a delta and sent it to the shell, which re-synced. `TokenStore::issue` prunes every live token on each issue, so its cost grows over the 30 s token lifetime. After the repaint fixes it was the largest Rust frame: 12.7% of compositor CPU in the final settle.
+
+### Fixes (PR #696)
+
+1. The damage tracker takes the drawn elements themselves, each at its pass's scale, so a commit damages what its client reported. Passes are tracked bottom to top, so an element appearing on top shifts no other element's stacking index. Elements that come, go, move or restack are left to the tracker; global drawing changes and changed opaque regions still repaint the whole buffer.
+2. A throttled window's frame callbacks do not count as output work, also when it is a drawn root.
+3. `StateModel::update` logs a change only when the patch changed the entry.
+
+### Local before and after, compositor % of one core (shell-gtk in brackets)
+
+Two alternating runs each.
+
+| Phase | main `e670b4f4` | Fixes 1 and 2 | Fixes 1, 2 and 3 |
+|---|---:|---:|---:|
+| Launches | 16.7, 18.8 | 7.2, 9.1 | 8.1, 8.2 (0.4) |
+| Overview toggles | 36.6, 40.4 (4.5–4.9) | 19.7, 30.9 | 26.6, 29.8 (4.2–4.4) |
+| Notifications | 35.5, 37.5 (5.8–7.6) | 17.4, 19.9 | 18.0, 19.3 (8.0–10.0) |
+| Final settle | 30.1, 30.9 (1.1–1.2) | 10.7, 11.7 | 9.4, 10.0 (0.5) |
+
+The host's load varied between runs (load average 1.5–5). Fix 3 is measured against fixes 1 and 2 in a separate pair of runs (overview 29.9–31.7 → 26.6–29.8, final settle 11.3–11.4 → 9.4–10.0, shell-gtk final settle 1.3 → 0.5).
+
+After the fixes, llvmpipe still does 60–65% of the overview work. 87% of the overview's shaded pixels come from the roughly 10 full-output frames of each transition: about 1.4 Mpx per frame for clear, wallpaper cards, scaled previews and the shell layers. The full-output transparent preview-chrome layer (`tuna-shell-gtk` `PreviewChrome`) is blended over the whole frame on each of them. That is the next compositor-side lever, together with whether Smithay's texture shader reaches llvmpipe's linear fast path (`LP_FS_KIND_LLVM_LINEAR`).
+
+The paired Marlin run for #696 (`package_source=candidate`) is pending its CI package. Its medians belong in this section when it completes.
