@@ -37,6 +37,7 @@ mod orca;
 mod osd;
 mod overview;
 mod polkit;
+mod portal_opt_out;
 mod power;
 mod preview_chrome;
 mod providers;
@@ -2405,6 +2406,8 @@ fn main() -> glib::ExitCode {
     // The old name's environment, for one release (#505).
     tuna_shell_control::legacy::import_env("tuna-shell-gtk");
     glib::set_prgname(Some("tuna-shell-gtk"));
+    // GTK and libadwaita must not block startup on portal activation.
+    let portals = std::cell::Cell::new(Some(portal_opt_out::disable()));
     // Before any window is realized, so GSK's first renderer follows it.
     if gtk::init().is_ok() {
         if let Some(display) = gtk::gdk::Display::default() {
@@ -2415,6 +2418,12 @@ fn main() -> glib::ExitCode {
         .application_id("org.tuna.Shell")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    // The class handlers (GTK, then libadwaita) ran first.
+    app.connect_startup(move |_| {
+        if let Some(saved) = portals.take() {
+            saved.restore();
+        }
+    });
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
 }
