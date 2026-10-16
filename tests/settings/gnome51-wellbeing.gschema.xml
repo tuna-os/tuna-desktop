@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test fixture ONLY (never installed: these IDs ship with gsettings-desktop-schemas).
+  Merged verbatim from the 51.0 tag (tag object 1a97aa82fe617217ed1b251665f7f3c6b536e407):
+  - schemas/org.gnome.desktop.break-reminders.gschema.xml.in
+  - schemas/org.gnome.desktop.screen-time-limits.gschema.xml.in
+  https://github.com/GNOME/gsettings-desktop-schemas/tree/51.0/schemas
+-->
+<schemalist gettext-domain="gsettings-desktop-schemas">
+  <schema id="org.gnome.desktop.break-reminders" path="/org/gnome/desktop/break-reminders/">
+    <key name="selected-breaks" type="as">
+      <summary>List of breaks that are currently enabled</summary>
+      <default>[]</default>
+    </key>
+
+    <child schema="org.gnome.desktop.break-reminders.movement" name="movement"/>
+    <child schema="org.gnome.desktop.break-reminders.eyesight" name="eyesight"/>
+  </schema>
+  <schema id="org.gnome.desktop.break-reminders.movement" path="/org/gnome/desktop/break-reminders/movement/">
+    <key name="interval-seconds" type="u">
+      <summary>Time between breaks</summary>
+      <description>The time between rest breaks, in seconds.</description>
+      <default>1800</default>
+      <range min="10"/>
+    </key>
+
+    <key name="duration-seconds" type="u">
+      <summary>Duration of each break</summary>
+      <description>The duration of each rest break, in seconds.</description>
+      <default>300</default>
+      <range min="10"/>
+    </key>
+
+    <key name="delay-seconds" type="u">
+      <summary>Amount to delay break if requested</summary>
+      <description>The amount to delay taking the break by, if the user requests a delay, in seconds.</description>
+      <default>180</default>
+      <range min="10"/>
+    </key>
+
+    <key name="fade-screen" type="b">
+      <summary>Fade screen during breaks</summary>
+      <description>True to fade the screen during rest breaks.</description>
+      <default>true</default>
+    </key>
+
+    <key name="lock-screen" type="b">
+      <summary>Lock screen during breaks</summary>
+      <description>True to lock the screen during rest breaks.</description>
+      <default>false</default>
+    </key>
+
+    <key name="play-sound" type="b">
+      <summary>Play sound when a break finishes</summary>
+      <description>True to play a sound when a break finishes.</description>
+      <default>true</default>
+    </key>
+
+    <key name="notify" type="b">
+      <summary>Notify when a break is due</summary>
+      <description>True to emit a notification when a break is due to start.</description>
+      <default>true</default>
+    </key>
+
+    <key name="notify-upcoming" type="b">
+      <summary>Notify when a break is upcoming</summary>
+      <description>True to emit a notification a few minutes before a break is due.</description>
+      <default>true</default>
+    </key>
+
+    <key name="notify-overdue" type="b">
+      <summary>Notify when a break is overdue</summary>
+      <description>True to emit a notification when a break is overdue.</description>
+      <default>true</default>
+    </key>
+
+    <key name="countdown" type="b">
+      <summary>Notify when a break is due</summary>
+      <description>True to show a prominent countdown shortly before a break is due.</description>
+      <default>false</default>
+    </key>
+  </schema>
+  <schema id="org.gnome.desktop.break-reminders.eyesight" path="/org/gnome/desktop/break-reminders/eyesight/">
+    <key name="interval-seconds" type="u">
+      <summary>Time between breaks</summary>
+      <description>The time between rest breaks, in seconds.</description>
+      <default>1200</default>
+      <range min="10"/>
+    </key>
+
+    <key name="duration-seconds" type="u">
+      <summary>Duration of each break</summary>
+      <description>The duration of each rest break, in seconds.</description>
+      <default>20</default>
+      <range min="10"/>
+    </key>
+
+    <key name="delay-seconds" type="u">
+      <summary>Amount to delay break if requested</summary>
+      <description>The amount to delay taking the break by, if the user requests a delay, in seconds.</description>
+      <default>180</default>
+      <range min="10"/>
+    </key>
+
+    <key name="fade-screen" type="b">
+      <summary>Fade screen during breaks</summary>
+      <description>True to fade the screen during rest breaks.</description>
+      <default>true</default>
+    </key>
+
+    <key name="lock-screen" type="b">
+      <summary>Lock screen during breaks</summary>
+      <description>True to lock the screen during rest breaks.</description>
+      <default>false</default>
+    </key>
+
+    <key name="play-sound" type="b">
+      <summary>Play sound when a break finishes</summary>
+      <description>True to play a sound when a break finishes.</description>
+      <default>true</default>
+    </key>
+
+    <key name="notify" type="b">
+      <summary>Notify when a break is due</summary>
+      <description>True to emit a notification when a break is due to start.</description>
+      <default>true</default>
+    </key>
+
+    <key name="notify-upcoming" type="b">
+      <summary>Notify when a break is upcoming</summary>
+      <description>True to emit a notification a few minutes before a break is due.</description>
+      <default>false</default>
+    </key>
+
+    <key name="notify-overdue" type="b">
+      <summary>Notify when a break is overdue</summary>
+      <description>True to emit a notification when a break is overdue.</description>
+      <default>true</default>
+    </key>
+
+    <key name="countdown" type="b">
+      <summary>Notify when a break is due</summary>
+      <description>True to show a prominent countdown shortly before a break is due.</description>
+      <default>false</default>
+    </key>
+  </schema>
+  <schema id="org.gnome.desktop.screen-time-limits" path="/org/gnome/desktop/screen-time-limits/">
+    <key name="history-enabled" type="b">
+      <summary>Enable screen time history</summary>
+      <description>
+        Enable basic screen time functionality, recording usage data for viewing history.
+      </description>
+      <default>true</default>
+    </key>
+
+    <key name="daily-limit-enabled" type="b">
+      <summary>Enable daily screen time limit</summary>
+      <description>Enable imposing a screen time limit on the user, as set in “daily-limit-seconds”.</description>
+      <default>false</default>
+    </key>
+
+    <key name="daily-limit-seconds" type="u">
+      <summary>Daily screen time limit</summary>
+      <description>The limit on the amount of daily screen time the user is allowed, in seconds.</description>
+      <default>28800</default>
+      <range min="10"/>
+    </key>
+
+    <key name="grayscale" type="b">
+      <summary>Grayscale once limit is reached</summary>
+      <description>Whether to make the screen grayscale once the user’s screen time limit is reached.</description>
+      <default>true</default>
+    </key>
+  </schema>
+</schemalist>

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import gi
+from tuna_picker_geometry import application_id
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('GdkWayland', '4.0')
@@ -20,8 +21,8 @@ window.set_default_size(400, 300)
 button = Gtk.Button(label='Independent application input control')
 window.set_child(button)
 clicks = keys = sequence = 0
-app_id = 'org.example.TunaPickerUnrelated'
 start_time = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+app_id = application_id(os.getpid(), start_time)
 
 def clicked(_button):
     global clicks
@@ -48,7 +49,8 @@ def record():
     temporary = output.with_suffix('.tmp')
     temporary.write_text(json.dumps({'pid': os.getpid(), 'uid': os.getuid(),
         'start_time': start_time, 'app_id': app_id, 'clicks': clicks,
-        'keys': keys, 'sequence': sequence, 'mapped': button.get_mapped()}))
+        'keys': keys, 'sequence': sequence, 'mapped': button.get_mapped(),
+        'window_size': [window.get_width(), window.get_height()]}))
     temporary.replace(output)
     return True
 GLib.timeout_add(50, record)

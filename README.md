@@ -6,6 +6,8 @@ A new, independent Wayland desktop session with a GNOME-inspired everyday workfl
 
 The compositor is a long-lived Rust process built with Smithay. The shell UI runs as a supervised Wayland client. The first delivery target is a nested developer preview that can map ordinary applications and recover its shell UI after a shell crash.
 
+Our v1 goal is [GNOME 51 parity plus better responsiveness at matching CPU](docs/v1.md) — the checklist stays public and current there.
+
 ## Quickstart
 
 - **Install:** [docs/install.md](docs/install.md) covers the Debian-format
@@ -28,25 +30,17 @@ today, in frames the GTK shell proof takes on each change.
 
 ## Screenshots and overview demo
 
-![Tuna Desktop overview with Files, Disks and System Monitor open on the Marlin wallpaper](docs/walkthrough/hero-overview.png)
+![Tuna Desktop overview with three live window previews](docs/walkthrough/overview-demo.png)
 
-| App grid | Quick settings |
+| Quick settings | App grid |
 | --- | --- |
-| ![Tuna Desktop app grid with the installed GNOME apps](docs/walkthrough/hero-app-grid.png) | ![Tuna Desktop quick settings with volume, network, Night Light, Dark Style and Do Not Disturb](docs/walkthrough/hero-quick-settings.png) |
+| ![Tuna Desktop quick settings with volume, brightness and service controls](docs/walkthrough/quick-settings-demo.png) | ![Tuna Desktop app grid](docs/walkthrough/app-grid-demo.png) |
 
-| Notifications and calendar | Alt+Tab |
-| --- | --- |
-| ![Tuna Desktop message list with grouped notifications beside the calendar](docs/walkthrough/hero-notifications.png) | ![Tuna Desktop Alt+Tab switcher with live window thumbnails](docs/walkthrough/hero-switcher.png) |
+![Overview demo: open the overview, select a window, and return to the desktop](docs/walkthrough/overview-demo.gif)
 
-![Tuna Desktop lock screen clock over the blurred wallpaper](docs/walkthrough/hero-lock.png)
-
-![Overview demo: open the overview with three apps, return to the desktop, then open the app grid](docs/walkthrough/hero-overview.gif)
-
-[Play or download the overview video (MP4)](docs/walkthrough/hero-overview.mp4).
-These are frames from the real Marlin image booted in a QEMU VM by CI, on
-its hardware (DRM/KMS) session, with the GNOME apps the image ships and its
-default wallpaper. See [capture details](docs/walkthrough/README-media.md)
-for the run, source revision and how to reproduce.
+[Play or download the overview video (MP4, 12 seconds)](docs/walkthrough/overview-demo.mp4).
+The demo shows an actual nested Tuna Desktop session with three libadwaita test windows.
+See [capture details](docs/walkthrough/README-media.md) for source revisions and reproduction.
 
 ## Project status
 
@@ -110,4 +104,4 @@ requirement traceability.
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 
-The [public roadmap](ROADMAP.md) records priorities through October 2027, current release limits and contribution opportunities.
+The [public roadmap](docs/roadmap.md#public-roadmap) records priorities through October 2027, current release limits and contribution opportunities.

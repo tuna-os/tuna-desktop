@@ -378,8 +378,12 @@ fn a_frame_request_without_pixel_damage_keeps_native_refresh_work_pending() {
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
     assert!(
-        tuna_compositor::frame_timing::pending_output_work(&roots, &[]),
+        tuna_compositor::frame_timing::pending_output_work(&roots, &[], &[]),
         "callback-only pacing remains owed even without visible presentation"
+    );
+    assert!(
+        !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
+        "a hidden window's callback waits for its beat, not a scanout"
     );
     assert_eq!(peer.client.frames, 0);
     let output = comp.state.primary_output().unwrap();
@@ -447,7 +451,7 @@ fn a_hidden_window_keeps_its_feedback_until_drawn() {
     let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
     assert!(
-        !tuna_compositor::frame_timing::pending_output_work(&roots, &[]),
+        !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &[]),
         "hidden presentation must not keep an unchanged output repainting"
     );
     let drawn: Vec<_> = tuna_compositor::frame_timing::drawn_roots(&comp.state, &manager, false)
@@ -455,7 +459,7 @@ fn a_hidden_window_keeps_its_feedback_until_drawn() {
         .map(|(surface, _)| surface)
         .collect();
     assert!(
-        tuna_compositor::frame_timing::pending_output_work(&roots, &drawn),
+        tuna_compositor::frame_timing::pending_output_work(&roots, &drawn, &[]),
         "revealing the actual window owes a real submission"
     );
     assert_eq!(
@@ -495,6 +499,10 @@ fn fifo_holds_a_waiting_commit_until_the_next_refresh() {
     // then releases the barrier.
     let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
+    assert!(
+        tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
+        "a hidden window's FIFO barrier still advances on each refresh"
+    );
     tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 1);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(peer.client.fates.get(&2), None, "held behind the barrier");
@@ -841,4 +849,105 @@ fn parented_dialogs_remain_centered_on_left_and_upper_outputs() {
             drop(portal_peer);
         }
     }
+}
+
+#[test]
+fn minimized_parent_hides_transients_and_child_activation_restores_ancestors() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "parent-minimize");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let (child_surface, child) = window(&mut peer, "child-minimize");
+    child.set_parent(Some(&parent));
+    child_surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "parent-minimize");
+    let child_id = id_of(&manager, "child-minimize");
+    manager.focus(&mut comp.state, Some(child_id));
+    assert!(manager.minimize(&mut comp.state, parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert!(!manager.is_minimized(child_id));
+    assert_eq!(manager.model().focused(), None);
+    manager.focus(&mut comp.state, Some(child_id));
+    assert!(!manager.is_minimized(parent_id));
+    assert_eq!(manager.visible_windows().len(), 2);
+    assert_eq!(manager.model().focused(), Some(child_id));
+}
+
+#[test]
+fn dash_icon_targets_ignore_unknown_windows_and_retire_destroyed_window_targets() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (surface, top) = window(&mut peer, "dash-target-owner");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let id = id_of(&manager, "dash-target-owner");
+    let target = smithay::utils::Rectangle::new((-500, 700).into(), (64, 64).into());
+    manager.set_icon_geometries(vec![(id, target), (u64::MAX, target)]);
+    assert_eq!(manager.icon_geometry(id), Some(target));
+    assert_eq!(manager.icon_geometry(u64::MAX), None);
+    manager.set_icon_geometries(Vec::new());
+    assert_eq!(
+        manager.icon_geometry(id),
+        None,
+        "full replacement selects fallback"
+    );
+    manager.set_icon_geometries(vec![(id, target)]);
+    top.destroy();
+    surface.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        manager.icon_geometry(id),
+        None,
+        "destroy must retire old target"
+    );
+    manager.set_icon_geometries(vec![(id, target)]);
+    assert_eq!(
+        manager.icon_geometry(id),
+        None,
+        "stale shell publication is ignored"
+    );
+}
+
+#[test]
+fn restoring_parent_preserves_independent_child_minimize() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "independent-parent");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let (surface, child) = window(&mut peer, "independent-child");
+    child.set_parent(Some(&parent));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "independent-parent");
+    let child_id = id_of(&manager, "independent-child");
+    manager.minimize(&mut comp.state, child_id);
+    manager.minimize(&mut comp.state, parent_id);
+    manager.focus(&mut comp.state, Some(parent_id));
+    assert!(!manager.is_minimized(parent_id));
+    assert!(manager.is_minimized(child_id));
+    assert_eq!(manager.visible_windows().len(), 1);
+    assert_eq!(manager.model().focused(), Some(parent_id));
+}
+
+#[test]
+fn child_mapping_and_closing_cannot_restore_hidden_parent() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "hidden-parent");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "hidden-parent");
+    manager.minimize(&mut comp.state, parent_id);
+    let (surface, child) = window(&mut peer, "hidden-new-child");
+    child.set_parent(Some(&parent));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(manager.is_minimized(parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert_eq!(manager.model().focused(), None);
+    child.destroy();
+    surface.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(manager.is_minimized(parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert_eq!(manager.model().focused(), None);
 }

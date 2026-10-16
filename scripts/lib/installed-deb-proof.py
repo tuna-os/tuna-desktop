@@ -95,7 +95,9 @@ def preflight():
     for name in BINS:
         path = '/usr/bin/' + name
         package = owner(path)
-        if package['name'] != 'tuna-desktop' or package['version'] != version or run([path, '--version']) != name + ' ' + version:
+        # scripts/tuna-release writes a SemVer prerelease (X.Y.Z-beta.N) as the
+        # Debian version X.Y.Z~beta.N; the binaries report the SemVer form.
+        if package['name'] != 'tuna-desktop' or package['version'] != version or run([path, '--version']) != name + ' ' + version.replace('~', '-', 1):
             raise ValueError('installed-binary-contract')
         files[name] = digest(path)
     for package, floor in (('libgtk4-layer-shell0', '1.1'), ('libgtk-4-1', '4.12'), ('libadwaita-1-0', '1.0')):

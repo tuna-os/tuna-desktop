@@ -1,0 +1,597 @@
+{
+  "generated_by": "tuna-walkthrough refresh",
+  "refreshed_utc": "2026-10-12T19:37:37Z",
+  "run_id": "38293537511",
+  "attempt": "1",
+  "branch": "w3-visual-capture",
+  "source": {
+    "built_head_sha": "833af9213527832a7b42340ec79491e5cc0b7b1c",
+    "built_tree_sha": "3dca19e21f04d48fa89645d7afb00bbbd1ce7858",
+    "tree_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "event_sha": "833af9213527832a7b42340ec79491e5cc0b7b1c",
+    "event_name": "workflow_dispatch",
+    "packages": {},
+    "image": {
+      "os_release": {
+        "PRETTY_NAME": "Ubuntu 24.04.5 LTS",
+        "NAME": "Ubuntu",
+        "VERSION_ID": "24.04",
+        "VERSION": "24.04.5 LTS (Noble Numbat)",
+        "VERSION_CODENAME": "noble",
+        "ID": "ubuntu",
+        "ID_LIKE": "debian",
+        "HOME_URL": "https://www.ubuntu.com/",
+        "SUPPORT_URL": "https://help.ubuntu.com/",
+        "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+        "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+        "UBUNTU_CODENAME": "noble",
+        "LOGO": "ubuntu-logo"
+      },
+      "image_os": "ubuntu24",
+      "image_version": "20261004.327.1",
+      "runner_arch": "X64",
+      "github_run_id": "38293537511",
+      "github_run_attempt": "1",
+      "github_sha": "833af9213527832a7b42340ec79491e5cc0b7b1c",
+      "github_ref": "refs/heads/w3-visual-capture"
+    }
+  },
+  "stages": {
+    "calendar": {
+      "status": "ok",
+      "stage_json_sha256": "1b67461a7e879d73a57c374627346d5f935e39ecc1bbb19336f98eaea85f1a05"
+    },
+    "input": {
+      "status": "ok",
+      "stage_json_sha256": "7b6a394690061c6602353f60150ae078ed17c10c573fcaff9b2e64b055e2b058"
+    },
+    "notifications": {
+      "status": "ok",
+      "stage_json_sha256": "6b0151cc6854df31d0b8d62835fb5daec2cd95664ed8a77392d455df7a2c1217"
+    },
+    "overview": {
+      "status": "ok",
+      "stage_json_sha256": "237571e4bb63c47ae10dadee57ba63ec19a4dea24fb4a9ae148cd4f06f7f2582"
+    },
+    "panel": {
+      "status": "ok",
+      "stage_json_sha256": "7fe7c78ddeaac0fa8c8d7fb3066c15be484b1bc84b200b0e7c48fb26aaabe204"
+    },
+    "quick-settings": {
+      "status": "ok",
+      "stage_json_sha256": "b1f3f57a678336415409545973bf77312ca1394eb5ce20c42ed74819943afa79"
+    },
+    "scroll": {
+      "status": "ok",
+      "stage_json_sha256": "d0e926d1bc932901538cb785291cc7fc06d8f02b36723abeb0c2e244f2b6617a"
+    },
+    "search-apps": {
+      "status": "ok",
+      "stage_json_sha256": "0b64d429534e53595c9bf1060c62b15291b65b9303ed62b4adeca83a4ab14c43"
+    },
+    "switcher": {
+      "status": "ok",
+      "stage_json_sha256": "2802b2fc99753e664f632239538992bd809d4c8b0eb6a9c6a24245dd5cda1250"
+    },
+    "system": {
+      "status": "ok",
+      "stage_json_sha256": "fa2f1b2b3accb114dc8589db3f7fbe3051634972073ddc1f55d5bf0f98ede6eb"
+    },
+    "windows": {
+      "status": "ok",
+      "stage_json_sha256": "bac79a1aaf021a9024cf41d1db17d44c56d40c31ddadcb86c4d7bea4b71c5cb9"
+    },
+    "x11": {
+      "status": "ok",
+      "stage_json_sha256": "dac3bd7a1cb30585162bca709e088b510a102852606ddb7e67ba4fbc6482ed05"
+    }
+  },
+  "frames": {
+    "panel": {
+      "file": "walkthrough/panel.png",
+      "sha256": "6ad3f64d6b105cddedbd0a4759946c6421e98495d533e514ffc96877f0a43515",
+      "bytes": 7386,
+      "capture": "ok",
+      "stage": "panel",
+      "artifact": "visual-panel",
+      "label": "duplicate",
+      "resolved_from": "00-baseline-desktop.png",
+      "stage_finished_utc": "2026-10-12T18:54:35Z"
+    },
+    "calendar": {
+      "file": "walkthrough/calendar.png",
+      "sha256": "8f9cbade757c675e96f3f39284528a25a39299e8d96dc6da1c175b6e411f964d",
+      "bytes": 41345,
+      "capture": "ok",
+      "stage": "calendar",
+      "artifact": "visual-calendar",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:31Z"
+    },
+    "tray": {
+      "file": "walkthrough/tray.png",
+      "sha256": "5c75cfd9ab28ea7a8c75b3e1f407fea87b38528105ab15e0bf2c406ec1545a76",
+      "bytes": 11739,
+      "capture": "ok",
+      "stage": "panel",
+      "artifact": "visual-panel",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:35Z"
+    },
+    "quick-settings": {
+      "file": "walkthrough/quick-settings.png",
+      "sha256": "9b7d3a7ce05671a7d76860dae327bf88bd6fa3d2a08b5d688ff54342d3d3aff6",
+      "bytes": 31729,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "wifi-menu": {
+      "file": "walkthrough/wifi-menu.png",
+      "sha256": "9db0a8670fecd531428524747d1228625acd0cf153cfb4e0c2c1b855537844e5",
+      "bytes": 45258,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "network-agent": {
+      "file": "walkthrough/network-agent.png",
+      "sha256": "8df9ab955ad8e2d59df9140c93f638cf1f068171a291fcd395cb456a1351df87",
+      "bytes": 65909,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "wired-menu": {
+      "file": "walkthrough/wired-menu.png",
+      "sha256": "8d8c98b40feadd5b1037f23268271723c0df10692a8c29593e682c6efe12c737",
+      "bytes": 38859,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "bluetooth-menu": {
+      "file": "walkthrough/bluetooth-menu.png",
+      "sha256": "a1fd8d384d92ae449ab3a152444a65924a936d25dea3ba2bdd8fd427367b8cb8",
+      "bytes": 41464,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "microphone": {
+      "file": "walkthrough/microphone.png",
+      "sha256": "1b7636099c96a5b27434850f5c3743c70a68b505c61691289ee128203463950d",
+      "bytes": 33190,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "power-menu": {
+      "file": "walkthrough/power-menu.png",
+      "sha256": "769b14dbb6a7a0c8eab90156628350c8a576b009040674a8ec6ea89e1c105023",
+      "bytes": 39560,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "osd-volume": {
+      "file": "walkthrough/osd-volume.png",
+      "sha256": "0309d45b48176b728449e16ebc90885257e1b38f5a612562723617287025fa3d",
+      "bytes": 10908,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "osd-brightness": {
+      "file": "walkthrough/osd-brightness.png",
+      "sha256": "b3447db8b9cd49e456be13be9cecd03e577a26c142d212454744a777054b6169",
+      "bytes": 11061,
+      "capture": "ok",
+      "stage": "quick-settings",
+      "artifact": "visual-quick-settings",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:21Z"
+    },
+    "windows": {
+      "file": "walkthrough/windows.png",
+      "sha256": "8a1bd05bbf3c95d99cf54b96aa30d1308db352a244cdc66b5a73223fda1f9384",
+      "bytes": 27729,
+      "capture": "ok",
+      "stage": "windows",
+      "artifact": "visual-windows",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:20Z"
+    },
+    "popover": {
+      "file": "walkthrough/popover.png",
+      "sha256": "9834b3f2f49880cfc24c479275dcf471c34d326265fcc0a755769943545f7019",
+      "bytes": 33873,
+      "capture": "ok",
+      "stage": "windows",
+      "artifact": "visual-windows",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:20Z"
+    },
+    "tile-preview": {
+      "file": "walkthrough/tile-preview.png",
+      "sha256": "7fefe5b33b3f1931c3b2e469e3c7eb23d5ac7e7ac79ab29cd417a20be04cf39b",
+      "bytes": 33092,
+      "capture": "ok",
+      "stage": "windows",
+      "artifact": "visual-windows",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:20Z"
+    },
+    "window-menu": {
+      "file": "walkthrough/window-menu.png",
+      "sha256": "c852e656c2c6da0497fabba214e7ab49ef03f60c16a30f5da7edfa5a2e4b8ef8",
+      "bytes": 40090,
+      "capture": "ok",
+      "stage": "windows",
+      "artifact": "visual-windows",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:20Z"
+    },
+    "x11": {
+      "file": "walkthrough/x11.png",
+      "sha256": "6bd1b808948f3580a01793bc6b1b2a369951252f6a5d35d5396e3913963f0f42",
+      "bytes": 11412,
+      "capture": "ok",
+      "stage": "x11",
+      "artifact": "visual-x11",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:39Z"
+    },
+    "scroll-strip": {
+      "file": "walkthrough/scroll-strip.png",
+      "sha256": "b52064cbb870b676245485529c9a610f82728cec374a70333530807d5c98e844",
+      "bytes": 19664,
+      "capture": "ok",
+      "stage": "scroll",
+      "artifact": "visual-scroll",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:19Z"
+    },
+    "scroll-follow": {
+      "file": "walkthrough/scroll-follow.png",
+      "sha256": "ab6243d024bfea831d5406302383b10476a8345d13e9ecc8cffe3272cce48525",
+      "bytes": 19612,
+      "capture": "ok",
+      "stage": "scroll",
+      "artifact": "visual-scroll",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:19Z"
+    },
+    "scroll-presets": {
+      "file": "walkthrough/scroll-presets.png",
+      "sha256": "6e3fa4559d9bcbffc5f29095e1615ff559be55cbe76ac72f02505fe36bdd00c0",
+      "bytes": 19047,
+      "capture": "ok",
+      "stage": "scroll",
+      "artifact": "visual-scroll",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:19Z"
+    },
+    "switcher": {
+      "file": "walkthrough/switcher.png",
+      "sha256": "baf1d661b93a47b26f8642673c4687f93181b648d671aea5591a2db9ecf5d960",
+      "bytes": 37274,
+      "capture": "ok",
+      "stage": "switcher",
+      "artifact": "visual-switcher",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:23Z"
+    },
+    "switcher-thumbnails": {
+      "file": "walkthrough/switcher-thumbnails.png",
+      "sha256": "40a65918c3e9f4a894ead33381e8c3a960c4abbba5d92998d877935f2bfc918f",
+      "bytes": 46351,
+      "capture": "ok",
+      "stage": "switcher",
+      "artifact": "visual-switcher",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:23Z"
+    },
+    "overview": {
+      "file": "walkthrough/overview.png",
+      "sha256": "ddf201cd581422e921e0eba7c5255c43624b63c61a493e3b79934484b321f8c5",
+      "bytes": 45028,
+      "capture": "ok",
+      "stage": "overview",
+      "artifact": "visual-overview",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:47Z"
+    },
+    "workspaces": {
+      "file": "walkthrough/workspaces.png",
+      "sha256": "57133bfea3ecad2f633f9745ea69ebc75f1888900e6922edddc0196ad5fb9f21",
+      "bytes": 34727,
+      "capture": "ok",
+      "stage": "overview",
+      "artifact": "visual-overview",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:47Z"
+    },
+    "overview-drag": {
+      "file": "walkthrough/overview-drag.png",
+      "sha256": "4b414071e7fd9b8f85e1cefde585d24f31f214858246d643d42f047499278ca5",
+      "bytes": 33729,
+      "capture": "ok",
+      "stage": "overview",
+      "artifact": "visual-overview",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:47Z"
+    },
+    "workspace-popup": {
+      "file": "walkthrough/workspace-popup.png",
+      "sha256": "30b114f859d7f60d97e157a00641a1ef854cffdcc10757d185188e81dfb9f525",
+      "bytes": 21901,
+      "capture": "ok",
+      "stage": "overview",
+      "artifact": "visual-overview",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:47Z"
+    },
+    "search": {
+      "file": "walkthrough/search.png",
+      "sha256": "bc3943008c8ecc9b2ada5acd5854cb5f94e9fa35a77befa3d9c31071b99cb284",
+      "bytes": 20095,
+      "capture": "ok",
+      "stage": "search-apps",
+      "artifact": "visual-search-apps",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:53Z"
+    },
+    "search-provider": {
+      "file": "walkthrough/search-provider.png",
+      "sha256": "8752b91ad7e5fab8da1812fddfb84c943d8c9a6fdd10fab7fe22986561e6eece",
+      "bytes": 21257,
+      "capture": "ok",
+      "stage": "search-apps",
+      "artifact": "visual-search-apps",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:53Z"
+    },
+    "app-grid": {
+      "file": "walkthrough/app-grid.png",
+      "sha256": "fa9e90eebf495c5a966dd7015319d311e155dccb7c4afc19854b684e1b06ab6d",
+      "bytes": 66981,
+      "capture": "ok",
+      "stage": "search-apps",
+      "artifact": "visual-search-apps",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:53Z"
+    },
+    "app-folder": {
+      "file": "walkthrough/app-folder.png",
+      "sha256": "3e8f9e5465e8e52f8d0dd2df267be181c19048d0b534cd7b17958632b98ed1b1",
+      "bytes": 39791,
+      "capture": "ok",
+      "stage": "search-apps",
+      "artifact": "visual-search-apps",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:53Z"
+    },
+    "app-grid-pages": {
+      "file": "walkthrough/app-grid-pages.png",
+      "sha256": "fa9e90eebf495c5a966dd7015319d311e155dccb7c4afc19854b684e1b06ab6d",
+      "bytes": 66981,
+      "capture": "ok",
+      "stage": "search-apps",
+      "artifact": "visual-search-apps",
+      "label": "duplicate",
+      "resolved_from": "app-grid.png",
+      "stage_finished_utc": "2026-10-12T18:55:53Z"
+    },
+    "folder-made": {
+      "file": "walkthrough/folder-made.png",
+      "sha256": "2bf3353e85f527cd7964155b6711f7e2d52a553a1fcf91ed4163887f11a25abf",
+      "bytes": 63796,
+      "capture": "ok",
+      "stage": "search-apps",
+      "artifact": "visual-search-apps",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:53Z"
+    },
+    "grid-reorder": {
+      "file": "walkthrough/grid-reorder.png",
+      "sha256": "d6de5617939d371a5457268b244d5dfb6165e076c5676ed5c7abbf9bcd2b8fe5",
+      "bytes": 65670,
+      "capture": "ok",
+      "stage": "search-apps",
+      "artifact": "visual-search-apps",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:53Z"
+    },
+    "banner": {
+      "file": "walkthrough/banner.png",
+      "sha256": "f907a5f0218d97e7a5ab1aa94604edb9034db47beea86a8dad9775145717c4fe",
+      "bytes": 15558,
+      "capture": "ok",
+      "stage": "notifications",
+      "artifact": "visual-notifications",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:36Z"
+    },
+    "notification-list": {
+      "file": "walkthrough/notification-list.png",
+      "sha256": "fedb84a5eed5a9e2c9245eb0de9057f1d5ac5aaabe3a25b0f5f243d346064299",
+      "bytes": 44562,
+      "capture": "ok",
+      "stage": "notifications",
+      "artifact": "visual-notifications",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:36Z"
+    },
+    "do-not-disturb": {
+      "file": "walkthrough/do-not-disturb.png",
+      "sha256": "14610327c457312b2888f73309172579c7174a556c3469bd2d950621c6901384",
+      "bytes": 45551,
+      "capture": "ok",
+      "stage": "notifications",
+      "artifact": "visual-notifications",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:36Z"
+    },
+    "notification-group": {
+      "file": "walkthrough/notification-group.png",
+      "sha256": "97dd4cf884c848c2e9005094580193233877dc844f21fa633697ae7929318f97",
+      "bytes": 44048,
+      "capture": "ok",
+      "stage": "notifications",
+      "artifact": "visual-notifications",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:36Z"
+    },
+    "notification-group-expanded": {
+      "file": "walkthrough/notification-group-expanded.png",
+      "sha256": "3042819c8f4f5d70d9850eaab9599d3c46b9a86e09677ceb18692fed61a33a23",
+      "bytes": 53712,
+      "capture": "ok",
+      "stage": "notifications",
+      "artifact": "visual-notifications",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:55:36Z"
+    },
+    "ime": {
+      "file": "walkthrough/ime.png",
+      "sha256": "035f2589672e3ed1a5e4ce6db8068517064f6af609e946f5e97b472c4f9ca6bc",
+      "bytes": 12530,
+      "capture": "ok",
+      "stage": "input",
+      "artifact": "visual-input",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:21Z"
+    },
+    "ime-candidates": {
+      "file": "walkthrough/ime-candidates.png",
+      "sha256": "df9f215790f3c5ef6cbe43dad6fad7bb34553c5755d47e868e558b605a17ea1e",
+      "bytes": 16430,
+      "capture": "ok",
+      "stage": "input",
+      "artifact": "visual-input",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:21Z"
+    },
+    "screenshot-ui": {
+      "file": "walkthrough/screenshot-ui.png",
+      "sha256": "b9a64d22da490993a7cad4efb79fbe11a3b1782bc72fe9af3557349175c6a902",
+      "bytes": 22355,
+      "capture": "ok",
+      "stage": "system",
+      "artifact": "visual-system",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:56Z"
+    },
+    "polkit": {
+      "file": "walkthrough/polkit.png",
+      "sha256": "5a792dc930bbebb08ba8deb1fb784572ae78d2ff70d46d7174d4f52f1a8af23d",
+      "bytes": 64522,
+      "capture": "ok",
+      "stage": "system",
+      "artifact": "visual-system",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:56Z"
+    },
+    "end-session": {
+      "file": "walkthrough/end-session.png",
+      "sha256": "492d697cfa7968ad0aed5f45c0647d877db458a35c734e33d7cf229c4a0bcf13",
+      "bytes": 63410,
+      "capture": "ok",
+      "stage": "system",
+      "artifact": "visual-system",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:56Z"
+    },
+    "lock": {
+      "file": "walkthrough/lock.png",
+      "sha256": "601c6c2f06db981fba169a9597ebdc7b71d6c2b641d4b64b4c172f9945433e9f",
+      "bytes": 18994,
+      "capture": "ok",
+      "stage": "system",
+      "artifact": "visual-system",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:56Z"
+    },
+    "unlock": {
+      "file": "walkthrough/unlock.png",
+      "sha256": "a8e9eabe2714d639e715545e399d9cae5cbe2bb313f41d5f474b015477eadc2e",
+      "bytes": 14203,
+      "capture": "ok",
+      "stage": "system",
+      "artifact": "visual-system",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:56Z"
+    },
+    "scale": {
+      "file": "walkthrough/scale.png",
+      "sha256": "4e4b2b62aebdc94e947ca3971f7aea1c00a429bb16fe9c179bd77feffae20562",
+      "bytes": 28511,
+      "capture": "ok",
+      "stage": "system",
+      "artifact": "visual-system",
+      "label": "feature",
+      "resolved_from": null,
+      "stage_finished_utc": "2026-10-12T18:54:56Z"
+    }
+  }
+}

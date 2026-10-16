@@ -1,0 +1,51 @@
+# CI fixtures on the published flavor; no Tuna Desktop or greeter payload replacement.
+ARG BASE_IMAGE
+# The hot-corner constraint client, built as in the current-build lane's
+# Containerfile; the build toolchain stays out of the booted fixture.
+FROM ${BASE_IMAGE} AS constraint-builder
+COPY packaging/marlin/vm-lane/tuna-vm-constraints.c /build/tuna-vm-constraints.c
+COPY packaging/marlin/vm-lane/tuna-vm-constraints-build /build/tuna-vm-constraints-build
+RUN pacman -Sy --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-protocols \
+    && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build
+
+FROM ${BASE_IMAGE}
+COPY --from=constraint-builder /usr/libexec/tuna-vm-constraints /usr/libexec/tuna-vm-constraints
+COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm-constraints
+
+COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
+COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
+COPY packaging/marlin/vm-lane/tuna-vm-profile /usr/libexec/tuna-vm-profile
+COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
+COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
+COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.toml
+COPY packaging/marlin/vm-lane/tuna-vm-health /usr/libexec/tuna-vm-health
+COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tuna-vm-health.service
+
+# The greeter's session list (/etc/greetd/environments) is not asserted here:
+# what gtkgreet lists is a qualification check (V-GREETER-LIST) on the booted
+# image, so a wrong entry fails that check instead of the fixture build.
+RUN mkdir -p /usr/share/tuna-vm \
+    && pacman -Q tuna-desktop > /usr/share/tuna-vm/shipped-package.txt \
+    && pacman -Q > /usr/share/tuna-vm/shipped-packages.txt \
+    && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor \
+         /usr/bin/tuna-shell-host /usr/bin/tuna-shell-gtk \
+         /usr/bin/tuna-ibus-bridge /usr/bin/tuna-greeter \
+         /usr/share/wayland-sessions/tuna.desktop \
+         /usr/libexec/tunaos/greetd-session /etc/greetd/config.toml /etc/greetd/gtkgreet.css \
+         /etc/greetd/environments > /usr/share/tuna-vm/shipped-payload.sha256 \
+    && test "$(readlink -f /bin/sh)" = /usr/bin/bash \
+    && grep -q '/usr/libexec/tunaos/greetd-session' /etc/greetd/config.toml \
+    && ! grep -q '\[initial_session\]' /etc/greetd/config.toml \
+    && pacman -Sy --noconfirm \
+    && pacman -S --needed --noconfirm qemu-guest-agent python python-gobject grim wtype wayland-utils gnome-disk-utility gnome-system-monitor \
+    && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
+    && echo 'tuna-test:tuna' | chpasswd \
+    && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input \
+    && printf 'L+ /var/home/tuna-test/.profile - tuna-test tuna-test - /usr/libexec/tuna-vm-profile\n' >> /usr/lib/tmpfiles.d/tuna-vm-lane.conf \
+    && systemctl enable tuna-vm-health.service \
+    && systemctl add-wants multi-user.target qemu-guest-agent.service \
+    && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
+    && pacman -Q > /usr/share/tuna-vm/fixture-packages.txt \
+    && python3 -c 'from pathlib import Path; p=Path("/usr/share/tuna-vm"); before=set((p/"shipped-packages.txt").read_text().splitlines()); after=set((p/"fixture-packages.txt").read_text().splitlines()); assert before <= after, "fixture installation changed shipped package versions"'
+
+LABEL org.opencontainers.image.title="marlin-tuna-published-vm-fixtures"

@@ -10,9 +10,11 @@
 
 ## From the Debian-format package
 
-The preferred GTK shell is required for Debian/Ubuntu production support.
-The first installed-package CI target is Ubuntu 26.04 amd64; actual package
-and control proof remains pending. Packages must be built against their target
+The package ships the preferred GTK shell beside the compositor. The first
+installed-package CI target is Ubuntu 26.04 amd64. CI includes a clean
+`ubuntu:26.04` container install with only declared dependencies and installed
+binary version checks; real session and hardware qualification remain
+separate acceptance requirements. Packages must be built against their target
 distribution's libraries. The required gtk4-layer-shell version is at least
 1.1; [Debian 13 stable provides 1.0.4](https://packages.debian.org/trixie/libgtk4-layer-shell0),
 so that target still needs a genuine packaged backport and separate installed

@@ -94,6 +94,7 @@ pub struct OverviewLayout {
     pub thumbnails: Vec<WorkspaceCard>,
     /// The new-workspace drop slot, visible only during a window drag.
     pub placeholder: Option<(u32, Rectangle<i32, Logical>)>,
+    pub allow_workspace_insertion: bool,
 }
 
 /// GNOME shows the thumbnails strip once dynamic workspaces number more
@@ -270,6 +271,9 @@ pub fn insertion_target(layout: &OverviewLayout, pos: Point<f64, Logical>) -> Op
 /// Spread the thumbnails around a new-workspace slot, keeping their
 /// miniature windows aligned with their cards.
 pub fn show_placeholder(layout: &mut OverviewLayout, at: u32) {
+    if !layout.allow_workspace_insertion {
+        return;
+    }
     let Some(first) = layout.thumbnails.first() else {
         return;
     };
@@ -519,6 +523,7 @@ pub fn blend(from: &OverviewLayout, to: &OverviewLayout, p: f64) -> OverviewLayo
     let mut out = OverviewLayout {
         hovered: to.hovered,
         placeholder: to.placeholder,
+        allow_workspace_insertion: to.allow_workspace_insertion,
         ..Default::default()
     };
     for c in &to.cards {
@@ -801,6 +806,21 @@ impl Default for OverviewMotion {
 }
 
 impl OverviewMotion {
+    /// Whether any of the overview's tweens still moves (or a motion is
+    /// pending). The loop keeps the frame cadence until they settle (#503).
+    pub(crate) fn animating(&self) -> bool {
+        !self.progress.done()
+            || !self.search.done()
+            || !self.drag_shrink.done()
+            || self.hover.iter().any(|(_, tween)| !tween.done())
+            || self
+                .morph
+                .as_ref()
+                .is_some_and(|(_, tween, _)| !tween.done())
+            || self.revert.as_ref().is_some_and(|(_, tween)| !tween.done())
+            || self.pending.is_some()
+    }
+
     /// The drawn transition: 0 the desktop, 1 the overview.
     pub fn progress(&self) -> f64 {
         self.progress.value()
@@ -832,7 +852,8 @@ impl OverviewMotion {
             return;
         }
         let target = if open { 1.0 } else { 0.0 };
-        if self.progress.to != target {
+        let retargeted = self.progress.to != target;
+        if retargeted {
             let curve = if open { OPEN_CURVE } else { CLOSE_CURVE };
             self.progress
                 .retarget(target, motion.adjust_ms(TRANSITION_MS), curve, animate);
@@ -850,7 +871,12 @@ impl OverviewMotion {
         } else if !animate {
             self.progress = Tween::settled(target);
         }
-        self.progress.step(dt_ms);
+        // dt_ms is time since the last rendered frame, not since this
+        // target was requested. After settled idle it can span seconds.
+        // A new transition starts from the last drawn value at this frame;
+        // only subsequent frames advance it. The same boundary applies to
+        // reversal, so pre-request time cannot consume the replacement tween.
+        self.progress.step(if retargeted { 0.0 } else { dt_ms });
         let (t, value) = (self.progress.elapsed_ms, self.progress.value());
         for trace in [&mut self.open_trace, &mut self.close_trace]
             .into_iter()
@@ -1218,6 +1244,7 @@ pub fn transition(
         lerp_rect(start, card.rect, p)
     };
     let mut out = OverviewLayout {
+        allow_workspace_insertion: layout.allow_workspace_insertion,
         cards: layout
             .cards
             .iter()
@@ -1596,8 +1623,26 @@ pub fn layout(
     active: u32,
     windows: &[OverviewWindow],
 ) -> OverviewLayout {
-    let mut out = OverviewLayout::default();
-    let workspaces = shown_workspaces(workspaces, windows);
+    layout_with_policy(output, work_top, workspaces, active, windows, true)
+}
+
+pub fn layout_with_policy(
+    output: Rectangle<i32, Logical>,
+    work_top: i32,
+    workspaces: &[u32],
+    active: u32,
+    windows: &[OverviewWindow],
+    dynamic: bool,
+) -> OverviewLayout {
+    let mut out = OverviewLayout {
+        allow_workspace_insertion: dynamic,
+        ..Default::default()
+    };
+    let workspaces = if dynamic {
+        shown_workspaces(workspaces, windows)
+    } else {
+        workspaces.to_vec()
+    };
     let index = workspaces.iter().position(|w| *w == active).unwrap_or(0);
     let neighbors = [
         (index.checked_sub(1), -1),
@@ -1868,8 +1913,26 @@ pub fn app_grid_layout(
     active: u32,
     windows: &[OverviewWindow],
 ) -> OverviewLayout {
-    let mut out = OverviewLayout::default();
-    let shown = shown_workspaces(workspaces, windows);
+    app_grid_layout_with_policy(output, work_top, workspaces, active, windows, true)
+}
+
+pub fn app_grid_layout_with_policy(
+    output: Rectangle<i32, Logical>,
+    work_top: i32,
+    workspaces: &[u32],
+    active: u32,
+    windows: &[OverviewWindow],
+    dynamic: bool,
+) -> OverviewLayout {
+    let mut out = OverviewLayout {
+        allow_workspace_insertion: dynamic,
+        ..Default::default()
+    };
+    let shown = if dynamic {
+        shown_workspaces(workspaces, windows)
+    } else {
+        workspaces.to_vec()
+    };
     let work_h = (output.size.h - work_top).max(1);
     let w = (f64::from(output.size.w) * THUMBNAIL_SCALE).round();
     let h = (f64::from(work_h) * THUMBNAIL_SCALE).round();
@@ -1959,6 +2022,25 @@ pub fn hit(layout: &OverviewLayout, pos: Point<f64, Logical>) -> OverviewHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_workspace_layout_has_exact_slots_and_no_insertion_placeholder() {
+        let windows = [win(1, 3, 10, 30, 300, 200)];
+        let overview = layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false);
+        assert_eq!(overview.thumbnails.len(), 4);
+        let app_grid = app_grid_layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false);
+        assert_eq!(app_grid.cards.len(), 4);
+        assert!(app_grid.thumbnails.is_empty());
+        for mut layout in [overview, app_grid] {
+            assert!(layout.cards.iter().all(|card| card.workspace < 4));
+            show_placeholder(&mut layout, 4);
+            assert!(layout.placeholder.is_none());
+            assert!(!transition(&layout, 0.5, output(), &windows).allow_workspace_insertion);
+        }
+        let single = layout_with_policy(output(), 24, &[0], 0, &[], false);
+        assert_eq!(single.cards.len(), 1);
+        assert!(single.thumbnails.is_empty());
+    }
 
     const FULL: MotionPolicy = MotionPolicy {
         level: tuna_shell_control::motion::MotionLevel::Full,
@@ -2456,6 +2538,90 @@ mod tests {
         assert_eq!(d["close"]["duration_ms"], 250.0);
         let samples = d["close"]["samples"].as_array().unwrap();
         assert!(samples.iter().any(|s| s[0] == 125.0 && s[1] == 0.25));
+    }
+
+    #[test]
+    fn settled_idle_time_does_not_consume_new_open_or_close_transition() {
+        let mut motion = OverviewMotion::default();
+        // The idle scheduler can leave the preceding render far in the past.
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(
+            motion.diagnostics()["open"]["samples"][0],
+            serde_json::json!([0.0, 0.0])
+        );
+        motion.step_progress(125.0, true, FULL);
+        assert!((motion.progress() - ease_out_sine(0.5)).abs() < 1e-9);
+        motion.step_progress(125.0, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        let diagnostics = motion.diagnostics();
+        assert_eq!(diagnostics["close"]["duration_ms"], 250.0);
+        assert_eq!(
+            diagnostics["close"]["samples"][0],
+            serde_json::json!([0.0, 1.0])
+        );
+        motion.step_progress(125.0, false, FULL);
+        assert!((motion.progress() - 0.25).abs() < 1e-9);
+        motion.step_progress(125.0, false, FULL);
+        assert_eq!(motion.progress(), 0.0);
+    }
+
+    #[test]
+    fn repeated_settled_target_does_not_restart_transition_or_trace() {
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        let before = motion.diagnostics()["open"].clone();
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        assert_eq!(motion.diagnostics()["open"], before);
+        motion.step_progress(10_000.0, false, FULL);
+        motion.step_progress(250.0, false, FULL);
+        let before = motion.diagnostics()["close"].clone();
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(motion.diagnostics()["close"], before);
+    }
+
+    #[test]
+    fn idle_elapsed_before_midflight_reversal_does_not_consume_replacement() {
+        let mut motion = OverviewMotion::default();
+        motion.step_progress(0.0, true, FULL);
+        motion.step_progress(100.0, true, FULL);
+        let drawn = motion.progress();
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), drawn);
+        motion.step_progress(125.0, false, FULL);
+        assert!((motion.progress() - drawn * 0.25).abs() < 1e-9);
+        let drawn = motion.progress();
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), drawn);
+        motion.step_progress(125.0, true, FULL);
+        assert!((motion.progress() - (drawn + (1.0 - drawn) * ease_out_sine(0.5))).abs() < 1e-9);
+    }
+
+    #[test]
+    fn idle_boundary_preserves_reduced_off_and_slowdown_policy() {
+        let reduced = MotionPolicy::new(tuna_shell_control::motion::MotionLevel::FadeOnly, 1.0);
+        for policy in [OFF, reduced] {
+            let mut motion = OverviewMotion::default();
+            motion.step_progress(10_000.0, true, policy);
+            assert_eq!(motion.progress(), 1.0);
+            motion.step_progress(10_000.0, false, policy);
+            assert_eq!(motion.progress(), 0.0);
+            assert!(motion.diagnostics()["open"].is_null());
+            assert!(motion.diagnostics()["close"].is_null());
+        }
+        let mut motion = OverviewMotion::default();
+        let slow = MotionPolicy::new(tuna_shell_control::motion::MotionLevel::Full, 2.0);
+        motion.step_progress(10_000.0, true, slow);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(motion.diagnostics()["open"]["duration_ms"], 500.0);
+        motion.step_progress(250.0, true, slow);
+        assert!((motion.progress() - ease_out_sine(0.5)).abs() < 1e-9);
+        motion.step_progress(10_000.0, false, OFF);
+        assert_eq!(motion.progress(), 0.0);
     }
 
     #[test]

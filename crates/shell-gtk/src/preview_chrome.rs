@@ -36,6 +36,13 @@ pub fn overlay_opacity(elapsed_ms: f64, policy: tuna_shell_control::MotionPolicy
 }
 
 /// Fade `widgets` in together, GNOME's hover overlay.
+///
+/// The tick callback lives on the first widget and holds every widget
+/// weakly. [`PreviewChrome::update`] rebuilds the chrome on each preview
+/// change, often before a fade ends, and a removed widget never ticks
+/// again: a strong capture made the first widget own a callback that
+/// owned it, leaking the caption row and close button of every
+/// interrupted fade (#658).
 fn fade_in(widgets: Vec<gtk::Widget>) {
     let Some(first) = widgets.first().cloned() else {
         return;
@@ -46,6 +53,7 @@ fn fade_in(widgets: Vec<gtk::Widget>) {
     for w in &widgets {
         w.set_opacity(0.0);
     }
+    let widgets: Vec<_> = widgets.iter().map(ObjectExt::downgrade).collect();
     let started = Cell::new(None);
     first.add_tick_callback(move |_, clock| {
         let start = started.get().unwrap_or_else(|| {
@@ -54,7 +62,7 @@ fn fade_in(widgets: Vec<gtk::Widget>) {
         });
         let elapsed_ms = (clock.frame_time() - start) as f64 / 1000.0;
         let opacity = overlay_opacity(elapsed_ms, crate::motion::current());
-        for w in &widgets {
+        for w in widgets.iter().filter_map(glib::WeakRef::upgrade) {
             w.set_opacity(opacity);
         }
         if opacity >= 1.0 {
@@ -190,6 +198,13 @@ impl PreviewChrome {
         if let Some(surface) = self.window.surface() {
             surface.set_input_region(Some(&region));
         }
+    }
+
+    /// Forget what the overlay drew, so the next [`PreviewChrome::update`]
+    /// looks every window's title and icon up again (the app list
+    /// changed). The hover stays, so nothing fades in again.
+    pub fn forget_windows(&self) {
+        self.shown.borrow_mut().0.clear();
     }
 }
 

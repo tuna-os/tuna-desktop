@@ -2,13 +2,14 @@
 //!
 //! The shell publishes the Settings wallpaper URI out-of-band: it
 //! writes the URI to [`wallpaper_drop_path`] in the runtime dir, and
-//! the compositor re-reads that file on every frame. An optional second
+//! the compositor watches its directory for changes. An optional second
 //! line carries GNOME's `primary-color` (`#rrggbb`), the colour shown
 //! when there is no picture or it cannot be read, as in GNOME. No
 //! wallpaper state crosses the control protocol by design. Any
 //! failure — missing file, unparsable URI, undecodable image,
 //! oversized output — degrades to the solid clear, never an error.
 
+use crate::slideshow::{Sample, Timeline, MAX_XML_BYTES};
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
@@ -89,21 +90,32 @@ pub fn wallpaper_uri_to_path(uri: &str) -> Option<PathBuf> {
 /// Cached wallpaper image, re-scaled to the output that showed it.
 #[derive(Debug)]
 struct Loaded {
+    paint: Option<serde_json::Value>,
+    epoch: Option<String>,
     /// URI text that produced this image (or failed to).
     uri: String,
     /// Output size the pixels match (`None` when the URI failed).
     size: Option<Size<i32, Logical>>,
     /// ARGB8888 pixels at `size`, ready to upload.
-    pixels: Option<Vec<u8>>,
+    pixels: Option<std::sync::Arc<[u8]>>,
     /// The uploadable buffer, kept so its texture is uploaded once, not
     /// every frame.
     buffer: Option<MemoryRenderBuffer>,
+    cards_prewarmed: bool,
 }
 
 /// One rendered overview card (GNOME's workspace background), cached by
 /// what it shows and its size.
+type CardKey = (String, Size<i32, Logical>, i32, i32, i32, Option<[u8; 3]>);
+
+#[derive(Debug)]
+struct PendingCard {
+    key: CardKey,
+    result: std::sync::mpsc::Receiver<Option<tuna_wallpaper::Card>>,
+}
+
 struct CardCache {
-    key: (String, Size<i32, Logical>, i32, i32, Option<[u8; 3]>),
+    key: CardKey,
     buffer: MemoryRenderBuffer,
     margin: i32,
 }
@@ -118,11 +130,19 @@ const MAX_CARDS: usize = 4;
 /// together, so extra outputs cannot grow memory without bound.
 #[derive(Debug, Default)]
 pub struct Wallpaper {
+    wake: crate::wake::Wake,
+    current_uris: Vec<String>,
     loaded: Vec<Loaded>,
     /// Journey-only observation of the last attempted refresh, not a paint claim.
     refresh_stage: Option<&'static str>,
     identities: Vec<IdentitySnapshot>,
-    identity_pending: Vec<(String, std::sync::mpsc::Receiver<Option<FileIdentity>>)>,
+    identity_pending: Vec<(
+        String,
+        std::sync::mpsc::Receiver<std::sync::Arc<SourceObservation>>,
+    )>,
+    animation_samples: Vec<AnimationSample>,
+    paint_state: Option<serde_json::Value>,
+    image_cache: std::sync::Arc<BackgroundCaches>,
     /// Decodes running on worker threads, by URI and output size: a
     /// 4K JPEG XL takes long enough to stall frames, so the clear
     /// colour shows until the picture is ready (GNOME loads
@@ -134,6 +154,8 @@ pub struct Wallpaper {
     accent: Option<[f32; 3]>,
     /// Overview cards.
     cards: Vec<CardCache>,
+    /// Keep unfinished jobs counted across wallpaper/layout changes.
+    card_pending: Vec<PendingCard>,
     /// The lock screen's blurred, dimmed copy, by URI and output size.
     locked: Vec<(String, Size<i32, Logical>, MemoryRenderBuffer)>,
 }
@@ -160,6 +182,8 @@ pub fn parse_color(text: &str) -> Option<[f32; 3]> {
 
 #[derive(Debug)]
 struct Pending {
+    paint: Option<serde_json::Value>,
+    epoch: Option<String>,
     uri: String,
     size: Size<i32, Logical>,
     result: std::sync::mpsc::Receiver<Option<Vec<u8>>>,
@@ -173,14 +197,91 @@ const MAX_WALLPAPER_SLOTS: usize = 4;
 #[derive(Debug)]
 struct IdentitySnapshot {
     uri: String,
-    value: Option<FileIdentity>,
+    value: std::sync::Arc<SourceObservation>,
     observed: std::time::Instant,
 }
 
+type ImageCache = std::sync::Mutex<Vec<(FileIdentity, std::sync::Arc<image::RgbaImage>)>>;
+
+type PlacedKey = (
+    FileIdentity,
+    tuna_shell_control::background::Placement,
+    Geometry,
+);
+type PlacementCache = std::sync::Mutex<
+    Vec<(
+        PlacedKey,
+        std::sync::Arc<tuna_wallpaper::background::PlacedImage>,
+    )>,
+>;
+#[derive(Debug, Default)]
+struct BackgroundCaches {
+    images: ImageCache,
+    placed: PlacementCache,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SourceObservation {
+    generation: String,
+    identity: Option<FileIdentity>,
+    xml: bool,
+    timeline: Option<Timeline>,
+    references: Vec<(PathBuf, Option<FileIdentity>)>,
+}
+#[derive(Debug)]
+struct AnimationSample {
+    key: String,
+    sampled_wall: f64,
+    sampled_mono: std::time::Instant,
+    sample: Sample,
+}
+type AnimationPaint = (Sample, Vec<(PathBuf, Option<FileIdentity>)>);
+
+#[derive(Debug, Clone)]
+struct Paint {
+    epoch: Option<String>,
+    uri: String,
+    identity: Option<FileIdentity>,
+    animation: Option<AnimationPaint>,
+}
+
 impl Wallpaper {
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
+    pub(crate) fn maintenance_deadline(&self) -> Option<std::time::Instant> {
+        self.identities
+            .iter()
+            .filter(|item| self.current_uris.contains(&item.uri))
+            .filter(|item| {
+                !self
+                    .identity_pending
+                    .iter()
+                    .any(|(uri, _)| uri == &item.uri)
+            })
+            .map(|item| {
+                let deadline = item.observed + std::time::Duration::from_secs(1);
+                let now = std::time::Instant::now();
+                // An unsupported render size must not spin on a deadline that
+                // refresh could not service: retry one display frame later.
+                if deadline <= now {
+                    now + std::time::Duration::from_millis(16)
+                } else {
+                    deadline
+                }
+            })
+            .min()
+    }
+
     /// Empty wallpaper (solid clear until a drop file appears).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Counts only; benchmark observation must not start work or wait for it.
+    #[cfg(feature = "drm")]
+    pub(crate) fn card_counts(&self) -> (usize, usize) {
+        (self.cards.len(), self.card_pending.len())
     }
 
     /// Bounded in-memory observations only. Never inspect an arbitrary source
@@ -196,7 +297,7 @@ impl Wallpaper {
             "list_limit": MAX_WALLPAPER_SLOTS,
             "identity_count": self.identities.len(),
             "identities": self.identities.iter().take(MAX_WALLPAPER_SLOTS).map(|item| serde_json::json!({
-                "uri": text(&item.uri), "identity": text(&format!("{:?}", item.value)),
+                "uri": text(&item.uri), "identity": text(&format!("{:?}", item.value.identity)),
                 "age_ms": item.observed.elapsed().as_millis(),
             })).collect::<Vec<_>>(),
             "identity_pending_count": self.identity_pending.len(),
@@ -205,10 +306,20 @@ impl Wallpaper {
             "decode_pending": self.pending.iter().take(MAX_WALLPAPER_SLOTS).map(|item| serde_json::json!({
                 "request_key": text(&item.uri), "size": [item.size.w, item.size.h],
             })).collect::<Vec<_>>(),
+            "card_pending_count": self.card_pending.len(),
+            "card_cache_count": self.cards.len(),
+            "card_pending": self.card_pending.iter().take(MAX_CARDS).map(|job| serde_json::json!({
+                "request_key": text(&job.key.0), "output": [job.key.1.w, job.key.1.h],
+                "rendered": [job.key.2, job.key.3], "crop_top": job.key.4,
+            })).collect::<Vec<_>>(),
+            "card_cache": self.cards.iter().take(MAX_CARDS).map(|card| serde_json::json!({
+                "request_key": text(&card.key.0), "output": [card.key.1.w, card.key.1.h],
+                "rendered": [card.key.2, card.key.3], "crop_top": card.key.4,
+            })).collect::<Vec<_>>(),
             "decode_result_count": self.loaded.len(),
             "decode_results": self.loaded.iter().take(MAX_WALLPAPER_SLOTS).map(|item| serde_json::json!({
                 "request_key": text(&item.uri), "size": item.size.map(|s| [s.w, s.h]),
-                "pixel_bytes": item.pixels.as_ref().map(Vec::len),
+                "pixel_bytes": item.pixels.as_ref().map(|pixels| pixels.len()),
                 "buffer_available": item.buffer.is_some(),
             })).collect::<Vec<_>>(),
         })
@@ -216,13 +327,20 @@ impl Wallpaper {
 
     /// Arbitrary configured paths can reside on slow network/FUSE mounts.
     /// Observe them only on bounded workers; the frame path uses snapshots.
+    #[cfg(test)]
     fn poll_identity(&mut self, uri: &str) -> Option<Option<FileIdentity>> {
+        self.poll_source(uri).map(|source| source.identity.clone())
+    }
+
+    fn poll_source(&mut self, uri: &str) -> Option<std::sync::Arc<SourceObservation>> {
         let mut index = 0;
         while index < self.identity_pending.len() {
             let result = match self.identity_pending[index].1.try_recv() {
                 Ok(value) => Some(value),
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(std::sync::Arc::new(SourceObservation::default()))
+                }
             };
             if let Some(value) = result {
                 let (completed, _) = self.identity_pending.remove(index);
@@ -253,10 +371,15 @@ impl Wallpaper {
         {
             let (send, result) = std::sync::mpsc::channel();
             let path = uri.to_owned();
+            let completion = self.wake.completion();
             if std::thread::Builder::new()
                 .name("tuna-wallpaper-identity".into())
                 .spawn(move || {
-                    let _ = send.send(FileIdentity::for_uri(&path));
+                    let _completion = completion;
+                    // Drop the result sender before the completion wake, including unwind.
+                    let result_sender = send;
+                    let observed = std::sync::Arc::new(SourceObservation::observe(&path));
+                    let _ = result_sender.send(observed);
                 })
                 .is_ok()
             {
@@ -270,11 +393,10 @@ impl Wallpaper {
     fn poll_decode(
         &mut self,
         key: &str,
-        uri: &str,
+        paint: Paint,
         output: Size<i32, Logical>,
         settings: PictureSettings,
         geometry: Geometry,
-        identity: Option<FileIdentity>,
     ) {
         let index = self
             .pending
@@ -293,12 +415,37 @@ impl Wallpaper {
                 return;
             }
             let (send, result) = std::sync::mpsc::channel();
-            let job = uri.to_owned();
+            let epoch = paint.epoch.clone();
+            let paint_record = paint.animation.as_ref().map(|(sample,references)| serde_json::json!({
+                "sample_wall": sample.wall, "progress": sample.progress, "interval": sample.interval,
+                "from": sample.from, "to": sample.to, "slide": sample.slide,
+                "generation": epoch, "source_uri": paint.uri, "root_identity": format!("{:?}",paint.identity),
+                "source_identities": references.iter().map(|(path,id)| serde_json::json!({"path":path.to_string_lossy(),"identity":format!("{id:?}")})).collect::<Vec<_>>(), "geometry": {"physical":geometry.physical,
+                    "origin":geometry.origin,"desktop":geometry.desktop,"scale":geometry.scale()},
+            }));
+            let job = paint;
+            let image_cache = self.image_cache.clone();
+            let completion = self.wake.completion();
             let spawned = std::thread::Builder::new()
                 .name("tuna-wallpaper".into())
                 .spawn(move || {
+                    let _completion = completion;
+                    // Drop the result sender before the completion wake, including unwind.
+                    let result_sender = send;
                     let started = std::time::Instant::now();
-                    let pixels = load_static_wallpaper(&job, settings, geometry, identity);
+                    let pixels = if let Some((sample, references)) = job.animation {
+                        load_animation_wallpaper(
+                            &job.uri,
+                            job.identity,
+                            sample,
+                            references,
+                            settings,
+                            geometry,
+                            &image_cache,
+                        )
+                    } else {
+                        load_static_wallpaper(&job.uri, settings, geometry, job.identity)
+                    };
                     eprintln!(
                         "tuna-compositor: wallpaper {} for {}x{} in {} ms",
                         if pixels.is_some() {
@@ -310,10 +457,12 @@ impl Wallpaper {
                         output.h,
                         started.elapsed().as_millis()
                     );
-                    let _ = send.send(pixels);
+                    let _ = result_sender.send(pixels);
                 });
             if spawned.is_ok() {
                 self.pending.push(Pending {
+                    paint: paint_record,
+                    epoch,
                     uri: key.to_owned(),
                     size: output,
                     result,
@@ -326,10 +475,11 @@ impl Wallpaper {
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
         };
-        self.pending.remove(index);
+        let pending = self.pending.remove(index);
         if self.loaded.len() >= MAX_WALLPAPER_SLOTS {
             self.loaded.remove(0);
         }
+        let pixels = pixels.map(std::sync::Arc::<[u8]>::from);
         let buffer = pixels.as_ref().map(|pixels| {
             MemoryRenderBuffer::from_slice(
                 pixels,
@@ -341,10 +491,13 @@ impl Wallpaper {
             )
         });
         self.loaded.push(Loaded {
+            paint: pending.paint,
+            epoch: pending.epoch,
             uri: key.to_owned(),
             size: Some(output),
             pixels,
             buffer,
+            cards_prewarmed: false,
         });
     }
 
@@ -357,6 +510,10 @@ impl Wallpaper {
 
     /// GNOME's `primary-color` as last published, for the clear under
     /// the picture (and instead of it when there is none).
+    pub fn paint_state(&self) -> Option<&serde_json::Value> {
+        self.paint_state.as_ref()
+    }
+
     pub fn color(&self) -> Option<[f32; 3]> {
         self.color
     }
@@ -374,14 +531,31 @@ impl Wallpaper {
         geometry: Geometry,
     ) -> Option<MemoryRenderBufferRenderElement<GlesRenderer>> {
         let output = Size::<i32, Logical>::from((w, h));
+        self.paint_state = None;
         let uri = self.refresh(output, geometry)?;
+        self.poll_cards();
+        if self.loaded.iter().any(|loaded| {
+            loaded.uri == uri
+                && loaded.size == Some(output)
+                && !loaded.cards_prewarmed
+                && loaded.pixels.is_some()
+        }) {
+            self.prewarm_cards(output, geometry, &uri);
+            if let Some(loaded) = self
+                .loaded
+                .iter_mut()
+                .find(|loaded| loaded.uri == uri && loaded.size == Some(output))
+            {
+                loaded.cards_prewarmed = true;
+            }
+        }
         let loaded = self
             .loaded
             .iter()
             .find(|loaded| loaded.uri == uri && loaded.size == Some(output))?;
         let buffer = loaded.buffer.as_ref()?;
         let size = loaded.size?;
-        MemoryRenderBufferRenderElement::from_buffer(
+        let element = MemoryRenderBufferRenderElement::from_buffer(
             renderer,
             Point::<f64, Physical>::from((0.0, 0.0)),
             buffer,
@@ -390,7 +564,9 @@ impl Wallpaper {
             Some(size),
             Kind::Unspecified,
         )
-        .ok()
+        .ok()?;
+        self.paint_state = loaded.paint.clone();
+        Some(element)
     }
 
     /// GNOME's lock-screen background over a `w` x `h` output: the
@@ -473,27 +649,9 @@ impl Wallpaper {
         if area == 0 || area > MAX_WALLPAPER_AREA {
             return None;
         }
+        self.current_uris.clear();
         self.refresh_stage = Some("drop-open");
-        let mut drop_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(wallpaper_drop_path())
-            .ok()?;
-        self.refresh_stage = Some("drop-metadata");
-        let meta = drop_file.metadata().ok()?;
-        if !meta.is_file() || meta.len() > 16 * 1024 {
-            return None;
-        }
-        self.refresh_stage = Some("drop-read-bounded-utf8");
-        let mut text = String::new();
-        drop_file
-            .by_ref()
-            .take(16 * 1024 + 1)
-            .read_to_string(&mut text)
-            .ok()?;
-        if text.len() > 16 * 1024 {
-            return None;
-        }
+        let text = crate::runtime_signal::read_bounded(&wallpaper_drop_path(), 16 * 1024).ok()?;
         self.refresh_stage = Some("drop-parse-metadata");
         let mut lines = text.lines();
         let mut uri = lines.next().unwrap_or_default().trim().to_owned();
@@ -525,25 +683,136 @@ impl Wallpaper {
         if lock && !lock_uri.is_empty() {
             uri = lock_uri.to_owned();
         }
-        let identity = if settings.placement == tuna_shell_control::background::Placement::None {
+        self.current_uris = vec![uri.clone()];
+        let (identity, epoch, animation) = if settings.placement
+            == tuna_shell_control::background::Placement::None
+        {
             // GNOME NONE has no source file. In particular, an ignored lock
             // URI must not schedule a network/FUSE identity task or delay its
             // pure color/gradient. Empty URI also makes every downstream cache
             // and render worker independent of the unused file.
             uri.clear();
-            None
+            self.current_uris.clear();
+            (None, None, None)
         } else {
             self.refresh_stage = Some("source-identity-pending");
-            self.poll_identity(&uri)?
+            let observation = self.poll_source(&uri)?;
+            let identity = observation.identity.clone();
+            let epoch = observation.timeline.as_ref().map(|_| {
+                format!(
+                    "{uri}\n{settings:?}\n{geometry:?}\n{}",
+                    observation.generation
+                )
+            });
+            let animation = if observation.xml
+                && settings.placement != tuna_shell_control::background::Placement::None
+            {
+                let timeline = observation.timeline.as_ref()?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_secs_f64();
+                let sample_key = format!(
+                    "{uri}\n{identity:?}\n{geometry:?}\n{}",
+                    observation.generation
+                );
+                let index = self
+                    .animation_samples
+                    .iter()
+                    .position(|s| s.key == sample_key);
+                let previous = index.map(|i| &self.animation_samples[i]);
+                let due = previous.is_none_or(|old| {
+                    old.sampled_mono.elapsed().as_secs_f64() >= old.sample.interval
+                        || ((now - old.sampled_wall) - old.sampled_mono.elapsed().as_secs_f64())
+                            .abs()
+                            > 1.0
+                });
+                if due {
+                    let logical = [
+                        (f64::from(geometry.physical[0]) / geometry.scale()).round() as i32,
+                        (f64::from(geometry.physical[1]) / geometry.scale()).round() as i32,
+                    ];
+                    let mut sample = timeline.sample(now, logical)?;
+                    if sample.to.is_none() {
+                        sample.progress = 0.0;
+                    }
+                    if let Some(index) = index {
+                        self.animation_samples.remove(index);
+                    }
+                    if self.animation_samples.len() >= MAX_WALLPAPER_SLOTS {
+                        self.animation_samples.remove(0);
+                    }
+                    self.animation_samples.push(AnimationSample {
+                        key: sample_key.clone(),
+                        sampled_wall: now,
+                        sampled_mono: std::time::Instant::now(),
+                        sample,
+                    });
+                }
+                let sample = self
+                    .animation_samples
+                    .iter()
+                    .find(|s| s.key == sample_key)?
+                    .sample
+                    .clone();
+                let references = observation
+                    .references
+                    .iter()
+                    .filter(|&(path, _)| *path == sample.from || sample.to.as_ref() == Some(path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                Some((sample, references))
+            } else {
+                None
+            };
+            (identity, epoch, animation)
         };
-        // A missing picture still paints its configured color/gradient.
-        let key = format!("{uri}\n{settings:?}\n{geometry:?}\n{identity:?}");
+        // XML epoch, selected keyframe identities and actual sampled progress
+        // participate in the cache key. Old results cannot satisfy a new key.
+        let key =
+            format!("{uri}\n{settings:?}\n{geometry:?}\n{identity:?}\n{epoch:?}\n{animation:?}");
+
         if !self
             .loaded
             .iter()
             .any(|loaded| loaded.uri == key && loaded.size == Some(output))
         {
-            self.poll_decode(&key, &uri, output, settings, geometry, identity);
+            self.poll_decode(
+                &key,
+                Paint {
+                    epoch: epoch.clone(),
+                    uri,
+                    identity,
+                    animation,
+                },
+                output,
+                settings,
+                geometry,
+            );
+        }
+        if epoch.is_some()
+            && !self
+                .loaded
+                .iter()
+                .any(|loaded| loaded.uri == key && loaded.buffer.is_some())
+        {
+            // Retain a completed frame only within the exact same XML/settings/
+            // geometry/source epoch while its next transition step is pending.
+            // Source or calendar changes never reuse obsolete epoch pixels.
+            if let Some(previous) = self.loaded.iter().rev().find(|loaded| {
+                loaded.epoch == epoch
+                    && loaded.buffer.is_some()
+                    && loaded.paint.as_ref().is_some_and(|record| {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|t| t.as_secs_f64())
+                            .unwrap_or(f64::INFINITY);
+                        let age = now - record["sample_wall"].as_f64().unwrap_or(f64::NEG_INFINITY);
+                        age >= 0.0 && age <= record["interval"].as_f64().unwrap_or(0.0) + 0.5
+                    })
+            }) {
+                return Some(previous.uri.clone());
+            }
         }
         self.refresh_stage = Some("request-accepted");
         Some(key)
@@ -555,7 +824,7 @@ impl Wallpaper {
     /// `0 4px 16px 4px` shadow at 20%, both scaled with the card as GNOME
     /// scales them. Without a picture it shows `primary-color`.
     ///
-    /// The card is rendered (in software) at its `settled` size only and
+    /// The card is rendered on a bounded worker at its `settled` size only and
     /// drawn scaled to `card`: overview transition frames resize the card
     /// every frame, and re-rendering it per size cost a full crop, resize
     /// and shadow blur on the compositor thread each frame while evicting
@@ -580,58 +849,7 @@ impl Wallpaper {
             card.size
         };
         let uri = self.refresh(output, geometry).unwrap_or_default();
-        let color = self.color.map(|[r, g, b]| {
-            [
-                (r * 255.0).round() as u8,
-                (g * 255.0).round() as u8,
-                (b * 255.0).round() as u8,
-            ]
-        });
-        let key = (uri.clone(), output, rendered.w, rendered.h, color);
-        if !self.cards.iter().any(|c| c.key == key) {
-            let full = self
-                .loaded
-                .iter()
-                .find(|l| l.uri == uri && l.size == Some(output))
-                .and_then(|l| l.pixels.as_deref());
-            // Still decoding: draw nothing new yet rather than cache a
-            // colour card the picture will replace.
-            if !uri.is_empty() && full.is_none() {
-                return None;
-            }
-            let scale = f64::from(rendered.w) / f64::from(output.w.max(1));
-            let s = scale as f32;
-            let top = work_top.clamp(0, output.h - 1) as u32;
-            let rendered = tuna_wallpaper::card(
-                full.map(|p| (p, output.w as u32, output.h as u32)),
-                (0, top, output.w as u32, output.h as u32 - top),
-                color.unwrap_or([0x14, 0x17, 0x1c]),
-                rendered.w as u32,
-                rendered.h as u32,
-                30.0 * s,
-                tuna_wallpaper::Shadow {
-                    dy: 4.0 * s,
-                    blur: 16.0 * s,
-                    spread: 4.0 * s,
-                    alpha: 0.2,
-                },
-            )?;
-            if self.cards.len() >= MAX_CARDS {
-                self.cards.remove(0);
-            }
-            self.cards.push(CardCache {
-                key: key.clone(),
-                buffer: MemoryRenderBuffer::from_slice(
-                    &rendered.pixels,
-                    Fourcc::Argb8888,
-                    (rendered.width as i32, rendered.height as i32),
-                    1,
-                    Transform::Normal,
-                    None,
-                ),
-                margin: rendered.margin as i32,
-            });
-        }
+        let key = self.request_card(&uri, output, work_top, rendered)?;
         let cached = self.cards.iter().find(|c| c.key == key)?;
         let (location, size) = card_placement(card, rendered, cached.margin);
         MemoryRenderBufferRenderElement::from_buffer(
@@ -645,6 +863,169 @@ impl Wallpaper {
         )
         .ok()
     }
+
+    /// Prepare the common two-workspace picker during desktop painting, before
+    /// the first overview keypress. Layout changes use the same async path on
+    /// demand. Use logical geometry first so fractional-scale rounding matches
+    /// the real overview; the card crop itself is in physical pixels.
+    fn prewarm_cards(&mut self, output: Size<i32, Logical>, geometry: Geometry, uri: &str) {
+        let scale = f64::from_bits(geometry.scale_bits);
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        let top = (f64::from(crate::windows::WORK_AREA_TOP) * scale).round() as i32;
+        for rendered in picker_card_sizes(output, scale) {
+            self.request_card(uri, output, top, rendered);
+        }
+    }
+
+    /// Collect completed preparation even while the overview is closed, so the
+    /// worker pixels do not sit in channels until the first keypress and the
+    /// diagnostics distinguish prepared cache entries from unfinished work.
+    fn poll_cards(&mut self) {
+        let mut index = 0;
+        while index < self.card_pending.len() {
+            let result = match self.card_pending[index].result.try_recv() {
+                Ok(card) => Some(card),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                let pending = self.card_pending.remove(index);
+                if let Some(card) = result {
+                    if self.cards.len() >= MAX_CARDS {
+                        self.cards.remove(0);
+                    }
+                    self.cards.push(CardCache {
+                        key: pending.key,
+                        buffer: MemoryRenderBuffer::from_slice(
+                            &card.pixels,
+                            Fourcc::Argb8888,
+                            (card.width as i32, card.height as i32),
+                            1,
+                            Transform::Normal,
+                            None,
+                        ),
+                        margin: card.margin as i32,
+                    });
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Poll only in-memory results on the compositor thread. Cropping, scaling,
+    /// rounding and the shadow blur run on at most MAX_CARDS bounded workers.
+    /// A cache miss never blocks input dispatch or renders a stale wallpaper.
+    fn request_card(
+        &mut self,
+        uri: &str,
+        output: Size<i32, Logical>,
+        work_top: i32,
+        rendered: Size<i32, Physical>,
+    ) -> Option<CardKey> {
+        if output.w <= 0
+            || output.h <= 0
+            || rendered.w <= 0
+            || rendered.h <= 0
+            || rendered.w as u64 * rendered.h as u64 > MAX_WALLPAPER_AREA
+        {
+            return None;
+        }
+        // The shadow extends with width/output scale. Area of the content
+        // alone does not bound an extremely wide card's shadow allocation.
+        let margin = (24.0 * f64::from(rendered.w) / f64::from(output.w)).ceil() as u64 + 2;
+        let outer = (rendered.w as u64 + 2 * margin).checked_mul(rendered.h as u64 + 2 * margin);
+        if outer.is_none_or(|area| area > MAX_WALLPAPER_AREA) {
+            return None;
+        }
+        let color = self.color.map(|rgb| rgb.map(|v| (v * 255.0).round() as u8));
+        let top = work_top.clamp(0, output.h - 1);
+        // Crop origin is part of the image, even when output/card size stays fixed.
+        let key = (uri.to_owned(), output, rendered.w, rendered.h, top, color);
+        self.poll_cards();
+        if self.cards.iter().any(|card| card.key == key)
+            || self.card_pending.iter().any(|card| card.key == key)
+            || self.card_pending.len() >= MAX_CARDS
+        {
+            return Some(key);
+        }
+        let full = self
+            .loaded
+            .iter()
+            .find(|loaded| loaded.uri == uri && loaded.size == Some(output))
+            .and_then(|loaded| loaded.pixels.clone());
+        if !uri.is_empty() && full.is_none() {
+            return None;
+        }
+        let (send, result) = std::sync::mpsc::channel();
+        let completion = self.wake.completion();
+        if std::thread::Builder::new()
+            .name("tuna-wallpaper-card".into())
+            .spawn(move || {
+                let _completion = completion;
+                // Drop the result sender before the completion wake, including unwind.
+                let result_sender = send;
+                let scale = rendered.w as f32 / output.w as f32;
+                let card = tuna_wallpaper::card(
+                    full.as_deref()
+                        .map(|p| (p, output.w as u32, output.h as u32)),
+                    (0, top as u32, output.w as u32, (output.h - top) as u32),
+                    color.unwrap_or([0x14, 0x17, 0x1c]),
+                    rendered.w as u32,
+                    rendered.h as u32,
+                    30.0 * scale,
+                    tuna_wallpaper::Shadow {
+                        dy: 4.0 * scale,
+                        blur: 16.0 * scale,
+                        spread: 4.0 * scale,
+                        alpha: 0.2,
+                    },
+                );
+                let _ = result_sender.send(card);
+            })
+            .is_ok()
+        {
+            self.card_pending.push(PendingCard {
+                key: key.clone(),
+                result,
+            });
+        }
+        Some(key)
+    }
+}
+
+/// Sizes to prepare without needing a renderer or spawning a worker.
+fn picker_card_sizes(output: Size<i32, Logical>, scale: f64) -> Vec<Size<i32, Physical>> {
+    let logical = Rectangle::from_size(
+        (
+            (f64::from(output.w) / scale).round() as i32,
+            (f64::from(output.h) / scale).round() as i32,
+        )
+            .into(),
+    );
+    let layout = crate::overview::layout(logical, crate::windows::WORK_AREA_TOP, &[0, 1], 0, &[]);
+    let mut sizes = Vec::new();
+    for card in layout.cards {
+        let rendered = (
+            (f64::from(card.settled.w) * scale).round() as i32,
+            (f64::from(card.settled.h) * scale).round() as i32,
+        )
+            .into();
+        sizes.push(rendered);
+        // At rest runtime derives the size from both rounded physical edges.
+        // This can differ from rounding width/height at fractional scale.
+        let width = ((card.rect.loc.x + card.rect.size.w) as f64 * scale).round()
+            - (card.rect.loc.x as f64 * scale).round();
+        let height = ((card.rect.loc.y + card.rect.size.h) as f64 * scale).round()
+            - (card.rect.loc.y as f64 * scale).round();
+        let at_rest = (width as i32, height as i32).into();
+        if at_rest != rendered {
+            sizes.push(at_rest);
+        }
+    }
+    sizes
 }
 
 /// Where a card rendered at `rendered` (plus `margin` shadow pixels on
@@ -701,10 +1082,221 @@ impl FileIdentity {
         })
     }
     fn for_uri(uri: &str) -> Option<Self> {
-        let path = wallpaper_uri_to_path(uri)?.canonicalize().ok()?;
+        Self::for_path(&wallpaper_uri_to_path(uri)?)
+    }
+    fn for_path(path: &std::path::Path) -> Option<Self> {
+        let path = path.canonicalize().ok()?;
         Self::from_metadata(path.clone(), &std::fs::metadata(path).ok()?)
     }
 }
+/// This entire observer executes on a bounded worker, including timezone
+/// calendar conversion and every referenced image's arbitrary-path metadata.
+impl SourceObservation {
+    fn observe(uri: &str) -> Self {
+        let identity = FileIdentity::for_uri(uri);
+        let mut observed = Self {
+            identity: identity.clone(),
+            ..Self::default()
+        };
+        let Some(identity) = identity else {
+            return observed;
+        };
+        // GNOME slideshow descriptors use XML. Sniff their bounded content too,
+        // rather than treating an XML descriptor as an undecodable static image.
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&identity.path)
+        else {
+            return observed;
+        };
+        let mut prefix = [0; 256];
+        let count = file.read(&mut prefix).unwrap_or_default();
+        observed.xml = identity.path.extension().is_some_and(|e| e == "xml");
+        let markup = prefix[..count]
+            .iter()
+            .copied()
+            .find(|v| !v.is_ascii_whitespace())
+            == Some(b'<');
+        if !observed.xml && !markup {
+            return observed;
+        }
+        let Some(bytes) = read_identity(&identity, MAX_XML_BYTES as u64) else {
+            return observed;
+        };
+        // SVG is an image XML vocabulary, not a GNOME slideshow. A successful
+        // <background> parser is required before a non-.xml file becomes one.
+        let timeline = Timeline::parse(&bytes);
+        if timeline.is_some() {
+            observed.xml = true;
+        }
+        let Some(timeline) = timeline else {
+            return observed;
+        };
+        for path in timeline
+            .slides
+            .iter()
+            .flat_map(|s| s.from.iter().chain(s.to.iter()))
+            .map(|v| &v.path)
+        {
+            if !observed.references.iter().any(|(p, _)| p == path) {
+                if observed.references.len() >= 128 {
+                    return observed;
+                }
+                observed
+                    .references
+                    .push((path.clone(), FileIdentity::for_path(path)));
+            }
+        }
+        if FileIdentity::for_uri(uri) == observed.identity {
+            observed.generation = format!(
+                "{:?}\n{}\n{:?}",
+                observed.identity,
+                timeline.start.to_bits(),
+                observed.references
+            );
+            observed.timeline = Some(timeline);
+        }
+        observed
+    }
+}
+fn read_identity(expected: &FileIdentity, limit: u64) -> Option<Vec<u8>> {
+    if expected.bytes > limit {
+        return None;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&expected.path)
+        .ok()?;
+    if FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
+        != Some(expected.clone())
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.by_ref().take(limit + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 == expected.bytes
+        && FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
+            == Some(expected.clone()))
+    .then_some(bytes)
+}
+fn load_animation_wallpaper(
+    uri: &str,
+    identity: Option<FileIdentity>,
+    sample: Sample,
+    references: Vec<(PathBuf, Option<FileIdentity>)>,
+    settings: PictureSettings,
+    geometry: Geometry,
+    caches: &BackgroundCaches,
+) -> Option<Vec<u8>> {
+    let unchanged = || {
+        FileIdentity::for_uri(uri) == identity
+            && references
+                .iter()
+                .all(|(path, id)| FileIdentity::for_path(path) == *id)
+    };
+    if !unchanged() {
+        return None;
+    }
+    let decode = |path: &PathBuf| -> Option<std::sync::Arc<image::RgbaImage>> {
+        let identity = references.iter().find(|(p, _)| p == path)?.1.as_ref()?;
+        if let Some(found) = caches
+            .images
+            .lock()
+            .ok()?
+            .iter()
+            .find(|(key, _)| key == identity)
+            .map(|(_, image)| image.clone())
+        {
+            return Some(found);
+        }
+        let image = std::sync::Arc::new(
+            tuna_wallpaper::decode(&read_identity(identity, 64 * 1024 * 1024)?)?.to_rgba8(),
+        );
+        if FileIdentity::for_path(path) != Some(identity.clone()) {
+            return None;
+        }
+        let mut slots = caches.images.lock().ok()?;
+        let mut bytes = slots
+            .iter()
+            .map(|(_, image)| image.as_raw().len())
+            .sum::<usize>();
+        if image.as_raw().len() <= 64 * 1024 * 1024 {
+            while !slots.is_empty()
+                && (slots.len() >= MAX_WALLPAPER_SLOTS
+                    || bytes + image.as_raw().len() > 64 * 1024 * 1024)
+            {
+                bytes -= slots.remove(0).1.as_raw().len();
+            }
+            slots.push((identity.clone(), image.clone()));
+        }
+        Some(image)
+    };
+    let from = decode(&sample.from);
+    let to = sample.to.as_ref().and_then(decode);
+    let progress = if sample.to.is_some() {
+        sample.progress
+    } else {
+        0.0
+    };
+    let placed = |path: &PathBuf, image: Option<&image::RgbaImage>| {
+        let image = image?;
+        let identity = references.iter().find(|(p, _)| p == path)?.1.clone()?;
+        let key = (identity, settings.placement, geometry);
+        if let Some(found) = caches
+            .placed
+            .lock()
+            .ok()?
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, image)| image.clone())
+        {
+            return Some(found);
+        }
+        let image = std::sync::Arc::new(tuna_wallpaper::background::place(
+            image,
+            settings.placement,
+            geometry,
+        )?);
+        let mut slots = caches.placed.lock().ok()?;
+        let mut bytes = slots.iter().map(|(_, image)| image.bytes()).sum::<usize>();
+        while !slots.is_empty()
+            && (bytes + image.bytes() > 64 * 1024 * 1024 || slots.len() >= MAX_WALLPAPER_SLOTS)
+        {
+            bytes -= slots.remove(0).1.bytes();
+        }
+        slots.push((key, image.clone()));
+        Some(image)
+    };
+    let placed_from = placed(&sample.from, from.as_deref());
+    let placed_to = sample
+        .to
+        .as_ref()
+        .and_then(|path| placed(path, to.as_deref()));
+    let pixels =
+        if (from.is_none() || placed_from.is_some()) && (to.is_none() || placed_to.is_some()) {
+            tuna_wallpaper::background::render_placed_blend(
+                placed_from.as_deref(),
+                placed_to.as_deref(),
+                progress,
+                settings,
+                geometry,
+            )
+        } else {
+            // An output larger than the placement-cache byte budget still renders
+            // faithfully on its bounded worker, without keeping large float planes.
+            tuna_wallpaper::background::render_blend(
+                from.as_deref(),
+                to.as_deref(),
+                progress,
+                settings,
+                geometry,
+            )
+        }?;
+    unchanged().then_some(pixels)
+}
+
 fn load_static_wallpaper(
     uri: &str,
     settings: PictureSettings,
@@ -883,6 +1475,41 @@ fn cache_path(path: &std::path::Path, w: u32, h: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_current_wallpaper_policy_retires_old_maintenance_eligibility() {
+        let _serial = RUNTIME_DIR_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _runtime = RuntimeDirGuard::point_at(dir.path());
+        std::fs::write(wallpaper_drop_path(), "old\n\n\n\n{not-valid-json}").unwrap();
+        let mut wallpaper = Wallpaper::new();
+        wallpaper.current_uris.push("old".into());
+        wallpaper.identities.push(IdentitySnapshot {
+            uri: "old".into(),
+            value: std::sync::Arc::new(SourceObservation::observe("old")),
+            observed: std::time::Instant::now() - std::time::Duration::from_secs(3),
+        });
+        assert!(wallpaper.refresh((8, 8).into(), test_geometry()).is_none());
+        assert_eq!(wallpaper.maintenance_deadline(), None);
+    }
+    #[test]
+    fn maintenance_deadlines_exclude_old_uri_and_inflight_identity_work() {
+        let now = std::time::Instant::now();
+        let mut wallpaper = super::Wallpaper::new();
+        wallpaper.identities.push(super::IdentitySnapshot {
+            uri: "old".into(),
+            value: std::sync::Arc::new(super::SourceObservation::observe("old")),
+            observed: now - std::time::Duration::from_secs(3),
+        });
+        assert_eq!(wallpaper.maintenance_deadline(), None);
+        wallpaper.current_uris.push("old".into());
+        assert!(
+            wallpaper.maintenance_deadline().unwrap() > now,
+            "past due maintenance retains a bounded retry, never a zero spin"
+        );
+        let (_send, receive) = std::sync::mpsc::channel();
+        wallpaper.identity_pending.push(("old".into(), receive));
+        assert_eq!(wallpaper.maintenance_deadline(), None);
+    }
     use super::*;
     use std::sync::Mutex;
 
@@ -912,6 +1539,249 @@ mod tests {
                 None => std::env::remove_var("XDG_RUNTIME_DIR"),
             }
         }
+    }
+
+    #[test]
+    fn card_workers_are_bounded_and_never_block_on_stalled_results() {
+        let mut wallpaper = Wallpaper::new();
+        let mut senders = Vec::new();
+        for index in 0..MAX_CARDS {
+            let (send, result) = std::sync::mpsc::channel();
+            senders.push(send);
+            wallpaper.card_pending.push(PendingCard {
+                key: (
+                    format!("stalled-{index}"),
+                    (1280, 800).into(),
+                    922,
+                    553,
+                    32,
+                    None,
+                ),
+                result,
+            });
+        }
+        for _ in 0..100 {
+            assert!(wallpaper
+                .request_card("", (1280, 800).into(), 32, (922, 553).into())
+                .is_some());
+        }
+        assert_eq!(wallpaper.card_pending.len(), MAX_CARDS);
+        assert!(wallpaper.cards.is_empty());
+        assert_eq!(senders.len(), MAX_CARDS);
+    }
+
+    #[test]
+    fn failed_and_disconnected_card_workers_release_their_budget_for_retry() {
+        let mut wallpaper = Wallpaper::new();
+        let key: CardKey = ("".into(), (64, 48).into(), 46, 28, 4, None);
+        let (send, result) = std::sync::mpsc::channel();
+        send.send(None).unwrap();
+        wallpaper.card_pending.push(PendingCard {
+            key: key.clone(),
+            result,
+        });
+        for index in 1..MAX_CARDS {
+            let (send, result) = std::sync::mpsc::channel();
+            drop(send);
+            wallpaper.card_pending.push(PendingCard {
+                key: (
+                    format!("disconnected-{index}"),
+                    (64, 48).into(),
+                    46,
+                    28,
+                    4,
+                    None,
+                ),
+                result,
+            });
+        }
+        assert_eq!(
+            wallpaper.request_card("", (64, 48).into(), 4, (46, 28).into()),
+            Some(key)
+        );
+        assert_eq!(
+            wallpaper.card_pending.len(),
+            1,
+            "failed slots permit one deduplicated retry"
+        );
+        assert!(wallpaper.cards.is_empty());
+    }
+
+    #[test]
+    fn async_card_result_reuses_cache_and_keys_the_crop() {
+        let mut wallpaper = Wallpaper::new();
+        let output = (64, 48).into();
+        let rendered = (46, 28).into();
+        let key = wallpaper.request_card("", output, 4, rendered).unwrap();
+        assert_eq!(wallpaper.card_pending.len(), 1);
+        assert!(
+            wallpaper.cards.is_empty(),
+            "first request schedules instead of rendering inline"
+        );
+        assert_eq!(
+            wallpaper.request_card("", output, 4, rendered),
+            Some(key.clone())
+        );
+        assert_eq!(
+            wallpaper.card_pending.len() + wallpaper.cards.len(),
+            1,
+            "duplicate requests share a job or its completed cache entry"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !wallpaper.cards.iter().any(|card| card.key == key) {
+            wallpaper.poll_cards();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "card worker did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for _ in 0..20 {
+            wallpaper.request_card("", output, 4, rendered);
+        }
+        assert!(
+            wallpaper.card_pending.is_empty(),
+            "settled/transition frames reuse the upload"
+        );
+        let changed = wallpaper.request_card("", output, 8, rendered).unwrap();
+        assert_ne!(key, changed, "moving the panel changes the wallpaper crop");
+        assert_eq!(wallpaper.card_pending.len(), 1);
+    }
+
+    #[test]
+    fn card_worker_preserves_the_synchronous_card_pixels() {
+        let mut wallpaper = Wallpaper::new();
+        let output = (64, 48).into();
+        let mut pixels = vec![0u8; 64 * 48 * 4];
+        for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            pixel.copy_from_slice(&[(index % 256) as u8, 40, 120, 255]);
+        }
+        let pixels: std::sync::Arc<[u8]> = pixels.into();
+        wallpaper.loaded.push(Loaded {
+            paint: None,
+            epoch: None,
+            uri: "test-image".into(),
+            size: Some(output),
+            pixels: Some(pixels.clone()),
+            buffer: None,
+            cards_prewarmed: false,
+        });
+        wallpaper
+            .request_card("test-image", output, 4, (46, 28).into())
+            .unwrap();
+        let job = wallpaper.card_pending.pop().unwrap();
+        let actual = job
+            .result
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let scale = 46.0 / 64.0;
+        let expected = tuna_wallpaper::card(
+            Some((&pixels, 64, 48)),
+            (0, 4, 64, 44),
+            [0x14, 0x17, 0x1c],
+            46,
+            28,
+            30.0 * scale,
+            tuna_wallpaper::Shadow {
+                dy: 4.0 * scale,
+                blur: 16.0 * scale,
+                spread: 4.0 * scale,
+                alpha: 0.2,
+            },
+        )
+        .unwrap();
+        assert_eq!(actual.pixels, expected.pixels);
+        assert_eq!(
+            (actual.width, actual.height, actual.margin),
+            (expected.width, expected.height, expected.margin)
+        );
+    }
+
+    #[test]
+    #[ignore = "manual host timing, not a GNOME performance qualification"]
+    fn measure_cold_card_thread_occupancy() {
+        let output = (1280, 800).into();
+        let pixels: std::sync::Arc<[u8]> = vec![80u8; 1280 * 800 * 4].into();
+        let scale = 922.0 / 1280.0;
+        let started = std::time::Instant::now();
+        let synchronous = tuna_wallpaper::card(
+            Some((&pixels, 1280, 800)),
+            (0, 32, 1280, 768),
+            [20, 23, 28],
+            922,
+            553,
+            30.0 * scale,
+            tuna_wallpaper::Shadow {
+                dy: 4.0 * scale,
+                blur: 16.0 * scale,
+                spread: 4.0 * scale,
+                alpha: 0.2,
+            },
+        )
+        .unwrap();
+        let synchronous_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut wallpaper = Wallpaper::new();
+        wallpaper.loaded.push(Loaded {
+            paint: None,
+            epoch: None,
+            uri: "timing-image".into(),
+            size: Some(output),
+            pixels: Some(pixels),
+            buffer: None,
+            cards_prewarmed: false,
+        });
+        let started = std::time::Instant::now();
+        wallpaper
+            .request_card("timing-image", output, 32, (922, 553).into())
+            .unwrap();
+        let dispatch_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let job = wallpaper.card_pending.pop().unwrap();
+        let asynchronous = job
+            .result
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        let ready_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(synchronous.pixels, asynchronous.pixels);
+        println!("cold card: synchronous_event_thread_ms={synchronous_ms:.3} async_dispatch_event_thread_ms={dispatch_ms:.3} async_pixels_ready_ms={ready_ms:.3} card_bytes={}", asynchronous.pixels.len());
+    }
+
+    #[test]
+    fn desktop_prewarms_picker_sizes_at_native_and_fractional_scale() {
+        for (scale, physical, expected) in [
+            (1.0f64, [1280, 800], vec![(922, 553), (867, 520)]),
+            (
+                1.25,
+                [1600, 1000],
+                vec![(1153, 691), (1152, 691), (1084, 650)],
+            ),
+        ] {
+            let actual: std::collections::HashSet<_> =
+                picker_card_sizes((physical[0], physical[1]).into(), scale)
+                    .into_iter()
+                    .map(|size| (size.w, size.h))
+                    .collect();
+            assert_eq!(actual, expected.into_iter().collect(), "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn card_requests_reject_oversized_layouts_before_spawning() {
+        let mut wallpaper = Wallpaper::new();
+        assert!(wallpaper
+            .request_card("", (1280, 800).into(), 32, (i32::MAX, i32::MAX).into())
+            .is_none());
+        assert!(wallpaper
+            .request_card("", (0, 800).into(), 32, (922, 553).into())
+            .is_none());
+        assert!(
+            wallpaper
+                .request_card("", (1, 800).into(), 32, (30_000_000, 1).into())
+                .is_none(),
+            "shadow area also stays bounded for extreme aspect ratios"
+        );
+        assert!(wallpaper.card_pending.is_empty());
     }
 
     #[test]
@@ -1341,6 +2211,74 @@ mod tests {
             "replacement inode must invalidate cached pixels even for same dimensions/content"
         );
     }
+    #[test]
+    fn xml_reference_replacement_changes_epoch_and_rejects_stale_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let picture = dir.path().join("frame.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([240, 0, 0, 255]))
+            .save(&picture)
+            .unwrap();
+        let xml = dir.path().join("timeline.xml");
+        let document = format!(
+            "<background><static><duration>4</duration><file>{}</file></static></background>",
+            picture.display()
+        );
+        std::fs::write(&xml, &document).unwrap();
+        let uri = format!("file://{}", xml.display());
+        let original = SourceObservation::observe(&uri);
+        let sample = original
+            .timeline
+            .as_ref()
+            .unwrap()
+            .sample(100.0, [8, 8])
+            .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 240, 255]))
+            .save(&picture)
+            .unwrap();
+        let changed = SourceObservation::observe(&uri);
+        assert_eq!(original.identity, changed.identity);
+        assert_ne!(
+            original.generation, changed.generation,
+            "same XML URI must observe changed referenced-image identity"
+        );
+        assert!(
+            load_animation_wallpaper(
+                &uri,
+                original.identity.clone(),
+                sample.clone(),
+                original.references.clone(),
+                PictureSettings::default(),
+                test_geometry(),
+                &BackgroundCaches::default()
+            )
+            .is_none(),
+            "stale source worker cannot publish old image identity"
+        );
+        std::fs::write(&xml, document.replace("<duration>4", "<duration>8")).unwrap();
+        assert!(
+            load_animation_wallpaper(
+                &uri,
+                changed.identity,
+                sample,
+                changed.references,
+                PictureSettings::default(),
+                test_geometry(),
+                &BackgroundCaches::default()
+            )
+            .is_none(),
+            "stale XML worker cannot publish after descriptor replacement"
+        );
+        let svg = dir.path().join("image.svg");
+        std::fs::write(&svg, "<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+        assert!(
+            !SourceObservation::observe(&format!("file://{}", svg.display())).xml,
+            "SVG must not claim slideshow support"
+        );
+        std::fs::write(&xml, "<!DOCTYPE background [<!ENTITY a 'x'>]><background/>").unwrap();
+        let invalid = SourceObservation::observe(&uri);
+        assert!(invalid.xml && invalid.timeline.is_none());
+    }
+
     #[test]
     fn stalled_identity_observation_does_not_block_frames_or_spawn_unbounded_jobs() {
         let mut wallpaper = Wallpaper::new();

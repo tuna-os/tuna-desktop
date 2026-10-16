@@ -65,14 +65,16 @@ impl Element for ElementSignature {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FrameSignature {
+    pub effects: Vec<u32>,
     pub size: (i32, i32),
     pub location: (i32, i32),
     pub scale: f64,
+    /// DisplayConfig transform (#345): rotation invalidates damage history.
+    pub transform: u32,
     pub locked: bool,
     pub background: Color32F,
     pub blank_alpha: f32,
     pub accent: [f32; 3],
-    pub pointer: Option<(f64, f64)>,
     pub decor: Vec<(Color32F, Vec<Rectangle<i32, Physical>>)>,
     pub above: usize,
     // Separate passes preserve both ordering and which scale each pass uses.
@@ -86,12 +88,13 @@ impl FrameSignature {
         self.size == old.size
             && self.location == old.location
             && self.scale == old.scale
+            && self.transform == old.transform
             && self.locked == old.locked
             && self.background == old.background
             && self.blank_alpha == old.blank_alpha
             && self.accent == old.accent
-            && self.pointer == old.pointer
             && self.decor == old.decor
+            && self.effects == old.effects
             && self.above == old.above
             && self.groups.len() == old.groups.len()
             && self.groups.iter().zip(&old.groups).all(|(new, old)| {
@@ -162,6 +165,28 @@ pub(crate) fn scanout_damage(
     repainted.to_vec()
 }
 
+/// KMS damage clips in scanout-buffer pixels (#345): `repainted`
+/// damage from [`damage_region`] is in pre-transform output space,
+/// which matches the buffer only when unrotated. Under rotation each
+/// rect maps into the buffer through the output transform (Smithay
+/// `Transform::transform_rect_in`, the logical-to-buffer direction
+/// also used for `RecordArea` capture); unrotated outputs pass
+/// through exactly as [`scanout_damage`] does.
+pub(crate) fn scanout_damage_rotated(
+    repainted: &[Rectangle<i32, Physical>],
+    transform: Transform,
+    logical: (i32, i32),
+) -> Vec<Rectangle<i32, Physical>> {
+    if transform == Transform::Normal {
+        return scanout_damage(repainted);
+    }
+    let area = smithay::utils::Size::<i32, smithay::utils::Physical>::from(logical);
+    repainted
+        .iter()
+        .map(|rect| transform.transform_rect_in(*rect, &area))
+        .collect()
+}
+
 /// Timing requests need an actual submitted frame even without pixel damage.
 pub(crate) fn needs_repaint(
     previous: Option<&FrameSignature>,
@@ -178,20 +203,37 @@ mod tests {
 
     fn scene() -> FrameSignature {
         FrameSignature {
+            effects: Vec::new(),
             size: (1280, 800),
             location: (0, 0),
             scale: 1.0,
+            transform: 0,
             locked: false,
             background: Color32F::BLACK,
             blank_alpha: 0.0,
             accent: [0.0; 3],
-            pointer: Some((100.0, 200.0)),
             decor: vec![],
             above: 0,
             groups: vec![],
         }
     }
 
+    #[test]
+    fn parent_brightness_change_invalidates_native_repaint_and_damage_layout() {
+        let before = scene();
+        let mut after = before.clone();
+        after.effects = vec![0.7f32.to_bits()];
+        assert!(needs_repaint(Some(&before), &after, false));
+        assert!(!after.same_global_drawing(&before));
+    }
+    #[test]
+    fn rotation_change_repaints_and_resets_damage() {
+        let before = scene();
+        let mut after = before.clone();
+        after.transform = 1;
+        assert!(needs_repaint(Some(&before), &after, false));
+        assert!(!after.same_global_drawing(&before));
+    }
     #[test]
     fn unchanged_scene_sleeps_but_first_frame_and_timing_requests_render() {
         let next = scene();
@@ -201,24 +243,59 @@ mod tests {
     }
 
     #[test]
-    fn lock_fade_cursor_output_and_decor_changes_render_immediately() {
+    fn lock_fade_output_and_decor_changes_render_immediately() {
         let before = scene();
-        let mut variants = vec![before.clone(); 9];
+        let mut variants = vec![before.clone(); 8];
         variants[0].locked = true;
         variants[1].blank_alpha = 1.0;
-        variants[2].pointer = Some((101.0, 200.0));
-        variants[3].size = (800, 600);
-        variants[4].scale = 1.25;
-        variants[5].location = (1280, 0);
-        variants[6].background = Color32F::new(1.0, 1.0, 1.0, 1.0);
-        variants[7].accent = [1.0; 3];
-        variants[8].decor = vec![(
+        variants[2].size = (800, 600);
+        variants[3].scale = 1.25;
+        variants[4].location = (1280, 0);
+        variants[5].background = Color32F::new(1.0, 1.0, 1.0, 1.0);
+        variants[6].accent = [1.0; 3];
+        variants[7].decor = vec![(
             Color32F::new(1.0, 1.0, 1.0, 1.0),
             vec![Rectangle::from_size((40, 30).into())],
         )];
         for next in variants {
             assert!(needs_repaint(Some(&before), &next, false));
         }
+    }
+
+    #[test]
+    fn cursor_motion_keeps_buffer_age_history_and_bounds_damage() {
+        let id = Id::new();
+        let cursor = |x| {
+            let element = SolidColorRenderElement::new(
+                id.clone(),
+                Rectangle::new((x, 40).into(), (24, 24).into()),
+                CommitCounter::default(),
+                Color32F::BLACK,
+                Kind::Cursor,
+            );
+            ElementSignature::capture(&element, 1.0)
+        };
+        let mut before = scene();
+        before.groups = vec![vec![cursor(20)]];
+        let mut after = before.clone();
+        after.groups[0][0] = cursor(25);
+        assert!(needs_repaint(Some(&before), &after, false));
+        assert!(after.same_global_drawing(&before));
+        let mut tracker = OutputDamageTracker::new(
+            smithay::utils::Size::<i32, smithay::utils::Physical>::from((1280, 800)),
+            1.0,
+            Transform::Normal,
+        );
+        damage_region(&mut tracker, 0, &before).unwrap();
+        let damage = damage_region(&mut tracker, 1, &after).unwrap();
+        assert!(!damage.is_empty());
+        let expected = Rectangle::new((20, 40).into(), (29, 24).into());
+        assert!(damage
+            .iter()
+            .all(|rect| rect.intersection(expected) == Some(*rect)));
+        // No cursor element on a second output means no changed signature.
+        let other_output = scene();
+        assert!(!needs_repaint(Some(&other_output), &other_output, false));
     }
 
     #[test]
@@ -247,6 +324,30 @@ mod tests {
         let mut removed = before.clone();
         removed.groups.clear();
         assert!(needs_repaint(Some(&before), &removed, false));
+    }
+
+    #[test]
+    fn asynchronously_ready_background_repaints_an_idle_scene() {
+        // The native path polls wallpaper/card workers before capturing this
+        // signature. An absent card becoming ready adds its new buffer ID to
+        // the background pass even without an input event or client commit.
+        let mut pending = scene();
+        pending.groups = vec![vec![]];
+        assert!(!needs_repaint(Some(&pending), &pending, false));
+        let mut ready = pending.clone();
+        ready.groups[0].push(ElementSignature::capture(
+            &SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::from_size((40, 30).into()),
+                0usize,
+                Color32F::BLACK,
+                Kind::Unspecified,
+            ),
+            1.0,
+        ));
+        assert!(needs_repaint(Some(&pending), &ready, false));
+        assert!(!ready.same_global_drawing(&pending));
+        assert!(!needs_repaint(Some(&ready), &ready, false));
     }
 
     #[test]
@@ -355,6 +456,40 @@ mod tests {
     }
 
     #[test]
+    fn rotated_scanout_damage_maps_into_buffer_pixels() {
+        // A 90° 4x2 panel tracks damage in its 2x4 logical frame; the
+        // KMS clips must name 4x2 buffer pixels instead.
+        let r = |x, y, w, h| Rectangle::<i32, Physical>::new((x, y).into(), (w, h).into());
+        let full = vec![r(0, 0, 2, 4)];
+        assert_eq!(
+            scanout_damage_rotated(&full, Transform::_90, (2, 4)),
+            vec![r(0, 0, 4, 2)]
+        );
+        // A logical corner rect rotates with the content it covers.
+        let corner = vec![r(0, 0, 1, 1)];
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::_90, (2, 4)),
+            vec![r(3, 0, 1, 1)]
+        );
+        // 180° and the flip map to their own buffer corners.
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::_180, (4, 2)),
+            vec![r(3, 1, 1, 1)]
+        );
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::Flipped, (4, 2)),
+            vec![r(3, 0, 1, 1)]
+        );
+        // Unrotated outputs pass damage through untouched, and empty
+        // damage stays empty under any transform.
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::Normal, (4, 2)),
+            corner
+        );
+        assert!(scanout_damage_rotated(&[], Transform::_90, (2, 4)).is_empty());
+    }
+
+    #[test]
     fn scanout_damage_is_the_repainted_buffer_age_region() {
         let id = Id::new();
         let mut tracker = OutputDamageTracker::new((32, 32), 1.0, Transform::Normal);
@@ -438,18 +573,28 @@ mod tests {
     fn global_drawing_pass_order_and_opacity_changes_reset_buffer_history() {
         let id = Id::new();
         let before = moving_scene(&id, 0, 0);
-        assert!(before.same_global_drawing(&moving_scene(&id, 8, 1)));
-        let mut variants = vec![before.clone(); 5];
+        let moved = moving_scene(&id, 8, 1);
+        assert!(needs_repaint(Some(&before), &moved, false));
+        assert!(
+            before.same_global_drawing(&moved),
+            "element movement must not reset global buffer history"
+        );
+        let mut variants = vec![before.clone(); 4];
         variants[0].locked = true;
-        variants[1].pointer = None;
-        variants[2].scale = 2.0;
-        variants[3].groups[0][0].opaque.clear();
-        variants[3].groups[0][0]
+        variants[1].scale = 2.0;
+        variants[2].groups[0][0].opaque.clear();
+        variants[2].groups[0][0]
             .opaque
             .push(Rectangle::from_size((1, 1).into()));
-        variants[4].groups[0][0].id = Id::new();
-        for next in variants {
-            assert!(!next.same_global_drawing(&before));
+        variants[3].groups[0][0].id = Id::new();
+        for (cause, next) in ["lock", "scale", "opacity", "element identity"]
+            .into_iter()
+            .zip(variants)
+        {
+            assert!(
+                !next.same_global_drawing(&before),
+                "{cause} must reset buffer history"
+            );
         }
     }
 }

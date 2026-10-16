@@ -7,6 +7,10 @@
 //! the [`TestCompositor`] helper drives the display manually so
 //! integration tests stay deterministic without an event loop or GPU.
 
+// The compositor state snapshot is one large `serde_json::json!` object,
+// which outgrows the default macro recursion limit.
+#![recursion_limit = "256"]
+
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
@@ -48,27 +52,44 @@ use smithay::{
 
 pub mod animation;
 pub mod animation_clock;
+mod auth_owner;
+mod bell;
 pub mod capture_security;
 mod constraint_motion;
 pub mod control;
+mod control_readiness;
 pub mod corner_pressure;
+pub mod cursor;
+mod cursor_svg;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub mod fprintd;
 pub mod frame_timing;
 pub mod idle_monitor;
 pub mod ime;
+pub mod input_aids;
 pub mod introspect;
 pub mod layer;
 pub mod lock;
+pub mod minimize;
+pub mod modal_dim;
 pub mod monitors;
 pub mod mutter;
 #[cfg(feature = "drm")]
 mod native_repaint;
+pub mod night_light;
+pub(crate) mod night_light_settings;
 mod occlusion;
 pub mod orca;
+pub mod orientation;
+mod output_constraints;
 pub mod overlay;
 pub mod overview;
 pub mod pam;
+pub mod pam_backend;
+pub mod pam_cancel;
+pub mod pam_conversation;
+pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;
 pub mod popup;
@@ -78,19 +99,28 @@ mod runtime_signal;
 mod sandbox_identity;
 pub mod screencast;
 pub mod screenshot;
+pub mod screenshot_flash;
 pub mod session_lock;
+pub mod session_restore;
 pub mod session_services;
 pub mod size_change;
 #[cfg(feature = "drm")]
 pub mod sleep;
+pub mod slideshow;
 pub mod spring;
 pub mod state;
 pub mod supervise;
+mod transient_family;
 pub mod unlock;
+mod wake;
 pub mod wallpaper;
+pub mod wellbeing_effects;
 pub mod window_icons;
+pub mod window_lifecycle;
 pub mod windows;
+pub mod workspace_policy;
 pub mod workspace_slide;
+pub mod workspace_tracker;
 #[cfg(feature = "xwayland")]
 mod x11_icons;
 #[cfg(feature = "xwayland")]
@@ -142,6 +172,9 @@ pub struct State {
     /// The icon a client's drag-and-drop carries, drawn at the pointer
     /// until the drop.
     dnd_icon: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    /// What the client under the pointer asked the cursor to be: a
+    /// `wp_cursor_shape_v1` shape, its own surface, or hidden (#342).
+    pub(crate) cursor_image: smithay::input::pointer::CursorImageStatus,
     /// Middle-click primary selection beside the clipboard.
     primary_selection_state: PrimarySelectionState,
     pub(crate) panel_surfaces: Vec<layer::PanelSurface>,
@@ -668,6 +701,16 @@ impl SeatHandler for State {
             self.reactivate_inhibitor(surface);
         }
     }
+
+    /// A client set the cursor (wl_pointer.set_cursor or a
+    /// `wp_cursor_shape_v1` shape); drawn by `cursor.rs` (#342).
+    fn cursor_image(
+        &mut self,
+        _seat: &Seat<Self>,
+        image: smithay::input::pointer::CursorImageStatus,
+    ) {
+        self.cursor_image = image;
+    }
 }
 
 /// Wayland seat name shared by the protocol state, the token store's
@@ -751,10 +794,33 @@ impl State {
     }
 
     /// Number of physically held keys, without exposing their identities.
+    /// Whether a client surface holds pointer focus: only then does its
+    /// cursor request apply; elsewhere the compositor shows its arrow.
+    pub fn pointer_focused(&self) -> bool {
+        self.seat
+            .get_pointer()
+            .is_some_and(|pointer| pointer.current_focus().is_some())
+    }
+
     pub fn pressed_key_count(&self) -> usize {
         self.seat
             .get_keyboard()
             .map_or(0, |keyboard| keyboard.pressed_keys().len())
+    }
+
+    /// Query real client DnD ownership, independently of optional icon lifetime.
+    pub(crate) fn client_dnd_active(&self) -> bool {
+        smithay::wayland::selection::data_device::client_dnd_active(&self.seat)
+    }
+
+    pub(crate) fn cancel_client_dnd(&mut self, time: u32) -> bool {
+        let seat = self.seat.clone();
+        smithay::wayland::selection::data_device::cancel_client_dnd(
+            &seat,
+            self,
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            time,
+        )
     }
 
     /// Seat for capability attachment and input routing.
@@ -835,6 +901,7 @@ impl State {
             layer_shell_state: WlrLayerShellState::new::<State>(dh),
             data_device_state: DataDeviceState::new::<State>(dh),
             dnd_icon: None,
+            cursor_image: smithay::input::pointer::CursorImageStatus::default_named(),
             primary_selection_state: PrimarySelectionState::new::<State>(dh),
             panel_surfaces: Vec::new(),
             dead_layer_surfaces: std::collections::HashSet::new(),
@@ -1049,6 +1116,25 @@ impl State {
             .unwrap_or(self.protocols.preferred_scale)
     }
 
+    /// Logical monitor selected by maximum overlap, including nested outputs.
+    pub fn monitor_geometry(
+        &self,
+        rect: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        self.outputs
+            .iter()
+            .max_by_key(|e| {
+                let r = smithay::utils::Rectangle::new(e.loc.into(), e.size);
+                (
+                    r.intersection(rect)
+                        .map_or(0i64, |i| i64::from(i.size.w) * i64::from(i.size.h)),
+                    e.primary,
+                )
+            })
+            .map(|e| smithay::utils::Rectangle::new(e.loc.into(), e.size))
+            .unwrap_or(rect)
+    }
+
     /// Scale of the output a logical rect overlaps most (the primary on
     /// a tie or no overlap), as niri picks it for a window (#59).
     pub fn scale_for(
@@ -1197,6 +1283,21 @@ impl TestCompositor {
     pub fn pump(&mut self) {
         self.display.dispatch_clients(&mut self.state).unwrap();
         self.display.flush_clients().unwrap();
+    }
+
+    /// Seat capability handles for native protocol fixtures.
+    pub fn test_seat(&self) -> Seat<State> {
+        self.state.seat.clone()
+    }
+
+    /// Inspect native client-DnD ownership in socketpair protocol tests.
+    pub fn client_dnd_active(&self) -> bool {
+        self.state.client_dnd_active()
+    }
+
+    /// Cancel native client DnD through the production seat path.
+    pub fn cancel_client_dnd(&mut self, time: u32) -> bool {
+        self.state.cancel_client_dnd(time)
     }
 
     /// Build a [`windows::WindowManager`] attached to the test seat, for

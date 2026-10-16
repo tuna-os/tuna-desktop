@@ -21,6 +21,60 @@ pub struct MonitorConfig {
     pub y: i32,
     /// GNOME's primary monitor (top bar).
     pub primary: bool,
+    /// Mutter DisplayConfig transform (0-7) from the `<transform>` block
+    /// (#345): 0 normal, 1 left, 2 upside-down, 3 right, 4-7 flipped.
+    /// Absent blocks stay 0, as mutter writes normal without a block.
+    pub transform: u32,
+}
+
+/// Mutter 51.0 rotation names (`meta-monitor-config-store.c`):
+/// `normal`, `left`, `upside_down`, `right`, plus a `flipped` flag.
+fn parse_transform(logical: roxmltree::Node<'_, '_>) -> u32 {
+    let Some(block) = logical.children().find(|c| c.has_tag_name("transform")) else {
+        return 0;
+    };
+    let text = |name: &str| {
+        block
+            .children()
+            .find(|c| c.has_tag_name(name))
+            .and_then(|c| c.text())
+            .map(str::trim)
+            .unwrap_or_default()
+    };
+    let base = match text("rotation") {
+        "left" => 1,
+        // Mutter writes `upside_down`; accept the hyphenated twin too.
+        "upside_down" | "upside-down" => 2,
+        "right" => 3,
+        _ => 0,
+    };
+    // Unknown rotations fall back to normal rather than failing the
+    // whole arrangement; flipped composes as transforms 4-7.
+    let flipped = text("flipped") == "yes";
+    if flipped {
+        base + 4
+    } else {
+        base
+    }
+}
+
+/// A `<transform>` block in mutter's exact format (normal omits it).
+fn transform_xml(transform: u32) -> String {
+    if transform == 0 {
+        return String::new();
+    }
+    let (rotation, flipped) = match transform {
+        1 | 5 => ("left", transform >= 4),
+        2 | 6 => ("upside_down", transform >= 4),
+        3 | 7 => ("right", transform >= 4),
+        4 => ("normal", true),
+        _ => return String::new(),
+    };
+    format!(
+        "      <transform>\n        <rotation>{}</rotation>\n        <flipped>{}</flipped>\n      </transform>\n",
+        rotation,
+        if flipped { "yes" } else { "no" },
+    )
 }
 
 /// Every arrangement in a monitors.xml, each as its monitors.
@@ -53,6 +107,7 @@ pub fn parse(xml: &str) -> Vec<Vec<MonitorConfig>> {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                     let primary = child_text(logical, "primary").is_some_and(|p| p == "yes");
+                    let transform = parse_transform(logical);
                     // A logical monitor may mirror several connectors.
                     logical
                         .children()
@@ -66,6 +121,7 @@ pub fn parse(xml: &str) -> Vec<Vec<MonitorConfig>> {
                                 x,
                                 y,
                                 primary,
+                                transform,
                             })
                         })
                         .collect::<Vec<_>>()
@@ -142,11 +198,12 @@ pub fn to_xml(configs: &[MonitorConfig]) -> String {
     let mut out = String::from("<monitors version=\"2\">\n  <configuration>\n");
     for c in configs {
         out.push_str(&format!(
-            "    <logicalmonitor>\n      <x>{}</x>\n      <y>{}</y>\n      <scale>{}</scale>\n{}      <monitor>\n        <monitorspec>\n          <connector>{}</connector>\n        </monitorspec>\n      </monitor>\n    </logicalmonitor>\n",
+            "    <logicalmonitor>\n      <x>{}</x>\n      <y>{}</y>\n      <scale>{}</scale>\n{}{}      <monitor>\n        <monitorspec>\n          <connector>{}</connector>\n        </monitorspec>\n      </monitor>\n    </logicalmonitor>\n",
             c.x,
             c.y,
             c.scale,
             if c.primary { "      <primary>yes</primary>\n" } else { "" },
+            transform_xml(c.transform),
             escape(&c.connector),
         ));
     }
@@ -214,6 +271,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 primary: true,
+                transform: 0,
             },
             MonitorConfig {
                 connector: "HDMI-A-1".into(),
@@ -221,10 +279,65 @@ mod tests {
                 x: 1536,
                 y: 0,
                 primary: false,
+                transform: 0,
             },
         ];
         let back = parse(&to_xml(&configs));
         assert_eq!(back, vec![configs]);
+    }
+
+    #[test]
+    fn rotation_round_trips_in_gnome_format() {
+        // Mutter's rotation names and flipped flag (#345).
+        let xml = r#"<monitors version="2">
+  <configuration>
+    <logicalmonitor>
+      <x>0</x><y>0</y><scale>1</scale><primary>yes</primary>
+      <transform><rotation>left</rotation><flipped>no</flipped></transform>
+      <monitor><monitorspec><connector>eDP-1</connector></monitorspec></monitor>
+    </logicalmonitor>
+    <logicalmonitor>
+      <x>1080</x><y>0</y><scale>1</scale>
+      <transform><rotation>right</rotation><flipped>yes</flipped></transform>
+      <monitor><monitorspec><connector>HDMI-A-1</connector></monitorspec></monitor>
+    </logicalmonitor>
+    <logicalmonitor>
+      <x>0</x><y>1920</y><scale>1</scale>
+      <transform><rotation>upside_down</rotation><flipped>no</flipped></transform>
+      <monitor><monitorspec><connector>DP-1</connector></monitorspec></monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>"#;
+        let configs = parse(xml);
+        assert_eq!(configs.len(), 1);
+        let transforms: Vec<(String, u32)> = configs[0]
+            .iter()
+            .map(|c| (c.connector.clone(), c.transform))
+            .collect();
+        assert_eq!(
+            transforms,
+            [
+                ("eDP-1".to_owned(), 1),
+                ("HDMI-A-1".to_owned(), 7),
+                ("DP-1".to_owned(), 2),
+            ]
+        );
+        // Rotation survives a save/load cycle; normal still omits the block.
+        let back = parse(&to_xml(&configs[0]));
+        assert_eq!(back, configs);
+        assert!(!to_xml(&configs[0][..0]).contains("transform"));
+        let normal = MonitorConfig {
+            connector: "eDP-1".into(),
+            scale: 1.0,
+            x: 0,
+            y: 0,
+            primary: true,
+            transform: 0,
+        };
+        assert!(!to_xml(std::slice::from_ref(&normal)).contains("transform"));
+        // Unknown rotations keep the arrangement readable at normal.
+        let broken = xml.replace("<rotation>left</rotation>", "<rotation>diagonal</rotation>");
+        assert_eq!(parse(&broken)[0][0].transform, 0);
     }
 
     #[test]

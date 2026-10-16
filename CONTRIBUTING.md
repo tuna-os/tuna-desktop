@@ -1,7 +1,7 @@
 # Contributing to Tuna Desktop
 
 Tuna Desktop (formerly Roost) is in active implementation as a nested developer preview (see
-[README.md](README.md) and [ROADMAP.md](ROADMAP.md)). A Smithay compositor
+[README.md](README.md) and [the roadmap](docs/roadmap.md#public-roadmap)). A Smithay compositor
 supervises a GTK4/libadwaita shell, session supervisor, greetd greeter, and
 versioned control protocol, tested across nested graphical journeys, AT-SPI
 accessibility, and Marlin VM lanes.
@@ -80,16 +80,24 @@ Once a plan is approved and implementation starts:
 - **Sign off every commit.** This project uses the Developer Certificate of
   Origin. Commit with `git commit -s` (or add `Signed-off-by:` by hand) —
   every commit in this repository's history carries it.
-- **CI must pass.** [.github/workflows/ci.yml](.github/workflows/ci.yml) runs,
-  on every push and pull request:
+- **CI must pass.** [.github/workflows/ci.yml](.github/workflows/ci.yml) runs
+  the `check` job on every push and pull request:
   - `cargo fmt --all -- --check`
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `cargo test --workspace`
+
+  and, on every push to `main`, nightly and on dispatch, every proof lane:
   - a nested-session journey test (`scripts/tuna-journey`) that launches the
     nested compositor under Xvfb and asserts visible reaction; artifacts are
     uploaded for human review.
   - an app-content journey (headed Chromium via Playwright as a Wayland
     client) asserting the compositor renders real app content.
+  - the GTK shell, DRM, portal, remote-desktop, niri, package and Marlin
+    VM lanes.
+
+  A pull request runs only the lanes its changes can affect
+  (`scripts/ci-select-lanes`; see
+  [docs/testing.md](docs/testing.md#which-lanes-a-pull-request-runs)).
 
   Run the fast checks locally before pushing:
 
