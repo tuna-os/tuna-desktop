@@ -1,6 +1,6 @@
 # Where Tuna's remaining CPU goes against GNOME 51 (2026-10-15)
 
-ADR 0008 requires Tuna Desktop's CPU to be no worse than GNOME 51.0 on the paired Marlin VM benchmark. This report attributes the CPU in [paired run 38713249586](https://github.com/tuna-os/tuna-desktop/actions/runs/38713249586) (main `c9d94d15`, stock profile, three alternating pairs) to processes and workload phases. It names the code behind the largest gaps and the fixes in progress. It follows the [2026-10-08 investigation](2026-10-08-cpu-investigation.md).
+[ADR 0009](../adr/0009-performance-regression-budgets.md) requires Tuna Desktop's CPU to be no worse than GNOME 51.0 on the paired Marlin VM benchmark. This report attributes the CPU in [paired run 38713249586](https://github.com/tuna-os/tuna-desktop/actions/runs/38713249586) (main `c9d94d15`, stock profile, three alternating pairs) to processes and workload phases. It names the code behind the largest gaps and the fixes in progress. It follows the [2026-10-08 investigation](2026-10-08-cpu-investigation.md).
 
 ## Headline numbers (stock profile, median of three pairs)
 
@@ -223,6 +223,25 @@ Weighted by phase length, Tuna's excess is split as follows:
 | Idle | 0% | 0 | 0 |
 
 The compositor column subtracts gnome-shell, because gnome-shell does the work of both Tuna processes. Over the whole run the gap is 12.7 (17.4) CPU-seconds. tuna-compositor accounts for 5.5 (8.9) of it and tuna-shell-gtk for 8.4 (8.0). Applications add about 1. GNOME's heavier startup services give back 1–2.
+
+## Budget baseline: paired run 38910158684
+
+[Paired run 38910158684](https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684) measured the trusted main package `78dc07cf` (ci run 38886906531) with the observer that names every process and the workload that marks every phase on the guest clock (#547). Its three stock pairs completed; the diagnostic profile lost its first GNOME session to a kernel-observer refusal and is not used. The table gives the median over the three pairs, in percent of one core. "Desktop" is tuna-compositor plus tuna-shell-gtk against gnome-shell; "total" adds Xwayland, portals, services and the applications. Ratios are the median of each pair's Tuna / max(GNOME, 1.0). These medians, plus 15%, are the first budgets in [`budgets.json`](budgets.json) ([ADR 0009](../adr/0009-performance-regression-budgets.md)).
+
+| Phase | Desktop, GNOME | Desktop, Tuna | Ratio | Total, GNOME | Total, Tuna | Ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| idle | 0.0 | 0.3 | 0.34 | 0.1 | 0.5 | 0.48 |
+| frames | 21.2 | 13.3 | 0.63 | 21.7 | 15.0 | 0.69 |
+| typing | 18.7 | 28.3 | 1.50 | 36.1 | 41.4 | 1.15 |
+| overview | 24.5 | 33.4 | 1.36 | 32.6 | 40.7 | 1.25 |
+| workspaces | 29.9 | 35.7 | 1.14 | 39.4 | 46.9 | 1.17 |
+| window cycling | 34.2 | 45.1 | 1.41 | 57.6 | 65.1 | 1.24 |
+| notifications | 12.1 | 34.2 | 2.82 | 22.4 | 40.8 | 1.87 |
+| settle | 7.5 | 17.6 | 2.36 | 15.1 | 22.2 | 1.49 |
+
+Whole-run user CPU p50: GNOME 14.0%, Tuna 23.0% (ratio 1.57). Overview response p50 166 ms against 163 ms, p95 625 ms against 428 ms. Frame-pacer interval p95 26.7 ms against 13.3 ms, p99 240 ms against 147 ms.
+
+Tuna is ahead of GNOME on frame pacing, overview response and the frame-pacer phase, at parity within the 1.0 floor at idle, and behind in every interactive phase. The largest desktop ratios are notifications (2.82×) and the final settle (2.36×), the same phases findings 4 and 5 name. The new window-cycling phase (ten Alt+Tab presses across three apps) costs 1.41× GNOME's desktop CPU.
 
 ## Remaining gap and owners
 
