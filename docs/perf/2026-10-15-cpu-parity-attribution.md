@@ -278,4 +278,19 @@ The host's load varied between runs (load average 1.5–5). Fix 3 is measured ag
 
 After the fixes, llvmpipe still does 60–65% of the overview work. 87% of the overview's shaded pixels come from the roughly 10 full-output frames of each transition: about 1.4 Mpx per frame for clear, wallpaper cards, scaled previews and the shell layers. The full-output transparent preview-chrome layer (`tuna-shell-gtk` `PreviewChrome`) is blended over the whole frame on each of them. That is the next compositor-side lever, together with whether Smithay's texture shader reaches llvmpipe's linear fast path (`LP_FS_KIND_LLVM_LINEAR`).
 
-The paired Marlin run for #696 (`package_source=candidate`) is pending its CI package. Its medians belong in this section when it completes.
+### Paired Marlin results (run 38927781532, exact candidate `ae9bd5fe`)
+
+Paired stock run with `package_source=candidate`, `package_run=38919696836` (dispatched CI), candidate commit `ae9bd5fe` (the PR head), median of three alternating pairs against GNOME 51.0:
+
+| Metric / Phase | GNOME 51.0 | Tuna | Gap (Tuna − GNOME) |
+|---|---:|---:|---:|
+| Whole-run user CPU, mean | 22.8% | 28.3% | **+5.5 points** (was +8.4 in #690) |
+| Idle user CPU, mean | 0.17% | 0.79% | +0.62 points |
+| Overview toggles (compositor) | 26.3% | 31.9% | **+7.4 points** (was +11.0) |
+| Notifications (compositor) | 12.2% | 28.5% | +17.5 points (was +14.7) |
+| Final settle, 3 apps (compositor) | 6.7% | 18.0% | +10.9 points (was +9.0) |
+| Workspace switches (compositor) | 28.3% | 33.3% | +4.3 points (was −1.9) |
+
+The whole-run gap narrowed from +8.4 to **+5.5 points** (a 35% reduction in the remaining gap).
+The overview gap narrowed from +11.0 to **+7.4 points** (a 33% reduction), matching the local A/B's finding that taking each preview's own damage significantly cuts overdraw during overview updates.
+In the final settle, the benchmark fixture's window arrangement (Files partially overlapping System Monitor, as captured in `overview-01.png`) leaves both the top and bottom of System Monitor's Resources graphs visible, so fix 2 (occluded callbacks) does not trigger in the benchmark's static geometry, and the exposed graph areas continue to redraw at the graph update rate. The shell's final settle CPU is now 0.2% of a core (down from 0.3–0.6%), reflecting fix 3 (no-op model updates suppressed).
