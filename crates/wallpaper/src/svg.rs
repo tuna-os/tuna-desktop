@@ -1,6 +1,9 @@
 //! Bounded transport to the separately packaged GNOME SVG loader. Call only
-//! from decoding/identity workers; FontConfig and all filesystem work stay in
-//! the helper process. No GdkPixbuf/GTK dependency enters the compositor.
+//! from decoding workers; FontConfig and all filesystem work stay in the
+//! helper process. No GdkPixbuf/GTK dependency enters the compositor.
+//! Rendered SVGs depend on the native loader and fonts, so callers must not
+//! persist them in caches keyed only by the source file (see
+//! [`crate::is_raster`]).
 use std::{
     io::{Read, Write},
     os::fd::AsRawFd,
@@ -11,39 +14,14 @@ use std::{
 
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
-type BackendObservation = Option<(Instant, Option<String>)>;
 
 fn helper_path() -> Option<std::path::PathBuf> {
     let executable = std::env::current_exe().ok()?;
     Some(executable.parent()?.join("tuna-wallpaper-svg"))
 }
 
-/// Receipt of the actual mapped SVG/native font libraries and configured font
-/// files, computed in a bounded process. Worker calls share a one-second
-/// observation; never invoke this from a render/frame callback.
-pub fn backend_identity() -> Option<String> {
-    static OBSERVATION: std::sync::OnceLock<std::sync::Mutex<BackendObservation>> =
-        std::sync::OnceLock::new();
-    let mut observation = OBSERVATION.get_or_init(Default::default).lock().ok()?;
-    if let Some((at, value)) = &*observation {
-        if at.elapsed() < Duration::from_secs(1) {
-            return value.clone();
-        }
-    }
-    let value = exchange(Some("--identity"), &[], 65).and_then(|bytes| {
-        let value = std::str::from_utf8(&bytes).ok()?.strip_suffix('\n')?;
-        (value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit()))
-            .then(|| value.to_owned())
-    });
-    *observation = Some((Instant::now(), value.clone()));
-    value
-}
-
 pub fn decode(bytes: &[u8]) -> Option<image::DynamicImage> {
-    // A missing/failed backend observation cannot produce a reusable SVG cache
-    // entry whose identity silently omits its actual loader and fonts.
-    backend_identity()?;
-    let output = exchange(None, bytes, crate::MAX_DECODED_BYTES + 16)?;
+    let output = exchange(bytes, crate::MAX_DECODED_BYTES + 16)?;
     parse_output(output)
 }
 
@@ -74,7 +52,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Option<()> {
     Some(())
 }
 
-fn exchange(argument: Option<&str>, bytes: &[u8], maximum: usize) -> Option<Vec<u8>> {
+fn exchange(bytes: &[u8], maximum: usize) -> Option<Vec<u8>> {
     if bytes.len() > MAX_INPUT {
         return None;
     }
@@ -84,9 +62,6 @@ fn exchange(argument: Option<&str>, bytes: &[u8], maximum: usize) -> Option<Vec<
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    if let Some(argument) = argument {
-        command.arg(argument);
-    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {

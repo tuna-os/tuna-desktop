@@ -10,18 +10,23 @@ internal references retain the loader's semantics. Ordinary local/remote
 external references are governed by that actual stream loader, rather than a
 hand-written substitute.
 
-The helper has a 64 MiB input bound, 33,177,600 intrinsic pixel bound, 1 GiB
+The helper has a 64 MiB input bound, the compositor's decoded-image
+admission (at most 7680×4320 and a 64 MiB RGBA8 footprint), a 1 GiB
 address-space bound, 4-second CPU soft/5-second hard limit, and the parent
 sends termination at 5 seconds wall time and retains the worker slot until
 the helper is reaped. Its caller-death binding supplements the actual native
 Glycin/bwrap parent-death and PID-namespace teardown contracts; the proof
-verifies that exact observed owned processor identities do not remain live. It never silently resizes an
-oversized source. Every transport operation uses nonblocking pipes on the
-existing bounded worker. All filesystem, font/library initialization and
-helper waits happen outside compositor frame callbacks. Cache identity
-includes the worker-observed hash of the actual helper, actual selected processor, mapped libraries,
-Glycin registered descriptors and FontConfig configuration and configured font files. Old worker completions
-remain counted and cannot satisfy a changed identity/geometry key.
+verifies that exact observed owned processor identities do not remain live.
+It never silently resizes an oversized source. Every transport operation
+uses nonblocking pipes on the existing bounded worker. All filesystem,
+font/library initialization and helper waits happen outside compositor frame
+callbacks. The compositor falls back to the helper only for content no raster
+codec recognizes, and never writes an SVG render to its persistent static
+cache: that key identifies the source file, not the installed loader and
+fonts the render depends on. The helper's `--receipt`/`--identity` hash of
+the actual helper, selected processor, mapped libraries, Glycin registered
+descriptors and FontConfig configuration and font files is retained by the
+runtime proof.
 
 The runtime proof retains actual loader/font/helper file hashes and RPM
 ownership/version/verification. It selects the real SVG item and light/dark
