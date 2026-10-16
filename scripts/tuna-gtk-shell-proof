@@ -8158,7 +8158,7 @@ echo 1000 >"$ARTIFACTS/backlight/aaa-other/max_brightness"
 echo 700 >"$ARTIFACTS/backlight/aaa-other/brightness"
 echo 1010 >"$BACKLIGHT/max_brightness"
 echo raw >"$BACKLIGHT/type"
-echo platform >"$ARTIFACTS/backlight/aaa-other/type"
+echo raw >"$ARTIFACTS/backlight/aaa-other/type"
 "$PY" - "$ARTIFACTS/devices/card0-tuna-0" "$ARTIFACTS/devices/card0-other" "$TUNA_BACKLIGHT_TEST_CONNECTORS" <<'PYFIXTURE'
 import json,os,pathlib,sys
 path0=pathlib.Path(sys.argv[1]).resolve()
