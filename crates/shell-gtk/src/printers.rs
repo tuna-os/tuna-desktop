@@ -2993,6 +2993,7 @@ pub struct PrintersMenu {
     receiver: mpsc::Receiver<Result<Snapshot, CupsError>>,
     inflight: Cell<bool>,
     ticks: Cell<u64>,
+    rendered: RefCell<Option<Result<Snapshot, CupsError>>>,
 }
 
 impl PrintersMenu {
@@ -3014,6 +3015,7 @@ impl PrintersMenu {
             receiver,
             inflight: Cell::new(false),
             ticks: Cell::new(0),
+            rendered: RefCell::new(None),
         });
         menu.tick();
         {
@@ -3115,6 +3117,12 @@ impl PrintersMenu {
     }
 
     fn apply(self: &Rc<Self>, result: Result<Snapshot, CupsError>) {
+        // AT-SPI actions and keyboard focus belong to the current buttons.
+        // A periodic identical snapshot must not detach those buttons while
+        // an accessibility activation is queued on the main loop.
+        if self.rendered.borrow().as_ref() == Some(&result) {
+            return;
+        }
         let subtitle = tile_subtitle(&result);
         if let Some(tile) = self.tile.borrow().as_ref() {
             tile.subtitle.set_text(&subtitle);
@@ -3135,6 +3143,7 @@ impl PrintersMenu {
                 self.list.append(&self.placeholder);
             }
         }
+        self.rendered.replace(Some(result));
     }
 
     fn append_row(self: &Rc<Self>, entry: &PrinterEntry) {
