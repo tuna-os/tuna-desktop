@@ -33,7 +33,7 @@ fn main() {
             let after = probe.status();
             assert!(after.locked && after.outer_pending && after.epoch == before.epoch + 1);
             std::fs::write(
-                root.join("epoch-injected.json"),
+                root.join("epoch-injected.tmp"),
                 serde_json::to_vec(&serde_json::json!({
                     "before":before.epoch,"after":after.epoch,"busy_sync_denied":!busy,
                     "scope":"controlled runtime epoch injection, not logind or S3"
@@ -41,6 +41,8 @@ fn main() {
                 .unwrap(),
             )
             .unwrap();
+            std::fs::rename(root.join("epoch-injected.tmp"), root.join("epoch-injected.json"))
+                .unwrap();
             injected = true;
         }
         if !synced && root.join("try-sync").exists() {
@@ -52,7 +54,7 @@ fn main() {
             let after = probe.status();
             assert!(!after.locked && !after.outer_pending && after.epoch == before.epoch + 1);
             std::fs::write(
-                root.join("sync-result.json"),
+                root.join("sync-result.tmp"),
                 serde_json::to_vec(&serde_json::json!({
                     "applied":applied,"before":before.epoch,"after":after.epoch,
                     "scope":"real public Runtime::try_unlock on controlled greetd"
@@ -60,6 +62,7 @@ fn main() {
                 .unwrap(),
             )
             .unwrap();
+            std::fs::rename(root.join("sync-result.tmp"), root.join("sync-result.json")).unwrap();
             synced = true;
         }
         if root.join("stop-probe").exists() {
