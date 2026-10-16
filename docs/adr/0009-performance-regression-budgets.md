@@ -1,7 +1,7 @@
 # ADR 0009: GNOME-relative performance budgets with a ratchet
 
 - Status: Decided
-- Decision date: 2026-10-09
+- Decision date: 2026-10-16
 - Owner: project
 - Related issues: #315 regression gate, #503 CPU below GNOME, #73 performance evidence
 
@@ -15,13 +15,13 @@ The roadmap's change control says performance thresholds change only with repeat
 
 Budgets live in `docs/perf/budgets.json`. Each one is a metric for one workload phase, such as the overview phase's total user CPU or the overview response p95. The budget is a ratio to the GNOME 51 session in the same job, plus an optional absolute ceiling. The gate takes the median, over the job's completed pairs, of Tuna / max(GNOME, floor). The floor keeps a near-zero GNOME value (idle CPU) from inflating the ratio.
 
-The target ratio is 1.0. The first budgets are the measured ratio from run 37788482241 (main `c9be27dd`) plus a 15% margin, taking the worse of the two GNOME profiles. From then on budgets only ratchet tighter:
+The target ratio is 1.0. The first budgets are the median ratio over the three stock pairs of paired run 38910158684 (trusted main package `78dc07cf`) plus a 15% margin, never below 1.0. That is the first run of the paired route whose observer names every process and whose workload marks every phase on the guest clock; its medians are recorded in [docs/perf/2026-10-15-cpu-parity-attribution.md](../perf/2026-10-15-cpu-parity-attribution.md#budget-baseline-paired-run-38910158684). Absolute ceilings are raised to Tuna's measured value plus the margin where that run already exceeds them. From then on budgets only ratchet tighter:
 
 - Tightening needs a newer paired run URL as `evidence`. `scripts/tuna-perf-gate propose` computes the tightened values.
 - Loosening a ratio, ceiling, floor or enforcement, or removing a budget, also needs a new ADR referenced by `adr`.
 - CI (`check` job) refuses any other change.
 
-Budgets that have no evidence yet are recorded with `enforced: false` and only warn. This covers the per-role "desktop" (compositor plus shell) metrics, which need the process names this change adds to the observer, and the new window-cycling phase. Enforcing one is a tightening.
+Every budget starts enforced, including the per-role "desktop" (compositor plus shell) metrics and the window-cycling phase, because the baseline run measured all of them in three pairs. A budget added later without three measured pairs is recorded with `enforced: false` and only warns; enforcing it is a tightening.
 
 A nightly scheduled run measures the latest trusted main package and fails on any enforced budget. Pull requests do not run it, except the existing trigger on measurement-code changes, which only reports. The run can be dispatched on any branch.
 

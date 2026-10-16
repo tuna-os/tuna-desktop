@@ -91,7 +91,7 @@ Each budget has these fields:
 - `floor`: the smallest GNOME value used as a divisor, so 0.0% idle on GNOME does not make every ratio infinite.
 - `enforced`, `evidence` (a run URL) and, optionally, `adr` and `note`.
 
-The first budgets are the measured ratios of [run 37788482241](https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241) (main `c9be27dd`, before #518) plus 15%. Phase boundaries in that older run were reconstructed from host clock markers. Budgets never start below the target ratio of 1.0.
+The first budgets are the median ratios over the three stock pairs of [paired run 38910158684](https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684) (trusted main package `78dc07cf`) plus 15%, never below the target ratio of 1.0. It is the first paired run with process names and guest-clock markers for every phase. Its per-phase medians and role attribution are in the [2026-10-15 attribution report](2026-10-15-cpu-parity-attribution.md#budget-baseline-paired-run-38910158684).
 
 - **To tighten** after an improvement, take a passing run's artifact and run:
 
@@ -104,7 +104,7 @@ The first budgets are the measured ratios of [run 37788482241](https://github.co
   This lowers each budget to the measured ratio plus the margin, never below 1.0, and never raises one. Commit the result with the run linked in the PR. Enforcing a provisional budget is also a tightening.
 - **Loosening** (a higher ratio, ceiling or floor, dropping `enforced`, or removing a budget) needs a new ADR under `docs/adr/`, referenced from the budget's `adr` field, as the roadmap's change control requires. CI's ratchet check (`scripts/tuna-perf-gate ratchet --base <main's budgets.json>`) refuses any change that is not backed by new run evidence, and any loosening without that ADR.
 
-The per-role "desktop" budgets and the window-cycling budget start provisional (`enforced: false`). Older runs carry no process names and no window-cycling phase. Enforce them from the first nightly run that measures them.
+Every budget in the baseline is enforced, since that run measured each one in three pairs. A budget added later without three measured pairs starts provisional (`enforced: false`) and is enforced from the first run that measures it.
 
 ### Running it locally
 
