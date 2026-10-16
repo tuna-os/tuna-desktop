@@ -17,6 +17,6 @@ The register distinguishes decided choices from remaining release gates. Record 
 | Settings compatibility map and notification/service ownership | 002/004 | Open; blocks truthful integration behavior |
 | Tiling requirement for 1.0 | Release scope review | Proposed later; promote only by evidence-backed scope change |
 | Package/session upgrade rollback per distro | 006 release | Open; blocks daily-driver release |
-| Performance regression thresholds | 006 release; #315 | Decided: GNOME-relative budgets that only ratchet tighter ([0008](0008-performance-regression-budgets.md)) |
+| Performance regression thresholds | 006 release; #315 | Decided: GNOME-relative budgets that only ratchet tighter ([0009](0009-performance-regression-budgets.md)) |
 | Monorepo vs split-off repos | All | Decided: monorepo, preserve seams ([004](0004-no-split-preserve-seams.md)) |
 | v1 beta track, all-TunaOS v1 scope, waived GPU/power comparison, emulated proof for device-only rows | 006 release; v1 definition | Decided ([0008](0008-v1-beta-track-and-release-scope.md)) |

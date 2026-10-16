@@ -1,4 +1,4 @@
-# ADR 0008: GNOME-relative performance budgets with a ratchet
+# ADR 0009: GNOME-relative performance budgets with a ratchet
 
 - Status: Decided
 - Decision date: 2026-10-09

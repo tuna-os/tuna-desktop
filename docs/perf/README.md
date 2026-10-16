@@ -12,7 +12,7 @@ The host waits for an actual rendered black panel, allows an equal 30-second pos
 
 The CI-only guest agent runs only the fixed `/usr/libexec/tuna-perf-phase` helper. It marks the idle boundaries with the guest's CLOCK_BOOTTIME, matching the observer's own clock. Idle CPU excludes any interval crossing either boundary, and fewer than 20 complete intervals fail the measurement. Host phase timestamps remain separate provenance. The fixture sends notifications to the actual interactive user's Notifications service and requires ten distinct nonzero uint32 IDs; the service's acceptance and first frame are retained. Acceptance is a workload record, not a claim of notification input-to-frame latency. Guest-agent packages, helper and service are fixture-only and installed identically in both sessions.
 
-Input timings bound the response observed through QMP captures. Each observation records a conservative lower bound, upper bound and capture duration. QMP key injection, capture/poll overhead and host scheduling affect these measurements; they are **not** compositor input-to-frame tracing or a frame-pacing measurement. The software/guest path, only one boot, potentially unavailable DRM memory counters, and missing 24-hour soak remain limitations. The regression budgets below are GNOME-relative ratchets ([ADR 0008](../adr/0008-performance-regression-budgets.md)), not a release claim of parity.
+Input timings bound the response observed through QMP captures. Each observation records a conservative lower bound, upper bound and capture duration. QMP key injection, capture/poll overhead and host scheduling affect these measurements; they are **not** compositor input-to-frame tracing or a frame-pacing measurement. The software/guest path, only one boot, potentially unavailable DRM memory counters, and missing 24-hour soak remain limitations. The regression budgets below are GNOME-relative ratchets ([ADR 0009](../adr/0009-performance-regression-budgets.md)), not a release claim of parity.
 
 Run a fixture disk with `scripts/tuna-vm-perf --disk disk.raw --desktop gnome --out /tmp/gnome-perf-fresh`, or select `tuna` for the candidate. Each artifact directory must be new. Build `packaging/marlin/perf/Containerfile` with `DESKTOP=gnome` or `DESKTOP=tuna` on the same shared preview image; it adds the test user, autologin, serial logging, observer and fixed guest probes. The fixture never ships in a desktop image.
 
@@ -46,7 +46,7 @@ overview-card and plane-damage fixes, and ranks the remaining work for #503.
 
 ## Regression gate (#315)
 
-Tuna Desktop's target is to match or beat GNOME 51 on every metric below, and never to regress. `scripts/tuna-perf-gate` compares each paired run with the budgets in [`budgets.json`](budgets.json). The decision is recorded in [ADR 0008](../adr/0008-performance-regression-budgets.md).
+Tuna Desktop's target is to match or beat GNOME 51 on every metric below, and never to regress. `scripts/tuna-perf-gate` compares each paired run with the budgets in [`budgets.json`](budgets.json). The decision is recorded in [ADR 0009](../adr/0009-performance-regression-budgets.md).
 
 ### When it runs
 
