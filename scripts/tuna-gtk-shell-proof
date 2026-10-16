@@ -177,6 +177,9 @@
 #   G-WM-KEYS      Alt+Space, Alt+F10, Super+End/Home (wm keybindings)
 #   G-WM-REBIND    GNOME's maximize key rebinds through its settings:
 #                  the old chord stops, the new one maximizes
+#   G-FOCUS-MOUSE  focus-mode click ignores hovering; sloppy follows the
+#                  pointer without raising; a click raises; auto-raise
+#                  raises after its delay (#347)
 #   G-SIZE-CHANGE-ANIM maximize, unmaximize, half-tiling and a client's
 #                  fullscreen ease 250 ms from the old frame (#496), never
 #                  stretching new content; fade-only under Reduced Motion,
@@ -5910,6 +5913,91 @@ cstate ".focused_rect[2] != $WIDTH" "restored" || fail G-WM-REBIND "Super+Down d
 gsettings reset org.gnome.desktop.wm.keybindings maximize
 sleep 1
 pass G-WM-REBIND "GNOME's maximize key rebinds: the old chord stops and the new one maximizes"
+
+# GNOME's focus policy (#347), live from org.gnome.desktop.wm.preferences:
+# click focus ignores hovering; sloppy focus follows the pointer without
+# raising; a click raises the hover-focused window (raise-on-click); with
+# auto-raise the hovered window rises after its delay. Alpha is tiled
+# left and another window right so the pointer crosses between them.
+pick_app() {
+    xdotool key Super_L
+    cstate '.overview_open and (.previews | length) > 0' "overview" || return 1
+    sleep 1
+    app_at="$(jq -r --arg a "$1" '[.previews[] | select(.app_id == $a)][0].rect // empty | "\(.[0] + .[2] / 2) \(.[1] + .[3] / 2)"' "$CSTATE")"
+    [ -n "$app_at" ] || return 1
+    # shellcheck disable=SC2086
+    xdotool mousemove --window "$WID" $app_at click 1
+    cstate "(.overview_open | not) and .overview_progress == 0 and .focused_app_id == \"$1\"" "$1"
+}
+cstate '.wm_preferences.focus_mode == "click" and .wm_preferences.raise_on_click and (.wm_preferences.auto_raise | not)' "click default" ||
+    fail G-FOCUS-MOUSE "focus policy is not GNOME's click/raise-on-click default"
+pick_alpha || fail G-FOCUS-MOUSE "could not focus Alpha from the overview"
+focus_alpha="$(jq -r .focused "$CSTATE")"
+focus_alpha_rect="$(jq -c .focused_rect "$CSTATE")"
+focus_other_app="$(jq -r '.active_workspace as $w | [.windows[] | select(.workspace == $w and .app_id != "tuna-test-alpha") | .app_id][0] // empty' "$CSTATE")"
+[ -n "$focus_other_app" ] || fail G-FOCUS-MOUSE "no second window on the active workspace"
+xdotool key super+Left
+cstate ".focused == $focus_alpha and .focused_rect == [0, 32, $((WIDTH / 2)), $((HEIGHT - 32))]" "alpha left" ||
+    fail G-FOCUS-MOUSE "Super+Left did not tile Alpha left"
+pick_app "$focus_other_app" || fail G-FOCUS-MOUSE "could not focus $focus_other_app from the overview"
+focus_other="$(jq -r .focused "$CSTATE")"
+focus_other_rect="$(jq -c .focused_rect "$CSTATE")"
+xdotool key super+Right
+cstate ".focused == $focus_other and .focused_rect == [$((WIDTH / 2)), 32, $((WIDTH / 2)), $((HEIGHT - 32))]" "other right" ||
+    fail G-FOCUS-MOUSE "Super+Right did not tile $focus_other_app right"
+focus_left="$((WIDTH / 4)) $((HEIGHT / 2))"
+focus_right="$((WIDTH * 3 / 4)) $((HEIGHT / 2))"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $focus_right
+sleep 0.5
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $focus_left
+sleep 1
+cstate ".focused == $focus_other and .stacking[-1] == $focus_other" "click holds" 3 ||
+    fail G-FOCUS-MOUSE "hovering Alpha moved focus or the stack under click focus"
+gsettings set org.gnome.desktop.wm.preferences focus-mode 'sloppy'
+cstate '.wm_preferences.focus_mode == "sloppy"' "sloppy live" ||
+    fail G-FOCUS-MOUSE "focus-mode sloppy did not reach the compositor"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $focus_right
+sleep 0.5
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $focus_left
+cstate ".focused == $focus_alpha and .stacking[-1] == $focus_other" "sloppy follows" ||
+    fail G-FOCUS-MOUSE "sloppy focus did not follow the pointer to Alpha without raising it"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $focus_left click 1
+cstate ".focused == $focus_alpha and .stacking[-1] == $focus_alpha" "click raises" ||
+    fail G-FOCUS-MOUSE "clicking the hover-focused Alpha did not raise it"
+gsettings set org.gnome.desktop.wm.preferences auto-raise-delay 300
+gsettings set org.gnome.desktop.wm.preferences auto-raise true
+cstate '.wm_preferences.auto_raise and .wm_preferences.auto_raise_delay_ms == 300' "auto-raise live" ||
+    fail G-FOCUS-MOUSE "auto-raise did not reach the compositor"
+# A preference change resets hover tracking: settle the pointer on Alpha
+# again before crossing to the other window.
+xdotool mousemove --window "$WID" $((WIDTH / 4 + 10)) $((HEIGHT / 2))
+sleep 0.5
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $focus_right
+cstate ".focused == $focus_other" "hover focus" ||
+    fail G-FOCUS-MOUSE "sloppy focus did not follow the pointer to $focus_other_app"
+cstate ".stacking[-1] == $focus_other" "auto-raised" ||
+    fail G-FOCUS-MOUSE "auto-raise did not raise the hovered window after its delay"
+cp "$CSTATE" "$ARTIFACTS/wm-focus-mouse.json"
+gsettings reset org.gnome.desktop.wm.preferences focus-mode
+gsettings reset org.gnome.desktop.wm.preferences auto-raise
+gsettings reset org.gnome.desktop.wm.preferences auto-raise-delay
+cstate '.wm_preferences.focus_mode == "click" and (.wm_preferences.auto_raise | not)' "click restored" ||
+    fail G-FOCUS-MOUSE "resetting the focus policy did not restore click focus"
+pick_app "$focus_other_app" || fail G-FOCUS-MOUSE "could not refocus $focus_other_app"
+xdotool key super+Right
+cstate ".focused == $focus_other and .focused_rect == $focus_other_rect" "other floating" ||
+    fail G-FOCUS-MOUSE "Super+Right did not untile $focus_other_app"
+pick_alpha || fail G-FOCUS-MOUSE "could not refocus Alpha"
+xdotool key super+Left
+cstate ".focused == $focus_alpha and .focused_rect == $focus_alpha_rect" "alpha floating" ||
+    fail G-FOCUS-MOUSE "Super+Left did not untile Alpha"
+pass G-FOCUS-MOUSE "click focus ignores hovering; sloppy follows the pointer without raising; a click raises; auto-raise raises the hovered window after its delay"
 
 # GNOME's size-change transition (#496, windowManager.js
 # _sizeChangeWindow): the window stays on its old frame until the client

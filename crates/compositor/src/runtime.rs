@@ -2233,6 +2233,21 @@ impl Runtime {
                 })
                 .collect::<Vec<_>>(),
         });
+        // GNOME's window-manager focus/mouse policy in force, Show
+        // Desktop and the stacking order bottom-to-top (#347).
+        let wm = self.manager.wm_preferences();
+        doc["wm_preferences"] = serde_json::json!({
+            "focus_mode": format!("{:?}", wm.focus_mode).to_lowercase(),
+            "focus_change_on_pointer_rest": wm.focus_change_on_pointer_rest,
+            "focus_new_windows": format!("{:?}", wm.focus_new_windows).to_lowercase(),
+            "auto_raise": wm.auto_raise,
+            "auto_raise_delay_ms": wm.auto_raise_delay_ms,
+            "raise_on_click": wm.raise_on_click,
+            "mouse_button_modifier": wm.mouse_button_modifier,
+            "resize_with_right_button": wm.resize_with_right_button,
+        });
+        doc["showing_desktop"] = serde_json::json!(self.manager.showing_desktop());
+        doc["stacking"] = serde_json::json!(self.manager.stacking_order());
         // Keep this nested object outside the large json! expansion so
         // additions cannot exceed serde_json's default macro recursion bound.
         // One clock/sample also makes the diagnostic tuple internally coherent.
@@ -3562,6 +3577,7 @@ impl Runtime {
         self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
             .apply_workspace_policy(&mut self.state, settings.workspace_policy);
+        self.manager.apply_wm_preferences(settings.wm_preferences);
         // Release delayed/synthetic input under the OLD map. An unrelated
         // preference change must not reinstall the map or lose held state.
         if aids::keymap_changed(&self.input_settings, &settings) {
@@ -3925,6 +3941,13 @@ impl Runtime {
         {
             due(Duration::from_millis(ms));
         }
+        // Focus-follows-mouse pointer rest and auto-raise (#347).
+        if let Some(ms) = self
+            .manager
+            .hover_wake_ms(crate::state::system_millis())
+        {
+            due(Duration::from_millis(ms));
+        }
         if self.hidden_waiting {
             due(self.hidden_beat.map_or(Duration::ZERO, |last| {
                 (last + crate::occlusion::HIDDEN_FRAME_INTERVAL).saturating_duration_since(now)
@@ -3956,6 +3979,8 @@ impl Runtime {
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        // Focus-follows-mouse timers (pointer rest, auto-raise).
+        self.manager.tick_hover(&mut self.state);
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
@@ -4082,6 +4107,9 @@ impl Runtime {
         }
         for backward in outcome.input_source_switches {
             self.switch_input_source_with_aid_reset(backward);
+        }
+        for _ in 0..outcome.show_desktop_toggles {
+            self.manager.toggle_show_desktop(&mut self.state);
         }
         // Header-bar right clicks: GNOME's window menu, drawn by the shell.
         for (window, x, y) in self.manager.take_menu_requests() {

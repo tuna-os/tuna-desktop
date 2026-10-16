@@ -533,47 +533,47 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | cycle-panels-backward | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | cycle-windows | Honored | Live SetSwitcherKeys registration; window MRU popup or immediate window/group cycling |
 | cycle-windows-backward | Honored | Live SetSwitcherKeys registration; window MRU popup or immediate window/group cycling |
-| lower | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| lower | Honored | Live shell accelerator registration and compositor dispatch |
 | maximize | Honored | Live shell accelerator registration and compositor dispatch |
-| maximize-horizontally | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| maximize-vertically | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| maximize-horizontally | Honored | Live shell accelerator registration and compositor dispatch; floating windows fill the work area's width and toggle back |
+| maximize-vertically | Honored | Live shell accelerator registration and compositor dispatch; floating windows fill the work area's height and toggle back |
 | minimize | Honored | Live shell accelerator registration and compositor dispatch |
-| move-to-center | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-corner-ne | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-corner-nw | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-corner-se | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-corner-sw | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-monitor-down | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-monitor-left | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-monitor-right | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-monitor-up | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-side-e | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-side-n | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-side-s | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-side-w | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| move-to-center | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
+| move-to-corner-ne | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
+| move-to-corner-nw | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
+| move-to-corner-se | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
+| move-to-corner-sw | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
+| move-to-monitor-down | Honored | Live shell accelerator registration and compositor dispatch; floating windows keep their relative place on the neighboring monitor |
+| move-to-monitor-left | Honored | Live shell accelerator registration and compositor dispatch; floating windows keep their relative place on the neighboring monitor |
+| move-to-monitor-right | Honored | Live shell accelerator registration and compositor dispatch; floating windows keep their relative place on the neighboring monitor |
+| move-to-monitor-up | Honored | Live shell accelerator registration and compositor dispatch; floating windows keep their relative place on the neighboring monitor |
+| move-to-side-e | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
+| move-to-side-n | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
+| move-to-side-s | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
+| move-to-side-w | Honored | Live shell accelerator registration and compositor dispatch (floating windows) |
 | move-to-workspace-1 | Honored | Live shell accelerator registration and compositor dispatch |
-| move-to-workspace-10 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-11 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-12 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-2 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-3 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-4 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-5 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-6 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-7 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-8 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-9 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| move-to-workspace-down | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| move-to-workspace-10 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-11 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-12 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-2 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-3 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-4 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-5 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-6 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-7 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-8 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-9 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| move-to-workspace-down | Ignored | Compatibility decision: GNOME 51 lays workspaces out in one horizontal row, so a vertical neighbor never exists and the key has no effect |
 | move-to-workspace-last | Honored | Live shell accelerator registration and compositor dispatch |
 | move-to-workspace-left | Honored | Live shell accelerator registration and compositor dispatch |
 | move-to-workspace-right | Honored | Live shell accelerator registration and compositor dispatch |
-| move-to-workspace-up | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| move-to-workspace-up | Ignored | Compatibility decision: GNOME 51 lays workspaces out in one horizontal row, so a vertical neighbor never exists and the key has no effect |
 | panel-main-menu | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | panel-run-dialog | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| raise | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| raise-or-lower | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| set-spew-mark | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| show-desktop | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| raise | Honored | Live shell accelerator registration and compositor dispatch |
+| raise-or-lower | Honored | Live shell accelerator registration and compositor dispatch; lowers when nothing shown covers the window, else raises |
+| set-spew-mark | Ignored | Compatibility decision: a Mutter debugging aid with no default binding and no user-facing behavior |
+| show-desktop | Honored | Live shell accelerator registration; ToggleShowDesktop hides the active workspace's windows and brings them back |
 | switch-applications | Honored | Live shell accelerator registration and compositor dispatch |
 | switch-applications-backward | Honored | Live shell accelerator registration and compositor dispatch |
 | switch-group | Honored | Live shell accelerator registration and compositor dispatch |
@@ -583,28 +583,28 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | switch-panels | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | switch-panels-backward | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | switch-to-workspace-1 | Honored | Live shell accelerator registration and compositor dispatch |
-| switch-to-workspace-10 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-11 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-12 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-2 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-3 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-4 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-5 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-6 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-7 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-8 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-9 | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| switch-to-workspace-down | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| switch-to-workspace-10 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-11 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-12 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-2 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-3 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-4 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-5 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-6 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-7 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-8 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-9 | Honored | Live shell accelerator registration and compositor dispatch; a workspace past the last does not exist, so the key does nothing |
+| switch-to-workspace-down | Ignored | Compatibility decision: GNOME 51 lays workspaces out in one horizontal row, so a vertical neighbor never exists and the key has no effect |
 | switch-to-workspace-last | Honored | Live shell accelerator registration and compositor dispatch |
 | switch-to-workspace-left | Honored | Live shell accelerator registration and compositor dispatch |
 | switch-to-workspace-right | Honored | Live shell accelerator registration and compositor dispatch |
-| switch-to-workspace-up | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| switch-to-workspace-up | Ignored | Compatibility decision: GNOME 51 lays workspaces out in one horizontal row, so a vertical neighbor never exists and the key has no effect |
 | switch-windows | Honored | Live SetSwitcherKeys registration; window MRU popup or immediate window/group cycling |
 | switch-windows-backward | Honored | Live SetSwitcherKeys registration; window MRU popup or immediate window/group cycling |
-| toggle-above | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| toggle-fullscreen | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| toggle-above | Honored | Live shell accelerator registration and compositor dispatch (Always on Top) |
+| toggle-fullscreen | Honored | Live shell accelerator registration and compositor dispatch |
 | toggle-maximized | Honored | Live shell accelerator registration and compositor dispatch |
-| toggle-on-all-workspaces | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| toggle-on-all-workspaces | Honored | Live shell accelerator registration and compositor dispatch (Always on Visible Workspace) |
 | unmaximize | Honored | Live shell accelerator registration and compositor dispatch |
 ## org.gnome.desktop.wm.preferences
 
@@ -614,16 +614,16 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | action-middle-click-titlebar | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | action-right-click-titlebar | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | audible-bell | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| auto-raise | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| auto-raise-delay | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
+| auto-raise | Honored | Read live into the compositor's focus policy; under sloppy or mouse focus the hovered window rises after the delay. Proof G-FOCUS-MOUSE |
+| auto-raise-delay | Honored | Read live; the auto-raise delay in milliseconds. Proof G-FOCUS-MOUSE |
 | button-layout | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | disable-workarounds | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| focus-mode | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| focus-new-windows | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| mouse-button-modifier | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
+| focus-mode | Honored | Read live; click, sloppy and mouse focus in the compositor, pointer focus never raising. Proof G-FOCUS-MOUSE |
+| focus-new-windows | Honored | Read live; strict leaves focus where it is and opens the new window below the focused one |
+| mouse-button-modifier | Honored | Read live; the modifier plus a button moves, resizes or opens the window menu (empty disables) |
 | num-workspaces | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| raise-on-click | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| resize-with-right-button | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
+| raise-on-click | Honored | Read live; off focuses a clicked window without raising it, on raises a hover-focused window when clicked |
+| resize-with-right-button | Honored | Read live; the modifier plus the right button resizes and the middle one opens the window menu |
 | theme | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
 | titlebar-font | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
 | titlebar-uses-system-font | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |

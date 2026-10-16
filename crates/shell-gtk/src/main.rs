@@ -2259,6 +2259,25 @@ fn build(app: &adw::Application) {
                             }
                         }
                     }
+                    Action::Window(what) => {
+                        let mut shell = shell.borrow_mut();
+                        if let Some(control) = shell.control.as_mut() {
+                            let focused = control
+                                .model()
+                                .windows()
+                                .iter()
+                                .find(|w| w.active)
+                                .map(|w| w.id);
+                            if let Some(id) = focused {
+                                let _ = control.window_action(id, what);
+                            }
+                        }
+                    }
+                    Action::ShowDesktop => {
+                        if let Some(control) = shell.borrow_mut().control.as_mut() {
+                            let _ = control.toggle_show_desktop();
+                        }
+                    }
                     Action::Workspace(target) | Action::MoveToWorkspace(target) => {
                         let mut shell = shell.borrow_mut();
                         let Some(control) = shell.control.as_mut() else {
@@ -2655,6 +2674,10 @@ fn build(app: &adw::Application) {
                         if schema.has_key("edge-tiling") {
                             out.workspace_policy.edge_tiling = mutter.boolean("edge-tiling");
                         }
+                        if schema.has_key("focus-change-on-pointer-rest") {
+                            out.wm_preferences.focus_change_on_pointer_rest =
+                                mutter.boolean("focus-change-on-pointer-rest");
+                        }
                     }
                 }
                 motion::set(out.motion);
@@ -2663,6 +2686,20 @@ fn build(app: &adw::Application) {
                     out.bell.audible = wm.boolean("audible-bell");
                     out.bell.visual = wm.boolean("visual-bell");
                     out.bell.frame_flash = wm.string("visual-bell-type") == "frame-flash";
+                    // GNOME's focus and mouse policy (#347).
+                    let prefs = &mut out.wm_preferences;
+                    prefs.focus_mode =
+                        tuna_shell_control::FocusMode::from_nick(&wm.string("focus-mode"));
+                    prefs.focus_new_windows = tuna_shell_control::FocusNewWindows::from_nick(
+                        &wm.string("focus-new-windows"),
+                    );
+                    prefs.auto_raise = wm.boolean("auto-raise");
+                    prefs.auto_raise_delay_ms =
+                        u32::try_from(wm.int("auto-raise-delay")).unwrap_or(0);
+                    prefs.raise_on_click = wm.boolean("raise-on-click");
+                    prefs.mouse_button_modifier =
+                        logic::mouse_button_modifier_bits(&wm.string("mouse-button-modifier"));
+                    prefs.resize_with_right_button = wm.boolean("resize-with-right-button");
                 }
                 if let Some(sound) = all[7].as_ref() {
                     out.bell.event_sounds = sound.boolean("event-sounds");
