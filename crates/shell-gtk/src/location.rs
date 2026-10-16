@@ -7,7 +7,7 @@
 //! (unknown apps are offered to `on_prompt`; without a dialog they are
 //! denied), clamped to the master switch and `max-accuracy-level`. The
 //! `InUse` manager property drives the panel icon. With GeoClue absent
-//! the switch still writes GSettings, and nothing is authorized.
+//! the indicator hides; Settings still gates the exported agent's grants.
 //!
 //! The agent id (`tuna-shell`) must join GeoClue's `[agent] whitelist`
 //! on the image, beside `gnome-shell` (`man geoclue`); that packaging

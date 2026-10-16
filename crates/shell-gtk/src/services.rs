@@ -421,8 +421,8 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
 }
 
 /// Location services: export the GeoClue2 agent on the system bus and
-/// follow its `InUse`. The tile itself is GSettings-backed, so it
-/// stays operable with GeoClue absent.
+/// follow its `InUse`. Settings owns the GSettings-backed master switch,
+/// which continues to gate the agent even with GeoClue absent.
 fn location(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
     w.location_agent.attach(conn);
 }
