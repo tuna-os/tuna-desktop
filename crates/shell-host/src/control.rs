@@ -844,11 +844,12 @@ impl ControlClient {
             }
             Err(e) => {
                 // A nonblocking read commonly exposes the underlying I/O
-                // variant. Ordinary EAGAIN is readiness, not peer loss.
-                let would_block = matches!(&e, ControlError::WouldBlock)
+                // variant. Ordinary EAGAIN or EINTR is transient readiness,
+                // not peer loss.
+                let transient = matches!(&e, ControlError::WouldBlock)
                     || matches!(&e, ControlError::Io(error)
-                        if error.kind() == io::ErrorKind::WouldBlock);
-                if !would_block {
+                        if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted));
+                if !transient {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                     self.native_outputs.clear();
                 }

@@ -221,12 +221,11 @@ def main():
                 if other_read('brightness')!=other_dimmed:raise RuntimeError(f'second output failed to dim: got {other_read("brightness")}, expected {other_dimmed}')
                 ext_a=baseline-100 if baseline>minimum+150 else baseline+100
                 (device/'brightness').write_text(f'{ext_a}\n')
-                request('SetAutoBrightnessTarget',0.8)
+                bus.call_sync(owner,'/org/gnome/Shell/Brightness','org.freedesktop.DBus.Properties','Get',GLib.Variant('(ss)',('org.gnome.Shell.Brightness','HasBrightnessControl')),None,Gio.DBusCallFlags.NONE,5000,None)
                 deadline=time.monotonic()+5
                 while other_read('brightness')!=other_base and time.monotonic()<deadline:time.sleep(0.02)
                 receipts.append(dict(test='multi-output-dim-cancel',other_device=args.other_device,other_baseline=other_base,other_dimmed=other_dimmed,actual_restored=other_read('brightness'),expected_restored=other_base))
                 if other_read('brightness')!=other_base:raise RuntimeError(f'second output was not restored after external change on first: got {other_read("brightness")}, expected {other_base}')
-                request('SetAutoBrightnessTarget',-1.0)
                 (device/'brightness').write_text(f'{baseline}\n')
                 request('SetDimming',False);observe(baseline)
             # Genuine session-bus error paths against the controlled logind fixture.
