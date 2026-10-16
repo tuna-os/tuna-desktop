@@ -2018,16 +2018,15 @@ fi
 cstate ".client_dnd_active == false and .overview_open and .overview_app_grid and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame) and (.seat_pressed_key_count == $grid_cancel_before_keys)" "folder cancellation before release" || fail G-GRID-DRAG-CANCEL "Escape failed to cancel native drag while keeping grid open"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-release.json"
 scrot "$ARTIFACTS/grid-cancel-before-release.png" >/dev/null
-# GTK hears the compositor's cancel asynchronously; poll its tree (button
-# still held) rather than sampling once right after the compositor state.
+# GTK hears cancel asynchronously and removes preview widgets during traversal.
+# Reject an inconsistent tree, then wait for a fresh complete owner-bound tree
+# within the existing budget, with the pointer button still held.
 end=$(($(date +%s) + 5))
-while :; do
-    grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" || fail G-GRID-DRAG-CANCEL "fresh cancellation tree missing"
-    if showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" &&
-        ! showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; then
-        break
-    fi
-    [ "$(date +%s)" -le "$end" ] || break
+until grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" &&
+    showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" &&
+    ! showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; do
+    [ "$(date +%s)" -le "$end" ] ||
+        fail G-GRID-DRAG-CANCEL "complete cancellation tree did not restore arrow before release"
     sleep 0.3
 done
 showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" || fail G-GRID-DRAG-CANCEL "GTK drag cleanup did not restore arrow before release"
