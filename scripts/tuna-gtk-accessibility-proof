@@ -70,7 +70,23 @@ trap cleanup EXIT INT TERM
 # Xvfb chooses a free server without sharing a pre-existing graphical session.
 Xvfb -displayfd 3 -screen 0 1280x800x24 3>"$ARTIFACTS/display-number" >"$ARTIFACTS/xvfb.log" 2>&1 &
 X_PID=$!
-for _ in $(seq 1 100); do [ -s "$ARTIFACTS/display-number" ] && break; sleep .1; done
+# Xvfb writes its display number to -displayfd only once it accepts
+# clients. Hosted runners have taken over 10 s to get there; never start
+# GTK against a display that is not up (it read as ":" and failed init).
+display_deadline=$(($(date +%s) + 30))
+until [ -s "$ARTIFACTS/display-number" ]; do
+    if ! kill -0 "$X_PID" 2>/dev/null; then
+        echo "Xvfb exited before accepting clients" >&2
+        cat "$ARTIFACTS/xvfb.log" >&2
+        exit 1
+    fi
+    if [ "$(date +%s)" -ge "$display_deadline" ]; then
+        echo "Xvfb did not accept clients within 30 s" >&2
+        cat "$ARTIFACTS/xvfb.log" >&2
+        exit 1
+    fi
+    sleep .1
+done
 DISPLAY=:$(cat "$ARTIFACTS/display-number")
 export DISPLAY
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
@@ -125,6 +141,7 @@ manifest['proof_script_sha256']=hashlib.sha256(pathlib.Path(sys.argv[4]).read_by
 manifest['guard_sha256']=hashlib.sha256(pathlib.Path(sys.argv[5]).read_bytes()).hexdigest()
 pathlib.Path(sys.argv[3]).write_text(json.dumps(manifest,indent=2)+'\n')
 PY
-"$TEST_BIN" accessibility::tests::live_menu_and_focus_settings --ignored --test-threads=1 --nocapture >"$ARTIFACTS/test.log" 2>&1
+"$TEST_BIN" accessibility::tests::live_menu_and_focus_settings --ignored --test-threads=1 --nocapture >"$ARTIFACTS/test.log" 2>&1 ||
+    { cat "$ARTIFACTS/test.log" >&2; exit 1; }
 cat "$ARTIFACTS/test.log"
 cat "$TUNA_A11Y_RECEIPT"

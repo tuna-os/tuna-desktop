@@ -11,13 +11,17 @@
 //! D-Bus edge mirrors [`WatcherBus`](crate::watcher::WatcherBus): the
 //! owner calls [`NotificationBus::ensure`] until it connects, and a taken
 //! name (or no bus) reads as no intake — never a hang. Method calls
-//! dispatch on zbus worker threads straight into the shared center, then
-//! run the [`NotificationBus::on_change`] callback so the owner can
-//! redraw without polling the center.
+//! arrive on zbus worker threads. `Notify` is filed on the owner's GLib
+//! main context when it names one ([`NotificationBus::deliver_in`]),
+//! because filing consults a policy store that may use GSettings; other
+//! calls go straight into the shared center. Each then runs the
+//! [`NotificationBus::on_change`] callback so the owner can redraw
+//! without polling the center.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use gio::glib;
 use zbus::object_server::SignalEmitter;
 
 use crate::notifications::{
@@ -103,6 +107,8 @@ pub type OnChange = Arc<dyn Fn() + Send + Sync>;
 struct Notifications {
     center: Arc<Mutex<NotificationCenter>>,
     on_change: Option<OnChange>,
+    /// Where `Notify` is filed (`None`: on the zbus thread).
+    deliver_in: Option<glib::MainContext>,
 }
 
 impl Notifications {
@@ -119,7 +125,7 @@ impl Notifications {
     /// id the app uses to replace or close it). A poisoned center
     /// reads as id zero, which no real notification carries.
     #[allow(clippy::too_many_arguments)]
-    fn notify(
+    async fn notify(
         &self,
         app_name: String,
         replaces_id: u32,
@@ -143,11 +149,19 @@ impl Notifications {
             desktop_entry: string_hint(&hints, "desktop-entry"),
             sound: sound_hints(&hints),
         };
-        let id = self
-            .center
-            .lock()
-            .map(|mut center| center.deliver(incoming))
-            .unwrap_or(0) as u32;
+        let center = self.center.clone();
+        let file = move || {
+            center
+                .lock()
+                .map(|mut center| center.deliver(incoming))
+                .unwrap_or(0) as u32
+        };
+        // The reply waits for the filing, so the sender's next call
+        // (and a settings read) sees its registration.
+        let id = match &self.deliver_in {
+            Some(context) => context.spawn(async move { file() }).await.unwrap_or(0),
+            None => file(),
+        };
         self.changed();
         id
     }
@@ -194,6 +208,7 @@ pub struct NotificationBus {
     conn: Option<zbus::blocking::Connection>,
     center: Arc<Mutex<NotificationCenter>>,
     on_change: Option<OnChange>,
+    deliver_in: Option<glib::MainContext>,
 }
 
 impl NotificationBus {
@@ -204,6 +219,7 @@ impl NotificationBus {
             conn: None,
             center,
             on_change: None,
+            deliver_in: None,
         }
     }
 
@@ -212,6 +228,14 @@ impl NotificationBus {
     /// served object takes it when it connects.
     pub fn on_change(&mut self, on_change: impl Fn() + Send + Sync + 'static) {
         self.on_change = Some(Arc::new(on_change));
+    }
+
+    /// File `Notify` calls on whichever thread iterates `context`,
+    /// replying once filed. Required when the center's policy store
+    /// uses GSettings ([`GioPolicyStore`](crate::notification_policy::GioPolicyStore)),
+    /// which is only safe there. Set before [`NotificationBus::ensure`].
+    pub fn deliver_in(&mut self, context: glib::MainContext) {
+        self.deliver_in = Some(context);
     }
 
     /// Whether the edge is connected and owns the notifications name.
@@ -253,6 +277,7 @@ impl NotificationBus {
         let notifications = Notifications {
             center: self.center.clone(),
             on_change: self.on_change.clone(),
+            deliver_in: self.deliver_in.clone(),
         };
         let conn = match builder.serve_at(NOTIFICATIONS_PATH, notifications) {
             Ok(conn) => conn,
@@ -454,7 +479,9 @@ mod tests {
         use std::time::Duration;
 
         use super::super::{NotificationBus, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH};
+        use crate::notification_policy::{AppPrefs, GlobalPrefs, PolicyStore};
         use crate::notifications::{NotificationCenter, NotificationError};
+        use gio::glib;
 
         /// Private bus daemon plus its address, or `None` when no
         /// daemon is usable (the caller skips the test).
@@ -741,6 +768,98 @@ mod tests {
             );
 
             let _ = daemon.kill();
+        }
+
+        /// A policy store that reports which thread each call ran on.
+        struct ThreadStore(std::sync::mpsc::Sender<std::thread::ThreadId>);
+
+        impl ThreadStore {
+            fn seen(&self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+
+        impl PolicyStore for ThreadStore {
+            fn app_for(&self, _desktop_entry: &str, app_name: &str) -> Option<String> {
+                self.seen();
+                Some(app_name.to_owned())
+            }
+            fn global(&self) -> GlobalPrefs {
+                self.seen();
+                GlobalPrefs::default()
+            }
+            fn app(&self, _app_id: &str) -> AppPrefs {
+                self.seen();
+                AppPrefs::default()
+            }
+            fn register(&self, _app_id: &str) {
+                self.seen();
+            }
+        }
+
+        /// GSettings is only safe on the thread iterating its main
+        /// context (GLib's keyfile backend reloads there, unlocked):
+        /// every policy call a wire `Notify` makes runs on the
+        /// delivery context's thread, and the reply waits for it.
+        #[test]
+        fn notify_files_on_the_delivery_context_thread() {
+            let Some((address, mut daemon)) = private_bus() else {
+                eprintln!("SKIP live notification test: no usable dbus-daemon on PATH");
+                return;
+            };
+            let (seen, calls) = std::sync::mpsc::channel();
+            let center = shared_center();
+            center
+                .lock()
+                .expect("center lock")
+                .set_policy(Arc::new(ThreadStore(seen)));
+            let context = glib::MainContext::new();
+            let main_loop = glib::MainLoop::new(Some(&context), false);
+            let owner = {
+                let main_loop = main_loop.clone();
+                std::thread::spawn(move || main_loop.run())
+            };
+            let mut bus = NotificationBus::new(center.clone());
+            bus.deliver_in(context);
+            let Some(bus) = owned_bus_with(bus, &address) else {
+                main_loop.quit();
+                let _ = daemon.kill();
+                eprintln!("SKIP live notification test: private bus refused connections");
+                return;
+            };
+            let Some(client) = client_conn(&address) else {
+                main_loop.quit();
+                let _ = daemon.kill();
+                eprintln!("SKIP live notification test: private bus refused connections");
+                return;
+            };
+            let Some(proxy) = notify_proxy(&client) else {
+                main_loop.quit();
+                let _ = daemon.kill();
+                panic!("intake proxy builds on a private bus");
+            };
+
+            let id = stub_notify(&proxy, Vec::new());
+            assert_ne!(id, 0, "intake returns a live notification id");
+            let banners = center
+                .lock()
+                .expect("center lock")
+                .banners()
+                .iter()
+                .map(|n| n.id)
+                .collect::<Vec<_>>();
+            assert_eq!(banners, vec![id as u64], "the reply follows the filing");
+            let seen: Vec<_> = calls.try_iter().collect();
+            assert!(!seen.is_empty(), "filing consults the policy store");
+            assert!(
+                seen.iter().all(|thread| *thread == owner.thread().id()),
+                "every policy call runs on the delivery context's thread"
+            );
+
+            main_loop.quit();
+            owner.join().expect("delivery thread");
+            let _ = daemon.kill();
+            let _ = bus;
         }
     }
 }
