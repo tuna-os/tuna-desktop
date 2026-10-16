@@ -935,7 +935,10 @@ mod tests {
     #[test]
     fn content_type_is_set_as_the_input_context_property() {
         let (interface, member, args) = content_type_call(8, 2048);
-        assert_eq!((interface, member), ("org.freedesktop.DBus.Properties", "Set"));
+        assert_eq!(
+            (interface, member),
+            ("org.freedesktop.DBus.Properties", "Set")
+        );
         assert_eq!(args.type_().as_str(), "(ssv)");
         assert_eq!(args.child_value(0).str(), Some(CONTEXT));
         assert_eq!(args.child_value(1).str(), Some("ContentType"));
