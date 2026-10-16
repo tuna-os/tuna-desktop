@@ -214,7 +214,7 @@ pub fn handlers_allowed() -> bool {
 pub fn open_settings_panel(panel: Option<&str>) -> bool {
     let policy = read();
     let launched = spawn_settings_for_policy(panel, &policy, &|panel| {
-        let mut command = std::process::Command::new("gnome-control-center");
+        let mut command = tuna_shell_host::apps::application_command("gnome-control-center");
         if let Some(panel) = panel {
             command.arg(panel);
         }

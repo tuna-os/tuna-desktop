@@ -11,45 +11,25 @@
 //!
 //! The opt-out uses environment variables only, because
 //! `gtk_disable_portals` needs GTK 4.18. The variables are set before GTK
-//! starts. Once GTK and libadwaita have read them, the caller's values are
-//! put back, so apps the shell launches inherit the user's environment.
+//! starts and stay set for the shell's entire lifetime, including lazy
+//! widget initialization and recovery. App launches restore the caller's
+//! original values only in their child environment.
 
 use std::ffi::{OsStr, OsString};
 
 const GDK_DEBUG: &str = "GDK_DEBUG";
 const ADW_DISABLE_PORTAL: &str = "ADW_DISABLE_PORTAL";
 
-/// The caller's values, restored by [`Saved::restore`].
-pub struct Saved {
-    gdk_debug: Option<OsString>,
-    adw_disable_portal: Option<OsString>,
-}
-
 /// Call before `gtk::init`, while the process is single-threaded.
-pub fn disable() -> Saved {
-    let saved = Saved {
-        gdk_debug: std::env::var_os(GDK_DEBUG),
-        adw_disable_portal: std::env::var_os(ADW_DISABLE_PORTAL),
-    };
-    std::env::set_var(GDK_DEBUG, with_no_portals(saved.gdk_debug.as_deref()));
+pub fn disable() {
+    let gdk_debug = std::env::var_os(GDK_DEBUG);
+    let adw_disable_portal = std::env::var_os(ADW_DISABLE_PORTAL);
+    std::env::set_var(GDK_DEBUG, with_no_portals(gdk_debug.as_deref()));
     std::env::set_var(ADW_DISABLE_PORTAL, "1");
-    saved
-}
-
-impl Saved {
-    /// Call from `startup`, after GTK (display open) and libadwaita
-    /// (style manager) initialised.
-    pub fn restore(self) {
-        for (key, value) in [
-            (GDK_DEBUG, self.gdk_debug),
-            (ADW_DISABLE_PORTAL, self.adw_disable_portal),
-        ] {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
+    tuna_shell_host::apps::set_application_environment(vec![
+        (GDK_DEBUG.into(), gdk_debug),
+        (ADW_DISABLE_PORTAL.into(), adw_disable_portal),
+    ]);
 }
 
 /// `GDK_DEBUG` with `no-portals` added to any flags the user set.

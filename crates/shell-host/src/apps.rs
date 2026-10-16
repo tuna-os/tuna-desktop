@@ -347,14 +347,60 @@ pub fn launch_environment() -> Vec<(String, String)> {
     LAUNCH_ENV.lock().map(|env| env.clone()).unwrap_or_default()
 }
 
+/// Caller environment for variables the shell overrides privately. Capture
+/// once before toolkit initialization; never restore them in the live shell.
+static APPLICATION_ENV: std::sync::OnceLock<Vec<(OsString, Option<OsString>)>> =
+    std::sync::OnceLock::new();
+
+/// Preserve the caller's values for child-only restoration. Call once with
+/// values captured before the shell applies private environment overrides.
+pub fn set_application_environment(vars: Vec<(OsString, Option<OsString>)>) {
+    APPLICATION_ENV
+        .set(vars)
+        .expect("application environment must be captured once");
+}
+
+/// A user application command, with session updates and the caller's
+/// original values (including absent variables), not shell-private flags.
+pub fn application_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.envs(launch_environment());
+    if let Some(vars) = APPLICATION_ENV.get() {
+        for (key, value) in vars {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+    }
+    command
+}
+
+/// The same environment boundary for GIO URI/MIME application launches.
+pub fn application_launch_context() -> gio::AppLaunchContext {
+    use gio::prelude::*;
+    let context = gio::AppLaunchContext::new();
+    for (key, value) in launch_environment() {
+        context.setenv(key, value);
+    }
+    if let Some(vars) = APPLICATION_ENV.get() {
+        for (key, value) in vars {
+            match value {
+                Some(value) => context.setenv(key, value),
+                None => context.unsetenv(key),
+            }
+        }
+    }
+    context
+}
+
 pub fn launch(entry: &AppEntry) -> io::Result<Launched> {
     let (program, args) = entry
         .argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty Exec argv"))?;
-    let child = Command::new(program)
+    let child = application_command(program)
         .args(args)
-        .envs(launch_environment())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -456,6 +502,37 @@ mod tests {
     use crate::search::SearchAction;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn application_environment_is_restored_only_for_commands_and_gio_launches() {
+        use gio::prelude::*;
+        use std::ffi::OsStr;
+        let present = "TUNA_TEST_APPLICATION_ENV_PRESENT";
+        let absent = "TUNA_TEST_APPLICATION_ENV_ABSENT";
+        let before = (std::env::var_os(present), std::env::var_os(absent));
+        set_application_environment(vec![
+            (present.into(), Some("caller-value".into())),
+            (absent.into(), None),
+        ]);
+        let command = application_command("/bin/true");
+        let environment: HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            environment.get(OsStr::new(present)),
+            Some(&Some(OsStr::new("caller-value")))
+        );
+        assert_eq!(environment.get(OsStr::new(absent)), Some(&None));
+        let context = application_launch_context();
+        let environment = context.environment();
+        assert!(environment.contains(&format!("{present}=caller-value").into()));
+        assert!(!environment
+            .iter()
+            .any(|value| value.to_string_lossy().starts_with(&format!("{absent}="))));
+        assert_eq!(
+            (std::env::var_os(present), std::env::var_os(absent)),
+            before,
+            "application launches must not mutate the running shell's environment"
+        );
+    }
 
     fn write_entry(dir: &Path, name: &str, body: &str) {
         fs::write(dir.join(name), body).expect("write test entry");
