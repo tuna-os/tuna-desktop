@@ -231,17 +231,20 @@ fn client() {
     send(&mut replacement, 12, CommandKind::SetIdleTimeout { ms: 50 });
     result(&mut replacement, 12, true);
     wait(|| state(&root)["locked"] == true && state(&root)["auth_owner"]["epoch"] == 3);
-    publish_json(&root.join("success.json"), &serde_json::json!({
-        "supervised_client_pid":std::process::id(), "manual_epoch":1,"unlock_epoch":2,"idle_epoch":3,
-        "concurrent_other_same_id_denied":true,"same_session_excess_denied":true,
-        "replacement_same_id_busy_denied":true,
-        "late_closed_origin_success_denied":std::env::var(ROLE).as_deref()!=Ok("3"),
-        "closed_origin_canceled_retired":std::env::var(ROLE).as_deref()==Ok("3"),
-        "fresh_origin_success":true,
-        "held_self_path_replaced":std::env::var(ROLE).as_deref()==Ok("3"),
-        "origin_loss_wakes_private_pam_without_fixture_release":std::env::var(ROLE).as_deref()==Ok("3"),
-        "scope":if std::env::var(ROLE).as_deref()==Ok("3") { "actual main Runtime PAM: stable held image, old origin denied, actual retirement; not hardware/MFA/S3" } else { "actual nested outer-wrapper ownership; no PAM retirement" }
-    }));
+    publish_json(
+        &root.join("success.json"),
+        &serde_json::json!({
+            "supervised_client_pid":std::process::id(), "manual_epoch":1,"unlock_epoch":2,"idle_epoch":3,
+            "concurrent_other_same_id_denied":true,"same_session_excess_denied":true,
+            "replacement_same_id_busy_denied":true,
+            "late_closed_origin_success_denied":std::env::var(ROLE).as_deref()!=Ok("3"),
+            "closed_origin_canceled_retired":std::env::var(ROLE).as_deref()==Ok("3"),
+            "fresh_origin_success":true,
+            "held_self_path_replaced":std::env::var(ROLE).as_deref()==Ok("3"),
+            "origin_loss_wakes_private_pam_without_fixture_release":std::env::var(ROLE).as_deref()==Ok("3"),
+            "scope":if std::env::var(ROLE).as_deref()==Ok("3") { "actual main Runtime PAM: stable held image, old origin denied, actual retirement; not hardware/MFA/S3" } else { "actual nested outer-wrapper ownership; no PAM retirement" }
+        }),
+    );
     // Keep the supervised process alive until parent sends graceful termination.
     std::thread::sleep(Duration::from_secs(2));
 }
@@ -304,12 +307,15 @@ fn epoch_client() {
         serde_json::from_slice(&std::fs::read(root.join("sync-result.json")).unwrap()).unwrap();
     assert_eq!(synced["applied"], true);
     wait(|| state(&root)["locked"] == false && state(&root)["auth_owner"]["epoch"] == 5);
-    publish_json(&root.join("success.json"), &serde_json::json!({
-        "supervised_client_pid":std::process::id(),"late_epoch_success_denied":true,
-        "busy_public_sync_denied":true,"fresh_origin_success":true,"public_sync_success":true,
-        "manual_epoch":1,"injected_epoch":2,"fresh_epoch":3,"relock_epoch":4,"sync_epoch":5,
-        "scope":"actual runtime controlled epoch injection and public try_unlock; not logind/S3/backend duplicate"
-    }));
+    publish_json(
+        &root.join("success.json"),
+        &serde_json::json!({
+            "supervised_client_pid":std::process::id(),"late_epoch_success_denied":true,
+            "busy_public_sync_denied":true,"fresh_origin_success":true,"public_sync_success":true,
+            "manual_epoch":1,"injected_epoch":2,"fresh_epoch":3,"relock_epoch":4,"sync_epoch":5,
+            "scope":"actual runtime controlled epoch injection and public try_unlock; not logind/S3/backend duplicate"
+        }),
+    );
     // Parent admits this live process, copies receipts, then terminates the driver.
     std::thread::sleep(Duration::from_secs(2));
 }
@@ -413,7 +419,12 @@ fn greetd_accept_budget_waits_for_client_admission() {
     let listener = UnixListener::bind(&socket).unwrap();
     let server_root = root.path().to_owned();
     let server = std::thread::spawn(move || {
-        greetd(listener, server_root, 1, Instant::now() + Duration::from_secs(30))
+        greetd(
+            listener,
+            server_root,
+            1,
+            Instant::now() + Duration::from_secs(30),
+        )
     });
     // Model compositor startup longer than the unchanged backend accept budget.
     std::thread::sleep(LIMIT + Duration::from_millis(50));

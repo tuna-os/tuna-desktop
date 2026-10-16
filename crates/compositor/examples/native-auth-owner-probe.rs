@@ -41,8 +41,11 @@ fn main() {
                 .unwrap(),
             )
             .unwrap();
-            std::fs::rename(root.join("epoch-injected.tmp"), root.join("epoch-injected.json"))
-                .unwrap();
+            std::fs::rename(
+                root.join("epoch-injected.tmp"),
+                root.join("epoch-injected.json"),
+            )
+            .unwrap();
             injected = true;
         }
         if !synced && root.join("try-sync").exists() {
