@@ -6,166 +6,156 @@
   "comparison": "Median over the run's paired sessions of Tuna / max(GNOME, floor). GNOME 51 is the paired session in the same job.",
   "metrics": {
     "cpu.frames.desktop.mean": {
-      "max_ratio": 4.0,
+      "max_ratio": 1.0,
       "ceiling": null,
       "floor": 1.0,
       "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.frames.total.mean": {
+      "max_ratio": 1.0,
+      "ceiling": 75,
+      "floor": 1.0,
+      "unit": "% of one core",
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
+    },
+    "cpu.idle.desktop.mean": {
+      "max_ratio": 1.0,
+      "ceiling": null,
+      "floor": 1.0,
+      "unit": "% of one core",
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
+    },
+    "cpu.idle.desktop.p95": {
+      "max_ratio": 2.3,
+      "ceiling": 3,
+      "floor": 1.0,
+      "unit": "% of one core",
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
+    },
+    "cpu.idle.total.mean": {
+      "max_ratio": 1.0,
+      "ceiling": 2,
+      "floor": 1.0,
+      "unit": "% of one core",
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
+    },
+    "cpu.idle.total.p95": {
+      "max_ratio": 2.3,
+      "ceiling": 5,
+      "floor": 1.0,
+      "unit": "% of one core",
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
+    },
+    "cpu.notifications.desktop.mean": {
+      "max_ratio": 3.25,
+      "ceiling": null,
+      "floor": 1.0,
+      "unit": "% of one core",
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
+    },
+    "cpu.notifications.total.mean": {
       "max_ratio": 2.15,
       "ceiling": 75,
       "floor": 1.0,
       "unit": "% of one core",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
-    },
-    "cpu.idle.desktop.mean": {
-      "max_ratio": 4.0,
-      "ceiling": null,
-      "floor": 1.0,
-      "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
-    },
-    "cpu.idle.desktop.p95": {
-      "max_ratio": 3.0,
-      "ceiling": 2.0,
-      "floor": 1.0,
-      "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
-    },
-    "cpu.idle.total.mean": {
-      "max_ratio": 1.6,
-      "ceiling": 2,
-      "floor": 1.0,
-      "unit": "% of one core",
-      "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
-    },
-    "cpu.idle.total.p95": {
-      "max_ratio": 3.45,
-      "ceiling": 5,
-      "floor": 1.0,
-      "unit": "% of one core",
-      "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
-    },
-    "cpu.notifications.desktop.mean": {
-      "max_ratio": 4.0,
-      "ceiling": null,
-      "floor": 1.0,
-      "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
-    },
-    "cpu.notifications.total.mean": {
-      "max_ratio": 3.15,
-      "ceiling": 75,
-      "floor": 1.0,
-      "unit": "% of one core",
-      "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.overview.desktop.mean": {
-      "max_ratio": 4.0,
+      "max_ratio": 1.6,
       "ceiling": null,
       "floor": 1.0,
       "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.overview.total.mean": {
-      "max_ratio": 2.9,
+      "max_ratio": 1.45,
       "ceiling": 80,
       "floor": 1.0,
       "unit": "% of one core",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.settle.desktop.mean": {
-      "max_ratio": 4.0,
+      "max_ratio": 2.75,
       "ceiling": null,
       "floor": 1.0,
       "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.settle.total.mean": {
-      "max_ratio": 3.7,
+      "max_ratio": 1.75,
       "ceiling": 70,
       "floor": 1.0,
       "unit": "% of one core",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.typing.desktop.mean": {
-      "max_ratio": 4.0,
+      "max_ratio": 1.75,
       "ceiling": null,
       "floor": 1.0,
       "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.typing.total.mean": {
-      "max_ratio": 1.9,
+      "max_ratio": 1.35,
       "ceiling": 70,
       "floor": 1.0,
       "unit": "% of one core",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.whole.total.p50": {
-      "max_ratio": 3.4,
+      "max_ratio": 1.85,
       "ceiling": 65,
       "floor": 1.0,
       "unit": "% of one core",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.window_cycling.desktop.mean": {
-      "max_ratio": 4.0,
+      "max_ratio": 1.65,
       "ceiling": null,
       "floor": 1.0,
       "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.window_cycling.total.mean": {
-      "max_ratio": 3.5,
+      "max_ratio": 1.45,
       "ceiling": null,
       "floor": 1.0,
       "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: no evidence yet for this phase. Tighten and enforce from the first nightly run."
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.workspaces.desktop.mean": {
-      "max_ratio": 4.0,
+      "max_ratio": 1.35,
       "ceiling": null,
       "floor": 1.0,
       "unit": "% of one core",
-      "enforced": false,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241",
-      "note": "Provisional: needs process names (observer change in this PR). Tighten and enforce from the first nightly run."
+      "enforced": true,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "cpu.workspaces.total.mean": {
-      "max_ratio": 2.0,
+      "max_ratio": 1.35,
       "ceiling": 75,
       "floor": 1.0,
       "unit": "% of one core",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "frame_pacing.interval_ms.p95": {
       "max_ratio": 1.0,
@@ -173,31 +163,31 @@
       "floor": 0,
       "unit": "ms",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "frame_pacing.interval_ms.p99": {
       "max_ratio": 1.0,
-      "ceiling": 100,
+      "ceiling": 169,
       "floor": 0,
       "unit": "ms",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "overview.response_ms.p50": {
-      "max_ratio": 2.55,
+      "max_ratio": 1.15,
       "ceiling": 500,
       "floor": 0,
       "unit": "ms",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     },
     "overview.response_ms.p95": {
-      "max_ratio": 1.8,
+      "max_ratio": 1.0,
       "ceiling": 950,
       "floor": 0,
       "unit": "ms",
       "enforced": true,
-      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/37788482241"
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     }
   }
 }
