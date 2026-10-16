@@ -651,6 +651,9 @@ jobs:
       # dbus-daemon semantics: portal activation hangs instead of failing
       # fast, and the shell must still own org.gnome.Shell promptly.
       - run: scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal
+      # Screen magnifier (#349): real GSettings writes, magnified pixels
+      # in shell screenshot captures (M-OFF..M-DISABLE).
+      - run: shellcheck scripts/tuna-magnifier-proof && scripts/tuna-magnifier-proof --artifacts gtk-shell-artifacts/magnifier
       # Keep runnable binaries even when a later live proof assertion fails.
       - if: always()
         run: |
