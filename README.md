@@ -30,11 +30,21 @@ today, in frames the GTK shell proof takes on each change.
 
 ## Screenshots and overview demo
 
-![Tuna Desktop overview with three live window previews](docs/walkthrough/overview-demo.png)
+![Tuna Desktop overview with Disks, System Monitor and Files open on the Marlin wallpaper](docs/walkthrough/hero-overview.png)
 
-| Quick settings | App grid |
+| App grid | Quick settings |
 | --- | --- |
-| ![Tuna Desktop quick settings with volume, brightness and service controls](docs/walkthrough/quick-settings-demo.png) | ![Tuna Desktop app grid](docs/walkthrough/app-grid-demo.png) |
+| ![Tuna Desktop app grid with the apps the Marlin image ships](docs/walkthrough/hero-app-grid.png) | ![Tuna Desktop quick settings with volume, wired network, Night Light, Dark Style and Do Not Disturb](docs/walkthrough/hero-quick-settings.png) |
+
+| Calendar | Alt+Tab |
+| --- | --- |
+| ![Tuna Desktop calendar beside the empty message list](docs/walkthrough/hero-calendar.png) | ![Tuna Desktop Alt+Tab switcher with live window thumbnails](docs/walkthrough/hero-switcher.png) |
+
+![Tuna Desktop lock screen clock over the blurred wallpaper](docs/walkthrough/hero-lock.png)
+
+These are frames from the real TunaOS Marlin image booted in a QEMU VM by
+CI, on its hardware (DRM/KMS) session with the apps the image ships and its
+default wallpaper.
 
 ![Overview demo: open the overview, select a window, and return to the desktop](docs/walkthrough/overview-demo.gif)
 

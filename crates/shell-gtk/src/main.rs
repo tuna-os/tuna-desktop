@@ -22,6 +22,8 @@ mod events;
 mod fd_watch;
 mod folder_dialog;
 mod folders;
+mod grid_animation;
+mod grid_pager;
 mod group_animation;
 mod ibus_panel;
 mod ibus_property_menu;
@@ -40,10 +42,12 @@ mod orca;
 mod osd;
 mod overview;
 mod panel_focus;
+mod pointer_a11y;
 mod polkit;
 mod portal_opt_out;
 mod power;
 mod preview_chrome;
+mod printers;
 mod privacy;
 mod privacy_portal;
 mod providers;
@@ -120,7 +124,21 @@ struct Drained {
     consent: Option<Option<(u64, String)>>,
     popups: Vec<(u32, u32)>,
     aid_switches: Vec<(tuna_shell_control::KeyboardAid, bool)>,
+    /// The click the next hover click makes, when the compositor changed it.
+    dwell_click: Option<tuna_shell_control::DwellClick>,
+    /// Pointer accessibility timeouts for the pie timer, in order.
+    pointer_timeouts: Vec<PointerTimeout>,
 }
+
+/// One pointer accessibility timeout report: kind, duration when it
+/// started, whether it clicked when it stopped, and where.
+type PointerTimeout = (
+    tuna_shell_control::PointerTimeoutKind,
+    Option<u32>,
+    bool,
+    i32,
+    i32,
+);
 
 /// The control connection after a drain.
 enum Link {
@@ -184,6 +202,16 @@ fn drain(
                 }
             }
             Handled::KeyboardAidToggled { aid, enabled } => out.aid_switches.push((aid, enabled)),
+            Handled::DwellClickType(click) => out.dwell_click = Some(click),
+            Handled::PointerTimeout {
+                kind,
+                duration_ms,
+                clicked,
+                x,
+                y,
+            } => out
+                .pointer_timeouts
+                .push((kind, duration_ms, clicked, x, y)),
             Handled::WorkspacePopup { index, count } => out.popups.push((index, count)),
             Handled::Accelerator { action, time, mode } => {
                 out.accelerators.push((action, time, mode));
@@ -1030,6 +1058,41 @@ fn quick_settings_popover(
     });
     let bluetooth = qs_menu_tile("bluetooth-active-symbolic", "Bluetooth", None, &bt_menu_ui);
     bt_menu.set_tile(bluetooth.clone());
+    // Printers (#362 P-ST-10): the live CUPS queue. The tile's
+    // subtitle tracks the print service; its menu lists one compact
+    // row per printer, refreshed whenever the menu opens. A row, Print
+    // Settings or the toggle opens the queue window with the full
+    // panel; printers have no on/off, so the toggle is momentary.
+    let printers_menu_ui = QsMenu::new("printer-symbolic", "Printers");
+    let printers_menu = printers::PrintersMenu::new(printers_menu_ui.list());
+    printers_menu_ui.separator();
+    let (print_settings, _) = printers_menu_ui.item(None, "Print Settings");
+    print_settings.connect_clicked({
+        let menu = printers_menu.clone();
+        move |_| menu.open_window()
+    });
+    let printers_tile = qs_menu_tile("printer-symbolic", "Printers", None, &printers_menu_ui);
+    printers_menu.set_tile(printers_tile.clone());
+    printers_menu.set_on_open({
+        let popover = popover.clone();
+        move || popover.popdown()
+    });
+    {
+        let menu = printers_menu.clone();
+        printers_menu_ui.revealer.connect_visible_notify(move |r| {
+            if r.is_visible() {
+                menu.refresh();
+            }
+        });
+    }
+    printers_tile.on_user_toggle({
+        let menu = printers_menu.clone();
+        move |on| {
+            if on {
+                menu.open_window();
+            }
+        }
+    });
     let power_menu_ui = QsMenu::new("power-profile-balanced-symbolic", "Power Mode");
     let power_items: Vec<(&'static str, gtk::Button, gtk::Image)> = [
         ("performance", "Performance"),
@@ -1060,6 +1123,7 @@ fn quick_settings_popover(
     grid.add(&wifi, Some(&wifi_menu_ui));
     grid.add(&wired, Some(&wired_menu_ui));
     grid.add(&bluetooth, Some(&bt_menu_ui));
+    grid.add(&printers_tile, Some(&printers_menu_ui));
     grid.add(&power_mode, Some(&power_menu_ui));
     for tile in [&night, &dark, &dnd_tile] {
         grid.add(tile, None);
@@ -1127,6 +1191,24 @@ fn quick_settings_popover(
     ] {
         let popover = popover.clone();
         settings.connect_clicked(move |_| popover.popdown());
+    }
+    // The printers menu dims and resets like the other toggle menus;
+    // kept as its own block so the printers wiring stays additive.
+    {
+        let popover = popover.clone();
+        printers_menu_ui
+            .revealer
+            .connect_visible_notify(move |menu| {
+                if menu.is_visible() {
+                    popover.add_css_class("dimmed");
+                } else {
+                    popover.remove_css_class("dimmed");
+                }
+            });
+    }
+    {
+        let menu = printers_menu_ui.revealer.clone();
+        popover.connect_closed(move |_| menu.set_visible(false));
     }
     let dnd = dnd_tile.button.clone();
 
@@ -1567,6 +1649,16 @@ fn build(app: &adw::Application) {
     // whenever it lands (G-PANEL-FOCUS).
     let panel_held: Rc<Cell<bool>> = Rc::default();
     let panel_escape_guard: Rc<Cell<panel_focus::EscapeGuard>> = Rc::default();
+    // GNOME's hover-click chooser (dwellClick.js), before the system
+    // indicators.
+    let dwell_chooser = {
+        let shell = shell.clone();
+        pointer_a11y::DwellChooser::new(Rc::new(move |click| {
+            if let Some(control) = shell.borrow_mut().control.as_mut() {
+                let _ = control.set_dwell_click_type(click);
+            }
+        }))
+    };
     let bar = gtk::CenterBox::new();
     bar.set_start_widget(Some(&activities));
     bar.set_center_widget(Some(&clock));
@@ -1647,6 +1739,7 @@ fn build(app: &adw::Application) {
             on_tray_escape.clone(),
         )
     };
+    end.append(&dwell_chooser.button);
     end.append(&tray_box);
     end.append(&input);
     end.append(&a11y);
@@ -2638,6 +2731,7 @@ fn build(app: &adw::Application) {
             "org.gnome.desktop.sound",
             "org.gnome.mutter",
             kbd_a11y::SCHEMA,
+            pointer_a11y::SCHEMA,
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -2730,6 +2824,7 @@ fn build(app: &adw::Application) {
                     out.bell.theme = sound.string("theme-name").to_string();
                 }
                 out.keyboard_aids = kbd_a11y::read(all[9].as_ref());
+                out.pointer_aids = pointer_a11y::read(all[10].as_ref());
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }
@@ -2846,6 +2941,7 @@ fn build(app: &adw::Application) {
         )
     };
     let kbd_a11y_dialog = kbd_a11y::KbdA11yDialog::new(app.upcast_ref());
+    let pie_timer = pointer_a11y::PieTimer::new(app.upcast_ref());
     // Compositor state: the control socket is drained whenever it is
     // readable, then mirrored into the views. Nothing runs while the
     // session idles: the views re-sync after the compositor said
@@ -2909,6 +3005,8 @@ fn build(app: &adw::Application) {
                     consent,
                     popups,
                     aid_switches,
+                    dwell_click,
+                    pointer_timeouts,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -2966,6 +3064,12 @@ fn build(app: &adw::Application) {
                 }
                 for (aid, enabled) in aid_switches {
                     kbd_a11y_dialog.switched(aid, enabled, locked);
+                }
+                if let Some(click) = dwell_click {
+                    dwell_chooser.set_click_type(click);
+                }
+                for (kind, duration_ms, clicked, x, y) in pointer_timeouts {
+                    pointer_a11y::on_timeout(&pie_timer, kind, duration_ms, clicked, x, y);
                 }
                 if locked {
                     kbd_a11y_dialog.dismiss();

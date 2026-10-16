@@ -11,9 +11,9 @@
 //! theme has a cursor a built-in arrow, drawn at the requested size,
 //! stands in, so the pointer never disappears.
 //!
-//! The hot-corner ripples of #513 are not on main yet; the ripple drawn
-//! here is a small self-contained one and should move onto that shared
-//! rendering once it lands.
+//! The ring timing ([`RIPPLES`], [`ripple_ring`]) is shared with the
+//! hot-corner ripples (`crate::transitions`), which draw GNOME's
+//! quarter-disc `.ripple-box` instead of this accent disc.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -1102,7 +1102,8 @@ pub fn ripple_ring(ring: usize, elapsed_ms: f64) -> Option<(f64, f64)> {
     Some((scale, opacity))
 }
 
-fn ripples_end_ms() -> f64 {
+/// When the last ring ends.
+pub(crate) fn ripples_end_ms() -> f64 {
     RIPPLES
         .iter()
         .map(|(delay, duration, ..)| delay + duration)

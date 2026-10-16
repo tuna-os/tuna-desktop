@@ -93,6 +93,7 @@ pub mod pam_conversation;
 pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;
+pub mod pointer_aids;
 pub mod popup;
 pub mod protocols;
 pub mod runtime;
@@ -112,6 +113,7 @@ pub mod spring;
 pub mod state;
 pub mod supervise;
 mod transient_family;
+pub mod transitions;
 pub mod unlock;
 mod wake;
 pub mod wallpaper;

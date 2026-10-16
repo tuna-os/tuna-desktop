@@ -69,6 +69,14 @@ DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
 # stable prefix so startup is still recognized (run 38102898073 r04).
 SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings:")
 EXHAUSTED = "shell supervision: BudgetExhausted"
+# Startup watchdog (the llvmpipe startup hang of run 38890516197): when
+# the keybindings line is still missing SHELL_STACK_AFTER seconds after the
+# shell's first output, or SHELL_STACK_UNPRINTED seconds after the DRM
+# output line while the shell has printed nothing, the guest dumps every
+# shell thread's kernel wait site and user stack into the lane artifacts.
+SHELL_OUTPUT_RE = re.compile(r"tuna-shell-gtk: ")
+SHELL_STACK_AFTER = (20, 60)
+SHELL_STACK_UNPRINTED = 40
 # tuna-vm-health activation probes on the session user's bus; the capture
 # pair proves tuna-portals.conf routes Screenshot and ScreenCast.
 PORTAL_PROBES = ("calendar", "portal", "portal-gnome", "portal-screenshot", "portal-screencast")
@@ -1550,6 +1558,22 @@ def greeter_list_ok(greeter):
     return True, f"gtkgreet picker lists {sessions} with {GREETER_SESSION_NAME!r} preselected"
 
 
+def dump_shell_stack(agent_path, path):
+    """Write the guest's shell-stack diagnostics (or why there are none) to path."""
+    agent = None
+    try:
+        agent = guest_agent.GuestAgent(agent_path)
+        result = agent.run("shell-stack", timeout=120)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        result = {"error": str(error)}
+    finally:
+        if agent is not None:
+            agent.close()
+    with open(path, "w") as stream:
+        json.dump(result, stream, indent=2)
+    log(f"shell startup watchdog: no keybindings line; stacks in {os.path.basename(path)}")
+
+
 def greetd_login(qmp, agent_path, out, record):
     """Drive the shipped graphical greeter, never an initial/autologin session."""
     agent = None
@@ -1612,6 +1636,53 @@ def greetd_login(qmp, agent_path, out, record):
         agent.close()
 
 
+def grey_share(px, rect, step=6):
+    """Share of sampled pixels in rect (WIDTH x HEIGHT RGB bytes) that are
+    the shell's dark neutral grey; the Marlin wallpaper's dark areas are
+    saturated navy, and windows are light, so neither counts."""
+    x0, y0, x1, y1 = rect
+    total = grey = 0
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            i = (y * WIDTH + x) * 3
+            r, g, b = px[i], px[i + 1], px[i + 2]
+            total += 1
+            grey += max(r, g, b) - min(r, g, b) < 14 and 45 < r + g + b < 225
+    return grey / total if total else 0.0
+
+
+# Calibrated on Marlin VM frames (runs 37937493915, 38878636595 and
+# 38887426688): the overview backdrop fills the bottom-left corner, where
+# the desktop shows wallpaper; window previews keep the centre off-grey,
+# unlike the search and app-grid views. The Alt+Tab popup is a dark grey
+# island whose top and bottom padding span a full row over the windows.
+CORNER, CENTRE = (0, 690, 170, 780), (340, 250, 940, 550)
+
+
+def overview_windows_shown(px):
+    return grey_share(px, CORNER) > 0.85 and grey_share(px, CENTRE) < 0.5
+
+
+def switcher_shown(px):
+    return (grey_share(px, CORNER) < 0.2 and grey_share(px, CENTRE) < 0.6
+            and any(grey_share(px, (380, y, 900, y + 1), step=4) >= 0.9
+                    for y in range(280, 520, 2)))
+
+
+def desktop_shown(px):
+    return grey_share(px, CORNER) < 0.2 and not switcher_shown(px)
+
+
+def ppm_pixels(path):
+    """RGB bytes of a binary WIDTH x HEIGHT PPM, or None while incomplete."""
+    with open(path, "rb") as stream:
+        data = stream.read()
+    header = f"P6\n{WIDTH} {HEIGHT}\n255\n".encode()
+    if not data.startswith(header) or len(data) != len(header) + WIDTH * HEIGHT * 3:
+        return None
+    return data[len(header):]
+
+
 class Recorder:
     """Serialize input and completed screendumps, including their frame indices.
 
@@ -1623,7 +1694,7 @@ class Recorder:
         self.qmp, self.dir = qmp, os.path.join(out, "frames")
         os.makedirs(self.dir, exist_ok=False)
         self.lock, self.stop = threading.RLock(), threading.Event()
-        self.n, self.marks, self.stills = 0, [], {}
+        self.n, self.marks, self.stills, self.unconfirmed = 0, [], {}, []
         self.frames = []
         self.timeout, self.error = timeout, None
         self.original_cmd = qmp.cmd
@@ -1765,6 +1836,47 @@ class Recorder:
         time.sleep(delay)
         self.stills[card] = self._capture(mode="still")
 
+    def view(self):
+        """Pixels on screen now, from an uncompressed probe screendump that
+        is not a tour frame; None until QEMU has written all of it."""
+        probe = os.path.join(os.path.dirname(self.dir), "probe.ppm")
+        self._command("screendump", filename=probe, format="ppm")
+        try:
+            return ppm_pixels(probe)
+        except FileNotFoundError:
+            return None
+
+    def await_view(self, predicate, timeout):
+        """Poll until predicate(pixels) holds. The VM display trails input
+        by 1.5 to 4.5 s under llvmpipe (runs 38878636595, 38887426688), so
+        a fixed wait lands before or after a transient view."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pixels = self.view()
+            if pixels is not None and predicate(pixels):
+                return True
+            time.sleep(0.25)
+        return False
+
+    def await_still(self, card, predicate, timeout, settle=0.5):
+        """Keep this section's still once predicate holds and still holds
+        settle seconds later, so the view has finished animating in. If it
+        never does, keep the current frame and list the card as unconfirmed
+        so nothing presents that still as the view."""
+        deadline = time.monotonic() + timeout
+        confirmed = False
+        while self.await_view(predicate, deadline - time.monotonic()):
+            time.sleep(settle)
+            pixels = self.view()
+            if pixels is not None and predicate(pixels):
+                confirmed = True
+                break
+        if not confirmed:
+            log(f"tour: the {card} view never appeared; its still is unconfirmed")
+            self.unconfirmed.append(card)
+        self.still(card)
+        return confirmed
+
     def close(self):
         self.stop.set()
         if self.thread.ident is not None:
@@ -1873,11 +1985,23 @@ def run_tour(qmp, out, serial_path, older_guest=False):
         rec.mark("alt-tab")
         for query in ("disks", "system monitor", "files"):
             launch(query)
+        # Input and display trail by 1.5 to 4.5 s under llvmpipe, so each
+        # still waits for its view on screen, and the next key waits for
+        # the view to go. Alt stays held while the switcher is awaited.
+        pressed = time.monotonic()
+        keys("alt", "tab", hold_ms=8000)
+        rec.await_still("alt-tab", switcher_shown, timeout=10)
+        wait(max(0.0, 8.5 - (time.monotonic() - pressed)))
+        rec.await_view(desktop_shown, timeout=15)
         keys("alt", "tab", hold_ms=1500)
-        rec.still("alt-tab", delay=1.0)
         wait(3)
-        keys("alt", "tab", hold_ms=1500)
-        wait(3)
+        rec.await_view(desktop_shown, timeout=15)
+        # The overview with the three apps' live previews (README hero).
+        keys("meta_l")
+        rec.await_still("overview-windows", overview_windows_shown, timeout=20)
+        keys("esc")
+        rec.await_view(desktop_shown, timeout=20)
+        wait(1)
         rec.mark("scroll")
         keys("meta_l", "shift", "t")
         wait(3)
@@ -1937,7 +2061,8 @@ def run_tour(qmp, out, serial_path, older_guest=False):
     with open(os.path.join(tour, "capture-timing.json"), "w") as stream:
         json.dump({"schema": 1, "periodic_target_fps": TOUR_FPS,
                    "uniform_capture_intervals": False, "frames": rec.frames,
-                   "stills": rec.stills, "title_marks": rec.marks,
+                   "stills": rec.stills, "unconfirmed_stills": rec.unconfirmed,
+                   "title_marks": rec.marks,
                    "lane_source_sha256": baseline.sha256(__file__),
                    "card_source_sha256": baseline.sha256(os.path.join(CARDS, "render.py")),
                    "card_sha256": {name: baseline.sha256(os.path.join(cards_dir, name + ".png"))
@@ -2251,10 +2376,20 @@ def main():
                 record("V-GREETD-LOGIN", False, str(error))
                 login_ok = False
         n = 0
+        drm_at = output_at = None
+        stacks = 0
         while login_ok and time.time() - start < a.timeout and vm.poll() is None:
             text = read_text(serial_path)
             drm = drm or DRM_RE.search(text)
             shell = shell or SHELL_RE.search(text)
+            now = time.time()
+            drm_at = drm_at or (now if drm else None)
+            output_at = output_at or (now if SHELL_OUTPUT_RE.search(text) else None)
+            armed_at = output_at or (drm_at + SHELL_STACK_UNPRINTED - SHELL_STACK_AFTER[0] if drm_at else None)
+            if (not shell and armed_at is not None and stacks < len(SHELL_STACK_AFTER)
+                    and time.time() - armed_at >= SHELL_STACK_AFTER[stacks]):
+                stacks += 1
+                dump_shell_stack(agent_path, os.path.join(out, f"shell-startup-stack-{stacks}.json"))
             if n % 3 == 0:
                 qmp.frame(os.path.join(out, f"boot-{n // 3:03d}.png"))
             n += 1

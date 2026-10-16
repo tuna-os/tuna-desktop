@@ -1,0 +1,345 @@
+=== cargo test -p tuna-shell-gtk --bin tuna-shell-gtk printers:: ===
+   Compiling libc v0.2.190
+   Compiling bitflags v2.13.2
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-core v0.3.34
+   Compiling smallvec v1.16.2
+   Compiling slab v0.4.12
+   Compiling crossbeam-utils v0.8.23
+   Compiling futures-io v0.3.34
+   Compiling glib-sys v0.22.9
+   Compiling num-traits v0.2.19
+   Compiling gobject-sys v0.22.9
+   Compiling gio-sys v0.22.9
+   Compiling futures-task v0.3.34
+   Compiling futures-util v0.3.34
+   Compiling pango-sys v0.22.9
+   Compiling cairo-sys-rs v0.22.9
+   Compiling gdk-pixbuf-sys v0.22.9
+   Compiling futures-channel v0.3.34
+   Compiling parking v2.2.1
+   Compiling arrayvec v0.7.8
+   Compiling linux-raw-sys v0.12.1
+   Compiling futures-executor v0.3.34
+   Compiling glib v0.22.10
+   Compiling rustix v1.1.5
+   Compiling simd-adler32 v0.3.10
+   Compiling bytemuck v1.25.2
+   Compiling graphene-sys v0.22.9
+   Compiling gdk4-sys v0.11.5
+   Compiling log v0.4.34
+   Compiling crossbeam-epoch v0.9.21
+   Compiling adler2 v2.0.1
+   Compiling fastrand v2.5.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling thiserror v2.0.21
+   Compiling crossbeam-deque v0.8.8
+   Compiling gsk4-sys v0.11.5
+   Compiling equator v0.4.2
+   Compiling rayon-core v1.13.0
+   Compiling gio v0.22.10
+   Compiling portable-atomic v1.15.0
+   Compiling event-listener v5.4.2
+   Compiling num-integer v0.1.47
+   Compiling concurrent-queue v2.5.0
+   Compiling either v1.18.0
+   Compiling zerocopy v0.8.59
+   Compiling num-bigint v0.4.8
+   Compiling event-listener-strategy v0.5.4
+   Compiling once_cell v1.21.4
+   Compiling aligned-vec v0.6.4
+   Compiling proc-macro2 v1.0.107
+   Compiling crc32fast v1.5.2
+   Compiling gtk4-sys v0.11.5
+   Compiling futures-lite v2.6.1
+   Compiling miniz_oxide v0.9.1
+   Compiling aho-corasick v1.1.5
+   Compiling regex-syntax v0.8.11
+   Compiling regex-automata v0.4.18
+   Compiling pango v0.22.9
+   Compiling gdk-pixbuf v0.22.0
+   Compiling flate2 v1.1.10
+   Compiling quote v1.0.47
+   Compiling v_frame v0.3.9
+   Compiling num-rational v0.4.2
+   Compiling wayland-sys v0.31.11
+   Compiling anyhow v1.0.104
+   Compiling rayon v1.12.0
+   Compiling cairo-rs v0.22.9
+   Compiling as-slice v0.2.1
+   Compiling miniz_oxide v0.8.9
+   Compiling quick-error v2.0.1
+   Compiling downcast-rs v1.2.1
+   Compiling float-cmp v0.9.0
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling strict-num v0.1.1
+   Compiling wayland-backend v0.3.17
+   Compiling aligned v0.4.3
+   Compiling gdk4 v0.11.5
+   Compiling syn v3.0.6
+   Compiling memoffset v0.9.1
+   Compiling graphene-rs v0.22.8
+   Compiling fdeflate v0.3.7
+   Compiling polling v3.11.0
+   Compiling polycool v0.4.0
+   Compiling errno v0.3.14
+   Compiling nom v8.0.0
+   Compiling no_std_io2 v0.9.4
+   Compiling arrayref v0.3.9
+   Compiling byteorder v1.5.0
+   Compiling async-task v4.7.1
+   Compiling y4m v0.8.0
+   Compiling weezl v0.1.12
+   Compiling zune-core v0.5.3
+   Compiling zune-jpeg v0.5.15
+   Compiling av-scenechange v0.14.1
+   Compiling hash32 v0.2.1
+   Compiling av1-grain v0.2.5
+   Compiling tiny-skia-path v0.12.0
+   Compiling bitstream-io v4.10.0
+   Compiling profiling v1.0.18
+   Compiling signal-hook-registry v1.4.8
+   Compiling kurbo v0.13.1
+   Compiling png v0.18.1
+   Compiling async-io v2.6.0
+   Compiling gsk4 v0.11.5
+   Compiling field-offset v0.3.6
+   Compiling zvariant_utils v4.2.0
+   Compiling wayland-client v0.31.15
+   Compiling libm v0.2.16
+   Compiling spin v0.9.9
+   Compiling maybe-rayon v0.1.1
+   Compiling regex v1.13.1
+   Compiling async-channel v2.5.0
+   Compiling half v2.7.1
+   Compiling itertools v0.14.0
+   Compiling num-complex v0.4.6
+   Compiling rgb v0.8.53
+   Compiling raw-cpuid v11.6.0
+   Compiling color_quant v1.1.0
+   Compiling reborrow v0.5.5
+   Compiling siphasher v1.0.4
+   Compiling atomic-waker v1.1.2
+   Compiling imgref v1.12.3
+   Compiling byteorder-lite v0.1.0
+   Compiling lazy_static v1.5.0
+   Compiling new_debug_unreachable v1.0.6
+   Compiling pulp-wasm-simd-flag v0.1.1
+   Compiling rav1e v0.8.1
+   Compiling pulp v0.22.3
+   Compiling locale_config v0.3.0
+   Compiling image-webp v0.2.4
+   Compiling loop9 v0.1.5
+   Compiling piper v0.2.5
+   Compiling svgtypes v0.16.1
+   Compiling gif v0.14.2
+   Compiling gtk4 v0.11.5
+   Compiling gettext-sys v0.27.0
+   Compiling heapless v0.7.17
+   Compiling wayland-protocols v0.32.13
+   Compiling zvariant v5.15.0
+   Compiling async-signal v0.2.14
+   Compiling const-random v0.1.18
+   Compiling getrandom v0.3.4
+   Compiling tracing-core v0.1.36
+   Compiling async-lock v3.4.2
+   Compiling cobs v0.3.0
+   Compiling simplecss v0.2.2
+   Compiling zune-inflate v0.2.54
+   Compiling avif-serialize v0.8.9
+   Compiling roxmltree v0.21.1
+   Compiling fax v0.2.7
+   Compiling static_assertions v1.1.0
+   Compiling getrandom v0.4.3
+   Compiling pxfm v0.1.30
+   Compiling lebe v0.5.3
+   Compiling bit_field v0.10.3
+   Compiling data-url v0.3.2
+   Compiling imagesize v0.15.0
+   Compiling pico-args v0.5.0
+   Compiling usvg v0.48.1
+   Compiling exr v1.74.2
+   Compiling moxcms v0.8.1
+   Compiling smartstring v1.0.1
+   Compiling tiff v0.11.3
+   Compiling tracing v0.1.44
+   Compiling ravif v0.13.0
+   Compiling postcard v1.1.3
+   Compiling async-process v2.5.0
+   Compiling ahash v0.8.12
+   Compiling zbus_names v4.3.4
+   Compiling gettext-rs v0.8.0
+   Compiling zmij v1.0.23
+   Compiling blocking v1.7.0
+   Compiling tiny-skia v0.12.0
+   Compiling async-executor v1.14.0
+   Compiling bstr v1.13.1
+   Compiling async-broadcast v0.7.2
+   Compiling qoi v0.4.1
+   Compiling memmap2 v0.9.11
+   Compiling uuid v1.26.1
+   Compiling ordered-stream v0.2.0
+   Compiling xdg v3.0.0
+   Compiling jiff-core v0.1.1
+   Compiling thin-vec v0.2.20
+   Compiling itoa v1.0.18
+   Compiling hex v0.4.3
+   Compiling unicase v2.9.0
+   Compiling xkeysym v0.2.1
+   Compiling jiff v0.2.38
+   Compiling xkbcommon v0.9.0
+   Compiling freedesktop-desktop-entry v0.8.3
+   Compiling zbus v5.19.0
+   Compiling serde_json v1.0.151
+   Compiling rhai v1.26.1
+   Compiling image v0.25.10
+   Compiling resvg v0.48.1
+   Compiling libadwaita-sys v0.9.2
+   Compiling gtk4-session-lock-sys v0.4.1
+   Compiling gtk4-layer-shell-sys v0.6.1
+   Compiling tuna-shell-control v0.1.0 (/tmp/tuna-v1-muse-w2-362-print/crates/shell-control-schema)
+   Compiling wayland-protocols-wlr v0.3.12
+   Compiling wayland-protocols-misc v0.3.12
+   Compiling tuna-shell-host v0.1.0 (/tmp/tuna-v1-muse-w2-362-print/crates/shell-host)
+   Compiling tempfile v3.27.0
+   Compiling gtk4-layer-shell v0.8.1
+   Compiling gtk4-session-lock v0.4.1
+   Compiling libadwaita v0.9.2
+   Compiling tuna-shell-gtk v0.1.0 (/tmp/tuna-v1-muse-w2-362-print/crates/shell-gtk)
+    Finished `test` profile [unoptimized] target(s) in 18m 13s
+     Running unittests src/main.rs (target/debug/deps/tuna_shell_gtk-c488ce85effe2904)
+
+running 28 tests
+test printers::tests::additional_values_accumulate ... ok
+test printers::tests::banner_only_when_stopped_or_refusing ... ok
+test printers::tests::client_lists_printers_over_http ... FAILED
+test printers::tests::client_lists_jobs_and_cancels ... FAILED
+test printers::tests::client_reports_no_print_service ... ok
+test printers::tests::client_submits_document_after_encoding ... FAILED
+test printers::tests::client_maps_http_auth_and_ipp_status ... ok
+test printers::tests::collection_decodes_members ... ok
+test printers::tests::endpoints_default_and_server ... ok
+test printers::tests::head_parses_status_and_length ... ok
+test printers::tests::head_without_status_errors ... ok
+test printers::tests::job_maps_and_detects_auth_hold ... ok
+test printers::tests::language_text_decodes_to_text_part ... ok
+test printers::tests::markers_absent_means_no_ink_row ... ok
+test printers::tests::post_shape ... ok
+test printers::tests::printer_maps_and_summarizes ... ok
+test printers::tests::printer_name_rule ... ok
+test printers::tests::read_response_reads_exact_body ... ok
+test printers::tests::read_response_skips_interim ... ok
+test printers::tests::reason_severity_order ... ok
+test printers::tests::request_header_layout ... ok
+test printers::tests::request_round_trips ... ok
+test printers::tests::state_labels_match_panel ... ok
+test printers::tests::testprint_search_order ... ok
+test printers::tests::truncated_message_errors ... ok
+test printers::tests::uri_escape_and_lpoptions ... ok
+test printers::tests::user_and_language_fallbacks ... ok
+test printers::tests::server_default_reads_printer_name ... FAILED
+
+failures:
+
+---- printers::tests::client_lists_printers_over_http stdout ----
+
+thread 'printers::tests::client_lists_printers_over_http' (2639326) panicked at crates/shell-gtk/src/printers.rs:2516:29:
+index out of bounds: the len is 107 but the index is 109
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- printers::tests::client_lists_jobs_and_cancels stdout ----
+
+thread 'printers::tests::client_lists_jobs_and_cancels' (2639325) panicked at crates/shell-gtk/src/printers.rs:2516:29:
+index out of bounds: the len is 107 but the index is 109
+
+---- printers::tests::client_submits_document_after_encoding stdout ----
+
+thread 'printers::tests::client_submits_document_after_encoding' (2639332) panicked at crates/shell-gtk/src/printers.rs:2516:29:
+index out of bounds: the len is 107 but the index is 109
+
+---- printers::tests::server_default_reads_printer_name stdout ----
+
+thread 'printers::tests::server_default_reads_printer_name' (2639350) panicked at crates/shell-gtk/src/printers.rs:2516:29:
+index out of bounds: the len is 107 but the index is 109
+
+
+failures:
+    printers::tests::client_lists_jobs_and_cancels
+    printers::tests::client_lists_printers_over_http
+    printers::tests::client_submits_document_after_encoding
+    printers::tests::server_default_reads_printer_name
+
+test result: FAILED. 24 passed; 4 failed; 0 ignored; 0 measured; 128 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p tuna-shell-gtk --bin tuna-shell-gtk`
+exit=101
+=== rerun: cargo test -p tuna-shell-gtk --bin tuna-shell-gtk printers:: ===
+   Compiling tuna-shell-gtk v0.1.0 (/tmp/tuna-v1-muse-w2-362-print/crates/shell-gtk)
+    Finished `test` profile [unoptimized] target(s) in 1m 15s
+     Running unittests src/main.rs (target/debug/deps/tuna_shell_gtk-c488ce85effe2904)
+
+running 28 tests
+test printers::tests::banner_only_when_stopped_or_refusing ... ok
+test printers::tests::additional_values_accumulate ... ok
+test printers::tests::client_lists_printers_over_http ... ok
+test printers::tests::client_lists_jobs_and_cancels ... ok
+test printers::tests::client_reports_no_print_service ... ok
+test printers::tests::client_maps_http_auth_and_ipp_status ... ok
+test printers::tests::collection_decodes_members ... ok
+test printers::tests::endpoints_default_and_server ... ok
+test printers::tests::head_parses_status_and_length ... ok
+test printers::tests::head_without_status_errors ... ok
+test printers::tests::job_maps_and_detects_auth_hold ... ok
+test printers::tests::language_text_decodes_to_text_part ... ok
+test printers::tests::markers_absent_means_no_ink_row ... ok
+test printers::tests::post_shape ... ok
+test printers::tests::printer_maps_and_summarizes ... ok
+test printers::tests::client_submits_document_after_encoding ... ok
+test printers::tests::printer_name_rule ... ok
+test printers::tests::read_response_reads_exact_body ... ok
+test printers::tests::read_response_skips_interim ... ok
+test printers::tests::reason_severity_order ... ok
+test printers::tests::request_header_layout ... ok
+test printers::tests::request_round_trips ... ok
+test printers::tests::state_labels_match_panel ... ok
+test printers::tests::testprint_search_order ... ok
+test printers::tests::truncated_message_errors ... ok
+test printers::tests::uri_escape_and_lpoptions ... ok
+test printers::tests::user_and_language_fallbacks ... ok
+test printers::tests::server_default_reads_printer_name ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 128 filtered out; finished in 0.04s
+
+exit=0
+=== cargo test -p tuna-shell-gtk --bin tuna-shell-gtk (full) ===
+test ws_dots::tests::settled_dots_match_gnome_sizes ... ok
+test ws_dots::tests::the_pill_moves_between_dots_over_250_ms ... ok
+test ws_dots::tests::without_animations_everything_lands_at_once ... ok
+test ws_popup::tests::the_pill_fades_over_100_ms_ease_out_quad ... ok
+test ws_popup::tests::the_pill_grows_32px_and_12px_a_workspace ... ok
+
+test result: ok. 154 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+=== clippy ===
+1404 |     accepting_jobs: bool,
+1405 ~     status: Option<&str>,
+1406 ~ ) -> Option<&str> {
+     |
+
+error: could not compile `tuna-shell-gtk` (bin "tuna-shell-gtk") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `tuna-shell-gtk` (bin "tuna-shell-gtk" test) due to 2 previous errors
+exit=0
+=== clippy rerun ===
+   Compiling tuna-shell-gtk v0.1.0 (/tmp/tuna-v1-muse-w2-362-print/crates/shell-gtk)
+    Finished `dev` profile [unoptimized] target(s) in 27.34s
+=== focused tests rerun ===
+test printers::tests::server_default_reads_printer_name ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 128 filtered out; finished in 0.03s
+
+=== post-fmt rerun: printers:: ===
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 128 filtered out; finished in 0.02s
+
