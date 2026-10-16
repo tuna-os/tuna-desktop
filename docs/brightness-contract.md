@@ -37,6 +37,11 @@ user-bias formula. Disabling either policy restores the user baseline after
 exact actual readback. Policy changes do not emit a user-update signal.
 External hardware changes cancel dimming before subsequent policy derivation.
 
+The installed session requires GNOME Settings Daemon's power schemas for
+`idle-brightness` and policy updates (`gnome-settings-daemon-common` on Debian,
+`gnome-settings-daemon` on Arch). These are runtime package dependencies; the
+controlled proof uses the same installed schema rather than a private substitute.
+
 Each hardware transaction uses asynchronous logind calls with a two-second
 call bound and exact device, range, output-membership and post-call readback
 checks. Partial writes and refusals return failure; requested percentages are
