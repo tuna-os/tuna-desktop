@@ -68,9 +68,11 @@ impl Controller {
                 );
             }
         }
-        // Newly associated devices must obey an already-active policy too.
-        let held = self.model.borrow().policy;
-        if available && changed && (held.dimming || held.auto >= 0.0) {
+        // Reconcile devices whenever availability or device state changed.
+        // The current!=target filter below avoids redundant writes; when
+        // an external change on one output cancels global dimming, remaining
+        // outputs (which still reflect the dimmed value) are restored here.
+        if available && changed {
             let targets = self.model.borrow().targets();
             if let Ok(targets) = targets {
                 let pending: Vec<_> = targets

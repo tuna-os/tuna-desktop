@@ -7750,14 +7750,20 @@ echo 1000 >"$ARTIFACTS/backlight/aaa-other/max_brightness"
 echo 700 >"$ARTIFACTS/backlight/aaa-other/brightness"
 echo 1010 >"$BACKLIGHT/max_brightness"
 echo raw >"$BACKLIGHT/type"
-"$PY" - "$ARTIFACTS/devices/card0-tuna-0" "$TUNA_BACKLIGHT_TEST_CONNECTORS" <<'PYFIXTURE'
+echo platform >"$ARTIFACTS/backlight/aaa-other/type"
+"$PY" - "$ARTIFACTS/devices/card0-tuna-0" "$ARTIFACTS/devices/card0-other" "$TUNA_BACKLIGHT_TEST_CONNECTORS" <<'PYFIXTURE'
 import json,os,pathlib,sys
-path=pathlib.Path(sys.argv[1]).resolve()
-for name,value in [('connector_id','1'),('status','connected'),('enabled','enabled')]:
-    (path/name).write_text(value+'\n')
-metadata=path.stat()
-pathlib.Path(sys.argv[2]).write_text(json.dumps([dict(name='tuna-0',drm_device=0,connector_id=1,
-    connector_sysfs=str(path),connector_device=metadata.st_dev,connector_inode=metadata.st_ino)]))
+path0=pathlib.Path(sys.argv[1]).resolve()
+path1=pathlib.Path(sys.argv[2]).resolve()
+for path,cid in [(path0,'1'),(path1,'2')]:
+    for name,value in [('connector_id',cid),('status','connected'),('enabled','enabled')]:
+        (path/name).write_text(value+'\n')
+m0=path0.stat()
+m1=path1.stat()
+pathlib.Path(sys.argv[3]).write_text(json.dumps([
+    dict(name='tuna-0',drm_device=0,connector_id=1,connector_sysfs=str(path0),connector_device=m0.st_dev,connector_inode=m0.st_ino),
+    dict(name='other-0',drm_device=0,connector_id=2,connector_sysfs=str(path1),connector_device=m1.st_dev,connector_inode=m1.st_ino),
+]))
 PYFIXTURE
 echo 510 >"$BACKLIGHT/brightness"
 # The per-monitor actions stay on their GNOME defaults
@@ -7803,7 +7809,7 @@ end=$(($(date +%s) + 10))
 until [ "$(cat "$BACKLIGHT/brightness")" = 510 ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
 [ "$(cat "$BACKLIGHT/brightness")" = 510 ] || fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing"
 "$PY" "$ROOT/scripts/lib/gnome-brightness-proof.py" --out "$ARTIFACTS/brightness-controlled.json" \
-    --controlled-root "$ARTIFACTS/backlight" --device tuna-bl \
+    --controlled-root "$ARTIFACTS/backlight" --device tuna-bl --other-device aaa-other \
     --shell-executable "$privacy_expected_shell" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||
     fail G-BRIGHTNESS-CONTRACT "controlled policy/readback contract rejected; see retained JSON/log"
 pass G-BRIGHTNESS-CONTRACT "actual original shell wire schema and controlled associated dim/restore/auto/reset readbacks; synthetic sysfs/logind only"
