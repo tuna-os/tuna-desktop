@@ -1452,6 +1452,10 @@ impl Runtime {
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
         self.lock.lock();
+        // Pre-lock presses never report repeats or releases across the
+        // lock boundary.
+        self.manager.invalidate_held_accelerators();
+        self.control.cancel_pending_accelerators();
         self.cursor.on_lock();
         self.control.set_locked(true);
         let remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
@@ -1806,6 +1810,10 @@ impl Runtime {
             for (action, time, mode) in self.manager.take_accelerators_fired() {
                 self.control.queue_accelerator(action, time, mode);
             }
+            for (action, time, mode) in self.manager.take_accelerators_released() {
+                self.control
+                    .queue_accelerator_deactivated(action, time, mode);
+            }
             return;
         }
         if waking_blank {
@@ -1954,6 +1962,10 @@ impl Runtime {
             }
             for (action, time, mode) in self.manager.take_accelerators_fired() {
                 self.control.queue_accelerator(action, time, mode);
+            }
+            for (action, time, mode) in self.manager.take_accelerators_released() {
+                self.control
+                    .queue_accelerator_deactivated(action, time, mode);
             }
             for (index, count) in self.manager.take_workspace_popups() {
                 self.control
@@ -4230,7 +4242,7 @@ impl Runtime {
                 });
         }
         if let Some(list) = outcome.accelerators {
-            self.manager.set_accelerators(list);
+            self.manager.set_accelerator_grabs(list);
             self.manager.trace_media_accelerators(self.is_locked());
         }
         for (window, action) in outcome.window_actions {
