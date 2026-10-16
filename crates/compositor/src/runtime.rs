@@ -761,6 +761,10 @@ pub struct Runtime {
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
+    /// Screen magnifier (#349): Settings file cache plus each
+    /// output's tracking state. Captures and casts apply it; the
+    /// lock screen never magnifies.
+    magnifier: crate::magnifier::MagnifierState,
     exit: bool,
     stats: RunStats,
     /// `TUNA_COMPOSITOR_STATE` snapshot path (journeys only).
@@ -1271,6 +1275,7 @@ impl Runtime {
             unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idle_monitor: crate::idle_monitor::start(),
+            magnifier: crate::magnifier::MagnifierState::new(),
             exit: false,
             stats: RunStats::default(),
             state_path: std::env::var_os("TUNA_COMPOSITOR_STATE")
@@ -3089,7 +3094,10 @@ impl Runtime {
 
     /// Render one output's current scene (the primary, or `connector`)
     /// offscreen and read it back in `fourcc` byte order (Abgr8888 is
-    /// RGBA in memory, Xrgb8888 is BGRx). Never while locked.
+    /// RGBA in memory, Xrgb8888 is BGRx). Never while locked. When the
+    /// screen magnifier is on (#349), the read-back frame carries the
+    /// magnified view, so screenshots and casts show actual zoomed
+    /// pixels; the lock screen itself never magnifies.
     fn render_pixels(
         &mut self,
         connector: Option<&str>,
@@ -3123,14 +3131,14 @@ impl Runtime {
         let desktop = self.background_desktop();
         let bell = self.bell_frame();
         let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
-        let (renderer, size, view) = match &mut self.backend {
+        let (renderer, size, view, output_name) = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = backend.window_size();
                 let view = View {
                     offset: (0, 0),
                     scale: self.scale,
                 };
-                (backend.renderer(), size, view)
+                (backend.renderer(), size, view, "tuna-0".to_owned())
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
@@ -3145,7 +3153,7 @@ impl Runtime {
                     offset: out.loc,
                     scale: out.scale,
                 };
-                (renderer, out.size, view)
+                (renderer, out.size, view, out.name.clone())
             }
         };
         let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
@@ -3223,7 +3231,54 @@ impl Runtime {
             .copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)
             .ok()?;
         let bytes = renderer.map_texture(&mapping).ok()?.to_vec();
+        let bytes = self.apply_magnifier(&output_name, size.w, size.h, view, bytes);
         Some((size.w, size.h, bytes))
+    }
+
+    /// Magnify a read-back frame when the screen magnifier is on
+    /// (#349): pointer, caret and focus positions feed the per-output
+    /// tracking state, and the region of interest rescales onto the
+    /// viewport. Disabled (or unity) passes the frame through
+    /// untouched; a malformed view keeps the original bytes rather
+    /// than failing the capture.
+    fn apply_magnifier(
+        &mut self,
+        output: &str,
+        w: i32,
+        h: i32,
+        view: View,
+        bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        let pointer = self.manager.pointer_pos();
+        let caret = self.state.ime_cursor_rect().map(|rect| {
+            (
+                f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+                f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+            )
+        });
+        let focus = self
+            .manager
+            .model()
+            .focused()
+            .and_then(|id| self.manager.geometry(id))
+            .map(|rect| {
+                (
+                    f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+                    f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+                )
+            });
+        let inputs = crate::magnifier::TrackingInputs {
+            pointer: (pointer.x, pointer.y),
+            caret,
+            focus,
+        };
+        let Some(active) = self
+            .magnifier
+            .view_for(output, w, h, view.scale, view.offset, inputs)
+        else {
+            return bytes;
+        };
+        crate::magnifier::magnify_frame(&bytes, w, h, active).unwrap_or(bytes)
     }
 
     /// Screen-cast work for this tick (#61): start and stop casts the
