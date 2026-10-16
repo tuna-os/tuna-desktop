@@ -41,7 +41,7 @@ GNOME: 136 visible nodes; 9 named controls. Tuna Desktop: 15 named nodes in the 
 
 ## quick-settings
 
-GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 27 named nodes in the proof golden.
+GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 29 named nodes in the proof golden.
 
 | GNOME named control | Tuna Desktop named node |
 | --- | --- |
@@ -67,6 +67,8 @@ GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 27 named nodes in the p
 | — | toggle button: Bluetooth Menu |
 | — | toggle button: Printers |
 | — | toggle button: Printers Menu |
+| — | toggle button: Mobile Network |
+| — | toggle button: Mobile Network Menu |
 | — | toggle button: Power Mode |
 | — | toggle button: Power Mode Menu |
 | — | toggle button: Night Light |
