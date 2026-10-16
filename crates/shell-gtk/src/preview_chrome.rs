@@ -282,8 +282,8 @@ mod tests {
 
     #[test]
     fn bounds_include_shadow_bleed_without_rounding_widget_positions() {
-        let bounds = chrome_bounds([(200.5, 400.2, 64, 64), (100.0, 500.2, 300, 32)].into_iter())
-            .unwrap();
+        let bounds =
+            chrome_bounds([(200.5, 400.2, 64, 64), (100.0, 500.2, 300, 32)].into_iter()).unwrap();
         assert_eq!((bounds.x(), bounds.y()), (88, 388));
         assert_eq!((bounds.width(), bounds.height()), (324, 157));
         // Translating to the layer and back preserves the original subpixel position.
