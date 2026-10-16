@@ -967,10 +967,6 @@
     },
     {
       "schema": "org.gnome.desktop.peripherals.touchscreen",
-      "key": "orientation-lock"
-    },
-    {
-      "schema": "org.gnome.desktop.peripherals.touchscreen",
       "key": "output"
     },
     {

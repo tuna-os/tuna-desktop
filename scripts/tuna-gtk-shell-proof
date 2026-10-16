@@ -4,6 +4,8 @@
 # Usage:
 #   scripts/tuna-gtk-shell-proof [--display :N] [--artifacts DIR]
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
+#   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
+#   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
 # Runs the nested compositor with tuna-shell-gtk as its supervised shell
 # on a private session bus with the AT-SPI accessibility bus, then:
@@ -75,8 +77,59 @@
 #   G-SETTINGS-INPUT GNOME's input sources set the keymap (Super+Space
 #                  switches), repeat-interval the repeat rate, and
 #                  enable-hot-corners the hot corner (#60)
+#   G-A11Y-STICKY  Sticky Keys: a tapped Shift latches for one key, two
+#                  taps lock, two modifiers at once switch the aid off (#350)
+#   G-A11Y-SHORTCUTS Shift five times / held eight seconds switch Sticky /
+#                  Slow Keys with GNOME's confirmation; Toggle Keys beep
+#   G-A11Y-SLOW    Slow Keys drop short taps and deliver held keys once
+#   G-A11Y-BOUNCE  Bounce Keys drop a repeat within the delay
+#   G-A11Y-MOUSEKEYS the keypad moves (accelerating) and clicks the pointer
+#   G-CURSOR-SIZE  GNOME's cursor-theme and cursor-size change the
+#                  compositor-drawn cursor live: an inherited Xcursor
+#                  theme's image at 24px, then 48px (#342)
+#   G-CURSOR-SHAPE wp_cursor_shape_v1 requests draw that theme's shape
+#                  (a missing one falls back to Adwaita or the arrow); a client
+#                  cursor surface draws at its own size
+#   G-LOCATE-POINTER with locate-pointer on, a lone Ctrl tap draws GNOME's
+#                  ripples at the pointer; off, it draws nothing
 #   G-SETTINGS-IDLE GNOME's idle-delay and lock-enabled keys set the
 #                  compositor's idle lock live (#63)
+#   G-SET-WALLPAPER GNOME Settings' picture-uri write reaches the
+#                  compositor live: drop file, file identity, decoded
+#                  pixels and a visible repaint, with file-replacement
+#                  refresh, an ignored invalid URI and revert (#594)
+#   G-SET-CLOCK  clock-format and clock-show-date reach the panel
+#                  clock live, an invalid format is rejected or falls
+#                  back without a crash, and revert restores (#594)
+#   G-SET-FONTS  document/monospace fonts reach GTK apps live through
+#                  the apps' own Gio.Settings reads with a visible
+#                  repaint, a bogus family falls back without a crash,
+#                  and revert restores (#594)
+#   G-WELLBEING-HISTORY the shell records GNOME-compatible
+#                  session-active history, deleted while disabled (#354)
+#   G-WELLBEING-LIMIT a spent daily limit posts its notice and
+#                  requests grayscale, live (#354)
+#   G-WELLBEING-BREAK a 10 s break shows the OSD countdown, the due
+#                  notice, and an idle take fades and sounds (#354)
+#   G-WELLBEING-PIXEL-GRAY gray-only framebuffer: 3s EASE_OUT_QUAD to
+#                  full desaturation, immediate disable (#354)
+#   G-WELLBEING-PIXEL-FADE fade-only framebuffer: 3s EASE_OUT_QUAD to
+#                  brightness 0.6, immediate disable (#354)
+#   G-WELLBEING-PIXEL-BOTH combined framebuffer: settled gray plus a
+#                  fade ramp to 1.0/0.6, immediate disable (#354)
+#   G-WELLBEING-PIXEL-RESET reset-to-neutral holds with no restore
+#                  fade across stepped time (#354)
+#   G-WELLBEING-ACTION-TAKE-LOCK an actual Take press locks; stale
+#                  Take fails (#354)
+#   G-WELLBEING-ACTION-TAKE-FADE an actual Take press fades a frame
+#                  to 0.6; stale Take fails (#354)
+#   G-WELLBEING-ACTION-DELAY an actual Delay press moves the live due
+#                  by delay-seconds; stale Delay fails (#354)
+#   G-WELLBEING-ACTION-SKIP an actual Skip press on the upcoming
+#                  notice retires it with the due schedule left
+#                  undisturbed; stale Skip fails (#354)
+#   G-WELLBEING-NEGATIVE neutral frames fail every effect assertion,
+#                  intermediates hold, stale presses fail (#354)
 #   G-SCREENSHOT   org.gnome.Shell.Screenshot saves the screen as a PNG
 #                  the right way up (#61)
 #   G-SCREENSHOT-BUTTON the quick-settings button saves one under
@@ -101,6 +154,11 @@
 #                  the key fires AcceleratorActivated, and ShowOSD shows
 #   G-KEYBINDINGS  GNOME Shell's keys: Super+S quick settings, Super+V the
 #                  date menu, Super+A the app grid (and back)
+#   G-PANEL-FOCUS  Ctrl+Alt+Tab focuses the top bar (switch-panels):
+#                  Activities takes focus, Tab walks to the clock and
+#                  the system menu, Enter opens quick settings, Escape
+#                  unwinds and returns focus to the client; the
+#                  backward chord starts on the last control
 #   G-KEY-BRIGHTNESS the brightness key steps the backlight through logind
 #   G-SCREENSHOT-UI  Print opens the screenshot UI; Screen + Capture saves
 #   G-SCREENSHOT-UI-WINDOW Window shows GNOME's window selector, the
@@ -143,8 +201,9 @@
 #   G-APP-DRAG  dragging an app's header bar moves the window (#58)
 #   G-TILE-PREVIEW dragging a window to the left edge shows GNOME's tile
 #               preview over the left half; dragging back drops it
-#   G-TRAY      an AppIndicator item shows in the panel and its menu
-#               row reaches the item (P-TR-01)
+#   G-TRAY      an AppIndicator item shows in the panel with its
+#               tooltip, its menu row reaches the item, and the row
+#               leaves the panel when the item exits (P-TR-01)
 #   G-SWITCHER-GROUP Alt+Above_Tab shows an app's windows as thumbnails
 #               inside the output and steps through them; W closes the
 #               focused one
@@ -179,10 +238,16 @@ WIDTH=1280
 HEIGHT=800
 INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
-COMPANIONS="$ROOT/target/debug/examples"
+GRID_CANCEL_ONLY=0
+GRID_CANCEL_OLD_NEGATIVE=0
+GRID_CANCEL_ADMISSION=""
+COMPANIONS="${TUNA_PROOF_COMPANIONS:-$ROOT/target/debug/examples}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --installed-package) INSTALLED_PACKAGE=1; shift ;;
+        --grid-cancel-only) GRID_CANCEL_ONLY=1; shift ;;
+        --expect-grid-cancel-old-negative) GRID_CANCEL_OLD_NEGATIVE=1; shift ;;
+        --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
@@ -190,6 +255,13 @@ while [ $# -gt 0 ]; do
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then
+    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
+        echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1
+    fi
+elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; then
+    echo "old-negative/admission flags require --grid-cancel-only" >&2; exit 1
+fi
 mkdir -p "$ARTIFACTS"
 ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
 OWNED_RUNTIME=""
@@ -231,6 +303,9 @@ fi
 XDG_STATE_HOME="$ARTIFACTS/state"
 XDG_DATA_HOME="$ARTIFACTS/data"
 export XDG_STATE_HOME XDG_DATA_HOME
+# Cursor themes (#342): the proof's own first, then the system's.
+XCURSOR_PATH="$XDG_DATA_HOME/icons:$HOME/.icons:/usr/share/icons:/usr/share/pixmaps"
+export XCURSOR_PATH
 # The dash shows only the proof's own windows: pin a favourite no
 # runner has, so the host's apps (GitHub's runners now ship Firefox,
 # which GNOME's default favourites name) never reach the a11y goldens.
@@ -315,8 +390,11 @@ HINTS_PID=""
 PERMISSIONS_PID=""
 INHIBITOR_PID=""
 SCROLL_PROBE_PID=""
+SET_FONTS_PID=""
 HOT_CORNER_PID=""
 OCCLUSION_PIDS=""
+A11Y_INPUT_PID=""
+CURSOR_PID=""
 IME_PIDS=""
 cleanup() {
     if [ -n "$ICON_PID" ]; then kill "$ICON_PID" 2>/dev/null || true; fi
@@ -324,7 +402,10 @@ cleanup() {
     if [ -n "$INHIBITOR_PID" ]; then kill "$INHIBITOR_PID" 2>/dev/null || true; fi
     if [ -n "$PERMISSIONS_PID" ]; then kill "$PERMISSIONS_PID" 2>/dev/null || true; fi
     if [ -n "$SCROLL_PROBE_PID" ]; then kill "$SCROLL_PROBE_PID" 2>/dev/null || true; fi
+    if [ -n "$SET_FONTS_PID" ]; then kill "$SET_FONTS_PID" 2>/dev/null || true; fi
     if [ -n "$HOT_CORNER_PID" ]; then kill "$HOT_CORNER_PID" 2>/dev/null || true; fi
+    if [ -n "$A11Y_INPUT_PID" ]; then kill "$A11Y_INPUT_PID" 2>/dev/null || true; fi
+    if [ -n "$CURSOR_PID" ]; then kill "$CURSOR_PID" 2>/dev/null || true; fi
     # shellcheck disable=SC2086
     if [ -n "$OCCLUSION_PIDS" ]; then kill $OCCLUSION_PIDS 2>/dev/null || true; fi
     # shellcheck disable=SC2086
@@ -373,6 +454,14 @@ showing() {
     jq -e --arg n "$2" 'any(.[]; .name == $n and .showing)' "$1" >/dev/null
 }
 
+hidden() {
+    jq -e --arg n "$2" 'any(.[]; .name == $n and .showing) | not' "$1" >/dev/null
+}
+
+focused() {
+    jq -e --arg n "$2" 'any(.[]; .name == $n and .focused)' "$1" >/dev/null
+}
+
 cstate() {
     end=$(($(date +%s) + ${3:-20}))
     while [ "$(date +%s)" -le "$end" ]; do
@@ -395,6 +484,9 @@ PY=/usr/bin/python3
 CSTATE="$ARTIFACTS/compositor-state.json"
 TUNA_COMPOSITOR_STATE="$CSTATE"
 export TUNA_COMPOSITOR_STATE
+# The marker exists only during the unlocked media sequence, not lock proofs.
+TUNA_MEDIA_DIAGNOSTICS="$ARTIFACTS/media-diagnostics-enabled"
+export TUNA_MEDIA_DIAGNOSTICS
 
 # Accessibility bus for GTK's AT-SPI backend.
 if [ -x /usr/libexec/at-spi-bus-launcher ]; then
@@ -547,6 +639,17 @@ if ! gsettings range org.gnome.desktop.calendar week-start-day >/dev/null 2>&1; 
     GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
     export GSETTINGS_SCHEMA_DIR
 fi
+# Wellbeing schemas for hosts without gsettings-desktop-schemas 51 (#354).
+# The shell reads them live from startup, so they must exist before the
+# nested session launches; after that the gates drive the real keys.
+if ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.desktop.screen-time-limits || \
+    ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.desktop.break-reminders; then
+    mkdir -p "$ARTIFACTS/schemas"
+    cp "$ROOT/tests/settings/gnome51-wellbeing.gschema.xml" "$ARTIFACTS/schemas/"
+    glib-compile-schemas --strict "$ARTIFACTS/schemas"
+    GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
+    export GSETTINGS_SCHEMA_DIR
+fi
 gsettings reset org.gnome.desktop.calendar week-start-day
 gsettings reset org.gnome.desktop.calendar show-weekdate
 gsettings set org.gnome.settings-daemon.plugins.color night-light-enabled false
@@ -585,6 +688,9 @@ echo 0.50 >"$MIC_FILE"
 RECORDING_FILE="$ARTIFACTS/recording"
 cat >"$ARTIFACTS/bin/wpctl" <<WPCTL
 #!/bin/sh
+if [ -f "$ARTIFACTS/media-diagnostics-enabled" ]; then
+    "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" wpctl-enter "\$$" "\$@" || exit 125
+fi
 mark() { [ "\$(cat "$SINK_FILE")" = "\$1" ] && echo "*" || echo " "; }
 muted() { [ "\$(cat "\$1")" = 1 ] && printf ' [MUTED]' || true; }
 case "\$1" in
@@ -615,6 +721,9 @@ case "\$1" in
         fi ;;
     *) ;;
 esac
+if [ -f "$ARTIFACTS/media-diagnostics-enabled" ]; then
+    "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" wpctl-exit "\$$" "\$@" || exit 125
+fi
 "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event
 WPCTL
 # Only audio monitoring uses the event fixture. Capture revocation must inspect
@@ -730,14 +839,25 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
 fi
+# The compositor and the shell share this log from one file description.
+# Truncate first (a fresh log each run, as before), then append: O_APPEND
+# keeps each process's write() contiguous, so concurrent lines can only
+# interleave whole pieces, never overwrite bytes (tuna-fade-match tolerates
+# the interleaved pieces).
+: >"$LOG"
+# Persist the disabled policy before the GTK publisher starts. The portal
+# probe must observe it on first acquisition, before testing live toggles.
+if [ "$SCREENSHOT_KEYS_ONLY" != 1 ]; then
+    gsettings set org.gnome.desktop.privacy disable-camera true
+fi
 if [ -n "$PAM_ON" ]; then
     env IBUS_ADDRESS="unix:path=$ARTIFACTS/not-the-private-ibus" \
         LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
         PAM_WRAPPER_SERVICE_DIR="$ARTIFACTS/pam/services" \
-        "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >"$LOG" 2>&1 &
+        "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >>"$LOG" 2>&1 &
 else
     env IBUS_ADDRESS="unix:path=$ARTIFACTS/not-the-private-ibus" \
-        "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >"$LOG" 2>&1 &
+        "$ROOT/scripts/lib/tuna-proof-session-launch" "$INSTALLED_PACKAGE" "$ROOT" "tuna-gtk-proof-$$" >>"$LOG" 2>&1 &
 fi
 COMPOSITOR_PID=$!
 
@@ -829,6 +949,19 @@ SCREENSHOT_SOURCE
     screenshot_keys_proof
     exit 0
 fi
+
+set --
+privacy_expected_shell="${TUNA_PROOF_SHELL_BIN:-${TUNA_PROOF_BIN_DIR:-$ROOT/target/debug}/tuna-shell-gtk}"
+if [ "$INSTALLED_PACKAGE" = 1 ]; then
+    set -- --installed
+    privacy_expected_shell=/usr/bin/tuna-shell-gtk
+fi
+"$PY" "$ROOT/scripts/lib/gtk-privacy-portal-proof.py" --root "$ROOT" \
+    --output "$ARTIFACTS/privacy-portal" --expected-shell "$privacy_expected_shell" "$@" ||
+    fail G-PRIVACY-PORTAL "actual GTK publisher/real portal camera gate failed"
+pass G-PRIVACY-PORTAL "GTK owns Lockdown; real portal denies camera and readmits requests on restore (no hardware qualification)"
+# Return this owned startup fixture to the schema default for later stages.
+gsettings reset org.gnome.desktop.privacy disable-camera
 
 sleep 2
 scrot "$ARTIFACTS/01-panel.png" >/dev/null
@@ -991,7 +1124,8 @@ pass A11Y-QS "quick-settings toggles, slider, and lock exposed"
 xdotool key Escape
 sleep 1
 
-# Tray (P-TR-01): an item registers, shows, and its menu fires.
+# Tray (P-TR-01): an item registers, shows with its tooltip, its
+# menu fires, and its row leaves the panel when it exits.
 TRAY_MARKER="$ARTIFACTS/tray-marker"
 rm -f "$TRAY_MARKER"
 "$PY" "$ROOT/scripts/lib/tuna-tray-item-stub.py" "$TRAY_MARKER" >"$ARTIFACTS/tray.log" 2>&1 &
@@ -1004,6 +1138,10 @@ for _ in $(seq 1 20); do
 done
 showing "$ARTIFACTS/a11y-tray.json" "Tuna Desktop Tray Probe" ||
     fail G-TRAY "the registered item never showed in the panel"
+jq -e --arg n "Tuna Desktop Tray Probe" \
+    'any(.[]; .name == $n and .showing and ((.description // "") | contains("Tray probe tip")))' \
+    "$ARTIFACTS/a11y-tray.json" >/dev/null ||
+    fail G-TRAY "the item showed without its tooltip"
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-tray-menu.json" 20 \
     --press "Tuna Desktop Tray Probe" || fail G-TRAY "could not open the item"
 scrot "$ARTIFACTS/03b-tray-menu.png" >/dev/null
@@ -1013,7 +1151,20 @@ end=$(($(date +%s) + 10))
 until [ -s "$TRAY_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q "^clicked 1" "$TRAY_MARKER" 2>/dev/null || fail G-TRAY "the menu row never reached the item"
 kill "$TRAY_PID" 2>/dev/null || true
-pass G-TRAY "an AppIndicator item shows and its menu row reaches it"
+tray_absent=0
+for _ in $(seq 1 30); do
+    if "$PY" "$ROOT/scripts/lib/tuna_tray_absence.py" "$ARTIFACTS/privacy-portal/receipt.json" \
+        "$ARTIFACTS/a11y-tray-gone.json" "$ROOT/scripts/lib/tuna-a11y-dump.py"; then
+        tray_absent=1
+        break
+    else
+        tray_observation=$?
+        [ "$tray_observation" = 2 ] || fail G-TRAY "fresh owner-bound tray absence observation failed"
+    fi
+    sleep 0.5
+done
+[ "$tray_absent" = 1 ] || fail G-TRAY "the item stayed in the panel after it exited"
+pass G-TRAY "an AppIndicator item shows with its tooltip, fires its menu, and leaves on exit"
 xdotool key Escape
 sleep 1
 
@@ -1042,9 +1193,14 @@ n=0
 for spec in Alpha:#3584e4 Beta:#2ec27e Gamma:#e66100; do
     WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
         "${spec%%:*}" "${spec#*:}" >"$ARTIFACTS/window-${spec%%:*}.log" 2>&1 &
+    fixture_pid=$!
     n=$((n + 1))
     cstate "(.windows | length) == $n" "window $n" ||
         fail G-WINDOWS "${spec%%:*} never mapped"
+    if [ "${spec%%:*}" = Alpha ]; then
+        "$PY" "$ROOT/scripts/lib/tuna_window_menu_fixture.py" record "$CSTATE" "$ARTIFACTS/alpha-window-owner.json" "$fixture_pid" ||
+            fail G-WINDOWS "original native Alpha launch identity could not be recorded"
+    fi
 done
 cstate '(.windows | length) == 3' "three app windows" ||
     fail G-WINDOWS "three libadwaita windows never mapped"
@@ -1367,11 +1523,11 @@ cstate ".focused != $second and .focused_app_id == \"tuna-test-alpha\" and .swit
 # over 100 ms, each starting animated and settling.
 cstate 'all(.layers[]; .namespace != "tuna-shell-switcher")' "switcher faded out" 5 ||
     fail G-SWITCHER-FADE "the switcher never finished fading out"
-fades="$(tail -c +"$((fade_mark + 1))" "$LOG" | grep 'tuna-shell-gtk: switcher fade' || true)"
+fade_seg="$(tail -c +"$((fade_mark + 1))" "$LOG")"
 for fade in thumbnails-in popup-out; do
-    printf '%s\n' "$fades" | grep -q "fade $fade start animated=true" ||
+    printf '%s\n' "$fade_seg" | "$ROOT/scripts/lib/tuna-fade-match" "$fade" start true ||
         fail G-SWITCHER-FADE "the $fade fade did not start animated"
-    printf '%s\n' "$fades" | grep -q "fade $fade settled" ||
+    printf '%s\n' "$fade_seg" | "$ROOT/scripts/lib/tuna-fade-match" "$fade" settled ||
         fail G-SWITCHER-FADE "the $fade fade did not settle"
 done
 pass G-SWITCHER-FADE "the switcher's thumbnails fade in and its popup fades out, animated and settled"
@@ -1538,18 +1694,72 @@ a11y_settled() {
     done
 }
 
+# Bind this drag proof to the one supervised GTK child, never a same-name peer.
+grid_cancel_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" || fail G-GRID-DRAG-CANCEL "GTK child absent"
+case "$grid_cancel_pid" in ''|*[!0-9]*) fail G-GRID-DRAG-CANCEL "ambiguous GTK child" ;; esac
+grid_cancel_start="$("$PY" - "$grid_cancel_pid" <<'PY_GRID_OWNER'
+import pathlib, sys
+print(pathlib.Path(f"/proc/{int(sys.argv[1])}/stat").read_text().rsplit(")", 1)[1].split()[19])
+PY_GRID_OWNER
+)" || fail G-GRID-DRAG-CANCEL "GTK child identity unavailable"
+grid_cancel_dump() {
+    rm -f "$1"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$1" 20 --strict --pid "$grid_cancel_pid" || return 1
+    "$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" tree "$grid_cancel_pid" "$grid_cancel_start" "$1"
+}
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then
+    "$PY" - "$ROOT" "$GRID_CANCEL_ADMISSION" "$COMPOSITOR_PID" "$grid_cancel_pid" "$GRID_CANCEL_OLD_NEGATIVE" <<'PY_GRID_ADMIT'
+import importlib.util, json, pathlib, sys
+root, admission, compositor, shell, old = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("comparison", pathlib.Path(root) / "scripts/lib/grid_cancel_comparison.py")
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+contract.validate_live_admission(json.loads(pathlib.Path(admission).read_text()), pathlib.Path(root), int(compositor), int(shell), old == "1")
+PY_GRID_ADMIT
+fi
+"$PY" - "$ROOT" "$grid_cancel_pid" "$grid_cancel_start" "$COMPOSITOR_PID" "$ARTIFACTS/grid-cancel-provenance.json" <<'PY_GRID_PROVENANCE'
+import hashlib, json, os, pathlib, subprocess, sys
+root, shell_pid, shell_start, compositor_pid, output = sys.argv[1:]
+root = pathlib.Path(root)
+def digest(path):
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+def git(*args):
+    return subprocess.check_output(["git", "-C", str(root), *args]).decode().strip()
+receipt = {
+    "scope": "harness-owned nested drag; not installed image or authenticated drag-source identity",
+    "harness_source": git("rev-parse", "HEAD"),
+    "harness_diff_sha256": hashlib.sha256(subprocess.check_output(["git", "-C", str(root), "diff", "HEAD", "--binary"])).hexdigest(),
+    "harness_sha256": digest(root / "scripts/tuna-gtk-shell-proof"),
+    "helper_sha256": digest(root / "scripts/lib/tuna_grid_cancel_proof.py"),
+    "binary_source_external": os.environ.get("TUNA_PROOF_BINARY_SOURCE_COMMIT"),
+    "run": os.environ.get("GITHUB_RUN_ID"), "attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+    "runtime": os.environ["XDG_RUNTIME_DIR"],
+    "shell": {"pid": int(shell_pid), "start": shell_start, "binary_sha256": digest(f"/proc/{shell_pid}/exe")},
+    "compositor": {"pid": int(compositor_pid), "binary_sha256": digest(f"/proc/{compositor_pid}/exe")},
+}
+pathlib.Path(output).write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+PY_GRID_PROVENANCE
 # A local folder source must initialize hints too. Cancel the real drag
 # before dropping and require normal arrows with no preview or stale timer.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-page-back.json" 20 \
     --press "Previous Page" || fail G-GRID-DRAG-CANCEL "could not return to page one"
 sleep 1
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-page-source.json" 20 || fail G-GRID-DRAG-CANCEL "folder source dump failed"
+grid_cancel_dump "$ARTIFACTS/a11y-folder-page-source.json" || fail G-GRID-DRAG-CANCEL "folder source dump failed"
 grid_origin tuna-shell-appgrid
 folder_coordinates="$(grid_point "$ARTIFACTS/a11y-folder-page-source.json" "$grid_long_name")" || fail G-GRID-DRAG-CANCEL "real folder source has no bounds"
 read -r folder_source_x folder_source_y <<EOF
 $folder_coordinates
 EOF
+# Select an empty interior gap from the real owned tree, not a nominal hint
+# width. The later live preview tree must confirm it against actual hints.
+neutral_coordinates="$("$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" neutral \
+    "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-source.json" \
+    "$CSTATE" "$ARTIFACTS/grid-cancel-neutral-point.json")" || fail G-GRID-DRAG-CANCEL "no actual neutral grid region"
+read -r grid_neutral_x grid_neutral_y <<EOF
+$neutral_coordinates
+EOF
 folder_layout_before="$(gsettings get org.gnome.shell app-picker-layout)"
+printf '%s\n' "$folder_layout_before" > "$ARTIFACTS/grid-cancel-layout-before.txt"
 xdotool mousemove --window "$WID" "$folder_source_x" "$folder_source_y"
 sleep 0.3
 xdotool mousedown 1
@@ -1558,30 +1768,90 @@ for step in $(seq 1 6); do
     xdotool mousemove --window "$WID" $((folder_source_x + step * 10)) "$folder_source_y"
     sleep 0.05
 done
-a11y_until "$ARTIFACTS/a11y-folder-page-peek.json" 'any(.[]; .showing and .name == "Next page preview")' ||
-    fail G-GRID-DRAG-CANCEL "real local folder drag has no neighboring-page hint"
+# Keep the actual button held, but leave timed page hints and tile hover
+# targets before slow AT-SPI/screenshot/state acquisition. GTK shows the
+# hint once it hears the drag: poll the bound child's tree, no fixed sleep.
+xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
+grid_peek_end=$(($(date +%s) + 10))
+until grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" &&
+    showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview"; do
+    [ "$(date +%s)" -lt "$grid_peek_end" ] ||
+        fail G-GRID-DRAG-CANCEL "real local folder drag has no neighboring-page hint"
+    sleep 0.1
+done
 scrot "$ARTIFACTS/11h-folder-page-peek.png" >/dev/null
-cstate '.client_dnd_active' "folder drag" || fail G-GRID-DRAG-CANCEL "the folder drag never took the pointer"
+cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" || fail G-GRID-DRAG-CANCEL "native client drag never acquired grab"
+cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
+"$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" neutral-check \
+    "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-peek.json" \
+    "$ARTIFACTS/grid-cancel-before-escape.json" "$grid_neutral_x" "$grid_neutral_y" \
+    "$ARTIFACTS/a11y-folder-page-source.json" "$ARTIFACTS/grid-cancel-neutral-admission.json" || fail G-GRID-DRAG-CANCEL "active neutral pointer or first page not observed"
+[ "$(gsettings get org.gnome.shell app-picker-layout)" = "$folder_layout_before" ] || fail G-GRID-DRAG-CANCEL "preview already committed layout"
+grid_cancel_before_frame="$(jq -er .rendered_frames "$ARTIFACTS/grid-cancel-before-escape.json")" || fail G-GRID-DRAG-CANCEL "drag frame missing"
+grid_cancel_before_keys="$(jq -er .seat_pressed_key_count "$ARTIFACTS/grid-cancel-before-escape.json")" || fail G-GRID-DRAG-CANCEL "held-key baseline missing"
 xdotool key Escape
-# Escape cancels the drag as Mutter's drag grab does, with the button still
-# held: the overview stays open and the release has nothing to drop.
-cstate '(.client_dnd_active | not) and .overview_open and .overview_app_grid' "drag cancelled" ||
-    fail G-GRID-DRAG-CANCEL "Escape did not cancel the drag with the grid open"
-a11y_until "$ARTIFACTS/a11y-folder-page-escaped.json" 'any(.[]; .showing and .name == "Next Page") and (any(.[]; .showing and (.name | endswith("page preview"))) | not)' ||
-    fail G-GRID-DRAG-CANCEL "the shell kept the drag's hints after the cancel"
+if [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ]; then
+    # Test-only old-source discriminator. The default/full gate NEVER accepts
+    # overview close, and this branch requires the exact live old tuple above.
+    cstate ".client_dnd_active == true and .overview_open == false and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame)" "old drag retained before release" || fail G-GRID-DRAG-OLD-NEG "reviewed old source did not reproduce Escape routing failure"
+    cp "$CSTATE" "$ARTIFACTS/grid-cancel-old-before-release.json"
+    scrot "$ARTIFACTS/grid-cancel-old-before-release.png" >/dev/null
+    gsettings get org.gnome.shell app-picker-layout > "$ARTIFACTS/grid-cancel-old-layout-before-release.txt"
+    "$PY" - "$ROOT" "$ARTIFACTS/grid-cancel-before-escape.json" "$ARTIFACTS/grid-cancel-old-before-release.json" <<'PY_GRID_OLD'
+import importlib.util, json, pathlib, sys
+root, before, after = map(pathlib.Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("comparison", root / "scripts/lib/grid_cancel_comparison.py")
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+contract.old_negative(json.loads(before.read_text()), json.loads(after.read_text()))
+PY_GRID_OLD
+    pass G-GRID-DRAG-OLD-NEG "exact observation-only old source retained native drag while closing grid; button still held"
+    # Exit/cleanup without releasing the button; preserve pre-release evidence.
+    exit 0
+fi
+# The source must retire while the button is STILL held. Overview close/reopen
+# cannot stand in for cancellation, and mouseup must not complete an old offer.
+# xdotool's Escape release reaches the seat after its press cancels the drag,
+# so wait for the held-key count to return to its baseline too.
+cstate ".client_dnd_active == false and .overview_open and .overview_app_grid and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame) and (.seat_pressed_key_count == $grid_cancel_before_keys)" "folder cancellation before release" || fail G-GRID-DRAG-CANCEL "Escape failed to cancel native drag while keeping grid open"
+cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-release.json"
+scrot "$ARTIFACTS/grid-cancel-before-release.png" >/dev/null
+# GTK hears the compositor's cancel asynchronously; poll its tree (button
+# still held) rather than sampling once right after the compositor state.
+end=$(($(date +%s) + 5))
+while :; do
+    grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" || fail G-GRID-DRAG-CANCEL "fresh cancellation tree missing"
+    if showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" &&
+        ! showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; then
+        break
+    fi
+    [ "$(date +%s)" -le "$end" ] || break
+    sleep 0.3
+done
+showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" || fail G-GRID-DRAG-CANCEL "GTK drag cleanup did not restore arrow before release"
+if showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; then fail G-GRID-DRAG-CANCEL "GTK drag preview remains before release"; fi
 xdotool mouseup 1
-# Resting at the edge past the 1 s dwell: no stale timer may turn the page.
+sleep 1
 xdotool mousemove --window "$WID" $((WIDTH - 6)) "$folder_source_y"
 sleep 1.5
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-page-cancelled.json" 20 || fail G-GRID-DRAG-CANCEL "cancelled dump failed"
+grid_cancel_dump "$ARTIFACTS/a11y-folder-page-cancelled.json" || fail G-GRID-DRAG-CANCEL "cancelled dump failed"
 showing "$ARTIFACTS/a11y-folder-page-cancelled.json" "Next Page" || fail G-GRID-DRAG-CANCEL "normal Next Page arrow did not return"
 for name in "Previous Page" "Next page preview" "Previous page preview"; do
     if showing "$ARTIFACTS/a11y-folder-page-cancelled.json" "$name"; then
         fail G-GRID-DRAG-CANCEL "cancelled drag left '$name' visible or a timer turned the page"
     fi
 done
-[ "$(gsettings get org.gnome.shell app-picker-layout)" = "$folder_layout_before" ] || fail G-GRID-DRAG-CANCEL "cancelled folder drag changed the saved layout"
-pass G-GRID-DRAG-CANCEL "real local folder drag shows hints; Escape cancels it with the grid open, restores arrows, stops edge paging and preserves layout"
+gsettings get org.gnome.shell app-picker-layout > "$ARTIFACTS/grid-cancel-layout-after.txt"
+"$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" \
+    "$ARTIFACTS/grid-cancel-before-escape.json" "$ARTIFACTS/grid-cancel-before-release.json" \
+    "$ARTIFACTS/grid-cancel-layout-before.txt" "$ARTIFACTS/grid-cancel-layout-after.txt" || \
+    fail G-GRID-DRAG-CANCEL "native cancellation evidence or saved layout invalid"
+xdotool key Escape
+cstate '.overview_open == false and .client_dnd_active == false' "ordinary Escape closes overview" || fail G-GRID-DRAG-CANCEL "ordinary Escape no longer closes overview"
+xdotool key super+a
+cstate '.overview_open and .overview_app_grid' "grid reopened after ordinary Escape" || fail G-GRID-DRAG-CANCEL "grid did not reopen"
+pass G-GRID-DRAG-CANCEL "native cancel before release preserves layout; subsequent ordinary Escape closes overview"
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then exit 0; fi
 # Restore page two for the existing app-drag proof's Previous Page action.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-page-next.json" 20 \
     --press "Next Page" || fail G-GRID-DRAG-CANCEL "could not return to page two"
@@ -1796,6 +2066,8 @@ xdotool key Escape
 cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-REORDER "overview stayed open"; }
 # Moving an item to another page leaves its old page short; a catalog
 # rebuild must respect those saved page boundaries instead of flattening.
+"$PY" "$ROOT/scripts/lib/grid-target-settled-tests.py" >"$ARTIFACTS/grid-target-settled-tests.log" 2>&1 ||
+    fail G-GRID-SHORT-PAGES "settled target negative controls failed"
 gsettings set org.gnome.shell app-picker-layout "[{'tuna-move-One.desktop': <{'position': <0>}>, 'tuna-move-Three.desktop': <{'position': <1>}>}, {'tuna-move-Two.desktop': <{'position': <0>}>}]"
 printf '[Desktop Entry]\nName=ZZZ Rebuild Probe\nExec=true\nType=Application\n' >"$XDG_DATA_HOME/applications/tuna-grid-rebuild.desktop"
 sleep 1.5
@@ -1825,10 +2097,18 @@ done
 a11y_until "$ARTIFACTS/a11y-grid-short-drag.json" 'any(.[]; .showing and .name == "Next page preview")' ||
     fail G-GRID-SHORT-PAGES "the drag did not start"
 xdotool mousemove --window "$WID" $((WIDTH - 6)) 330
-# The bump turns the page: aim once the carousel rests with the target in view.
-a11y_settled "$ARTIFACTS/a11y-grid-short-target.json" "[.[] | select(.showing and (.role == \"push button\" or .role == \"button\") and .name == \"AAA Move Two\" and .bounds[2] > 0 and .bounds[0] + $grid_origin_x >= 0 and .bounds[0] + $grid_origin_x + .bounds[2] <= $WIDTH)][0].bounds | select(. != null)" ||
-    fail G-GRID-SHORT-PAGES "bumping the edge did not turn to the target page"
-grid_coordinates="$(grid_point "$ARTIFACTS/a11y-grid-short-target.json" "AAA Move Two" 4)" || fail G-GRID-SHORT-PAGES "target edge bounds missing"
+# Observe the owned target while keeping the drag at the page edge. A
+# merely visible tile can still move 21px before release, turning +4px
+# reorder into an OnIcon folder drop. Require fully onscreen fresh bounds
+# unchanged for 200ms, with one absolute 10s deadline (including AT-SPI).
+grid_target_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk | head -1 || true)"
+[ -n "$grid_target_pid" ] || fail G-GRID-SHORT-PAGES "owned shell PID missing"
+grid_coordinates="$("$PY" "$ROOT/scripts/lib/grid-target-settled.py" \
+    --dump "$ROOT/scripts/lib/tuna-a11y-dump.py" --out "$ARTIFACTS/a11y-grid-short-target.json" \
+    --receipt "$ARTIFACTS/grid-short-target-settled.json" --name "AAA Move Two" \
+    --pid "$grid_target_pid" --origin "$grid_origin_x" "$grid_origin_y" \
+    --viewport "$WIDTH" "$HEIGHT" --timeout 10)" ||
+    fail G-GRID-SHORT-PAGES "owned second-page target did not settle within 10s at the edge"
 read -r target_x target_y <<EOF
 $grid_coordinates
 EOF
@@ -1923,6 +2203,26 @@ showing "$ARTIFACTS/a11y-folders.json" "Probe Tools" ||
 if showing "$ARTIFACTS/a11y-folders.json" "Tuna Probe"; then
     fail G-APP-FOLDERS "a foldered app still shows loose in the grid"
 fi
+# Mutate root and child settings while the same app grid remains open.
+folder_watch_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)"
+case "$folder_watch_pid" in *[!0-9]*|'') fail G-APP-FOLDERS "GTK child PID is not unique" ;; esac
+folder_watch_observe() {
+    timeout --kill-after=2s 10s "$PY" "$ROOT/scripts/lib/gtk-folder-watch-proof.py" --pid "$folder_watch_pid" \
+        --parent "$COMPOSITOR_PID" --binary "$privacy_expected_shell" \
+        --output "$ARTIFACTS/folder-watch-$1.json" --present "$2" --absent "$3" || \
+        fail G-APP-FOLDERS "live settings change did not update the owned grid: $1"
+}
+gsettings set "$FOLDER" name 'Probe Tools Live'
+folder_watch_observe rename 'Probe Tools Live' 'Probe Tools'
+gsettings set "$FOLDER" apps "[]"
+folder_watch_observe child-remove 'Tuna Probe' 'Probe Tools Live'
+gsettings set "$FOLDER" apps "['tuna-probe.desktop']"
+folder_watch_observe child-readd 'Probe Tools Live' 'Tuna Probe'
+gsettings set org.gnome.desktop.app-folders folder-children "[]"
+folder_watch_observe remove 'Tuna Probe' 'Probe Tools Live'
+gsettings set "$FOLDER" name 'Probe Tools'
+gsettings set org.gnome.desktop.app-folders folder-children "['ProbeTools']"
+folder_watch_observe readd 'Probe Tools' 'Tuna Probe'
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-open.json" 20 --press "Probe Tools" ||
     fail G-APP-FOLDERS "could not open the folder"
 scrot "$ARTIFACTS/11b-app-folder.png" >/dev/null
@@ -2543,6 +2843,8 @@ WAYLAND_DISPLAY="$SOCKET_NAME" GSK_RENDERER=gl "$PY" "$ROOT/scripts/lib/tuna-tes
     Delta "#c01c28" >"$ARTIFACTS/window-Delta.log" 2>&1 &
 cstate '.windows | any(.app_id == "tuna-test-delta")' "gl window" ||
     fail G-GL-WINDOW "a GL-rendered GTK window never mapped"
+# The compositor draws the pointer (#342): park it off the probed body.
+xdotool mousemove --window "$WID" $((WIDTH - 2)) $((HEIGHT - 2))
 sleep 2
 scrot "$ARTIFACTS/19-gl-window.png" >/dev/null
 centre="$(jq -r '.windows[] | select(.app_id == "tuna-test-delta") | .rect | "\(.[0] + .[2] / 2) \(.[1] + .[3] / 3)"' "$CSTATE")"
@@ -2770,6 +3072,269 @@ gsettings set org.gnome.desktop.interface text-scaling-factor "$original_scale"
 sleep 1
 pass G-SETTINGS-FONT "font-name family/size/style and text-scaling-factor change the running panel"
 
+# P-ST-01 (#594): GNOME Settings' wallpaper write reaches the running
+# desktop live. The shell publishes the drop file, the compositor
+# records the file's identity and decoded pixels, and the desktop
+# visibly repaints. Re-setting the same URI is idempotent (no
+# restart); replacing the file refreshes without a URI change; an
+# invalid URI is ignored without a crash. Restart persistence is
+# covered by cargo:wallpaper_survives_session_restart.
+set_wallpaper_before_uri=$(gsettings get org.gnome.desktop.background picture-uri)
+set_wallpaper_before_dark=$(gsettings get org.gnome.desktop.background picture-uri-dark)
+set_wallpaper_before_options=$(gsettings get org.gnome.desktop.background picture-options)
+set_wallpaper_green="$ARTIFACTS/set-wallpaper-green.png"
+ffmpeg -loglevel error -y -f lavfi -i color=c=0x00ff00:s=64x64 -frames:v 1 -threads 1 "$set_wallpaper_green"
+set_wallpaper_uri=$("$PY" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' "$set_wallpaper_green")
+printf '%s\n' "$set_wallpaper_uri" >"$ARTIFACTS/set-wallpaper-uri.txt"
+gsettings set org.gnome.desktop.background picture-options zoom
+gsettings set org.gnome.desktop.background picture-uri "$set_wallpaper_uri"
+gsettings set org.gnome.desktop.background picture-uri-dark "$set_wallpaper_uri"
+set_wallpaper_end=$(($(date +%s) + 15))
+while :; do
+    set_wallpaper_drop_first=$(sed -n '1p' "$XDG_RUNTIME_DIR/tuna-wallpaper" 2>/dev/null || true)
+    [ "$set_wallpaper_drop_first" = "$set_wallpaper_uri" ] && break
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "shell did not publish $set_wallpaper_uri to the wallpaper drop file (got '$set_wallpaper_drop_first')"
+    sleep 0.3
+done
+set_wallpaper_end=$(($(date +%s) + 20))
+while :; do
+    "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" wallpaper-check "$CSTATE" \
+        --uri "$set_wallpaper_uri" --identity file --decoded \
+        >"$ARTIFACTS/set-wallpaper-check.txt" 2>&1 && break
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "compositor never tracked the wallpaper: $(cat "$ARTIFACTS/set-wallpaper-check.txt")"
+    sleep 0.3
+done
+set_wallpaper_sample=$("$PY" "$ROOT/scripts/lib/tuna-set-gates.py" desktop-pixel "$CSTATE" --width "$WIDTH" --height "$HEIGHT") ||
+    fail G-SET-WALLPAPER "no desktop pixel outside every window to sample"
+# shellcheck disable=SC2086
+set -- $set_wallpaper_sample
+set_wallpaper_x=$1
+set_wallpaper_y=$2
+set_wallpaper_end=$(($(date +%s) + 15))
+while :; do
+    scrot -o "$ARTIFACTS/set-wallpaper-shot-green.png" >/dev/null
+    set_wallpaper_rgb=$(px "$ARTIFACTS/set-wallpaper-shot-green.png" "$set_wallpaper_x" "$set_wallpaper_y")
+    # shellcheck disable=SC2086
+    set -- $set_wallpaper_rgb
+    if [ "${1:-255}" -lt 20 ] && [ "${2:-0}" -gt 220 ] && [ "${3:-255}" -lt 20 ]; then break; fi
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "wallpaper write did not paint green at $set_wallpaper_x,$set_wallpaper_y: $set_wallpaper_rgb"
+    sleep 0.3
+done
+# Idempotent: writing the same URI again changes nothing observable.
+gsettings set org.gnome.desktop.background picture-uri "$set_wallpaper_uri"
+sleep 1
+[ "$(sed -n '1p' "$XDG_RUNTIME_DIR/tuna-wallpaper")" = "$set_wallpaper_uri" ] ||
+    fail G-SET-WALLPAPER "re-setting the same wallpaper URI moved the drop file"
+scrot -o "$ARTIFACTS/set-wallpaper-shot-green-again.png" >/dev/null
+set_wallpaper_rgb=$(px "$ARTIFACTS/set-wallpaper-shot-green-again.png" "$set_wallpaper_x" "$set_wallpaper_y")
+# shellcheck disable=SC2086
+set -- $set_wallpaper_rgb
+if [ "${1:-255}" -ge 20 ] || [ "${2:-0}" -le 220 ] || [ "${3:-255}" -ge 20 ]; then
+    fail G-SET-WALLPAPER "re-setting the same wallpaper URI lost the green desktop: $set_wallpaper_rgb"
+fi
+# Refresh: replacing the file repaints without a URI change.
+ffmpeg -loglevel error -y -f lavfi -i color=c=0xff00ff:s=64x64 -frames:v 1 -threads 1 "$set_wallpaper_green"
+set_wallpaper_end=$(($(date +%s) + 20))
+while :; do
+    scrot -o "$ARTIFACTS/set-wallpaper-shot-magenta.png" >/dev/null
+    set_wallpaper_rgb=$(px "$ARTIFACTS/set-wallpaper-shot-magenta.png" "$set_wallpaper_x" "$set_wallpaper_y")
+    # shellcheck disable=SC2086
+    set -- $set_wallpaper_rgb
+    if [ "${1:-0}" -gt 220 ] && [ "${2:-255}" -lt 20 ] && [ "${3:-0}" -gt 220 ]; then break; fi
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "replacing the wallpaper file did not repaint magenta: $set_wallpaper_rgb"
+    sleep 0.3
+done
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" wallpaper-check "$CSTATE" \
+    --uri "$set_wallpaper_uri" --identity file --decoded ||
+    fail G-SET-WALLPAPER "compositor lost the replaced wallpaper"
+# Negative control: a non-file URI is ignored as an image (identity
+# None, solid fallback) without crashing the shell or compositor.
+gsettings set org.gnome.desktop.background picture-uri 'http://example.invalid/set-wallpaper.png'
+gsettings set org.gnome.desktop.background picture-uri-dark 'http://example.invalid/set-wallpaper.png'
+sleep 2
+kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail G-SET-WALLPAPER "invalid wallpaper URI killed the compositor"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-wallpaper-invalid.json" 20 ||
+    fail G-SET-WALLPAPER "shell stopped answering after an invalid wallpaper URI"
+set_wallpaper_end=$(($(date +%s) + 15))
+while :; do
+    "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" wallpaper-check "$CSTATE" \
+        --uri 'http://example.invalid/set-wallpaper.png' --identity none \
+        >"$ARTIFACTS/set-wallpaper-invalid-check.txt" 2>&1 && break
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "invalid URI was not ignored: $(cat "$ARTIFACTS/set-wallpaper-invalid-check.txt")"
+    sleep 0.3
+done
+scrot -o "$ARTIFACTS/set-wallpaper-shot-invalid.png" >/dev/null
+set_wallpaper_rgb=$(px "$ARTIFACTS/set-wallpaper-shot-invalid.png" "$set_wallpaper_x" "$set_wallpaper_y")
+# shellcheck disable=SC2086
+set -- $set_wallpaper_rgb
+if [ "${1:-0}" -gt 220 ] && [ "${2:-255}" -lt 20 ] && [ "${3:-0}" -gt 220 ]; then
+    fail G-SET-WALLPAPER "invalid wallpaper URI kept the magenta image: $set_wallpaper_rgb"
+fi
+gsettings set org.gnome.desktop.background picture-uri "$set_wallpaper_before_uri"
+gsettings set org.gnome.desktop.background picture-uri-dark "$set_wallpaper_before_dark"
+gsettings set org.gnome.desktop.background picture-options "$set_wallpaper_before_options"
+# The shell publishes the dark URI under the dark style, nothing when
+# picture-options is "none": expect exactly what it must publish. The
+# pre-proof file may not exist on the runner, so the revert asserts the
+# shell's publication (already proved end to end above), not a decode.
+set_wallpaper_scheme=$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null || echo "'default'")
+set_wallpaper_before_bare=$(printf '%s' "$set_wallpaper_before_uri" | sed "s/^'//; s/'$//")
+set_wallpaper_before_dark_bare=$(printf '%s' "$set_wallpaper_before_dark" | sed "s/^'//; s/'$//")
+set_wallpaper_expect_revert="$set_wallpaper_before_bare"
+if [ "$set_wallpaper_scheme" = "'prefer-dark'" ] && [ -n "$set_wallpaper_before_dark_bare" ]; then
+    set_wallpaper_expect_revert="$set_wallpaper_before_dark_bare"
+fi
+if [ "$set_wallpaper_before_options" = "'none'" ]; then
+    set_wallpaper_expect_revert=""
+fi
+set_wallpaper_end=$(($(date +%s) + 15))
+while :; do
+    set_wallpaper_drop_first=$(sed -n '1p' "$XDG_RUNTIME_DIR/tuna-wallpaper" 2>/dev/null || true)
+    [ "$set_wallpaper_drop_first" = "$set_wallpaper_expect_revert" ] && break
+    [ "$(date +%s)" -ge "$set_wallpaper_end" ] && fail G-SET-WALLPAPER "revert did not restore the drop file (got '$set_wallpaper_drop_first')"
+    sleep 0.3
+done
+sleep 1
+scrot -o "$ARTIFACTS/set-wallpaper-shot-reverted.png" >/dev/null
+cp "$CSTATE" "$ARTIFACTS/set-wallpaper-reverted-state.json"
+pass G-SET-WALLPAPER "picture-uri writes publish, identify, decode and visibly repaint; replacement refreshes, an invalid URI is ignored, and revert restores"
+
+# P-ST-01 (#594): clock-format and clock-show-date reach the panel clock
+# live. The shell re-reads them every second, so no restart is needed
+# and re-setting the same values is idempotent. Seconds are covered by
+# G-SETTINGS-CLOCK; the weekday key shares this date code path.
+set_clock_before_format=$(gsettings get org.gnome.desktop.interface clock-format)
+set_clock_before_date=$(gsettings get org.gnome.desktop.interface clock-show-date)
+set_clock_before_weekday=$(gsettings get org.gnome.desktop.interface clock-show-weekday)
+set_clock_before_seconds=$(gsettings get org.gnome.desktop.interface clock-show-seconds)
+gsettings set org.gnome.desktop.interface clock-show-weekday false
+gsettings set org.gnome.desktop.interface clock-show-date false
+gsettings set org.gnome.desktop.interface clock-show-seconds false
+gsettings set org.gnome.desktop.interface clock-format '12h'
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-12h.json" 20 ||
+    fail G-SET-CLOCK "accessibility dump failed"
+scrot "$ARTIFACTS/set-clock-12h.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-12h.json" --format 12h --date off ||
+    fail G-SET-CLOCK "clock-format 12h without date did not reach the panel clock"
+gsettings set org.gnome.desktop.interface clock-show-date true
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-date.json" 20 ||
+    fail G-SET-CLOCK "accessibility dump failed"
+scrot "$ARTIFACTS/set-clock-date.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-date.json" --format 12h --date on ||
+    fail G-SET-CLOCK "clock-show-date did not add the date to the panel clock"
+# Negative control: an invalid format is rejected by the schema (or
+# falls back to 24h where the schema allows it) without breaking the clock.
+if gsettings set org.gnome.desktop.interface clock-format 'bogus' 2>"$ARTIFACTS/set-clock-invalid.err"; then
+    sleep 2
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-invalid.json" 20 ||
+        fail G-SET-CLOCK "accessibility dump failed"
+    scrot "$ARTIFACTS/set-clock-invalid.png" >/dev/null
+    "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-invalid.json" --format 24h --date on ||
+        fail G-SET-CLOCK "invalid clock-format did not fall back to a 24h clock"
+else
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-invalid.json" 20 ||
+        fail G-SET-CLOCK "accessibility dump failed"
+    scrot "$ARTIFACTS/set-clock-invalid.png" >/dev/null
+    "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-invalid.json" --format 12h --date on ||
+        fail G-SET-CLOCK "rejected clock-format changed the panel clock"
+fi
+gsettings set org.gnome.desktop.interface clock-format "$set_clock_before_format"
+gsettings set org.gnome.desktop.interface clock-show-date "$set_clock_before_date"
+gsettings set org.gnome.desktop.interface clock-show-weekday "$set_clock_before_weekday"
+gsettings set org.gnome.desktop.interface clock-show-seconds "$set_clock_before_seconds"
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-set-clock-reverted.json" 20 ||
+    fail G-SET-CLOCK "accessibility dump failed"
+scrot "$ARTIFACTS/set-clock-reverted.png" >/dev/null
+set_clock_expect_format=24h
+case "$set_clock_before_format" in *12h*) set_clock_expect_format=12h ;; esac
+set_clock_expect_date=off
+case "$set_clock_before_date" in *true*) set_clock_expect_date=on ;; esac
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" clock-check "$ARTIFACTS/a11y-set-clock-reverted.json" --format "$set_clock_expect_format" --date "$set_clock_expect_date" ||
+    fail G-SET-CLOCK "revert did not restore clock-format $set_clock_before_format / clock-show-date $set_clock_before_date"
+pass G-SET-CLOCK "clock-format and clock-show-date render live; an invalid format is rejected or falls back, and revert restores"
+
+# P-ST-01 (#594): document and monospace fonts reach GTK apps live
+# through the apps' own Gio.Settings reads, as gnome-terminal and
+# gedit read them (GTK offers no Gtk.Settings properties for these
+# keys; Tuna Desktop chrome keeps using font-name). No restart is
+# needed and re-setting the same values is idempotent.
+set_fonts_before_doc=$(gsettings get org.gnome.desktop.interface document-font-name)
+set_fonts_before_mono=$(gsettings get org.gnome.desktop.interface monospace-font-name)
+set_fonts_before_doc_bare=$(printf '%s' "$set_fonts_before_doc" | sed "s/^'//; s/'$//")
+set_fonts_before_mono_bare=$(printf '%s' "$set_fonts_before_mono" | sed "s/^'//; s/'$//")
+set_fonts_count="$(jq '.windows | length' "$CSTATE")"
+SET_FONTS_JSON="$ARTIFACTS/set-fonts-fixture.json"
+rm -f "$SET_FONTS_JSON"
+WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-set-font-fixture.py" "$SET_FONTS_JSON" >"$ARTIFACTS/set-fonts-fixture.log" 2>&1 &
+SET_FONTS_PID=$!
+cstate '.windows | any(.app_id == "tuna-set-fonts-fixture")' "fonts fixture mapped" ||
+    { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "GTK font fixture never mapped"; }
+sleep 1
+scrot "$ARTIFACTS/set-fonts-before.png" >/dev/null
+gsettings set org.gnome.desktop.interface document-font-name 'Serif 24'
+gsettings set org.gnome.desktop.interface monospace-font-name 'Monospace 24'
+set_fonts_end=$(($(date +%s) + 20))
+while :; do
+    if [ -s "$SET_FONTS_JSON" ]; then
+        "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" fonts-check "$SET_FONTS_JSON" \
+            --document 'Serif 24' --monospace 'Monospace 24' \
+            >"$ARTIFACTS/set-fonts-check.txt" 2>&1 && break
+    fi
+    [ "$(date +%s)" -ge "$set_fonts_end" ] && { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "GTK app never observed the font keys: $(cat "$ARTIFACTS/set-fonts-check.txt" 2>/dev/null || echo 'no fixture report')"; }
+    sleep 0.3
+done
+cp "$SET_FONTS_JSON" "$ARTIFACTS/set-fonts-after.json"
+sleep 1
+scrot "$ARTIFACTS/set-fonts-after.png" >/dev/null
+set_fonts_rect="$(jq -r '.windows[] | select(.app_id == "tuna-set-fonts-fixture") | .rect | join(" ")' "$CSTATE")"
+[ -n "$set_fonts_rect" ] ||
+    { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "font fixture window has no rectangle to sample"; }
+# shellcheck disable=SC2086
+set -- $set_fonts_rect
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" pixel-diff "$ARTIFACTS/set-fonts-before.png" "$ARTIFACTS/set-fonts-after.png" \
+    "$1" "$2" "$3" "$4" --min-fraction 0.02 ||
+    { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "document/monospace change did not visibly repaint the GTK fixture"; }
+# Idempotent: writing the same fonts again keeps the same app read.
+gsettings set org.gnome.desktop.interface document-font-name 'Serif 24'
+gsettings set org.gnome.desktop.interface monospace-font-name 'Monospace 24'
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" fonts-check "$SET_FONTS_JSON" \
+    --document 'Serif 24' --monospace 'Monospace 24' ||
+    { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "re-setting the same fonts lost the app's font read"; }
+# Negative control: a bogus family falls back in Pango without killing
+# the app or its font read.
+gsettings set org.gnome.desktop.interface document-font-name 'NoSuchFontXYZ 24'
+sleep 1
+kill -0 "$SET_FONTS_PID" 2>/dev/null || fail G-SET-FONTS "bogus document font killed the GTK fixture"
+cstate '.windows | any(.app_id == "tuna-set-fonts-fixture")' "fixture survives bogus font" ||
+    fail G-SET-FONTS "bogus document font unmapped the GTK fixture"
+scrot "$ARTIFACTS/set-fonts-invalid.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-set-gates.py" fonts-check "$SET_FONTS_JSON" \
+    --document 'NoSuchFontXYZ 24' --monospace 'Monospace 24' ||
+    fail G-SET-FONTS "bogus document font broke the app's font read"
+gsettings set org.gnome.desktop.interface document-font-name "$set_fonts_before_doc"
+gsettings set org.gnome.desktop.interface monospace-font-name "$set_fonts_before_mono"
+set_fonts_end=$(($(date +%s) + 20))
+while :; do
+    if [ -s "$SET_FONTS_JSON" ]; then
+        "$PY" "$ROOT/scripts/lib/tuna-set-gates.py" fonts-check "$SET_FONTS_JSON" \
+            --document "$set_fonts_before_doc_bare" --monospace "$set_fonts_before_mono_bare" \
+            >"$ARTIFACTS/set-fonts-revert-check.txt" 2>&1 && break
+    fi
+    [ "$(date +%s)" -ge "$set_fonts_end" ] && { kill "$SET_FONTS_PID" 2>/dev/null || true; SET_FONTS_PID=""; fail G-SET-FONTS "revert never reached the GTK app: $(cat "$ARTIFACTS/set-fonts-revert-check.txt" 2>/dev/null || echo 'no fixture report')"; }
+    sleep 0.3
+done
+sleep 1
+scrot "$ARTIFACTS/set-fonts-reverted.png" >/dev/null
+kill "$SET_FONTS_PID" 2>/dev/null || true
+SET_FONTS_PID=""
+cstate ".windows | length == $set_fonts_count" "fonts fixture removed" ||
+    fail G-SET-FONTS "font fixture window did not unmap"
+pass G-SET-FONTS "document/monospace fonts reach GTK apps live with a visible repaint; a bogus family falls back, and revert restores"
+
 # GNOME's input settings (#60).
 gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us'), ('xkb', 'de')]"
 cstate '.keyboard.layouts == ["English (US)", "German"]' "two sources" ||
@@ -2802,6 +3367,162 @@ xdotool key Escape
 cstate '.overview_open | not' "hot corner dismissed" ||
     fail G-HOT-CORNER "the corner-opened overview did not close"
 pass G-HOT-CORNER "live GNOME disable rejects the corner; enable opens the actual overview"
+
+# GNOME's cursor theme, size and shapes are the compositor's to draw
+# (#342). A proof theme inherits its cursors from a base theme, with
+# 24px and 48px images, so the drawn buffer shows which size applied.
+"$ROOT/scripts/tuna-cursor-client-build" "$ARTIFACTS/cursor-client" >"$ARTIFACTS/cursor-client-build.log" 2>&1 ||
+    fail G-CURSOR-SIZE "the cursor probe did not build: $(tail -3 "$ARTIFACTS/cursor-client-build.log")"
+"$PY" "$ROOT/scripts/lib/cursor-proof-theme.py" "$XDG_DATA_HOME/icons"
+cursor_theme_before="$(gsettings get org.gnome.desktop.interface cursor-theme)"
+cursor_size_before="$(gsettings get org.gnome.desktop.interface cursor-size)"
+cursor_windows="$(jq '.windows | length' "$CSTATE")"
+# cursor_probe MODE ARG: map the probe window and put the pointer on it.
+cursor_probe() {
+    [ -z "$CURSOR_PID" ] || { kill "$CURSOR_PID" 2>/dev/null || true; wait "$CURSOR_PID" 2>/dev/null || true; }
+    cstate ".windows | length == $cursor_windows" "cursor probe gone" ||
+        fail "$3" "the previous cursor probe did not close"
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) 16
+    WAYLAND_DISPLAY="$SOCKET_NAME" "$ARTIFACTS/cursor-client/tuna-cursor-client" "$1" "$2" \
+        >"$ARTIFACTS/cursor-probe-$1-$2.log" 2>&1 &
+    CURSOR_PID=$!
+    cstate 'any(.windows[]; .app_id == "tuna-cursor-probe")' "cursor probe mapped" ||
+        fail "$3" "the cursor probe ($1 $2) did not map"
+    probe_rect="$(jq -r '.windows[] | select(.app_id == "tuna-cursor-probe") | .rect | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' "$CSTATE")"
+    # shellcheck disable=SC2086 # two coordinates
+    xdotool mousemove --window "$WID" $probe_rect
+    for _ in $(seq 1 20); do
+        grep -q enter "$ARTIFACTS/cursor-probe-$1-$2.log" && return 0
+        xdotool mousemove_relative 1 0
+        sleep 0.25
+    done
+    fail "$3" "the pointer never entered the cursor probe ($1 $2)"
+}
+cursor_probe shape default G-CURSOR-SIZE
+gsettings set org.gnome.desktop.interface cursor-theme 'TunaProof'
+gsettings set org.gnome.desktop.interface cursor-size 24
+cstate '.cursor.theme == "TunaProof" and .cursor.size == 24 and .cursor.kind == "named" and .cursor.name == "default" and .cursor.source == "client" and .cursor.image_theme == "TunaProofBase" and .cursor.image == [24, 24] and .cursor.logical == [24, 24]' "theme cursor at 24px" ||
+    fail G-CURSOR-SIZE "cursor-theme TunaProof at size 24 did not draw the inherited 24px image"
+cp "$CSTATE" "$ARTIFACTS/cursor-size-24.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-size-24.png" 24 1 1 181,29,91 ||
+    fail G-CURSOR-SIZE "the actual 24px legacy cursor pixels or hotspot differ"
+gsettings set org.gnome.desktop.interface cursor-size 48
+cstate '.cursor.size == 48 and .cursor.image_theme == "TunaProofBase" and .cursor.image == [48, 48] and .cursor.logical == [48, 48]' "theme cursor at 48px" ||
+    fail G-CURSOR-SIZE "cursor-size 48 did not redraw the cursor from the 48px image live"
+cp "$CSTATE" "$ARTIFACTS/cursor-size-48.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-size-48.png" 48 1 1 25,173,125 ||
+    fail G-CURSOR-SIZE "the actual 48px legacy cursor pixels or hotspot differ"
+# A live theme change must replace the buffer with GNOME51 SVG data,
+# preserving its hotspot while rasterizing the requested physical size.
+gsettings set org.gnome.desktop.interface cursor-theme TunaProofSvg
+cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [48,48]' "48px scalable cursor" ||
+    fail G-CURSOR-SIZE "the scalable theme did not replace the legacy image"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-svg-48.png" 48 8 12 49,95,199 ||
+    fail G-CURSOR-SIZE "the actual 48px SVG pixels or scaled hotspot differ"
+gsettings set org.gnome.desktop.interface cursor-size 24
+cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [24,24]' "24px scalable cursor" ||
+    fail G-CURSOR-SIZE "the scalable theme did not resize live"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-svg-24.png" 24 4 6 49,95,199 ||
+    fail G-CURSOR-SIZE "the actual 24px SVG pixels or hotspot differ"
+gsettings set org.gnome.desktop.interface cursor-theme TunaProof
+pass G-CURSOR-SIZE "live cursor-theme (inherited) and cursor-size: 24px then 48px images drawn at 24 and 48 logical px"
+
+gsettings set org.gnome.desktop.interface cursor-size 24
+cursor_probe shape crosshair G-CURSOR-SHAPE
+cstate '.cursor.kind == "named" and .cursor.name == "crosshair" and .cursor.source == "client" and .cursor.file == "crosshair" and .cursor.image_theme == "TunaProofBase" and .cursor.image == [24, 24]' "crosshair shape" ||
+    fail G-CURSOR-SHAPE "a wp_cursor_shape_v1 crosshair request did not draw the theme's crosshair"
+cp "$CSTATE" "$ARTIFACTS/cursor-shape-crosshair.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-shape-crosshair.png" 24 1 1 181,29,91 ||
+    fail G-CURSOR-SHAPE "the requested shape has incorrect actual legacy pixels"
+# A shape the theme chain lacks still shows: from libXcursor's default
+# and GNOME's Adwaita fallbacks when installed, else the theme's arrow.
+cursor_probe shape pointer G-CURSOR-SHAPE
+cstate '.cursor.kind == "named" and .cursor.name == "pointer" and (.cursor.file == "default" or (.cursor.image_theme | IN("default", "Adwaita", "hicolor")))' "missing shape" ||
+    fail G-CURSOR-SHAPE "a shape missing from the theme did not fall back"
+# After the initial pointer enter, both frames must actually paint with no
+# additional pointer/key events. Distinct colors expose a stuck first frame.
+cursor_probe shape wait G-CURSOR-SHAPE
+cstate '.cursor.image_theme == "TunaProofBase" and .cursor.animation_frames == 2 and .cursor.image == [24,24]' "animated legacy cursor" ||
+    fail G-CURSOR-SHAPE "the legacy wait cursor did not retain both frames"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-legacy-frame-0.png" 24 1 1 181,29,91 ||
+    fail G-CURSOR-SHAPE "the first legacy animation frame never painted"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-legacy-frame-1.png" 24 1 1 25,173,125 ||
+    fail G-CURSOR-SHAPE "the second legacy animation frame never painted without new input"
+gsettings set org.gnome.desktop.interface cursor-theme TunaProofSvg
+cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.animation_frames == 2 and .cursor.image == [24,24]' "animated scalable cursor" ||
+    fail G-CURSOR-SHAPE "the SVG wait cursor did not replace both legacy frames"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-svg-frame-0.png" 24 4 6 49,95,199 ||
+    fail G-CURSOR-SHAPE "the first SVG animation frame never painted"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-svg-frame-1.png" 24 4 6 213,161,33 ||
+    fail G-CURSOR-SHAPE "the second SVG animation frame never painted without new input"
+cursor_probe surface 32 G-CURSOR-SHAPE
+cstate '.cursor.kind == "surface" and .cursor.image == [32, 32] and .cursor.logical == [32, 32]' "client cursor surface" ||
+    fail G-CURSOR-SHAPE "a client's 32px cursor surface was not drawn at its size"
+cp "$CSTATE" "$ARTIFACTS/cursor-surface.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-surface.png" 32 0 0 224,27,36 ||
+    fail G-CURSOR-SHAPE "the client surface has incorrect actual pixels"
+kill "$CURSOR_PID" 2>/dev/null || true
+wait "$CURSOR_PID" 2>/dev/null || true
+CURSOR_PID=""
+cstate ".windows | length == $cursor_windows" "cursor probe closed" ||
+    fail G-CURSOR-SHAPE "the cursor probe did not close"
+gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme_before"
+gsettings set org.gnome.desktop.interface cursor-size "$cursor_size_before"
+pass G-CURSOR-SHAPE "cursor-shape crosshair drawn from the theme, a missing shape falls back, a 32px client surface draws at 32px"
+
+# Callback-only commits must progress without reattaching or damaging the
+# unchanged cursor buffer. An unselected cursor must receive no callbacks.
+xdotool mousemove --window "$WID" $((WIDTH / 2)) 16
+WAYLAND_DISPLAY="$SOCKET_NAME" "$ARTIFACTS/cursor-client/tuna-cursor-client" callbacks 32 \
+    >"$ARTIFACTS/cursor-callbacks.log" 2>&1 &
+CURSOR_PID=$!
+cstate 'any(.windows[]; .app_id == "tuna-cursor-probe")' "callback cursor mapped" ||
+    fail G-CURSOR-FRAME "the callback fixture did not map"
+sleep 0.3
+if grep -q cursor_callback "$ARTIFACTS/cursor-callbacks.log"; then
+    fail G-CURSOR-FRAME "an unselected cursor received frame callbacks"
+fi
+probe_rect="$(jq -r '.windows[] | select(.app_id == "tuna-cursor-probe") | .rect | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' "$CSTATE")"
+# shellcheck disable=SC2086 # exactly two numeric coordinates
+xdotool mousemove --window "$WID" $probe_rect
+for _ in $(seq 1 30); do
+    grep -q '"cursor_callback":16,' "$ARTIFACTS/cursor-callbacks.log" && break
+    sleep 0.2
+done
+grep -q '"cursor_callback":16,' "$ARTIFACTS/cursor-callbacks.log" ||
+    fail G-CURSOR-FRAME "unchanged-buffer frame-only commits stalled without new input"
+kill "$CURSOR_PID" 2>/dev/null || true
+wait "$CURSOR_PID" 2>/dev/null || true
+CURSOR_PID=""
+cstate ".windows | length == $cursor_windows" "callback cursor gone" ||
+    fail G-CURSOR-FRAME "the callback fixture did not close"
+pass G-CURSOR-FRAME "unselected cursor receives no callback; 16 callback-only commits progress on the visible unchanged cursor without fresh input"
+
+# GNOME's locate-pointer: a lone Ctrl tap ripples at the pointer, only
+# while the key is on (Mutter's locate-pointer-key, Control_L).
+xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+gsettings set org.gnome.desktop.interface locate-pointer false
+cstate '.cursor.locate_pointer.enabled | not' "locate-pointer off" ||
+    fail G-LOCATE-POINTER "locate-pointer false did not reach the compositor"
+locate_before="$(jq '.cursor.locate_pointer.count' "$CSTATE")"
+locate_frames="$(jq '.cursor.locate_pointer.frames' "$CSTATE")"
+xdotool key Control_L
+sleep 1.5
+jq -e ".cursor.locate_pointer.count == $locate_before and .cursor.locate_pointer.frames == $locate_frames" "$CSTATE" >/dev/null ||
+    fail G-LOCATE-POINTER "a Ctrl tap rippled with locate-pointer off"
+gsettings set org.gnome.desktop.interface locate-pointer true
+cstate '.cursor.locate_pointer.enabled' "locate-pointer on" ||
+    fail G-LOCATE-POINTER "locate-pointer true did not reach the compositor"
+xdotool key Control_L
+cstate ".cursor.locate_pointer.count == $((locate_before + 1)) and .cursor.locate_pointer.active and .cursor.locate_pointer.frames > $locate_frames" "ripples" 3 ||
+    fail G-LOCATE-POINTER "a Ctrl tap with locate-pointer on drew no ripples"
+cp "$CSTATE" "$ARTIFACTS/locate-pointer.json"
+jq -e ".cursor.locate_pointer.at == [$((WIDTH / 2)), $((HEIGHT / 2))]" "$CSTATE" >/dev/null ||
+    fail G-LOCATE-POINTER "the ripples did not center on the pointer: $(jq -c '.cursor.locate_pointer' "$CSTATE")"
+cstate '.cursor.locate_pointer.active | not' "ripples finished" 5 ||
+    fail G-LOCATE-POINTER "the ripples did not finish"
+gsettings set org.gnome.desktop.interface locate-pointer false
+pass G-LOCATE-POINTER "a Ctrl tap ripples at the pointer with locate-pointer on, nothing with it off"
 
 # A genuine GTK fullscreen request blocks accidental corner opening, while
 # deliberate Super access remains available and unfullscreen restores it.
@@ -2939,6 +3660,347 @@ cstate '.keyboard.layouts == ["English (US)"]' "one source" ||
     fail G-SETTINGS-INPUT "the keymap did not return to us"
 pass G-SETTINGS-INPUT "input sources, Super+Space, key repeat and the hot corner follow GNOME"
 
+# GNOME's keyboard accessibility aids (#350). Real key events from the
+# host X server pass through the compositor's input pipeline into a
+# recording GTK client; each aid is first shown absent (negative control),
+# then switched on through GNOME's own settings and exercised.
+"$PY" "$ROOT/scripts/lib/tuna-a11y-input-keyvals-tests.py" >"$ARTIFACTS/a11y-keyvals-classifier.log" 2>&1 ||
+    fail G-A11Y-KEYMAP "the GTK recorder character classifier failed its negative controls"
+A11Y_KBD=org.gnome.desktop.a11y.keyboard
+A11Y_KEYS="$ARTIFACTS/a11y-input.json"
+rm -f "$A11Y_KEYS"
+gsettings reset-recursively "$A11Y_KBD"
+WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-a11y-input-window.py" "$A11Y_KEYS" >"$ARTIFACTS/a11y-input.log" 2>&1 &
+A11Y_INPUT_PID=$!
+cstate '.focused_app_id == "org.tuna.A11yInputProof"' "a11y recorder focused" ||
+    fail G-A11Y-STICKY "the recording GTK window did not map focused"
+[ -s "$A11Y_KEYS" ] || sleep 1
+# Wait for the recorder to satisfy a jq expression.
+a11y_wait() {
+    end=$(($(date +%s) + ${3:-10}))
+    while [ "$(date +%s)" -le "$end" ]; do
+        [ -s "$A11Y_KEYS" ] && jq -e "$1" "$A11Y_KEYS" >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    echo "tuna-gtk-shell-proof: a11y recorder ($2) was:" >&2
+    cat "$A11Y_KEYS" >&2 2>/dev/null || true
+    return 1
+}
+# Printable presses as classified by the real GTK recorder through GDK
+# Unicode conversion (ISO_Level3_Shift is below 0xff00), since mark $1, as
+# "keyval:shift" strings.
+a11y_typed() {
+    echo "[.presses[$1:][] | select(.printable) | \"\\(.keyval):\\(.shift)\"]"
+}
+a11y_mark() { jq '.presses | length' "$A11Y_KEYS"; }
+
+# Sticky Keys. Without the aid a tapped Shift is spent at once.
+mark="$(a11y_mark)"
+xdotool key Shift_L
+xdotool key a
+a11y_wait "$(a11y_typed "$mark") == [\"97:false\"]" "plain shift tap" ||
+    fail G-A11Y-STICKY "without Sticky Keys a Shift tap should not change the next key"
+gsettings set "$A11Y_KBD" stickykeys-enable true
+cstate '.input_aids.sticky' "sticky on" || fail G-A11Y-STICKY "stickykeys-enable did not reach the compositor"
+mark="$(a11y_mark)"
+xdotool key Shift_L
+cstate '.input_aids.latched == ["shift"]' "shift latched" || fail G-A11Y-STICKY "a Shift tap did not latch"
+xdotool key a
+xdotool key b
+a11y_wait "$(a11y_typed "$mark") == [\"65:true\",\"98:false\"]" "latched shift" ||
+    fail G-A11Y-STICKY "the latched Shift did not apply to exactly one key"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "latch spent" ||
+    fail G-A11Y-STICKY "the latched Shift was not released after one key"
+# A live semantic keymap replacement must release the old modifier under
+# the old map; unrelated repeat updates must preserve a pending latch.
+a11y_xkb_options="$(gsettings get org.gnome.desktop.input-sources xkb-options)"
+xdotool key Control_L
+cstate '.input_aids.latched == ["control"]' "control before repeat update" ||
+    fail G-A11Y-KEYMAP "the old map did not latch Control"
+gsettings set org.gnome.desktop.peripherals.keyboard repeat-interval 60
+cstate '.keyboard.repeat_rate == 16 and .input_aids.latched == ["control"]' "repeat without map reset" ||
+    fail G-A11Y-KEYMAP "an unrelated repeat change discarded the Control latch"
+gsettings set org.gnome.desktop.input-sources xkb-options "['ctrl:swapcaps']"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "old-map holds released" ||
+    fail G-A11Y-KEYMAP "a keymap replacement retained old modifier state"
+mark="$(a11y_mark)"
+xdotool key a
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,ctrl}] == [{\"keyval\":97,\"ctrl\":false}]" "no old-map control" ||
+    fail G-A11Y-KEYMAP "the old Control latch affected the first new-map key"
+xdotool key Caps_Lock
+cstate '.input_aids.latched == ["control"]' "remapped Caps is Control" ||
+    fail G-A11Y-KEYMAP "the configured Caps-to-Control role did not latch"
+mark="$(a11y_mark)"
+xdotool key a
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,ctrl}] == [{\"keyval\":97,\"ctrl\":true}]" "real remapped control chord" ||
+    fail G-A11Y-KEYMAP "the remapped physical Caps key did not control the real GTK key"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "remapped latch spent" ||
+    fail G-A11Y-KEYMAP "the remapped Control latch did not release"
+# Balance the host Caps Lock toggle while the guest still maps it to Control.
+xdotool key Caps_Lock
+cstate '.input_aids.latched == ["control"]' "remapped control before restore" ||
+    fail G-A11Y-KEYMAP "the remapped role did not remain live before restoration"
+gsettings set org.gnome.desktop.input-sources xkb-options "$a11y_xkb_options"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "map restoration clears holds" ||
+    fail G-A11Y-KEYMAP "restoring the original map retained a remapped Control hold"
+gsettings set org.gnome.desktop.peripherals.keyboard repeat-interval 50
+cstate '.keyboard.repeat_rate == 20' "repeat restored" ||
+    fail G-A11Y-KEYMAP "repeat preferences did not restore"
+cp "$A11Y_KEYS" "$ARTIFACTS/a11y-keymap.json"
+pass G-A11Y-KEYMAP "repeat changes preserve a latch; semantic keymap replacement clears it; remapped physical Caps produces a real Control chord"
+# The private Xvfb/evdev input fixture uses X keycode108 for physical
+# RightAlt (evdev100). xdotool's Alt_R keysym lookup sends an additional
+# Alt_L64 on this host map, so tap the physical key through XTEST. Keep
+# exact guest latch assertions: US RightAlt is Alt, German RightAlt is
+# Level3. No host modifier clearing/filtering is performed.
+"$PY" "$ROOT/scripts/lib/xkeycode-tap-tests.py" >"$ARTIFACTS/a11y-physical-tap-tests.log" 2>&1 ||
+    fail G-A11Y-KEYMAP "physical key driver negative controls failed"
+a11y_right_alt_tap() {
+    "$PY" "$ROOT/scripts/lib/xkeycode-tap.py" "$DISPLAY" --keycode 108 ||
+        fail G-A11Y-KEYMAP "physical RightAlt XTEST tap failed"
+}
+"$PY" "$ROOT/scripts/lib/xkeysym-levels.py" "$DISPLAY" ffea fe03 >"$ARTIFACTS/a11y-host-rightalt-levels.log" 2>&1 ||
+    fail G-A11Y-KEYMAP "could not record the host RightAlt/Level3 keymap"
+cp "$CSTATE" "$ARTIFACTS/a11y-keymap-before-rightalt.json"
+mark="$(a11y_mark)"
+a11y_right_alt_tap
+cstate '.input_aids.latched == ["alt"]' "US physical RightAlt is Alt" ||
+    fail G-A11Y-KEYMAP "US physical RightAlt did not latch only Alt"
+xdotool key a
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,alt}] == [{\"keyval\":97,\"alt\":true}]" "US RightAlt actual chord" ||
+    fail G-A11Y-KEYMAP "US RightAlt was not delivered as a real Alt chord"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "US RightAlt spent" ||
+    fail G-A11Y-KEYMAP "US RightAlt remained held after its chord"
+# Actual German Level3 selector: an AltGr tap must affect exactly one
+# subsequent real client key, and be inert with Sticky Keys disabled.
+a11y_sources="$(gsettings get org.gnome.desktop.input-sources sources)"
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de')]"
+cstate '.keyboard.layouts == ["German"] and .input_aids.latched == [] and .seat_pressed_key_count == 0' "German map resets holds" ||
+    fail G-A11Y-KEYMAP "German layout replacement did not clear held modifiers"
+gsettings set "$A11Y_KBD" stickykeys-enable false
+cstate '(.input_aids.sticky | not)' "German sticky off" || fail G-A11Y-KEYMAP "Sticky Keys off did not apply"
+cp "$CSTATE" "$ARTIFACTS/a11y-keymap-german-sticky-off.json"
+mark="$(a11y_mark)"
+a11y_right_alt_tap
+xdotool key q
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,alt}] == [{\"keyval\":113,\"alt\":false}]" "plain German AltGr tap" ||
+    fail G-A11Y-KEYMAP "without Sticky Keys an AltGr tap changed the next q"
+gsettings set "$A11Y_KBD" stickykeys-enable true
+cstate '.input_aids.sticky and (.input_aids.shortcuts | not)' "German sticky without shortcuts" ||
+    fail G-A11Y-KEYMAP "Sticky Keys must operate independently of shortcut enable"
+mark="$(a11y_mark)"
+a11y_right_alt_tap
+cstate '.input_aids.latched == ["level3"]' "German Level3 latched" ||
+    fail G-A11Y-KEYMAP "the configured German AltGr selector did not latch Level3"
+cp "$CSTATE" "$ARTIFACTS/a11y-keymap-german-level3-latched.json"
+xdotool key q q
+a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,alt}] == [{\"keyval\":64,\"alt\":false},{\"keyval\":113,\"alt\":false}]" "German Level3 spent once" ||
+    fail G-A11Y-KEYMAP "the real German client did not receive @ then plain q"
+cstate '.input_aids.latched == [] and .seat_pressed_key_count == 0' "German latch released" ||
+    fail G-A11Y-KEYMAP "German Level3 retained a synthetic hold"
+a11y_right_alt_tap
+cstate '.input_aids.latched == ["level3"]' "German pending latch before restore" ||
+    fail G-A11Y-KEYMAP "German Level3 second latch was missing"
+gsettings set org.gnome.desktop.input-sources sources "$a11y_sources"
+cstate '.keyboard.layouts != ["German"] and .input_aids.latched == [] and .seat_pressed_key_count == 0' "restore map clears German hold" ||
+    fail G-A11Y-KEYMAP "restoring original source retained the Level3 hold"
+cp "$A11Y_KEYS" "$ARTIFACTS/a11y-keymap-level3.json"
+# Two taps lock, a third releases.
+mark="$(a11y_mark)"
+xdotool key Shift_L
+xdotool key Shift_L
+cstate '.input_aids.locked == ["shift"]' "shift locked" || fail G-A11Y-STICKY "a second Shift tap did not lock"
+xdotool key a
+xdotool key b
+xdotool key Shift_L
+cstate '.input_aids.locked == []' "shift unlocked" || fail G-A11Y-STICKY "a third Shift tap did not unlock"
+xdotool key c
+a11y_wait "$(a11y_typed "$mark") == [\"65:true\",\"66:true\",\"99:false\"]" "locked shift" ||
+    fail G-A11Y-STICKY "the locked Shift did not hold across keys and release on the third tap"
+cp "$A11Y_KEYS" "$ARTIFACTS/a11y-sticky.json"
+# stickykeys-two-key-off: two modifiers at once switch the aid off, the
+# shell saves it and shows GNOME's confirmation; Enter keeps it off.
+gsettings set "$A11Y_KBD" stickykeys-two-key-off true
+sleep 0.5
+xdotool keydown Control_L keydown Alt_L
+xdotool keyup Alt_L keyup Control_L
+cstate '(.input_aids.sticky | not) and any(.layers[]; .namespace == "tuna-kbd-a11y")' "two keys off" ||
+    fail G-A11Y-STICKY "two modifiers at once did not switch Sticky Keys off and confirm"
+[ "$(gsettings get "$A11Y_KBD" stickykeys-enable)" = false ] ||
+    fail G-A11Y-STICKY "the shell did not save stickykeys-enable false"
+scrot "$ARTIFACTS/a11y-sticky-off-dialog.png" >/dev/null
+xdotool key Return
+cstate 'all(.layers[]; .namespace != "tuna-kbd-a11y")' "dialog closed" ||
+    fail G-A11Y-STICKY "Leave Off did not close the confirmation"
+[ "$(gsettings get "$A11Y_KBD" stickykeys-enable)" = false ] ||
+    fail G-A11Y-STICKY "Leave Off did not keep Sticky Keys off"
+pass G-A11Y-STICKY "a tapped Shift latches for one key, two taps lock, and two modifiers at once switch the aid off with GNOME's confirmation"
+
+# Keyboard shortcuts (enable): Shift five times switches Sticky Keys on.
+gsettings set "$A11Y_KBD" enable true
+gsettings set "$A11Y_KBD" togglekeys-enable true
+cstate '.input_aids.shortcuts' "shortcuts on" || fail G-A11Y-SHORTCUTS "enable did not reach the compositor"
+for _ in 1 2 3 4 5; do xdotool key Shift_L; sleep 0.1; done
+cstate '.input_aids.sticky and any(.layers[]; .namespace == "tuna-kbd-a11y")' "shift five times" ||
+    fail G-A11Y-SHORTCUTS "Shift pressed five times did not switch Sticky Keys on"
+scrot "$ARTIFACTS/a11y-sticky-on-dialog.png" >/dev/null
+[ "$(gsettings get "$A11Y_KBD" stickykeys-enable)" = true ] ||
+    fail G-A11Y-SHORTCUTS "the shell did not save stickykeys-enable true"
+xdotool key Return
+cstate 'all(.layers[]; .namespace != "tuna-kbd-a11y")' "leave on" ||
+    fail G-A11Y-SHORTCUTS "Leave On did not close the confirmation"
+gsettings set "$A11Y_KBD" stickykeys-enable false
+cstate '(.input_aids.sticky | not)' "sticky off" || fail G-A11Y-SHORTCUTS "stickykeys-enable false did not apply"
+# Toggle Keys follows actual XKB LED transitions (twice restores Caps).
+cstate '.input_aids.toggle_beep' "toggle preference live" || fail G-A11Y-SHORTCUTS "Toggle Keys preference did not apply"
+bells="$(jq '.input_aids.bells' "$CSTATE")"
+xdotool key Caps_Lock Caps_Lock Num_Lock Num_Lock
+cstate ".input_aids.bells == $((bells + 4))" "toggle beeps" ||
+    fail G-A11Y-SHORTCUTS "Toggle Keys did not ring once per actual Caps/Num LED change"
+# The setting must be live before measuring. No bell for Caps remapped
+# to Control: its keysym/physical location does not change actual LEDs.
+cstate '.input_aids.toggle_beep' "toggle preference live" || fail G-A11Y-SHORTCUTS "Toggle Keys preference did not apply"
+gsettings set org.gnome.desktop.input-sources xkb-options "['ctrl:swapcaps']"
+gsettings set "$A11Y_KBD" stickykeys-enable true
+cstate '.input_aids.sticky' "toggle map barrier sticky on" || fail G-A11Y-SHORTCUTS "Sticky Keys on did not apply"
+xdotool key Caps_Lock Caps_Lock
+cstate '.input_aids.locked == ["control"]' "toggle actual remapped role" || fail G-A11Y-SHORTCUTS "the actual Caps-to-Control keymap was not applied"
+gsettings set "$A11Y_KBD" stickykeys-enable false
+cstate '(.input_aids.sticky | not)' "toggle remap sticky off" || fail G-A11Y-SHORTCUTS "Sticky Keys off did not apply"
+bells="$(jq '.input_aids.bells' "$CSTATE")"
+mark="$(a11y_mark)"
+xdotool key Caps_Lock Caps_Lock a
+a11y_wait "[.presses[$mark:][] | select(.printable) | .keyval] == [97]" "remapped no-LED client barrier" || fail G-A11Y-SHORTCUTS "remapped key sequence did not reach client"
+cstate ".input_aids.bells == $bells" "no LED change no bell" || fail G-A11Y-SHORTCUTS "a Caps-to-Control press rang without a LED transition"
+gsettings set "$A11Y_KBD" stickykeys-enable true
+cstate '.input_aids.sticky' "toggle restore barrier sticky on" || fail G-A11Y-SHORTCUTS "Sticky Keys on did not apply"
+xdotool key Caps_Lock Caps_Lock
+cstate '.input_aids.locked == ["control"]' "toggle pending remapped latch" || fail G-A11Y-SHORTCUTS "the remapped Control barrier was missing"
+gsettings set org.gnome.desktop.input-sources xkb-options "$a11y_xkb_options"
+cstate '.input_aids.latched == [] and .input_aids.locked == [] and .seat_pressed_key_count == 0' "toggle original map restored" || fail G-A11Y-SHORTCUTS "toggle map restoration retained holds"
+gsettings set "$A11Y_KBD" stickykeys-enable false
+cstate '(.input_aids.sticky | not)' "toggle restore sticky off" || fail G-A11Y-SHORTCUTS "Sticky Keys off did not apply"
+gsettings set "$A11Y_KBD" togglekeys-enable false
+cstate '(.input_aids.toggle_beep | not)' "toggle preference off" || fail G-A11Y-SHORTCUTS "Toggle Keys off did not apply"
+bells="$(jq '.input_aids.bells' "$CSTATE")"
+mark="$(a11y_mark)"
+xdotool key Caps_Lock Caps_Lock a
+a11y_wait "[.presses[$mark:][] | select(.printable) | .keyval] == [97]" "toggle off client barrier" || fail G-A11Y-SHORTCUTS "Toggle Keys off sequence did not reach client"
+cstate ".input_aids.bells == $bells" "toggle disabled no bell" || fail G-A11Y-SHORTCUTS "disabled Toggle Keys rang for an actual LED transition"
+# Shift held eight seconds switches Slow Keys on.
+xdotool keydown Shift_L
+sleep 9
+cstate '.input_aids.slow and any(.layers[]; .namespace == "tuna-kbd-a11y")' "shift held" ||
+    { xdotool keyup Shift_L; fail G-A11Y-SHORTCUTS "Shift held eight seconds did not switch Slow Keys on"; }
+xdotool keyup Shift_L
+[ "$(gsettings get "$A11Y_KBD" slowkeys-enable)" = true ] ||
+    fail G-A11Y-SHORTCUTS "the shell did not save slowkeys-enable true"
+# Slow Keys now apply: Turn Off needs Escape held past the delay.
+xdotool keydown Escape
+sleep 0.8
+xdotool keyup Escape
+cstate '(.input_aids.slow | not) and all(.layers[]; .namespace != "tuna-kbd-a11y")' "turn off" ||
+    fail G-A11Y-SHORTCUTS "Turn Off did not switch Slow Keys back off"
+gsettings set "$A11Y_KBD" enable false
+gsettings set "$A11Y_KBD" togglekeys-enable false
+pass G-A11Y-SHORTCUTS "Shift five times and Shift held eight seconds switch Sticky and Slow Keys with GNOME's confirmation; Toggle Keys beep"
+
+# Slow Keys: a quick tap is dropped, a held key arrives once.
+gsettings set "$A11Y_KBD" slowkeys-delay 600
+gsettings set "$A11Y_KBD" slowkeys-enable true
+cstate '.input_aids.slow' "slow on" || fail G-A11Y-SLOW "slowkeys-enable did not reach the compositor"
+mark="$(a11y_mark)"
+rejected="$(jq '.input_aids.slow_rejected' "$CSTATE")"
+xdotool key a
+cstate ".input_aids.slow_rejected == $((rejected + 1))" "tap rejected" ||
+    fail G-A11Y-SLOW "a tap shorter than the delay was not rejected"
+xdotool keydown b
+sleep 1
+xdotool keyup b
+a11y_wait "$(a11y_typed "$mark") == [\"98:false\"]" "held key" ||
+    fail G-A11Y-SLOW "Slow Keys did not deliver only the key held past the delay"
+gsettings set "$A11Y_KBD" slowkeys-enable false
+cstate '(.input_aids.slow | not)' "slow off" || fail G-A11Y-SLOW "slowkeys-enable false did not apply"
+mark="$(a11y_mark)"
+xdotool key a
+a11y_wait "$(a11y_typed "$mark") == [\"97:false\"]" "slow off" ||
+    fail G-A11Y-SLOW "a tap was not delivered with Slow Keys off"
+pass G-A11Y-SLOW "Slow Keys drop a tap shorter than slowkeys-delay and deliver a held key once"
+
+# Bounce Keys: a key pressed again within the delay is ignored.
+mark="$(a11y_mark)"
+xdotool key a
+sleep 0.1
+xdotool key a
+a11y_wait "$(a11y_typed "$mark") == [\"97:false\",\"97:false\"]" "no bounce" ||
+    fail G-A11Y-BOUNCE "without Bounce Keys both presses should arrive"
+gsettings set "$A11Y_KBD" bouncekeys-delay 700
+gsettings set "$A11Y_KBD" bouncekeys-enable true
+cstate '.input_aids.bounce' "bounce on" || fail G-A11Y-BOUNCE "bouncekeys-enable did not reach the compositor"
+mark="$(a11y_mark)"
+xdotool key a
+sleep 0.1
+xdotool key a
+sleep 1
+xdotool key a
+a11y_wait "$(a11y_typed "$mark") == [\"97:false\",\"97:false\"]" "bounce" ||
+    fail G-A11Y-BOUNCE "the quick repeat was not dropped, or the later press was"
+cstate '.input_aids.bounce_rejected >= 1' "bounce counted" || fail G-A11Y-BOUNCE "no bounce was rejected"
+gsettings set "$A11Y_KBD" bouncekeys-enable false
+pass G-A11Y-BOUNCE "a repeat within bouncekeys-delay is dropped; a later press arrives"
+
+# Mouse Keys: the keypad moves the pointer and clicks.
+a11y_rect="$(jq -c '.focused_rect' "$CSTATE")"
+a11y_cx="$(echo "$a11y_rect" | jq '.[0] + (.[2] / 2 | floor)')"
+a11y_cy="$(echo "$a11y_rect" | jq '.[1] + (.[3] / 2 | floor)')"
+xdotool mousemove --window "$WID" "$a11y_cx" "$a11y_cy"
+cstate ".pointer_position == [$a11y_cx, $a11y_cy]" "pointer on recorder" ||
+    fail G-A11Y-MOUSEKEYS "the pointer did not reach the recording window"
+xdotool keydown KP_Right
+sleep 0.6
+xdotool keyup KP_Right
+sleep 0.3
+cstate ".pointer_position == [$a11y_cx, $a11y_cy]" "keypad without mouse keys" ||
+    fail G-A11Y-MOUSEKEYS "the keypad moved the pointer without Mouse Keys"
+gsettings set "$A11Y_KBD" mousekeys-max-speed 1000
+gsettings set "$A11Y_KBD" mousekeys-accel-time 300
+gsettings set "$A11Y_KBD" mousekeys-init-delay 100
+gsettings set "$A11Y_KBD" mousekeys-enable true
+cstate '.input_aids.mouse' "mouse keys on" || fail G-A11Y-MOUSEKEYS "mousekeys-enable did not reach the compositor"
+xdotool keydown KP_Right
+sleep 0.8
+xdotool keyup KP_Right
+cstate ".pointer_position[0] >= $((a11y_cx + 60)) and .pointer_position[1] == $a11y_cy" "pointer moved right" ||
+    fail G-A11Y-MOUSEKEYS "holding keypad 6 did not accelerate the pointer right"
+moved="$(jq -c '.pointer_position' "$CSTATE")"
+sleep 0.5
+cstate ".pointer_position == $moved" "pointer stopped" ||
+    fail G-A11Y-MOUSEKEYS "the pointer kept moving after the key was released"
+# The host pointer never left the center, so return one pixel aside:
+# a move to where it already is sends no motion.
+xdotool mousemove --window "$WID" $((a11y_cx + 1)) "$a11y_cy"
+cstate ".pointer_position == [$((a11y_cx + 1)), $a11y_cy]" "pointer back on recorder" ||
+    fail G-A11Y-MOUSEKEYS "the pointer did not return to the recording window"
+buttons="$(jq '.buttons | length' "$A11Y_KEYS")"
+xdotool key KP_Begin
+a11y_wait "(.buttons | length) == $((buttons + 1)) and .buttons[-1].button == 1" "keypad click" ||
+    fail G-A11Y-MOUSEKEYS "keypad 5 did not click the primary button"
+xdotool key KP_Subtract KP_Begin
+a11y_wait "(.buttons | length) == $((buttons + 2)) and .buttons[-1].button == 3" "keypad secondary" ||
+    fail G-A11Y-MOUSEKEYS "keypad - then 5 did not click the secondary button"
+cp "$A11Y_KEYS" "$ARTIFACTS/a11y-mousekeys.json"
+gsettings set "$A11Y_KBD" mousekeys-enable false
+cstate '(.input_aids.mouse | not) and .input_aids.mouse_buttons_down == 0' "mouse keys off" ||
+    fail G-A11Y-MOUSEKEYS "mousekeys-enable false did not apply"
+pass G-A11Y-MOUSEKEYS "keypad 6 accelerates the pointer and stops on release; 5 clicks, - picks the secondary button"
+
+gsettings reset-recursively "$A11Y_KBD"
+kill "$A11Y_INPUT_PID" 2>/dev/null || true
+A11Y_INPUT_PID=""
+cstate 'all(.windows[]; .app_id != "org.tuna.A11yInputProof")' "a11y recorder closed" ||
+    fail G-A11Y-MOUSEKEYS "the recording window did not unmap"
+xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+
 # Disabling animations is live and snaps compositor and GTK transitions.
 gsettings set org.gnome.desktop.interface enable-animations false
 cstate '(.animations_enabled | not)' "animations disabled" ||
@@ -2968,7 +4030,7 @@ sleep 0.3
 xdotool key Escape keyup Alt_L
 cstate 'all(.layers[]; .namespace != "tuna-shell-switcher")' "switcher closed without motion" 5 ||
     fail G-ANIMATIONS-OFF "the switcher did not close"
-tail -c +"$((fade_mark + 1))" "$LOG" | grep -q 'switcher fade popup-out start animated=false' ||
+tail -c +"$((fade_mark + 1))" "$LOG" | "$ROOT/scripts/lib/tuna-fade-match" popup-out start false ||
     fail G-ANIMATIONS-OFF "the switcher popup still faded with animations off"
 gsettings set org.gnome.desktop.interface enable-animations true
 cstate '.animations_enabled' "animations enabled" ||
@@ -2995,7 +4057,7 @@ sleep 0.3
 xdotool key Escape keyup Alt_L
 cstate 'all(.layers[]; .namespace != "tuna-shell-switcher")' "reduced switcher closed" 5 ||
     fail G-ANIMATIONS-OFF "the Reduced Motion switcher did not close"
-tail -c +"$((fade_mark + 1))" "$LOG" | grep -q 'switcher fade popup-out start animated=true' ||
+tail -c +"$((fade_mark + 1))" "$LOG" | "$ROOT/scripts/lib/tuna-fade-match" popup-out start true ||
     fail G-ANIMATIONS-OFF "Reduced Motion dropped the switcher popup's fade"
 # The idle shield is a fade: Reduced Motion keeps it (GNOME's screenShield
 # uses adjustAnimationTime), while animations off removes it.
@@ -3072,6 +4134,1422 @@ cstate '.idle_timeout_ms == 310000' "idle 300" ||
     fail G-SETTINGS-IDLE "the idle lock did not follow back to 300 s"
 pass G-SETTINGS-IDLE "GNOME's idle-delay and lock-enabled set the idle lock live"
 
+# Wellbeing (#354): the live shell records session-active history where
+# GNOME Settings 51 reads it, with GNOME's field names and a startup edge
+# from this journey (not fabricated usage).
+HISTORY_FILE="$XDG_DATA_HOME/gnome-shell/session-active-history.json"
+[ -s "$HISTORY_FILE" ] || fail G-WELLBEING-HISTORY "no history file at $HISTORY_FILE"
+"$PY" - "$HISTORY_FILE" <<'PYHIST' || fail G-WELLBEING-HISTORY "history file failed validation"
+import json, sys, time
+transitions = json.load(open(sys.argv[1]))
+assert transitions, "history is empty"
+for t in transitions:
+    assert set(t) == {"oldState", "newState", "wallTimeSecs"}, t
+    assert t["oldState"] != t["newState"], t
+    assert t["wallTimeSecs"] <= time.time() + 60, t
+recent = [t for t in transitions if abs(t["wallTimeSecs"] - time.time()) < 7200]
+assert recent, "no startup edge from this journey"
+PYHIST
+cp "$HISTORY_FILE" "$ARTIFACTS/wellbeing-history.json"
+# Negative control: disabling recording deletes the file live through the
+# settings watch (not the 30 s tick); re-enabling records again.
+gsettings set org.gnome.desktop.screen-time-limits history-enabled false
+end=$(($(date +%s) + 15))
+while [ -f "$HISTORY_FILE" ] && [ "$(date +%s)" -le "$end" ]; do sleep 1; done
+[ ! -f "$HISTORY_FILE" ] || fail G-WELLBEING-HISTORY "history file survived history-enabled=false"
+gsettings reset org.gnome.desktop.screen-time-limits history-enabled
+end=$(($(date +%s) + 15))
+while [ ! -s "$HISTORY_FILE" ] && [ "$(date +%s)" -le "$end" ]; do sleep 1; done
+[ -s "$HISTORY_FILE" ] || fail G-WELLBEING-HISTORY "history did not resume after re-enabling"
+pass G-WELLBEING-HISTORY "the shell records GNOME-compatible session-active history, deleted while disabled"
+
+# History was just deleted and restarted. A real 10 s daily limit must
+# reach its deadline within this 20 s gate, post the limit notice and request
+# grayscale without waiting for the 30 s background sample. Banners need DND
+# off; the journey's DND state is restored after the break gate.
+DND_BEFORE="$(gsettings get org.gnome.desktop.notifications show-banners)"
+gsettings set org.gnome.desktop.notifications show-banners true
+sleep 2
+gsettings set org.gnome.desktop.screen-time-limits daily-limit-seconds 10
+gsettings set org.gnome.desktop.screen-time-limits daily-limit-enabled true
+LIMIT_BANNER=""
+end=$(($(date +%s) + 20))
+while [ "$(date +%s)" -le "$end" ]; do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-limit.json" 20 >/dev/null 2>&1 || continue
+    if showing "$ARTIFACTS/a11y-wellbeing-limit.json" "Screen Time Limit Reached"; then LIMIT_BANNER=1; break; fi
+    sleep 2
+done
+[ -n "$LIMIT_BANNER" ] || fail G-WELLBEING-LIMIT "no Screen Time Limit Reached banner"
+scrot "$ARTIFACTS/25-wellbeing-limit.png" >/dev/null
+grep -q "wellbeing: effect grayscale=true" "$LOG" || fail G-WELLBEING-LIMIT "no grayscale request in the shell log"
+# Negative controls: grayscale off clears the request; the limit off
+# returns the tracker to Active without a second notice.
+gsettings set org.gnome.desktop.screen-time-limits grayscale false
+end=$(($(date +%s) + 15))
+until grep -q "wellbeing: effect grayscale=false" "$LOG" || [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+grep -q "wellbeing: effect grayscale=false" "$LOG" || fail G-WELLBEING-LIMIT "grayscale=false did not clear the request"
+limit_mark="$(wc -c <"$LOG")"
+gsettings reset org.gnome.desktop.screen-time-limits daily-limit-enabled
+gsettings reset org.gnome.desktop.screen-time-limits daily-limit-seconds
+gsettings reset org.gnome.desktop.screen-time-limits grayscale
+end=$(($(date +%s) + 15))
+until tail -c +"$((limit_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" || [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((limit_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" || fail G-WELLBEING-LIMIT "the tracker did not return to Active"
+pass G-WELLBEING-LIMIT "the spent daily limit posts its notice and requests grayscale live"
+
+# Break reminders with correct timing: a 10 s eyesight interval shows the
+# OSD countdown, then the due notice; an idle user takes the break (fade
+# request) and finishing it plays the complete sound.
+wb_mark="$(wc -c <"$LOG")"
+xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10
+gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 10
+gsettings set org.gnome.desktop.break-reminders.eyesight countdown true
+gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']"
+# Three keep-alives over 6 s: the user stays in the Active phase (idle
+# under 10 s) while the countdown shows and the break comes due. Due is
+# detected on a 2 s tick, so the last input lands 4-6 s before it: away
+# enough for the banner to wait (over 1 s), present enough to be due.
+sleep 2
+xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2))
+sleep 2
+xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+sleep 2
+xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2))
+scrot "$ARTIFACTS/26a-wellbeing-countdown.png" >/dev/null
+DUE_BANNER=""
+end=$(($(date +%s) + 20))
+while [ "$(date +%s)" -le "$end" ]; do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-break.json" 20 >/dev/null 2>&1 || continue
+    if showing "$ARTIFACTS/a11y-wellbeing-break.json" "Time for an Eyesight Break"; then DUE_BANNER=1; break; fi
+    sleep 2
+done
+[ -n "$DUE_BANNER" ] || fail G-WELLBEING-BREAK "no Time for an Eyesight Break banner"
+scrot "$ARTIFACTS/26b-wellbeing-due.png" >/dev/null
+tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: countdown Break in" || fail G-WELLBEING-BREAK "no countdown OSD for the upcoming break"
+# The idle user takes the 10 s break: InBreak fades, completion unfades
+# and sounds. Completion lands ~20 s after selection; sleep past it.
+sleep 20
+end=$(($(date +%s) + 15))
+until tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=true" || [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=true" || fail G-WELLBEING-BREAK "no fade request while the break was taken"
+tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: break complete sound" || fail G-WELLBEING-BREAK "no complete sound when the break finished"
+tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" || fail G-WELLBEING-BREAK "no unfade after the break finished"
+# Leave no trace for the later gates: deselect (Disabled), reset the keys,
+# clear the notices, let the banners expire, restore the journey's DND.
+gsettings reset org.gnome.desktop.break-reminders selected-breaks
+gsettings reset org.gnome.desktop.break-reminders.eyesight interval-seconds
+gsettings reset org.gnome.desktop.break-reminders.eyesight duration-seconds
+gsettings reset org.gnome.desktop.break-reminders.eyesight countdown
+open_calendar
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-cleared.json" 20 --press "Clear" ||
+    fail G-WELLBEING-BREAK "could not press Clear"
+xdotool key Escape
+xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+sleep 3
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-quiet.json" 20 ||
+    fail G-WELLBEING-BREAK "quiet dump failed"
+if showing "$ARTIFACTS/a11y-wellbeing-quiet.json" "Time for an Eyesight Break"; then
+    fail G-WELLBEING-BREAK "the due banner outlived Clear"
+fi
+if showing "$ARTIFACTS/a11y-wellbeing-quiet.json" "Screen Time Limit Reached"; then
+    fail G-WELLBEING-BREAK "the limit banner outlived Clear"
+fi
+gsettings set org.gnome.desktop.notifications show-banners "$DND_BEFORE"
+pass G-WELLBEING-BREAK "the 10 s break counts down, notifies due, and an idle take fades and sounds"
+
+# Wellbeing pixel/action proofs (#354, w3 pixel lane, proof4f hardening):
+# framebuffer effects through the production path (settings ->
+# tick/deadline -> 0.35 wire -> compositor FrameColor), sampled on the
+# EXISTING deterministic saturated native test-client region
+# (tuna-cursor-client 320x200 solid 0xff8f3fd0, same interior offsets as
+# the native tuna-wellbeing-proof). Hardening over frozen 47d:
+#
+# - probe binding: CSTATE exposes id/app_id/application_window_id but
+#   NOT pid/start, and no script-readable inventory exposes the kernel
+#   client PID, so PID-from-CSTATE is never asserted. The probe is
+#   bound by exact before/after unique new-map identity (one new
+#   native window with the owned app_id; decoys fail closed) plus the
+#   owned client's own pointer-enter handshake and /proc lifetime
+#   (pid/uid/start/exe) re-checked on every gate.
+# - owned-region proof: baselines must show the exact known interior
+#   RGB, every capture re-checks the bound geometry, requires settled
+#   overview_progress==0, and excludes actual layers geometrically.
+# - frame bracketing: a CSTATE snapshot is taken BEFORE and AFTER
+#   every scrot; identical manual clock + effect sample + owned
+#   geometry is required or the capture is discarded and the gate
+#   fails.
+# - provenance: every capture carries a capture-time /proc snapshot
+#   (exe byte hash + starttime + boot id); the gate requires
+#   cross-capture agreement and requires the admitted binary hashes to
+#   equal the live processes' exe bytes. No path-only hashing.
+# - stale-press (NARROWED, do not expand): retired-UI-absence is
+#   asserted only with a mandatory alive owned (--pid) AT-SPI tree and
+#   zero transport errors; a dead bus or timeout FAILS the gate.
+#   Delay/Skip stale checks also assert the live-press due schedule is
+#   undisturbed. Callback-retirement stays explicitly UNQUALIFIED at
+#   e2e (qualified at unit/GTK level elsewhere); no callback evidence
+#   is claimed here.
+# - neutral control: geometry/image inputs are validated before any
+#   effect assertion; malformed inputs are harness errors (exit 2),
+#   never passes and never pixel verdicts.
+#
+# Each gate records source commit, binary hashes, capture timestamps
+# and animation-clock readings; missing or stale captures fail closed.
+# Pixel tolerance is fixed at 2 (no widening); logs never qualify.
+# Manual-clock steps never skip the 3s ramp (500ms steps). No
+# old-build controls: every capture comes from this run's single
+# admitted build. Issue #354 stays OPEN; nested observation pending.
+WB_PROBE_PID=""
+WB_SHELL_PID=""
+WB_SHELL_START=""
+WB_GATE=""
+WB_NONCE=""
+WB_DUMP_SEQ=0
+WB_START=0
+WB_FROZEN=0
+WB_CAPS_JSONL=""
+WB_STATE_JSONL=""
+WB_WINDOWS_BEFORE=0
+
+wb_proc_start_ticks() {
+    "$PY" -c 'import sys
+pid = sys.argv[1]
+try:
+    stat = open("/proc/%s/stat" % pid).read().rsplit(")", 1)[1].split()
+    print(int(stat[19]))
+except Exception as exc:
+    print("cannot read start time of %s: %s" % (pid, exc))
+    raise SystemExit(1)' "$1"
+}
+
+wb_gate_begin() {
+    WB_GATE="$1"
+    WB_START="$(date +%s)"
+    WB_NONCE="$1-$(date +%s)-$$"
+    WB_DUMP_SEQ=0
+    WB_CAPS_JSONL="$ARTIFACTS/wb-$WB_GATE-captures.jsonl"
+    : >"$WB_CAPS_JSONL"
+    WB_STATE_JSONL="$ARTIFACTS/wb-$WB_GATE-state.jsonl"
+    : >"$WB_STATE_JSONL"
+    [ -x "$ARTIFACTS/cursor-client/tuna-cursor-client" ] ||
+        fail "$WB_GATE" "the cursor probe build is missing"
+    [ -f "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" ] ||
+        fail "$WB_GATE" "the frame proof helper is missing"
+    [ -f "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" ] ||
+        fail "$WB_GATE" "the action proof helper is missing"
+    [ -f "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" ] ||
+        fail "$WB_GATE" "the probe bind helper is missing"
+    if [ -z "$COMPOSITOR_PID" ] || ! kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
+        fail "$WB_GATE" "the compositor process went missing"
+    fi
+    wb_shell_matches="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk || true)"
+    [ -n "$wb_shell_matches" ] ||
+        fail "$WB_GATE" "no shell process under the compositor (expected exactly one)"
+    [ "$(printf '%s\n' "$wb_shell_matches" | wc -l)" -eq 1 ] ||
+        fail "$WB_GATE" "ambiguous shell processes under the compositor (expected exactly one)"
+    WB_SHELL_PID="$wb_shell_matches"
+    kill -0 "$WB_SHELL_PID" 2>/dev/null ||
+        fail "$WB_GATE" "the shell process went missing"
+    WB_SHELL_START="$(wb_proc_start_ticks "$WB_SHELL_PID")" ||
+        fail "$WB_GATE" "the shell start time is unreadable"
+    [ -n "$WB_SHELL_START" ] ||
+        fail "$WB_GATE" "the shell start time is unreadable"
+}
+
+wb_stamp_dump() {
+    wb_stamp_ticks="$(wb_proc_start_ticks "$WB_SHELL_PID")" || return 1
+    [ "$wb_stamp_ticks" = "$WB_SHELL_START" ] || return 1
+    wb_stamp_sha="$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" || return 1
+    [ -n "$wb_stamp_sha" ] || return 1
+    jq -n --arg gate "$WB_GATE" --arg nonce "$WB_NONCE" \
+        --argjson seq "$WB_DUMP_SEQ" --argjson pid "$WB_SHELL_PID" \
+        --argjson start_ticks "$wb_stamp_ticks" \
+        --argjson epoch "$(date +%s)" --arg dump_sha256 "$wb_stamp_sha" \
+        '{gate:$gate,nonce:$nonce,seq:$seq,pid:$pid,start_ticks:$start_ticks,epoch:$epoch,dump_sha256:$dump_sha256}' \
+        >"$1.stamp" || return 1
+}
+
+wb_dump_anchor() {
+    [ "$(jq -r '.[0].process_id // "null"' "$1" 2>/dev/null)" = "$WB_SHELL_PID" ] || return 1
+    jq -e 'any(.[]; .showing)' "$1" >/dev/null 2>&1 || return 1
+}
+
+wb_a11y_dump() {
+    wb_dump_out="$1"
+    wb_dump_timeout="$2"
+    shift 2
+    WB_DUMP_SEQ=$((WB_DUMP_SEQ + 1))
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk \
+        "$wb_dump_out" "$wb_dump_timeout" --pid "$WB_SHELL_PID" "$@" || return $?
+    wb_stamp_dump "$wb_dump_out" || return 1
+    wb_dump_anchor "$wb_dump_out" || return 1
+}
+
+# Wait up to SECONDS for a wellbeing banner titled TITLE and press its BUTTON
+# in the same AT-SPI pass that saw it (OUT is that pre-press tree). GNOME
+# times a banner out 4 s after it shows to an active user, or 2 s after an
+# away user's next input, and the shell retires its actions on expiry. A
+# separate dump-then-press round trip with keep-alive input in between could
+# press a banner that had already expired, so one keep-alive move per short
+# step keeps the user active and the press within about a second of the
+# banner showing. Waits 1.5 s after the press, like --press alone.
+wb_press_banner() {
+    wbpb_gate="$1" wbpb_out="$2" wbpb_title="$3" wbpb_button="$4"
+    wbpb_until=$(($(date +%s) + $5)) wbpb_step=0
+    while [ "$(date +%s)" -le "$wbpb_until" ]; do
+        xdotool mousemove --window "$WID" $((WIDTH / 3 + wbpb_step % 2 * 40)) $((HEIGHT / 2)) ||
+            fail "$wbpb_gate" "keep-alive failed"
+        wbpb_step=$((wbpb_step + 1))
+        sleep 0.5
+        if wb_a11y_dump "$wbpb_out" 20 --when-showing "$wbpb_title" --press "$wbpb_button" >/dev/null 2>&1; then
+            WB_PRESS_EPOCH="$(date +%s)"
+            sleep 1.5
+            return 0
+        fi
+    done
+    return 1
+}
+
+wb_probe_ensure() {
+    if [ -n "$WB_PROBE_PID" ] && kill -0 "$WB_PROBE_PID" 2>/dev/null; then
+        cstate 'any(.windows[]; .app_id == "tuna-cursor-probe")' "probe mapped" 5 ||
+            fail "$WB_GATE" "the owned probe window went missing"
+        "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" check \
+            --cstate "$CSTATE" --owner "$ARTIFACTS/wb-probe-owner.json" \
+            --pid "$WB_PROBE_PID" ||
+            fail "$WB_GATE" "the owned probe binding no longer holds (decoy, move, or client change)"
+    else
+        if [ -n "$WB_PROBE_PID" ]; then
+            kill "$WB_PROBE_PID" 2>/dev/null || true
+            wait "$WB_PROBE_PID" 2>/dev/null || true
+            WB_PROBE_PID=""
+        fi
+        cstate 'all(.windows[]; .app_id != "tuna-cursor-probe")' "stale probe gone" 5 ||
+            fail "$WB_GATE" "a stale probe map outlived its client"
+        cp "$CSTATE" "$ARTIFACTS/wb-probe-before.json" ||
+            fail "$WB_GATE" "compositor state missing before probe map"
+        rm -f "$ARTIFACTS/wb-cursor-probe.log"
+        WAYLAND_DISPLAY="$SOCKET_NAME" "$ARTIFACTS/cursor-client/tuna-cursor-client" surface 32 \
+            >"$ARTIFACTS/wb-cursor-probe.log" 2>&1 &
+        WB_PROBE_PID=$!
+        cstate 'any(.windows[]; .app_id == "tuna-cursor-probe")' "probe mapped" ||
+            fail "$WB_GATE" "the owned probe window never mapped"
+        # A new window's first published rect can precede the client's
+        # own size (the idle loop writes state as soon as it maps): bind
+        # only once the same rect has been published three reads running.
+        wb_rect_last=""
+        wb_rect_same=0
+        wb_rect_end=$(($(date +%s) + 10))
+        while [ "$wb_rect_same" -lt 3 ]; do
+            [ "$(date +%s)" -le "$wb_rect_end" ] ||
+                fail "$WB_GATE" "the owned probe geometry never settled"
+            wb_rect_now="$(jq -c '[.windows[] | select(.app_id == "tuna-cursor-probe") | .rect]' "$CSTATE" 2>/dev/null)" || wb_rect_now=""
+            if [ -n "$wb_rect_now" ] && [ "$wb_rect_now" = "$wb_rect_last" ]; then
+                wb_rect_same=$((wb_rect_same + 1))
+            else
+                wb_rect_same=1
+                wb_rect_last="$wb_rect_now"
+            fi
+            sleep 0.3
+        done
+        cp "$CSTATE" "$ARTIFACTS/wb-probe-after.json" ||
+            fail "$WB_GATE" "compositor state missing after probe map"
+        "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" bind \
+            --before "$ARTIFACTS/wb-probe-before.json" \
+            --after "$ARTIFACTS/wb-probe-after.json" --pid "$WB_PROBE_PID" \
+            --app-id tuna-cursor-probe --out "$ARTIFACTS/wb-probe-owner.json" ||
+            fail "$WB_GATE" "the owned probe map is ambiguous (decoy?) or not native"
+        # Fresh-enter handshake: only our client writes this log.
+        # Park away and OBSERVE the pointer outside the bound rect (an
+        # actual leave, not a commanded move), record the log byte
+        # offset, move onto the bound center, then require a NEW
+        # complete enter strictly after the offset while the pointer
+        # sits inside the bound rect; bound geometry and the
+        # owned-client lifetime are pinned before and after.
+        # Whole-log matching is gone, and the wait itself only
+        # completes on a complete NEW record (no substring grep). The
+        # outside observation runs through pointer-zone, which rejects
+        # malformed pointer shapes, mistyped or non-finite coordinates
+        # instead of letting jq null-ordering accept [] as outside.
+        probe_center="$(jq -r '.rect | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' \
+            "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        if [ -z "$probe_center" ] || [ "$probe_center" = "null null" ]; then
+            fail "$WB_GATE" "the bound probe rect went missing"
+        fi
+        wb_bound_x="$(jq -r '.rect[0]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_y="$(jq -r '.rect[1]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_w="$(jq -r '.rect[2]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        wb_bound_h="$(jq -r '.rect[3]' "$ARTIFACTS/wb-probe-owner.json")" ||
+            fail "$WB_GATE" "the bound probe rect went missing"
+        for wb_bound_v in "$wb_bound_x" "$wb_bound_y" "$wb_bound_w" "$wb_bound_h"; do
+            case "$wb_bound_v" in ''|*[!0-9]*) fail "$WB_GATE" "the bound probe rect is not integer geometry" ;; esac
+        done
+        wb_park_x=20
+        wb_park_y=$((HEIGHT - 20))
+        if [ "$wb_park_x" -ge "$wb_bound_x" ] && [ "$wb_park_x" -lt "$((wb_bound_x + wb_bound_w))" ] &&
+            [ "$wb_park_y" -ge "$wb_bound_y" ] && [ "$wb_park_y" -lt "$((wb_bound_y + wb_bound_h))" ]; then
+            fail "$WB_GATE" "the probe covers the park corner; no leave is observable"
+        fi
+        xdotool mousemove --window "$WID" "$wb_park_x" "$wb_park_y" ||
+            fail "$WB_GATE" "could not park the pointer for a fresh enter"
+        wb_left=""
+        for _ in $(seq 1 20); do
+            wb_zone="$("$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" pointer-zone \
+                --cstate "$CSTATE" \
+                --rect "$wb_bound_x,$wb_bound_y,$wb_bound_w,$wb_bound_h" 2>/dev/null)" || { sleep 0.25; continue; }
+            if [ "$wb_zone" = "outside" ]; then wb_left=1; break; fi
+            sleep 0.25
+        done
+        if [ -z "$wb_left" ]; then
+            if wb_zone_err="$("$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" pointer-zone \
+                --cstate "$CSTATE" \
+                --rect "$wb_bound_x,$wb_bound_y,$wb_bound_w,$wb_bound_h" 2>&1)"; then
+                fail "$WB_GATE" "the pointer never left the bound rect before the enter mark"
+            fi
+            fail "$WB_GATE" "pointer position unusable before the enter mark: $wb_zone_err"
+        fi
+        kill -0 "$WB_PROBE_PID" 2>/dev/null ||
+            fail "$WB_GATE" "the owned probe client died before the enter handshake"
+        "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" check \
+            --cstate "$CSTATE" --owner "$ARTIFACTS/wb-probe-owner.json" \
+            --pid "$WB_PROBE_PID" ||
+            fail "$WB_GATE" "the owned probe binding broke before the enter handshake"
+        wb_probe_start_before="$(wb_proc_start_ticks "$WB_PROBE_PID")" ||
+            fail "$WB_GATE" "the owned probe start time is unreadable"
+        wb_enter_mark="$(wc -c <"$ARTIFACTS/wb-cursor-probe.log")" ||
+            fail "$WB_GATE" "the owned client log went missing"
+        # shellcheck disable=SC2086 # two coordinates, second move after leave
+        xdotool mousemove --window "$WID" $probe_center ||
+            fail "$WB_GATE" "could not move onto the bound probe"
+        cstate ".pointer_position != null and .pointer_position[0] >= $wb_bound_x and .pointer_position[1] >= $wb_bound_y and .pointer_position[0] < $((wb_bound_x + wb_bound_w)) and .pointer_position[1] < $((wb_bound_y + wb_bound_h))" "pointer inside the bound rect" 5 ||
+            fail "$WB_GATE" "the pointer did not land inside the bound rect"
+        wb_entered=""
+        for _ in $(seq 1 20); do
+            if "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" fresh-enter \
+                --log "$ARTIFACTS/wb-cursor-probe.log" --offset "$wb_enter_mark" >/dev/null 2>&1; then wb_entered=1; break; fi
+            sleep 0.25
+        done
+        [ -n "$wb_entered" ] ||
+            fail "$WB_GATE" "no fresh pointer enter after the offset on the bound surface"
+        "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" fresh-enter \
+            --log "$ARTIFACTS/wb-cursor-probe.log" --offset "$wb_enter_mark" ||
+            fail "$WB_GATE" "no fresh pointer enter strictly after the offset"
+        kill -0 "$WB_PROBE_PID" 2>/dev/null ||
+            fail "$WB_GATE" "the owned probe client died across the enter handshake"
+        "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" check \
+            --cstate "$CSTATE" --owner "$ARTIFACTS/wb-probe-owner.json" \
+            --pid "$WB_PROBE_PID" ||
+            fail "$WB_GATE" "the owned probe binding broke across the enter handshake"
+        wb_probe_start_after="$(wb_proc_start_ticks "$WB_PROBE_PID")" ||
+            fail "$WB_GATE" "the owned probe start time is unreadable"
+        [ "$wb_probe_start_after" = "$wb_probe_start_before" ] ||
+            fail "$WB_GATE" "the owned probe client was replaced across the enter handshake"
+    fi
+    owner_rect="$(jq -c '.rect' "$ARTIFACTS/wb-probe-owner.json")" ||
+        fail "$WB_GATE" "the bound probe rect went missing"
+    if [ -z "$owner_rect" ] || [ "$owner_rect" = "null" ]; then
+        fail "$WB_GATE" "the bound probe rect went missing"
+    fi
+    region_rect="$(jq -n --argjson r "$owner_rect" '[($r[0]+64),($r[1]+64),16,16]')" ||
+        fail "$WB_GATE" "could not derive the sample region"
+    jq -n --argjson rect "$region_rect" \
+        '[{name:"wb-probe-texture",kind:"texture",rect:$rect}]' >"$ARTIFACTS/wb-regions.json" ||
+        fail "$WB_GATE" "could not write the sample regions"
+    xdotool mousemove --window "$WID" 20 $((HEIGHT - 20)) ||
+        fail "$WB_GATE" "could not park the pointer away from the probe"
+}
+
+wb_pixel_preconditions() {
+    gsettings set org.gnome.desktop.notifications show-banners false ||
+        fail "$WB_GATE" "could not hold banners back"
+    [ "$(gsettings get org.gnome.desktop.notifications show-banners)" = "false" ] ||
+        fail "$WB_GATE" "DND did not hold"
+    cstate '.motion_policy == "full"' "full motion" ||
+        fail "$WB_GATE" "motion is not full; 3s ramps do not apply"
+    cstate '(.overview_open | not) and .overview_progress == 0' "settled no overview" ||
+        fail "$WB_GATE" "the overview overlaps the probe or is not settled"
+    cstate 'all(.layers[]; .namespace != "tuna-shell-switcher")' "no switcher" ||
+        fail "$WB_GATE" "a switcher popup overlaps the probe"
+    cstate '.wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1' "neutral" ||
+        fail "$WB_GATE" "effects are not neutral at gate start"
+}
+
+# The shell logs its effect request before the compositor applies it, so an
+# off capture taken on the log line alone can bracket the change (gtk-shell
+# 38732705939: brightness 0.6 -> 1.0 across both-off). The animation clock is
+# frozen here, so any fade-out would hold an intermediate value and never
+# reach neutral: waiting for neutral keeps the immediacy proof intact.
+wb_await_off() {
+    cstate '.wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1 and .wellbeing_effects.animating == false' \
+        "compositor applied the disable" 5 ||
+        fail "$1" "the compositor never reached neutral on the frozen clock (fade-out found)"
+}
+
+wb_capture() {
+    label="$1"
+    cstate '.animation_clock_manual == true and (.animation_clock_ms | type) == "number" and .animation_clock_ms >= 0 and .animation_clock_ms == (.animation_clock_ms | floor)' "manual capture clock" ||
+        fail "$WB_GATE" "pixel capture $label requires a typed manual animation clock"
+    png="$ARTIFACTS/wb-$label.png"
+    cstate_before="$ARTIFACTS/wb-$label-cstate-before.json"
+    cstate_after="$ARTIFACTS/wb-$label-cstate-after.json"
+    proc_before_file="$ARTIFACTS/wb-$label-proc-before.json"
+    proc_after_file="$ARTIFACTS/wb-$label-proc-after.json"
+    cp "$CSTATE" "$cstate_before" || fail "$WB_GATE" "compositor state missing before $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
+        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
+        >"$proc_before_file" ||
+        fail "$WB_GATE" "capture-time process snapshot failed before $label"
+    scrot "$png" >/dev/null || fail "$WB_GATE" "scrot failed for $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
+        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
+        >"$proc_after_file" ||
+        fail "$WB_GATE" "capture-time process snapshot failed after $label"
+    cp "$CSTATE" "$cstate_after" || fail "$WB_GATE" "compositor state missing after $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-sandwich \
+        --before "$proc_before_file" --after "$proc_after_file" --label "$label" ||
+        fail "$WB_GATE" "a capture-time process was replaced across $label"
+    proc_json="$(cat "$proc_after_file")" ||
+        fail "$WB_GATE" "capture-time process snapshot unreadable for $label"
+    proc_before_json="$(cat "$proc_before_file")" ||
+        fail "$WB_GATE" "capture-time process snapshot unreadable for $label"
+    clk="$(jq -r '.animation_clock_ms // "null"' "$cstate_after")" ||
+        fail "$WB_GATE" "clock unreadable after $label"
+    epoch="$(date +%s)"
+    iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    jq -n -c --arg label "$label" --arg image "$png" \
+        --arg before "$cstate_before" --arg after "$cstate_after" \
+        --argjson clock "$clk" --argjson epoch "$epoch" --arg iso "$iso" \
+        --argjson proc "$proc_json" --argjson proc_before "$proc_before_json" \
+        '{label:$label,image:$image,cstate_before:$before,cstate_after:$after,clock_ms:$clock,epoch:$epoch,iso:$iso,proc:$proc,proc_before:$proc_before}' \
+        >>"$WB_CAPS_JSONL" || fail "$WB_GATE" "could not record $label"
+}
+
+# Live Delay/Skip schedules use wall time. Freeze only their resulting pixel
+# capture, then restore wall time before the next action or cleanup.
+wb_capture_after_live_action() {
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen capture clock" ||
+        fail "$WB_GATE" "the clock did not freeze for the live-action capture"
+    wb_capture "$1" || fail "$WB_GATE" "live-action pixel capture failed"
+    rm -f "$TUNA_ANIMATION_CLOCK"
+    cstate '.animation_clock_manual | not' "real clock" ||
+        fail "$WB_GATE" "real time did not resume after the live-action capture"
+}
+
+wb_state_capture() {
+    label="$1"
+    cstate_before="$ARTIFACTS/wb-$label-cstate-before.json"
+    cstate_after="$ARTIFACTS/wb-$label-cstate-after.json"
+    proc_before_file="$ARTIFACTS/wb-$label-proc-before.json"
+    proc_after_file="$ARTIFACTS/wb-$label-proc-after.json"
+    cp "$CSTATE" "$cstate_before" || fail "$WB_GATE" "compositor state missing before $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
+        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
+        >"$proc_before_file" ||
+        fail "$WB_GATE" "capture-time process snapshot failed before $label"
+    cp "$CSTATE" "$cstate_after" || fail "$WB_GATE" "compositor state missing after $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
+        --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
+        >"$proc_after_file" ||
+        fail "$WB_GATE" "capture-time process snapshot failed after $label"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-sandwich \
+        --before "$proc_before_file" --after "$proc_after_file" --label "$label" ||
+        fail "$WB_GATE" "a capture-time process was replaced across $label"
+    proc_json="$(cat "$proc_after_file")" ||
+        fail "$WB_GATE" "capture-time process snapshot unreadable for $label"
+    proc_before_json="$(cat "$proc_before_file")" ||
+        fail "$WB_GATE" "capture-time process snapshot unreadable for $label"
+    epoch="$(date +%s)"
+    iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    jq -n -c --arg label "$label" \
+        --arg before "$cstate_before" --arg after "$cstate_after" \
+        --argjson epoch "$epoch" --arg iso "$iso" \
+        --argjson proc "$proc_json" --argjson proc_before "$proc_before_json" \
+        '{label:$label,cstate_before:$before,cstate_after:$after,epoch:$epoch,iso:$iso,proc:$proc,proc_before:$proc_before}' \
+        >>"$WB_STATE_JSONL" || fail "$WB_GATE" "could not record $label"
+}
+
+wb_provenance_finish() {
+    comp_bin="$(readlink -f "/proc/$COMPOSITOR_PID/exe")"
+    [ -n "$comp_bin" ] || fail "$WB_GATE" "the compositor binary went missing"
+    kill -0 "$WB_SHELL_PID" 2>/dev/null || fail "$WB_GATE" "the shell process went missing"
+    shell_bin="$(readlink -f "/proc/$WB_SHELL_PID/exe")"
+    [ -n "$shell_bin" ] || fail "$WB_GATE" "the shell binary went missing"
+    jq -n --arg c "$comp_bin" --arg s "$shell_bin" \
+        --arg p "$ARTIFACTS/cursor-client/tuna-cursor-client" \
+        --arg f "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" \
+        --arg a "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" \
+        --arg b "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" \
+        '{compositor:$c,shell:$s,probe:$p,frame_helper:$f,action_helper:$a,bind_helper:$b}' \
+        >"$ARTIFACTS/wb-$WB_GATE-binaries.json"
+    jq -s '.' "$WB_CAPS_JSONL" >"$ARTIFACTS/wb-$WB_GATE-captures.json"
+    jq -s '.' "$WB_STATE_JSONL" >"$ARTIFACTS/wb-$WB_GATE-state-captures.json"
+    commit="$(git -C "$ROOT" rev-parse HEAD)"
+    [ -n "$commit" ] || fail "$WB_GATE" "source commit missing"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" provenance \
+        --gate "$WB_GATE" --source-commit "$commit" \
+        --binaries "$ARTIFACTS/wb-$WB_GATE-binaries.json" \
+        --captures "$ARTIFACTS/wb-$WB_GATE-captures.json" \
+        --state-captures "$ARTIFACTS/wb-$WB_GATE-state-captures.json" \
+        --owner "$ARTIFACTS/wb-probe-owner.json" \
+        --regions "$ARTIFACTS/wb-regions.json" \
+        --gate-start "$WB_START" \
+        --output "$ARTIFACTS/wb-$WB_GATE-provenance.json" ||
+        fail "$WB_GATE" "provenance failed to close"
+    if [ -s "$WB_STATE_JSONL" ]; then
+        echo "tuna-gtk-shell-proof: $WB_GATE state-only evidence: $(jq -r '[.[].label] | join(", ")' "$ARTIFACTS/wb-$WB_GATE-state-captures.json")"
+    fi
+}
+
+wb_step_ramp() {
+    prefix="$1"
+    file_base="$2"
+    for step in 0 500 1000 1500 2000 2500 3000; do
+        anim_clock $((file_base + step))
+        cstate ".animation_clock_manual and .animation_clock_ms == $((WB_FROZEN + file_base + step))" \
+            "$prefix at $step ms" ||
+            fail "$WB_GATE" "the manual clock did not reach $((file_base + step))ms"
+        sleep 0.5
+        wb_capture "$prefix-$step"
+    done
+}
+
+wb_limit_cleanup() {
+    wb_mark="$(wc -c <"$LOG")"
+    gsettings reset org.gnome.desktop.screen-time-limits daily-limit-enabled ||
+        fail "$WB_GATE" "could not reset the daily limit"
+    gsettings reset org.gnome.desktop.screen-time-limits daily-limit-seconds ||
+        fail "$WB_GATE" "could not reset the limit seconds"
+    end=$(($(date +%s) + 15))
+    until tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+    tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" ||
+        fail "$WB_GATE" "the tracker did not return to Active"
+}
+
+wb_break_cleanup() {
+    gsettings reset org.gnome.desktop.break-reminders selected-breaks ||
+        fail "$WB_GATE" "could not deselect breaks"
+    gsettings reset org.gnome.desktop.break-reminders.eyesight interval-seconds ||
+        fail "$WB_GATE" "could not reset the break interval"
+    gsettings reset org.gnome.desktop.break-reminders.eyesight duration-seconds ||
+        fail "$WB_GATE" "could not reset the break duration"
+    gsettings reset org.gnome.desktop.break-reminders.eyesight delay-seconds ||
+        fail "$WB_GATE" "could not reset the break delay"
+    gsettings reset org.gnome.desktop.break-reminders.eyesight countdown ||
+        fail "$WB_GATE" "could not reset the countdown"
+    gsettings reset org.gnome.desktop.break-reminders.eyesight fade-screen ||
+        fail "$WB_GATE" "could not reset fade-screen"
+    gsettings reset org.gnome.desktop.break-reminders.eyesight lock-screen ||
+        fail "$WB_GATE" "could not reset lock-screen"
+    open_calendar
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-$WB_GATE-cleared.json" 20 --press "Clear" ||
+        fail "$WB_GATE" "could not press Clear"
+    xdotool key Escape || fail "$WB_GATE" "could not close the calendar"
+    xdotool mousemove --window "$WID" 20 $((HEIGHT - 20)) ||
+        fail "$WB_GATE" "could not park the pointer"
+    sleep 3
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-$WB_GATE-quiet.json" 20 ||
+        fail "$WB_GATE" "quiet dump failed"
+    if showing "$ARTIFACTS/a11y-wb-$WB_GATE-quiet.json" "Time for an Eyesight Break"; then
+        fail "$WB_GATE" "a break banner outlived cleanup"
+    fi
+    if showing "$ARTIFACTS/a11y-wb-$WB_GATE-quiet.json" "Screen Time Limit Reached"; then
+        fail "$WB_GATE" "a limit banner outlived cleanup"
+    fi
+}
+
+# Gray-only: daily limit -> screen tick -> 0.35 grayscale -> desaturation
+# 1.0, 3s EASE_OUT_QUAD entry, immediate disable on Active.
+wb_gate_begin G-WELLBEING-PIXEL-GRAY
+WB_WINDOWS_BEFORE="$(jq '.windows | length' "$CSTATE")"
+wb_probe_ensure
+wb_pixel_preconditions
+# Freeze before the baseline: bracketed captures require identical
+# typed manual-clock samples, and real time reports ms null.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-PIXEL-GRAY "the clock file did not freeze animation time"
+WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
+wb_capture gray-baseline
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
+    --image "$ARTIFACTS/wb-gray-baseline.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --rgb 143,63,208 \
+    --cstate-before "$ARTIFACTS/wb-gray-baseline-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-gray-baseline-cstate-after.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-gray-baseline-check.json" ||
+    fail G-WELLBEING-PIXEL-GRAY "baseline is not the live owned probe interior (overlap?)"
+gray_mark="$(wc -c <"$LOG")"
+gsettings set org.gnome.desktop.screen-time-limits grayscale true ||
+    fail G-WELLBEING-PIXEL-GRAY "could not set grayscale"
+gsettings set org.gnome.desktop.screen-time-limits daily-limit-seconds 10 ||
+    fail G-WELLBEING-PIXEL-GRAY "could not set the daily limit"
+gsettings set org.gnome.desktop.screen-time-limits daily-limit-enabled true ||
+    fail G-WELLBEING-PIXEL-GRAY "could not enable the daily limit"
+end=$(($(date +%s) + 25))
+until tail -c +"$((gray_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=false" ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((gray_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=false" ||
+    fail G-WELLBEING-PIXEL-GRAY "no grayscale request reached the 0.35 wire"
+wb_step_ramp gray-ramp 0
+jq -s '[.[] | select(.label | startswith("gray-ramp-"))]' "$WB_CAPS_JSONL" \
+    >"$ARTIFACTS/wb-gray-ramp-captures.json"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" ramp \
+    --baseline "$ARTIFACTS/wb-gray-baseline.png" \
+    --captures "$ARTIFACTS/wb-gray-ramp-captures.json" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --grayscale true --fade false \
+    --start-clock-ms "$((WB_FROZEN + 0))" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-gray-ramp-check.json" ||
+    fail G-WELLBEING-PIXEL-GRAY "the gray ramp diverged from 3s EASE_OUT_QUAD to 1.0"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" negative-neutral \
+    --baseline "$ARTIFACTS/wb-gray-baseline.png" \
+    --neutral "$ARTIFACTS/wb-gray-baseline.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --desaturation 1 --brightness 1 ||
+    fail G-WELLBEING-PIXEL-GRAY "neutral passed the gray assertion (weak test)"
+wb_limit_cleanup
+wb_await_off G-WELLBEING-PIXEL-GRAY
+wb_capture gray-off
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" immediate-off \
+    --baseline "$ARTIFACTS/wb-gray-baseline.png" \
+    --current "$ARTIFACTS/wb-gray-off.png" \
+    --cstate-before "$ARTIFACTS/wb-gray-off-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-gray-off-cstate-after.json" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --clock-ms "$((WB_FROZEN + 3000))" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-gray-off-check.json" ||
+    fail G-WELLBEING-PIXEL-GRAY "disable was not immediate (fade-out found)"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '(.animation_clock_manual | not) and .wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1' "real neutral" ||
+    fail G-WELLBEING-PIXEL-GRAY "real time did not resume neutral"
+wb_provenance_finish
+pass G-WELLBEING-PIXEL-GRAY "gray-only pixels ease 3s EASE_OUT_QUAD to full desaturation and disable immediately"
+
+# Fade-only: break idle take -> 2s tick -> 0.35 fade -> brightness 0.6,
+# 3s EASE_OUT_QUAD entry, immediate disable on Disabled.
+wb_gate_begin G-WELLBEING-PIXEL-FADE
+wb_probe_ensure
+wb_pixel_preconditions
+# Freeze before the baseline: bracketed captures require identical
+# typed manual-clock samples, and real time reports ms null.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-PIXEL-FADE "the clock file did not freeze animation time"
+WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
+wb_capture fade-baseline
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
+    --image "$ARTIFACTS/wb-fade-baseline.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --rgb 143,63,208 \
+    --cstate-before "$ARTIFACTS/wb-fade-baseline-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-fade-baseline-cstate-after.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-fade-baseline-check.json" ||
+    fail G-WELLBEING-PIXEL-FADE "baseline is not the live owned probe interior (overlap?)"
+fade_mark="$(wc -c <"$LOG")"
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
+    fail G-WELLBEING-PIXEL-FADE "could not set the break interval"
+gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 60 ||
+    fail G-WELLBEING-PIXEL-FADE "could not set the break duration"
+gsettings set org.gnome.desktop.break-reminders.eyesight countdown false ||
+    fail G-WELLBEING-PIXEL-FADE "could not silence the countdown OSD"
+gsettings set org.gnome.desktop.break-reminders.eyesight fade-screen true ||
+    fail G-WELLBEING-PIXEL-FADE "could not set fade-screen"
+gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
+    fail G-WELLBEING-PIXEL-FADE "could not clear lock-screen"
+gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
+    fail G-WELLBEING-PIXEL-FADE "could not select the eyesight break"
+sleep 15
+end=$(($(date +%s) + 15))
+until tail -c +"$((fade_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=true" ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((fade_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=true" ||
+    fail G-WELLBEING-PIXEL-FADE "no fade request reached the 0.35 wire"
+wb_step_ramp fade-ramp 0
+jq -s '[.[] | select(.label | startswith("fade-ramp-"))]' "$WB_CAPS_JSONL" \
+    >"$ARTIFACTS/wb-fade-ramp-captures.json"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" ramp \
+    --baseline "$ARTIFACTS/wb-fade-baseline.png" \
+    --captures "$ARTIFACTS/wb-fade-ramp-captures.json" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --grayscale false --fade true \
+    --start-clock-ms "$((WB_FROZEN + 0))" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-fade-ramp-check.json" ||
+    fail G-WELLBEING-PIXEL-FADE "the fade ramp diverged from 3s EASE_OUT_QUAD to 0.6"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" negative-neutral \
+    --baseline "$ARTIFACTS/wb-fade-baseline.png" \
+    --neutral "$ARTIFACTS/wb-fade-baseline.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --desaturation 0 --brightness 0.6 ||
+    fail G-WELLBEING-PIXEL-FADE "neutral passed the fade assertion (weak test)"
+fade_off_mark="$(wc -c <"$LOG")"
+gsettings reset org.gnome.desktop.break-reminders selected-breaks ||
+    fail G-WELLBEING-PIXEL-FADE "could not deselect breaks"
+end=$(($(date +%s) + 15))
+until tail -c +"$((fade_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((fade_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" ||
+    fail G-WELLBEING-PIXEL-FADE "no unfade after deselect"
+wb_await_off G-WELLBEING-PIXEL-FADE
+wb_capture fade-off
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" immediate-off \
+    --baseline "$ARTIFACTS/wb-fade-baseline.png" \
+    --current "$ARTIFACTS/wb-fade-off.png" \
+    --cstate-before "$ARTIFACTS/wb-fade-off-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-fade-off-cstate-after.json" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --clock-ms "$((WB_FROZEN + 3000))" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-fade-off-check.json" ||
+    fail G-WELLBEING-PIXEL-FADE "disable was not immediate (fade-out found)"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '(.animation_clock_manual | not) and .wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1' "real neutral" ||
+    fail G-WELLBEING-PIXEL-FADE "real time did not resume neutral"
+wb_break_cleanup
+wb_provenance_finish
+pass G-WELLBEING-PIXEL-FADE "fade-only pixels ease 3s EASE_OUT_QUAD to brightness 0.6 and disable immediately"
+
+# Both-on: gray ramp settles first, then fade ramps while gray stays at
+# 1.0 (independent 0.35 starts); endpoint is 1.0/0.6, disable immediate.
+wb_gate_begin G-WELLBEING-PIXEL-BOTH
+wb_probe_ensure
+wb_pixel_preconditions
+# Freeze before the baseline: bracketed captures require identical
+# typed manual-clock samples, and real time reports ms null.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-PIXEL-BOTH "the clock file did not freeze animation time"
+WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
+wb_capture both-baseline
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
+    --image "$ARTIFACTS/wb-both-baseline.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --rgb 143,63,208 \
+    --cstate-before "$ARTIFACTS/wb-both-baseline-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-both-baseline-cstate-after.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-both-baseline-check.json" ||
+    fail G-WELLBEING-PIXEL-BOTH "baseline is not the live owned probe interior (overlap?)"
+both_gray_mark="$(wc -c <"$LOG")"
+gsettings set org.gnome.desktop.screen-time-limits grayscale true ||
+    fail G-WELLBEING-PIXEL-BOTH "could not set grayscale"
+gsettings set org.gnome.desktop.screen-time-limits daily-limit-seconds 10 ||
+    fail G-WELLBEING-PIXEL-BOTH "could not set the daily limit"
+gsettings set org.gnome.desktop.screen-time-limits daily-limit-enabled true ||
+    fail G-WELLBEING-PIXEL-BOTH "could not enable the daily limit"
+end=$(($(date +%s) + 25))
+until tail -c +"$((both_gray_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=false" ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((both_gray_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=false" ||
+    fail G-WELLBEING-PIXEL-BOTH "no grayscale request reached the 0.35 wire"
+wb_step_ramp both-gray 0
+jq -s '[.[] | select(.label | startswith("both-gray-"))]' "$WB_CAPS_JSONL" \
+    >"$ARTIFACTS/wb-both-gray-captures.json"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" ramp \
+    --baseline "$ARTIFACTS/wb-both-baseline.png" \
+    --captures "$ARTIFACTS/wb-both-gray-captures.json" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --grayscale true --fade false \
+    --start-clock-ms "$((WB_FROZEN + 0))" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-both-gray-check.json" ||
+    fail G-WELLBEING-PIXEL-BOTH "the gray phase diverged from 3s EASE_OUT_QUAD"
+both_fade_mark="$(wc -c <"$LOG")"
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
+    fail G-WELLBEING-PIXEL-BOTH "could not set the break interval"
+gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 60 ||
+    fail G-WELLBEING-PIXEL-BOTH "could not set the break duration"
+gsettings set org.gnome.desktop.break-reminders.eyesight countdown false ||
+    fail G-WELLBEING-PIXEL-BOTH "could not silence the countdown OSD"
+gsettings set org.gnome.desktop.break-reminders.eyesight fade-screen true ||
+    fail G-WELLBEING-PIXEL-BOTH "could not set fade-screen"
+gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
+    fail G-WELLBEING-PIXEL-BOTH "could not clear lock-screen"
+gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
+    fail G-WELLBEING-PIXEL-BOTH "could not select the eyesight break"
+sleep 15
+end=$(($(date +%s) + 15))
+until tail -c +"$((both_fade_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=true" ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((both_fade_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=true fade=true" ||
+    fail G-WELLBEING-PIXEL-BOTH "no combined request reached the 0.35 wire"
+wb_step_ramp both-fade 3000
+jq -s '[.[] | select(.label | startswith("both-fade-"))]' "$WB_CAPS_JSONL" \
+    >"$ARTIFACTS/wb-both-fade-captures.json"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" ramp \
+    --baseline "$ARTIFACTS/wb-both-baseline.png" \
+    --captures "$ARTIFACTS/wb-both-fade-captures.json" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --grayscale settled --fade true \
+    --start-clock-ms "$((WB_FROZEN + 3000))" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-both-fade-check.json" ||
+    fail G-WELLBEING-PIXEL-BOTH "the fade phase diverged while gray stayed settled"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" negative-neutral \
+    --baseline "$ARTIFACTS/wb-both-baseline.png" \
+    --neutral "$ARTIFACTS/wb-both-baseline.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --desaturation 1 --brightness 0.6 ||
+    fail G-WELLBEING-PIXEL-BOTH "neutral passed the combined assertion (weak test)"
+wb_limit_cleanup
+both_off_mark="$(wc -c <"$LOG")"
+gsettings reset org.gnome.desktop.break-reminders selected-breaks ||
+    fail G-WELLBEING-PIXEL-BOTH "could not deselect breaks"
+end=$(($(date +%s) + 15))
+until tail -c +"$((both_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
+tail -c +"$((both_off_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" ||
+    fail G-WELLBEING-PIXEL-BOTH "no combined unfade after reset"
+wb_await_off G-WELLBEING-PIXEL-BOTH
+wb_capture both-off
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" immediate-off \
+    --baseline "$ARTIFACTS/wb-both-baseline.png" \
+    --current "$ARTIFACTS/wb-both-off.png" \
+    --cstate-before "$ARTIFACTS/wb-both-off-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-both-off-cstate-after.json" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --clock-ms "$((WB_FROZEN + 6000))" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-both-off-check.json" ||
+    fail G-WELLBEING-PIXEL-BOTH "combined disable was not immediate (fade-out found)"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '(.animation_clock_manual | not) and .wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1' "real neutral" ||
+    fail G-WELLBEING-PIXEL-BOTH "real time did not resume neutral"
+wb_break_cleanup
+wb_provenance_finish
+pass G-WELLBEING-PIXEL-BOTH "combined pixels settle at desaturation 1.0 and brightness 0.6 and disable immediately"
+
+# Reset-to-neutral: with no effects desired, stepped animation time stays
+# neutral (immediate disable leaves no restore fade behind).
+wb_gate_begin G-WELLBEING-PIXEL-RESET
+wb_probe_ensure
+wb_pixel_preconditions
+# Freeze before the baseline: bracketed captures require identical
+# typed manual-clock samples, and real time reports ms null.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-PIXEL-RESET "the clock file did not freeze animation time"
+WB_FROZEN="$(jq -r '.animation_clock_ms' "$CSTATE")"
+wb_capture reset-baseline
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
+    --image "$ARTIFACTS/wb-reset-baseline.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --rgb 143,63,208 \
+    --cstate-before "$ARTIFACTS/wb-reset-baseline-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-reset-baseline-cstate-after.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-reset-baseline-check.json" ||
+    fail G-WELLBEING-PIXEL-RESET "baseline is not the live owned probe interior (overlap?)"
+wb_step_ramp reset-neutral 0
+jq -s '[.[] | select(.label | startswith("reset-neutral-"))]' "$WB_CAPS_JSONL" \
+    >"$ARTIFACTS/wb-reset-ramp-captures.json"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" ramp \
+    --baseline "$ARTIFACTS/wb-reset-baseline.png" \
+    --captures "$ARTIFACTS/wb-reset-ramp-captures.json" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --grayscale false --fade false \
+    --start-clock-ms "$((WB_FROZEN + 0))" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-reset-ramp-check.json" ||
+    fail G-WELLBEING-PIXEL-RESET "neutral did not hold across stepped time"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '(.animation_clock_manual | not) and .wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1' "real neutral" ||
+    fail G-WELLBEING-PIXEL-RESET "real time did not resume neutral"
+wb_provenance_finish
+pass G-WELLBEING-PIXEL-RESET "reset-to-neutral holds across stepped animation time with no restore fade"
+
+# Take-with-lock: an ACTUAL Take press on the due banner locks the session
+# (lock-screen toggle on). Without pam_wrapper the session could not
+# unlock to continue, so the gate records infeasible evidence and skips
+# exactly like G-UNLOCK; it never passes weakly.
+wb_gate_begin G-WELLBEING-ACTION-TAKE-LOCK
+if [ -z "$PAM_ON" ]; then
+    jq -n --arg reason "no pam_wrapper: locking would strand the journey (G-UNLOCK also skips)" \
+        '{gate:"G-WELLBEING-ACTION-TAKE-LOCK",verdict:"infeasible",reason:$reason}' \
+        >"$ARTIFACTS/wb-G-WELLBEING-ACTION-TAKE-LOCK-infeasible.json"
+    echo "tuna-gtk-shell-proof: G-WELLBEING-ACTION-TAKE-LOCK skipped (no pam_wrapper)"
+else
+    # The probe is ensured (not sampled) so capture-time provenance binds
+    # the same three processes in every gate.
+    wb_probe_ensure
+    gsettings set org.gnome.desktop.notifications show-banners true ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not show banners"
+    cstate '(.overview_open | not)' "no overview" ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "the overview is open"
+    gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not set the break interval"
+    gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 10 ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not set the break duration"
+    gsettings set org.gnome.desktop.break-reminders.eyesight countdown false ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not silence the countdown OSD"
+    gsettings set org.gnome.desktop.break-reminders.eyesight fade-screen false ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not clear fade-screen"
+    gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen true ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not set lock-screen"
+    gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not select the eyesight break"
+    wb_press_banner G-WELLBEING-ACTION-TAKE-LOCK "$ARTIFACTS/a11y-wb-take-lock-due.json" \
+        "Time for an Eyesight Break" Take 25 ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "no due banner to take"
+    cstate '.locked' "locked" 10 ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "Take did not lock the session"
+    wb_state_capture take-lock-locked
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" locked-state \
+        --cstate-before "$ARTIFACTS/wb-take-lock-locked-cstate-before.json" \
+        --cstate-after "$ARTIFACTS/wb-take-lock-locked-cstate-after.json" \
+        --proc-before "$ARTIFACTS/wb-take-lock-locked-proc-before.json" \
+        --proc-after "$ARTIFACTS/wb-take-lock-locked-proc-after.json" \
+        --label take-lock-locked ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "lock not observed in state (full typed presence, redaction, sandwich)"
+    cp "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-before.json"
+    stale_code=0
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
+    cp "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-after.json"
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-retired.json" 20 ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+    take_lock_retired_seq="$WB_DUMP_SEQ"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
+        --exit-code "$stale_code" \
+        --before "$ARTIFACTS/wb-take-lock-stale-before.json" \
+        --after "$ARTIFACTS/wb-take-lock-stale-after.json" \
+        --action Take \
+        --dump "$ARTIFACTS/a11y-wb-take-lock-retired.json" \
+        --title "Time for an Eyesight Break" \
+        --gate-start "$WB_START" \
+        --expect-pid "$WB_SHELL_PID" \
+        --expect-start "$WB_SHELL_START" \
+        --stamp "$ARTIFACTS/a11y-wb-take-lock-retired.json.stamp" \
+        --expect-gate G-WELLBEING-ACTION-TAKE-LOCK \
+        --expect-nonce "$WB_NONCE" \
+        --expect-seq "$take_lock_retired_seq" ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "a stale Take press fired"
+    sleep 1
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1 ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not lift the curtain"
+    sleep 1
+    xdotool type --delay 30 "$UNLOCK_PASSWORD" ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not type the password"
+    xdotool key Return || fail G-WELLBEING-ACTION-TAKE-LOCK "could not submit"
+    cstate '(.locked | not)' "unlocked" 15 ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "the password did not unlock"
+    wb_break_cleanup
+    gsettings set org.gnome.desktop.notifications show-banners false ||
+        fail G-WELLBEING-ACTION-TAKE-LOCK "could not restore DND"
+    wb_provenance_finish
+    pass G-WELLBEING-ACTION-TAKE-LOCK "an actual Take press locks the session (state-only locked evidence) and a stale Take fails"
+fi
+
+# Take-with-fade: an ACTUAL Take press (lock off, fade on) produces a
+# faded frame at brightness 0.6 on the owned probe.
+wb_gate_begin G-WELLBEING-ACTION-TAKE-FADE
+wb_probe_ensure
+gsettings set org.gnome.desktop.notifications show-banners true ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "could not show banners"
+cstate '(.overview_open | not)' "no overview" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "the overview is open"
+cstate '.motion_policy == "full"' "full motion" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "motion is not full"
+cstate '.wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1' "neutral" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "effects are not neutral at gate start"
+# Freeze brackets the baseline only: bracketed captures require identical
+# typed manual-clock samples, while the live break countdown and fade run
+# on real time below.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "the clock file did not freeze animation time"
+wb_capture take-fade-baseline
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" owned-interior \
+    --image "$ARTIFACTS/wb-take-fade-baseline.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --rgb 143,63,208 \
+    --cstate-before "$ARTIFACTS/wb-take-fade-baseline-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-take-fade-baseline-cstate-after.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-take-fade-baseline-check.json" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "baseline is not the live owned probe interior (overlap?)"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '.animation_clock_manual | not' "real clock" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "real time did not resume after the baseline"
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "could not set the break interval"
+# The break must outlive settle + capture + stale check so the settled
+# 0.6 fade the gate asserts cannot end mid-observation (setup, not tolerance).
+gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 60 ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "could not set the break duration"
+gsettings set org.gnome.desktop.break-reminders.eyesight countdown false ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "could not silence the countdown OSD"
+gsettings set org.gnome.desktop.break-reminders.eyesight fade-screen true ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "could not set fade-screen"
+gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "could not clear lock-screen"
+gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "could not select the eyesight break"
+wb_press_banner G-WELLBEING-ACTION-TAKE-FADE "$ARTIFACTS/a11y-wb-take-fade-due.json" \
+    "Time for an Eyesight Break" Take 25 ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "no due banner to take"
+cstate '.wellbeing_effects.brightness < 1' "fade started" 10 ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "Take produced no fade"
+# The compositor stores effects as f32: settled brightness serializes as
+# 0.6000000238418579, which exact f64 equality can never match. Compare
+# within 1e-6 of the unchanged 0.6 target instead, and require the ramp
+# to have finished so a still-running pass near target cannot qualify.
+cstate '(.wellbeing_effects.animating == false) and ((.wellbeing_effects.brightness - 0.6 | if . < 0 then -. else . end) < 0.000001)' "fade settled" 10 ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "the fade did not settle at 0.6"
+# Re-freeze the settled fade for its bracketed capture: progress already
+# reached 1, so freezing holds 0.6 instead of stalling a live ramp.
+anim_clock 0
+cstate '.animation_clock_manual' "frozen clock" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "the clock file did not freeze animation time"
+wb_capture take-fade-settled
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" fade-sample \
+    "$ARTIFACTS/wb-take-fade-settled-cstate-after.json" --expect faded ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "faded sample not observed in state"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" verify \
+    --baseline "$ARTIFACTS/wb-take-fade-baseline.png" \
+    --current "$ARTIFACTS/wb-take-fade-settled.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --desaturation 0 --brightness 0.6 \
+    --cstate-before "$ARTIFACTS/wb-take-fade-settled-cstate-before.json" \
+    --cstate-after "$ARTIFACTS/wb-take-fade-settled-cstate-after.json" \
+    --owner "$ARTIFACTS/wb-probe-owner.json" \
+    --gate-start "$WB_START" \
+    --receipt "$ARTIFACTS/wb-take-fade-check.json" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "no faded frame on the owned probe"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '.animation_clock_manual | not' "real clock" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "real time did not resume after the settled capture"
+cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-before.json"
+stale_code=0
+wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
+cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-after.json"
+wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-retired.json" 20 ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+take_fade_retired_seq="$WB_DUMP_SEQ"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
+    --exit-code "$stale_code" \
+    --before "$ARTIFACTS/wb-take-fade-stale-before.json" \
+    --after "$ARTIFACTS/wb-take-fade-stale-after.json" \
+    --action Take \
+    --dump "$ARTIFACTS/a11y-wb-take-fade-retired.json" \
+    --title "Time for an Eyesight Break" \
+    --gate-start "$WB_START" \
+    --expect-pid "$WB_SHELL_PID" \
+    --expect-start "$WB_SHELL_START" \
+    --stamp "$ARTIFACTS/a11y-wb-take-fade-retired.json.stamp" \
+    --expect-gate G-WELLBEING-ACTION-TAKE-FADE \
+    --expect-nonce "$WB_NONCE" \
+    --expect-seq "$take_fade_retired_seq" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "a stale Take press fired"
+wb_break_cleanup
+gsettings set org.gnome.desktop.notifications show-banners false ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "could not restore DND"
+cstate '.wellbeing_effects.brightness == 1' "neutral" ||
+    fail G-WELLBEING-ACTION-TAKE-FADE "the fade outlived cleanup"
+wb_provenance_finish
+pass G-WELLBEING-ACTION-TAKE-FADE "an actual Take press fades a frame to brightness 0.6 and a stale Take fails"
+
+# Delay: an ACTUAL Delay press moves the live due by delay-seconds (30s),
+# observed as the next due banner's arrival time.
+wb_gate_begin G-WELLBEING-ACTION-DELAY
+wb_probe_ensure
+gsettings set org.gnome.desktop.notifications show-banners true ||
+    fail G-WELLBEING-ACTION-DELAY "could not show banners"
+cstate '(.overview_open | not)' "no overview" ||
+    fail G-WELLBEING-ACTION-DELAY "the overview is open"
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10 ||
+    fail G-WELLBEING-ACTION-DELAY "could not set the break interval"
+gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 10 ||
+    fail G-WELLBEING-ACTION-DELAY "could not set the break duration"
+gsettings set org.gnome.desktop.break-reminders.eyesight delay-seconds 30 ||
+    fail G-WELLBEING-ACTION-DELAY "could not set delay-seconds"
+gsettings set org.gnome.desktop.break-reminders.eyesight countdown false ||
+    fail G-WELLBEING-ACTION-DELAY "could not silence the countdown OSD"
+gsettings set org.gnome.desktop.break-reminders.eyesight fade-screen false ||
+    fail G-WELLBEING-ACTION-DELAY "could not clear fade-screen"
+gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
+    fail G-WELLBEING-ACTION-DELAY "could not clear lock-screen"
+gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
+    fail G-WELLBEING-ACTION-DELAY "could not select the eyesight break"
+wb_press_banner G-WELLBEING-ACTION-DELAY "$ARTIFACTS/a11y-wb-delay-due.json" \
+    "Time for an Eyesight Break" Delay 25 ||
+    fail G-WELLBEING-ACTION-DELAY "no due banner to delay"
+delay_due_epoch="$WB_PRESS_EPOCH"
+cp "$CSTATE" "$ARTIFACTS/wb-delay-stale-before.json"
+stale_code=0
+wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-stale.json" 20 --press "Delay" >/dev/null 2>&1 || stale_code=$?
+cp "$CSTATE" "$ARTIFACTS/wb-delay-stale-after.json"
+# The retired dump is taken now (the redue banner is not showing yet);
+# the stale verdict waits for the redue so the due schedule the live
+# press set is proven undisturbed by the stale press.
+wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-retired.json" 20 ||
+    fail G-WELLBEING-ACTION-DELAY "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+delay_retired_seq="$WB_DUMP_SEQ"
+DELAYREDUE=""
+end=$(($(date +%s) + 45))
+while [ "$(date +%s)" -le "$end" ]; do
+    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
+        fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
+    sleep 1
+    xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
+        fail G-WELLBEING-ACTION-DELAY "keep-alive failed"
+    sleep 1
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-redue.json" 20 >/dev/null 2>&1 || continue
+    if showing "$ARTIFACTS/a11y-wb-delay-redue.json" "Time for an Eyesight Break"; then
+        delay_redue_epoch="$(date +%s)"
+        DELAYREDUE=1
+        break
+    fi
+done
+[ -n "$DELAYREDUE" ] || fail G-WELLBEING-ACTION-DELAY "no redue banner after Delay"
+wb_capture_after_live_action delay-redue
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" delay \
+    --old-due "$delay_due_epoch" --new-due "$delay_redue_epoch" --delay-secs 30 ||
+    fail G-WELLBEING-ACTION-DELAY "live due did not move by delay-seconds"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
+    --exit-code "$stale_code" \
+    --before "$ARTIFACTS/wb-delay-stale-before.json" \
+    --after "$ARTIFACTS/wb-delay-stale-after.json" \
+    --action Delay \
+    --dump "$ARTIFACTS/a11y-wb-delay-retired.json" \
+    --title "Time for an Eyesight Break" \
+    --gate-start "$WB_START" \
+    --expect-pid "$WB_SHELL_PID" \
+    --expect-start "$WB_SHELL_START" \
+    --stamp "$ARTIFACTS/a11y-wb-delay-retired.json.stamp" \
+    --expect-gate G-WELLBEING-ACTION-DELAY \
+    --expect-nonce "$WB_NONCE" \
+    --expect-seq "$delay_retired_seq" \
+    --due-kind delay --due-old "$delay_due_epoch" --due-new "$delay_redue_epoch" --due-expect 30 ||
+    fail G-WELLBEING-ACTION-DELAY "a stale Delay press fired"
+wb_break_cleanup
+gsettings set org.gnome.desktop.notifications show-banners false ||
+    fail G-WELLBEING-ACTION-DELAY "could not restore DND"
+wb_provenance_finish
+pass G-WELLBEING-ACTION-DELAY "an actual Delay press moves the live due by delay-seconds and a stale Delay fails"
+
+# Skip: GNOME 51 offers Skip ONLY on the upcoming notice (breakManager.js
+# at 2177bdf9, lines 985-1023); the due notice carries Delay+Take with no
+# Skip (lines 1133-1162). An ACTUAL Skip press on the upcoming warning
+# retires it and leaves the due schedule undisturbed (the press is a
+# timer no-op), observed as the due banner still arriving on the
+# original schedule. A stale Skip press must fail.
+wb_gate_begin G-WELLBEING-ACTION-SKIP
+wb_probe_ensure
+gsettings set org.gnome.desktop.notifications show-banners true ||
+    fail G-WELLBEING-ACTION-SKIP "could not show banners"
+cstate '(.overview_open | not)' "no overview" ||
+    fail G-WELLBEING-ACTION-SKIP "the overview is open"
+# Interval 130: with remaining 130 at enable, the one-shot upcoming warning
+# posts ~10 s into the poll (first 2 s tick with remaining <= 120), mid-poll
+# with warm dumps. At 65 it posts on the select-breaks tick itself and its
+# 4 s fuse expires before the first dumps can see it (run 38467423094).
+gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 130 ||
+    fail G-WELLBEING-ACTION-SKIP "could not set the break interval"
+gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 10 ||
+    fail G-WELLBEING-ACTION-SKIP "could not set the break duration"
+gsettings set org.gnome.desktop.break-reminders.eyesight delay-seconds 30 ||
+    fail G-WELLBEING-ACTION-SKIP "could not set delay-seconds"
+gsettings set org.gnome.desktop.break-reminders.eyesight notify-upcoming true ||
+    fail G-WELLBEING-ACTION-SKIP "could not enable upcoming notices"
+gsettings set org.gnome.desktop.break-reminders.eyesight countdown false ||
+    fail G-WELLBEING-ACTION-SKIP "could not silence the countdown OSD"
+gsettings set org.gnome.desktop.break-reminders.eyesight fade-screen false ||
+    fail G-WELLBEING-ACTION-SKIP "could not clear fade-screen"
+gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
+    fail G-WELLBEING-ACTION-SKIP "could not clear lock-screen"
+gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
+    fail G-WELLBEING-ACTION-SKIP "could not select the eyesight break"
+skip_enable_epoch="$(date +%s)"
+skip_orig_due_epoch=$((skip_enable_epoch + 130))
+wb_press_banner G-WELLBEING-ACTION-SKIP "$ARTIFACTS/a11y-wb-skip-upcoming.json" \
+    "Eyesight Break Soon" Skip 30 ||
+    fail G-WELLBEING-ACTION-SKIP "no upcoming banner to skip"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" notice-buttons \
+    "$ARTIFACTS/a11y-wb-skip-upcoming.json" --title "Eyesight Break Soon" \
+    --expect Delay,Skip --reject Take ||
+    fail G-WELLBEING-ACTION-SKIP "the upcoming banner does not offer Delay+Skip without Take"
+cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-before.json"
+stale_code=0
+wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-stale.json" 20 --press "Skip" >/dev/null 2>&1 || stale_code=$?
+cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-after.json"
+# The retired dump is taken now (the due banner is not showing yet);
+# the stale verdict waits for the due so the original schedule the
+# live press left undisturbed is proven intact after the stale press.
+wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-retired.json" 20 ||
+    fail G-WELLBEING-ACTION-SKIP "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+skip_retired_seq="$WB_DUMP_SEQ"
+# Sample at wb_press_banner's cadence: one keep-alive move per 0.5 s step
+# keeps idle under GNOME's IDLE_TIME (1 s), so the due banner shows to an
+# active user for the full BANNER_TIMEOUT. With 1 s gaps the banner could
+# post to an "away" user and expire 2 s after the next move, and a sample
+# could then land in its slide-out, when expiry has retired its actions
+# and the shell is clearing the card mid-walk (title seen, action row
+# already gone). A sample counts once the banner's action row is
+# observable (any notice action pressable); the Take+Delay/no-Skip
+# verdict below is pinned on that same sample. Arrival is the first
+# sighting of the title.
+SKIPDUE=""
+skip_due_epoch=""
+skip_step=0
+end=$(($(date +%s) + 150))
+while [ "$(date +%s)" -le "$end" ]; do
+    xdotool mousemove --window "$WID" $((WIDTH / 3 + skip_step % 2 * 40)) $((HEIGHT / 2)) ||
+        fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
+    skip_step=$((skip_step + 1))
+    sleep 0.5
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-due.json" 20 >/dev/null 2>&1 || continue
+    showing "$ARTIFACTS/a11y-wb-skip-due.json" "Time for an Eyesight Break" || continue
+    if [ -z "$skip_due_epoch" ]; then
+        skip_due_epoch="$(date +%s)"
+        # The banner lives BANNER_TIMEOUT (4 s) once shown.
+        end=$((skip_due_epoch + 6))
+    fi
+    if jq -e 'any(.[]; (.name == "Take" or .name == "Delay" or .name == "Skip")
+            and .role != "label" and .showing)' \
+        "$ARTIFACTS/a11y-wb-skip-due.json" >/dev/null; then
+        SKIPDUE=1
+        break
+    fi
+done
+[ -n "$skip_due_epoch" ] || fail G-WELLBEING-ACTION-SKIP "no due banner on the original schedule after Skip"
+[ -n "$SKIPDUE" ] || fail G-WELLBEING-ACTION-SKIP "the due banner does not offer Take+Delay without Skip"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" notice-buttons \
+    "$ARTIFACTS/a11y-wb-skip-due.json" --title "Time for an Eyesight Break" \
+    --expect Take,Delay --reject Skip ||
+    fail G-WELLBEING-ACTION-SKIP "the due banner does not offer Take+Delay without Skip"
+# Capture label stays skip-redue: pinned by test_wb_shell_contract.py.
+wb_capture_after_live_action skip-redue
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" skip-undisturbed \
+    --orig-due "$skip_orig_due_epoch" --due-arrival "$skip_due_epoch" ||
+    fail G-WELLBEING-ACTION-SKIP "the Skip press disturbed the due schedule"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
+    --exit-code "$stale_code" \
+    --before "$ARTIFACTS/wb-skip-stale-before.json" \
+    --after "$ARTIFACTS/wb-skip-stale-after.json" \
+    --action Skip \
+    --dump "$ARTIFACTS/a11y-wb-skip-retired.json" \
+    --title "Eyesight Break Soon" \
+    --gate-start "$WB_START" \
+    --expect-pid "$WB_SHELL_PID" \
+    --expect-start "$WB_SHELL_START" \
+    --stamp "$ARTIFACTS/a11y-wb-skip-retired.json.stamp" \
+    --expect-gate G-WELLBEING-ACTION-SKIP \
+    --expect-nonce "$WB_NONCE" \
+    --expect-seq "$skip_retired_seq" \
+    --due-kind skip-undisturbed --due-old "$skip_orig_due_epoch" --due-new "$skip_due_epoch" --due-expect 0 ||
+    fail G-WELLBEING-ACTION-SKIP "a stale Skip press fired"
+wb_break_cleanup
+gsettings set org.gnome.desktop.notifications show-banners false ||
+    fail G-WELLBEING-ACTION-SKIP "could not restore DND"
+wb_provenance_finish
+pass G-WELLBEING-ACTION-SKIP "an actual Skip press on the upcoming notice retires it with the schedule undisturbed and a stale Skip fails"
+
+# Negative controls: neutral frames FAIL the effect assertions (assertion
+# failure, same build, not source-identity failure); intermediate RGB is
+# asserted explicitly, not just endpoints; a post-cleanup stale press FAILS.
+# The intermediates' brackets were proven when their ramps consumed them,
+# so this gate re-verifies their pixels only. Callback-retirement stays
+# explicitly unqualified at e2e (qualified at unit/GTK level elsewhere):
+# no callback evidence is claimed here.
+wb_gate_begin G-WELLBEING-NEGATIVE
+wb_probe_ensure
+gray_start="$(jq -r '.gate_start_epoch' "$ARTIFACTS/wb-G-WELLBEING-PIXEL-GRAY-provenance.json")"
+if [ -z "$gray_start" ] || [ "$gray_start" = "null" ]; then
+    fail G-WELLBEING-NEGATIVE "gray gate provenance missing; controls have no admitted source"
+fi
+for spec in "gray:1:1" "fade:0:0.6" "both:1:0.6"; do
+    name="${spec%%:*}"
+    rest="${spec#*:}"
+    desat="${rest%%:*}"
+    bright="${rest##*:}"
+    [ -f "$ARTIFACTS/wb-$name-baseline.png" ] ||
+        fail G-WELLBEING-NEGATIVE "missing $name baseline for the neutral control"
+    "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" negative-neutral \
+        --baseline "$ARTIFACTS/wb-$name-baseline.png" \
+        --neutral "$ARTIFACTS/wb-$name-baseline.png" \
+        --regions "$ARTIFACTS/wb-regions.json" \
+        --desaturation "$desat" --brightness "$bright" ||
+        fail G-WELLBEING-NEGATIVE "neutral passed the $name assertion (weak test)"
+done
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" verify \
+    --baseline "$ARTIFACTS/wb-gray-baseline.png" \
+    --current "$ARTIFACTS/wb-gray-ramp-1500.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --desaturation 0.75 --brightness 1 \
+    --receipt "$ARTIFACTS/wb-negative-gray-mid-check.json" ||
+    fail G-WELLBEING-NEGATIVE "the gray 1500ms intermediate diverged from 0.75"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" verify \
+    --baseline "$ARTIFACTS/wb-fade-baseline.png" \
+    --current "$ARTIFACTS/wb-fade-ramp-1500.png" \
+    --regions "$ARTIFACTS/wb-regions.json" \
+    --desaturation 0 --brightness 0.7 \
+    --receipt "$ARTIFACTS/wb-negative-fade-mid-check.json" ||
+    fail G-WELLBEING-NEGATIVE "the fade 1500ms intermediate diverged from 0.7"
+cp "$CSTATE" "$ARTIFACTS/wb-negative-stale-before.json"
+stale_code=0
+wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
+cp "$CSTATE" "$ARTIFACTS/wb-negative-stale-after.json"
+wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-retired.json" 20 ||
+    fail G-WELLBEING-NEGATIVE "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
+negative_retired_seq="$WB_DUMP_SEQ"
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
+    --exit-code "$stale_code" \
+    --before "$ARTIFACTS/wb-negative-stale-before.json" \
+    --after "$ARTIFACTS/wb-negative-stale-after.json" \
+    --action Take \
+    --dump "$ARTIFACTS/a11y-wb-negative-retired.json" \
+    --title "Time for an Eyesight Break" \
+    --gate-start "$WB_START" \
+    --expect-pid "$WB_SHELL_PID" \
+    --expect-start "$WB_SHELL_START" \
+    --stamp "$ARTIFACTS/a11y-wb-negative-retired.json.stamp" \
+    --expect-gate G-WELLBEING-NEGATIVE \
+    --expect-nonce "$WB_NONCE" \
+    --expect-seq "$negative_retired_seq" ||
+    fail G-WELLBEING-NEGATIVE "a post-cleanup stale Take press fired"
+wb_capture_after_live_action negative-baseline
+wb_provenance_finish
+pass G-WELLBEING-NEGATIVE "neutral frames fail every effect assertion, intermediates hold, stale presses fail"
+
+# Leave no trace for later gates: close the owned probe, restore the
+# journey's DND state and real animation time.
+if [ -n "$WB_PROBE_PID" ]; then
+    kill "$WB_PROBE_PID" 2>/dev/null || true
+    wait "$WB_PROBE_PID" 2>/dev/null || true
+    WB_PROBE_PID=""
+fi
+cstate ".windows | length == $WB_WINDOWS_BEFORE" "probe closed" ||
+    fail G-WELLBEING-NEGATIVE "the owned probe did not close"
+gsettings set org.gnome.desktop.notifications show-banners "$DND_BEFORE" ||
+    fail G-WELLBEING-NEGATIVE "could not restore DND"
+rm -f "$TUNA_ANIMATION_CLOCK"
+cstate '(.animation_clock_manual | not)' "real clock" ||
+    fail G-WELLBEING-NEGATIVE "the animation clock did not resume"
+
 # org.gnome.Shell for gnome-settings-daemon: a caller outside GNOME's
 # allowlist is refused; the media-keys daemon's grab takes the key away
 # from apps, fires AcceleratorActivated, and its ShowOSD shows the OSD.
@@ -3098,7 +5576,55 @@ pass G-ACCEL "gnome-settings-daemon's grab fires on its key and its ShowOSD show
 
 # Native media actions work even without gsd-media-keys. These assert
 # the actual asynchronous backend mutations, including GNOME's unmute rule.
-echo 0.40 >"$VOLUME_FILE"
+touch "$TUNA_MEDIA_DIAGNOSTICS"
+media_mark() { "$PY" "$ROOT/scripts/lib/media-causal-trace.py" "$ARTIFACTS" marker "$$" "$1"; }
+media_mark begin
+MEDIA_SHELL_PID="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" ||
+    fail G-MEDIA-VOLUME "expected exactly one owned shell"
+case "$MEDIA_SHELL_PID" in
+    ''|0|*[!0-9]*) fail G-MEDIA-VOLUME "expected exactly one owned shell" ;;
+esac
+"$PY" - "$MEDIA_SHELL_PID" "$ARTIFACTS/media-completion-owner.json" <<'PY_MEDIA_OWNER'
+import json, pathlib, sys
+pid = int(sys.argv[1])
+fields = (pathlib.Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+pathlib.Path(sys.argv[2]).write_text(json.dumps({'pid': pid, 'start_ticks': int(fields[19])}) + '\n')
+PY_MEDIA_OWNER
+MEDIA_SINCE=0
+MEDIA_KIND=idle
+media_wait() {
+    policy="$(gsettings get org.gnome.desktop.sound allow-volume-above-100-percent)"
+    "$PY" "$ROOT/scripts/lib/media-completion-barrier.py" --log "$LOG" \
+        --pid "$MEDIA_SHELL_PID" --owner "$ARTIFACTS/media-completion-owner.json" \
+        --since "$MEDIA_SINCE" --kind "$MEDIA_KIND" --policy "$policy" \
+        --receipt "$ARTIFACTS/media-completion-last.json" ||
+        fail G-MEDIA-VOLUME "actual owned key/clamp callbacks did not settle"
+}
+media_policy() {
+    old_policy="$(gsettings get org.gnome.desktop.sound allow-volume-above-100-percent)"
+    if [ "$old_policy" != "$1" ]; then
+        MEDIA_SINCE="$("$PY" -c 'import time; print(time.monotonic_ns())')"
+        MEDIA_KIND=clamp
+    fi
+    gsettings set org.gnome.desktop.sound allow-volume-above-100-percent "$1"
+    media_wait
+}
+media_key() {
+    MEDIA_SINCE="$("$PY" -c 'import time; print(time.monotonic_ns())')"
+    MEDIA_KIND=key
+    xdotool key "$@"
+    media_wait
+}
+media_baseline() {
+    media_wait
+    echo "$1" >"$VOLUME_FILE"
+}
+# Force one real settings callback before the first baseline; no value/idle
+# inference and no dependency on incidental AudioUi monitor polling.
+original_policy="$(gsettings get org.gnome.desktop.sound allow-volume-above-100-percent)"
+if [ "$original_policy" = false ]; then media_policy true; else media_policy false; fi
+media_policy "$original_policy"
+media_baseline 0.40
 echo 0 >"$VOLUME_MUTED_FILE"
 media_volume() {
     expected=$1
@@ -3108,69 +5634,83 @@ media_volume() {
     done
     return 1
 }
-xdotool key XF86AudioRaiseVolume
+media_key XF86AudioRaiseVolume
 media_volume 0.4600 || fail G-MEDIA-VOLUME "volume up did not apply the 6% step"
-xdotool key XF86AudioLowerVolume
+media_key XF86AudioLowerVolume
 media_volume 0.4000 || fail G-MEDIA-VOLUME "volume down did not apply the 6% step"
-xdotool key shift+XF86AudioRaiseVolume
+media_key shift+XF86AudioRaiseVolume
 media_volume 0.4200 || fail G-MEDIA-VOLUME "precise volume up did not use 2%"
-xdotool key XF86AudioMute
+media_key XF86AudioMute
 for _ in $(seq 1 30); do [ "$(cat "$VOLUME_MUTED_FILE")" = 1 ] && break; sleep 0.1; done
 [ "$(cat "$VOLUME_MUTED_FILE")" = 1 ] || fail G-MEDIA-VOLUME "volume mute did not mute"
-xdotool key XF86AudioRaiseVolume
+media_key XF86AudioRaiseVolume
 for _ in $(seq 1 30); do [ "$(cat "$VOLUME_MUTED_FILE")" = 0 ] && break; sleep 0.1; done
 if [ "$(cat "$VOLUME_MUTED_FILE")" != 0 ] || [ "$(cat "$VOLUME_FILE")" != 0.4200 ]; then
     fail G-MEDIA-VOLUME "unmuting increased or lost the existing volume"
 fi
-xdotool key XF86AudioMicMute
+media_key XF86AudioMicMute
 for _ in $(seq 1 30); do [ "$(cat "$MIC_MUTED_FILE")" = 1 ] && break; sleep 0.1; done
 [ "$(cat "$MIC_MUTED_FILE")" = 1 ] || fail G-MEDIA-VOLUME "microphone mute did not mute"
-xdotool key XF86AudioMicMute
+media_key XF86AudioMicMute
 for _ in $(seq 1 30); do [ "$(cat "$MIC_MUTED_FILE")" = 0 ] && break; sleep 0.1; done
 [ "$(cat "$MIC_MUTED_FILE")" = 0 ] || fail G-MEDIA-VOLUME "microphone unmute did not unmute"
 # This headed fixture uses a wpctl stand-in; the native VM separately checks
 # actual HDA/PipeWire channel volume. Same live shell and real hardware keys.
 SOUND_SCHEMA=org.gnome.desktop.sound
-gsettings set "$SOUND_SCHEMA" allow-volume-above-100-percent false
+media_policy false
 sleep 0.3
-echo 0.98 >"$VOLUME_FILE"
-xdotool key XF86AudioRaiseVolume
+media_baseline 0.98
+media_key XF86AudioRaiseVolume
 media_volume 1.0000 || fail G-MEDIA-AMPLIFICATION "disabled amplification did not cap at 100%"
-gsettings set "$SOUND_SCHEMA" allow-volume-above-100-percent true
+media_policy true
 sleep 0.3
-echo 0.98 >"$VOLUME_FILE"
-xdotool key XF86AudioRaiseVolume
+media_baseline 0.98
+media_key XF86AudioRaiseVolume
 media_volume 1.0400 || fail G-MEDIA-AMPLIFICATION "live enabled amplification did not cross 100%"
-echo 1.50 >"$VOLUME_FILE"
-xdotool key XF86AudioRaiseVolume
+media_baseline 1.50
+media_key XF86AudioRaiseVolume
 media_volume 1.5252 || fail G-MEDIA-AMPLIFICATION "amplified key did not obey GNOME's +11dB limit"
-gsettings set "$SOUND_SCHEMA" allow-volume-above-100-percent false
+media_policy false
 sleep 0.3
-echo 0.98 >"$VOLUME_FILE"
-xdotool key XF86AudioRaiseVolume
+media_baseline 0.98
+media_key XF86AudioRaiseVolume
 media_volume 1.0000 || fail G-MEDIA-AMPLIFICATION "live disable did not restore the ordinary limit"
+media_mark amplification-reset-before
 gsettings reset "$SOUND_SCHEMA" allow-volume-above-100-percent
-echo 0.4200 >"$VOLUME_FILE"
+media_mark amplification-reset-after
+media_baseline 0.4200
+media_mark baseline-written
 pass G-MEDIA-AMPLIFICATION "same shell follows live opt-in and reset; native VM qualifies real PipeWire separately"
 
 # Live rebinding and an empty static array must take effect without restart.
 MEDIA_SCHEMA=org.gnome.settings-daemon.plugins.media-keys
+media_mark static-disable-before
 gsettings set "$MEDIA_SCHEMA" volume-up-static '[]'
+media_mark static-disable-after
 sleep 0.7
+media_mark disabled-key-before
+cp "$CSTATE" "$ARTIFACTS/media-before-disabled-key.json"
 xdotool key XF86AudioRaiseVolume
+media_mark disabled-key-after
 sleep 0.7
+media_mark disabled-check
+cp "$CSTATE" "$ARTIFACTS/media-after-disabled-key.json"
 [ "$(cat "$VOLUME_FILE")" = 0.4200 ] || fail G-MEDIA-VOLUME "an explicitly disabled hardware key still changed volume"
 gsettings set "$MEDIA_SCHEMA" volume-up "['F8']"
 gsettings set "$MEDIA_SCHEMA" volume-step 10
 sleep 0.7
+MEDIA_SINCE="$("$PY" -c 'import time; print(time.monotonic_ns())')"
+MEDIA_KIND=key
 fkey_tap "" ffc5 || fail G-MEDIA-VOLUME "F8 tap failed"
+media_wait
 media_volume 0.5200 || fail G-MEDIA-VOLUME "live rebound volume key ignored the configured step"
 gsettings reset "$MEDIA_SCHEMA" volume-up
 gsettings reset "$MEDIA_SCHEMA" volume-up-static
 gsettings reset "$MEDIA_SCHEMA" volume-step
 sleep 0.7
-echo 0.4200 >"$VOLUME_FILE"
+media_baseline 0.4200
 scrot "$ARTIFACTS/media-volume-osd.png" >/dev/null
+rm -f "$TUNA_MEDIA_DIAGNOSTICS"
 pass G-MEDIA-VOLUME "native volume/precise/mute/microphone keys mutate PipeWire state; unmute preserves the level"
 
 # GNOME Shell's own keybindings (org.gnome.shell.keybindings defaults).
@@ -3203,6 +5743,71 @@ cstate '.overview_open | not' "closed" || fail G-KEYBINDINGS "Super+A again did 
 # The shell hides its overview surfaces on its next frame: let it.
 sleep 1
 pass G-KEYBINDINGS "Super+S, Super+V and Super+A open GNOME's menus and the app grid"
+# Ctrl+Alt+Tab (switch-panels) moves keyboard focus into the top bar:
+# first control forward, last control backward; Tab walks the strip,
+# Enter opens the focused menu, Escape unwinds, and a final Escape
+# returns focus to the client (NORMAL chords pause while held).
+xdotool key ctrl+alt+Tab
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-focus.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+focused "$ARTIFACTS/a11y-panel-focus.json" "Activities" ||
+    fail G-PANEL-FOCUS "Ctrl+Alt+Tab did not focus Activities"
+scrot "$ARTIFACTS/panel-focus.png" >/dev/null
+xdotool key Tab
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-tab.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+focused "$ARTIFACTS/a11y-panel-tab.json" "Date and Time" ||
+    fail G-PANEL-FOCUS "Tab did not move panel focus to the clock"
+for _ in $(seq 1 6); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-walk.json" 20 ||
+        fail G-PANEL-FOCUS "accessibility dump failed"
+    focused "$ARTIFACTS/a11y-panel-walk.json" "System" && break
+    xdotool key Tab
+    sleep 1
+done
+focused "$ARTIFACTS/a11y-panel-walk.json" "System" ||
+    fail G-PANEL-FOCUS "Tab did not reach the system menu"
+xdotool key Return
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-open.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+showing "$ARTIFACTS/a11y-panel-open.json" "Dark Style" ||
+    fail G-PANEL-FOCUS "Enter did not open quick settings from the bar"
+xdotool key Escape
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-unwind.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-panel-unwind.json" "Dark Style" ||
+    fail G-PANEL-FOCUS "Escape did not close the keyboard-opened menu"
+focused "$ARTIFACTS/a11y-panel-unwind.json" "System" ||
+    fail G-PANEL-FOCUS "Escape did not keep focus on the system button"
+xdotool key super+s
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-held.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-panel-held.json" "Dark Style" ||
+    fail G-PANEL-FOCUS "a NORMAL chord fired while the bar held the keyboard"
+xdotool key Escape
+sleep 1
+xdotool key shift+ctrl+alt+Tab
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-backward.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+focused "$ARTIFACTS/a11y-panel-backward.json" "System" ||
+    fail G-PANEL-FOCUS "the backward chord did not focus the last control"
+xdotool key Escape
+sleep 1
+xdotool key super+v
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel-returned.json" 20 ||
+    fail G-PANEL-FOCUS "accessibility dump failed"
+showing "$ARTIFACTS/a11y-panel-returned.json" "Previous month" ||
+    fail G-PANEL-FOCUS "NORMAL chords stayed paused after the final Escape"
+xdotool key Escape
+sleep 1
+pass G-PANEL-FOCUS "Ctrl+Alt+Tab walks the bar, Enter opens menus, Escape unwinds and returns focus"
 # Both directions are rebound, then walk every overview state.
 gsettings set org.gnome.shell.keybindings shift-overview-up "['<Super>F8']"
 gsettings set org.gnome.shell.keybindings shift-overview-down "['<Super>F7']"
@@ -3230,7 +5835,7 @@ pick_alpha() {
     [ -n "$alpha" ] || return 1
     # shellcheck disable=SC2086
     xdotool mousemove --window "$WID" $alpha click 1
-    cstate '(.overview_open | not) and .focused_app_id == "tuna-test-alpha"' "alpha"
+    cstate '(.overview_open | not) and .overview_progress == 0 and .focused_app_id == "tuna-test-alpha"' "alpha"
 }
 window_menu() {
     header="$(jq -r '.focused_rect | "\(.[0] + 60) \(.[1] + 20)"' "$CSTATE")"
@@ -3686,6 +6291,76 @@ if command -v ibus-daemon >/dev/null 2>&1 &&
         fail G-IME-CANDIDATES "the candidate window stayed after the commit"
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT - 40))
     pass G-IME-CANDIDATES "the shell draws IBus's candidates (你 尼 泥) under the cursor, the first highlighted (surface $surface), and clicking 尼 commits it"
+    # The active engine's real properties travel through ibus-daemon, not a
+    # synthetic GTK model. This helper binds the exact live shell PID and uses
+    # its private accessibility bus. External timeout also bounds blocked AT-SPI.
+    property_shell_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" ||
+        fail G-IME-PROPERTIES "shell owner absent"
+    case "$property_shell_pid" in *[!0-9]*|"") fail G-IME-PROPERTIES "shell owner not unique";; esac
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+        TUNA_PROOF_SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD)" timeout --kill-after=2s 40s "$PY" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" \
+        "$property_shell_pid" "$ENGINE_LOG" "$ARTIFACTS/ibus-properties-receipt.json" \
+        "$privacy_expected_shell" "${IME_PIDS%% *}" \
+        >"$ARTIFACTS/ibus-properties-proof.log" 2>&1 || fail G-IME-PROPERTIES "live properties proof failed"
+    scrot "$ARTIFACTS/24p-ime-properties.png" >/dev/null
+    pass G-IME-PROPERTIES "real daemon toggle/radio/submenu/action traffic; hidden/disabled and forged-peer denials"
+    # Separate lifecycle proof: preserve the original 40s property gate above.
+    # Two real nested lock cycles use the existing private PAM fixture. No
+    # password enters the observer, phase file, trace, or receipt.
+    [ -n "$PAM_ON" ] || fail G-IME-PROPERTIES-LIFECYCLE "private PAM fixture absent"
+    property_engine_pid="${IME_PIDS%% *}"
+    property_phase="$ARTIFACTS/ibus-properties-lifecycle-phase.json"
+    rm -f "$property_phase"
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+        TUNA_PROOF_SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD)" timeout --kill-after=2s 160s \
+        "$PY" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" "$property_shell_pid" "$ENGINE_LOG" \
+        "$ARTIFACTS/ibus-properties-lifecycle-receipt.json" "$privacy_expected_shell" \
+        "$property_engine_pid" "$property_phase" "$LOG" \
+        >"$ARTIFACTS/ibus-properties-lifecycle.log" 2>&1 &
+    property_driver_pid=$!
+    IME_PIDS="$IME_PIDS $property_driver_pid"
+    for property_case in normal other-panel; do
+        end=$(($(date +%s) + 35))
+        until [ -f "$property_phase" ] && jq -e --arg phase "locked-$property_case" \
+            --argjson gtk "$property_shell_pid" '.phase == $phase and .gtk.pid == $gtk' \
+            "$property_phase" >/dev/null; do
+            kill -0 "$property_driver_pid" 2>/dev/null || fail G-IME-PROPERTIES-LIFECYCLE "observer exited before lock phase"
+            [ "$(date +%s)" -le "$end" ] || fail G-IME-PROPERTIES-LIFECYCLE "lock phase deadline"
+            sleep 0.1
+        done
+        "$PY" - "$property_phase" "$property_driver_pid" "$ROOT/scripts/lib/tuna-ibus-properties-proof.py" <<'PY_IBUS_PHASE'
+import json, pathlib, sys
+phase = json.loads(pathlib.Path(sys.argv[1]).read_text())
+pid = int(phase["pid"])
+fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+if int(fields[1]) != int(sys.argv[2]):
+    raise SystemExit("observer is not the owned timeout child")
+if sys.argv[3].encode() not in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"):
+    raise SystemExit("observer source path differs")
+PY_IBUS_PHASE
+        cstate '.locked' "IBus lifecycle locked" 5 || fail G-IME-PROPERTIES-LIFECYCLE "observer phase disagrees with runtime lock"
+        # Same real lock UI wake/submission path as G-UNLOCK below.
+        sleep 1
+        xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
+        sleep 1
+        xdotool type --delay 30 "$UNLOCK_PASSWORD"
+        xdotool key Return
+        cstate '(.locked | not)' "IBus lifecycle authenticated unlock" 15 || \
+            fail G-IME-PROPERTIES-LIFECYCLE "private PAM fixture did not unlock"
+    done
+    wait "$property_driver_pid" || fail G-IME-PROPERTIES-LIFECYCLE "context/owner/lock property proof failed"
+    # The observer leaves the property menu open; close it with real Escape
+    # (the G-IME-ESCAPE path) and require it gone before XIM.
+    property_menu_closed=
+    for _ in 1 2 3; do
+        xdotool key Escape
+        sleep 0.5
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-ime-properties-closed.json" 20 ||
+            fail G-IME-PROPERTIES-LIFECYCLE "post-Escape shell dump failed"
+        if ! showing "$ARTIFACTS/a11y-ime-properties-closed.json" "Input Mode"; then property_menu_closed=1; break; fi
+    done
+    [ -n "$property_menu_closed" ] || fail G-IME-PROPERTIES-LIFECYCLE "Escape did not close the property menu"
+    pass G-IME-PROPERTIES-LIFECYCLE "fresh unchanged-engine unlock; old context/lock actions have no effect; other panel is not replaced"
     # XIM talks to the session's XWayland, never the outer Xvfb display.
     x11_display="$(jq -r .x11_display "$CSTATE")"
     [ "$x11_display" != null ] || fail G-IME-XIM "XWayland display missing"
@@ -4096,10 +6771,14 @@ pass G-SWIPE-REDUCED-MOTION "up/down gestures snap while held and settle correct
 # GNOME 51 eases the overview open with EASE_OUT_SINE and closed with
 # EASE_OUT_QUAD over 250 ms (#499). The compositor records the progress
 # of every frame it drew; each must sit on its own direction's curve,
-# with at least one sample strictly mid-transition each way.
+# with at least one sample strictly mid-transition each way. Leave a bounded
+# settled idle interval before each input; elapsed time before the request
+# must not be charged to the newly started transition (adaptive repaint).
+sleep 1
 xdotool key Super_L
 cstate '.overview_open and .overview_progress == 1' "eased open" ||
     fail G-OVERVIEW-EASING "the overview did not open"
+sleep 1
 xdotool key Escape
 cstate '(.overview_open | not) and .overview_progress == 0' "eased close" ||
     fail G-OVERVIEW-EASING "the overview did not close"
@@ -4109,6 +6788,7 @@ jq -e '
     def frac: (.[0] / 250) | if . > 1 then 1 else . end;
     .overview_motion.open as $o | .overview_motion.close as $c |
     $o.curve == "ease-out-sine" and $o.duration_ms == 250 and $o.from == 0 and $o.to == 1 and
+    $o.samples[0] == [0, 0] and $c.samples[0] == [0, 1] and
     $c.curve == "ease-out-quad" and $c.duration_ms == 250 and $c.from == 1 and $c.to == 0 and
     ([$o.samples[] | select(.[0] > 0 and .[0] < 250 and .[1] > 0 and .[1] < 1)] | length) > 0 and
     ([$c.samples[] | select(.[0] > 0 and .[0] < 250 and .[1] > 0 and .[1] < 1)] | length) > 0 and
@@ -4147,13 +6827,22 @@ pass G-SWIPE-MOMENTUM "a released swipe keeps its momentum: projected target and
 # GNOME's workspace thumbnails: a window moved one workspace right makes
 # three (the trailing empty one included), so the overview shows the
 # strip; a thumbnail click switches there with the overview still open.
-home_ws="$(jq -r '.active_workspace' "$CSTATE")"
-moved="$(jq -r .focused "$CSTATE")"
-window_menu
+# Swipes restore the previous focus, which can legitimately be XEyes.
+# Select the owned native header fixture before the single menu attempt.
+pick_alpha || fail G-WS-THUMBS "could not focus the original native Alpha fixture"
+cp "$CSTATE" "$ARTIFACTS/ws-thumbs-native-before.json"
+menu_target="$("$PY" "$ROOT/scripts/lib/tuna_window_menu_fixture.py" target "$ARTIFACTS/ws-thumbs-native-before.json" "$ARTIFACTS/alpha-window-owner.json")" ||
+    fail G-WS-THUMBS "original native Alpha identity/focus/geometry is not ready"
+read -r moved home_ws menu_x menu_y <<EOF
+$menu_target
+EOF
+xdotool mousemove --window "$WID" "$menu_x" "$menu_y" click 3
+sleep 1.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-ws-right.json" 20 \
     --press "Move to Workspace Right" || fail G-WS-THUMBS "the window menu has no Move to Workspace Right"
 cstate ".active_workspace == $home_ws and any(.windows[]; .id == $moved and .workspace == $home_ws + 1)" \
-    "moved" || fail G-WS-THUMBS "the window did not move one workspace right"
+    "moved" || fail G-WS-THUMBS "the original native Alpha did not move one workspace right"
+cp "$CSTATE" "$ARTIFACTS/ws-thumbs-native-after.json"
 sleep 1
 # Hold a synthetic three-finger swipe at half progress. The event enters the
 # compositor's normal gesture handler; the held frame lets CI sample it.
@@ -4738,7 +7427,7 @@ end=$(($(date +%s) + 10))
 until grep -q Suspend "$POWER_LOG" 2>/dev/null || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q Suspend "$POWER_LOG" || fail G-SUSPEND-LOCK "logind never got Suspend"
 cstate '.locked' "locked" 10 || fail G-SUSPEND-LOCK "PrepareForSleep did not lock the session"
-cstate 'has("pointer_position") and has("pointer_fullscreen_blocked") and .pointer_position == null and .pointer_fullscreen_blocked == null' "locked pointer diagnostics redacted" ||
+cstate 'has("pointer_position") and has("pointer_fullscreen_blocked") and .pointer_position == null and .pointer_fullscreen_blocked == null and has("cursor") and .cursor == null' "locked pointer diagnostics redacted" ||
     fail G-POINTER-TRACE-PRIVATE "credential input retained pointer diagnostics"
 pass G-POINTER-TRACE-PRIVATE "actual locked scene omits pointer coordinates and fullscreen observations"
 "$PY" "$ROOT/scripts/lib/tuna-capture-security-client.py" >"$ARTIFACTS/capture-locked-denial.log" 2>&1 ||
@@ -4825,9 +7514,29 @@ if [ -n "$PAM_ON" ]; then
     grep -q 'ActiveChanged.*true' "$ARTIFACTS/screensaver-signals.log" || fail G-LOCK-KEY "no active signal"
     grep -q 'ActiveChanged.*false' "$ARTIFACTS/screensaver-signals.log" || fail G-LOCK-KEY "no inactive signal"
     pass G-LOCK-KEY "Super+L locks; PAM unlocks; ActiveChanged publishes both transitions"
+    # Freeze only the animation clock so a genuine rendered Ctrl ripple
+    # remains in flight until the real D-Bus lock. No synthetic frames/time.
+    anim_clock 20000
+    cstate '.animation_clock_manual and (.locked | not)' "locate privacy clock" ||
+        fail G-POINTER-TRACE-PRIVATE "could not freeze the unlocked animation clock"
+    gsettings set org.gnome.desktop.interface locate-pointer true
+    cstate '.cursor.locate_pointer.enabled' "locate privacy enabled" ||
+        fail G-POINTER-TRACE-PRIVATE "locate-pointer did not enable"
+    locate_lock_frames=$(jq '.cursor.locate_pointer.frames' "$CSTATE")
+    xdotool key Control_L
+    cstate ".cursor.locate_pointer.active and .cursor.locate_pointer.at != null and .cursor.locate_pointer.frames > $locate_lock_frames" "rendered ripple before D-Bus lock" ||
+        fail G-POINTER-TRACE-PRIVATE "no actual active rendered ripple before locking"
+    cp "$CSTATE" "$ARTIFACTS/locate-before-dbus-lock.json"
     gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/ScreenSaver \
         --method org.gnome.ScreenSaver.Lock >/dev/null || fail G-DBUS-LOCK "D-Bus Lock failed"
     cstate '.locked' "D-Bus locked" 5 || fail G-DBUS-LOCK "D-Bus Lock replied without locking"
+    cstate '.locked and .animation_clock_manual and has("cursor") and .cursor == null and .pointer_position == null and .pointer_fullscreen_blocked == null' "D-Bus lock redacts active ripple" ||
+        fail G-POINTER-TRACE-PRIVATE "D-Bus lock retained cursor activity or pointer coordinates"
+    cp "$CSTATE" "$ARTIFACTS/locate-dbus-locked-private.json"
+    rm -f "$TUNA_ANIMATION_CLOCK"
+    cstate '.locked and (.animation_clock_manual | not)' "locked real clock restored" ||
+        fail G-POINTER-TRACE-PRIVATE "animation proof clock remained active"
+
     # The first printable key lifts the curtain and becomes exactly one
     # password character. Do not click, clear, or replace the entry here:
     # PAM acceptance proves the wake key was neither lost nor inserted twice.
@@ -4840,6 +7549,12 @@ if [ -n "$PAM_ON" ]; then
     cstate '(.locked | not)' "first-printable lock wake authenticated through PAM" 15 ||
         fail G-LOCK-FIRST-PRINTABLE "first wake character was lost, duplicated, or could not authenticate"
     pass G-LOCK-FIRST-PRINTABLE "a printable wake key becomes exactly one password character and PAM unlocks"
+    cstate '(.locked | not) and (.cursor.locate_pointer.active | not) and .cursor.locate_pointer.at == null and .cursor.locate_pointer.count == 0 and .cursor.locate_pointer.frames == 0' "unlock retains no prior ripple" ||
+        fail G-POINTER-TRACE-PRIVATE "unlock resurrected pre-lock cursor activity/history"
+    cp "$CSTATE" "$ARTIFACTS/locate-after-dbus-unlock.json"
+    gsettings set org.gnome.desktop.interface locate-pointer false
+    pass G-POINTER-TRACE-PRIVATE "D-Bus lock during an actual rendered frozen-clock ripple redacts cursor diagnostics; unlock retains no activity/history"
+
     pass G-DBUS-LOCK "org.gnome.Shell exposes the screen-saver object and Lock waits for confirmation"
 
     # A short idle policy must fade, cancel on activity, then latch only

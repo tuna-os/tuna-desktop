@@ -61,6 +61,9 @@ pub struct ColumnSpring {
     elapsed: f64,
 }
 impl ColumnSpring {
+    pub(crate) fn running(&self) -> bool {
+        !self.x.done_at(self.elapsed) || !self.width.done_at(self.elapsed)
+    }
     pub fn new(from: Rect, to: Rect) -> Self {
         Self {
             to,

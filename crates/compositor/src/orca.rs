@@ -32,6 +32,7 @@ impl Drop for Observation {
 }
 
 pub struct Reader {
+    wake: crate::wake::Wake,
     display: String,
     enabled: bool,
     child: Option<Child>,
@@ -43,12 +44,12 @@ pub struct Reader {
     sent: State,
     attempts: u8,
     next_start: Instant,
-    waker: Option<calloop::ping::Ping>,
 }
 impl Reader {
     pub fn new(display: &str) -> Self {
         Self {
             display: display.into(),
+            wake: Default::default(),
             enabled: false,
             child: None,
             observed: None,
@@ -57,8 +58,10 @@ impl Reader {
             sent: State::Disabled,
             attempts: 0,
             next_start: Instant::now(),
-            waker: None,
         }
+    }
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
     }
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
@@ -88,16 +91,10 @@ impl Reader {
         }
     }
 
-    /// Wake the compositor loop whenever a watcher thread reports, so
-    /// [`poll`](Self::poll) runs on demand rather than every frame (#503).
-    pub fn set_waker(&mut self, waker: calloop::ping::Ping) {
-        self.waker = Some(waker);
-    }
-
     /// When [`poll`](Self::poll) next starts a reader by itself: the
     /// restart gate of an enabled reader without a child (a departure
     /// still in progress is checked again at the gate). Child exits wake
-    /// the loop through SIGCHLD and watcher reports through the waker.
+    /// the loop through SIGCHLD and watcher reports through the [`Wake`](crate::wake::Wake).
     pub fn next_deadline(&self) -> Option<Instant> {
         (self.enabled && self.child.is_none() && self.attempts < 3).then_some(self.next_start)
     }
@@ -127,16 +124,14 @@ impl Reader {
     fn await_departure(&mut self, pid: u32) {
         let (sender, receiver) = mpsc::channel();
         self.departing = Some(receiver);
-        let waker = self.waker.clone();
+        let wake = self.wake.clone();
         std::thread::spawn(move || {
             let until = Instant::now() + DEPARTURE_BOUND;
             while departing_owner(pid, &bus_call) && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(50));
             }
             let _ = sender.send(());
-            if let Some(waker) = waker {
-                waker.ping();
-            }
+            wake.signal();
         });
     }
     /// True while a stopped child may still hold an Orca name.
@@ -186,9 +181,13 @@ impl Reader {
                 Ok(None) => observed_running = true,
             }
         }
-        if let Some(Ok((pid, state, reason))) =
-            self.observed.as_ref().map(|o| o.receiver.try_recv())
-        {
+        let observation = self.observed.as_ref().map(|o| o.receiver.try_recv());
+        if matches!(observation, Some(Err(mpsc::TryRecvError::Disconnected))) {
+            self.stop();
+            self.state = State::Unavailable;
+            self.attempts = 3;
+        }
+        if let Some(Ok((pid, state, reason))) = observation {
             if self.pid() == Some(pid) {
                 if state == State::Active {
                     self.state = state;
@@ -246,13 +245,12 @@ impl Reader {
                         receiver,
                         cancel: cancel.clone(),
                     });
-                    let waker = self.waker.clone();
+                    let wake = self.wake.clone();
                     std::thread::spawn(move || {
+                        let _completion = wake.completion();
                         let report = |state, reason| {
                             let sent = sender.send((pid, state, reason)).is_ok();
-                            if let Some(waker) = &waker {
-                                waker.ping();
-                            }
+                            wake.signal();
                             sent
                         };
                         watch_orca_name(pid, &bus_call, &cancel, READINESS_GRACE, report)
@@ -659,5 +657,26 @@ mod tests {
         sender.send(()).unwrap();
         assert!(!reader.departure_pending());
         assert!(reader.departing.is_none());
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    #[test]
+    fn broken_observer_stops_bounded_retry_and_never_leaves_a_stale_deadline() {
+        let mut reader = Reader::new("isolated-test");
+        let (send, receive) = mpsc::channel();
+        drop(send);
+        reader.observed = Some(Observation {
+            receiver: receive,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        reader.enabled = true;
+        reader.attempts = 1;
+        assert_eq!(reader.poll(false), Some(State::Unavailable));
+        assert_eq!(reader.attempts, 3);
+        assert_eq!(reader.next_deadline(), None);
+        assert!(reader.observed.is_none());
     }
 }

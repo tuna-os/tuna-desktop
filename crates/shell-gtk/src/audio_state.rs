@@ -1,6 +1,7 @@
 //! Bounded state from pw-dump's event stream. No GTK or daemon calls.
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use tuna_shell_host::settings::PrivacyPolicy;
 
 pub const MAX_PENDING: usize = 4 * 1024 * 1024;
 const MAX_OBJECTS: usize = 4096;
@@ -11,6 +12,7 @@ pub struct AudioState {
     objects: BTreeMap<u64, Value>,
     pending: Vec<u8>,
     state_bytes: usize,
+    authoritative: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,6 +29,8 @@ pub struct Snapshot {
     pub recording: bool,
     pub source: Option<(f64, bool)>,
     pub sink: Option<(f64, bool)>,
+    /// None until the default node reports a recognized playback state.
+    pub sink_running: Option<bool>,
     pub outputs: Vec<Output>,
 }
 
@@ -84,7 +88,11 @@ impl AudioState {
                         object["metadata"] = Value::Array(entries);
                     }
                 }
-                if self.objects.len() < MAX_OBJECTS || self.objects.contains_key(&id) {
+                if self.objects.len() >= MAX_OBJECTS && !self.objects.contains_key(&id) {
+                    self.authoritative = false;
+                    return Err("audio graph exceeds the object-count limit");
+                }
+                {
                     let previous = self.objects.get(&id).map_or(0, |old| old.to_string().len());
                     let total = self
                         .state_bytes
@@ -97,6 +105,11 @@ impl AudioState {
                     self.objects.insert(id, object);
                 }
             }
+        }
+        if changed {
+            // The initial pw-dump array is complete only after JSON framing
+            // succeeds. A disconnected or partially read cache proves no removals.
+            self.authoritative = true;
         }
         Ok(changed)
     }
@@ -115,6 +128,125 @@ impl AudioState {
                 };
                 value["name"].as_str().map(str::to_owned)
             })
+    }
+
+    /// The owned feedback player must actually be running and linked to
+    /// the current default sink; an alive player or a different output
+    /// does not establish playback on this sink.
+    pub fn default_sink_has_running_process(&self, pid: u32) -> bool {
+        let Some(name) = self.default_name("default.audio.sink") else {
+            return false;
+        };
+        let Some((&sink, _)) = self.objects.iter().find(|(_, object)| {
+            object["info"]["props"]["media.class"] == "Audio/Sink"
+                && object["info"]["props"]["node.name"] == name
+        }) else {
+            return false;
+        };
+        self.objects.iter().any(|(&stream, object)| {
+            object["info"]["state"] == "running"
+                && object["info"]["props"]["media.class"] == "Stream/Output/Audio"
+                && number(&object["info"]["props"]["application.process.id"])
+                    == Some(u64::from(pid))
+                && self.objects.values().any(|link| {
+                    number(&link["info"]["output-node-id"]) == Some(stream)
+                        && number(&link["info"]["input-node-id"]) == Some(sink)
+                        && link["info"]["state"] == "active"
+                })
+        })
+    }
+
+    /// Fold the current graph against the privacy kill-switches:
+    /// which nodes must read muted, which camera nodes/streams must
+    /// not exist, and which nodes are muted right now. A video
+    /// capture stream counts as camera capture only while linked to
+    /// a `Video/Source` node — an unlinked stream captures nothing,
+    /// and a stream wired to anything else (a screen-share feed) is
+    /// never the camera's business.
+    pub fn privacy_scan(&self, policy: &PrivacyPolicy) -> crate::privacy::PrivacyScan {
+        let mut scan = crate::privacy::PrivacyScan {
+            authoritative: self.authoritative,
+            cookie: self.objects.values().find_map(|object| {
+                (object["type"].as_str() == Some("PipeWire:Interface:Core"))
+                    .then(|| number(&object["info"]["cookie"]).and_then(|v| u32::try_from(v).ok()))
+                    .flatten()
+            }),
+            serials: BTreeMap::new(),
+            audio_present: BTreeSet::new(),
+            mute_required: BTreeSet::new(),
+            destroy: Vec::new(),
+            unclassified_video_sources: Vec::new(),
+            muted_now: BTreeSet::new(),
+        };
+        for (&id, object) in &self.objects {
+            let props = &object["info"]["props"];
+            let class = props["media.class"].as_str().unwrap_or("");
+            if let Some(serial) = number(&props["object.serial"]) {
+                scan.serials.insert(id, serial);
+            }
+            let audio_required = if class == "Audio/Source" {
+                Some(policy.microphone_disabled)
+            } else if class == "Audio/Sink" {
+                Some(policy.sound_output_disabled)
+            } else {
+                None
+            };
+            if let Some(required) = audio_required {
+                scan.audio_present.insert(id);
+                if node_muted(object) {
+                    scan.muted_now.insert(id);
+                }
+                if required {
+                    scan.mute_required.insert(id);
+                }
+            } else if policy.camera_disabled
+                && (self.is_camera_node(object)
+                    || (class == "Stream/Input/Video" && self.video_stream_captures_camera(id)))
+            {
+                scan.destroy.push(id);
+            } else if policy.camera_disabled && is_video_source(class) {
+                scan.unclassified_video_sources.push(id);
+            }
+        }
+        scan
+    }
+
+    /// Positive provider evidence avoids destroying desktop sources sharing
+    /// Video/Source. These graph properties guide device enforcement; they are
+    /// not an access-control boundary (clients may publish properties).
+    fn is_camera_node(&self, node: &Value) -> bool {
+        let props = &node["info"]["props"];
+        if !is_video_source(props["media.class"].as_str().unwrap_or("")) {
+            return false;
+        }
+        let camera_api =
+            |props: &Value| matches!(props["device.api"].as_str(), Some("v4l2" | "libcamera"));
+        camera_api(props)
+            || number(&props["device.id"]).is_some_and(|device| {
+                self.objects.get(&device).is_some_and(|parent| {
+                    parent["type"].as_str() == Some("PipeWire:Interface:Device")
+                        && parent["info"]["props"]["media.class"].as_str() == Some("Video/Device")
+                        && camera_api(&parent["info"]["props"])
+                })
+            })
+    }
+
+    /// A video capture stream captures the camera while a link feeds
+    /// it from a `Video/Source` node (data flows output node to
+    /// input node, as in
+    /// [`AudioState::default_sink_has_running_process`]).
+    fn video_stream_captures_camera(&self, stream: u64) -> bool {
+        self.objects.values().any(|object| {
+            let info = &object["info"];
+            let output = number(&info["output-node-id"]);
+            let input = number(&info["input-node-id"]);
+            input == Some(stream)
+                && output.is_some_and(|camera| {
+                    self.objects
+                        .get(&camera)
+                        .is_some_and(|node| self.is_camera_node(node))
+                })
+        })
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -148,6 +280,11 @@ impl AudioState {
             }
             if is_default_sink {
                 snapshot.sink = node_level(object);
+                snapshot.sink_running = match object["info"]["state"].as_str() {
+                    Some("running") => Some(true),
+                    Some("idle" | "suspended") => Some(false),
+                    _ => None,
+                };
             }
             let name = props["node.description"]
                 .as_str()
@@ -210,6 +347,19 @@ impl AudioState {
 fn property_bool(v: &Value) -> bool {
     v.as_bool().unwrap_or(v.as_str() == Some("true"))
 }
+/// Video source class alone is not camera provenance.
+fn is_video_source(class: &str) -> bool {
+    class == "Video/Source" || class.starts_with("Video/Source/")
+}
+/// A node's mixer mute flag. Missing mixer state reads as unmuted,
+/// so an unknown node is muted (and re-muted) rather than trusted.
+fn node_muted(node: &Value) -> bool {
+    node["info"]["params"]["Props"]
+        .as_array()
+        .and_then(|params| params.first())
+        .and_then(|props| props["mute"].as_bool())
+        .unwrap_or(false)
+}
 fn number(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str()?.parse().ok())
 }
@@ -239,9 +389,29 @@ mod tests {
         assert!(!muted);
     }
 
-    fn feed(state: &mut AudioState, value: Value) {
+    fn feed(state: &mut AudioState, mut value: Value) {
+        if let Some(objects) = value.as_array_mut() {
+            for object in objects {
+                if object["info"].is_object() && object["info"]["props"].is_object() {
+                    object["info"]["props"]["object.serial"] = object["id"].clone();
+                }
+            }
+        }
         state.feed(value.to_string().as_bytes()).unwrap();
     }
+    #[test]
+    fn oversized_initial_graph_cannot_claim_authority() {
+        let mut state = AudioState::default();
+        let objects: Vec<Value> = (0..=MAX_OBJECTS)
+            .map(|id| json!({"id":id,"info":{"props":{}}}))
+            .collect();
+        assert_eq!(
+            state.feed(Value::Array(objects).to_string().as_bytes()),
+            Err("audio graph exceeds the object-count limit")
+        );
+        assert!(!state.privacy_scan(&PrivacyPolicy::default()).authoritative);
+    }
+
     #[test]
     fn split_events_remove_capture_and_ignore_monitor_streams() {
         let mut s = AudioState::default();
@@ -261,6 +431,67 @@ mod tests {
             .feed(&vec![b' '; MAX_PENDING + 1])
             .is_err());
     }
+    #[test]
+    fn playback_state_is_default_sink_scoped_and_unknown_is_conservative() {
+        let mut state = AudioState::default();
+        feed(
+            &mut state,
+            json!([
+                {"id":20,"type":"PipeWire:Interface:Metadata","props":{"metadata.name":"default"},"metadata":[{"subject":0,"key":"default.audio.sink","value":{"name":"main"}}]},
+                {"id":1,"info":{"state":"running","props":{"media.class":"Audio/Sink","node.name":"other"}}},
+                {"id":2,"info":{"state":"idle","props":{"media.class":"Audio/Sink","node.name":"main"}}}
+            ]),
+        );
+        assert_eq!(state.snapshot().sink_running, Some(false));
+        feed(
+            &mut state,
+            json!([{"id":2,"info":{"state":"running","props":{"media.class":"Audio/Sink","node.name":"main"}}}]),
+        );
+        assert_eq!(state.snapshot().sink_running, Some(true));
+        feed(
+            &mut state,
+            json!([{"id":2,"info":{"state":"error","props":{"media.class":"Audio/Sink","node.name":"main"}}}]),
+        );
+        assert_eq!(state.snapshot().sink_running, None);
+        feed(&mut state, json!([{"id":2,"info":null}]));
+        assert_eq!(state.snapshot().sink_running, None);
+    }
+
+    #[test]
+    fn feedback_player_requires_running_stream_on_default_sink() {
+        let mut state = AudioState::default();
+        feed(
+            &mut state,
+            json!([
+                {"id":20,"type":"PipeWire:Interface:Metadata","props":{"metadata.name":"default"},"metadata":[{"subject":0,"key":"default.audio.sink","value":{"name":"main"}}]},
+                {"id":2,"info":{"props":{"media.class":"Audio/Sink","node.name":"main"}}},
+                {"id":3,"info":{"props":{"media.class":"Audio/Sink","node.name":"other"}}},
+                {"id":4,"info":{"state":"running","props":{"media.class":"Stream/Output/Audio","application.process.id":"42"}}},
+                {"id":5,"info":{"state":"active","output-node-id":4,"input-node-id":2}}
+            ]),
+        );
+        assert!(state.default_sink_has_running_process(42));
+        assert!(!state.default_sink_has_running_process(43));
+        feed(
+            &mut state,
+            json!([{"id":5,"info":{"state":"active","output-node-id":4,"input-node-id":3}}]),
+        );
+        assert!(!state.default_sink_has_running_process(42));
+        feed(
+            &mut state,
+            json!([{"id":5,"info":{"state":"paused","output-node-id":4,"input-node-id":2}}]),
+        );
+        assert!(!state.default_sink_has_running_process(42));
+        feed(
+            &mut state,
+            json!([{"id":5,"info":{"state":"active","output-node-id":4,"input-node-id":2}},
+            {"id":4,"info":{"state":"idle","props":{"media.class":"Stream/Output/Audio","application.process.id":42}}}]),
+        );
+        assert!(!state.default_sink_has_running_process(42));
+        feed(&mut state, json!([{"id":4,"info":null}]));
+        assert!(!state.default_sink_has_running_process(42));
+    }
+
     #[test]
     fn ports_share_a_sink_but_switch_distinct_routes_and_metadata_is_incremental() {
         let mut s = AudioState::default();
@@ -291,5 +522,148 @@ mod tests {
         );
         assert_eq!(s.snapshot().source, a.source);
         assert!(s.snapshot().sink.is_none());
+    }
+
+    fn privacy_graph() -> AudioState {
+        let mut s = AudioState::default();
+        feed(
+            &mut s,
+            json!([
+                {"id":48,"info":{"props":{"media.class":"Audio/Sink","node.name":"analog"},"params":{"Props":[{"channelVolumes":[0.512],"mute":false}]}}},
+                {"id":49,"info":{"props":{"media.class":"Audio/Sink","node.name":"hdmi"},"params":{"Props":[{"channelVolumes":[0.512],"mute":true}]}}},
+                {"id":50,"info":{"props":{"media.class":"Audio/Source","node.name":"mic"},"params":{"Props":[{"channelVolumes":[0.125],"mute":false}]}}},
+                {"id":51,"info":{"props":{"media.class":"Audio/Source","node.name":"monitor"},"params":{"Props":[{"mute":true}]}}},
+                {"id":60,"info":{"state":"running","props":{"media.class":"Video/Source","device.api":"v4l2","node.name":"camera"}}},
+                {"id":61,"info":{"state":"running","props":{"media.class":"Stream/Input/Video","node.name":"capture"}}},
+                {"id":62,"info":{"state":"running","props":{"media.class":"Stream/Input/Video","node.name":"share-view"}}},
+                {"id":63,"info":{"state":"running","props":{"media.class":"Stream/Output/Video","node.name":"producer"}}},
+                {"id":64,"info":{"props":{"media.class":"Video/Source/Custom","device.api":"libcamera","node.name":"doorbell"}}},
+                {"id":70,"info":{"state":"active","output-node-id":60,"input-node-id":61}},
+                {"id":71,"info":{"state":"active","output-node-id":63,"input-node-id":62}}
+            ]),
+        );
+        s
+    }
+
+    #[test]
+    fn privacy_scan_is_empty_when_everything_is_allowed() {
+        let s = privacy_graph();
+        let scan = s.privacy_scan(&PrivacyPolicy::default());
+        assert!(scan.mute_required.is_empty());
+        assert!(scan.destroy.is_empty());
+        assert_eq!(scan.muted_now, BTreeSet::from([49, 51]));
+    }
+
+    #[test]
+    fn privacy_scan_requires_mute_on_every_unmuted_device() {
+        let s = privacy_graph();
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            microphone_disabled: true,
+            sound_output_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert_eq!(scan.mute_required, BTreeSet::from([48, 49, 50, 51]));
+        assert!(scan.destroy.is_empty());
+    }
+
+    #[test]
+    fn camera_provenance_preserves_realistic_desktop_sources_and_consumers() {
+        // xdg-desktop-portal-wlr explicitly publishes Video/Source without
+        // camera provenance. Mutter51 meta-stream-source.c and Tuna start_cast
+        // supply output streams without camera device.api. See docs references.
+        let mut graph = AudioState::default();
+        feed(
+            &mut graph,
+            json!([
+                {"id":40,"type":"PipeWire:Interface:Device","info":{"props":{"media.class":"Video/Device","device.api":"libcamera"}}},
+                {"id":41,"info":{"props":{"media.class":"Video/Source","device.id":"40"}}},
+                {"id":42,"info":{"props":{"media.class":"Video/Source","device.api":"v4l2"}}},
+                {"id":50,"info":{"props":{"media.class":"Video/Source","node.name":"xdpw-stream-ABCDEF"}}},
+                {"id":51,"info":{"props":{"media.class":"Video/Source","media.role":"Screen"}}},
+                {"id":52,"info":{"props":{"media.class":"Video/Source","media.role":"Camera"}}},
+                {"id":53,"info":{"props":{"media.class":"Stream/Output/Video","node.name":"meta-stream-source-source"}}},
+                {"id":54,"info":{"props":{"media.class":"Stream/Output/Video","node.name":"tuna-screen-cast"}}},
+                {"id":55,"info":{"props":{"media.class":"Video/Source","device.id":999}}},
+            {"id":56,"info":{"props":{"media.class":"Video/Source","device.id":80}}},
+            {"id":57,"info":{"props":{"media.class":"Video/Source","device.id":81}}},
+            {"id":80,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Video/Device","device.api":"libcamera"}}},
+            {"id":81,"type":"PipeWire:Interface:Device","info":{"props":{"media.class":"Audio/Device","device.api":"v4l2"}}},
+                {"id":60,"info":{"props":{"media.class":"Stream/Input/Video"}}},
+                {"id":61,"info":{"props":{"media.class":"Stream/Input/Video"}}},
+                {"id":62,"info":{"props":{"media.class":"Stream/Input/Video"}}},
+                {"id":70,"info":{"output-node-id":41,"input-node-id":60}},
+                {"id":71,"info":{"output-node-id":50,"input-node-id":61}},
+                {"id":72,"info":{"output-node-id":54,"input-node-id":62}}
+            ]),
+        );
+        let scan = graph.privacy_scan(&PrivacyPolicy {
+            camera_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert_eq!(scan.destroy, vec![41, 42, 60]);
+        assert_eq!(
+            scan.unclassified_video_sources,
+            vec![50, 51, 52, 55, 56, 57]
+        );
+    }
+
+    #[test]
+    fn privacy_scan_destroys_cameras_but_not_screen_shares() {
+        let s = privacy_graph();
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            camera_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert!(scan.mute_required.is_empty());
+        // Both camera flavors plus the stream fed by the camera; the
+        // stream fed by the video producer and the producer itself
+        // are not camera capture.
+        assert_eq!(scan.destroy, vec![60, 61, 64]);
+    }
+
+    #[test]
+    fn privacy_scan_ignores_an_unlinked_capture_stream() {
+        let mut s = AudioState::default();
+        feed(
+            &mut s,
+            json!([
+                {"id":61,"info":{"state":"running","props":{"media.class":"Stream/Input/Video","node.name":"capture"}}}
+            ]),
+        );
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            camera_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert!(scan.destroy.is_empty());
+        // Linking it to a camera later makes it camera capture.
+        feed(
+            &mut s,
+            json!([
+                {"id":60,"info":{"state":"running","props":{"media.class":"Video/Source","device.api":"v4l2","node.name":"camera"}}},
+                {"id":70,"info":{"state":"active","output-node-id":60,"input-node-id":61}}
+            ]),
+        );
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            camera_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert_eq!(scan.destroy, vec![60, 61]);
+    }
+
+    #[test]
+    fn privacy_scan_treats_missing_mixer_state_as_unmuted() {
+        let mut s = AudioState::default();
+        feed(
+            &mut s,
+            json!([
+                {"id":50,"info":{"props":{"media.class":"Audio/Source","node.name":"mic"}}}
+            ]),
+        );
+        let scan = s.privacy_scan(&PrivacyPolicy {
+            microphone_disabled: true,
+            ..PrivacyPolicy::default()
+        });
+        assert_eq!(scan.mute_required, BTreeSet::from([50]));
+        assert!(scan.muted_now.is_empty());
     }
 }

@@ -21,6 +21,9 @@ pub struct LoginView {
     pub prompt: Option<String>,
     /// Whether the answer field masks input.
     pub prompt_secret: bool,
+    /// Whether the current prompt asks for a fingerprint (#366):
+    /// the window shows a typed-input refusal, not an active-reader claim.
+    pub fingerprint_hint: bool,
     /// Whether the answer field + login button are sensitive.
     pub input_sensitive: bool,
     /// Session picker rows (names), Tuna Desktop default first.
@@ -39,10 +42,15 @@ pub fn render_snapshot(
     let current = model.current_prompt();
     LoginView {
         title: "Sign in to Tuna Desktop".to_string(),
-        notice: model.notice.clone(),
+        notice: if model.wants_fingerprint() {
+            Some(crate::model::FINGERPRINT_TYPED_NOTICE.into())
+        } else {
+            model.notice.clone()
+        },
         prompt: current.map(|p| p.text.clone()),
         prompt_secret: current.is_some_and(|p| p.secret),
-        input_sensitive: !matches!(model.screen, Screen::Launching),
+        fingerprint_hint: current.is_some_and(|p| p.fingerprint),
+        input_sensitive: !matches!(model.screen, Screen::Launching) && !model.wants_fingerprint(),
         sessions: sessions.iter().map(|s| s.name.clone()).collect(),
         selected_session: sessions.iter().position(|s| s.is_default).unwrap_or(0),
     }
@@ -113,6 +121,23 @@ mod tests {
     use super::*;
     use crate::model::GreeterModel;
 
+    #[test]
+    fn fingerprint_snapshot_does_not_offer_typed_input_or_claim_device_verification() {
+        let mut model = GreeterModel::new();
+        model.begin_user("ada");
+        model.apply_response(&greetd_ipc::Response::AuthMessage {
+            auth_message_type: greetd_ipc::AuthMessageType::Secret,
+            auth_message: "Place your finger on the fingerprint reader".into(),
+        });
+        let view = render_snapshot(&model, &sessions(), &[]);
+        assert!(!view.input_sensitive);
+        assert!(view.fingerprint_hint);
+        assert_eq!(
+            view.notice.as_deref(),
+            Some(crate::model::FINGERPRINT_TYPED_NOTICE)
+        );
+    }
+
     fn sessions() -> Vec<SessionEntry> {
         vec![
             SessionEntry {
@@ -150,6 +175,26 @@ mod tests {
         let view = render_snapshot(&model, &sessions(), &[]);
         assert_eq!(view.notice.as_deref(), Some("Sign-in failed. Try again."));
         assert!(view.input_sensitive);
+    }
+
+    #[test]
+    fn fingerprint_prompt_renders_touch_hint() {
+        use greetd_ipc::AuthMessageType;
+        let mut model = GreeterModel::new();
+        model.begin_user("ada");
+        model.apply_response(&greetd_ipc::Response::AuthMessage {
+            auth_message_type: AuthMessageType::Secret,
+            auth_message: "Place your finger on the fingerprint reader".to_string(),
+        });
+        let view = render_snapshot(&model, &sessions(), &[]);
+        assert!(view.fingerprint_hint);
+        assert!(view.prompt_secret);
+    }
+
+    #[test]
+    fn password_prompt_has_no_touch_hint() {
+        let view = render_snapshot(&GreeterModel::new(), &sessions(), &[]);
+        assert!(!view.fingerprint_hint);
     }
 
     #[test]

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Admitted GTK callback controls; not an installed/session-lock pixel proof."""
+import hashlib,importlib.util,json,os,re,subprocess,sys,tempfile,time
+from pathlib import Path
+sys.dont_write_bytecode = True
+
+def load(name):
+ spec=importlib.util.spec_from_file_location(name,Path(__file__).resolve().parent / "lib" / (name+".py"))
+ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+identity=load("auth_proof_identity")
+lifetime=load("auth_proof_process")
+
+def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+root=Path.cwd().resolve()
+admission=json.loads(Path('gtk-shell-artifacts/a11y/bin/build-admission.json').read_text())
+source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+run_identity=identity.current_identity(root)
+source_identity=identity.source_tuple(root)
+assert admission['source_commit']==source==run_identity['head']
+assert admission['cargo_lock_sha256']==sha('Cargo.lock')
+for key,env in [('run_id','GITHUB_RUN_ID'),('run_attempt','GITHUB_RUN_ATTEMPT')]:assert admission[key]==os.environ[env]
+metadata=json.loads(subprocess.check_output(['cargo','metadata','--locked','--no-deps','--format-version=1']))
+packages=[p for p in metadata['packages'] if p['name']=='tuna-shell-gtk' and Path(p['manifest_path']).resolve()==root/'crates/shell-gtk/Cargo.toml']
+assert len(packages)==1
+rows=[json.loads(line) for line in Path(os.environ['RUNNER_TEMP'],'tuna-gtk-a11y-build.json').read_text().splitlines()]
+rows=[r for r in rows if r.get('reason')=='compiler-artifact' and r.get('package_id')==packages[0]['id'] and r.get('target',{}).get('name')=='tuna-shell-gtk' and r['target'].get('kind')==['bin'] and r.get('profile',{}).get('test') is True and Path(r['target'].get('src_path','')).resolve()==root/'crates/shell-gtk/src/main.rs' and r.get('executable')]
+assert len(rows)==1 and rows[0]['executable']==admission['cargo_executable']
+binary=Path(admission['admitted_executable']).resolve();assert sha(binary)==sha(rows[0]['executable'])==admission['executable_sha256']
+out=Path('gtk-shell-artifacts/auth-no-replay');out.mkdir(parents=True,exist_ok=False)
+case='lock::auth_transport_ui_tests::actual_gtk_auth_send_failure_and_generation_reset'
+# API admission runs before removing token/session environment from the child.
+with tempfile.TemporaryDirectory(prefix="tuna-auth-gtk-",dir=os.environ['RUNNER_TEMP']) as temporary:
+ private=Path(temporary);os.chmod(private,0o700)
+ env=os.environ.copy()
+ for key in list(env):
+  if key.startswith(('DBUS_','AT_SPI_','AT_SPI_BUS','XDG_','WAYLAND_')) or key in ('DISPLAY','SESSION_MANAGER','DESKTOP_SESSION','GH_TOKEN','GITHUB_TOKEN'):
+   env.pop(key,None)
+ for variable,dirname in [('HOME','home'),('XDG_RUNTIME_DIR','runtime'),('XDG_CONFIG_HOME','config'),('XDG_DATA_HOME','data'),('XDG_CACHE_HOME','cache')]:
+  directory=private/dirname;directory.mkdir(mode=0o700);env[variable]=str(directory)
+ env.update(GDK_BACKEND='x11',TUNA_REQUIRE_AUTH_TRANSPORT_GTK='1')
+ argv=['dbus-run-session','--','xvfb-run','-a',str(binary),case,'--exact','--ignored','--test-threads=1','--nocapture']
+ receipt={'source':source,'source_identity':source_identity,'run_identity':run_identity,'build_admission':admission,'cargo_artifact':rows[0],'argv':argv,'scope':'real GTK activation/reset callbacks; host socket transport tests separate; not installed session-lock surface/physical input'}
+ result=lifetime.bounded_command(argv,out/'output.txt',time.monotonic()+30,env=env)
+ receipt['process']=result
+ status=result['exit']
+receipt['exit_status']=status
+assert identity.source_tuple(root)==source_identity
+assert identity.current_identity(root)==run_identity
+receipt['binary_unchanged']=sha(binary)==admission['executable_sha256']
+(out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+text=(out/'output.txt').read_text();print(text)
+assert result['owned_cleanup'] and result['command_error'] is None and status==0 and receipt['binary_unchanged']
+assert re.search(r'^running 1 test$',text,re.M) and '1 passed; 0 failed; 0 ignored;' in text

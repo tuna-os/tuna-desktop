@@ -34,7 +34,7 @@ fn success_exchange_signs_in() {
                 },
                 Step::Exchange {
                     expect_kind: "start",
-                    reply: None,
+                    reply: Some(Response::Success),
                 },
             ],
         )
@@ -107,7 +107,7 @@ fn multi_prompt_password_plus_token() {
                 },
                 Step::Exchange {
                     expect_kind: "start",
-                    reply: None,
+                    reply: Some(Response::Success),
                 },
             ],
         )
@@ -130,7 +130,7 @@ fn multi_prompt_password_plus_token() {
 }
 
 #[test]
-fn session_crash_after_start_is_observable() {
+fn daemon_disconnect_before_start_reply_is_not_handoff() {
     let (a, b) = pair();
     let handle = thread::spawn(move || {
         run_script(
@@ -147,22 +147,15 @@ fn session_crash_after_start_is_observable() {
         )
     });
 
-    let probe = b.try_clone().unwrap();
     let mut client = GreeterClient::from_stream(b);
-    let mut model = GreeterModel::new();
-    model.begin_user("ada");
-    let event = model.apply_response(&client.create_session("ada").unwrap());
-    assert_eq!(event, ModelEvent::Authenticated);
-    client
+    assert!(matches!(
+        client.create_session("ada").unwrap(),
+        Response::Success
+    ));
+    // A sent StartSession alone is not a successful handoff: require its reply.
+    assert!(client
         .start_session(vec!["tuna-session".into()], vec![])
-        .unwrap();
-    model.mark_session_starting();
-    // The dead session shows up as a broken conversation: with the
-    // peer gone, the next wire read fails cleanly (EOF) instead of
-    // hanging or yielding a phantom message.
-    use greetd_ipc::codec::SyncCodec;
-    let mut raw = probe;
-    assert!(greetd_ipc::Response::read_from(&mut raw).is_err());
+        .is_err());
     drop(client);
     handle.join().unwrap();
 }

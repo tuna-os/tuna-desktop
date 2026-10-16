@@ -1,0 +1,65 @@
+w2-345 followup fixes: local verification evidence
+branch w2-345, head 27d05760 (ci: install Arch runtime dependencies)
+fix stack on top of c767e6b3:
+  accdaf0d fix(compositor): correct flipped output transforms to Smithay pixel centers (#345)
+  698c133a fix(compositor): wire rotation-aware touch and RecordArea remap (#345)
+  2bbc6c85 fix(compositor): render truly rotated native frames (#345)
+  2973a208 fix(compositor): resolve idle_schedule in bell audio example (PR601 CI)
+  a8991629 docs: correct orientation-lock schema inventory (#345)
+env: CARGO_TARGET_DIR=/tmp/tuna-v1-muse-w2-345/target CARGO_BUILD_JOBS=2
+
+=== cargo test -p tuna-compositor --lib (exit 0) ===
+test result: ok. 411 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.37s
+(404 before + 7 new: all pass; pre-existing rotation tests preserved)
+new tests, all ok:
+  orientation::tests::flipped_transforms_match_smithay_pixel_centers
+  orientation::tests::transform_point_matches_smithay_on_every_pixel
+  orientation::tests::transform_point_never_panics_or_wraps_on_extremes
+  orientation::tests::touch_points_invert_the_panel_to_logical
+  orientation::tests::render_transforms_follow_smithay_damage_tracker
+  mutter::tests::record_areas_remap_into_rotated_scanouts
+  native_repaint::tests::rotated_scanout_damage_maps_into_buffer_pixels
+slide suite on this head (untouched path, regression guard): 11/11 ok
+  incl. workspace_slide::tests::a_second_press_retargets_from_the_drawn_offset
+
+=== cargo clippy -p tuna-compositor --all-targets -- -D warnings (exit 0) ===
+Finished `dev` profile [unoptimized] target(s) in 8m 27s
+example tuna-bell-audio-client: no E0433, no dead-code warnings
+(preempts the PR600 standalone-pattern failure via module decl + crate allow)
+
+=== cargo clippy --workspace --all-targets -- -D warnings (exit 0, exact CI command) ===
+Finished `dev` profile [unoptimized] target(s) in 18m 06s
+only warning line: vendored smithay lib summary (pre-existing cap-lints, as in CI)
+
+=== cargo fmt --all -- --check (exit 0) ===
+=== scripts/tuna-settings-inventory-check (exit 0) ===
+settings inventory: 428 GNOME 51 desktop keys classified
+
+=== clippy base-vs-branch verdict: PRE-EXISTING ===
+base worktree a445af2e (pristine, read-only; target dir outside):
+  cargo check --locked -p tuna-compositor --all-targets
+  -> error[E0433]: cannot find `idle_schedule` in the crate root
+     crates/compositor/examples/../src/bell.rs:51:41 (example tuna-bell-audio-client)
+  identical failure on files byte-identical to the branch (git diff empty).
+fix: example-file only (declare idle_schedule mod + #![allow(dead_code)],
+matching the volume-feedback precedent); bell.rs/idle_schedule.rs untouched.
+
+=== G-WORKSPACE-SLIDE CI failure (run 38089837949, job 114324902417): NOT lane-caused ===
+symptom: second Super+Page_Down never advanced the model (active stayed 1,
+no 0->2 record after the 20s poll); identical press1 path worked moments earlier.
+- entire press2 path byte-identical base->head: windows.rs, workspace_slide.rs,
+  shell-gtk/**, state.rs (fmt only), runtime input dispatch (lane hunks are
+  orientation/DRM-repaint only); slide unit tests 11/11 green on head.
+- prime suspect excluded: FrameSignature/same_global_drawing run only in the
+  DRM loop; the nested slide path never calls them.
+- comparative: sibling lane w2-354 (same base a445af2e) fails J-WS-NEXT on
+  run 38090906681 with the same lost-Super+Page_Down signature.
+verdict: live-harness input loss (environmental flake); no lane code change.
+recommendation: re-run gtk-shell; J-WS-NEXT correlation noted for journey fixer.
+
+=== union notes ===
+- native_repaint.rs changes purely additive (56 insertions, 0 deletions).
+- no protocol/schema version bumped; no excluded file edited.
+- open follow-up (out of scope): nothing publishes orientation-lock from
+  GSettings yet (InputSettings.orientation_lock has no producer); compositor
+  policy + PanelOrientationManaged are ready.

@@ -95,7 +95,7 @@ const XML: &str = r#"<node>
     <signal name="CursorDown"/>
     <signal name="PageUp"/>
     <signal name="PageDown"/>
-    <signal name="PropertyActivate"><arg type="s"/><arg type="i"/></signal>
+    <signal name="PropertyActivate"><arg type="s"/><arg type="u"/></signal>
     <signal name="PropertyShow"><arg type="s"/></signal>
     <signal name="PropertyHide"><arg type="s"/></signal>
     <signal name="CandidateClicked"><arg type="u"/><arg type="u"/><arg type="u"/></signal>
@@ -252,6 +252,7 @@ pub struct CandidatePopup {
     /// The address file changed while a connection attempt was running.
     missed: Cell<bool>,
     log_pending: Cell<bool>,
+    properties: Rc<crate::ibus_property_menu::PropertyMenu>,
     /// IBus's address directory, whose changes mean a daemon (re)started.
     address_monitor: RefCell<Option<gio::FileMonitor>>,
     /// The next try while not connected, when there is no monitor.
@@ -259,7 +260,10 @@ pub struct CandidatePopup {
 }
 
 impl CandidatePopup {
-    fn new(app: &gtk::Application) -> Rc<Self> {
+    fn new(
+        app: &gtk::Application,
+        properties: Rc<crate::ibus_property_menu::PropertyMenu>,
+    ) -> Rc<Self> {
         let window = gtk::Window::new();
         window.set_application(Some(app));
         window.add_css_class("tuna-ibus-candidates");
@@ -339,10 +343,20 @@ impl CandidatePopup {
             connecting: Cell::new(false),
             missed: Cell::new(false),
             log_pending: Cell::new(false),
+            properties,
             address_monitor: RefCell::new(None),
             retry: RefCell::new(None),
         });
         ui.wire();
+        let weak = Rc::downgrade(&ui);
+        ui.properties.set_unavailable(Rc::new(move || {
+            if let Some(ui) = weak.upgrade() {
+                // No call to ui.reset(): that would recursively reset the
+                // property connection that is in the middle of its refresh.
+                *ui.state.borrow_mut() = State::default();
+                ui.window.set_visible(false);
+            }
+        }));
         ui
     }
 
@@ -611,6 +625,7 @@ impl CandidatePopup {
 
     /// Hide everything (the bus went away).
     fn reset(&self) {
+        self.properties.reset();
         *self.state.borrow_mut() = State::default();
         self.window.set_visible(false);
     }
@@ -730,10 +745,38 @@ impl CandidatePopup {
             }
         };
         let Some(info) = info else { return };
+        self.properties.connect(&conn);
         let weak = Rc::downgrade(self);
         let registered = conn
             .register_object(PANEL_PATH, &info)
-            .method_call(move |_, _, _, _, method, params, invocation| {
+            .method_call(move |conn, sender, _, _, method, params, invocation| {
+                if matches!(
+                    method,
+                    "RegisterProperties"
+                        | "UpdateProperty"
+                        | "FocusIn"
+                        | "FocusOut"
+                        | "DestroyContext"
+                ) {
+                    let Some(ui) = weak.upgrade() else {
+                        invocation.return_dbus_error(
+                            "org.freedesktop.DBus.Error.Disconnected",
+                            "Panel no longer available",
+                        );
+                        return;
+                    };
+                    if let Err(error) = ui.properties.method(&conn, sender, method, &params) {
+                        // An unsupported new property peer does not suppress
+                        // the existing daemon FocusOut candidate-hide path.
+                        if method == "FocusOut" && sender == Some("org.freedesktop.DBus") {
+                            invocation.return_value(None);
+                            ui.method(method, &params);
+                            return;
+                        }
+                        invocation.return_dbus_error(error, "Property call rejected");
+                        return;
+                    }
+                }
                 if method == "ProcessKeyEvent" {
                     // The emoji extension's keys; GNOME's panel takes none.
                     invocation.return_value(Some(&(false,).to_variant()));
@@ -750,6 +793,8 @@ impl CandidatePopup {
             self.retry_later();
             return;
         }
+        let weak = Rc::downgrade(self);
+        let owned_conn = conn.clone();
         conn.call(
             Some("org.freedesktop.DBus"),
             "/org/freedesktop/DBus",
@@ -760,15 +805,22 @@ impl CandidatePopup {
             gio::DBusCallFlags::NONE,
             -1,
             gio::Cancellable::NONE,
-            |reply| match reply.map(|r| r.child_value(0).get::<u32>()) {
-                // DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER / ALREADY_OWNER.
-                Ok(Some(1 | 4)) => {
-                    eprintln!("tuna-shell-gtk: IBus panel: owns {PANEL_NAME} on the IBus bus");
+            move |reply| {
+                let code = reply.map(|r| r.child_value(0).get::<u32>());
+                if let Some(ui) = weak.upgrade() {
+                    ui.properties
+                        .name_acquired(&owned_conn, matches!(code, Ok(Some(1 | 4))));
                 }
-                Ok(code) => {
-                    eprintln!("tuna-shell-gtk: IBus panel: {PANEL_NAME} not owned ({code:?})")
+                match code {
+                    // DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER / ALREADY_OWNER.
+                    Ok(Some(1 | 4)) => {
+                        eprintln!("tuna-shell-gtk: IBus panel: owns {PANEL_NAME} on the IBus bus");
+                    }
+                    Ok(code) => {
+                        eprintln!("tuna-shell-gtk: IBus panel: {PANEL_NAME} not owned ({code:?})")
+                    }
+                    Err(e) => eprintln!("tuna-shell-gtk: IBus panel: RequestName: {e}"),
                 }
-                Err(e) => eprintln!("tuna-shell-gtk: IBus panel: RequestName: {e}"),
             },
         );
         // GDBus emits `closed` on this (the main) thread's context.
@@ -790,11 +842,11 @@ impl CandidatePopup {
 /// Become IBus's panel when IBus is installed: connect to its bus when
 /// its address file appears or changes (tuna-ibus-bridge starts the
 /// daemon), and again after the bus closes.
-pub fn start(app: &gtk::Application) {
+pub fn start(app: &gtk::Application, properties: Rc<crate::ibus_property_menu::PropertyMenu>) {
     if !ibus_installed() {
         return;
     }
-    let ui = CandidatePopup::new(app);
+    let ui = CandidatePopup::new(app, properties);
     if std::env::var("IBUS_ADDRESS")
         .ok()
         .is_none_or(|a| a.is_empty())

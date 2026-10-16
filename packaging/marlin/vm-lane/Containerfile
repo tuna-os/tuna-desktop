@@ -42,7 +42,7 @@ COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tun
 # /home is a symlink to /var/home on bootc systems and /var is only
 # seeded at install time, so the home directory and the AccountsService
 # record come from tmpfiles.d on every boot rather than from this layer.
-RUN pacman -Syu --needed --noconfirm greetd greetd-gtkgreet cage qemu-guest-agent python python-gobject grim wtype wayland-utils \
+RUN pacman -Syu --needed --noconfirm greetd greetd-gtkgreet cage qemu-guest-agent python python-gobject python-cairo grim wtype wayland-utils \
     && /usr/libexec/tuna-image-kernels vm \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \

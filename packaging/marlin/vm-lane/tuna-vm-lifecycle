@@ -70,15 +70,157 @@ def gpu_pci_caps():
     return result
 
 
+
+PAM_HELPER_FLAG = b"--internal-pam-conversation"
+
+
+def auth_process(pid):
+    """Read only fixed helper flags and kernel identity; never return argv."""
+    path = pathlib.Path(f"/proc/{pid}")
+    try:
+        first = (path / "stat").read_text().rsplit(")", 1)[1].split()
+        uid = path.stat().st_uid
+        executable = pathlib.Path(os.readlink(path / "exe")).name
+        inode = (path / "exe").stat()
+        marked = private = False
+        if executable == COMPOSITOR:
+            with (path / "cmdline").open("rb") as stream:
+                raw = stream.read(4097)
+            if len(raw) > 4096 or not raw.endswith(b"\0"):
+                raise RuntimeError("unbounded or partial compositor command metadata")
+            args = raw[:-1].split(b"\0")
+            marked = PAM_HELPER_FLAG in args
+            private = len(args) == 2 and args[1] == PAM_HELPER_FLAG
+        second = (path / "stat").read_text().rsplit(")", 1)[1].split()
+        after = (path / "exe").stat()
+        if ((first[19], first[1], first[2]) != (second[19], second[1], second[2])
+                or (inode.st_dev, inode.st_ino) != (after.st_dev, after.st_ino)
+                or uid != path.stat().st_uid):
+            raise RuntimeError("authentication process identity changed during read")
+        return {"pid": int(pid), "uid": uid, "ppid": int(first[1]),
+                "pgrp": int(first[2]), "start_ticks": int(first[19]),
+                "executable": executable, "exe_device": inode.st_dev, "exe_inode": inode.st_ino,
+                "_marked": marked, "_private": private, "_state": second[0]}
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def public_auth_identity(value):
+    return {key: item for key, item in value.items() if not key.startswith("_")}
+
+
+def classify_pam_helpers(rows):
+    """Exact owned held-self children, not an arbitrary descendant sleep."""
+    roots = [row for row in rows if row["uid"] == OWNER.pw_uid
+             and row["executable"] == COMPOSITOR and not row["_marked"]]
+    if len(roots) != 1:
+        return None, []
+    desktop = roots[0]
+    helpers = [row for row in rows if row["_private"] and row["_state"] not in ("Z", "X")
+               and row["uid"] == desktop["uid"] and row["ppid"] == desktop["pid"]
+               and row["pgrp"] == row["pid"] and row["start_ticks"] >= desktop["start_ticks"]
+               and (row["exe_device"], row["exe_inode"]) == (desktop["exe_device"], desktop["exe_inode"])]
+    return desktop, helpers
+
+
+def pam_process_snapshot():
+    rows = []
+    for path in pathlib.Path("/proc").iterdir():
+        if path.name.isdigit():
+            # Limit command metadata reads to the original user and fixed binaries.
+            try:
+                if path.stat().st_uid != OWNER.pw_uid:
+                    continue
+                name = pathlib.Path(os.readlink(path / "exe")).name
+                if name not in (COMPOSITOR, "sleep"):
+                    continue
+                row = auth_process(int(path.name))
+                if row is not None:
+                    rows.append(row)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+    return rows
+
+
+def delayed_auth_state(pid, start_ticks):
+    rows = pam_process_snapshot()
+    desktop, helpers = classify_pam_helpers(rows)
+    if desktop is None or (desktop["pid"], desktop["start_ticks"]) != (pid, start_ticks):
+        raise RuntimeError("original desktop identity missing or replaced")
+    sleep_inode = pathlib.Path("/usr/bin/sleep").stat()
+    # pam_exec forks the command and calls setsid() before exec, so the
+    # delay is the helper's direct child leading its own session and group.
+    delays = [row for row in rows if row["executable"] == "sleep" and row["_state"] not in ("Z", "X")
+              and (row["exe_device"], row["exe_inode"]) == (sleep_inode.st_dev, sleep_inode.st_ino)
+              and any(row["uid"] == helper["uid"] and row["ppid"] == helper["pid"]
+                      and row["pgrp"] == row["pid"] and row["start_ticks"] >= helper["start_ticks"]
+                      for helper in helpers)]
+    owner = json.loads(STATE.read_text()).get("auth_owner")
+    pending = type(owner) is dict and owner.get("outer_pending") is True
+    return {"real_pam_delay_running": pending and len(helpers) == 1 and len(delays) == 1,
+            "auth_owner": owner,
+            "compositor": public_auth_identity(desktop),
+            "helpers": [public_auth_identity(row) for row in helpers],
+            "delays": [public_auth_identity(row) for row in delays]}
+
+
+def auth_retirement_state(record):
+    if type(record) is not dict or set(record) != {"compositor", "helper", "delay", "attempt"}:
+        raise ValueError("invalid original authentication observation")
+    current = auth_process(record["compositor"]["pid"])
+    if current is None or public_auth_identity(current) != record["compositor"]:
+        raise RuntimeError("original desktop changed before retirement observation")
+    presence = {}
+    for role in ("helper", "delay"):
+        current = auth_process(record[role]["pid"])
+        # Retiring the helper orphans a still-running delay, which the kernel
+        # reparents: a new ppid is the same process, still not absent. Every
+        # other identity field (start time, group, uid, executable) must hold.
+        if current is not None and ({k: v for k, v in public_auth_identity(current).items() if k != "ppid"}
+                                    != {k: v for k, v in record[role].items() if k != "ppid"}):
+            raise RuntimeError("original method PID was replaced")
+        presence[role + "_absent"] = current is None and not pathlib.Path(f"/proc/{record[role]['pid']}").exists()
+    # Absence of two PIDs alone is not absence of other owned group descendants:
+    # the helper's group, and the session pam_exec's setsid() gave the delay.
+    groups = {record["helper"]["pid"], record["delay"]["pid"]}
+    members = []
+    for path in pathlib.Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[2]) in groups:
+                members.append({"pid": int(path.name), "start_ticks": int(fields[19])})
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    # Recheck after the group scan; a reused numeric PID cannot become an
+    # absence receipt while this observation is being assembled.
+    for role in ("helper", "delay"):
+        if presence[role + "_absent"] and pathlib.Path(f"/proc/{record[role]['pid']}").exists():
+            raise RuntimeError("original method PID appeared during absence observation")
+    current = auth_process(record["compositor"]["pid"])
+    if current is None or public_auth_identity(current) != record["compositor"]:
+        raise RuntimeError("original desktop changed during retirement observation")
+    return presence | {"owned_group_members": sorted(members, key=lambda row: row["pid"]),
+                       "original": record}
+
+
 def inventory():
     state = json.loads(STATE.read_text())
     processes = []
+    _, helpers = classify_pam_helpers(pam_process_snapshot())
+    helper_identities = {row["pid"]: public_auth_identity(row) for row in helpers}
     for path in pathlib.Path("/proc").iterdir():
         if not path.name.isdigit():
             continue
         try:
             uid = path.stat().st_uid
             executable = pathlib.Path(os.readlink(path / "exe")).name
+            if int(path.name) in helper_identities:
+                observed_helper = auth_process(int(path.name))
+                if (observed_helper is not None and observed_helper["_private"]
+                        and public_auth_identity(observed_helper) == helper_identities[int(path.name)]):
+                    continue
             if uid != OWNER.pw_uid or executable not in {
                 COMPOSITOR, SHELL_GTK, "gnome-disks",
                 "gnome-system-monitor", "nautilus",
@@ -115,11 +257,13 @@ def inventory():
     # collapsing every probe into a missing session (run 37696030597).
     return {"probe_uid": os.geteuid(), "session_uid": OWNER.pw_uid,
             "session": owned[0],
+            # Published pre-key snapshots (run 37696030597) still detect the
+            # session; a missing device list stays None, never an empty list.
             "state": {k: state[k] for k in ("locked", "windows", "focused", "active_workspace")}
                      | {k: state.get(k) for k in ("overview_open", "pointer_position",
-                                                  "native_relative_motion_count",
+                                                  "native_relative_motion_count", "input_devices",
                                                   "mouse_left_handed", "touchpad_left_handed",
-                                                  "hot_corners")},
+                                                  "hot_corners", "auth_owner")},
             "processes": sorted(processes, key=lambda item: item["pid"])}
 
 
@@ -456,6 +600,253 @@ def background_user_diagnostics():
     return result
 
 
+STRIP_EXE = pathlib.Path("/usr/libexec/tuna-vm-input")
+STRIP_OWNER = pathlib.Path("/run/tuna-vm-strip-owner.json")
+
+
+def strip_nonce(value):
+    import re
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise ValueError("invalid strip fixture nonce")
+    return value
+
+
+def strip_json(path, uid):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not file_stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
+            raise RuntimeError("strip receipt ownership/permissions mismatch")
+        value = stream.read(131073)
+    if len(value) > 131072:
+        raise RuntimeError("strip receipt exceeds byte bound")
+    return json.loads(value)
+
+
+def strip_sha(path):
+    digest = hashlib.sha256()
+    size = 0
+    with pathlib.Path(path).open("rb") as stream:
+        while block := stream.read(65536):
+            size += len(block)
+            if size > 256 * 1024 * 1024:
+                raise RuntimeError("strip executable exceeds hash byte bound")
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def strip_core(current):
+    members = [p for p in current["processes"] if p["executable"] in (COMPOSITOR, SHELL_GTK)]
+    if sorted(p["executable"] for p in members) != sorted((COMPOSITOR, SHELL_GTK)):
+        raise RuntimeError("original native compositor/shell pair absent or ambiguous")
+    return {p["executable"]: strip_identity(p["pid"], OWNER.pw_uid) for p in members}
+
+
+def strip_identity(pid, uid):
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("invalid strip process PID")
+    path = pathlib.Path(f"/proc/{pid}")
+    fd = os.pidfd_open(pid)
+    try:
+        before = (path / "stat").read_text().rsplit(")", 1)[1].split()
+        inode = (path / "exe").stat()
+        if path.stat().st_uid != uid or before[0] == "Z":
+            raise RuntimeError("strip process owner/liveness mismatch")
+        actual = {"pid": pid, "uid": uid, "start_ticks": int(before[19]),
+                  "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                  "exe_inode": inode.st_ino, "exe_device": inode.st_dev,
+                  "exe_sha256": strip_sha(path / "exe")}
+        after = (path / "stat").read_text().rsplit(")", 1)[1].split()
+        new_inode = (path / "exe").stat()
+        stable = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if before[19] != after[19] or after[0] == "Z" or stable(new_inode) != stable(inode):
+            raise RuntimeError("strip process changed during identity read")
+        return actual
+    finally:
+        os.close(fd)
+
+
+def strip_validate_client(value, nonce, launcher, mode="baseline"):
+    if value.get("schema") != 1 or value.get("nonce") != nonce or value.get("backend") != "wayland":
+        raise RuntimeError("strip fixture receipt identity mismatch")
+    if mode not in ("baseline", "edge") or value.get("fixture_mode") != mode:
+        raise RuntimeError("actual strip fixture mode differs from admitted source mode")
+    original = value["identity"]
+    actual = strip_identity(original["pid"], OWNER.pw_uid)
+    if any(original.get(key) != actual[key] for key in actual):
+        raise RuntimeError("strip fixture process restarted or receipt is stale")
+    if original.get("script_sha256") != strip_sha(STRIP_EXE):
+        raise RuntimeError("strip fixture installed script bytes changed")
+    path = pathlib.Path(f"/proc/{actual['pid']}")
+    with (path / "cmdline").open("rb") as stream:
+        command = stream.read(16385)
+    argv = command.rstrip(b"\0").split(b"\0")
+    if len(command) > 16384 or len(argv) != 4 or argv[1:] != [os.fsencode(STRIP_EXE), b"--strip-edge-fixture" if mode == "edge" else b"--strip-fixture", nonce.encode()]:
+        raise RuntimeError("strip fixture is not the actual admitted script invocation")
+    # A Python script receipt is not an executable binary identity by itself.
+    # The exact interpreter inode/hash plus actual argv and parent link are checked.
+    if launcher is not None:
+        parent = int((path / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        if parent != launcher["pid"]:
+            raise RuntimeError("strip fixture was not launched by the owned original launcher")
+    return actual | {"script_sha256": original["script_sha256"]}
+
+
+def strip_write_owner(value, exclusive=False):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_EXCL if exclusive else os.O_TRUNC)
+    fd = os.open(STRIP_OWNER, flags, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        if os.fstat(stream.fileno()).st_uid != 0:
+            raise RuntimeError("strip owner record is not root-owned")
+        json.dump(value, stream)
+
+
+def strip_stop_identity(original, uid, deadline):
+    import select
+    import signal
+    pid = original["pid"]
+    if time.monotonic() >= deadline:
+        raise TimeoutError("strip cleanup absolute deadline expired")
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return {"original": original, "retired": True, "proc_absent": True}
+    try:
+        # A replacement PID is never signalled. Exit readiness before identity
+        # acquisition is accepted only when the original process is gone.
+        poll = select.poll()
+        poll.register(fd, select.POLLIN)
+        live = None
+        if not poll.poll(0):
+            try:
+                live = strip_identity(pid, uid)
+            except (OSError, RuntimeError):
+                # The launcher retires as soon as its client does, so it can
+                # exit under the read. An exiting process drops its executable
+                # mapping (exit_mm) before the kernel marks it exited
+                # (exit_notify) and its pidfd turns readable, so the read can
+                # fail a moment before readiness: marlin-vm 116724301628 saw
+                # runuser close its PAM session and strip-stop fail at once.
+                # The pidfd predates the read: readiness within this short
+                # bound means that process (the original, or a replacement of
+                # an original already gone) has exited; nothing is signalled.
+                remaining = min(1.0, max(0.0, deadline - time.monotonic()))
+                if not poll.poll(int(remaining * 1000)):
+                    raise
+        if live is not None:
+            if live != original:
+                raise RuntimeError("refuse to signal changed strip process identity")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("strip cleanup absolute deadline expired")
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+            remaining = min(2.0, max(0.0, deadline - time.monotonic()))
+            if not poll.poll(int(remaining * 1000)):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("strip process retirement unconfirmed at absolute deadline")
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                remaining = max(0.0, deadline - time.monotonic())
+                if not poll.poll(int(remaining * 1000)):
+                    raise RuntimeError("strip process physical retirement unconfirmed")
+        while pathlib.Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+            time.sleep(min(.02, max(0, deadline - time.monotonic())))
+        absent = not pathlib.Path(f"/proc/{pid}").exists()
+        if not absent:
+            raise RuntimeError("strip process PID remains; cleanup unconfirmed")
+        return {"original": original, "retired": True, "proc_absent": True}
+    finally:
+        os.close(fd)
+
+
+def strip_client(action, nonce):
+    nonce = strip_nonce(nonce)
+    receipt_path = pathlib.Path(RUNTIME, f"tuna-vm-strip-{nonce}.json")
+    if action in ("start", "edge-start"):
+        mode = "edge" if action == "edge-start" else "baseline"
+        current = inventory()
+        if receipt_path.exists():
+            raise RuntimeError("refuse an existing strip fixture receipt")
+        owner = {"nonce": nonce, "fixture_mode": mode, "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                 "launch_state": "unknown", "launcher": None, "client": None, "core": strip_core(current)}
+        strip_write_owner(owner, exclusive=True)
+        compositor = next(p for p in current["processes"] if p["executable"] == COMPOSITOR)
+        launcher = subprocess.Popen(["runuser", "-u", OWNER.pw_name, "--", "env",
+                                     f"XDG_RUNTIME_DIR={RUNTIME}",
+                                     f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus",
+                                     f"WAYLAND_DISPLAY=tuna-nested-{compositor['pid']}", "GDK_BACKEND=wayland",
+                                     str(STRIP_EXE), "--strip-edge-fixture" if mode == "edge" else "--strip-fixture", nonce],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+        owner["launcher"] = strip_identity(launcher.pid, 0)
+        strip_write_owner(owner)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                value = strip_json(receipt_path, OWNER.pw_uid)
+                owner["client"] = strip_validate_client(value, nonce, owner["launcher"], mode)
+                owner["launch_state"] = "known"
+                strip_write_owner(owner)
+                return {"owner": owner, "fixture": value, "inventory": inventory()}
+            except FileNotFoundError:
+                time.sleep(min(.05, max(0, deadline - time.monotonic())))
+        raise RuntimeError("strip launch acknowledgement absent; retirement unconfirmed")
+    owner = strip_json(STRIP_OWNER, 0)
+    if owner.get("nonce") != nonce or owner.get("boot_id") != pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip():
+        raise RuntimeError("strip owner nonce/boot mismatch")
+    mode = owner.get("fixture_mode")
+    if mode not in ("baseline", "edge"):
+        raise RuntimeError("unknown original strip owner mode")
+    if action == "stop":
+        deadline = time.monotonic() + 6
+        records = []
+        client = owner.get("client")
+        stages = []
+        if client is not None:
+            identity = {key: value for key, value in client.items() if key != "script_sha256"}
+            stages.append(("client", identity, OWNER.pw_uid))
+        if owner.get("launcher") is not None:
+            stages.append(("launcher", owner["launcher"], 0))
+        for stage, identity, uid in stages:
+            try:
+                records.append(strip_stop_identity(identity, uid, deadline))
+            except Exception as error:
+                error.strip_stage = stage
+                raise
+        if owner.get("launch_state") != "known" or client is None:
+            raise RuntimeError("unknown fixture launch prevents confirmed cleanup")
+        return {"nonce": nonce, "boot_id": owner["boot_id"], "owned_processes": records,
+                "cleanup_confirmed": True, "descendant_group_retirement_qualified": False}
+    if action != "state" or owner.get("launch_state") != "known":
+        raise RuntimeError("strip fixture ownership not admitted")
+    fixture = strip_json(receipt_path, OWNER.pw_uid)
+    if strip_validate_client(fixture, nonce, owner["launcher"], mode) != owner["client"]:
+        raise RuntimeError("strip client identity differs from original admission")
+    current = inventory()
+    if strip_core(current) != owner["core"]:
+        raise RuntimeError("native compositor/shell identity changed since original fixture admission")
+    summary = strip_json(STATE, OWNER.pw_uid)
+    current["state"].update({key: summary.get(key) for key in
+                           ("session_mode", "strip_offset", "strip_view", "strip_animating", "rendered_frames", "tile_preview")})
+    # Native window->PID kernel credentials are not in the current summary.
+    # Nonce app IDs/new-map sets are checked by the host; never fabricate that join.
+    return {"owner": owner, "fixture": fixture, "inventory": current,
+            "native_window_kernel_pid_join_qualified": False}
+
+
+def strip_stop_error(error):
+    """Bounded strip-stop failure record for the lane's failure record.
+
+    Strip cleanup carries no credentials: its messages are this helper's own
+    fixed strings or OS errors on /proc paths. QGA's stderr stays discarded.
+    """
+    result = {"exception_type": type(error).__name__,
+              "message": "".join(c for c in str(error)[:512] if c.isprintable())}
+    if isinstance(error, OSError) and type(error.errno) is int:
+        result["errno"] = error.errno
+    if getattr(error, "strip_stage", None) in ("client", "launcher"):
+        result["stage"] = error.strip_stage
+    return result
+
+
 def main():
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
@@ -468,6 +859,16 @@ def main():
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
     elif action == "inventory":
         result = inventory()
+    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-stop"):
+        if len(sys.argv) != 3:
+            raise ValueError("strip action requires exactly one nonce")
+        try:
+            result = strip_client(action.removeprefix("strip-"), sys.argv[2])
+        except Exception as error:
+            if action != "strip-stop":
+                raise
+            print(json.dumps({"strip_stop_error": strip_stop_error(error)}))
+            raise SystemExit(1) from None
     elif action == "orca-departed":
         pid, ticks = int(sys.argv[2]), int(sys.argv[3])
         try:
@@ -576,19 +977,9 @@ def main():
         service.write_text("auth required pam_exec.so /usr/bin/sleep 8\n" + original)
         result = {"pam": "real stack delayed"}
     elif action == "delayed-auth-state":
-        compositor = next(p for p in inventory()["processes"] if p["executable"] == COMPOSITOR)
-        waiting = False
-        for path in pathlib.Path("/proc").iterdir():
-            if not path.name.isdigit():
-                continue
-            try:
-                stat = (path / "stat").read_text().rsplit(")", 1)[1].split()
-                if (path.stat().st_uid == OWNER.pw_uid and (path / "comm").read_text().strip() == "sleep"
-                        and int(stat[1]) == compositor["pid"]):
-                    waiting = True
-            except (FileNotFoundError, PermissionError, ProcessLookupError):
-                continue
-        result = {"real_pam_delay_running": waiting}
+        result = delayed_auth_state(int(sys.argv[2]), int(sys.argv[3]))
+    elif action == "auth-retirement-state":
+        result = auth_retirement_state(json.loads(sys.argv[2]))
     elif action == "deny-unlock":
         # Real PAM failure, not a substitute authenticator or fake daemon.
         service = pathlib.Path(LOCK_PAM)
@@ -652,6 +1043,18 @@ def main():
             raise ValueError("mouse handedness must be true or false")
         call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "left-handed", value, user=True)
         result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "left-handed", user=True) == value}
+    elif action == "mouse-speed":
+        value = float(sys.argv[2])
+        if not -1.0 <= value <= 1.0:
+            raise ValueError("mouse speed must be within GNOME's -1..1")
+        call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "speed", str(value), user=True)
+        result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "speed", user=True) == str(value)}
+    elif action == "mouse-natural":
+        value = sys.argv[2]
+        if value not in ("true", "false"):
+            raise ValueError("mouse natural scroll must be true or false")
+        call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "natural-scroll", value, user=True)
+        result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "natural-scroll", user=True) == value}
     elif action in ("input-count", "input-ready", "input-buttons"):
         result = json.loads(pathlib.Path(RUNTIME, "tuna-vm-input.json").read_text())
         if pathlib.Path(f"/proc/{result['pid']}").stat().st_uid != OWNER.pw_uid:

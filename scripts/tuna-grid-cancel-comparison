@@ -1,0 +1,171 @@
+#!/usr/bin/python3
+"""Build/admit two exact CI sources and run the same real headed drag harness."""
+import argparse
+import ctypes
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location("comparison", ROOT / "scripts/lib/grid_cancel_comparison.py")
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+
+
+def owned_processes(token):
+    result = []
+    for directory in Path("/proc").iterdir():
+        if not directory.name.isdecimal():
+            continue
+        try:
+            if directory.stat().st_uid != os.getuid():
+                continue
+            if f"TUNA_GRID_COMPARISON_OWNER={token}".encode() not in (directory / "environ").read_bytes().split(b"\0"):
+                continue
+            start = (directory / "stat").read_text().rsplit(")", 1)[1].split()[19]
+            result.append((int(directory.name), start))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return result
+
+
+def cleanup_owned(child, token):
+    # This wrapper is a subreaper. Reap inherited proof descendants after its
+    # own session/group was terminated, including daemonized private services.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try: os.killpg(child.pid, sig)
+        except ProcessLookupError: pass
+        for pid, start in owned_processes(token):
+            try:
+                if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19] == start:
+                    os.kill(pid, sig)
+            except (FileNotFoundError, ProcessLookupError): pass
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0]: pass
+            except ChildProcessError: pass
+            try: os.killpg(child.pid, 0)
+            except ProcessLookupError:
+                if not owned_processes(token): return True
+            time.sleep(.05)
+    return False
+
+
+def build(source, role, work, ci):
+    target = work / f"target-{role}"
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target), PYTHONDONTWRITEBYTECODE="1",
+               CARGO_PROFILE_DEV_DEBUG="0", CARGO_INCREMENTAL="0")
+    logs = []
+    for number, arguments in enumerate((
+        ["-p", "tuna-compositor", "-p", "tuna-shell-gtk", "-p", "tuna-shell-host"],
+        ["-p", "tuna-compositor", "--example", "icon-probe", "--example", "shortcut-inhibit-client"],
+    )):
+        if shutil.disk_usage(work).free < 3 * 1024 ** 3: raise ValueError("insufficient reserved build capacity")
+        path = work / f"cargo-{role}-{number}.json"
+        with path.open("w") as out:
+            subprocess.run(["cargo", "build", "--locked", "--message-format=json", *arguments],
+                           cwd=source, env=env, stdout=out, check=True, timeout=1800)
+        if path.stat().st_size > 32 * 1024 * 1024: raise ValueError("Cargo JSON budget exceeded")
+        logs.extend(json.loads(line) for line in path.read_text().splitlines())
+    files = contract.select_artifacts(logs, source, target)
+    binaries = work / f"bin-{role}"
+    binaries.mkdir()
+    (binaries / "examples").mkdir()
+    for name, record in files.items():
+        copied = binaries / ("examples" if record["kind"] == "example" else "") / name
+        shutil.copy2(record["cargo_executable"], copied)
+        if contract.digest(copied) != record["sha256"]: raise ValueError("copied build bytes differ")
+        record["admitted_executable"] = str(copied)
+    admission = {"role": role, "source_root": str(source), "source": contract.source_tuple(source),
+                 "harness": contract.source_tuple(ROOT), "ci": ci, "files": files,
+                 "build_env": {k: env.get(k) for k in ("CARGO_TARGET_DIR", "CARGO_PROFILE_DEV_DEBUG", "CARGO_INCREMENTAL", "RUSTFLAGS")}}
+    path = work / f"admission-{role}.json"
+    path.write_text(json.dumps(admission, indent=2) + "\n")
+    return path, admission, binaries
+
+
+def run_role(role, work, admission_path, admission, binaries):
+    home = work / f"home-{role}"
+    home.mkdir(mode=0o700)
+    for name in ("config", "cache", "data"): (home / name).mkdir(mode=0o700)
+    token = str(uuid.uuid4())
+    env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+               XDG_CACHE_HOME=str(home / "cache"), XDG_DATA_HOME=str(home / "data"),
+               PYTHONDONTWRITEBYTECODE="1", TUNA_PROOF_BIN_DIR=str(binaries),
+               TUNA_PROOF_COMPANIONS=str(binaries / "examples"),
+               TUNA_PROOF_BINARY_SOURCE_COMMIT=admission["source"]["sha"],
+               TUNA_GRID_COMPARISON_OWNER=token)
+    for name in ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET", "TUNA_PROOF_SHELL_BIN", "TUNA_SHELL_BIN",
+                 "TUNA_PROOF_PRIVATE_BUS", "AT_SPI_BUS_ADDRESS", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"):
+        env.pop(name, None)
+    artifacts = work / role
+    argv = [str(ROOT / "scripts/tuna-gtk-shell-proof"), "--grid-cancel-only",
+            "--grid-cancel-admission", str(admission_path), "--artifacts", str(artifacts)]
+    if role == "old": argv.append("--expect-grid-cancel-old-negative")
+    with (work / f"output-{role}.txt").open("w") as out:
+        child = subprocess.Popen(argv, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        try: status = child.wait(timeout=600)
+        except subprocess.TimeoutExpired: status = 124
+        clean = cleanup_owned(child, token)
+    receipt = {"role": role, "exit": status, "owned_cleanup": clean, "admission": admission,
+               "output_sha256": contract.digest(work / f"output-{role}.txt")}
+    (work / f"receipt-{role}.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    if status != 0 or not clean: raise ValueError("headed comparison failed or left owned processes")
+    if contract.source_tuple(Path(admission["source_root"])) != admission["source"] or contract.source_tuple(ROOT) != admission["harness"]:
+        raise ValueError("proof source/lock changed")
+    for record in admission["files"].values():
+        if any(contract.digest(record[key]) != record["sha256"] for key in ("cargo_executable", "admitted_executable")):
+            raise ValueError("proof executable changed")
+    assertions = (artifacts / "assertions.txt").read_text().splitlines()
+    contract.validate_assertions(assertions, role)
+    before = json.loads((artifacts / "grid-cancel-before-escape.json").read_text())
+    if role == "old":
+        after = json.loads((artifacts / "grid-cancel-old-before-release.json").read_text())
+        contract.old_negative(before, after)
+    else:
+        predicate_spec = importlib.util.spec_from_file_location("predicate", ROOT / "scripts/lib/tuna_grid_cancel_proof.py")
+        predicate = importlib.util.module_from_spec(predicate_spec)
+        predicate_spec.loader.exec_module(predicate)
+        predicate.validate(before, json.loads((artifacts / "grid-cancel-before-release.json").read_text()),
+                           (artifacts / "grid-cancel-layout-before.txt").read_bytes(),
+                           (artifacts / "grid-cancel-layout-after.txt").read_bytes())
+    return receipt
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifacts", type=Path, required=True)
+    args = parser.parse_args()
+    work = args.artifacts.resolve()
+    work.mkdir(parents=True, exist_ok=False)
+    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError("could not own adopted proof descendants")
+    ci = contract.current_identity(ROOT)
+    (work / "api-ci-admission.json").write_text(json.dumps(ci, indent=2) + "\n")
+    old_commit = contract.api(f"git/commits/{contract.OLD_SHA}")
+    subprocess.run(["git", "fetch", "--no-tags", "origin", contract.OLD_SHA], cwd=ROOT, check=True, timeout=60)
+    old_root = work / "old-source"
+    subprocess.run(["git", "worktree", "add", "--detach", str(old_root), contract.OLD_SHA], cwd=ROOT, check=True)
+    contract.validate_old_source(old_root, old_commit)
+    tuples = {role: build(source, role, work, ci) for role, source in (("old", old_root), ("fixed", ROOT))}
+    receipts = []
+    for role in ("old", "fixed"):
+        if contract.current_identity(ROOT) != ci: raise ValueError("CI identity changed before role")
+        receipts.append(run_role(role, work, *tuples[role]))
+    if contract.current_identity(ROOT) != ci: raise ValueError("CI identity changed after comparison")
+    (work / "comparison.json").write_text(json.dumps({"ci": ci, "roles": receipts,
+        "scope": "real nested GTK old Escape routing negative and fixed cancellation; full regular GTK/native controls still required"}, indent=2) + "\n")
+    print("GRID-CANCEL-COMPARISON pass exact old/fixed headed gates with immutable admitted binaries")
+
+
+if __name__ == "__main__": main()
