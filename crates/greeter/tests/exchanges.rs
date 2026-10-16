@@ -8,7 +8,7 @@ use std::thread;
 
 use fake_greetd::{auth_error, run_script, secret_prompt, visible_prompt, Step};
 use greetd_ipc::Response;
-use roost_greeter::{
+use tuna_greeter::{
     client::GreeterClient,
     model::{GreeterModel, ModelEvent},
 };
@@ -34,7 +34,7 @@ fn success_exchange_signs_in() {
                 },
                 Step::Exchange {
                     expect_kind: "start",
-                    reply: None,
+                    reply: Some(Response::Success),
                 },
             ],
         )
@@ -50,9 +50,9 @@ fn success_exchange_signs_in() {
     assert_eq!(event, ModelEvent::Authenticated);
     model.mark_session_starting();
     client
-        .start_session(vec!["roost-session".into()], vec![])
+        .start_session(vec!["tuna-session".into()], vec![])
         .unwrap();
-    assert_eq!(model.screen, roost_greeter::model::Screen::Launching);
+    assert_eq!(model.screen, tuna_greeter::model::Screen::Launching);
     handle.join().unwrap();
 }
 
@@ -107,7 +107,7 @@ fn multi_prompt_password_plus_token() {
                 },
                 Step::Exchange {
                     expect_kind: "start",
-                    reply: None,
+                    reply: Some(Response::Success),
                 },
             ],
         )
@@ -124,13 +124,13 @@ fn multi_prompt_password_plus_token() {
     let e3 = model.apply_response(&client.answer(Some("123456".into())).unwrap());
     assert_eq!(e3, ModelEvent::Authenticated);
     client
-        .start_session(vec!["roost-session".into()], vec![])
+        .start_session(vec!["tuna-session".into()], vec![])
         .unwrap();
     handle.join().unwrap();
 }
 
 #[test]
-fn session_crash_after_start_is_observable() {
+fn daemon_disconnect_before_start_reply_is_not_handoff() {
     let (a, b) = pair();
     let handle = thread::spawn(move || {
         run_script(
@@ -147,22 +147,15 @@ fn session_crash_after_start_is_observable() {
         )
     });
 
-    let probe = b.try_clone().unwrap();
     let mut client = GreeterClient::from_stream(b);
-    let mut model = GreeterModel::new();
-    model.begin_user("ada");
-    let event = model.apply_response(&client.create_session("ada").unwrap());
-    assert_eq!(event, ModelEvent::Authenticated);
-    client
-        .start_session(vec!["roost-session".into()], vec![])
-        .unwrap();
-    model.mark_session_starting();
-    // The dead session shows up as a broken conversation: with the
-    // peer gone, the next wire read fails cleanly (EOF) instead of
-    // hanging or yielding a phantom message.
-    use greetd_ipc::codec::SyncCodec;
-    let mut raw = probe;
-    assert!(greetd_ipc::Response::read_from(&mut raw).is_err());
+    assert!(matches!(
+        client.create_session("ada").unwrap(),
+        Response::Success
+    ));
+    // A sent StartSession alone is not a successful handoff: require its reply.
+    assert!(client
+        .start_session(vec!["tuna-session".into()], vec![])
+        .is_err());
     drop(client);
     handle.join().unwrap();
 }
@@ -170,8 +163,8 @@ fn session_crash_after_start_is_observable() {
 #[test]
 fn fixture_dir_enumerates_with_default() {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let out = roost_greeter::session::enumerate_dirs(&[&dir]);
+    let out = tuna_greeter::session::enumerate_dirs(&[&dir]);
     assert_eq!(out.entries.len(), 2);
-    assert_eq!(out.entries[0].name, "Roost");
+    assert_eq!(out.entries[0].name, "Tuna Desktop");
     assert_eq!(out.skipped, 1);
 }

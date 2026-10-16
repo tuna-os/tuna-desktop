@@ -67,6 +67,17 @@ impl SessionLock {
         self.last_input_ms = self.last_input_ms.max(timestamp_ms);
     }
 
+    /// An inhibitor's removal starts a fresh idle stretch even after a long
+    /// blocked wait. Return whether the runtime must reset its real-time anchor.
+    pub(crate) fn inhibitor_activity(&mut self, was: bool, held: bool, now_ms: u64) -> bool {
+        if held || was {
+            self.note_input(now_ms);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Idle milliseconds at `now_ms` in the input base (saturating).
     pub fn idle_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_sub(self.last_input_ms)
@@ -112,6 +123,16 @@ pub fn content_visible(locked: bool) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_long_inhibited_wait_does_not_lock_or_blank_on_removal() {
+        let mut lock = SessionLock::new(1000);
+        assert!(lock.inhibitor_activity(false, true, 100));
+        assert!(lock.inhibitor_activity(true, false, 100_000));
+        assert_eq!(lock.idle_ms(100_000), 0);
+        assert!(!lock.check_timeout(100_999));
+        assert!(!lock.inhibitor_activity(false, false, 100_999));
+        assert!(lock.check_timeout(101_000));
+    }
     #[test]
     fn starts_unlocked_with_zero_idle() {
         let lock = SessionLock::new(1_000);

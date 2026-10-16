@@ -4,18 +4,18 @@
 //! service directory and password file without root. The test re-runs
 //! itself with LD_PRELOAD set; without pam_wrapper it is skipped with a
 //! note, so a developer machine without the package stays green. CI
-//! installs it (gtk-shell job) and sets ROOST_REQUIRE_PAM_WRAPPER=1,
+//! installs it (gtk-shell job) and sets TUNA_REQUIRE_PAM_WRAPPER=1,
 //! which turns the skip into a failure.
 
 use std::path::Path;
 use std::process::Command;
 
-use roost_compositor::pam::{authenticate, PamClient};
-use roost_compositor::unlock::{attempt_unlock, UnlockOutcome};
+use tuna_compositor::pam::{authenticate, PamClient};
+use tuna_compositor::unlock::{attempt_unlock, UnlockOutcome};
 
 const WRAPPER: &str = "/usr/lib/x86_64-linux-gnu/libpam_wrapper.so";
 const MATRIX: &str = "/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so";
-const CHILD: &str = "ROOST_PAM_TEST_CHILD";
+const CHILD: &str = "TUNA_PAM_TEST_CHILD";
 
 #[test]
 fn pam_unlock_accepts_the_right_password_and_nothing_else() {
@@ -24,7 +24,7 @@ fn pam_unlock_accepts_the_right_password_and_nothing_else() {
     }
     if !Path::new(WRAPPER).exists() || !Path::new(MATRIX).exists() {
         assert!(
-            std::env::var_os("ROOST_REQUIRE_PAM_WRAPPER").is_none(),
+            std::env::var_os("TUNA_REQUIRE_PAM_WRAPPER").is_none(),
             "pam_wrapper is required here but missing"
         );
         eprintln!("pam_unlock: pam_wrapper not installed, skipped");
@@ -32,11 +32,18 @@ fn pam_unlock_accepts_the_right_password_and_nothing_else() {
     }
     let dir = tempfile::tempdir().unwrap();
     let passdb = dir.path().join("passdb");
-    std::fs::write(&passdb, "roostuser:right-password:roost-lock-test\n").unwrap();
+    let own_user = tuna_compositor::unlock::session_user().expect("kernel session account");
+    std::fs::write(
+        &passdb,
+        format!(
+            "tunauser:right-password:tuna-lock-test\n{own_user}:right-password:tuna-lock-test\n"
+        ),
+    )
+    .unwrap();
     let services = dir.path().join("services");
     std::fs::create_dir(&services).unwrap();
     std::fs::write(
-        services.join("roost-lock-test"),
+        services.join("tuna-lock-test"),
         format!(
             "auth required {MATRIX} passdb={p}\naccount required {MATRIX} passdb={p}\n",
             p = passdb.display()
@@ -60,24 +67,49 @@ fn pam_unlock_accepts_the_right_password_and_nothing_else() {
 }
 
 fn child() {
-    let service = "roost-lock-test";
-    assert!(authenticate(service, "roostuser", "right-password"));
-    assert!(!authenticate(service, "roostuser", "wrong-password"));
+    let service = "tuna-lock-test";
+    assert!(authenticate(service, "tunauser", "right-password"));
+    assert!(!authenticate(service, "tunauser", "wrong-password"));
     assert!(!authenticate(service, "nobody-here", "right-password"));
-    assert!(!authenticate(service, "roostuser", ""));
+    assert!(!authenticate(service, "tunauser", ""));
     assert!(!authenticate(
         "no-such-service",
-        "roostuser",
+        "tunauser",
         "right-password"
     ));
-    // Through the unlock seam the lock screen uses.
-    let mut client = PamClient::new(service);
+    // The private helper permits ONLY the kernel session owner. Keep the raw
+    // controlled matrix checks above, and use that owner for the live facade.
+    let own_user = tuna_compositor::unlock::session_user().expect("kernel session account");
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tuna-compositor"));
+    let backend = tuna_compositor::pam_backend::Backend::with_trusted_factory(
+        move |identity, service, user, budget, cancel| {
+            tuna_compositor::pam_helper::Supervisor::spawn_cancellable(
+                &executable,
+                identity,
+                service,
+                user,
+                budget,
+                cancel,
+            )
+        },
+    )
+    .unwrap();
+    let mut client = PamClient::with_backend(service, backend.clone());
     assert_eq!(
-        attempt_unlock(&mut client, "roostuser", "right-password"),
+        attempt_unlock(&mut client, &own_user, "right-password"),
         UnlockOutcome::Unlocked
     );
     assert_eq!(
-        attempt_unlock(&mut client, "roostuser", "nope"),
+        attempt_unlock(&mut client, &own_user, "nope"),
         UnlockOutcome::Denied
     );
+    assert_ne!(
+        own_user, "tunauser",
+        "foreign-user negative fixture must be distinct"
+    );
+    assert_eq!(
+        attempt_unlock(&mut client, "tunauser", "right-password"),
+        UnlockOutcome::Denied
+    );
+    backend.shutdown();
 }

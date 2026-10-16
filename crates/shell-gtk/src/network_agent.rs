@@ -130,6 +130,8 @@ struct Pending {
 /// The agent owns one modal request; cancellation also invalidates async work.
 pub struct NetworkAgent {
     window: gtk::Window,
+    /// The modal fade in and out (`ModalDialog`, 100 ms).
+    fade: crate::transient::ModalFade,
     title: gtk::Label,
     message: gtk::Label,
     content: gtk::Box,
@@ -143,12 +145,12 @@ impl NetworkAgent {
     fn new(app: &gtk::Application) -> Rc<Self> {
         let window = gtk::Window::new();
         window.set_application(Some(app));
-        window.add_css_class("roost-end-session");
-        window.add_css_class("roost-network-agent");
+        window.add_css_class("tuna-end-session");
+        window.add_css_class("tuna-network-agent");
         window.set_title(Some("Authentication required"));
         window.init_layer_shell();
         window.set_layer(Layer::Overlay);
-        window.set_namespace(Some(roost_shell_control::NETWORK_AGENT_NAMESPACE));
+        window.set_namespace(Some(tuna_shell_control::NETWORK_AGENT_NAMESPACE));
         for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
             window.set_anchor(edge, true);
         }
@@ -186,6 +188,7 @@ impl NetworkAgent {
         card.append(&buttons);
         window.set_child(Some(&card));
         let agent = Rc::new(Self {
+            fade: crate::transient::ModalFade::new(&window),
             window,
             title,
             message,
@@ -370,7 +373,7 @@ impl NetworkAgent {
         }
         *self.entries.borrow_mut() = entries;
         self.validate();
-        self.window.present();
+        self.fade.present();
         if let Some(entry) = self.entries.borrow().iter().find(|e| e.is_editable()) {
             entry.grab_focus();
         }
@@ -406,7 +409,7 @@ impl NetworkAgent {
         }
     }
     fn clear(&self) {
-        self.window.set_visible(false);
+        self.fade.hide();
         for entry in self.entries.borrow().iter() {
             entry.set_text("");
         }
@@ -554,7 +557,7 @@ pub fn start(app: &gtk::Application) {
     let node = match gio::DBusNodeInfo::for_xml(XML) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("roost-shell-gtk: network agent interface: {e}");
+            eprintln!("tuna-shell-gtk: network agent interface: {e}");
             return;
         }
     };
@@ -610,7 +613,7 @@ pub fn start(app: &gtk::Application) {
             })
             .build();
         if let Err(e) = registered {
-            eprintln!("roost-shell-gtk: network agent object: {e}");
+            eprintln!("tuna-shell-gtk: network agent object: {e}");
             return;
         }
         let conn2 = conn.clone();
@@ -661,8 +664,8 @@ fn register(conn: &gio::DBusConnection, owner: Rc<RefCell<Option<String>>>) {
         10_000,
         gio::Cancellable::NONE,
         |res| match res {
-            Ok(_) => eprintln!("roost-shell-gtk: network agent registered"),
-            Err(e) => eprintln!("roost-shell-gtk: network agent not registered: {e}"),
+            Ok(_) => eprintln!("tuna-shell-gtk: network agent registered"),
+            Err(e) => eprintln!("tuna-shell-gtk: network agent not registered: {e}"),
         },
     );
 }

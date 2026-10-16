@@ -1,0 +1,548 @@
+#!/bin/sh
+# tuna-walkthrough — the feature walkthrough (docs/walkthrough.md),
+# built from the GTK shell proof's own frames.
+#
+# Usage:
+#   scripts/tuna-walkthrough build ARTIFACTS [--dest DIR]
+#   scripts/tuna-walkthrough page [--dest DIR]
+#   scripts/tuna-walkthrough check
+#   scripts/tuna-walkthrough regen [proof arguments...]
+#   scripts/tuna-walkthrough refresh VISUAL_ALL --run-id ID [--merge-sha SHA] [--dest DIR] [--branch B] [--attempt N]
+#   scripts/tuna-walkthrough freshness [--dest DIR] [--expect-head H] [--expect-tree T] [--expect-merge M]
+#
+# docs/walkthrough.tsv lists each feature: an id, the proof frame that
+# shows it, its section, title, caption and parity-ledger row. `build`
+# copies those frames out of a tuna-gtk-shell-proof artifact directory
+# into DIR/walkthrough/<id>.png and writes DIR/walkthrough.md (DIR
+# defaults to docs/); a frame the proof no longer takes fails the build,
+# so the walkthrough cannot go stale silently. `page` writes the
+# markdown only; `check` fails when docs/walkthrough.md or its images
+# disagree with the manifest. `regen` runs the proof first.
+#
+# `refresh` rebuilds the images ONLY from exact, fully successful
+# visual-capture artifacts: VISUAL_ALL holds downloaded visual-<stage>
+# dirs from one pinned CI run, every consumed stage must report ok, all
+# stages must share the pinned run id, one attempt and one built tree,
+# every consumed input is hash-validated first, and every frame must be
+# proven (wallpaper and unverified duplicates refuse; verified
+# duplicates keep their label; baseline only for the desktop state). It
+# writes DIR/walkthrough/<id>.png, DIR/walkthrough.md and a per-frame
+# DIR/walkthrough/manifest.json (frame hashes, capture outcomes, built
+# tree/head, event SHA, packages, run id, attempt). `freshness` reports
+# CURRENT only when bytes match AND the recorded built tree equals the
+# expected identity for this head; otherwise STALE or MISSING per
+# frame. Without a manifest every frame is STALE, so existing images
+# are never labeled current automatically.
+set -eu
+
+unset CDPATH
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+MANIFEST="$ROOT/docs/walkthrough.tsv"
+VISUAL_MAP="$ROOT/docs/walkthrough-visual.tsv"
+DEST="$ROOT/docs"
+
+usage() {
+    sed -n '2,35p' "$0"
+}
+
+# Manifest rows without comments or blank lines.
+rows() {
+    grep -v '^#' "$MANIFEST" | grep -v '^[[:space:]]*$'
+}
+
+page() {
+    {
+        cat <<'HEAD'
+# Walkthrough
+
+Tuna Desktop's features as they look today. Every frame is taken by the GTK
+shell proof (`scripts/tuna-gtk-shell-proof`) in a nested session, the
+same run CI makes on every change, so the windows are the proof's test
+windows and the services are its stubs. Regenerate with
+`scripts/tuna-walkthrough regen`; the list of features lives in
+`docs/walkthrough.tsv`. How each feature compares with GNOME 51 is in
+the [parity ledger](parity-ledger.md).
+HEAD
+        rows | awk -F '\t' '
+            {
+                if ($3 != section) { section = $3; printf "\n## %s\n", section }
+                printf "\n### %s\n\n%s", $4, $5
+                if ($6 != "") printf " (`%s`)", $6
+                printf "\n\n![%s](walkthrough/%s.png)\n", $4, $1
+            }'
+    } >"$1"
+}
+
+build() {
+    [ "$#" -ge 1 ] || { usage >&2; exit 1; }
+    ARTIFACTS="$1"
+    mkdir -p "$DEST/walkthrough"
+    rows | while IFS="$(printf '\t')" read -r id frame _rest; do
+        if [ ! -f "$ARTIFACTS/$frame" ]; then
+            echo "tuna-walkthrough: the proof took no $frame (for $id)" >&2
+            exit 1
+        fi
+        cp "$ARTIFACTS/$frame" "$DEST/walkthrough/$id.png"
+    done
+    page "$DEST/walkthrough.md"
+    echo "tuna-walkthrough: $(rows | wc -l) features in $DEST/walkthrough.md"
+}
+
+check() {
+    tmp="$(mktemp)"
+    page "$tmp"
+    if ! diff -u "$ROOT/docs/walkthrough.md" "$tmp"; then
+        rm -f "$tmp"
+        echo "tuna-walkthrough: docs/walkthrough.md is stale; run scripts/tuna-walkthrough page" >&2
+        exit 1
+    fi
+    rm -f "$tmp"
+    missing=0
+    for id in $(rows | cut -f1); do
+        if [ ! -f "$ROOT/docs/walkthrough/$id.png" ]; then
+            echo "tuna-walkthrough: no docs/walkthrough/$id.png" >&2
+            missing=1
+        fi
+    done
+    [ "$missing" = 0 ] || exit 1
+    echo "tuna-walkthrough: docs/walkthrough.md matches the manifest"
+}
+
+# refresh VISUAL_ALL --run-id ID [--merge-sha SHA] [--dest DIR]
+# [--branch B] [--attempt N]: rebuild the walkthrough ONLY from exact,
+# fully successful visual-capture artifacts. Refuses partial runs, mixed
+# run ids, attempts or built trees, and any frame not proven (wallpaper
+# and unverified duplicates refuse; verified duplicates keep their
+# label; baseline is allowed only for the explicit desktop state).
+# Every consumed input is hash-validated before use; --merge-sha, when
+# given, must equal the event SHA recorded in every consumed provenance
+# (fail closed on mismatch). Writes the images, the page and
+# walkthrough/manifest.json.
+refresh() {
+    bundle="${1:-}"; [ "$#" -gt 0 ] && shift
+    run_id=""
+    merge_sha=""
+    branch=""
+    attempt=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --dest) DEST="$2"; shift 2 ;;
+            --run-id) run_id="$2"; shift 2 ;;
+            --merge-sha) merge_sha="$2"; shift 2 ;;
+            --branch) branch="$2"; shift 2 ;;
+            --attempt) attempt="$2"; shift 2 ;;
+            *) echo "tuna-walkthrough: unknown refresh argument $1" >&2; exit 1 ;;
+        esac
+    done
+    [ -n "$bundle" ] || { echo "tuna-walkthrough: refresh needs VISUAL_ALL" >&2; exit 1; }
+    [ -d "$bundle" ] || { echo "tuna-walkthrough: no such bundle $bundle" >&2; exit 1; }
+    [ -n "$run_id" ] || { echo "tuna-walkthrough: refresh needs --run-id" >&2; exit 1; }
+    PY_REFRESH=/usr/bin/python3
+    [ -x "$PY_REFRESH" ] || PY_REFRESH=python3
+    BUNDLE="$bundle" DESTDIR="$DEST" MANIFEST_TSV="$MANIFEST" VISUAL_TSV="$VISUAL_MAP" \
+        RUN_ID="$run_id" MERGE_SHA="$merge_sha" BRANCH="$branch" ATTEMPT="$attempt" \
+        "$PY_REFRESH" - <<'REFRESH'
+import datetime
+import hashlib
+import json
+import os
+import sys
+
+bundle = os.environ["BUNDLE"]
+dest = os.environ["DESTDIR"]
+run_id = str(os.environ["RUN_ID"])
+merge_sha = os.environ["MERGE_SHA"]
+branch = os.environ.get("BRANCH") or None
+attempt = str(os.environ.get("ATTEMPT") or "") or None
+
+def fail(message):
+    print("tuna-walkthrough: refresh refused: %s" % message, file=sys.stderr)
+    sys.exit(1)
+
+def rows(path):
+    out = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip() and not line.startswith("#"):
+                out.append(line.rstrip("\n").split("\t"))
+    return out
+
+want = [r[0] for r in rows(os.environ["MANIFEST_TSV"])]
+visual = {r[0]: (r[1], r[2]) for r in rows(os.environ["VISUAL_TSV"]) if len(r) >= 3}
+missing_map = [i for i in want if i not in visual]
+if missing_map:
+    fail("visual map misses ids: %s" % ", ".join(missing_map))
+stages = sorted({stage for stage, _ in visual.values()})
+
+def load_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+# Every consumed stage must be fully ok: never from partial runs.
+stage_json = {}
+for stage in stages:
+    path = os.path.join(bundle, "visual-" + stage, "stage.json")
+    if not os.path.isfile(path):
+        fail("stage %s has no stage.json (partial bundle)" % stage)
+    data = load_json(path)
+    if data.get("status") != "ok":
+        fail("stage %s is '%s', not ok (refusing a partial run)" % (stage, data.get("status")))
+    stage_json[stage] = data
+
+# One pinned run, one attempt, one built tree across all consumed stages.
+provenance = {}
+for stage in stages:
+    path = os.path.join(bundle, "visual-" + stage, "provenance.json")
+    if not os.path.isfile(path):
+        fail("stage %s has no provenance.json" % stage)
+    provenance[stage] = load_json(path)
+for stage, prov in provenance.items():
+    got_run = str((prov.get("image") or {}).get("github_run_id") or "")
+    if got_run != run_id:
+        fail("stage %s pins run %s, not %s" % (stage, got_run or "none", run_id))
+attempts = {str((p.get("image") or {}).get("github_run_attempt") or "") for p in provenance.values()}
+attempts.discard("")
+if len(attempts) > 1:
+    fail("mixed attempts across stages: %s (attempts are separate sessions)" % sorted(attempts))
+if attempt and attempts and attempt not in attempts:
+    fail("pinned attempt %s does not match bundle attempt %s" % (attempt, sorted(attempts)))
+heads = {(p.get("source") or {}).get("built_head_sha") for p in provenance.values()}
+if len(heads) != 1 or None in heads:
+    fail("mixed or missing built head SHAs across stages: %s" % sorted(str(h) for h in heads))
+trees = {(p.get("source") or {}).get("built_tree_sha") for p in provenance.values()}
+if len(trees) != 1 or None in trees:
+    fail("mixed or missing built tree SHAs across stages: %s" % sorted(str(h) for h in trees))
+events = {(p.get("source") or {}).get("event_sha") for p in provenance.values()}
+if len(events) != 1 or None in events:
+    fail("mixed or missing event SHAs across stages: %s" % sorted(str(h) for h in events))
+event_sha = sorted(events)[0]
+if merge_sha and merge_sha != event_sha:
+    fail("passed --merge-sha %s does not match the recorded event SHA %s (forged or mismatched)"
+         % (merge_sha, event_sha))
+first = provenance[stages[0]]
+built_head = first["source"]["built_head_sha"]
+built_tree = first["source"]["built_tree_sha"]
+if not branch:
+    ref = (first.get("image") or {}).get("github_ref") or ""
+    branch = ref.replace("refs/heads/", "") if ref.startswith("refs/heads/") else (ref or "unknown")
+
+def sha_of(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+# Every frame must be validated, proven evidence: the recorded input
+# hash is checked before the bytes are consumed, duplicate chains are
+# walked with cycle detection, and the original label is preserved
+# (never forcibly relabeled). Baseline is allowed only for the explicit
+# desktop state (walkthrough id "panel").
+frames_meta = {}
+for stage in stages:
+    path = os.path.join(bundle, "visual-" + stage, "frames.json")
+    if not os.path.isfile(path):
+        fail("stage %s has no frames.json" % stage)
+    for entry in load_json(path).get("frames", []):
+        frames_meta.setdefault(stage, {})[entry.get("file")] = entry
+problems = []
+plan = []
+for ident in want:
+    stage, frame = visual[ident]
+    leaf = os.path.join(bundle, "visual-" + stage, frame)
+    if not os.path.isfile(leaf):
+        problems.append("%s: missing %s" % (ident, frame))
+        continue
+    meta = frames_meta.get(stage, {}).get(frame)
+    if meta is None:
+        problems.append("%s: %s has no frames.json entry" % (ident, frame))
+        continue
+    if not meta.get("sha256") or sha_of(leaf) != meta["sha256"]:
+        problems.append("%s: %s bytes do not match the recorded input hash (tampered?)"
+                        % (ident, frame))
+        continue
+    seen = [frame]
+    current = meta
+    while current.get("label") == "duplicate":
+        target = current.get("duplicate_of")
+        if not target:
+            current = None
+            break
+        if target in seen:
+            problems.append("%s: duplicate cycle %s" % (ident, " -> ".join(seen + [target])))
+            current = None
+            break
+        target_meta = frames_meta.get(stage, {}).get(target)
+        target_path = os.path.join(bundle, "visual-" + stage, target)
+        if target_meta is None or not os.path.isfile(target_path):
+            problems.append("%s: duplicate resolves to missing %s" % (ident, target))
+            current = None
+            break
+        if not target_meta.get("sha256") or sha_of(target_path) != target_meta["sha256"]:
+            problems.append("%s: duplicate target %s bytes do not match its recorded hash"
+                            % (ident, target))
+            current = None
+            break
+        if sha_of(target_path) != sha_of(leaf):
+            problems.append("%s: unverified duplicate of %s (bytes differ from the original)"
+                            % (ident, target))
+            current = None
+            break
+        seen.append(target)
+        current = target_meta
+    if current is None:
+        continue
+    root_label = current.get("label")
+    if root_label == "baseline" and ident != "panel":
+        problems.append("%s: baseline frame is not feature proof (allowed only for the desktop state)"
+                        % ident)
+        continue
+    if root_label not in ("feature", "baseline"):
+        problems.append("%s: %s is labeled '%s', not feature proof" % (ident, frame, root_label))
+        continue
+    src = os.path.join(bundle, "visual-" + stage, seen[-1])
+    plan.append((ident, stage, src, meta.get("label"), meta.get("duplicate_of")))
+if problems:
+    fail("%d frame(s) unusable:\n  %s" % (len(problems), "\n  ".join(problems)))
+
+out_images = os.path.join(dest, "walkthrough")
+os.makedirs(out_images, exist_ok=True)
+manifest_frames = {}
+for ident, stage, src, label, resolved_from in plan:
+    with open(src, "rb") as handle:
+        blob = handle.read()
+    digest = hashlib.sha256(blob).hexdigest()
+    with open(os.path.join(out_images, ident + ".png"), "wb") as handle:
+        handle.write(blob)
+    manifest_frames[ident] = {
+        "file": "walkthrough/%s.png" % ident,
+        "sha256": digest,
+        "bytes": len(blob),
+        "capture": "ok",
+        "stage": stage,
+        "artifact": "visual-" + stage,
+        "label": label,
+        "resolved_from": resolved_from,
+        "stage_finished_utc": stage_json[stage].get("finished_utc"),
+    }
+stage_digests = {}
+for stage in stages:
+    with open(os.path.join(bundle, "visual-" + stage, "stage.json"), "rb") as handle:
+        stage_digests[stage] = hashlib.sha256(handle.read()).hexdigest()
+manifest = {
+    "generated_by": "tuna-walkthrough refresh",
+    "refreshed_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "run_id": run_id,
+    "attempt": sorted(attempts)[0] if attempts else None,
+    "branch": branch,
+    "source": {
+        # The exact built tree the frames were captured from.
+        "built_head_sha": built_head,
+        "built_tree_sha": built_tree,
+        "tree_diff_sha256": first["source"].get("tree_diff_sha256"),
+        # The triggering event's commit (the merge ref for PR runs);
+        # validated against every consumed provenance, never the tested tree.
+        "event_sha": event_sha,
+        "event_name": first["source"].get("event_name"),
+        "packages": (first.get("packages") or {}),
+        "image": (first.get("image") or {}),
+    },
+    "stages": {s: {"status": "ok", "stage_json_sha256": stage_digests[s]} for s in stages},
+    "frames": manifest_frames,
+}
+with open(os.path.join(out_images, "manifest.json"), "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+    handle.write("\n")
+print("tuna-walkthrough: refreshed %d frames from run %s (built tree %s, event %s)"
+      % (len(plan), run_id, built_tree[:12], event_sha[:12]))
+REFRESH
+    page "$DEST/walkthrough.md"
+}
+
+# freshness [--dest DIR] [--expect-head H] [--expect-tree T]
+# [--expect-merge M]: verify checked-in images against
+# walkthrough/manifest.json AND against the expected source/build
+# identity. A frame is CURRENT only when the checked-in bytes match the
+# recorded capture hash and the recorded built tree (plus head/merge
+# when expected) equals the expected identity for this run/head -- never
+# merely self-consistent with its own manifest entry. Prints a per-frame
+# CURRENT/STALE/MISSING report; exits 1 unless every frame is current.
+# Without a manifest, or when the expected identity cannot be
+# determined, every frame is STALE: existing images are never labeled
+# current automatically.
+freshness() {
+    expect_head=""
+    expect_tree=""
+    expect_merge=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --dest) DEST="$2"; shift 2 ;;
+            --expect-head) expect_head="$2"; shift 2 ;;
+            --expect-tree) expect_tree="$2"; shift 2 ;;
+            --expect-merge) expect_merge="$2"; shift 2 ;;
+            *) echo "tuna-walkthrough: unknown freshness argument $1" >&2; exit 1 ;;
+        esac
+    done
+    if [ -z "$expect_head" ]; then
+        expect_head="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+    fi
+    if [ -z "$expect_tree" ]; then
+        expect_tree="$(git -C "$ROOT" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+    fi
+    PY_FRESH=/usr/bin/python3
+    [ -x "$PY_FRESH" ] || PY_FRESH=python3
+    DESTDIR="$DEST" MANIFEST_TSV="$MANIFEST" EXPECT_HEAD="$expect_head" \
+        EXPECT_TREE="$expect_tree" EXPECT_MERGE="$expect_merge" \
+        REPO_ROOT="${TUNA_WALKTHROUGH_REPO_ROOT:-$ROOT}" \
+        "$PY_FRESH" - <<'FRESH'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+dest = os.environ["DESTDIR"]
+images = os.path.join(dest, "walkthrough")
+manifest_path = os.path.join(images, "manifest.json")
+expect_head = os.environ.get("EXPECT_HEAD") or ""
+expect_tree = os.environ.get("EXPECT_TREE") or ""
+expect_merge = os.environ.get("EXPECT_MERGE") or ""
+
+def rows(path):
+    out = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip() and not line.startswith("#"):
+                out.append(line.rstrip("\n").split("\t")[0])
+    return out
+
+want = rows(os.environ["MANIFEST_TSV"])
+manifest = None
+if os.path.isfile(manifest_path):
+    with open(manifest_path, encoding="utf-8") as handle:
+        try:
+            manifest = json.load(handle)
+        except ValueError:
+            manifest = None
+if manifest is None:
+    print("tuna-walkthrough: no usable manifest at %s; every frame is STALE" % manifest_path)
+    for ident in want:
+        print("STALE   %s (no manifest; image age unknown)" % ident)
+    print("tuna-walkthrough: freshness 0/%d current" % len(want))
+    sys.exit(1)
+if not expect_tree:
+    print("tuna-walkthrough: cannot determine the expected built tree; every frame is STALE")
+    for ident in want:
+        print("STALE   %s (expected identity unknown)" % ident)
+    print("tuna-walkthrough: freshness 0/%d current" % len(want))
+    sys.exit(1)
+entries = manifest.get("frames", {})
+source = manifest.get("source", {})
+recorded_tree = source.get("built_tree_sha") or ""
+recorded_head = source.get("built_head_sha") or ""
+recorded_merge = source.get("event_sha") or manifest.get("merge_sha") or ""
+print("tuna-walkthrough: manifest run %s attempt %s built tree %s event %s" % (
+    manifest.get("run_id"), manifest.get("attempt"),
+    str(recorded_tree)[:12], str(recorded_merge)[:12]))
+print("tuna-walkthrough: expected tree %s head %s merge %s" % (
+    expect_tree[:12], (expect_head[:12] if expect_head else "(any)"),
+    (expect_merge[:12] if expect_merge else "(any)")))
+def walkthrough_only_drift(recorded, expected):
+    """True when both trees resolve locally and differ only in the
+    walkthrough's own managed paths (the adopt commit itself). Any git
+    failure fails closed to False."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", os.environ.get("REPO_ROOT", "."),
+             "diff", "--no-commit-id", "--name-only", "-r", recorded, expected],
+            capture_output=True, text=True, timeout=60)
+    except Exception:
+        return False
+    if out.returncode != 0:
+        return False
+    names = [line for line in out.stdout.splitlines() if line.strip()]
+    if not names:
+        return True
+    return all(name == "docs/walkthrough.md" or name.startswith("docs/walkthrough/")
+               for name in names)
+
+
+tree_ok = bool(recorded_tree) and (
+    recorded_tree == expect_tree or walkthrough_only_drift(recorded_tree, expect_tree))
+head_ok = True
+if expect_head:
+    head_ok = bool(recorded_head) and (
+        recorded_head == expect_head or walkthrough_only_drift(recorded_head, expect_head))
+merge_ok = True
+if expect_merge:
+    merge_ok = (recorded_merge == expect_merge)
+source_ok = tree_ok and head_ok and merge_ok
+if tree_ok and recorded_tree != expect_tree:
+    print("tuna-walkthrough: recorded tree differs from expected only in walkthrough paths (adopt drift)")
+if not recorded_tree:
+    source_note = "no recorded tree identity"
+elif not tree_ok:
+    source_note = "recorded tree %s != expected %s" % (recorded_tree[:12], expect_tree[:12])
+elif not head_ok:
+    source_note = "recorded head %s != expected %s" % (recorded_head[:12], expect_head[:12])
+elif not merge_ok:
+    source_note = "recorded event %s != expected %s" % (recorded_merge[:12], expect_merge[:12])
+else:
+    source_note = ""
+current = 0
+bad = 0
+for ident in want:
+    path = os.path.join(images, ident + ".png")
+    entry = entries.get(ident)
+    if entry is None or entry.get("capture") != "ok":
+        print("STALE   %s (no ok manifest entry)" % ident)
+        bad += 1
+    elif not os.path.isfile(path):
+        print("MISSING %s (no %s.png)" % (ident, ident))
+        bad += 1
+    else:
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        if digest != entry.get("sha256"):
+            print("STALE   %s (hash mismatch: checked-in image is not the recorded capture)" % ident)
+            bad += 1
+        elif not source_ok:
+            print("STALE   %s (%s)" % (ident, source_note))
+            bad += 1
+        else:
+            print("CURRENT %s" % ident)
+            current += 1
+print("tuna-walkthrough: freshness %d/%d current" % (current, len(want)))
+sys.exit(1 if bad else 0)
+FRESH
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift
+case "$cmd" in
+    build|page)
+        args=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --dest) DEST="$2"; shift 2 ;;
+                *) args="$args $1"; shift ;;
+            esac
+        done
+        if [ "$cmd" = page ]; then
+            mkdir -p "$DEST"
+            page "$DEST/walkthrough.md"
+        else
+            # shellcheck disable=SC2086 # one artifact path, no spaces
+            build $args
+        fi
+        ;;
+    check) check ;;
+    refresh) refresh "$@" ;;
+    freshness) freshness "$@" ;;
+    regen)
+        ARTIFACTS="$(mktemp -d)"
+        # shellcheck disable=SC2064
+        trap "rm -rf '$ARTIFACTS'" EXIT INT TERM
+        "$ROOT/scripts/tuna-gtk-shell-proof" --artifacts "$ARTIFACTS" "$@"
+        build "$ARTIFACTS"
+        ;;
+    -h|--help) usage ;;
+    *) usage >&2; exit 1 ;;
+esac

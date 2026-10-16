@@ -5,13 +5,13 @@
 //! the shell where they are (`OverviewPreviews`); this click-through
 //! overlay draws the chrome, taking input only on the close button.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use roost_shell_control::PreviewInfo;
+use tuna_shell_control::PreviewInfo;
 
 /// `ICON_SIZE`, `ICON_OVERLAP` and `ICON_TITLE_SPACING`.
 const ICON_SIZE: i32 = 64;
@@ -19,6 +19,59 @@ const ICON_OVERLAP: f64 = 0.7;
 const ICON_TITLE_SPACING: f64 = 6.0;
 /// The close button (`.window-close`): 32px.
 const CLOSE_SIZE: i32 = 32;
+/// The hovered preview's caption and close button fade in
+/// (`WINDOW_OVERLAY_FADE_TIME`, ease-out-quad).
+const OVERLAY_FADE_MS: f64 = 200.0;
+
+/// Overlay opacity `elapsed_ms` into the fade under `policy`: a fade,
+/// so fade-only keeps it; the slow-down factor stretches it.
+pub fn overlay_opacity(elapsed_ms: f64, policy: tuna_shell_control::MotionPolicy) -> f64 {
+    let duration = policy.adjust_ms(OVERLAY_FADE_MS);
+    let t = if policy.allows_fades() && duration > 0.0 {
+        (elapsed_ms / duration).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    1.0 - (1.0 - t) * (1.0 - t)
+}
+
+/// Fade `widgets` in together, GNOME's hover overlay.
+///
+/// The tick callback lives on the first widget and holds every widget
+/// weakly. [`PreviewChrome::update`] rebuilds the chrome on each preview
+/// change, often before a fade ends, and a removed widget never ticks
+/// again: a strong capture made the first widget own a callback that
+/// owned it, leaking the caption row and close button of every
+/// interrupted fade (#658).
+fn fade_in(widgets: Vec<gtk::Widget>) {
+    let Some(first) = widgets.first().cloned() else {
+        return;
+    };
+    if !crate::motion::current().allows_fades() {
+        return;
+    }
+    for w in &widgets {
+        w.set_opacity(0.0);
+    }
+    let widgets: Vec<_> = widgets.iter().map(ObjectExt::downgrade).collect();
+    let started = Cell::new(None);
+    first.add_tick_callback(move |_, clock| {
+        let start = started.get().unwrap_or_else(|| {
+            started.set(Some(clock.frame_time()));
+            clock.frame_time()
+        });
+        let elapsed_ms = (clock.frame_time() - start) as f64 / 1000.0;
+        let opacity = overlay_opacity(elapsed_ms, crate::motion::current());
+        for w in widgets.iter().filter_map(glib::WeakRef::upgrade) {
+            w.set_opacity(opacity);
+        }
+        if opacity >= 1.0 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
 
 /// What one preview shows: its window's title and app icon.
 pub struct PreviewWindow {
@@ -36,10 +89,10 @@ pub struct PreviewChrome {
 impl PreviewChrome {
     pub fn new(app: &gtk::Application, close: Rc<dyn Fn(u64)>) -> Rc<Self> {
         let window = gtk::ApplicationWindow::new(app);
-        window.add_css_class("roost-overview-chrome");
+        window.add_css_class("tuna-overview-chrome");
         window.init_layer_shell();
         window.set_layer(Layer::Top);
-        window.set_namespace(Some(roost_shell_control::PREVIEW_CHROME_NAMESPACE));
+        window.set_namespace(Some(tuna_shell_control::PREVIEW_CHROME_NAMESPACE));
         for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
             window.set_anchor(edge, true);
         }
@@ -73,12 +126,13 @@ impl PreviewChrome {
         hovered: Option<u64>,
         windows: &dyn Fn(u64) -> Option<PreviewWindow>,
     ) {
-        {
+        let newly_hovered = {
             let shown = self.shown.borrow();
             if shown.0 == previews && shown.1 == hovered {
                 return;
             }
-        }
+            shown.1 != hovered
+        };
         *self.shown.borrow_mut() = (previews.to_vec(), hovered);
         while let Some(child) = self.fixed.first_child() {
             self.fixed.remove(&child);
@@ -130,6 +184,9 @@ impl PreviewChrome {
                 close.connect_clicked(move |_| close_fn(id));
             }
             input = Some(gtk::cairo::RectangleInt::new(x, y, CLOSE_SIZE, CLOSE_SIZE));
+            if newly_hovered {
+                fade_in(vec![row.upcast(), close.upcast()]);
+            }
         }
         self.window.set_visible(true);
         // Clicks fall through to the compositor's previews except on
@@ -141,5 +198,36 @@ impl PreviewChrome {
         if let Some(surface) = self.window.surface() {
             surface.set_input_region(Some(&region));
         }
+    }
+
+    /// Forget what the overlay drew, so the next [`PreviewChrome::update`]
+    /// looks every window's title and icon up again (the app list
+    /// changed). The hover stays, so nothing fades in again.
+    pub fn forget_windows(&self) {
+        self.shown.borrow_mut().0.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overlay_opacity;
+    use tuna_shell_control::{MotionLevel, MotionPolicy};
+
+    #[test]
+    fn the_hover_overlay_fades_in_over_200_ms_ease_out_quad() {
+        let full = MotionPolicy::default();
+        assert_eq!(overlay_opacity(0.0, full), 0.0);
+        assert_eq!(overlay_opacity(100.0, full), 0.75);
+        assert_eq!(overlay_opacity(200.0, full), 1.0);
+        let fade_only = MotionPolicy::new(MotionLevel::FadeOnly, 1.0);
+        assert_eq!(overlay_opacity(100.0, fade_only), 0.75);
+        assert_eq!(
+            overlay_opacity(200.0, MotionPolicy::new(MotionLevel::Full, 2.0)),
+            0.75
+        );
+        assert_eq!(
+            overlay_opacity(0.0, MotionPolicy::new(MotionLevel::Off, 1.0)),
+            1.0
+        );
     }
 }

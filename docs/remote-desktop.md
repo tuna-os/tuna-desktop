@@ -1,6 +1,6 @@
 # Remote desktop consent and input
 
-Roost exposes GNOME's Mutter RemoteDesktop interface to the installed,
+Tuna Desktop exposes GNOME's Mutter RemoteDesktop interface to the installed,
 root-owned portal backend. Creating a session requires the same authenticated
 portal/shell authority as capture. Every subsequent operation requires its
 original unique D-Bus owner. Creation, start, EIS connection and input are denied
@@ -37,13 +37,13 @@ storage exceeds 64; FD-clone failure closes the connection; its upstream
 rejected. No physical input device, GPU or VT acceptance follows from nested
 software-rendered proof.
 
-`scripts/roost-remote-security --candidate DIR --out DIR` tests a packaged
+`scripts/tuna-remote-security --candidate DIR --out DIR` tests a packaged
 compositor and GTK shell with the installed Fedora GNOME 51 portal backend,
 a real Wayland GTK input client and the independently installed libei client.
 It requires actual Cancel/Allow, a linked PipeWire frame, foreign input denial,
 legacy and EIS keyboard/button delivery, node removal after Close/client/backend
 loss/EIS disconnect/lock, and new-session lock denial. Candidate commit, runtime
 versions, consent screenshots, input logs and frame evidence accompany the run.
-The exact `1f441bb` Remote head passed all sixteen checks in [CI 37214121497](https://github.com/hanthor/roost-desktop/actions/runs/37214121497). The combined Screenshot/Remote candidate `3249f362` passed the same complete GNOME 51 journey in [CI 37214394538](https://github.com/hanthor/roost-desktop/actions/runs/37214394538), including independent installed libei 1.6 keyboard and pointer delivery. See `remote-desktop-evidence.json` for candidate, runtime versions and retained artifacts. The proof requires fresh key/button events after each delivery baseline, then no new client input and an empty held seat after backend/lock revocation; a frontend void-method reply alone is not an admission oracle. New locked sessions are denied at CreateSession with response 2.
+The exact `1f441bb` Remote head passed all sixteen checks in [CI 37214121497](https://github.com/tuna-os/tuna-desktop/actions/runs/37214121497). The combined Screenshot/Remote candidate `3249f362` passed the same complete GNOME 51 journey in [CI 37214394538](https://github.com/tuna-os/tuna-desktop/actions/runs/37214394538), including independent installed libei 1.6 keyboard and pointer delivery. See `remote-desktop-evidence.json` for candidate, runtime versions and retained artifacts. The proof requires fresh key/button events after each delivery baseline, then no new client input and an empty held seat after backend/lock revocation; a frontend void-method reply alone is not an admission oracle. New locked sessions are denied at CreateSession with response 2.
 
 Issue #61's stated consent, stream, revoke and locked-denial acceptance is complete. The unsupported capabilities above remain broader GNOME parity limits, and P-SY-05 stays partial.

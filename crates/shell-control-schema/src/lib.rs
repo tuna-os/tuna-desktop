@@ -10,6 +10,9 @@
 //! rejected before any postcard decoding happens.
 
 pub mod background;
+pub mod legacy;
+pub mod motion;
+pub use motion::{MotionLevel, MotionPolicy};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,9 +31,9 @@ pub const MAX_TITLE_LEN: usize = 512;
 pub mod layer_namespaces;
 pub use layer_namespaces::{
     BANNER_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE,
-    GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, NETWORK_AGENT_NAMESPACE,
-    OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
-    SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
+    GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE,
+    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE, POLKIT_NAMESPACE,
+    PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
     SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
 };
 
@@ -151,9 +154,20 @@ impl ProtocolVersion {
     /// `0.26` appends the shell text direction to InputSettings.
     /// Both positional postcard peers ship together.
     /// `0.27` appends hardware Screen Reader preference/status messages.
+    ///
+    /// `0.28` replaces `InputSettings::enable_animations` with `motion`,
+    /// GNOME's three-state motion policy plus its slow-down factor.
+    /// The positional postcard body changes, so both peers ship together.
+    /// `0.29` appends private screenshot selection pointer movement.
+    /// `0.30` appends live sound/bell and attached-modal brightness preferences.
+    /// `0.31` appends workspace and edge-tiling preferences.
+    /// `0.32` appends trusted dash icon targets for minimize/restore.
+    /// `0.33` appends cursor theme, size, locate-pointer and its keysym preference.
+    /// `0.34` appends keyboard accessibility aids and toggle notifications.
+    /// `0.35` appends atomic wellbeing scene effects.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 27,
+        minor: 35,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -195,6 +209,9 @@ pub struct WindowInfo {
     pub activation_token: String,
     /// Compositor-owned PNG cache path or sanitized theme icon name.
     pub icon: Option<String>,
+    /// Sticky windows and windows outside the primary monitor's workspace set.
+    #[serde(default)]
+    pub on_all_workspaces: bool,
 }
 
 /// Workspace state owned by the compositor and mirrored to the shell.
@@ -213,7 +230,7 @@ pub struct WorkspaceInfo {
 /// stays compositor-internal, so no other wire types change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputInfo {
-    /// Output name, e.g. `roost-0`.
+    /// Output name, e.g. `tuna-0`.
     pub name: String,
     /// Output width in physical pixels.
     pub width: i32,
@@ -302,7 +319,7 @@ pub enum CommandKind {
     /// GNOME's input settings, as the shell reads them from GSettings
     /// (#60): keymap, key repeat, pointer devices, hot corner. Sent at
     /// start and on every change; the compositor applies them live.
-    SetInputSettings(InputSettings),
+    SetInputSettings(Box<InputSettings>),
     /// The overview shows the app grid (or not): while it does, the
     /// compositor draws the workspaces as thumbnails along the top, as
     /// GNOME's app grid state does. UI state; it resets whenever the
@@ -369,7 +386,27 @@ pub enum CommandKind {
     /// Preference from the authenticated supervised shell. Nested runtimes
     /// ignore it; the hardware compositor owns the actual Orca child.
     SetScreenReader { enabled: bool },
+    /// GNOME screenshot keyboard selection cursor feedback. Coordinates are
+    /// local to the mapped exclusive screenshot overlay in logical pixels,
+    /// never global input.
+    MoveScreenshotPointer { x: i32, y: i32 },
+    /// Trusted shell dash icon bounds in global logical coordinates. Full replacement.
+    SetWindowIconGeometries { geometries: Vec<WindowIconGeometry> },
+    /// Atomic scene effects from the authenticated shell; cursor excluded.
+    SetWellbeingEffects { grayscale: bool, fade: bool },
 }
+
+/// A running window's dash icon target; empty replacement selects monitor fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowIconGeometry {
+    pub window: u64,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+pub const MAX_WINDOW_ICON_GEOMETRIES: usize = 256;
 
 /// Screen Reader process lifecycle, not proof of spoken usability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -712,6 +749,19 @@ pub enum Message {
     PointerOutput { name: Option<String> },
     /// Actual compositor-owned Screen Reader child status.
     ScreenReader { state: ScreenReaderState },
+    /// A keyboard shortcut (Shift five times, Shift held eight seconds,
+    /// two modifiers at once) switched an aid; the shell saves the
+    /// setting and confirms it as GNOME does.
+    KeyboardAidToggled { aid: KeyboardAid, enabled: bool },
+}
+
+/// The keyboard aids GNOME lets the keyboard itself switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyboardAid {
+    /// `stickykeys-enable`.
+    StickyKeys,
+    /// `slowkeys-enable`.
+    SlowKeys,
 }
 
 /// GNOME's dynamic workspace count: one empty workspace always follows
@@ -731,8 +781,49 @@ pub struct PreviewInfo {
     pub height: i32,
 }
 
-/// GNOME's input settings (`org.gnome.desktop.input-sources` and
-/// `org.gnome.desktop.peripherals.*`), flattened for the compositor.
+/// GNOME sound and window-manager bell preferences, consumed by the compositor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BellPolicy {
+    pub audible: bool,
+    pub visual: bool,
+    pub frame_flash: bool,
+    pub event_sounds: bool,
+    pub theme: String,
+}
+impl Default for BellPolicy {
+    fn default() -> Self {
+        Self {
+            audible: true,
+            visual: false,
+            frame_flash: false,
+            event_sounds: true,
+            theme: "freedesktop".into(),
+        }
+    }
+}
+
+/// GNOME Shell's workspace and edge-tiling preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePolicy {
+    pub dynamic: bool,
+    pub fixed_count: u32,
+    pub only_on_primary: bool,
+    pub edge_tiling: bool,
+}
+
+impl Default for WorkspacePolicy {
+    fn default() -> Self {
+        Self {
+            dynamic: true,
+            fixed_count: 4,
+            only_on_primary: true,
+            edge_tiling: true,
+        }
+    }
+}
+
+/// GNOME input and bell preferences, flattened for the compositor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSettings {
     /// xkb layouts, comma separated, in input-source order (`us,de`).
@@ -756,9 +847,10 @@ pub struct InputSettings {
     pub mouse_speed_milli: i32,
     /// `org.gnome.desktop.interface enable-hot-corners`.
     pub hot_corners: bool,
-    /// `org.gnome.desktop.interface enable-animations` (default enabled).
-    #[serde(default = "animations_default")]
-    pub enable_animations: bool,
+    /// GNOME's motion policy: `enable-animations`, `reduced-motion` and
+    /// the slow-down factor, derived by the shell (default full motion).
+    #[serde(default)]
+    pub motion: MotionPolicy,
     /// GNOME mouse primary button and resolved touchpad orientation.
     #[serde(default)]
     pub mouse_left_handed: bool,
@@ -767,9 +859,96 @@ pub struct InputSettings {
     /// GTK shell default text direction; corners and Activities follow it.
     #[serde(default)]
     pub right_to_left: bool,
+    #[serde(default)]
+    pub bell: BellPolicy,
+    /// Enable the attached-modal parent brightness effect (Mutter preference).
+    #[serde(default = "default_attach_modal_dialogs")]
+    pub attach_modal_dialogs: bool,
+    #[serde(default)]
+    pub workspace_policy: WorkspacePolicy,
+    /// `orientation-lock` from `org.gnome.settings-daemon.peripherals.touchscreen`
+    /// (#345): the shell reads the key, the compositor stops sensor-driven
+    /// rotation while set. Appended last: the postcard body is positional.
+    /// UNION: this field addition needs the Wave2 minor version bump.
+    #[serde(default)]
+    pub orientation_lock: bool,
+    /// Cursor preferences appended in 0.33; both peers ship together.
+    #[serde(default)]
+    pub cursor_theme: String,
+    #[serde(default)]
+    pub cursor_size: u32,
+    #[serde(default)]
+    pub locate_pointer: bool,
+    #[serde(default = "default_locate_pointer_key")]
+    pub locate_pointer_key: String,
+    /// GNOME keyboard accessibility input aids.
+    #[serde(default)]
+    pub keyboard_aids: KeyboardAids,
 }
 
-fn animations_default() -> bool {
+/// GNOME's `org.gnome.desktop.a11y.keyboard`, flattened for the
+/// compositor's input pipeline. Delays are milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyboardAids {
+    /// `enable`: the keyboard may switch Sticky and Slow Keys.
+    pub shortcuts: bool,
+    /// `feature-state-change-beep`.
+    pub feature_beep: bool,
+    /// `stickykeys-enable`, `stickykeys-two-key-off`, `stickykeys-modifier-beep`.
+    pub sticky: bool,
+    pub sticky_two_key_off: bool,
+    pub sticky_beep: bool,
+    /// `slowkeys-enable`, `slowkeys-delay` and its three beeps.
+    pub slow: bool,
+    pub slow_delay_ms: u32,
+    pub slow_beep_press: bool,
+    pub slow_beep_accept: bool,
+    pub slow_beep_reject: bool,
+    /// `bouncekeys-enable`, `bouncekeys-delay`, `bouncekeys-beep-reject`.
+    pub bounce: bool,
+    pub bounce_delay_ms: u32,
+    pub bounce_beep_reject: bool,
+    /// `togglekeys-enable`.
+    pub toggle_beep: bool,
+    /// `mousekeys-enable`, `mousekeys-max-speed` (pixels per second),
+    /// `mousekeys-accel-time` and `mousekeys-init-delay`.
+    pub mouse: bool,
+    pub mouse_max_speed: u32,
+    pub mouse_accel_ms: u32,
+    pub mouse_init_delay_ms: u32,
+}
+
+impl Default for KeyboardAids {
+    /// GNOME 51's defaults: every aid off.
+    fn default() -> Self {
+        Self {
+            shortcuts: false,
+            feature_beep: false,
+            sticky: false,
+            sticky_two_key_off: false,
+            sticky_beep: false,
+            slow: false,
+            slow_delay_ms: 300,
+            slow_beep_press: false,
+            slow_beep_accept: false,
+            slow_beep_reject: false,
+            bounce: false,
+            bounce_delay_ms: 300,
+            bounce_beep_reject: false,
+            toggle_beep: false,
+            mouse: false,
+            mouse_max_speed: 10,
+            mouse_accel_ms: 300,
+            mouse_init_delay_ms: 300,
+        }
+    }
+}
+
+fn default_locate_pointer_key() -> String {
+    "Control_L".into()
+}
+
+fn default_attach_modal_dialogs() -> bool {
     true
 }
 
@@ -783,17 +962,29 @@ impl Default for InputSettings {
             repeat: true,
             repeat_delay_ms: 500,
             repeat_interval_ms: 30,
-            tap_to_click: false,
+            // GNOME 51.0 enables touchpad tap by default
+            // (org.gnome.desktop.peripherals.touchpad tap-to-click).
+            tap_to_click: true,
             touchpad_natural_scroll: true,
             touchpad_speed_milli: 0,
             disable_while_typing: true,
             mouse_natural_scroll: false,
             mouse_speed_milli: 0,
             hot_corners: true,
-            enable_animations: true,
+            motion: MotionPolicy::default(),
             mouse_left_handed: false,
             touchpad_left_handed: false,
             right_to_left: false,
+            bell: BellPolicy::default(),
+            attach_modal_dialogs: true,
+            workspace_policy: WorkspacePolicy::default(),
+            // GNOME default: convertibles auto-rotate out of the box.
+            orientation_lock: false,
+            keyboard_aids: KeyboardAids::default(),
+            cursor_theme: "Adwaita".into(),
+            cursor_size: 24,
+            locate_pointer: false,
+            locate_pointer_key: default_locate_pointer_key(),
         }
     }
 }
@@ -1052,6 +1243,83 @@ pub fn encode_frame(msg: &Message) -> Vec<u8> {
     }
 }
 
+/// Owned credential frame. Drop wipes this encoder's sole allocation; this is
+/// not a claim about caller/GTK/decoded/kernel copies or generic encode_frame.
+pub struct SensitiveFrame(Vec<u8>);
+impl SensitiveFrame {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+    fn wipe(&mut self) {
+        wipe_auth_bytes(&mut self.0);
+    }
+}
+impl Drop for SensitiveFrame {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+impl std::fmt::Debug for SensitiveFrame {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("SensitiveFrame(<redacted>)")
+    }
+}
+struct OwnedUnlock(Message);
+impl OwnedUnlock {
+    fn wipe(&mut self) {
+        if let Message::Command {
+            kind: CommandKind::Unlock { password },
+            ..
+        } = &mut self.0
+        {
+            // SAFETY: exclusively owned string bytes become valid UTF-8 NULs.
+            unsafe {
+                wipe_auth_bytes(password.0.as_mut_vec());
+            }
+        }
+    }
+}
+impl Drop for OwnedUnlock {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+fn wipe_auth_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+}
+/// Encode the unchanged Unlock wire shape with one wiped buffer, no growth
+/// scratch or copied frame. Ownership includes input on errors/early denial.
+pub fn encode_unlock_frame(id: u64, password: Secret) -> Result<SensitiveFrame, ControlError> {
+    let message = OwnedUnlock(Message::Command {
+        id,
+        kind: CommandKind::Unlock { password },
+    });
+    let Message::Command {
+        kind: CommandKind::Unlock { password },
+        ..
+    } = &message.0
+    else {
+        unreachable!()
+    };
+    if password.0.len() > MAX_FRAME_BYTES {
+        return Err(ControlError::Unexpected(
+            "authentication frame exceeds bound".into(),
+        ));
+    }
+    let cap = password.0.len().saturating_add(64).min(MAX_FRAME_BYTES);
+    let mut frame = SensitiveFrame(vec![0u8; cap + 4]);
+    let used = postcard::to_slice(&message.0, &mut frame.0[4..])
+        .map_err(|_| ControlError::Unexpected("authentication frame encoding refused".into()))?
+        .len();
+    frame.0[..4].copy_from_slice(&(used as u32).to_le_bytes());
+    frame.0.truncate(used + 4);
+    Ok(frame)
+}
+
 /// Decode one length-prefixed frame into a message.
 ///
 /// Checks run in wire order: prefix present, declared length within
@@ -1086,7 +1354,12 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Message, DecodeError> {
             postcard::Error::DeserializeBadEncoding,
         ));
     }
-    let msg: Message = postcard::from_bytes(&body[..len])?;
+    let (msg, trailing): (Message, &[u8]) = postcard::take_from_bytes(&body[..len])?;
+    if !trailing.is_empty() {
+        return Err(DecodeError::Malformed(
+            postcard::Error::DeserializeBadEncoding,
+        ));
+    }
     validate_titles(&msg)?;
     if let Message::Hello { version } = &msg {
         if version.major != CURRENT_VERSION.major {
@@ -1135,6 +1408,25 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             check_title(&settings.xkb_layout)?;
             check_title(&settings.xkb_variant)?;
             check_title(&settings.xkb_options)?;
+            check_title(&settings.cursor_theme)?;
+            check_title(&settings.locate_pointer_key)?;
+        }
+        Message::Command {
+            kind: CommandKind::SetWindowIconGeometries { geometries },
+            ..
+        } if geometries.len() > MAX_WINDOW_ICON_GEOMETRIES
+            || geometries.iter().any(|g| {
+                g.width <= 0
+                    || g.height <= 0
+                    || g.width > 16384
+                    || g.height > 16384
+                    || g.x.checked_add(g.width).is_none()
+                    || g.y.checked_add(g.height).is_none()
+            }) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
         }
         Message::Command {
             kind: CommandKind::SetSwitcherThumbnails { thumbnails },
@@ -1166,6 +1458,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::WorkspacePopup { .. }
         | Message::PointerOutput { .. }
         | Message::ScreenReader { .. }
+        | Message::KeyboardAidToggled { .. }
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }
         | Message::CommandResult { .. }
@@ -1191,6 +1484,7 @@ mod tests {
 
     fn sample_window(id: WindowId) -> WindowInfo {
         WindowInfo {
+            on_all_workspaces: false,
             icon: None,
             id,
             title: format!("Terminal {id}"),
@@ -1220,6 +1514,127 @@ mod tests {
     }
 
     #[test]
+    fn boxed_input_settings_preserve_inline_positional_wire_and_strict_decode() {
+        // The old inline SetInputSettings is variant7. Box serializes
+        // transparently; allocation changes must not change protocol0.34.
+        struct InlineSettings<'a>(&'a InputSettings);
+        impl Serialize for InlineSettings<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_newtype_variant("CommandKind", 7, "SetInputSettings", self.0)
+            }
+        }
+        struct InlineCommand<'a>(&'a InputSettings);
+        impl Serialize for InlineCommand<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStructVariant;
+                let mut command =
+                    serializer.serialize_struct_variant("Message", 3, "Command", 2)?;
+                command.serialize_field("id", &42u64)?;
+                command.serialize_field("kind", &InlineSettings(self.0))?;
+                command.end()
+            }
+        }
+        let settings = InputSettings {
+            xkb_layout: "de".into(),
+            keyboard_aids: KeyboardAids {
+                sticky: true,
+                toggle_beep: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let kind = CommandKind::SetInputSettings(Box::new(settings.clone()));
+        let mut old = vec![0; MAX_FRAME_BYTES];
+        let mut new = vec![0; MAX_FRAME_BYTES];
+        assert_eq!(
+            postcard::to_slice(&InlineSettings(&settings), &mut old).unwrap(),
+            postcard::to_slice(&kind, &mut new).unwrap()
+        );
+        let message = Message::Command { id: 42, kind };
+        let legacy_body = postcard::to_slice(&InlineCommand(&settings), &mut old).unwrap();
+        let mut legacy_frame = (legacy_body.len() as u32).to_le_bytes().to_vec();
+        legacy_frame.extend_from_slice(legacy_body);
+        assert_eq!(encode_frame(&message), legacy_frame);
+        assert_eq!(decode_frame(&legacy_frame).unwrap(), message);
+        roundtrip(&message);
+        let mut trailing = legacy_frame;
+        trailing.push(0);
+        let length = (trailing.len() - 4) as u32;
+        trailing[..4].copy_from_slice(&length.to_le_bytes());
+        assert!(matches!(
+            decode_frame(&trailing),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn combined_bell_and_modal_preferences_survive_positional_wire() {
+        for attach in [false, true] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                    attach_modal_dialogs: attach,
+                    bell: BellPolicy {
+                        audible: false,
+                        visual: true,
+                        frame_flash: true,
+                        event_sounds: false,
+                        theme: "custom".into(),
+                    },
+                    ..Default::default()
+                })),
+            });
+        }
+    }
+
+    #[test]
+    fn multitasking_preferences_survive_positional_wire() {
+        for fixed_count in [1, 4, 36] {
+            for enabled in [false, true] {
+                roundtrip(&Message::Command {
+                    id: 90,
+                    kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                        workspace_policy: WorkspacePolicy {
+                            dynamic: enabled,
+                            fixed_count,
+                            only_on_primary: !enabled,
+                            edge_tiling: enabled,
+                        },
+                        ..Default::default()
+                    })),
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn all_workspace_window_state_survives_delta_wire() {
+        for enabled in [false, true] {
+            let mut window = sample_window(7);
+            window.on_all_workspaces = enabled;
+            roundtrip(&Message::Changes {
+                from_revision: 1,
+                to_revision: 2,
+                ops: vec![StateOp::WindowOpened(window)],
+            });
+        }
+    }
+
+    #[test]
+    fn attach_modal_dialogs_survives_positional_control_wire() {
+        for enabled in [true, false] {
+            let settings = InputSettings {
+                attach_modal_dialogs: enabled,
+                ..Default::default()
+            };
+            let mut buffer = [0u8; 256];
+            let body = postcard::to_slice(&settings, &mut buffer).unwrap();
+            let decoded: InputSettings = postcard::from_bytes(body).unwrap();
+            assert_eq!(decoded, settings);
+        }
+        assert!(InputSettings::default().attach_modal_dialogs);
+    }
+    #[test]
     fn secrets_never_reach_debug_output() {
         let kind = CommandKind::Unlock {
             password: Secret("hunter2".into()),
@@ -1230,8 +1645,177 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_27() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 27));
+    fn current_version_is_0_35() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 35));
+    }
+
+    #[test]
+    fn wellbeing_effects_are_atomic_bounded_and_strictly_decoded() {
+        for grayscale in [false, true] {
+            for fade in [false, true] {
+                let msg = Message::Command {
+                    id: 71,
+                    kind: CommandKind::SetWellbeingEffects { grayscale, fade },
+                };
+                roundtrip(&msg);
+                let mut frame = encode_frame(&msg);
+                let n = frame.len();
+                frame[n - 1] = 2; // postcard bool accepts only 0/1
+                assert!(decode_frame(&frame).is_err());
+                let mut frame = encode_frame(&msg);
+                frame.push(0);
+                let body_len = (frame.len() - 4) as u32;
+                frame[..4].copy_from_slice(&body_len.to_le_bytes());
+                assert!(
+                    decode_frame(&frame).is_err(),
+                    "trailing fields must not be silently accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dash_icon_targets_roundtrip_and_reject_oversize_invalid_bounds() {
+        let icon = WindowIconGeometry {
+            window: 4,
+            x: -900,
+            y: 700,
+            width: 64,
+            height: 64,
+        };
+        roundtrip(&Message::Command {
+            id: 77,
+            kind: CommandKind::SetWindowIconGeometries {
+                geometries: vec![icon],
+            },
+        });
+        for geometries in [
+            vec![icon; MAX_WINDOW_ICON_GEOMETRIES + 1],
+            vec![WindowIconGeometry { width: 0, ..icon }],
+            vec![WindowIconGeometry { height: -1, ..icon }],
+            vec![WindowIconGeometry {
+                width: 16385,
+                ..icon
+            }],
+            vec![WindowIconGeometry {
+                height: 16385,
+                ..icon
+            }],
+            vec![WindowIconGeometry {
+                x: i32::MAX,
+                ..icon
+            }],
+            vec![WindowIconGeometry {
+                y: i32::MAX,
+                ..icon
+            }],
+        ] {
+            let bytes = encode_frame(&Message::Command {
+                id: 77,
+                kind: CommandKind::SetWindowIconGeometries { geometries },
+            });
+            assert!(decode_frame(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn dash_icon_targets_accept_empty_and_maximum_replacements_but_no_trailing_fields() {
+        let icon = WindowIconGeometry {
+            window: 4,
+            x: i32::MIN,
+            y: -500,
+            width: 16384,
+            height: 16384,
+        };
+        for geometries in [Vec::new(), vec![icon; MAX_WINDOW_ICON_GEOMETRIES]] {
+            let message = Message::Command {
+                id: 77,
+                kind: CommandKind::SetWindowIconGeometries { geometries },
+            };
+            roundtrip(&message);
+            let mut bytes = encode_frame(&message);
+            bytes.push(0);
+            let size = (bytes.len() - 4) as u32;
+            bytes[..4].copy_from_slice(&size.to_le_bytes());
+            assert!(decode_frame(&bytes).is_err(), "undeclared postcard fields");
+        }
+    }
+
+    #[test]
+    fn dash_icon_targets_reject_unknown_fields_and_command_variants() {
+        use serde::de::value::{Error, MapDeserializer, StrDeserializer};
+        let fields = [
+            ("window", 4_u64),
+            ("x", 10),
+            ("y", 20),
+            ("width", 64),
+            ("height", 64),
+        ];
+        let valid = MapDeserializer::<_, Error>::new(fields.into_iter());
+        assert!(WindowIconGeometry::deserialize(valid).is_ok());
+        let invalid =
+            MapDeserializer::<_, Error>::new(fields.into_iter().chain([("unexpected", 1)]));
+        assert!(WindowIconGeometry::deserialize(invalid).is_err());
+        assert!(CommandKind::deserialize(StrDeserializer::<Error>::new(
+            "SetUnrecognizedIconGeometries"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn cursor_settings_survive_the_positional_control_wire() {
+        for (theme, size, locate_pointer) in [("Adwaita", 24, false), ("DMZ-White", 48, true)] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                    cursor_theme: theme.into(),
+                    cursor_size: size,
+                    locate_pointer,
+                    right_to_left: true,
+                    ..InputSettings::default()
+                })),
+            });
+        }
+    }
+
+    #[test]
+    fn locate_key_defaults_roundtrips_and_bounds() {
+        assert_eq!(InputSettings::default().locate_pointer_key, "Control_L");
+        for name in ["Control_L", "Control_R", "Super_L", "", "NoSuchKeysym"] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                    locate_pointer_key: name.into(),
+                    ..InputSettings::default()
+                })),
+            });
+        }
+        let frame = encode_frame(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                locate_pointer_key: "x".repeat(MAX_TITLE_LEN + 1),
+                ..InputSettings::default()
+            })),
+        });
+        assert!(matches!(
+            decode_frame(&frame),
+            Err(DecodeError::TitleTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_cursor_theme_names_are_rejected() {
+        let frame = encode_frame(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                cursor_theme: "x".repeat(MAX_TITLE_LEN + 1),
+                ..InputSettings::default()
+            })),
+        });
+        assert!(matches!(
+            decode_frame(&frame),
+            Err(DecodeError::TitleTooLong { .. })
+        ));
     }
 
     #[test]
@@ -1254,15 +1838,76 @@ mod tests {
     }
 
     #[test]
+    fn live_bell_policy_survives_the_positional_control_wire() {
+        roundtrip(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                bell: BellPolicy {
+                    audible: false,
+                    visual: true,
+                    frame_flash: true,
+                    event_sounds: false,
+                    theme: "custom".into(),
+                },
+                ..InputSettings::default()
+            })),
+        });
+    }
+
+    #[test]
     fn shell_text_direction_survives_the_positional_control_wire() {
         for right_to_left in [false, true] {
             roundtrip(&Message::Command {
                 id: 1,
-                kind: CommandKind::SetInputSettings(InputSettings {
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                     right_to_left,
                     ..InputSettings::default()
-                }),
+                })),
             });
+        }
+    }
+
+    #[test]
+    fn keyboard_aids_survive_the_positional_control_wire() {
+        roundtrip(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                keyboard_aids: KeyboardAids {
+                    shortcuts: true,
+                    sticky: true,
+                    sticky_two_key_off: true,
+                    slow: true,
+                    slow_delay_ms: 450,
+                    bounce: true,
+                    bounce_delay_ms: 120,
+                    mouse: true,
+                    mouse_max_speed: 900,
+                    ..KeyboardAids::default()
+                },
+                right_to_left: true,
+                ..InputSettings::default()
+            })),
+        });
+        for aid in [KeyboardAid::StickyKeys, KeyboardAid::SlowKeys] {
+            for enabled in [false, true] {
+                roundtrip(&Message::KeyboardAidToggled { aid, enabled });
+            }
+        }
+    }
+
+    #[test]
+    fn motion_policy_survives_the_positional_control_wire() {
+        for level in [MotionLevel::Full, MotionLevel::FadeOnly, MotionLevel::Off] {
+            for slowdown in [0.5, 1.0, 4.0] {
+                roundtrip(&Message::Command {
+                    id: 1,
+                    kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                        motion: MotionPolicy::new(level, slowdown),
+                        right_to_left: true,
+                        ..InputSettings::default()
+                    })),
+                });
+            }
         }
     }
 
@@ -1272,11 +1917,11 @@ mod tests {
             for touchpad in [false, true] {
                 roundtrip(&Message::Command {
                     id: 1,
-                    kind: CommandKind::SetInputSettings(InputSettings {
+                    kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                         mouse_left_handed: mouse,
                         touchpad_left_handed: touchpad,
                         ..InputSettings::default()
-                    }),
+                    })),
                 });
             }
         }
@@ -1314,7 +1959,9 @@ mod tests {
         assert!(ProtocolVersion::new(0, 25).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 26).is_compatible_with(&ours));
         assert!(ProtocolVersion::new(0, 27).is_compatible_with(&ours));
-        assert!(!ProtocolVersion::new(0, 28).is_compatible_with(&ours));
+        assert!(ProtocolVersion::new(0, 28).is_compatible_with(&ours));
+        assert!(ProtocolVersion::new(0, 29).is_compatible_with(&ours));
+        assert!(!ProtocolVersion::new(ours.major, ours.minor + 1).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 4).is_compatible_with(&ours));
         assert!(!ProtocolVersion::new(1, 0).is_compatible_with(&ours));
     }
@@ -1410,6 +2057,7 @@ mod tests {
             CommandKind::FocusWorkspace { workspace: 2 },
             CommandKind::ToggleOverview,
             CommandKind::CloseWindow { window: 7 },
+            CommandKind::MoveScreenshotPointer { x: 475, y: 399 },
             CommandKind::Lock,
         ] {
             roundtrip(&Message::Command { id: 99, kind });
@@ -1682,5 +2330,55 @@ mod tests {
         let token3 = ActivationToken::new("other".to_owned());
         assert_eq!(token1, token2);
         assert_ne!(token1, token3);
+    }
+}
+
+#[cfg(test)]
+mod sensitive_frame_tests {
+    use super::*;
+    #[test]
+    fn dedicated_unlock_encoder_is_legacy_wire_equivalent() {
+        for text in [
+            String::new(),
+            "owned-test-password".into(),
+            "語".repeat(4096),
+        ] {
+            let expected = encode_frame(&Message::Command {
+                id: u64::MAX,
+                kind: CommandKind::Unlock {
+                    password: Secret(text.clone()),
+                },
+            });
+            let frame = encode_unlock_frame(u64::MAX, Secret(text)).unwrap();
+            assert_eq!(frame.as_bytes(), expected);
+        }
+    }
+    #[test]
+    fn sensitive_frame_and_input_drop_wipe_their_owned_buffers() {
+        let mut message = OwnedUnlock(Message::Command {
+            id: 1,
+            kind: CommandKind::Unlock {
+                password: Secret("owned-test-password".into()),
+            },
+        });
+        message.wipe();
+        let Message::Command {
+            kind: CommandKind::Unlock { password },
+            ..
+        } = &message.0
+        else {
+            panic!()
+        };
+        assert!(password.0.as_bytes().iter().all(|b| *b == 0));
+        let mut frame = encode_unlock_frame(1, Secret("owned-test-password".into())).unwrap();
+        frame.wipe();
+        assert!(frame.as_bytes().iter().all(|b| *b == 0));
+        // Calls the SAME wipe method used by Drop; never inspect freed memory.
+        assert!(!format!("{frame:?}").contains("owned-test-password"));
+    }
+    #[test]
+    fn oversize_input_and_body_overhead_fail_closed_without_panic() {
+        assert!(encode_unlock_frame(1, Secret("p".repeat(MAX_FRAME_BYTES + 1))).is_err());
+        assert!(encode_unlock_frame(u64::MAX, Secret("p".repeat(MAX_FRAME_BYTES))).is_err());
     }
 }

@@ -6,7 +6,7 @@
 //! countdown, Cancel, and the action; the countdown runs the action.
 //! Everything goes through logind on the system bus.
 //!
-//! In the nested preview (`ROOST_SESSION_KIND=nested`) logind's session
+//! In the nested preview (`TUNA_SESSION_KIND=nested`) logind's session
 //! is the host's: only Log Out is offered, and it ends this compositor
 //! (SIGTERM to its parent), never the host session.
 //!
@@ -83,7 +83,7 @@ pub fn menu_actions(nested: bool) -> &'static [Action] {
 
 /// Whether this shell runs inside another desktop.
 pub fn is_nested() -> bool {
-    std::env::var("ROOST_SESSION_KIND").map_or(true, |kind| kind != "hardware")
+    std::env::var("TUNA_SESSION_KIND").map_or(true, |kind| kind != "hardware")
 }
 
 fn system_call(
@@ -105,7 +105,7 @@ fn system_call(
         None::<&gio::Cancellable>,
         |reply| {
             if let Err(e) = reply {
-                eprintln!("roost-shell-gtk: logind call failed: {e}");
+                eprintln!("tuna-shell-gtk: logind call failed: {e}");
             }
         },
     );
@@ -123,7 +123,7 @@ fn perform(action: Action, nested: bool, conn: Option<&gio::DBusConnection>) {
         return;
     }
     let Some(conn) = conn else {
-        eprintln!("roost-shell-gtk: no system bus for {action:?}");
+        eprintln!("tuna-shell-gtk: no system bus for {action:?}");
         return;
     };
     let interactive = Some((true,).to_variant());
@@ -140,6 +140,8 @@ pub struct PowerUi {
     nested: bool,
     conn: Rc<RefCell<Option<gio::DBusConnection>>>,
     dialog: gtk::ApplicationWindow,
+    /// The modal fade in and out (`ModalDialog`, 100 ms).
+    fade: crate::transient::ModalFade,
     title: gtk::Label,
     body: gtk::Label,
     confirm: gtk::Button,
@@ -153,10 +155,10 @@ impl PowerUi {
     pub fn new(app: &gtk::Application, lock: Rc<dyn Fn()>) -> Rc<Self> {
         let nested = is_nested();
         let dialog = gtk::ApplicationWindow::new(app);
-        dialog.add_css_class("roost-end-session");
+        dialog.add_css_class("tuna-end-session");
         dialog.init_layer_shell();
         dialog.set_layer(Layer::Overlay);
-        dialog.set_namespace(Some(roost_shell_control::END_SESSION_NAMESPACE));
+        dialog.set_namespace(Some(tuna_shell_control::END_SESSION_NAMESPACE));
         for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
             dialog.set_anchor(edge, true);
         }
@@ -197,6 +199,7 @@ impl PowerUi {
         dialog.set_child(Some(&card));
 
         let ui = Rc::new(Self {
+            fade: crate::transient::ModalFade::new(&dialog),
             nested,
             conn: Rc::new(RefCell::new(None)),
             dialog,
@@ -293,7 +296,7 @@ impl PowerUi {
         self.title.set_text(action.title());
         self.confirm.set_label(action.title());
         self.body.set_text(&action.countdown_text(COUNTDOWN_S));
-        self.dialog.present();
+        self.fade.present();
         // Cancel holds the focus when the dialog opens, as in GNOME.
         if let Some(cancel) = self.confirm.prev_sibling().and_downcast::<gtk::Button>() {
             cancel.grab_focus();
@@ -324,12 +327,12 @@ impl PowerUi {
     fn cancel(&self) {
         self.stop_timer();
         self.pending.set(None);
-        self.dialog.set_visible(false);
+        self.fade.hide();
     }
 
     fn run_pending(&self) {
         self.stop_timer();
-        self.dialog.set_visible(false);
+        self.fade.hide();
         if let Some(action) = self.pending.take() {
             self.perform(action);
         }

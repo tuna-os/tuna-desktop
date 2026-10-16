@@ -7,7 +7,7 @@
 
 use std::os::unix::net::UnixStream;
 
-use roost_compositor::TestCompositor;
+use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
         wl_callback::WlCallback, wl_data_device::WlDataDevice,
@@ -170,7 +170,7 @@ fn data_device_manager_binds_and_source_offers() {
 
 // --- Copy/paste round-trip between two focused clients ---
 
-use roost_compositor::windows::{ManagerInput, WindowManager};
+use tuna_compositor::windows::{ManagerInput, WindowManager};
 use wayland_client::protocol::{
     wl_compositor::WlCompositor,
     wl_data_offer::WlDataOffer,
@@ -190,10 +190,10 @@ use wayland_protocols::xdg::shell::client::{
 
 /// Bytes the copy side serves; small enough to fit any pipe buffer so
 /// the source can write without a concurrent reader.
-const PASTE_BYTES: &[u8] = b"roost-clipboard-round-trip";
+const PASTE_BYTES: &[u8] = b"tuna-clipboard-round-trip";
 /// Same for the primary selection side (distinct so a crossed wire
 /// between the two selections fails loudly).
-const PRIMARY_BYTES: &[u8] = b"roost-primary-round-trip";
+const PRIMARY_BYTES: &[u8] = b"tuna-primary-round-trip";
 /// Evdev `a`: a bare key whose press hands the copy side an honest
 /// serial for `set_selection`.
 const KEY_A: u32 = 30;
@@ -205,6 +205,16 @@ struct ClipClient {
     compositor: Option<WlCompositor>,
     seat: Option<WlSeat>,
     keyboard: Option<WlKeyboard>,
+    pointer: Option<wayland_client::protocol::wl_pointer::WlPointer>,
+    buttons: Vec<u32>,
+    touch: Option<wayland_client::protocol::wl_touch::WlTouch>,
+    touch_downs: Vec<u32>,
+    cancelled: usize,
+    drops: usize,
+    drop_performed: usize,
+    finished: usize,
+    leaves: usize,
+    drag_enter_serial: Option<u32>,
     xdg_base: Option<XdgWmBase>,
     manager: Option<WlDataDeviceManager>,
     device: Option<WlDataDevice>,
@@ -240,6 +250,8 @@ impl ClipClient {
         self.compositor.is_some()
             && self.seat.is_some()
             && self.keyboard.is_some()
+            && self.pointer.is_some()
+            && self.touch.is_some()
             && self.xdg_base.is_some()
             && self.manager.is_some()
             && self.primary_manager.is_some()
@@ -292,6 +304,8 @@ impl Dispatch<WlRegistry, ()> for ClipClient {
                 "wl_seat" => {
                     let seat = registry.bind::<WlSeat, _, _>(name, version, qh, ());
                     state.keyboard = Some(seat.get_keyboard(qh, ()));
+                    state.pointer = Some(seat.get_pointer(qh, ()));
+                    state.touch = Some(seat.get_touch(qh, ()));
                     state.seat = Some(seat);
                 }
                 "xdg_wm_base" => {
@@ -397,6 +411,9 @@ impl Dispatch<WlDataDevice, ()> for ClipClient {
         match event {
             DeviceEvent::DataOffer { id } => state.offers.push(id),
             DeviceEvent::Selection { id } => state.selection = id,
+            DeviceEvent::Drop => state.drops += 1,
+            DeviceEvent::Leave => state.leaves += 1,
+            DeviceEvent::Enter { serial, .. } => state.drag_enter_serial = Some(serial),
             _ => {}
         }
     }
@@ -433,6 +450,12 @@ impl Dispatch<WlDataSource, ()> for ClipClient {
     ) {
         use std::io::Write;
         use wayland_client::protocol::wl_data_source::Event as SourceEvent;
+        match &event {
+            SourceEvent::Cancelled => state.cancelled += 1,
+            SourceEvent::DndDropPerformed => state.drop_performed += 1,
+            SourceEvent::DndFinished => state.finished += 1,
+            _ => {}
+        }
         if let SourceEvent::Send { mime_type, fd } = event {
             state.sent_mimes.push(mime_type);
             // Small payload: one write, then drop the fd so the
@@ -934,4 +957,353 @@ fn primary_selection_round_trips_between_focused_clients() {
         .read_to_end(&mut pasted)
         .unwrap();
     assert_eq!(pasted, PRIMARY_BYTES);
+}
+
+impl Dispatch<wayland_client::protocol::wl_pointer::WlPointer, ()> for ClipClient {
+    fn event(
+        state: &mut Self,
+        _: &wayland_client::protocol::wl_pointer::WlPointer,
+        event: wayland_client::protocol::wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_pointer::Event::Button {
+            serial,
+            state: button_state,
+            ..
+        } = event
+        {
+            if button_state
+                == wayland_client::WEnum::Value(
+                    wayland_client::protocol::wl_pointer::ButtonState::Pressed,
+                )
+            {
+                state.buttons.push(serial);
+            }
+        }
+    }
+}
+
+fn native_drag_case(
+    cancel: bool,
+    icon_present: bool,
+    destroy_icon: bool,
+    destroy_source: bool,
+    touch_drag: bool,
+    source_less: bool,
+) {
+    use wayland_client::protocol::wl_data_device_manager::DndAction;
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let touch = touch_drag.then(|| comp.test_seat().add_touch());
+    let (conn, mut queue, mut client) = clip_connect(&mut comp);
+    map_selection_client(&mut comp, &conn, &mut queue, &mut client, "drag");
+    manager.reconcile(&mut comp.state);
+    client.synced = false;
+    conn.display().sync(&queue.handle(), ());
+    pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+    manager.reconcile(&mut comp.state);
+    let rect = manager.visible_windows()[0].1;
+    let serial = if let Some(touch) = &touch {
+        let target = comp.state.first_toplevel_surface();
+        touch.down(
+            &mut comp.state,
+            Some((target, rect.loc.to_f64())),
+            &smithay::input::touch::DownEvent {
+                slot: Some(0).into(),
+                location: (f64::from(rect.loc.x + 20), f64::from(rect.loc.y + 20)).into(),
+                serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                time: 11,
+            },
+        );
+        touch.frame(&mut comp.state);
+        client.synced = false;
+        conn.display().sync(&queue.handle(), ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(!client.touch_downs.is_empty(), "real touch serial required");
+        client.touch_downs[0]
+    } else {
+        manager.on_input(
+            &mut comp.state,
+            ManagerInput::Motion {
+                pos: (f64::from(rect.loc.x + 20), f64::from(rect.loc.y + 20)).into(),
+                time: 10,
+            },
+        );
+        manager.on_input(
+            &mut comp.state,
+            ManagerInput::Button {
+                button: 0x110,
+                pressed: true,
+                time: 11,
+            },
+        );
+        client.synced = false;
+        conn.display().sync(&queue.handle(), ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(!client.buttons.is_empty(), "real pointer serial required");
+        client.buttons[0]
+    };
+    assert!(
+        !comp.client_dnd_active(),
+        "implicit pointer/touch grab is not client DnD"
+    );
+    assert!(
+        !comp.cancel_client_dnd(11),
+        "cancellation preserves a non-DnD implicit grab"
+    );
+    let qh = queue.handle();
+    let source = client.manager.as_ref().unwrap().create_data_source(&qh, ());
+    source.offer("text/plain".into());
+    source.set_actions(DndAction::Move);
+    let icon = icon_present.then(|| client.compositor.as_ref().unwrap().create_surface(&qh, ()));
+    client.device.as_ref().unwrap().start_drag(
+        if source_less { None } else { Some(&source) },
+        client.surface.as_ref().unwrap(),
+        icon.as_ref(),
+        serial,
+    );
+    client.source = Some(source.clone());
+    client.synced = false;
+    conn.display().sync(&qh, ());
+    pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+    assert!(
+        comp.client_dnd_active(),
+        "native StartDrag must be accepted"
+    );
+    if destroy_icon {
+        icon.as_ref().unwrap().destroy();
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(
+            comp.client_dnd_active(),
+            "icon lifetime does not own the drag"
+        );
+    }
+    if let Some(touch) = &touch {
+        let target = comp.state.first_toplevel_surface();
+        touch.motion(
+            &mut comp.state,
+            Some((target, rect.loc.to_f64())),
+            &smithay::input::touch::MotionEvent {
+                slot: Some(0).into(),
+                location: (f64::from(rect.loc.x + 40), f64::from(rect.loc.y + 40)).into(),
+                time: 12,
+            },
+        );
+        touch.frame(&mut comp.state);
+    } else {
+        manager.on_input(
+            &mut comp.state,
+            ManagerInput::Motion {
+                pos: (f64::from(rect.loc.x + 40), f64::from(rect.loc.y + 40)).into(),
+                time: 12,
+            },
+        );
+    }
+    // A source-less same-client drag has no offer but still owns the grab.
+    let offer = if source_less {
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(client.offers.is_empty());
+        None
+    } else {
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert!(
+            !client.offers.is_empty(),
+            "real drag offer required after motion"
+        );
+        let offer = client.offers.last().unwrap().clone();
+        offer.accept(
+            client.drag_enter_serial.expect("real target Enter serial"),
+            Some("text/plain".into()),
+        );
+        offer.set_actions(DndAction::Move, DndAction::Move);
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        Some(offer)
+    };
+    if destroy_source {
+        source.destroy();
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+    }
+    if cancel {
+        assert!(comp.cancel_client_dnd(13));
+        assert!(!comp.client_dnd_active());
+        assert!(!comp.cancel_client_dnd(14));
+        if let Some(offer) = &offer {
+            // Requests already queued by the target cannot revive a cancelled offer.
+            offer.accept(
+                client.drag_enter_serial.expect("real target Enter serial"),
+                Some("text/plain".into()),
+            );
+            offer.set_actions(DndAction::Move, DndAction::Move);
+            let (_reader, writer) = UnixStream::pair().unwrap();
+            use std::os::fd::AsFd;
+            offer.receive("text/plain".into(), writer.as_fd());
+            client.synced = false;
+            conn.display().sync(&qh, ());
+            pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+            assert!(
+                client.sent_mimes.is_empty(),
+                "cancelled offer must refuse Receive before release"
+            );
+        }
+    }
+    if let Some(touch) = &touch {
+        touch.up(
+            &mut comp.state,
+            &smithay::input::touch::UpEvent {
+                slot: Some(0).into(),
+                serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                time: 15,
+            },
+        );
+        touch.frame(&mut comp.state);
+    } else {
+        manager.on_input(
+            &mut comp.state,
+            ManagerInput::Button {
+                button: 0x110,
+                pressed: false,
+                time: 15,
+            },
+        );
+    }
+    client.synced = false;
+    conn.display().sync(&qh, ());
+    pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+    assert!(!comp.client_dnd_active());
+    assert_eq!(
+        client.drops,
+        usize::from(!cancel && !destroy_source && !source_less)
+    );
+    assert_eq!(
+        client.drop_performed,
+        usize::from(!cancel && !destroy_source && !source_less)
+    );
+    assert_eq!(
+        client.cancelled,
+        usize::from(cancel && !destroy_source && !source_less)
+    );
+    assert!(client.leaves > 0);
+    if !cancel && !destroy_source && !source_less {
+        // Actual owned bytes must cross the successful dropped offer BEFORE Finish.
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let (reader, writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        offer
+            .as_ref()
+            .unwrap()
+            .receive("text/plain".into(), writer.as_fd());
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert_eq!(
+            client.sent_mimes,
+            vec!["text/plain".to_owned()],
+            "real Send event required before reading"
+        );
+        drop(writer);
+        let mut received = Vec::new();
+        std::io::BufReader::new(reader)
+            .read_to_end(&mut received)
+            .unwrap();
+        assert_eq!(
+            received, PASTE_BYTES,
+            "normal dropped offer delivers the owned payload"
+        );
+        assert_eq!(client.sent_mimes, vec!["text/plain".to_owned()]);
+        offer.as_ref().unwrap().finish();
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+        assert_eq!(
+            client.finished, 1,
+            "successful offer remains valid for Finish"
+        );
+        assert!(!comp.cancel_client_dnd(16));
+        assert_eq!(client.cancelled, 0);
+    }
+    if let Some(offer) = offer {
+        offer.destroy();
+    }
+    client.synced = false;
+    conn.display().sync(&qh, ());
+    pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
+    assert_eq!(
+        client.cancelled,
+        usize::from(cancel && !destroy_source && !source_less),
+        "destroying the retired offer cannot double-cancel"
+    );
+}
+
+#[test]
+fn native_drag_cancel_without_icon_is_terminal_and_idempotent() {
+    native_drag_case(true, false, false, false, false, false);
+}
+#[test]
+fn native_drag_cancel_with_destroyed_icon_keeps_real_ownership() {
+    native_drag_case(true, true, true, false, false, false);
+}
+#[test]
+fn native_drag_dead_source_cannot_commit() {
+    native_drag_case(false, false, false, true, false, false);
+}
+#[test]
+fn native_drag_normal_drop_offer_can_finish() {
+    native_drag_case(false, true, false, false, false, false);
+}
+
+impl Dispatch<wayland_client::protocol::wl_touch::WlTouch, ()> for ClipClient {
+    fn event(
+        state: &mut Self,
+        _: &wayland_client::protocol::wl_touch::WlTouch,
+        event: wayland_client::protocol::wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_touch::Event::Down { serial, .. } = event {
+            state.touch_downs.push(serial);
+        }
+    }
+}
+
+#[test]
+fn native_touch_drag_cancel_without_icon_is_terminal() {
+    native_drag_case(true, false, false, false, true, false);
+}
+#[test]
+fn native_touch_drag_normal_drop_offer_can_finish() {
+    native_drag_case(false, false, false, false, true, false);
+}
+
+#[test]
+fn native_touch_drag_cancel_with_destroyed_icon_keeps_ownership() {
+    native_drag_case(true, true, true, false, true, false);
+}
+#[test]
+fn native_drag_cancel_after_source_destroy_never_double_notifies() {
+    native_drag_case(true, false, false, true, false, false);
+}
+
+#[test]
+fn native_source_less_same_client_drag_can_cancel_without_icon() {
+    native_drag_case(true, false, false, false, false, true);
+}
+#[test]
+fn native_touch_source_less_same_client_drag_can_cancel_without_icon() {
+    native_drag_case(true, false, false, false, true, true);
 }

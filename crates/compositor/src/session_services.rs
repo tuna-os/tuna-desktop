@@ -37,15 +37,48 @@ fn run(program: &str, args: &[String]) -> bool {
     }
 }
 
-fn activation_args(socket: &str, desktop: &str) -> Vec<String> {
-    vec![
-        "--systemd".into(),
-        format!("WAYLAND_DISPLAY={socket}"),
-        format!("XDG_CURRENT_DESKTOP={desktop}"),
-        "XDG_SESSION_TYPE=wayland".into(),
-        // Clear a previous session's X display. The portal uses Wayland.
-        "DISPLAY=".into(),
+/// The display environment activated services need. An empty `DISPLAY`
+/// clears a previous session's X display; the portal uses Wayland.
+fn activation_vars<'a>(socket: &'a str, desktop: &'a str) -> [(&'static str, &'a str); 4] {
+    [
+        ("WAYLAND_DISPLAY", socket),
+        ("XDG_CURRENT_DESKTOP", desktop),
+        ("XDG_SESSION_TYPE", "wayland"),
+        ("DISPLAY", ""),
     ]
+}
+
+/// systemd's user manager starts the portals and every unit-backed D-Bus
+/// service. `systemctl` ships with systemd; `dbus-update-activation-environment`
+/// does not (Fedora and EL put it in dbus-tools, which images need not carry).
+fn systemd_import_args(vars: &[(&str, &str)]) -> Vec<String> {
+    let mut args = vec!["--user".to_owned(), "set-environment".to_owned()];
+    args.extend(vars.iter().map(|(name, value)| format!("{name}={value}")));
+    args
+}
+
+/// The bus's own activation environment, for services it starts without
+/// systemd. `gdbus` ships with glib2, which the shell already needs.
+fn bus_import_args(vars: &[(&str, &str)]) -> Vec<String> {
+    let quote = |text: &str| format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"));
+    let entries: Vec<String> = vars
+        .iter()
+        .map(|(name, value)| format!("{}: {}", quote(name), quote(value)))
+        .collect();
+    [
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.DBus",
+        "--object-path",
+        "/org/freedesktop/DBus",
+        "--method",
+        "org.freedesktop.DBus.UpdateActivationEnvironment",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(std::iter::once(format!("{{{}}}", entries.join(", "))))
+    .collect()
 }
 
 /// Holds the systemd graphical session open for the DRM runtime's lifetime.
@@ -55,7 +88,7 @@ pub struct SessionServices {
 impl Drop for SessionServices {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
-        let args = ["--user", "--no-block", "stop", "roost-session.target"]
+        let args = ["--user", "--no-block", "stop", "tuna-session.target"]
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
@@ -72,18 +105,20 @@ pub fn publish(socket: &str) -> SessionServices {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "Roost:GNOME".into());
-    if !run(
-        "dbus-update-activation-environment",
-        &activation_args(socket, &desktop),
-    ) {
-        eprintln!("roost-compositor: session services: display environment import failed");
+        .unwrap_or_else(|| "Tuna:GNOME".into());
+    let vars = activation_vars(socket, &desktop);
+    let systemd = run("systemctl", &systemd_import_args(&vars));
+    let bus = run("gdbus", &bus_import_args(&vars));
+    if !systemd && !bus {
+        eprintln!("tuna-compositor: session services: display environment import failed");
         return guard;
     }
-    eprintln!("roost-compositor: session services: display environment imported");
+    eprintln!(
+        "tuna-compositor: session services: display environment imported (systemd={systemd} bus={bus})"
+    );
     // GTK can activate portals before the display is ready. After the shell
     // owns its bus name, clear any start-limit failure and refresh the portal
-    // frontend so it chooses Roost's backends using the imported desktop.
+    // frontend so it chooses Tuna Desktop's backends using the imported desktop.
     std::thread::spawn(move || {
         let args: Vec<String> = [
             "call",
@@ -121,10 +156,12 @@ pub fn publish(socket: &str) -> SessionServices {
                     *registration.last_mut().unwrap() =
                         "org.gnome.DisplayManager.Manager.RegisterDisplay".into();
                     if run("gdbus", &registration) {
-                        eprintln!("roost-compositor: session services: GDM session and display registered");
+                        eprintln!(
+                            "tuna-compositor: session services: GDM session and display registered"
+                        );
                     } else {
                         eprintln!(
-                            "roost-compositor: session services: GDM display registration failed"
+                            "tuna-compositor: session services: GDM display registration failed"
                         );
                     }
                 }
@@ -134,25 +171,25 @@ pub fn publish(socket: &str) -> SessionServices {
                 }
                 // systemd refuses a manual start of graphical-session.target.
                 // Our packaged target pulls it in through BindsTo instead.
-                let start_graphical = ["--user", "start", "roost-session.target"]
+                let start_graphical = ["--user", "start", "tuna-session.target"]
                     .into_iter()
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
                 if !run("systemctl", &start_graphical) {
-                    eprintln!("roost-compositor: session services: graphical target failed");
+                    eprintln!("tuna-compositor: session services: graphical target failed");
                     return;
                 }
                 // Drop may race the worker's start. Stop again if shutdown
                 // occurred before systemd acknowledged the target.
                 if !alive.load(Ordering::Acquire) {
-                    let stop = ["--user", "--no-block", "stop", "roost-session.target"]
+                    let stop = ["--user", "--no-block", "stop", "tuna-session.target"]
                         .into_iter()
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
                     let _ = run("systemctl", &stop);
                     return;
                 }
-                eprintln!("roost-compositor: session services: graphical target active");
+                eprintln!("tuna-compositor: session services: graphical target active");
 
                 let reset = [
                     "--user",
@@ -174,13 +211,13 @@ pub fn publish(socket: &str) -> SessionServices {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
                 if run("systemctl", &restart) {
-                    eprintln!("roost-compositor: session services: portals refreshed");
+                    eprintln!("tuna-compositor: session services: portals refreshed");
                 }
                 return;
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        eprintln!("roost-compositor: session services: shell bus name not ready");
+        eprintln!("tuna-compositor: session services: shell bus name not ready");
     });
     guard
 }
@@ -191,23 +228,45 @@ mod tests {
 
     #[test]
     fn activation_import_names_only_the_hardware_display() {
-        let args = activation_args("wayland-roost", "Roost:GNOME");
+        let vars = activation_vars("wayland-tuna", "Tuna:GNOME");
+        let args = systemd_import_args(&vars);
         assert_eq!(
             args,
             [
-                "--systemd",
-                "WAYLAND_DISPLAY=wayland-roost",
-                "XDG_CURRENT_DESKTOP=Roost:GNOME",
+                "--user",
+                "set-environment",
+                "WAYLAND_DISPLAY=wayland-tuna",
+                "XDG_CURRENT_DESKTOP=Tuna:GNOME",
                 "XDG_SESSION_TYPE=wayland",
                 "DISPLAY="
             ]
         );
-        assert!(!args.iter().any(|a| a == "--all"));
+        assert!(!args.iter().any(|a| a == "import-environment"));
+        let bus = bus_import_args(&vars);
+        assert_eq!(
+            bus.last().map(String::as_str),
+            Some(
+                "{'WAYLAND_DISPLAY': 'wayland-tuna', 'XDG_CURRENT_DESKTOP': 'Tuna:GNOME', \
+                 'XDG_SESSION_TYPE': 'wayland', 'DISPLAY': ''}"
+            )
+        );
+        assert!(bus
+            .iter()
+            .any(|a| a == "org.freedesktop.DBus.UpdateActivationEnvironment"));
+    }
+
+    #[test]
+    fn the_bus_import_quotes_values_as_gvariant_strings() {
+        let bus = bus_import_args(&[("XDG_CURRENT_DESKTOP", r"it's\here")]);
+        assert_eq!(
+            bus.last().map(String::as_str),
+            Some(r"{'XDG_CURRENT_DESKTOP': 'it\'s\\here'}")
+        );
     }
 
     #[test]
     fn session_utility_failures_are_reported() {
-        assert!(!run("/definitely/missing/roost-session-tool", &[]));
+        assert!(!run("/definitely/missing/tuna-session-tool", &[]));
         assert!(!run("/bin/false", &[]));
         assert!(run("/bin/true", &[]));
     }

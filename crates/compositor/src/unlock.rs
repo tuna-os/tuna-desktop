@@ -17,11 +17,11 @@
 //! [`UnlockOutcome::Denied`], which carries no detail by construction.
 //! Secrets are never logged and daemon text never surfaces.
 //!
-//! [`GreeterClient`]: roost_greeter::client::GreeterClient
-//! [`GreeterModel`]: roost_greeter::model::GreeterModel
+//! [`GreeterClient`]: tuna_greeter::client::GreeterClient
+//! [`GreeterModel`]: tuna_greeter::model::GreeterModel
 
 use greetd_ipc::{codec::Error as CodecError, Response};
-use roost_greeter::{
+use tuna_greeter::{
     client::GreeterClient,
     model::{GreeterModel, ModelEvent},
 };
@@ -92,7 +92,7 @@ pub fn unlock_user() -> Option<String> {
 }
 
 /// Verify one entered password through the greeter login path: open a
-/// greetd attempt for `user`, answer each prompt with the password
+/// greetd attempt for `user`, answer at most one ordinary Secret prompt
 /// (info/error notices auto-acknowledge exactly like login), and
 /// report the outcome. Success cancels the pending conversation —
 /// this session is already running, so nothing starts.
@@ -107,9 +107,17 @@ pub fn attempt_unlock(client: &mut impl UnlockClient, user: &str, password: &str
         Ok(response) => response,
         Err(_) => return UnlockOutcome::Denied,
     };
+    let mut password_used = false;
     for _ in 0..MAX_AUTH_ROUNDS {
         match model.apply_response(&response) {
-            ModelEvent::NeedAnswer { .. } => {
+            ModelEvent::NeedAnswer { prompt } => {
+                if prompt.fingerprint || !prompt.secret || password_used {
+                    // This adapter has no typed answer for a device challenge.
+                    // Never replay a password (or acknowledge it as an answer).
+                    let _ = client.cancel();
+                    return UnlockOutcome::Denied;
+                }
+                password_used = true;
                 response = match client.answer(Some(password.to_string())) {
                     Ok(response) => response,
                     Err(_) => return UnlockOutcome::Denied,
@@ -134,25 +142,114 @@ pub fn attempt_unlock(client: &mut impl UnlockClient, user: &str, password: &str
     UnlockOutcome::Denied
 }
 
+/// The fingerprint seam [`attempt_fprint_unlock`] drives.
+/// [`crate::fprintd::Fprintd`] is the production implementation; tests
+/// stub here (no reader on CI).
+pub trait FprintVerifier {
+    /// One bounded verification for `user`.
+    fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome;
+}
+
+impl FprintVerifier for crate::fprintd::Fprintd {
+    fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome {
+        crate::fprintd::Fprintd::verify_user(self, user)
+    }
+}
+
+/// One fingerprint attempt for `user`: only a daemon-reported match
+/// unlocks. No-match, no device, no enrolled prints, cancellation,
+/// timeout and errors all collapse to [`UnlockOutcome::Denied`] with no
+/// detail, exactly like the password path.
+pub fn attempt_fprint_unlock(verifier: &mut impl FprintVerifier, user: &str) -> UnlockOutcome {
+    match verifier.verify(user) {
+        crate::fprintd::VerifyOutcome::Matched => UnlockOutcome::Unlocked,
+        _ => UnlockOutcome::Denied,
+    }
+}
+
+/// Truthful fingerprint capability for `user` (reader present plus
+/// enrollment), for the lock screen to decide whether to offer a
+/// fingerprint attempt. Unavailable on any failure, including no
+/// daemon. Blocking (D-Bus round trips), so the runtime calls it on a
+/// worker thread, like [`verify`].
+pub fn fprint_capability(user: &str) -> crate::fprintd::Capability {
+    crate::fprintd::Fprintd::connect()
+        .map(|client| client.capability(user))
+        .unwrap_or_else(crate::fprintd::Capability::unavailable)
+}
+
+/// One live fingerprint verification for `user` through fprintd,
+/// without touching any lock state. `false` on every non-match,
+/// including no daemon, no reader, and no enrolled prints. Blocking
+/// (the user may take the whole [`crate::fprintd::VERIFY_TIMEOUT`]),
+/// so the runtime calls it on a worker thread.
+pub fn verify_fingerprint(user: &str) -> bool {
+    let Some(client) = crate::fprintd::Fprintd::connect() else {
+        return false;
+    };
+    matches!(
+        client.verify_user(user),
+        crate::fprintd::VerifyOutcome::Matched
+    )
+}
+
 /// Verify `password` for `user` the way [`unlock_session`] does, without
 /// touching any lock state: greetd's daemon when one runs, else PAM's
-/// `roost-lock` service (GDM sessions). Blocking (PAM may delay a
+/// `tuna-lock` service (GDM sessions). Blocking (PAM may delay a
 /// failure for seconds), so the runtime calls it on a worker thread.
-pub fn verify(user: &str, password: &str) -> bool {
-    if let Some(path) = greetd_socket_path() {
-        let Ok(mut client) = GreeterClient::connect(&path) else {
-            return false;
-        };
-        return matches!(
-            attempt_unlock(&mut client, user, password),
-            UnlockOutcome::Unlocked
-        );
-    }
-    let mut client = crate::pam::PamClient::new(crate::pam::service());
+pub(crate) fn verify_greetd(path: &str, user: &str, password: &str) -> bool {
+    let Ok(mut client) = GreeterClient::connect(path) else {
+        return false;
+    };
     matches!(
         attempt_unlock(&mut client, user, password),
         UnlockOutcome::Unlocked
     )
+}
+
+pub fn verify(user: &str, password: &str) -> bool {
+    if let Some(path) = greetd_socket_path() {
+        return verify_greetd(&path, user, password);
+    }
+    crate::pam::authenticate_with_deadline(&crate::pam::service(), user, password)
+}
+
+/// Off-loop ownership path. PAM timeout emits denial while the SAME outer
+/// wrapper waits for actual helper retirement; poison is never a retirement.
+/// Configured greetd remains authoritative and never falls back to PAM.
+pub fn verify_owned(
+    user: &str,
+    password: tuna_shell_control::Secret,
+    cancel: crate::pam_cancel::Cancellation,
+    pending: impl FnMut(),
+) -> crate::pam_backend::Verification {
+    verify_owned_credential(
+        user,
+        crate::pam_backend::Credential::from_schema(password),
+        cancel,
+        pending,
+    )
+}
+
+pub(crate) fn verify_owned_credential(
+    user: &str,
+    password: crate::pam_backend::Credential,
+    cancel: crate::pam_cancel::Cancellation,
+    pending: impl FnMut(),
+) -> crate::pam_backend::Verification {
+    use crate::pam_backend::Verification;
+    if let Some(path) = greetd_socket_path() {
+        return Verification::Retired {
+            authenticated: verify_greetd(&path, user, password.as_str()),
+        };
+    }
+    let Some(backend) = crate::pam_backend::Backend::live() else {
+        return Verification::RejectedBeforeSpawn;
+    };
+    match backend.begin_credential(crate::pam::service(), user.to_owned(), password, cancel) {
+        Ok(ticket) => ticket.wait_retired(pending),
+        Err(result) => result,
+    }
 }
 
 /// The session's user name, for unlocking.
@@ -273,6 +370,53 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_questions_never_receive_password_and_cancel_the_attempt() {
+        for style in [AuthMessageType::Secret, AuthMessageType::Visible] {
+            let mut stub = ScriptStub::new(vec![
+                Ok(Response::AuthMessage {
+                    auth_message_type: style,
+                    auth_message: "Place your finger on the fingerprint reader".into(),
+                }),
+                Ok(Response::Success),
+            ]);
+            assert_eq!(
+                attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
+                UnlockOutcome::Denied
+            );
+            assert!(stub.answers.is_empty());
+            assert!(stub.cancelled);
+        }
+    }
+    #[test]
+    fn password_then_fingerprint_does_not_replay_password_into_second_question() {
+        let mut stub = ScriptStub::new(vec![
+            Ok(secret_prompt("Password:")),
+            Ok(secret_prompt("Swipe your finger again")),
+            Ok(Response::Success),
+        ]);
+        assert_eq!(
+            attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
+            UnlockOutcome::Denied
+        );
+        assert_eq!(stub.answers, [Some("owned-fixture-secret".into())]);
+        assert!(stub.cancelled);
+    }
+    #[test]
+    fn fingerprint_info_remains_empty_ack_then_normal_password_succeeds() {
+        let mut stub = ScriptStub::new(vec![
+            Ok(info_notice("Place your finger on the fingerprint reader")),
+            Ok(secret_prompt("Password:")),
+            Ok(Response::Success),
+        ]);
+        assert_eq!(
+            attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
+            UnlockOutcome::Unlocked
+        );
+        assert_eq!(stub.answers, [None, Some("owned-fixture-secret".into())]);
+        assert!(stub.cancelled);
+    }
+
+    #[test]
     fn correct_password_unlocks_and_releases_the_attempt() {
         let mut stub = ScriptStub::new(vec![Ok(secret_prompt("Password:")), Ok(Response::Success)]);
         assert_eq!(
@@ -315,6 +459,39 @@ mod tests {
     }
 
     #[test]
+    fn distinct_pin_or_visible_prompt_never_receives_reused_password() {
+        for second in [
+            secret_prompt("Separate PIN:"),
+            Response::AuthMessage {
+                auth_message_type: AuthMessageType::Visible,
+                auth_message: "Visible second challenge".into(),
+            },
+        ] {
+            let mut stub = ScriptStub::new(vec![
+                Ok(secret_prompt("Password:")),
+                Ok(second),
+                Ok(Response::Success),
+            ]);
+            assert_eq!(
+                attempt_unlock(&mut stub, "ada", "owned-first-answer"),
+                UnlockOutcome::Denied
+            );
+            assert_eq!(stub.answers, [Some("owned-first-answer".into())]);
+            assert!(stub.cancelled);
+        }
+        let mut stub = ScriptStub::new(vec![Ok(Response::AuthMessage {
+            auth_message_type: AuthMessageType::Visible,
+            auth_message: "PIN:".into(),
+        })]);
+        assert_eq!(
+            attempt_unlock(&mut stub, "ada", "owned-first-answer"),
+            UnlockOutcome::Denied
+        );
+        assert!(stub.answers.is_empty());
+        assert!(stub.cancelled);
+    }
+
+    #[test]
     fn endless_prompts_deny_bounded() {
         let mut stub = ScriptStub::new(
             (0..MAX_AUTH_ROUNDS + 4)
@@ -325,7 +502,7 @@ mod tests {
             attempt_unlock(&mut stub, "ada", "s3cret"),
             UnlockOutcome::Denied
         );
-        assert_eq!(stub.answers.len(), MAX_AUTH_ROUNDS);
+        assert_eq!(stub.answers.len(), 1);
     }
 
     #[test]
@@ -337,6 +514,93 @@ mod tests {
         );
         // Info carries no question: acknowledged empty, unprompted.
         assert_eq!(stub.answers, vec![None]);
+    }
+
+    /// Scripted fingerprint stub: canned outcomes, recording the user.
+    struct FprintStub {
+        outcomes: VecDeque<crate::fprintd::VerifyOutcome>,
+        users: Vec<String>,
+    }
+
+    impl FprintStub {
+        fn new(outcome: crate::fprintd::VerifyOutcome) -> Self {
+            Self::sequenced(vec![outcome])
+        }
+
+        fn sequenced(outcomes: Vec<crate::fprintd::VerifyOutcome>) -> Self {
+            Self {
+                outcomes: outcomes.into(),
+                users: Vec::new(),
+            }
+        }
+    }
+
+    impl FprintVerifier for FprintStub {
+        fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome {
+            self.users.push(user.to_string());
+            self.outcomes
+                .pop_front()
+                .unwrap_or(crate::fprintd::VerifyOutcome::Error)
+        }
+    }
+
+    #[test]
+    fn fingerprint_match_unlocks_for_that_user() {
+        let mut stub = FprintStub::new(crate::fprintd::VerifyOutcome::Matched);
+        assert_eq!(
+            attempt_fprint_unlock(&mut stub, "ada"),
+            UnlockOutcome::Unlocked
+        );
+        assert_eq!(stub.users, vec!["ada".to_string()]);
+    }
+
+    #[test]
+    fn every_fingerprint_non_match_denies_silently() {
+        use crate::fprintd::VerifyOutcome::*;
+        for outcome in [NoMatch, NoDevice, NotEnrolled, Cancelled, TimedOut, Error] {
+            let mut stub = FprintStub::new(outcome);
+            assert_eq!(
+                attempt_fprint_unlock(&mut stub, "ada"),
+                UnlockOutcome::Denied,
+                "unlocked on {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_worker_result_cannot_apply_to_a_newer_generation() {
+        // Each attempt resolves solely on its own verification: the first
+        // attempt times out and stays denied (its worker's late result has
+        // no attempt to apply to — the waiter is gone), and the newer
+        // generation decides solely on its own outcome. Generations never
+        // leak into each other in either direction.
+        use crate::fprintd::VerifyOutcome::*;
+        let mut stub = FprintStub::sequenced(vec![TimedOut, Matched]);
+        assert_eq!(
+            attempt_fprint_unlock(&mut stub, "ada"),
+            UnlockOutcome::Denied
+        );
+        assert_eq!(
+            attempt_fprint_unlock(&mut stub, "ada"),
+            UnlockOutcome::Unlocked
+        );
+        assert_eq!(stub.users, vec!["ada".to_string(), "ada".to_string()]);
+    }
+
+    #[test]
+    fn fingerprint_capability_is_unavailable_when_disabled() {
+        let _guard = crate::fprintd::test_serialize_env().lock().unwrap();
+        let prior = std::env::var_os(crate::fprintd::DISABLE_ENV);
+        unsafe { std::env::set_var(crate::fprintd::DISABLE_ENV, "1") };
+        let capability = fprint_capability("ada");
+        assert!(!capability.offered());
+        assert!(!verify_fingerprint("ada"));
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var(crate::fprintd::DISABLE_ENV, value),
+                None => std::env::remove_var(crate::fprintd::DISABLE_ENV),
+            }
+        }
     }
 
     #[test]

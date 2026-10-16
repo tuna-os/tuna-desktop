@@ -6,9 +6,9 @@
 //!
 //! As in GNOME, those methods answer only allowlisted callers (Settings,
 //! the media-keys daemon, the GNOME portal backend). Harnesses set
-//! `ROOST_SHELL_DBUS_UNRESTRICTED=1`, GNOME's unsafe mode.
+//! `TUNA_SHELL_DBUS_UNRESTRICTED=1`, GNOME's unsafe mode.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -69,7 +69,7 @@ pub trait ShellActions {
     fn show_applications(&self);
     fn overview_active(&self) -> bool;
     /// Hand the compositor the full set of grabs.
-    fn set_accelerators(&self, accelerators: Vec<roost_shell_control::Accelerator>);
+    fn set_accelerators(&self, accelerators: Vec<tuna_shell_control::Accelerator>);
 }
 
 /// Parse a GNOME accelerator string (`<Super>p`, `XF86AudioRaiseVolume`)
@@ -82,10 +82,10 @@ pub fn parse_accelerator(accelerator: &str) -> Option<(u32, u32)> {
     while let Some(after) = rest.strip_prefix('<') {
         let (token, tail) = after.split_once('>')?;
         bits |= match token.to_ascii_lowercase().as_str() {
-            "shift" => roost_shell_control::MOD_SHIFT,
-            "control" | "ctrl" | "primary" => roost_shell_control::MOD_CTRL,
-            "alt" | "mod1" | "meta" => roost_shell_control::MOD_ALT,
-            "super" | "mod4" | "hyper" => roost_shell_control::MOD_LOGO,
+            "shift" => tuna_shell_control::MOD_SHIFT,
+            "control" | "ctrl" | "primary" => tuna_shell_control::MOD_CTRL,
+            "alt" | "mod1" | "meta" => tuna_shell_control::MOD_ALT,
+            "super" | "mod4" | "hyper" => tuna_shell_control::MOD_LOGO,
             _ => return None,
         };
         rest = tail;
@@ -138,14 +138,23 @@ impl Grabs {
                 .by_action
                 .values()
                 .any(|g| g.keysym == keysym && g.mods == mods)
-            || self.by_action.len() >= roost_shell_control::MAX_ACCELERATORS
+            || self.by_action.len() >= tuna_shell_control::MAX_ACCELERATORS
         {
             return 0;
         }
-        self.next = self.next.wrapping_add(1).max(1);
+        // Never reuse a retired action or enter the shell's private namespace:
+        // a queued activation still carries only this numeric identity.
+        let Some(next) = self
+            .next
+            .checked_add(1)
+            .filter(|next| *next < INTERNAL_BASE)
+        else {
+            return 0;
+        };
+        self.next = next;
         // GNOME's modes; none given means the normal session.
         let modes = if modes == 0 {
-            roost_shell_control::MODE_NORMAL
+            tuna_shell_control::MODE_NORMAL
         } else {
             modes
         };
@@ -178,10 +187,10 @@ impl Grabs {
         before != self.by_action.len()
     }
 
-    fn list(&self) -> Vec<roost_shell_control::Accelerator> {
+    fn list(&self) -> Vec<tuna_shell_control::Accelerator> {
         self.by_action
             .iter()
-            .map(|(action, g)| roost_shell_control::Accelerator {
+            .map(|(action, g)| tuna_shell_control::Accelerator {
                 action: *action,
                 keysym: g.keysym,
                 mods: g.mods,
@@ -191,8 +200,9 @@ impl Grabs {
     }
 }
 
-/// Runs one of the shell's own keybindings by index.
-type InternalRun = Rc<dyn Fn(usize)>;
+/// Runs one of the shell's own keybindings by index, with the
+/// `MODE_*` bit it fired in (panel focus pauses session chords).
+type InternalRun = Rc<dyn Fn(usize, u32)>;
 
 /// Action ids of the shell's own keybindings start here, clear of the
 /// ids D-Bus callers get.
@@ -203,7 +213,10 @@ pub struct Service {
     conn: RefCell<Option<gio::DBusConnection>>,
     grabs: RefCell<Grabs>,
     /// The shell's own keybindings, ids from [`INTERNAL_BASE`].
-    internal: RefCell<Vec<roost_shell_control::Accelerator>>,
+    internal: RefCell<Vec<tuna_shell_control::Accelerator>>,
+    /// Monotonic action identities; retired generations are never reused.
+    next_internal: Cell<u32>,
+    internal_indices: RefCell<BTreeMap<u32, usize>>,
     /// Runs an internal binding by its index.
     on_internal: RefCell<Option<InternalRun>>,
     actions: Rc<dyn ShellActions>,
@@ -220,15 +233,23 @@ impl Service {
     }
 
     /// Bind the shell's own keys: `accelerators[i]` with its modes runs
-    /// `run(i)`. Keys that do not parse are skipped.
+    /// `run(i, mode)`. Keys that do not parse are skipped.
     pub fn set_internal(&self, accelerators: &[(String, u32)], run: InternalRun) {
         let mut list = Vec::new();
         let mut reserved = Vec::new();
+        let mut indices = BTreeMap::new();
         for (i, (accel, modes)) in accelerators.iter().enumerate() {
             if let Some((keysym, mods)) = parse_accelerator(accel) {
+                let action = self.next_internal.get();
+                let Some(next) = action.checked_add(1) else {
+                    // Exhaustion disables new bindings instead of reusing an id.
+                    break;
+                };
+                self.next_internal.set(next);
                 reserved.push((keysym, mods));
-                list.push(roost_shell_control::Accelerator {
-                    action: INTERNAL_BASE + i as u32,
+                indices.insert(action, i);
+                list.push(tuna_shell_control::Accelerator {
+                    action,
                     keysym,
                     mods,
                     modes: *modes,
@@ -237,6 +258,7 @@ impl Service {
         }
         self.grabs.borrow_mut().reserved = reserved;
         *self.internal.borrow_mut() = list;
+        *self.internal_indices.borrow_mut() = indices;
         *self.on_internal.borrow_mut() = Some(run);
         self.push();
     }
@@ -246,9 +268,10 @@ impl Service {
     /// AcceleratorActivated).
     pub fn accelerator_activated(&self, action: u32, time: u32, mode: u32) {
         if action >= INTERNAL_BASE {
+            let index = self.internal_indices.borrow().get(&action).copied();
             let run = self.on_internal.borrow().clone();
-            if let Some(run) = run {
-                run((action - INTERNAL_BASE) as usize);
+            if let (Some(index), Some(run)) = (index, run) {
+                run(index, mode);
             }
             return;
         }
@@ -292,7 +315,7 @@ pub fn parse_osd(params: &glib::Variant) -> OsdRequest {
 
 /// Whether `sender` (a unique bus name) owns one of the allowlisted names.
 fn sender_allowed(conn: &gio::DBusConnection, sender: Option<&str>) -> bool {
-    if std::env::var_os("ROOST_SHELL_DBUS_UNRESTRICTED").is_some_and(|v| v == "1") {
+    if std::env::var_os("TUNA_SHELL_DBUS_UNRESTRICTED").is_some_and(|v| v == "1") {
         return true;
     }
     let Some(sender) = sender else {
@@ -323,6 +346,8 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
         conn: RefCell::new(None),
         grabs: RefCell::new(Grabs::default()),
         internal: RefCell::new(Vec::new()),
+        next_internal: Cell::new(INTERNAL_BASE),
+        internal_indices: RefCell::new(BTreeMap::new()),
         on_internal: RefCell::new(None),
         actions: actions.clone(),
         watch: RefCell::new(None),
@@ -330,7 +355,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
     let node = match gio::DBusNodeInfo::for_xml(XML) {
         Ok(node) => node,
         Err(e) => {
-            eprintln!("roost-shell-gtk: org.gnome.Shell interface: {e}");
+            eprintln!("tuna-shell-gtk: org.gnome.Shell interface: {e}");
             return service;
         }
     };
@@ -448,7 +473,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                 })
                 .build();
             if let Err(e) = registered {
-                eprintln!("roost-shell-gtk: org.gnome.Shell object: {e}");
+                eprintln!("tuna-shell-gtk: org.gnome.Shell object: {e}");
             }
             // A caller that leaves the bus loses its grabs, as in GNOME.
             let leave_svc = svc.clone();
@@ -474,7 +499,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
             *leave_svc.watch.borrow_mut() = Some(subscription);
         },
         |_, _| {},
-        |_, _| eprintln!("roost-shell-gtk: org.gnome.Shell is owned elsewhere"),
+        |_, _| eprintln!("tuna-shell-gtk: org.gnome.Shell is owned elsewhere"),
     );
     // The name is held for the session: an OwnerId releases nothing
     // when it drops.
@@ -515,11 +540,11 @@ mod tests {
         assert_eq!((vol, mods), (0x1008FF13, 0));
         let (p, mods) = parse_accelerator("<Super>p").unwrap();
         assert_eq!(p, u32::from(b'p'));
-        assert_eq!(mods, roost_shell_control::MOD_LOGO);
+        assert_eq!(mods, tuna_shell_control::MOD_LOGO);
         let (_, mods) = parse_accelerator("<Primary><Alt>Delete").unwrap();
         assert_eq!(
             mods,
-            roost_shell_control::MOD_CTRL | roost_shell_control::MOD_ALT
+            tuna_shell_control::MOD_CTRL | tuna_shell_control::MOD_ALT
         );
         assert!(parse_accelerator("not a key").is_none());
     }
@@ -535,8 +560,116 @@ mod tests {
         assert!(!grabs.ungrab(":1.6", a), "only the owner ungrabs");
         let list = grabs.list();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].modes, roost_shell_control::MODE_NORMAL);
+        assert_eq!(list[0].modes, tuna_shell_control::MODE_NORMAL);
         assert!(grabs.forget(":1.5"));
         assert!(grabs.list().is_empty());
+    }
+
+    #[test]
+    fn external_actions_never_reuse_or_enter_internal_namespace() {
+        let mut grabs = Grabs {
+            next: INTERNAL_BASE - 2,
+            ..Grabs::default()
+        };
+        let last = grabs.grab(":1.5", "XF86AudioMute", 0);
+        assert_eq!(last, INTERNAL_BASE - 1);
+        assert!(grabs.ungrab(":1.5", last));
+        assert_eq!(grabs.grab(":1.6", "XF86AudioMute", 0), 0);
+        assert!(grabs.list().is_empty());
+        grabs.next = u32::MAX;
+        assert_eq!(grabs.grab(":1.6", "XF86AudioMute", 0), 0);
+    }
+
+    #[derive(Default)]
+    struct RecordedActions(RefCell<Vec<tuna_shell_control::Accelerator>>);
+
+    impl ShellActions for RecordedActions {
+        fn show_osd(&self, _: &OsdRequest) {}
+        fn focus_search(&self) {}
+        fn show_applications(&self) {}
+        fn overview_active(&self) -> bool {
+            false
+        }
+        fn set_accelerators(&self, accelerators: Vec<tuna_shell_control::Accelerator>) {
+            *self.0.borrow_mut() = accelerators;
+        }
+    }
+
+    fn test_service(actions: Rc<RecordedActions>) -> Service {
+        Service {
+            conn: RefCell::new(None),
+            grabs: RefCell::new(Grabs::default()),
+            internal: RefCell::new(Vec::new()),
+            next_internal: Cell::new(INTERNAL_BASE),
+            internal_indices: RefCell::new(BTreeMap::new()),
+            on_internal: RefCell::new(None),
+            actions,
+            watch: RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn retired_internal_actions_cannot_call_a_rebound_callback() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        let old_calls = Rc::new(RefCell::new(Vec::new()));
+        let calls = old_calls.clone();
+        service.set_internal(
+            &[(
+                "XF86AudioRaiseVolume".into(),
+                tuna_shell_control::MODE_NORMAL,
+            )],
+            Rc::new(move |index, mode| calls.borrow_mut().push((index, mode))),
+        );
+        let retired = actions.0.borrow()[0].action;
+        service.accelerator_activated(retired, 1, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(old_calls.borrow().len(), 1);
+
+        let new_calls = Rc::new(RefCell::new(Vec::new()));
+        let calls = new_calls.clone();
+        service.set_internal(
+            &[
+                ("not a key".into(), tuna_shell_control::MODE_NORMAL),
+                ("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL),
+            ],
+            Rc::new(move |index, mode| calls.borrow_mut().push((index, mode))),
+        );
+        let current = actions.0.borrow()[0].action;
+        assert_ne!(retired, current);
+        service.accelerator_activated(retired, 2, tuna_shell_control::MODE_NORMAL);
+        service.accelerator_activated(u32::MAX, 3, tuna_shell_control::MODE_NORMAL);
+        assert!(new_calls.borrow().is_empty());
+        assert_eq!(old_calls.borrow().len(), 1);
+        service.accelerator_activated(current, 4, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(*new_calls.borrow(), [(1, tuna_shell_control::MODE_NORMAL)]);
+
+        service.set_internal(&[], Rc::new(|_, _| panic!("disabled binding ran")));
+        service.accelerator_activated(current, 5, tuna_shell_control::MODE_NORMAL);
+        assert!(actions.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn internal_action_exhaustion_does_not_wrap_or_keep_old_bindings() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        service.next_internal.set(u32::MAX - 1);
+        service.set_internal(
+            &[
+                ("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL),
+                (
+                    "XF86AudioRaiseVolume".into(),
+                    tuna_shell_control::MODE_NORMAL,
+                ),
+            ],
+            Rc::new(|_, _| {}),
+        );
+        assert_eq!(actions.0.borrow().len(), 1);
+        assert_eq!(actions.0.borrow()[0].action, u32::MAX - 1);
+        service.set_internal(
+            &[("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL)],
+            Rc::new(|_, _| panic!("exhausted binding ran")),
+        );
+        assert!(actions.0.borrow().is_empty());
+        service.accelerator_activated(u32::MAX - 1, 1, tuna_shell_control::MODE_NORMAL);
     }
 }

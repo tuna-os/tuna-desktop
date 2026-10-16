@@ -1,5 +1,5 @@
 [package]
-name = "roost-compositor"
+name = "tuna-compositor"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
@@ -10,13 +10,24 @@ smithay.workspace = true
 # loaded at run time, so builds need no PAM headers and a system without
 # it fails closed.
 libc = "0.2"
+# Native color settings live on one owned GLib worker, never the frame thread.
+gio = "0.22"
 libloading = "0.9"
 # GNOME's monitors.xml (per-output scale and layout, #59).
 roxmltree = "0.21"
 # org.gnome.Shell.Screenshot (#61): D-Bus service and PNG output.
 zbus = { workspace = true }
+# Fingerprint setup race (#366): the async builder build bounded by the
+# attempt deadline (Timer + race), via zbus's own async-io/futures-lite.
+async-io = "2.6"
+futures-lite = "2.6.1"
 xkbcommon.workspace = true
 png = "0.18"
+# GNOME's cursor themes (#342): Xcursor files, parsed only; theme
+# lookup and inheritance are our own (src/cursor.rs).
+xcursor = "0.3"
+# GNOME51/KDE scalable cursor metadata and physical-scale rasterization.
+resvg.workspace = true
 # Screen sharing (#61): org.gnome.Mutter.ScreenCast streams over PipeWire,
 # niri's shape. Needs libpipewire-0.3 (and libclang to build).
 pipewire = { version = "0.10", features = ["v0_3_33"] }
@@ -27,15 +38,15 @@ rand.workspace = true
 wayland-protocols.workspace = true
 wayland-server.workspace = true
 wayland-scanner = "=0.31.11"
-roost-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
 # The unlock path uses the greeter's prompt model and greetd client only; the
 # GTK window is never constructed here, so `gtk-ui` stays off and the
 # compositor's build needs no GTK system libraries.
-roost-greeter = { path = "../greeter", version = "0.1.0", default-features = false }
+tuna-greeter = { path = "../greeter", version = "0.1.0", default-features = false }
 greetd_ipc.workspace = true
 image.workspace = true
 tempfile = "3"
-roost-wallpaper = { path = "../wallpaper" }
+tuna-wallpaper = { path = "../wallpaper" }
 serde_json.workspace = true
 rustix.workspace = true
 # GNOME51 RemoteDesktop.ConnectToEIS: bounded, revocable input transport.

@@ -18,7 +18,8 @@
 //! (`WORKSPACE_INACTIVE_SCALE`); and, as GNOME's dynamic workspaces
 //! always keep one, an empty workspace follows the last occupied one.
 
-use smithay::utils::{Logical, Point, Rectangle};
+use smithay::utils::{Logical, Point, Rectangle, Size};
+use tuna_shell_control::MotionPolicy;
 
 /// Card size as a fraction of the work area (GNOME 51: 922x553 on a
 /// 1280x768 work area).
@@ -57,6 +58,10 @@ pub struct WorkspaceCard {
     pub active: bool,
     /// Opacity while the card joins the overview transition.
     pub alpha: f32,
+    /// The card's size once the transition settles. Transition frames
+    /// resize `rect`; the drawn wallpaper card is rendered once at this
+    /// size and scaled, rather than re-rendered for every frame's size.
+    pub settled: Size<i32, Logical>,
 }
 
 /// One window preview: where to draw the window's surface and at what
@@ -89,6 +94,7 @@ pub struct OverviewLayout {
     pub thumbnails: Vec<WorkspaceCard>,
     /// The new-workspace drop slot, visible only during a window drag.
     pub placeholder: Option<(u32, Rectangle<i32, Logical>)>,
+    pub allow_workspace_insertion: bool,
 }
 
 /// GNOME shows the thumbnails strip once dynamic workspaces number more
@@ -128,25 +134,51 @@ fn thumbnail_size_for(w: i32, work_h: i32) -> (i32, i32) {
 /// GNOME's hover growth (`WINDOW_ACTIVE_SIZE_INC`): 5px each side.
 pub const HOVER_GROWTH: i32 = 5;
 
+/// The topmost active preview under `pointer`: the one GNOME grows.
+pub fn hovered_at(layout: &OverviewLayout, pointer: Point<f64, Logical>) -> Option<u64> {
+    layout
+        .previews
+        .iter()
+        .rev()
+        .find(|p| p.active && p.rect.to_f64().contains(pointer))
+        .map(|p| p.id)
+}
+
 /// Grow the topmost active preview under `pointer` by
 /// [`HOVER_GROWTH`] a side, as GNOME does, and remember it as hovered.
 pub fn grow_hovered(layout: &mut OverviewLayout, pointer: Point<f64, Logical>) {
+    let Some(id) = hovered_at(layout, pointer) else {
+        return;
+    };
+    grow_preview(layout, id, 1.0);
+    layout.hovered = Some(id);
+}
+
+/// Grow window `id`'s active preview by `amount` (0..1) of
+/// [`HOVER_GROWTH`] a side: GNOME's hover scale part-way through its
+/// 200 ms tween. The surface scale follows continuously; the rect
+/// snaps to whole logical pixels.
+pub fn grow_preview(layout: &mut OverviewLayout, id: u64, amount: f64) {
+    let amount = amount.clamp(0.0, 1.0);
+    if amount <= 0.0 {
+        return;
+    }
     let Some(p) = layout
         .previews
         .iter_mut()
         .rev()
-        .find(|p| p.active && p.rect.to_f64().contains(pointer))
+        .find(|p| p.active && p.id == id)
     else {
         return;
     };
-    let g = HOVER_GROWTH;
-    let w = p.rect.size.w.max(1);
-    p.scale *= f64::from(w + 2 * g) / f64::from(w);
+    let growth = f64::from(HOVER_GROWTH) * amount;
+    let w = f64::from(p.rect.size.w.max(1));
+    p.scale *= (w + 2.0 * growth) / w;
+    let g = growth.round() as i32;
     p.rect = Rectangle::new(
         (p.rect.loc.x - g, p.rect.loc.y - g).into(),
         (p.rect.size.w + 2 * g, p.rect.size.h + 2 * g).into(),
     );
-    layout.hovered = Some(p.id);
 }
 
 /// GNOME's window drag in the overview (windowPreview.js): the
@@ -168,12 +200,27 @@ pub fn drag_preview(
     start: Point<f64, Logical>,
     pos: Point<f64, Logical>,
 ) {
+    drag_preview_shrinking(layout, id, start, pos, 1.0);
+}
+
+/// [`drag_preview`] part-way through GNOME's 250 ms drag shrink
+/// (`SCALE_ANIMATION_TIME`): `shrink` 0 keeps the preview's size, 1 is
+/// the full [`WINDOW_DND_SIZE`] fit. The opacity drops at once, as
+/// GNOME's `dragActorOpacity` does.
+pub fn drag_preview_shrinking(
+    layout: &mut OverviewLayout,
+    id: u64,
+    start: Point<f64, Logical>,
+    pos: Point<f64, Logical>,
+    shrink: f64,
+) {
     let Some(index) = layout.previews.iter().position(|p| p.active && p.id == id) else {
         return;
     };
     let mut p = layout.previews.remove(index);
     let (w, h) = (f64::from(p.rect.size.w), f64::from(p.rect.size.h));
-    let k = (WINDOW_DND_SIZE / w.max(h).max(1.0)).min(1.0);
+    let fit = (WINDOW_DND_SIZE / w.max(h).max(1.0)).min(1.0);
+    let k = 1.0 + (fit - 1.0) * shrink.clamp(0.0, 1.0);
     let (fx, fy) = (
         (start.x - f64::from(p.rect.loc.x)) / w.max(1.0),
         (start.y - f64::from(p.rect.loc.y)) / h.max(1.0),
@@ -224,6 +271,9 @@ pub fn insertion_target(layout: &OverviewLayout, pos: Point<f64, Logical>) -> Op
 /// Spread the thumbnails around a new-workspace slot, keeping their
 /// miniature windows aligned with their cards.
 pub fn show_placeholder(layout: &mut OverviewLayout, at: u32) {
+    if !layout.allow_workspace_insertion {
+        return;
+    }
     let Some(first) = layout.thumbnails.first() else {
         return;
     };
@@ -290,6 +340,871 @@ pub fn ease_out_quad(t: f64) -> f64 {
     1.0 - (1.0 - t) * (1.0 - t)
 }
 
+/// GNOME's `EASE_OUT_SINE`: how the overview opens.
+pub fn ease_out_sine(t: f64) -> f64 {
+    (t.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2).sin()
+}
+
+/// GNOME's `EASE_OUT_CUBIC`: gesture completion and workspace scrolls.
+pub fn ease_out_cubic(t: f64) -> f64 {
+    let u = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - u * u * u
+}
+
+/// The Clutter animation modes the overview uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Curve {
+    EaseOutQuad,
+    EaseOutSine,
+    EaseOutCubic,
+}
+
+impl Curve {
+    /// Eased fraction at linear time fraction `t`.
+    pub fn apply(self, t: f64) -> f64 {
+        match self {
+            Curve::EaseOutQuad => ease_out_quad(t),
+            Curve::EaseOutSine => ease_out_sine(t),
+            Curve::EaseOutCubic => ease_out_cubic(t),
+        }
+    }
+
+    /// The name proofs and state snapshots use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Curve::EaseOutQuad => "ease-out-quad",
+            Curve::EaseOutSine => "ease-out-sine",
+            Curve::EaseOutCubic => "ease-out-cubic",
+        }
+    }
+}
+
+/// Closing eases with GNOME's `EASE_OUT_QUAD` (`animateFromOverview`).
+pub const CLOSE_CURVE: Curve = Curve::EaseOutQuad;
+/// Opening eases with `EASE_OUT_SINE` (`animateToOverview`).
+pub const OPEN_CURVE: Curve = Curve::EaseOutSine;
+/// Window picker and app grid swap (`SIDE_CONTROLS_ANIMATION_TIME`).
+pub const SIDE_CONTROLS_MS: f64 = 250.0;
+/// The app grid's own fade (appDisplay.js), drawn by the shell.
+pub const APP_GRID_FADE_MS: f64 = 400.0;
+/// The app grid fade waits this long after the swap starts.
+pub const APP_GRID_FADE_DELAY_MS: f64 = 100.0;
+/// Hover grow and overlay fade (`WINDOW_SCALE_TIME`,
+/// `WINDOW_OVERLAY_FADE_TIME`).
+pub const HOVER_MS: f64 = 200.0;
+/// Thumbnails slide in and collapse (`SLIDE_ANIMATION_TIME`,
+/// `RESCALE_ANIMATION_TIME`).
+pub const THUMBNAIL_MS: f64 = 200.0;
+/// A new window's preview scales in (workspace.js `_doAddWindow`).
+pub const NEW_PREVIEW_MS: f64 = 250.0;
+/// Drag shrink (`SCALE_ANIMATION_TIME`).
+pub const DRAG_SCALE_MS: f64 = 250.0;
+/// A drag dropped on nothing glides home (`SNAP_BACK_ANIMATION_TIME`).
+pub const SNAP_BACK_MS: f64 = 250.0;
+/// A drop that was accepted but changed nothing fades the preview back
+/// in where it was (`REVERT_ANIMATION_TIME`).
+pub const REVERT_MS: f64 = 750.0;
+/// Workspace scroll inside the overview (`WORKSPACE_SWITCH_TIME`).
+pub const WORKSPACE_SCROLL_MS: f64 = 250.0;
+
+/// One eased value moving between two endpoints over a fixed time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tween {
+    pub from: f64,
+    pub to: f64,
+    pub duration_ms: f64,
+    pub elapsed_ms: f64,
+    pub curve: Curve,
+}
+
+impl Tween {
+    /// Resting at `value`.
+    pub fn settled(value: f64) -> Self {
+        Self {
+            from: value,
+            to: value,
+            duration_ms: 0.0,
+            elapsed_ms: 0.0,
+            curve: Curve::EaseOutQuad,
+        }
+    }
+
+    pub fn new(from: f64, to: f64, duration_ms: f64, curve: Curve) -> Self {
+        Self {
+            from,
+            to,
+            duration_ms,
+            elapsed_ms: 0.0,
+            curve,
+        }
+    }
+
+    /// Linear time fraction, 0..1.
+    pub fn time(&self) -> f64 {
+        if self.duration_ms <= 0.0 {
+            1.0
+        } else {
+            (self.elapsed_ms / self.duration_ms).clamp(0.0, 1.0)
+        }
+    }
+
+    pub fn value(&self) -> f64 {
+        self.from + (self.to - self.from) * self.curve.apply(self.time())
+    }
+
+    pub fn done(&self) -> bool {
+        self.time() >= 1.0
+    }
+
+    pub fn step(&mut self, dt_ms: f64) {
+        self.elapsed_ms += dt_ms.max(0.0);
+    }
+
+    /// Head for `to` from wherever the value is now (GNOME's `ease`
+    /// replacing a running transition), or snap when `animate` is off.
+    pub fn retarget(&mut self, to: f64, duration_ms: f64, curve: Curve, animate: bool) {
+        if self.to == to {
+            return;
+        }
+        *self = if animate {
+            Self::new(self.value(), to, duration_ms, curve)
+        } else {
+            Self::settled(to)
+        };
+    }
+}
+
+/// Whether `preview` is a miniature in the thumbnails strip.
+fn in_thumbnail(layout: &OverviewLayout, preview: &Preview) -> bool {
+    let center = preview.rect.loc
+        + Point::<i32, Logical>::from((preview.rect.size.w / 2, preview.rect.size.h / 2));
+    layout.thumbnails.iter().any(|t| t.rect.contains(center))
+}
+
+/// `rect` scaled by `k` about its center.
+fn scale_about_center(rect: Rectangle<i32, Logical>, k: f64) -> Rectangle<i32, Logical> {
+    let (w, h) = (
+        (f64::from(rect.size.w) * k).round() as i32,
+        (f64::from(rect.size.h) * k).round() as i32,
+    );
+    Rectangle::new(
+        (
+            rect.loc.x + (rect.size.w - w) / 2,
+            rect.loc.y + (rect.size.h - h) / 2,
+        )
+            .into(),
+        (w, h).into(),
+    )
+}
+
+/// A thumbnail `fraction` collapsed: narrowed about its center
+/// (workspaceThumbnail.js `collapse-fraction`).
+fn collapse(rect: Rectangle<i32, Logical>, fraction: f64) -> Rectangle<i32, Logical> {
+    let w = (f64::from(rect.size.w) * (1.0 - fraction.clamp(0.0, 1.0))).round() as i32;
+    Rectangle::new(
+        (rect.loc.x + (rect.size.w - w) / 2, rect.loc.y).into(),
+        (w, rect.size.h).into(),
+    )
+}
+
+/// The scene `p` of the way from `from` to `to` (both settled overview
+/// scenes): cards and thumbnails matched by workspace, previews by
+/// window and by whether they sit in the strip. What only `to` has
+/// arrives (a new window's preview scales in from its center, GNOME's
+/// `_doAddWindow`; a new thumbnail widens out of nothing; anything else
+/// fades in); what only `from` had leaves the same way in reverse.
+pub fn blend(from: &OverviewLayout, to: &OverviewLayout, p: f64) -> OverviewLayout {
+    if p >= 1.0 {
+        return to.clone();
+    }
+    let p = p.max(0.0);
+    let a = p as f32;
+    let mix = |x: f32, y: f32| x + (y - x) * a;
+    let mut out = OverviewLayout {
+        hovered: to.hovered,
+        placeholder: to.placeholder,
+        allow_workspace_insertion: to.allow_workspace_insertion,
+        ..Default::default()
+    };
+    for c in &to.cards {
+        out.cards.push(
+            match from.cards.iter().find(|o| o.workspace == c.workspace) {
+                Some(o) => WorkspaceCard {
+                    rect: lerp_rect(o.rect, c.rect, p),
+                    alpha: mix(o.alpha, c.alpha),
+                    ..*c
+                },
+                None => WorkspaceCard {
+                    alpha: c.alpha * a,
+                    ..*c
+                },
+            },
+        );
+    }
+    for o in &from.cards {
+        if !to.cards.iter().any(|c| c.workspace == o.workspace) {
+            out.cards.push(WorkspaceCard {
+                active: false,
+                alpha: o.alpha * (1.0 - a),
+                ..*o
+            });
+        }
+    }
+    for t in &to.thumbnails {
+        out.thumbnails.push(
+            match from.thumbnails.iter().find(|o| o.workspace == t.workspace) {
+                Some(o) => WorkspaceCard {
+                    rect: lerp_rect(o.rect, t.rect, p),
+                    alpha: mix(o.alpha, t.alpha),
+                    ..*t
+                },
+                None => WorkspaceCard {
+                    rect: collapse(t.rect, 1.0 - p),
+                    alpha: t.alpha * a,
+                    ..*t
+                },
+            },
+        );
+    }
+    for o in &from.thumbnails {
+        if !to.thumbnails.iter().any(|t| t.workspace == o.workspace) {
+            out.thumbnails.push(WorkspaceCard {
+                rect: collapse(o.rect, p),
+                active: false,
+                alpha: o.alpha * (1.0 - a),
+                ..*o
+            });
+        }
+    }
+    // Leaving previews paint underneath the arriving scene.
+    for o in &from.previews {
+        let strip = in_thumbnail(from, o);
+        if !to
+            .previews
+            .iter()
+            .any(|t| t.id == o.id && in_thumbnail(to, t) == strip)
+        {
+            out.previews.push(Preview {
+                active: false,
+                alpha: o.alpha * (1.0 - a),
+                ..*o
+            });
+        }
+    }
+    for t in &to.previews {
+        let strip = in_thumbnail(to, t);
+        let old = from
+            .previews
+            .iter()
+            .find(|o| o.id == t.id && in_thumbnail(from, o) == strip);
+        out.previews.push(match old {
+            Some(o) => Preview {
+                rect: lerp_rect(o.rect, t.rect, p),
+                scale: o.scale + (t.scale - o.scale) * p,
+                alpha: mix(o.alpha, t.alpha),
+                ..*t
+            },
+            None if t.active => Preview {
+                rect: scale_about_center(t.rect, p),
+                scale: t.scale * p,
+                alpha: if p > 0.0 { t.alpha } else { 0.0 },
+                ..*t
+            },
+            None => Preview {
+                alpha: t.alpha * a,
+                ..*t
+            },
+        });
+    }
+    out
+}
+
+/// Why the settled overview scene changed shape, which decides how
+/// GNOME animates the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MorphCause {
+    /// Window picker and app grid swapped (250 ms `EASE_OUT_SINE`).
+    AppGrid,
+    /// The active workspace changed (250 ms `EASE_OUT_CUBIC`).
+    Workspace,
+    /// Thumbnails were added or removed (200 ms).
+    Thumbnails,
+    /// Previews came or went, a new window's scaling in (250 ms).
+    Windows,
+    /// A drag dropped on nothing glides home (250 ms).
+    SnapBack,
+}
+
+impl MorphCause {
+    pub fn timing(self) -> (f64, Curve) {
+        match self {
+            MorphCause::AppGrid => (SIDE_CONTROLS_MS, Curve::EaseOutSine),
+            MorphCause::Workspace => (WORKSPACE_SCROLL_MS, Curve::EaseOutCubic),
+            MorphCause::Thumbnails => (THUMBNAIL_MS, Curve::EaseOutQuad),
+            MorphCause::Windows => (NEW_PREVIEW_MS, Curve::EaseOutQuad),
+            MorphCause::SnapBack => (SNAP_BACK_MS, Curve::EaseOutQuad),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MorphCause::AppGrid => "app-grid",
+            MorphCause::Workspace => "workspace",
+            MorphCause::Thumbnails => "thumbnails",
+            MorphCause::Windows => "windows",
+            MorphCause::SnapBack => "snap-back",
+        }
+    }
+}
+
+/// A swipe driving the transition: where it began, the finger travel
+/// toward open so far, and its recent `(time, delta)` events.
+#[derive(Debug, Clone)]
+struct Swipe {
+    initial: f64,
+    travel: f64,
+    history: crate::workspace_slide::SwipeHistory,
+}
+
+/// What a settled scene's shape is, to notice when it changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SceneShape {
+    app_grid: bool,
+    active: Option<u32>,
+    thumbnails: Vec<u32>,
+    previews: Vec<u64>,
+}
+
+impl SceneShape {
+    fn of(layout: &OverviewLayout, app_grid: bool) -> Self {
+        let mut previews: Vec<u64> = layout
+            .previews
+            .iter()
+            .filter(|p| p.active)
+            .map(|p| p.id)
+            .collect();
+        previews.sort_unstable();
+        Self {
+            app_grid,
+            active: layout.cards.iter().find(|c| c.active).map(|c| c.workspace),
+            thumbnails: layout.thumbnails.iter().map(|t| t.workspace).collect(),
+            previews,
+        }
+    }
+
+    fn cause(&self, next: &Self) -> Option<MorphCause> {
+        if self.app_grid != next.app_grid {
+            Some(MorphCause::AppGrid)
+        } else if self.active != next.active {
+            Some(MorphCause::Workspace)
+        } else if self.thumbnails != next.thumbnails {
+            Some(MorphCause::Thumbnails)
+        } else if self.previews != next.previews {
+            Some(MorphCause::Windows)
+        } else {
+            None
+        }
+    }
+}
+
+/// Where a released overview swipe settles and how long it takes
+/// (`SwipeTracker._getEndProgress` and `_endGesture` over the overview's
+/// hidden/open snap points): `progress` now, `initial` where it began,
+/// `velocity` in touchpad units per ms toward open over `distance`.
+/// The same tracker as the workspace swipe ([`crate::workspace_slide`]),
+/// over the overview's two snap points. GNOME breaks an exact half-way
+/// tie toward closed; Tuna Desktop has always opened there, and keeps
+/// doing so.
+pub fn swipe_release(progress: f64, initial: f64, velocity: f64, distance: f64) -> (f64, f64) {
+    crate::workspace_slide::swipe_release_over(
+        progress,
+        initial.round().clamp(0.0, 1.0),
+        2,
+        velocity,
+        false,
+        distance,
+    )
+}
+
+/// Samples of one timed open or close, for proofs to check the curve.
+#[derive(Debug, Clone, PartialEq)]
+struct Trace {
+    tween: Tween,
+    samples: Vec<(f64, f64)>,
+}
+
+const TRACE_SAMPLES: usize = 64;
+
+/// A released swipe: where it went, how fast and for how long.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Release {
+    from: f64,
+    target: f64,
+    velocity: f64,
+    duration_ms: f64,
+}
+
+/// What the overview should be doing this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverviewCues {
+    pub open: bool,
+    pub app_grid: bool,
+    pub search: bool,
+    /// GNOME's motion policy: fade-only keeps the fades and snaps
+    /// everything that moves or scales; durations take the slow-down.
+    pub motion: MotionPolicy,
+}
+
+/// Every overview animation in one place (GNOME 51's timings): the
+/// open/close transition and the swipe that drives it, plus the
+/// settled scene's own motion (picker and app grid, workspace scroll,
+/// thumbnails, new previews, hover, drag and search). The runtime feeds
+/// it frame times and cues; [`OverviewMotion::scene`] draws from it.
+/// Nothing here runs while the overview is fully closed.
+#[derive(Debug, Clone)]
+pub struct OverviewMotion {
+    progress: Tween,
+    /// A swipe holds the transition.
+    swipe: Option<Swipe>,
+    open_trace: Option<Trace>,
+    close_trace: Option<Trace>,
+    release: Option<Release>,
+    shape: Option<SceneShape>,
+    morph: Option<(OverviewLayout, Tween, MorphCause)>,
+    last_morph: Option<MorphCause>,
+    pending: Option<MorphCause>,
+    last_scene: Option<OverviewLayout>,
+    search: Tween,
+    hovered: Option<u64>,
+    hover: Vec<(u64, Tween)>,
+    drag_shrink: Tween,
+    dragging: bool,
+    revert: Option<(u64, Tween)>,
+}
+
+impl Default for OverviewMotion {
+    fn default() -> Self {
+        Self {
+            progress: Tween::settled(0.0),
+            swipe: None,
+            open_trace: None,
+            close_trace: None,
+            release: None,
+            shape: None,
+            morph: None,
+            last_morph: None,
+            pending: None,
+            last_scene: None,
+            search: Tween::settled(0.0),
+            hovered: None,
+            hover: Vec::new(),
+            drag_shrink: Tween::settled(0.0),
+            dragging: false,
+            revert: None,
+        }
+    }
+}
+
+impl OverviewMotion {
+    /// Whether any of the overview's tweens still moves (or a motion is
+    /// pending). The loop keeps the frame cadence until they settle (#503).
+    pub(crate) fn animating(&self) -> bool {
+        !self.progress.done()
+            || !self.search.done()
+            || !self.drag_shrink.done()
+            || self.hover.iter().any(|(_, tween)| !tween.done())
+            || self
+                .morph
+                .as_ref()
+                .is_some_and(|(_, tween, _)| !tween.done())
+            || self.revert.as_ref().is_some_and(|(_, tween)| !tween.done())
+            || self.pending.is_some()
+    }
+
+    /// The drawn transition: 0 the desktop, 1 the overview.
+    pub fn progress(&self) -> f64 {
+        self.progress.value()
+    }
+
+    /// Whether search has fully faded the workspaces out.
+    pub fn search_covers(&self) -> bool {
+        self.search.value() >= 1.0
+    }
+
+    /// Jump everything to its end state (motion turned off).
+    pub fn snap(&mut self, open: bool) {
+        self.progress = Tween::settled(if open { 1.0 } else { 0.0 });
+        self.search = Tween::settled(self.search.to);
+        self.morph = None;
+        self.revert = None;
+        self.drag_shrink = Tween::settled(self.drag_shrink.to);
+        for (_, t) in &mut self.hover {
+            *t = Tween::settled(t.to);
+        }
+    }
+
+    /// Advance the open/close transition by `dt_ms` toward `open`:
+    /// opening eases out-sine, closing out-quad, 250 ms either way from
+    /// wherever it is (GNOME's `animateToOverview`/`animateFromOverview`).
+    pub fn step_progress(&mut self, dt_ms: f64, open: bool, motion: MotionPolicy) {
+        let animate = motion.allows_motion();
+        if self.swipe.is_some() {
+            return;
+        }
+        let target = if open { 1.0 } else { 0.0 };
+        let retargeted = self.progress.to != target;
+        if retargeted {
+            let curve = if open { OPEN_CURVE } else { CLOSE_CURVE };
+            self.progress
+                .retarget(target, motion.adjust_ms(TRANSITION_MS), curve, animate);
+            let trace = Some(Trace {
+                tween: self.progress,
+                samples: Vec::new(),
+            });
+            if animate {
+                if open {
+                    self.open_trace = trace;
+                } else {
+                    self.close_trace = trace;
+                }
+            }
+        } else if !animate {
+            self.progress = Tween::settled(target);
+        }
+        // dt_ms is time since the last rendered frame, not since this
+        // target was requested. After settled idle it can span seconds.
+        // A new transition starts from the last drawn value at this frame;
+        // only subsequent frames advance it. The same boundary applies to
+        // reversal, so pre-request time cannot consume the replacement tween.
+        self.progress.step(if retargeted { 0.0 } else { dt_ms });
+        let (t, value) = (self.progress.elapsed_ms, self.progress.value());
+        for trace in [&mut self.open_trace, &mut self.close_trace]
+            .into_iter()
+            .flatten()
+        {
+            if trace.tween.from == self.progress.from
+                && trace.tween.to == self.progress.to
+                && trace.tween.curve == self.progress.curve
+                && trace.samples.len() < TRACE_SAMPLES
+                && trace.samples.last().is_none_or(|(last, _)| *last < t)
+                && t <= trace.tween.duration_ms + 50.0
+            {
+                trace.samples.push((t, value));
+            }
+        }
+    }
+
+    /// Whether a swipe holds the transition.
+    pub fn swiping(&self) -> bool {
+        self.swipe.is_some()
+    }
+
+    /// The swipe has travelled `travel` touchpad units toward open in
+    /// all, at `time`, over `distance` units for the whole transition.
+    /// The first call begins it where the transition is. The transition
+    /// follows the fingers, or with motion off jumps to the nearer end.
+    pub fn swipe_update(&mut self, time: u32, travel: f64, distance: f64, motion: MotionPolicy) {
+        let animate = motion.allows_motion();
+        let at = self.progress.value();
+        let swipe = self.swipe.get_or_insert_with(|| Swipe {
+            initial: at,
+            travel: 0.0,
+            history: Default::default(),
+        });
+        swipe.history.append(time, travel - swipe.travel);
+        swipe.travel = travel;
+        let raw = (swipe.initial + travel / distance.max(1.0)).clamp(0.0, 1.0);
+        let shown = if animate {
+            raw
+        } else if raw >= 0.5 {
+            1.0
+        } else {
+            0.0
+        };
+        self.progress = Tween::settled(shown);
+    }
+
+    /// The swipe ended at `time`: finish toward where GNOME's tracker
+    /// would, carrying the fingers' velocity into an `EASE_OUT_CUBIC`
+    /// of matching duration (back where it began when `cancelled`).
+    /// Returns whether the overview ends open, or `None` without a swipe.
+    pub fn swipe_end(
+        &mut self,
+        time: u32,
+        cancelled: bool,
+        distance: f64,
+        motion: MotionPolicy,
+    ) -> Option<bool> {
+        let animate = motion.allows_motion();
+        let Swipe {
+            initial,
+            mut history,
+            ..
+        } = self.swipe.take()?;
+        let at = self.progress.value();
+        let velocity = history.velocity(time);
+        let (target, duration) = crate::workspace_slide::swipe_release_over(
+            at,
+            initial.round().clamp(0.0, 1.0),
+            2,
+            velocity,
+            cancelled,
+            distance,
+        );
+        let duration = motion.adjust_ms(duration);
+        self.progress = if animate && duration > 0.0 {
+            Tween::new(at, target, duration, Curve::EaseOutCubic)
+        } else {
+            Tween::settled(target)
+        };
+        self.release = Some(Release {
+            from: at,
+            target,
+            velocity,
+            duration_ms: if animate { duration } else { 0.0 },
+        });
+        Some(target >= 1.0)
+    }
+
+    /// A preview drag began: start GNOME's shrink.
+    pub fn drag_begin(&mut self, motion: MotionPolicy) {
+        self.dragging = true;
+        self.drag_shrink = Tween::settled(0.0);
+        self.drag_shrink.retarget(
+            1.0,
+            motion.adjust_ms(DRAG_SCALE_MS),
+            Curve::EaseOutQuad,
+            motion.allows_motion(),
+        );
+    }
+
+    /// A drag dropped on nothing: glide the preview home from where it
+    /// was drawn.
+    pub fn drag_snap_back(&mut self, motion: MotionPolicy) {
+        self.drag_released();
+        if motion.allows_motion() {
+            self.pending = Some(MorphCause::SnapBack);
+        }
+    }
+
+    /// A drop that changed nothing: the preview reappears in its slot
+    /// and fades in over 750 ms.
+    /// A fade, so fade-only keeps it.
+    pub fn drag_revert(&mut self, id: u64, motion: MotionPolicy) {
+        self.drag_released();
+        if motion.allows_fades() {
+            let duration = motion.adjust_ms(REVERT_MS);
+            self.revert = Some((id, Tween::new(0.0, 1.0, duration, Curve::EaseOutQuad)));
+        }
+    }
+
+    /// A drop that moved the window: the scene's own change animates it.
+    pub fn drag_released(&mut self) {
+        self.dragging = false;
+        self.drag_shrink = Tween::settled(0.0);
+    }
+
+    /// Advance the settled scene's motion by `dt_ms`. `base` is the
+    /// overview as it would rest (`layout` or `app_grid_layout`), `drag`
+    /// the dragged window and its grab point.
+    pub fn step_scene(
+        &mut self,
+        dt_ms: f64,
+        base: &OverviewLayout,
+        cues: OverviewCues,
+        drag: Option<(u64, Point<f64, Logical>)>,
+        pointer: Point<f64, Logical>,
+    ) {
+        if self.progress.value() <= 0.0 && !cues.open {
+            self.reset_scene();
+            return;
+        }
+        let motion = cues.motion;
+        let animate = motion.allows_motion();
+        let shape = SceneShape::of(base, cues.app_grid);
+        let cause = self
+            .pending
+            .take()
+            .or_else(|| self.shape.as_ref().and_then(|old| old.cause(&shape)));
+        if let (Some(cause), Some(from), true) = (cause, self.last_scene.take(), animate) {
+            let (duration, curve) = cause.timing();
+            let duration = motion.adjust_ms(duration);
+            self.morph = Some((from, Tween::new(0.0, 1.0, duration, curve), cause));
+            self.last_morph = Some(cause);
+        }
+        self.shape = Some(shape);
+        self.search.retarget(
+            if cues.search { 1.0 } else { 0.0 },
+            motion.adjust_ms(SIDE_CONTROLS_MS),
+            Curve::EaseOutQuad,
+            motion.allows_fades(),
+        );
+        // GNOME grows the preview under the pointer once settled.
+        self.hovered = (self.progress.value() >= 1.0 && drag.is_none())
+            .then(|| hovered_at(base, pointer))
+            .flatten();
+        if let Some(id) = self.hovered {
+            if !self.hover.iter().any(|(h, _)| *h == id) {
+                self.hover.push((id, Tween::settled(0.0)));
+            }
+        }
+        for (id, tween) in &mut self.hover {
+            let target = if Some(*id) == self.hovered { 1.0 } else { 0.0 };
+            tween.retarget(
+                target,
+                motion.adjust_ms(HOVER_MS),
+                Curve::EaseOutQuad,
+                animate,
+            );
+            tween.step(dt_ms);
+        }
+        self.hover
+            .retain(|(id, t)| Some(*id) == self.hovered || t.value() > 0.0);
+        if drag.is_none() && self.dragging {
+            self.drag_released();
+        }
+        self.search.step(dt_ms);
+        self.drag_shrink.step(dt_ms);
+        if let Some((_, tween)) = self.revert.as_mut() {
+            tween.step(dt_ms);
+        }
+        if self.revert.as_ref().is_some_and(|(_, t)| t.done()) {
+            self.revert = None;
+        }
+        if let Some((_, tween, _)) = self.morph.as_mut() {
+            tween.step(dt_ms);
+        }
+        if self.morph.as_ref().is_some_and(|(_, t, _)| t.done()) {
+            self.morph = None;
+        }
+        self.last_scene = Some(self.settled_scene(base, drag, pointer));
+    }
+
+    /// Forget the scene's motion (the overview closed).
+    pub fn reset_scene(&mut self) {
+        self.shape = None;
+        self.morph = None;
+        self.pending = None;
+        self.last_scene = None;
+        self.search = Tween::settled(0.0);
+        self.hovered = None;
+        self.hover.clear();
+        self.revert = None;
+        self.drag_released();
+    }
+
+    /// The overview scene before the open/close transition and search
+    /// fade: hover, drag, revert and any running morph applied.
+    fn settled_scene(
+        &self,
+        base: &OverviewLayout,
+        drag: Option<(u64, Point<f64, Logical>)>,
+        pointer: Point<f64, Logical>,
+    ) -> OverviewLayout {
+        let mut scene = base.clone();
+        match drag {
+            Some((id, start)) => {
+                if let Some(at) = insertion_target(&scene, pointer) {
+                    show_placeholder(&mut scene, at);
+                }
+                drag_preview_shrinking(&mut scene, id, start, pointer, self.drag_shrink.value());
+            }
+            None => {
+                for (id, tween) in &self.hover {
+                    grow_preview(&mut scene, *id, tween.value());
+                }
+                scene.hovered = self.hovered;
+            }
+        }
+        if let Some((id, tween)) = self.revert {
+            for p in scene.previews.iter_mut().filter(|p| p.id == id && p.active) {
+                p.alpha *= tween.value() as f32;
+            }
+        }
+        if let Some((from, tween, _)) = &self.morph {
+            scene = blend(from, &scene, tween.value());
+        }
+        scene
+    }
+
+    /// The overview as drawn this frame from its resting `base`.
+    pub fn scene(
+        &self,
+        base: &OverviewLayout,
+        drag: Option<(u64, Point<f64, Logical>)>,
+        pointer: Point<f64, Logical>,
+        output: Rectangle<i32, Logical>,
+        windows: &[OverviewWindow],
+    ) -> OverviewLayout {
+        let mut scene = self.settled_scene(base, drag, pointer);
+        // Search fades the workspaces out (`_onSearchChanged`).
+        let shown = 1.0 - self.search.value() as f32;
+        if shown < 1.0 {
+            for c in scene.cards.iter_mut().chain(scene.thumbnails.iter_mut()) {
+                c.alpha *= shown;
+            }
+            for p in &mut scene.previews {
+                p.alpha *= shown;
+            }
+        }
+        let progress = self.progress.value();
+        if progress < 1.0 {
+            return transition(&scene, progress, output, windows);
+        }
+        scene
+    }
+
+    /// Timings and samples for state snapshots and proofs.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        let trace = |t: &Option<Trace>| {
+            t.as_ref().map(|t| {
+                serde_json::json!({
+                    "from": t.tween.from,
+                    "to": t.tween.to,
+                    "curve": t.tween.curve.name(),
+                    "duration_ms": t.tween.duration_ms,
+                    "samples": t.samples,
+                })
+            })
+        };
+        serde_json::json!({
+            "open": trace(&self.open_trace),
+            "close": trace(&self.close_trace),
+            "running": (!self.progress.done()).then(|| serde_json::json!({
+                "from": self.progress.from,
+                "to": self.progress.to,
+                "curve": self.progress.curve.name(),
+                "duration_ms": self.progress.duration_ms,
+            })),
+            "release": self.release.map(|r| serde_json::json!({
+                "from": r.from,
+                "target": r.target,
+                "velocity": r.velocity,
+                "duration_ms": r.duration_ms,
+                "curve": Curve::EaseOutCubic.name(),
+            })),
+            "morph": self.morph.as_ref().map(|(_, t, cause)| serde_json::json!({
+                "cause": cause.name(),
+                "curve": t.curve.name(),
+                "duration_ms": t.duration_ms,
+                "time": t.time(),
+            })),
+            "last_morph": self.last_morph.map(|cause| {
+                let (duration, curve) = cause.timing();
+                serde_json::json!({
+                    "cause": cause.name(),
+                    "curve": curve.name(),
+                    "duration_ms": duration,
+                })
+            }),
+            "search": self.search.value(),
+            "hover": self.hover.iter().map(|(id, t)| serde_json::json!([id, t.value()])).collect::<Vec<_>>(),
+            "drag_shrink": self.drag_shrink.value(),
+            "revert": self.revert.map(|(id, t)| serde_json::json!([id, t.value()])),
+        })
+    }
+}
+
 fn lerp_rect(
     a: Rectangle<i32, Logical>,
     b: Rectangle<i32, Logical>,
@@ -302,7 +1217,7 @@ fn lerp_rect(
     )
 }
 
-/// The overview part-way open (GNOME's transition): at eased progress
+/// The overview part-way open (GNOME's transition): at drawn progress
 /// `p` (0 the desktop, 1 the overview) the active workspace card grows
 /// out of the whole output and each window on it glides from where it
 /// sits on the desktop into its preview. Neighbouring cards and the
@@ -329,6 +1244,7 @@ pub fn transition(
         lerp_rect(start, card.rect, p)
     };
     let mut out = OverviewLayout {
+        allow_workspace_insertion: layout.allow_workspace_insertion,
         cards: layout
             .cards
             .iter()
@@ -707,8 +1623,26 @@ pub fn layout(
     active: u32,
     windows: &[OverviewWindow],
 ) -> OverviewLayout {
-    let mut out = OverviewLayout::default();
-    let workspaces = shown_workspaces(workspaces, windows);
+    layout_with_policy(output, work_top, workspaces, active, windows, true)
+}
+
+pub fn layout_with_policy(
+    output: Rectangle<i32, Logical>,
+    work_top: i32,
+    workspaces: &[u32],
+    active: u32,
+    windows: &[OverviewWindow],
+    dynamic: bool,
+) -> OverviewLayout {
+    let mut out = OverviewLayout {
+        allow_workspace_insertion: dynamic,
+        ..Default::default()
+    };
+    let workspaces = if dynamic {
+        shown_workspaces(workspaces, windows)
+    } else {
+        workspaces.to_vec()
+    };
     let index = workspaces.iter().position(|w| *w == active).unwrap_or(0);
     let neighbors = [
         (index.checked_sub(1), -1),
@@ -731,6 +1665,7 @@ pub fn layout(
             rect,
             active: false,
             alpha: 1.0,
+            settled: rect.size,
         });
         for w in windows.iter().filter(|w| w.workspace == workspace) {
             let x =
@@ -757,6 +1692,7 @@ pub fn layout(
             rect: active_card,
             active: true,
             alpha: 1.0,
+            settled: active_card.size,
         },
     );
     // GNOME lays the windows out in the window picker: the card plus
@@ -782,7 +1718,7 @@ pub fn layout(
         .filter(|w| w.workspace == active)
         .map(|w| (w.id, w.geometry))
         .collect();
-    // GNOME sorts by stable sequence: creation order (Roost ids rise).
+    // GNOME sorts by stable sequence: creation order (Tuna Desktop ids rise).
     mine.sort_by_key(|(id, _)| *id);
     for (id, rect, scale) in window_slots(workarea, output.size.h, picker, &mine) {
         out.previews.push(Preview {
@@ -826,6 +1762,7 @@ fn thumbnails(
             rect,
             active: workspace == active,
             alpha: 1.0,
+            settled: rect.size,
         });
         for win in windows.iter().filter(|w| w.workspace == workspace) {
             let x =
@@ -976,8 +1913,26 @@ pub fn app_grid_layout(
     active: u32,
     windows: &[OverviewWindow],
 ) -> OverviewLayout {
-    let mut out = OverviewLayout::default();
-    let shown = shown_workspaces(workspaces, windows);
+    app_grid_layout_with_policy(output, work_top, workspaces, active, windows, true)
+}
+
+pub fn app_grid_layout_with_policy(
+    output: Rectangle<i32, Logical>,
+    work_top: i32,
+    workspaces: &[u32],
+    active: u32,
+    windows: &[OverviewWindow],
+    dynamic: bool,
+) -> OverviewLayout {
+    let mut out = OverviewLayout {
+        allow_workspace_insertion: dynamic,
+        ..Default::default()
+    };
+    let shown = if dynamic {
+        shown_workspaces(workspaces, windows)
+    } else {
+        workspaces.to_vec()
+    };
     let work_h = (output.size.h - work_top).max(1);
     let w = (f64::from(output.size.w) * THUMBNAIL_SCALE).round();
     let h = (f64::from(work_h) * THUMBNAIL_SCALE).round();
@@ -1004,6 +1959,7 @@ pub fn app_grid_layout(
             rect,
             active: is_active,
             alpha: 1.0,
+            settled: rect.size,
         };
         if is_active {
             out.cards.insert(0, card);
@@ -1066,6 +2022,34 @@ pub fn hit(layout: &OverviewLayout, pos: Point<f64, Logical>) -> OverviewHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_workspace_layout_has_exact_slots_and_no_insertion_placeholder() {
+        let windows = [win(1, 3, 10, 30, 300, 200)];
+        let overview = layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false);
+        assert_eq!(overview.thumbnails.len(), 4);
+        let app_grid = app_grid_layout_with_policy(output(), 24, &[0, 1, 2, 3], 3, &windows, false);
+        assert_eq!(app_grid.cards.len(), 4);
+        assert!(app_grid.thumbnails.is_empty());
+        for mut layout in [overview, app_grid] {
+            assert!(layout.cards.iter().all(|card| card.workspace < 4));
+            show_placeholder(&mut layout, 4);
+            assert!(layout.placeholder.is_none());
+            assert!(!transition(&layout, 0.5, output(), &windows).allow_workspace_insertion);
+        }
+        let single = layout_with_policy(output(), 24, &[0], 0, &[], false);
+        assert_eq!(single.cards.len(), 1);
+        assert!(single.thumbnails.is_empty());
+    }
+
+    const FULL: MotionPolicy = MotionPolicy {
+        level: tuna_shell_control::motion::MotionLevel::Full,
+        slowdown_milli: 1000,
+    };
+    const OFF: MotionPolicy = MotionPolicy {
+        level: tuna_shell_control::motion::MotionLevel::Off,
+        slowdown_milli: 1000,
+    };
 
     const BLUE: [f32; 3] = [53.0 / 255.0, 132.0 / 255.0, 228.0 / 255.0];
 
@@ -1285,6 +2269,33 @@ mod tests {
     }
 
     #[test]
+    fn transition_frames_keep_each_cards_settled_size() {
+        let windows = [win(1, 0, 320, 182, 640, 420), win(2, 1, 320, 182, 640, 420)];
+        let open = layout(output(), 32, &[0, 1, 2], 0, &windows);
+        for card in open.cards.iter().chain(&open.thumbnails) {
+            assert_eq!(card.settled, card.rect.size);
+        }
+        for p in [0.0, 0.3, 0.7] {
+            let frame = transition(&open, p, output(), &windows);
+            for (drawn, settled) in [
+                (&frame.cards, &open.cards),
+                (&frame.thumbnails, &open.thumbnails),
+            ] {
+                for card in drawn {
+                    let settled = settled
+                        .iter()
+                        .find(|c| c.workspace == card.workspace)
+                        .unwrap();
+                    assert_eq!(card.settled, settled.rect.size);
+                }
+            }
+        }
+        // The growing active card changes size; only its settled size is cached.
+        let closed = transition(&open, 0.0, output(), &windows);
+        assert_ne!(closed.cards[0].rect.size, closed.cards[0].settled);
+    }
+
+    #[test]
     fn neighboring_workspaces_and_thumbnails_follow_intermediate_swipe_progress() {
         let windows = [win(1, 0, 320, 182, 640, 420), win(2, 1, 320, 182, 640, 420)];
         let open = layout(output(), 32, &[0, 1], 0, &windows);
@@ -1486,5 +2497,492 @@ mod tests {
         assert_eq!(l.thumbnails[0].rect.loc.x, first.loc.x);
         assert!(l.thumbnails[1].rect.loc.x > second.loc.x);
         assert!(thumbnail_decor(&l, [0.2, 0.5, 0.8]).len() > 2);
+    }
+
+    #[test]
+    fn gnome_curves_match_clutter_modes() {
+        assert!((ease_out_sine(0.5) - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-9);
+        assert!((ease_out_cubic(0.5) - 0.875).abs() < 1e-9);
+        for curve in [Curve::EaseOutQuad, Curve::EaseOutSine, Curve::EaseOutCubic] {
+            assert_eq!(curve.apply(0.0), 0.0);
+            assert!((curve.apply(1.0) - 1.0).abs() < 1e-12);
+            assert!((curve.apply(7.0) - 1.0).abs() < 1e-12);
+        }
+    }
+
+    fn opened(motion: &mut OverviewMotion) {
+        motion.step_progress(0.0, true, FULL);
+        motion.step_progress(TRANSITION_MS, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+    }
+
+    #[test]
+    fn opening_eases_out_sine_and_closing_eases_out_quad() {
+        let mut motion = OverviewMotion::default();
+        motion.step_progress(0.0, true, FULL);
+        motion.step_progress(125.0, true, FULL);
+        // GNOME's animateToOverview: EASE_OUT_SINE over 250 ms.
+        assert!((motion.progress() - ease_out_sine(0.5)).abs() < 1e-9);
+        motion.step_progress(125.0, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        motion.step_progress(0.0, false, FULL);
+        motion.step_progress(125.0, false, FULL);
+        // animateFromOverview: EASE_OUT_QUAD toward hidden, so half the
+        // time leaves a quarter of the overview (not ease-in's 0.75).
+        assert!((motion.progress() - 0.25).abs() < 1e-9);
+        motion.step_progress(125.0, false, FULL);
+        assert_eq!(motion.progress(), 0.0);
+        let d = motion.diagnostics();
+        assert_eq!(d["open"]["curve"], "ease-out-sine");
+        assert_eq!(d["close"]["curve"], "ease-out-quad");
+        assert_eq!(d["close"]["duration_ms"], 250.0);
+        let samples = d["close"]["samples"].as_array().unwrap();
+        assert!(samples.iter().any(|s| s[0] == 125.0 && s[1] == 0.25));
+    }
+
+    #[test]
+    fn settled_idle_time_does_not_consume_new_open_or_close_transition() {
+        let mut motion = OverviewMotion::default();
+        // The idle scheduler can leave the preceding render far in the past.
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(
+            motion.diagnostics()["open"]["samples"][0],
+            serde_json::json!([0.0, 0.0])
+        );
+        motion.step_progress(125.0, true, FULL);
+        assert!((motion.progress() - ease_out_sine(0.5)).abs() < 1e-9);
+        motion.step_progress(125.0, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        let diagnostics = motion.diagnostics();
+        assert_eq!(diagnostics["close"]["duration_ms"], 250.0);
+        assert_eq!(
+            diagnostics["close"]["samples"][0],
+            serde_json::json!([0.0, 1.0])
+        );
+        motion.step_progress(125.0, false, FULL);
+        assert!((motion.progress() - 0.25).abs() < 1e-9);
+        motion.step_progress(125.0, false, FULL);
+        assert_eq!(motion.progress(), 0.0);
+    }
+
+    #[test]
+    fn repeated_settled_target_does_not_restart_transition_or_trace() {
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        let before = motion.diagnostics()["open"].clone();
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        assert_eq!(motion.diagnostics()["open"], before);
+        motion.step_progress(10_000.0, false, FULL);
+        motion.step_progress(250.0, false, FULL);
+        let before = motion.diagnostics()["close"].clone();
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(motion.diagnostics()["close"], before);
+    }
+
+    #[test]
+    fn idle_elapsed_before_midflight_reversal_does_not_consume_replacement() {
+        let mut motion = OverviewMotion::default();
+        motion.step_progress(0.0, true, FULL);
+        motion.step_progress(100.0, true, FULL);
+        let drawn = motion.progress();
+        motion.step_progress(10_000.0, false, FULL);
+        assert_eq!(motion.progress(), drawn);
+        motion.step_progress(125.0, false, FULL);
+        assert!((motion.progress() - drawn * 0.25).abs() < 1e-9);
+        let drawn = motion.progress();
+        motion.step_progress(10_000.0, true, FULL);
+        assert_eq!(motion.progress(), drawn);
+        motion.step_progress(125.0, true, FULL);
+        assert!((motion.progress() - (drawn + (1.0 - drawn) * ease_out_sine(0.5))).abs() < 1e-9);
+    }
+
+    #[test]
+    fn idle_boundary_preserves_reduced_off_and_slowdown_policy() {
+        let reduced = MotionPolicy::new(tuna_shell_control::motion::MotionLevel::FadeOnly, 1.0);
+        for policy in [OFF, reduced] {
+            let mut motion = OverviewMotion::default();
+            motion.step_progress(10_000.0, true, policy);
+            assert_eq!(motion.progress(), 1.0);
+            motion.step_progress(10_000.0, false, policy);
+            assert_eq!(motion.progress(), 0.0);
+            assert!(motion.diagnostics()["open"].is_null());
+            assert!(motion.diagnostics()["close"].is_null());
+        }
+        let mut motion = OverviewMotion::default();
+        let slow = MotionPolicy::new(tuna_shell_control::motion::MotionLevel::Full, 2.0);
+        motion.step_progress(10_000.0, true, slow);
+        assert_eq!(motion.progress(), 0.0);
+        assert_eq!(motion.diagnostics()["open"]["duration_ms"], 500.0);
+        motion.step_progress(250.0, true, slow);
+        assert!((motion.progress() - ease_out_sine(0.5)).abs() < 1e-9);
+        motion.step_progress(10_000.0, false, OFF);
+        assert_eq!(motion.progress(), 0.0);
+    }
+
+    #[test]
+    fn reversing_mid_transition_continues_from_the_drawn_value() {
+        let mut motion = OverviewMotion::default();
+        motion.step_progress(0.0, true, FULL);
+        motion.step_progress(100.0, true, FULL);
+        let at = motion.progress();
+        motion.step_progress(0.0, false, FULL);
+        assert!(
+            (motion.progress() - at).abs() < 1e-12,
+            "no jump on reversal"
+        );
+        motion.step_progress(TRANSITION_MS, false, FULL);
+        assert_eq!(motion.progress(), 0.0);
+    }
+
+    #[test]
+    fn disabled_motion_jumps_to_the_end_state() {
+        let mut motion = OverviewMotion::default();
+        motion.step_progress(1.0, true, OFF);
+        assert_eq!(motion.progress(), 1.0);
+        motion.step_progress(1.0, false, OFF);
+        assert_eq!(motion.progress(), 0.0);
+        motion.step_progress(0.0, true, FULL);
+        motion.step_progress(50.0, true, FULL);
+        motion.snap(true);
+        assert_eq!(motion.progress(), 1.0);
+    }
+
+    #[test]
+    fn swipe_release_projects_velocity_like_gnome() {
+        // Slow release just past half: nearest end, at GNOME's base
+        // velocity, capped at 400 ms.
+        assert_eq!(swipe_release(0.5, 0.0, 0.0, 300.0), (1.0, 400.0));
+        assert_eq!(swipe_release(0.3, 0.0, 0.2, 300.0).0, 0.0);
+        // A flick upward from closed opens even from a fifth of the way,
+        // and the fingers' speed sets the duration: 0.8 / (3 / 300) * 3.
+        let (target, duration) = swipe_release(0.2, 0.0, 3.0, 300.0);
+        assert_eq!(target, 1.0);
+        assert!((duration - 240.0).abs() < 1e-9, "{duration}");
+        // Faster is shorter, never under 100 ms.
+        assert!(swipe_release(0.2, 0.0, 6.0, 300.0).1 < duration);
+        assert_eq!(swipe_release(0.9, 0.0, 30.0, 300.0).1, 100.0);
+        // A downward flick from open closes from most of the way open.
+        assert_eq!(swipe_release(0.8, 1.0, -3.0, 300.0).0, 0.0);
+        // Cancelled: back to the start, whatever the fingers did.
+        assert_eq!(
+            crate::workspace_slide::swipe_release_over(0.8, 0.0, 2, 3.0, true, 300.0).0,
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_released_swipe_keeps_its_momentum() {
+        let mut motion = OverviewMotion::default();
+        for (i, travel) in [15.0, 45.0, 75.0].into_iter().enumerate() {
+            motion.swipe_update(1000 + 10 * i as u32, travel, 300.0, FULL);
+        }
+        assert!((motion.progress() - 0.25).abs() < 1e-9);
+        assert_eq!(motion.swipe_end(1030, false, 300.0, FULL), Some(true));
+        let d = motion.diagnostics();
+        assert_eq!(d["release"]["curve"], "ease-out-cubic");
+        assert!((d["release"]["velocity"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+        // 0.75 left at 3 px/ms over 300: 225 ms, eased out-cubic.
+        let duration = d["release"]["duration_ms"].as_f64().unwrap();
+        assert!((duration - 225.0).abs() < 1e-6, "{duration}");
+        motion.step_progress(duration / 2.0, true, FULL);
+        assert!((motion.progress() - (0.25 + 0.75 * ease_out_cubic(0.5))).abs() < 1e-9);
+        motion.step_progress(duration, true, FULL);
+        assert_eq!(motion.progress(), 1.0);
+        // Cancelled: back where it began.
+        motion.swipe_update(2000, -100.0, 300.0, FULL);
+        assert_eq!(motion.swipe_end(2010, true, 300.0, FULL), Some(true));
+        // Motion off: the held swipe sits at an end and releases there.
+        let mut motion = OverviewMotion::default();
+        motion.swipe_update(0, 180.0, 300.0, OFF);
+        assert_eq!(motion.progress(), 1.0);
+        assert_eq!(motion.swipe_end(10, false, 300.0, OFF), Some(true));
+        assert_eq!(motion.progress(), 1.0);
+        assert_eq!(motion.swipe_end(20, false, 300.0, OFF), None);
+    }
+
+    fn cues(app_grid: bool, search: bool) -> OverviewCues {
+        OverviewCues {
+            open: true,
+            app_grid,
+            search,
+            motion: FULL,
+        }
+    }
+
+    const AWAY: Point<f64, Logical> = Point::new(-10.0, -10.0);
+
+    #[test]
+    fn the_app_grid_swap_morphs_out_sine_over_250_ms() {
+        let windows = [win(1, 0, 320, 182, 640, 420)];
+        let picker = layout(output(), 32, &[0], 0, &windows);
+        let grid = app_grid_layout(output(), 32, &[0], 0, &windows);
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &picker, cues(false, false), None, AWAY);
+        motion.step_scene(0.0, &grid, cues(true, false), None, AWAY);
+        assert_eq!(motion.diagnostics()["morph"]["cause"], "app-grid");
+        assert_eq!(motion.diagnostics()["morph"]["curve"], "ease-out-sine");
+        motion.step_scene(125.0, &grid, cues(true, false), None, AWAY);
+        let mid = motion.scene(&grid, None, AWAY, output(), &windows);
+        let p = ease_out_sine(0.5);
+        let expect = lerp_rect(picker.cards[0].rect, grid.cards[0].rect, p);
+        assert_eq!(mid.cards[0].rect, expect);
+        let from = picker.previews.iter().find(|p| p.active).unwrap();
+        let to = grid.previews.iter().find(|p| p.id == 1).unwrap();
+        let shown = mid.previews.iter().find(|p| p.id == 1).unwrap();
+        assert_eq!(shown.rect, lerp_rect(from.rect, to.rect, p));
+        motion.step_scene(125.0, &grid, cues(true, false), None, AWAY);
+        assert_eq!(motion.scene(&grid, None, AWAY, output(), &windows), grid);
+    }
+
+    #[test]
+    fn a_workspace_switch_scrolls_out_cubic_and_new_windows_scale_in() {
+        let windows = [win(1, 0, 320, 182, 640, 420), win(2, 1, 320, 182, 640, 420)];
+        let first = layout(output(), 32, &[0, 1], 0, &windows);
+        let second = layout(output(), 32, &[0, 1], 1, &windows);
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &first, cues(false, false), None, AWAY);
+        motion.step_scene(0.0, &second, cues(false, false), None, AWAY);
+        let d = motion.diagnostics();
+        assert_eq!(d["morph"]["cause"], "workspace");
+        assert_eq!(d["morph"]["curve"], "ease-out-cubic");
+        motion.step_scene(125.0, &second, cues(false, false), None, AWAY);
+        let mid = motion.scene(&second, None, AWAY, output(), &windows);
+        let active = mid.cards.iter().find(|c| c.workspace == 1).unwrap().rect;
+        let was = first.cards.iter().find(|c| c.workspace == 1).unwrap().rect;
+        assert_eq!(
+            active,
+            lerp_rect(was, second.cards[0].rect, ease_out_cubic(0.5))
+        );
+
+        // A window mapped while the overview is open scales in about
+        // its slot's center over 250 ms.
+        let more = [windows[0], windows[1], win(3, 1, 0, 32, 640, 420)];
+        let grown = layout(output(), 32, &[0, 1], 1, &more);
+        motion.step_scene(250.0, &second, cues(false, false), None, AWAY);
+        motion.step_scene(0.0, &grown, cues(false, false), None, AWAY);
+        assert_eq!(motion.diagnostics()["morph"]["cause"], "windows");
+        motion.step_scene(NEW_PREVIEW_MS / 2.0, &grown, cues(false, false), None, AWAY);
+        let mid = motion.scene(&grown, None, AWAY, output(), &more);
+        let target = grown
+            .previews
+            .iter()
+            .find(|p| p.id == 3 && p.active)
+            .unwrap();
+        let shown = mid.previews.iter().find(|p| p.id == 3 && p.active).unwrap();
+        let k = ease_out_quad(0.5);
+        assert!((shown.scale - target.scale * k).abs() < 1e-9);
+        let center = |r: Rectangle<i32, Logical>| (r.loc.x + r.size.w / 2, r.loc.y + r.size.h / 2);
+        let (a, b) = (center(shown.rect), center(target.rect));
+        assert!((a.0 - b.0).abs() <= 1 && (a.1 - b.1).abs() <= 1);
+    }
+
+    #[test]
+    fn thumbnails_widen_in_over_200_ms() {
+        let one = [win(1, 0, 320, 182, 640, 420)];
+        let two = [one[0], win(2, 1, 320, 182, 640, 420)];
+        let before = layout(output(), 32, &[0, 1], 0, &one);
+        let after = layout(output(), 32, &[0, 1], 0, &two);
+        assert!(before.thumbnails.is_empty() && after.thumbnails.len() == 3);
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &before, cues(false, false), None, AWAY);
+        motion.step_scene(0.0, &after, cues(false, false), None, AWAY);
+        assert_eq!(motion.diagnostics()["morph"]["cause"], "thumbnails");
+        assert_eq!(motion.diagnostics()["morph"]["duration_ms"], 200.0);
+        motion.step_scene(100.0, &after, cues(false, false), None, AWAY);
+        let mid = motion.scene(&after, None, AWAY, output(), &two);
+        let full = after.thumbnails[0].rect;
+        let shown = mid.thumbnails[0];
+        assert!(shown.rect.size.w > 0 && shown.rect.size.w < full.size.w);
+        assert!((shown.alpha - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hover_grows_over_200_ms_out_quad() {
+        let windows = [win(1, 0, 320, 182, 640, 420)];
+        let base = layout(output(), 32, &[0], 0, &windows);
+        let rest = base.previews[0];
+        let center = Point::from((
+            f64::from(rest.rect.loc.x + rest.rect.size.w / 2),
+            f64::from(rest.rect.loc.y + rest.rect.size.h / 2),
+        ));
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &base, cues(false, false), None, center);
+        motion.step_scene(100.0, &base, cues(false, false), None, center);
+        let mid = motion.scene(&base, None, center, output(), &windows);
+        assert_eq!(mid.hovered, Some(1));
+        let g = (f64::from(HOVER_GROWTH) * ease_out_quad(0.5)).round() as i32;
+        assert_eq!(mid.previews[0].rect.loc.x, rest.rect.loc.x - g);
+        motion.step_scene(100.0, &base, cues(false, false), None, center);
+        let mut full = base.clone();
+        grow_hovered(&mut full, center);
+        assert_eq!(motion.scene(&base, None, center, output(), &windows), full);
+        // Leaving shrinks it back over the same time.
+        motion.step_scene(100.0, &base, cues(false, false), None, AWAY);
+        let leaving = motion.scene(&base, None, AWAY, output(), &windows);
+        assert_eq!(leaving.hovered, None);
+        assert!(leaving.previews[0].rect.size.w > rest.rect.size.w);
+        motion.step_scene(100.0, &base, cues(false, false), None, AWAY);
+        assert_eq!(motion.scene(&base, None, AWAY, output(), &windows), base);
+    }
+
+    #[test]
+    fn drags_shrink_then_snap_back_or_revert_like_gnome() {
+        let windows = [win(1, 0, 320, 182, 640, 420)];
+        let base = layout(output(), 32, &[0], 0, &windows);
+        let rest = base.previews[0];
+        let start = Point::from((
+            f64::from(rest.rect.loc.x + 10),
+            f64::from(rest.rect.loc.y + 10),
+        ));
+        let pointer = Point::from((100.0, 740.0));
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &base, cues(false, false), None, start);
+        motion.drag_begin(FULL);
+        motion.step_scene(
+            DRAG_SCALE_MS / 2.0,
+            &base,
+            cues(false, false),
+            Some((1, start)),
+            pointer,
+        );
+        let mid = motion.scene(&base, Some((1, start)), pointer, output(), &windows);
+        let dragged = *mid.previews.last().unwrap();
+        let mut full = base.clone();
+        drag_preview(&mut full, 1, start, pointer);
+        let shrunk = *full.previews.last().unwrap();
+        assert!(dragged.rect.size.w < rest.rect.size.w);
+        assert!(dragged.rect.size.w > shrunk.rect.size.w);
+        assert_eq!(dragged.alpha, DRAGGING_WINDOW_OPACITY);
+        // Dropped on nothing: glide home over 250 ms.
+        motion.drag_snap_back(FULL);
+        motion.step_scene(0.0, &base, cues(false, false), None, pointer);
+        assert_eq!(motion.diagnostics()["morph"]["cause"], "snap-back");
+        motion.step_scene(SNAP_BACK_MS / 2.0, &base, cues(false, false), None, pointer);
+        let home = motion.scene(&base, None, pointer, output(), &windows);
+        let gliding = home.previews.iter().find(|p| p.id == 1).unwrap();
+        assert!(gliding.rect.loc.x > dragged.rect.loc.x && gliding.rect.loc.x < rest.rect.loc.x);
+        motion.step_scene(SNAP_BACK_MS / 2.0, &base, cues(false, false), None, pointer);
+        assert_eq!(motion.scene(&base, None, pointer, output(), &windows), base);
+        // Accepted without a change: back in place, fading in for 750 ms.
+        motion.drag_revert(1, FULL);
+        motion.step_scene(REVERT_MS / 2.0, &base, cues(false, false), None, pointer);
+        let fading = motion.scene(&base, None, pointer, output(), &windows);
+        assert_eq!(fading.previews[0].rect, rest.rect);
+        assert!((fading.previews[0].alpha - 0.75).abs() < 1e-6);
+        motion.step_scene(REVERT_MS / 2.0, &base, cues(false, false), None, pointer);
+        assert_eq!(motion.scene(&base, None, pointer, output(), &windows), base);
+    }
+
+    #[test]
+    fn search_fades_the_workspaces_over_250_ms() {
+        let windows = [win(1, 0, 320, 182, 640, 420)];
+        let base = layout(output(), 32, &[0], 0, &windows);
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &base, cues(false, false), None, AWAY);
+        motion.step_scene(125.0, &base, cues(false, true), None, AWAY);
+        let mid = motion.scene(&base, None, AWAY, output(), &windows);
+        assert!((mid.cards[0].alpha - 0.25).abs() < 1e-6);
+        assert!((mid.previews[0].alpha - 0.25).abs() < 1e-6);
+        assert!(!motion.search_covers());
+        motion.step_scene(125.0, &base, cues(false, true), None, AWAY);
+        assert!(motion.search_covers());
+        // Motion off: no tween anywhere.
+        let mut off = OverviewMotion::default();
+        off.step_progress(0.0, true, OFF);
+        let still = OverviewCues {
+            motion: OFF,
+            ..cues(false, true)
+        };
+        off.step_scene(0.0, &base, still, None, AWAY);
+        assert!(off.search_covers());
+    }
+
+    #[test]
+    fn fade_only_keeps_fades_and_slow_down_stretches_every_tween() {
+        let windows = [win(1, 0, 320, 182, 640, 420)];
+        let base = layout(output(), 32, &[0], 0, &windows);
+        let fade_only = MotionPolicy::new(tuna_shell_control::motion::MotionLevel::FadeOnly, 1.0);
+        let mut motion = OverviewMotion::default();
+        // The transition moves and scales: fade-only snaps it.
+        motion.step_progress(0.0, true, fade_only);
+        assert_eq!(motion.progress(), 1.0);
+        let only_fades = OverviewCues {
+            motion: fade_only,
+            ..cues(false, false)
+        };
+        motion.step_scene(0.0, &base, only_fades, None, AWAY);
+        // Search is a fade: it still takes its 250 ms.
+        let searching = OverviewCues {
+            search: true,
+            ..only_fades
+        };
+        motion.step_scene(125.0, &base, searching, None, AWAY);
+        assert!((motion.diagnostics()["search"].as_f64().unwrap() - 0.75).abs() < 1e-9);
+        // GNOME's slow-down factor scales durations (`adjustAnimationTime`).
+        let slow = MotionPolicy::new(tuna_shell_control::motion::MotionLevel::Full, 2.0);
+        let mut motion = OverviewMotion::default();
+        motion.step_progress(0.0, true, slow);
+        motion.step_progress(250.0, true, slow);
+        assert!((motion.progress() - ease_out_sine(0.5)).abs() < 1e-9);
+        assert_eq!(motion.diagnostics()["open"]["duration_ms"], 500.0);
+    }
+
+    #[test]
+    fn fading_overview_elements_are_never_drawn_opaque() {
+        // Occlusion culling (#503) trusts `opaque_regions`, which smithay
+        // empties below alpha 1: every element part-way through a fade
+        // must carry that alpha so nothing beneath it is culled.
+        let windows = [win(1, 0, 320, 182, 640, 420), win(2, 1, 320, 182, 640, 420)];
+        let open = layout(output(), 32, &[0, 1], 0, &windows);
+        let mid = transition(&open, 0.4, output(), &windows);
+        for card in mid
+            .cards
+            .iter()
+            .filter(|c| !c.active)
+            .chain(&mid.thumbnails)
+        {
+            assert!(card.alpha < 1.0, "{card:?}");
+        }
+        assert!(mid
+            .previews
+            .iter()
+            .filter(|p| !p.active)
+            .all(|p| p.alpha < 1.0));
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &open, cues(false, false), None, AWAY);
+        motion.step_scene(60.0, &open, cues(false, true), None, AWAY);
+        let searching = motion.scene(&open, None, AWAY, output(), &windows);
+        assert!(searching.cards.iter().all(|c| c.alpha < 1.0));
+        assert!(searching.thumbnails.iter().all(|c| c.alpha < 1.0));
+        assert!(searching.previews.iter().all(|p| p.alpha < 1.0));
+        // Leaving a morph: what goes fades, never opaque on its way out.
+        let fewer = layout(output(), 32, &[0], 0, &windows[..1]);
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &open, cues(false, false), None, AWAY);
+        motion.step_scene(0.0, &fewer, cues(false, false), None, AWAY);
+        motion.step_scene(50.0, &fewer, cues(false, false), None, AWAY);
+        let leaving = motion.scene(&fewer, None, AWAY, output(), &windows);
+        assert!(leaving.thumbnails.iter().all(|t| t.alpha < 1.0));
+        assert!(leaving
+            .previews
+            .iter()
+            .filter(|p| !fewer
+                .previews
+                .iter()
+                .any(|f| f.id == p.id && f.active == p.active))
+            .all(|p| p.alpha < 1.0));
     }
 }

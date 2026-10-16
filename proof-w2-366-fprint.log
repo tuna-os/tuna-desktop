@@ -1,0 +1,74 @@
+=== tuna-greeter lib tests ===
+failures:
+
+---- model::tests::fingerprint_prompts_are_flagged_not_answered_with_password stdout ----
+
+thread 'model::tests::fingerprint_prompts_are_flagged_not_answered_with_password' (2670261) panicked at crates/greeter/src/model.rs:282:13:
+missed: Swipe was too short, try again
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    model::tests::fingerprint_prompts_are_flagged_not_answered_with_password
+
+test result: FAILED. 20 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p tuna-greeter --lib`
+=== compositor fprintd+pam+unlock tests ===
+test fprintd::tests::own_user_claims_anonymously_other_users_explicitly ... ok
+test fprintd::tests::retry_reasons_continue_bounded ... ok
+test fprintd::tests::terminal_signals_end_the_attempt ... ok
+test fprintd::tests::unknown_results_fail_closed_when_terminal ... ok
+test fprintd::tests::no_daemon_fails_closed_without_panic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 404 filtered out; finished in 0.02s
+
+test pam::tests::fingerprint_prompt_fails_instead_of_consuming_the_password ... ok
+test pam::tests::null_message_text_keeps_historical_behavior ... ok
+test pam::tests::info_and_error_messages_stay_unanswered ... ok
+test pam::tests::password_prompt_still_gets_the_password ... ok
+test pam::tests::username_prompt_still_gets_the_user ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 406 filtered out; finished in 0.00s
+
+test unlock::tests::info_notice_auto_acknowledges_like_login ... ok
+test unlock::tests::mid_conversation_drop_denies ... ok
+test unlock::tests::unlock_user_reads_session_owner ... ok
+test unlock::tests::wrong_password_denies_without_release ... ok
+test unlock::tests::every_fingerprint_non_match_denies_silently ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 401 filtered out; finished in 0.00s
+
+=== RERUN after swipe fix: greeter ===
+test session::tests::non_desktop_files_and_missing_dirs_ignored ... ok
+test ui::tests::password_prompt_has_no_touch_hint ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+=== FULL compositor lib ===
+test xwayland::tests::untitled_fallback_const_is_stable_and_nonblank ... ok
+test wallpaper::tests::static_metadata_and_file_replacement_change_all_render_keys ... ok
+
+test result: ok. 410 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.85s
+
+=== clippy touched crates ===
+      1 error: could not compile `tuna-compositor` (example "tuna-bell-audio-client") due to 1 previous error
+      1 error[E0433]: cannot find `idle_schedule` in the crate root
+      1 warning: `smithay` (lib) generated 8 warnings (run `cargo clippy --fix --lib -p smithay -- ` to apply 8 suggestions)
+      1 warning: build failed, waiting for other jobs to finish...
+      1 warning: direct cast of function item into an integer
+      6 warning: unused import: `error`
+      1 warning: use of deprecated method `std::sync::atomic::Atomic::<u8>::fetch_update`: renamed to `try_update` for consistency
+clippy-exit:0
+=== POST-FMT greeter ===
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== POST-FMT compositor lib ===
+test result: ok. 410 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.63s
+
+=== POST-BASEFMT greeter ===
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== POST-BASEFMT compositor lib ===
+test result: ok. 410 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.62s
+

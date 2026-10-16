@@ -1,13 +1,13 @@
 //! DRM/KMS hardware session backend (#52).
 //!
 //! The nested winit backend draws into a window of a host session; this
-//! backend owns the display hardware itself, so Roost can start from a
+//! backend owns the display hardware itself, so Tuna Desktop can start from a
 //! TTY through greetd:
 //!
 //! - **Session**: libseat (logind or seatd) grants device access and
 //!   reports VT pause/activate. Ctrl+Alt+F1..F12 switches VTs.
 //! - **Device**: udev's primary GPU for the seat (or
-//!   `ROOST_DRM_DEVICE`), opened through the session; GBM allocates
+//!   `TUNA_DRM_DEVICE`), opened through the session; GBM allocates
 //!   scanout buffers and EGL/GLES renders into them.
 //! - **Outputs**: every connected connector with its preferred mode and
 //!   a free CRTC, tiled left to right in the same order the output
@@ -76,8 +76,10 @@ pub struct DrmOutput {
     /// Top-left in the global logical space: GNOME's arrangement from
     /// monitors.xml, else left-to-right.
     pub loc: (i32, i32),
-    /// Output scale from monitors.xml (`ROOST_SCALE` without one), #59.
+    /// Output scale from monitors.xml (`TUNA_SCALE` without one), #59.
     pub scale: f64,
+    /// DisplayConfig transform (0-7) from monitors.xml or Settings, #345.
+    pub transform: u32,
     /// A frame is queued and its page flip has not completed yet.
     pub pending: bool,
     pub(crate) last_frame: Option<crate::native_repaint::FrameSignature>,
@@ -92,15 +94,16 @@ impl DrmOutput {
         }
         let state = self.surface.surface().get_crtc(self.crtc);
         eprintln!(
-            "roost-compositor: drm: wake frame queued {} commit_pending={} crtc={state:?}",
+            "tuna-compositor: drm: wake frame queued {} commit_pending={} crtc={state:?}",
             self.name,
             self.surface.surface().commit_pending(),
         );
     }
 
-    /// Size in logical pixels (mode size over scale).
+    /// Size in logical pixels (mode size over scale, swapped under
+    /// 90°/270° rotation).
     pub fn logical_size(&self) -> (i32, i32) {
-        crate::runtime::logical_size(self.size.w, self.size.h, self.scale)
+        crate::orientation::logical_extent(self.size.w, self.size.h, self.scale, self.transform)
     }
 }
 
@@ -129,7 +132,7 @@ pub struct DrmBackend {
     alt: bool,
     /// libinput devices, for GNOME's touchpad and mouse settings (#60).
     devices: Vec<smithay::reexports::input::Device>,
-    input_settings: roost_shell_control::InputSettings,
+    input_settings: tuna_shell_control::InputSettings,
 }
 
 /// Event sources the runtime installs on its loop.
@@ -209,7 +212,7 @@ impl DrmBackend {
         let (mut session, session_notifier) =
             LibSeatSession::new().map_err(|e| err("libseat session")(e.to_string()))?;
         let seat = session.seat();
-        let path = match std::env::var_os("ROOST_DRM_DEVICE") {
+        let path = match std::env::var_os("TUNA_DRM_DEVICE") {
             Some(path) => std::path::PathBuf::from(path),
             None => smithay::backend::udev::primary_gpu(&seat)
                 .ok()
@@ -275,7 +278,7 @@ impl DrmBackend {
             let surface = match drm.create_surface(crtc, mode, &[*handle]) {
                 Ok(surface) => surface,
                 Err(e) => {
-                    eprintln!("roost-compositor: drm: skip connector: {e}");
+                    eprintln!("tuna-compositor: drm: skip connector: {e}");
                     continue;
                 }
             };
@@ -291,7 +294,7 @@ impl DrmBackend {
             ) {
                 Ok(surface) => surface,
                 Err(e) => {
-                    eprintln!("roost-compositor: drm: skip connector: {e}");
+                    eprintln!("tuna-compositor: drm: skip connector: {e}");
                     continue;
                 }
             };
@@ -305,7 +308,7 @@ impl DrmBackend {
                 PhysicalProperties {
                     size: (mm_w as i32, mm_h as i32).into(),
                     subpixel: Subpixel::Unknown,
-                    make: "Roost".to_owned(),
+                    make: "Tuna Desktop".to_owned(),
                     model: name.clone(),
                 },
             );
@@ -320,6 +323,7 @@ impl DrmBackend {
                 size,
                 loc: (0, 0),
                 scale: 1.0,
+                transform: 0,
                 pending: false,
                 last_frame: None,
                 damage_tracker: None,
@@ -327,11 +331,11 @@ impl DrmBackend {
             });
         }
         // GNOME's arrangement for exactly these connectors (#59): scale
-        // and logical position per output; without one, ROOST_SCALE (or
+        // and logical position per output; without one, TUNA_SCALE (or
         // 1) and left-to-right logical placement.
         let names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
         let arrangement = crate::monitors::load(&names);
-        let fallback_scale = std::env::var("ROOST_SCALE")
+        let fallback_scale = std::env::var("TUNA_SCALE")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .map(crate::runtime::clamp_scale)
@@ -341,16 +345,24 @@ impl DrmBackend {
                 Some(config) => {
                     out.scale = crate::runtime::clamp_scale(config.scale);
                     out.loc = (config.x, config.y);
+                    out.transform = config.transform;
                 }
                 None => {
                     out.scale = fallback_scale;
                     out.loc = (next_x, 0);
                 }
             }
+            if !crate::orientation::transform_is_supported(out.transform) {
+                eprintln!(
+                    "tuna-compositor: drm: output {}: transform {} unsupported, staying normal",
+                    out.name, out.transform
+                );
+                out.transform = 0;
+            }
             next_x = next_x.max(out.loc.0 + out.logical_size().0);
             out.output.change_current_state(
                 None,
-                None,
+                Some(crate::orientation::smithay_transform(out.transform)),
                 Some(if out.scale == 1.0 {
                     smithay::output::Scale::Integer(1)
                 } else {
@@ -359,8 +371,8 @@ impl DrmBackend {
                 Some(out.loc.into()),
             );
             eprintln!(
-                "roost-compositor: drm: output {} {}x{} at {},{} scale {}",
-                out.name, out.size.w, out.size.h, out.loc.0, out.loc.1, out.scale
+                "tuna-compositor: drm: output {} {}x{} at {},{} scale {} transform {}",
+                out.name, out.size.w, out.size.h, out.loc.0, out.loc.1, out.scale, out.transform
             );
         }
         // GNOME's primary monitor first: it carries the top bar.
@@ -435,18 +447,18 @@ impl DrmBackend {
         self.corner_pressure.reset();
         match event {
             SessionEvent::PauseSession => {
-                eprintln!("roost-compositor: drm: session paused");
+                eprintln!("tuna-compositor: drm: session paused");
                 self.active = false;
                 self.libinput.suspend();
                 self.drm.pause();
             }
             SessionEvent::ActivateSession => {
-                eprintln!("roost-compositor: drm: session activated");
+                eprintln!("tuna-compositor: drm: session activated");
                 if self.libinput.resume().is_err() {
-                    eprintln!("roost-compositor: drm: libinput resume failed");
+                    eprintln!("tuna-compositor: drm: libinput resume failed");
                 }
                 if let Err(e) = self.drm.activate(false) {
-                    eprintln!("roost-compositor: drm: activate failed: {e}");
+                    eprintln!("tuna-compositor: drm: activate failed: {e}");
                 }
                 for out in &mut self.outputs {
                     out.surface.reset_buffers();
@@ -471,8 +483,8 @@ impl DrmBackend {
             return;
         }
         self.sleep_reset_pending = false;
-        eprintln!("roost-compositor: drm: system wake scanout reset");
-        let trace = std::env::var_os("ROOST_LOCK_TRACE").is_some();
+        eprintln!("tuna-compositor: drm: system wake scanout reset");
+        let trace = std::env::var_os("TUNA_LOCK_TRACE").is_some();
         self.wake_event_traces = if trace { 2 } else { 0 };
         // Pending and queued flips can be lost across S3. Drop both without
         // submitting an old queued scene or claiming presentation. Ordinary
@@ -491,7 +503,7 @@ impl DrmBackend {
         // that the kernel restored its framebuffer. The next locked frame
         // commits the retained modes and surfaces again.
         if let Err(error) = self.drm.reset_state() {
-            eprintln!("roost-compositor: drm: wake KMS reset failed: {error}");
+            eprintln!("tuna-compositor: drm: wake KMS reset failed: {error}");
             // An unsuccessful reset cannot retire old kernel completions.
             // Stay masked without submitting a frame whose feedback could
             // be attached to an abandoned flip. VT activation can recover.
@@ -504,11 +516,11 @@ impl DrmBackend {
         // so its timestamp cannot identify an abandoned pre-sleep frame.
         match drain_reset_events(|| self.drm.receive_events().map(|events| events.count())) {
             Ok(count) if trace => {
-                eprintln!("roost-compositor: drm: wake obsolete events drained={count}");
+                eprintln!("tuna-compositor: drm: wake obsolete events drained={count}");
             }
             Ok(_) => {}
             Err(error) => {
-                eprintln!("roost-compositor: drm: wake event drain failed: {error}");
+                eprintln!("tuna-compositor: drm: wake event drain failed: {error}");
                 self.sleep_reset_pending = true;
                 return;
             }
@@ -517,7 +529,7 @@ impl DrmBackend {
         if trace {
             for out in &self.outputs {
                 eprintln!(
-                    "roost-compositor: drm: wake reset {} atomic={} commit_pending={} crtc={:?}",
+                    "tuna-compositor: drm: wake reset {} atomic={} commit_pending={} crtc={:?}",
                     out.name,
                     self.drm.is_atomic(),
                     out.surface.surface().commit_pending(),
@@ -544,7 +556,7 @@ impl DrmBackend {
                 if self.wake_event_traces != 0 {
                     self.wake_event_traces -= 1;
                     eprintln!(
-                        "roost-compositor: drm: wake pageflip crtc={crtc:?} metadata={metadata:?}",
+                        "tuna-compositor: drm: wake pageflip crtc={crtc:?} metadata={metadata:?}",
                     );
                 }
                 let index = self.outputs.iter().position(|o| o.crtc == crtc)?;
@@ -552,7 +564,7 @@ impl DrmBackend {
                 let feedback = match out.surface.frame_submitted() {
                     Ok(feedback) => feedback,
                     Err(e) => {
-                        eprintln!("roost-compositor: drm: frame_submitted: {e}");
+                        eprintln!("tuna-compositor: drm: frame_submitted: {e}");
                         None
                     }
                 };
@@ -576,7 +588,7 @@ impl DrmBackend {
                 })
             }
             DrmEvent::Error(e) => {
-                eprintln!("roost-compositor: drm: device error: {e}");
+                eprintln!("tuna-compositor: drm: device error: {e}");
                 None
             }
         }
@@ -667,7 +679,7 @@ impl DrmBackend {
                 if pressed && self.ctrl && self.alt {
                     if let Some(vt) = vt_for_key(code) {
                         if let Err(e) = self.session.change_vt(vt) {
-                            eprintln!("roost-compositor: drm: change_vt({vt}): {e}");
+                            eprintln!("tuna-compositor: drm: change_vt({vt}): {e}");
                         }
                         return Vec::new();
                     }
@@ -678,7 +690,30 @@ impl DrmBackend {
                 )
             }
             other => {
-                let inputs = crate::windows::translate_input(other, self.primary_size());
+                let mut inputs = crate::windows::translate_input(other, self.primary_size());
+                // Rotation (#345): absolute devices report panel-native
+                // pixels; remap them into the rotated logical frame the
+                // manager works in. Touch and absolute pointers arrive
+                // as Motion here; relative motion has its own arm.
+                if let Some(primary) = self.outputs.first() {
+                    if primary.transform != 0 {
+                        let (w, h) = (primary.size.w, primary.size.h);
+                        let transform = primary.transform;
+                        for input in &mut inputs {
+                            if let ManagerInput::Motion { pos, .. } = input {
+                                let (x, y) = crate::orientation::touch_point(
+                                    w,
+                                    h,
+                                    transform,
+                                    pos.x.round() as i32,
+                                    pos.y.round() as i32,
+                                );
+                                pos.x = f64::from(x);
+                                pos.y = f64::from(y);
+                            }
+                        }
+                    }
+                }
                 for input in &inputs {
                     if let ManagerInput::Motion { pos, .. } = input {
                         self.corner_pressure.observe_position(*pos);
@@ -704,7 +739,7 @@ impl DrmBackend {
         }
     }
 
-    pub fn apply_input_settings(&mut self, settings: &roost_shell_control::InputSettings) {
+    pub fn apply_input_settings(&mut self, settings: &tuna_shell_control::InputSettings) {
         if self.input_settings.hot_corners != settings.hot_corners
             || self.input_settings.right_to_left != settings.right_to_left
         {
@@ -714,6 +749,39 @@ impl DrmBackend {
         for device in &mut self.devices {
             apply_libinput(settings, device);
         }
+    }
+
+    /// Live libinput state for every tracked device (#343): names and
+    /// capability kinds plus the configuration libinput itself reports
+    /// back, with per-option availability, so proofs assert applied
+    /// device state rather than the settings echo and unsupported
+    /// options are visible instead of silently ignored. No input
+    /// content, only configuration.
+    pub fn input_device_states(&self) -> Vec<serde_json::Value> {
+        self.devices
+            .iter()
+            .map(|device| {
+                let kind = match pointer_kind(device) {
+                    PointerKind::Touchpad => "touchpad",
+                    PointerKind::Pointer => "pointer",
+                    PointerKind::Other => "other",
+                };
+                serde_json::json!({
+                    "name": device.name(),
+                    "kind": kind,
+                    "tap_fingers": device.config_tap_finger_count(),
+                    "left_handed": device.config_left_handed(),
+                    "handed_available": device.config_left_handed_is_available(),
+                    "tap_enabled": device.config_tap_enabled(),
+                    "natural_scroll": device.config_scroll_natural_scroll_enabled(),
+                    "natural_available": device.config_scroll_has_natural_scroll(),
+                    "accel_speed": device.config_accel_speed(),
+                    "accel_available": device.config_accel_is_available(),
+                    "dwt_enabled": device.config_dwt_enabled(),
+                    "dwt_available": device.config_dwt_is_available(),
+                })
+            })
+            .collect()
     }
 
     /// Move the drawn cursor to where the window manager put the pointer.
@@ -788,91 +856,109 @@ mod wake_event_tests {
     }
 }
 
+/// Which GNOME settings family a libinput device takes (#343): touchpads
+/// take the touchpad keys, every other pointer (mice, trackballs,
+/// pointing sticks) the mouse keys, as Mutter maps POINTER minus
+/// TOUCHPAD onto the mouse schema. Known gap: Mutter gives pointing
+/// sticks their own speed, which needs a wire field (#343 follow-up).
+/// Keyboards and tablets take none of these keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerKind {
+    Touchpad,
+    Pointer,
+    Other,
+}
+
+/// One device's libinput configuration, resolved from GNOME's settings
+/// for its [`PointerKind`]. `None` tap/disable-while-typing means the
+/// device family has no such key.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LibinputPolicy {
+    pub left_handed: bool,
+    pub tap_to_click: Option<bool>,
+    pub natural_scroll: bool,
+    pub speed: f64,
+    pub disable_while_typing: Option<bool>,
+}
+
+/// Classify a libinput device the way [`apply_libinput`] does.
+pub fn pointer_kind(device: &smithay::reexports::input::Device) -> PointerKind {
+    if device.config_tap_finger_count() > 0 {
+        PointerKind::Touchpad
+    } else if device.has_capability(smithay::reexports::input::DeviceCapability::Pointer) {
+        PointerKind::Pointer
+    } else {
+        PointerKind::Other
+    }
+}
+
+/// Resolve the libinput configuration for one device kind from GNOME's
+/// settings. `None` leaves the device alone. Speed is GNOME's -1..1.
+pub fn libinput_policy(
+    settings: &tuna_shell_control::InputSettings,
+    kind: PointerKind,
+) -> Option<LibinputPolicy> {
+    let speed = |milli: i32| f64::from(milli.clamp(-1000, 1000)) / 1000.0;
+    match kind {
+        PointerKind::Touchpad => Some(LibinputPolicy {
+            left_handed: settings.touchpad_left_handed,
+            tap_to_click: Some(settings.tap_to_click),
+            natural_scroll: settings.touchpad_natural_scroll,
+            speed: speed(settings.touchpad_speed_milli),
+            disable_while_typing: Some(settings.disable_while_typing),
+        }),
+        PointerKind::Pointer => Some(LibinputPolicy {
+            left_handed: settings.mouse_left_handed,
+            tap_to_click: None,
+            natural_scroll: settings.mouse_natural_scroll,
+            speed: speed(settings.mouse_speed_milli),
+            disable_while_typing: None,
+        }),
+        PointerKind::Other => None,
+    }
+}
+
 /// One device's libinput configuration from GNOME's settings, as Mutter
 /// applies them (niri's `apply_libinput_settings` shape): touchpads get
 /// tap-to-click, natural scroll, disable-while-typing and their speed;
 /// other pointers their natural scroll and speed.
 fn apply_libinput(
-    settings: &roost_shell_control::InputSettings,
+    settings: &tuna_shell_control::InputSettings,
     device: &mut smithay::reexports::input::Device,
 ) {
-    let speed = |milli: i32| f64::from(milli.clamp(-1000, 1000)) / 1000.0;
-    if device.config_tap_finger_count() > 0 {
-        apply_handedness(device, settings.touchpad_left_handed);
-        let _ = device.config_tap_set_enabled(settings.tap_to_click);
-        let _ = device.config_scroll_set_natural_scroll_enabled(settings.touchpad_natural_scroll);
-        let _ = device.config_dwt_set_enabled(settings.disable_while_typing);
-        let _ = device.config_accel_set_speed(speed(settings.touchpad_speed_milli));
-    } else if device.has_capability(smithay::reexports::input::DeviceCapability::Pointer) {
-        apply_handedness(device, settings.mouse_left_handed);
-        let _ = device.config_scroll_set_natural_scroll_enabled(settings.mouse_natural_scroll);
-        let _ = device.config_accel_set_speed(speed(settings.mouse_speed_milli));
+    let Some(policy) = libinput_policy(settings, pointer_kind(device)) else {
+        return;
+    };
+    apply_handedness(device, policy.left_handed);
+    if let Some(tap) = policy.tap_to_click {
+        let _ = device.config_tap_set_enabled(tap);
     }
+    let _ = device.config_scroll_set_natural_scroll_enabled(policy.natural_scroll);
+    if let Some(dwt) = policy.disable_while_typing {
+        let _ = device.config_dwt_set_enabled(dwt);
+    }
+    let _ = device.config_accel_set_speed(policy.speed);
 }
 
 fn apply_handedness(device: &smithay::reexports::input::Device, left_handed: bool) {
     if device.config_left_handed_is_available() {
         if let Err(error) = device.config_left_handed_set(left_handed) {
             eprintln!(
-                "roost-compositor: libinput: primary button setting rejected for {}: {error:?}",
+                "tuna-compositor: libinput: primary button setting rejected for {}: {error:?}",
                 device.name()
             );
         }
     } else if left_handed {
         eprintln!(
-            "roost-compositor: libinput: primary button swapping unsupported for {}",
+            "tuna-compositor: libinput: primary button swapping unsupported for {}",
             device.name()
         );
     }
 }
 
-/// Rectangles in an output's physical pixel space.
-pub type PixelRects = Vec<Rectangle<i32, Physical>>;
-
-/// Software pointer: an arrow drawn as stacked rectangles (outline
-/// first, fill second), relative to the hotspot at `pos` and offset by
-/// the output's location. Returns `(outline, fill)` damage-style rects.
-pub fn cursor_rects(
-    pos: Point<f64, Logical>,
-    output_loc: (i32, i32),
-    scale: f64,
-) -> (PixelRects, PixelRects) {
-    let x = ((pos.x - f64::from(output_loc.0)) * scale).round() as i32;
-    let y = ((pos.y - f64::from(output_loc.1)) * scale).round() as i32;
-    // The arrow grows by whole pixels with the scale, staying crisp.
-    let k = (scale.round() as i32).max(1);
-    let rect = |dx: i32, dy: i32, w: i32| -> Rectangle<i32, Physical> {
-        Rectangle::new((x + dx * k, y + dy * k).into(), (w * k, k).into())
-    };
-    let mut outline = Vec::new();
-    let mut fill = Vec::new();
-    // Left-aligned triangle, 12 rows tall, plus a short tail.
-    for row in 0..12 {
-        outline.push(rect(0, row, row + 2));
-        if row > 0 && row < 11 {
-            fill.push(rect(1, row, row));
-        }
-    }
-    for row in 12..17 {
-        outline.push(rect(4, row, 4));
-        fill.push(rect(5, row, 2));
-    }
-    (outline, fill)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cursor_scales_with_the_output() {
-        // At scale 2 the arrow sits at the scaled position, twice as big.
-        let (outline, _) = cursor_rects((110.0, 20.0).into(), (100, 0), 2.0);
-        assert_eq!(outline[0].loc, (20, 40).into());
-        assert_eq!(outline[0].size, (4, 2).into());
-        let (outline, _) = cursor_rects((110.0, 20.0).into(), (100, 0), 1.0);
-        assert_eq!(outline[0].size, (2, 1).into());
-    }
 
     #[test]
     fn function_keys_map_to_vts() {
@@ -899,10 +985,67 @@ mod tests {
         assert_eq!(left, (0.0, 10.0).into());
     }
 
+    /// Distinct touchpad and mouse settings, so a swapped family shows.
+    fn pointer_settings() -> tuna_shell_control::InputSettings {
+        tuna_shell_control::InputSettings {
+            tap_to_click: true,
+            touchpad_natural_scroll: true,
+            touchpad_speed_milli: -500,
+            disable_while_typing: false,
+            touchpad_left_handed: true,
+            mouse_natural_scroll: false,
+            mouse_speed_milli: 250,
+            mouse_left_handed: false,
+            ..tuna_shell_control::InputSettings::default()
+        }
+    }
+
     #[test]
-    fn cursor_is_offset_by_output_location() {
-        let (outline, fill) = cursor_rects((1930.0, 5.0).into(), (1920, 0), 1.0);
-        assert_eq!(outline[0].loc, (10, 5).into());
-        assert!(!fill.is_empty());
+    fn touchpad_policy_carries_the_touchpad_keys() {
+        let policy = libinput_policy(&pointer_settings(), PointerKind::Touchpad).unwrap();
+        assert!(policy.left_handed);
+        assert_eq!(policy.tap_to_click, Some(true));
+        assert!(policy.natural_scroll);
+        assert_eq!(policy.speed, -0.5);
+        assert_eq!(policy.disable_while_typing, Some(false));
+    }
+
+    #[test]
+    fn pointer_policy_carries_the_mouse_keys() {
+        // Mice, trackballs and pointing sticks all take the mouse
+        // keys, as Mutter maps POINTER minus TOUCHPAD (#343).
+        let policy = libinput_policy(&pointer_settings(), PointerKind::Pointer).unwrap();
+        assert!(!policy.left_handed);
+        assert_eq!(policy.tap_to_click, None);
+        assert!(!policy.natural_scroll);
+        assert_eq!(policy.speed, 0.25);
+        assert_eq!(policy.disable_while_typing, None);
+    }
+
+    #[test]
+    fn other_devices_are_left_alone() {
+        assert_eq!(
+            libinput_policy(&pointer_settings(), PointerKind::Other),
+            None
+        );
+    }
+
+    #[test]
+    fn pointer_speed_clamps_to_gnomes_range() {
+        let mut settings = pointer_settings();
+        settings.mouse_speed_milli = 5000;
+        settings.touchpad_speed_milli = -5000;
+        assert_eq!(
+            libinput_policy(&settings, PointerKind::Pointer)
+                .unwrap()
+                .speed,
+            1.0
+        );
+        assert_eq!(
+            libinput_policy(&settings, PointerKind::Touchpad)
+                .unwrap()
+                .speed,
+            -1.0
+        );
     }
 }

@@ -1,8 +1,8 @@
 //! Static release contract: the plan criteria that need no build and no
 //! package tooling.
 //!
-//! `scripts/roost-release` must stay an executable fail-fast script that
-//! stamps `ROOST_VERSION`, stages the four binaries plus the session entry,
+//! `scripts/tuna-release` must stay an executable fail-fast script that
+//! stamps `TUNA_VERSION`, stages the six binaries plus the session entry,
 //! generates the control metadata from the stamp, and builds via
 //! `dpkg-deb`. `docs/release.md` must keep the checklist and the
 //! notes-template sections; `docs/install.md` must keep the package-install
@@ -28,7 +28,7 @@ fn read_workspace(rel: &str) -> String {
 
 #[test]
 fn release_script_is_an_executable_fail_fast_script() {
-    let rel = "scripts/roost-release";
+    let rel = "scripts/tuna-release";
     let meta = std::fs::metadata(workspace_root().join(rel)).expect("release script exists");
     #[cfg(unix)]
     assert_ne!(
@@ -50,16 +50,17 @@ fn release_script_is_an_executable_fail_fast_script() {
 
 #[test]
 fn release_script_stages_layout_and_metadata_from_the_stamp() {
-    let body = read_workspace("scripts/roost-release");
+    let body = read_workspace("scripts/tuna-release");
     for token in [
-        "ROOST_VERSION",
-        "roost-compositor",
-        "roost-session",
-        "roost-shell-host",
-        "roost-ibus-bridge",
-        "roost-greeter",
-        "roost.desktop",
-        "pam.d/roost-lock",
+        "TUNA_VERSION",
+        "tuna-compositor",
+        "tuna-session",
+        "tuna-shell-gtk",
+        "tuna-shell-host",
+        "tuna-ibus-bridge",
+        "tuna-greeter",
+        "tuna.desktop",
+        "pam.d/tuna-lock",
         "DEBIAN/control",
         "Version:",
         "Depends:",
@@ -74,11 +75,36 @@ fn release_script_stages_layout_and_metadata_from_the_stamp() {
 }
 
 #[test]
+fn debian_archive_is_root_owned_and_ships_the_gtk_shell() {
+    // #476: system files must not keep the build user's uid/gid.
+    let release = read_workspace("scripts/tuna-release");
+    assert!(
+        release.contains("dpkg-deb --root-owner-group --build"),
+        "release script must normalize archive ownership to root"
+    );
+    // #468: the preferred GTK shell is listed, owned and installed cleanly.
+    let check = read_workspace("scripts/check-deb-clean-install");
+    for token in [
+        "dpkg-deb -c",
+        "root/root",
+        "./usr/bin/tuna-shell-gtk",
+        "apt-get install",
+    ] {
+        assert!(check.contains(token), "clean-install check keeps {token}");
+    }
+    let ci = read_workspace(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("scripts/check-deb-clean-install package-artifacts/*.deb"),
+        "CI must install the built .deb on a clean image"
+    );
+}
+
+#[test]
 fn release_notes_template_keeps_the_required_sections() {
     let doc = read_workspace("docs/release.md");
     for token in [
         "## Checklist",
-        "scripts/roost-release",
+        "scripts/tuna-release",
         "git tag vX.Y.Z",
         "## Release notes template",
         "## Changes",
@@ -113,7 +139,7 @@ fn install_doc_covers_package_install_and_data_preservation() {
 
 #[test]
 fn release_requires_a_filled_visual_review() {
-    let script = read_workspace("scripts/roost-release");
+    let script = read_workspace("scripts/tuna-release");
     for token in ["docs/reviews/$RELEASE_TAG.md", "TBD"] {
         assert!(
             script.contains(token),
@@ -143,16 +169,16 @@ fn release_requires_a_filled_visual_review() {
 fn arch_package_stamps_and_checks_the_version() {
     let pkgbuild = read_workspace("packaging/arch/PKGBUILD");
     for token in [
-        "ROOST_VERSION",
-        "roost-compositor",
-        "roost-session",
-        "roost-shell-host",
-        "roost-shell-gtk",
-        "roost-ibus-bridge",
+        "TUNA_VERSION",
+        "tuna-compositor",
+        "tuna-session",
+        "tuna-shell-host",
+        "tuna-shell-gtk",
+        "tuna-ibus-bridge",
         "gtk4-layer-shell",
-        "pam.d/roost-lock",
-        "roost-greeter",
-        "roost.desktop",
+        "pam.d/tuna-lock",
+        "tuna-greeter",
+        "tuna.desktop",
         "check()",
         "--locked",
     ] {
@@ -162,12 +188,12 @@ fn arch_package_stamps_and_checks_the_version() {
     assert!(containerfile.contains("ghcr.io/tuna-os/marlin:gnome"));
     // Selectable at login now that the lock screen unlocks through PAM
     // under GDM (#62): the session and its PAM service must both ship.
-    assert!(containerfile.contains("Name=Roost (preview)"));
-    assert!(containerfile.contains("test -f /etc/pam.d/roost-lock"));
-    assert!(!containerfile.contains("mv /usr/share/wayland-sessions/roost.desktop"));
+    assert!(containerfile.contains("Name=Tuna Desktop (preview)"));
+    assert!(containerfile.contains("test -f /etc/pam.d/tuna-lock"));
+    assert!(!containerfile.contains("mv /usr/share/wayland-sessions/tuna.desktop"));
     // Both installed executables are checked through the bounded diagnostic
     // loop; a missing executable or failed version command aborts the build.
-    assert!(containerfile.contains("for bin in roost-compositor roost-shell-gtk; do"));
+    assert!(containerfile.contains("for bin in tuna-compositor tuna-shell-gtk; do"));
     assert!(containerfile.contains("command -v \"$bin\" && test -f \"/usr/bin/$bin\""));
     assert!(containerfile.contains("test -x \"/usr/bin/$bin\""));
     assert!(containerfile.contains("\"$bin\" --version || exit 1;"));

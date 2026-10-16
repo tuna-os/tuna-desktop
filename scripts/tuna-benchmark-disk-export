@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""CI-only compact paired benchmark disk; no VM or cluster operation."""
+import argparse
+import json
+import os
+import re
+from pathlib import Path
+import shutil
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT/'scripts/lib'))
+from tuna_benchmark_disk import digest, provenance, require, storage_receipt, VIRTUAL_BYTES
+from tuna_benchmark_esp import repair as repair_esp, Commands, retire_backing
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--profile', choices=['stock', 'diagnostic'], required=True)
+    p.add_argument('--ssh-public-key-file', type=Path, required=True)
+    p.add_argument('--artifacts', type=Path, default=Path('benchmark-disk'))
+    p.add_argument('--scratch', type=Path, default=Path('/mnt/perf/benchmark-export'))
+    args = p.parse_args()
+    os.chdir(ROOT)
+    artifacts = args.artifacts.resolve()
+    require(not artifacts.exists(), 'use a new artifact directory')
+    artifacts.mkdir(parents=True)
+    args.scratch.mkdir(parents=True, exist_ok=False)
+    raw = args.scratch/'disk.raw'
+    disk = artifacts/'disk.qcow2'
+    receipt = {'schema': 1, 'export_succeeded': False, 'performance_qualified': False}
+    result_code = 1
+    profile_root = ROOT/'perf-artifacts'
+    if args.profile == 'stock':
+        profile_root /= 'stock'
+
+    commands = Commands(artifacts/'commands.log')
+    install_attempted = False
+    phase_deadlines = {'fixture-build': 1800, 'pinned-baseline': 180,
+                       'disk-install': 1800, 'disk-convert': 900, 'disk-check': 180}
+    receipt['phase_deadlines_seconds'] = phase_deadlines | {'query': 60, 'cleanup': 30}
+
+    def run(command, phase):
+        receipt['phase'] = phase
+        previous_log = commands.log
+        commands.log = artifacts/(phase+'.log')
+        try:
+            commands.call(command, timeout=phase_deadlines[phase], max_output=64*1024*1024)
+        finally:
+            commands.log = previous_log
+
+    def output(command):
+        return commands.call(command, timeout=60)[1]
+
+    try:
+        source = output(['git', 'rev-parse', 'HEAD']).strip()
+        commands.call(['git', 'diff', '--quiet', 'HEAD'])
+        if os.environ.get('GITHUB_SHA'):
+            require(source == os.environ['GITHUB_SHA'], 'checkout/CI source mismatch')
+        selection = json.loads((ROOT/'perf-artifacts/package-selection.json').read_text())
+        payload = json.loads((ROOT/'perf-artifacts/package-payload.json').read_text())
+        reference = json.loads((profile_root/'reference-image.json').read_text())
+        receipt.update(provenance(source, selection, payload, reference, args.profile))
+        public_key = args.ssh_public_key_file.resolve()
+        key_text = public_key.read_text().strip()
+        require(re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/]+={0,2}(?: [^\r\n]*)?', key_text) is not None,
+                'benchmark requires one plain Ed25519 public key')
+        fingerprint = output(['ssh-keygen', '-lf', str(public_key)]).split()[1]
+        require(fingerprint.startswith('SHA256:'), 'public key fingerprint missing')
+        receipt['ssh'] = {'user': 'root', 'public_key_sha256': digest(public_key),
+                          'public_key_fingerprint': fingerprint, 'password_authentication': False,
+                          'authorized_keys_path': '/etc/ssh/authorized_keys/root',
+                          'boot_access_qualified': False}
+        image = 'localhost/marlin-corral-benchmark:export'
+        shared = f'localhost/marlin-tuna-preview:{args.profile}'
+        run(['sudo', 'podman', 'build', '--force-rm', '-f', 'packaging/marlin/perf/Containerfile',
+             '--build-arg', f'BASE_IMAGE={shared}', '--build-arg', 'DESKTOP=gnome',
+             '--build-arg', 'PAIRED_SESSION=true', '--build-arg', 'CORRAL_SSH=true',
+             '--secret', f'id=benchmark-ssh-key,src={public_key}', '-t', image, '.'], 'fixture-build')
+        receipt['fixture_image_id'] = output(['sudo', 'podman', 'inspect', image, '--format', '{{.Id}}']).strip()
+        require(re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', receipt['fixture_image_id']),
+                'fixture inspection must return an immutable image ID')
+        # All remaining probes and installation use the exact inspected image.
+        image = receipt['fixture_image_id']
+        receipt['shared_image_id'] = (ROOT/f'shared-image-id-{args.profile}').read_text().strip()
+        receipt['coherent_image_id'] = (ROOT/'perf-artifacts/coherent-image-id').read_text().strip()
+        receipt['base_digest'] = (ROOT/'base-digest').read_text().strip()
+        require(json.loads(output(['sudo', 'podman', 'run', '--rm', image, 'cat',
+                                   '/usr/share/tuna-perf-reference.json'])) == reference,
+                'fixture changed protected GNOME reference')
+        run(['sudo', 'podman', 'run', '--rm', image, '/usr/libexec/tuna-pinned-baseline'], 'pinned-baseline')
+        receipt['fixture_member_sha256'] = {}
+        for member, expected in payload['required_members'].items():
+            actual = output(['sudo', 'podman', 'run', '--rm', image, 'sha256sum', '/'+member]).split()[0]
+            if member != 'usr/share/wayland-sessions/tuna.desktop':
+                require(actual == expected.get('preview_install', expected)['sha256'],
+                        'fixture native/package bytes changed: '+member)
+            else:
+                session = output(['sudo', 'podman', 'run', '--rm', image, 'cat', '/'+member])
+                require('Exec=/usr/libexec/tuna-perf-session\n' in session,
+                        'paired Tuna trace session entry missing')
+                (artifacts/'tuna.desktop').write_text(session)
+            receipt['fixture_member_sha256'][member] = actual
+        receipt['kernel_package'] = output(['sudo', 'podman', 'run', '--rm', image, 'pacman', '-Q', 'linux']).strip()
+        receipt['qemu_version'] = output(['qemu-img', '--version']).splitlines()[0]
+        receipt['exporter_source_sha256'] = {name: digest(ROOT/name) for name in [
+            'scripts/tuna-benchmark-disk-export', 'scripts/lib/tuna_benchmark_disk.py',
+            'scripts/lib/tuna_benchmark_esp.py',
+            'packaging/marlin/perf/Containerfile.baseline', 'packaging/marlin/perf/Containerfile',
+            'packaging/marlin/Containerfile']}
+        receipt['gnome_version'] = output(['sudo', 'podman', 'run', '--rm', image, 'gnome-shell', '--version']).strip()
+        probe = 'if grep -A8 "^\\[composefs\\]" /usr/lib/ostree/prepare-root.conf 2>/dev/null | grep -qiE "enabled[[:space:]]*=[[:space:]]*(yes|true|1|signed)" || ls /usr/lib/systemd/boot/efi/systemd-boot*.efi >/dev/null 2>&1; then echo --composefs-backend; fi; grep -A8 "^\\[composefs\\]" /usr/lib/ostree/prepare-root.conf 2>/dev/null | grep -qiE "enabled[[:space:]]*=[[:space:]]*(yes|true|1|signed)" && echo "--filesystem ext4" || true'
+        flags = output(['sudo', 'podman', 'run', '--rm', '--entrypoint', '', image, 'sh', '-c', probe]).split()
+        require(flags in [[], ['--composefs-backend'], ['--filesystem', 'ext4'],
+                          ['--composefs-backend', '--filesystem', 'ext4']], 'bootc probe flags')
+        with raw.open('xb') as stream:
+            stream.truncate(VIRTUAL_BYTES)
+        install_attempted = True
+        run(['sudo', 'podman', 'run', '--rm', '--privileged', '--pid=host', '--security-opt',
+             'label=type:unconfined_t', '-v', '/dev:/dev', '-v', '/var/lib/containers:/var/lib/containers',
+             '-v', f'{args.scratch.resolve()}:/output', receipt['fixture_image_id'], 'bootc', 'install', 'to-disk',
+             '--via-loopback', '--generic-image', '--wipe', *flags, '/output/disk.raw'], 'disk-install')
+        commands.call(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(raw)])
+        receipt['esp_repair'] = {'required': '--composefs-backend' in flags}
+        if receipt['esp_repair']['required']:
+            repair_esp(raw, receipt['fixture_image_id'], args.scratch,
+                       profile_root/'baseline-critical.sha256', receipt['esp_repair'],
+                       artifacts/'esp-repair.log')
+        receipt['raw_sha256'] = digest(raw)
+        run(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', '-c', str(raw), str(disk)], 'disk-convert')
+        run(['qemu-img', 'check', '-f', 'qcow2', str(disk)], 'disk-check')
+        info = json.loads(output(['qemu-img', 'info', '--output=json', str(disk)]))
+        mapping = json.loads(output(['qemu-img', 'map', '--output=json', str(disk)]))
+        receipt['storage'] = storage_receipt(info, mapping, disk.stat().st_size)
+        receipt['disk_sha256'] = digest(disk)
+        for name, value in [('qemu-info.json', info), ('qemu-map.json', mapping)]:
+            (artifacts/name).write_text(json.dumps(value, indent=2)+'\n')
+        receipt['evidence'] = {}
+        for name in ['reference-image.json', 'baseline-critical.sha256', 'baseline-packages.txt',
+                     'installed-payload.json', 'installed-runtime.json']:
+            target = artifacts/name
+            shutil.copy2(profile_root/name, target)
+            receipt['evidence'][name] = digest(target)
+        (artifacts/'SHA256SUMS').write_text(receipt['disk_sha256']+'  disk.qcow2\n')
+        receipt.update(export_succeeded=True, phase='complete', disk_format='qcow2',
+                       import_transport='authenticated CI artifact download/extract then owned CDI upload; artifact ZIP is not an HTTP qcow2 endpoint',
+                       firmware='uefi', requested_pvc='20Gi', node_storage_qualified=False)
+        result_code = 0
+    except Exception as error:
+        receipt['error'] = str(error)
+        disk.unlink(missing_ok=True)
+        print(error, file=sys.stderr)
+        result_code = 1
+    finally:
+        try:
+            commands.cleanup_containers()
+            require(not commands.process_cleanup_uncertain,
+                    'retaining scratch: owned privileged process cleanup unconfirmed')
+            require(not commands.interrupted_build,
+                    'retaining scratch: interrupted Buildah working-container cleanup unconfirmed')
+            require(receipt.get('esp_repair', {}).get('owned_resources_removed', True),
+                    'retaining raw backing/scratch after unsafe ESP resource cleanup')
+            if install_attempted:
+                retire_backing(commands, raw.resolve())
+            raw.unlink(missing_ok=True)
+            args.scratch.rmdir()
+            receipt['owned_scratch_removed'] = True
+        except Exception as error:
+            receipt.update(owned_scratch_removed=False, export_succeeded=False,
+                           cleanup_error=str(error))
+            disk.unlink(missing_ok=True)
+        receipt['command_deadlines'] = commands.events
+        (artifacts/'manifest.json').write_text(json.dumps(receipt, indent=2)+'\n')
+        if not receipt['owned_scratch_removed']:
+            result_code = 1
+    return result_code
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

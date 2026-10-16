@@ -176,6 +176,8 @@ pub struct Supervisor {
     restarts_used: u32,
     next_allowed_ms: u64,
     last_exit: Option<Option<i32>>,
+    /// Never reset with restart budget: even failed spawn admissions consume it.
+    child_generation: Option<u64>,
 }
 
 impl Supervisor {
@@ -188,6 +190,7 @@ impl Supervisor {
             restarts_used: 0,
             next_allowed_ms: 0,
             last_exit: None,
+            child_generation: Some(0),
         }
     }
 
@@ -196,6 +199,7 @@ impl Supervisor {
     /// [`Supervisor::reset_budget`] afterwards if this is an operator-
     /// requested relaunch rather than the initial start.
     pub fn spawn(&mut self, command: &mut Command) -> io::Result<()> {
+        self.reserve_child_generation()?;
         self.kill_child();
         self.child = Some(command.spawn()?);
         self.started = true;
@@ -233,6 +237,8 @@ impl Supervisor {
         if now_ms < self.next_allowed_ms {
             return Ok(ChildEvent::Exited(self.last_exit.unwrap_or(None)));
         }
+        self.reserve_child_generation()
+            .map_err(SuperviseError::SpawnFailed)?;
         match remake().spawn() {
             Ok(child) => {
                 self.child = Some(child);
@@ -249,6 +255,21 @@ impl Supervisor {
                 Err(SuperviseError::SpawnFailed(e))
             }
         }
+    }
+
+    fn reserve_child_generation(&mut self) -> io::Result<()> {
+        self.child_generation = self
+            .child_generation
+            .and_then(|generation| generation.checked_add(1));
+        if self.child_generation.is_none() {
+            return Err(io::Error::other("shell child generation exhausted"));
+        }
+        Ok(())
+    }
+    /// Identity of the held supervised child. PID reuse and budget reset cannot
+    /// re-admit a previous authentication lease. Exhaustion closes auth authority.
+    pub fn child_generation(&self) -> Option<u64> {
+        self.child.as_ref().and(self.child_generation)
     }
 
     /// Report whether supervision is exhausted: no child held and no
@@ -350,7 +371,7 @@ pub enum ShellStatus {
 /// One supervised shell child bound to a nested session (001 T5).
 ///
 /// Owns a [`Supervisor`] plus the remake recipe: the shell binary with
-/// the session's `WAYLAND_DISPLAY` and `ROOST_CONTROL_SOCKET` set for the
+/// the session's `WAYLAND_DISPLAY` and `TUNA_CONTROL_SOCKET` set for the
 /// child only. Drive with [`poll`](Self::poll) once per compositor tick
 /// and drain [`events`](Self::drain_events) for redacted diagnostics.
 pub struct ShellDriver {
@@ -397,10 +418,6 @@ impl ShellDriver {
         self.env.push((name.to_owned(), value.to_owned()));
     }
 
-    /// Non-blocking supervision step at `now_ms`. Never blocks the
-    /// compositor tick: spawn failures and dead children report as
-    /// values, and every outcome is also appended as a
-    /// [`SupervisorEvent`] for [`drain_events`](Self::drain_events).
     pub fn poll(&mut self, now_ms: u64) -> ShellStatus {
         let supervisor = &mut self.supervisor;
         let bin = &self.bin;
@@ -413,7 +430,7 @@ impl ShellDriver {
             // The shell's IBus panel must discover this session's private bus,
             // rather than inherit an outer session's explicit address.
             command.env_remove("IBUS_ADDRESS");
-            command.env("ROOST_CONTROL_SOCKET", control_socket);
+            command.env("TUNA_CONTROL_SOCKET", control_socket);
             command.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             command
         };
@@ -479,6 +496,11 @@ impl ShellDriver {
     /// control socket admits once supervision runs (#30).
     pub fn child_pid(&self) -> Option<u32> {
         self.supervisor.child_pid()
+    }
+
+    /// Nonreused authentication identity from the actual child supervisor.
+    pub fn child_generation(&self) -> Option<u64> {
+        self.supervisor.child_generation()
     }
 
     /// Policy this driver enforces.
@@ -559,13 +581,44 @@ mod tests {
     }
 
     #[test]
+    fn child_generation_never_reuses_after_budget_reset_spawn_failure_or_exhaustion() {
+        let mut supervisor = Supervisor::new(RestartPolicy::default());
+        assert_eq!(supervisor.child_generation(), None);
+        supervisor.spawn(&mut true_cmd()).unwrap();
+        assert_eq!(supervisor.child_generation(), Some(1));
+        supervisor.reset_budget();
+        assert_eq!(supervisor.child_generation(), Some(1));
+        supervisor.spawn(&mut true_cmd()).unwrap();
+        assert_eq!(supervisor.child_generation(), Some(2));
+        assert!(supervisor
+            .spawn(&mut Command::new("/nonexistent/tuna-owned-child"))
+            .is_err());
+        assert_eq!(supervisor.child_generation(), None);
+        supervisor.spawn(&mut true_cmd()).unwrap();
+        assert_eq!(supervisor.child_generation(), Some(4));
+        supervisor.kill_child();
+        supervisor.poll(&mut true_cmd, 0).unwrap();
+        assert_eq!(supervisor.child_generation(), Some(5));
+        supervisor.child_generation = Some(u64::MAX);
+        assert!(supervisor.spawn(&mut true_cmd()).is_err());
+        assert_eq!(supervisor.child_generation(), None);
+        supervisor.reset_budget();
+        assert!(supervisor.spawn(&mut true_cmd()).is_err());
+        assert_eq!(supervisor.child_generation(), None);
+        supervisor.kill_child();
+        assert!(matches!(
+            supervisor.poll(&mut true_cmd, 0),
+            Err(SuperviseError::SpawnFailed(_))
+        ));
+    }
+    #[test]
     fn driver_spawns_shell_with_session_env_and_reports_running() {
         let dir = tempfile::tempdir().unwrap();
         let control = dir.path().join("control.sock");
         let mut driver = ShellDriver::new(
             RestartPolicy::new(1, 1_000, 1_000),
             std::path::PathBuf::from("/bin/true"),
-            "roost-test.sock".to_owned(),
+            "tuna-test.sock".to_owned(),
             control,
         );
         assert_eq!(driver.poll(0), ShellStatus::Running);
@@ -580,7 +633,7 @@ mod tests {
         let mut driver = ShellDriver::new(
             RestartPolicy::new(1, 1_000, 1_000),
             dir.path().join("no-such-shell"),
-            "roost-test.sock".to_owned(),
+            "tuna-test.sock".to_owned(),
             dir.path().join("control.sock"),
         );
         assert!(matches!(driver.poll(0), ShellStatus::Fault(_)));
@@ -598,7 +651,7 @@ mod tests {
         let mut driver = ShellDriver::new(
             RestartPolicy::new(1, 1, 1),
             std::path::PathBuf::from("/bin/false"),
-            "roost-test.sock".to_owned(),
+            "tuna-test.sock".to_owned(),
             dir.path().join("control.sock"),
         );
         let reap_exit = |driver: &mut ShellDriver, now: u64| {
@@ -635,7 +688,7 @@ mod tests {
         let mut driver = ShellDriver::new(
             RestartPolicy::new(5, 10_000, 10_000),
             std::path::PathBuf::from("/bin/false"),
-            "roost-test.sock".to_owned(),
+            "tuna-test.sock".to_owned(),
             dir.path().join("control.sock"),
         );
         assert_eq!(driver.poll(0), ShellStatus::Running);
@@ -679,7 +732,7 @@ mod tests {
         let mut driver = ShellDriver::new(
             RestartPolicy::new(1, 1, 1),
             std::path::PathBuf::from("/bin/false"),
-            "roost-test.sock".to_owned(),
+            "tuna-test.sock".to_owned(),
             dir.path().join("control.sock"),
         );
         let reap_exit = |driver: &mut ShellDriver, now: u64| {

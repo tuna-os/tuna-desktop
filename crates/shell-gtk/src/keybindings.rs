@@ -8,7 +8,7 @@
 use gtk4::gio;
 use gtk4::prelude::*;
 
-use roost_shell_control::{
+use tuna_shell_control::{
     SwitcherKey, SwitcherKeyKind, KEYSYM_ABOVE_TAB, MODE_LOCK_SCREEN, MODE_NORMAL, MODE_OVERVIEW,
     MODE_POPUP, MODE_UNLOCK_SCREEN,
 };
@@ -44,6 +44,9 @@ pub enum Action {
         precise: bool,
     },
     VolumeMute,
+    VolumeUpQuiet,
+    VolumeDownQuiet,
+    VolumeMuteQuiet,
     MicrophoneMute,
     BrightnessUp,
     BrightnessDown,
@@ -54,6 +57,17 @@ pub enum Action {
     FocusActiveNotification,
     ShiftOverviewUp,
     ShiftOverviewDown,
+    /// GNOME's Ctrl+Alt+Tab "Switch system controls"
+    /// (`switch-panels`): move keyboard focus into the top bar, where
+    /// Tab/arrows walk every control and Enter activates it. GNOME
+    /// 51 shows a group switcher first (ctrlAltTab.js); with one bar
+    /// the chord focuses it directly: the first control, or the last
+    /// when `backward` (`switch-panels-backward`). Tray icons, the
+    /// accessibility menu and the screencast stop button have no
+    /// other keyboard route.
+    FocusPanel {
+        backward: bool,
+    },
     /// Window-manager keys on the focused window or the workspaces.
     WindowMenu,
     ToggleMaximized,
@@ -301,7 +315,7 @@ fn specs() -> Vec<Spec> {
         ("mic-mute", Action::MicrophoneMute, vec!["XF86AudioMicMute"]),
         (
             "volume-up-quiet",
-            Action::VolumeUp { precise: false },
+            Action::VolumeUpQuiet,
             vec![
                 "<Alt>XF86AudioRaiseVolume",
                 "<Alt><Ctrl>XF86AudioRaiseVolume",
@@ -309,7 +323,7 @@ fn specs() -> Vec<Spec> {
         ),
         (
             "volume-down-quiet",
-            Action::VolumeDown { precise: false },
+            Action::VolumeDownQuiet,
             vec![
                 "<Alt>XF86AudioLowerVolume",
                 "<Alt><Ctrl>XF86AudioLowerVolume",
@@ -317,7 +331,7 @@ fn specs() -> Vec<Spec> {
         ),
         (
             "volume-mute-quiet",
-            Action::VolumeMute,
+            Action::VolumeMuteQuiet,
             vec!["<Alt>XF86AudioMute"],
         ),
         (
@@ -399,6 +413,23 @@ fn specs() -> Vec<Spec> {
         },
         wm("begin-move", Action::BeginMove, vec!["<Alt>F7"]),
         wm("begin-resize", Action::BeginResize, vec!["<Alt>F8"]),
+        // GNOME binds these in NORMAL|OVERVIEW|LOCK|UNLOCK|LOGIN
+        // (windowManager.js `_startA11ySwitcher`); the lock screen
+        // shows no panel here, so NORMAL|OVERVIEW.
+        Spec {
+            schema: Schema::Wm,
+            key: "switch-panels".into(),
+            action: Action::FocusPanel { backward: false },
+            defaults: vec!["<Control><Alt>Tab"],
+            modes: NORMAL_OVERVIEW,
+        },
+        Spec {
+            schema: Schema::Wm,
+            key: "switch-panels-backward".into(),
+            action: Action::FocusPanel { backward: true },
+            defaults: vec!["<Shift><Control><Alt>Tab"],
+            modes: NORMAL_OVERVIEW,
+        },
         wm(
             "switch-to-workspace-1",
             Action::Workspace(Target::First),
@@ -513,6 +544,20 @@ pub fn bindings(
                 })
         })
         .collect()
+}
+
+/// Whether a fired binding runs while Ctrl+Alt+Tab holds the bar's
+/// exclusive keyboard (`mode`: the `MODE_*` bit it fired in). Session
+/// chords pause while held: a NORMAL/OVERVIEW fire then is spurious
+/// (the hold owns the keyboard), so only the hold's own chord —
+/// re-anchoring the bar — and the lock screen stay live. POPUP-mode
+/// system keys (volume, brightness) keep working: the hold lets them
+/// through, as the compositor's popup mode does.
+pub fn runs_while_panel_held(action: Action, mode: u32) -> bool {
+    if mode != MODE_NORMAL && mode != MODE_OVERVIEW {
+        return true;
+    }
+    matches!(action, Action::FocusPanel { .. } | Action::LockScreen)
 }
 
 /// The switcher's keys (`switch-applications`, `switch-group` and
@@ -644,7 +689,7 @@ mod tests {
 
     #[test]
     fn switcher_keys_default_and_parse_like_mutter() {
-        use roost_shell_control::{MOD_ALT, MOD_LOGO, MOD_SHIFT};
+        use tuna_shell_control::{MOD_ALT, MOD_LOGO, MOD_SHIFT};
         let keys: Vec<SwitcherKey> = switcher_keys(None)
             .iter()
             .filter_map(|(a, kind)| parse_switcher_key(a, *kind))
@@ -693,16 +738,23 @@ mod tests {
         assert_eq!(find(Action::LockScreen), ["<Super>l"]);
         assert_eq!(
             find(Action::VolumeUp { precise: false }),
+            ["XF86AudioRaiseVolume", "<Ctrl>XF86AudioRaiseVolume",]
+        );
+        assert_eq!(find(Action::VolumeMute), ["XF86AudioMute"]);
+        assert_eq!(find(Action::VolumeMuteQuiet), ["<Alt>XF86AudioMute"]);
+        assert_eq!(
+            find(Action::VolumeUpQuiet),
             [
-                "XF86AudioRaiseVolume",
-                "<Ctrl>XF86AudioRaiseVolume",
                 "<Alt>XF86AudioRaiseVolume",
                 "<Alt><Ctrl>XF86AudioRaiseVolume"
             ]
         );
         assert_eq!(
-            find(Action::VolumeMute),
-            ["XF86AudioMute", "<Alt>XF86AudioMute"]
+            find(Action::VolumeDownQuiet),
+            [
+                "<Alt>XF86AudioLowerVolume",
+                "<Alt><Ctrl>XF86AudioLowerVolume"
+            ]
         );
         assert_eq!(find(Action::MicrophoneMute), ["XF86AudioMicMute"]);
         assert_eq!(volume_step(None), 6.0);
@@ -716,6 +768,14 @@ mod tests {
         assert_eq!(find(Action::ShowScreenshotUi), ["Print"]);
         assert_eq!(find(Action::ShowScreenRecordingUi), ["<Ctrl><Shift><Alt>R"]);
         assert_eq!(find(Action::WindowMenu), ["<Alt>space"]);
+        assert_eq!(
+            find(Action::FocusPanel { backward: false }),
+            ["<Control><Alt>Tab"]
+        );
+        assert_eq!(
+            find(Action::FocusPanel { backward: true }),
+            ["<Shift><Control><Alt>Tab"]
+        );
         // GNOME 51's defaults for the keys the compositor used to own.
         assert_eq!(find(Action::Maximize), ["<Super>Up"]);
         assert_eq!(find(Action::Unmaximize), ["<Super>Down", "<Alt>F5"]);
@@ -757,6 +817,36 @@ mod tests {
                 "{}",
                 b.accelerator
             );
+        }
+    }
+
+    #[test]
+    fn panel_hold_pauses_session_chords_but_keeps_its_own_and_lock() {
+        use tuna_shell_control::{MODE_LOCK_SCREEN, MODE_UNLOCK_SCREEN};
+        // The G-PANEL-FOCUS regression: Super+S (NORMAL) must not run
+        // while the bar holds the keyboard, in either session mode.
+        for mode in [MODE_NORMAL, MODE_OVERVIEW] {
+            assert!(!runs_while_panel_held(Action::ToggleQuickSettings, mode));
+            assert!(!runs_while_panel_held(Action::ToggleMessageTray, mode));
+            assert!(!runs_while_panel_held(Action::ToggleOverview, mode));
+            assert!(!runs_while_panel_held(Action::SwitchToApplication(1), mode));
+            assert!(!runs_while_panel_held(Action::WindowMenu, mode));
+            // The hold's own chord re-anchors; the lock screen stays live.
+            assert!(runs_while_panel_held(
+                Action::FocusPanel { backward: false },
+                mode
+            ));
+            assert!(runs_while_panel_held(
+                Action::FocusPanel { backward: true },
+                mode
+            ));
+            assert!(runs_while_panel_held(Action::LockScreen, mode));
+        }
+        // Popup-mode system keys and lock-screen fires pass through.
+        for mode in [MODE_POPUP, MODE_LOCK_SCREEN, MODE_UNLOCK_SCREEN] {
+            assert!(runs_while_panel_held(Action::ToggleQuickSettings, mode));
+            assert!(runs_while_panel_held(Action::VolumeUpQuiet, mode));
+            assert!(runs_while_panel_held(Action::LockScreen, mode));
         }
     }
 }

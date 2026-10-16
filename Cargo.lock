@@ -3491,109 +3491,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "roost-compositor"
-version = "0.1.0"
-dependencies = [
- "calloop 0.14.5",
- "greetd_ipc",
- "image",
- "libc",
- "libloading 0.9.0",
- "pipewire",
- "png",
- "rand 0.10.3",
- "reis",
- "roost-greeter",
- "roost-shell-control",
- "roost-wallpaper",
- "roxmltree",
- "rustix 1.1.5",
- "serde",
- "serde_json",
- "signal-hook",
- "smithay",
- "tempfile",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "wayland-scanner",
- "wayland-server",
- "xkbcommon 0.9.0",
- "zbus",
-]
-
-[[package]]
-name = "roost-greeter"
-version = "0.1.0"
-dependencies = [
- "greetd_ipc",
- "gtk4",
- "libadwaita",
- "tempfile",
-]
-
-[[package]]
-name = "roost-shell-control"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
-]
-
-[[package]]
-name = "roost-shell-gtk"
-version = "0.1.0"
-dependencies = [
- "gio",
- "glib",
- "glib-build-tools",
- "gtk4",
- "gtk4-layer-shell",
- "gtk4-session-lock",
- "jiff",
- "libadwaita",
- "libc",
- "roost-shell-control",
- "roost-shell-host",
- "serde_json",
- "tempfile",
- "xkbcommon 0.9.0",
-]
-
-[[package]]
-name = "roost-shell-host"
-version = "0.1.0"
-dependencies = [
- "freedesktop-desktop-entry",
- "gio",
- "image",
- "jiff",
- "resvg",
- "rhai",
- "roost-compositor",
- "roost-shell-control",
- "rustix 1.1.5",
- "serde_json",
- "tempfile",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "xkbcommon 0.9.0",
- "zbus",
-]
-
-[[package]]
-name = "roost-wallpaper"
-version = "0.1.0"
-dependencies = [
- "image",
- "jxl-oxide",
- "roost-shell-control",
-]
-
-[[package]]
 name = "roxmltree"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3708,9 +3605,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
  "itoa",
  "memchr",
@@ -4243,6 +4140,117 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "tuna-compositor"
+version = "0.1.0"
+dependencies = [
+ "async-io",
+ "calloop 0.14.5",
+ "futures-lite",
+ "gio",
+ "greetd_ipc",
+ "image",
+ "libc",
+ "libloading 0.9.0",
+ "pipewire",
+ "png",
+ "rand 0.10.3",
+ "reis",
+ "resvg",
+ "roxmltree",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "smithay",
+ "tempfile",
+ "tuna-greeter",
+ "tuna-shell-control",
+ "tuna-wallpaper",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "wayland-scanner",
+ "wayland-server",
+ "xcursor",
+ "xkbcommon 0.9.0",
+ "zbus",
+]
+
+[[package]]
+name = "tuna-greeter"
+version = "0.1.0"
+dependencies = [
+ "greetd_ipc",
+ "gtk4",
+ "libadwaita",
+ "tempfile",
+]
+
+[[package]]
+name = "tuna-shell-control"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+]
+
+[[package]]
+name = "tuna-shell-gtk"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "gio",
+ "glib",
+ "glib-build-tools",
+ "gtk4",
+ "gtk4-layer-shell",
+ "gtk4-session-lock",
+ "jiff",
+ "libadwaita",
+ "libc",
+ "pipewire",
+ "serde_json",
+ "tempfile",
+ "tuna-shell-control",
+ "tuna-shell-host",
+ "unicode-segmentation",
+ "xkbcommon 0.9.0",
+]
+
+[[package]]
+name = "tuna-shell-host"
+version = "0.1.0"
+dependencies = [
+ "freedesktop-desktop-entry",
+ "gio",
+ "image",
+ "jiff",
+ "resvg",
+ "rhai",
+ "rustix 1.1.5",
+ "serde_json",
+ "tempfile",
+ "tuna-compositor",
+ "tuna-shell-control",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "xkbcommon 0.9.0",
+ "zbus",
+]
+
+[[package]]
+name = "tuna-wallpaper"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "jxl-oxide",
+ "tuna-shell-control",
 ]
 
 [[package]]

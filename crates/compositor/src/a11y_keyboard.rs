@@ -423,7 +423,7 @@ impl Monitor {
             inner.available = Availability::Unavailable;
             inner.pid = 0;
             inner.invalidate();
-            eprintln!("roost-compositor: accessibility keyboard bus unavailable");
+            eprintln!("tuna-compositor: accessibility keyboard bus unavailable");
         }
     }
     async fn authorize(

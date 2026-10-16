@@ -14,14 +14,20 @@
 pub mod apps;
 pub mod control;
 pub mod dock;
+pub mod error;
 pub mod extensions;
+
+pub use error::ShellHostError;
 pub mod favorites;
 pub mod ibus;
+pub mod ibus_properties;
 pub mod icons;
 pub mod intake;
 pub mod introspect;
 pub mod keyboard;
+pub mod lockdown;
 pub mod model;
+pub mod notification_policy;
 pub mod notifications;
 pub mod overview;
 pub mod panel;

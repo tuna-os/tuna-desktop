@@ -1,9 +1,10 @@
 // Greeter entry point: builds the login window from the model.
-// Daemon conversation wiring lands with the walkthrough task.
-use gtk4::gio::prelude::*;
-use roost_greeter::{model::GreeterModel, session::enumerate_system, ui};
+// Every greetd exchange completes on a worker before the next UI step.
+use gtk4::prelude::*;
+use std::{cell::RefCell, rc::Rc};
+use tuna_greeter::{login, session::enumerate_system};
 
-/// Release version stamped at build time: `ROOST_VERSION` (a `vX.Y.Z` tag or
+/// Release version stamped at build time: `TUNA_VERSION` (a `vX.Y.Z` tag or
 /// plain `X.Y.Z`) wins, otherwise the crate version. Duplicated per binary on
 /// purpose — no shared dependency for a few lines.
 fn normalize_version<'a>(raw: Option<&'a str>, fallback: &'a str) -> &'a str {
@@ -14,7 +15,7 @@ fn normalize_version<'a>(raw: Option<&'a str>, fallback: &'a str) -> &'a str {
 }
 
 fn release_version() -> &'static str {
-    normalize_version(option_env!("ROOST_VERSION"), env!("CARGO_PKG_VERSION"))
+    normalize_version(option_env!("TUNA_VERSION"), env!("CARGO_PKG_VERSION"))
 }
 
 fn main() {
@@ -22,18 +23,27 @@ fn main() {
         .skip(1)
         .any(|arg| arg == "--version" || arg == "-V")
     {
-        println!("roost-greeter {}", release_version());
+        println!("tuna-greeter {}", release_version());
         return;
     }
     let app = libadwaita::Application::builder()
-        .application_id("asia.reilly.roost.greeter")
+        .application_id("asia.reilly.tuna.greeter")
         .build();
-    app.connect_activate(|app| {
-        let model = GreeterModel::new();
+    let windows = Rc::new(RefCell::new(Vec::<login::LoginWindow>::new()));
+    let owner = windows.clone();
+    app.connect_activate(move |app| {
+        if let Some(window) = owner.borrow().first() {
+            window.widgets().window.present();
+            return;
+        }
         let sessions = enumerate_system();
-        let users: Vec<String> = Vec::new();
-        let view = ui::render_snapshot(&model, &sessions.entries, &users);
-        ui::build_ui(app, &view);
+        let socket = std::env::var("GREETD_SOCK").unwrap_or_default();
+        owner
+            .borrow_mut()
+            .push(login::build_login(app, sessions.entries, socket));
+    });
+    app.connect_shutdown(move |_| {
+        windows.borrow_mut().clear();
     });
     app.run();
 }

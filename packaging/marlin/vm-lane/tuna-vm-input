@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Real Wayland GTK client recording only key counts, never key values/text."""
+import json
+import os
+import pathlib
+
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk
+
+def strip_fixture(nonce, edge=False):
+    """Actual GTK clients and input requests; no compositor geometry/state writes."""
+    import hashlib
+    import re
+    import signal
+    import time
+    gi.require_foreign("cairo")
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("GdkWayland", "4.0")
+    from gi.repository import Gdk, GdkWayland
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise ValueError("invalid strip fixture nonce")
+    # Independent best-effort lifetime cap, never a claim of D-state retirement.
+    signal.alarm(180)
+    runtime = pathlib.Path(os.environ["XDG_RUNTIME_DIR"])
+    target = runtime / f"tuna-vm-strip-{nonce}.json"
+    proc = pathlib.Path("/proc/self")
+    ticks = int((proc / "stat").read_text().rsplit(")", 1)[1].split()[19])
+    executable = proc / "exe"
+    inode = executable.stat()
+    identity = {"pid": os.getpid(), "uid": os.getuid(), "start_ticks": ticks,
+                "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "exe_inode": inode.st_ino, "exe_device": inode.st_dev,
+                "exe_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+                "script_sha256": hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()}
+    records = {}
+    windows = []
+    sequence = 0
+    colors = {"alpha": (44, 102, 164), "beta": (171, 65, 81), "gamma": (65, 145, 89)}
+
+    if edge:
+        colors["delta"] = (147, 96, 179)
+
+    def publish():
+        nonlocal sequence
+        sequence += 1
+        value = {"schema": 1, "nonce": nonce, "identity": identity, "sequence": sequence,
+                 "monotonic_ns": time.monotonic_ns(),
+                 "boottime_ns": time.clock_gettime_ns(time.CLOCK_BOOTTIME),
+                 "gtk_version": [Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()],
+                 "backend": "wayland", "fixture_mode": "edge" if edge else "baseline", "windows": records}
+        temporary = target.with_suffix(".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream)
+        temporary.replace(target)
+
+    def activate_strip(app):
+        for role, color in colors.items():
+            app_id = f"org.tuna.VmStrip.n{nonce}.{role}"
+            window = Gtk.ApplicationWindow(application=app, title=f"Installed strip {role}")
+            window.set_decorated(False)
+            window.set_default_size(320, 240)
+            records[role] = {"app_id": app_id, "mapped": False, "active": False,
+                             "width": 0, "height": 0, "paint_count": 0,
+                             "painted_width": 0, "painted_height": 0,
+                             "color": list(color), "move_requests": 0,
+                             "resize_requests": 0, "delivered_buttons": 0,
+                             "key_count": 0}
+            area = Gtk.DrawingArea()
+            window.set_child(area)
+
+            def paint(widget, context, width, height, role=role, color=color):
+                context.set_source_rgb(*(channel / 255 for channel in color))
+                context.paint()
+                context.set_source_rgb(.12, .12, .12)
+                context.rectangle(0, 0, width, 40)
+                context.fill()
+                context.set_source_rgb(1, 1, 1)
+                context.move_to(12, 25)
+                context.show_text(f"Installed {role} — drag title / resize bottom-right")
+                context.rectangle(max(0, width - 12), max(0, height - 12), 12, 12)
+                context.fill()
+                records[role]["painted_width"] = width
+                records[role]["painted_height"] = height
+
+            area.set_draw_func(paint)
+
+            def realized(widget, role=role):
+                surface = widget.get_surface()
+                if not isinstance(surface, GdkWayland.WaylandToplevel):
+                    raise RuntimeError("strip fixture did not use actual Wayland")
+                def after_paint(_clock):
+                    records[role]["paint_count"] += 1
+                    records[role]["width"] = widget.get_width()
+                    records[role]["height"] = widget.get_height()
+                    records[role]["mapped"] = widget.get_mapped()
+                    records[role]["active"] = widget.is_active()
+                    publish()
+                widget.get_frame_clock().connect("after-paint", after_paint)
+            window.connect("realize", realized)
+            def mapped(widget, app_id=app_id):
+                # GtkWindow's map default creates the xdg_toplevel. Setting
+                # its ID at realize is a no-op in GDK Wayland: the protocol
+                # toplevel does not exist yet. Reapply after every actual map.
+                surface = widget.get_surface()
+                if not isinstance(surface, GdkWayland.WaylandToplevel):
+                    raise RuntimeError("strip fixture did not map actual Wayland")
+                GdkWayland.WaylandToplevel.set_application_id(surface, app_id)
+            window.connect("map", mapped)
+            window.connect("notify::is-active", lambda widget, _prop, role=role:
+                           (records[role].update(active=widget.is_active()), publish()))
+            window.connect("notify::mapped", lambda widget, _prop, role=role:
+                           (records[role].update(mapped=widget.get_mapped()), publish()))
+            drag = Gtk.GestureDrag()
+            drag.set_button(1)
+            drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+            def begin(gesture, x, y, window=window, role=role):
+                event = gesture.get_current_event()
+                device = gesture.get_device()
+                if event is None or device is None:
+                    raise RuntimeError("actual GTK input event/device missing")
+                surface = window.get_surface()
+                button = gesture.get_current_button()
+                if x >= window.get_width() - 16 and y >= window.get_height() - 16:
+                    Gdk.Toplevel.begin_resize(surface, Gdk.SurfaceEdge.SOUTH_EAST, device, button, x, y, event.get_time())
+                    records[role]["resize_requests"] += 1
+                elif y < 40:
+                    Gdk.Toplevel.begin_move(surface, device, button, x, y, event.get_time())
+                    records[role]["move_requests"] += 1
+                else:
+                    return
+                gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+                publish()
+            drag.connect("drag-begin", begin)
+            window.add_controller(drag)
+            clicks = Gtk.GestureClick()
+            clicks.set_button(0)
+            def clicked(_gesture, _count, _x, _y, role=role):
+                records[role]["delivered_buttons"] += 1
+                publish()
+            clicks.connect("pressed", clicked)
+            window.add_controller(clicks)
+            keys = Gtk.EventControllerKey()
+            def key(_controller, _keyval, _keycode, _state, role=role):
+                records[role]["key_count"] += 1
+                publish()
+                return False
+            keys.connect("key-pressed", key)
+            window.add_controller(keys)
+            windows.append(window)
+            window.present()
+        publish()
+
+    app = Gtk.Application(application_id=f"org.tuna.VmStrip.n{nonce}")
+    app.connect("activate", activate_strip)
+    app.run([])
+    signal.alarm(0)
+
+
+import sys
+if len(sys.argv) > 1:
+    if len(sys.argv) != 3 or sys.argv[1] not in ("--strip-fixture", "--strip-edge-fixture"):
+        raise SystemExit("unsupported input fixture mode")
+    strip_fixture(sys.argv[2], edge=sys.argv[1] == "--strip-edge-fixture")
+    raise SystemExit(0)
+
+
+path = pathlib.Path(os.environ["XDG_RUNTIME_DIR"], "tuna-vm-input.json")
+count = 0
+buttons = {"1": 0, "2": 0, "3": 0}
+button_releases = {}
+event_count = 0
+motions = 0
+window = None
+
+
+def publish():
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"pid": os.getpid(), "count": count, "buttons": buttons,
+                                    "button_releases": button_releases, "event_count": event_count,
+                                    "motions": motions,
+                                    "gtk_version": [Gtk.get_major_version(), Gtk.get_minor_version(),
+                                                    Gtk.get_micro_version()],
+                                    "mapped": window.get_mapped(),
+                                    "active": window.is_active(),
+                                    "width": window.get_width(),
+                                    "height": window.get_height()}))
+    temporary.replace(path)
+
+
+def activate(app):
+    global window
+    window = Gtk.ApplicationWindow(application=app, title="VM input probe")
+    window.set_default_size(400, 240)
+    button = Gtk.Button(label="Count-only input probe")
+    window.set_child(button)
+    controller = Gtk.EventControllerKey()
+    controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    def pressed(*_arguments):
+        global count
+        count += 1
+        button.set_label(f"Keys received: {count}")
+        publish()
+        return True
+    controller.connect("key-pressed", pressed)
+    window.add_controller(controller)
+    clicks = Gtk.GestureClick()
+    clicks.set_button(0)
+    clicks.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    def pressed_button(gesture, *_arguments):
+        key = str(gesture.get_current_button())
+        if key in buttons:
+            buttons[key] += 1
+        publish()
+    clicks.connect("pressed", pressed_button)
+    window.add_controller(clicks)
+    def released_button(gesture, *_arguments):
+        key = str(gesture.get_current_button())
+        button_releases[key] = button_releases.get(key, 0) + 1
+        publish()
+    clicks.connect("released", released_button)
+    # Count delivered events without inspecting the GdkEvent payload: older
+    # PyGObject versions expose that signal argument as None. No key values.
+    events = Gtk.EventControllerLegacy()
+    events.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    def delivered(*_arguments):
+        global event_count
+        event_count += 1
+        publish()
+        return False
+    events.connect("event", delivered)
+    window.add_controller(events)
+    motion = Gtk.EventControllerMotion()
+    motion.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    def moved(*_arguments):
+        global motions
+        motions += 1
+        publish()
+    motion.connect("motion", moved)
+    motion.connect("enter", moved)
+    window.add_controller(motion)
+    window.connect("notify::mapped", lambda *_arguments: publish())
+    window.connect("notify::is-active", lambda *_arguments: publish())
+    def allocated(widget, _clock):
+        # Mapping/activation notifications can precede the first allocation.
+        publish()
+        return not (widget.get_mapped() and widget.get_width() > 0
+                    and widget.get_height() > 0)
+    window.add_tick_callback(allocated)
+    window.present()
+    button.grab_focus()
+    publish()
+
+
+app = Gtk.Application(application_id="org.tuna.VmInput")
+app.connect("activate", activate)
+app.run([])

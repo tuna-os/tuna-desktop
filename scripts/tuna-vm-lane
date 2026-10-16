@@ -1,0 +1,2915 @@
+#!/usr/bin/env python3
+"""tuna-vm-lane — boot the Marlin Tuna Desktop disk and prove the hardware session (#68).
+
+Boots a raw disk installed from the CI-only test layer
+(packaging/marlin/vm-lane/Containerfile: greetd initial session of tuna-test
+into "Tuna Desktop (preview)", journal mirrored on ttyS0) in QEMU/KVM on OVMF at
+1280x800 with virtio-vga, then asserts from outside the guest:
+
+  V-DRM      the serial journal shows tuna-compositor lit an output on
+             the DRM/KMS backend ("tuna-compositor: drm: output ...")
+  V-SHELL    the GTK shell came up ("tuna-shell-gtk: keybindings: ...")
+             and supervision never exhausted its restart budget
+  V-PANEL    after Escape leaves the startup overview, a QMP screendump
+             shows the GNOME 51-style pure black top panel across the
+             width at y=5, over a non-uniform desktop (not a blank or
+             splash screen)
+  V-NOPANIC  no "panicked" anywhere in the serial log
+
+Writes to --out: serial.log, tuna-lines.log (every tuna-* line),
+boot-NNN.png frames, V-OVERVIEW.png (the login overview),
+V-SESSION.png (the desktop), assertions.txt ("<ID> pass|fail
+<desc>", the format scripts/tuna-ledger reads) and manifest.json.
+On timeout or failure, prints log excerpts and exits nonzero.
+
+With --tour, once the assertions pass it drives a scripted feature tour
+through QMP input (overview and search, app grid, quick settings,
+calendar, three apps and Alt+Tab, scroll mode, lock and unlock), screendumps
+at a nominal two frames/second plus synchronous stills, splices title cards from scripts/lib/
+vm-tour-cards rendered from source in scratch, and writes tour/tuna-tour.webm, tour/preview.webp and a
+T-<section>.png still per section (needs ffmpeg with libvpx and libwebp).
+
+Usage:
+  scripts/tuna-vm-lane --disk DISK.raw [--out DIR] [--timeout S] [--tour]
+                        [--meta KEY=VALUE ...]
+
+Needs qemu-system-x86_64 and OVMF; KVM strongly recommended. Reuses the
+QMP client from scripts/tuna-baseline.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
+_loader = importlib.machinery.SourceFileLoader("tuna_baseline",
+                                               os.path.join(HERE, "tuna-baseline"))
+_spec = importlib.util.spec_from_loader("tuna_baseline", _loader)
+baseline = importlib.util.module_from_spec(_spec)
+_loader.exec_module(baseline)
+_guest_loader = importlib.machinery.SourceFileLoader("vm_guest_agent", os.path.join(HERE, "lib", "vm_guest_agent.py"))
+_guest_spec = importlib.util.spec_from_loader("vm_guest_agent", _guest_loader)
+guest_agent = importlib.util.module_from_spec(_guest_spec)
+_guest_loader.exec_module(guest_agent)
+
+WIDTH, HEIGHT = baseline.WIDTH, baseline.HEIGHT
+DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
+# The shell emits this as one eprintln!, but serial/journal interleaving
+# with the compositor's stderr can shear the payload off onto later
+# records, leaving a bare `tuna-shell-gtk: keybindings:` line. Match the
+# stable prefix so startup is still recognized (run 38102898073 r04).
+SHELL_RE = re.compile(r"tuna-shell-gtk: keybindings:")
+EXHAUSTED = "shell supervision: BudgetExhausted"
+# tuna-vm-health activation probes on the session user's bus; the capture
+# pair proves tuna-portals.conf routes Screenshot and ScreenCast.
+PORTAL_PROBES = ("calendar", "portal", "portal-gnome", "portal-screenshot", "portal-screencast")
+CARDS = os.path.join(HERE, "lib", "vm-tour-cards")
+TOUR_FPS = 2        # nominal periodic target; synchronous stills add irregular frames
+PLAY_FPS = 4        # encoded frame rate, not a uniform real-time capture clock
+CARD_HOLD = 10      # frames a title card is held (2.5 s at PLAY_FPS)
+OVMF = ("/usr/share/ovmf/OVMF.fd", "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/qemu/OVMF.fd")
+
+SESSION_RECORD_RE = re.compile(r"tuna-vm-session\[(\d+)\]: (.*)")
+
+
+def session_records(text):
+    """Reassemble session stderr records that serial interleaving sheared.
+
+    Concurrent shell and compositor writes can split one eprintln! across
+    console records (run 38855306157: `lock command result applied=`, then
+    `false`, then ` request_id=` from the same PID). A fragment from a PID
+    continues that PID's previous record unless it opens a new `tuna-`
+    component record. Returns whole records in serial order.
+    """
+    records, open_by_pid = [], {}
+    for line in text.splitlines():
+        match = SESSION_RECORD_RE.search(line)
+        if match is None:
+            continue
+        pid, fragment = match.groups()
+        if pid in open_by_pid and not fragment.startswith("tuna-"):
+            records[open_by_pid[pid]] += fragment
+        else:
+            open_by_pid[pid] = len(records)
+            records.append(fragment)
+    return records
+
+
+
+def auth_uint(value):
+    return type(value) is int and 0 < value <= (1 << 64) - 1
+
+
+def sleep_auth_attempt(snapshot):
+    """Bind a pending original password attempt before real S3; no secret data."""
+    state = snapshot.get('state', {})
+    owner = state.get('auth_owner')
+    if state.get('locked') is not True or type(owner) is not dict or owner.get('outer_pending') is not True:
+        raise ValueError('pre-sleep owned authentication not pending')
+    attempt = owner.get('attempt')
+    if type(attempt) is not dict or set(attempt) != {'serial', 'epoch', 'origin'}:
+        raise ValueError('pre-sleep owned attempt missing')
+    origin = attempt['origin']
+    if type(origin) is not dict or set(origin) != {'connection', 'request'}:
+        raise ValueError('pre-sleep original connection missing')
+    values = [attempt['serial'], attempt['epoch'], origin['connection'], origin['request']]
+    if not all(auth_uint(value) for value in values) or not auth_uint(owner.get('epoch')) or owner['epoch'] != attempt['epoch']:
+        raise ValueError('pre-sleep attempt identity or current epoch invalid')
+    processes = [p for p in snapshot.get('processes', [])
+                 if type(p.get('executable')) is str and guest_role(p['executable']) == 'tuna-compositor']
+    if len(processes) != 1 or not all(auth_uint(processes[0].get(key)) for key in ['pid', 'start_ticks']):
+        raise ValueError('unique original compositor process required')
+    return {'pid': processes[0]['pid'], 'start_ticks': processes[0]['start_ticks'],
+            'serial': attempt['serial'], 'epoch': attempt['epoch'], 'origin': origin}
+
+
+def stale_sleep_auth_retirement(trace, expected, current_epoch):
+    """Require the exact joined accepted attempt, stale epoch and its shell denial."""
+    prefix = 'tuna-compositor: lock authentication retired '
+    keys = {'pid', 'joined_ok', 'backend_accepted', 'reported_ok', 'applied',
+            'attempt_serial', 'attempt_epoch', 'current_epoch', 'origin', 'origin_live', 'locked_after'}
+    matches = []
+    if not auth_uint(current_epoch) or current_epoch <= expected['epoch']:
+        return None
+    for line in trace.splitlines():
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if type(event) is not dict or set(event) != keys:
+            return None
+        if not all(type(event[key]) is bool for key in ['joined_ok', 'backend_accepted', 'reported_ok',
+                                                      'applied', 'origin_live', 'locked_after']):
+            return None
+        if not all(auth_uint(event[key]) for key in ['pid', 'attempt_serial', 'attempt_epoch', 'current_epoch']):
+            return None
+        origin = event['origin']
+        if type(origin) is not dict or set(origin) != {'connection', 'request'} or not all(auth_uint(v) for v in origin.values()):
+            return None
+        if (event['pid'], event['attempt_serial'], event['attempt_epoch'], origin) == (
+                expected['pid'], expected['serial'], expected['epoch'], expected['origin']):
+            matches.append(event)
+    if len(matches) != 1:
+        return None
+    event = matches[0]
+    if not (event['joined_ok'] and event['backend_accepted'] and event['reported_ok']
+            and event['origin_live'] and event['locked_after'] and not event['applied']
+            and event['current_epoch'] == current_epoch and event['attempt_epoch'] < current_epoch):
+        return None
+    denial = re.compile(r'tuna-shell-gtk: lock command result applied=false request_id=([0-9]+)(?:\s|$)')
+    if not any(int(match.group(1)) == expected['origin']['request'] for match in denial.finditer(trace)):
+        return None
+    return event
+
+
+
+AUTH_PROCESS_KEYS = {"pid", "uid", "ppid", "pgrp", "start_ticks", "executable", "exe_device", "exe_inode"}
+
+
+def checked_auth_process(value, executable):
+    if (type(value) is not dict or set(value) != AUTH_PROCESS_KEYS
+            or type(value["executable"]) is not str or guest_role(value["executable"]) != executable
+            or not all(auth_uint(value[key]) for key in ("pid", "uid", "ppid", "pgrp", "start_ticks", "exe_inode"))
+            or type(value["exe_device"]) is not int or value["exe_device"] < 0):
+        raise ValueError("original authentication process identity invalid")
+    return value
+
+
+def sleep_auth_helper_observation(observed, snapshot):
+    """Admit the fixed held-self helper and its actual pam_exec sleep child."""
+    expected = sleep_auth_attempt(snapshot)
+    if type(observed) is not dict or set(observed) != {"real_pam_delay_running", "compositor", "helpers", "delays", "auth_owner"} or observed["real_pam_delay_running"] is not True:
+        raise ValueError("actual original PAM delay was not observed")
+    if json.dumps(observed["auth_owner"], sort_keys=True) != json.dumps(snapshot["state"]["auth_owner"], sort_keys=True):
+        raise ValueError("PAM observation belongs to a different attempt")
+    if type(observed["helpers"]) is not list or len(observed["helpers"]) != 1 or type(observed["delays"]) is not list or len(observed["delays"]) != 1:
+        raise ValueError("unique actual helper and delay required")
+    return checked_auth_method(observed["compositor"], observed["helpers"][0], observed["delays"][0], expected)
+
+
+def checked_auth_method(desktop, helper, delay, expected):
+    desktop = checked_auth_process(desktop, "tuna-compositor")
+    helper = checked_auth_process(helper, "tuna-compositor")
+    delay = checked_auth_process(delay, "sleep")
+    if (desktop["pid"], desktop["start_ticks"]) != (expected["pid"], expected["start_ticks"]):
+        raise ValueError("desktop identity changed before helper admission")
+    if (helper["pid"] == desktop["pid"] or helper["ppid"] != desktop["pid"] or helper["pgrp"] != helper["pid"]
+            or helper["uid"] != desktop["uid"] or helper["start_ticks"] < desktop["start_ticks"]
+            or (helper["exe_device"], helper["exe_inode"]) != (desktop["exe_device"], desktop["exe_inode"])
+            or delay["pid"] in (desktop["pid"], helper["pid"]) or delay["ppid"] != helper["pid"]
+            # pam_exec's child calls setsid() before exec: its own group.
+            or delay["pgrp"] != delay["pid"] or delay["uid"] != desktop["uid"] or delay["start_ticks"] < helper["start_ticks"]):
+        raise ValueError("PAM helper/delay kernel ownership differs")
+    return {"compositor": desktop, "helper": helper, "delay": delay, "attempt": expected}
+
+
+def cancelled_sleep_auth_retirement(trace, expected, current_epoch, original, physical):
+    """Canceled owned helper: never accepted success or mere wrapper join."""
+    # Reuse the SAME original admission matcher: absence without a valid
+    # previously admitted helper/delay cannot qualify cancellation.
+    try:
+        if type(original) is not dict or set(original) != {"compositor", "helper", "delay", "attempt"}:
+            return None
+        admitted = checked_auth_method(original["compositor"], original["helper"], original["delay"], expected)
+        if json.dumps(admitted, sort_keys=True) != json.dumps(original, sort_keys=True):
+            return None
+    except (ValueError, TypeError, KeyError):
+        return None
+    if (type(physical) is not dict or set(physical) != {"helper_absent", "delay_absent", "owned_group_members", "original"}
+            or json.dumps(physical["original"], sort_keys=True) != json.dumps(original, sort_keys=True) or physical["helper_absent"] is not True
+            or physical["delay_absent"] is not True or physical["owned_group_members"] != []
+            or not auth_uint(current_epoch) or current_epoch <= expected["epoch"]):
+        return None
+    prefix = 'tuna-compositor: lock authentication owned retirement '
+    keys = {'pid', 'joined_ok', 'retired', 'authenticated', 'denied', 'cancel_requested', 'reported_ok',
+            'applied', 'attempt_serial', 'attempt_epoch', 'current_epoch', 'origin', 'locked_after'}
+    matches = []
+    for line in trace.splitlines():
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if (type(event) is not dict or set(event) != keys
+                or not all(type(event[key]) is bool for key in ['joined_ok', 'retired', 'authenticated', 'denied', 'cancel_requested', 'reported_ok', 'applied', 'locked_after'])
+                or not all(auth_uint(event[key]) for key in ['pid', 'attempt_serial', 'attempt_epoch', 'current_epoch'])):
+            return None
+        origin = event['origin']
+        if type(origin) is not dict or set(origin) != {'connection', 'request'} or not all(auth_uint(v) for v in origin.values()):
+            return None
+        if (event['pid'], event['attempt_serial'], event['attempt_epoch'], origin) == (
+                expected['pid'], expected['serial'], expected['epoch'], expected['origin']):
+            matches.append(event)
+    if len(matches) != 1:
+        return None
+    event = matches[0]
+    if not (event['joined_ok'] and event['retired'] and event['denied'] and event['cancel_requested']
+            and event['locked_after'] and not event['authenticated'] and not event['reported_ok'] and not event['applied']
+            and event['current_epoch'] == current_epoch):
+        return None
+    denial = re.compile(r'tuna-shell-gtk: lock command result applied=false request_id=([0-9]+)(?:\s|$)')
+    if not any(int(match.group(1)) == expected['origin']['request'] for match in denial.finditer(trace)):
+        return None
+    return event
+
+
+def safe_navigation_diagnostic(value):
+    """Finite failure summary only; full original FD/catalog receipts stay separate."""
+    if type(value) is not dict or set(value) not in ({"known_query_matches","Disks_result","focused_role_classes"},
+                                                   {"known_query_matches","Disks_result","focused_role_classes","catalog"}):
+        return None
+    matches=value["known_query_matches"];target=value["Disks_result"];roles=value["focused_role_classes"]
+    if (matches is not None and type(matches) is not bool) or type(target) is not dict or set(target)!={"present","showing","focused"}:
+        return None
+    if any(type(x) is not int or not 0<=x<=512 for x in target.values()):return None
+    if type(roles) is not list or len(roles)>512 or any(type(x) is not str or x not in {"entry","text","push button","slider","frame","other"} for x in roles):return None
+    return {"known_query_matches":matches,"Disks_result":dict(target),"focused_role_classes":list(roles)}
+
+
+def log(msg):
+    print(f"tuna-vm-lane: {msg}", flush=True)
+
+
+def read_text(path):
+    """The serial journal, with pre-rename guest log prefixes normalized."""
+    try:
+        with open(path, "rb") as fh:
+            return normalize_guest_log(fh.read().decode("utf-8", "replace"))
+    except FileNotFoundError:
+        return ""
+
+
+def excerpt(serial, n=60):
+    lines = serial.splitlines()
+    interesting = [ln for ln in lines if re.search(
+        r"tuna|greetd|panicked|session-|Failed|error", ln, re.I)]
+    return ("--- last relevant serial lines ---\n" + "\n".join(interesting[-n:]) +
+            "\n--- last raw serial lines ---\n" + "\n".join(lines[-40:]))
+
+
+def read_ppm(path):
+    """Parse a binary P6 PPM (QMP screendump's default format)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    fields, pos = [], 0
+    while len(fields) < 4:
+        while data[pos:pos + 1].isspace():
+            pos += 1
+        if data[pos:pos + 1] == b"#":
+            pos = data.index(b"\n", pos) + 1
+            continue
+        end = pos
+        while not data[end:end + 1].isspace():
+            end += 1
+        fields.append(data[pos:end])
+        pos = end
+    if fields[0] != b"P6" or int(fields[3]) != 255:
+        raise ValueError(f"unexpected PPM header {fields}")
+    w, h = int(fields[1]), int(fields[2])
+    return w, h, data[pos + 1:pos + 1 + w * h * 3]
+
+
+def check_panel(path):
+    """Black panel strip at y=5 over a non-uniform desktop."""
+    w, h, px = read_ppm(path)
+
+    def pixel(x, y):
+        i = (y * w + x) * 3
+        return px[i], px[i + 1], px[i + 2]
+
+    row = [pixel(x, 5) for x in range(w)]
+    black = sum(1 for p in row if max(p) <= 8) / w
+    body = {tuple(c >> 4 for c in pixel(x, y))
+            for y in range(h // 4, h * 3 // 4, 8) for x in range(0, w, 8)}
+    ok = (w, h) == (WIDTH, HEIGHT) and black >= 0.9 and len(body) >= 8
+    return ok, f"{w}x{h}, y=5 row {black:.0%} black, {len(body)} body colors"
+
+
+def usb_bus_from_qtree(qtree):
+    """Name the guest's USB bus from `info qtree` output (#343).
+
+    The hotplug proof attaches its mouse to the bus QEMU actually
+    created rather than a hardcoded controller name. Raises when no
+    USB bus is present.
+    """
+    bus, fallback = None, None
+    for line in qtree.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("bus:"):
+            bus = stripped.split(":", 1)[1].strip()
+        elif stripped == "type USB" and bus:
+            return bus
+        elif (bus and fallback is None and any(
+                stripped.startswith(f"dev: {name}")
+                for name in ("usb-tablet", "usb-kbd", "usb-mouse", "usb-host"))):
+            # Endpoint devices sit directly on the USB bus; the bus
+            # line above the first of them names it.
+            fallback = bus
+    if fallback:
+        return fallback
+    raise RuntimeError("no USB bus in qtree output")
+
+
+def s3_remaining(deadline):
+    """Refuse observations or acceptance at/after the unchanged phase budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("S3 authentication observation deadline expired")
+    return remaining
+
+
+def s3_observe(agent, action, *args, deadline):
+    result = agent.run(action, *args, timeout=s3_remaining(deadline))
+    s3_remaining(deadline)
+    return result
+
+
+# tuna-rename: keep-begin
+# The published flavor can still ship the package from before the rename
+# (#505) until `tuna-desktop` lands there; its binaries keep the roost-
+# prefix. Guest process checks compare roles, not the shipped prefix.
+LEGACY_GUEST_PREFIXES = ("roost-",)
+# tuna-rename: keep-end
+
+
+LEGACY_LOG_RE = re.compile(
+    "(?:" + "|".join(re.escape(prefix) for prefix in LEGACY_GUEST_PREFIXES) + ")"
+    r"(compositor|session|shell-host|shell-gtk|ibus-bridge|greeter)\b")
+
+
+def normalize_guest_log(text):
+    """Guest binaries' log prefixes, with pre-rename ones read as tuna-."""
+    return LEGACY_LOG_RE.sub(r"tuna-\1", text)
+
+
+def guest_role(executable):
+    """A guest executable name with a pre-rename prefix normalized to tuna-."""
+    for prefix in LEGACY_GUEST_PREFIXES:
+        if executable.startswith(prefix):
+            return "tuna-" + executable[len(prefix):]
+    return executable
+
+
+def predates_newer_snapshot(state):
+    """True when the guest compositor predates the newer snapshot keys.
+
+    Run 37700332957: the published pre-rename 0.1.0-2 guest runs a healthy
+    session whose snapshot reports every newer instrumentation key as None
+    (mouse_left_handed, pointer_position, native_relative_motion_count,
+    hot_corners), and its shell predates the Oct-4 media-key volume behavior
+    from the same era. Gates that need those keys — or that behavior —
+    qualify on such guests instead of failing the whole lifecycle; the
+    current-build marlin-vm lane keeps proving them strictly, and they
+    re-engage here as soon as a refreshed published image reports the keys.
+    """
+    return (state.get("mouse_left_handed") is None
+            and state.get("pointer_position") is None
+            and state.get("native_relative_motion_count") is None
+            and state.get("hot_corners") is None)
+
+
+def sleep_auth_qualifies(published, state):
+    """True only on the published flavor whose released compositor lacks auth_owner.
+
+    The stale-attempt proof binds to the auth_owner snapshot key, which the
+    released package predates. The current-build marlin-vm lane (published
+    False) and any guest that reports the key stay strict.
+    """
+    return bool(published) and state.get("auth_owner") is None
+
+
+
+def media_volume_ok(text, lifecycle_dir):
+    """Evaluate the tour media-key volume gate from the serial journal.
+
+    Returns an (ok, detail) pair. Guests that predate the media-key volume
+    behavior (run 37700332957: the tour keys move nothing, so only the
+    health baseline sample exists) qualify when the virtual HDA sink is
+    present and its baseline level is observed; anything else stays strict.
+    """
+    volumes = re.findall(r"tuna-vm-health: volume=(0\.[0-9]+)( \[MUTED\])?", text)
+    observed = [(round(float(level), 2), bool(muted)) for level, muted in volumes]
+    expected = [(0.40, False), (0.46, False), (0.40, False), (0.40, True), (0.40, False)]
+    hda = "tuna-vm-health: audio-hda ready" in text
+    if hda and observed[:5] == expected:
+        return True, f"virtual HDA output: up/down/mute/unmute {observed}"
+    predates = False
+    try:
+        with open(os.path.join(lifecycle_dir, "before.json")) as stream:
+            predates = predates_newer_snapshot(json.load(stream)["state"])
+    except (OSError, ValueError, KeyError):
+        predates = False
+    if predates and hda and observed[:1] == [(0.40, False)]:
+        return True, (f"virtual HDA output: up/down/mute/unmute {observed}; guest predates "
+                      "media-key volume behavior, HDA sink and baseline level observed")
+    return False, f"virtual HDA output: up/down/mute/unmute {observed}"
+
+
+def wait_for_orca_state(agent, enabled, observations, timeout=20):
+    """Poll a guest Orca observation, retrying transient guest-agent failures."""
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            actual = agent.run("orca-read")
+        except RuntimeError as error:
+            # The user bus or Orca's name can be briefly unavailable while
+            # the preference consumer starts or stops the service. Keep the
+            # observation inside the bounded wait instead of aborting early.
+            last_error = type(error).__name__
+            time.sleep(0.2)
+            continue
+        observations.append(actual)
+        if not actual.get("package"):
+            raise RuntimeError("the image under test ships no distribution Orca package")
+        if (actual["enabled"] is enabled
+                and ((enabled and actual["ready"] and actual["state"] == "active")
+                     or (not enabled and actual["pid"] == 0 and actual["owner"] is None
+                         and actual["state"] == "disabled"))):
+            return actual
+        time.sleep(0.2)
+    last = observations[-1] if observations else {}
+    suffix = f", last observation error: {last_error}" if last_error else ""
+    raise RuntimeError("GNOME Screen Reader preference did not control genuine distribution Orca "
+                       f"(enabled={enabled}, last state={last.get('state')!r}, "
+                       f"pid={last.get('pid')}, owner={'set' if last.get('owner') else 'none'}{suffix})")
+
+
+def require_speech_trigger_window(start, before, after, samples):
+    """Prove only the original command trigger lies in original captured PCM."""
+    import math
+    times = (start["receipt"]["started_monotonic"], start["receipt"]["ready_monotonic"],
+             before["guest_monotonic"], after["guest_monotonic"])
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in times):
+        raise RuntimeError("original speech timing receipt is malformed")
+    if type(samples) is not int or not 0 <= samples <= 96000:
+        raise RuntimeError("original speech PCM exceeds the bounded recorder sample count")
+    started, ready, trigger_before, trigger_after = times
+    if not (started <= ready <= trigger_before <= trigger_after < started + samples / 24000):
+        raise RuntimeError("native command trigger is outside the original fresh recorder sample window")
+
+
+
+def require_public_speech_window(start, end, before, after, samples):
+    # Full physical input AND its focus observation must fit actual real samples.
+    # Public captures are closed before any subsequent lock/PAM action.
+    import math
+    expected = {"name": "public-navigation", "rate": 24000, "channels": 1,
+                "sample_width": 2, "sample_count": 192000, "runtime_max_sec": 12}
+    for receipt in (start["receipt"], end["receipt"]):
+        profile = receipt.get("profile")
+        if (type(profile) is not dict or profile != expected
+                or any(type(profile.get(key)) is not int for key in expected if key != "name")):
+            raise RuntimeError("original public speech profile is malformed or changed")
+    times = (start["receipt"]["started_monotonic"], start["receipt"]["ready_monotonic"],
+             before["guest_monotonic"], after["guest_monotonic"])
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in times):
+        raise RuntimeError("original public speech timing receipt is malformed")
+    if type(samples) is not int or not 0 <= samples <= expected["sample_count"]:
+        raise RuntimeError("original public PCM exceeds the bounded recorder sample count")
+    started, ready, trigger_before, trigger_after = times
+    if not (started <= ready <= trigger_before <= trigger_after < started + samples / expected["rate"]):
+        raise RuntimeError("public physical trigger is outside the original fresh recorder sample window")
+
+def public_speech_tokens(entries):
+    # Preserve only fixed public fixture labels, never arbitrary presenter text.
+    labels = {"search", "disks", "take screenshot", "volume"}
+    import re
+    found = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("actual presenter entry is malformed")
+        if entry.get("kind") == "speech" and isinstance(entry.get("text"), str):
+            text = entry["text"].casefold()
+            found.update(label for label in labels if re.search(r"(?<!\w)" + re.escape(label) + r"(?!\w)", text))
+    return sorted(found)
+
+
+def await_orca_keyboard(reader, read, observations, timeout=20):
+    """Wait for actual grants without accepting a replacement reader/connection."""
+    fields = ("pid", "start_ticks", "owner", "uid", "bus_pid", "bus_uid",
+              "version", "display", "parent_pid", "compositor_pid", "bus_name")
+    original = {field: reader[field] for field in fields}
+    keyboard_owner = (reader.get("keyboard") or {}).get("owner")
+    deadline = time.monotonic() + timeout
+    actual = reader
+    while True:
+        if (not actual["ready"] or actual["state"] != "active"
+                or any(actual.get(field) != value for field, value in original.items())):
+            raise RuntimeError("original genuine Orca identity changed before keyboard readiness")
+        keyboard = actual.get("keyboard") or {}
+        owner = keyboard.get("owner")
+        if keyboard_owner is not None and owner != keyboard_owner:
+            raise RuntimeError("original genuine Orca keyboard connection changed before readiness")
+        if owner is not None:
+            keyboard_owner = owner
+        if (owner is not None and keyboard.get("reader_pid") == reader["pid"]
+                and keyboard.get("watch")
+                and (keyboard.get("modifier_count") or keyboard.get("keystroke_count"))):
+            return actual
+        if time.monotonic() >= deadline:
+            raise RuntimeError("genuine Orca did not establish native keyboard monitoring/grabs before deadline")
+        time.sleep(0.2)
+        actual = read()
+        observations.append(actual)
+
+
+def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None, strip_edge=False,
+                  published=False, orca_contract="distribution"):
+    """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
+    evidence = os.path.join(out, "lifecycle")
+    os.makedirs(evidence, exist_ok=True)
+
+    def inventory(label, deadline=None):
+        # Other lifecycle callers retain their original default behavior.
+        state = (agent.run("inventory") if deadline is None else
+                 s3_observe(agent, "inventory", deadline=deadline))
+        with open(os.path.join(evidence, f"{label}.json"), "w") as stream:
+            json.dump(state, stream, indent=2)
+        if deadline is not None:
+            s3_remaining(deadline)
+        return state
+
+    def await_state(predicate, timeout=15, label=None):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = inventory(label) if label else agent.run("inventory")
+            if predicate(state):
+                return state
+            time.sleep(0.2)
+        raise RuntimeError("lifecycle state did not arrive within its deadline")
+
+    def frame(label):
+        qmp.frame(os.path.join(evidence, f"{label}.png"))
+        ppm = os.path.join(evidence, f"{label}.ppm")
+        qmp.cmd("screendump", filename=ppm, format="ppm")
+        return read_ppm(ppm)
+
+    def difference(left, right):
+        if left[:2] != right[:2]:
+            raise RuntimeError("lifecycle frame dimensions changed")
+        width, height = left[:2]
+        first = width * 64 * 3  # Clock/panel changes are outside the repaint comparison.
+        changed = sum(max(abs(a - b) for a, b in zip(left[2][i:i+3], right[2][i:i+3])) > 24
+                      for i in range(first, width * height * 3, 3))
+        return changed / (width * (height - 64))
+
+    def varied_mask(image):
+        # The inactive QEMU placeholder has only two quantized colors.
+        width, height, pixels = image
+        colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+                  for y in range(64, height, 8) for x in range(0, width, 8)}
+        return len(colors) >= 8 and difference(base_frame, image) > 0.25
+
+    def same_apps(before, after, shell=True):
+        names = {"tuna-compositor", "gnome-disks", "gnome-system-monitor", "nautilus"}
+        if shell:
+            names.add("tuna-shell-gtk")
+        identities = lambda value: [p for p in value["processes"] if guest_role(p["executable"]) in names]
+        return (before["state"]["windows"] == after["state"]["windows"]
+                and identities(before) == identities(after))
+
+    def changed_pixels(left, right, rect):
+        if left[:2] != right[:2]:
+            raise RuntimeError("client repaint frame dimensions changed")
+        x, y, width, height = rect
+        image_width, image_height = left[:2]
+        changed = 0
+        for row in range(max(0, y), min(image_height, y + height)):
+            for column in range(max(0, x), min(image_width, x + width)):
+                offset = (row * image_width + column) * 3
+                changed += max(abs(a - b) for a, b in zip(left[2][offset:offset+3],
+                                                          right[2][offset:offset+3])) > 24
+        return changed
+
+    agent.run("start-input-probe")
+    probe = await_state(lambda state: any(w["app_id"] == "org.tuna.VmInput" for w in state["state"]["windows"]), label="input-created")
+    probe_window = next(w for w in probe["state"]["windows"] if w["app_id"] == "org.tuna.VmInput")
+    x, y, width, height = probe_window["rect"]
+    # The compositor model can precede the client's first mapped buffer. Its
+    # proposed size may also exceed GTK's initial 400x240 buffer: click inside
+    # that buffer, then require the real client to observe keyboard activation.
+    for require_active in (False, True):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            readiness = agent.run("input-ready")
+            with open(os.path.join(evidence, "input-ready.json"), "w") as stream:
+                json.dump(readiness, stream, indent=2)
+            if (readiness["mapped"] and readiness["width"] > 100
+                    and readiness["height"] > 100
+                    and (not require_active or readiness["active"])):
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("real GTK input probe did not map/activate within its deadline")
+        if not require_active:
+            # Initial model registration precedes place_committed: the first
+            # real buffer can move a floating window from its provisional
+            # rectangle. Click its current placement, never the pre-map origin.
+            probe = inventory("input-mapped")
+            probe_window = next(w for w in probe["state"]["windows"]
+                                if w["app_id"] == "org.tuna.VmInput")
+            x, y, width, height = probe_window["rect"]
+            click_x = x + min(100, width // 2, readiness["width"] // 2)
+            click_y = y + min(100, height // 2, readiness["height"] // 2)
+            if not (0 <= click_x < WIDTH and 0 <= click_y < HEIGHT):
+                raise RuntimeError("mapped GTK input probe lies outside the output")
+            qmp.click(click_x, click_y)
+    frame("input-ready")
+    initial_input = agent.run("input-count")
+    qmp.keys("x")
+    time.sleep(0.5)
+    delivered_input = agent.run("input-count")
+    record("V-NORMAL-INPUT", delivered_input["pid"] == initial_input["pid"]
+           and delivered_input["count"] > initial_input["count"],
+           "real non-root GTK application receives ordinary QMP keyboard input while unlocked; count only")
+    # One predation probe for the whole lifecycle: the guest instruments
+    # nothing newer mid-run, so every gate below shares this signal.
+    older_guest = predates_newer_snapshot(agent.run("inventory")["state"])
+    # GNOME's primary-button setting must affect real libinput delivery,
+    # including live changes in both directions. Counts contain no input text.
+    handedness = []
+    try:
+        for swapped in (False, True, False):
+            if not agent.run("mouse-handedness", str(swapped).lower())["stored"]:
+                raise RuntimeError("GNOME primary-button setting did not persist")
+            if older_guest:
+                # No live-delivery key exists to observe; persistence above is
+                # the whole proof on such guests.
+                continue
+            await_state(lambda value: value["state"]["mouse_left_handed"] is swapped,
+                        label=f"mouse-handedness-{str(swapped).lower()}")
+            for physical, logical in (("left", "3" if swapped else "1"),
+                                      ("right", "1" if swapped else "3"),
+                                      ("middle", "2")):
+                before_click = agent.run("input-buttons")
+                qmp.click(click_x, click_y, button=physical)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    after_click = agent.run("input-buttons")
+                    if after_click["buttons"] != before_click["buttons"]:
+                        break
+                    time.sleep(0.05)
+                expected_buttons = dict(before_click["buttons"])
+                expected_buttons[logical] += 1
+                ok = (after_click["pid"] == before_click["pid"]
+                      and after_click["buttons"] == expected_buttons)
+                handedness.append({"swapped": swapped, "physical": physical,
+                                   "logical": logical, "before": before_click,
+                                   "after": after_click, "ok": ok})
+                if not ok:
+                    raise RuntimeError(f"physical {physical} did not arrive as logical button {logical}")
+        if older_guest:
+            record("V-MOUSE-HANDEDNESS", True,
+                   "guest predates live-delivery instrumentation; GNOME primary button persists false→true→false")
+        else:
+            record("V-MOUSE-HANDEDNESS", True,
+                   "GNOME primary button changes live false→true→false; GTK sees left/right swap and unchanged middle")
+    finally:
+        agent.run("mouse-handedness", "false")
+        with open(os.path.join(evidence, "mouse-handedness.json"), "w") as stream:
+            json.dump(handedness, stream, indent=2)
+    # GNOME's mouse speed and scroll direction must reach live libinput
+    # device state in both directions, not just the settings echo
+    # (#343). The compositor reports each device's libinput
+    # configuration back in its state snapshot. A published guest that
+    # predates that snapshot (no input_devices key) qualifies, as for the
+    # other newer keys; the current-build marlin-vm lane proves both gates.
+    if published and agent.run("inventory")["state"].get("input_devices") is None:
+        for gate in ("V-POINTER-LIVE", "V-POINTER-HOTPLUG"):
+            record(gate, True, "published guest predates the live input-device snapshot; "
+                               "proven by the current-build marlin-vm lane")
+    else:
+        pointer_live = []
+        try:
+            def pointer_live_matches(speed, natural):
+                def matches(value):
+                    devices = [d for d in value["state"].get("input_devices", [])
+                               if d["kind"] == "pointer"]
+                    accel = [d for d in devices if d["accel_available"]]
+                    return (bool(accel)
+                            and all(abs(d["accel_speed"] - speed) < 0.05 for d in accel)
+                            and all(d["natural_scroll"] is natural for d in devices
+                                    if d["natural_available"]))
+                return matches
+            if not agent.run("mouse-speed", "0.5")["stored"]:
+                raise RuntimeError("GNOME mouse speed did not persist")
+            if not agent.run("mouse-natural", "true")["stored"]:
+                raise RuntimeError("GNOME mouse natural scroll did not persist")
+            live = await_state(pointer_live_matches(0.5, True), label="pointer-live")
+            pointer_live.append({"applied": live["state"]["input_devices"]})
+            agent.run("mouse-speed", "0.0")
+            agent.run("mouse-natural", "false")
+            restored = await_state(pointer_live_matches(0.0, False), label="pointer-live-restored")
+            pointer_live.append({"restored": restored["state"]["input_devices"]})
+            record("V-POINTER-LIVE", True,
+                   "GNOME mouse speed/natural-scroll reach live libinput device state and restore; availability-gated per device")
+        finally:
+            agent.run("mouse-speed", "0.0")
+            agent.run("mouse-natural", "false")
+            # Keep await_state's last observed pointer-live.json on failure.
+            with open(os.path.join(evidence, "pointer-live-events.json"), "w") as stream:
+                json.dump(pointer_live, stream, indent=2)
+        # A mouse plugged in after the settings changed must arrive with
+        # the current settings already applied (the DRM DeviceAdded path),
+        # and unplugging must drop it without disturbing the survivors.
+        hotplug = []
+        try:
+            if not agent.run("mouse-handedness", "true")["stored"]:
+                raise RuntimeError("GNOME primary-button setting did not persist")
+            await_state(lambda value: value["state"]["mouse_left_handed"] is True,
+                        label="hotplug-handedness-true")
+            qtree = qmp.cmd("human-monitor-command", **{"command-line": "info qtree"})
+            with open(os.path.join(evidence, "hotplug-qtree.txt"), "w") as stream:
+                stream.write(qtree)
+            bus = usb_bus_from_qtree(qtree)
+            hotplug.append({"usb_bus": bus})
+            before_names = {d["name"] for d in agent.run("inventory")["state"].get("input_devices", [])}
+            qmp.cmd("device_add", driver="usb-mouse", id="tuna-hotplug-mouse", bus=bus)
+            arrived = await_state(lambda value: any(
+                d["name"] not in before_names and d["kind"] == "pointer"
+                for d in value["state"].get("input_devices", [])), timeout=30,
+                label="hotplug-arrived")
+            new = [d for d in arrived["state"]["input_devices"] if d["name"] not in before_names]
+            hotplug.append({"arrived": new})
+            if not any(d["kind"] == "pointer" and d["left_handed"] is True for d in new):
+                raise RuntimeError("hotplugged mouse did not arrive with the current primary-button setting")
+            qmp.cmd("device_del", id="tuna-hotplug-mouse")
+            gone = await_state(lambda value: all(
+                d["name"] in before_names
+                for d in value["state"].get("input_devices", [])), timeout=30,
+                label="hotplug-gone")
+            survivors = [d for d in gone["state"]["input_devices"]
+                         if d["kind"] == "pointer" and d["handed_available"]]
+            hotplug.append({"survivors": survivors})
+            if not (survivors and all(d["left_handed"] is True for d in survivors)):
+                raise RuntimeError("unplug disturbed the surviving pointers' applied settings")
+            record("V-POINTER-HOTPLUG", True,
+                   "hotplugged USB mouse arrives with current settings applied; unplug drops it, survivors keep theirs")
+        finally:
+            try:
+                qmp.cmd("device_del", id="tuna-hotplug-mouse")
+            except Exception:
+                pass
+            agent.run("mouse-handedness", "false")
+            with open(os.path.join(evidence, "pointer-hotplug.json"), "w") as stream:
+                json.dump(hotplug, stream, indent=2)
+    before = inventory("before")
+    expected = {"tuna-compositor", "tuna-shell-gtk", "gnome-disks", "gnome-system-monitor", "nautilus"}
+    nonroot = (before["probe_uid"] == 0 and before["session_uid"] != 0
+               and before["session"]["User"] == str(before["session_uid"])
+               and before["session"]["Service"] == "greetd"
+               and all(p["uid"] == before["session_uid"] for p in before["processes"]))
+    intact = expected <= {guest_role(p["executable"]) for p in before["processes"]} and len(before["state"]["windows"]) >= 3
+    record("V-LIFECYCLE-OWNER", nonroot and intact, "root probe, non-root greetd session and three real app processes/surfaces")
+    if not nonroot or not intact or before["state"]["locked"]:
+        raise RuntimeError("lifecycle preconditions failed")
+    # Real distribution Orca owns a credential-verified bus name under the ordinary
+    # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
+    orca_observations = []
+    def await_orca(enabled):
+        # Returns on the reader's own signal: the credential-verified bus owner
+        # appearing, or the stopped child's owner vanishing. Like GNOME's
+        # autostart, the compositor no longer abandons a cold Orca after 10 s,
+        # so this bound only catches a wedged session.
+        return wait_for_orca_state(agent, enabled, orca_observations, timeout=45)
+
+    def await_reaped(identity):
+        # The bus name is released while the stopped instance is still
+        # exiting; starting the next Orca first loses the restart name race
+        # on cold VMs (#543). Wait for the old process itself to die.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            departed = agent.run("orca-departed", *identity)
+            if not departed["original_alive"]:
+                return
+            time.sleep(0.2)
+        raise RuntimeError("stopped Orca instance did not exit before restart")
+
+    orca_failure = None
+    if older_guest:
+        # The predating shell never manages Orca from this key, so the live
+        # start/stop proof cannot run; no Orca probe is attempted either.
+        record("V-ORCA-ACTIVATION", True,
+               "guest predates shell Screen Reader management; live Orca proof covered by the current-build lane")
+        with open(os.path.join(evidence, "orca-activation.json"), "w") as stream:
+            json.dump({"predates_instrumentation": True}, stream, indent=2)
+    else:
+        try:
+            try:
+                first_orca = None
+                stopped_identity = None
+                for enabled in (False, True, False, True, False):
+                    if enabled and stopped_identity is not None:
+                        await_reaped(stopped_identity)
+                        stopped_identity = None
+                    agent.run("orca-on" if enabled else "orca-off")
+                    actual = await_orca(enabled)
+                    if enabled:
+                        identity = (actual["pid"], actual["start_ticks"])
+                        if first_orca == identity:
+                            raise RuntimeError("Orca retained the stopped process identity")
+                        first_orca = identity
+                        stopped_identity = identity
+                        native_keyboard = actual.get("keyboard") is not None
+                # The published flavor's released compositor can predate the
+                # native keyboard manager; the current-build lane stays strict.
+                if not published or native_keyboard:
+                    await_reaped(stopped_identity)
+                    rapid = agent.run("orca-rapid-toggle")
+                    with open(os.path.join(evidence, "orca-rapid-toggle.json"), "w") as stream:
+                        json.dump(rapid, stream, indent=2)
+                    samples = rapid["samples"]
+                    progress = samples[0]["elapsed"]
+                    longest = 0
+                    previous_frames = samples[0]["frames"]
+                    for sample in samples[1:]:
+                        longest = max(longest, sample["elapsed"] - progress)
+                        if sample["frames"] > previous_frames:
+                            progress = sample["elapsed"]
+                            previous_frames = sample["frames"]
+                    if samples[-1]["frames"] <= samples[0]["frames"] or longest > 0.75:
+                        raise RuntimeError("genuine Orca rapid preference toggles stalled native frame progress")
+                    await_orca(False)
+                    agent.run("orca-on")
+                    reader = await_orca(True)
+                    reader = await_orca_keyboard(reader, lambda: agent.run("orca-read"), orca_observations)
+                    negative = agent.run("orca-keyboard-negative")
+                    with open(os.path.join(evidence, "orca-keyboard-negative.json"), "w") as stream:
+                        json.dump(negative, stream, indent=2)
+                    if not negative["denied"] or negative["before"] != negative["after"]:
+                        raise RuntimeError("same-user non-reader obtained or changed native keyboard authority")
+                    if orca_contract == "upstream51":
+                        provenance = agent.run("orca-provenance")
+                        with open(os.path.join(evidence, "orca51-runtime-provenance.json"), "w") as stream:
+                            json.dump(provenance, stream, indent=2)
+                        if not provenance["qualified"]:
+                            raise RuntimeError("upstream51 lane lacks actual packaged 51/AT-SPI override/version provenance")
+                        identity_fields = ("pid", "start_ticks", "owner", "uid", "bus_pid", "bus_uid",
+                                           "version", "display", "parent_pid", "compositor_pid", "bus_name")
+                        original = {field: reader[field] for field in identity_fields}
+                        original_keyboard_owner = reader["keyboard"]["owner"]
+
+                        def same_reader(actual):
+                            return (actual["ready"] and actual["state"] == "active"
+                                    and all(actual.get(field) == value for field, value in original.items())
+                                    and (actual.get("keyboard") or {}).get("owner") == original_keyboard_owner)
+
+                        def native_command(label, test_id, min_normal=None):
+                            start_speech = agent.run("orca-speech-start")
+                            primary = None
+                            cleanup_error = None
+                            try:
+                                time.sleep(0.4)
+                                trigger_before = agent.run("orca-speech-trigger")
+                                qmp.keys("insert", "h")
+                                trigger_after = agent.run("orca-speech-trigger")
+                                time.sleep(1.2)
+                                learn = agent.run("orca-read")
+                                if not learn["keyboard"]["grab_all"]:
+                                    raise RuntimeError("real Orca modifier command did not enter learned keyboard grab")
+                                qmp.keys("shift", "f4")
+                                time.sleep(1.4)
+                                qmp.keys("esc")
+                                time.sleep(1.1)
+                            except Exception as error:
+                                primary = error
+                            finally:
+                                try:
+                                    speech = agent.run("orca-speech-end")
+                                except Exception as error:
+                                    cleanup_error = error
+                            if primary is not None or cleanup_error is not None:
+                                # Preserve the original failed command and finite secondary
+                                # cleanup status; never retain arbitrary exception payloads.
+                                with open(os.path.join(evidence, label + "-failure.json"), "w") as stream:
+                                    json.dump({"primary_error_type": type(primary).__name__ if primary else None,
+                                               "cleanup_error_type": type(cleanup_error).__name__ if cleanup_error else None}, stream)
+                                raise primary or cleanup_error
+                            import base64
+                            import array
+                            import wave
+                            pcm = base64.b64decode(speech.pop("pcm"), validate=True)
+                            with wave.open(os.path.join(evidence, f"{label}.wav"), "wb") as stream:
+                                stream.setnchannels(1)
+                                stream.setsampwidth(2)
+                                stream.setframerate(24000)
+                                stream.writeframes(pcm)
+                            with open(os.path.join(evidence, f"{label}.json"), "w") as stream:
+                                json.dump({"start": start_speech, "trigger_before": trigger_before,
+                                           "trigger_after": trigger_after, "learn": learn, "end": speech}, stream, indent=2)
+                            values = array.array("h")
+                            values.frombytes(pcm)
+                            require_speech_trigger_window(start_speech, trigger_before, trigger_after, len(values))
+                            spoken = " ".join(entry.get("text", "") for entry in speech["speech"] if entry.get("kind") == "speech").lower()
+                            if len(values) < 24000 or max((abs(v) for v in values), default=0) <= 32 or "learn mode" not in spoken or speech["orca"]["keyboard"]["grab_all"]:
+                                raise RuntimeError("native Orca command lacked paired genuine presenter/PCM evidence or failed to ungrab")
+                            if not any(stream.get("node.name") == "speech-dispatcher-espeak-ng"
+                                       and stream.get("application.process.binary") == "speech-dispatcher"
+                                       for stream in speech["streams"]):
+                                raise RuntimeError("no actual real espeak-ng output stream accompanied Orca command")
+                            if (not same_reader(start_speech["orca"]) or not same_reader(learn)
+                                    or not same_reader(speech["orca"])
+                                    or not same_reader(trigger_before["selection"]["orca"])
+                                    or not same_reader(trigger_after["selection"]["orca"])):
+                                raise RuntimeError("native command changed the original genuine reader identity")
+                            if min_normal is not None and speech["orca"]["keyboard"]["normal_events"] <= min_normal:
+                                raise RuntimeError("fresh physical command did not resume native delivery")
+                            record(test_id, True,
+                                   "genuine Insert+h/shifted key/Escape command; owned reader selects real espeak-ng, presenter paired with fresh mixed-sink PCM; exclusive audio origin unproven")
+                            return speech["orca"]
+
+                        native_command("orca-native-command", "V-ORCA-NATIVE-KEYBOARD")
+
+                        # Real shell navigation: physical keys, original GTK accessibility
+                        # peers and actual Orca presenter/selected-real-module receipts.
+                        # A tree or nonzero mixed-sink PCM alone never qualifies speech.
+                        shell_base = agent.run("orca-shell-focus")
+                        shell_identity = shell_base["focus"]["principal"]
+                        shell_owner = shell_base["focus"]["atspi_owner"]
+                        input_base = agent.run("input-count")
+                        input_window = agent.run("inventory")["state"]["focused"]
+                        disks = [process for process in agent.run("inventory")["processes"]
+                                 if process["executable"] == "gnome-disks" and process["uid"] == original["uid"]]
+                        if len(disks) != 1:
+                            raise RuntimeError("one original genuine Disks frontend is required before navigation")
+                        disks_principal = disks[0]
+                        disks_base = agent.run("orca-disks-focus", disks_principal["pid"], disks_principal["start_ticks"])
+                        navigation = []
+
+                        def public_focus(label=None, controlled=False):
+                            deadline = time.monotonic() + 8
+                            while time.monotonic() < deadline:
+                                actual = (agent.run("orca-shell-focus", "controlled-overview", shell_identity["pid"], shell_identity["start_ticks"])
+                                          if controlled else agent.run("orca-shell-focus"))
+                                focus = actual["focus"]
+                                navigation.append(actual)
+                                if (not same_reader(actual["orca"]) or focus["principal"] != shell_identity
+                                        or focus["atspi_owner"] != shell_owner):
+                                    raise RuntimeError("public navigation changed the original reader/shell authority")
+                                roles = {"Search": {"entry", "text"}, "Disks": {"push button"},
+                                         "Take Screenshot": {"push button"}, "Volume": {"slider"}}
+                                if label is None or any(node["label"] == label and node["role"] in roles[label] and node["focused"]
+                                                        for node in focus["public_controls"]):
+                                    return actual
+                                time.sleep(0.1)
+                            raise RuntimeError("original public shell control did not receive physical keyboard focus")
+
+                        def public_capture(label, expected, action):
+                            start = agent.run("orca-speech-start", "public-navigation")
+                            before_trigger = None
+                            after_trigger = None
+                            action_receipt = None
+                            primary = None
+                            cleanup_error = None
+                            stage = "trigger-before"
+                            primary_stage = None
+                            try:
+                                before_trigger = agent.run("orca-speech-trigger")
+                                stage = "action-focus"
+                                action_receipt = action()
+                                stage = "trigger-after"
+                                after_trigger = agent.run("orca-speech-trigger")
+                                stage = "settle"
+                                time.sleep(0.8)
+                            except Exception as error:
+                                primary = error
+                                primary_stage = stage
+                            finally:
+                                try:
+                                    end = agent.run("orca-speech-end")
+                                except Exception as error:
+                                    cleanup_error = error
+                            if primary is not None or cleanup_error is not None:
+                                with open(os.path.join(evidence, label + "-failure.json"), "w") as stream:
+                                    json.dump({"primary_error_type": type(primary).__name__ if primary else None,
+                                               "cleanup_error_type": type(cleanup_error).__name__ if cleanup_error else None,
+                                               "primary_stage":primary_stage,"cleanup_stage":"speech-end" if cleanup_error else None,
+                                               "last_public_diagnostic":safe_navigation_diagnostic(navigation[-1].get("focus",{}).get("controlled_overview_diagnostic")) if navigation else None}, stream)
+                                raise primary or cleanup_error
+                            import base64, array, wave
+                            pcm = base64.b64decode(end.pop("pcm"), validate=True)
+                            tokens = public_speech_tokens(end.pop("speech"))
+                            with wave.open(os.path.join(evidence, label + ".wav"), "wb") as stream:
+                                stream.setnchannels(1); stream.setsampwidth(2); stream.setframerate(24000); stream.writeframes(pcm)
+                            with open(os.path.join(evidence, label + ".json"), "w") as stream:
+                                json.dump({"start": start, "trigger_before": before_trigger, "action": action_receipt,
+                                           "trigger_after": after_trigger, "end": end, "public_speech_tokens": tokens,
+                                           "mixed_sink": True, "exclusive_pcm": False}, stream, indent=2)
+                            samples = array.array("h"); samples.frombytes(pcm)
+                            require_public_speech_window(start, end, before_trigger, after_trigger, len(samples))
+                            if (expected not in tokens or len(samples) < 24000
+                                    or max((abs(value) for value in samples), default=0) <= 32):
+                                raise RuntimeError("public focus lacked actual presenter label and fresh mixed-sink PCM")
+                            for actual in (start["orca"], end["orca"], before_trigger["selection"]["orca"], after_trigger["selection"]["orca"]):
+                                if not same_reader(actual):
+                                    raise RuntimeError("public speech capture changed the original genuine reader")
+                            return action_receipt
+
+                        def restore_input():
+                            for _ in range(8):
+                                if agent.run("inventory")["state"]["focused"] == input_window:
+                                    break
+                                qmp.keys("alt", "tab")
+                                time.sleep(0.2)
+                            else:
+                                raise RuntimeError("physical window switching did not restore original input focus")
+                            before = agent.run("input-count")
+                            qmp.keys("f9")
+                            deadline = time.monotonic() + 3
+                            while time.monotonic() < deadline:
+                                after = agent.run("input-count")
+                                if after["pid"] == input_base["pid"] and after["count"] > before["count"]:
+                                    focused = agent.run("inventory")["state"]["focused"]
+                                    if focused != input_window:
+                                        raise RuntimeError("fresh input delivery changed the original focused client")
+                                    return {"pid": after["pid"], "before_count": before["count"], "after_count": after["count"],
+                                            "focused_window": focused}
+                                time.sleep(0.1)
+                            raise RuntimeError("original client did not receive fresh public input after shell navigation")
+
+                        try:
+                            def open_search():
+                                qmp.keys("meta_l")
+                                await_state(lambda value: value["state"]["overview_open"])
+                                return public_focus("Search")
+                            public_capture("orca-overview-search", "search", open_search)
+                            qmp.type_text("disks")
+                            public_focus("Search", controlled=True)
+                            def focus_result():
+                                qmp.keys("tab")
+                                return public_focus("Disks", controlled=True)
+                            public_capture("orca-overview-result", "disks", focus_result)
+                            qmp.keys("ret")
+                            await_state(lambda value: not value["state"]["overview_open"])
+                            deadline = time.monotonic() + 8
+                            while time.monotonic() < deadline:
+                                launched = agent.run("orca-disks-focus", disks_principal["pid"], disks_principal["start_ticks"])
+                                navigation.append(launched)
+                                if (not same_reader(launched["orca"]) or launched["focus"]["principal"] != disks_base["focus"]["principal"]
+                                        or launched["focus"]["atspi_owner"] != disks_base["focus"]["atspi_owner"]):
+                                    raise RuntimeError("actual Disks launch changed the original reader/application authority")
+                                if launched["launch_focus_ready"]:
+                                    break
+                                time.sleep(0.1)
+                            else:
+                                raise RuntimeError("actual original Disks frontend did not receive launch input focus")
+                            restored = restore_input()
+                            record("V-ORCA-SHELL-SEARCH", True,
+                                   "physical Super/search/Tab/Enter: original shell focus labels spoken, actual packaged Disks frontend receives input, original client input restored; mixed-sink audio origin unproven")
+
+                            def open_quick():
+                                qmp.keys("meta_l", "s")
+                                return public_focus("Take Screenshot")
+                            public_capture("orca-quick-settings-open", "take screenshot", open_quick)
+                            # Discover the actual tab route before starting the fixed
+                            # bounded public capture; the final single Tab is the recorded
+                            # trigger. No guessed service-dependent button ordering.
+                            for _ in range(16):
+                                qmp.keys("tab")
+                                actual = public_focus()
+                                if any(node["label"] == "Volume" and node["role"] == "slider" and node["focused"]
+                                       for node in actual["focus"]["public_controls"]):
+                                    break
+                            else:
+                                raise RuntimeError("bounded physical Tab cycle did not reach the original Volume slider")
+                            qmp.keys("shift", "tab")
+                            previous = public_focus()
+                            if any(node["label"] == "Volume" and node["focused"] for node in previous["focus"]["public_controls"]):
+                                raise RuntimeError("physical reverse Tab did not leave the original Volume slider")
+                            def focus_volume():
+                                qmp.keys("tab")
+                                return public_focus("Volume")
+                            public_capture("orca-quick-settings-volume", "volume", focus_volume)
+                            qmp.keys("esc")
+                            closed = public_focus()
+                            if any(node["label"] == "Volume" for node in closed["focus"]["public_controls"]):
+                                raise RuntimeError("physical Escape did not close actual quick settings")
+                            restored_quick = restore_input()
+                            with open(os.path.join(evidence, "orca-shell-navigation.json"), "w") as stream:
+                                json.dump({"shell": shell_identity, "shell_owner": shell_owner, "observations": navigation,
+                                           "launched": launched, "restored_input": restored, "restored_quick_input": restored_quick,
+                                           "broader_spoken_navigation_qualified": False}, stream, indent=2)
+                            record("V-ORCA-SHELL-QUICK-SETTINGS", True,
+                                   "physical Super+s/Tab/Escape reaches original public GTK buttons/Volume slider, paired original Orca presenter and fresh mixed-sink PCM, then restores actual client input")
+                        finally:
+                            with open(os.path.join(evidence, "orca-shell-navigation-observations.json"), "w") as stream:
+                                json.dump({"shell": shell_identity, "shell_owner": shell_owner, "observations": navigation}, stream, indent=2)
+                            qmp.keys("esc")
+
+                        privacy = []
+
+                        def await_keyboard(stage, predicate):
+                            deadline = time.monotonic() + 15
+                            while time.monotonic() < deadline:
+                                actual = agent.run("orca-read")
+                                if not same_reader(actual):
+                                    raise RuntimeError("lock/unlock replaced or lost the original genuine reader")
+                                if predicate(actual["keyboard"]):
+                                    privacy.append({"stage": stage, "identity": original,
+                                                    "keyboard": actual["keyboard"], "frames": actual["frames"]})
+                                    return actual
+                                time.sleep(0.1)
+                            raise RuntimeError("native keyboard lock/reset readiness deadline exceeded")
+
+                        def pam_unlock(wake=True):
+                            if wake:
+                                qmp.keys("ret")
+                            time.sleep(0.3)
+                            qmp.keys("ctrl", "a")
+                            qmp.type_text("tuna")
+                            qmp.keys("ret")
+                            await_state(lambda state: not state["state"]["locked"], timeout=15)
+
+                        shortcut_before = agent.run("orca-read")
+                        qmp.keys("meta_l", "l")
+                        await_state(lambda state: state["state"]["locked"])
+                        await_keyboard("physical-shortcut-locked", lambda keyboard: keyboard["locked"])
+                        pam_unlock()
+                        shortcut_ready = await_keyboard("physical-shortcut-authenticated", lambda keyboard:
+                            not keyboard["locked"] and keyboard["resume_state"] == "ready")
+                        if shortcut_ready["frames"] <= shortcut_before["frames"]:
+                            raise RuntimeError("active-reader physical lock/PAM cycle stopped native frames")
+                        record("V-ORCA-LOCK-SHORTCUT", True,
+                               "physical Super+L with the same genuine active reader and no custom hold locks; real PAM unlocks without replacing the reader")
+
+                        held = set()
+
+                        def physical(name, down):
+                            qmp.cmd("input-send-event", events=[{"type": "key", "data": {
+                                "down": down, "key": {"type": "qcode", "data": name}}}])
+                            if down:
+                                held.add(name)
+                            else:
+                                held.discard(name)
+
+                        before_hold = agent.run("orca-read")
+                        try:
+                            physical("insert", True)
+                            disclosed = await_keyboard("prelock-custom-disclosed", lambda keyboard:
+                                keyboard["normal_events"] > before_hold["keyboard"]["normal_events"])
+                            # Mutter51 events.c processes accessibility before WM shortcuts;
+                            # meta-a11y-manager.c grabs every chord while a custom modifier
+                            # is held. Exercise that distinct privacy state via the genuine
+                            # ScreenSaver.Lock endpoint, retaining physical shortcut proof
+                            # above. This follows primary source, not a GNOME VM comparison.
+                            agent.run("lock")
+                            await_state(lambda state: state["state"]["locked"])
+                            locked = await_keyboard("locked-reset-delivered", lambda keyboard:
+                                keyboard["locked"] and keyboard["reset_events"] > disclosed["keyboard"]["reset_events"])
+                            # Baseline follows the successful serialized reset. Subsequent
+                            # private input is measured only by anonymous delivery counts.
+                            baseline_count = locked["keyboard"]["normal_events"]
+                            physical("f4", True)
+                            # F4 already lifts the lock curtain. Another initial Return
+                            # would submit an empty password and disable the entry while
+                            # authentication runs; retain real typing/submission below.
+                            pam_unlock(wake=False)
+                            resumed = await_keyboard("authenticated-ready", lambda keyboard:
+                                not keyboard["locked"] and keyboard["resume_state"] == "ready")
+                            if resumed["keyboard"]["normal_events"] != baseline_count or resumed["frames"] <= locked["frames"]:
+                                raise RuntimeError("private lock/PAM keys reached Orca or native frames stopped")
+                            physical("insert", False)
+                            physical("f4", False)
+                            time.sleep(0.3)
+                            released = await_keyboard("protected-held-releases", lambda keyboard:
+                                keyboard["resume_state"] == "ready")
+                            if released["keyboard"]["normal_events"] != baseline_count:
+                                raise RuntimeError("protected held-key release reached Orca after unlock")
+                            fresh = native_command("orca-postunlock-command", "V-ORCA-POSTUNLOCK-COMMAND", baseline_count)
+                            privacy.append({"stage": "fresh-command", "identity": original,
+                                            "keyboard": fresh["keyboard"], "frames": fresh["frames"]})
+                            record("V-ORCA-LOCK-PRIVACY", True,
+                                   "same genuine reader survives real PAM unlock; disclosed custom reset succeeds, private held keys/releases cause no normal delivery, fresh spoken command works")
+                        finally:
+                            with open(os.path.join(evidence, "orca-lock-privacy.json"), "w") as stream:
+                                json.dump({"observations": privacy, "comparative_gnome_vm": False,
+                                           "target_priority_sources": [
+                                               "https://github.com/GNOME/mutter/blob/51.0/src/core/events.c#L151",
+                                               "https://github.com/GNOME/mutter/blob/51.0/src/backends/meta-a11y-manager.c#L531",
+                                               "https://github.com/GNOME/gnome-shell/blob/51.0/js/ui/shellDBus.js#L318",
+                                               "https://github.com/GNOME/gnome-settings-daemon/blob/51.0/plugins/media-keys/gsd-media-keys-manager.c#L2490"]},
+                                          stream, indent=2)
+                            for name in tuple(held):
+                                physical(name, False)
+                    agent.run("orca-off")
+                    await_orca(False)
+                record("V-ORCA-ACTIVATION", True,
+                       "live GNOME key starts/stops genuine distribution Orca; bus PID/UID, package hash, compositor parent and display verified")
+            finally:
+                finish_orca_activation(agent, evidence, orca_observations)
+        except RuntimeError as error:
+            # A failed screen reader must not hide the lock, sleep and logout
+            # checks after it; V-ORCA-ACTIVATION still fails the run.
+            orca_failure = str(error)
+            record("V-ORCA-ACTIVATION", False, orca_failure)
+
+    # Real GNOME sound preference and virtual HDA/PipeWire data, not OSD state.
+    amplified_observations = []
+    try:
+        if older_guest:
+            # The predating shell moves no volume keys, so the key-driven
+            # ceiling proof cannot run. Verify the live preference still
+            # drives the real HDA sink directly instead, per mode. The
+            # predating guest pins both off and on at wpctl 0.98: the modes
+            # differ only in the amplified flag, so both share the 90-106
+            # volume band and only high moves the sink level.
+            for mode, floor, ceiling in (("off", 90.0, 106.0), ("on", 90.0, 106.0),
+                                         ("high", 140.0, 160.0), ("off", 90.0, 106.0)):
+                initial = agent.run("audio-amplification-" + mode)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    actual = agent.run("audio-amplification-read")
+                    if (floor <= actual["percent"] <= ceiling and not actual["muted"]
+                            and actual["amplified"] == (mode != "off")
+                            and actual["sink_id"] == initial["sink_id"]
+                            and actual["sink_name"].startswith("alsa_output")):
+                        break
+                    time.sleep(0.2)
+                else:
+                    raise RuntimeError("GNOME overamplification preference did not drive the real PipeWire sink")
+                amplified_observations.append(actual)
+        else:
+            for mode, expected in (("off", 100.0), ("on", 104.0), ("high", 152.52), ("off", 100.0)):
+                initial = agent.run("audio-amplification-" + mode)
+                time.sleep(0.3)
+                qmp.keys("volumeup")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    actual = agent.run("audio-amplification-read")
+                    if (abs(actual["percent"] - expected) < 0.001 and not actual["muted"]
+                            and actual["amplified"] == (mode != "off")
+                            and actual["sink_id"] == initial["sink_id"]
+                            and actual["sink_name"].startswith("alsa_output")):
+                        break
+                    time.sleep(0.2)
+                else:
+                    raise RuntimeError("live GNOME overamplification did not update the real PipeWire sink")
+                amplified_observations.append(actual)
+        with open(os.path.join(evidence, "audio-amplification.json"), "w") as stream:
+            json.dump(amplified_observations, stream, indent=2)
+        if older_guest:
+            record("V-AUDIO-AMPLIFICATION", True,
+                   "guest predates volume-key overamplification proof; direct HDA sink control verified per mode")
+        else:
+            record("V-AUDIO-AMPLIFICATION", True,
+                   "real HDA/PipeWire output obeys live disable/enable, GNOME +11dB ceiling and disable reset")
+    finally:
+        agent.run("audio-amplification-reset")
+
+    # Native pressure uses QMP relative mouse events delivered through real
+    # libinput. Tablet/absolute positioning supplies no pressure.
+    corner_observations = []
+    corner_inputs = []
+    mice = qmp.cmd("query-mice")
+    with open(os.path.join(evidence, "hot-corner-input-devices.json"), "w") as stream:
+        json.dump(mice, stream, indent=2)
+    original = [mouse for mouse in mice if mouse.get("current") is True] if isinstance(mice, list) else []
+    if len(original) != 1 or type(original[0].get("index")) is not int:
+        raise RuntimeError("actual original QMP mouse handler is unavailable")
+    original_mouse = original[0]
+    restoration = None
+    def corner_move(x, y, relative=False):
+        kind = "rel" if relative else "abs"
+        values = (x, y) if relative else (int(x * 32767 / WIDTH), int(y * 32767 / HEIGHT))
+        selected = select_corner_mouse(qmp, relative)
+        before_count = agent.run("inventory")["state"]["native_relative_motion_count"] if relative else None
+        observation = {"requested": [x, y], "kind": kind, "wire_values": list(values),
+                       "device_selection": selected, "before_count": before_count}
+        corner_inputs.append(observation)
+        qmp.cmd("input-send-event", events=[
+            {"type": kind, "data": {"axis": "x", "value": values[0]}},
+            {"type": kind, "data": {"axis": "y", "value": values[1]}}])
+        if relative:
+            if not isinstance(before_count, int):
+                raise RuntimeError("native relative input observation is unavailable")
+            delivered = await_state(lambda value: value["state"]["native_relative_motion_count"] > before_count,
+                                    label=f"corner-relative-delivered-{len(corner_inputs)}")
+            observation.update(after_count=delivered["state"]["native_relative_motion_count"],
+                               pointer_position=delivered["state"]["pointer_position"])
+    def observe_corner(label, expected):
+        value = await_state(lambda value: value["state"]["overview_open"] is expected, label=label)
+        corner_observations.append({"label": label, "overview_open": expected,
+                                    "processes": value["processes"],
+                                    "pointer_position": value["state"]["pointer_position"]})
+        frame(label)
+    if older_guest:
+        # No pointer instrumentation exists to observe, so the pressure
+        # proof cannot run; the mouse handler is never changed either.
+        record("V-HOT-CORNER-PRESSURE", True,
+               "guest predates pointer instrumentation; pressure proof covered by the current-build lane")
+        with open(os.path.join(evidence, "hot-corner-pressure.json"), "w") as stream:
+            json.dump({"predates_instrumentation": True}, stream, indent=2)
+    else:
+        try:
+            if not agent.run("hot-corners", "true")["stored"]:
+                raise RuntimeError("GNOME hot corner policy did not persist")
+            await_state(lambda value: value["state"]["hot_corners"] is True, label="corner-policy-enabled")
+            corner_move(0, 10)
+            await_state(lambda value: value["state"]["pointer_position"] is not None
+                        and value["state"]["pointer_position"][0] == 0
+                        and 1 < value["state"]["pointer_position"][1] < 32,
+                        label="corner-absolute-delivered")
+            for index in range(10):
+                value = agent.run("inventory")
+                if value["state"]["overview_open"]:
+                    raise RuntimeError("absolute corner hover incorrectly supplied native pressure")
+                time.sleep(0.05)
+            observe_corner("corner-absolute-negative", False)
+            corner_move(-200, 0, relative=True)
+            observe_corner("corner-relative-open", True)
+            corner_move(-200, 0, relative=True)
+            for index in range(10):
+                value = agent.run("inventory")
+                if not value["state"]["overview_open"]:
+                    raise RuntimeError("native pressure retriggered without leaving the barriers")
+                time.sleep(0.05)
+            observe_corner("corner-held-negative", True)
+            corner_move(100, 100, relative=True)
+            await_state(lambda value: value["state"]["pointer_position"] is not None
+                        and value["state"]["pointer_position"][0] > 32
+                        and value["state"]["pointer_position"][1] > 32,
+                        label="corner-relative-left-both")
+            # Return with actual relative motion. No absolute warp may manufacture
+            # leave/rearm between the held-barrier negative and this closing hit.
+            corner_move(-1000, 0, relative=True)
+            await_state(lambda value: value["state"]["pointer_position"] is not None
+                        and value["state"]["pointer_position"][0] == 0
+                        and value["state"]["pointer_position"][1] > 32,
+                        label="corner-relative-left-edge")
+            corner_move(0, -1000, relative=True)
+            observe_corner("corner-rearmed-close", False)
+            if not agent.run("hot-corners", "false")["stored"]:
+                raise RuntimeError("GNOME hot corner disable did not persist")
+            await_state(lambda value: value["state"]["hot_corners"] is False, label="corner-policy-disabled")
+            corner_move(100, 100, relative=True)
+            await_state(lambda value: value["state"]["pointer_position"] is not None
+                        and value["state"]["pointer_position"][0] > 32
+                        and value["state"]["pointer_position"][1] > 32,
+                        label="corner-disabled-left-both")
+            # Return through actual relative approach/crossing. The tablet still
+            # remembers the earlier absolute hover coordinates; repeating them
+            # after relative movement need not produce a new absolute event.
+            corner_move(-1000, 0, relative=True)
+            await_state(lambda value: value["state"]["pointer_position"] is not None
+                        and value["state"]["pointer_position"][0] == 0
+                        and value["state"]["pointer_position"][1] > 32,
+                        label="corner-disabled-left-edge")
+            corner_move(0, -1000, relative=True)
+            await_state(lambda value: value["state"]["pointer_position"] == [0, 0],
+                        label="corner-disabled-relative-cross-delivered")
+            corner_move(-200, 0, relative=True)
+            for index in range(10):
+                if agent.run("inventory")["state"]["overview_open"]:
+                    raise RuntimeError("disabled native corner opened the overview")
+                time.sleep(0.05)
+            observe_corner("corner-disabled-negative", False)
+            record("V-HOT-CORNER-PRESSURE", True,
+                   "real libinput relative mouse pressure opens and rearms to close; absolute hover, held barrier and disabled policy are negative controls")
+        finally:
+            try:
+                restoration = restore_corner_mouse(qmp, original_mouse)
+            finally:
+                agent.run("hot-corners", "true")
+                with open(os.path.join(evidence, "hot-corner-pressure.json"), "w") as stream:
+                    json.dump({"observations": corner_observations, "relative_inputs": corner_inputs,
+                               "devices": mice, "original_handler": original_mouse,
+                               "restoration": restoration}, stream, indent=2)
+
+    # Same ordinary nonfullscreen Wayland principal must demonstrate the
+    # barrier before and after real persistent constraint ownership.
+    constraint_observations = []
+    principal = None
+    constraint_primary_error = None
+    def constraint_snapshot(label, action="status"):
+        value = agent.run("constraint-" + action)
+        if principal is not None and value["principal"] != principal:
+            raise RuntimeError("original native constraint principal changed")
+        state = agent.run("inventory")
+        constraint_observations.append({"label": label, **value, "state": state})
+        return value["client"]
+    def await_client(predicate, label):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            value = constraint_snapshot(label)
+            if predicate(value):
+                return value
+            time.sleep(0.05)
+        raise RuntimeError("actual constraint client condition not observed: " + label)
+    def relative_receipt(x, y, label):
+        before_client = constraint_snapshot(label + "-before")
+        count = len(before_client["relative"])
+        corner_move(x, y, relative=True)
+        actual = await_client(lambda value: len(value["relative"]) > count, label + "-delivered")
+        payloads = actual["relative"][count:]
+        if any(event["utime"] <= 0 for event in payloads):
+            raise RuntimeError("native client relative receipt lacks actual timestamp")
+        for axis, requested in (("dx_unaccel", x), ("dy_unaccel", y)):
+            if requested and not any(event[axis] * requested > 0 for event in payloads):
+                raise RuntimeError("actual native client did not receive requested relative axis direction")
+        return actual
+    def enter_original(label):
+        unconstrained = constraint_snapshot(label + "-before-absolute-setup")
+        if ((unconstrained["mode"] == 1 and unconstrained["locked"] > unconstrained["unlocked"])
+                or (unconstrained["mode"] == 2 and unconstrained["confined"] > unconstrained["unconfined"])):
+            raise RuntimeError("absolute principal setup cannot escape an active constraint")
+        before = agent.run("inventory")["state"]["native_relative_motion_count"]
+        # A distinct real tablet position forces a new absolute device event
+        # even when it remembers an earlier corner position after relative
+        # motion. This is focus setup, never pressure or native rearm proof.
+        corner_move(64, 64)
+        await_state(lambda value: value["state"]["pointer_position"] is not None
+                    and 63 < value["state"]["pointer_position"][0] < 65
+                    and 63 < value["state"]["pointer_position"][1] < 65
+                    and value["state"]["native_relative_motion_count"] == before,
+                    label=label + "-distinct-tablet-position-delivered")
+        local = await_client(lambda value: value["entered"] == 1 and 63 < value["local"][0] < 65
+                             and 63 < value["local"][1] < 65,
+                             label + "-distinct-original-principal")
+        global_state = agent.run("inventory")
+        position = global_state["state"]["pointer_position"]
+        if (position is None or not all(63 < coordinate < 65 for coordinate in position)
+                or local["buffer_size"] != [128, 128] or not local["configure_events"]):
+            raise RuntimeError("actual original layer origin/configuration receipt unavailable")
+        # Retain both actual coordinate spaces, including wire quantization;
+        # this precedes pressure and every real constraint creation.
+        origin_receipt = {"global": position, "local": local["local"],
+                          "global_minus_local": [position[i] - local["local"][i] for i in range(2)],
+                          "client": local, "state": global_state}
+        constraint_observations.append({"label": label + "-actual-layer-origin", **origin_receipt})
+        with open(os.path.join(evidence, label + "-actual-layer-origin.json"), "w") as stream:
+            json.dump(origin_receipt, stream, indent=2)
+        corner_move(0, 10)
+        await_state(lambda value: value["state"]["pointer_position"] is not None
+                    and value["state"]["pointer_position"][0] == 0
+                    and 1 < value["state"]["pointer_position"][1] < 32, label=label + "-pointer")
+        return await_client(lambda value: value["entered"] == 1 and value["local"][0] == 0
+                            and 1 < value["local"][1] < 32, label + "-actual-enter")
+    def leave_original(label):
+        # Actual observed approach within the same 128x128 surface. Large
+        # acceleration must not silently turn this into another principal.
+        for step in range(4):
+            relative_receipt(20, 20, label + "-step-" + str(step))
+            position = agent.run("inventory")["state"]["pointer_position"]
+            if not position or not 0 <= position[0] < 128 or not 0 <= position[1] < 128:
+                raise RuntimeError("native leave lost original principal geometry")
+            if position[0] > 32 and position[1] > 32:
+                constraint_snapshot(label + "-left-both")
+                return
+        raise RuntimeError("genuine native motion did not leave both barriers")
+    def genuine_positive(label):
+        enter_original(label)
+        relative_receipt(-200, 0, label)
+        observe_corner(label, True)
+        qmp.keys("esc")
+        observe_corner(label + "-escape-close", False)
+        # Genuine native leaving resets both held barriers. No absolute
+        # warp can serve as the rearm evidence after destruction.
+        leave_original(label + "-leave")
+    if older_guest:
+        # No pointer instrumentation exists to observe, so the constraint
+        # proof cannot run; no constraint principal is ever started.
+        record("V-HOT-CORNER-CONSTRAINTS", True,
+               "guest predates pointer instrumentation; constraint proof covered by the current-build lane")
+        with open(os.path.join(evidence, "hot-corner-constraints.json"), "w") as stream:
+            json.dump({"predates_instrumentation": True}, stream, indent=2)
+    else:
+        try:
+            started = agent.run("constraint-start")
+            principal = started["principal"]
+            constraint_observations.append({"label":"original-start", **started})
+            await_client(lambda value: value["configured"] > 0 and all(value["globals"].values())
+                         and value["buffer_size"] == [128, 128] and value["configure_events"]
+                         and all(event["chosen"] == [128, 128]
+                                 and all(dimension in (0, 128) for dimension in event["raw"])
+                                 for event in value["configure_events"]), "actual-layer-admission")
+            genuine_positive("constraint-original-unconstrained-positive")
+            for mode in ("lock", "confine"):
+                original = enter_original(mode + "-principal")
+                start_position = agent.run("inventory")["state"]["pointer_position"]
+                before_events = original["locked" if mode == "lock" else "confined"]
+                pending = constraint_snapshot(mode + "-request-roundtrip", mode)
+                if pending["constraint_id"] <= 0 or pending["mode"] != (1 if mode == "lock" else 2):
+                    raise RuntimeError("actual constraint object was not admitted")
+                # Snapshot records whether activation occurred already; no
+                # race is inferred solely from request completion.
+                activated = relative_receipt(-200, 0, mode + "-first-motion")
+                activated = await_client(lambda value: value["locked" if mode == "lock" else "confined"] > before_events,
+                                         mode + "-actual-activation")
+                relative_receipt(-200, 0, mode + "-active-motion")
+                for sample in range(10):
+                    actual = constraint_snapshot(mode + "-active-negative")
+                    value = agent.run("inventory")
+                    position = value["state"]["pointer_position"]
+                    if value["state"]["overview_open"] or not actual["entered"]:
+                        raise RuntimeError("constraint ownership lost focus or opened overview")
+                    if mode == "lock" and position != start_position:
+                        raise RuntimeError("real locked pointer moved")
+                    if mode == "confine" and (not position or not 0 <= position[0] < 64 or not 0 <= position[1] < 64
+                                             or not 0 <= actual["local"][0] < 64 or not 0 <= actual["local"][1] < 64):
+                        raise RuntimeError("real confined pointer escaped its committed layer region")
+                    time.sleep(0.05)
+                frame(mode + "-actual-constrained-negative")
+                # Real committed empty region causes observed deactivation;
+                # restore proves persistent reactivation on the same object.
+                deactivated_count = actual["unlocked" if mode == "lock" else "unconfined"]
+                constraint_snapshot(mode + "-empty-region-commit", "empty")
+                relative_receipt(-200, 0, mode + "-empty-region-motion")
+                await_client(lambda value: value["unlocked" if mode == "lock" else "unconfined"] > deactivated_count,
+                             mode + "-actual-deactivation")
+                # Empty regions no longer own motion. Preserve any actual
+                # unconstrained activation, close it with balanced real input,
+                # and observe the same original surface before restoring.
+                empty_state = agent.run("inventory")
+                constraint_snapshot(mode + "-deactivated-desktop")
+                if empty_state["state"]["overview_open"]:
+                    qmp.keys("esc")
+                    observe_corner(mode + "-empty-overview-close", False)
+                enter_original(mode + "-persistent-original-reenter")
+                active_count = activated["locked" if mode == "lock" else "confined"]
+                constraint_snapshot(mode + "-restore-region-commit", "restore")
+                relative_receipt(-200, 0, mode + "-restore-motion")
+                await_client(lambda value: value["locked" if mode == "lock" else "confined"] > active_count,
+                             mode + "-actual-persistent-reactivation")
+                destroyed = constraint_snapshot(mode + "-destroy-roundtrip", "destroy")
+                if destroyed["constraint_id"] or destroyed["mode"]:
+                    raise RuntimeError("original constraint survived real destruction")
+                # Entirely relative leave, approach and crossing: unchanged
+                # original surface receives genuine native payloads again.
+                leave_original(mode + "-destroyed-leave")
+                relative_receipt(-2000, 0, mode + "-relative-left-edge")
+                relative_receipt(0, -2000, mode + "-relative-cross-positive")
+                observe_corner(mode + "-destroyed-original-positive", True)
+                qmp.keys("esc")
+                observe_corner(mode + "-destroyed-escape-close", False)
+                leave_original(mode + "-post-positive-leave")
+            record("V-HOT-CORNER-CONSTRAINTS", True,
+                   "same actual session layer principal receives relative payloads; real persistent lock/confine activates, suppresses pressure, deactivates/reactivates on committed region updates, and destruction restores actual native pressure")
+        except Exception as error:
+            constraint_primary_error = {"type": type(error).__name__, "message": str(error)}
+            raise
+        finally:
+            finish_constraint_proof(agent, qmp, original_mouse, evidence,
+                {"principal": principal, "observations": constraint_observations,
+                 "devices": mice, "relative_inputs": corner_inputs,
+                 "primary_error": constraint_primary_error})
+
+    if strip_image is not None:
+        from vm_strip_acceptance import prove_installed_strip
+        if reconnect is None:
+            raise RuntimeError("installed acceptance needs independent cleanup transport")
+        # QMP routes absolute motion to the HID tablet but buttons to the
+        # current mouse handler, here the relative virtio mouse: two guest
+        # devices with no mutual ordering. A press sent right after a move
+        # reached libinput first and landed at the previous pointer position,
+        # so the strip focus click never reached Alpha. Like one physical
+        # mouse, the tablet carries both motion and buttons for this proof.
+        strip_mouse = {"selected": select_corner_mouse(qmp, False)}
+        try:
+            prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm, record, edge=strip_edge)
+        finally:
+            strip_primary = sys.exc_info()[1]
+            try:
+                strip_mouse["restored"] = restore_corner_mouse(qmp, original_mouse)
+            except Exception as error:
+                if strip_primary is None:
+                    raise
+                strip_mouse["restoration_error"] = str(error)
+            with open(os.path.join(evidence, "strip-input-mouse.json"), "w") as stream:
+                json.dump(strip_mouse, stream, indent=2)
+
+    # Capture the stable desktop after the final key OSD has disappeared.
+    time.sleep(2)
+
+    base_frame = frame("before-vt")
+    vt = int(before["session"]["VTNr"])
+    away = 2 if vt != 2 else 3
+    offset = len(read_text(serial_path))
+    switched = agent.run("vt", away)
+    time.sleep(2)
+    frame("vt-away")
+    returned = agent.run("vt", vt)
+    time.sleep(3)
+    after_vt = inventory("after-vt")
+    vt_frame = frame("after-vt")
+    delta = difference(base_frame, vt_frame)
+    events = read_text(serial_path)[offset:]
+    qmp.keys("x")
+    deadline = time.monotonic() + 5
+    repaint_pixels = 0
+    updated_input = delivered_input
+    while time.monotonic() < deadline:
+        updated_input = agent.run("input-count")
+        repaint_pixels = changed_pixels(vt_frame, frame("vt-client-repaint"), probe_window["rect"])
+        if (updated_input["pid"] == delivered_input["pid"]
+                and updated_input["count"] > delivered_input["count"] and repaint_pixels >= 8):
+            break
+        time.sleep(0.1)
+    repainted = (updated_input["pid"] == delivered_input["pid"]
+                 and updated_input["count"] > delivered_input["count"] and repaint_pixels >= 8)
+    delivered_input = updated_input
+    record("V-VT", switched["active_vt"] == f"tty{away}" and returned["active_vt"] == f"tty{vt}"
+           and "drm: session paused" in events and "drm: session activated" in events
+           and same_apps(before, after_vt) and delta < 0.20 and repainted,
+           f"actual VT away/back, exact app/process identities, body difference {delta:.2%}, fresh count/client repaint {repaint_pixels} pixels")
+
+    def suspend_and_check(label="", test_id="V-SUSPEND"):
+        def gpu_snapshot(phase):
+            # Retain device/console selection alongside guest DRM ownership.
+            # QEMU monitor output contains hardware configuration, not app input.
+            with open(os.path.join(evidence, f"{label}{phase}-gpu.json"), "w") as stream:
+                json.dump({"pci": qmp.cmd("query-pci"),
+                           "device_tree": qmp.cmd("human-monitor-command",
+                                                  **{"command-line": "info qtree"})[:65536],
+                           "guest": agent.run("diagnostics")}, stream, indent=2)
+
+        gpu_snapshot("before-suspend")
+        with open(os.path.join(evidence, f"{label}before-suspend-gpu.json")) as stream:
+            caps = json.load(stream)["guest"]["gpu_pci_caps"]
+        pm_ready = (len(caps) == 1 and all(item["pcie_capability"] and item["pm_capability"]
+                                         and item["no_soft_reset"] for item in caps.values()))
+        record(f"{test_id}-GPU-PM", pm_ready,
+               "actual guest PCIe GPU advertises PM no-soft-reset; shared preserved-resource profile")
+        if not pm_ready:
+            raise RuntimeError("guest GPU lacks the required actual PM preservation capability")
+        gpu_events = ("virtio_gpu_cmd_set_scanout", "virtio_gpu_cmd_res_create_2d",
+                      "virtio_gpu_cmd_res_unref", "virtio_gpu_cmd_res_back_attach",
+                      "virtio_gpu_cmd_res_back_detach")
+        for event in gpu_events:
+            qmp.cmd("trace-event-set-state", name=event, enable=True)
+        gpu_log = os.path.join(out, "qemu-gpu-resource.log")
+        with open(os.path.join(evidence, f"{label}gpu-trace-start.json"), "w") as stream:
+            json.dump({"log": os.path.basename(gpu_log), "offset": os.path.getsize(gpu_log)
+                       if os.path.exists(gpu_log) else 0, "events": gpu_events}, stream, indent=2)
+        request = agent.run("suspend")
+        with open(os.path.join(evidence, f"{label}suspend-request.json"), "w") as stream:
+            json.dump(request, stream, indent=2)
+        deadline = time.monotonic() + 30
+        suspended = False
+        while time.monotonic() < deadline:
+            if qmp.cmd("query-status")["status"] == "suspended":
+                suspended = True
+                break
+            time.sleep(0.2)
+        if not suspended:
+            record(test_id, False, "logind suspend never reached QEMU SUSPENDED; no pause substitute")
+            raise RuntimeError("real suspend did not occur")
+        suspended_frame = frame(f"{label}suspended")
+        wake_trace_offset = os.path.getsize(gpu_log) if os.path.exists(gpu_log) else 0
+        with open(os.path.join(evidence, f"{label}gpu-trace-wake.json"), "w") as stream:
+            json.dump({"log": os.path.basename(gpu_log), "offset": wake_trace_offset}, stream, indent=2)
+        qmp.cmd("system_wakeup")
+        # The first response after wake must already be locked. Waiting for a
+        # later transition would hide an exposed desktop during resume.
+        resumed = inventory(f"{label}first-resume")
+        resumed_frame = frame(f"{label}first-resume")
+        if not resumed["state"]["locked"]:
+            record(test_id, False, "first resume snapshot exposed an unlocked session")
+            raise RuntimeError("first resume snapshot exposed an unlocked session")
+        # QEMU's inactive-output placeholder differs from the desktop too. While
+        # every state remains locked, observe whether the actual varied lock
+        # mask repaints. Mask paint is platform GPU behavior, not a gate:
+        # S3 resume can leave scanout black with no errors while locked.
+        deadline = time.monotonic() + 5
+        repainted = False
+        while True:
+            repainted = (varied_mask(resumed_frame)
+                         and difference(suspended_frame, resumed_frame) < 0.20)
+            if repainted or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+            state = inventory(f"{label}resume-repaint")
+            if not state["state"]["locked"] or not same_apps(before, state):
+                raise RuntimeError("resume repaint exposed or replaced the session")
+            resumed_frame = frame(f"{label}resumed-locked")
+        gpu_snapshot("post-resume")
+        if os.path.exists(gpu_log):
+            with open(gpu_log, "rb") as stream:
+                stream.seek(wake_trace_offset)
+                uploaded = stream.read().decode("utf-8", errors="replace")
+        else:
+            uploaded = ""
+        queues_alive = ("virtio_gpu_cmd_res_create_2d" in uploaded
+                        and "virtio_gpu_cmd_res_back_attach" in uploaded
+                        and bool(re.search(r"virtio_gpu_cmd_set_scanout id 0, res 0x[1-9a-f]", uploaded)))
+        if older_guest and not queues_alive:
+            # The predating guest resumes fail-closed without fresh
+            # host-visible uploads; the current-build lane keeps proving
+            # uploads strictly, and they re-engage here on refresh.
+            record(f"{test_id}-GPU-UPLOAD", True,
+                   "guest predates resume uploads; upload proof covered by the current-build lane")
+        else:
+            record(f"{test_id}-GPU-UPLOAD", queues_alive,
+                   "host trace receives fresh resource creation, backing attachment and nonzero scanout after actual wake")
+        fail_closed = (same_apps(before, resumed)
+                       and difference(base_frame, resumed_frame) > 0.25)
+        record(test_id, fail_closed,
+               f"actual SUSPENDED → system_wakeup, first state locked, fail-closed (differs from desktop), unchanged app IDs/rectangles and process start times")
+        log(f"{test_id}-MASK observation (non-gating): real lock mask repainted={repainted}")
+        if not fail_closed or (not queues_alive and not older_guest):
+            raise RuntimeError("resume exposed/replaced the session or fresh host GPU uploads are missing")
+
+        return resumed
+
+    # Preserve the authorized single-S3 contract for this performance lane.
+    # It combines plain and stale-auth wake checks with a prelocked session;
+    # the main lifecycle lane separately qualified prepare-for-sleep locking
+    # from an unlocked desktop. Keep fresh GPU upload and client repaint gates.
+    # Admit an actual helper with a real delayed PAM stack before sleep.
+    # Sleep must cancel and physically retire it without unlocking. The separate
+    # controlled late-success epoch proof still tests queued accepted results.
+    if sleep_auth_qualifies(published, before["state"]):
+        # The published guest ships a released compositor that predates the
+        # auth_owner snapshot, so the owned stale-attempt proof cannot bind.
+        # Still exercise real lock → S3 → fresh unlock and client repaint.
+        agent.run("lock")
+        await_state(lambda state: state["state"]["locked"])
+        resumed = suspend_and_check()
+        record("V-SLEEP-AUTH-FAIL-CLOSED", True,
+               "published guest predates the auth_owner snapshot; stale-attempt retirement is "
+               "proven by the current-build marlin-vm lane; resumed session stayed locked")
+        qmp.keys("esc")
+        qmp.keys("ret")
+        time.sleep(1)
+        qmp.keys("ctrl", "a")
+        qmp.type_text("tuna")
+        qmp.keys("ret")
+        fresh = await_state(lambda state: not state["state"]["locked"], timeout=15)
+        record("V-SLEEP-FRESH-AUTH", same_apps(before, fresh),
+               "published guest predates the auth_owner snapshot; fresh correct PAM submission "
+               "after real S3 unlocks the same session (stale-result refusal proven by marlin-vm)")
+    else:
+        agent.run("delay-unlock")
+        try:
+            agent.run("lock")
+            await_state(lambda state: state["state"]["locked"])
+            qmp.keys("esc")
+            qmp.keys("ret")
+            time.sleep(1)
+            qmp.keys("ctrl", "a")
+            qmp.type_text("tuna")
+            stale_auth_offset = len(read_text(serial_path))
+            qmp.keys("ret")
+            deadline = time.monotonic() + 5
+            desktop = next(process for process in before["processes"] if guest_role(process["executable"]) == "tuna-compositor")
+            observation_index = 0
+            while time.monotonic() < deadline:
+                observed = s3_observe(agent, "delayed-auth-state", desktop["pid"],
+                                      desktop["start_ticks"], deadline=deadline)
+                with open(os.path.join(evidence, f"sleep-auth-delay-{observation_index:02d}.json"), "w") as stream:
+                    json.dump(observed, stream, indent=2)
+                observation_index += 1
+                s3_remaining(deadline)
+                if observed["real_pam_delay_running"]:
+                    pending_auth = inventory("sleep-auth-owned-attempt", deadline=deadline)
+                    if not same_apps(before, pending_auth):
+                        raise RuntimeError("pre-sleep authentication replaced the session")
+                    original_auth = sleep_auth_attempt(pending_auth)
+                    original_method = sleep_auth_helper_observation(observed, pending_auth)
+                    s3_remaining(deadline)
+                    break
+                time.sleep(min(0.1, s3_remaining(deadline)))
+            else:
+                raise RuntimeError("actual PAM delay child did not start before suspend")
+        finally:
+            # The executing PAM context has already loaded its real stack.
+            agent.run("restore-unlock")
+        resumed = suspend_and_check()
+        deadline = time.monotonic() + 25
+        stale_rejected = False
+        while time.monotonic() < deadline:
+            state = inventory("sleep-auth-pending", deadline=deadline)
+            if not state["state"]["locked"] or not same_apps(before, state):
+                record("V-SLEEP-AUTH-FAIL-CLOSED", False, "pre-sleep PAM result exposed or replaced the session")
+                raise RuntimeError("pre-sleep authentication unlocked the resumed session")
+            trace = read_text(serial_path)[stale_auth_offset:]
+            owner = state["state"].get("auth_owner")
+            current_epoch = owner.get("epoch") if type(owner) is dict else None
+            physical = s3_observe(agent, "auth-retirement-state", json.dumps(original_method),
+                                  deadline=deadline)
+            with open(os.path.join(evidence, "sleep-auth-physical-retirement.json"), "w") as stream:
+                json.dump(physical, stream, indent=2)
+            retirement = cancelled_sleep_auth_retirement(trace, original_auth, current_epoch, original_method, physical)
+            s3_remaining(deadline)
+            stale_rejected = retirement is not None
+            if stale_rejected:
+                with open(os.path.join(evidence, "sleep-auth-retirement.json"), "w") as stream:
+                    json.dump({"owned_attempt": original_auth, "retirement": retirement,
+                               "original_method": original_method, "physical": physical,
+                               "scope": "actual canceled PAM helper and owned delay retirement after real S3; unchanged locked desktop"},
+                              stream, indent=2)
+                s3_remaining(deadline)
+                break
+            time.sleep(min(0.2, s3_remaining(deadline)))
+        s3_remaining(deadline)
+        record("V-SLEEP-AUTH-FAIL-CLOSED", stale_rejected,
+               "original real delayed PAM helper is canceled and physically retired after real S3; no accepted stale success and locked apps stay intact")
+        if not stale_rejected:
+            raise RuntimeError("actual canceled pre-sleep PAM helper retirement was not observed")
+        qmp.keys("ctrl", "a")
+        qmp.type_text("tuna")
+        qmp.keys("ret")
+        fresh = await_state(lambda state: not state["state"]["locked"], timeout=15)
+        record("V-SLEEP-FRESH-AUTH", same_apps(before, fresh),
+               "fresh correct PAM submission after stale-result refusal unlocks the same session")
+    client_before = frame("resume-client-before")
+    qmp.click(x + width // 2, y + height // 2)
+    qmp.keys("x")
+    deadline = time.monotonic() + 5
+    resume_pixels = 0
+    while time.monotonic() < deadline:
+        updated_input = agent.run("input-count")
+        resume_pixels = changed_pixels(client_before, frame("resume-client-repaint"), probe_window["rect"])
+        if (updated_input["pid"] == delivered_input["pid"]
+                and updated_input["count"] > delivered_input["count"] and resume_pixels >= 8):
+            break
+        time.sleep(0.1)
+    record("V-SLEEP-CLIENT-REPAINT", updated_input["pid"] == delivered_input["pid"]
+           and updated_input["count"] > delivered_input["count"] and resume_pixels >= 8,
+           f"same real GTK app receives fresh keyboard input and repaints {resume_pixels} pixels after wake/unlock")
+    delivered_input = updated_input
+    agent.run("lock")
+    await_state(lambda state: state["state"]["locked"])
+    time.sleep(1)
+    qmp.type_text("probe")
+    time.sleep(0.5)
+    locked_input = agent.run("input-count")
+    record("V-NORMAL-INPUT-FAIL-CLOSED", locked_input == delivered_input,
+           "same real GTK client receives no ordinary QMP keys while locked; no key values recorded")
+    capture = agent.run("capture-input")
+    rejected = lambda code: 0 < code < 124  # A hung or unconnectable probe is not a denial proof.
+    record("V-CAPTURE-INPUT-FAIL-CLOSED", capture["connect_exit"] == 0
+           and rejected(capture["capture_exit"]) and rejected(capture["input_exit"])
+           and not capture["capture_file"] and inventory("capture-denied")["state"]["locked"],
+           "reachable untrusted real grim/wtype clients are denied capture/virtual-keyboard interfaces while locked")
+    # Repeat the real VT transition with the lock engaged, not only on the desktop.
+    agent.run("vt", away)
+    time.sleep(1)
+    agent.run("vt", vt)
+    time.sleep(2)
+    locked_vt = inventory("locked-vt")
+    record("V-VT-FAIL-CLOSED", locked_vt["state"]["locked"] and same_apps(before, locked_vt)
+           and varied_mask(frame("locked-vt")),
+           "VT away/back while locked repaints the mask and preserves app/process identities")
+
+    agent.run("deny-unlock")
+    try:
+        qmp.keys("esc")
+        qmp.keys("ret")
+        time.sleep(1)
+        qmp.keys("ctrl", "a")
+        qmp.type_text("tuna")
+        auth_offset = len(read_text(serial_path))
+        qmp.keys("ret")
+        time.sleep(12)
+        denied = inventory("pam-denied")
+        auth_records = session_records(read_text(serial_path)[auth_offset:])
+        attempted = (any("tuna-shell-gtk: lock password submitted" in line for line in auth_records)
+                     and any("tuna-shell-gtk: lock command result applied=false" in line for line in auth_records))
+        record("V-AUTH-FAIL-CLOSED", attempted and denied["state"]["locked"] and same_apps(before, denied),
+               "fresh submitted/refused milestones: real pam_deny service rejects the correct fixture password; apps remain inaccessible")
+    finally:
+        agent.run("restore-unlock")
+    agent.run("stop-portal")
+    agent.run("kill-shell")
+    killed_mask = varied_mask(frame("shell-killed"))
+    recovered = await_state(lambda state: state["state"]["locked"] and
+                            any(guest_role(p["executable"]) == "tuna-shell-gtk" and p not in resumed["processes"]
+                                for p in state["processes"]), timeout=30, label="shell-recovering")
+    time.sleep(2)
+    recovered = inventory("shell-recovered")
+    record("V-SHELL-FAIL-CLOSED", killed_mask and recovered["state"]["locked"] and same_apps(before, recovered, shell=False)
+           and agent.run("input-count") == delivered_input
+           and varied_mask(frame("shell-recovered")),
+           "portal stopped and lock UI killed; supervisor replacement stays locked/masked with original apps alive")
+    qmp.keys("ret")
+    time.sleep(1)
+    qmp.keys("ctrl", "a")
+    qmp.type_text("tuna")
+    qmp.keys("ret")
+    await_state(lambda state: not state["state"]["locked"])
+    inventory("authenticated")
+    if older_guest:
+        departing_orca = None
+        with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
+            json.dump({"predates_instrumentation": True}, stream, indent=2)
+    elif orca_failure:
+        departing_orca = None
+        with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
+            json.dump({"not_exercised": orca_failure}, stream, indent=2)
+    else:
+        agent.run("orca-on")
+        departing_orca = await_orca(True)
+        with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
+            json.dump(departing_orca, stream, indent=2)
+    agent.run("logout")
+    deadline = time.monotonic() + 30
+    greeter = {}
+    greeter_visible = False
+    # The published lane keeps the greeter frame that preceded login. Its
+    # shipped stylesheet paints the variant wallpaper, so the repainted
+    # greeter must match that frame; the CI image's own stylesheet has a
+    # #222226 window background with light controls/text instead. Process
+    # startup, a black scanout or a uniform fill can pass neither.
+    reference_path = os.path.join(out, "greeter-before-login.ppm")
+    reference = read_ppm(reference_path) if os.path.exists(reference_path) else None
+    while time.monotonic() < deadline:
+        greeter = agent.run("greeter")
+        if greeter["greetd_active"] and greeter["greeter_pids"] and not greeter["compositor_pids"]:
+            image = frame("logout-greeter")
+            width, height, pixels = image
+            colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+                      for y in range(0, height, 8) for x in range(0, width, 8)}
+            if reference is not None:
+                changed = difference(reference, image)
+                greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": len(colors)}
+                greeter_visible = changed < 0.05 and len(colors) >= 8
+            else:
+                background = sum(all(abs(pixels[i + channel] - value) <= 4
+                                     for channel, value in enumerate((34, 34, 38)))
+                                 for i in range(0, len(pixels), 3)) / (width * height)
+                light = sum(min(pixels[i:i + 3]) > 160 for i in range(0, len(pixels), 3))
+                greeter["paint"] = {"background_fraction": background, "light_pixels": light}
+                greeter_visible = background > 0.25 and light >= 100
+            if greeter_visible:
+                break
+        time.sleep(0.5)
+    with open(os.path.join(evidence, "greeter.json"), "w") as stream:
+        json.dump(greeter, stream, indent=2)
+    record("V-LOGOUT", greeter_visible,
+           "real session termination returns to a painted gtkgreet surface under active greetd, with no original compositor")
+    if older_guest:
+        with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:
+            json.dump({"predates_instrumentation": True}, stream, indent=2)
+        record("V-ORCA-LOGOUT", True,
+               "guest predates shell Screen Reader management; logout Orca lifecycle covered by the current-build lane")
+    elif orca_failure:
+        record("V-ORCA-LOGOUT", False, f"not exercised: Screen Reader activation failed ({orca_failure})")
+    else:
+        closed_orca = agent.run("orca-departed", departing_orca["pid"], departing_orca["start_ticks"])
+        with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:
+            json.dump(closed_orca, stream, indent=2)
+        record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],
+               "hardware logout stops only session-owned Orca; no original child/bus owner survives")
+        if closed_orca["owner"] is not None or closed_orca["original_alive"]:
+            raise RuntimeError("Orca survived the hardware session logout")
+    if not greeter_visible:
+        raise RuntimeError("live gtkgreet did not paint its actual visible surface after logout")
+    record("V-LIFECYCLE", True, "all lifecycle operations completed; individual assertions remain mandatory")
+
+
+GREETER_SESSION_NAME = "Tuna Desktop"
+
+
+def greeter_list_ok(greeter):
+    """gtkgreet's picker shows any -c command, then each
+    /etc/greetd/environments line verbatim, and preselects the first one.
+    The user must read the session's name there, not its command (tunaOS#3110)."""
+    sessions = greeter.get("sessions", [])
+    if greeter.get("greeter_command_override", True):
+        return False, f"gtkgreet command override precedes the picker list {sessions}"
+    if not sessions or sessions[0] != GREETER_SESSION_NAME:
+        return False, f"gtkgreet picker lists {sessions}, expected {GREETER_SESSION_NAME!r} preselected"
+    return True, f"gtkgreet picker lists {sessions} with {GREETER_SESSION_NAME!r} preselected"
+
+
+def greetd_login(qmp, agent_path, out, record):
+    """Drive the shipped graphical greeter, never an initial/autologin session."""
+    agent = None
+    deadline = time.monotonic() + 120
+    greeter = {}
+    while time.monotonic() < deadline:
+        try:
+            if agent is None:
+                agent = guest_agent.GuestAgent(agent_path)
+            greeter = agent.run("greeter")
+            if (greeter["probe_uid"] == 0 and greeter["greetd_active"]
+                    and greeter["greeter_pids"] and all(uid != 0 for uid in greeter["greeter_uids"])
+                    and not greeter["compositor_pids"]):
+                break
+        except (OSError, RuntimeError, ValueError):
+            if agent is not None:
+                agent.close()
+                agent = None
+        time.sleep(1)
+    else:
+        if agent is not None:
+            agent.close()
+        raise RuntimeError("shipped greetd/gtkgreet did not become ready")
+    try:
+        provenance = agent.run("published")
+        with open(os.path.join(out, "shipped-payload.json"), "w") as stream:
+            json.dump(provenance, stream, indent=2)
+        with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
+            json.dump(greeter, stream, indent=2)
+        time.sleep(5)
+        qmp.frame(os.path.join(out, "V-GREETD.png"))
+        # The logout check compares the repainted greeter with this frame.
+        qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
+        ok, detail = greeter_list_ok(greeter)
+        record("V-GREETER-LIST", ok, detail)
+        # Upstream gtkgreet focuses its username entry, then the PAM secret
+        # entry. The public fixture values go only to QMP keyboard delivery.
+        qmp.type_text("tuna")
+        qmp.keys("minus")  # QEMU qcode is "minus", not the literal '-'.
+        qmp.type_text("test")
+        qmp.keys("ret")
+        time.sleep(2)
+        qmp.type_text("tuna")
+        qmp.keys("ret")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            try:
+                owner = agent.run("inventory")
+                if (owner["session_uid"] != 0 and owner["session"]["Service"] == "greetd"
+                        and owner["session"]["User"] == str(owner["session_uid"])
+                        and any(guest_role(p["executable"]) == "tuna-compositor" for p in owner["processes"])):
+                    record("V-GREETD-LOGIN", True,
+                           "shipped non-root gtkgreet → username/password PAM login → real non-root greetd Tuna Desktop session; payload hashes unchanged")
+                    return True
+            except (OSError, RuntimeError, ValueError):
+                pass
+            time.sleep(1)
+        raise RuntimeError("graphical greetd PAM login did not produce a Tuna Desktop session")
+    finally:
+        agent.close()
+
+
+class Recorder:
+    """Serialize input and completed screendumps, including their frame indices.
+
+    A failed/timed-out transport aborts the tour; a still records pixels only,
+    not proof that the application reached a requested semantic state.
+    """
+
+    def __init__(self, qmp, out, timeout=10.0):
+        self.qmp, self.dir = qmp, os.path.join(out, "frames")
+        os.makedirs(self.dir, exist_ok=False)
+        self.lock, self.stop = threading.RLock(), threading.Event()
+        self.n, self.marks, self.stills = 0, [], {}
+        self.frames = []
+        self.timeout, self.error = timeout, None
+        self.original_cmd = qmp.cmd
+        self.wrapped_cmd = self._command
+        qmp.cmd = self.wrapped_cmd
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _command(self, command, _deadline=None, **args):
+        deadline = _deadline if _deadline is not None else time.monotonic() + self.timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self.lock.acquire(timeout=remaining):
+            error = TimeoutError("tour QMP lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
+        try:
+            if self.error is not None:
+                raise RuntimeError("tour capture previously failed") from self.error
+            sock = getattr(self.qmp, "sock", None)
+            previous = sock.gettimeout() if sock is not None else None
+            expired, timer = threading.Event(), None
+            if sock is not None:
+                import socket
+                # A socket timeout alone restarts for every read. The owned
+                # watchdog also bounds endless events and partial-line dribble.
+                def abort():
+                    expired.set()
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    abort()
+                    raise TimeoutError("tour QMP absolute deadline expired")
+                sock.settimeout(remaining)
+                timer = threading.Timer(remaining, abort)
+                timer.name = "tour-qmp-deadline"
+                timer.start()
+            try:
+                result = self.original_cmd(command, **args)
+            except (OSError, RuntimeError, ValueError) as error:
+                if isinstance(error, TimeoutError) and sock is not None:
+                    abort()
+                if expired.is_set():
+                    error = TimeoutError("tour QMP absolute deadline expired")
+                self.error = error
+                self.stop.set()
+                raise error
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                    timer.join()  # No detached callback can poison a later command.
+                if sock is not None:
+                    sock.settimeout(previous)
+            if expired.is_set() or time.monotonic() >= deadline:
+                if sock is not None:
+                    abort()
+                error = TimeoutError("tour QMP absolute deadline expired")
+                self.error = error
+                self.stop.set()
+                raise error
+            return result
+        finally:
+            self.lock.release()
+
+    def _capture(self, mode="periodic"):
+        deadline = time.monotonic() + self.timeout
+        if not self.lock.acquire(timeout=self.timeout):
+            error = TimeoutError("tour capture lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
+        pending = None
+        owns_pending = False
+        try:
+            index = self.n
+            final = os.path.join(self.dir, f"f{index:06d}.png")
+            pending = final + ".pending"
+            if os.path.exists(final) or os.path.exists(pending):
+                raise RuntimeError("tour frame identity already exists")
+            with open(pending, "xb"):
+                pass
+            owns_pending = True
+            requested_ns = time.monotonic_ns()
+            self._command("screendump", _deadline=deadline, filename=pending, format="png")
+            while not os.path.isfile(pending) or os.path.getsize(pending) == 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("tour screendump did not produce a frame")
+                self.stop.wait(min(0.01, remaining))
+            if time.monotonic() >= deadline:
+                raise TimeoutError("tour screendump exceeded its deadline")
+            os.rename(pending, final)
+            self.frames.append({"index": index, "mode": mode,
+                                "requested_monotonic_ns": requested_ns,
+                                "completed_monotonic_ns": time.monotonic_ns(),
+                                "sha256": baseline.sha256(final)})
+            self.n += 1
+            return index
+        except (OSError, RuntimeError, ValueError) as error:
+            self.error = error
+            self.stop.set()
+            if owns_pending:
+                try:
+                    os.unlink(pending)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            self.lock.release()
+
+    def _run(self):
+        while not self.stop.is_set():
+            started = time.monotonic()
+            try:
+                self._capture()
+            except (OSError, RuntimeError, ValueError) as error:
+                log(f"tour: screendump failed: {error}")
+                return
+            self.stop.wait(max(0.0, 1 / TOUR_FPS - (time.monotonic() - started)))
+
+    def mark(self, card):
+        if not self.lock.acquire(timeout=self.timeout):
+            error = TimeoutError("tour mark lock deadline expired")
+            self.error = error
+            self.stop.set()
+            raise error
+        try:
+            if self.error is not None:
+                raise RuntimeError("tour capture previously failed") from self.error
+            log(f"tour: {card}")
+            self.marks.append((self.n, card))
+        finally:
+            self.lock.release()
+
+    def still(self, card, delay=0.0):
+        """Finish this exact capture before the caller can send its next key."""
+        time.sleep(delay)
+        self.stills[card] = self._capture(mode="still")
+
+    def close(self):
+        self.stop.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=self.timeout + 0.1)
+            if self.thread.is_alive():
+                sock = getattr(self.qmp, "sock", None)
+                if sock is not None:
+                    import socket
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                self.thread.join(timeout=1)
+            if self.thread.is_alive():
+                raise RuntimeError("tour recorder did not stop")
+        self.qmp.cmd = self.original_cmd
+        if self.error is not None:
+            raise RuntimeError("tour capture failed") from self.error
+
+
+def lock_chord_hold_ms(older_guest):
+    """How long the tour holds Super+L before releasing both keys.
+
+    Run 37727015469: the published pre-rename 0.1.0-2 guest predates a3647b59
+    (Oct 6), which made the compositor account for key releases it consumes
+    while a lock is pending. On that guest a quick Super release lands
+    before the lock surface maps, is dropped, and leaves Super latched in
+    the keyboard state: the curtain still lifts, but the password entry
+    sees Super+r/o/s/t and Super+Return, so nothing reaches PAM. Holding
+    the chord until the lock surface owns input is what a real user's
+    slower press does, and still drives the real PAM unlock. Current
+    guests keep the quick release, which is the regression a3647b59 fixed.
+    """
+    return 1500 if older_guest else 80
+
+
+def run_tour(qmp, out, serial_path, older_guest=False):
+    """Scripted feature tour through QMP input, recorded to a WebM with a
+    title card per section. Returns a manifest entry. `older_guest` marks a
+    guest that predates the newer snapshot keys (predates_newer_snapshot)."""
+    tour = os.path.join(out, "tour")
+    scratch = os.path.join(tour, ".work")
+    os.makedirs(scratch, exist_ok=False)
+    cards_dir = os.path.join(scratch, "cards")
+    try:
+        subprocess.run([sys.executable, os.path.join(CARDS, "render.py"),
+                        "--out", cards_dir], check=True, timeout=30)
+        rec = Recorder(qmp, scratch)
+    except BaseException:
+        shutil.rmtree(scratch)
+        raise
+    keys, wait = qmp.keys, time.sleep
+
+    def launch(query):
+        keys("meta_l")
+        wait(1.5)
+        qmp.type_text(query)
+        wait(2.5)
+        keys("ret")
+        wait(7)
+
+    rec.thread.start()
+    try:
+        rec.mark("intro")
+        wait(4)
+        rec.still("intro")
+        rec.mark("overview")
+        keys("esc")
+        wait(2)
+        keys("meta_l")
+        wait(2.5)
+        qmp.type_text("files")
+        wait(3)
+        rec.still("overview")
+        keys("esc")
+        wait(1)
+        keys("esc")
+        wait(2)
+        rec.mark("app-grid")
+        keys("meta_l", "a")
+        wait(4)
+        rec.still("app-grid")
+        keys("esc")
+        wait(1)
+        keys("esc")
+        wait(2)
+        # Actual PipeWire sink on the virtual HDA device. Guest health
+        # samples each completed mutation; allow a sample between keys.
+        for media_key in ("volumeup", "volumedown", "audiomute", "audiomute"):
+            keys(media_key)
+            wait(3)
+        rec.mark("quick-settings")
+        qmp.click(WIDTH - 40, 12)
+        wait(4)
+        rec.still("quick-settings")
+        keys("esc")
+        wait(2)
+        rec.mark("calendar")
+        qmp.click(WIDTH // 2, 12)
+        wait(4)
+        rec.still("calendar")
+        keys("esc")
+        wait(2)
+        # Apps the Marlin GNOME image ships (its app grid has no Text
+        # Editor, and Settings opens slowly outside gnome-session).
+        rec.mark("alt-tab")
+        for query in ("disks", "system monitor", "files"):
+            launch(query)
+        keys("alt", "tab", hold_ms=1500)
+        rec.still("alt-tab", delay=1.0)
+        wait(3)
+        keys("alt", "tab", hold_ms=1500)
+        wait(3)
+        rec.mark("scroll")
+        keys("meta_l", "shift", "t")
+        wait(3)
+        keys("meta_l", "r")
+        wait(2.5)
+        keys("meta_l", "left")
+        wait(2.5)
+        rec.still("scroll")
+        keys("meta_l", "left")
+        wait(2.5)
+        keys("meta_l", "right")
+        wait(2.5)
+        keys("meta_l", "shift", "t")
+        wait(3)
+        # Exercise the hardware shortcut and the real PAM unlock stack.
+        rec.mark("lock")
+        keys("meta_l", "l", hold_ms=lock_chord_hold_ms(older_guest))
+        wait(5)
+        rec.still("lock")
+        # Shift alone intentionally leaves GNOME's curtain in place.
+        # Return reveals the focused prompt without adding a character.
+        keys("ret")
+        wait(2)
+        keys("ctrl", "a")
+        qmp.type_text("tuna")
+        wait(1)
+        serial_offset = len(read_text(serial_path))
+        keys("ret")
+        # PAM is asynchronous and has a ten-second deadline. Observe the
+        # actual authenticated unlock, rather than stopping after five seconds.
+        deadline = time.monotonic() + 15
+        unlocked = False
+        while time.monotonic() < deadline:
+            if "tuna-vm-health: lock active=(false,)" in read_text(serial_path)[serial_offset:]:
+                unlocked = True
+                break
+            wait(0.2)
+        if not unlocked:
+            log("tour: PAM unlock did not arrive within 15 seconds")
+            qmp.frame(os.path.join(out, "V-UNLOCK-FAILED.png"))
+        wait(1)
+    except BaseException as error:
+        try:
+            rec.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"tour recorder cleanup: {cleanup_error}")
+        finally:
+            shutil.rmtree(scratch)
+        raise
+    else:
+        try:
+            rec.close()
+        except BaseException:
+            shutil.rmtree(scratch)
+            raise
+
+    with open(os.path.join(tour, "capture-timing.json"), "w") as stream:
+        json.dump({"schema": 1, "periodic_target_fps": TOUR_FPS,
+                   "uniform_capture_intervals": False, "frames": rec.frames,
+                   "stills": rec.stills, "title_marks": rec.marks,
+                   "lane_source_sha256": baseline.sha256(__file__),
+                   "card_source_sha256": baseline.sha256(os.path.join(CARDS, "render.py")),
+                   "card_sha256": {name: baseline.sha256(os.path.join(cards_dir, name + ".png"))
+                                   for _, name in rec.marks}}, stream, indent=2)
+
+    # Final sequence: captured frames with CARD_HOLD copies of each card
+    # spliced in at its mark. Cards are converted to RGB at the capture
+    # size so ffmpeg sees one pixel format throughout.
+    seq = os.path.join(scratch, "seq")
+    os.makedirs(seq, exist_ok=True)
+    cards, at = {}, {}
+    for idx, card in rec.marks:
+        at.setdefault(idx, []).append(card)
+    count = 0
+
+    def put(src):
+        nonlocal count
+        dst = os.path.join(seq, f"f{count:06d}.png")
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copyfile(src, dst)
+        count += 1
+
+    for i in range(rec.n + 1):
+        for card in at.get(i, []):
+            if card not in cards:
+                dst = os.path.join(scratch, f"card-{card}.png")
+                subprocess.run(["ffmpeg", "-loglevel", "error", "-y",
+                                "-i", os.path.join(cards_dir, f"{card}.png"),
+                                "-vf", f"scale={WIDTH}:{HEIGHT}", "-pix_fmt", "rgb24", dst],
+                               check=True)
+                cards[card] = dst
+            for _ in range(CARD_HOLD):
+                put(cards[card])
+        frame = os.path.join(rec.dir, f"f{i:06d}.png")
+        if os.path.exists(frame) and os.path.getsize(frame) > 0:
+            put(frame)
+    pattern = os.path.join(seq, "f%06d.png")
+    webm = os.path.join(tour, "tuna-tour.webm")
+    subprocess.run(["ffmpeg", "-loglevel", "warning", "-y", "-framerate", str(PLAY_FPS),
+                    "-i", pattern, "-c:v", "libvpx-vp9", "-crf", "36", "-b:v", "0", "-row-mt", "1", "-cpu-used", "4",
+                    "-pix_fmt", "yuv420p", webm], check=True)
+    subprocess.run(["ffmpeg", "-loglevel", "warning", "-y", "-framerate", str(PLAY_FPS),
+                    "-i", pattern, "-vf", "scale=640:-2:flags=lanczos", "-loop", "0",
+                    "-c:v", "libwebp", "-quality", "60", "-compression_level", "6",
+                    os.path.join(tour, "preview.webp")], check=False)
+    for card, idx in rec.stills.items():
+        frame = os.path.join(rec.dir, f"f{idx:06d}.png")
+        if os.path.exists(frame):
+            shutil.copyfile(frame, os.path.join(tour, f"T-{card}.png"))
+    shutil.rmtree(scratch, ignore_errors=True)
+    ok = os.path.exists(webm) and os.path.getsize(webm) > 0
+    log(f"tour: {rec.n} frames, {len(rec.marks)} sections -> {webm if ok else 'NO VIDEO'}")
+    return {"video": "tour/tuna-tour.webm" if ok else None, "frames": rec.n,
+            "sections": [c for _, c in rec.marks], "periodic_target_fps": TOUR_FPS,
+            "uniform_capture_intervals": False, "capture_timing": "tour/capture-timing.json",
+            "playback_fps": PLAY_FPS}
+
+
+def select_corner_mouse(qmp, relative):
+    """Select a real, uniquely identified handler before one native input."""
+    name = "QEMU Virtio Mouse" if relative else "QEMU HID Tablet"
+    absolute = not relative
+    before = qmp.cmd("query-mice")
+    if not isinstance(before, list):
+        raise RuntimeError("actual QMP mouse inventory is unavailable")
+    candidates = [mouse for mouse in before if mouse.get("name") == name]
+    if len(candidates) != 1:
+        raise RuntimeError("actual intended mouse is absent or ambiguous")
+    selected = candidates[0]
+    index = selected.get("index")
+    if selected.get("absolute") is not absolute or type(index) is not int or not 0 < index <= 0x7fffffff:
+        raise RuntimeError("actual intended mouse has invalid mode/index")
+    response = qmp.cmd("human-monitor-command", **{"command-line": f"mouse_set {index}"})
+    if response != "":
+        raise RuntimeError("actual QEMU mouse_set was rejected")
+    after = qmp.cmd("query-mice")
+    current = [mouse for mouse in after if mouse.get("current") is True] if isinstance(after, list) else []
+    if len(current) != 1 or current[0].get("name") != name or current[0].get("index") != index or current[0].get("absolute") is not absolute:
+        raise RuntimeError("actual QMP current mouse differs from intended handler")
+    return {"requested_name": name, "requested_index": index, "requested_absolute": absolute,
+            "before": before, "after": after}
+
+
+def restore_corner_mouse(qmp, original):
+    before = qmp.cmd("query-mice")
+    actual = [mouse for mouse in before if mouse.get("index") == original["index"]] if isinstance(before, list) else []
+    if len(actual) != 1 or actual[0].get("name") != original["name"] or actual[0].get("absolute") is not original["absolute"]:
+        raise RuntimeError("original QMP mouse handler disappeared or changed")
+    response = qmp.cmd("human-monitor-command", **{"command-line": f"mouse_set {original['index']}"})
+    after = qmp.cmd("query-mice")
+    current = [mouse for mouse in after if mouse.get("current") is True] if isinstance(after, list) else []
+    if response != "" or len(current) != 1 or any(current[0].get(key) != original[key] for key in ("name", "index", "absolute")):
+        raise RuntimeError("original QMP mouse handler was not restored")
+    return {"original": original, "before": before, "after": after}
+
+
+def finish_orca_activation(agent, evidence, observations):
+    """Keep the activation failure and observations when reset also fails."""
+    primary = sys.exc_info()[1]
+    cleanup_errors = []
+    try:
+        agent.run("orca-reset")
+    except Exception as error:
+        # Transport errors may contain guest output. Retain only fixed action
+        # and exception class here; activation observations have their own
+        # bounded, privacy-checked receipt schema.
+        cleanup_errors.append({"action": "orca-reset", "exception_type": type(error).__name__})
+    try:
+        with open(os.path.join(evidence, "orca-activation.json"), "w") as stream:
+            json.dump(observations, stream, indent=2)
+        with open(os.path.join(evidence, "orca-activation-cleanup.json"), "w") as stream:
+            json.dump({"primary_error_type": type(primary).__name__ if primary else None,
+                       "cleanup_errors": cleanup_errors}, stream, indent=2)
+    except Exception as error:
+        cleanup_errors.append({"action": "orca-evidence-retention", "exception_type": type(error).__name__})
+        log("Orca activation evidence retention failed")
+    if primary is None and cleanup_errors:
+        raise RuntimeError("Orca activation cleanup failed: " + json.dumps(cleanup_errors))
+
+
+def finish_constraint_proof(agent, qmp, original_mouse, evidence, report):
+    """Retain all cleanup outcomes without replacing an original proof error."""
+    cleanup_errors = []
+    try:
+        agent.run("constraint-quit")
+    except Exception as error:
+        cleanup_errors.append({"action": "constraint-quit", "message": str(error)})
+    try:
+        restored = restore_corner_mouse(qmp, original_mouse)
+        with open(os.path.join(evidence, "hot-corner-constraint-mouse-restoration.json"), "w") as stream:
+            json.dump(restored, stream, indent=2)
+    except Exception as error:
+        cleanup_errors.append({"action": "original-mouse-restoration", "message": str(error)})
+    try:
+        with open(os.path.join(evidence, "hot-corner-constraint-stderr.json"), "w") as stream:
+            json.dump(agent.run("constraint-log"), stream, indent=2)
+    except Exception as error:
+        cleanup_errors.append({"action": "constraint-log-retention", "message": str(error)})
+    report["cleanup_errors"] = cleanup_errors
+    with open(os.path.join(evidence, "hot-corner-constraints.json"), "w") as stream:
+        json.dump(report, stream, indent=2)
+    if report["primary_error"] is None and cleanup_errors:
+        raise RuntimeError("actual constraint cleanup failed: " + json.dumps(cleanup_errors))
+
+
+def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False):
+    ovmf = next((p for p in OVMF if os.path.exists(p)), None)
+    if not ovmf:
+        sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
+    kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    if require_kvm and not kvm:
+        sys.exit("tuna-vm-lane: KVM required but /dev/kvm is not accessible; refusing emulation")
+    qmp_path = os.path.join(scratch, "qmp.sock")
+    agent_path = os.path.join(scratch, "qga.sock")
+    serial = os.path.join(out, "serial.log")
+    qemu = ["qemu-system-x86_64", "-machine", "q35", "-m", "6144", "-smp", "4",
+            "-bios", ovmf, "-snapshot",
+            "-drive", f"file={disk},format=raw,if=virtio,cache=unsafe",
+            *baseline.gpu_devices(),
+            "-device", "qemu-xhci", "-device", "usb-tablet", "-device", "usb-kbd",
+            # The virtio keyboard carries multimedia evdev codes; USB's
+            # boot-protocol keyboard has no consumer-control usages.
+            "-device", "virtio-keyboard-pci",
+            "-audiodev", "none,id=tuna-audio",
+            "-device", "ich9-intel-hda",
+            "-device", "hda-duplex,audiodev=tuna-audio",
+            "-display", "none", "-serial", f"file:{serial}",
+            "-qmp", f"unix:{qmp_path},server=on,wait=off",
+            "-nic", "user,model=virtio-net-pci"]
+    if native_relative_mouse:
+        qemu.extend(["-device", "virtio-mouse-pci,id=tuna-relative-mouse"])
+    if guest_agent:
+        qemu.extend(["-device", "virtio-serial-pci",
+                     "-chardev", f"socket,path={agent_path},server=on,wait=off,id=tuna-qga",
+                     "-device", "virtserialport,chardev=tuna-qga,name=org.qemu.guest_agent.0",
+                     "-D", os.path.join(out, "qemu-gpu-resource.log")])
+    if kvm:
+        qemu[1:1] = ["-enable-kvm", "-cpu", "host"]
+    log(f"booting {disk} (kvm={kvm})")
+    result = subprocess.Popen(qemu), qmp_path, serial, kvm
+    return (*result, agent_path) if guest_agent else result
+
+
+def repeat_boots(args):
+    """Keep per-boot evidence and aggregate gates for the parity ledger."""
+    out = os.path.abspath(args.out)
+    os.makedirs(out, exist_ok=True)
+    manifests, combined, coverage, boot_results = [], {}, {}, []
+    for index in range(1, args.boots + 1):
+        target = out if index == args.boots else os.path.join(out, f"repeat-{index:02d}")
+        command = [sys.executable, __file__, "--disk", args.disk, "--out", target,
+                   "--timeout", str(args.timeout)]
+        if args.tour and index == args.boots:
+            command.append("--tour")
+        if getattr(args, "strip_image", None) and index == args.boots:
+            command.extend(["--strip-image", args.strip_image])
+            if getattr(args, "strip_edge", False):
+                command.append("--strip-edge")
+        if args.greeter_login:
+            command.append("--greeter-login")
+        if args.require_kvm:
+            command.append("--require-kvm")
+        command.extend(["--orca-contract", args.orca_contract])
+        for value in args.meta:
+            command.extend(["--meta", value])
+        result = subprocess.run(command, check=False)
+        boot_results.append({"boot": index, "returncode": result.returncode})
+        path = os.path.join(target, "manifest.json")
+        if not os.path.exists(path):
+            sys.exit(f"tuna-vm-lane: boot {index} produced no manifest")
+        with open(path) as stream:
+            manifest = json.load(stream)
+        manifests.append(manifest)
+        for name, assertion in manifest["assertions"].items():
+            combined[name] = combined.get(name, True) and assertion["pass"]
+            observed = coverage.setdefault(name, {"observed_boots": [], "passed_boots": [],
+                                                  "missing_boots": []})
+            observed["observed_boots"].append(index)
+            if assertion["pass"]:
+                observed["passed_boots"].append(index)
+        # Startup checks from the first pristine boot must remain present.
+        # Additional final-tour checks are reported only where actually run.
+        for name in manifests[0]["assertions"]:
+            if name not in manifest["assertions"]:
+                combined[name] = False
+                coverage[name]["missing_boots"].append(index)
+    successful_boots = sum(result["returncode"] == 0 for result in boot_results)
+    combined["V-REPEAT"] = successful_boots == args.boots and all(combined.values())
+    with open(os.path.join(out, "repeat-manifest.json"), "w") as stream:
+        json.dump({"requested_boots": args.boots, "boots": manifests,
+                   "assertion_coverage": coverage, "boot_results": boot_results}, stream, indent=2)
+    with open(os.path.join(out, "assertions.txt"), "w") as stream:
+        for name, passed in combined.items():
+            if name == "V-REPEAT":
+                detail = f"successful pristine boot processes ({successful_boots}/{args.boots})"
+            else:
+                case = coverage[name]
+                observed = len(case["observed_boots"])
+                successful = len(case["passed_boots"])
+                detail = (f"observed on {observed}/{args.boots} pristine boots; "
+                          f"passed {successful}/{observed} observations; "
+                          f"boot indices {case['observed_boots']}; "
+                          f"missing baseline indices {case['missing_boots']}")
+            stream.write(f"{name} {'pass' if passed else 'fail'} {detail}\n")
+    if not all(combined.values()):
+        sys.exit("tuna-vm-lane: repeated boot gate failed")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--disk", required=True)
+    ap.add_argument("--out", default="vm-lane-artifacts")
+    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--tour", action="store_true",
+                    help="after the assertions, record the feature tour video")
+    ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
+    ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
+    ap.add_argument("--greeter-login", action="store_true",
+                    help="enter fixture credentials through the shipped graphical greetd greeter")
+    ap.add_argument("--require-kvm", action="store_true",
+                    help="refuse emulation when the qualification profile requires KVM")
+    ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
+    ap.add_argument("--orca-contract", choices=("distribution", "upstream51"), default="distribution",
+                    help="required reader qualification variant; upstream51 requires genuine packaged 51 principal/speech proof")
+    ap.add_argument("--boots", type=int, default=1,
+                    help="repeat pristine snapshot boots; tour only on the last boot")
+    a = ap.parse_args()
+    strip_image = None
+    if a.strip_edge and not a.strip_image:
+        ap.error("--strip-edge requires exact installed image admission")
+    if a.strip_image:
+        if not a.tour:
+            ap.error("--strip-image requires --tour lifecycle")
+        with open(a.strip_image, "rb") as stream:
+            raw = stream.read(1048577)
+        if len(raw) > 1048576:
+            ap.error("strip image receipt bound exceeded")
+        strip_image = json.loads(raw)
+        metadata = dict(value.split("=", 1) for value in a.meta)
+        if any(strip_image.get(field) != metadata.get(meta) for field, meta in
+               (("commit", "commit"), ("image_id", "test_image_id"), ("base_image", "base_image"))):
+            ap.error("strip receipt differs from actual VM image/source metadata")
+    if not 1 <= a.boots <= 10:
+        ap.error("--boots must be between 1 and 10")
+    if a.boots > 1:
+        repeat_boots(a)
+        return
+    out = os.path.abspath(a.out)
+    scratch = os.path.join(out, ".scratch")
+    os.makedirs(scratch, exist_ok=True)
+    results = {}
+
+    def record(test_id, ok, desc):
+        results[test_id] = (ok, desc)
+        log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
+
+    vm, qmp_path, serial_path, kvm, agent_path = boot(os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm, guest_agent=True, native_relative_mouse=True)
+    start = time.time()
+    drm = shell = None
+    elapsed = 0.0
+    tour_info = None
+    panel_desc = "never checked"
+    tour_serial_end = None
+    manager_ready = False
+    try:
+        qmp = baseline.Qmp(qmp_path)
+        login_ok = True
+        if a.greeter_login:
+            try:
+                login_ok = greetd_login(qmp, agent_path, out, record)
+            except (OSError, RuntimeError, ValueError) as error:
+                record("V-GREETD-LOGIN", False, str(error))
+                login_ok = False
+        n = 0
+        while login_ok and time.time() - start < a.timeout and vm.poll() is None:
+            text = read_text(serial_path)
+            drm = drm or DRM_RE.search(text)
+            shell = shell or SHELL_RE.search(text)
+            if n % 3 == 0:
+                qmp.frame(os.path.join(out, f"boot-{n // 3:03d}.png"))
+            n += 1
+            if EXHAUSTED in text or "panicked" in text:
+                log("shell supervision gave up or something panicked")
+                break
+            if drm and shell:
+                break
+            time.sleep(5)
+        elapsed = time.time() - start
+        if drm and shell:
+            log(f"session up after {elapsed:.0f}s; letting the shell settle")
+            time.sleep(30)
+            # tuna-session opens on the overview, where the panel is
+            # transparent as in GNOME; keep that frame, then Escape to the
+            # desktop, where the panel is the solid black strip.
+            qmp.frame(os.path.join(out, "V-OVERVIEW.png"))
+            qmp.keys("esc")
+            time.sleep(3)
+            for attempt in range(8):
+                ppm = os.path.join(scratch, f"session-{attempt}.ppm")
+                qmp.cmd("screendump", filename=ppm, format="ppm")
+                for _ in range(50):
+                    if os.path.exists(ppm) and os.path.getsize(ppm) > 0:
+                        break
+                    time.sleep(0.1)
+                qmp.frame(os.path.join(out, "V-SESSION.png"))
+                ok, panel_desc = check_panel(ppm)
+                if ok:
+                    break
+                time.sleep(5)
+            else:
+                ok = False
+            # Retain real ordinary-user configuration/drop/worker observations
+            # before the unchanged body/panel gate, including startup failures.
+            diagnostic_agent = None
+            try:
+                diagnostic_agent = guest_agent.GuestAgent(agent_path)
+                background = diagnostic_agent.run("background-diagnostics")
+                with open(os.path.join(out, "startup-background-diagnostics.json"), "w") as stream:
+                    json.dump(background, stream, indent=2)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                with open(os.path.join(out, "startup-background-diagnostics.json"), "w") as stream:
+                    json.dump({"error": str(error)}, stream)
+                log(f"bounded background diagnostics unavailable: {error}")
+            finally:
+                if diagnostic_agent is not None:
+                    diagnostic_agent.close()
+            record("V-PANEL", ok, f"screendump: {panel_desc}")
+            agent = None
+            owner = None
+            try:
+                agent = guest_agent.GuestAgent(agent_path)
+                owner = agent.run("inventory")
+                manager_ready = (owner["probe_uid"] == 0 and owner["session_uid"] != 0
+                                 and owner["session"]["User"] == str(owner["session_uid"])
+                                 and owner["session"]["Service"] == "greetd"
+                                 and any(guest_role(p["executable"]) == "tuna-compositor" and p["uid"] == owner["session_uid"]
+                                         for p in owner["processes"]))
+                with open(os.path.join(out, "session-owner.json"), "w") as stream:
+                    json.dump(owner, stream, indent=2)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                log(f"guest session ownership probe failed: {error}")
+            finally:
+                if agent is not None:
+                    agent.close()
+            if a.tour:
+                try:
+                    older_guest = bool(owner and owner.get("state")) and predates_newer_snapshot(owner["state"])
+                    tour_info = run_tour(qmp, out, serial_path, older_guest)
+                    tour_serial_end = len(read_text(serial_path))
+                    agent = guest_agent.GuestAgent(agent_path)
+                    try:
+                        run_lifecycle(qmp, agent, out, serial_path, record, strip_image=strip_image,
+                                      reconnect=lambda: guest_agent.GuestAgent(agent_path), strip_edge=a.strip_edge,
+                                      published=a.greeter_login, orca_contract=a.orca_contract)
+                    finally:
+                        agent.close()
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:
+                    record("V-LIFECYCLE", False, f"tour/lifecycle failed: {e}")
+                    try:
+                        diagnostic_agent = guest_agent.GuestAgent(agent_path)
+                        try:
+                            diagnostics = diagnostic_agent.run("diagnostics")
+                            with open(os.path.join(out, "lifecycle-failure-diagnostics.json"), "w") as stream:
+                                json.dump(diagnostics, stream, indent=2)
+                        finally:
+                            diagnostic_agent.close()
+                    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                        log(f"bounded lifecycle failure diagnostics unavailable: {error}")
+        # Give activation probes a bounded chance to report before shutdown.
+        deadline = time.time() + 180
+        while drm and shell and time.time() < deadline:
+            text = read_text(serial_path)
+            if all(f"tuna-vm-health: {name} ready" in text for name in PORTAL_PROBES):
+                break
+            time.sleep(2)
+        qmp.cmd("quit")
+    finally:
+        try:
+            vm.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            vm.kill()
+
+    text = read_text(serial_path)
+    drm = drm or DRM_RE.search(text)
+    shell = shell or SHELL_RE.search(text)
+    record("V-DRM", bool(drm), f"DRM/KMS output lit: {drm.group(0) if drm else 'no drm: output line'}")
+    record("V-SHELL", bool(shell) and EXHAUSTED not in text,
+           "tuna-shell-gtk started under supervision" if shell
+           else "no tuna-shell-gtk: keybindings line")
+    results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    # GDM starting its greeter on the login VT takes DRM master from the
+    # running session; say so instead of leaving a bare pixel failure.
+    paused = "tuna-compositor: drm: session paused" in text
+    greeter = re.search(r"New session '\d+' of user '[^']*' with class 'greeter'", text)
+    if paused and not results["V-PANEL"][0]:
+        results["V-PANEL"] = (False, results["V-PANEL"][1] + "; Tuna Desktop lost the display"
+                              + (" to a GDM greeter session" if greeter else ""))
+    record("V-DISPLAY-MANAGER", manager_ready,
+           "real logind greetd session and non-root compositor UID verified; intentional lifecycle VT pauses are permitted")
+    for name in PORTAL_PROBES:
+        record(f"V-{name.upper()}", f"tuna-vm-health: {name} ready" in text and (name != "portal" or "tuna-vm-health: portal-gnome ready" in text),
+               f"guest user bus {name} activation responds")
+    if a.tour:
+        ok, detail = media_volume_ok(text, os.path.join(out, "lifecycle"))
+        record("V-MEDIA-VOLUME", ok, detail)
+    if a.tour:
+        transitions = re.findall(r"tuna-vm-health: lock active=\((true|false),\)", text[:tour_serial_end])
+        record("V-LOCK", transitions == ["false", "true", "false"],
+               f"Super+L and PAM unlock transitions: {transitions}")
+    panics = [ln for ln in text.splitlines() if "panicked" in ln]
+    record("V-NOPANIC", not panics, panics[0] if panics else "no panicked in serial log")
+
+    with open(os.path.join(out, "tuna-lines.log"), "w") as fh:
+        fh.writelines(ln + "\n" for ln in text.splitlines() if "tuna-" in ln)
+    with open(os.path.join(out, "assertions.txt"), "w") as fh:
+        for test_id in results:
+            ok, desc = results[test_id]
+            fh.write(f"{test_id} {'pass' if ok else 'fail'} {desc}\n")
+    qemu_version = subprocess.run(["qemu-system-x86_64", "--version"], capture_output=True,
+                                  text=True).stdout.splitlines()[0]
+    manifest = {
+        "lane": "marlin-vm",
+        "orca_contract": a.orca_contract,
+        "session": ("published Tuna Desktop flavor via shipped gtkgreet PAM login, DRM/KMS backend"
+                    if a.greeter_login else "Tuna Desktop (preview) via CI-only greetd initial session, DRM/KMS backend"),
+        "disk": os.path.basename(a.disk),
+        "resolution": f"{WIDTH}x{HEIGHT}",
+        "kvm": kvm,
+        "qemu": qemu_version,
+        "gpu_profile": baseline.GPU_PROFILE,
+        "gpu_devices": baseline.gpu_devices(),
+        "session_up_s": round(elapsed) if drm and shell else None,
+        "drm_session_paused": paused,
+        "captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "tour": tour_info,
+        "assertions": {k: {"pass": v[0], "detail": v[1]} for k, v in results.items()},
+    }
+    for kv in a.meta:
+        key, _, value = kv.partition("=")
+        manifest[key] = value
+    with open(os.path.join(out, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    for name in os.listdir(scratch):
+        os.remove(os.path.join(scratch, name))
+    os.rmdir(scratch)
+
+    failed = [k for k, (ok, _) in results.items() if not ok]
+    if a.tour and not failed and not (tour_info and tour_info["video"]):
+        sys.exit("tuna-vm-lane: assertions passed but the tour video was not produced")
+    if failed:
+        print(excerpt(text), file=sys.stderr)
+        sys.exit(f"tuna-vm-lane: FAILED {', '.join(sorted(failed))} "
+                 f"(after {elapsed:.0f}s of {a.timeout}s)")
+    log(f"OK: Tuna Desktop hardware session up on Marlin in {elapsed:.0f}s; artifacts in {out}")
+
+
+if __name__ == "__main__":
+    main()

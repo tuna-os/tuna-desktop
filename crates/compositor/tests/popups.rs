@@ -9,9 +9,9 @@
 
 use std::os::unix::net::UnixStream;
 
-use roost_compositor::windows::WindowManager;
-use roost_compositor::TestCompositor;
 use smithay::utils::{Logical, Point};
+use tuna_compositor::windows::WindowManager;
+use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
         wl_callback::WlCallback,
@@ -31,6 +31,13 @@ use wayland_protocols::xdg::shell::client::{
     xdg_surface::XdgSurface,
     xdg_toplevel::XdgToplevel,
     xdg_wm_base::XdgWmBase,
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{Layer as ClientLayer, ZwlrLayerShellV1},
+    zwlr_layer_surface_v1::{
+        Anchor as ClientAnchor, Event as LayerEvent, KeyboardInteractivity as ClientKeyboard,
+        ZwlrLayerSurfaceV1,
+    },
 };
 
 const PUMP_ROUNDS: usize = 200;
@@ -53,6 +60,10 @@ struct Client {
     releases: u32,
     /// Surface ids keyboard focus entered, in order.
     keyboard_entered: Vec<u32>,
+    layer_shell: Option<ZwlrLayerShellV1>,
+    /// Mapped Exclusive layer surface, committed on configure ack.
+    layer_wl: Option<WlSurface>,
+    layer_configured: bool,
 }
 
 impl Client {
@@ -91,6 +102,10 @@ impl Dispatch<WlRegistry, ()> for Client {
                 }
                 "xdg_wm_base" => {
                     state.xdg_base = Some(registry.bind(name, version.min(7), qh, ()));
+                }
+                "zwlr_layer_shell_v1" => {
+                    state.layer_shell =
+                        Some(registry.bind::<ZwlrLayerShellV1, _, _>(name, version.min(5), qh, ()));
                 }
                 _ => {}
             }
@@ -213,6 +228,25 @@ impl Dispatch<WlKeyboard, ()> for Client {
     }
 }
 
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrLayerSurfaceV1,
+        event: <ZwlrLayerSurfaceV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let LayerEvent::Configure { serial, .. } = event {
+            proxy.ack_configure(serial);
+            if let Some(surface) = &state.layer_wl {
+                surface.commit();
+            }
+            state.layer_configured = true;
+        }
+    }
+}
+
 macro_rules! empty_dispatch {
     ($iface:ty) => {
         impl Dispatch<$iface, ()> for Client {
@@ -234,6 +268,7 @@ empty_dispatch!(WlSurface);
 empty_dispatch!(WlSeat);
 empty_dispatch!(XdgToplevel);
 empty_dispatch!(XdgPositioner);
+empty_dispatch!(ZwlrLayerShellV1);
 
 struct Fixture {
     comp: TestCompositor,
@@ -563,4 +598,57 @@ fn popup_slides_back_onto_the_output() {
         "popup right edge {right_edge} slid inside the {output_w}px output"
     );
     assert_eq!(w, 400, "slide keeps the size");
+}
+
+/// Map a Top-layer surface with Exclusive keyboard interactivity (the
+/// panel holding Ctrl+Alt+Tab focus), pumped until configured.
+fn map_exclusive_layer(f: &mut Fixture) -> WlSurface {
+    let qh = f.queue.handle();
+    let wl = f
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let role = f.client.layer_shell.as_ref().unwrap().get_layer_surface(
+        &wl,
+        None,
+        ClientLayer::Top,
+        "tuna-test-panel".into(),
+        &qh,
+        (),
+    );
+    role.set_size(1280, 32);
+    role.set_anchor(ClientAnchor::Top | ClientAnchor::Left | ClientAnchor::Right);
+    role.set_exclusive_zone(32);
+    role.set_keyboard_interactivity(ClientKeyboard::Exclusive);
+    f.client.layer_wl = Some(wl.clone());
+    wl.commit();
+    pump(f, |c| c.layer_configured);
+    sync(f);
+    wl
+}
+
+#[test]
+fn keyboard_focus_returns_to_the_exclusive_layer_after_the_grab() {
+    // G-PANEL-FOCUS: Escape closes the panel menu; the popup grab ends
+    // and keyboard focus must return to the Exclusive panel — not to
+    // the focused window (or nothing), or the bar goes inactive with
+    // GTK focus intact and the unwind assertion fails.
+    let mut f = fixture();
+    let layer = map_exclusive_layer(&mut f);
+    assert_eq!(
+        f.client.keyboard_entered.last().copied(),
+        Some(layer.id().protocol_id()),
+        "exclusive layer takes keyboard on map"
+    );
+    let (_popup_surface, popup) = open_popup(&mut f, true);
+    popup.destroy();
+    sync(&mut f);
+    sync(&mut f);
+    assert_eq!(
+        f.client.keyboard_entered.last().copied(),
+        Some(layer.id().protocol_id()),
+        "grab hand-back restores the exclusive layer, not the window"
+    );
 }

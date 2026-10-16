@@ -1,4 +1,4 @@
-//! The GNOME 51 protocols Roost added to close P-SY-06's gaps (#89):
+//! The GNOME 51 protocols Tuna Desktop added to close P-SY-06's gaps (#89):
 //! presentation-time, fifo, keyboard-shortcuts-inhibit, xdg-dialog,
 //! xdg-foreign, xdg-system-bell and xdg-toplevel-tag, driven by a real
 //! client against the headless compositor.
@@ -6,11 +6,11 @@
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 
-use roost_compositor::windows::{
+use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use tuna_compositor::windows::{
     ManagerInput, WindowManager, ESCAPE_KEYCODE, PAGE_DOWN_KEYCODE, SUPER_LEFT_KEYCODE,
 };
-use roost_compositor::TestCompositor;
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
         wl_callback::{self, WlCallback},
@@ -262,11 +262,11 @@ impl Peer {
 fn compositor() -> (TestCompositor, WindowManager) {
     let mut comp = TestCompositor::new();
     let output = Output::new(
-        "roost-0".to_owned(),
+        "tuna-0".to_owned(),
         PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
-            make: "Roost".to_owned(),
+            make: "Tuna Desktop".to_owned(),
             model: "Test".to_owned(),
         },
     );
@@ -275,7 +275,7 @@ fn compositor() -> (TestCompositor, WindowManager) {
         refresh: 60_000,
     };
     output.change_current_state(Some(mode), None, None, Some((0, 0).into()));
-    comp.state.add_output("roost-0", Some(output), 1280, 800);
+    comp.state.add_output("tuna-0", Some(output), 1280, 800);
     let manager = comp.window_manager();
     (comp, manager)
 }
@@ -370,16 +370,20 @@ fn a_frame_request_without_pixel_damage_keeps_native_refresh_work_pending() {
     let mut peer = connect(&mut comp, &mut manager);
     let (surface, _toplevel) = window(&mut peer, "idle client");
     pump(&mut comp, &mut manager, &mut [&mut peer]);
-    let roots = roost_compositor::frame_timing::frame_roots(&comp.state, &manager);
-    assert!(!roost_compositor::frame_timing::pending_frame_work(&roots));
+    let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
+    assert!(!tuna_compositor::frame_timing::pending_frame_work(&roots));
     let _callback = surface.frame(&peer.qh(), ());
     // No buffer attachment or damage: this is a request for pacing alone.
     surface.commit();
     pump(&mut comp, &mut manager, &mut [&mut peer]);
-    assert!(roost_compositor::frame_timing::pending_frame_work(&roots));
+    assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
     assert!(
-        roost_compositor::frame_timing::pending_output_work(&roots, &[]),
+        tuna_compositor::frame_timing::pending_output_work(&roots, &[], &[]),
         "callback-only pacing remains owed even without visible presentation"
+    );
+    assert!(
+        !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
+        "a hidden window's callback waits for its beat, not a scanout"
     );
     assert_eq!(peer.client.frames, 0);
     let output = comp.state.primary_output().unwrap();
@@ -394,7 +398,7 @@ fn a_frame_request_without_pixel_damage_keeps_native_refresh_work_pending() {
     }
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(peer.client.frames, 1);
-    assert!(!roost_compositor::frame_timing::pending_frame_work(&roots));
+    assert!(!tuna_compositor::frame_timing::pending_frame_work(&roots));
 }
 
 #[test]
@@ -414,10 +418,10 @@ fn presentation_feedback_reports_the_frame_that_drew_the_window() {
     surface.commit();
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(peer.client.fates.is_empty(), "nothing drawn yet");
-    let roots = roost_compositor::frame_timing::frame_roots(&comp.state, &manager);
-    assert!(roost_compositor::frame_timing::pending_frame_work(&roots));
+    let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
+    assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
 
-    roost_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 42);
+    tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 42);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(
         peer.client.fates.get(&1),
@@ -426,7 +430,7 @@ fn presentation_feedback_reports_the_frame_that_drew_the_window() {
             refresh: 16_666_666,
         })
     );
-    assert!(!roost_compositor::frame_timing::pending_frame_work(&roots));
+    assert!(!tuna_compositor::frame_timing::pending_frame_work(&roots));
 }
 
 #[test]
@@ -441,21 +445,21 @@ fn a_hidden_window_keeps_its_feedback_until_drawn() {
     pump(&mut comp, &mut manager, &mut [&mut peer]);
 
     // Locked: only the lock screen is drawn.
-    roost_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, true, 1);
+    tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, true, 1);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(peer.client.fates.get(&7), None);
-    let roots = roost_compositor::frame_timing::frame_roots(&comp.state, &manager);
-    assert!(roost_compositor::frame_timing::pending_frame_work(&roots));
+    let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
+    assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
     assert!(
-        !roost_compositor::frame_timing::pending_output_work(&roots, &[]),
+        !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &[]),
         "hidden presentation must not keep an unchanged output repainting"
     );
-    let drawn: Vec<_> = roost_compositor::frame_timing::drawn_roots(&comp.state, &manager, false)
+    let drawn: Vec<_> = tuna_compositor::frame_timing::drawn_roots(&comp.state, &manager, false)
         .into_iter()
         .map(|(surface, _)| surface)
         .collect();
     assert!(
-        roost_compositor::frame_timing::pending_output_work(&roots, &drawn),
+        tuna_compositor::frame_timing::pending_output_work(&roots, &drawn, &[]),
         "revealing the actual window owes a real submission"
     );
     assert_eq!(
@@ -464,7 +468,7 @@ fn a_hidden_window_keeps_its_feedback_until_drawn() {
         "visibility check does not resolve feedback"
     );
 
-    roost_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 2);
+    tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 2);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(matches!(
         peer.client.fates.get(&7),
@@ -493,13 +497,17 @@ fn fifo_holds_a_waiting_commit_until_the_next_refresh() {
 
     // The first refresh draws what was applied (not the held update),
     // then releases the barrier.
-    let roots = roost_compositor::frame_timing::frame_roots(&comp.state, &manager);
-    assert!(roost_compositor::frame_timing::pending_frame_work(&roots));
-    roost_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 1);
+    let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
+    assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
+    assert!(
+        tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
+        "a hidden window's FIFO barrier still advances on each refresh"
+    );
+    tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 1);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(peer.client.fates.get(&2), None, "held behind the barrier");
 
-    roost_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 2);
+    tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 2);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(matches!(
         peer.client.fates.get(&2),
@@ -533,11 +541,11 @@ fn an_inhibiting_window_gets_the_shortcuts_until_super_escape() {
 
     // Registered shell grabs must obey the same consent. This catches a
     // global accelerator bypass even when built-in workspace keys work.
-    manager.set_accelerators(vec![roost_shell_control::Accelerator {
+    manager.set_accelerators(vec![tuna_shell_control::Accelerator {
         action: 77,
         keysym: 0xff56, // Page_Down
-        mods: roost_shell_control::MOD_LOGO,
-        modes: roost_shell_control::MODE_NORMAL,
+        mods: tuna_shell_control::MOD_LOGO,
+        modes: tuna_shell_control::MODE_NORMAL,
     }]);
     chord(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
     assert!(manager.take_accelerators_fired().is_empty());
@@ -550,7 +558,7 @@ fn an_inhibiting_window_gets_the_shortcuts_until_super_escape() {
     chord(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
     assert_eq!(
         manager.take_accelerators_fired(),
-        [(77, 5000, roost_shell_control::MODE_NORMAL)]
+        [(77, 5000, tuna_shell_control::MODE_NORMAL)]
     );
     manager.set_accelerators(vec![]);
     chord(&mut manager, &mut comp, PAGE_DOWN_KEYCODE);
@@ -740,7 +748,7 @@ fn running_app_eligibility_follows_real_transient_parent_changes() {
 #[test]
 fn the_system_bell_rings() {
     // No sound from the test run.
-    std::env::set_var("ROOST_BELL", "0");
+    std::env::set_var("TUNA_BELL", "0");
     let (mut comp, mut manager) = compositor();
     let mut peer = connect(&mut comp, &mut manager);
     let bell: XdgSystemBellV1 = peer.bind(1);
@@ -763,7 +771,7 @@ fn windows_keep_their_toplevel_tag() {
     tags.set_toplevel_description(&toplevel, "New message".into());
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     let surface = comp.state.toplevels()[0].wl_surface().clone();
-    let tag = roost_compositor::protocols::toplevel_tag(&surface);
+    let tag = tuna_compositor::protocols::toplevel_tag(&surface);
     assert_eq!(tag.tag.as_deref(), Some("composer"));
     assert_eq!(tag.description.as_deref(), Some("New message"));
 }
@@ -779,7 +787,7 @@ fn parented_dialogs_remain_centered_on_left_and_upper_outputs() {
                     PhysicalProperties {
                         size: (0, 0).into(),
                         subpixel: Subpixel::Unknown,
-                        make: "Roost".into(),
+                        make: "Tuna Desktop".into(),
                         model: "Dialog topology test".into(),
                     },
                 );
@@ -841,4 +849,105 @@ fn parented_dialogs_remain_centered_on_left_and_upper_outputs() {
             drop(portal_peer);
         }
     }
+}
+
+#[test]
+fn minimized_parent_hides_transients_and_child_activation_restores_ancestors() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "parent-minimize");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let (child_surface, child) = window(&mut peer, "child-minimize");
+    child.set_parent(Some(&parent));
+    child_surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "parent-minimize");
+    let child_id = id_of(&manager, "child-minimize");
+    manager.focus(&mut comp.state, Some(child_id));
+    assert!(manager.minimize(&mut comp.state, parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert!(!manager.is_minimized(child_id));
+    assert_eq!(manager.model().focused(), None);
+    manager.focus(&mut comp.state, Some(child_id));
+    assert!(!manager.is_minimized(parent_id));
+    assert_eq!(manager.visible_windows().len(), 2);
+    assert_eq!(manager.model().focused(), Some(child_id));
+}
+
+#[test]
+fn dash_icon_targets_ignore_unknown_windows_and_retire_destroyed_window_targets() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (surface, top) = window(&mut peer, "dash-target-owner");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let id = id_of(&manager, "dash-target-owner");
+    let target = smithay::utils::Rectangle::new((-500, 700).into(), (64, 64).into());
+    manager.set_icon_geometries(vec![(id, target), (u64::MAX, target)]);
+    assert_eq!(manager.icon_geometry(id), Some(target));
+    assert_eq!(manager.icon_geometry(u64::MAX), None);
+    manager.set_icon_geometries(Vec::new());
+    assert_eq!(
+        manager.icon_geometry(id),
+        None,
+        "full replacement selects fallback"
+    );
+    manager.set_icon_geometries(vec![(id, target)]);
+    top.destroy();
+    surface.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        manager.icon_geometry(id),
+        None,
+        "destroy must retire old target"
+    );
+    manager.set_icon_geometries(vec![(id, target)]);
+    assert_eq!(
+        manager.icon_geometry(id),
+        None,
+        "stale shell publication is ignored"
+    );
+}
+
+#[test]
+fn restoring_parent_preserves_independent_child_minimize() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "independent-parent");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let (surface, child) = window(&mut peer, "independent-child");
+    child.set_parent(Some(&parent));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "independent-parent");
+    let child_id = id_of(&manager, "independent-child");
+    manager.minimize(&mut comp.state, child_id);
+    manager.minimize(&mut comp.state, parent_id);
+    manager.focus(&mut comp.state, Some(parent_id));
+    assert!(!manager.is_minimized(parent_id));
+    assert!(manager.is_minimized(child_id));
+    assert_eq!(manager.visible_windows().len(), 1);
+    assert_eq!(manager.model().focused(), Some(parent_id));
+}
+
+#[test]
+fn child_mapping_and_closing_cannot_restore_hidden_parent() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let (_, parent) = window(&mut peer, "hidden-parent");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let parent_id = id_of(&manager, "hidden-parent");
+    manager.minimize(&mut comp.state, parent_id);
+    let (surface, child) = window(&mut peer, "hidden-new-child");
+    child.set_parent(Some(&parent));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(manager.is_minimized(parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert_eq!(manager.model().focused(), None);
+    child.destroy();
+    surface.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(manager.is_minimized(parent_id));
+    assert!(manager.visible_windows().is_empty());
+    assert_eq!(manager.model().focused(), None);
 }

@@ -1,5 +1,5 @@
 [package]
-name = "roost-greeter"
+name = "tuna-greeter"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
@@ -14,11 +14,13 @@ gtk-ui = ["dep:gtk4", "dep:libadwaita"]
 
 [dependencies]
 greetd_ipc.workspace = true
-gtk4 = { workspace = true, optional = true }
+# Accessibility labels are part of the live login UI; declare the required
+# API here so standalone greeter builds do not rely on workspace unification.
+gtk4 = { workspace = true, optional = true, features = ["v4_10"] }
 libadwaita = { workspace = true, optional = true }
 
 [[bin]]
-name = "roost-greeter"
+name = "tuna-greeter"
 path = "src/main.rs"
 required-features = ["gtk-ui"]
 

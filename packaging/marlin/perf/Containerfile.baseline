@@ -1,14 +1,34 @@
-# CI-only GNOME 51 baseline derived from the recorded Marlin image.
-# Arch stable currently ships GNOME 50.5; enable both testing repositories
-# together and perform a complete upgrade to avoid a partial Arch upgrade.
+# CI-only GNOME 51.0 baseline derived from the recorded Marlin image.
+# The declared baseline is GNOME 51.0 (ADR 0007), but Arch and the published
+# Marlin tag have moved on to the 51.1 point release. Resolve every Arch
+# repository from one dated Arch Linux Archive snapshot instead of the moving
+# mirrors. ARCH_ARCHIVE_SNAPSHOT is the last daily snapshot in which extra
+# carries gnome-shell 1:51.0-1 together with Mutter 51.0 (the next day's
+# snapshot already moved Mutter to 51.1). The Mutter profiler build, the shared
+# preview and the Tuna payload's dependencies all resolve from this image's
+# synced databases, so they share the same snapshot. Changing this date changes
+# the baseline and requires an ADR (docs/roadmap.md change control).
+# Both testing repositories stay enabled from the same snapshot, as in the last
+# green derived baseline. -yy forces a database refresh: the base image's core
+# and extra databases are newer than the snapshot, so a plain -y keeps them.
+# -uu then performs one complete transaction that also downgrades packages the
+# base image already took from newer mirrors.
+# The archive is a single host and pacman's built-in downloader neither
+# retries nor waits more than 10 s to connect, so every derived stage fetches
+# through curl with bounded retries instead (run 38712122495 lost the profiler
+# build to archive connect timeouts).
 ARG BASE_IMAGE=ghcr.io/tuna-os/marlin:gnome
 ARG COHERENT_BASE=gnome-baseline
+ARG ARCH_ARCHIVE_SNAPSHOT=2026/10/13
 FROM ${BASE_IMAGE} AS gnome-baseline
-RUN sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra-testing]\nInclude = /etc/pacman.d/mirrorlist\n' /etc/pacman.conf && \
-    pacman -Syu --noconfirm gnome-shell mutter gdm \
+ARG ARCH_ARCHIVE_SNAPSHOT
+RUN printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_ARCHIVE_SNAPSHOT" > /etc/pacman.d/mirrorlist && \
+    sed -i '/^\[options\]/a XferCommand = /usr/bin/curl --fail --location --continue-at - --retry 8 --retry-connrefused --retry-delay 15 --connect-timeout 30 --silent --show-error --output %o %u' /etc/pacman.conf && \
+    sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra-testing]\nInclude = /etc/pacman.d/mirrorlist\n' /etc/pacman.conf && \
+    pacman -Syyuu --noconfirm gnome-shell mutter gdm \
         evolution-data-server gnome-keyring xdg-desktop-portal-gnome xdg-desktop-portal-gtk \
         gst-plugin-pipewire gst-plugins-good orca speech-dispatcher \
-        python python-gobject wayland-utils qemu-guest-agent gcc pkgconf wayland-protocols && \
+        python python-gobject wayland-utils qemu-guest-agent openssh gcc pkgconf wayland-protocols && \
     kernel_count=0 && \
     for module_dir in /usr/lib/modules/*; do \
         test -d "$module_dir" || continue; \
@@ -18,28 +38,29 @@ RUN sed -i '/^\[core\]/i [core-testing]\nInclude = /etc/pacman.d/mirrorlist\n\n[
         depmod "$kernel" && dracut --force "$module_dir/initramfs.img" "$kernel" || exit 1; \
     done && \
     test "$kernel_count" -eq 1 && \
-    gnome-shell --version | grep -Eq '^GNOME Shell 51([. ]|$)' && \
-    pacman -Q > /tmp/roost-baseline-packages.txt && \
-    LC_ALL=C sort /tmp/roost-baseline-packages.txt > /usr/share/roost-perf-baseline-packages.txt && \
-    rm /tmp/roost-baseline-packages.txt
+    gnome-shell --version | grep -qx 'GNOME Shell 51.0' && \
+    pacman -Q mutter | grep -Eqx 'mutter 51\.0-[0-9]+' && \
+    pacman -Q > /tmp/tuna-baseline-packages.txt && \
+    LC_ALL=C sort /tmp/tuna-baseline-packages.txt > /usr/share/tuna-perf-baseline-packages.txt && \
+    rm /tmp/tuna-baseline-packages.txt
 
 # Unmodified distribution GNOME target; no diagnostic package is installed.
 FROM ${COHERENT_BASE} AS stock-reference
 COPY scripts/lib/gnome_reference.py /usr/libexec/gnome_reference.py
-COPY packaging/marlin/perf/roost-perf-reference-image /usr/libexec/roost-perf-reference-image
-RUN pacman -Qlq linux mutter gnome-shell > /tmp/roost-baseline-critical-files.txt && \
+COPY packaging/marlin/perf/tuna-perf-reference-image /usr/libexec/tuna-perf-reference-image
+RUN pacman -Qlq linux mutter gnome-shell > /tmp/tuna-baseline-critical-files.txt && \
     for module_dir in /usr/lib/modules/*; do \
         if test -f "$module_dir/vmlinuz"; then \
             test -s "$module_dir/vmlinuz" && test -s "$module_dir/initramfs.img" && test -s "$module_dir/modules.dep" && \
                 printf '%s\n' "$module_dir/vmlinuz" "$module_dir/initramfs.img" "$module_dir/modules.dep" || exit 1; \
         fi; \
-    done >> /tmp/roost-baseline-critical-files.txt && \
+    done >> /tmp/tuna-baseline-critical-files.txt && \
     while IFS= read -r path; do \
         test ! -f "$path" || sha256sum "$path" || exit 1; \
-    done < /tmp/roost-baseline-critical-files.txt > /usr/share/roost-perf-baseline-critical.sha256 && \
-    test -s /usr/share/roost-perf-baseline-critical.sha256 && \
-    rm /tmp/roost-baseline-critical-files.txt && \
-    python3 /usr/libexec/roost-perf-reference-image stock
+    done < /tmp/tuna-baseline-critical-files.txt > /usr/share/tuna-perf-baseline-critical.sha256 && \
+    test -s /usr/share/tuna-perf-baseline-critical.sha256 && \
+    rm /tmp/tuna-baseline-critical-files.txt && \
+    python3 /usr/libexec/tuna-perf-reference-image stock
 
 # Build the pinned Arch 51.0 diagnostic variant with closed writer and source IDs.
 # Toolchain and source files remain in this build stage, outside the measured image.
@@ -53,30 +74,30 @@ RUN pacman -S --needed --noconfirm base-devel git sudo && \
     cd /build/mutter-profiler && \
     runuser -u profiler-builder -- makepkg --syncdeps --noconfirm --cleanbuild && \
     mkdir /profiler-package && \
-    cp mutter-51.0-1.6-x86_64.pkg.tar.zst /profiler-package/ && \
-    cp PKGBUILD release-trace-context.patch frame-source-evidence.patch drained-capture-start.patch /profiler-package/ && \
+    cp mutter-51.0-1.7-x86_64.pkg.tar.zst /profiler-package/ && \
+    cp PKGBUILD release-trace-context.patch frame-source-evidence.patch drained-capture-start.patch page-flip-identity.patch /profiler-package/ && \
     cd /profiler-package && \
-    sha256sum PKGBUILD release-trace-context.patch frame-source-evidence.patch drained-capture-start.patch mutter-51.0-1.6-x86_64.pkg.tar.zst > sha256sums
+    sha256sum PKGBUILD release-trace-context.patch frame-source-evidence.patch drained-capture-start.patch page-flip-identity.patch mutter-51.0-1.7-x86_64.pkg.tar.zst > sha256sums
 
 FROM ${COHERENT_BASE} AS diagnostic-reference
 COPY scripts/lib/gnome_reference.py /usr/libexec/gnome_reference.py
-COPY packaging/marlin/perf/roost-perf-reference-image /usr/libexec/roost-perf-reference-image
-COPY --from=mutter-profiler-build /profiler-package /usr/share/roost-perf-mutter-profiler
-RUN cd /usr/share/roost-perf-mutter-profiler && sha256sum -c sha256sums && \
-    pacman -U --noconfirm mutter-51.0-1.6-x86_64.pkg.tar.zst && \
-    pacman -Q mutter | grep -qx 'mutter 51.0-1.6' && \
-    pacman -Q > /tmp/roost-baseline-packages.txt && \
-    LC_ALL=C sort /tmp/roost-baseline-packages.txt > /usr/share/roost-perf-baseline-packages.txt && \
-    pacman -Qlq linux mutter > /tmp/roost-baseline-critical-files.txt && \
+COPY packaging/marlin/perf/tuna-perf-reference-image /usr/libexec/tuna-perf-reference-image
+COPY --from=mutter-profiler-build /profiler-package /usr/share/tuna-perf-mutter-profiler
+RUN cd /usr/share/tuna-perf-mutter-profiler && sha256sum -c sha256sums && \
+    pacman -U --noconfirm mutter-51.0-1.7-x86_64.pkg.tar.zst && \
+    pacman -Q mutter | grep -qx 'mutter 51.0-1.7' && \
+    pacman -Q > /tmp/tuna-baseline-packages.txt && \
+    LC_ALL=C sort /tmp/tuna-baseline-packages.txt > /usr/share/tuna-perf-baseline-packages.txt && \
+    pacman -Qlq linux mutter > /tmp/tuna-baseline-critical-files.txt && \
     for module_dir in /usr/lib/modules/*; do \
         if test -f "$module_dir/vmlinuz"; then \
             test -s "$module_dir/vmlinuz" && test -s "$module_dir/initramfs.img" && test -s "$module_dir/modules.dep" && \
                 printf '%s\n' "$module_dir/vmlinuz" "$module_dir/initramfs.img" "$module_dir/modules.dep" || exit 1; \
         fi; \
-    done >> /tmp/roost-baseline-critical-files.txt && \
+    done >> /tmp/tuna-baseline-critical-files.txt && \
     while IFS= read -r path; do \
         test ! -f "$path" || sha256sum "$path" || exit 1; \
-    done < /tmp/roost-baseline-critical-files.txt > /usr/share/roost-perf-baseline-critical.sha256 && \
-    test -s /usr/share/roost-perf-baseline-critical.sha256 && \
-    rm /tmp/roost-baseline-packages.txt /tmp/roost-baseline-critical-files.txt && \
-    python3 /usr/libexec/roost-perf-reference-image diagnostic
+    done < /tmp/tuna-baseline-critical-files.txt > /usr/share/tuna-perf-baseline-critical.sha256 && \
+    test -s /usr/share/tuna-perf-baseline-critical.sha256 && \
+    rm /tmp/tuna-baseline-packages.txt /tmp/tuna-baseline-critical-files.txt && \
+    python3 /usr/libexec/tuna-perf-reference-image diagnostic

@@ -9,12 +9,15 @@ use std::path::Path;
 const MAX_BYTES: u64 = 4096;
 
 pub(crate) fn read(path: &Path) -> io::Result<String> {
+    read_bounded(path, MAX_BYTES)
+}
+pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+    if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime signal must be a small regular file",
@@ -23,8 +26,8 @@ pub(crate) fn read(path: &Path) -> io::Result<String> {
     // The file can grow after metadata inspection. Limit the descriptor read
     // too, with one extra byte to detect overflow rather than accept a prefix.
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_BYTES {
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime signal exceeds its size limit",
@@ -40,11 +43,11 @@ mod tests {
     #[test]
     fn regular_runtime_signals_follow_atomic_policy_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("roost-idle-blank");
+        let path = dir.path().join("tuna-idle-blank");
         std::fs::write(&path, "300000\n10000\n").unwrap();
         let policy = crate::lock::IdleBlank::parse(&read(&path).unwrap());
         assert_eq!((policy.idle_ms, policy.fade_ms), (300000, 10000));
-        let next = dir.path().join(".roost-idle-blank.tmp");
+        let next = dir.path().join(".tuna-idle-blank.tmp");
         std::fs::write(&next, "120000\n0\n").unwrap();
         std::fs::rename(next, &path).unwrap();
         let policy = crate::lock::IdleBlank::parse(&read(&path).unwrap());
@@ -59,7 +62,7 @@ mod tests {
     #[test]
     fn runtime_signal_rejects_a_fifo_without_a_writer_and_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("roost-idle-blank");
+        let fifo = dir.path().join("tuna-idle-blank");
         rustix::fs::mkfifoat(
             rustix::fs::CWD,
             &fifo,
@@ -72,7 +75,7 @@ mod tests {
         assert_eq!((fallback.idle_ms, fallback.fade_ms), (0, 0));
         let target = dir.path().join("regular");
         std::fs::write(&target, "300000\n10000\n").unwrap();
-        let link = dir.path().join("roost-swipe-input");
+        let link = dir.path().join("tuna-swipe-input");
         std::os::unix::fs::symlink(target, &link).unwrap();
         assert!(read(&link).is_err(), "signal must not follow a symlink");
     }
@@ -80,7 +83,7 @@ mod tests {
     #[test]
     fn runtime_signal_bounds_bytes_and_rejects_invalid_utf8() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("roost-swipe-input");
+        let path = dir.path().join("tuna-swipe-input");
         std::fs::write(&path, vec![b'x'; MAX_BYTES as usize]).unwrap();
         assert_eq!(read(&path).unwrap().len(), MAX_BYTES as usize);
         std::fs::write(&path, vec![b'x'; MAX_BYTES as usize + 1]).unwrap();

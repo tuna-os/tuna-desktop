@@ -7,7 +7,7 @@
 //!
 //! # Live runtime
 //!
-//! The compositor serves `zwlr_layer_shell_v1` (see `roost_compositor::layer`),
+//! The compositor serves `zwlr_layer_shell_v1` (see `tuna_compositor::layer`),
 //! so this binary attaches for real: connect, bind, create the top-anchored
 //! surface, ack configures, run until closed. Against a compositor without
 //! the global it exits with a clear error instead of guessing a fallback
@@ -26,7 +26,7 @@ use std::os::unix::io::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use roost_shell_control::OutputInfo;
+use tuna_shell_control::OutputInfo;
 use wayland_client::{
     delegate_noop,
     globals::{registry_queue_init, BindError, GlobalListContents},
@@ -69,7 +69,9 @@ use crate::favorites::Favorites;
 use crate::icons::Artwork;
 use crate::intake::NotificationBus;
 use crate::keyboard::{KeyAction, XkbFeed};
+use crate::lockdown::LockdownBus;
 use crate::model::ShellModel;
+use crate::notification_policy::GioPolicyStore;
 use crate::notifications::{NotificationAction, NotificationCenter, Urgency};
 use crate::overview::{
     banner_hit, banner_strip_height, blit_glyph, glyph_index, overview_press, paint_panel,
@@ -93,7 +95,7 @@ use crate::watcher::{
 ///
 /// Shared with the compositor: both sides read these from the same source
 /// to prevent drift in the compositor↔shell interface.
-pub use roost_shell_control::{
+pub use tuna_shell_control::{
     BANNER_NAMESPACE, DOCK_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_HEIGHT, PANEL_NAMESPACE,
     SWITCHER_NAMESPACE,
 };
@@ -161,7 +163,21 @@ impl fmt::Display for PanelError {
     }
 }
 
-impl std::error::Error for PanelError {}
+impl std::error::Error for PanelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect(err) => Some(err),
+            Self::Registry(err) => Some(err),
+            Self::NoCompositor(err) => Some(err),
+            Self::NoLayerShell(err) => Some(err),
+            Self::NoShm(err) => Some(err),
+            Self::NoSeat(err) => Some(err),
+            Self::Dispatch(err) => Some(err),
+            Self::Control(err) => Some(err),
+            Self::Flush(_) => None,
+        }
+    }
+}
 
 /// Application state driven by the Wayland event queue.
 pub struct ShellHost {
@@ -278,6 +294,8 @@ pub struct ShellHost {
     watcher: WatcherBus,
     /// D-Bus edge behind the notification center.
     notifications: NotificationBus,
+    /// D-Bus edge behind the portal lockdown publisher.
+    lockdown: LockdownBus,
     /// Resolved icon artwork keyed (theme, name, size). Cleared
     /// wholesale when the snapshot theme changes.
     icon_cache: std::collections::HashMap<(String, String, u32), Artwork>,
@@ -788,7 +806,7 @@ fn shm_upload(
     if pixels.is_empty() || width <= 0 || height <= 0 {
         return None;
     }
-    let fd = rustix::fs::memfd_create("roost-shm", rustix::fs::MemfdFlags::CLOEXEC).ok()?;
+    let fd = rustix::fs::memfd_create("tuna-shm", rustix::fs::MemfdFlags::CLOEXEC).ok()?;
     let mut file = std::fs::File::from(fd);
     file.set_len(pixels.len() as u64).ok()?;
     use std::io::Write;
@@ -897,7 +915,16 @@ impl ShellHost {
             apps.clone() as Arc<dyn crate::search::SearchProvider>,
         ]);
         let center = Arc::new(Mutex::new(NotificationCenter::new()));
-        let notifications = NotificationBus::new(center.clone());
+        // GNOME Settings' notification policy, read live on every
+        // arrival (#348).
+        if let Ok(mut filed) = center.lock() {
+            filed.set_policy(Arc::new(GioPolicyStore::new()));
+        }
+        let mut notifications = NotificationBus::new(center.clone());
+        // The policy store uses GSettings: file wire arrivals where the
+        // slow tick pumps the GLib context (`TileSet::refresh`), never
+        // on a zbus thread.
+        notifications.deliver_in(gio::glib::MainContext::default());
         Self {
             model: ShellModel::new(),
             panel,
@@ -948,6 +975,7 @@ impl ShellHost {
             pending_presses: Vec::new(),
             watcher: WatcherBus::new(),
             notifications,
+            lockdown: LockdownBus::new(),
             icon_cache: std::collections::HashMap::new(),
             icon_theme: crate::settings::DEFAULT_ICON_THEME.to_owned(),
             pending_dock: Vec::new(),
@@ -1036,10 +1064,10 @@ impl ShellHost {
         }
     }
 
-    /// Load the Roost-owned prefs from the system state file at host
+    /// Load the Tuna-owned prefs from the system state file at host
     /// start. Same fail-closed rule as the notification queue: a bad
     /// file never blocks the panel.
-    pub fn load_roost_prefs(&mut self) {
+    pub fn load_tuna_prefs(&mut self) {
         self.tiles.load_prefs_system();
     }
 
@@ -1749,6 +1777,7 @@ impl ShellHost {
             self.sync_icon_theme();
             self.poll_indicators();
             self.poll_notifications();
+            self.poll_lockdown();
             // Extension scripts run here, off the paint and event
             // paths: the drive reloads changed scripts and refreshes
             // cached outputs, queued presses drain into handlers,
@@ -1871,7 +1900,7 @@ impl ShellHost {
             }
         }
         // Row presses inside the open calendar fire the footer
-        // toggles (clock format above, Roost prefs below); the
+        // toggles (clock format above, Tuna Desktop prefs below); the
         // calendar stays open on the new face, and anything else
         // falls through to the strip.
         if self.popup.body() == Some(PopupBody::Calendar) {
@@ -3132,7 +3161,7 @@ impl ShellHost {
         if runtime_dir.as_os_str().is_empty() {
             return;
         }
-        let path = runtime_dir.join("roost-wallpaper");
+        let path = runtime_dir.join("tuna-wallpaper");
         let done = match &current {
             Some(uri) => std::fs::write(&path, uri).is_ok(),
             None => std::fs::remove_file(&path).is_ok(),
@@ -3292,6 +3321,22 @@ impl ShellHost {
     /// the tick only ensures the name. Silent no-op without a bus.
     fn poll_notifications(&mut self) {
         self.notifications.ensure();
+    }
+
+    /// Publish the privacy kill-switches to the portal bus: take the
+    /// Tuna backend role when free, then re-sync from GSettings and
+    /// broadcast whatever moved. Silent no-op without a bus.
+    fn poll_lockdown(&mut self) {
+        self.lockdown.ensure();
+        self.lockdown_with(&crate::settings::GioBackend);
+    }
+
+    /// [`poll_lockdown`](Self::poll_lockdown) against an explicit
+    /// backend (tests substitute a fake; the tick passes the
+    /// platform backend). Split out so the settings leg is testable
+    /// without a bus.
+    fn lockdown_with(&mut self, backend: &dyn crate::settings::SettingsBackend) {
+        self.lockdown.poll(backend);
     }
 
     /// Open an indicator's menu, fetching its rows first. An empty
@@ -3794,11 +3839,11 @@ fn drive_control(control: &mut ControlClient, host: &mut ShellHost) {
         Ok(Handled::Gap { .. }) => {
             host.sync_overview(control);
             if let Err(e) = control.request_snapshot() {
-                eprintln!("roost-shell-host: control resnapshot failed: {e}");
+                eprintln!("tuna-shell-host: control resnapshot failed: {e}");
             }
         }
         Ok(_) => host.sync_overview(control),
-        Err(e) => eprintln!("roost-shell-host: control error: {e}"),
+        Err(e) => eprintln!("tuna-shell-host: control error: {e}"),
     }
     // Per-output surfaces follow the inventory every tick, whether or
     // not a control frame landed: registry naming and inventory
@@ -4203,7 +4248,7 @@ fn pump_wayland(
 /// set, the panel also speaks the control channel — handshake and
 /// initial snapshot up front, then one nonblocking control step per
 /// panel-loop iteration keeps the overview model on compositor truth.
-/// The compositor sets `ROOST_CONTROL_SOCKET` for the supervised child;
+/// The compositor sets `TUNA_CONTROL_SOCKET` for the supervised child;
 /// running without it leaves a panel with an empty overview.
 pub fn run_panel_with_control(
     panel: PanelConfig,
@@ -4225,7 +4270,7 @@ pub fn run_panel_with_control(
 
     let mut host = ShellHost::new(panel, AppProvider::system(), Favorites::system());
     host.load_notification_queue();
-    host.load_roost_prefs();
+    host.load_tuna_prefs();
     host.attach_wayland(compositor.clone(), layer_shell.clone(), shm, qh.clone());
     host.attach_seat(seat.clone(), &qh);
     host.create_panel_surface(&compositor, &layer_shell, &qh);
@@ -4307,7 +4352,7 @@ mod tests {
     /// `wl_output` names, with no Wayland attached. Hand-written
     /// expectations, never derived from the planner itself.
     mod output_plan {
-        use roost_shell_control::OutputInfo;
+        use tuna_shell_control::OutputInfo;
 
         use super::super::{plan_output_surfaces, OutputPlan};
 
@@ -4409,7 +4454,7 @@ mod tests {
         use std::rc::Rc;
         use std::sync::Mutex;
 
-        use roost_compositor::{
+        use tuna_compositor::{
             control::ControlHub,
             state::{StateModel, TokenStore},
             TestCompositor, SEAT_NAME,
@@ -4555,7 +4600,7 @@ mod tests {
                 host.tiles.settings.wallpaper_uri.as_deref(),
                 Some("file:///wall.png")
             );
-            let drop = run.path().join(roost_compositor::wallpaper::WALLPAPER_FILE);
+            let drop = run.path().join(tuna_compositor::wallpaper::WALLPAPER_FILE);
             assert_eq!(
                 std::fs::read_to_string(&drop).expect("drop file"),
                 "file:///wall.png"
@@ -4590,14 +4635,14 @@ mod tests {
                 host.tiles.settings.wallpaper_uri.as_deref(),
                 Some("file:///wall.png")
             );
-            let drop = run.path().join(roost_compositor::wallpaper::WALLPAPER_FILE);
+            let drop = run.path().join(tuna_compositor::wallpaper::WALLPAPER_FILE);
             assert_eq!(
                 std::fs::read_to_string(&drop).expect("drop file"),
                 "file:///wall.png"
             );
         }
 
-        /// Roost prefs surface round trip: a press on the calendar's
+        /// Tuna Desktop prefs surface round trip: a press on the calendar's
         /// prefs row flips the weekday prefix, the calendar stays
         /// open, and the pinned prefs file carries the flip without
         /// hand editing.
@@ -4628,11 +4673,11 @@ mod tests {
             );
         }
 
-        /// Changed Roost option shows the kept value after shell
+        /// Changed Tuna Desktop option shows the kept value after shell
         /// restart: a fresh host restoring from the same prefs file
         /// paints the weekday prefix with no further writes.
         #[test]
-        fn changed_roost_option_shows_kept_value_after_restart() {
+        fn changed_tuna_option_shows_kept_value_after_restart() {
             let (mut host, _dir) = test_host();
             let state = tempfile::tempdir().expect("tempdir");
             let prefs = state.path().join(crate::prefs::PREFS_FILE);
@@ -6311,7 +6356,7 @@ mod tests {
                 "overview sized at first geometry"
             );
             comp.state.set_output_size(1600, 900);
-            roost_compositor::layer::arrange_after_commit(&comp.state);
+            tuna_compositor::layer::arrange_after_commit(&comp.state);
             for _ in 0..PUMP_ROUNDS {
                 pump_server(&mut comp, &mut queue, &mut host);
                 host.update_overview(None);
@@ -6818,7 +6863,7 @@ mod tests {
                 .collect();
             assert_eq!(banners.len(), 1, "one banner strip tracked");
             assert!(banners[0].configured, "banner acked the configure");
-            assert_eq!(banners[0].layer, roost_compositor::layer::Layer::Overlay);
+            assert_eq!(banners[0].layer, tuna_compositor::layer::Layer::Overlay);
 
             // Draining the queue destroys the surface server-side too.
             host.notification_center()
@@ -7318,7 +7363,7 @@ mod tests {
         /// focus. Same `sync_overview` path the run loop drives.
         #[test]
         fn switcher_drive_steps_and_commits() {
-            use roost_shell_control::{CommandStatus, SwitcherAction};
+            use tuna_shell_control::{CommandStatus, SwitcherAction};
 
             let dir = crate::panel::tests::private_tempdir();
             let socket_path = dir.path().join("control.sock");
@@ -7643,7 +7688,7 @@ mod tests {
         #[test]
         fn activate_window_hit_focuses_and_dismisses() {
             use crate::search::SearchResult;
-            use roost_shell_control::CommandStatus;
+            use tuna_shell_control::CommandStatus;
 
             let dir = crate::panel::tests::private_tempdir();
             let socket_path = dir.path().join("control.sock");
@@ -7734,7 +7779,7 @@ mod tests {
         /// value with no window content.
         #[test]
         fn manual_lock_engages_lock_screen_at_once() {
-            use roost_shell_control::CommandStatus;
+            use tuna_shell_control::CommandStatus;
 
             let dir = crate::panel::tests::private_tempdir();
             let socket_path = dir.path().join("control.sock");
@@ -7997,7 +8042,7 @@ mod tests {
             let apps_dir = tempfile::tempdir().unwrap();
             std::fs::write(
                 apps_dir.path().join("broken.desktop"),
-                "[Desktop Entry]\nName=Broken Probe\nExec=/nonexistent-roost-binary-xyz\nType=Application\n",
+                "[Desktop Entry]\nName=Broken Probe\nExec=/nonexistent-tuna-binary-xyz\nType=Application\n",
             )
             .unwrap();
             let fav_dir = tempfile::tempdir().unwrap();
@@ -8039,7 +8084,7 @@ mod tests {
             let apps_dir = tempfile::tempdir().unwrap();
             std::fs::write(
                 apps_dir.path().join("broken.desktop"),
-                "[Desktop Entry]\nName=Broken Probe\nExec=/nonexistent-roost-binary-xyz\nType=Application\n",
+                "[Desktop Entry]\nName=Broken Probe\nExec=/nonexistent-tuna-binary-xyz\nType=Application\n",
             )
             .unwrap();
             let fav_dir = tempfile::tempdir().unwrap();
@@ -8097,8 +8142,8 @@ mod tests {
         #[test]
         fn overview_press_action_runs_command_and_dismisses() {
             use crate::search::SearchResult;
-            use roost_shell_control::CommandStatus;
             use std::rc::Rc;
+            use tuna_shell_control::CommandStatus;
 
             let dir = crate::panel::tests::private_tempdir();
             let socket_path = dir.path().join("control.sock");
@@ -8310,7 +8355,7 @@ mod tests {
         fn sync_icon_theme_clears_cache_and_bumps_paint_keys_on_flip() {
             let (mut host, _dir) = test_host();
             host.icon_cache.insert(
-                (host.icon_theme.clone(), "roost-cached".to_owned(), 32),
+                (host.icon_theme.clone(), "tuna-cached".to_owned(), 32),
                 dummy_artwork(),
             );
             host.panel_paint_key = Some(some_panel_key());
@@ -8331,7 +8376,7 @@ mod tests {
         fn sync_icon_theme_is_noop_when_theme_unchanged() {
             let (mut host, _dir) = test_host();
             host.icon_cache.insert(
-                (host.icon_theme.clone(), "roost-cached".to_owned(), 32),
+                (host.icon_theme.clone(), "tuna-cached".to_owned(), 32),
                 dummy_artwork(),
             );
             host.panel_paint_key = Some(some_panel_key());
@@ -8355,7 +8400,7 @@ mod tests {
             let (mut host, _dir) = test_host();
             host.icon_theme = "CacheTheme".to_owned();
 
-            assert_eq!(host.icon_art("no-such-roost-icon", 32), None);
+            assert_eq!(host.icon_art("no-such-tuna-icon", 32), None);
             assert!(
                 host.icon_cache.is_empty(),
                 "misses must not pollute the cache"
@@ -8367,20 +8412,20 @@ mod tests {
         #[test]
         fn icon_art_caches_resolved_artwork() {
             let _lock = ENV_LOCK.lock().expect("env lock");
-            let tmp = icon_theme_fixture("CacheTheme", "roost-cache-icon");
+            let tmp = icon_theme_fixture("CacheTheme", "tuna-cache-icon");
             let _env = EnvRestore::install(&tmp);
             let (mut host, _dir) = test_host();
             host.icon_theme = "CacheTheme".to_owned();
 
             let first = host
-                .icon_art("roost-cache-icon", 32)
+                .icon_art("tuna-cache-icon", 32)
                 .expect("fixture icon resolves");
             assert_eq!(first.size, 32);
             assert_eq!(first.argb.len(), 32 * 32 * 4);
             assert_eq!(host.icon_cache.len(), 1);
 
             let second = host
-                .icon_art("roost-cache-icon", 32)
+                .icon_art("tuna-cache-icon", 32)
                 .expect("cached icon resolves");
             assert_eq!(first, second, "second call serves cached artwork");
             assert_eq!(host.icon_cache.len(), 1, "repeat hit adds no entry");
@@ -8414,9 +8459,9 @@ mod tests {
         #[test]
         fn dock_icon_resolves_pinned_app_through_cache() {
             let _lock = ENV_LOCK.lock().expect("env lock");
-            let tmp = icon_theme_fixture("DockTheme", "roost-dock-app");
+            let tmp = icon_theme_fixture("DockTheme", "tuna-dock-app");
             let _env = EnvRestore::install(&tmp);
-            let (mut host, _dir) = dock_icon_test_host(Some("roost-dock-app"));
+            let (mut host, _dir) = dock_icon_test_host(Some("tuna-dock-app"));
             host.icon_theme = "DockTheme".to_owned();
             let items = host.dock_items();
             assert_eq!(items.len(), 1, "pinned app composes one item");
@@ -8465,11 +8510,10 @@ mod tests {
                 for px in img.pixels_mut() {
                     *px = pixel;
                 }
-                img.save(path.join("roost-dock-flip.png"))
-                    .expect("save png");
+                img.save(path.join("tuna-dock-flip.png")).expect("save png");
             }
             let _env = EnvRestore::install(&tmp);
-            let (mut host, _dir) = dock_icon_test_host(Some("roost-dock-flip"));
+            let (mut host, _dir) = dock_icon_test_host(Some("tuna-dock-flip"));
             host.icon_theme = "DockFlipA".to_owned();
             host.dock_paint_key = Some(some_dock_key());
 
@@ -8499,6 +8543,8 @@ mod tests {
                 icon_pixmap: Vec::new(),
                 attention_name: String::new(),
                 attention_pixmap: Vec::new(),
+                tooltip_title: String::new(),
+                tooltip_body: String::new(),
             }
         }
 
@@ -8553,12 +8599,12 @@ mod tests {
         fn build_icon_attention_name_resolves_via_theme_fixture() {
             use crate::watcher::{IndicatorIcon, INDICATOR_CELL};
             let _lock = ENV_LOCK.lock().expect("env lock");
-            let tmp = icon_theme_fixture("TrayTheme", "roost-tray-attention");
+            let tmp = icon_theme_fixture("TrayTheme", "tuna-tray-attention");
             let _env = EnvRestore::install(&tmp);
             let (mut host, _dir) = test_host();
             host.icon_theme = "TrayTheme".to_owned();
             let mut info = tray_info("NeedsAttention", "test.tray");
-            info.attention_name = "roost-tray-attention".to_owned();
+            info.attention_name = "tuna-tray-attention".to_owned();
             match host.build_icon(&info) {
                 IndicatorIcon::Pixmap {
                     width,
@@ -8586,8 +8632,8 @@ mod tests {
             let (mut host, _dir) = test_host();
             host.icon_theme = "TrayTheme".to_owned();
             let mut info = tray_info("Active", "test.tray");
-            info.icon_name = "no-such-roost-tray-icon".to_owned();
-            info.attention_name = "no-such-roost-tray-attention".to_owned();
+            info.icon_name = "no-such-tuna-tray-icon".to_owned();
+            info.attention_name = "no-such-tuna-tray-attention".to_owned();
             assert_eq!(
                 host.build_icon(&info),
                 IndicatorIcon::Named("test.tray".to_owned())
@@ -8609,12 +8655,12 @@ mod tests {
         fn build_icon_symbolic_name_retints_toward_accent() {
             use crate::watcher::IndicatorIcon;
             let _lock = ENV_LOCK.lock().expect("env lock");
-            let tmp = icon_theme_fixture("TrayTheme", "roost-tray-symbolic");
+            let tmp = icon_theme_fixture("TrayTheme", "tuna-tray-symbolic");
             let _env = EnvRestore::install(&tmp);
             let (mut host, _dir) = test_host();
             host.icon_theme = "TrayTheme".to_owned();
             let mut info = tray_info("Active", "test.tray");
-            info.icon_name = "roost-tray-symbolic".to_owned();
+            info.icon_name = "tuna-tray-symbolic".to_owned();
             match host.build_icon(&info) {
                 IndicatorIcon::Pixmap { argb, .. } => {
                     assert!(!argb.is_empty(), "symbolic icon must decode");

@@ -1,11 +1,11 @@
 //! Opt-in CI observations of the original cached catalog used by show_results.
 //! Same-user fixture provenance only; never an authentication boundary or a
 //! replacement for physical focus, launch, presenter or audio evidence.
-use roost_shell_host::apps::AppEntry;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
+use tuna_shell_host::apps::AppEntry;
 
 type Key = (u64, u64, u32, u32, u64, i64, i64, i64, i64);
 fn key(value: &fs::Metadata) -> Key {
@@ -36,12 +36,12 @@ fn principal() -> Option<Principal> {
         return None;
     }
     let mapped = fs::metadata("/proc/self/exe").ok()?;
-    let named = fs::symlink_metadata("/usr/bin/roost-shell-gtk").ok()?;
+    let named = fs::symlink_metadata("/usr/bin/tuna-shell-gtk").ok()?;
     if !named.is_file()
         || named.uid() != 0
         || named.mode() & 0o022 != 0
         || key(&mapped) != key(&named)
-        || fs::read_link("/proc/self/exe").ok()?.as_os_str() != "/usr/bin/roost-shell-gtk"
+        || fs::read_link("/proc/self/exe").ok()?.as_os_str() != "/usr/bin/tuna-shell-gtk"
     {
         return None;
     }
@@ -64,7 +64,7 @@ fn principal() -> Option<Principal> {
         .ok()?;
     if ticks == 0
         || key(&fs::metadata("/proc/self/exe").ok()?) != key(&mapped)
-        || key(&fs::symlink_metadata("/usr/bin/roost-shell-gtk").ok()?) != key(&named)
+        || key(&fs::symlink_metadata("/usr/bin/tuna-shell-gtk").ok()?) != key(&named)
     {
         return None;
     }
@@ -100,7 +100,7 @@ pub struct Capture {
 }
 impl Capture {
     pub fn new() -> Option<Self> {
-        if std::env::var_os("ROOST_VM_PUBLIC_SEARCH_DIAGNOSTICS").as_deref()
+        if std::env::var_os("TUNA_VM_PUBLIC_SEARCH_DIAGNOSTICS").as_deref()
             != Some(std::ffi::OsStr::new("1"))
         {
             return None;
@@ -113,7 +113,7 @@ impl Capture {
         }
         Some(Self {
             original,
-            path: directory.join("roost-vm-public-search.json"),
+            path: directory.join("tuna-vm-public-search.json"),
             owned: None,
             sequence: 0,
         })
@@ -177,7 +177,7 @@ impl Capture {
             return;
         }
         let temporary = self.path.with_file_name(format!(
-            ".roost-vm-public-search-{}-{sequence}",
+            ".tuna-vm-public-search-{}-{sequence}",
             self.original.pid
         ));
         let mut created = None;

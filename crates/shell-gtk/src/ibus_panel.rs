@@ -5,7 +5,7 @@
 //! disable` (so no `ibus-ui-gtk3` runs) and owns
 //! `org.freedesktop.IBus.Panel` on IBus's own bus through
 //! `IBus.PanelService`. The daemon then routes to that name what an
-//! input context cannot show itself: `roost-ibus-bridge`, like GNOME
+//! input context cannot show itself: `tuna-ibus-bridge`, like GNOME
 //! Shell's input method, declares preedit but not lookup-table or
 //! auxiliary-text capabilities, so the engine's candidates arrive here
 //! (`UpdateLookupTable`, `ShowLookupTable`, `HideLookupTable`,
@@ -23,6 +23,8 @@
 //! `CursorUp`/`CursorDown`, as `IBus.PanelService` emits them.
 
 use std::cell::{Cell, RefCell};
+use std::os::unix::fs::DirBuilderExt;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -30,8 +32,8 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-pub use roost_shell_host::ibus::text as ibus_text;
-use roost_shell_host::ibus::{address as ibus_address, debug};
+pub use tuna_shell_host::ibus::text as ibus_text;
+use tuna_shell_host::ibus::{address as ibus_address, debug};
 
 const PANEL_NAME: &str = "org.freedesktop.IBus.Panel";
 const PANEL_PATH: &str = "/org/freedesktop/IBus/Panel";
@@ -52,7 +54,8 @@ const ARROW_RISE: i32 = 6;
 /// Transparent room around the content for its box-shadow (the
 /// content's CSS margin in style.css).
 const SHADOW: i32 = 6;
-/// How often to look for IBus's bus while not connected to it.
+/// With a fixed `IBUS_ADDRESS` (no address file to watch), how often to
+/// look for IBus's bus while not connected to it.
 const RETRY: Duration = Duration::from_secs(2);
 
 /// org.freedesktop.IBus.Panel, as ibus's `ibuspanelservice.c` declares it.
@@ -92,7 +95,7 @@ const XML: &str = r#"<node>
     <signal name="CursorDown"/>
     <signal name="PageUp"/>
     <signal name="PageDown"/>
-    <signal name="PropertyActivate"><arg type="s"/><arg type="i"/></signal>
+    <signal name="PropertyActivate"><arg type="s"/><arg type="u"/></signal>
     <signal name="PropertyShow"><arg type="s"/></signal>
     <signal name="PropertyHide"><arg type="s"/></signal>
     <signal name="CandidateClicked"><arg type="u"/><arg type="u"/><arg type="u"/></signal>
@@ -246,18 +249,28 @@ pub struct CandidatePopup {
     state: RefCell<State>,
     conn: RefCell<Option<gio::DBusConnection>>,
     connecting: Cell<bool>,
+    /// The address file changed while a connection attempt was running.
+    missed: Cell<bool>,
     log_pending: Cell<bool>,
+    properties: Rc<crate::ibus_property_menu::PropertyMenu>,
+    /// IBus's address directory, whose changes mean a daemon (re)started.
+    address_monitor: RefCell<Option<gio::FileMonitor>>,
+    /// The next try while not connected, when there is no monitor.
+    retry: RefCell<Option<glib::SourceId>>,
 }
 
 impl CandidatePopup {
-    fn new(app: &gtk::Application) -> Rc<Self> {
+    fn new(
+        app: &gtk::Application,
+        properties: Rc<crate::ibus_property_menu::PropertyMenu>,
+    ) -> Rc<Self> {
         let window = gtk::Window::new();
         window.set_application(Some(app));
-        window.add_css_class("roost-ibus-candidates");
+        window.add_css_class("tuna-ibus-candidates");
         window.set_title(Some("Input Method Candidates"));
         window.init_layer_shell();
         window.set_layer(Layer::Overlay);
-        window.set_namespace(Some(roost_shell_control::IBUS_CANDIDATES_NAMESPACE));
+        window.set_namespace(Some(tuna_shell_control::IBUS_CANDIDATES_NAMESPACE));
         window.set_anchor(Edge::Top, true);
         window.set_anchor(Edge::Left, true);
         window.set_exclusive_zone(-1);
@@ -328,9 +341,22 @@ impl CandidatePopup {
             state: RefCell::default(),
             conn: RefCell::new(None),
             connecting: Cell::new(false),
+            missed: Cell::new(false),
             log_pending: Cell::new(false),
+            properties,
+            address_monitor: RefCell::new(None),
+            retry: RefCell::new(None),
         });
         ui.wire();
+        let weak = Rc::downgrade(&ui);
+        ui.properties.set_unavailable(Rc::new(move || {
+            if let Some(ui) = weak.upgrade() {
+                // No call to ui.reset(): that would recursively reset the
+                // property connection that is in the middle of its refresh.
+                *ui.state.borrow_mut() = State::default();
+                ui.window.set_visible(false);
+            }
+        }));
         ui
     }
 
@@ -345,7 +371,7 @@ impl CandidatePopup {
                     let button = gesture.current_button();
                     let state = gesture.current_event_state().bits();
                     if debug() {
-                        eprintln!("roost-shell-gtk: ibus candidate {i} clicked (button {button})");
+                        eprintln!("tuna-shell-gtk: ibus candidate {i} clicked (button {button})");
                     }
                     ui.emit(
                         "CandidateClicked",
@@ -391,7 +417,7 @@ impl CandidatePopup {
             return;
         };
         if let Err(e) = conn.emit_signal(None, PANEL_PATH, PANEL_NAME, signal, args.as_ref()) {
-            eprintln!("roost-shell-gtk: IBus panel: {signal}: {e}");
+            eprintln!("tuna-shell-gtk: IBus panel: {signal}: {e}");
         }
     }
 
@@ -583,7 +609,7 @@ impl CandidatePopup {
             }
             previous_end = Some(start + length);
             lines.push(format!(
-                "roost-shell-gtk: ibus candidate {i} {} at {} {} {} {}",
+                "tuna-shell-gtk: ibus candidate {i} {} at {} {} {} {}",
                 row.label.label(),
                 ox + (sx + f64::from(b.x())).round() as i32,
                 oy + (sy + f64::from(b.y())).round() as i32,
@@ -599,25 +625,20 @@ impl CandidatePopup {
 
     /// Hide everything (the bus went away).
     fn reset(&self) {
+        self.properties.reset();
         *self.state.borrow_mut() = State::default();
         self.window.set_visible(false);
     }
 
-    /// Connect to IBus's bus when not connected; notice when it closes.
-    fn poll(self: &Rc<Self>) {
-        let current = self.conn.borrow().clone();
-        if let Some(conn) = current {
-            if !conn.is_closed() {
-                return;
-            }
-            eprintln!("roost-shell-gtk: IBus panel: the IBus bus closed");
-            self.conn.replace(None);
-            self.reset();
-        }
-        if self.connecting.get() {
+    /// Connect to IBus's bus unless connected (or connecting). Without
+    /// a bus, or with a stale address, the address directory's next
+    /// change tries again ([`CandidatePopup::watch_address_dir`]).
+    fn connect(self: &Rc<Self>) {
+        if self.conn.borrow().is_some() || self.connecting.get() {
             return;
         }
         let Some(address) = ibus_address() else {
+            self.retry_later();
             return;
         };
         self.connecting.set(true);
@@ -631,12 +652,87 @@ impl CandidatePopup {
             move |result| {
                 let Some(ui) = weak.upgrade() else { return };
                 ui.connecting.set(false);
-                // A stale address (the daemon gone): try again later.
-                if let Ok(conn) = result {
-                    ui.serve(conn);
+                let missed = ui.missed.replace(false);
+                match result {
+                    Ok(conn) => ui.serve(conn),
+                    // The address file changed mid-attempt: use the new one.
+                    Err(_) if missed => ui.connect(),
+                    // A stale address (the daemon gone): try again later.
+                    Err(_) => ui.retry_later(),
                 }
             },
         );
+    }
+
+    /// Try again on a one-shot timeout, only when no address directory
+    /// is watched (a fixed `IBUS_ADDRESS`, or the watch failed).
+    fn retry_later(self: &Rc<Self>) {
+        if self.address_monitor.borrow().is_some() || self.retry.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(RETRY, move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.retry.take();
+                ui.connect();
+            }
+        });
+        *self.retry.borrow_mut() = Some(id);
+    }
+
+    /// The IBus bus closed (the daemon exited or restarted).
+    fn closed(self: &Rc<Self>) {
+        if self.conn.borrow_mut().take().is_none() {
+            return;
+        }
+        eprintln!("tuna-shell-gtk: IBus panel: the IBus bus closed");
+        self.reset();
+        self.connect();
+    }
+
+    /// Watch the directory IBus writes its address file into
+    /// (`ibus_get_socket_path`): a daemon writes it each time it starts,
+    /// so its changes stand in for polling `ibus address`.
+    fn watch_address_dir(self: &Rc<Self>) {
+        let dir = match std::env::var_os("IBUS_ADDRESS_FILE") {
+            Some(file) => PathBuf::from(file).parent().map(PathBuf::from),
+            None => Some(glib::user_config_dir().join("ibus").join("bus")),
+        };
+        let Some(dir) = dir else { return };
+        // GIO polls for a directory that does not exist yet; IBus
+        // creates this one with the same mode itself.
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir);
+        let monitor = match gio::File::for_path(&dir)
+            .monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+        {
+            Ok(monitor) => monitor,
+            Err(e) => {
+                eprintln!(
+                    "tuna-shell-gtk: IBus panel: cannot watch {}: {e}",
+                    dir.display()
+                );
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        monitor.connect_changed(move |_, _, _, event| {
+            let written = matches!(
+                event,
+                gio::FileMonitorEvent::Created
+                    | gio::FileMonitorEvent::Changed
+                    | gio::FileMonitorEvent::ChangesDoneHint
+                    | gio::FileMonitorEvent::MovedIn
+                    | gio::FileMonitorEvent::Renamed
+            );
+            if let Some(ui) = weak.upgrade().filter(|_| written) {
+                ui.missed.set(ui.connecting.get());
+                ui.connect();
+            }
+        });
+        *self.address_monitor.borrow_mut() = Some(monitor);
     }
 
     /// Serve org.freedesktop.IBus.Panel on IBus's bus and take its name.
@@ -644,15 +740,43 @@ impl CandidatePopup {
         let info = match gio::DBusNodeInfo::for_xml(XML) {
             Ok(node) => node.lookup_interface(PANEL_NAME),
             Err(e) => {
-                eprintln!("roost-shell-gtk: IBus panel interface: {e}");
+                eprintln!("tuna-shell-gtk: IBus panel interface: {e}");
                 return;
             }
         };
         let Some(info) = info else { return };
+        self.properties.connect(&conn);
         let weak = Rc::downgrade(self);
         let registered = conn
             .register_object(PANEL_PATH, &info)
-            .method_call(move |_, _, _, _, method, params, invocation| {
+            .method_call(move |conn, sender, _, _, method, params, invocation| {
+                if matches!(
+                    method,
+                    "RegisterProperties"
+                        | "UpdateProperty"
+                        | "FocusIn"
+                        | "FocusOut"
+                        | "DestroyContext"
+                ) {
+                    let Some(ui) = weak.upgrade() else {
+                        invocation.return_dbus_error(
+                            "org.freedesktop.DBus.Error.Disconnected",
+                            "Panel no longer available",
+                        );
+                        return;
+                    };
+                    if let Err(error) = ui.properties.method(&conn, sender, method, &params) {
+                        // An unsupported new property peer does not suppress
+                        // the existing daemon FocusOut candidate-hide path.
+                        if method == "FocusOut" && sender == Some("org.freedesktop.DBus") {
+                            invocation.return_value(None);
+                            ui.method(method, &params);
+                            return;
+                        }
+                        invocation.return_dbus_error(error, "Property call rejected");
+                        return;
+                    }
+                }
                 if method == "ProcessKeyEvent" {
                     // The emoji extension's keys; GNOME's panel takes none.
                     invocation.return_value(Some(&(false,).to_variant()));
@@ -665,9 +789,12 @@ impl CandidatePopup {
             })
             .build();
         if let Err(e) = registered {
-            eprintln!("roost-shell-gtk: IBus panel object: {e}");
+            eprintln!("tuna-shell-gtk: IBus panel object: {e}");
+            self.retry_later();
             return;
         }
+        let weak = Rc::downgrade(self);
+        let owned_conn = conn.clone();
         conn.call(
             Some("org.freedesktop.DBus"),
             "/org/freedesktop/DBus",
@@ -678,40 +805,63 @@ impl CandidatePopup {
             gio::DBusCallFlags::NONE,
             -1,
             gio::Cancellable::NONE,
-            |reply| match reply.map(|r| r.child_value(0).get::<u32>()) {
-                // DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER / ALREADY_OWNER.
-                Ok(Some(1 | 4)) => {
-                    eprintln!("roost-shell-gtk: IBus panel: owns {PANEL_NAME} on the IBus bus");
+            move |reply| {
+                let code = reply.map(|r| r.child_value(0).get::<u32>());
+                if let Some(ui) = weak.upgrade() {
+                    ui.properties
+                        .name_acquired(&owned_conn, matches!(code, Ok(Some(1 | 4))));
                 }
-                Ok(code) => {
-                    eprintln!("roost-shell-gtk: IBus panel: {PANEL_NAME} not owned ({code:?})")
+                match code {
+                    // DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER / ALREADY_OWNER.
+                    Ok(Some(1 | 4)) => {
+                        eprintln!("tuna-shell-gtk: IBus panel: owns {PANEL_NAME} on the IBus bus");
+                    }
+                    Ok(code) => {
+                        eprintln!("tuna-shell-gtk: IBus panel: {PANEL_NAME} not owned ({code:?})")
+                    }
+                    Err(e) => eprintln!("tuna-shell-gtk: IBus panel: RequestName: {e}"),
                 }
-                Err(e) => eprintln!("roost-shell-gtk: IBus panel: RequestName: {e}"),
             },
         );
+        // GDBus emits `closed` on this (the main) thread's context.
+        let weak = Rc::downgrade(self);
+        conn.connect_local("closed", false, move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.closed();
+            }
+            None
+        });
+        let gone = conn.is_closed();
         self.conn.replace(Some(conn));
+        if gone {
+            self.closed();
+        }
     }
 }
 
-/// Become IBus's panel when IBus is installed: look for its bus every
-/// few seconds (roost-ibus-bridge starts the daemon), and again after
-/// it goes away. The poll keeps the popup for the shell's life.
-pub fn start(app: &gtk::Application) {
+/// Become IBus's panel when IBus is installed: connect to its bus when
+/// its address file appears or changes (tuna-ibus-bridge starts the
+/// daemon), and again after the bus closes.
+pub fn start(app: &gtk::Application, properties: Rc<crate::ibus_property_menu::PropertyMenu>) {
     if !ibus_installed() {
         return;
     }
-    let ui = CandidatePopup::new(app);
-    ui.poll();
-    glib::timeout_add_local(RETRY, move || {
-        ui.poll();
-        glib::ControlFlow::Continue
-    });
+    let ui = CandidatePopup::new(app, properties);
+    if std::env::var("IBUS_ADDRESS")
+        .ok()
+        .is_none_or(|a| a.is_empty())
+    {
+        ui.watch_address_dir();
+    }
+    ui.connect();
+    // The popup lives as long as the shell, like the windows it owns.
+    std::mem::forget(ui);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roost_shell_host::ibus::text_variant as text;
+    use tuna_shell_host::ibus::text_variant as text;
 
     fn texts(items: &[&str]) -> glib::Variant {
         glib::Variant::array_from_iter_with_type(

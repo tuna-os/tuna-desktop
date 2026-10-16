@@ -45,7 +45,10 @@ pub struct LockUi {
     requested: Cell<bool>,
     /// The password check in flight, by request id.
     pending: Cell<Option<u64>>,
+    connection_generation: Cell<Option<u64>>,
     clock_format: Box<dyn Fn() -> logic::ClockFormat>,
+    /// Wakes the clock on the minute while the lock screens are up.
+    wall_clock: RefCell<Option<crate::wall_clock::WallClock>>,
 }
 
 impl LockUi {
@@ -61,14 +64,17 @@ impl LockUi {
             screens: RefCell::new(Vec::new()),
             requested: Cell::new(false),
             pending: Cell::new(None),
+            connection_generation: Cell::new(None),
             clock_format,
+            wall_clock: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&ui);
             ui.instance.connect_failed(move |_| {
-                eprintln!("roost-shell-gtk: the compositor refused the session lock");
+                eprintln!("tuna-shell-gtk: the compositor refused the session lock");
                 if let Some(ui) = weak.upgrade() {
                     ui.screens.borrow_mut().clear();
+                    ui.wall_clock.take();
                 }
             });
         }
@@ -77,18 +83,9 @@ impl LockUi {
             ui.instance.connect_unlocked(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     ui.screens.borrow_mut().clear();
+                    ui.wall_clock.take();
                     ui.pending.set(None);
                 }
-            });
-        }
-        {
-            let weak = Rc::downgrade(&ui);
-            glib::timeout_add_seconds_local(1, move || match weak.upgrade() {
-                Some(ui) => {
-                    ui.tick();
-                    glib::ControlFlow::Continue
-                }
-                None => glib::ControlFlow::Break,
             });
         }
         ui
@@ -100,7 +97,7 @@ impl LockUi {
         if locked && !self.requested.get() {
             self.requested.set(true);
             if !self.instance.lock() {
-                eprintln!("roost-shell-gtk: session lock unavailable");
+                eprintln!("tuna-shell-gtk: session lock unavailable");
                 return;
             }
             // One lock window per monitor, assigned right after lock()
@@ -120,10 +117,30 @@ impl LockUi {
                 self.instance.assign_window_to_monitor(&window, &monitor);
                 window.present();
             }
-            self.tick();
+            self.refresh_clock();
+            let weak = Rc::downgrade(self);
+            *self.wall_clock.borrow_mut() =
+                Some(crate::wall_clock::WallClock::new(false, move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.refresh_clock();
+                    }
+                }));
         } else if !locked && self.requested.get() {
             self.requested.set(false);
             self.instance.unlock();
+        }
+    }
+
+    /// A transport generation change aborts local entry only. It never releases
+    /// the lock surface; only the authoritative locked=false state does that.
+    pub fn sync_connection_generation(&self, generation: Option<u64>) {
+        if !generation_changed(&self.connection_generation, generation) {
+            return;
+        }
+        self.pending.set(None);
+        for screen in self.screens.borrow().iter() {
+            screen.stack.set_visible_child_name("prompt");
+            reset_prompt(&screen.entry, &screen.message);
         }
     }
 
@@ -134,8 +151,8 @@ impl LockUi {
             return;
         }
         self.pending.set(None);
-        if std::env::var_os("ROOST_LOCK_TRACE").is_some() {
-            eprintln!("roost-shell-gtk: lock command result applied={applied}");
+        if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+            eprintln!("tuna-shell-gtk: lock command result applied={applied} request_id={id}");
         }
         for screen in self.screens.borrow().iter() {
             screen.entry.set_sensitive(true);
@@ -148,8 +165,9 @@ impl LockUi {
         }
     }
 
-    /// Clock and date, as GNOME's UnlockDialogClock shows them.
-    fn tick(&self) {
+    /// Clock and date, as GNOME's UnlockDialogClock shows them (on each
+    /// minute while locked, and when the clock format changes).
+    pub fn refresh_clock(&self) {
         let now = jiff::Zoned::now().datetime();
         let time = logic::lock_clock_text(&now, (self.clock_format)());
         let date = logic::lock_date_text(now.date());
@@ -164,7 +182,7 @@ impl LockUi {
     fn screen(self: &Rc<Self>, app: &gtk::Application) -> gtk::Window {
         let window = gtk::Window::new();
         window.set_application(Some(app));
-        window.add_css_class("roost-lock");
+        window.add_css_class("tuna-lock");
         window.set_title(Some("Lock Screen"));
 
         // The clock page (unlock-dialog-clock).
@@ -349,10 +367,10 @@ impl LockUi {
                     if matches!(
                         key,
                         gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
-                    ) && std::env::var_os("ROOST_LOCK_TRACE").is_some()
+                    ) && std::env::var_os("TUNA_LOCK_TRACE").is_some()
                     {
                         eprintln!(
-                            "roost-shell-gtk: lock Return received sensitive={}",
+                            "tuna-shell-gtk: lock Return received sensitive={}",
                             entry.is_sensitive()
                         );
                     }
@@ -410,28 +428,7 @@ impl LockUi {
             let message = message.clone();
             entry.connect_activate(move |entry| {
                 let Some(ui) = weak.upgrade() else { return };
-                if ui.pending.get().is_some() {
-                    return;
-                }
-                if std::env::var_os("ROOST_LOCK_TRACE").is_some() {
-                    eprintln!("roost-shell-gtk: lock password submitted");
-                }
-                let password = entry.text().to_string();
-                message.set_label("");
-                // GtkText needs its normal focus-leave cleanup while still
-                // sensitive, including stopping its cursor blink callback.
-                if let Some(root) = entry.root() {
-                    root.set_focus(gtk::Widget::NONE);
-                }
-                entry.set_sensitive(false);
-                match (ui.send)(password) {
-                    Some(id) => ui.pending.set(Some(id)),
-                    None => {
-                        entry.set_sensitive(true);
-                        entry.grab_focus();
-                        message.set_label(FAILED);
-                    }
-                }
+                submit_password(entry, &message, &ui.pending, &ui.send);
             });
         }
         // GNOME's caps-lock warning under the entry.
@@ -466,5 +463,109 @@ impl Drop for Screen {
     fn drop(&mut self) {
         // Never leave a typed password behind in a dead window.
         self.entry.set_text("");
+    }
+}
+
+fn generation_changed(current: &Cell<Option<u64>>, next: Option<u64>) -> bool {
+    let previous = current.replace(next);
+    previous.is_some() && previous != next
+}
+fn reset_prompt(entry: &gtk::PasswordEntry, message: &gtk::Label) {
+    entry.set_text("");
+    entry.set_sensitive(true);
+    entry.grab_focus();
+    message.set_label(FAILED);
+}
+fn submit_password(
+    entry: &gtk::PasswordEntry,
+    message: &gtk::Label,
+    pending: &Cell<Option<u64>>,
+    send: &SendUnlock,
+) {
+    if pending.get().is_some() {
+        return;
+    }
+    if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+        eprintln!("tuna-shell-gtk: lock password submitted");
+    }
+    let password = entry.text().to_string();
+    message.set_label("");
+    if let Some(root) = entry.root() {
+        root.set_focus(gtk::Widget::NONE);
+    }
+    entry.set_sensitive(false);
+    match send(password) {
+        Some(id) => pending.set(Some(id)),
+        None => reset_prompt(entry, message),
+    }
+}
+#[cfg(test)]
+mod auth_transport_ui_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires admitted Xvfb GTK proof"]
+    fn actual_gtk_auth_send_failure_and_generation_reset() {
+        assert!(
+            std::env::var_os("TUNA_REQUIRE_AUTH_TRANSPORT_GTK").is_some(),
+            "dedicated admission required"
+        );
+        gtk::init().expect("actual GTK display required");
+        let entry = gtk::PasswordEntry::new();
+        let message = gtk::Label::new(None);
+        let pending = Rc::new(Cell::new(None));
+        let next = Rc::new(Cell::new(None));
+        let sends = Rc::new(Cell::new(0));
+        let send: SendUnlock = {
+            let next = next.clone();
+            let sends = sends.clone();
+            Rc::new(move |_password| {
+                sends.set(sends.get() + 1);
+                next.get()
+            })
+        };
+        {
+            let pending = pending.clone();
+            let message = message.clone();
+            let send = send.clone();
+            entry.connect_activate(move |entry| submit_password(entry, &message, &pending, &send));
+        }
+        entry.set_text("controlled-only");
+        entry.emit_by_name::<()>("activate", &[]);
+        assert_eq!(entry.text(), "");
+        assert!(entry.is_sensitive());
+        assert_eq!(pending.get(), None);
+        next.set(Some(9));
+        entry.set_text("controlled-only");
+        entry.emit_by_name::<()>("activate", &[]);
+        assert_eq!(pending.get(), Some(9));
+        assert!(!entry.is_sensitive());
+        assert_eq!(sends.get(), 2);
+        entry.emit_by_name::<()>("activate", &[]);
+        assert_eq!(
+            sends.get(),
+            2,
+            "stale captured activation while pending cannot send"
+        );
+        let generation = Cell::new(Some(0));
+        let reset = gtk::Button::new();
+        {
+            let pending = pending.clone();
+            let entry = entry.clone();
+            let message = message.clone();
+            reset.connect_clicked(move |_| {
+                if generation_changed(&generation, Some(1)) {
+                    pending.set(None);
+                    reset_prompt(&entry, &message);
+                }
+            });
+        }
+        reset.emit_clicked();
+        assert_eq!(pending.get(), None);
+        assert_eq!(entry.text(), "");
+        assert!(entry.is_sensitive());
+        assert_eq!(sends.get(), 2, "reset itself must not submit credentials");
+        entry.set_text("explicit-fresh-input");
+        entry.emit_by_name::<()>("activate", &[]);
+        assert_eq!(sends.get(), 3);
     }
 }

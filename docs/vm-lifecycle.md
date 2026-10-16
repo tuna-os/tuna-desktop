@@ -1,7 +1,7 @@
 # Marlin VM lifecycle proof
 
 The existing `marlin-vm` CI job installs the ordinary Marlin preview image,
-then a CI-only fixture layer. The fixture starts `roost-test` once through
+then a CI-only fixture layer. The fixture starts `tuna-test` once through
 greetd's initial session. Its default greeter is Cage with normal-window
 gtkgreet, matching the measured TunaOS launcher; logout must reach that
 actual greeter. This changes neither the shipped preview image nor the
@@ -28,6 +28,8 @@ feature tour:
 | V-LIFECYCLE-OWNER | Root probe, non-root greetd session, three application surfaces/processes |
 | V-NORMAL-INPUT / V-NORMAL-INPUT-FAIL-CLOSED | A real GTK client receives ordinary QMP keys while unlocked, then receives none while locked; artifacts contain only counts and PID, never key values |
 | V-MOUSE-HANDEDNESS | Nine physical QMP clicks pass through native libinput to the same non-root GTK client while the real GNOME mouse setting changes false→true→false; left/right swap, middle stays unchanged, exact before/after counters retained in lifecycle/mouse-handedness.json |
+| V-POINTER-LIVE | GNOME mouse speed/natural-scroll reach live libinput device state and restore, asserted on the compositor's per-device libinput readback with per-option availability; snapshots retained in lifecycle/pointer-live.json (#343) |
+| V-POINTER-HOTPLUG | A QMP-hotplugged USB mouse arrives with the current settings already applied (DRM DeviceAdded path); unplug drops it while survivors keep theirs; bus discovery, arrival and survivor snapshots retained in lifecycle/pointer-hotplug.json (#343) |
 | V-VT | VT away/back, DRM pause/activate events, unchanged process identities and app rectangles, matching body plus a fresh visible count update from the real GTK client |
 | V-SUSPEND | Real logind suspend reaches QEMU `suspended`; the first guest snapshot after `system_wakeup` must already be locked, with all application identities intact; the real varied lock mask must repaint within five seconds, matching the pre-suspend mask; QEMU inactive-output placeholders fail |
 | V-SLEEP-AUTH-FAIL-CLOSED / V-SLEEP-FRESH-AUTH | The single real suspend interrupts a correct password attempt delayed by actual pam_exec; the real PAM success from the old generation is refused, then fresh correct authentication succeeds |
@@ -68,7 +70,7 @@ and [QEMU wake-up](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html#co
 The shared GPU profile `virtio-vga-pcie-pm-preserved-v1` keeps the same
 virtio-vga, resolution, CPU, RAM and workloads. It places that GPU behind
 one PCIe root port and advertises PM no-soft-reset. All native GNOME
-capture and Roost/performance boot callers use the same GPU arguments;
+capture and Tuna Desktop/performance boot callers use the same GPU arguments;
 manifest/report fields record them. Fresh GNOME comparison evidence must
 use this profile; old-profile latency or cadence does not qualify it.
 The actual guest PCI capability chain must include PCIe, PM and the

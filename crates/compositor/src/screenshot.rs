@@ -26,13 +26,19 @@ pub enum Request {
         filename: PathBuf,
         /// The focused window alone (`ScreenshotWindow`), not the screen.
         window: bool,
+        flash: bool,
         reply: mpsc::Sender<Option<PathBuf>>,
     },
     /// Every window of the screenshot UI's window selector, each saved
-    /// into `directory` (Roost's `ScreenshotWindows`).
+    /// into `directory` (Tuna Desktop's `ScreenshotWindows`).
     Windows {
         directory: PathBuf,
         reply: mpsc::Sender<Vec<WindowShot>>,
+    },
+    /// Authorized screenshot feedback without a new capture (the shell UI).
+    Flash {
+        area: [i32; 4],
+        reply: mpsc::Sender<bool>,
     },
 }
 
@@ -73,7 +79,7 @@ struct Service {
     to_loop: calloop::channel::Sender<Request>,
 }
 
-/// Roost's own addition on the same object: the screenshot UI's window
+/// Tuna Desktop's own addition on the same object: the screenshot UI's window
 /// selector needs every window's picture, which GNOME Shell takes
 /// in-process (`paint_to_content`). Window contents are no more private
 /// than the screen, which `org.gnome.Shell.Screenshot` already hands out.
@@ -86,7 +92,7 @@ struct WindowsService {
 /// x, y, width, height, path.
 pub type WindowShotReply = (u64, String, bool, i32, i32, i32, i32, String);
 
-#[zbus::interface(name = "org.roost.Screenshot")]
+#[zbus::interface(name = "org.tuna.Screenshot")]
 impl WindowsService {
     /// `(directory) -> a(tsbiiiis)`: the active workspace's windows,
     /// each saved as a PNG into `directory`, with their selector slots.
@@ -130,12 +136,40 @@ impl WindowsService {
 
 #[zbus::interface(name = "org.gnome.Shell.Screenshot")]
 impl Service {
+    async fn flash_area(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.authority.authenticate(conn, &header).await?;
+        self.authority
+            .unlocked()
+            .map_err(|_| zbus::fdo::Error::Failed("session locked".into()))?;
+        let (reply, answer) = mpsc::channel();
+        self.to_loop
+            .send(Request::Flash {
+                area: [x, y, width, height],
+                reply,
+            })
+            .map_err(|_| zbus::fdo::Error::Failed("compositor gone".into()))?;
+        match answer.recv_timeout(DEADLINE) {
+            Ok(true) => Ok(()),
+            _ => Err(zbus::fdo::Error::Failed(
+                "invalid area or unavailable feedback".into(),
+            )),
+        }
+    }
+
     /// GNOME Shell's signature: `(include_cursor, flash, filename) ->
     /// (success, filename_used)`.
     async fn screenshot(
         &self,
         _include_cursor: bool,
-        _flash: bool,
+        flash: bool,
         filename: String,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -144,16 +178,16 @@ impl Service {
         if self.authority.unlocked().is_err() {
             return Ok((false, String::new()));
         }
-        self.request(filename, false)
+        self.request(filename, false, flash)
     }
 
     /// `(include_frame, include_cursor, flash, filename)`: the focused
-    /// window. Roost windows draw their own frames, so it is always in.
+    /// window. Tuna Desktop windows draw their own frames, so it is always in.
     async fn screenshot_window(
         &self,
         _include_frame: bool,
         _include_cursor: bool,
-        _flash: bool,
+        flash: bool,
         filename: String,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -162,17 +196,23 @@ impl Service {
         if self.authority.unlocked().is_err() {
             return Ok((false, String::new()));
         }
-        self.request(filename, true)
+        self.request(filename, true, flash)
     }
 }
 
 impl Service {
-    fn request(&self, filename: String, window: bool) -> zbus::fdo::Result<(bool, String)> {
+    fn request(
+        &self,
+        filename: String,
+        window: bool,
+        flash: bool,
+    ) -> zbus::fdo::Result<(bool, String)> {
         let (reply, answer) = mpsc::channel();
         self.to_loop
             .send(Request::Shot {
                 filename: PathBuf::from(filename),
                 window,
+                flash,
                 reply,
             })
             .map_err(|_| zbus::fdo::Error::Failed("compositor gone".into()))?;
@@ -192,7 +232,7 @@ impl Service {
 pub fn start(authority: crate::capture_security::Authority) -> calloop::channel::Channel<Request> {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _ = std::thread::Builder::new()
-        .name("roost-screenshot".into())
+        .name("tuna-screenshot".into())
         .spawn(move || {
             let conn = match zbus::blocking::connection::Builder::session()
                 .and_then(|b| {
@@ -209,20 +249,20 @@ pub fn start(authority: crate::capture_security::Authority) -> calloop::channel:
             {
                 Ok(conn) => conn,
                 Err(e) => {
-                    eprintln!("roost-compositor: screenshot service: no session bus: {e}");
+                    eprintln!("tuna-compositor: screenshot service: no session bus: {e}");
                     return;
                 }
             };
             let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
             match conn.request_name_with_flags(NAME, flags) {
                 Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
-                    eprintln!("roost-compositor: screenshot service on {NAME}");
+                    eprintln!("tuna-compositor: screenshot service on {NAME}");
                     // The connection serves from its own executor; keep it.
                     loop {
                         std::thread::park();
                     }
                 }
-                _ => eprintln!("roost-compositor: {NAME} is taken; screenshot service off"),
+                _ => eprintln!("tuna-compositor: {NAME} is taken; screenshot service off"),
             }
         });
     from_dbus

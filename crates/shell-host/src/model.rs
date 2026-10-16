@@ -33,6 +33,7 @@ pub struct WindowEntry {
     /// The dock matches running windows to desktop entries on this;
     /// `None` falls back to title matching.
     pub app_id: Option<String>,
+    pub on_all_workspaces: bool,
 }
 
 impl WindowEntry {
@@ -40,6 +41,7 @@ impl WindowEntry {
     pub fn new(id: u64, title: impl Into<String>, active: bool) -> Self {
         Self {
             icon: None,
+            on_all_workspaces: false,
             id,
             title: title.into(),
             active,
@@ -62,6 +64,11 @@ impl WindowEntry {
     /// Attach the client-supplied application id, for dock matching.
     pub fn with_app_id(mut self, app_id: Option<String>) -> Self {
         self.app_id = app_id;
+        self
+    }
+
+    pub fn with_all_workspaces(mut self, on_all_workspaces: bool) -> Self {
+        self.on_all_workspaces = on_all_workspaces;
         self
     }
 }
@@ -95,6 +102,24 @@ pub struct ShellModel {
     switcher_all_windows: bool,
     /// Which app a window belongs to (GNOME's WindowTracker).
     app_resolver: AppResolver,
+    switcher_workspace_policy: SwitcherWorkspacePolicy,
+    fixed_workspace_count: Option<u32>,
+}
+
+/// Live GNOME app and window switcher workspace preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitcherWorkspacePolicy {
+    pub applications_current_workspace_only: bool,
+    pub windows_current_workspace_only: bool,
+}
+
+impl Default for SwitcherWorkspacePolicy {
+    fn default() -> Self {
+        Self {
+            applications_current_workspace_only: false,
+            windows_current_workspace_only: true,
+        }
+    }
 }
 
 /// Maps a window's app id to the desktop entry it belongs to, or `None`
@@ -128,7 +153,7 @@ pub enum SwitcherEffect {
 }
 
 /// Keysyms the switcher acts on, shared with the compositor wire producer.
-pub use roost_shell_control::switcher_keys;
+pub use tuna_shell_control::switcher_keys;
 
 impl ShellModel {
     /// Empty model: no windows, no workspaces, overview closed.
@@ -144,6 +169,14 @@ impl ShellModel {
     /// Known workspace ids, sorted and deduplicated.
     pub fn workspaces(&self) -> &[u32] {
         &self.workspaces
+    }
+
+    pub fn fixed_workspace_count(&self) -> Option<u32> {
+        self.fixed_workspace_count
+    }
+
+    pub fn set_fixed_workspace_count(&mut self, count: Option<u32>) {
+        self.fixed_workspace_count = count.map(|count| count.clamp(1, 36));
     }
 
     /// Active workspace id scoping overview rendering.
@@ -264,11 +297,7 @@ impl ShellModel {
                 .mru
                 .iter()
                 .copied()
-                .filter(|id| {
-                    self.windows
-                        .iter()
-                        .any(|w| w.id == *id && w.workspace == self.active_workspace)
-                })
+                .filter(|id| self.switcher_window_allowed(*id, true))
                 .collect();
         }
         let mut seen: Vec<String> = Vec::new();
@@ -276,6 +305,9 @@ impl ShellModel {
             .iter()
             .copied()
             .filter(|id| {
+                if !self.switcher_window_allowed(*id, false) {
+                    return false;
+                }
                 let key = self.app_key(*id);
                 if seen.contains(&key) {
                     false
@@ -296,7 +328,7 @@ impl ShellModel {
         let key = self.app_key(id);
         self.windows
             .iter()
-            .filter(|w| self.app_key(w.id) == key)
+            .filter(|w| self.app_key(w.id) == key && self.switcher_window_allowed(w.id, false))
             .count()
     }
 
@@ -304,6 +336,52 @@ impl ShellModel {
     /// WindowTracker): windows no entry claims stop grouping by app id.
     pub fn set_app_resolver(&mut self, resolve: impl Fn(&str) -> Option<String> + 'static) {
         self.app_resolver = AppResolver(Some(Box::new(resolve)));
+    }
+
+    pub fn set_switcher_workspace_policy(&mut self, policy: SwitcherWorkspacePolicy) {
+        if self.switcher_workspace_policy == policy {
+            return;
+        }
+        let selected = self.switcher_selection();
+        self.switcher_workspace_policy = policy;
+        if !self.switcher_open {
+            return;
+        }
+        let items = self.switcher_items();
+        if items.is_empty() {
+            self.switcher_cancel();
+            return;
+        }
+        self.switcher_index = selected
+            .and_then(|id| {
+                items.iter().position(|item| {
+                    *item == id
+                        || (!self.switcher_all_windows && self.app_key(*item) == self.app_key(id))
+                })
+            })
+            .unwrap_or_else(|| self.switcher_index.min(items.len() - 1));
+        self.switcher_window = selected.and_then(|id| {
+            self.app_windows(items[self.switcher_index])
+                .iter()
+                .position(|window| *window == id)
+                .filter(|_| self.switcher_window.is_some())
+        });
+    }
+
+    fn switcher_window_allowed(&self, id: u64, all_windows: bool) -> bool {
+        let current_only = if all_windows {
+            self.switcher_workspace_policy
+                .windows_current_workspace_only
+        } else {
+            self.switcher_workspace_policy
+                .applications_current_workspace_only
+        };
+        self.windows.iter().any(|window| {
+            window.id == id
+                && (!current_only
+                    || window.on_all_workspaces
+                    || window.workspace == self.active_workspace)
+        })
     }
 
     fn app_key(&self, id: u64) -> String {
@@ -357,7 +435,7 @@ impl ShellModel {
         self.mru
             .iter()
             .copied()
-            .filter(|w| self.app_key(*w) == key)
+            .filter(|w| self.app_key(*w) == key && self.switcher_window_allowed(*w, false))
             .collect()
     }
 
@@ -488,10 +566,9 @@ impl ShellModel {
             .iter()
             .copied()
             .filter(|id| {
-                self.windows
-                    .iter()
-                    .any(|w| w.id == *id && w.workspace == self.active_workspace)
-                    && (!group || self.app_key(*id) == self.app_key(focused))
+                self.windows.iter().any(|w| {
+                    w.id == *id && (w.on_all_workspaces || w.workspace == self.active_workspace)
+                }) && (!group || self.app_key(*id) == self.app_key(focused))
             })
             .collect();
         let index = items.iter().position(|id| *id == focused).unwrap_or(0);
@@ -579,7 +656,7 @@ impl ShellModel {
 /// { windows, workspaces }` into this view (`WindowInfo.focused` maps to
 /// [`WindowEntry::active`]; workspace ids narrow from the schema's `u64`
 /// to the `u32` ids this model keeps). This file never imports
-/// `roost-shell-control`, so the wire format can evolve without churning
+/// `tuna-shell-control`, so the wire format can evolve without churning
 /// the view model.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotView {
@@ -594,6 +671,99 @@ pub struct SnapshotView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workspace_switcher_model() -> ShellModel {
+        let mut model = ShellModel::new();
+        model.apply_window_list(
+            vec![
+                WindowEntry::new(1, "Local editor", true).with_app_id(Some("editor".into())),
+                WindowEntry::new(2, "Remote editor", false)
+                    .with_workspace(1)
+                    .with_app_id(Some("editor".into())),
+                WindowEntry::new(3, "Remote browser", false)
+                    .with_workspace(1)
+                    .with_app_id(Some("browser".into())),
+                WindowEntry::new(4, "Local terminal", false).with_app_id(Some("terminal".into())),
+            ],
+            vec![0, 1],
+        );
+        model
+    }
+
+    #[test]
+    fn application_workspace_filter_scopes_groups_counts_and_thumbnails() {
+        let mut model = workspace_switcher_model();
+        assert_eq!(model.app_window_count(1), 2);
+        assert!(model.switcher_items().contains(&3));
+        model.set_switcher_workspace_policy(SwitcherWorkspacePolicy {
+            applications_current_workspace_only: true,
+            ..Default::default()
+        });
+        assert_eq!(model.switcher_items(), vec![1, 4]);
+        assert_eq!(model.app_windows(1), vec![1]);
+        assert_eq!(model.app_window_count(1), 1);
+        assert_eq!(model.app_windows(3), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn window_workspace_filter_is_independent_and_changes_live() {
+        let mut model = workspace_switcher_model();
+        model.switcher_step_all_windows(true);
+        assert_eq!(model.switcher_items(), vec![1, 4]);
+        model.set_switcher_workspace_policy(SwitcherWorkspacePolicy {
+            applications_current_workspace_only: true,
+            windows_current_workspace_only: false,
+        });
+        assert_eq!(model.switcher_items(), vec![1, 2, 3, 4]);
+        assert_eq!(model.switcher_selection(), Some(4));
+        model.switcher_cancel();
+        model.switcher_step(true);
+        assert_eq!(model.switcher_items(), vec![1, 4]);
+    }
+
+    #[test]
+    fn enabling_filter_reconciles_an_open_remote_selection() {
+        let mut model = workspace_switcher_model();
+        assert_eq!(model.switcher_step(true), Some(3));
+        model.set_switcher_workspace_policy(SwitcherWorkspacePolicy {
+            applications_current_workspace_only: true,
+            ..Default::default()
+        });
+        assert!(model.is_switcher_open());
+        assert_eq!(model.switcher_selection(), Some(4));
+    }
+
+    #[test]
+    fn enabling_filter_closes_popup_with_no_remaining_windows() {
+        let mut model = ShellModel::new();
+        model.apply_window_list(
+            vec![WindowEntry::new(1, "Elsewhere", false).with_workspace(1)],
+            vec![0, 1],
+        );
+        assert_eq!(model.switcher_step(true), Some(1));
+        model.set_switcher_workspace_policy(SwitcherWorkspacePolicy {
+            applications_current_workspace_only: true,
+            ..Default::default()
+        });
+        assert!(!model.is_switcher_open());
+        assert_eq!(model.switcher_commit(), None);
+    }
+
+    #[test]
+    fn all_workspace_windows_survive_both_current_workspace_filters() {
+        let mut model = workspace_switcher_model();
+        let mut windows = model.windows().to_vec();
+        windows[1].on_all_workspaces = true;
+        model.apply_window_list(windows, vec![0, 1]);
+        model.set_switcher_workspace_policy(SwitcherWorkspacePolicy {
+            applications_current_workspace_only: true,
+            windows_current_workspace_only: true,
+        });
+        assert_eq!(model.app_windows(1), vec![1, 2]);
+        assert_eq!(model.app_window_count(1), 2);
+        model.switcher_step_all_windows(true);
+        assert_eq!(model.switcher_items(), vec![1, 2, 4]);
+    }
 
     fn two_windows() -> Vec<WindowEntry> {
         vec![
