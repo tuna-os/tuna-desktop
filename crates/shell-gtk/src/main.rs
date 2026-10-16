@@ -40,6 +40,7 @@ mod polkit;
 mod power;
 mod preview_chrome;
 mod providers;
+mod renderer;
 mod screencast;
 mod screensaver;
 mod screenshot_selection;
@@ -2404,6 +2405,12 @@ fn main() -> glib::ExitCode {
     // The old name's environment, for one release (#505).
     tuna_shell_control::legacy::import_env("tuna-shell-gtk");
     glib::set_prgname(Some("tuna-shell-gtk"));
+    // Before any window is realized, so GSK's first renderer follows it.
+    if gtk::init().is_ok() {
+        if let Some(display) = gtk::gdk::Display::default() {
+            renderer::prefer_cairo_on_software_gl(&display);
+        }
+    }
     let app = adw::Application::builder()
         .application_id("org.tuna.Shell")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
