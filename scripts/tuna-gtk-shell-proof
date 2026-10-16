@@ -337,6 +337,11 @@ echo '["org.tuna.ProofNoFavorite.desktop"]' >"$XDG_DATA_HOME/tuna-shell/favorite
 # Exec leaves a marker, proving search-to-launch end to end.
 PROBE_MARKER="$ARTIFACTS/probe-marker"
 rm -f "$PROBE_MARKER"
+# pyatspi ships with the distro Python, which a user-local Python
+# (Homebrew, pyenv) may shadow on PATH.
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+
 # The shell keeps portal opt-outs privately for its whole lifetime; a
 # desktop-entry child must see exactly the caller's original flag values.
 cat >"$ARTIFACTS/launch-environment.py" <<'PYENV'
@@ -537,11 +542,6 @@ cstate() {
 }
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
-
-# pyatspi ships with the distro Python, which a user-local Python
-# (Homebrew, pyenv) may shadow on PATH.
-PY=/usr/bin/python3
-[ -x "$PY" ] || PY=python3
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
