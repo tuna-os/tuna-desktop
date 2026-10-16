@@ -89,7 +89,10 @@ class Controls(unittest.TestCase):
         self.assertEqual(namespace["matching"](tree, *namespace["INDICATOR"]), [inner])
         helper = SOURCE.read_text()
         self.assertNotIn('press("中")', helper)
-        self.assertEqual(helper.count('press(*INDICATOR)'), 3)
+        # Open-only: the lifecycle's final close is real Escape in the harness.
+        self.assertEqual(helper.count('press(*INDICATOR)'), 2)
+        harness = (ROOT / "scripts/tuna-gtk-shell-proof").read_text()
+        self.assertIn('fail G-IME-PROPERTIES-LIFECYCLE "Escape did not close the property menu"', harness)
 
     def test_harness_has_external_blocking_call_bound_and_expected_executable(self):
         harness = (ROOT / "scripts/tuna-gtk-shell-proof").read_text()
