@@ -495,9 +495,8 @@ impl WwanMenu {
             "{name}, {detail}"
         ))]);
         button.connect_clicked(|_| {
-            let _ = std::process::Command::new("gnome-control-center")
-                .arg("network")
-                .spawn();
+            // Administrative lockdown (#357) applies inside the helper.
+            crate::lockdown::open_settings_panel(Some("wwan"));
         });
         button
     }

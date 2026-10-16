@@ -1109,9 +1109,8 @@ fn quick_settings_popover(
     wwan_menu_ui.separator();
     let (wwan_settings, _) = wwan_menu_ui.item(None, "Mobile Network Settings");
     wwan_settings.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center")
-            .arg("network")
-            .spawn();
+        // Administrative lockdown (#357) applies inside the helper.
+        lockdown::open_settings_panel(Some("wwan"));
     });
     let wwan = qs_menu_tile(
         "network-cellular-signal-excellent-symbolic",
