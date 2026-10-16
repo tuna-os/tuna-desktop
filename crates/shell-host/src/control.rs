@@ -403,6 +403,7 @@ impl ControlClient {
     pub fn await_hello(&mut self) -> Result<(), ControlError> {
         self.input_method_admission = InputMethodAdmission::AwaitHello;
         self.native_outputs.clear();
+        self.monitor_identities.clear();
         match self.read_frame()? {
             Message::Hello { version } => {
                 if version.is_compatible_with(&CURRENT_VERSION) {
@@ -830,6 +831,7 @@ impl ControlClient {
             {
                 self.input_method_admission = InputMethodAdmission::AwaitHello;
                 self.native_outputs.clear();
+                self.monitor_identities.clear();
                 self.wellbeing_applied = None;
                 self.wellbeing_pending = None;
                 self.read_buf.clear();
@@ -858,6 +860,7 @@ impl ControlClient {
                 if !transient {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                     self.native_outputs.clear();
+                    self.monitor_identities.clear();
                 }
                 Err(e)
             }
@@ -874,6 +877,7 @@ impl ControlClient {
                 } else {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                     self.native_outputs.clear();
+                    self.monitor_identities.clear();
                     // Same-major decode already passed, so this is a newer
                     // minor we cannot speak: report it as typed, keep the
                     // model state untouched; input-method admission fails closed.
@@ -1087,6 +1091,7 @@ impl ControlClient {
                 if kind == ErrorKind::IncompatibleVersion {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                     self.native_outputs.clear();
+                    self.monitor_identities.clear();
                 }
                 if kind == ErrorKind::RevisionGap {
                     // Compositor-side gap signal: same handling as a local
@@ -1146,6 +1151,7 @@ impl ControlClient {
     fn reconnect(&mut self) -> Result<(), ControlError> {
         self.input_method_admission = InputMethodAdmission::AwaitHello;
         self.native_outputs.clear();
+        self.monitor_identities.clear();
         let path = self.socket_path.clone().ok_or_else(|| {
             ControlError::Unexpected("reconnect without a socket path".to_owned())
         })?;
@@ -1194,6 +1200,7 @@ impl ControlClient {
                 Ok(0) => {
                     self.closed = true;
                     self.native_outputs.clear();
+                    self.monitor_identities.clear();
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "control connection closed",
@@ -1208,6 +1215,7 @@ impl ControlClient {
                     ) {
                         self.closed = true;
                         self.native_outputs.clear();
+                        self.monitor_identities.clear();
                     }
                     return Err(ControlError::Io(e));
                 }
@@ -1842,10 +1850,22 @@ mod tests {
                 outputs: vec![owner.clone()],
             },
         );
+        let info = tuna_shell_control::MonitorIdentityInfo {
+            owner: owner.clone(),
+            edid: None,
+        };
+        server_write(
+            &mut server1,
+            &Message::MonitorIdentityInventory {
+                outputs: vec![info.clone()],
+            },
+        );
+        client.poll().unwrap();
         client.poll().unwrap();
         assert_eq!(client.native_outputs(), &[owner]);
+        assert_eq!(client.monitor_identities(), &[info]);
 
-        // Transport loss and socket gone: redial fails, native_outputs must be cleared.
+        // Transport loss and socket gone: redial fails, native_outputs and monitor_identities must be cleared.
         drop(server1);
         drop(listener);
         std::fs::remove_file(&path).expect("remove socket");
@@ -1853,6 +1873,10 @@ mod tests {
         assert!(
             client.native_outputs().is_empty(),
             "failed redial must clear connection-scoped native outputs"
+        );
+        assert!(
+            client.monitor_identities().is_empty(),
+            "failed redial must clear connection-scoped monitor identities"
         );
     }
 
