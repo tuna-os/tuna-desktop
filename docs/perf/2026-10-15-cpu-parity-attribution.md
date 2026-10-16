@@ -213,7 +213,7 @@ A per-frame draw trace (temporary instrumentation in `draw_scene`) showed where 
 
 1. The damage tracker takes the drawn elements themselves, each at its pass's scale, so a commit damages what its client reported. Passes are tracked bottom to top, so an element appearing on top shifts no other element's stacking index. Elements that come, go, move or restack are left to the tracker; global drawing changes and changed opaque regions still repaint the whole buffer.
 2. A throttled window's frame callbacks do not count as output work, also when it is a drawn root.
-3. `StateModel::update` logs a change only when the patch changed the entry.
+3. `StateModel::update` logs a change only when the patch changed the entry. The per-tick deltas had also been the shell's only source of fresh activation tokens, which are one-use and expire after 30 s. Without them, the gtk-shell lane's window cycling (`G-CYCLE-KEYS`) was refused once a token was spent. The hub now reissues a window's token right after an activation consumes it, and every window's token every 15 s.
 
 ### Local before and after, compositor % of one core (shell-gtk in brackets)
 

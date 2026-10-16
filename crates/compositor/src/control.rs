@@ -44,11 +44,16 @@ use tuna_shell_control::{
     CURRENT_VERSION, MAX_FRAME_BYTES,
 };
 
-use crate::state::{StateChange, StateModel, TokenStore, WindowEntry};
+use crate::state::{StateChange, StateModel, TokenPolicy, TokenStore, WindowEntry};
 
 /// How soon the hub wants another [`ControlHub::poll`] while a handshake
 /// is due or a broadcast is owed after backpressure (one display frame).
 pub const RETRY: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// How often the hub reissues every window's activation token: half the
+/// token lifetime, so the shell always holds one that has not expired.
+pub const TOKEN_REISSUE: std::time::Duration =
+    std::time::Duration::from_millis(TokenPolicy::MAX_AGE_MS / 2);
 
 /// Transport and protocol failures, shared with the shell-host endpoint.
 ///
@@ -974,6 +979,9 @@ fn apply_command(
                 );
             }
             let _ = model.set_focused(Some(*window));
+            // The token is spent: the next delta carries a fresh one, so
+            // the shell can activate this window again (window cycling).
+            model.reissue(Some(*window));
             (CommandStatus::Applied, None)
         }
         CommandKind::FocusWorkspace { workspace } => {
@@ -1213,6 +1221,9 @@ pub struct ControlHub {
     /// Connections refused by the gate or the pending cap, for
     /// diagnostics (a count only; never peer details).
     refused: u64,
+    /// When every window's activation token was last reissued; see
+    /// [`TOKEN_REISSUE`].
+    tokens_reissued: std::time::Instant,
 }
 
 impl ControlHub {
@@ -1274,6 +1285,7 @@ impl ControlHub {
             pending_peers: Vec::new(),
             fresh_peers: Vec::new(),
             refused: 0,
+            tokens_reissued: std::time::Instant::now(),
         })
     }
 
@@ -1459,6 +1471,12 @@ impl ControlHub {
             let _ = stream.set_nonblocking(true);
             self.fresh.push(stream);
             self.fresh_peers.push(cred);
+        }
+        // Tokens expire: reissue every window's before the shell's go
+        // stale. Windows that did not change send no delta in between.
+        if self.tokens_reissued.elapsed() >= TOKEN_REISSUE {
+            model.reissue(None);
+            self.tokens_reissued = std::time::Instant::now();
         }
         // A narrowed gate evicts sessions it no longer admits.
         let mut i = 0;

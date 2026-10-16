@@ -399,6 +399,20 @@ impl StateModel {
         }
     }
 
+    /// Log the unchanged entries again so shells receive fresh activation
+    /// tokens: each `WindowUpdated` delta mints one per window. `None`
+    /// reissues every window. Tokens are one-use and expire, so the
+    /// control hub reissues after an activation and before expiry.
+    pub fn reissue(&mut self, id: Option<u64>) {
+        let windows: Vec<WindowEntry> = match id {
+            Some(id) => self.windows.get(&id).cloned().into_iter().collect(),
+            None => self.windows.values().cloned().collect(),
+        };
+        for window in windows {
+            self.commit(StateChange::WindowUpdated { window });
+        }
+    }
+
     fn next_id(&mut self) -> u64 {
         let id = self.next_id.max(1);
         self.next_id = id.wrapping_add(1).max(1);
@@ -698,6 +712,36 @@ mod tests {
             &m.changes_since(rev).unwrap()[..],
             [(_, StateChange::WindowUpdated { window })] if window.title == "b"
         ));
+    }
+
+    #[test]
+    fn reissue_logs_unchanged_windows_for_fresh_tokens() {
+        let mut m = StateModel::new();
+        let a = m.insert("a", None, 0);
+        let b = m.insert("b", None, 0);
+        let rev = m.revision();
+        m.reissue(Some(a));
+        assert!(matches!(
+            &m.changes_since(rev).unwrap()[..],
+            [(_, StateChange::WindowUpdated { window })] if window.id == a && window.title == "a"
+        ));
+        let rev = m.revision();
+        m.reissue(None);
+        let ids: Vec<u64> = m
+            .changes_since(rev)
+            .unwrap()
+            .iter()
+            .filter_map(|(_, c)| match c {
+                StateChange::WindowUpdated { window } => Some(window.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a) && ids.contains(&b));
+        // Unknown ids reissue nothing.
+        let rev = m.revision();
+        m.reissue(Some(999));
+        assert_eq!(m.revision(), rev);
     }
 
     #[test]
