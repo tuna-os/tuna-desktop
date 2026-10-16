@@ -113,6 +113,7 @@ pub mod spring;
 pub mod state;
 pub mod supervise;
 mod transient_family;
+pub mod transitions;
 pub mod unlock;
 mod wake;
 pub mod wallpaper;
