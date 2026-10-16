@@ -337,6 +337,15 @@ echo '["org.tuna.ProofNoFavorite.desktop"]' >"$XDG_DATA_HOME/tuna-shell/favorite
 # Exec leaves a marker, proving search-to-launch end to end.
 PROBE_MARKER="$ARTIFACTS/probe-marker"
 rm -f "$PROBE_MARKER"
+# The shell keeps portal opt-outs privately for its whole lifetime; a
+# desktop-entry child must see exactly the caller's original flag values.
+cat >"$ARTIFACTS/launch-environment.py" <<'PYENV'
+import json, os, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    key: os.environ.get(key) for key in ("GDK_DEBUG", "ADW_DISABLE_PORTAL")
+}, sort_keys=True))
+PYENV
+"$PY" "$ARTIFACTS/launch-environment.py" "$ARTIFACTS/launch-environment-expected.json"
 mkdir -p "$XDG_DATA_HOME/applications"
 # The test windows are apps with (hidden) desktop entries, as most apps
 # are: windows no entry claims would each be an app of their own.
@@ -347,7 +356,7 @@ done
 cat >"$XDG_DATA_HOME/applications/tuna-probe.desktop" <<EOF
 [Desktop Entry]
 Name=Tuna Probe
-Exec=touch $PROBE_MARKER
+Exec=$PY $ARTIFACTS/launch-environment.py $PROBE_MARKER
 Icon=applications-system
 Type=Application
 EOF
@@ -1682,8 +1691,10 @@ xdotool key Return
 end=$(($(date +%s) + 15))
 until [ -f "$PROBE_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 [ -f "$PROBE_MARKER" ] || fail G-OV-LAUNCH "Enter did not launch the top result"
+cmp -s "$PROBE_MARKER" "$ARTIFACTS/launch-environment-expected.json" ||
+    fail G-OV-LAUNCH "desktop-entry launch inherited shell-private portal flags"
 cstate '.overview_open | not' "closed" || fail G-OV-LAUNCH "overview stayed open after launch"
-pass G-OV-LAUNCH "Enter launches the top result and closes the overview"
+pass G-OV-LAUNCH "Enter launches the top result with the caller's portal flags and closes the overview"
 
 # An app installed while the shell runs is searchable at once (GNOME
 # watches the application directories too).

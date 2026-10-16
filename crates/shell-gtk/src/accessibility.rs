@@ -121,7 +121,7 @@ pub fn menu() -> gtk::MenuButton {
             eprintln!("tuna-shell-gtk: accessibility settings are disabled by your administrator.");
             return;
         }
-        if let Err(error) = std::process::Command::new("gnome-control-center")
+        if let Err(error) = tuna_shell_host::apps::application_command("gnome-control-center")
             .arg("universal-access")
             .spawn()
         {

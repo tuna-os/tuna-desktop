@@ -31,6 +31,10 @@ and gtk4-session-lock. Proven end to end by `scripts/tuna-gtk-shell-proof`,
 `scripts/tuna-scale-proof` and `scripts/tuna-slow-portal-proof`. The shell
 never uses xdg-desktop-portal (`src/portal_opt_out.rs`): it starts before
 graphical-session.target, so portal activation could block its startup.
+The opt-out stays active for the shell's whole lifetime, including lazy
+widget construction and supervised recovery. Desktop-entry, Settings and
+URI launches restore the caller's original portal flags in the child
+command or GIO launch context only; they never mutate the live shell.
 
 ## Docs
 
