@@ -240,28 +240,46 @@ impl StateModel {
 
     /// Apply a partial [`WindowUpdate`]. Returns false (no bump, no change)
     /// when the id is unknown. A workspace move registers the workspace if
-    /// new. Appends `WindowUpdated`.
+    /// new. Appends `WindowUpdated` when the patch changed the entry; a
+    /// patch restating the entry (the per-tick title sync) bumps nothing,
+    /// so shells are not sent a delta for every window on every tick.
     pub fn update(&mut self, id: u64, patch: WindowUpdate) -> bool {
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
+        let mut changed = false;
         if let Some(title) = patch.title {
-            window.title = cap_title(&title);
+            let title = cap_title(&title);
+            if window.title != title {
+                window.title = title;
+                changed = true;
+            }
         }
         if let Some(app_id) = patch.app_id {
-            window.app_id = app_id;
+            if window.app_id != app_id {
+                window.app_id = app_id;
+                changed = true;
+            }
         }
         if let Some(workspace) = patch.workspace {
-            window.workspace = workspace;
+            if window.workspace != workspace {
+                window.workspace = workspace;
+                changed = true;
+            }
         }
         if let Some(active) = patch.active {
-            window.active = active;
+            if window.active != active {
+                window.active = active;
+                changed = true;
+            }
+        }
+        if !changed {
+            return true;
         }
         let window = window.clone();
         if let Some(workspace) = patch.workspace {
             self.register_workspace(workspace);
         }
-        self.windows.insert(id, window.clone());
         self.commit(StateChange::WindowUpdated { window });
         true
     }
@@ -650,6 +668,36 @@ mod tests {
         assert!(!m.update(999, WindowUpdate::default()));
         assert!(!m.set_focused(Some(999)));
         assert_eq!(m.revision(), 4);
+    }
+
+    #[test]
+    fn restating_a_window_bumps_nothing() {
+        let mut m = StateModel::new();
+        let a = m.insert("a", Some("app"), 1);
+        let rev = m.revision();
+        // The per-tick title sync restates what the model holds.
+        let same = || WindowUpdate {
+            title: Some("a".into()),
+            app_id: Some(Some("app".into())),
+            workspace: Some(1),
+            ..Default::default()
+        };
+        assert!(m.update(a, same()));
+        assert_eq!(m.revision(), rev);
+        assert!(m.changes_since(rev).unwrap().is_empty());
+        // A real change still logs one update.
+        assert!(m.update(
+            a,
+            WindowUpdate {
+                title: Some("b".into()),
+                ..same()
+            }
+        ));
+        assert_eq!(m.revision(), rev + 1);
+        assert!(matches!(
+            &m.changes_since(rev).unwrap()[..],
+            [(_, StateChange::WindowUpdated { window })] if window.title == "b"
+        ));
     }
 
     #[test]
