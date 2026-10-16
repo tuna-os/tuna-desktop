@@ -37,15 +37,48 @@ fn run(program: &str, args: &[String]) -> bool {
     }
 }
 
-fn activation_args(socket: &str, desktop: &str) -> Vec<String> {
-    vec![
-        "--systemd".into(),
-        format!("WAYLAND_DISPLAY={socket}"),
-        format!("XDG_CURRENT_DESKTOP={desktop}"),
-        "XDG_SESSION_TYPE=wayland".into(),
-        // Clear a previous session's X display. The portal uses Wayland.
-        "DISPLAY=".into(),
+/// The display environment activated services need. An empty `DISPLAY`
+/// clears a previous session's X display; the portal uses Wayland.
+fn activation_vars<'a>(socket: &'a str, desktop: &'a str) -> [(&'static str, &'a str); 4] {
+    [
+        ("WAYLAND_DISPLAY", socket),
+        ("XDG_CURRENT_DESKTOP", desktop),
+        ("XDG_SESSION_TYPE", "wayland"),
+        ("DISPLAY", ""),
     ]
+}
+
+/// systemd's user manager starts the portals and every unit-backed D-Bus
+/// service. `systemctl` ships with systemd; `dbus-update-activation-environment`
+/// does not (Fedora and EL put it in dbus-tools, which images need not carry).
+fn systemd_import_args(vars: &[(&str, &str)]) -> Vec<String> {
+    let mut args = vec!["--user".to_owned(), "set-environment".to_owned()];
+    args.extend(vars.iter().map(|(name, value)| format!("{name}={value}")));
+    args
+}
+
+/// The bus's own activation environment, for services it starts without
+/// systemd. `gdbus` ships with glib2, which the shell already needs.
+fn bus_import_args(vars: &[(&str, &str)]) -> Vec<String> {
+    let quote = |text: &str| format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"));
+    let entries: Vec<String> = vars
+        .iter()
+        .map(|(name, value)| format!("{}: {}", quote(name), quote(value)))
+        .collect();
+    [
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.DBus",
+        "--object-path",
+        "/org/freedesktop/DBus",
+        "--method",
+        "org.freedesktop.DBus.UpdateActivationEnvironment",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(std::iter::once(format!("{{{}}}", entries.join(", "))))
+    .collect()
 }
 
 /// Holds the systemd graphical session open for the DRM runtime's lifetime.
@@ -73,14 +106,16 @@ pub fn publish(socket: &str) -> SessionServices {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Tuna:GNOME".into());
-    if !run(
-        "dbus-update-activation-environment",
-        &activation_args(socket, &desktop),
-    ) {
+    let vars = activation_vars(socket, &desktop);
+    let systemd = run("systemctl", &systemd_import_args(&vars));
+    let bus = run("gdbus", &bus_import_args(&vars));
+    if !systemd && !bus {
         eprintln!("tuna-compositor: session services: display environment import failed");
         return guard;
     }
-    eprintln!("tuna-compositor: session services: display environment imported");
+    eprintln!(
+        "tuna-compositor: session services: display environment imported (systemd={systemd} bus={bus})"
+    );
     // GTK can activate portals before the display is ready. After the shell
     // owns its bus name, clear any start-limit failure and refresh the portal
     // frontend so it chooses Tuna Desktop's backends using the imported desktop.
@@ -193,18 +228,40 @@ mod tests {
 
     #[test]
     fn activation_import_names_only_the_hardware_display() {
-        let args = activation_args("wayland-tuna", "Tuna:GNOME");
+        let vars = activation_vars("wayland-tuna", "Tuna:GNOME");
+        let args = systemd_import_args(&vars);
         assert_eq!(
             args,
             [
-                "--systemd",
+                "--user",
+                "set-environment",
                 "WAYLAND_DISPLAY=wayland-tuna",
                 "XDG_CURRENT_DESKTOP=Tuna:GNOME",
                 "XDG_SESSION_TYPE=wayland",
                 "DISPLAY="
             ]
         );
-        assert!(!args.iter().any(|a| a == "--all"));
+        assert!(!args.iter().any(|a| a == "import-environment"));
+        let bus = bus_import_args(&vars);
+        assert_eq!(
+            bus.last().map(String::as_str),
+            Some(
+                "{'WAYLAND_DISPLAY': 'wayland-tuna', 'XDG_CURRENT_DESKTOP': 'Tuna:GNOME', \
+                 'XDG_SESSION_TYPE': 'wayland', 'DISPLAY': ''}"
+            )
+        );
+        assert!(bus
+            .iter()
+            .any(|a| a == "org.freedesktop.DBus.UpdateActivationEnvironment"));
+    }
+
+    #[test]
+    fn the_bus_import_quotes_values_as_gvariant_strings() {
+        let bus = bus_import_args(&[("XDG_CURRENT_DESKTOP", r"it's\here")]);
+        assert_eq!(
+            bus.last().map(String::as_str),
+            Some(r"{'XDG_CURRENT_DESKTOP': 'it\'s\\here'}")
+        );
     }
 
     #[test]

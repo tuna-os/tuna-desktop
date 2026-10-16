@@ -113,9 +113,57 @@ Together they cost 0.27–0.37% of a core at idle, and they also run through eve
 - change signals for notifications, DND and the tray;
 - a wall-clock timer for the clock that fires on the minute.
 
-### 4. Shell bursts on the first overview search (open)
+### 4. Shell bursts on the first overview search (fixed: #693)
 
 When the overview first opens and "disks" is typed, `tuna-shell-gtk` uses 0.9–2.0 cores for about 7 s, about 8.3 CPU-seconds in total. gnome-shell uses about 4.8 CPU-seconds for the same input. Later searches cost about 1.5 CPU-seconds each. This is the largest single item in the probe and launch phase. It needs a profile of the search and app-grid build: icon lookups, provider calls, grid construction. **Owner: tuna-shell-gtk.**
+
+#### tuna-shell-gtk: profile and fix (#693)
+
+**Method.** The fixture has no in-guest profiler for Tuna, so the workload was replayed locally. The setup was the Marlin image with the CI-built `tuna-desktop` package, Disks and System Monitor added, and `tuna-compositor --backend winit` under Xvfb. GL was llvmpipe, as on the VM. `xdotool` drove the same input: Super, type the query, Return and 8 s, for "disks", "system monitor" and "files"; then 20 overview toggles, 10 workspace switch pairs and 10 `Notify` calls. CPU per phase was read from `/proc/<pid>/stat`. `perf record -g -p <shell>` ran on one phase at a time.
+
+**Hotspots, main package (share of tuna-shell-gtk samples).** The app grid, providers and `.desktop` scans were not significant. `OverviewUi::rebuild_grid` was about 1% of the toggle samples in a symbolized build. Search-provider calls are asynchronous and showed no measurable shell cost. The app list is cached by `LiveApps`.
+
+| Phase | libLLVM (llvmpipe shader JIT) | libgallium (llvmpipe) | kernel | libc | GTK |
+|---|---:|---:|---:|---:|---:|
+| First search ("disks") | 77% | 9% | 5% | 7% | <1% |
+| Overview toggles | 24% | 6% | 34% | 15% | 8% |
+| Notifications | 27% | — | 30% | 14% | 9% |
+
+**Cause.** GSK skips its GL renderer when `GL_RENDERER` is llvmpipe ("Not using GL: renderer is llvmpipe"). Marlin has no Vulkan driver, and in that case GSK's fallback chain (`gskrenderer.c`) still takes llvmpipe GL before cairo. LLVM then compiles each new shader variant the shell's surfaces need. This also accounts for the 0.9–2.0 cores: llvmpipe runs its own threads.
+
+**Fix (#693).** Before any window is realized, the shell reads `GL_RENDERER` from a GL context on its display, which is GSK's own check. On llvmpipe or softpipe it sets `GSK_RENDERER=cairo`. An explicit `GSK_RENDERER` still wins, and hardware GL is unchanged. The `gtk-shell` CI lane runs on llvmpipe, so it exercises the cairo path, and all its gates pass: G-OV-SEARCH, G-OV-APPGRID, the G-GRID-* gates and G-NOTIFY-*.
+
+**Local replica, tuna-shell-gtk CPU-seconds, median of three alternating pairs.** Main package vs candidate package `a84fb35a`:
+
+| Phase | Main | #693 |
+|---|---:|---:|
+| Startup to idle | 0.94 | 0.96 |
+| Search 1 / 2 / 3 | 2.90 / 1.11 / 2.00 | 0.10 / 0.10 / 0.13 |
+| 20 overview toggles | 1.38 | 0.55 |
+| Workspace switches | 0.51 | 0.21 |
+| 10 notifications | 0.83 | 0.37 |
+| Whole workload | 9.56 | 2.54 |
+
+Startup with `tuna-session`'s startup overview: 2.31–2.45 s on main against 1.16–1.24 s with #693.
+
+**Paired Marlin run.** [38852155131](https://github.com/tuna-os/tuna-desktop/actions/runs/38852155131) used package [38846235169](https://github.com/tuna-os/tuna-desktop/actions/runs/38846235169) (`a84fb35a`). The workflow ref was the #697 branch, because every run of a post-#689 package was refused before #697 landed. All three diagnostic pairs completed. Stock pair 3 failed on the GNOME side ("resource samples are missing or incomplete"), so the stock figures are two pairs. GNOME on these runners was slower than in 38823409355: gnome-shell used 29–30 CPU-seconds in stock against 22–23. Compare the gaps within each run.
+
+| | Main 38823409355 (stock, 3 pairs) | #693 38852155131 (stock, 2 pairs) |
+|---|---:|---:|
+| tuna-shell-gtk, whole run, CPU-seconds | 8.35 / 7.95 / 7.48 | 5.48 / 5.11 |
+| — probe + launches | 4.59 / 3.86 / 4.03 | 1.90 / 1.57 |
+| — overview toggles | 1.32 / 1.27 / 1.07 | 1.09 / 1.06 |
+| — notifications | 1.12 / 1.12 / 1.03 | 0.87 / 0.88 |
+| — settle (startup) | 0.62 / 0.91 / 0.88 | 1.08 / 1.14 |
+| Whole run, Tuna vs GNOME | 24.9 vs 16.5 (+8.4) | 28.2 vs 22.4 (+5.8), 27.6 vs 22.4 (+5.2) |
+
+The diagnostic pairs agree. tuna-shell-gtk used 8.31/7.40/8.17 CPU-seconds on main and 5.89/5.71/5.52 with #693. The whole-run gap went from +8.4/+7.3/+9.6 to +7.5/+7.9/+5.4.
+
+In the VM the search bursts drop from 2.6/1.1/0.9 CPU-seconds to 0.65/0.76/0.42. Locally they cost 0.1 each, so the VM still pays for something the replica lacks. The live search providers are one difference: they do not answer in the container. The remaining shell cost:
+
+- **Per-tick resync once app windows exist.** This is 2–9 ticks per second through the overview, workspace and notification phases. The compositor sends a `WindowUpdated` delta for every window on every tick, which #696 fixes compositor-side.
+- **Startup.** In the VM, startup is 0.2–0.5 CPU-seconds above main. The probe initializes GDK's GL, about 0.1 s locally. A surfaceless EGL probe would cost about half of that.
+- **Notifications, 0.9 s.** Each update rebuilds the whole history list, and the banner slide is drawn by cairo.
 
 ### 5. Compositor cost per committed frame under workload (open)
 

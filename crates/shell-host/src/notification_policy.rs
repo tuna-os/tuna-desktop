@@ -11,9 +11,13 @@
 //!
 //! The rules are pure functions over plain snapshots ([`GlobalPrefs`],
 //! [`AppPrefs`]) so they unit-test without a bus; [`GioPolicyStore`] reads
-//! the real keys through GSettings and is safe to call from the
-//! notification daemon's worker threads (each call opens its own
-//! `Settings`, nothing is shared).
+//! and writes the real keys through GSettings, so it must run on the
+//! thread iterating the GLib main context, as all GSettings use must:
+//! GLib's keyfile backend is one in-memory file per process, reloaded
+//! there on every file change without a lock, and a read or write from
+//! another thread races that reload (lost writes, a truncated file). The
+//! notification daemon files `Notify` calls on that context
+//! ([`crate::intake::NotificationBus::deliver_in`]).
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -258,8 +262,8 @@ pub fn lock_screen<'a>(
         .collect()
 }
 
-/// Where policy comes from. The center asks on every arrival, from
-/// whichever thread the daemon serves on.
+/// Where policy comes from. The center asks on every arrival, on
+/// whichever thread files it.
 pub trait PolicyStore: Send + Sync {
     /// The installed app a notification belongs to (see [`resolve_app`]).
     fn app_for(&self, desktop_entry: &str, app_name: &str) -> Option<String>;
@@ -282,6 +286,8 @@ pub trait PolicyStore: Send + Sync {
 
 /// The real store: GNOME's keys through GSettings, apps through the XDG
 /// application dirs. Without the schemas everything reads as defaults.
+/// Call it only on the thread iterating the GLib main context (see the
+/// module docs).
 #[derive(Debug, Default)]
 pub struct GioPolicyStore {
     /// Apps registered this session (each is written once).
@@ -359,7 +365,7 @@ impl PolicyStore for GioPolicyStore {
         if let Some(next) = register_child(&children, &canonical_app_id(app_id)) {
             let _ = global.set_strv("application-children", next);
         }
-        // Worker threads have no main loop to flush on.
+        // Land the write before the sender hears back.
         gio::Settings::sync();
     }
 }

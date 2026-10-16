@@ -12,7 +12,10 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION`.
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.32).
+- Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
+  appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
+  windows are ignored by the compositor; an empty list selects monitor fallback.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
@@ -37,3 +40,12 @@ activation tokens),
 [ADR 0005](../../docs/adr/0005-control-socket-peer-authentication.md)
 (control-socket peer authentication),
 [architecture](../../docs/architecture.md).
+
+## Wellbeing scene effects (0.35)
+
+`CommandKind::SetWellbeingEffects { grayscale: bool, fade: bool }` appends a
+single atomic command. Earlier command indices, 0.34 keyboard/cursor fields,
+and strict trailing-byte rejection remain intact. Both booleans are required;
+postcard rejects values other than 0/1. The authenticated shell sends the full
+pair initially and whenever wellbeing state changes. The compositor owns the
+three-second entry animation and immediate exit; the cursor is excluded.

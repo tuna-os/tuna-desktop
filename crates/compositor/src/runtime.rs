@@ -14,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use calloop::{EventLoop, LoopHandle};
 use smithay::{
@@ -58,9 +58,10 @@ use crate::windows::{
     translate_input, ManagerInput, TriggerAction, TriggerState, WindowManager, ESCAPE_KEYCODE,
 };
 use crate::xwayland::XWaylandSupervisor;
-use tuna_greeter::client::GreeterClient;
 
 use crate::{ClientState, State};
+
+mod aids;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
 /// most this long, so animations step near 60 Hz and the loop never
@@ -81,7 +82,6 @@ const ACTIVITY_LINGER: Duration = Duration::from_millis(500);
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
 /// client epoll set; a duplicate keeps calloop's source lifetime independent.
-#[cfg(any(feature = "drm", test))]
 fn display_readiness_source(
     display: &Display<State>,
 ) -> std::io::Result<calloop::generic::Generic<std::os::fd::OwnedFd>> {
@@ -98,6 +98,19 @@ mod display_readiness_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn modal_parent_fades_run_until_settled() {
+        let mut dim = crate::modal_dim::ModalDim::default();
+        let alive = std::collections::HashSet::from([1]);
+        let policy = tuna_shell_control::motion::MotionPolicy::default();
+        dim.step(&alive, &alive, Duration::ZERO, policy, true);
+        // A running fade keeps next_wake at the frame pace; a settled one
+        // lets the loop sleep.
+        assert!(dim.running());
+        dim.step(&alive, &alive, Duration::from_secs(1), policy, true);
+        assert!(!dim.running());
+    }
 
     #[test]
     fn accepted_wayland_requests_wake_the_loop_and_drained_clients_do_not_spin() {
@@ -409,6 +422,16 @@ mod scene_slot_tests {
     use super::{scene_slots, SceneSlot::*};
 
     #[test]
+    fn frame_bell_stays_under_higher_windows_and_only_in_its_slice() {
+        let mut over = scene_slots(2, 0, false, &[0]);
+        super::insert_bell_slot(&mut over, 1, 0);
+        assert_eq!(over, [Snapshot(0), Element(0), Bell(0), Element(1)]);
+        let mut under = scene_slots(2, 2, true, &[]);
+        super::insert_bell_slot(&mut under, 1, 0);
+        assert_eq!(under, [Element(2), Element(3)]);
+    }
+
+    #[test]
     fn snapshots_draw_in_front_of_the_elements_at_and_after_their_index() {
         // Five elements split at 2: snapshot 0 sits at index 1 (over half),
         // snapshot 1 at the boundary 2 (under half's end only), snapshots
@@ -557,6 +580,24 @@ struct RemoteHeld {
     buttons: std::collections::HashSet<u32>,
 }
 
+struct PendingScreenshotReply {
+    deadline: Duration,
+    reply: std::sync::mpsc::Sender<Option<std::path::PathBuf>>,
+    saved: Option<std::path::PathBuf>,
+}
+
+enum UnlockEvent {
+    Pending,
+    Finished(bool),
+}
+struct UnlockWorker {
+    attempt: crate::auth_owner::Attempt,
+    worker: std::thread::JoinHandle<crate::pam_backend::Verification>,
+    cancel: crate::pam_cancel::Cancellation,
+    phase: Arc<std::sync::atomic::AtomicU8>,
+    denied: bool,
+}
+
 pub struct Runtime {
     display: Display<State>,
     state: State,
@@ -569,12 +610,19 @@ pub struct Runtime {
     ime: Option<crate::ime::ImeBridge>,
     overlay: Overlay,
     wallpaper: Wallpaper,
+    /// The compositor-drawn pointer and locate-pointer (#342).
+    cursor: crate::cursor::Cursor,
     triggers: TriggerState,
     /// Compositor-owned session lock: flag plus idle accumulator fed
     /// from input timestamps. The hub mirror carries the flag to shell
     /// snapshots; the shell never owns it.
     lock: SessionLock,
     blank: crate::lock::IdleBlank,
+    screenshot_flashes: crate::screenshot_flash::Flashes,
+    screenshot_replies: Vec<PendingScreenshotReply>,
+    /// Worker threads (idle watches, Orca, wallpaper, Night Light, IME,
+    /// X11 icons, PAM, logind) ping the loop through this (#503).
+    wake: crate::wake::Wake,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -583,6 +631,11 @@ pub struct Runtime {
     /// Cloned from the owned event loop at launch; `'static`
     /// because the loop outlives the runtime in `run`.
     loop_handle: LoopHandle<'static, Runtime>,
+    /// A hardware button release that would end a direct strip move or
+    /// resize, held until the current dispatch finishes (see the input
+    /// source in `launch`).
+    #[cfg(feature = "drm")]
+    strip_release_held: Option<ManagerInput>,
     /// XWayland server client awaiting its `Ready` event, after
     /// which the X11 window manager starts against it (xwayland
     /// feature only).
@@ -603,6 +656,9 @@ pub struct Runtime {
     scale: f64,
     /// GNOME's input settings as last applied (#60).
     input_settings: tuna_shell_control::InputSettings,
+    wellbeing_effects: crate::wellbeing_effects::Effects,
+    /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
+    input_aids: aids::RuntimeAids,
     /// An Escape press cancelled a client drag; its repeats and release
     /// belong to that cancel, not to the overview or a client.
     dnd_escape_held: bool,
@@ -612,6 +668,18 @@ pub struct Runtime {
     casts: Vec<crate::screencast::Cast>,
     /// Monitor list the Mutter D-Bus side serves.
     cast_outputs: crate::mutter::Outputs,
+    /// Orientation lock plus the latest accelerometer sample (#345).
+    orientation: crate::orientation::OrientationPolicy,
+    /// Flags shared with the Mutter D-Bus thread (managed property,
+    /// sensor inhibition).
+    orientation_share: std::sync::Arc<crate::orientation::OrientationShare>,
+    /// Night Light evaluation: settings, schedule, smear (#339).
+    /// The controller also owns the live state shared with the D-Bus
+    /// thread (active, temperature, "disabled until tomorrow").
+    night_light: crate::night_light::NightLightController,
+    /// Configured transform per connector (Settings/monitors.xml):
+    /// the sensor overrides these live but never rewrites them.
+    manual_transforms: std::collections::HashMap<String, u32>,
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
@@ -671,9 +739,11 @@ pub struct Runtime {
     /// `last_stamp + anchor.elapsed()`.
     idle_since: Instant,
     /// Lock-screen password checks report back here.
-    unlock_results: calloop::channel::Sender<(u64, u64, bool)>,
+    unlock_results: calloop::channel::Sender<(crate::auth_owner::Attempt, UnlockEvent)>,
     /// A password check is running.
-    unlock_inflight: bool,
+    unlock_slot: crate::auth_owner::Slot,
+    unlock_worker: Option<UnlockWorker>,
+    unlock_quarantined: Option<crate::auth_owner::Attempt>,
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
@@ -702,6 +772,11 @@ pub fn control_socket_path(socket_name: &str) -> Option<std::path::PathBuf> {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        if let Some(worker) = &self.unlock_worker {
+            worker.cancel.cancel();
+        }
+        // Shutdown requests cancellation; it never certifies retirement.
+        crate::pam_backend::Backend::shutdown_live();
         #[cfg(feature = "xwayland")]
         {
             // Event sources can retain loop handles after dispatch stops.
@@ -719,6 +794,15 @@ impl Drop for Runtime {
             self.active_x11_client = None;
         }
     }
+}
+
+/// `(reported_ok, ok)` for a joined unlock worker. `reported_ok` is what the
+/// PAM worker itself returned: a cancelled or failed verification never
+/// reports OK (the tick path used to claim OK for every finished attempt).
+/// A denial (stale epoch, lost origin, cancel) leaves a real success visible
+/// for the trace but never lets it unlock.
+fn unlock_outcome(authenticated: bool, denied: bool) -> (bool, bool) {
+    (authenticated, authenticated && !denied)
 }
 
 impl Runtime {
@@ -748,6 +832,9 @@ impl Runtime {
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
+                        if matches!(event, smithay::backend::session::Event::PauseSession) {
+                            rt.manager.cancel_strip_pointer(&mut rt.state);
+                        }
                         if let Backend::Drm(drm) = &mut rt.backend {
                             drm.on_session_event(event);
                         }
@@ -766,6 +853,22 @@ impl Runtime {
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 handle
                     .insert_source(sources.input, |event, _, rt: &mut Runtime| {
+                        // A VT switch revokes the evdev fds before libseat's
+                        // PauseSession reaches us; libinput answers by
+                        // releasing every held button and then removing the
+                        // device, in one dispatch. That release must roll a
+                        // direct strip move/resize back, never commit it, so
+                        // a strip-owning release waits for the dispatch to
+                        // end and a device removal meanwhile cancels the grab
+                        // (marlin-vm 38732705939 committed a column move).
+                        if rt.strip_release_held.is_some()
+                            && matches!(
+                                event,
+                                smithay::backend::input::InputEvent::DeviceRemoved { .. }
+                            )
+                        {
+                            rt.manager.cancel_strip_pointer(&mut rt.state);
+                        }
                         let corners_active = !rt.is_locked()
                             && !rt.manager.pointer_constraint_owns_motion(&rt.state)
                             && !rt.overlay.visible
@@ -780,7 +883,25 @@ impl Runtime {
                             Backend::Winit(_) => Vec::new(),
                         };
                         for input in inputs {
-                            rt.on_manager_input(input);
+                            if let ManagerInput::Button {
+                                button,
+                                pressed: false,
+                                ..
+                            } = input
+                            {
+                                if rt.strip_release_held.is_none()
+                                    && rt.manager.strip_grab_button() == Some(button)
+                                {
+                                    rt.strip_release_held = Some(input);
+                                    rt.loop_handle.insert_idle(|rt| {
+                                        if let Some(input) = rt.strip_release_held.take() {
+                                            rt.on_backend_input(input);
+                                        }
+                                    });
+                                    continue;
+                                }
+                            }
+                            rt.on_backend_input(input);
                         }
                         // The window manager has the final say (a locked
                         // pointer stays put): the drawn cursor follows it.
@@ -840,6 +961,18 @@ impl Runtime {
             .ok_or_else(|| RuntimeError::Socket("XDG_RUNTIME_DIR is unset".to_owned()))?;
         let control = ControlHub::bind(control_path.clone(), tokens, crate::SEAT_NAME)
             .map_err(|e| RuntimeError::Socket(e.to_string()))?;
+        event_loop
+            .handle()
+            .insert_source(
+                control
+                    .readiness_source()
+                    .map_err(|e| RuntimeError::Loop(e.to_string()))?,
+                |_, fd, _: &mut Runtime| {
+                    crate::control_readiness::drain(fd)?;
+                    Ok(calloop::PostAction::Continue)
+                },
+            )
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let shell_policy = RestartPolicy::default();
         let mut shell = ShellDriver::new(
             shell_policy,
@@ -853,7 +986,10 @@ impl Runtime {
             Some(backend) => backend,
             None => {
                 let (backend, winit_loop) = winit::init::<GlesRenderer>()
-                    .map_err(|e| RuntimeError::Backend(e.to_string()))?;
+                    // Smithay's Display omits the underlying Winit error.
+                    // Retain it so missing runtime libraries/display errors
+                    // can be distinguished from candidate render failures.
+                    .map_err(|e| RuntimeError::Backend(format!("{e:?}")))?;
                 event_loop
                     .handle()
                     .insert_source(winit_loop, |event, _, runtime: &mut Runtime| {
@@ -863,8 +999,9 @@ impl Runtime {
                 Backend::Winit(Box::new(backend))
             }
         };
-        #[cfg(feature = "drm")]
-        if matches!(backend, Backend::Drm(_)) {
+        {
+            // Accepted clients also wake the nested backend, independently of
+            // host window input. The scheduler separately accounts for active work.
             event_loop
                 .handle()
                 .insert_source(
@@ -922,6 +1059,10 @@ impl Runtime {
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen
         // sharing through the stock GNOME portal.
         let cast_outputs: crate::mutter::Outputs = Default::default();
+        let orientation_share: std::sync::Arc<crate::orientation::OrientationShare> =
+            Default::default();
+        let night_light_share: std::sync::Arc<crate::night_light::NightLightShare> =
+            Default::default();
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
@@ -933,6 +1074,8 @@ impl Runtime {
                     introspect.windows.clone(),
                     capture_authority.clone(),
                     display.handle(),
+                    orientation_share.clone(),
+                    night_light_share.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -953,17 +1096,54 @@ impl Runtime {
                         calloop::channel::Event::Msg(Request::Shot {
                             filename,
                             window,
+                            flash,
                             reply,
                         }) => {
+                            if flash
+                                && rt.screenshot_replies.len()
+                                    == crate::screenshot_flash::MAX_FLASHES
+                            {
+                                let _ = reply.send(None);
+                                return;
+                            }
                             let saved = if window {
                                 rt.capture_window(&filename)
                             } else {
                                 rt.capture(&filename)
                             };
-                            let _ = reply.send(saved);
+                            let deadline = (flash && saved.is_some())
+                                .then(|| rt.start_screenshot_flash(window))
+                                .flatten();
+                            if let Some(deadline) = deadline {
+                                rt.screenshot_replies.push(PendingScreenshotReply {
+                                    deadline,
+                                    reply,
+                                    saved,
+                                });
+                            } else {
+                                let _ = reply.send(saved);
+                            }
                         }
                         calloop::channel::Event::Msg(Request::Windows { directory, reply }) => {
                             let _ = reply.send(rt.capture_selector_windows(&directory));
+                        }
+                        calloop::channel::Event::Msg(Request::Flash { area, reply }) => {
+                            let valid = !rt.is_locked()
+                                && rt.state.outputs.iter().any(|out| {
+                                    let [x, y, width, height] = area;
+                                    width > 0
+                                        && height > 0
+                                        && x >= out.loc.0
+                                        && y >= out.loc.1
+                                        && i64::from(x) + i64::from(width)
+                                            <= i64::from(out.loc.0) + i64::from(out.size.w)
+                                        && i64::from(y) + i64::from(height)
+                                            <= i64::from(out.loc.1) + i64::from(out.size.h)
+                                });
+                            if valid {
+                                let _ = rt.start_flash_area(area);
+                            }
+                            let _ = reply.send(valid);
                         }
                         calloop::channel::Event::Closed => {}
                     }
@@ -972,25 +1152,29 @@ impl Runtime {
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
 
         // Lock-screen password checks finish here, between frames.
-        let (unlock_results, unlock_source) = calloop::channel::channel::<(u64, u64, bool)>();
+        let (unlock_results, unlock_source) =
+            calloop::channel::channel::<(crate::auth_owner::Attempt, UnlockEvent)>();
         event_loop
             .handle()
             .insert_source(unlock_source, |event, _, rt: &mut Runtime| {
-                if let calloop::channel::Event::Msg((request, generation, ok)) = event {
-                    rt.finish_unlock(request, generation, ok);
+                if let calloop::channel::Event::Msg((attempt, event)) = event {
+                    match event {
+                        UnlockEvent::Pending => rt.deny_pending_unlock(attempt),
+                        // Grant only after tick consumes control EOF/gate changes.
+                        UnlockEvent::Finished(false) => rt.deny_pending_unlock(attempt),
+                        UnlockEvent::Finished(true) => {}
+                    }
                 }
             })
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-        // Worker threads (Mutter idle watches, Orca watchers, wallpaper
-        // decodes) ping the loop when they have something for the tick
-        // (#503); the ping only wakes it.
-        let (waker, wakeups) =
-            calloop::ping::make_ping().map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        // Worker threads ping the loop when they have something for the
+        // tick (#503); the ping only wakes it.
+        let (wake, wake_source) =
+            crate::wake::Wake::new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         event_loop
             .handle()
-            .insert_source(wakeups, |_, _, _: &mut Runtime| {})
+            .insert_source(wake_source, |_, _, _: &mut Runtime| {})
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-
         let loop_handle = event_loop.handle();
         let mut runtime = Runtime {
             display,
@@ -1002,11 +1186,17 @@ impl Runtime {
             ime: crate::ime::ImeBridge::configured(&session.socket_name),
             overlay,
             wallpaper: Wallpaper::new(),
+            cursor: crate::cursor::Cursor::new(),
             triggers: TriggerState::default(),
             lock: SessionLock::new(idle_timeout_ms()),
             blank: crate::lock::IdleBlank::default(),
+            screenshot_flashes: Default::default(),
+            screenshot_replies: Vec::new(),
+            wake,
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
+            #[cfg(feature = "drm")]
+            strip_release_held: None,
             #[cfg(feature = "xwayland")]
             pending_x11_client: None,
             #[cfg(feature = "xwayland")]
@@ -1043,20 +1233,28 @@ impl Runtime {
             animation_clock: crate::animation_clock::AnimationClock::real(),
             scale: clamp_scale(session.scale),
             input_settings: Default::default(),
+            wellbeing_effects: Default::default(),
+            input_aids: aids::RuntimeAids::default(),
             dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name),
             pipewire: None,
             casts: Vec::new(),
             cast_outputs,
+            orientation: Default::default(),
+            orientation_share,
+            night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
+            manual_transforms: Default::default(),
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
             introspect,
             idle_since: Instant::now(),
             unlock_results,
-            unlock_inflight: false,
+            unlock_slot: crate::auth_owner::Slot::default(),
+            unlock_worker: None,
+            unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            idle_monitor: crate::idle_monitor::start(waker.clone()),
+            idle_monitor: crate::idle_monitor::start(),
             exit: false,
             stats: RunStats::default(),
             state_path: std::env::var_os("TUNA_COMPOSITOR_STATE")
@@ -1069,6 +1267,20 @@ impl Runtime {
         };
         runtime.animation_clock =
             crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
+        runtime.wallpaper.set_wake(&runtime.wake);
+        // Night Light (#339): D-Bus preview/clear/temp-disable
+        // records ping the already-registered wake above; its no-op
+        // callback plus the unconditional tick/render below serve
+        // them, so no second wake source or thread is needed.
+        night_light_share.set_wake(&runtime.wake);
+        night_light_share.start_reader(&runtime.wake);
+        runtime.orca.set_wake(&runtime.wake);
+        runtime.idle_monitor.set_wake(&runtime.wake);
+        if let Some(ime) = &runtime.ime {
+            ime.set_wake(&runtime.wake);
+        }
+        #[cfg(feature = "xwayland")]
+        runtime.x11_icon_reader.set_wake(&runtime.wake);
         let started = runtime.animation_clock.now();
         runtime.overview_progress_at = started;
         runtime.strip_view_at = started;
@@ -1076,24 +1288,6 @@ impl Runtime {
             && [crate::animation_clock::CLOCK_ENV, "TUNA_PROOF_SWIPE_INPUT"]
                 .iter()
                 .any(|key| std::env::var_os(key).is_some());
-        runtime.orca.set_waker(waker.clone());
-        runtime.wallpaper.set_waker(waker);
-        // The shell's commands wake the loop instead of being polled.
-        let control_ready = runtime
-            .control
-            .wake_fd()
-            .map_err(|e| RuntimeError::Socket(e.to_string()))?;
-        event_loop
-            .handle()
-            .insert_source(
-                calloop::generic::Generic::new(
-                    control_ready,
-                    calloop::Interest::READ,
-                    calloop::Mode::Level,
-                ),
-                |_, _, _: &mut Runtime| Ok(calloop::PostAction::Continue),
-            )
-            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         // The shell's idle-blank settings and wallpaper drop live in the
         // runtime dir: any change there wakes the loop, and the blank
         // file is read again only when it changed. A state document the
@@ -1134,7 +1328,9 @@ impl Runtime {
         #[cfg(feature = "xwayland")]
         if session.xwayland {
             if let Err(error) = runtime.prepare_x11(None) {
-                eprintln!("tuna-compositor: xwayland: socket preparation failed: {error}; native session continues");
+                eprintln!(
+                    "tuna-compositor: xwayland: socket preparation failed: {error}; native session continues"
+                );
             }
         }
         // GNOME Shell greets a login with the overview.
@@ -1172,7 +1368,7 @@ impl Runtime {
                     Backend::Drm(_) => return,
                 };
                 for input in translate_input(event, area) {
-                    self.on_manager_input(input);
+                    self.on_backend_input(input);
                 }
             }
             WinitEvent::Redraw | WinitEvent::Focus(_) => {}
@@ -1206,9 +1402,13 @@ impl Runtime {
     /// snapshots), overview dismissed, and the exclusive lock surface
     /// up with an empty list — no window titles while locked.
     fn engage_lock(&mut self) {
+        // Track lifecycle separately: idle check_timeout has already locked its flag.
+        self.unlock_slot.note_lock(&self.unlock_generation);
         #[cfg(feature = "drm")]
         self.performance_trace.cancel();
+        self.reset_input_aid_ownership();
         self.lock.lock();
+        self.cursor.on_lock();
         self.control.set_locked(true);
         let remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
         for id in remote_ids {
@@ -1227,57 +1427,261 @@ impl Runtime {
     /// silent; auth is never invented. Returns whether the session is
     /// unlocked afterwards.
     pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
-        let now_ms = self.lock_now_ms();
-        // Under greetd, its daemon checks the password; under any other
-        // login manager (GDM on Marlin), PAM does (#62). Both fail closed.
-        if let Some(path) = crate::unlock::greetd_socket_path() {
-            let Ok(mut client) = GreeterClient::connect(&path) else {
-                return false;
-            };
-            return crate::unlock::unlock_session(
-                &mut self.lock,
-                &self.control,
-                &mut self.overlay,
-                now_ms,
-                user,
-                password,
-                &mut client,
-            );
+        use crate::pam_backend::{Initial, Verification};
+        if !self.is_locked() {
+            return true;
         }
-        let mut client = crate::pam::PamClient::new(crate::pam::service());
-        crate::unlock::unlock_session(
-            &mut self.lock,
-            &self.control,
-            &mut self.overlay,
-            now_ms,
-            user,
-            password,
-            &mut client,
-        )
+        self.unlock_slot.note_lock(&self.unlock_generation);
+        let epoch = self
+            .unlock_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let Some(attempt) = self.unlock_slot.begin(None, epoch) else {
+            return false;
+        };
+        // A configured greetd path never falls back to PAM.
+        if let Some(path) = crate::unlock::greetd_socket_path() {
+            let ok = crate::unlock::verify_greetd(&path, user, password);
+            return self.unlock_slot.retire(attempt)
+                && ok
+                && self.apply_verified_unlock(attempt.epoch);
+        }
+        let cancel = crate::pam_cancel::Cancellation::default();
+        let ticket = crate::pam_backend::Backend::live()
+            .ok_or(Verification::RejectedBeforeSpawn)
+            .and_then(|backend| {
+                backend.begin(
+                    crate::pam::service(),
+                    user.to_owned(),
+                    tuna_shell_control::Secret(password.to_owned()),
+                    cancel.clone(),
+                )
+            });
+        match ticket {
+            Ok(mut ticket) => match ticket.initial() {
+                Initial::Finished(result) => {
+                    if !result.may_retire() {
+                        self.unlock_quarantined = Some(attempt);
+                        return false;
+                    }
+                    self.unlock_slot.retire(attempt)
+                        && result.authenticated()
+                        && self.apply_verified_unlock(attempt.epoch)
+                }
+                Initial::Pending => {
+                    // The public caller gets denial now; no later result can grant it.
+                    self.start_unlock_worker(attempt, cancel, true, move |_| {
+                        ticket.wait_retired(|| {})
+                    });
+                    false
+                }
+            },
+            Err(result) => {
+                if result.may_retire() {
+                    self.unlock_slot.retire(attempt);
+                } else {
+                    self.unlock_quarantined = Some(attempt);
+                }
+                false
+            }
+        }
     }
 
-    /// A lock-screen password check finished: a verified password
-    /// clears the lock (the shell then destroys its lock surfaces), and
-    /// the shell hears the result either way.
-    fn finish_unlock(&mut self, request: u64, generation: u64, ok: bool) {
-        self.unlock_inflight = false;
-        let applied = ok
-            && generation
-                == self
-                    .unlock_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
+    fn start_unlock_worker(
+        &mut self,
+        attempt: crate::auth_owner::Attempt,
+        cancel: crate::pam_cancel::Cancellation,
+        denied: bool,
+        verify: impl FnOnce(Box<dyn FnMut() + Send>) -> crate::pam_backend::Verification
+            + Send
+            + 'static,
+    ) {
+        let reply = self.unlock_results.clone();
+        let wake = self.wake.clone();
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(u8::from(denied)));
+        let worker_phase = phase.clone();
+        let pending_reply = reply.clone();
+        let pending_phase = phase.clone();
+        let worker = std::thread::Builder::new()
+            .name("tuna-unlock".into())
+            .spawn(move || {
+                let _completion = wake.phase_completion(worker_phase.clone());
+                let result = verify(Box::new(move || {
+                    pending_phase.store(1, std::sync::atomic::Ordering::Release);
+                    let _ = pending_reply.send((attempt, UnlockEvent::Pending));
+                }));
+                worker_phase.store(2, std::sync::atomic::Ordering::Release);
+                let _ = reply.send((attempt, UnlockEvent::Finished(result.authenticated())));
+                result
+            });
+        match worker {
+            Ok(worker) => {
+                self.unlock_worker = Some(UnlockWorker {
+                    attempt,
+                    worker,
+                    cancel,
+                    phase,
+                    denied,
+                })
+            }
+            Err(_) => {
+                cancel.cancel();
+                // A public pending ticket may already own a helper: no fabricated reap.
+                if denied {
+                    self.unlock_quarantined = Some(attempt);
+                } else {
+                    self.unlock_slot.retire(attempt);
+                }
+                if let Some(origin) = attempt.origin {
+                    self.control.finish_unlock(origin, false);
+                }
+            }
+        }
+    }
+
+    fn deny_pending_unlock(&mut self, attempt: crate::auth_owner::Attempt) {
+        if !self.unlock_slot.matches(attempt) {
+            return;
+        }
+        let Some(worker) = self
+            .unlock_worker
+            .as_mut()
+            .filter(|worker| worker.attempt == attempt)
+        else {
+            return;
+        };
+        worker.cancel.cancel();
+        if worker.denied {
+            return;
+        }
+        worker.denied = true;
+        if let Some(origin) = attempt.origin {
+            self.control.finish_unlock(origin, false);
+        }
+    }
+
+    fn cancel_invalid_unlock(&mut self) {
+        let Some(worker) = self.unlock_worker.as_ref() else {
+            return;
+        };
+        let attempt = worker.attempt;
+        if !self.unlock_slot.matches(attempt) {
+            return;
+        }
+        let epoch = self
+            .unlock_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let origin_lost = attempt
+            .origin
+            .is_some_and(|origin| !self.control.origin_pending_live(origin));
+        if epoch != attempt.epoch || origin_lost || !self.is_locked() {
+            // Retain this exact worker and slot until actual helper retirement.
+            self.deny_pending_unlock(attempt);
+        }
+    }
+
+    fn apply_verified_unlock(&mut self, epoch: u64) -> bool {
+        if !self.is_locked() || !self.unlock_slot.grant(&self.unlock_generation, epoch) {
+            return false;
+        }
+        self.reset_input_aid_ownership();
+        self.lock.unlock(self.lock_now_ms());
+        self.control.set_locked(false);
+        self.state.set_shortcut_inhibition_locked(false);
+        self.overlay.hide();
+        true
+    }
+
+    /// Actual helper retirement is required in addition to the joined wrapper.
+    /// A poisoned owner denies permanently; it cannot release this slot.
+    fn finish_unlock(&mut self, attempt: crate::auth_owner::Attempt) {
+        if !self.unlock_slot.matches(attempt) {
+            return;
+        }
+        let Some(worker) = self.unlock_worker.as_ref() else {
+            return;
+        };
+        if worker.attempt != attempt || !worker.worker.is_finished() {
+            return;
+        }
+        self.cancel_invalid_unlock();
+        let worker = self.unlock_worker.take().expect("matched owned worker");
+        let denied = worker.denied;
+        let cancel_requested = worker.cancel.is_canceled();
+        let joined = worker.worker.join();
+        let joined_ok = joined.is_ok();
+        let result = joined.unwrap_or(crate::pam_backend::Verification::Unretired);
+        let backend_accepted = result.authenticated();
+        let (reported_ok, ok) = unlock_outcome(backend_accepted, denied);
+        let live = attempt
+            .origin
+            .is_some_and(|origin| self.control.origin_pending_live(origin));
+        if !result.may_retire() {
+            self.unlock_quarantined = Some(attempt);
+            if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+                eprintln!(
+                    "tuna-compositor: lock authentication unretired {}",
+                    serde_json::json!({
+                        "pid":std::process::id(), "joined_ok":joined_ok,
+                        "attempt_serial":attempt.serial,"attempt_epoch":attempt.epoch,
+                        "current_epoch":self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                        "origin_live":live,"locked_after":self.is_locked()
+                    })
+                );
+            }
+            if !denied {
+                if let Some(origin) = attempt.origin {
+                    self.control.finish_unlock(origin, false);
+                }
+            }
+            return;
+        }
+        let completion_live =
+            self.unlock_slot
+                .completion_live(attempt, &self.unlock_generation, live);
+        if !self.unlock_slot.retire_pam_method(
+            attempt,
+            crate::auth_owner::MethodKind::Password,
+            result,
+        ) {
+            return;
+        }
+        let applied = ok && completion_live && self.apply_verified_unlock(attempt.epoch);
         if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             eprintln!(
-                "tuna-compositor: lock authentication finished accepted={ok} applied={applied}"
+                "tuna-compositor: lock authentication retired {}",
+                serde_json::json!({
+                    "pid": std::process::id(), "joined_ok": joined_ok,
+                    "backend_accepted": backend_accepted, "reported_ok": reported_ok,
+                    "applied": applied, "attempt_serial": attempt.serial,
+                    "attempt_epoch": attempt.epoch,
+                    "current_epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                    "origin": attempt.origin.map(|origin| serde_json::json!({
+                        "connection": origin.connection, "request": origin.request })),
+                    "origin_live": live, "locked_after": self.is_locked()
+                })
             );
         }
-        if applied && self.is_locked() {
-            self.lock.unlock(self.lock_now_ms());
-            self.control.set_locked(false);
-            self.state.set_shortcut_inhibition_locked(false);
-            self.overlay.hide();
+        if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+            eprintln!(
+                "tuna-compositor: lock authentication owned retirement {}",
+                serde_json::json!({
+                    "pid":std::process::id(), "joined_ok":joined_ok,
+                    "retired":matches!(result, crate::pam_backend::Verification::Retired { .. }),
+                    "authenticated":result.authenticated(), "denied":denied,
+                    "cancel_requested":cancel_requested,"reported_ok":reported_ok,"applied":applied,
+                    "attempt_serial":attempt.serial,"attempt_epoch":attempt.epoch,
+                    "current_epoch":self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                    "origin":attempt.origin.map(|origin| serde_json::json!({
+                        "connection":origin.connection,"request":origin.request })),
+                    "locked_after":self.is_locked()
+                })
+            );
         }
-        self.control.finish_unlock(request, applied);
+        if !denied {
+            if let Some(origin) = attempt.origin {
+                self.control.finish_unlock(origin, applied);
+            }
+        }
     }
 
     /// Route one backend input event: consumed by the lock surface while
@@ -1307,6 +1711,38 @@ impl Runtime {
         self.idle_since = Instant::now();
         self.idle_monitor.activity();
         self.active_at = Instant::now();
+        if self.is_locked() {
+            self.cursor.locate.reset_keys();
+        } else {
+            // GNOME's locate-pointer: a lone Ctrl tap; the key still
+            // reaches the client (#342).
+            let now = self.animation_clock.now();
+            let matches_key = if let ManagerInput::Key { keycode, .. } = &input {
+                self.state.seat.get_keyboard().is_some_and(|keyboard| {
+                    keyboard.with_xkb_state(&mut self.state, |context| {
+                        let Ok(xkb) = context.xkb().lock() else {
+                            return false;
+                        };
+                        let code = keycode.saturating_add(8).into();
+                        // SAFETY: the state is borrowed only while the XKB
+                        // mutex is held; no state reference escapes this call.
+                        let layout = smithay::input::keyboard::Layout(unsafe {
+                            xkb.state().key_get_layout(code)
+                        });
+                        self.cursor.locate.matches_keysym(
+                            xkb.raw_syms_for_key_in_layout(code, layout)
+                                .iter()
+                                .map(|symbol| symbol.raw()),
+                        )
+                    })
+                })
+            } else {
+                false
+            };
+            self.cursor
+                .locate
+                .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
+        }
         if self.is_locked() {
             // The lock takes the keyboard: a held Escape's release
             // never comes back to the drag cancel below.
@@ -1449,6 +1885,9 @@ impl Runtime {
                 }
             }
             self.manager.on_input(&mut self.state, input);
+            for backward in self.manager.take_input_source_switches() {
+                self.switch_input_source_with_aid_reset(backward);
+            }
             // Alt-Tab drive: forward whatever the manager queued into
             // the hub broadcast; the next hub poll delivers it to the
             // shell, which owns MRU order and rendering.
@@ -1611,6 +2050,16 @@ impl Runtime {
         crate::xwayland::on_xwayland_event(self, event);
     }
 
+    /// Live libinput device configuration (#343): empty off hardware,
+    /// where there is no libinput context.
+    fn input_device_states(&self) -> Vec<serde_json::Value> {
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &self.backend {
+            return drm.input_device_states();
+        }
+        Vec::new()
+    }
+
     /// Write the compositor-side state snapshot when it changed
     /// (`TUNA_COMPOSITOR_STATE`, journeys only; #65). App ids and ids,
     /// never titles.
@@ -1696,6 +2145,7 @@ impl Runtime {
             "overview_search": self.overview_search,
             "overview_app_grid": self.overview_app_grid,
             "keyboard": keyboard,
+            "background_paint": if self.is_locked() { None } else { self.wallpaper.paint_state() },
             "overview_open": overview_open,
             "animations_enabled": self.input_settings.motion.animations_enabled(),
             "mouse_left_handed": self.input_settings.mouse_left_handed,
@@ -1783,8 +2233,20 @@ impl Runtime {
                 })
                 .collect::<Vec<_>>(),
         });
+        // Keep this nested object outside the large json! expansion so
+        // additions cannot exceed serde_json's default macro recursion bound.
+        // One clock/sample also makes the diagnostic tuple internally coherent.
+        let wellbeing_now = self.animation_clock.now();
+        let wellbeing_sample = self.wellbeing_effects.sample(wellbeing_now);
+        doc["wellbeing_effects"] = serde_json::json!({
+            "desaturation": wellbeing_sample.desaturation,
+            "brightness": wellbeing_sample.brightness,
+            "animating": self.wellbeing_effects.animating(wellbeing_now),
+        });
         // Overdraw per output for the last drawn frame (#503).
+        doc["workspaces"] = serde_json::json!(model.workspaces());
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
+        doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
             .frame_costs
             .iter()
@@ -1833,13 +2295,16 @@ impl Runtime {
         doc["animation_clock_ms"] =
             serde_json::json!(manual.then(|| self.animation_clock.now().as_millis() as u64));
         doc["overview_motion"] = self.overview_motion.diagnostics();
+        doc["cursor"] = self
+            .cursor
+            .diagnostics(self.animation_clock.now(), self.is_locked());
         doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());
         doc["screen_reader_state"] = serde_json::json!(self.orca.state());
         // Keep backend-specific observations outside the large scene macro so
         // its expansion remains below the compiler's default recursion limit.
         // These values keep the same flat JSON fields and suppress lock input.
         doc["native_relative_motion_count"] = serde_json::json!((!self.is_locked())
-            .then(|| match &self.backend {
+            .then_some(match &self.backend {
                 #[cfg(feature = "drm")]
                 Backend::Drm(drm) => Some(drm.relative_motion_events()),
                 Backend::Winit(_) => None::<u64>,
@@ -1849,13 +2314,31 @@ impl Runtime {
             let pos = self.manager.pointer_pos();
             [pos.x, pos.y]
         }));
+        doc["input_aids"] = self.input_aids_summary();
+        // Owned proof diagnostics only: no credentials, prompts or typed input.
+        doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+            serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
+                "backend_unretired": self.unlock_quarantined.is_some(),
+                "epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
+                "attempt": self.unlock_worker.as_ref().map(|worker| worker.attempt).or(self.unlock_quarantined).map(|attempt| serde_json::json!({
+                    "serial": attempt.serial, "epoch": attempt.epoch,
+                    "origin": attempt.origin.map(|origin| serde_json::json!({
+                        "connection": origin.connection, "request": origin.request }))
+                })) })
+        } else {
+            serde_json::Value::Null
+        };
         doc["pointer_fullscreen_blocked"] = serde_json::json!(
             (!self.is_locked()).then(|| self.manager.fullscreen_at(self.manager.pointer_pos()))
         );
-        // Whether a client drag-and-drop holds the pointer (the shell's
-        // grid drags), so proofs can wait for a drag's start and cancel.
+        // Live libinput device configuration (#343): beside the macro,
+        // which is already at its recursion limit.
+        // Keep this unlocked drag observation outside the large scene macro.
         doc["client_dnd_active"] =
             serde_json::Value::Bool(!self.is_locked() && self.state.client_dnd_active());
+        // Canonical view AND column spring state, outside the large scene macro.
+        doc["strip_animating"] = serde_json::Value::Bool(self.manager.strip_animating());
+        doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
         let doc = doc.to_string();
         if doc == self.state_last {
             return;
@@ -1873,9 +2356,9 @@ impl Runtime {
         let output = Rectangle::new((0, 0).into(), size);
         let model = self.manager.model();
         let layout = if self.overview_app_grid {
-            crate::overview::app_grid_layout
+            crate::overview::app_grid_layout_with_policy
         } else {
-            crate::overview::layout
+            crate::overview::layout_with_policy
         };
         layout(
             output,
@@ -1883,6 +2366,7 @@ impl Runtime {
             model.workspaces(),
             model.active_workspace(),
             &self.manager.overview_windows(),
+            model.fixed_workspace_count().is_none(),
         )
     }
 
@@ -1984,7 +2468,7 @@ impl Runtime {
         let dt = now.saturating_sub(self.strip_view_at).as_secs_f64();
         self.strip_view_at = now;
         self.manager
-            .step_strip_view(dt / self.input_settings.motion.slowdown());
+            .step_strip_view_with_pointer_dt(dt / self.input_settings.motion.slowdown(), dt);
     }
 
     /// Start and advance GNOME's size-change transitions (#496) before
@@ -2256,6 +2740,40 @@ impl Runtime {
         }
     }
 
+    fn start_screenshot_flash(&mut self, window: bool) -> Option<Duration> {
+        if self.is_locked() || !self.input_settings.motion.allows_fades() {
+            return None;
+        }
+        let area = if window {
+            self.manager
+                .model()
+                .focused()
+                .and_then(|id| self.manager.geometry(id))
+        } else {
+            self.state.primary_output_name().and_then(|name| {
+                self.state
+                    .outputs
+                    .iter()
+                    .find(|output| output.name == name)
+                    .map(|output| Rectangle::<i32, Logical>::new(output.loc.into(), output.size))
+            })
+        };
+        area.and_then(|area| {
+            self.start_flash_area([area.loc.x, area.loc.y, area.size.w, area.size.h])
+        })
+    }
+
+    fn start_flash_area(&mut self, area: [i32; 4]) -> Option<Duration> {
+        if self.is_locked() || !self.input_settings.motion.allows_fades() {
+            return None;
+        }
+        let now = self.animation_clock.now();
+        let duration =
+            Duration::from_secs_f64(self.input_settings.motion.adjust_ms(500.0) / 1000.0);
+        self.screenshot_flashes.trigger(area, now, duration);
+        now.checked_add(duration)
+    }
+
     /// Render the primary output's current scene offscreen and save it
     /// as a PNG (`requested` when absolute, else GNOME's default path).
     /// Never while locked: nothing behind the lock may leave the session.
@@ -2308,11 +2826,12 @@ impl Runtime {
         let model = self.manager.model();
         let active = model.active_workspace();
         let focused = model.focused();
+        let hidden = self.manager.hidden_by_minimize();
         let mut windows: Vec<(u64, Rectangle<i32, Logical>)> = self
             .manager
             .overview_windows()
             .into_iter()
-            .filter(|w| w.workspace == active && !self.manager.is_minimized(w.id))
+            .filter(|w| w.workspace == active && !hidden.contains(&w.id))
             .map(|w| (w.id, w.geometry))
             .collect();
         // GNOME sorts by stable sequence: creation order (Tuna Desktop ids rise).
@@ -2391,11 +2910,13 @@ impl Runtime {
             offset: (0, 0),
             scale,
         };
+        let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
+        let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
         // Surface-local origin such that the window geometry (inside any
         // client-side shadow) starts at the buffer's corner.
         let geo = crate::popup::window_geometry_loc(&surface);
@@ -2435,6 +2956,7 @@ impl Runtime {
                     damage: &[Rectangle::from_size(size)],
                     scale,
                     blank_alpha: 0.0,
+                    tint: color_effect.as_ref(),
                 },
                 &[],
                 &[],
@@ -2485,6 +3007,31 @@ impl Runtime {
         }
     }
 
+    /// Resolve only currently rendered target windows. A destroyed/hidden
+    /// explicit target does not redirect a frame flash to another window.
+    fn bell_frame(&mut self) -> Option<BellFrame> {
+        let now = Instant::now();
+        self.state.protocols.bell.tick(now);
+        if self.is_locked() {
+            self.state.protocols.bell.clear_visual();
+            return None;
+        }
+        let (alpha, surface) = self.state.protocols.bell.visual(now)?;
+        let target = if let Some(surface) = surface {
+            Some(
+                self.manager
+                    .render_entries()
+                    .into_iter()
+                    .find_map(|(id, _, geo)| {
+                        (self.manager.surface_of(id).as_ref() == Some(surface)).then_some((id, geo))
+                    })?,
+            )
+        } else {
+            None
+        };
+        Some((alpha, target))
+    }
+
     /// The desktop clear: GNOME's `primary-color` once the shell has
     /// published it, else a dark neutral.
     fn desktop_color(&self) -> Color32F {
@@ -2503,6 +3050,8 @@ impl Runtime {
         fourcc: smithay::backend::allocator::Fourcc,
     ) -> Option<(i32, i32, Vec<u8>)> {
         use smithay::backend::renderer::{ExportMem, Offscreen};
+        #[cfg(not(feature = "drm"))]
+        let _ = connector;
         if self.is_locked() {
             return None;
         }
@@ -2526,6 +3075,8 @@ impl Runtime {
             self.desktop_color()
         };
         let desktop = self.background_desktop();
+        let bell = self.bell_frame();
+        let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
         let (renderer, size, view) = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = backend.window_size();
@@ -2551,6 +3102,7 @@ impl Runtime {
                 (renderer, out.size, view)
             }
         };
+        let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
         let buffer_size = (size.w, size.h).into();
         let mut texture: smithay::backend::renderer::gles::GlesTexture =
             renderer.create_buffer(fourcc, buffer_size).ok()?;
@@ -2572,7 +3124,7 @@ impl Runtime {
         if overview.is_none() {
             elements
                 .tile
-                .extend(focus_ring_elements(&self.manager, view));
+                .extend(focus_ring_elements(&self.manager, view, None));
         }
         elements.top = previews_to_elements(
             renderer,
@@ -2586,6 +3138,7 @@ impl Runtime {
             view,
             self.manager.pointer_pos(),
         ));
+        install_bell(&mut elements, view, bell, desktop);
         let decor = decor_for_output(&decor_global, view);
         let previews = preview_elements(renderer, &self.manager, view, cards);
         let paper = backdrop(
@@ -2610,6 +3163,9 @@ impl Runtime {
                     damage: &[damage],
                     scale: view.scale,
                     blank_alpha,
+                    // Captures stay untinted, like GNOME's (gamma
+                    // applies past the framebuffer).
+                    tint: color_effect.as_ref(),
                 },
                 &decor,
                 &previews,
@@ -2679,6 +3235,8 @@ impl Runtime {
             let frame = match &target {
                 CastTarget::Window(id) => self.render_window_pixels(*id, Some(size), xrgb),
                 CastTarget::Monitor(connector) => {
+                    #[cfg(not(feature = "drm"))]
+                    let _ = connector;
                     let output = match &self.backend {
                         Backend::Winit(_) => None,
                         #[cfg(feature = "drm")]
@@ -2912,6 +3470,14 @@ impl Runtime {
                 self.casts.retain(|cast| cast.session_id != session_id);
                 self.cast_grants.remove(&session_id);
             }
+            crate::mutter::ToLoop::SensorSample {
+                present,
+                orientation,
+            } => {
+                self.orientation.sensor_present = present;
+                self.orientation.sensor = orientation;
+                self.apply_orientation_policy();
+            }
             crate::mutter::ToLoop::ApplyMonitors {
                 configs,
                 persistent,
@@ -2992,10 +3558,26 @@ impl Runtime {
     /// Apply GNOME's input settings (#60): the seat's keymap and key
     /// repeat, libinput pointer devices (hardware), the hot corner.
     fn apply_input_settings(&mut self, settings: tuna_shell_control::InputSettings) {
+        self.wellbeing_effects.motion(settings.motion);
+        self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
-            .apply_keyboard_settings(&mut self.state, &settings);
+            .apply_workspace_policy(&mut self.state, settings.workspace_policy);
+        // Release delayed/synthetic input under the OLD map. An unrelated
+        // preference change must not reinstall the map or lose held state.
+        if aids::keymap_changed(&self.input_settings, &settings) {
+            self.reset_input_aid_ownership();
+            self.manager
+                .apply_keyboard_settings(&mut self.state, &settings);
+        } else {
+            self.manager.apply_keyboard_repeat(&settings);
+        }
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
+        self.configure_input_aids(&settings.keyboard_aids);
+        self.cursor
+            .set_theme(&settings.cursor_theme, settings.cursor_size);
+        self.cursor.set_locate_pointer(settings.locate_pointer);
+        self.cursor.locate.set_key(&settings.locate_pointer_key);
         // Introspect's AnimationsEnabled is GNOME's enable-animations
         // (St): reduced motion keeps it true, as in GNOME 51.
         self.introspect
@@ -3009,12 +3591,67 @@ impl Runtime {
         if let Backend::Drm(drm) = &mut self.backend {
             drm.apply_input_settings(&settings);
         }
+        // Orientation lock (#345): stop sensor rotation live (and tell
+        // the sensor thread to release its claim, as mutter does).
+        if self.orientation.lock != settings.orientation_lock {
+            self.orientation.lock = settings.orientation_lock;
+            self.orientation_share
+                .set_inhibited(settings.orientation_lock);
+            self.apply_orientation_policy();
+        }
         self.input_settings = settings;
     }
 
+    /// Recompute sensor management and rotate unlocked built-in panels
+    /// to the accelerometer reading (live only: manual transforms in
+    /// monitors.xml are never rewritten). Called on every sensor
+    /// sample and every orientation-lock change.
+    fn apply_orientation_policy(&mut self) {
+        let entries = self.state.output_entries();
+        let has_builtin = entries
+            .iter()
+            .any(|(name, _, _, _)| crate::orientation::is_builtin_panel(name));
+        self.orientation_share
+            .set_managed(self.orientation.managed(has_builtin));
+        #[cfg(feature = "drm")]
+        {
+            let wants: Vec<(String, u32)> = entries
+                .iter()
+                .filter(|(name, _, _, _)| crate::orientation::is_builtin_panel(name))
+                .map(|(name, _, _, _)| {
+                    let manual = self.manual_transforms.get(name).copied().unwrap_or(0);
+                    (name.clone(), self.orientation.effective(name, manual))
+                })
+                .collect();
+            if let Backend::Drm(drm) = &mut self.backend {
+                for (name, want) in wants {
+                    let Some(out) = drm.outputs.iter_mut().find(|o| o.name == name) else {
+                        continue;
+                    };
+                    if out.transform == want {
+                        continue;
+                    }
+                    out.transform = want;
+                    out.output.change_current_state(
+                        None,
+                        Some(crate::orientation::smithay_transform(want)),
+                        None,
+                        None,
+                    );
+                    let (lw, lh) = out.logical_size();
+                    self.state
+                        .add_output(&name, Some(out.output.clone()), lw, lh);
+                    eprintln!("tuna-compositor: orientation: {name} rotated to transform {want}");
+                }
+            }
+        }
+    }
+
     /// Apply a display arrangement live (GNOME Settings' Displays
-    /// panel): each named output's scale and logical position. Layout,
-    /// rendering and the per-window client scale follow on the next frame.
+    /// panel): each named output's scale, logical position and rotation.
+    /// Layout, rendering and the per-window client scale follow on the
+    /// next frame. The sensor may immediately override a built-in
+    /// panel's rotation while orientation lock is off (#345).
     fn apply_monitors(&mut self, configs: &[crate::monitors::MonitorConfig]) {
         let scale_of = |s: f64| {
             if s == 1.0 {
@@ -3023,6 +3660,10 @@ impl Runtime {
                 Scale::Fractional(s)
             }
         };
+        for config in configs {
+            self.manual_transforms
+                .insert(config.connector.clone(), config.transform);
+        }
         match &mut self.backend {
             Backend::Winit(backend) => {
                 // One nested output: take the first arrangement entry.
@@ -3032,6 +3673,12 @@ impl Runtime {
                 self.scale = clamp_scale(config.scale);
                 if let Some(output) = self.state.primary_output() {
                     output.change_current_state(None, None, Some(scale_of(self.scale)), None);
+                }
+                if config.transform != 0 {
+                    eprintln!(
+                        "tuna-compositor: nested output cannot rotate; ignoring transform {}",
+                        config.transform
+                    );
                 }
                 let size = backend.window_size();
                 let (lw, lh) = logical_size(size.w, size.h, self.scale);
@@ -3046,16 +3693,22 @@ impl Runtime {
                     };
                     out.scale = clamp_scale(config.scale);
                     out.loc = (config.x, config.y);
+                    // The sensor wins on unlocked built-in panels; the
+                    // configured transform stays in manual_transforms.
+                    let transform = self.orientation.effective(&out.name, config.transform);
+                    out.transform = transform;
                     out.output.change_current_state(
                         None,
-                        None,
+                        Some(crate::orientation::smithay_transform(transform)),
                         Some(scale_of(out.scale)),
                         Some(out.loc.into()),
                     );
                     let (lw, lh) = out.logical_size();
-                    self.state
-                        .add_output(&out.name, Some(out.output.clone()), lw, lh);
-                    self.state.set_output_location(&out.name, out.loc);
+                    let output = out.output.clone();
+                    let name = out.name.clone();
+                    let loc = out.loc;
+                    self.state.add_output(&name, Some(output), lw, lh);
+                    self.state.set_output_location(&name, loc);
                 }
             }
         }
@@ -3120,6 +3773,9 @@ impl Runtime {
                     y: loc.1,
                     scale: output.current_scale().fractional_scale(),
                     primary,
+                    transform: crate::orientation::transform_from_smithay(
+                        output.current_transform(),
+                    ),
                 })
             })
             .collect();
@@ -3180,14 +3836,32 @@ impl Runtime {
             return FRAME_BUDGET;
         }
         let now = Instant::now();
+        let clock = self.animation_clock.now();
         if now.saturating_duration_since(self.active_at) < ACTIVITY_LINGER
             || self.overview_motion.animating()
             || self.manager.workspace_slide().running()
             || self.manager.strip_animating()
             || self.manager.size_changes().in_flight()
+            || self.manager.window_lifecycle().running()
+            || self.manager.modal_dim().running()
+            || self.cursor.animating(clock)
+            || self.wellbeing_effects.animating(clock)
+            || self.screenshot_flashes.running()
+            || !self.screenshot_replies.is_empty()
+            || self.tile_animation.as_ref().is_some_and(|(_, _, start)| {
+                clock.saturating_sub(*start).as_secs_f64()
+                    < 0.2 * self.input_settings.motion.slowdown()
+            })
+            || self.state.protocols.bell.visual(now).is_some()
             || self.shell_swipe.is_some()
             || self.overlay.visible
             || !self.casts.is_empty()
+            // A running PAM worker publishes its terminal phase before
+            // its wake; anything else is collected on the frame pace.
+            || self
+                .unlock_worker
+                .as_ref()
+                .is_some_and(|worker| worker.phase.load(std::sync::atomic::Ordering::Acquire) != 1)
         {
             return FRAME_BUDGET;
         }
@@ -3213,11 +3887,35 @@ impl Runtime {
                 }
             }
         }
-        for deadline in [self.idle_monitor.next_deadline(), self.orca.next_deadline()]
-            .into_iter()
-            .flatten()
+        for deadline in [
+            self.idle_monitor.next_deadline(),
+            self.orca.next_deadline(),
+            self.manager.workspace_lease_deadline(),
+            self.wallpaper.maintenance_deadline(),
+            // Night Light (#339): exact preview expiry (or its past-due
+            // restoring obligation) and the bounded settings re-read.
+            self.night_light.next_deadline(),
+            self.state.protocols.bell.player_deadline(),
+        ]
+        .into_iter()
+        .flatten()
         {
             due(deadline.saturating_duration_since(now));
+        }
+        #[cfg(feature = "xwayland")]
+        {
+            let system_now = crate::state::system_millis();
+            if !self.x11_failed {
+                if let Some(ms) = self.xwayland.next_delay_ms(system_now) {
+                    due(Duration::from_millis(ms));
+                }
+            }
+            if self.state.xwm.is_some() {
+                due(self
+                    .x11_icon_reader
+                    .next_deadline()
+                    .saturating_duration_since(now));
+            }
         }
         if let Some(ms) = self
             .ime
@@ -3258,6 +3956,7 @@ impl Runtime {
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        self.poll_input_aids();
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
         // connect and accidentally activate XWayland before a real client.
@@ -3295,7 +3994,16 @@ impl Runtime {
             })
             .map(|output| output.name.clone());
         self.control.set_pointer_output(output);
+        self.control.set_auth_owner(
+            self.shell
+                .child_pid()
+                .zip(self.shell.child_generation())
+                .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
+        );
         let outcome = self.control.poll(self.manager.model_mut());
+        for workspace in outcome.departed_workspaces.iter().copied() {
+            self.manager.keep_departed_workspace_alive(workspace);
+        }
         for id in outcome.activated {
             self.manager.focus(&mut self.state, Some(id));
         }
@@ -3317,8 +4025,29 @@ impl Runtime {
         if let Some(active) = outcome.overview_app_grid {
             self.overview_app_grid = active;
         }
+        if let Some(geometries) = outcome.icon_geometries {
+            self.manager.set_icon_geometries(
+                geometries
+                    .into_iter()
+                    .map(|g| {
+                        (
+                            g.window,
+                            Rectangle::new((g.x, g.y).into(), (g.width, g.height).into()),
+                        )
+                    })
+                    .collect(),
+            );
+        }
         if let Some(settings) = outcome.input_settings {
             self.apply_input_settings(settings);
+        }
+        if let Some((grayscale, fade)) = outcome.wellbeing_effects {
+            self.wellbeing_effects.set(
+                grayscale,
+                fade,
+                self.animation_clock.now(),
+                self.input_settings.motion,
+            );
         }
         if let Some((x, y)) = outcome.screenshot_pointer {
             self.move_screenshot_pointer(x, y);
@@ -3340,6 +4069,7 @@ impl Runtime {
         }
         if let Some(list) = outcome.accelerators {
             self.manager.set_accelerators(list);
+            self.manager.trace_media_accelerators(self.is_locked());
         }
         for (window, action) in outcome.window_actions {
             self.manager.window_action(&mut self.state, window, action);
@@ -3351,7 +4081,7 @@ impl Runtime {
             self.manager.set_switcher_keys(keys);
         }
         for backward in outcome.input_source_switches {
-            self.manager.switch_input_source(&mut self.state, backward);
+            self.switch_input_source_with_aid_reset(backward);
         }
         // Header-bar right clicks: GNOME's window menu, drawn by the shell.
         for (window, x, y) in self.manager.take_menu_requests() {
@@ -3364,7 +4094,7 @@ impl Runtime {
                     above: self.manager.is_above(window),
                     sticky: self.manager.is_sticky(window),
                     workspace_left: self.manager.workspace_left_of(window),
-                    workspace_right: true,
+                    workspace_right: self.manager.workspace_right_of(window),
                 });
         }
         if !self.control.overview_open() {
@@ -3379,9 +4109,7 @@ impl Runtime {
         // flag flipped without the idle machine, so mirror it locally,
         // dismiss the overview, and raise the exclusive surface.
         if self.control.is_locked() && !self.lock.is_locked() {
-            self.lock.lock();
-            self.control.set_overview(false);
-            self.overlay.show(Vec::new());
+            self.engage_lock();
         }
         // ext-session-lock-v1: only the supervised shell may lock, and
         // locking through the protocol engages the compositor's own
@@ -3408,24 +4136,31 @@ impl Runtime {
         }
         // A lock-screen password: verified off the loop (PAM may stall
         // for seconds on a failure), one attempt at a time.
-        if let Some((request, password)) = outcome.unlock {
-            if self.unlock_inflight || !self.is_locked() {
-                let unlocked = !self.is_locked();
-                self.control.finish_unlock(request, unlocked);
-            } else {
-                self.unlock_inflight = true;
-                if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
-                    eprintln!("tuna-compositor: lock authentication started");
-                }
-                let reply = self.unlock_results.clone();
-                let generation = self
-                    .unlock_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
-                std::thread::spawn(move || {
-                    let ok = crate::unlock::session_user()
-                        .is_some_and(|user| crate::unlock::verify(&user, &password.0));
-                    let _ = reply.send((request, generation, ok));
+        if let Some((origin, password)) = outcome.unlock {
+            let password = crate::pam_backend::Credential::from_schema(password);
+            let epoch = self
+                .unlock_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let attempt = self
+                .is_locked()
+                .then(|| self.unlock_slot.begin(Some(origin), epoch))
+                .flatten();
+            if let Some(attempt) = attempt {
+                let cancel = crate::pam_cancel::Cancellation::default();
+                let backend_cancel = cancel.clone();
+                self.start_unlock_worker(attempt, cancel, false, move |pending| {
+                    match crate::unlock::session_user() {
+                        Some(user) => crate::unlock::verify_owned_credential(
+                            &user,
+                            password,
+                            backend_cancel,
+                            pending,
+                        ),
+                        None => crate::pam_backend::Verification::RejectedBeforeSpawn,
+                    }
                 });
+            } else {
+                self.control.finish_unlock(origin, false);
             }
         }
         self.idle_monitor.tick();
@@ -3435,9 +4170,10 @@ impl Runtime {
         // inhibited stretch, so the idle clock restarts when it ends
         // instead of the session locking at once (#503).
         let inhibited = self.state.idle_inhibited();
-        if inhibited || self.idle_inhibited {
-            let now = self.lock_now_ms();
-            self.lock.note_input(now);
+        if self
+            .lock
+            .inhibitor_activity(self.idle_inhibited, inhibited, self.lock_now_ms())
+        {
             self.idle_since = Instant::now();
         }
         self.idle_inhibited = inhibited;
@@ -3490,10 +4226,27 @@ impl Runtime {
         // between restarts nobody may.
         self.capture_authority
             .publish(self.is_locked(), self.shell.child_pid());
+        self.control.set_auth_owner(
+            self.shell
+                .child_pid()
+                .zip(self.shell.child_generation())
+                .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
+        );
         self.control.set_peer_gate(match self.shell.child_pid() {
             Some(pid) => PeerGate::Pid(pid),
             None => PeerGate::Closed,
         });
+        // Control EOF, manual/protocol/idle gates and shell PID gating are now current.
+        // Never grant from a channel callback before those changes are observed.
+        self.cancel_invalid_unlock();
+        let completed = self
+            .unlock_worker
+            .as_ref()
+            .and_then(|worker| worker.worker.is_finished().then_some(worker.attempt));
+        if let Some(attempt) = completed {
+            self.finish_unlock(attempt);
+        }
+
         for event in self.shell.drain_events() {
             eprintln!("tuna-compositor: shell supervision: {event:?}");
         }
@@ -3555,10 +4308,40 @@ impl Runtime {
         self.stats.shell_restarts = self.shell.restarts_used();
         self.proof_swipe_input();
         self.animation_clock.poll();
+        // GNOME completes a flashing screenshot reply when its feedback ends.
+        // Locking or disabling animations also ends pending feedback promptly.
+        let now = self.animation_clock.now();
+        let ended = self.is_locked() || !self.input_settings.motion.allows_fades();
+        let mut index = 0;
+        while index < self.screenshot_replies.len() {
+            if ended || now >= self.screenshot_replies[index].deadline {
+                let pending = self.screenshot_replies.swap_remove(index);
+                let _ = pending.reply.send(pending.saved);
+            } else {
+                index += 1;
+            }
+        }
+        self.manager.reconcile_dynamic_workspaces(
+            self.overview_drag.is_some(),
+            now,
+            self.state.primary_size().w,
+            self.input_settings.motion,
+        );
         self.publish_state();
         self.publish_cast_outputs();
         self.publish_overview_previews();
+        let strip_was_animating = self.manager.strip_animating();
         self.render()?;
+        // Rendering advances the strip's springs. Publish the terminal frame
+        // before the motion scheduler goes idle; the pre-render snapshot can
+        // otherwise retain the previous frame's residual indefinitely. With
+        // motion disabled, publish the instant frame's actual render count too.
+        let strip_lands_immediately = self.manager.session_mode()
+            == crate::windows::SessionMode::Scroll
+            && !self.input_settings.motion.allows_motion();
+        if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
+            self.publish_state();
+        }
         self.screencast_tick();
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
@@ -3608,6 +4391,19 @@ impl Runtime {
         }
     }
 
+    /// Consume the bounded settings cache and evaluate the schedule for
+    /// this frame (#339). Native reads stay on the owned GIO worker.
+    /// Every wall-clock outcome still consumes monotonic preview expiry.
+    fn night_light_tick(&mut self) -> Option<crate::night_light::ColorGains> {
+        if self.night_light.poll_settings(Instant::now()) {
+            self.manager
+                .model_mut()
+                .set_night_light(self.night_light.config().clone());
+        }
+        self.night_light
+            .tick_at_system_time(SystemTime::now(), Instant::now())
+    }
+
     /// Render all mapped toplevels stacked at the origin, then send frame
     /// callbacks. While the recovery overlay is visible the background
     /// shifts to a deep red (provisional overlay visual; full overlay
@@ -3622,6 +4418,7 @@ impl Runtime {
             self.performance_trace.cancel();
         }
         let blank_alpha = self.blank_alpha();
+        let night_gains = self.night_light_tick();
         let show_content = content_visible(locked);
         let overlay_visible = self.overlay.visible;
         let background = if locked {
@@ -3641,17 +4438,29 @@ impl Runtime {
         self.step_workspace_slide();
         self.step_size_changes();
         let now = self.animation_clock.now();
+        if locked || !self.input_settings.motion.allows_fades() {
+            self.screenshot_flashes.clear();
+        }
+        self.screenshot_flashes.expire(now);
+        let flashes = self.screenshot_flashes.samples(now);
         let allowed = crate::window_lifecycle::effects_allowed(
             self.control.overview_open(),
             self.shell_swipe.is_some(),
             self.manager.workspace_slide().running(),
             locked,
         );
+        let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
+        self.manager.step_modal_dim(
+            now,
+            self.input_settings.motion,
+            allowed,
+            self.input_settings.attach_modal_dialogs,
+        );
         crate::window_lifecycle::step_frame(
             &mut self.manager,
             renderer,
@@ -3659,7 +4468,12 @@ impl Runtime {
             now,
             self.input_settings.motion,
             allowed,
+            self.input_settings.right_to_left,
         );
+        // The tint program is compiled once per renderer and cached;
+        // a compile failure draws this frame untinted.
+        let night_tint =
+            crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, night_gains);
         let overview = (show_content && !overlay_visible && drawn).then(|| self.overview_layout());
         // While search shows results, the workspace view steps aside.
         let cards = overview
@@ -3683,12 +4497,36 @@ impl Runtime {
         #[cfg(feature = "drm")]
         let overview_requested = self.control.overview_open();
         #[cfg(feature = "drm")]
-        let timing_roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
+        let timing_roots = {
+            let mut roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
+            // Cursor refresh obligations are output-local: only visible cursor
+            // geometry below joins that output's drawn/timing roots.
+            if let smithay::input::pointer::CursorImageStatus::Surface(surface) =
+                &self.state.cursor_image
+            {
+                roots.retain(|root| root != surface);
+            }
+            roots
+        };
         let desktop = self.background_desktop();
+        let bell = self.bell_frame();
         // Window clones (overview, switcher) and casts show windows the
         // scene hides: their frame callbacks keep full rate then.
         let clones_shown =
             overview.is_some() || !self.switcher_thumbnails.is_empty() || !self.casts.is_empty();
+        // The pointer is the compositor's to draw (#342): hidden while
+        // locked or blanked, as the software pointer always was.
+        let cursor_shown = !locked && blank_alpha < 1.0;
+        let cursor_what = if cursor_shown {
+            crate::cursor::Pointer::resolve(
+                &self.state.cursor_image,
+                self.manager.grab_cursor(),
+                self.state.pointer_focused(),
+            )
+        } else {
+            crate::cursor::Pointer::Hidden
+        };
+        let cursor_now = self.animation_clock.now();
         // Hidden windows' frame callbacks wait for the hidden beat; by
         // themselves they never make an unchanged output repaint.
         #[cfg(feature = "drm")]
@@ -3698,10 +4536,11 @@ impl Runtime {
         );
         let queued = match &mut self.backend {
             Backend::Winit(backend) => {
-                backend.window().set_cursor_visible(blank_alpha < 1.0);
+                backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
                 let drawn;
+                let presented_cursor;
                 {
                     let (renderer, mut framebuffer) = backend
                         .bind()
@@ -3732,7 +4571,7 @@ impl Runtime {
                     if overview.is_none() && show_content {
                         elements
                             .tile
-                            .extend(focus_ring_elements(&self.manager, view));
+                            .extend(focus_ring_elements(&self.manager, view, None));
                     }
                     elements.top = previews_to_elements(
                         renderer,
@@ -3746,6 +4585,8 @@ impl Runtime {
                         view,
                         self.manager.pointer_pos(),
                     ));
+                    elements.flashes = screenshot_flash_elements(&flashes, view);
+                    install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
                     let paper = backdrop(
@@ -3756,6 +4597,21 @@ impl Runtime {
                         show_paper,
                         cards,
                         locked,
+                    );
+                    let cursor = self.cursor.elements(
+                        renderer,
+                        &cursor_what,
+                        self.manager.pointer_pos(),
+                        Rectangle::from_size(size.to_f64().to_logical(view.scale).to_i32_round()),
+                        view.scale,
+                        cursor_now,
+                        accent,
+                    );
+                    presented_cursor = crate::cursor::presented_surface(
+                        &cursor,
+                        &cursor_what,
+                        view.scale,
+                        Rectangle::from_size(size),
                     );
                     // The winit EGL surface presents bottom-up (see the
                     // Y-flip in the backend's own damage path), so the
@@ -3773,11 +4629,14 @@ impl Runtime {
                             damage: &[damage],
                             scale: view.scale,
                             blank_alpha,
+                            tint: night_tint.as_ref(),
                         },
                         &decor,
                         &previews,
                     )?;
                     drawn = FrameCost::new(&drew, &elements.owners, &[damage], size);
+                    crate::cursor::draw(&mut frame, &cursor, view.scale, &[damage])
+                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     let _ = frame
                         .finish()
                         .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
@@ -3787,13 +4646,20 @@ impl Runtime {
                 backend
                     .submit(Some(&[damage]))
                     .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                if let Some(surface) = &presented_cursor {
+                    crate::cursor::Cursor::frame_done(
+                        &crate::cursor::Pointer::Surface(surface.clone()),
+                        cursor_now,
+                    );
+                }
                 // The host took the frame: presentation feedback,
                 // fifo barriers and commit timers (#89).
-                crate::frame_timing::present_nested_frame(
+                crate::frame_timing::present_nested_frame_with_cursor(
                     &mut self.state,
                     &self.manager,
                     locked,
                     self.stats.frames,
+                    presented_cursor,
                 );
                 self.stats.frames += 1;
                 true
@@ -3820,6 +4686,7 @@ impl Runtime {
                     rects.iter().position(|r| r.contains(*at)).unwrap_or(0)
                 };
                 let mut queued = false;
+                let mut cursor_presented = false;
                 for (index, out) in outputs.iter_mut().enumerate() {
                     // Display-paced: one frame in flight per output.
                     if out.pending {
@@ -3852,7 +4719,7 @@ impl Runtime {
                     if overview.is_none() && show_content {
                         elements
                             .tile
-                            .extend(focus_ring_elements(&self.manager, view));
+                            .extend(focus_ring_elements(&self.manager, view, None));
                     }
                     elements.top = previews_to_elements(
                         renderer,
@@ -3866,18 +4733,38 @@ impl Runtime {
                         view,
                         self.manager.pointer_pos(),
                     ));
+                    elements.flashes = screenshot_flash_elements(&flashes, view);
+                    install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
+                    // Rotation (#345): the tracker holds the output
+                    // transform while Smithay renders inverted (see
+                    // `orientation::render_transform`); layout, damage
+                    // and the wallpaper all work in the pre-transform
+                    // frame, whose physical size swaps at 90°/270°.
+                    let output_transform = crate::orientation::smithay_transform(out.transform);
+                    let logical = output_transform.transform_size(size);
                     let paper = backdrop(
                         &mut self.wallpaper,
                         renderer,
-                        background_geometry(size, view, desktop),
+                        background_geometry(logical, view, desktop),
                         view,
                         show_paper,
                         cards,
                         locked,
                     );
+                    let cursor = self.cursor.elements(
+                        renderer,
+                        &cursor_what,
+                        pointer,
+                        Rectangle::new(out.loc.into(), out.logical_size().into()),
+                        out.scale,
+                        cursor_now,
+                        accent,
+                    );
                     use crate::native_repaint::{FrameSignature, Tracked};
+                    let [cursor_images, cursor_surface] =
+                        crate::cursor::tracked(&cursor, view.scale, Rectangle::from_size(logical));
                     // Bottom to top, each pass at the scale it draws with.
                     let passes = [
                         Tracked::pass(&paper, 1.0),
@@ -3886,30 +4773,57 @@ impl Runtime {
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
-                            .snapshots
+                            .bell
                             .iter()
                             .rev()
                             .map(|(_, e)| Tracked::new(e, 1.0))
                             .collect(),
+                        elements
+                            .snapshots
+                            .iter()
+                            .rev()
+                            .map(|(_, e, _)| Tracked::new(e, 1.0))
+                            .collect(),
+                        Tracked::pass(&elements.flashes, 1.0),
+                        cursor_images,
+                        cursor_surface,
                     ];
                     let signature = FrameSignature {
                         size: (size.w, size.h),
                         location: out.loc,
                         scale: out.scale,
+                        transform: out.transform,
                         locked,
                         background,
                         blank_alpha,
                         accent,
-                        pointer: (!locked && blank_alpha < 1.0).then_some((pointer.x, pointer.y)),
                         decor: decor.clone(),
                         above: elements.above,
+                        effects: elements
+                            .brightness
+                            .iter()
+                            .copied()
+                            .chain(elements.snapshots.iter().map(|s| s.2))
+                            .map(f32::to_bits)
+                            // Night Light gains: a temperature step
+                            // repaints, an unchanged filter sleeps.
+                            .chain(self.night_light.effect_bits())
+                            .chain(wellbeing.bits())
+                            .collect(),
                         groups: FrameSignature::groups(&passes),
                     };
+                    let presented_cursor = crate::cursor::presented_surface(
+                        &cursor,
+                        &cursor_what,
+                        view.scale,
+                        Rectangle::from_size(logical),
+                    );
                     let mine: Vec<_> = drawn
                         .iter()
                         .filter(|(_, at)| owner(at) == index)
                         .map(|(surface, _)| surface.clone())
                         .chain(lock_surface.clone())
+                        .chain(presented_cursor.clone())
                         .collect();
                     let timing_work =
                         crate::frame_timing::pending_output_work(&timing_roots, &mine, &throttled);
@@ -3936,11 +4850,14 @@ impl Runtime {
                     if reset {
                         out.damage_tracker = None;
                     }
+                    // A transform change resets the tracker through the
+                    // signature above; the tracker holds the output
+                    // transform while the frame renders inverted.
                     let tracker = out.damage_tracker.get_or_insert_with(|| {
                         smithay::backend::renderer::damage::OutputDamageTracker::new(
                             size,
                             1.0,
-                            Transform::Normal,
+                            output_transform,
                         )
                     });
                     let damage = crate::native_repaint::damage_region(
@@ -3955,7 +4872,11 @@ impl Runtime {
                             .bind(&mut dmabuf)
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let mut frame = renderer
-                            .render(&mut target, size, Transform::Normal)
+                            .render(
+                                &mut target,
+                                size,
+                                crate::orientation::render_transform(out.transform),
+                            )
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let drew = draw_scene(
                             &mut frame,
@@ -3966,36 +4887,16 @@ impl Runtime {
                                 damage: &damage,
                                 scale: view.scale,
                                 blank_alpha,
+                                tint: night_tint.as_ref(),
                             },
                             &decor,
                             &previews,
                         )?;
                         cost = FrameCost::new(&drew, &elements.owners, &damage, size);
-                        // Software pointer on top (no host cursor on
-                        // bare hardware); hidden while locked.
-                        if !locked && blank_alpha < 1.0 {
-                            let (outline, fill) =
-                                crate::drm::cursor_rects(pointer, out.loc, out.scale);
-                            let clip = |rects: Vec<Rectangle<i32, smithay::utils::Physical>>| {
-                                rects
-                                    .into_iter()
-                                    .flat_map(|r| {
-                                        damage.iter().filter_map(move |d| r.intersection(*d))
-                                    })
-                                    .collect::<Vec<_>>()
-                            };
-                            let (outline, fill) = (clip(outline), clip(fill));
-                            if !outline.is_empty() {
-                                frame
-                                    .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &outline)
-                                    .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                            }
-                            if !fill.is_empty() {
-                                frame
-                                    .clear(Color32F::new(1.0, 1.0, 1.0, 1.0), &fill)
-                                    .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                            }
-                        }
+                        // The pointer on top (no host cursor on bare
+                        // hardware); hidden while locked (#342).
+                        crate::cursor::draw(&mut frame, &cursor, view.scale, &damage)
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         frame
                             .finish()
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?
@@ -4003,7 +4904,11 @@ impl Runtime {
                     let feedback = crate::frame_timing::take_feedback(&mine, &out.output);
                     if let Err(e) = out.surface.queue_buffer(
                         Some(sync),
-                        Some(crate::native_repaint::scanout_damage(&damage)),
+                        Some(crate::native_repaint::scanout_damage_rotated(
+                            &damage,
+                            output_transform,
+                            (logical.w, logical.h),
+                        )),
                         feedback,
                     ) {
                         eprintln!("tuna-compositor: drm: queue_buffer {}: {e}", out.name);
@@ -4027,12 +4932,18 @@ impl Runtime {
                             },
                         );
                     }
+                    cursor_presented |= presented_cursor.is_some();
                     out.last_frame = Some(signature);
                     self.frame_costs.insert(out.name.clone(), cost);
                     queued = true;
                 }
                 send_surface_scales(&self.state, &self.manager);
                 if queued {
+                    // The cursor surface is not a window: its callback
+                    // follows the scanout that showed it.
+                    if cursor_presented {
+                        crate::cursor::Cursor::frame_done(&cursor_what, cursor_now);
+                    }
                     self.stats.frames += 1;
                     self.active_at = Instant::now();
                 }
@@ -4256,6 +5167,8 @@ fn switcher_previews(
         .collect()
 }
 
+use crate::wellbeing_effects::FrameColor;
+
 /// One output's surfaces, front to back, with GNOME's tile preview
 /// slotted in: `elements[..above]` draw over the preview (the dragged
 /// window, its popups and the shell's layers), the rest beneath it.
@@ -4265,9 +5178,17 @@ struct Scene {
     tile: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
     /// Window thumbnails over everything (the Alt+Tab switcher's).
     top: Vec<PreviewElement>,
+    /// Capture feedback is painted only on outputs, never into saved pixels.
+    flashes: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
+    bell: Vec<(
+        Option<usize>,
+        smithay::backend::renderer::element::solid::SolidColorRenderElement,
+    )>,
     /// Old-frame snapshots of size-change transitions (#496), each
     /// drawn in front of `elements[index..]`, in physical pixels.
-    snapshots: Vec<(usize, SnapshotElement)>,
+    snapshots: Vec<(usize, SnapshotElement, f32)>,
+    brightness: Vec<f32>,
+    dim_program: Option<smithay::backend::renderer::gles::GlesTexProgram>,
     /// The window each of `elements` belongs to (popups included), for
     /// reporting which windows occlusion hid; `None` for layers.
     owners: Vec<Option<u64>>,
@@ -4296,10 +5217,107 @@ impl Scene {
             above,
             tile: Vec::new(),
             top: Vec::new(),
+            flashes: Vec::new(),
+            bell: Vec::new(),
             snapshots: Vec::new(),
+            brightness: vec![1.0; above],
+            dim_program: None,
             owners: vec![None; above],
         }
     }
+}
+
+/// The flash uses premultiplied white, with changing commit metadata so native
+/// damage includes every fade frame and the frame that removes the feedback.
+fn screenshot_flash_elements(
+    flashes: &[([i32; 4], f32)],
+    view: View,
+) -> Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement> {
+    use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Id, Kind};
+    thread_local! {
+        static IDS: [Id; crate::screenshot_flash::MAX_FLASHES] = std::array::from_fn(|_| Id::new());
+    }
+    IDS.with(|ids| {
+        flashes
+            .iter()
+            .zip(ids.iter())
+            .map(|(sample, id)| {
+                let ([x, y, width, height], alpha) = *sample;
+                let start = view.physical(f64::from(x), f64::from(y));
+                let end = view.physical(
+                    f64::from(x) + f64::from(width),
+                    f64::from(y) + f64::from(height),
+                );
+                SolidColorRenderElement::new(
+                    id.clone(),
+                    Rectangle::new(
+                        start,
+                        ((end.x - start.x).max(1), (end.y - start.y).max(1)).into(),
+                    ),
+                    alpha.to_bits() as usize,
+                    Color32F::new(alpha, alpha, alpha, alpha),
+                    Kind::Unspecified,
+                )
+            })
+            .collect()
+    })
+}
+
+/// A frame bell sits above its own window and below every higher layer/window.
+fn insert_bell_slots(slots: &mut Vec<SceneSlot>, scene: &Scene) {
+    for (k, (at, _)) in scene.bell.iter().enumerate() {
+        let Some(at) = at else { continue };
+        insert_bell_slot(slots, *at, k);
+    }
+}
+
+fn insert_bell_slot(slots: &mut Vec<SceneSlot>, at: usize, k: usize) {
+    if let Some(index) = slots
+        .iter()
+        .position(|slot| *slot == SceneSlot::Element(at))
+    {
+        slots.insert(index, SceneSlot::Bell(k));
+    }
+}
+
+type BellFrame = (f32, Option<(u64, Rectangle<i32, Logical>)>);
+
+fn install_bell(scene: &mut Scene, view: View, bell: Option<BellFrame>, desktop: [i32; 4]) {
+    use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Id};
+    let Some((alpha, target)) = bell.filter(|(alpha, _)| *alpha > 0.0) else {
+        return;
+    };
+    let (at, rect) = match target {
+        Some((id, geo)) => {
+            let Some(at) = scene.owners.iter().position(|owner| *owner == Some(id)) else {
+                return;
+            };
+            (Some(at), geo)
+        }
+        None => (
+            None,
+            Rectangle::new(
+                (desktop[0], desktop[1]).into(),
+                (desktop[2], desktop[3]).into(),
+            ),
+        ),
+    };
+    let origin = view.physical(f64::from(rect.loc.x), f64::from(rect.loc.y));
+    let end = view.physical(
+        f64::from(rect.loc.x + rect.size.w),
+        f64::from(rect.loc.y + rect.size.h),
+    );
+    thread_local! { static BELL_ID: Id = Id::new(); }
+    scene.bell.push((
+        at,
+        SolidColorRenderElement::new(
+            BELL_ID.with(Clone::clone),
+            Rectangle::new(origin, (end.x - origin.x, end.y - origin.y).into()),
+            0usize,
+            Color32F::new(0.0, 0.0, 0.0, alpha),
+            Kind::Unspecified,
+        ),
+    ));
 }
 
 /// GNOME's tile preview (`.tile-preview`: the accent at half opacity
@@ -4356,6 +5374,7 @@ fn tile_elements(
 fn focus_ring_elements(
     manager: &WindowManager,
     view: View,
+    tint: Option<crate::night_light::ColorGains>,
 ) -> Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement> {
     use smithay::backend::renderer::element::solid::SolidColorRenderElement;
     use smithay::backend::renderer::element::Id;
@@ -4381,7 +5400,12 @@ fn focus_ring_elements(
     if w <= 2 * b || h <= 2 * b {
         return Vec::new();
     }
-    let color = Color32F::new(0x7f as f32 / 255.0, 0xc8 as f32 / 255.0, 1.0, 1.0);
+    let [fr, fg, fb] = tint
+        .map(|gains| {
+            crate::night_light::apply_gains([0x7f as f32 / 255.0, 0xc8 as f32 / 255.0, 1.0], gains)
+        })
+        .unwrap_or([0x7f as f32 / 255.0, 0xc8 as f32 / 255.0, 1.0]);
+    let color = Color32F::new(fr, fg, fb, 1.0);
     let at = |x: i32, y: i32, w: i32, h: i32| -> Rectangle<i32, smithay::utils::Physical> {
         Rectangle::new((r.loc.x + x, r.loc.y + y).into(), (w, h).into())
     };
@@ -4506,7 +5530,7 @@ fn scene_elements(
                 manager
                     .window_lifecycle()
                     .element(ghost, renderer, view)
-                    .map(|e| (elements.len(), e)),
+                    .map(|e| (elements.len(), e, 1.0)),
             );
         }
         // Unassociated X11 windows contribute no surface yet and
@@ -4514,6 +5538,25 @@ fn scene_elements(
         if let Some(surface) = window.wl_surface() {
             if split_from.is_none() && split.is_some_and(|s| *s == *surface) {
                 split_from = Some(elements.len());
+            }
+            let buffer_size =
+                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+            let buffer_geometry = Rectangle::new(
+                crate::popup::surface_origin(&surface, geometry.loc),
+                buffer_size,
+            );
+            if let Some((r, fade)) = manager
+                .window_lifecycle()
+                .minimizing_frame(id, buffer_geometry.to_f64())
+            {
+                let scale = (
+                    r.size.w / f64::from(buffer_size.w),
+                    r.size.h / f64::from(buffer_size.h),
+                );
+                let origin = view.physical(r.loc.x, r.loc.y);
+                elements.extend(render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(renderer, &surface, origin, view.scale, fade, Kind::Unspecified).into_iter().map(|e| smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e, origin, scale)));
+                owners.resize(elements.len(), Some(id));
+                continue;
             }
             if let Some((mut frame, snapshot)) = manager.size_changes().frame(id) {
                 // A workspace switch carries the transition along with its
@@ -4553,9 +5596,29 @@ fn scene_elements(
                     );
                 }
                 snapshots.extend(
-                    crate::size_change::snapshot_element(renderer, snapshot, &frame, view)
-                        .map(|element| (elements.len(), element)),
+                    crate::size_change::snapshot_element(renderer, snapshot, &frame, view).map(
+                        |element| (elements.len(), element, manager.modal_dim().multiplier(id)),
+                    ),
                 );
+                owners.resize(elements.len(), Some(id));
+                continue;
+            }
+            let buffer_size =
+                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+            let buffer_geometry = Rectangle::new(
+                crate::popup::surface_origin(&surface, geometry.loc),
+                buffer_size,
+            );
+            if let Some((r, fade)) = manager
+                .window_lifecycle()
+                .restoring_frame(id, buffer_geometry.to_f64())
+            {
+                let scale = (
+                    r.size.w / f64::from(buffer_size.w),
+                    r.size.h / f64::from(buffer_size.h),
+                );
+                let origin = view.physical(r.loc.x, r.loc.y);
+                elements.extend(render_elements_from_surface_tree::<_,WaylandSurfaceRenderElement<_>>(renderer,&surface,origin,view.scale,fade*manager.render_alpha(&window),Kind::Unspecified).into_iter().map(|e|smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e,origin,scale)));
                 owners.resize(elements.len(), Some(id));
                 continue;
             }
@@ -4608,7 +5671,7 @@ fn scene_elements(
             manager
                 .window_lifecycle()
                 .element(ghost, renderer, view)
-                .map(|e| (elements.len(), e)),
+                .map(|e| (elements.len(), e, 1.0)),
         );
     }
     // Layer shell above windows: panel strip, then overview, each with
@@ -4632,15 +5695,29 @@ fn scene_elements(
     let above = elements.len() - split_from.unwrap_or(0);
     let total = elements.len();
     owners.resize(total, None);
-    let snapshots = snapshots
+    let snapshots: Vec<(usize, SnapshotElement, f32)> = snapshots
         .into_iter()
-        .map(|(index, element)| (total - index, element))
+        .map(|(index, element, brightness)| (total - index, element, brightness))
         .collect();
+    let brightness: Vec<f32> = owners
+        .iter()
+        .map(|id| id.map_or(1.0, |id| manager.modal_dim().multiplier(id)))
+        .collect();
+    let dim_program = if brightness.iter().any(|v| *v < 1.0) || snapshots.iter().any(|s| s.2 < 1.0)
+    {
+        crate::modal_dim::program(renderer)
+    } else {
+        None
+    };
     Scene {
         elements: crate::layer::front_to_back(elements),
+        brightness: crate::layer::front_to_back(brightness),
+        dim_program,
         above,
         tile: Vec::new(),
         top: Vec::new(),
+        flashes: Vec::new(),
+        bell: Vec::new(),
         snapshots,
         owners: crate::layer::front_to_back(owners),
     }
@@ -4726,6 +5803,8 @@ struct Target<'a> {
     damage: &'a [Rectangle<i32, smithay::utils::Physical>],
     scale: f64,
     blank_alpha: f32,
+    /// Scene wellbeing effect and output temperature; captures use unity temperature.
+    tint: Option<&'a FrameColor>,
 }
 
 fn draw_scene(
@@ -4745,7 +5824,34 @@ fn draw_scene(
         damage,
         scale,
         blank_alpha,
+        tint,
     } = target;
+    let recolor = |color| tint.map_or(color, |tint| tint.color(color));
+    let background = recolor(background);
+    let recolor_solid =
+        |element: &smithay::backend::renderer::element::solid::SolidColorRenderElement| {
+            use smithay::backend::renderer::element::Element;
+            SolidColorRenderElement::new(
+                element.id().clone(),
+                element.geometry(1.0.into()),
+                element.current_commit(),
+                recolor(element.color()),
+                element.kind(),
+            )
+        };
+    // The usual neutral frame borrows its solids without an extra allocation.
+    let colored_tile = tint.map(|_| scene.tile.iter().map(recolor_solid).collect::<Vec<_>>());
+    let tile = colored_tile.as_deref().unwrap_or(&scene.tile);
+    let colored_flashes = tint.map(|_| scene.flashes.iter().map(recolor_solid).collect::<Vec<_>>());
+    let flashes = colored_flashes.as_deref().unwrap_or(&scene.flashes);
+    // Install the tint program around one texture group; a no-op
+    // without a tint, cleared right after like the modal-dim override.
+    let set_tint = |frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+                    brightness: f32| {
+        if let Some(tint) = tint {
+            frame.override_default_tex_program(tint.program.clone(), tint.uniforms(brightness));
+        }
+    };
     let error =
         |e: smithay::backend::renderer::gles::GlesError| RuntimeError::Dispatch(e.to_string());
     // Plan top to bottom (#503): each element repaints only damage that
@@ -4764,14 +5870,24 @@ fn draw_scene(
         )
     });
     let shield_plan = occlusion.plan(1.0, shield.as_slice());
+    let flash_plan = occlusion.plan(1.0, &scene.flashes);
+    let fullscreen_bell: Vec<_> = scene
+        .bell
+        .iter()
+        .filter(|(at, _)| at.is_none())
+        .map(|(_, e)| recolor_solid(e))
+        .collect();
+    let bell_plan = occlusion.plan(1.0, &fullscreen_bell);
     let top_plan = occlusion.plan(scale, &scene.top);
     // Beneath the tile preview, the preview (blended), then the
     // dragged window and the layers over it, each half with the
     // size-change snapshots among its elements (#496).
     let split = scene.above.min(scene.elements.len());
-    let snapshot_at: Vec<usize> = scene.snapshots.iter().map(|(index, _)| *index).collect();
-    let over = scene_slots(split, 0, false, &snapshot_at);
-    let under = scene_slots(scene.elements.len() - split, split, true, &snapshot_at);
+    let snapshot_at: Vec<usize> = scene.snapshots.iter().map(|(index, _, _)| *index).collect();
+    let mut over = scene_slots(split, 0, false, &snapshot_at);
+    let mut under = scene_slots(scene.elements.len() - split, split, true, &snapshot_at);
+    insert_bell_slots(&mut over, scene);
+    insert_bell_slots(&mut under, scene);
     let over_plan = plan_slots(&mut occlusion, scale, scene, &over);
     let tile_plan = occlusion.plan(1.0, &scene.tile);
     let under_plan = plan_slots(&mut occlusion, scale, scene, &under);
@@ -4787,19 +5903,27 @@ fn draw_scene(
     if !clear.is_empty() {
         frame.clear(background, &clear).map_err(error)?;
     }
+    set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, 1.0, paper, &paper_plan).map_err(error)?;
+    frame.clear_tex_program_override();
     for ((color, _), rects) in decor.iter().zip(decor_plan.iter().rev()) {
         if !rects.is_empty() {
-            frame.clear(*color, rects).map_err(error)?;
+            frame.clear(recolor(*color), rects).map_err(error)?;
         }
     }
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
+    set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &under, &under_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.tile, &tile_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan).map_err(error)?;
+    frame.clear_tex_program_override();
+    draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
+    draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
+    set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
+    frame.clear_tex_program_override();
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, visible) in over
@@ -4824,6 +5948,7 @@ fn draw_scene(
 enum SceneSlot {
     Element(usize),
     Snapshot(usize),
+    Bell(usize),
 }
 
 /// The scene's `[base..base + len]` elements front to back, with the
@@ -4868,6 +5993,9 @@ fn plan_slots(
             SceneSlot::Element(index) => occlusion
                 .plan(scale, std::slice::from_ref(&scene.elements[index]))
                 .remove(0),
+            SceneSlot::Bell(k) => occlusion
+                .plan(1.0, std::slice::from_ref(&scene.bell[k].1))
+                .remove(0),
             SceneSlot::Snapshot(k) => occlusion
                 .plan(1.0, std::slice::from_ref(&scene.snapshots[k].1))
                 .remove(0),
@@ -4881,24 +6009,66 @@ fn draw_slots(
     scene: &Scene,
     slots: &[SceneSlot],
     plan: &[Vec<Rectangle<i32, smithay::utils::Physical>>],
+    tint: Option<&FrameColor>,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
         let visible = std::slice::from_ref(visible);
-        match *slot {
+        let brightness = match *slot {
+            SceneSlot::Element(index) => scene.brightness[index],
+            SceneSlot::Snapshot(k) => scene.snapshots[k].2,
+            SceneSlot::Bell(_) => 1.0,
+        };
+        // A tinted frame draws every texture through the tint
+        // program (brightness folds into the same override);
+        // otherwise only dimmed elements take an override.
+        if let Some(tint) = tint {
+            frame.override_default_tex_program(tint.program.clone(), tint.uniforms(brightness));
+        } else if brightness < 1.0 {
+            if let Some(program) = &scene.dim_program {
+                frame.override_default_tex_program(
+                    program.clone(),
+                    vec![smithay::backend::renderer::gles::Uniform::new(
+                        "brightness",
+                        brightness,
+                    )],
+                );
+            }
+        }
+        let result = match *slot {
             SceneSlot::Element(index) => draw_planned::<GlesRenderer, _>(
                 frame,
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
-            )?,
+            ),
+            SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
+                frame,
+                1.0,
+                std::slice::from_ref(&{
+                    use smithay::backend::renderer::element::{
+                        solid::SolidColorRenderElement, Element,
+                    };
+                    let e = &scene.bell[k].1;
+                    SolidColorRenderElement::new(
+                        e.id().clone(),
+                        e.geometry(1.0.into()),
+                        e.current_commit(),
+                        tint.map_or(e.color(), |tint| tint.color(e.color())),
+                        e.kind(),
+                    )
+                }),
+                visible,
+            ),
             SceneSlot::Snapshot(k) => draw_planned::<GlesRenderer, _>(
                 frame,
                 1.0,
                 std::slice::from_ref(&scene.snapshots[k].1),
                 visible,
-            )?,
-        }
+            ),
+        };
+        frame.clear_tex_program_override();
+        result?;
     }
     Ok(())
 }
@@ -5086,6 +6256,57 @@ fn send_frame_callbacks(
 /// `WAYLAND_DISPLAY` is set, so setting it first would point winit at our
 /// own not-yet-existing socket.
 pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
+    run_loop(session, |_| None)
+}
+
+/// Narrow, trusted Rust-only CI driver. The normal binary supplies no probe.
+/// No credential challenge, UI/configuration or IPC entry point is added.
+pub struct AuthOwnerProbe<'a> {
+    runtime: &'a mut Runtime,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct AuthOwnerStatus {
+    pub locked: bool,
+    pub epoch: u64,
+    pub outer_pending: bool,
+}
+impl AuthOwnerProbe<'_> {
+    pub fn status(&self) -> AuthOwnerStatus {
+        AuthOwnerStatus {
+            locked: self.runtime.is_locked(),
+            epoch: self
+                .runtime
+                .unlock_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            outer_pending: self.runtime.unlock_worker.is_some(),
+        }
+    }
+    /// Controlled epoch injection, not an observation of logind or S3.
+    pub fn invalidate_epoch(&mut self) -> bool {
+        crate::auth_owner::advance_epoch(&self.runtime.unlock_generation)
+    }
+    pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
+        self.runtime.try_unlock(user, password)
+    }
+    pub fn request_exit(&mut self) {
+        self.runtime.exit = true;
+        self.runtime.wake.signal();
+    }
+}
+
+/// Runs the identical runtime, input, IPC and owned-worker loop on the caller's
+/// main thread. A deadline belongs solely to the trusted probe caller.
+pub fn run_auth_owner_probe(
+    session: &NestedSession,
+    probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
+) -> Result<RunStats, RuntimeError> {
+    run_loop(session, probe)
+}
+
+fn run_loop(
+    session: &NestedSession,
+    mut probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
+) -> Result<RunStats, RuntimeError> {
     let (mut runtime, mut event_loop) = Runtime::launch(session)?;
     let prev_env = apply_nested_env(&session.socket_name);
     #[cfg(feature = "drm")]
@@ -5096,19 +6317,9 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
     };
     #[cfg(feature = "drm")]
     let sleep_monitor = if matches!(runtime.backend, Backend::Drm(_)) {
-        // The logind thread pings the loop so lock-on-suspend and resume
+        // The logind thread wakes the loop so lock-on-suspend and resume
         // are handled at once, not at the next timed wake.
-        let started = calloop::ping::make_ping()
-            .map_err(|e| e.to_string())
-            .and_then(|(waker, wakeups)| {
-                event_loop
-                    .handle()
-                    .insert_source(wakeups, |_, _, _: &mut Runtime| {})
-                    .map_err(|e| e.to_string())?;
-                crate::sleep::Monitor::start(runtime.unlock_generation.clone(), waker)
-                    .map_err(|e| e.to_string())
-            });
-        match started {
+        match crate::sleep::Monitor::start(runtime.unlock_generation.clone()) {
             Ok(monitor) => Some(monitor),
             Err(error) => {
                 eprintln!("tuna-compositor: logind sleep monitor unavailable: {error}");
@@ -5118,6 +6329,10 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
     } else {
         None
     };
+    #[cfg(feature = "drm")]
+    if let Some(monitor) = &sleep_monitor {
+        monitor.set_wake(&runtime.wake);
+    }
     // Graceful shutdown on SIGTERM/SIGINT: ending the loop drops the
     // runtime, whose supervisor kills the shell child (ADR 0003 kill
     // on exit). Without this a signal would bypass `Drop` and orphan
@@ -5143,13 +6358,14 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
             Ok(calloop::PostAction::Continue)
         })
         .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+    let mut wait = Duration::ZERO;
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             restore_env(prev_env);
             return Ok(runtime.stats);
         }
         let dispatched = event_loop
-            .dispatch(Some(runtime.next_wake()), &mut runtime)
+            .dispatch(Some(wait), &mut runtime)
             .map_err(|e| RuntimeError::Loop(e.to_string()));
         #[cfg(feature = "drm")]
         if let Some(monitor) = &sleep_monitor {
@@ -5166,8 +6382,18 @@ pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
             }
         }
         let ticked = dispatched.and_then(|_| runtime.tick());
+        let probe_delay = probe(&mut AuthOwnerProbe {
+            runtime: &mut runtime,
+        });
         match ticked {
-            Ok(true) => continue,
+            Ok(true) => {
+                wait = runtime.next_wake();
+                if let Some(delay) = probe_delay {
+                    wait =
+                        wait.min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100)));
+                }
+                continue;
+            }
             done => {
                 restore_env(prev_env);
                 return done.map(|_| runtime.stats);
@@ -5190,5 +6416,107 @@ fn input_time(input: &ManagerInput) -> u64 {
         | ManagerInput::SwipeUpdate { time, .. }
         | ManagerInput::SwipeEnd { time, .. } => u64::from(time),
         ManagerInput::RelativeMotion { utime, .. } => utime / 1000,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn unlock_outcome_reports_only_what_the_worker_returned() {
+        // S3 cancellation: the cancelled verification is denied and failed.
+        assert_eq!(unlock_outcome(false, true), (false, false));
+        assert_eq!(unlock_outcome(false, false), (false, false));
+        // Superseded epoch: the worker succeeded, but a denied attempt never applies.
+        assert_eq!(unlock_outcome(true, true), (true, false));
+        assert_eq!(unlock_outcome(true, false), (true, true));
+    }
+
+    /// A preview record must ping an idle loop through the share's
+    /// connected wake (#339): real calloop, no sleeps — dispatch
+    /// returns on the ping itself.
+    #[test]
+    fn night_light_preview_record_wakes_idle_loop() {
+        let (wake, source) = crate::wake::Wake::new().unwrap();
+        let share = std::sync::Arc::new(crate::night_light::NightLightShare::default());
+        share.set_wake(&wake);
+        let mut loop_: EventLoop<usize> = EventLoop::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let mut count = 0;
+        share.set_preview(2000, 5).unwrap();
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 1, "preview record must ping an idle loop");
+        // No spin: a zero-wait dispatch with no new records observes
+        // nothing further.
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Clear and temp-disable records carry the same wake
+    /// obligation as preview records (#339).
+    #[test]
+    fn night_light_clear_and_temp_disable_wake_idle_loop() {
+        let (wake, source) = crate::wake::Wake::new().unwrap();
+        let share = std::sync::Arc::new(crate::night_light::NightLightShare::default());
+        share.set_wake(&wake);
+        let mut loop_: EventLoop<usize> = EventLoop::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let mut count = 0;
+        share.set_preview(2000, 5).unwrap();
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 1);
+        share.clear_preview();
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "clear must provide its own wake after preview was drained"
+        );
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+        assert_eq!(count, 2, "no repeated clear wake");
+        share.set_disabled_until_tmw(Some(1_700_000_000));
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 3, "temp-disable set must ping");
+        share.set_disabled_until_tmw(None);
+        loop_
+            .dispatch(Some(Duration::from_secs(2)), &mut count)
+            .unwrap();
+        assert_eq!(count, 4, "temp-disable clear must ping");
+    }
+
+    /// Without `set_wake` the share still records (fallback path),
+    /// but nothing is pinged: wiring the setup hunk is what makes
+    /// an idle loop responsive (#339).
+    #[test]
+    fn night_light_unconnected_share_records_without_ping() {
+        let (_wake, source) = crate::wake::Wake::new().unwrap();
+        let share = crate::night_light::NightLightShare::default();
+        let mut loop_: EventLoop<usize> = EventLoop::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let mut count = 0;
+        share.set_preview(2000, 5).unwrap();
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+        assert_eq!(count, 0, "unconnected share must not ping");
+        assert!(share
+            .preview_temperature(std::time::Instant::now())
+            .is_some());
     }
 }

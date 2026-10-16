@@ -213,6 +213,9 @@ pub fn frame_roots(state: &State, manager: &WindowManager) -> Vec<WlSurface> {
     }
     roots.extend(state.dnd_icon());
     roots.extend(state.lock_surfaces());
+    if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &state.cursor_image {
+        roots.push(surface.clone());
+    }
     #[cfg(feature = "xwayland")]
     roots.extend(manager.x11_surfaces());
     #[cfg(not(feature = "xwayland"))]
@@ -319,6 +322,16 @@ impl State {
 /// counts frames (the host gives no vblank sequence). Tests drive the
 /// same call.
 pub fn present_nested_frame(state: &mut State, manager: &WindowManager, locked: bool, seq: u64) {
+    present_nested_frame_with_cursor(state, manager, locked, seq, None);
+}
+
+pub fn present_nested_frame_with_cursor(
+    state: &mut State,
+    manager: &WindowManager,
+    locked: bool,
+    seq: u64,
+    cursor: Option<WlSurface>,
+) {
     let Some(output) = state.primary_output() else {
         return;
     };
@@ -333,6 +346,7 @@ pub fn present_nested_frame(state: &mut State, manager: &WindowManager, locked: 
                 .and_then(|name| state.lock_surface_for(&name)),
         );
     }
+    drawn.extend(cursor);
     let mut feedback = take_feedback(&drawn, &output);
     let now = state.presentation_now();
     let refresh = refresh_of(&output);

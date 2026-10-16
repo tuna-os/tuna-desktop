@@ -8,6 +8,7 @@ import tempfile
 import subprocess
 import unittest
 from unittest.mock import patch
+from tuna_picker_geometry import application_id, committed_window
 
 spec = importlib.util.spec_from_file_location('finalizer', Path(__file__).with_name('tuna-portal-artifact-finalize.py'))
 f = importlib.util.module_from_spec(spec)
@@ -145,6 +146,50 @@ class FinalizationTests(unittest.TestCase):
         self.assertEqual(len(result['errors']), 1)
         self.assertFalse(result['qualified_finalization'])
         self.assertTrue((self.root / 'artifact-finalization-error.json').is_file())
+
+
+class PickerGeometryTests(unittest.TestCase):
+    def setUp(self):
+        self.identity = dict(pid=711, uid=1000, start_time="29468", parent_id=17)
+        self.record = dict(pid=711, uid=1000, start_time="29468",
+            app_id=application_id(711, "29468"), mapped=True, window_size=[400, 300])
+        self.window = dict(id=18, app_id=self.record["app_id"],
+            x11_window_id=None, rect=[240, 116, 800, 600])
+        self.scene = dict(focused=18, windows=[self.window])
+
+    def ready(self):
+        return committed_window(self.scene, self.record, **self.identity)
+
+    def test_placeholder_is_not_a_committed_input_target(self):
+        self.assertIsNone(self.ready())
+        self.window["rect"] = [440, 266, 400, 300]
+        self.assertIs(self.ready(), self.window)
+        self.assertEqual([self.window["rect"][0] + 50,
+                          self.window["rect"][1] + 100], [490, 366])
+
+    def test_same_title_and_geometry_from_other_process_are_not_ready(self):
+        self.window.update(title="Unrelated picker focus control",
+            app_id=application_id(712, "29469"), rect=[440, 266, 400, 300])
+        self.assertIsNone(self.ready())
+        self.record["pid"] = 712
+        with self.assertRaisesRegex(RuntimeError, "identity changed"):
+            self.ready()
+
+    def test_duplicate_identity_is_not_a_unique_input_target(self):
+        self.window["rect"] = [440, 266, 400, 300]
+        self.scene["windows"].append(dict(self.window, id=19))
+        self.assertIsNone(self.ready())
+
+    def test_unmapped_unfocused_and_invalid_size_are_not_ready(self):
+        self.window["rect"] = [440, 266, 400, 300]
+        self.record["mapped"] = False
+        self.assertIsNone(self.ready())
+        self.record["mapped"] = True
+        self.scene["focused"] = 17
+        self.assertIsNone(self.ready())
+        self.scene["focused"] = 18
+        self.record["window_size"] = [0, 300]
+        self.assertIsNone(self.ready())
 
 
 if __name__ == '__main__':

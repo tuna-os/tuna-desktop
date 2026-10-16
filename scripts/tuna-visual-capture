@@ -1,0 +1,2024 @@
+#!/bin/sh
+# tuna-visual-capture — reproducible per-feature visual capture of Tuna Desktop.
+#
+# Usage:
+#   scripts/tuna-visual-capture --list
+#   scripts/tuna-visual-capture --stage NAME --artifacts DIR [--bin-dir DIR] [--display :N]
+#   scripts/tuna-visual-capture --all --artifacts DIR [--bin-dir DIR] [--stages a,b,c]
+#   scripts/tuna-visual-capture --merge --artifacts DIR
+#   scripts/tuna-visual-capture --check-matrix
+#   scripts/tuna-visual-capture --provenance --artifacts DIR [--stage NAME]
+#
+# Each stage boots its own nested compositor + GTK shell session on a
+# private Xvfb and buses (the same fixture family as
+# scripts/tuna-gtk-shell-proof), drives the UI with real input (xdotool,
+# AT-SPI actions, D-Bus calls), and captures real frames with scrot plus
+# short transition clips with ffmpeg x11grab. Nothing here stages, mocks
+# or synthesizes pixels: every PNG is a frame of the nested session, and
+# scripts/lib/tuna-visual-label.py marks frames that are visually the
+# bare desktop as indistinguishable-from-baseline, never as feature proof.
+#
+# Isolation: --all runs every stage as a subprocess with try/continue, so
+# one failed stage (or one failed state inside a stage) never prevents
+# collecting the rest. CI runs one stage per matrix job (see
+# .github/workflows/visual-capture.yml) with fail-fast disabled, and each
+# job uploads its own visual-<stage> artifact. A capture failure is
+# reported as a capture failure: a wrong still alone never asserts the
+# product is broken (the audit's still-vs-video finding), so every state
+# records its state observation (a11y/compositor-state checks) next to
+# its stills and clips.
+#
+# --check-matrix verifies docs/visual-capture-matrix.md names every
+# parity-ledger row, every walkthrough.tsv entry and every stage here.
+# shellcheck disable=SC2329,SC2317 # state functions run indirectly via run_state
+set -eu
+
+unset CDPATH
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+WIDTH=1280
+HEIGHT=800
+
+STAGES="panel calendar quick-settings windows x11 scroll switcher overview search-apps notifications input system settings-a11y transitions"
+
+MODE=""
+STAGE=""
+STAGE_FILTER=""
+ARTIFACTS=""
+BIN_DIR=""
+DISPLAY_ARG=""
+# Parsed without shifting: "$@" must stay intact for the private-bus
+# re-exec below.
+expect=""
+for arg in "$@"; do
+    if [ -n "$expect" ]; then
+        case "$expect" in
+            stage) MODE="stage"; STAGE="$arg" ;;
+            stages) STAGE_FILTER="$arg" ;;
+            artifacts) ARTIFACTS="$arg" ;;
+            bin-dir) BIN_DIR="$arg" ;;
+            display) DISPLAY_ARG="$arg" ;;
+        esac
+        expect=""
+        continue
+    fi
+    case "$arg" in
+        --list) MODE="list" ;;
+        --all) MODE="all" ;;
+        --merge) MODE="merge" ;;
+        --check-matrix) MODE="check-matrix" ;;
+        --provenance) MODE="provenance" ;;
+        --stage) expect="stage" ;;
+        --stages) expect="stages" ;;
+        --artifacts) expect="artifacts" ;;
+        --bin-dir) expect="bin-dir" ;;
+        --display) expect="display" ;;
+        --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
+        *) echo "tuna-visual-capture: unknown argument $arg" >&2; exit 1 ;;
+    esac
+done
+if [ -n "$expect" ]; then
+    echo "tuna-visual-capture: --$expect needs a value" >&2
+    exit 1
+fi
+
+# Ledger rows each stage collects evidence for (space-separated).
+stage_ledger() {
+    case "$1" in
+        panel) echo "P-PN-01 P-TR-01" ;;
+        calendar) echo "P-PN-02 P-NT-02" ;;
+        quick-settings) echo "P-PN-03 P-SY-07 P-ST-01" ;;
+        windows) echo "P-WM-02 P-WM-04 P-WM-05 P-WM-06" ;;
+        x11) echo "P-SY-04" ;;
+        scroll) echo "P-WM-07" ;;
+        switcher) echo "P-WM-01" ;;
+        overview) echo "P-OV-01 P-OV-02 P-OV-03 P-OV-06 P-WM-03" ;;
+        search-apps) echo "P-OV-04 P-OV-05" ;;
+        notifications) echo "P-NT-01 P-NT-02" ;;
+        input) echo "P-IN-01" ;;
+        system) echo "P-SY-05 P-SY-07 P-LK-01 P-SY-03" ;;
+        settings-a11y) echo "P-ST-01 P-ST-08 P-A11Y-05 P-AN-01" ;;
+        transitions) echo "P-AN-01 P-AN-02 P-AN-04 P-AN-05 P-AN-07 P-AN-09" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Walkthrough states each stage captures (space-separated ids).
+stage_walkthrough() {
+    case "$1" in
+        panel) echo "panel tray" ;;
+        calendar) echo "calendar notification-list" ;;
+        quick-settings) echo "quick-settings wifi-menu network-agent wired-menu bluetooth-menu microphone power-menu osd-volume osd-brightness" ;;
+        windows) echo "windows popover tile-preview window-menu" ;;
+        x11) echo "x11" ;;
+        scroll) echo "scroll-strip scroll-follow scroll-presets" ;;
+        switcher) echo "switcher switcher-thumbnails" ;;
+        overview) echo "overview workspaces overview-drag workspace-popup" ;;
+        search-apps) echo "search search-provider app-grid app-folder app-grid-pages folder-made grid-reorder" ;;
+        notifications) echo "banner notification-list do-not-disturb notification-group notification-group-expanded" ;;
+        input) echo "ime ime-candidates" ;;
+        system) echo "screenshot-ui polkit end-session lock unlock scale" ;;
+        settings-a11y) echo "" ;;
+        transitions) echo "" ;;
+        *) echo "" ;;
+    esac
+}
+
+if [ "$MODE" = "list" ]; then
+    # shellcheck disable=SC2086
+    for s in $STAGES; do
+        printf '%s\tledger:%s\twalkthrough:%s\n' "$s" "$(stage_ledger "$s")" "$(stage_walkthrough "$s")"
+    done
+    exit 0
+fi
+
+if [ "$MODE" = "check-matrix" ]; then
+    MATRIX="$ROOT/docs/visual-capture-matrix.md"
+    [ -f "$MATRIX" ] || { echo "tuna-visual-capture: no $MATRIX" >&2; exit 1; }
+    gaps="$(mktemp)"
+    grep -o '^| P-[A-Z0-9-]*' "$ROOT/docs/parity-ledger.md" | cut -d' ' -f2 | sort -u | while read -r id; do
+        grep -q "$id" "$MATRIX" || echo "matrix misses ledger row $id"
+    done >"$gaps"
+    grep -v '^#' "$ROOT/docs/walkthrough.tsv" | grep -v '^[[:space:]]*$' | cut -f1 | while read -r id; do
+        grep -q "walkthrough:$id" "$MATRIX" || echo "matrix misses walkthrough state $id"
+    done >>"$gaps"
+    # shellcheck disable=SC2086
+    for s in $STAGES; do
+        grep -q "stage:$s" "$MATRIX" || echo "matrix misses stage $s" >>"$gaps"
+    done
+    if [ -s "$gaps" ]; then
+        sed 's/^/tuna-visual-capture: /' "$gaps" >&2
+        rm -f "$gaps"
+        exit 1
+    fi
+    rm -f "$gaps"
+    echo "tuna-visual-capture: matrix covers $(grep -c '^| P-' "$ROOT/docs/parity-ledger.md") ledger rows, $(grep -v '^#' "$ROOT/docs/walkthrough.tsv" | grep -vc '^[[:space:]]*$') walkthrough states, $(echo "$STAGES" | wc -w) stages"
+    exit 0
+fi
+
+if [ "$MODE" = "merge" ]; then
+    [ -n "$ARTIFACTS" ] || { echo "tuna-visual-capture: --merge needs --artifacts DIR" >&2; exit 1; }
+    [ -d "$ARTIFACTS" ] || { echo "tuna-visual-capture: no such dir $ARTIFACTS" >&2; exit 1; }
+    PY_MERGE=/usr/bin/python3
+    [ -x "$PY_MERGE" ] || PY_MERGE=python3
+    "$PY_MERGE" - "$ARTIFACTS" <<'MERGE'
+import json, os, sys
+root = sys.argv[1]
+stages = {}
+for name in sorted(os.listdir(root)):
+    stage_path = os.path.join(root, name, "stage.json")
+    if os.path.isfile(stage_path):
+        key = name[len("visual-"):] if name.startswith("visual-") else name
+        with open(stage_path, encoding="utf-8") as handle:
+            stages[key] = json.load(handle)
+provs = {}
+for name in sorted(os.listdir(root)):
+    prov_path = os.path.join(root, name, "provenance.json")
+    if os.path.isfile(prov_path):
+        key = name[len("visual-"):] if name.startswith("visual-") else name
+        with open(prov_path, encoding="utf-8") as handle:
+            provs[key] = json.load(handle)
+counts = {"ok": 0, "partial": 0, "failed": 0, "skipped": 0}
+state_totals = {"ok": 0, "failed": 0, "skipped": 0}
+for s in stages.values():
+    counts[s.get("status", "failed")] = counts.get(s.get("status"), 0) + 1
+    for name, num in (s.get("state_counts") or {}).items():
+        state_totals[name] = state_totals.get(name, 0) + num
+manifest = {"stages": stages, "provenance": provs,
+            "summary": {"stages_total": len(stages), "stages_ok": counts["ok"],
+                        "stages_partial": counts["partial"],
+                        "stages_failed": counts["failed"],
+                        "stages_skipped": counts["skipped"],
+                        "state_totals": state_totals}}
+with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+    handle.write("\n")
+print("tuna-visual-capture: merged %d stages (ok=%d partial=%d failed=%d skipped=%d) into %s/manifest.json"
+      % (len(stages), counts["ok"], counts["partial"], counts["failed"],
+         counts["skipped"], root))
+print("tuna-visual-capture: per-stage report (missing/failed/skipped are explicit)")
+for name in sorted(stages):
+    stage = stages[name]
+    print("  [%s] %s frames=%s" % (stage.get("status", "?"), name,
+                                   json.dumps(stage.get("frame_summary", {}), sort_keys=True)))
+    for step in stage.get("steps", []):
+        print("    %-8s %-16s %s" % (step.get("status", "?"), step.get("state", "?"),
+                                     (step.get("note") or "")[:120]))
+MERGE
+    exit 0
+fi
+
+# Provenance manifest: source identity (branch head AND any tested merge
+# commit are recorded distinctly), binary hashes, package versions, image
+# identity and the exact commands run. Never capitalizes a dirty tree as
+# the named commit: the diff hash says so.
+write_provenance() {
+    dir="$1"
+    stage="$2"
+    cmds_file="$3"
+    PY_PROV=/usr/bin/python3
+    [ -x "$PY_PROV" ] || PY_PROV=python3
+    STAGE_PROV="$stage" DIR_PROV="$dir" CMDS_PROV="$cmds_file" ROOT_PROV="$ROOT" \
+        BIN_PROV="${BIN_DIR:-}" "$PY_PROV" - <<'PROV'
+import hashlib, json, os, subprocess, sys
+
+def git(*args):
+    try:
+        return subprocess.check_output(["git", "-C", os.environ["ROOT_PROV"], *args],
+                                       stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return None
+
+def sha_file(path):
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+root = os.environ["ROOT_PROV"]
+directory = os.environ["DIR_PROV"]
+stage = os.environ["STAGE_PROV"]
+cmds_path = os.environ["CMDS_PROV"]
+binaries = os.environ.get("BIN_PROV") or os.path.join(root, "target/debug")
+commands = []
+if cmds_path and os.path.exists(cmds_path):
+    with open(cmds_path, encoding="utf-8") as handle:
+        commands = [line.rstrip("\n") for line in handle if line.strip()]
+diff_bytes = None
+try:
+    diff_bytes = subprocess.check_output(["git", "-C", root, "diff", "HEAD", "--binary"],
+                                         stderr=subprocess.DEVNULL)
+except Exception:
+    diff_bytes = None
+packages = {}
+try:
+    names = ["libgtk-4-1", "libadwaita-1-0", "xvfb", "xwayland", "x11-apps",
+             "pipewire", "wireplumber", "ibus", "python3", "python3-pil",
+             "ffmpeg", "scrot", "xdotool", "xdg-desktop-portal",
+             "xdg-desktop-portal-gnome", "xdg-desktop-portal-gtk",
+             "libpam-wrapper", "gstreamer1.0-tools", "mutter-common"]
+    out = subprocess.check_output(["dpkg-query", "-W", "-f=${Package} ${Version}\n", *names],
+                                  stderr=subprocess.DEVNULL).decode()
+    for line in out.splitlines():
+        if " " in line:
+            name, version = line.split(" ", 1)
+            packages[name] = version
+except Exception:
+    pass
+os_release = {}
+try:
+    with open("/etc/os-release", encoding="utf-8") as handle:
+        for line in handle:
+            if "=" in line:
+                key, value = line.rstrip("\n").split("=", 1)
+                os_release[key] = value.strip('"')
+except OSError:
+    pass
+manifest = {
+    "tool": "tuna-visual-capture",
+    "stage": stage or None,
+    "source": {
+        # The exact tree that was built and captured, pinned from the
+        # checkout itself -- never from the event payload.
+        "built_head_sha": git("rev-parse", "HEAD"),
+        "built_tree_sha": git("rev-parse", "HEAD^{tree}"),
+        "tree_diff_sha256": hashlib.sha256(diff_bytes).hexdigest() if diff_bytes is not None else None,
+        "tree_diff_bytes": len(diff_bytes) if diff_bytes is not None else None,
+        # The triggering event's commit (for pull_request events: the
+        # merge ref). Informational only: the merge is NOT built here.
+        "event_sha": os.environ.get("GITHUB_SHA"),
+        "event_name": os.environ.get("GITHUB_EVENT_NAME"),
+        "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+        "describe": git("describe", "--always", "--dirty"),
+    },
+    "binaries": {
+        "dir": binaries,
+        "tuna-compositor": sha_file(os.path.join(binaries, "tuna-compositor")),
+        "tuna-shell-gtk": sha_file(os.path.join(binaries, "tuna-shell-gtk")),
+        "tuna-ibus-bridge": sha_file(os.path.join(binaries, "tuna-ibus-bridge")),
+    },
+    "packages": packages,
+    "image": {
+        "os_release": os_release,
+        "image_os": os.environ.get("ImageOS"),
+        "image_version": os.environ.get("ImageVersion"),
+        "runner_arch": os.environ.get("RUNNER_ARCH"),
+        "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "github_sha": os.environ.get("GITHUB_SHA"),
+        "github_ref": os.environ.get("GITHUB_REF"),
+    },
+    "commands": commands,
+}
+with open(os.path.join(directory, "provenance.json"), "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+    handle.write("\n")
+print("tuna-visual-capture: provenance in %s/provenance.json" % directory)
+PROV
+}
+
+if [ "$MODE" = "provenance" ]; then
+    [ -n "$ARTIFACTS" ] || { echo "tuna-visual-capture: --provenance needs --artifacts DIR" >&2; exit 1; }
+    mkdir -p "$ARTIFACTS"
+    write_provenance "$ARTIFACTS" "$STAGE" "$ARTIFACTS/commands.txt"
+    exit 0
+fi
+
+if [ "$MODE" != "stage" ] && [ "$MODE" != "all" ]; then
+    echo "tuna-visual-capture: no mode (see --help)" >&2
+    exit 1
+fi
+
+# A private session bus per process, as the GTK shell proof does. (--all
+# re-execs once here, then once more per stage subprocess, so stages
+# never share a bus.)
+if [ -z "${TUNA_VISUAL_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    TUNA_VISUAL_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+fi
+
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+
+# Exact-command log: every xdotool/gdbus/gsettings/a11y invocation below
+# goes through these wrappers so provenance.json holds the real commands.
+CMDS_FILE=""
+log_cmd() {
+    [ -n "$CMDS_FILE" ] && printf '%s\n' "$*" >>"$CMDS_FILE"
+    return 0
+}
+xdo() { log_cmd "xdotool $*"; xdotool "$@"; }
+bus() { log_cmd "gdbus $*"; gdbus "$@"; }
+gset() { log_cmd "gsettings $*"; gsettings "$@"; }
+a11y() {
+    out="$1"; shift
+    log_cmd "tuna-a11y-dump.py tuna-shell-gtk $out 20 $*"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/$out" 20 "$@"
+}
+showing() {
+    jq -e --arg n "$2" 'any(.[]; .name == $n and .showing)' "$ARTIFACTS/$1" >/dev/null 2>&1
+}
+now_ms() {
+    if date +%s%3N >/dev/null 2>&1; then date +%s%3N; else echo "$(($(date +%s) * 1000))"; fi
+}
+cstate_wait() {
+    # cstate_wait <jq filter> [timeout seconds]; 0 when the compositor
+    # state matches, 1 on timeout. Observation only: callers decide.
+    end=$(($(date +%s) + ${2:-20}))
+    while [ "$(date +%s)" -le "$end" ]; do
+        [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1 && return 0
+        sleep 0.3
+    done
+    return 1
+}
+
+# --- nested session -------------------------------------------------------
+WID=""
+COMPOSITOR_PID=""
+SOCKET_NAME=""
+CSTATE=""
+LOG=""
+OWNED_XVFB=""
+STUBS_PID=""
+SYSBUS_PID=""
+CAL_PID=""
+PROV_PID=""
+TRAY_PID=""
+IME_PIDS=""
+OWNED_RUNTIME=""
+AT_SPI_PID=""
+CLIP_PID=""
+
+session_cleanup() {
+    if [ -n "$CLIP_PID" ]; then kill -INT "$CLIP_PID" 2>/dev/null || true; fi
+    # shellcheck disable=SC2086
+    if [ -n "$IME_PIDS" ]; then kill $IME_PIDS 2>/dev/null || true; fi
+    if [ -n "$TRAY_PID" ]; then kill "$TRAY_PID" 2>/dev/null || true; fi
+    if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
+    if [ -n "$PROV_PID" ]; then kill "$PROV_PID" 2>/dev/null || true; fi
+    if [ -n "$COMPOSITOR_PID" ]; then
+        kill "$COMPOSITOR_PID" 2>/dev/null || true
+        wait "$COMPOSITOR_PID" 2>/dev/null || true
+    fi
+    if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+    if [ -n "$STUBS_PID" ]; then kill "$STUBS_PID" 2>/dev/null || true; fi
+    if [ -n "$AT_SPI_PID" ]; then kill "$AT_SPI_PID" 2>/dev/null || true; fi
+    if [ -n "$OWNED_RUNTIME" ]; then rm -rf "$OWNED_RUNTIME" || true; fi
+    if [ -n "$SYSBUS_PID" ]; then kill "$SYSBUS_PID" 2>/dev/null || true; fi
+}
+
+pick_display() {
+    for d in $(seq 96 119); do
+        [ -e "/tmp/.X${d}-lock" ] || { echo ":$d"; return 0; }
+    done
+    return 1
+}
+
+# session_start <artifacts>; sets WID, SOCKET_NAME, CSTATE, LOG. Returns
+# nonzero (without exiting) when the session never comes up.
+session_start() {
+    ARTIFACTS="$1"
+    mkdir -p "$ARTIFACTS"
+    CMDS_FILE="$ARTIFACTS/commands.txt"
+    : >"$CMDS_FILE"
+    LOG="$ARTIFACTS/nested.log"
+    CSTATE="$ARTIFACTS/compositor-state.json"
+    export TUNA_COMPOSITOR_STATE="$CSTATE"
+    OWNED_RUNTIME="$(mktemp -d /tmp/tuna-visual-runtime.XXXXXX)"
+    chmod 0700 "$OWNED_RUNTIME"
+    XDG_RUNTIME_DIR="$OWNED_RUNTIME"
+    export XDG_RUNTIME_DIR
+    if [ -n "$DISPLAY_ARG" ]; then
+        DISPLAY="$DISPLAY_ARG"; export DISPLAY
+    else
+        DISPLAY="$(pick_display)" || return 1
+        export DISPLAY
+        Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+        ok=0
+        for _ in $(seq 1 30); do
+            if xdotool getdisplaygeometry >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+        done
+        [ "$ok" = 1 ] || return 1
+    fi
+    if [ -x /usr/libexec/at-spi-bus-launcher ]; then
+        /usr/libexec/at-spi-bus-launcher --launch-immediately >"$ARTIFACTS/atspi.log" 2>&1 &
+        AT_SPI_PID=$!
+        sleep 2
+    fi
+    XDG_DATA_HOME="$ARTIFACTS/data"
+    XDG_STATE_HOME="$ARTIFACTS/state"
+    XDG_CONFIG_HOME="$ARTIFACTS/config"
+    GSETTINGS_BACKEND=keyfile
+    export XDG_DATA_HOME XDG_STATE_HOME XDG_CONFIG_HOME GSETTINGS_BACKEND
+    if ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.shell; then
+        mkdir -p "$ARTIFACTS/schemas"
+        cat >"$ARTIFACTS/schemas/org.gnome.shell.gschema.xml" <<'XML'
+<schemalist>
+  <schema id="org.gnome.shell" path="/org/gnome/shell/">
+    <key name="favorite-apps" type="as"><default>[]</default></key>
+    <key name="app-picker-layout" type="aa{sv}"><default>[]</default></key>
+  </schema>
+</schemalist>
+XML
+        glib-compile-schemas "$ARTIFACTS/schemas" >/dev/null 2>&1 || return 1
+        GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+        export GSETTINGS_SCHEMA_DIR
+    fi
+    mkdir -p "$XDG_DATA_HOME/applications" "$XDG_DATA_HOME/tuna-shell"
+    echo '["org.tuna.ProofNoFavorite.desktop"]' >"$XDG_DATA_HOME/tuna-shell/favorites.json"
+    for t in alpha beta gamma delta; do
+        printf '[Desktop Entry]\nName=Tuna Desktop Test %s\nExec=true\nType=Application\nNoDisplay=true\n' "$t" \
+            >"$XDG_DATA_HOME/applications/tuna-test-$t.desktop"
+    done
+    SEARCH_MARKER="$ARTIFACTS/search-marker"
+    rm -f "$SEARCH_MARKER"
+    mkdir -p "$XDG_DATA_HOME/gnome-shell/search-providers"
+    cat >"$XDG_DATA_HOME/gnome-shell/search-providers/tuna-probe-search.ini" <<INI
+[Shell Search Provider]
+DesktopId=tuna-probe.desktop
+BusName=org.tuna.ProbeSearch
+ObjectPath=/org/tuna/ProbeSearch
+Version=2
+INI
+    PROBE_MARKER="$ARTIFACTS/probe-marker"
+    rm -f "$PROBE_MARKER"
+    cat >"$XDG_DATA_HOME/applications/tuna-probe.desktop" <<EOF
+[Desktop Entry]
+Name=Tuna Probe
+Exec=touch $PROBE_MARKER
+Icon=applications-system
+Type=Application
+EOF
+    X11_MARKER="$ARTIFACTS/x11-marker"
+    rm -f "$X11_MARKER"
+    mkdir -p "$ARTIFACTS/bin"
+    cat >"$ARTIFACTS/bin/tuna-x-probe" <<XPROBE
+#!/bin/sh
+echo "\$DISPLAY" >"$X11_MARKER"
+exec xeyes
+XPROBE
+    chmod +x "$ARTIFACTS/bin/tuna-x-probe"
+    cat >"$XDG_DATA_HOME/applications/tuna-x-probe.desktop" <<XDESK
+[Desktop Entry]
+Name=Tuna X Probe
+Exec=$ARTIFACTS/bin/tuna-x-probe
+Type=Application
+XDESK
+    BACKLIGHT="$ARTIFACTS/backlight/tuna-bl"
+    mkdir -p "$BACKLIGHT"
+    echo 1000 >"$BACKLIGHT/max_brightness"
+    echo 500 >"$BACKLIGHT/brightness"
+    TUNA_BACKLIGHT_ROOT="$ARTIFACTS/backlight"
+    export TUNA_BACKLIGHT_ROOT BACKLIGHT
+    VOLUME_FILE="$ARTIFACTS/volume"
+    echo 0.80 >"$VOLUME_FILE"
+    export VOLUME_FILE
+    VOLUME_MUTED_FILE="$ARTIFACTS/volume-muted"
+    MIC_MUTED_FILE="$ARTIFACTS/mic-muted"
+    echo 0 >"$VOLUME_MUTED_FILE"
+    echo 0 >"$MIC_MUTED_FILE"
+    SINK_FILE="$ARTIFACTS/default-sink"
+    echo 48 >"$SINK_FILE"
+    MIC_FILE="$ARTIFACTS/mic-volume"
+    echo 0.50 >"$MIC_FILE"
+    RECORDING_FILE="$ARTIFACTS/recording"
+    export RECORDING_FILE
+    cat >"$ARTIFACTS/bin/wpctl" <<WPCTL
+#!/bin/sh
+mark() { [ "\$(cat "$SINK_FILE")" = "\$1" ] && echo "*" || echo " "; }
+muted() { [ "\$(cat "\$1")" = 1 ] && printf ' [MUTED]' || true; }
+case "\$1" in
+    get-volume)
+        case "\$2" in
+            *SOURCE*) echo "Volume: \$(cat "$MIC_FILE")\$(muted "$MIC_MUTED_FILE")" ;;
+            *) echo "Volume: \$(cat "$VOLUME_FILE")\$(muted "$VOLUME_MUTED_FILE")" ;;
+        esac ;;
+    set-volume)
+        case "\$2" in
+            *SOURCE*) echo "\$3" >"$MIC_FILE" ;;
+            *) echo "\$3" >"$VOLUME_FILE" ;;
+        esac ;;
+    set-mute)
+        case "\$2" in *SOURCE*) mute_file="$MIC_MUTED_FILE" ;; *) mute_file="$VOLUME_MUTED_FILE" ;; esac
+        case "\$3" in toggle) echo "\$((1 - \$(cat "\$mute_file")))" >"\$mute_file" ;; *) echo "\$3" >"\$mute_file" ;; esac ;;
+    set-default) echo "\$2" >"$SINK_FILE" ;;
+    status)
+        printf 'Audio\n ├─ Sinks:\n'
+        printf ' │  %s   48. Built-in Audio Analog Stereo    [vol: 0.80]\n' "\$(mark 48)"
+        printf ' │  %s   52. Tuna Desktop HDMI Output               [vol: 1.00]\n' "\$(mark 52)"
+        printf ' │\n ├─ Sources:\n'
+        printf ' │  *   49. Built-in Audio Analog Stereo    [vol: 0.50]\n'
+        printf ' │\n └─ Streams:\n'
+        if [ -e "$RECORDING_FILE" ]; then
+            printf '        70. Voice Recorder\n'
+            printf '             71. input_MONO      < Built-in Audio Analog Stereo:capture_FL\t[active]\n'
+        fi ;;
+    *) ;;
+esac
+"$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event
+WPCTL
+    PW_DUMP_REAL="$(command -v pw-dump || true)"
+    cat >"$ARTIFACTS/bin/pw-dump" <<PW_DUMP
+#!/bin/sh
+for arg do
+    if [ "\$arg" = --monitor ] || [ "\$arg" = -m ]; then
+        exec "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS"
+    fi
+done
+[ -n "$PW_DUMP_REAL" ] || exit 127
+exec "$PW_DUMP_REAL" "\$@"
+PW_DUMP
+    cat >"$ARTIFACTS/bin/pw-cli" <<PW_CLI
+#!/bin/sh
+printf '%s\\n' "\$*" >>"$ARTIFACTS/audio-route-calls"
+case "\$*" in
+    'set-param 40 Route { index: 2, device: 0, save: true }') echo 2 >"$ARTIFACTS/audio-route" ;;
+    'set-param 40 Route { index: 1, device: 0, save: true }') echo 1 >"$ARTIFACTS/audio-route" ;;
+    *) exit 1 ;;
+esac
+"$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event
+PW_CLI
+    chmod +x "$ARTIFACTS/bin/wpctl" "$ARTIFACTS/bin/pw-dump" "$ARTIFACTS/bin/pw-cli"
+    PATH="$ARTIFACTS/bin:$PATH"
+    export PATH
+    SYSBUS_INFO="$(dbus-daemon --session --fork --print-address=1 --print-pid=1)"
+    DBUS_SYSTEM_BUS_ADDRESS="$(echo "$SYSBUS_INFO" | sed -n 1p)"
+    SYSBUS_PID="$(echo "$SYSBUS_INFO" | sed -n 2p)"
+    export DBUS_SYSTEM_BUS_ADDRESS
+    TUNA_STUB_NM_LOG="$ARTIFACTS/nm-calls"
+    TUNA_STUB_BT_LOG="$ARTIFACTS/bt-calls"
+    # The Authority stub reads TUNA_STUB_POLKIT_LOG from its own
+    # environment when the agent registers, so it must be exported
+    # before the stubs launch -- a later export never reaches them.
+    TUNA_STUB_POLKIT_LOG="$ARTIFACTS/polkit-agent"
+    export TUNA_STUB_NM_LOG TUNA_STUB_BT_LOG TUNA_STUB_POLKIT_LOG
+    "$PY" "$ROOT/scripts/lib/tuna-service-stubs.py" "$BACKLIGHT" >"$ARTIFACTS/stubs.log" 2>&1 &
+    STUBS_PID=$!
+    for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/stubs.log" 2>/dev/null && break; sleep 0.5; done
+    cat >"$ARTIFACTS/events.json" <<'EVENTS'
+[{"summary": "Design review", "day": 0, "start": "10:00", "end": "10:30"},
+ {"summary": "Release day", "day": 0},
+ {"summary": "Retro", "day": 1, "start": "15:00", "end": "16:00"}]
+EVENTS
+    "$PY" "$ROOT/scripts/lib/tuna-calendar-server-stub.py" "$ARTIFACTS/events.json" \
+        >"$ARTIFACTS/calendar-server.log" 2>&1 &
+    CAL_PID=$!
+    for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/calendar-server.log" 2>/dev/null && break; sleep 0.5; done
+    "$PY" "$ROOT/scripts/lib/tuna-search-provider-stub.py" "$SEARCH_MARKER" >"$ARTIFACTS/provider.log" 2>&1 &
+    PROV_PID=$!
+    for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/provider.log" 2>/dev/null && break; sleep 0.5; done
+    TUNA_SESSION_KIND=hardware
+    TUNA_POLKIT_HELPER="$ROOT/scripts/lib/tuna-polkit-helper-stub.py"
+    TUNA_IBUS=1
+    export TUNA_SESSION_KIND TUNA_POLKIT_HELPER TUNA_IBUS
+    # pam_wrapper serves the lock screen's PAM stack from a private
+    # password file when it is installed; otherwise unlock-auth states
+    # record skipped instead of failing the stage.
+    PAM_WRAPPER_LIB=/usr/lib/x86_64-linux-gnu/libpam_wrapper.so
+    PAM_MATRIX=/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so
+    UNLOCK_PASSWORD="tuna-visual-$$"
+    PAM_ON=""
+    if [ -e "$PAM_WRAPPER_LIB" ] && [ -e "$PAM_MATRIX" ]; then
+        mkdir -p "$ARTIFACTS/pam/services"
+        echo "$(id -un):$UNLOCK_PASSWORD:tuna-lock" >"$ARTIFACTS/pam/passdb"
+        printf 'auth required %s passdb=%s\naccount required %s passdb=%s\n' \
+            "$PAM_MATRIX" "$ARTIFACTS/pam/passdb" "$PAM_MATRIX" "$ARTIFACTS/pam/passdb" \
+            >"$ARTIFACTS/pam/services/tuna-lock"
+        PAM_ON=1
+    fi
+    export UNLOCK_PASSWORD PAM_ON
+    if [ -z "$BIN_DIR" ]; then
+        BIN_DIR="${TUNA_VISUAL_BIN_DIR:-$ROOT/target/debug}"
+    fi
+    if [ ! -x "$BIN_DIR/tuna-compositor" ] || [ ! -x "$BIN_DIR/tuna-shell-gtk" ]; then
+        if [ -n "${TUNA_VISUAL_BIN_DIR:-}" ]; then
+            echo "tuna-visual-capture: no binaries in $BIN_DIR" >&2
+            return 1
+        fi
+        log_cmd "cargo build -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host"
+        cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host || return 1
+        BIN_DIR="$ROOT/target/debug"
+    fi
+    export TUNA_PROOF_BIN_DIR="$BIN_DIR"
+    if [ -n "$PAM_ON" ]; then
+        env LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
+            PAM_WRAPPER_SERVICE_DIR="$ARTIFACTS/pam/services" \
+            "$ROOT/scripts/lib/tuna-proof-session-launch" 0 "$ROOT" "tuna-visual-$$" >"$LOG" 2>&1 &
+    else
+        "$ROOT/scripts/lib/tuna-proof-session-launch" 0 "$ROOT" "tuna-visual-$$" >"$LOG" 2>&1 &
+    fi
+    COMPOSITOR_PID=$!
+    WID=""
+    for _ in $(seq 1 60); do
+        kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
+        WID="$(xdotool search --pid "$COMPOSITOR_PID" --name Smithay 2>/dev/null | head -1 || true)"
+        [ -n "$WID" ] && break
+        sleep 1
+    done
+    [ -n "$WID" ] || return 1
+    xdo windowfocus --sync "$WID" || return 1
+    xdo mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2)) || return 1
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-ready.json" 60 >/dev/null 2>&1 || return 1
+    SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
+    [ -n "$SOCKET_NAME" ] || return 1
+    export SOCKET_NAME
+    sleep 2
+    return 0
+}
+
+# --- capture primitives ---------------------------------------------------
+# shot <name> [settle seconds]: one real frame + compositor-state sidecar.
+shot() {
+    sleep "${2:-1.5}"
+    ts="$(now_ms)"
+    scrot -o "$ARTIFACTS/$1.png" >/dev/null 2>&1 || return 1
+    if [ -f "$TUNA_COMPOSITOR_STATE" ]; then
+        cp "$TUNA_COMPOSITOR_STATE" "$ARTIFACTS/$1.json" 2>/dev/null || true
+    fi
+    sum="$(sha256sum "$ARTIFACTS/$1.png" | cut -d' ' -f1)"
+    printf '{"file":"%s.png","state":"%s","epoch_ms":%s,"sha256":"%s"}\n' \
+        "$1" "${STATE_NAME:-?}" "$ts" "$sum" >>"$ARTIFACTS/frames.jsonl"
+    echo "tuna-visual-capture [$STAGE]: $1.png"
+    return 0
+}
+
+# clip_start <name> [max seconds]: record the Xvfb screen with ffmpeg
+# x11grab. Sets CLIP_PID/CLIP_FILE; returns 1 when recording is
+# unavailable (callers fall back to timestamped still pairs).
+clip_start() {
+    CLIP_PID=""
+    CLIP_FILE="$ARTIFACTS/$1.webm"
+    command -v ffmpeg >/dev/null 2>&1 || return 1
+    log_cmd "ffmpeg -f x11grab -video_size ${WIDTH}x${HEIGHT} -framerate 30 -i $DISPLAY -t ${2:-8} $1.webm"
+    ffmpeg -nostdin -loglevel error -y -f x11grab -video_size "${WIDTH}x${HEIGHT}" \
+        -framerate 30 -i "$DISPLAY" -t "${2:-8}" -pix_fmt yuv420p "$CLIP_FILE" \
+        >"$ARTIFACTS/$1.clip.log" 2>&1 &
+    CLIP_PID=$!
+    sleep 0.4
+    kill -0 "$CLIP_PID" 2>/dev/null || { CLIP_PID=""; return 1; }
+    return 0
+}
+
+# clip_stop <name>: finish the recording started by clip_start.
+clip_stop() {
+    [ -n "$CLIP_PID" ] || return 1
+    kill -INT "$CLIP_PID" 2>/dev/null || true
+    wait "$CLIP_PID" 2>/dev/null || true
+    CLIP_PID=""
+    [ -s "$ARTIFACTS/$1.webm" ] || return 1
+    sum="$(sha256sum "$ARTIFACTS/$1.webm" | cut -d' ' -f1)"
+    printf '{"file":"%s.webm","state":"%s","epoch_ms":%s,"sha256":"%s"}\n' \
+        "$1" "${STATE_NAME:-?}" "$(now_ms)" "$sum" >>"$ARTIFACTS/frames.jsonl"
+    echo "tuna-visual-capture [$STAGE]: $1.webm"
+    return 0
+}
+
+# observe <file> <jq> <label>: record a state observation (never fails).
+observe() {
+    if [ -s "$ARTIFACTS/$1" ] && jq -e "$2" "$ARTIFACTS/$1" >/dev/null 2>&1; then
+        printf '{"state":"%s","observation":"%s","result":"yes"}\n' "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+    else
+        printf '{"state":"%s","observation":"%s","result":"no"}\n' "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+    fi
+    return 0
+}
+
+# Per-state consumer+render validators. Generic screening ("differs from
+# the desktop", "stage exited ok") is not named-state proof: every named
+# state requires its actual consumer to have rendered the expected
+# content, and a validator miss fails the state. Never silent green.
+require_jq() {
+    # require_jq <file> <jq> <desc>: fail unless the JSON matches.
+    observe "$1" "$2" "$3"
+    if [ -s "$ARTIFACTS/$1" ] && jq -e "$2" "$ARTIFACTS/$1" >/dev/null 2>&1; then
+        return 0
+    fi
+    state_fail "validator miss: $3"
+}
+require_absent() {
+    # require_absent <file> <jq> <desc>: fail when the JSON matches.
+    if [ -s "$ARTIFACTS/$1" ] && jq -e "$2" "$ARTIFACTS/$1" >/dev/null 2>&1; then
+        printf '{"state":"%s","observation":"%s","result":"PRESENT (want absent)"}\n' \
+            "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+        state_fail "validator miss: $3"
+    fi
+    printf '{"state":"%s","observation":"%s","result":"absent"}\n' \
+        "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+    return 0
+}
+require_cstate() {
+    # require_cstate <jq> <desc>: fail unless compositor state matches.
+    require_jq compositor-state.json "$1" "$2"
+}
+require_frame_differs() {
+    # require_frame_differs <new.png> <old.png> <desc>: fail unless the
+    # new frame differs from the old one above threshold. Fails closed
+    # when the comparison cannot run.
+    "$PY" "$ROOT/scripts/lib/tuna-visual-label.py" --compare \
+        "$ARTIFACTS/$2" "$ARTIFACTS/$1" >>"$ARTIFACTS/validators.log" 2>&1
+    code=$?
+    if [ "$code" = 0 ]; then
+        printf '{"state":"%s","observation":"%s","result":"differs"}\n' \
+            "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+        return 0
+    fi
+    printf '{"state":"%s","observation":"%s","result":"same-or-uncomparable"}\n' \
+        "${STATE_NAME:-?}" "$3" >>"$ARTIFACTS/observations.jsonl"
+    state_fail "validator miss: $3"
+}
+require_nonempty_file() {
+    # require_nonempty_file <path> <desc>: fail unless path is non-empty.
+    if [ -s "$1" ]; then
+        return 0
+    fi
+    state_fail "validator miss: $2"
+}
+
+# run_state <name> <function>: try/continue wrapper. The function runs in
+# a subshell with -e off so no failing command can abort the stage; its
+# outcome (ok/failed/skipped + reason) lands in steps.jsonl.
+run_state() {
+    STATE_NAME="$1"
+    export STATE_NAME
+    echo "tuna-visual-capture [$STAGE]: state $1"
+    start="$(date +%s)"
+    # Condition context: the subshell's nonzero exit must not trip -e.
+    if ( set +e; "$2" >"$ARTIFACTS/state-$1.log" 2>&1 ); then
+        code=0
+    else
+        code=$?
+    fi
+    end="$(date +%s)"
+    if [ "$code" = 0 ]; then
+        status="ok"
+    elif [ "$code" = 70 ]; then
+        status="skipped"
+    else
+        status="failed"
+    fi
+    reason="$(tail -2 "$ARTIFACTS/state-$1.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+    # shellcheck disable=SC2086
+    printf '{"state":"%s","status":"%s","seconds":%s,"note":%s}\n' "$1" "$status" \
+        "$((end - start))" "$(printf '%s' "$reason" | jq -Rs .)" >>"$ARTIFACTS/steps.jsonl"
+    STATE_NAME=""
+    export STATE_NAME
+    return 0
+}
+
+# state_fail/state_skip exit the state subshell (see run_state), so a
+# failed guard aborts the state instead of falling through.
+state_fail() { echo "capture failed: $1"; exit 1; }
+state_skip() { echo "skipped: $1"; exit 70; }
+
+park() { xdo mousemove --window "$WID" $((WIDTH - 4)) $((HEIGHT - 4)) || true; }
+open_calendar() { xdo mousemove --window "$WID" $((WIDTH / 2)) 16 click 1 && sleep 2; }
+open_qs() { xdo mousemove --window "$WID" $((WIDTH - 50)) 16 click 1 && sleep 2; }
+close_all() {
+    xdo key Escape || true
+    sleep 1
+    if ! cstate_wait '.overview_open | not' 3; then
+        xdo key Super_L || true
+        cstate_wait '.overview_open | not' 10 || true
+    fi
+    sleep 0.5
+    return 0
+}
+spawn_test_windows() {
+    n=0
+    for spec in Alpha:#3584e4 Beta:#2ec27e Gamma:#e66100; do
+        WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
+            "${spec%%:*}" "${spec#*:}" >"$ARTIFACTS/window-${spec%%:*}.log" 2>&1 &
+        n=$((n + 1))
+        cstate_wait "(.windows | length) == $n" 20 || return 1
+    done
+    sleep 2
+    return 0
+}
+notify() {
+    bus call --session --dest org.freedesktop.Notifications \
+        --object-path /org/freedesktop/Notifications \
+        --method org.freedesktop.Notifications.Notify \
+        -- "$1" 0 "" "$2" "$3" "[]" "{}" -1 >>"$ARTIFACTS/notify.log" 2>&1
+}
+
+# --- stage: panel -----------------------------------------------------------
+st_panel_desktop() {
+    a11y a11y-panel.json || state_fail "shell a11y dump failed"
+    require_jq a11y-panel.json 'any(.[]; .name == "Activities" and .showing)' "panel exposes Activities"
+    shot panel-desktop 2 || state_fail "scrot failed"
+}
+st_panel_tray() {
+    TRAY_MARKER="$ARTIFACTS/tray-marker"
+    rm -f "$TRAY_MARKER"
+    "$PY" "$ROOT/scripts/lib/tuna-tray-item-stub.py" "$TRAY_MARKER" >"$ARTIFACTS/tray.log" 2>&1 &
+    TRAY_PID=$!
+    ok=0
+    for _ in $(seq 1 30); do grep -q registered "$ARTIFACTS/tray.log" 2>/dev/null && { ok=1; break; }; sleep 0.5; done
+    [ "$ok" = 1 ] || state_fail "tray stub never registered"
+    for _ in $(seq 1 20); do
+        a11y a11y-tray.json >/dev/null 2>&1
+        showing a11y-tray.json "Tuna Desktop Tray Probe" && break
+        sleep 0.5
+    done
+    showing a11y-tray.json "Tuna Desktop Tray Probe" || state_fail "tray item never showed"
+    a11y a11y-tray-menu.json --press "Tuna Desktop Tray Probe" || state_fail "could not open tray menu"
+    require_jq a11y-tray-menu.json 'any(.[]; .name == "Open Probe" and .showing)' "tray menu row showing"
+    shot panel-tray-menu || state_fail "scrot failed"
+    kill "$TRAY_PID" 2>/dev/null || true
+    TRAY_PID=""
+    close_all
+}
+states_panel() {
+    run_state desktop st_panel_desktop
+    run_state tray st_panel_tray
+}
+
+# --- stage: calendar ----------------------------------------------------------
+st_calendar_menu() {
+    open_calendar || state_fail "could not click the clock"
+    a11y a11y-calendar.json || state_fail "a11y dump failed"
+    require_jq a11y-calendar.json 'any(.[]; .name == "Design review" and .showing)' "seeded event listed"
+    observe a11y-calendar.json 'any(.[]; .name == "No Notifications" and .showing)' "empty notification list"
+    shot calendar-menu || state_fail "scrot failed"
+    close_all
+}
+st_calendar_with_notification() {
+    notify "Tuna Desktop Proof" "Calendar Note" "Listed under the calendar" || state_fail "Notify failed"
+    # Let the banner expire first: it covers the clock and its node
+    # would satisfy the validator while the menu stays shut.
+    sleep 6
+    xdo mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) || true
+    sleep 3.5
+    open_calendar || state_fail "could not click the clock"
+    a11y a11y-calendar-list.json || state_fail "a11y dump failed"
+    require_jq a11y-calendar-list.json 'any(.[]; .name == "Design review" and .showing)' "calendar menu open"
+    require_jq a11y-calendar-list.json 'any(.[]; .name == "Calendar Note" and .showing)' "notification listed"
+    shot calendar-with-notification || state_fail "scrot failed"
+    close_all
+}
+states_calendar() {
+    run_state date-menu st_calendar_menu
+    run_state with-notification st_calendar_with_notification
+}
+
+# --- stage: quick-settings ------------------------------------------------------
+st_qs_grid() {
+    open_qs || state_fail "could not open quick settings"
+    a11y a11y-qs.json || state_fail "a11y dump failed"
+    require_jq a11y-qs.json 'any(.[]; .name == "Dark Style" and .showing)' "toggle grid showing"
+    shot qs-grid || state_fail "scrot failed"
+    # Leave it open: submenu states reuse it; each reopens if needed.
+}
+# qs_grid: leave quick settings showing its toggle grid, whatever it
+# showed before (grid, submenu, or closed). Each submenu state starts
+# here so presses never race a stale submenu.
+qs_grid() {
+    close_all
+    a11y a11y-qs-probe.json >/dev/null 2>&1
+    if showing a11y-qs-probe.json "Dark Style"; then
+        xdo key Escape || true
+        sleep 1
+    fi
+    open_qs || return 1
+    a11y a11y-qs-grid.json >/dev/null 2>&1 || return 1
+    showing a11y-qs-grid.json "Dark Style" || return 1
+    return 0
+}
+st_qs_wifi_menu() {
+    qs_grid || state_fail "quick settings would not open"
+    a11y a11y-qs-wifi.json --press "Wi-Fi Menu" || state_fail "could not open the Wi-Fi menu"
+    require_jq a11y-qs-wifi.json 'any(.[]; (.name // "" | startswith("Tuna Desktop")) and .showing)' "stub networks listed"
+    shot qs-wifi-menu || state_fail "scrot failed"
+}
+st_qs_network_agent() {
+    qs_grid || state_fail "quick settings would not open"
+    a11y a11y-qs-wifi2.json --press "Wi-Fi Menu" >/dev/null 2>&1
+    guest="$(jq -r '[.[] | select(.showing and ((.name // "") | test("Guest")))][0].name' "$ARTIFACTS/a11y-qs-wifi2.json")"
+    if [ -z "$guest" ] || [ "$guest" = "null" ]; then
+        state_skip "no unsaved secured network in the stub menu"
+    fi
+    a11y a11y-qs-agent.json --press "$guest" || state_fail "could not press $guest"
+    sleep 1
+    a11y a11y-qs-agent2.json >/dev/null 2>&1
+    require_jq a11y-qs-agent2.json 'any(.[]; (.name // "" | test("Authentication required|Password")) and .showing)' "secret dialog showing"
+    shot qs-network-agent || state_fail "scrot failed"
+    xdo key Escape || true
+    sleep 1
+}
+st_qs_wired_menu() {
+    qs_grid || state_fail "quick settings would not open"
+    a11y a11y-qs-wired.json --press "Wired Menu" || state_fail "could not open the Wired menu"
+    require_jq a11y-qs-wired.json 'any(.[]; (.name // "" | test("Disconnect|Wired Settings")) and .showing)' "wired menu entries"
+    shot qs-wired-menu || state_fail "scrot failed"
+}
+st_qs_bluetooth_menu() {
+    qs_grid || state_fail "quick settings would not open"
+    a11y a11y-qs-bt.json --press "Bluetooth Menu" || state_fail "could not open the Bluetooth menu"
+    require_jq a11y-qs-bt.json 'any(.[]; (.name // "" | test("Headphones|Bluetooth Settings")) and .showing)' "bluetooth menu entries"
+    shot qs-bluetooth-menu || state_fail "scrot failed"
+    close_all
+}
+st_qs_microphone() {
+    [ -x "$ARTIFACTS/bin/wpctl" ] || state_skip "no audio fixture"
+    touch "$ARTIFACTS/recording"
+    "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event >/dev/null 2>&1 || true
+    sleep 1
+    a11y a11y-mic.json >/dev/null 2>&1
+    require_jq a11y-mic.json 'any(.[]; .name == "Microphone in use" and .showing)' "panel mic indicator"
+    qs_grid || state_fail "quick settings would not open"
+    require_jq a11y-qs-grid.json 'any(.[]; .name == "Microphone" and .showing)' "Microphone slider"
+    shot qs-microphone || state_fail "scrot failed"
+    rm -f "$ARTIFACTS/recording"
+    "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event >/dev/null 2>&1 || true
+    close_all
+}
+st_qs_osd_volume() {
+    # Native media key: the shell steps the volume and raises the OSD.
+    before="$(cat "$VOLUME_FILE")"
+    xdo key XF86AudioRaiseVolume || state_fail "volume key failed"
+    ok=0
+    for _ in $(seq 1 30); do
+        [ "$(cat "$VOLUME_FILE")" != "$before" ] && { ok=1; break; }
+        sleep 0.2
+    done
+    [ "$ok" = 1 ] || state_fail "validator miss: volume key changed nothing"
+    shot qs-osd-volume 0.5 || state_fail "scrot failed"
+    require_frame_differs qs-osd-volume.png 00-baseline-desktop.png "volume OSD rendered"
+    sleep 2
+}
+st_qs_osd_brightness() {
+    before="$(cat "$BACKLIGHT/brightness")"
+    xdo key XF86MonBrightnessUp || state_fail "brightness key failed"
+    ok=0
+    for _ in $(seq 1 10); do
+        [ "$(cat "$BACKLIGHT/brightness")" != "$before" ] && { ok=1; break; }
+        sleep 0.3
+    done
+    [ "$ok" = 1 ] || state_skip "backlight did not move; OSD would be stale"
+    shot qs-osd-brightness 0.5 || state_fail "scrot failed"
+    require_frame_differs qs-osd-brightness.png 00-baseline-desktop.png "brightness OSD rendered"
+    sleep 2
+}
+st_qs_power_menu() {
+    open_qs || state_fail "quick settings would not open"
+    a11y a11y-power-menu.json --press "Power Off Menu" || state_fail "could not press the power button"
+    sleep 1
+    require_jq a11y-power-menu.json 'any(.[]; .name == "Suspend" and .showing)' "power menu entries"
+    shot qs-power-menu || state_fail "scrot failed"
+    close_all
+}
+states_quick_settings() {
+    run_state grid st_qs_grid
+    run_state wifi-menu st_qs_wifi_menu
+    run_state network-agent st_qs_network_agent
+    run_state wired-menu st_qs_wired_menu
+    run_state bluetooth-menu st_qs_bluetooth_menu
+    run_state microphone st_qs_microphone
+    run_state osd-volume st_qs_osd_volume
+    run_state osd-brightness st_qs_osd_brightness
+    run_state power-menu st_qs_power_menu
+}
+
+# --- stage: windows ---------------------------------------------------------------
+st_windows_three() {
+    spawn_test_windows || state_fail "test windows never mapped"
+    shot windows-three 2 || state_fail "scrot failed"
+    require_cstate '(.windows | length) == 3' "three windows mapped"
+}
+st_windows_popover() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-test-beta "$ARTIFACTS/a11y-beta-menu.json" 20 >/dev/null 2>&1 \
+        || state_fail "test window not on the a11y bus"
+    beta_origin="$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")"
+    if [ -z "$beta_origin" ] || [ "$beta_origin" = "null null" ]; then
+        state_fail "beta rect missing"
+    fi
+    # shellcheck disable=SC2086
+    menu="$(jq -er --argjson ox "${beta_origin%% *}" --argjson oy "${beta_origin##* }" '[.[] | select(.showing and .name == "Main Menu" and ((.bounds[2] // 0) > 0) and ((.bounds[3] // 0) > 0))][0].bounds | "\((.[0] + $ox + .[2] / 2) | floor) \(.[1] + $oy + .[3] / 2 | floor)"' "$ARTIFACTS/a11y-beta-menu.json")" \
+        || state_fail "menu button has no bounds"
+    # shellcheck disable=SC2086
+    xdo mousemove --window "$WID" $menu click 1 || state_fail "could not click the menu"
+    sleep 2
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-test-beta "$ARTIFACTS/a11y-beta.json" 20 >/dev/null 2>&1
+    require_jq a11y-beta.json 'any(.[]; .name == "Popover content" and .showing)' "popover open"
+    shot windows-popover || state_fail "scrot failed"
+    close_all
+}
+st_windows_tile_preview() {
+    read -r bx by <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")
+EOF2
+    if [ -z "$bx" ] || [ "$bx" = "null" ]; then
+        state_fail "beta rect missing"
+    fi
+    xdo mousemove --window "$WID" $((bx + 131)) $((by + 20)) || state_fail "mouse failed"
+    sleep 0.2
+    xdo mousedown 1 || state_fail "mousedown failed"
+    sleep 0.1
+    xdo mousemove --window "$WID" $((bx + 120)) $((by + 20)) || true
+    sleep 0.5
+    for step in $(seq 1 8); do
+        xdo mousemove --window "$WID" $(((bx + 120) * (8 - step) / 8 + 1)) $((by + 20 + step * 5)) || true
+        sleep 0.05
+    done
+    sleep 0.5
+    require_cstate '.tile_preview != null' "tile preview in compositor state"
+    shot windows-tile-preview || state_fail "scrot failed"
+    xdo mousemove --window "$WID" $((bx + 120)) $((by + 20)) || true
+    xdo mouseup 1 || true
+    sleep 0.8
+    park
+}
+st_windows_menu() {
+    read -r bx by <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")
+EOF2
+    if [ -z "$bx" ] || [ "$bx" = "null" ]; then
+        state_fail "beta rect missing"
+    fi
+    xdo mousemove --window "$WID" $((bx + 120)) $((by + 20)) || state_fail "mouse failed"
+    sleep 0.2
+    xdo click 3 || state_fail "right click failed"
+    sleep 1.5
+    a11y a11y-window-menu.json >/dev/null 2>&1
+    require_jq a11y-window-menu.json 'any(.[]; .name == "Close" and .showing)' "window menu open"
+    shot windows-menu || state_fail "scrot failed"
+    close_all
+}
+st_windows_maximize() {
+    xdo key super+Up || state_fail "Super+Up failed"
+    cstate_wait '.focused_rect == [0,32,1280,768]' 10 || state_fail "validator miss: maximize geometry not observed"
+    shot windows-maximized || state_fail "scrot failed"
+    xdo key super+Down || true
+    sleep 1
+}
+st_windows_tiled() {
+    xdo key super+Left || state_fail "Super+Left failed"
+    cstate_wait '.focused_rect == [0,32,640,768]' 10 || state_fail "validator miss: tile geometry not observed"
+    shot windows-tiled-left || state_fail "scrot failed"
+    xdo key super+Down || true
+    sleep 1
+}
+states_windows() {
+    run_state three st_windows_three
+    run_state popover st_windows_popover
+    run_state tile-preview st_windows_tile_preview
+    run_state window-menu st_windows_menu
+    run_state maximized st_windows_maximize
+    run_state tiled st_windows_tiled
+}
+
+# --- stage: x11 ---------------------------------------------------------------------
+st_x11_app() {
+    command -v Xwayland >/dev/null 2>&1 || state_skip "Xwayland not installed"
+    command -v xeyes >/dev/null 2>&1 || state_skip "xeyes not installed"
+    xdo key Super_L || state_fail "Super failed"
+    cstate_wait '.overview_open' 10 || state_fail "overview did not open"
+    sleep 1
+    xdo type --delay 60 "x probe" || state_fail "typing failed"
+    sleep 1.5
+    a11y a11y-x11-search.json >/dev/null 2>&1
+    observe a11y-x11-search.json 'any(.[]; .name == "Tuna X Probe" and .showing)' "X probe in search"
+    xdo key Return || state_fail "Return failed"
+    ok=0
+    for _ in $(seq 1 30); do [ -s "$X11_MARKER" ] && { ok=1; break; }; sleep 0.5; done
+    [ "$ok" = 1 ] || state_fail "X probe never launched"
+    cstate_wait '(.windows | length) >= 1' 20 || state_fail "X11 window never mapped"
+    sleep 1
+    shot x11-app 2 || state_fail "scrot failed"
+    require_nonempty_file "$X11_MARKER" "X probe launched with DISPLAY"
+    require_cstate '(.windows | length) >= 1' "X11 window mapped"
+    close_all
+}
+states_x11() {
+    run_state x11-app st_x11_app
+}
+
+# --- stage: scroll --------------------------------------------------------------------
+st_scroll_strip() {
+    spawn_test_windows || state_fail "test windows never mapped"
+    xdo key super+shift+t || state_fail "Super+Shift+T failed"
+    sleep 2
+    require_cstate '.session_mode == "scroll"' "strip mode in compositor state"
+    shot scroll-strip 2 || state_fail "scrot failed"
+}
+st_scroll_follow() {
+    xdo key super+Left || state_fail "Super+Left failed"
+    sleep 1.5
+    shot scroll-follow || state_fail "scrot failed"
+    require_frame_differs scroll-follow.png scroll-strip.png "view followed focus"
+}
+st_scroll_preset() {
+    xdo key super+r || state_fail "Super+R failed"
+    sleep 1.5
+    shot scroll-preset || state_fail "scrot failed"
+    require_frame_differs scroll-preset.png scroll-follow.png "column preset changed the strip"
+    xdo key super+shift+t || true
+    sleep 1
+}
+states_scroll() {
+    run_state strip st_scroll_strip
+    run_state follow st_scroll_follow
+    run_state preset st_scroll_preset
+}
+
+# --- stage: switcher --------------------------------------------------------------------
+st_switcher_popup() {
+    spawn_test_windows || state_fail "test windows never mapped"
+    xdo keydown Alt_L || state_fail "Alt down failed"
+    xdo key Tab || { xdo keyup Alt_L || true; state_fail "Tab failed"; }
+    sleep 1
+    a11y a11y-switcher.json >/dev/null 2>&1
+    require_jq a11y-switcher.json 'any(.[]; (.name // "" | test("tuna-test-")) and .showing)' "switcher lists apps"
+    shot switcher-popup || { xdo keyup Alt_L || true; state_fail "scrot failed"; }
+    xdo keyup Alt_L || true
+    sleep 1
+}
+st_switcher_thumbnails() {
+    delta_id="$(jq -r '.windows[] | select(.app_id == "tuna-test-delta") | .id' "$CSTATE" 2>/dev/null | head -1)"
+    if [ -z "$delta_id" ] || [ "$delta_id" = "null" ]; then
+        WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
+            Delta "#c01c28" >"$ARTIFACTS/window-Delta.log" 2>&1 &
+        sleep 2
+    fi
+    xdo keydown Alt_L || state_fail "Alt down failed"
+    xdo key Tab || { xdo keyup Alt_L || true; state_fail "Tab failed"; }
+    sleep 1
+    xdo key Down || { xdo keyup Alt_L || true; state_fail "Down failed"; }
+    sleep 1
+    require_cstate '.switcher_thumbnails > 0' "thumbnail view in compositor state"
+    shot switcher-thumbnails || { xdo keyup Alt_L || true; state_fail "scrot failed"; }
+    xdo keyup Alt_L || true
+    sleep 1
+}
+states_switcher() {
+    run_state popup st_switcher_popup
+    run_state thumbnails st_switcher_thumbnails
+}
+
+# --- stage: overview --------------------------------------------------------------------
+st_overview_open() {
+    spawn_test_windows || state_fail "test windows never mapped"
+    xdo mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2)) || true
+    xdo key Super_L || state_fail "Super failed"
+    cstate_wait '.overview_open and (.previews | length) == 3' 10 || state_fail "overview did not open with three previews"
+    sleep 1
+    require_cstate '.overview_open' "overview open in compositor state"
+    shot overview-open || state_fail "scrot failed"
+    a11y a11y-overview-shell.json >/dev/null 2>&1
+    require_jq a11y-overview-shell.json 'any(.[]; .name == "Search" and .showing)' "search entry showing"
+    require_jq a11y-overview-shell.json 'any(.[]; .name == "Show Apps" and .showing)' "dash showing"
+}
+st_overview_workspaces() {
+    cstate_wait '.overview_open' 3 || {
+        xdo key Super_L || state_fail "Super failed"
+        cstate_wait '.overview_open' 10 || state_fail "overview did not open"
+    }
+    xdo key Escape || true
+    sleep 1
+    # Three workspaces: move the focused window right through its menu.
+    read -r bx by <<EOF2
+$(jq -r '.focused_rect | "\(.[0]) \(.[1])"' "$CSTATE")
+EOF2
+    if [ -z "$bx" ] || [ "$bx" = "null" ]; then
+        state_fail "focused rect missing"
+    fi
+    xdo mousemove --window "$WID" $((bx + 60)) $((by + 20)) || state_fail "mouse failed"
+    sleep 0.2
+    xdo click 3 || state_fail "right click failed"
+    sleep 1
+    a11y a11y-ws-move.json --press "Move to Workspace Right" >/dev/null 2>&1 \
+        || state_fail "no Move to Workspace Right"
+    sleep 0.5
+    park
+    xdo key Super_L || state_fail "Super failed"
+    cstate_wait '.overview_open' 10 || state_fail "overview did not open"
+    sleep 1
+    require_cstate '(.thumbnails | length) >= 2' "thumbnail strip in compositor state"
+    shot overview-workspaces || state_fail "scrot failed"
+}
+st_overview_drag() {
+    cstate_wait '.overview_open' 3 || {
+        xdo key Super_L || state_fail "Super failed"
+        cstate_wait '.overview_open' 10 || state_fail "overview did not open"
+    }
+    sleep 1
+    read -r sx sy tx ty <<EOF2
+$(jq -r '[.previews[0].rect, .thumbnails[0].rect] | "\(.[0][0] + 1) \(.[0][1] + 1) \(.[1][0] + .[1][2] + 3) \(.[1][1] + .[1][3] - 1)"' "$CSTATE")
+EOF2
+    if [ -z "$sx" ] || [ "$sx" = "null" ]; then
+        state_fail "no preview/thumbnail rects to drag between"
+    fi
+    xdo mousemove --window "$WID" "$sx" "$sy" mousedown 1 || state_fail "mousedown failed"
+    for step in $(seq 1 12); do
+        xdo mousemove --window "$WID" $((sx + (tx - sx) * step / 12)) $((sy + (ty - sy) * step / 12)) || true
+        sleep 0.05
+    done
+    sleep 0.5
+    require_cstate '.workspace_placeholder != null' "insertion placeholder in compositor state"
+    shot overview-drag || { xdo mouseup 1 || true; state_fail "scrot failed"; }
+    xdo key Escape || true
+    xdo mouseup 1 || true
+    close_all
+}
+st_overview_popup() {
+    xdo key super+Page_Down || state_fail "Super+Page_Down failed"
+    shot overview-workspace-popup 0.35 || state_fail "scrot failed"
+    require_frame_differs overview-workspace-popup.png 00-baseline-desktop.png "workspace popup rendered"
+    sleep 1.5
+    require_cstate '.active_workspace == 1' "second workspace active"
+    shot overview-workspace-switched || state_fail "scrot failed"
+    xdo key super+Page_Up || true
+    sleep 1.2
+}
+states_overview() {
+    run_state open st_overview_open
+    run_state workspaces st_overview_workspaces
+    run_state drag st_overview_drag
+    run_state popup st_overview_popup
+}
+
+# --- stage: search-apps -------------------------------------------------------------------
+st_search_apps_search() {
+    xdo key Super_L || state_fail "Super failed"
+    cstate_wait '.overview_open' 10 || state_fail "overview did not open"
+    sleep 1
+    xdo type --delay 40 "tuna probe" || state_fail "typing failed"
+    sleep 1
+    a11y a11y-search.json >/dev/null 2>&1
+    require_jq a11y-search.json 'any(.[]; .name == "Tuna Probe" and .showing)' "probe app listed"
+    shot search-results || state_fail "scrot failed"
+    close_all
+}
+st_search_apps_provider() {
+    xdo key Super_L || state_fail "Super failed"
+    cstate_wait '.overview_open' 10 || state_fail "overview did not open"
+    sleep 1
+    xdo type --delay 40 "report" || state_fail "typing failed"
+    sleep 1.5
+    a11y a11y-provider.json >/dev/null 2>&1
+    require_jq a11y-provider.json 'any(.[]; .name == "Quarterly Report.odt" and .showing)' "provider result listed"
+    shot search-provider || state_fail "scrot failed"
+    close_all
+}
+st_search_apps_grid() {
+    # Seed page apps and folder config BEFORE the first grid open: the
+    # grid snapshots entries and folders when it opens.
+    for i in $(seq -w 1 30); do
+        printf '[Desktop Entry]\nName=Tuna Page App %s\nExec=true\nType=Application\n' "$i" \
+            >"$XDG_DATA_HOME/applications/tuna-page-$i.desktop"
+    done
+    gset set org.gnome.desktop.app-folders folder-children "['CaptureTools']" || state_fail "gsettings failed"
+    gset set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/CaptureTools/ name "Capture Tools" || true
+    gset set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/CaptureTools/ apps "['tuna-probe.desktop']" || true
+    sleep 1
+    xdo key super+a || state_fail "Super+A failed"
+    cstate_wait '.overview_open and .overview_app_grid' 10 || state_fail "app grid did not open"
+    sleep 1.5
+    require_cstate '.overview_app_grid' "app grid in compositor state"
+    shot app-grid || state_fail "scrot failed"
+}
+st_search_apps_folder() {
+    cstate_wait '.overview_open and .overview_app_grid' 3 || {
+        xdo key super+a || state_fail "Super+A failed"
+        cstate_wait '.overview_open and .overview_app_grid' 10 || state_fail "app grid did not open"
+        sleep 1
+    }
+    a11y a11y-folders.json >/dev/null 2>&1
+    require_jq a11y-folders.json 'any(.[]; .name == "Capture Tools" and .showing)' "folder tile showing"
+    a11y a11y-folder-open.json --press "Capture Tools" >/dev/null 2>&1 \
+        || state_fail "could not open the folder"
+    sleep 1
+    shot app-folder || state_fail "scrot failed"
+    a11y a11y-folder-shown.json >/dev/null 2>&1
+    require_jq a11y-folder-shown.json 'any(.[]; .name == "Tuna Probe" and .showing)' "folder dialog lists its app"
+    xdo key Escape || true
+    sleep 1
+}
+st_search_apps_pages() {
+    cstate_wait '.overview_open and .overview_app_grid' 3 || {
+        xdo key super+a || state_fail "Super+A failed"
+        cstate_wait '.overview_open and .overview_app_grid' 10 || state_fail "app grid did not open"
+        sleep 1
+    }
+    a11y a11y-grid-pages.json >/dev/null 2>&1
+    require_jq a11y-grid-pages.json 'any(.[]; .name == "Next Page" and .showing)' "page arrows showing"
+    shot app-grid-pages || state_fail "scrot failed"
+    a11y a11y-grid-next.json --press "Next Page" >/dev/null 2>&1 || state_fail "could not press Next Page"
+    sleep 1
+    shot app-grid-page2 || state_fail "scrot failed"
+    a11y a11y-grid-back.json --press "Previous Page" >/dev/null 2>&1 || true
+    sleep 1
+}
+# Grid tile center in nested-window coordinates, via live a11y bounds.
+grid_point() {
+    ox="$(jq --arg ns "tuna-shell-appgrid" '.layers[] | select(.namespace == $ns) | .rect[0]' "$CSTATE")"
+    oy="$(jq --arg ns "tuna-shell-appgrid" '.layers[] | select(.namespace == $ns) | .rect[1]' "$CSTATE")"
+    jq -er --arg name "$2" --argjson ox "$ox" --argjson oy "$oy" '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == $name and (.bounds[2] > 0) and (.bounds[3] > 0))][0].bounds | select(length == 4) | "\((.[0] + $ox + .[2] / 2) | floor) \(.[1] + $oy + .[3] / 2 | floor)"' "$1"
+}
+st_search_apps_folder_made() {
+    cstate_wait '.overview_open and .overview_app_grid' 3 || state_fail "app grid not open"
+    a11y a11y-grid-src.json >/dev/null 2>&1 || state_fail "dump failed"
+    src="$(jq -r '[.[] | select(.showing and .role == "table cell")][0].name' "$ARTIFACTS/a11y-grid-src.json")"
+    dst="$(jq -r '[.[] | select(.showing and .role == "table cell")][1].name' "$ARTIFACTS/a11y-grid-src.json")"
+    if [ -z "$src" ] || [ "$src" = "null" ] || [ -z "$dst" ] || [ "$dst" = "null" ]; then
+        state_fail "no two grid tiles to drag between"
+    fi
+    read -r sx sy <<EOF2
+$(grid_point "$ARTIFACTS/a11y-grid-src.json" "$src" || true)
+EOF2
+    [ -n "$sx" ] || state_fail "source tile has no bounds"
+    read -r tx ty <<EOF2
+$(grid_point "$ARTIFACTS/a11y-grid-src.json" "$dst" || true)
+EOF2
+    [ -n "$tx" ] || state_fail "target tile has no bounds"
+    layout_before="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null; gsettings get org.gnome.desktop.app-folders folder-children 2>/dev/null)"
+    xdo mousemove --window "$WID" "$sx" "$sy" || state_fail "mouse failed"
+    sleep 0.3
+    xdo mousedown 1 || state_fail "mousedown failed"
+    sleep 0.1
+    for step in $(seq 1 10); do
+        xdo mousemove --window "$WID" $((sx + (tx - sx) * step / 10)) $((sy + (ty - sy) * step / 10)) || true
+        sleep 0.05
+    done
+    sleep 0.8
+    xdo mouseup 1 || true
+    sleep 1.5
+    a11y a11y-grid-made.json >/dev/null 2>&1
+    shot grid-folder-made || state_fail "scrot failed"
+    observe a11y-grid-made.json 'any(.[]; (.name // "" | test("Folder|folder")) and .showing)' "folder dialog after drop"
+    layout_after="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null; gsettings get org.gnome.desktop.app-folders folder-children 2>/dev/null)"
+    if [ "$layout_before" = "$layout_after" ]; then
+        state_fail "validator miss: the drop changed no saved grid state"
+    fi
+}
+st_search_apps_reorder() {
+    cstate_wait '.overview_open and .overview_app_grid' 3 || state_fail "app grid not open"
+    a11y a11y-grid-re.json >/dev/null 2>&1 || state_fail "dump failed"
+    src="$(jq -r '[.[] | select(.showing and .role == "table cell")][2].name' "$ARTIFACTS/a11y-grid-re.json")"
+    if [ -z "$src" ] || [ "$src" = "null" ]; then
+        state_fail "no tile to reorder"
+    fi
+    read -r sx sy <<EOF2
+$(grid_point "$ARTIFACTS/a11y-grid-re.json" "$src" || true)
+EOF2
+    [ -n "$sx" ] || state_fail "tile has no bounds"
+    layout_before="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null)"
+    xdo mousemove --window "$WID" "$sx" "$sy" || state_fail "mouse failed"
+    sleep 0.3
+    xdo mousedown 1 || state_fail "mousedown failed"
+    sleep 0.1
+    for step in $(seq 1 6); do
+        xdo mousemove --window "$WID" $((sx + step * 12)) "$sy" || true
+        sleep 0.05
+    done
+    sleep 0.6
+    shot grid-reorder-drag || state_fail "scrot failed"
+    xdo mouseup 1 || true
+    sleep 1
+    shot grid-reordered || state_fail "scrot failed"
+    layout_after="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null)"
+    if [ "$layout_before" = "$layout_after" ]; then
+        state_fail "validator miss: the reorder changed no saved order"
+    fi
+}
+st_search_apps_drag_cancel() {
+    # The audit's DRAG-CANCEL finding, as capture: a real folder-tile
+    # drag shows the page hint, Escape cancels, and the settled frame
+    # plus the saved layout say whether the grid went back. A failure
+    # here must not take the rest of the stage (or run) down.
+    cstate_wait '.overview_open and .overview_app_grid' 3 || state_fail "app grid not open"
+    a11y a11y-grid-cancel-src.json >/dev/null 2>&1 || state_fail "dump failed"
+    src="$(jq -r '[.[] | select(.showing and .role == "table cell")][0].name' "$ARTIFACTS/a11y-grid-cancel-src.json")"
+    if [ -z "$src" ] || [ "$src" = "null" ]; then
+        state_fail "no tile to drag"
+    fi
+    read -r sx sy <<EOF2
+$(grid_point "$ARTIFACTS/a11y-grid-cancel-src.json" "$src" || true)
+EOF2
+    [ -n "$sx" ] || state_fail "tile has no bounds"
+    layout_before="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null || echo unknown)"
+    xdo mousemove --window "$WID" "$sx" "$sy" || state_fail "mouse failed"
+    sleep 0.3
+    xdo mousedown 1 || state_fail "mousedown failed"
+    sleep 0.1
+    for step in $(seq 1 6); do
+        xdo mousemove --window "$WID" $((sx + step * 10)) "$sy" || true
+        sleep 0.05
+    done
+    sleep 0.25
+    a11y a11y-grid-cancel-peek.json >/dev/null 2>&1
+    observe a11y-grid-cancel-peek.json 'any(.[]; .name == "Next page preview" and .showing)' "page hint during drag"
+    shot grid-drag-peek || { xdo mouseup 1 || true; state_fail "scrot failed"; }
+    xdo key Escape || true
+    xdo mouseup 1 || true
+    sleep 1
+    if ! cstate_wait '.overview_open and .overview_app_grid' 3; then
+        xdo key super+a || true
+        cstate_wait '.overview_open and .overview_app_grid' 10 || true
+        sleep 1
+    fi
+    xdo mousemove --window "$WID" $((WIDTH - 6)) "$sy" || true
+    sleep 1.5
+    a11y a11y-grid-cancelled.json >/dev/null 2>&1
+    require_jq a11y-grid-cancelled.json 'any(.[]; .name == "Next Page" and .showing)' "arrows back after cancel"
+    layout_after="$(gsettings get org.gnome.shell app-picker-layout 2>/dev/null || echo unknown)"
+    printf '%s\n---\n%s\n' "$layout_before" "$layout_after" >"$ARTIFACTS/grid-cancel-layout.txt"
+    if [ "$layout_before" != "$layout_after" ]; then
+        state_fail "validator miss: cancelled drag changed the saved layout"
+    fi
+    shot grid-drag-cancelled || state_fail "scrot failed"
+    close_all
+}
+states_search_apps() {
+    run_state search st_search_apps_search
+    run_state provider st_search_apps_provider
+    run_state grid st_search_apps_grid
+    run_state folder st_search_apps_folder
+    run_state pages st_search_apps_pages
+    run_state folder-made st_search_apps_folder_made
+    run_state reorder st_search_apps_reorder
+    run_state drag-cancel st_search_apps_drag_cancel
+}
+
+# --- stage: notifications -------------------------------------------------------------
+st_notify_banner() {
+    sleep 2
+    notify "Tuna Desktop Proof" "Proof Banner" "Sent over D-Bus" || state_fail "Notify failed"
+    sleep 1
+    a11y a11y-banner.json >/dev/null 2>&1
+    require_jq a11y-banner.json 'any(.[]; .name == "Proof Banner" and .showing)' "banner showing"
+    shot notify-banner || state_fail "scrot failed"
+    sleep 6
+    xdo mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) || true
+    sleep 3.5
+}
+st_notify_list() {
+    open_calendar || state_fail "could not click the clock"
+    a11y a11y-list.json >/dev/null 2>&1
+    require_jq a11y-list.json 'any(.[]; .name == "Proof Banner" and .showing)' "banner in history"
+    shot notify-list || state_fail "scrot failed"
+    a11y a11y-cleared.json --press "Clear" >/dev/null 2>&1 || true
+    sleep 1
+    close_all
+}
+st_notify_dnd() {
+    open_qs || state_fail "quick settings would not open"
+    a11y a11y-dnd.json --press "Do Not Disturb" >/dev/null 2>&1 || state_fail "could not press Do Not Disturb"
+    xdo key Escape || true
+    sleep 1
+    notify "Tuna Desktop Proof" "Quiet Note" "Held back by Do Not Disturb" || state_fail "Notify failed"
+    sleep 1
+    a11y a11y-dnd-banner.json >/dev/null 2>&1
+    require_absent a11y-dnd-banner.json 'any(.[]; .name == "Quiet Note" and .showing)' "banner held back by DND"
+    open_calendar || state_fail "could not click the clock"
+    a11y a11y-dnd-list.json >/dev/null 2>&1
+    require_jq a11y-dnd-list.json 'any(.[]; .name == "Quiet Note" and .showing)' "held note in history"
+    shot notify-dnd-list || state_fail "scrot failed"
+    a11y a11y-dnd-cleared.json --press "Clear" >/dev/null 2>&1 || true
+    sleep 1
+    close_all
+    open_qs || true
+    a11y a11y-dnd-off.json --press "Do Not Disturb" >/dev/null 2>&1 || true
+    close_all
+}
+st_notify_group() {
+    notify "Tuna Desktop Proof" "First Note" "One of two" || state_fail "Notify failed"
+    sleep 0.5
+    notify "Tuna Desktop Proof" "Second Note" "Two of two" || state_fail "Notify failed"
+    sleep 6
+    xdo mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) || true
+    sleep 3.5
+    open_calendar || state_fail "could not click the clock"
+    a11y a11y-group.json >/dev/null 2>&1
+    require_jq a11y-group.json 'any(.[]; .name == "Tuna Desktop Proof" and .showing)' "group header showing"
+    shot notify-group || state_fail "scrot failed"
+    a11y a11y-group-open.json --press "Tuna Desktop Proof" >/dev/null 2>&1 \
+        || state_fail "could not expand the group"
+    sleep 1
+    require_jq a11y-group-open.json 'any(.[]; .name == "First Note" and .showing)' "group expanded"
+    shot notify-group-expanded || state_fail "scrot failed"
+    close_all
+}
+states_notifications() {
+    run_state banner st_notify_banner
+    run_state list st_notify_list
+    run_state dnd st_notify_dnd
+    run_state group st_notify_group
+}
+
+# --- stage: input -------------------------------------------------------------------------
+st_input_preedit() {
+    command -v ibus-daemon >/dev/null 2>&1 || state_skip "ibus-daemon not installed"
+    "$PY" -c "import gi; gi.require_version('IBus', '1.0')" 2>/dev/null \
+        || state_skip "IBus GI bindings missing"
+    ok=0
+    for _ in $(seq 1 40); do grep -q "tuna-ibus-bridge: ready" "$LOG" 2>/dev/null && { ok=1; break; }; sleep 0.5; done
+    [ "$ok" = 1 ] || state_fail "the IBus bridge never came up"
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+        "$PY" -u "$ROOT/scripts/lib/tuna-ibus-test-engine.py" >"$ARTIFACTS/ibus-engine.log" 2>&1 &
+    IME_PIDS="$!"
+    ok=0
+    for _ in $(seq 1 30); do grep -q ready "$ARTIFACTS/ibus-engine.log" 2>/dev/null && { ok=1; break; }; sleep 0.5; done
+    [ "$ok" = 1 ] || state_fail "the test engine did not register with IBus"
+    IME_OUT="$ARTIFACTS/ime.txt"
+    rm -f "$IME_OUT"
+    WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-ime-window.py" "$IME_OUT" \
+        >"$ARTIFACTS/ime-window.log" 2>&1 &
+    IME_PIDS="$IME_PIDS $!"
+    cstate_wait '.windows | any(.app_id == "tuna-ime")' 20 || state_fail "the IME window never mapped"
+    sleep 1
+    xdo type --delay 100 nihao || state_fail "typing failed"
+    sleep 0.8
+    [ ! -s "$IME_OUT" ] || state_fail "pinyin committed before Space"
+    shot ime-preedit || state_fail "scrot failed"
+    require_frame_differs ime-preedit.png 00-baseline-desktop.png "IME composition rendered"
+    xdo key space || state_fail "Space failed"
+    ok=0
+    for _ in $(seq 1 20); do [ "$(cat "$IME_OUT" 2>/dev/null)" = "你好" ] && { ok=1; break; }; sleep 0.3; done
+    [ "$ok" = 1 ] || state_fail "field holds '$(cat "$IME_OUT" 2>/dev/null)', not committed hanzi"
+}
+st_input_candidates() {
+    [ -s "$ARTIFACTS/ime.txt" ] || state_fail "preedit state did not commit; cannot continue"
+    xdo key Return || true
+    sleep 0.5
+    xdo type --delay 100 ni || state_fail "typing failed"
+    sleep 1
+    a11y a11y-ime-candidates.json >/dev/null 2>&1
+    require_jq a11y-ime-candidates.json 'any(.[]; (.name // "" | test("你|尼|泥")) and .showing)' "candidates showing"
+    shot ime-candidates || state_fail "scrot failed"
+}
+states_input() {
+    run_state preedit st_input_preedit
+    run_state candidates st_input_candidates
+}
+
+# --- stage: system --------------------------------------------------------------------------
+st_system_screenshot_ui() {
+    xdo key Print || state_fail "Print key failed"
+    ok=0
+    for _ in $(seq 1 60); do
+        if jq -e '[.layers[]? | select(.namespace == "tuna-screenshot-ui")] | length > 0' "$CSTATE" >/dev/null 2>&1; then
+            ok=1; break
+        fi
+        sleep 0.5
+    done
+    [ "$ok" = 1 ] || state_fail "screenshot overlay never mapped"
+    sleep 1
+    shot system-screenshot-ui || state_fail "scrot failed"
+    require_cstate '[.layers[]? | select(.namespace == "tuna-screenshot-ui")] | length > 0' "screenshot overlay mapped"
+    require_frame_differs system-screenshot-ui.png 00-baseline-desktop.png "screenshot UI rendered"
+    xdo key Escape || true
+    sleep 1
+}
+st_system_polkit() {
+    # Agent registration is asynchronous and can trail shell startup by
+    # tens of seconds; the stub log existing proves the round trip.
+    ok=0
+    for _ in $(seq 1 180); do [ -s "$TUNA_STUB_POLKIT_LOG" ] && { ok=1; break; }; sleep 0.5; done
+    [ "$ok" = 1 ] || state_fail "the shell never registered a polkit agent"
+    read -r agent_name agent_path <"$TUNA_STUB_POLKIT_LOG"
+    bus call --system --dest "$agent_name" --object-path "$agent_path" \
+        --method org.freedesktop.PolicyKit1.AuthenticationAgent.BeginAuthentication \
+        org.tuna.proof "Authentication is required to run the Tuna Desktop capture." "" "{}" cookie-1 \
+        "[('unix-user', {'uid': <uint32 $(id -u)>})]" >"$ARTIFACTS/polkit-reply" 2>&1 &
+    ok=0
+    for _ in $(seq 1 30); do
+        if a11y a11y-polkit.json >/dev/null 2>&1 && showing a11y-polkit.json "Authenticate"; then
+            ok=1; break
+        fi
+        sleep 0.5
+    done
+    [ "$ok" = 1 ] || state_fail "no Authentication Required dialog"
+    sleep 1
+    shot system-polkit || state_fail "scrot failed"
+    xdo type --delay 30 "not-it" || true
+    xdo key Return || true
+    sleep 1.5
+    a11y a11y-polkit-failed.json >/dev/null 2>&1
+    require_jq a11y-polkit-failed.json 'any(.[]; (.name // "" | test("didn.t work")) and .showing)' "wrong password refused"
+    shot system-polkit-denied || state_fail "scrot failed"
+    xdo type --delay 30 "tuna-proof" || true
+    xdo key Return || true
+    sleep 2
+}
+st_system_end_session() {
+    open_qs || state_fail "quick settings would not open"
+    a11y a11y-power.json --press "Power Off Menu" >/dev/null 2>&1 || state_fail "could not press the power button"
+    a11y a11y-end.json --press "Power Off…" >/dev/null 2>&1 || state_fail "could not press Power Off…"
+    sleep 1
+    a11y a11y-end2.json >/dev/null 2>&1
+    require_jq a11y-end2.json 'any(.[]; .name == "Power Off" and .showing)' "confirmation dialog open"
+    shot system-end-session || state_fail "scrot failed"
+    a11y a11y-end-cancel.json --press "Cancel" >/dev/null 2>&1 || true
+    sleep 1
+    close_all
+}
+st_system_lock() {
+    TUNA_TEST_BOUNDS_MARKER=1 spawn_test_windows || state_fail "test windows never mapped"
+    open_qs || state_fail "quick settings would not open"
+    a11y a11y-suspend.json --press "Power Off Menu" >/dev/null 2>&1 || state_fail "could not press the power button"
+    a11y a11y-suspend2.json --press "Suspend" >/dev/null 2>&1 || state_fail "could not press Suspend"
+    cstate_wait '.locked' 20 || {
+        xdo key super+l || true
+        cstate_wait '.locked' 10 || state_fail "session never locked"
+    }
+    sleep 2
+    shot system-locked || state_fail "scrot failed"
+    require_cstate '.locked' "session locked"
+}
+st_system_unlock_prompt() {
+    cstate_wait '.locked' 5 || state_fail "session is not locked"
+    xdo mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1 || state_fail "click failed"
+    sleep 1
+    shot system-unlock-prompt || state_fail "scrot failed"
+    require_cstate '.locked' "session still locked at the prompt"
+    require_frame_differs system-unlock-prompt.png system-locked.png "unlock prompt raised"
+}
+st_system_unlock() {
+    cstate_wait '.locked' 5 || state_skip "session is not locked; nothing to unlock"
+    [ -n "$PAM_ON" ] || state_skip "pam_wrapper missing; password unlock unprovable here"
+    xdo mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1 || true
+    sleep 1
+    xdo type --delay 30 "$UNLOCK_PASSWORD" || state_fail "typing failed"
+    xdo key Return || state_fail "Return failed"
+    cstate_wait '(.locked | not) and (.windows | length) > 0' 15 \
+        || state_fail "the password did not unlock the session"
+    sleep 1
+    shot system-unlocked || state_fail "scrot failed"
+    require_cstate '(.locked | not) and (.windows | length) > 0' "session unlocked with windows"
+}
+st_system_scale() {
+    cstate_wait '(.locked | not)' 5 || state_skip "session is locked; scale capture needs the desktop"
+    bus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
+        -- 0 2 "[(0, 0, 1.25, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', @a{sv} {})])]" \
+        "@a{sv} {}" >>"$ARTIFACTS/display-config.log" 2>&1 || state_fail "ApplyMonitorsConfig failed"
+    cstate_wait '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' 10 \
+        || state_fail "layout did not follow scale 1.25"
+    sleep 1
+    shot system-scale-125 || state_fail "scrot failed"
+    require_cstate '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' "layout at scale 1.25"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-test-gamma "$ARTIFACTS/a11y-gamma-scale.json" 20 \
+        >/dev/null 2>&1 || state_fail "Gamma accessibility bounds missing"
+    "$PY" "$ROOT/scripts/lib/tuna-scale-frame-proof.py" \
+        "$ARTIFACTS/system-scale-125.png" "$ARTIFACTS/system-scale-125.json" \
+        "$ARTIFACTS/a11y-gamma-scale.json" "$ARTIFACTS/system-scale-frame-proof.json" \
+        || state_fail "Gamma pixels or close button extend outside scaled output"
+    read -r sx sy <<EOF2
+$(jq -r '.close_physical_center | "\(.[0]) \(.[1])"' "$ARTIFACTS/system-scale-frame-proof.json")
+EOF2
+    xdo mousemove --window "$WID" "$sx" "$sy" click 1 || state_fail "scaled close click failed"
+    cstate_wait '(.windows | all(.app_id != "tuna-test-gamma")) and (.windows | any(.app_id == "tuna-test-alpha")) and (.windows | any(.app_id == "tuna-test-beta"))' 10 \
+        || state_fail "actual scaled close button did not close only Gamma"
+    shot system-scale-125-closed || state_fail "scaled close frame failed"
+    jq '.input_close_delivered = true | .gamma_unmapped = true | .other_fixture_windows_retained = true' \
+        "$ARTIFACTS/system-scale-frame-proof.json" >"$ARTIFACTS/system-scale-frame-proof.done.json" \
+        || state_fail "scaled close receipt failed"
+    mv "$ARTIFACTS/system-scale-frame-proof.done.json" "$ARTIFACTS/system-scale-frame-proof.json"
+    bus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
+        -- 0 1 "[(0, 0, 1, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', @a{sv} {})])]" \
+        "@a{sv} {}" >>"$ARTIFACTS/display-config.log" 2>&1 || true
+    sleep 1
+}
+states_system() {
+    run_state screenshot-ui st_system_screenshot_ui
+    run_state polkit st_system_polkit
+    run_state end-session st_system_end_session
+    run_state lock st_system_lock
+    run_state unlock-prompt st_system_unlock_prompt
+    run_state unlock st_system_unlock
+    run_state scale st_system_scale
+}
+
+# --- stage: settings-a11y -----------------------------------------------------------------------
+st_settings_dark() {
+    open_qs || state_fail "quick settings would not open"
+    a11y a11y-dark.json --press "Dark Style" >/dev/null 2>&1 || state_fail "could not press Dark Style"
+    sleep 1
+    case "$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)" in
+        *prefer-dark*) ;;
+        *) state_fail "validator miss: Dark Style tile did not write prefer-dark" ;;
+    esac
+    scheme="$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null || echo unknown)"
+    printf '{"state":"%s","observation":"color-scheme after tile","result":"%s"}\n' \
+        "${STATE_NAME:-?}" "$scheme" >>"$ARTIFACTS/observations.jsonl"
+    shot settings-dark-qs || state_fail "scrot failed"
+    close_all
+    sleep 1
+    shot settings-dark-desktop || state_fail "scrot failed"
+}
+st_settings_clock() {
+    gset set org.gnome.desktop.interface clock-show-seconds true || state_fail "gsettings failed"
+    sleep 2
+    case "$(gsettings get org.gnome.desktop.interface clock-show-seconds 2>/dev/null)" in
+        *true*) ;;
+        *) state_fail "validator miss: clock-show-seconds did not stick" ;;
+    esac
+    a11y a11y-clock.json >/dev/null 2>&1
+    shot settings-clock-seconds || state_fail "scrot failed"
+    gset reset org.gnome.desktop.interface clock-show-seconds || true
+    sleep 1
+}
+st_settings_a11y_menu() {
+    gset set org.gnome.desktop.a11y always-show-universal-access-status true 2>/dev/null \
+        || state_skip "a11y status key missing on this host"
+    sleep 2
+    a11y a11y-menu.json >/dev/null 2>&1
+    require_jq a11y-menu.json 'any(.[]; (.name // "" | test("Accessibility|Universal Access")) and .showing)' "a11y indicator showing"
+    read -r ax ay <<EOF2
+$(jq -r '[.[] | select((.name // "" | test("Accessibility|Universal Access")) and .showing and ((.bounds[2] // 0) > 0))][0].bounds | "\(.[0] + .[2] / 2 | floor) \(.[1] + .[3] / 2 | floor)"' "$ARTIFACTS/a11y-menu.json")
+EOF2
+    if [ -z "$ax" ] || [ "$ax" = "null" ]; then
+        state_fail "a11y indicator has no clickable bounds"
+    fi
+    shot settings-a11y-before 0.2 || state_fail "scrot failed"
+    xdo mousemove --window "$WID" "$ax" "$ay" click 1 || state_fail "could not click the indicator"
+    sleep 2
+    shot settings-a11y-menu || state_fail "scrot failed"
+    require_frame_differs settings-a11y-menu.png settings-a11y-before.png "a11y menu rendered"
+    close_all
+    gset reset org.gnome.desktop.a11y always-show-universal-access-status 2>/dev/null || true
+    sleep 1
+}
+st_settings_background() {
+    ffmpeg -nostdin -loglevel error -y -f lavfi -i color=c=0x2ec27e:s=64x64 -frames:v 1 \
+        "$ARTIFACTS/wallpaper-green.png" 2>/dev/null || state_skip "ffmpeg unavailable for wallpaper fixture"
+    uri="$(printf 'file://%s' "$ARTIFACTS/wallpaper-green.png")"
+    shot settings-wallpaper-before 0.2 || state_fail "scrot failed"
+    # Both keys: the session runs dark, so picture-uri alone changes nothing.
+    gset set org.gnome.desktop.background picture-uri "$uri" || state_fail "gsettings failed"
+    gset set org.gnome.desktop.background picture-uri-dark "$uri" || state_fail "gsettings failed"
+    gset set org.gnome.desktop.background picture-options zoom || true
+    ok=0
+    for _ in $(seq 1 40); do grep -q "wallpaper decoded" "$LOG" 2>/dev/null && { ok=1; break; }; sleep 0.5; done
+    [ "$ok" = 1 ] || state_fail "validator miss: wallpaper never decoded"
+    sleep 1
+    shot settings-wallpaper || state_fail "scrot failed"
+    require_frame_differs settings-wallpaper.png settings-wallpaper-before.png "wallpaper rendered"
+    gset reset org.gnome.desktop.background picture-uri 2>/dev/null || true
+    gset reset org.gnome.desktop.background picture-uri-dark 2>/dev/null || true
+    sleep 1
+}
+states_settings_a11y() {
+    run_state dark-style st_settings_dark
+    run_state clock st_settings_clock
+    run_state a11y-menu st_settings_a11y_menu
+    run_state background st_settings_background
+}
+
+# --- stage: transitions ------------------------------------------------------------------------------
+# Each transition records a real x11grab clip spanning the gesture plus
+# timestamped before/after stills. When ffmpeg recording is unavailable
+# the still pair is the whole record (labeled honestly in frames.json).
+st_trans_overview() {
+    spawn_test_windows || state_fail "test windows never mapped"
+    shot trans-overview-before 0.2 || state_fail "scrot failed"
+    if clip_start trans-overview-open 6; then
+        xdo key Super_L || true
+        sleep 2
+        clip_stop trans-overview-open || state_fail "validator miss: overview-open clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-overview-open.webm" "overview-open clip recorded"
+    else
+        xdo key Super_L || state_fail "Super failed"
+        sleep 1
+    fi
+    cstate_wait '.overview_open' 10 || state_fail "overview did not open"
+    shot trans-overview-open-settled || state_fail "scrot failed"
+    require_cstate '.overview_open' "overview open"
+    if clip_start trans-overview-close 6; then
+        xdo key Escape || true
+        sleep 2
+        clip_stop trans-overview-close || state_fail "validator miss: overview-close clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-overview-close.webm" "overview-close clip recorded"
+    else
+        xdo key Escape || state_fail "Escape failed"
+        sleep 1
+    fi
+    cstate_wait '.overview_open | not' 10 || state_fail "overview did not close"
+    require_cstate '.overview_open | not' "overview closed"
+    shot trans-overview-after || state_fail "scrot failed"
+}
+st_trans_workspace_slide() {
+    close_all
+    shot trans-slide-before 0.2 || state_fail "scrot failed"
+    if clip_start trans-workspace-slide 6; then
+        xdo key super+Page_Down || true
+        sleep 2
+        clip_stop trans-workspace-slide || state_fail "validator miss: workspace-slide clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-workspace-slide.webm" "workspace-slide clip recorded"
+    else
+        xdo key super+Page_Down || state_fail "Super+Page_Down failed"
+        sleep 1.5
+    fi
+    require_cstate '.active_workspace == 1' "second workspace active"
+    shot trans-slide-after || state_fail "scrot failed"
+    xdo key super+Page_Up || true
+    sleep 1.2
+}
+st_trans_size_change() {
+    close_all
+    shot trans-size-before 0.2 || state_fail "scrot failed"
+    if clip_start trans-maximize 6; then
+        xdo key super+Up || true
+        sleep 2
+        clip_stop trans-maximize || state_fail "validator miss: maximize clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-maximize.webm" "maximize clip recorded"
+    else
+        xdo key super+Up || state_fail "Super+Up failed"
+        sleep 1
+    fi
+    cstate_wait '.focused_rect == [0,32,1280,768]' 10 || state_fail "maximize geometry not observed"
+    require_cstate '.focused_rect == [0,32,1280,768]' "window maximized"
+    shot trans-size-after || state_fail "scrot failed"
+    xdo key super+Down || true
+    sleep 1
+}
+st_trans_switcher_fade() {
+    close_all
+    if clip_start trans-switcher 6; then
+        xdo keydown Alt_L || true
+        xdo key Tab || true
+        sleep 1.5
+        xdo keyup Alt_L || true
+        sleep 1
+        clip_stop trans-switcher || state_fail "validator miss: switcher clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-switcher.webm" "switcher clip recorded"
+    else
+        xdo keydown Alt_L || state_fail "Alt down failed"
+        xdo key Tab || { xdo keyup Alt_L || true; state_fail "Tab failed"; }
+        shot trans-switcher-mid 0.8 || { xdo keyup Alt_L || true; state_fail "scrot failed"; }
+        xdo keyup Alt_L || true
+        sleep 1
+        shot trans-switcher-after || state_fail "scrot failed"
+        require_frame_differs trans-switcher-mid.png trans-switcher-after.png "switcher shown mid-transition"
+        return 0
+    fi
+    shot trans-switcher-after || state_fail "scrot failed"
+}
+st_trans_grid_morph() {
+    close_all
+    if clip_start trans-grid-morph 6; then
+        xdo key super+a || true
+        sleep 2
+        clip_stop trans-grid-morph || state_fail "validator miss: grid-morph clip empty"
+        require_nonempty_file "$ARTIFACTS/trans-grid-morph.webm" "grid-morph clip recorded"
+    else
+        xdo key super+a || state_fail "Super+A failed"
+        sleep 1.5
+    fi
+    cstate_wait '.overview_app_grid' 10 || state_fail "app grid did not open"
+    require_cstate '.overview_app_grid' "app grid open"
+    shot trans-grid-settled || state_fail "scrot failed"
+    close_all
+}
+states_transitions() {
+    run_state overview st_trans_overview
+    run_state workspace-slide st_trans_workspace_slide
+    run_state size-change st_trans_size_change
+    run_state switcher-fade st_trans_switcher_fade
+    run_state grid-morph st_trans_grid_morph
+}
+
+# --- stage runner ------------------------------------------------------------------
+run_stage() {
+    STAGE="$1"
+    ARTIFACTS="$2"
+    export STAGE
+    trap session_cleanup EXIT INT TERM
+    mkdir -p "$ARTIFACTS"
+    # Absolute: the compositor only honors an absolute
+    # TUNA_COMPOSITOR_STATE path, and every XDG dir derives from this.
+    ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
+    : >"$ARTIFACTS/frames.jsonl"
+    started="$(date -u +%FT%TZ)"
+    if ! session_start "$ARTIFACTS"; then
+        echo "tuna-visual-capture [$STAGE]: session never came up" >&2
+        status="failed"
+    else
+        STATE_NAME="baseline"
+        export STATE_NAME
+        shot 00-baseline-desktop 2 || true
+        STATE_NAME=""
+        export STATE_NAME
+        case "$STAGE" in
+            panel) states_panel ;;
+            calendar) states_calendar ;;
+            quick-settings) states_quick_settings ;;
+            windows) states_windows ;;
+            x11) states_x11 ;;
+            scroll) states_scroll ;;
+            switcher) states_switcher ;;
+            overview) states_overview ;;
+            search-apps) states_search_apps ;;
+            notifications) states_notifications ;;
+            input) states_input ;;
+            system) states_system ;;
+            settings-a11y) states_settings_a11y ;;
+            transitions) states_transitions ;;
+            *) echo "tuna-visual-capture: unknown stage $STAGE" >&2; status="failed" ;;
+        esac
+        status="done"
+    fi
+    session_cleanup
+    trap - EXIT INT TERM
+    # Honest labels for every frame (never fails the run).
+    if [ -f "$ARTIFACTS/frames.jsonl" ]; then
+        "$PY" "$ROOT/scripts/lib/tuna-visual-label.py" --dir "$ARTIFACTS" \
+            --baseline 00-baseline-desktop.png >/dev/null 2>&1 || true
+    fi
+    # A provenance bug must never cost the captured frames.
+    write_provenance "$ARTIFACTS" "$STAGE" "$ARTIFACTS/commands.txt" ||
+        echo "tuna-visual-capture [$STAGE]: provenance failed" >&2
+    # Stage manifest with label-coupled verdicts (see tuna-visual-finalize.py).
+    finished="$(date -u +%FT%TZ)"
+    "$PY" "$ROOT/scripts/lib/tuna-visual-finalize.py" "$ARTIFACTS" "$STAGE" \
+        "$(stage_ledger "$STAGE")" "$(stage_walkthrough "$STAGE")" \
+        "$started" "$finished"
+    return 0
+}
+
+if [ "$MODE" = "stage" ]; then
+    [ -n "$STAGE" ] || { echo "tuna-visual-capture: --stage needs a name" >&2; exit 1; }
+    [ -n "$ARTIFACTS" ] || { echo "tuna-visual-capture: --stage needs --artifacts DIR" >&2; exit 1; }
+    case " $STAGES " in *" $STAGE "*) ;; *) echo "tuna-visual-capture: unknown stage $STAGE" >&2; exit 1 ;; esac
+    run_stage "$STAGE" "$ARTIFACTS"
+    # A stage that collected nothing fails its job (the artifact upload
+    # still runs via if: always); partial success is still success.
+    if [ -f "$ARTIFACTS/stage.json" ] && \
+        jq -e '.status == "failed"' "$ARTIFACTS/stage.json" >/dev/null 2>&1; then
+        exit 1
+    fi
+    exit 0
+fi
+
+# --- --all: every stage as a subprocess, try/continue ----------------------------------
+[ -n "$ARTIFACTS" ] || { echo "tuna-visual-capture: --all needs --artifacts DIR" >&2; exit 1; }
+mkdir -p "$ARTIFACTS"
+if [ -n "$STAGE_FILTER" ]; then
+    wanted="$(printf '%s' "$STAGE_FILTER" | tr ',' ' ')"
+else
+    wanted="$STAGES"
+fi
+echo "tuna-visual-capture: capturing into $ARTIFACTS"
+failed=""
+# shellcheck disable=SC2086
+for s in $wanted; do
+    case " $STAGES " in *" $s "*) ;; *) echo "tuna-visual-capture: unknown stage $s" >&2; failed="$failed $s"; continue ;; esac
+    if timeout 1500 "$0" --stage "$s" --artifacts "$ARTIFACTS/$s" ${BIN_DIR:+--bin-dir "$BIN_DIR"}; then
+        echo "tuna-visual-capture: stage $s collected"
+    else
+        echo "tuna-visual-capture: stage $s FAILED (continuing)" >&2
+        failed="$failed $s"
+    fi
+done
+"$0" --merge --artifacts "$ARTIFACTS"
+if [ -n "$failed" ]; then
+    echo "tuna-visual-capture: failed stages:$failed" >&2
+    exit 1
+fi
+echo "tuna-visual-capture: all stages collected in $ARTIFACTS"
+exit 0

@@ -104,11 +104,16 @@ impl Inner {
 /// The runtime's handle: feed it input and ticks.
 #[derive(Debug, Clone)]
 pub struct IdleMonitor {
+    wake: crate::wake::Wake,
     inner: Arc<Mutex<Inner>>,
     fire: mpsc::Sender<u32>,
 }
 
 impl IdleMonitor {
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
+
     /// The user did something.
     pub fn activity(&self) {
         let fired = self
@@ -141,9 +146,8 @@ impl IdleMonitor {
 }
 
 struct Core {
+    wake: crate::wake::Wake,
     inner: Arc<Mutex<Inner>>,
-    /// Wakes the compositor loop to recompute its deadline.
-    waker: calloop::ping::Ping,
 }
 
 #[interface(name = "org.gnome.Mutter.IdleMonitor")]
@@ -170,7 +174,7 @@ impl Core {
                 interval: Duration::from_millis(interval),
                 fired: false,
             });
-        self.waker.ping();
+        self.wake.signal();
         Ok(id)
     }
 
@@ -179,12 +183,16 @@ impl Core {
             .inner
             .lock()
             .map_err(|_| zbus::fdo::Error::Failed("idle monitor poisoned".into()))?;
-        Ok(inner.add(Kind::Active))
+        let id = inner.add(Kind::Active);
+        drop(inner);
+        self.wake.signal();
+        Ok(id)
     }
 
     fn remove_watch(&self, id: u32) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.watches.retain(|w| w.id != id);
+            self.wake.signal();
         }
     }
 
@@ -192,9 +200,9 @@ impl Core {
     async fn watch_fired(emitter: &SignalEmitter<'_>, id: u32) -> zbus::Result<()>;
 }
 
-/// Serve the idle monitor on the session bus from a thread. `waker`
-/// wakes the compositor loop when a new idle watch moves its deadline.
-pub fn start(waker: calloop::ping::Ping) -> IdleMonitor {
+/// Serve the idle monitor on the session bus from a thread.
+pub fn start() -> IdleMonitor {
+    let wake = crate::wake::Wake::default();
     let inner = Arc::new(Mutex::new(Inner {
         last_activity: Instant::now(),
         next_id: 0,
@@ -202,8 +210,8 @@ pub fn start(waker: calloop::ping::Ping) -> IdleMonitor {
     }));
     let (fire, fired) = mpsc::channel::<u32>();
     let core = Core {
+        wake: wake.clone(),
         inner: inner.clone(),
-        waker,
     };
     let _ = std::thread::Builder::new()
         .name("tuna-idle-monitor".into())
@@ -236,7 +244,7 @@ pub fn start(waker: calloop::ping::Ping) -> IdleMonitor {
                 let _ = zbus::block_on(Core::watch_fired(&emitter, id));
             }
         });
-    IdleMonitor { inner, fire }
+    IdleMonitor { wake, inner, fire }
 }
 
 #[cfg(test)]
@@ -251,6 +259,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn watch_registration_removal_and_rearming_update_real_deadlines_and_wake() {
+        let t0 = Instant::now();
+        let shared = Arc::new(Mutex::new(inner(t0)));
+        let (wake, source) = crate::wake::Wake::new().unwrap();
+        let core = Core {
+            wake: wake.clone(),
+            inner: shared.clone(),
+        };
+        let (fire, _receive) = mpsc::channel();
+        let monitor = IdleMonitor {
+            wake,
+            inner: shared,
+            fire,
+        };
+        let mut loop_ = calloop::EventLoop::<usize>::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let active = core.add_user_active_watch().unwrap();
+        assert_eq!(monitor.next_deadline(), None);
+        let idle = core.add_idle_watch(1000).unwrap();
+        assert_eq!(monitor.next_deadline(), Some(t0 + Duration::from_secs(1)));
+        let mut count = 0;
+        loop_
+            .dispatch(Some(Duration::from_secs(1)), &mut count)
+            .unwrap();
+        assert_eq!(count, 1);
+        core.remove_watch(idle);
+        core.remove_watch(active);
+        loop_
+            .dispatch(Some(Duration::from_secs(1)), &mut count)
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(monitor.next_deadline(), None);
+    }
     #[test]
     fn idle_watches_fire_once_per_idle_stretch() {
         let t0 = Instant::now();

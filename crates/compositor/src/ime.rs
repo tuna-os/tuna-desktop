@@ -25,6 +25,7 @@ const RESTART_DELAY_MS: u64 = 2_000;
 
 /// The supervised bridge process.
 pub struct ImeBridge {
+    wake: crate::wake::Wake,
     bin: PathBuf,
     wayland_display: String,
     child: Option<Child>,
@@ -39,6 +40,10 @@ pub struct ImeBridge {
 }
 
 impl ImeBridge {
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
+
     /// The bridge to run for this session, if any: `TUNA_IBUS=0` turns
     /// it off; otherwise it runs when IBus is installed (`ibus-daemon`
     /// on `PATH`) and the bridge binary is found (`TUNA_IBUS_BRIDGE_BIN`,
@@ -75,6 +80,7 @@ impl ImeBridge {
             xim_address_probe: None,
             xim_starts: 0,
             xim_next_ms: 0,
+            wake: Default::default(),
         })
     }
 
@@ -203,11 +209,15 @@ impl ImeBridge {
             let (send, receive) = mpsc::sync_channel(1);
             self.xim_starts += 1;
             self.xim_next_ms = now_ms + RESTART_DELAY_MS;
+            let completion = self.wake.completion();
             if std::thread::Builder::new()
                 .name("tuna-xim-address".into())
                 .stack_size(256 * 1024)
                 .spawn(move || {
-                    let _ = send.send(bounded_address_probe(command));
+                    let _completion = completion;
+                    // Drop the result sender before the completion wake, including unwind.
+                    let result_sender = send;
+                    let _ = result_sender.send(bounded_address_probe(command));
                 })
                 .is_ok()
             {
@@ -469,6 +479,7 @@ mod tests {
             xim_address_probe: None,
             xim_starts: MAX_RESTARTS + 1,
             xim_next_ms: 456,
+            wake: Default::default(),
         };
         bridge.set_ready_x11_display(Some(5));
         assert_eq!(bridge.xim.as_ref().unwrap().id(), pid);

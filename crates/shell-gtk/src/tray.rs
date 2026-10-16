@@ -30,12 +30,15 @@ struct Item {
     icon_name: String,
     /// Largest pixmap as big-endian ARGB32 (`width`, `height`, bytes).
     pixmap: Option<(i32, i32, Vec<u8>)>,
+    /// Composed tooltip text, if the item sends any.
+    tooltip: Option<String>,
 }
 
 enum ToWorker {
     Menu(String),
     Fire(String, i32),
     Activate(String),
+    SecondaryActivate(String),
     /// The items may have changed: re-read them.
     Refresh,
 }
@@ -58,6 +61,10 @@ fn serve(bus: &WatcherBus, request: ToWorker, tx: &async_channel::Sender<FromWor
         }
         ToWorker::Activate(service) => {
             bus.activate(&service);
+            true
+        }
+        ToWorker::SecondaryActivate(service) => {
+            bus.secondary_activate(&service);
             true
         }
         ToWorker::Refresh => true,
@@ -91,6 +98,7 @@ fn publish(bus: &WatcherBus, last: &mut Vec<Item>, tx: &async_channel::Sender<Fr
                 title: info.title.clone(),
                 icon_name: name,
                 pixmap: pick_pixmap(pixmaps),
+                tooltip: tooltip_text(&info.tooltip_title, &info.tooltip_body),
             }
         })
         .collect();
@@ -175,8 +183,19 @@ fn icon_for(item: &Item) -> gtk::Image {
 }
 
 /// The tray box for the panel's right side. Empty (and invisible)
-/// until an item registers.
-pub fn tray() -> gtk::Box {
+/// until an item registers. `on_popdown` runs whenever a tray popover
+/// closes, so keyboard panel focus can return to the client.
+/// `escape_guard` is the shared Escape credit: a tray popover showing
+/// bounds stale credit, as for the built-in menus (G-PANEL-FOCUS).
+/// `on_tray_escape` runs the panel's Escape unwind for the given tray
+/// button: the popover's grab delivers Escape to the popover, never
+/// to the panel window controller, so each tray menu intercepts it
+/// the same way the built-ins do.
+pub fn tray(
+    on_popdown: std::rc::Rc<dyn Fn()>,
+    escape_guard: std::rc::Rc<std::cell::Cell<crate::panel_focus::EscapeGuard>>,
+    on_tray_escape: std::rc::Rc<dyn Fn(&gtk::MenuButton) -> glib::Propagation>,
+) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     row.set_visible(false);
     let (to_worker, worker_rx) = mpsc::channel();
@@ -202,6 +221,10 @@ pub fn tray() -> gtk::Box {
                         let popover = gtk::Popover::new();
                         popover.add_css_class("tuna-shell-popover");
                         popover.set_has_arrow(false);
+                        {
+                            let on_popdown = on_popdown.clone();
+                            popover.connect_closed(move |_| on_popdown());
+                        }
                         let button = gtk::MenuButton::builder()
                             .child(&icon_for(item))
                             .popover(&popover)
@@ -214,10 +237,42 @@ pub fn tray() -> gtk::Box {
                             item.title.as_str()
                         };
                         button.update_property(&[gtk::accessible::Property::Label(label)]);
+                        {
+                            let on_escape = on_tray_escape.clone();
+                            let button = button.clone();
+                            let escape_keys = gtk::EventControllerKey::new();
+                            escape_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+                            escape_keys.connect_key_pressed(move |_, key, _, _| {
+                                if key != gtk::gdk::Key::Escape {
+                                    return glib::Propagation::Proceed;
+                                }
+                                on_escape(&button)
+                            });
+                            popover.add_controller(escape_keys);
+                        }
+                        button.set_tooltip_text(item.tooltip.as_deref());
+                        // Middle click sends SecondaryActivate, as GNOME's
+                        // AppIndicator extension does.
+                        let secondary_click = gtk::GestureClick::new();
+                        secondary_click.set_button(gtk::gdk::BUTTON_MIDDLE);
+                        let (to_secondary, service_secondary) =
+                            (to_worker.clone(), item.service.clone());
+                        secondary_click.connect_pressed(move |_, _, _, _| {
+                            let _ = to_secondary
+                                .send(ToWorker::SecondaryActivate(service_secondary.clone()));
+                        });
+                        button.add_controller(secondary_click);
                         // Fresh rows each time the menu opens.
-                        let (to, service) = (to_worker.clone(), item.service.clone());
+                        let (to, service, guard) = (
+                            to_worker.clone(),
+                            item.service.clone(),
+                            escape_guard.clone(),
+                        );
                         popover.connect_show(move |_| {
                             let _ = to.send(ToWorker::Menu(service.clone()));
+                            let mut state = guard.get();
+                            state.note_shown();
+                            guard.set(state);
                         });
                         menus.borrow_mut().push((item.service.clone(), popover));
                         row2.append(&button);
@@ -255,4 +310,29 @@ pub fn tray() -> gtk::Box {
         }
     });
     row
+}
+
+/// Compose the text tooltip without duplicating the canonical host protocol model.
+fn tooltip_text(title: &str, body: &str) -> Option<String> {
+    match (title.is_empty(), body.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(title.to_owned()),
+        (true, false) => Some(body.to_owned()),
+        (false, false) => Some(format!("{title}\n{body}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tooltip_text;
+    #[test]
+    fn tooltip_text_composes_title_and_body() {
+        assert_eq!(tooltip_text("", ""), None);
+        assert_eq!(tooltip_text("Title", ""), Some("Title".to_owned()));
+        assert_eq!(tooltip_text("", "Body"), Some("Body".to_owned()));
+        assert_eq!(
+            tooltip_text("Title", "Body"),
+            Some("Title\nBody".to_owned())
+        );
+    }
 }

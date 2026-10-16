@@ -12,6 +12,8 @@ This implements menu settings and visibility. It does not implement missing magn
 
 Scope: source GTK widget behavior on the recorded host. Installed Wayland shell pixels, actual keyboard/pointer input, external toolkit clients, native output sessions, and paired GNOME behavior still need qualification. Pure policy tests and this focused source proof alone do not close P-A11Y-05.
 
+The wrapper emits `G-A11Y-PREFS pass` in `assertions.txt` only after the actual widget receipt, retained pidfds, verified registry/bus/launcher/Xvfb exits, and removed runtime directory all succeed. It clears previous receipts and assertions before starting. CI runs this proof explicitly; listing an ignored Cargo test is insufficient evidence that it ran.
+
 ### Local receipt (2026-10-10)
 
 Exact implementation source `88aa154950603ca5d60efc0d678b5a349c557fcc` was compiled after a workspace package clean under the shared build-and-freeze guard, with one build job and development/test debug info disabled. The frozen test executable is `/tmp/tuna-v1-a11y-qualified-binaries/gtk-tests`, SHA256 `d4885c49ee1e61e0e9f938622af45aab276a977a64f71e2c0b6b799af1827cf7`.

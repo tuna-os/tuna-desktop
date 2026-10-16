@@ -13,7 +13,7 @@ SOURCE_COMMIT=$2
 ARTIFACTS=$(realpath -m "$3")
 mkdir -p "$ARTIFACTS"
 # A reused directory must not supply a previous run's receipt.
-rm -f "$ARTIFACTS/result.txt" "$ARTIFACTS/manifest.json" "$ARTIFACTS/owned-accessibility.json"
+rm -f "$ARTIFACTS/result.txt" "$ARTIFACTS/manifest.json" "$ARTIFACTS/owned-accessibility.json" "$ARTIFACTS/assertions.txt"
 XDG_RUNTIME_DIR=$(mktemp -d /tmp/tuna-a11y-runtime.XXXXXX)
 chmod 0700 "$XDG_RUNTIME_DIR"
 export XDG_RUNTIME_DIR
@@ -63,6 +63,25 @@ if path.exists():
     data['runtime_removed']=not pathlib.Path(data['runtime_directory']).exists()
     path.write_text(json.dumps(data,indent=2)+'\n')
 PY_CLEANUP
+    if [ "$proof_status" -eq 0 ]; then
+        if ! /usr/bin/python3 - "$ARTIFACTS" <<'PY_GATE'
+import json, pathlib, sys
+artifacts = pathlib.Path(sys.argv[1])
+manifest = json.loads((artifacts / 'manifest.json').read_text())
+owned = json.loads((artifacts / 'owned-accessibility.json').read_text())
+assert manifest['runtime_removed'] is True
+assert owned['exit_verified'] is True
+assert {p['service'] for p in owned['owned']} == {
+    'org.a11y.atspi.Registry', 'org.freedesktop.DBus',
+    'accessibility-launcher', 'xvfb',
+}
+assert all(p['pidfd_retained'] is True for p in owned['owned'])
+assert (artifacts / 'result.txt').read_text().startswith('PASS actual GTK:')
+(artifacts / 'assertions.txt').write_text(
+    'G-A11Y-PREFS pass actual GTK widgets and timers; private session cleanup verified; source scope only\n')
+PY_GATE
+        then proof_status=1; fi
+    fi
     trap - EXIT INT TERM
     exit "$proof_status"
 }
@@ -70,7 +89,23 @@ trap cleanup EXIT INT TERM
 # Xvfb chooses a free server without sharing a pre-existing graphical session.
 Xvfb -displayfd 3 -screen 0 1280x800x24 3>"$ARTIFACTS/display-number" >"$ARTIFACTS/xvfb.log" 2>&1 &
 X_PID=$!
-for _ in $(seq 1 100); do [ -s "$ARTIFACTS/display-number" ] && break; sleep .1; done
+# Xvfb writes its display number to -displayfd only once it accepts
+# clients. Hosted runners have taken over 10 s to get there; never start
+# GTK against a display that is not up (it read as ":" and failed init).
+display_deadline=$(($(date +%s) + 30))
+until [ -s "$ARTIFACTS/display-number" ]; do
+    if ! kill -0 "$X_PID" 2>/dev/null; then
+        echo "Xvfb exited before accepting clients" >&2
+        cat "$ARTIFACTS/xvfb.log" >&2
+        exit 1
+    fi
+    if [ "$(date +%s)" -ge "$display_deadline" ]; then
+        echo "Xvfb did not accept clients within 30 s" >&2
+        cat "$ARTIFACTS/xvfb.log" >&2
+        exit 1
+    fi
+    sleep .1
+done
 DISPLAY=:$(cat "$ARTIFACTS/display-number")
 export DISPLAY
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
@@ -125,6 +160,7 @@ manifest['proof_script_sha256']=hashlib.sha256(pathlib.Path(sys.argv[4]).read_by
 manifest['guard_sha256']=hashlib.sha256(pathlib.Path(sys.argv[5]).read_bytes()).hexdigest()
 pathlib.Path(sys.argv[3]).write_text(json.dumps(manifest,indent=2)+'\n')
 PY
-"$TEST_BIN" accessibility::tests::live_menu_and_focus_settings --ignored --test-threads=1 --nocapture >"$ARTIFACTS/test.log" 2>&1
+"$TEST_BIN" accessibility::tests::live_menu_and_focus_settings --ignored --test-threads=1 --nocapture >"$ARTIFACTS/test.log" 2>&1 ||
+    { cat "$ARTIFACTS/test.log" >&2; exit 1; }
 cat "$ARTIFACTS/test.log"
 cat "$TUNA_A11Y_RECEIPT"

@@ -1,0 +1,7 @@
+Unmodified cursor assets from GNOME Shell51.0.
+Exact source and file hashes are recorded in UPSTREAM.json.
+SVG attribution/license declarations are preserved inside each source SVG.
+The upstream repository license is retained in UPSTREAM-COPYING.
+Local index.theme supports standard theme lookup.
+Installed privately under /usr/share/tuna-desktop/icons, without replacing
+files owned by the system Adwaita icon theme package.

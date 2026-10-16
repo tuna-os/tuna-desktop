@@ -360,7 +360,9 @@ def runtime(directory, report):
         status, status_identity = regular(Path(directory) / (binary + ".status"), 32)
         require(status.strip() == b"0", "installed runtime command failed")
         words = data.decode("utf-8").strip().split()
-        require(len(words) == 2 and words[0] == binary and words[1] == version,
+        # pacman forbids "-" in pkgver, so the PKGBUILD packages the
+        # prerelease X.Y.Z-beta.N as X.Y.Zbeta.N; the binaries print SemVer.
+        require(len(words) == 2 and words[0] == binary and words[1].replace("-", "", 1) == version,
                 "original installed runtime version differs")
         receipts[binary] = {"version": identity, "exit_status": status_identity}
     return receipts

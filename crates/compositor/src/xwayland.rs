@@ -116,6 +116,11 @@ impl XWaylandSupervisor {
     /// is installed. With no spawner the call is a no-op and the
     /// supervisor stays pending — the runtime polls this way until the
     /// window-model join installs the real Smithay spawn.
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn next_delay_ms(&self, now_ms: u64) -> Option<u64> {
+        (self.requested && matches!(self.readiness, Readiness::Idle | Readiness::Pending))
+            .then_some(self.next_allowed_ms.saturating_sub(now_ms))
+    }
     pub fn tick(
         &mut self,
         now_ms: u64,

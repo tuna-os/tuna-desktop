@@ -9,12 +9,15 @@ use std::path::Path;
 const MAX_BYTES: u64 = 4096;
 
 pub(crate) fn read(path: &Path) -> io::Result<String> {
+    read_bounded(path, MAX_BYTES)
+}
+pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+    if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime signal must be a small regular file",
@@ -23,8 +26,8 @@ pub(crate) fn read(path: &Path) -> io::Result<String> {
     // The file can grow after metadata inspection. Limit the descriptor read
     // too, with one extra byte to detect overflow rather than accept a prefix.
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_BYTES {
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime signal exceeds its size limit",
