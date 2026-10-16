@@ -4963,8 +4963,35 @@ impl Runtime {
                         cursor_now,
                         accent,
                     );
-                    use crate::native_repaint::{ElementSignature, FrameSignature};
-                    let mut signature = FrameSignature {
+                    use crate::native_repaint::{FrameSignature, Tracked};
+                    let [cursor_images, cursor_surface] =
+                        crate::cursor::tracked(&cursor, view.scale, Rectangle::from_size(logical));
+                    // Bottom to top, each pass at the scale it draws with.
+                    let passes = [
+                        Tracked::pass(&paper, 1.0),
+                        Tracked::pass(&previews, view.scale),
+                        Tracked::pass(&elements.elements, view.scale),
+                        Tracked::pass(&elements.tile, 1.0),
+                        Tracked::pass(&elements.top, view.scale),
+                        elements
+                            .bell
+                            .iter()
+                            .rev()
+                            .map(|(_, e)| Tracked::new(e, 1.0))
+                            .collect(),
+                        elements
+                            .snapshots
+                            .iter()
+                            .rev()
+                            .map(|(_, e, _)| Tracked::new(e, 1.0))
+                            .collect(),
+                        Tracked::pass(&elements.flashes, 1.0),
+                        Tracked::pass(&elements.effects.textures, 1.0),
+                        Tracked::pass(&elements.effects.solids, 1.0),
+                        cursor_images,
+                        cursor_surface,
+                    ];
+                    let signature = FrameSignature {
                         size: (size.w, size.h),
                         location: out.loc,
                         scale: out.scale,
@@ -4986,64 +5013,8 @@ impl Runtime {
                             .chain(self.night_light.effect_bits())
                             .chain(wellbeing.bits())
                             .collect(),
-                        groups: vec![
-                            elements
-                                .flashes
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            paper
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            previews
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .elements
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .tile
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            elements
-                                .top
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .bell
-                                .iter()
-                                .map(|(_, e)| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            elements
-                                .snapshots
-                                .iter()
-                                .map(|(_, e, _)| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            elements
-                                .effects
-                                .textures
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            elements
-                                .effects
-                                .solids
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                        ],
+                        groups: FrameSignature::groups(&passes),
                     };
-                    signature.groups.extend(crate::cursor::signatures(
-                        &cursor,
-                        view.scale,
-                        Rectangle::from_size(logical),
-                    ));
                     let presented_cursor = crate::cursor::presented_surface(
                         &cursor,
                         &cursor_what,
@@ -5095,7 +5066,7 @@ impl Runtime {
                     let damage = crate::native_repaint::damage_region(
                         tracker,
                         if reset { 0 } else { usize::from(age) },
-                        &signature,
+                        &passes,
                     )
                     .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     let cost;

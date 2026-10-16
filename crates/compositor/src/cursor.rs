@@ -972,27 +972,30 @@ pub fn draw(
     Ok(())
 }
 
-/// The cursor's passes for the native backend's repaint signature, so a
-/// shape, size or ripple change repaints and damages its area.
-pub(crate) fn signatures(
+/// The cursor's passes for the native backend's repaint signature and
+/// damage tracker, bottom to top, so a shape, size or ripple change
+/// repaints and damages its area. Trees wholly off this output are left out.
+pub(crate) fn tracked(
     elements: &CursorElements,
     scale: f64,
     bounds: Rectangle<i32, Physical>,
-) -> [Vec<crate::native_repaint::ElementSignature>; 2] {
-    use crate::native_repaint::ElementSignature;
+) -> [Vec<crate::native_repaint::Tracked<'_>>; 2] {
+    use crate::native_repaint::Tracked;
     use smithay::backend::renderer::element::Element;
     [
         elements
             .images
             .iter()
+            .rev()
             .filter(|e| visible_geometry(e.geometry(1.0.into()), bounds))
-            .map(|e| ElementSignature::capture(e, 1.0))
+            .map(|e| Tracked::new(e, 1.0))
             .collect(),
         elements
             .surface
             .iter()
+            .rev()
             .filter(|e| visible_geometry(e.geometry(scale.into()), bounds))
-            .map(|e| ElementSignature::capture(e, scale))
+            .map(|e| Tracked::new(e, scale))
             .collect(),
     ]
 }
