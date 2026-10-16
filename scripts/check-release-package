@@ -37,7 +37,10 @@ for path in \
     usr/bin/tuna-greeter \
     usr/share/wayland-sessions/tuna.desktop \
     usr/lib/systemd/user/tuna-session.target \
-    etc/pam.d/tuna-lock; do
+    etc/pam.d/tuna-lock \
+    usr/share/licenses/tuna-desktop/LICENSE \
+    usr/share/licenses/tuna-desktop/drm/LICENSE \
+    usr/share/licenses/tuna-desktop/drm-ffi/LICENSE; do
     printf '%s' "$CONTENTS" | grep -q "$path" || fail "missing $path"
 done
 
@@ -52,6 +55,13 @@ SEMVER="$(printf '%s' "$VERSION" | sed 's/~/-/')"
 DIR="$(mktemp -d)"
 trap 'rm -rf "$DIR"' EXIT INT TERM
 dpkg-deb -x "$PKG" "$DIR"
+cmp -s "$ROOT/LICENSE" "$DIR/usr/share/licenses/tuna-desktop/LICENSE" \
+    || fail "root LICENSE differs from original source"
+for dependency in drm drm-ffi; do
+    cmp -s "$ROOT/third-party/$dependency/LICENSE" \
+        "$DIR/usr/share/licenses/tuna-desktop/$dependency/LICENSE" \
+        || fail "$dependency LICENSE differs from original source"
+done
 python3 "$ROOT/scripts/tuna-cursor-assets-check" "$DIR/usr/share/tuna-desktop/icons/Adwaita" \
     || fail "bundled cursor assets rejected"
 for path in usr/share/wayland-sessions/tuna.desktop usr/lib/systemd/user/tuna-session.target etc/pam.d/tuna-lock; do
