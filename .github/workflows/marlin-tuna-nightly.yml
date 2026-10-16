@@ -15,6 +15,8 @@ on:
       - packaging/marlin/vm-lane/Containerfile.published
       - packaging/marlin/vm-lane/tuna-vm-lifecycle
       - packaging/marlin/vm-lane/tuna-vm-health
+      - packaging/marlin/vm-lane/tuna-vm-constraints.c
+      - packaging/marlin/vm-lane/tuna-vm-constraints-build
       - packaging/marlin/vm-lane/tuna-vm-profile
       - scripts/tuna-vm-lane
 

@@ -1,6 +1,16 @@
 # CI fixtures on the published flavor; no Tuna Desktop or greeter payload replacement.
 ARG BASE_IMAGE
+# The hot-corner constraint client, built as in the current-build lane's
+# Containerfile; the build toolchain stays out of the booted fixture.
+FROM ${BASE_IMAGE} AS constraint-builder
+COPY packaging/marlin/vm-lane/tuna-vm-constraints.c /build/tuna-vm-constraints.c
+COPY packaging/marlin/vm-lane/tuna-vm-constraints-build /build/tuna-vm-constraints-build
+RUN pacman -Sy --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-protocols \
+    && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build
+
 FROM ${BASE_IMAGE}
+COPY --from=constraint-builder /usr/libexec/tuna-vm-constraints /usr/libexec/tuna-vm-constraints
+COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm-constraints
 
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
