@@ -12,11 +12,10 @@
 //! system without libpam fails closed. [`PamClient`] answers the same
 //! [`UnlockClient`](crate::unlock::UnlockClient) seam as greetd, so the
 //! prompt flow and its silent-failure rules stay in one place. The
-//! transaction runs on a worker thread with a deadline: a PAM stack that
-//! never returns cannot hang the compositor past it.
+//! transaction runs in a private helper owned by a stable creator thread. A
+//! deadline denies without releasing a still-live or quarantined helper.
 
 use std::ffi::{c_char, c_int, c_void, CString};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use greetd_ipc::{codec::Error as CodecError, AuthMessageType, ErrorType, Response};
@@ -82,8 +81,24 @@ impl Drop for Secrets {
     }
 }
 
+/// True when a PAM message's text asks for a fingerprint rather than
+/// a typed secret (#366). A null or undecodable message is not one:
+/// the historical single-password behavior answers those unchanged.
+unsafe fn message_asks_fingerprint(message: *const PamMessage) -> bool {
+    let text = (*message).msg;
+    if text.is_null() {
+        return false;
+    }
+    let text = std::ffi::CStr::from_ptr(text).to_string_lossy();
+    tuna_greeter::model::is_fingerprint_prompt(&text)
+}
+
 /// The PAM conversation: the password for hidden prompts, the user name
-/// for visible ones, nothing for messages. Anything else fails it.
+/// for visible ones, nothing for messages. Anything else fails it — as
+/// does a hidden prompt that asks for a fingerprint (#366): distinct
+/// credentials are never answered with the password, so a fprintd-backed
+/// stack falls through to its own device flow instead of consuming the
+/// password as a fingerprint answer.
 unsafe extern "C" fn conversation(
     count: c_int,
     messages: *mut *const PamMessage,
@@ -107,7 +122,13 @@ unsafe extern "C" fn conversation(
             return PAM_CONV_ERR;
         }
         let reply = match (*message).msg_style {
-            PAM_PROMPT_ECHO_OFF => libc::strdup(secrets.password.as_ptr()),
+            PAM_PROMPT_ECHO_OFF => {
+                if message_asks_fingerprint(message) {
+                    free_responses(out, i);
+                    return PAM_CONV_ERR;
+                }
+                libc::strdup(secrets.password.as_ptr())
+            }
             PAM_PROMPT_ECHO_ON => libc::strdup(secrets.user.as_ptr()),
             PAM_ERROR_MSG | PAM_TEXT_INFO => std::ptr::null_mut(),
             _ => {
@@ -186,19 +207,21 @@ pub fn authenticate(service: &str, user: &str, password: &str) -> bool {
     }
 }
 
-/// [`authenticate`] on a worker thread, bounded by [`DEADLINE`].
+/// A bounded facade over the stable private-helper owner. A denial or caller
+/// return never frees its backend admission while the helper remains unretired.
 pub fn authenticate_with_deadline(service: &str, user: &str, password: &str) -> bool {
-    let (tx, rx) = mpsc::channel();
-    let (service, user, password) = (service.to_owned(), user.to_owned(), password.to_owned());
-    let spawned = std::thread::Builder::new()
-        .name("tuna-pam".into())
-        .spawn(move || {
-            let _ = tx.send(authenticate(&service, &user, &password));
-        });
-    if spawned.is_err() {
+    let Some(backend) = crate::pam_backend::Backend::live() else {
         return false;
-    }
-    rx.recv_timeout(DEADLINE).unwrap_or(false)
+    };
+    let Ok(mut ticket) = backend.begin(
+        service.to_owned(),
+        user.to_owned(),
+        tuna_shell_control::Secret(password.to_owned()),
+        crate::pam_cancel::Cancellation::default(),
+    ) else {
+        return false;
+    };
+    matches!(ticket.initial(), crate::pam_backend::Initial::Finished(result) if result.authenticated())
 }
 
 /// The service to use: [`SERVICE_ENV`] when set, else [`DEFAULT_SERVICE`].
@@ -214,13 +237,24 @@ pub fn service() -> String {
 pub struct PamClient {
     service: String,
     user: Option<String>,
+    backend: Option<crate::pam_backend::Backend>,
 }
 
 impl PamClient {
+    /// Trusted Rust fixture seam; production always uses the held self image.
+    #[doc(hidden)]
+    pub fn with_backend(service: impl Into<String>, backend: crate::pam_backend::Backend) -> Self {
+        Self {
+            service: service.into(),
+            user: None,
+            backend: Some(backend),
+        }
+    }
     pub fn new(service: impl Into<String>) -> Self {
         Self {
             service: service.into(),
             user: None,
+            backend: crate::pam_backend::Backend::live(),
         }
     }
 }
@@ -235,13 +269,20 @@ impl crate::unlock::UnlockClient for PamClient {
     }
 
     fn answer(&mut self, text: Option<String>) -> Result<Response, CodecError> {
-        let (Some(user), Some(password)) = (self.user.as_deref(), text) else {
+        let password = text.map(crate::pam_backend::Credential::from_string);
+        let (Some(user), Some(password)) = (self.user.as_deref(), password) else {
             return Ok(Response::Error {
                 error_type: ErrorType::AuthError,
                 description: String::new(),
             });
         };
-        if authenticate_with_deadline(&self.service, user, &password) {
+        let accepted = self.backend.as_ref().and_then(|backend| {
+            backend.begin_credential(self.service.clone(), user.to_owned(), password,
+                crate::pam_cancel::Cancellation::default()).ok()
+        }).is_some_and(|mut ticket| {
+            matches!(ticket.initial(), crate::pam_backend::Initial::Finished(result) if result.authenticated())
+        });
+        if accepted {
             Ok(Response::Success)
         } else {
             Ok(Response::Error {
@@ -254,5 +295,131 @@ impl crate::unlock::UnlockClient for PamClient {
     fn cancel(&mut self) -> Result<(), CodecError> {
         self.user = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// Drive [`conversation`] with `messages`, returning the status and
+    /// (on success) each reply text. Frees the C responses.
+    fn run_all(messages: &[(c_int, Option<&str>)]) -> (c_int, Vec<Option<String>>) {
+        let user = CString::new("ada").unwrap();
+        let password = CString::new("s3cret").unwrap();
+        let secrets = Box::new(Secrets { user, password });
+        let prompts: Vec<Option<CString>> = messages
+            .iter()
+            .map(|(_, text)| text.map(|t| CString::new(t).unwrap()))
+            .collect();
+        let pam_messages: Vec<PamMessage> = prompts
+            .iter()
+            .zip(messages.iter())
+            .map(|(prompt, (style, _))| PamMessage {
+                msg_style: *style,
+                msg: prompt.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+            })
+            .collect();
+        let mut ptrs: Vec<*const PamMessage> = pam_messages
+            .iter()
+            .map(|m| m as *const PamMessage)
+            .collect();
+        let mut out: *mut PamResponse = std::ptr::null_mut();
+        let rc = unsafe {
+            conversation(
+                ptrs.len() as c_int,
+                ptrs.as_mut_ptr(),
+                &mut out,
+                &*secrets as *const Secrets as *mut c_void,
+            )
+        };
+        let replies = if rc == PAM_SUCCESS && !out.is_null() {
+            let mut replies = Vec::with_capacity(ptrs.len());
+            for i in 0..ptrs.len() {
+                let resp = unsafe { (*out.add(i)).resp };
+                replies.push(if resp.is_null() {
+                    None
+                } else {
+                    Some(
+                        unsafe { std::ffi::CStr::from_ptr(resp) }
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                });
+            }
+            unsafe { free_responses(out, ptrs.len()) };
+            replies
+        } else {
+            Vec::new()
+        };
+        (rc, replies)
+    }
+
+    /// Drive [`conversation`] with one message, returning the status and
+    /// (on success) the first reply text. Frees the C responses.
+    fn run_once(style: c_int, text: Option<&str>) -> (c_int, Option<String>) {
+        let (rc, mut replies) = run_all(&[(style, text)]);
+        let reply = replies.pop().unwrap_or(None);
+        (rc, reply)
+    }
+
+    #[test]
+    fn password_prompt_still_gets_the_password() {
+        let (rc, reply) = run_once(PAM_PROMPT_ECHO_OFF, Some("Password:"));
+        assert_eq!(rc, PAM_SUCCESS);
+        assert_eq!(reply.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn username_prompt_still_gets_the_user() {
+        let (rc, reply) = run_once(PAM_PROMPT_ECHO_ON, Some("Login:"));
+        assert_eq!(rc, PAM_SUCCESS);
+        assert_eq!(reply.as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn fingerprint_prompt_fails_instead_of_consuming_the_password() {
+        for text in [
+            "Place your finger on the fingerprint reader",
+            "Swipe your finger across the fingerprint reader",
+            "Swipe your finger again",
+        ] {
+            let (rc, reply) = run_once(PAM_PROMPT_ECHO_OFF, Some(text));
+            assert_eq!(rc, PAM_CONV_ERR, "answered a fingerprint prompt: {text}");
+            assert_eq!(reply, None);
+        }
+    }
+
+    #[test]
+    fn mixed_password_and_fingerprint_conversation_fails_closed() {
+        // A stack that asks for a password and then a fingerprint: the
+        // whole conversation fails rather than answering the password
+        // prompt and handing the secret to the fingerprint one.
+        let (rc, replies) = run_all(&[
+            (PAM_PROMPT_ECHO_OFF, Some("Password:")),
+            (
+                PAM_PROMPT_ECHO_OFF,
+                Some("Place your finger on the fingerprint reader"),
+            ),
+        ]);
+        assert_eq!(rc, PAM_CONV_ERR);
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn null_message_text_keeps_historical_behavior() {
+        let (rc, reply) = run_once(PAM_PROMPT_ECHO_OFF, None);
+        assert_eq!(rc, PAM_SUCCESS);
+        assert_eq!(reply.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn info_and_error_messages_stay_unanswered() {
+        for style in [PAM_TEXT_INFO, PAM_ERROR_MSG] {
+            let (rc, reply) = run_once(style, Some("Place your finger on the fingerprint reader"));
+            assert_eq!(rc, PAM_SUCCESS);
+            assert_eq!(reply, None);
+        }
     }
 }

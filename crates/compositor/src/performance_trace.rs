@@ -259,12 +259,44 @@ mod tests {
         assert!(emit_to(&"x".repeat(4097), &destination).is_err());
         assert!(emit_to("forged\nMESSAGE=other", &destination).is_err());
         assert!(emit_to("nul\0record", &destination).is_err());
-        // Remove the socket path, don't just drop the receiver: a test thread
-        // that forks a child concurrently briefly holds every open fd, which
-        // keeps a dropped receiver alive and lets the send succeed.
         drop(receiver);
+        // A concurrently forked test child can still hold the receiver's socket
+        // until exec closes its inherited descriptors. Remove the address so
+        // this failure check does not depend on the last descriptor closing.
         std::fs::remove_file(&destination).unwrap();
-        assert!(emit_to(&message, &destination).is_err());
+        assert_eq!(
+            emit_to(&message, &destination).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn removed_native_datagram_address_fails_with_a_live_receiver_reference() {
+        use std::os::unix::net::UnixDatagram;
+        let directory = std::env::temp_dir().join(format!(
+            "tuna-native-trace-live-reference-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let destination = directory.join("journal");
+        let receiver = UnixDatagram::bind(&destination).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        // Model the remaining kernel reference held by an inherited descriptor.
+        let remaining_receiver = receiver.try_clone().unwrap();
+        drop(receiver);
+        emit_to("still reachable", &destination).unwrap();
+        let mut raw = [0_u8; 256];
+        assert!(remaining_receiver.recv(&mut raw).unwrap() > 0);
+
+        std::fs::remove_file(&destination).unwrap();
+        assert_eq!(
+            emit_to("unreachable", &destination).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        drop(remaining_receiver);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

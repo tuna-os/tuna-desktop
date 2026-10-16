@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.mutter" path="/org/gnome/mutter/">
+    <key name="attach-modal-dialogs" type="b">
+      <default>true</default>
+      <summary>Attach modal dialogs to their parent window</summary>
+    </key>
+  </schema>
+</schemalist>

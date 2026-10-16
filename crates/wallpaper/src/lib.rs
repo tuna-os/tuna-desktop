@@ -9,13 +9,51 @@
 pub mod background;
 
 use image::GenericImageView;
+use image::ImageDecoder;
+
+/// Decoded-image admission: at most 8K geometry (matching
+/// [`background::Geometry::valid`]) and a 64 MiB RGBA8 working
+/// budget (matching the retained-cache budget). The compressed
+/// source cap does NOT bound decoded pixels, so every number below
+/// is checked BEFORE its allocation: header dimensions before
+/// decode, decoded dimensions before RGBA conversion, stream
+/// dimensions before the JXL frame buffer, scaled dimensions
+/// before the cover resize.
+pub const MAX_DECODED_WIDTH: u32 = 7680;
+pub const MAX_DECODED_HEIGHT: u32 = 4320;
+pub const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Admit decoded dimensions: nonzero, within the geometry cap, and
+/// with an RGBA8 footprint inside the working budget. Returns the
+/// admitted byte footprint. Pure and total (checked arithmetic, no
+/// allocation): unit-tested without any decoder.
+pub fn admit_dimensions(w: u32, h: u32) -> Option<usize> {
+    if w == 0 || h == 0 || w > MAX_DECODED_WIDTH || h > MAX_DECODED_HEIGHT {
+        return None;
+    }
+    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if bytes > MAX_DECODED_BYTES {
+        return None;
+    }
+    Some(bytes)
+}
+
+fn strict_limits() -> image::Limits {
+    // `Limits` is #[non_exhaustive] in image 0.25.10: struct-literal
+    // construction is E0639 outside the crate, so start from the
+    // default (512 MiB max_alloc, no dimension caps) and assign.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODED_WIDTH);
+    limits.max_image_height = Some(MAX_DECODED_HEIGHT);
+    limits.max_alloc = Some(MAX_DECODED_BYTES as u64);
+    limits
+}
 
 /// Decode `bytes` and cover-scale them to exactly `w` x `h`, returning
 /// ARGB8888 pixels (B, G, R, A in memory). `None` on any failure.
 pub fn decode_cover_argb(bytes: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    if w == 0 || h == 0 {
-        return None;
-    }
+    // The output buffer is admitted before anything decodes.
+    admit_dimensions(w, h)?;
     let image = decode(bytes)?.to_rgba8();
     let cover = cover_crop(&image, w, h)?;
     let mut argb = cover.into_raw();
@@ -27,28 +65,53 @@ pub fn decode_cover_argb(bytes: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
 }
 
 /// Decode any format `image` reads, plus JPEG XL (gnome-backgrounds'
-/// adwaita-l.jxl and adwaita-d.jxl).
+/// adwaita-l.jxl and adwaita-d.jxl). Header dimensions gate the
+/// decode (strict reader limits reject oversized headers before any
+/// pixel allocation); the decoded dimensions are re-verified
+/// afterwards because decoder limit support is best-effort, so a
+/// returned image always admits its own RGBA conversion.
 pub fn decode(bytes: &[u8]) -> Option<image::DynamicImage> {
     if is_jxl(bytes) {
         return decode_jxl(bytes);
     }
-    image::load_from_memory(bytes).ok()
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    reader.limits(strict_limits());
+    let decoder = reader.with_guessed_format().ok()?.into_decoder().ok()?;
+    let (w, h) = decoder.dimensions();
+    admit_dimensions(w, h)?;
+    let image = image::DynamicImage::from_decoder(decoder).ok()?;
+    let (w, h) = image.dimensions();
+    admit_dimensions(w, h)?;
+    Some(image)
 }
 
 /// Decode JPEG XL converted to sRGB, as GNOME (mutter's colour
 /// management) shows it: GNOME 51's Adwaita wallpapers are Display P3,
-/// and read as sRGB unconverted their blues come out dull.
+/// and read as sRGB unconverted their blues come out dull. The
+/// header size gates the render, an allocation tracker caps the
+/// decoder's working memory, and the stream dimensions gate the
+/// frame buffer with checked arithmetic.
 fn decode_jxl(bytes: &[u8]) -> Option<image::DynamicImage> {
     let mut jxl = jxl_oxide::JxlImage::builder()
+        .alloc_tracker(jxl_oxide::AllocTracker::with_limit(MAX_DECODED_BYTES))
         .read(std::io::Cursor::new(bytes))
         .ok()?;
+    let size = &jxl.image_header().size;
+    admit_dimensions(size.width, size.height)?;
     jxl.request_color_encoding(jxl_oxide::EnumColourEncoding::srgb(
         jxl_oxide::RenderingIntent::Relative,
     ));
     let render = jxl.render_frame(0).ok()?;
     let mut stream = render.stream();
     let (w, h, c) = (stream.width(), stream.height(), stream.channels());
-    let mut buf = vec![0u8; (w as usize) * (h as usize) * (c as usize)];
+    let buf_len = (w as usize)
+        .checked_mul(h as usize)?
+        .checked_mul(c as usize)?;
+    if buf_len > MAX_DECODED_BYTES {
+        return None;
+    }
+    admit_dimensions(w, h)?;
+    let mut buf = vec![0u8; buf_len];
     stream.write_to_buffer(&mut buf);
     match c {
         1 => image::GrayImage::from_raw(w, h, buf).map(image::DynamicImage::ImageLuma8),
@@ -78,6 +141,10 @@ pub fn cover_crop(image: &image::RgbaImage, w: u32, h: u32) -> Option<image::Rgb
     let scale = (w as f64 / iw as f64).max(h as f64 / ih as f64);
     let sw = ((iw as f64 * scale).ceil() as u32).max(w);
     let sh = ((ih as f64 * scale).ceil() as u32).max(h);
+    // The intermediate is admitted before the resize allocates it:
+    // extreme aspect ratios can scale a small source past the
+    // working budget even when source and target each admit.
+    admit_dimensions(sw, sh)?;
     let scaled = image::imageops::resize(image, sw, sh, image::imageops::FilterType::Triangle);
     let x = (sw - w) / 2;
     let y = (sh - h) / 2;
@@ -315,6 +382,90 @@ mod tests {
             &[255, 0, 0, 255],
             "blue is B=255, G=0, R=0, A=255"
         );
+    }
+
+    #[test]
+    fn admission_rejects_zero_overflowing_and_overbudget_geometry() {
+        assert!(admit_dimensions(0, 64).is_none());
+        assert!(admit_dimensions(64, 0).is_none());
+        assert!(admit_dimensions(u32::MAX, u32::MAX).is_none());
+        assert!(admit_dimensions(u32::MAX, 1).is_none());
+        assert!(admit_dimensions(7681, 4320).is_none());
+        assert!(admit_dimensions(7680, 4321).is_none());
+        // Full 8K geometry fits the dimension caps but not the byte
+        // budget (7680 * 4320 * 4 = 132 MiB).
+        assert!(admit_dimensions(7680, 4320).is_none());
+        // Exact budget boundary admits: 4096 * 4096 * 4 = 64 MiB.
+        assert_eq!(admit_dimensions(4096, 4096), Some(64 * 1024 * 1024));
+        assert_eq!(admit_dimensions(1920, 1080), Some(1920 * 1080 * 4));
+    }
+
+    /// IEEE CRC32 (bit-by-bit; test-only PNG fixture surgery).
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// A valid PNG whose IHDR declares `w` x `h`: encoded small
+    /// through the real encoder, then header-patched with a fixed
+    /// CRC so the decoder accepts the header and reports the huge
+    /// dimensions.
+    fn png_with_declared_size(w: u32, h: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(&png[12..16], b"IHDR", "encoder must lead with IHDR");
+        png[16..20].copy_from_slice(&w.to_be_bytes());
+        png[20..24].copy_from_slice(&h.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        png
+    }
+
+    #[test]
+    fn oversized_declared_png_is_rejected_before_pixel_alloc() {
+        // 100000 x 100000 RGBA would need 40 GB; admission must
+        // reject on the header alone, never attempt it.
+        let huge = png_with_declared_size(100_000, 100_000);
+        assert!(decode(&huge).is_none());
+        // Over-budget but smaller declarations reject the same way.
+        let big = png_with_declared_size(7680, 4320);
+        assert!(decode(&big).is_none());
+    }
+
+    #[test]
+    fn small_valid_png_still_decodes() {
+        let small = png_with_declared_size(4, 4);
+        let image = decode(&small).expect("4x4 PNG must decode");
+        assert_eq!(image.dimensions(), (4, 4));
+    }
+
+    #[test]
+    fn truncated_jxl_and_garbage_reject_without_panic() {
+        assert!(decode(&[0xff, 0x0a, 0, 0]).is_none());
+        assert!(decode(&[0xff, 0x0a, 0xff, 0xff, 0xff, 0xff]).is_none());
+        assert!(decode(b"not an image at all....................").is_none());
+        assert!(decode(&[]).is_none());
+    }
+
+    #[test]
+    fn cover_crop_rejects_budget_busting_intermediate() {
+        // A panoramic source against a tall target scales the
+        // intermediate past 64 MiB even though source and target
+        // each admit on their own.
+        let pano = image::RgbaImage::new(7680, 8);
+        assert!(cover_crop(&pano, 64, 4320).is_none());
+        // Ordinary covers still work.
+        let photo = image::RgbaImage::new(160, 90);
+        assert_eq!(cover_crop(&photo, 64, 64).unwrap().dimensions(), (64, 64));
     }
 
     #[test]

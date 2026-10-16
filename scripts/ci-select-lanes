@@ -33,14 +33,17 @@ import sys
 # ci.yml job ids, in workflow order. scripts/lib/ci-select-lanes-tests.py
 # keeps this list and the workflow's lane conditions identical.
 LANES = [
-    "journey", "app-content", "scroll-proof", "drm-smoke", "gtk-shell",
+    "fprint-phase-proof", "journey", "app-content", "scroll-proof", "drm-smoke",
+    "grid-cancel-comparison", "greeter", "gtk-shell",
     "portal-security", "remote-security", "niri-parity", "arch-package",
     "marlin-image", "marlin-vm", "parity-ledger", "docs-shots",
 ]
 
 # Every code change runs the GTK shell proof: it drives the compositor and
-# the preferred shell together and is what most changes touch.
-CORE = ["gtk-shell"]
+# the preferred shell together and is what most changes touch. The
+# fingerprint phase, grid-cancel comparison and greeter proofs are short
+# and cover authentication and drag paths no rotated lane does.
+CORE = ["fprint-phase-proof", "grid-cancel-comparison", "greeter", "gtk-shell"]
 
 # Interchangeable end-to-end coverage of the same build, rotated per run.
 ROTATION = [
@@ -55,7 +58,7 @@ NEEDS = {
     "niri-parity": ["arch-package"],
     "marlin-image": ["arch-package"],
     "marlin-vm": ["arch-package"],
-    "parity-ledger": ["journey", "gtk-shell", "drm-smoke", "marlin-vm"],
+    "parity-ledger": ["journey", "greeter", "gtk-shell", "drm-smoke", "marlin-vm"],
     "docs-shots": ["journey", "app-content", "scroll-proof"],
 }
 

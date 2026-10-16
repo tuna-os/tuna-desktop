@@ -38,7 +38,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           sudo apt-get -o Acquire::Retries=3 update -qq
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg podman skopeo
+          # python3-pil + fonts-dejavu-core: the lane renders its tour cards from source (as marlin-vm does).
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg podman skopeo python3-pil fonts-dejavu-core
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
@@ -141,7 +142,7 @@ jobs:
                   detail = check['detail'].replace('|', '\\|')
                   summary.write(f"| {name} | {'pass' if check['pass'] else '**FAIL**'} | {detail} |\n")
           PY
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: published-marlin-tuna-vm-${{ github.run_id }}

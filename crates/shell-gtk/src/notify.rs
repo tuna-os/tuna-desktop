@@ -26,7 +26,9 @@ use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::intake::NotificationBus;
 use tuna_shell_host::notification_policy::GioPolicyStore;
-use tuna_shell_host::notifications::{Notification, NotificationCenter, Urgency};
+use tuna_shell_host::notifications::{
+    Notification, NotificationAction, NotificationCenter, Urgency,
+};
 
 /// How long a normal or low banner stays up (GNOME: about 4 s).
 pub const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
@@ -226,6 +228,72 @@ struct Shown {
     dnd: bool,
 }
 
+/// Local dispatch for shell-own notice actions (wellbeing Take/Delay/Skip).
+/// External notices route through the bus to their sender; shell-own
+/// notices have no sender, so the shell registers a callback per
+/// (notice id, action key) instead. The banner path always runs the
+/// bus invoke first (per-key replay guard + banner dismiss + signal)
+/// and only dispatches locally when that succeeds.
+///
+/// Admission is shell-owned: `live` holds the resident generation that
+/// may still fire. Center ids are monotonic and never reused, so
+/// dropping an id from `live` invalidates exactly that resident
+/// generation. The bus does NOT guard residency: `dismiss` removes only
+/// the banner while history keeps every unconsumed key invokable, so a
+/// second old key would still invoke after a first action or a banner
+/// close unless the shell retires the resident. Every terminal event
+/// therefore retires: a successful dispatch retires all sibling keys
+/// at once (first press wins), and banner close, body click, timeout
+/// expiry, list removal, and programmatic dismiss retire without
+/// firing. Unregistered ids behave exactly as before. Pure and
+/// headless-testable; the UI owns one.
+#[derive(Default)]
+struct ActionDispatch {
+    handlers: HashMap<(u64, String), Rc<dyn Fn()>>,
+    live: HashSet<u64>,
+}
+
+impl ActionDispatch {
+    /// Register (or replace) one action callback, admitting the resident.
+    fn register(&mut self, id: u64, action: &str, handler: Rc<dyn Fn()>) {
+        self.handlers.insert((id, action.to_owned()), handler);
+        self.live.insert(id);
+    }
+
+    /// Retire one resident generation entirely (action/dismiss/replace):
+    /// its keys must never fire again, even through a previously
+    /// captured path. History entries are untouched.
+    fn drop_notice(&mut self, id: u64) {
+        self.handlers.retain(|(known, _), _| *known != id);
+        self.live.remove(&id);
+    }
+
+    /// Release callbacks whose center entries were removed or history-pruned.
+    /// Banner absence is not removal: dismissed history still belongs to the center.
+    fn retain_history(&mut self, center: &NotificationCenter) {
+        let present: HashSet<u64> = center.history().iter().map(|n| n.id).collect();
+        self.handlers.retain(|(id, _), _| present.contains(id));
+        self.live.retain(|id| present.contains(id));
+    }
+
+    /// Run one registered callback, then retire the whole resident so no
+    /// sibling key can fire afterwards. False when unadmitted: unknown
+    /// ids, retired residents, and unregistered keys never fire.
+    fn dispatch(&mut self, id: u64, action: &str) -> bool {
+        if !self.live.contains(&id) {
+            return false;
+        }
+        match self.handlers.get(&(id, action.to_owned())) {
+            Some(handler) => {
+                handler();
+                self.drop_notice(id);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Notification surfaces and their store.
 pub struct NotifyUi {
     center: Arc<Mutex<NotificationCenter>>,
@@ -249,6 +317,7 @@ pub struct NotifyUi {
     expanded: RefCell<HashSet<String>>,
     group_widgets: RefCell<HashMap<String, Rc<crate::group_animation::Group>>>,
     shown: RefCell<Shown>,
+    local_actions: RefCell<ActionDispatch>,
     /// The next banner expiry (a one-shot timeout).
     deadline: RefCell<Option<glib::SourceId>>,
     /// The next try at the bus while it is not ours.
@@ -367,6 +436,17 @@ impl NotifyUi {
             filed.set_policy(Arc::new(GioPolicyStore::new()));
             filed.enforce_policy();
         }
+        Self::build(app, center, true)
+    }
+
+    // Tests use an in-memory center and ordinary GTK window. Production
+    // always retains the layer-shell surface, persisted notification store
+    // and GNOME's notification policy.
+    fn build(
+        app: &gtk::Application,
+        center: Arc<Mutex<NotificationCenter>>,
+        layered: bool,
+    ) -> Rc<Self> {
         let mut bus = NotificationBus::new(center.clone());
         // The policy store reads and registers through GSettings: file
         // wire arrivals on the GTK main loop, never a zbus thread.
@@ -380,13 +460,15 @@ impl NotifyUi {
 
         let banner_window = gtk::ApplicationWindow::new(app);
         banner_window.add_css_class("tuna-banners");
-        banner_window.init_layer_shell();
-        banner_window.set_layer(Layer::Overlay);
-        banner_window.set_namespace(Some(tuna_shell_control::GTK_BANNERS_NAMESPACE));
-        banner_window.set_anchor(Edge::Top, true);
-        // The card's own 4px margin puts it 4px under the bar (GNOME).
-        banner_window.set_margin(Edge::Top, 0);
-        banner_window.set_keyboard_mode(KeyboardMode::None);
+        if layered {
+            banner_window.init_layer_shell();
+            banner_window.set_layer(Layer::Overlay);
+            banner_window.set_namespace(Some(tuna_shell_control::GTK_BANNERS_NAMESPACE));
+            banner_window.set_anchor(Edge::Top, true);
+            // The card's own 4px margin puts it 4px under the bar (GNOME).
+            banner_window.set_margin(Edge::Top, 0);
+            banner_window.set_keyboard_mode(KeyboardMode::None);
+        }
         let keys = gtk::EventControllerKey::new();
         let banner_weak = banner_window.downgrade();
         keys.connect_key_pressed(move |_, key, _, _| {
@@ -464,6 +546,7 @@ impl NotifyUi {
                 banners: vec![u64::MAX],
                 ..Default::default()
             }),
+            local_actions: RefCell::new(ActionDispatch::default()),
             deadline: RefCell::new(None),
             bus_retry: RefCell::new(None),
             user_watch: Cell::new(UserWatch::Off),
@@ -502,6 +585,82 @@ impl NotifyUi {
             center.set_source(id, icon, "");
         }
         self.update();
+    }
+
+    /// Post the shell's own notification WITH invokable actions, returning
+    /// the center id (None when the store is unreachable). The banner
+    /// renders one button per action; a press runs the bus invoke first
+    /// (per-key replay guard + banner dismiss + signal) and then the
+    /// local handler, retiring all sibling keys on success.
+    pub fn post_with_actions(
+        self: &Rc<Self>,
+        app: &str,
+        icon: &str,
+        summary: &str,
+        body: &str,
+        actions: &[(String, String)],
+    ) -> Option<u64> {
+        let id = {
+            let mut center = self.center.lock().ok()?;
+            let listed = actions
+                .iter()
+                .map(|(id, label)| NotificationAction {
+                    id: id.clone(),
+                    label: label.clone(),
+                })
+                .collect();
+            let id = center.notify(app, summary, body, listed, Urgency::Normal, None);
+            center.set_source(id, icon, "");
+            id
+        };
+        // Arms the new banner's expiry, as for any other arrival.
+        self.update();
+        Some(id)
+    }
+
+    /// Register a local callback for one shell-own (notice, action key).
+    pub fn on_notification_action(self: &Rc<Self>, id: u64, action: &str, handler: Rc<dyn Fn()>) {
+        self.local_actions
+            .borrow_mut()
+            .register(id, action, handler);
+    }
+
+    /// Forget one notice's local callbacks (replacement/removal).
+    pub fn drop_notification_actions(self: &Rc<Self>, id: u64) {
+        self.local_actions.borrow_mut().drop_notice(id);
+    }
+
+    /// Dismiss one banner by id (history keeps the entry); false when the
+    /// center no longer knows it. Retires the resident's local callbacks:
+    /// history keeps unconsumed keys invokable, so without this an old
+    /// key could still dispatch after the user dismissed the banner.
+    pub fn dismiss_notification(self: &Rc<Self>, id: u64) -> bool {
+        let dismissed = self
+            .center
+            .lock()
+            .map(|mut center| center.dismiss(id))
+            .is_ok_and(|r| r.is_ok());
+        if dismissed {
+            self.retire_local_actions(id);
+            self.refresh();
+        }
+        dismissed
+    }
+
+    /// Run one registered local callback; false when unadmitted. Only
+    /// called after a successful bus invoke (per-key replay guard). A
+    /// successful dispatch retires the whole resident, so sibling keys
+    /// captured before the press can never fire afterwards.
+    fn dispatch_local_action(&self, id: u64, action: &str) -> bool {
+        self.local_actions.borrow_mut().dispatch(id, action)
+    }
+
+    /// Retire one resident's local callbacks without firing (banner
+    /// close, body click, timeout expiry, list removal, programmatic
+    /// dismiss). History entries are untouched; unregistered ids are a
+    /// no-op, so external notices behave exactly as before.
+    fn retire_local_actions(&self, id: u64) {
+        self.local_actions.borrow_mut().drop_notice(id);
     }
 
     /// The calendar popover's notification pane.
@@ -593,6 +752,7 @@ impl NotifyUi {
         };
         for id in &due.expired {
             let _ = self.bus.borrow().dismiss_banner(*id as u32, REASON_EXPIRED);
+            self.retire_local_actions(*id);
         }
         self.refresh();
         let mut next = due.next;
@@ -711,6 +871,10 @@ impl NotifyUi {
         let Ok(center) = self.center.lock() else {
             return;
         };
+        // Reconcile even when the visible view is unchanged. The center can
+        // remove/prune entries independently of this UI; stale widgets may
+        // still exist, but their local callbacks must no longer own state.
+        self.local_actions.borrow_mut().retain_history(&center);
         let groups = group_ids(center.history().iter().rev().map(|n| (n.id, group_key(n))));
         // A group that falls back to one card (or goes) forgets it was
         // expanded.
@@ -747,7 +911,16 @@ impl NotifyUi {
                     let button = gtk::Button::with_label(&action.label);
                     let (me, id, key) = (self.clone(), n.id, action.id.clone());
                     button.connect_clicked(move |_| {
-                        let _ = me.bus.borrow().invoke_action(id as u32, &key);
+                        // Bus first: its per-key replay guard rejects
+                        // unknown/replayed keys. Local dispatch then fires
+                        // only for admitted shell-own (id, key) pairs and
+                        // retires the whole resident on success, so no
+                        // sibling key captured before the press can fire
+                        // afterwards. Unregistered notices behave exactly
+                        // as before.
+                        if me.bus.borrow().invoke_action(id as u32, &key).is_ok() {
+                            me.dispatch_local_action(id, &key);
+                        }
                         me.refresh();
                     });
                     row.append(&button);
@@ -758,6 +931,7 @@ impl NotifyUi {
                 let (me, id) = (self.clone(), n.id);
                 close.connect_clicked(move |_| {
                     let _ = me.bus.borrow().dismiss_banner(id as u32, REASON_DISMISSED);
+                    me.retire_local_actions(id);
                     me.refresh();
                 });
             }
@@ -772,13 +946,14 @@ impl NotifyUi {
                         bus.dismiss_banner(id as u32, REASON_DISMISSED)
                     };
                     drop(bus);
+                    me.retire_local_actions(id);
                     me.refresh();
                 });
             }
             c.add_controller(click);
             self.banner_box.append(&c);
         }
-        if now.banners.is_empty() {
+        if now.banners.is_empty() && self.banner_window.is_layer_window() {
             self.banner_window.set_keyboard_mode(KeyboardMode::None);
             if leaving {
                 self.leave_banners();
@@ -812,6 +987,14 @@ impl NotifyUi {
                         let Some(item) = weak.upgrade() else {
                             return;
                         };
+                        // Like add_item, animate only a list on screen: an
+                        // unmapped item gets no frames, so its zoom would never
+                        // finish and the removal (with the notice's callbacks)
+                        // would never run.
+                        if !item.is_mapped() {
+                            me.remove(&[id]);
+                            return;
+                        }
                         item.set_can_target(false);
                         let me = me.clone();
                         item.animate(
@@ -907,6 +1090,7 @@ impl NotifyUi {
                 .bus
                 .borrow()
                 .dismiss_banner(id as u32, REASON_DISMISSED);
+            self.retire_local_actions(id);
             if let Ok(mut center) = self.center.lock() {
                 center.remove(id);
             }
@@ -1057,6 +1241,176 @@ mod group_tests {
 }
 
 #[cfg(test)]
+mod action_dispatch_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn counting(flag: &Rc<Cell<bool>>) -> Rc<dyn Fn()> {
+        let flag = flag.clone();
+        Rc::new(move || flag.set(true))
+    }
+
+    #[test]
+    fn removed_history_releases_callbacks_without_invocation() {
+        let mut center = NotificationCenter::new();
+        let old = center.notify("old", "old", "", vec![], Urgency::Normal, None);
+        let other = center.notify("other", "other", "", vec![], Urgency::Normal, None);
+        let fired = Rc::new(Cell::new(false));
+        let weak = Rc::downgrade(&fired);
+        let mut dispatch = ActionDispatch::default();
+        dispatch.register(old, "take", counting(&fired));
+        dispatch.register(other, "take", Rc::new(|| {}));
+        drop(fired);
+        center.dismiss(old).unwrap();
+        dispatch.retain_history(&center);
+        assert!(
+            weak.upgrade().is_some(),
+            "banner absence must not mean history removal"
+        );
+        assert!(dispatch.live.contains(&old));
+        assert!(
+            !weak.upgrade().unwrap().get(),
+            "reconciliation must not invoke"
+        );
+        center.remove(old);
+        dispatch.retain_history(&center);
+        assert!(
+            weak.upgrade().is_none(),
+            "removed callback must release captured state"
+        );
+        assert!(!dispatch.live.contains(&old));
+        assert_eq!(dispatch.handlers.len(), 1);
+        assert!(!dispatch.dispatch(old, "take"));
+        center.clear_history();
+        dispatch.retain_history(&center);
+        assert!(dispatch.handlers.is_empty() && dispatch.live.is_empty());
+    }
+
+    #[test]
+    fn bounded_history_pruning_retires_only_missing_ids() {
+        let mut center = NotificationCenter::new();
+        let old = center.notify("old", "old", "", vec![], Urgency::Normal, None);
+        let fired = Rc::new(Cell::new(false));
+        let mut dispatch = ActionDispatch::default();
+        dispatch.register(old, "take", counting(&fired));
+        let mut last = old;
+        for _ in 0..tuna_shell_host::notifications::MAX_HISTORY {
+            last = center.notify("new", "new", "", vec![], Urgency::Normal, None);
+        }
+        dispatch.register(last, "take", counting(&fired));
+        dispatch.retain_history(&center);
+        assert!(!dispatch.live.contains(&old));
+        assert_eq!(dispatch.handlers.len(), 1);
+        assert!(!dispatch.dispatch(old, "take"));
+        assert!(!fired.get());
+        assert!(dispatch.live.contains(&last));
+    }
+
+    #[test]
+    fn registered_keys_fire_and_unknown_keys_do_not() {
+        let mut dispatch = ActionDispatch::default();
+        let fired = Rc::new(Cell::new(false));
+        dispatch.register(7, "delay", counting(&fired));
+        // Denied: unknown key on a known notice never fires.
+        assert!(!dispatch.dispatch(7, "snooze"));
+        assert!(!fired.get());
+        // Denied: unknown notice never fires.
+        assert!(!dispatch.dispatch(8, "delay"));
+        assert!(!fired.get());
+        // Registered pair fires exactly.
+        assert!(dispatch.dispatch(7, "delay"));
+        assert!(fired.get());
+    }
+
+    #[test]
+    fn dropped_notices_stop_firing_like_closed_ones() {
+        let mut dispatch = ActionDispatch::default();
+        let fired = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&fired));
+        dispatch.drop_notice(7);
+        assert!(!dispatch.dispatch(7, "take"));
+        assert!(!fired.get());
+    }
+
+    #[test]
+    fn replacement_forgets_the_old_resident_only() {
+        let mut dispatch = ActionDispatch::default();
+        let old = Rc::new(Cell::new(false));
+        let new = Rc::new(Cell::new(false));
+        dispatch.register(7, "skip", counting(&old));
+        dispatch.register(9, "skip", counting(&new));
+        dispatch.drop_notice(7);
+        assert!(!dispatch.dispatch(7, "skip"));
+        assert!(dispatch.dispatch(9, "skip"));
+        assert!(!old.get());
+        assert!(new.get());
+    }
+
+    #[test]
+    fn reregistering_replaces_the_handler() {
+        let mut dispatch = ActionDispatch::default();
+        let first = Rc::new(Cell::new(false));
+        let second = Rc::new(Cell::new(false));
+        dispatch.register(7, "delay", counting(&first));
+        dispatch.register(7, "delay", counting(&second));
+        assert!(dispatch.dispatch(7, "delay"));
+        assert!(!first.get());
+        assert!(second.get());
+    }
+
+    #[test]
+    fn first_action_retires_captured_sibling_keys() {
+        let mut dispatch = ActionDispatch::default();
+        let take = Rc::new(Cell::new(false));
+        let delay = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&take));
+        dispatch.register(7, "delay", counting(&delay));
+        // First press wins...
+        assert!(dispatch.dispatch(7, "take"));
+        assert!(take.get());
+        // ...then the sibling key captured before the press is dead, as
+        // is a replay of the fired key: the resident is retired.
+        assert!(!dispatch.dispatch(7, "delay"));
+        assert!(!dispatch.dispatch(7, "take"));
+        assert!(!delay.get());
+    }
+
+    #[test]
+    fn dismiss_retires_all_keys_but_keeps_other_residents() {
+        let mut dispatch = ActionDispatch::default();
+        let take = Rc::new(Cell::new(false));
+        let other = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&take));
+        dispatch.register(7, "skip", counting(&take));
+        dispatch.register(9, "take", counting(&other));
+        // Same call the banner-close, body-click, expiry, removal, and
+        // programmatic-dismiss paths make: retire without firing.
+        dispatch.drop_notice(7);
+        assert!(!dispatch.dispatch(7, "take"));
+        assert!(!dispatch.dispatch(7, "skip"));
+        assert!(!take.get());
+        // A different live resident is unaffected.
+        assert!(dispatch.dispatch(9, "take"));
+        assert!(other.get());
+    }
+
+    #[test]
+    fn retired_resident_never_readmits_without_register() {
+        let mut dispatch = ActionDispatch::default();
+        let fired = Rc::new(Cell::new(false));
+        dispatch.register(7, "take", counting(&fired));
+        assert!(dispatch.dispatch(7, "take"));
+        // Retired by the dispatch above; no re-fire without a fresh post.
+        assert!(!dispatch.dispatch(7, "take"));
+        // A fresh post for the same id re-admits exactly its new keys.
+        dispatch.register(7, "take", counting(&fired));
+        fired.set(false);
+        assert!(dispatch.dispatch(7, "take"));
+        assert!(fired.get());
+    }
+}
+
+#[cfg(test)]
 mod timer_tests {
     use super::*;
 
@@ -1118,5 +1472,190 @@ mod timer_tests {
         assert_eq!(back.next, Some(t0 + Duration::from_millis(7_500)));
         assert!(!back.away);
         assert_eq!(due(std::iter::empty(), t0, None), Due::default());
+    }
+}
+
+#[cfg(test)]
+mod gtk_action_lifecycle_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn button(root: &impl IsA<gtk::Widget>, wanted: &str) -> gtk::Button {
+        fn collect(widget: &gtk::Widget, wanted: &str, found: &mut Vec<gtk::Button>) {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                if button.label().as_deref() == Some(wanted)
+                    || (wanted == "close" && button.has_css_class("message-close-button"))
+                {
+                    found.push(button.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                collect(&widget, wanted, found);
+                child = widget.next_sibling();
+            }
+        }
+        let mut found = Vec::new();
+        collect(root.as_ref(), wanted, &mut found);
+        assert_eq!(found.len(), 1, "one captured {wanted} button required");
+        found.pop().unwrap()
+    }
+
+    fn post(ui: &Rc<NotifyUi>) -> (u64, gtk::Button, gtk::Button, Rc<Cell<u32>>) {
+        let id = ui
+            .post_with_actions(
+                "Owned callback fixture",
+                "",
+                "Break",
+                "",
+                &[
+                    ("take".into(), "Take".into()),
+                    ("delay".into(), "Delay".into()),
+                ],
+            )
+            .unwrap();
+        let fired = Rc::new(Cell::new(0));
+        for key in ["take", "delay"] {
+            let count = fired.clone();
+            ui.on_notification_action(id, key, Rc::new(move || count.set(count.get() + 1)));
+        }
+        (
+            id,
+            button(&ui.banner_box, "Take"),
+            button(&ui.banner_box, "Delay"),
+            fired,
+        )
+    }
+
+    #[test]
+    #[ignore = "requires an owned Xvfb/private D-Bus session and explicit admission"]
+    fn actual_gtk_captured_actions_obey_resident_lifecycle() {
+        assert_eq!(std::env::var("TUNA_REQUIRE_NOTIFY_UI").as_deref(), Ok("1"));
+        assert!(std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok());
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        assert!(std::env::var_os("WAYLAND_SOCKET").is_none());
+        gtk::init().expect("real GTK display required");
+        let app = gtk::Application::builder()
+            .application_id("org.tuna.NotifyCallbackProof")
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let center = Arc::new(Mutex::new(NotificationCenter::new()));
+        let ui = NotifyUi::build(&app, center.clone(), false);
+        // Real clicked callbacks, retained even after their widgets leave the UI.
+        let (id, take, delay, fired) = post(&ui);
+        take.emit_clicked();
+        take.emit_clicked();
+        delay.emit_clicked();
+        assert_eq!(
+            fired.get(),
+            1,
+            "Take wins exactly once, stale sibling stays inert"
+        );
+        assert_eq!(center.lock().unwrap().history().len(), 1);
+        ui.clear.emit_clicked();
+        assert!(center.lock().unwrap().history().is_empty());
+        assert!(ui.bus.borrow().invoke_action(id as u32, "delay").is_err());
+
+        for terminal in [
+            "user-close",
+            "dismiss",
+            "replacement",
+            "timeout",
+            "history-close",
+            "center-remove",
+            "clear",
+        ] {
+            let (id, take, delay, fired) = post(&ui);
+            ui.refresh(); // Unchanged visible state must preserve admitted actions.
+            assert_eq!(ui.local_actions.borrow().handlers.len(), 2);
+            assert!(ui.local_actions.borrow().live.contains(&id));
+            match terminal {
+                "user-close" => button(&ui.banner_box, "close").emit_clicked(),
+                "dismiss" => assert!(ui.dismiss_notification(id)),
+                "replacement" => {
+                    // Production wellbeing replaces through these public APIs;
+                    // retain old buttons and ensure a new resident remains usable.
+                    ui.drop_notification_actions(id);
+                    assert!(ui.dismiss_notification(id));
+                }
+                "timeout" => {
+                    ui.first_seen.borrow_mut().insert(
+                        id,
+                        BannerTimer {
+                            shown: Instant::now() - Duration::from_secs(10),
+                            deadline: Some(Instant::now() - Duration::from_secs(1)),
+                        },
+                    );
+                    ui.update(); // Real expiry and retirement path, no sleep/retry.
+                    assert!(!center.lock().unwrap().banners().iter().any(|n| n.id == id));
+                }
+                "history-close" => button(&ui.list, "close").emit_clicked(),
+                "center-remove" => {
+                    center.lock().unwrap().remove(id);
+                    ui.refresh();
+                }
+                "clear" => ui.clear.emit_clicked(),
+                _ => unreachable!(),
+            }
+            assert!(
+                ui.local_actions.borrow().handlers.is_empty(),
+                "unused callbacks after {terminal}"
+            );
+            assert!(
+                ui.local_actions.borrow().live.is_empty(),
+                "unused admission after {terminal}"
+            );
+            assert_eq!(
+                Rc::strong_count(&fired),
+                1,
+                "callback capture not released after {terminal}"
+            );
+            take.emit_clicked();
+            delay.emit_clicked();
+            assert_eq!(
+                fired.get(),
+                0,
+                "captured old callbacks fired after {terminal}"
+            );
+            if matches!(terminal, "clear" | "history-close" | "center-remove") {
+                assert!(ui.bus.borrow().invoke_action(id as u32, "take").is_err());
+            } else {
+                assert!(center.lock().unwrap().history().iter().any(|n| n.id == id));
+            }
+            ui.clear.emit_clicked();
+            let (_, new_take, _, new_fired) = post(&ui);
+            new_take.emit_clicked();
+            assert_eq!(
+                new_fired.get(),
+                1,
+                "fresh resident remains actionable after {terminal}"
+            );
+            ui.clear.emit_clicked();
+        }
+        // External notices have no local handler. Dismiss keeps each history
+        // action invokable once, including a captured button after dismissal.
+        let id = ui
+            .post_with_actions(
+                "External fixture",
+                "",
+                "External",
+                "",
+                &[
+                    ("take".into(), "Take".into()),
+                    ("delay".into(), "Delay".into()),
+                ],
+            )
+            .unwrap();
+        let take = button(&ui.banner_box, "Take");
+        let delay = button(&ui.banner_box, "Delay");
+        button(&ui.banner_box, "close").emit_clicked();
+        take.emit_clicked();
+        delay.emit_clicked();
+        assert!(ui.bus.borrow().invoke_action(id as u32, "take").is_err());
+        assert!(ui.bus.borrow().invoke_action(id as u32, "delay").is_err());
+        assert_eq!(center.lock().unwrap().history().len(), 1);
+        ui.clear.emit_clicked();
+        ui.banner_window.close();
+        println!("G-NOTIFY-LOCAL-LIFECYCLE pass actual GTK clicked handlers and in-memory NotificationCenter; Xvfb source scope only");
     }
 }
