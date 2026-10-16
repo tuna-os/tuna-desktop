@@ -1690,8 +1690,14 @@ fi
 page_mark="$(log_mark)"
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-next.json" 20 \
     --press "Next Page" || fail G-APP-GRID-PAGES "could not press Next Page"
-log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch never settled"
-sleep 0.5
+# The comparison slice also runs old binaries, which predate the grid's
+# animations; the full gate checks them below.
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then
+    sleep 1
+else
+    log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch never settled"
+    sleep 0.5
+fi
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page2.json" 20 ||
     fail G-APP-GRID-PAGES "accessibility dump failed"
 showing "$ARTIFACTS/a11y-grid-page2.json" "Previous Page" ||
@@ -1701,32 +1707,34 @@ pass G-APP-GRID-PAGES "thirty more apps page the grid; indicators and arrows sho
 
 # GNOME's page switch (iconGrid.js goToPage): 300 ms ease-out-cubic,
 # instead of a spring; the Previous Page arrow fades in over 200 ms.
-log_has "$page_mark" "grid-anim page-switch start ms=300 motion=full" ||
-    fail G-GRID-PAGE-ANIM "the page switch did not start a 300 ms eased slide"
-page_ms="$(settle_ms "$page_mark" page-switch)"
-[ "${page_ms:-0}" -ge 290 ] || fail G-GRID-PAGE-ANIM "the page switch settled after ${page_ms:-?} ms, not 300"
-log_has "$page_mark" "grid-anim page-arrow start ms=200" ||
-    fail G-GRID-PAGE-ANIM "the page arrows did not fade over 200 ms"
-# With animations off the switch and the arrows jump.
-motion_policy Off
-page_mark="$(log_mark)"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-prev-off.json" 20 \
-    --press "Previous Page" || fail G-GRID-PAGE-ANIM "could not press Previous Page"
-log_wait "$page_mark" "grid-anim page-switch instant motion=off" ||
-    fail G-GRID-PAGE-ANIM "with animations off the page switch still animated"
-log_has "$page_mark" "grid-anim page-switch start" &&
-    fail G-GRID-PAGE-ANIM "with animations off a page slide started"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page1-off.json" 20 ||
-    fail G-GRID-PAGE-ANIM "accessibility dump failed"
-showing "$ARTIFACTS/a11y-grid-page1-off.json" "Previous Page" &&
-    fail G-GRID-PAGE-ANIM "with animations off the Previous Page arrow lingered"
-motion_policy Full
-page_mark="$(log_mark)"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-next-again.json" 20 \
-    --press "Next Page" || fail G-GRID-PAGE-ANIM "could not return to page two"
-log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch back never settled"
-sleep 0.5
-pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms and the arrows fade over 200 ms; with animations off both jump"
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    log_has "$page_mark" "grid-anim page-switch start ms=300 motion=full" ||
+        fail G-GRID-PAGE-ANIM "the page switch did not start a 300 ms eased slide"
+    page_ms="$(settle_ms "$page_mark" page-switch)"
+    [ "${page_ms:-0}" -ge 290 ] || fail G-GRID-PAGE-ANIM "the page switch settled after ${page_ms:-?} ms, not 300"
+    log_has "$page_mark" "grid-anim page-arrow start ms=200" ||
+        fail G-GRID-PAGE-ANIM "the page arrows did not fade over 200 ms"
+    # With animations off the switch and the arrows jump.
+    motion_policy Off
+    page_mark="$(log_mark)"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-prev-off.json" 20 \
+        --press "Previous Page" || fail G-GRID-PAGE-ANIM "could not press Previous Page"
+    log_wait "$page_mark" "grid-anim page-switch instant motion=off" ||
+        fail G-GRID-PAGE-ANIM "with animations off the page switch still animated"
+    log_has "$page_mark" "grid-anim page-switch start" &&
+        fail G-GRID-PAGE-ANIM "with animations off a page slide started"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page1-off.json" 20 ||
+        fail G-GRID-PAGE-ANIM "accessibility dump failed"
+    showing "$ARTIFACTS/a11y-grid-page1-off.json" "Previous Page" &&
+        fail G-GRID-PAGE-ANIM "with animations off the Previous Page arrow lingered"
+    motion_policy Full
+    page_mark="$(log_mark)"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-next-again.json" 20 \
+        --press "Next Page" || fail G-GRID-PAGE-ANIM "could not return to page two"
+    log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch back never settled"
+    sleep 0.5
+    pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms and the arrows fade over 200 ms; with animations off both jump"
+fi
 
 # Select the rendered icon through actual accessibility bounds, including
 # the descendant button; distribution app catalogs change grid allocation.
@@ -2345,7 +2353,7 @@ log_has "$folder_mark" "grid-anim folder-icon start ms=200" ||
 sleep 0.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-closed.json" 20 ||
     fail G-FOLDER-ZOOM "accessibility dump failed"
-showing "$ARTIFACTS/a11y-folder-closed.json" "Tuna Desktop Probe" &&
+showing "$ARTIFACTS/a11y-folder-closed.json" "Tuna Probe" &&
     fail G-FOLDER-ZOOM "the dialog still showed after its zoom settled"
 showing "$ARTIFACTS/a11y-folder-closed.json" "Probe Tools" ||
     fail G-FOLDER-ZOOM "the grid did not stay open under the closed dialog"
@@ -2356,7 +2364,7 @@ folder_mark="$(log_mark)"
     fail G-FOLDER-ZOOM "could not open the folder with animations off"
 log_wait "$folder_mark" "grid-anim folder-zoom-in instant motion=off" ||
     fail G-FOLDER-ZOOM "with animations off the dialog still zoomed open"
-showing "$ARTIFACTS/a11y-folder-open-off.json" "Tuna Desktop Probe" ||
+showing "$ARTIFACTS/a11y-folder-open-off.json" "Tuna Probe" ||
     fail G-FOLDER-ZOOM "with animations off the dialog did not show its app"
 folder_mark="$(log_mark)"
 folder_shade_click
@@ -2380,7 +2388,7 @@ pass G-FOLDER-ZOOM "the folder dialog zooms from and back to its icon over 200 m
 motion_policy Full
 rm -f "$PROBE_MARKER"
 launch_mark="$(log_mark)"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-launch.json" 20 --press "Tuna Desktop Probe" ||
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-launch.json" 20 --press "Tuna Probe" ||
     fail G-LAUNCH-ZOOM "could not press the folder's app"
 log_wait "$launch_mark" "grid-anim launch-zoom settle" ||
     fail G-LAUNCH-ZOOM "the launch zoom never settled"
