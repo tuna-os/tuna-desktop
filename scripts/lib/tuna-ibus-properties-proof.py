@@ -12,6 +12,7 @@ import sys
 import shutil
 import re
 import time
+from pathlib import Path
 import signal
 # The harness's own phase deadline can expire while this driver still waits;
 # its SIGTERM then dumps where it waited into the lifecycle log.

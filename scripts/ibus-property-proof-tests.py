@@ -142,6 +142,27 @@ class Controls(unittest.TestCase):
         self.assertIn('pub fn activate(&mut self, token: &Token) -> Vec<(String, u32)>', host)
         self.assertIn('<signal name="PropertyActivate"><arg type="s"/><arg type="u"/></signal>', panel)
 
+    def test_every_loaded_name_resolves(self):
+        # These controls never execute the helper end to end, so a dropped
+        # import only showed on CI as a NameError (journey 116756962210:
+        # 'Path' undefined after the faulthandler edit).
+        import builtins
+        bound = set(dir(builtins)) | {"__file__"}
+        for n in ast.walk(module):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                bound |= {(a.asname or a.name).split(".")[0] for a in n.names}
+            elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+                bound.add(n.name)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                bound.add(n.id)
+            elif isinstance(n, ast.arg):
+                bound.add(n.arg)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                bound.add(n.name)
+        loaded = {n.id for n in ast.walk(module)
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        self.assertEqual(loaded - bound, set())
+
 
 if __name__ == "__main__":
     unittest.main()

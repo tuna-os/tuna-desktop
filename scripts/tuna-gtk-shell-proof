@@ -5402,23 +5402,41 @@ cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-after.json"
 wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-retired.json" 20 ||
     fail G-WELLBEING-ACTION-SKIP "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 skip_retired_seq="$WB_DUMP_SEQ"
+# Sample at wb_press_banner's cadence: one keep-alive move per 0.5 s step
+# keeps idle under GNOME's IDLE_TIME (1 s), so the due banner shows to an
+# active user for the full BANNER_TIMEOUT. With 1 s gaps the banner could
+# post to an "away" user and expire 2 s after the next move, and a sample
+# could then land in its slide-out, when expiry has retired its actions
+# and the shell is clearing the card mid-walk (title seen, action row
+# already gone). A sample counts once the banner's action row is
+# observable (any notice action pressable); the Take+Delay/no-Skip
+# verdict below is pinned on that same sample. Arrival is the first
+# sighting of the title.
 SKIPDUE=""
+skip_due_epoch=""
+skip_step=0
 end=$(($(date +%s) + 150))
 while [ "$(date +%s)" -le "$end" ]; do
-    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2)) ||
+    xdotool mousemove --window "$WID" $((WIDTH / 3 + skip_step % 2 * 40)) $((HEIGHT / 2)) ||
         fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
-    sleep 1
-    xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2)) ||
-        fail G-WELLBEING-ACTION-SKIP "keep-alive failed"
-    sleep 1
+    skip_step=$((skip_step + 1))
+    sleep 0.5
     wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-due.json" 20 >/dev/null 2>&1 || continue
-    if showing "$ARTIFACTS/a11y-wb-skip-due.json" "Time for an Eyesight Break"; then
+    showing "$ARTIFACTS/a11y-wb-skip-due.json" "Time for an Eyesight Break" || continue
+    if [ -z "$skip_due_epoch" ]; then
         skip_due_epoch="$(date +%s)"
+        # The banner lives BANNER_TIMEOUT (4 s) once shown.
+        end=$((skip_due_epoch + 6))
+    fi
+    if jq -e 'any(.[]; (.name == "Take" or .name == "Delay" or .name == "Skip")
+            and .role != "label" and .showing)' \
+        "$ARTIFACTS/a11y-wb-skip-due.json" >/dev/null; then
         SKIPDUE=1
         break
     fi
 done
-[ -n "$SKIPDUE" ] || fail G-WELLBEING-ACTION-SKIP "no due banner on the original schedule after Skip"
+[ -n "$skip_due_epoch" ] || fail G-WELLBEING-ACTION-SKIP "no due banner on the original schedule after Skip"
+[ -n "$SKIPDUE" ] || fail G-WELLBEING-ACTION-SKIP "the due banner does not offer Take+Delay without Skip"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" notice-buttons \
     "$ARTIFACTS/a11y-wb-skip-due.json" --title "Time for an Eyesight Break" \
     --expect Take,Delay --reject Skip ||

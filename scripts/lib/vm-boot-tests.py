@@ -1186,7 +1186,15 @@ class PrivatePamSleepControls(unittest.TestCase):
             absent=scope['auth_retirement_state'](expected)
             self.assertFalse(absent['helper_absent']); self.assertTrue(absent['owned_group_members'])
             (root/'700/exe').symlink_to(binary)
+            # An orphan the kernel reparented (ppid 600 -> 1) is the same
+            # process, present rather than absent, never a replacement.
+            (root/'700/stat').write_text('700 (controlled) '+ ' '.join(['S','1','700']+['0']*16+['1700']))
+            present=scope['auth_retirement_state'](expected)
+            self.assertFalse(present['helper_absent']); self.assertTrue(present['owned_group_members'])
             (root/'700/stat').write_text('700 (controlled) '+ ' '.join(['S','600','700']+['0']*16+['1701']))
+            with self.assertRaisesRegex(RuntimeError,'PID was replaced'):
+                scope['auth_retirement_state'](expected)
+            (root/'700/stat').write_text('700 (controlled) '+ ' '.join(['S','1','600']+['0']*16+['1700']))
             with self.assertRaisesRegex(RuntimeError,'PID was replaced'):
                 scope['auth_retirement_state'](expected)
 

@@ -160,7 +160,11 @@ def auth_retirement_state(record):
     presence = {}
     for role in ("helper", "delay"):
         current = auth_process(record[role]["pid"])
-        if current is not None and public_auth_identity(current) != record[role]:
+        # Retiring the helper orphans a still-running delay, which the kernel
+        # reparents: a new ppid is the same process, still not absent. Every
+        # other identity field (start time, group, uid, executable) must hold.
+        if current is not None and ({k: v for k, v in public_auth_identity(current).items() if k != "ppid"}
+                                    != {k: v for k, v in record[role].items() if k != "ppid"}):
             raise RuntimeError("original method PID was replaced")
         presence[role + "_absent"] = current is None and not pathlib.Path(f"/proc/{record[role]['pid']}").exists()
     # Absence of two PIDs alone is not absence of other owned group descendants:
