@@ -1398,7 +1398,37 @@ fn quick_settings_popover(
     ] {
         tile.add_css_class("qs-dimmable");
     }
-    popover.set_child(Some(&col));
+    // Service-backed tiles may add rows while an inline submenu is open.
+    // Keep the popup on its monitor instead of letting GTK dismiss an
+    // oversized popup; keyboard focus and scrolling still reach every row.
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(600)
+        .child(&col)
+        .build();
+    {
+        let scroll = scroll.clone();
+        popover.connect_show(move |popup| {
+            let parent = popup.parent();
+            let surface = parent
+                .as_ref()
+                .and_then(|widget| widget.native())
+                .and_then(|native| native.surface());
+            if let Some(monitor) = surface.as_ref().and_then(|surface| {
+                gtk::prelude::WidgetExt::display(popup).monitor_at_surface(surface)
+            }) {
+                // Reserve the panel and the popup's padding, border and gap.
+                let panel_height = parent.as_ref().map_or(32, |widget| widget.height());
+                scroll.set_max_content_height(
+                    (monitor.geometry().height() - panel_height - 64).max(1),
+                );
+            }
+            scroll.vadjustment().set_value(0.0);
+        });
+    }
+    popover.set_child(Some(&scroll));
     popover
 }
 
