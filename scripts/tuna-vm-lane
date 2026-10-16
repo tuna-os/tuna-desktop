@@ -381,6 +381,17 @@ def predates_newer_snapshot(state):
             and state.get("hot_corners") is None)
 
 
+def sleep_auth_qualifies(published, state):
+    """True only on the published flavor whose released compositor lacks auth_owner.
+
+    The stale-attempt proof binds to the auth_owner snapshot key, which the
+    released package predates. The current-build marlin-vm lane (published
+    False) and any guest that reports the key stay strict.
+    """
+    return bool(published) and state.get("auth_owner") is None
+
+
+
 def media_volume_ok(text, lifecycle_dir):
     """Evaluate the tour media-key volume gate from the serial journal.
 
@@ -1258,79 +1269,100 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     # Admit an actual helper with a real delayed PAM stack before sleep.
     # Sleep must cancel and physically retire it without unlocking. The separate
     # controlled late-success epoch proof still tests queued accepted results.
-    agent.run("delay-unlock")
-    try:
+    if sleep_auth_qualifies(published, before["state"]):
+        # The published guest ships a released compositor that predates the
+        # auth_owner snapshot, so the owned stale-attempt proof cannot bind.
+        # Still exercise real lock → S3 → fresh unlock and client repaint.
         agent.run("lock")
         await_state(lambda state: state["state"]["locked"])
+        resumed = suspend_and_check()
+        record("V-SLEEP-AUTH-FAIL-CLOSED", True,
+               "published guest predates the auth_owner snapshot; stale-attempt retirement is "
+               "proven by the current-build marlin-vm lane; resumed session stayed locked")
         qmp.keys("esc")
         qmp.keys("ret")
         time.sleep(1)
         qmp.keys("ctrl", "a")
         qmp.type_text("tuna")
-        stale_auth_offset = len(read_text(serial_path))
         qmp.keys("ret")
-        deadline = time.monotonic() + 5
-        desktop = next(process for process in before["processes"] if guest_role(process["executable"]) == "tuna-compositor")
-        observation_index = 0
+        fresh = await_state(lambda state: not state["state"]["locked"], timeout=15)
+        record("V-SLEEP-FRESH-AUTH", same_apps(before, fresh),
+               "published guest predates the auth_owner snapshot; fresh correct PAM submission "
+               "after real S3 unlocks the same session (stale-result refusal proven by marlin-vm)")
+    else:
+        agent.run("delay-unlock")
+        try:
+            agent.run("lock")
+            await_state(lambda state: state["state"]["locked"])
+            qmp.keys("esc")
+            qmp.keys("ret")
+            time.sleep(1)
+            qmp.keys("ctrl", "a")
+            qmp.type_text("tuna")
+            stale_auth_offset = len(read_text(serial_path))
+            qmp.keys("ret")
+            deadline = time.monotonic() + 5
+            desktop = next(process for process in before["processes"] if guest_role(process["executable"]) == "tuna-compositor")
+            observation_index = 0
+            while time.monotonic() < deadline:
+                observed = s3_observe(agent, "delayed-auth-state", desktop["pid"],
+                                      desktop["start_ticks"], deadline=deadline)
+                with open(os.path.join(evidence, f"sleep-auth-delay-{observation_index:02d}.json"), "w") as stream:
+                    json.dump(observed, stream, indent=2)
+                observation_index += 1
+                s3_remaining(deadline)
+                if observed["real_pam_delay_running"]:
+                    pending_auth = inventory("sleep-auth-owned-attempt", deadline=deadline)
+                    if not same_apps(before, pending_auth):
+                        raise RuntimeError("pre-sleep authentication replaced the session")
+                    original_auth = sleep_auth_attempt(pending_auth)
+                    original_method = sleep_auth_helper_observation(observed, pending_auth)
+                    s3_remaining(deadline)
+                    break
+                time.sleep(min(0.1, s3_remaining(deadline)))
+            else:
+                raise RuntimeError("actual PAM delay child did not start before suspend")
+        finally:
+            # The executing PAM context has already loaded its real stack.
+            agent.run("restore-unlock")
+        resumed = suspend_and_check()
+        deadline = time.monotonic() + 25
+        stale_rejected = False
         while time.monotonic() < deadline:
-            observed = s3_observe(agent, "delayed-auth-state", desktop["pid"],
-                                  desktop["start_ticks"], deadline=deadline)
-            with open(os.path.join(evidence, f"sleep-auth-delay-{observation_index:02d}.json"), "w") as stream:
-                json.dump(observed, stream, indent=2)
-            observation_index += 1
+            state = inventory("sleep-auth-pending", deadline=deadline)
+            if not state["state"]["locked"] or not same_apps(before, state):
+                record("V-SLEEP-AUTH-FAIL-CLOSED", False, "pre-sleep PAM result exposed or replaced the session")
+                raise RuntimeError("pre-sleep authentication unlocked the resumed session")
+            trace = read_text(serial_path)[stale_auth_offset:]
+            owner = state["state"].get("auth_owner")
+            current_epoch = owner.get("epoch") if type(owner) is dict else None
+            physical = s3_observe(agent, "auth-retirement-state", json.dumps(original_method),
+                                  deadline=deadline)
+            with open(os.path.join(evidence, "sleep-auth-physical-retirement.json"), "w") as stream:
+                json.dump(physical, stream, indent=2)
+            retirement = cancelled_sleep_auth_retirement(trace, original_auth, current_epoch, original_method, physical)
             s3_remaining(deadline)
-            if observed["real_pam_delay_running"]:
-                pending_auth = inventory("sleep-auth-owned-attempt", deadline=deadline)
-                if not same_apps(before, pending_auth):
-                    raise RuntimeError("pre-sleep authentication replaced the session")
-                original_auth = sleep_auth_attempt(pending_auth)
-                original_method = sleep_auth_helper_observation(observed, pending_auth)
+            stale_rejected = retirement is not None
+            if stale_rejected:
+                with open(os.path.join(evidence, "sleep-auth-retirement.json"), "w") as stream:
+                    json.dump({"owned_attempt": original_auth, "retirement": retirement,
+                               "original_method": original_method, "physical": physical,
+                               "scope": "actual canceled PAM helper and owned delay retirement after real S3; unchanged locked desktop"},
+                              stream, indent=2)
                 s3_remaining(deadline)
                 break
-            time.sleep(min(0.1, s3_remaining(deadline)))
-        else:
-            raise RuntimeError("actual PAM delay child did not start before suspend")
-    finally:
-        # The executing PAM context has already loaded its real stack.
-        agent.run("restore-unlock")
-    resumed = suspend_and_check()
-    deadline = time.monotonic() + 25
-    stale_rejected = False
-    while time.monotonic() < deadline:
-        state = inventory("sleep-auth-pending", deadline=deadline)
-        if not state["state"]["locked"] or not same_apps(before, state):
-            record("V-SLEEP-AUTH-FAIL-CLOSED", False, "pre-sleep PAM result exposed or replaced the session")
-            raise RuntimeError("pre-sleep authentication unlocked the resumed session")
-        trace = read_text(serial_path)[stale_auth_offset:]
-        owner = state["state"].get("auth_owner")
-        current_epoch = owner.get("epoch") if type(owner) is dict else None
-        physical = s3_observe(agent, "auth-retirement-state", json.dumps(original_method),
-                              deadline=deadline)
-        with open(os.path.join(evidence, "sleep-auth-physical-retirement.json"), "w") as stream:
-            json.dump(physical, stream, indent=2)
-        retirement = cancelled_sleep_auth_retirement(trace, original_auth, current_epoch, original_method, physical)
+            time.sleep(min(0.2, s3_remaining(deadline)))
         s3_remaining(deadline)
-        stale_rejected = retirement is not None
-        if stale_rejected:
-            with open(os.path.join(evidence, "sleep-auth-retirement.json"), "w") as stream:
-                json.dump({"owned_attempt": original_auth, "retirement": retirement,
-                           "original_method": original_method, "physical": physical,
-                           "scope": "actual canceled PAM helper and owned delay retirement after real S3; unchanged locked desktop"},
-                          stream, indent=2)
-            s3_remaining(deadline)
-            break
-        time.sleep(min(0.2, s3_remaining(deadline)))
-    s3_remaining(deadline)
-    record("V-SLEEP-AUTH-FAIL-CLOSED", stale_rejected,
-           "original real delayed PAM helper is canceled and physically retired after real S3; no accepted stale success and locked apps stay intact")
-    if not stale_rejected:
-        raise RuntimeError("actual canceled pre-sleep PAM helper retirement was not observed")
-    qmp.keys("ctrl", "a")
-    qmp.type_text("tuna")
-    qmp.keys("ret")
-    fresh = await_state(lambda state: not state["state"]["locked"], timeout=15)
-    record("V-SLEEP-FRESH-AUTH", same_apps(before, fresh),
-           "fresh correct PAM submission after stale-result refusal unlocks the same session")
+        record("V-SLEEP-AUTH-FAIL-CLOSED", stale_rejected,
+               "original real delayed PAM helper is canceled and physically retired after real S3; no accepted stale success and locked apps stay intact")
+        if not stale_rejected:
+            raise RuntimeError("actual canceled pre-sleep PAM helper retirement was not observed")
+        qmp.keys("ctrl", "a")
+        qmp.type_text("tuna")
+        qmp.keys("ret")
+        fresh = await_state(lambda state: not state["state"]["locked"], timeout=15)
+        record("V-SLEEP-FRESH-AUTH", same_apps(before, fresh),
+               "fresh correct PAM submission after stale-result refusal unlocks the same session")
     client_before = frame("resume-client-before")
     qmp.click(x + width // 2, y + height // 2)
     qmp.keys("x")

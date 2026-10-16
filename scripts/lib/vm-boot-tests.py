@@ -1504,6 +1504,18 @@ class PredatingGuestQualification(unittest.TestCase):
         state = {**self.SHIPPED_STATE, "mouse_left_handed": False}
         self.assertFalse(lane.predates_newer_snapshot(state))
 
+    def test_sleep_auth_qualifies_on_published_guest_without_auth_owner(self):
+        state = {**self.CURRENT_STATE, "auth_owner": None}
+        self.assertTrue(lane.sleep_auth_qualifies(True, state))
+        self.assertTrue(lane.sleep_auth_qualifies(True, dict(self.SHIPPED_STATE)))
+
+    def test_sleep_auth_stays_strict_on_current_build_lane(self):
+        # marlin-vm runs the branch's own build: never qualified, even if
+        # the key were absent.
+        self.assertFalse(lane.sleep_auth_qualifies(False, dict(self.SHIPPED_STATE)))
+        owner = {"epoch": 1}
+        self.assertFalse(lane.sleep_auth_qualifies(True, {**self.CURRENT_STATE, "auth_owner": owner}))
+
     def test_media_volume_strict_sequence_passes(self):
         ok, detail = self.verdict(self.STRICT_SERIAL, self.CURRENT_STATE)
         self.assertTrue(ok)
