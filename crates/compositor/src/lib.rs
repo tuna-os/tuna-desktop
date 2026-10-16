@@ -71,6 +71,7 @@ pub mod input_aids;
 pub mod introspect;
 pub mod layer;
 pub mod lock;
+pub mod lockdown;
 pub mod minimize;
 pub mod modal_dim;
 pub mod monitors;
