@@ -20,10 +20,11 @@ from gi.repository import Gly, Gio, GLib
 formats = [f.get_name() for f in GdkPixbuf.Pixbuf.get_formats()]
 if 'svg' not in formats:
     raise RuntimeError('actual installed native SVG loader unavailable')
+# Receipt mode hashes every configured font file (60 s CPU bound in the helper).
 output = subprocess.run([str(HELPER), '--receipt'], stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE, check=True, timeout=6)
+                        stderr=subprocess.PIPE, check=True, timeout=70)
 receipt = json.loads(output.stdout)
-observed = subprocess.check_output([str(HELPER), '--identity'], text=True, timeout=6).strip()
+observed = subprocess.check_output([str(HELPER), '--identity'], text=True, timeout=70).strip()
 if receipt['sha256'] != observed or len(observed) != 64:
     raise RuntimeError('actual helper loader/font identity changed during preflight')
 # Actual primary loader objects keep their process alive through the receipt.

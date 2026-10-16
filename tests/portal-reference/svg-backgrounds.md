@@ -12,7 +12,8 @@ hand-written substitute.
 
 The helper has a 64 MiB input bound, the compositor's decoded-image
 admission (at most 7680×4320 and a 64 MiB RGBA8 footprint), a 1 GiB
-address-space bound, 4-second CPU soft/5-second hard limit, and the parent
+address-space bound, 4-second CPU soft/5-second hard limit (60 seconds in
+the font-hashing receipt mode, which decodes only a built-in document), and the parent
 sends termination at 5 seconds wall time and retains the worker slot until
 the helper is reaped. Its caller-death binding supplements the actual native
 Glycin/bwrap parent-death and PID-namespace teardown contracts; the proof

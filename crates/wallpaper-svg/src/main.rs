@@ -33,7 +33,10 @@ fn main() {
     }
 }
 
-fn limits() -> Result<(), Box<dyn std::error::Error>> {
+/// `identity` selects the receipt mode: it decodes only a fixed built-in
+/// document, then hashes every configured font file, whose CPU cost scales
+/// with the installed fonts rather than with untrusted input.
+fn limits(identity: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Bind the helper to its caller. Actual Glycin/bwrap binds its monitor
     // and PID-namespace child with --die-with-parent; other native paths use
     // PDEATHSIG. Killing our helper tears down those owned descendants too.
@@ -44,9 +47,10 @@ fn limits() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("caller lifecycle unavailable".into());
     }
+    let cpu = if identity { 60 } else { 4 };
     for (resource, soft, hard) in [
         (libc::RLIMIT_AS, 1024 * 1024 * 1024, 1024 * 1024 * 1024),
-        (libc::RLIMIT_CPU, 4, 5),
+        (libc::RLIMIT_CPU, cpu, cpu + 1),
         (libc::RLIMIT_CORE, 0, 0),
         (libc::RLIMIT_NOFILE, 128, 128),
     ] {
@@ -63,9 +67,9 @@ fn limits() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    limits()?;
     let argument = std::env::args().nth(1);
     let identity = matches!(argument.as_deref(), Some("--identity" | "--receipt"));
+    limits(identity)?;
     let mut bytes = Vec::new();
     if identity {
         // Exercise the actual font/text path so the receipt includes its loaded
