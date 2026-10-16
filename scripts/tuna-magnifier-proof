@@ -40,7 +40,8 @@ ASSERTIONS="$ARTIFACTS/assertions.txt"
 : >"$ASSERTIONS"
 CSTATE="$ARTIFACTS/compositor-state.json"
 HOME_PRIV="$ARTIFACTS/home"
-RUN_PRIV="$ARTIFACTS/run"
+# Keep AF_UNIX socket paths below SUN_LEN even in long CI checkout paths.
+RUN_PRIV="$(mktemp -d /tmp/tuna-mag.XXXXXX)"
 PICS_PRIV="$ARTIFACTS/pictures"
 CONF_PRIV="$ARTIFACTS/config"
 mkdir -p "$HOME_PRIV" "$RUN_PRIV" "$PICS_PRIV/Screenshots" "$CONF_PRIV"
@@ -67,6 +68,8 @@ cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
     if [ -n "$COMPOSITOR_PID" ]; then kill "$COMPOSITOR_PID" 2>/dev/null || true; fi
     if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+    if [ -n "$COMPOSITOR_PID" ]; then wait "$COMPOSITOR_PID" 2>/dev/null || true; fi
+    rm -rf "$RUN_PRIV"
 }
 trap cleanup EXIT INT TERM
 pass() { echo "$1 pass $2" >>"$ASSERTIONS"; echo "tuna-magnifier-proof: $1 pass: $2"; }
