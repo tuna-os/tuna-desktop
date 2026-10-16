@@ -3408,6 +3408,23 @@ tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ AddAg
     fail G-QS-LOCATION "the shell did not register its GeoClue agent on appearance"
 shell_bus=$(tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -oE "AddAgent tuna-shell from [^ ]+" | tail -1 | awk '{print $4}')
 [ -n "$shell_bus" ] || fail G-QS-LOCATION "no agent bus name in the GeoClue log"
+# dconf delivers the write to the shell asynchronously: wait until the
+# agent's own MaxAccuracyLevel reports the new ceiling before asking it
+# to authorize, so the answer reflects the setting rather than the race.
+agent_ceiling() {
+    local want="$1" got=""
+    for _ in $(seq 1 20); do
+        got=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+            --object-path /org/freedesktop/GeoClue2/Agent \
+            --method org.freedesktop.DBus.Properties.Get org.freedesktop.GeoClue2.Agent MaxAccuracyLevel 2>&1)
+        echo "$got" | grep -qE "^\(<(uint32 )?$want>,\)$" && return 0
+        sleep 0.25
+    done
+    echo "$got"
+    return 1
+}
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION "the agent never reported the exact ceiling: $ceiling"
 # InUse lights the panel indicator; clearing it darkens it again.
 gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
     --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
@@ -3458,6 +3475,8 @@ echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
     fail G-QS-LOCATION "stored EXACT grant answered $auth, not (true, 8)"
 gsettings set org.gnome.system.location max-accuracy-level 'city' ||
     fail G-QS-LOCATION "could not lower the accuracy ceiling"
+ceiling=$(agent_ceiling 4) ||
+    fail G-QS-LOCATION "the agent never reported the city ceiling: $ceiling"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
@@ -3466,6 +3485,8 @@ echo "$auth" | grep -qE "\(true, (uint32 )?4\)" ||
     fail G-QS-LOCATION "city ceiling answered $auth, not (true, 4)"
 gsettings set org.gnome.system.location max-accuracy-level 'exact' ||
     fail G-QS-LOCATION "could not restore the accuracy ceiling"
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION "the agent never reported the exact ceiling: $ceiling"
 # First use prompts: the stranger's request surfaces the consent
 # dialog; denying answers denied and saves the denial.
 gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
@@ -3529,6 +3550,8 @@ echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
 # indicator stays dark even while GeoClue reports in use.
 gsettings set org.gnome.system.location enabled false ||
     fail G-QS-LOCATION "could not switch location off"
+ceiling=$(agent_ceiling 0) ||
+    fail G-QS-LOCATION "the agent never reported the switch off: $ceiling"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
@@ -3581,6 +3604,8 @@ scrot "$ARTIFACTS/16f-location-absent.png" >/dev/null
 # stored grant, on restores it, and unknown apps stay denied throughout.
 gsettings set org.gnome.system.location enabled false ||
     fail G-QS-LOCATION-ABSENT "could not switch location off"
+ceiling=$(agent_ceiling 0) ||
+    fail G-QS-LOCATION-ABSENT "the agent never reported the switch off: $ceiling"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
@@ -3589,6 +3614,8 @@ echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
     fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch off, not denied"
 gsettings set org.gnome.system.location enabled true ||
     fail G-QS-LOCATION-ABSENT "could not switch location back on"
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION-ABSENT "the agent never reported the switch back on: $ceiling"
 auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
     --object-path /org/freedesktop/GeoClue2/Agent \
     --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
