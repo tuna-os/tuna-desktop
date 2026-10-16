@@ -130,6 +130,8 @@ that startup path directly.
 
 Additional gates are `V-GDM` (explicit registration, no session pause),
 `V-CALENDAR` (CalendarServer responds), `V-PORTAL` (portal Settings responds),
+`V-PORTAL-SCREENSHOT` and `V-PORTAL-SCREENCAST` (the portal frontend exports
+both interfaces, so `tuna-portals.conf` routes them to a working backend),
 `V-LOCK` (the final tour observes unlocked → locked → unlocked), and
 `V-REPEAT` (all five boots pass). Earlier boots keep their own artifacts
 under `repeat-NN/`; `repeat-manifest.json` records every boot, while the
