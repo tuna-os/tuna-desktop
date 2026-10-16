@@ -38,9 +38,9 @@ for path in \
     usr/share/wayland-sessions/tuna.desktop \
     usr/lib/systemd/user/tuna-session.target \
     etc/pam.d/tuna-lock \
-    usr/share/licenses/tuna/LICENSE \
-    usr/share/licenses/tuna/drm/LICENSE \
-    usr/share/licenses/tuna/drm-ffi/LICENSE; do
+    usr/share/licenses/tuna-desktop/LICENSE \
+    usr/share/licenses/tuna-desktop/drm/LICENSE \
+    usr/share/licenses/tuna-desktop/drm-ffi/LICENSE; do
     printf '%s' "$CONTENTS" | grep -q "$path" || fail "missing $path"
 done
 

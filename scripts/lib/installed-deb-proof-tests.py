@@ -218,6 +218,9 @@ def copy_shipped_icons(destination):
             path.chmod(path.stat().st_mode & ~0o022)
 
 
+LICENSE_SOURCES = ('LICENSE', 'third-party/drm/LICENSE', 'third-party/drm-ffi/LICENSE')
+
+
 class PackagePolicy(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -239,6 +242,11 @@ class PackagePolicy(unittest.TestCase):
         # Use the real shipped private theme and its integrity manifest rather
         # than bypassing asset admission in these controlled package fixtures.
         copy_shipped_icons(self.stage / 'usr/share/tuna-desktop/icons')
+        # The original root and vendored DRM notices, as tuna-release installs them.
+        for name in LICENSE_SOURCES:
+            target = self.stage / 'usr/share/licenses/tuna-desktop' / name.removeprefix('third-party/')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, target)
         self.env = dict(os.environ, PATH=str(self.tools) + ':' + os.environ['PATH'], FIXTURE=str(self.stage))
         self.tool('dpkg-deb', '''case "$1" in
 -c) find "$FIXTURE" -type f | while read -r path; do echo "-rwxr-xr-x $path"; done ;;
@@ -383,6 +391,9 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
             copy_shipped_icons(root / 'share/tuna-desktop/icons')
+            for name in LICENSE_SOURCES:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / name, root / name)
             checker = root / 'scripts/tuna-cursor-assets-check'
             checker.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / 'scripts/tuna-cursor-assets-check', checker)
