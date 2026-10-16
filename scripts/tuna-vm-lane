@@ -2152,6 +2152,7 @@ def repeat_boots(args):
     out = os.path.abspath(args.out)
     os.makedirs(out, exist_ok=True)
     manifests, combined, coverage, boot_results = [], {}, {}, []
+    args.boots = 12  # DIAG ONLY (never merged): more chances to catch the hang.
     for index in range(1, args.boots + 1):
         target = out if index == args.boots else os.path.join(out, f"repeat-{index:02d}")
         command = [sys.executable, __file__, "--disk", args.disk, "--out", target,
@@ -2289,6 +2290,8 @@ def main():
                     and time.time() - armed_at >= SHELL_STACK_AFTER[stacks]):
                 stacks += 1
                 dump_shell_stack(agent_path, os.path.join(out, f"shell-startup-stack-{stacks}.json"))
+                if stacks == len(SHELL_STACK_AFTER):
+                    break  # DIAG ONLY: stacks captured, save the job's time budget.
             if n % 3 == 0:
                 qmp.frame(os.path.join(out, f"boot-{n // 3:03d}.png"))
             n += 1

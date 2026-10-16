@@ -14,6 +14,8 @@
 //! starts. Once GTK and libadwaita have read them, the caller's values are
 //! put back, so apps the shell launches inherit the user's environment.
 
+#![allow(dead_code)] // DIAG ONLY: opt-out disabled to reproduce the hang.
+
 use std::ffi::{OsStr, OsString};
 
 const GDK_DEBUG: &str = "GDK_DEBUG";
