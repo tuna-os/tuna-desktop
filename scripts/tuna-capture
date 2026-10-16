@@ -2,14 +2,14 @@
 # tuna-capture — scripted demo-media capture for the release walkthrough.
 #
 # Usage:
-#   scripts/tuna-capture [--display :N] [--artifacts DIR] [--socket NAME] [--help]
+#   scripts/tuna-capture [--bin-dir DIR] [--display :N] [--artifacts DIR] [--socket NAME]
 #   scripts/tuna-capture --render-walkthrough vX.Y.Z [--artifacts DIR]
 #
 # --render-walkthrough stamps docs/walkthrough-template.md into
 # docs/walkthrough.md for the given release tag (run by the release
 # checklist after uploading the media bundle as release assets).
 #
-# Drives one nested session per core-tour feature (overview, app-launch,
+# Drives the GTK shell through each core-tour feature (overview, app-launch,
 # tiling-scroll, quick-settings, notifications, lock-screen) under Xvfb,
 # recording each with ffmpeg x11grab while replaying the pinned interaction
 # sequence, plus one still per feature. Emits <feature>.mp4 + <feature>.png
@@ -26,15 +26,15 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 DISPLAY_ARG=""
 ARTIFACTS="$ROOT/capture-artifacts"
 SOCKET="tuna-capture-$$"
+BIN_DIR=""
 WIDTH=1280
 HEIGHT=800
 
 RENDER_TAG=""
-# Walkthrough blurbs for the segments whose drivers are still being pinned;
-# finalized with the capture segments. Overridable from the environment.
-QUICK_SETTINGS_BLURB="${QUICK_SETTINGS_BLURB:-The panel status indicators open menus carrying the quick toggles.}"
+# Overridable descriptions for the captured GTK shell.
+QUICK_SETTINGS_BLURB="${QUICK_SETTINGS_BLURB:-The panel status button opens quick settings with sliders and toggles.}"
 NOTIFICATIONS_BLURB="${NOTIFICATIONS_BLURB:-Notification banners stack over the session.}"
-LOCK_BLURB="${LOCK_BLURB:-Idle lock blanks the session; any keypress wakes it.}"
+LOCK_BLURB="${LOCK_BLURB:-The idle shield locks the session; waking it reveals the authentication prompt.}"
 # The six-feature core tour. This list is the contract: every segment
 # must produce a clip plus a still below, and the walkthrough template
 # must link both under the release-asset URL for each name.
@@ -71,6 +71,7 @@ while [ $# -gt 0 ]; do
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --socket) SOCKET="$2"; shift 2 ;;
+        --bin-dir) BIN_DIR="$2"; shift 2 ;;
         --render-walkthrough) RENDER_TAG="$2"; shift 2 ;;
         --help | -h) sed -n '2,14p' "$0"; exit 0 ;;
         *) echo "tuna-capture: unknown argument $1" >&2; exit 1 ;;
@@ -97,21 +98,55 @@ fi
 mkdir -p "$ARTIFACTS"
 ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
 LOG="$ARTIFACTS/nested.log"
+. "$ROOT/scripts/lib/tuna-introspect.sh"
+TUNA_COMPOSITOR_STATE="$TUNA_INTROSPECT_FILE"
+export TUNA_COMPOSITOR_STATE
 
-# Probe app so the app-launch segment shows a genuine launch: typing the
-# query then Enter spawns it (marker file below), mirroring tuna-journey.
+# The launched fixture maps a real GTK window; a marker-only process would
+# leave app-launch and tiling footage showing an empty desktop.
 PROBE_HOME="$ARTIFACTS/probe-home"
 MARKER="$ARTIFACTS/launch-marker"
-rm -f "$MARKER"
-mkdir -p "$PROBE_HOME/applications"
+rm -f "$MARKER" "$ARTIFACTS/seed-marker"
+mkdir -p "$PROBE_HOME/applications" "$PROBE_HOME/config"
+cat >"$PROBE_HOME/application.py" <<'PY'
+import pathlib
+import sys
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, Gio
+
+marker, title = sys.argv[1:3]
+app = Gtk.Application(application_id="org.tuna.Capture", flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+def activate(application):
+    window = Gtk.ApplicationWindow(application=application, title=title)
+    window.set_default_size(540, 360)
+    window.set_child(Gtk.Label(label=title))
+    window.connect("map", lambda *_: pathlib.Path(marker).write_text("mapped\n"))
+    window.present()
+
+app.connect("activate", activate)
+app.run([])
+PY
 cat >"$PROBE_HOME/applications/tunaterm-probe.desktop" <<EOF
 [Desktop Entry]
 Name=Tunaterm Probe
-Exec=touch "$MARKER"
+Exec=/usr/bin/python3 "$PROBE_HOME/application.py" "$MARKER" "Launched from overview"
 Type=Application
 EOF
 XDG_DATA_HOME="$PROBE_HOME"
 export XDG_DATA_HOME
+XDG_CONFIG_HOME="$PROBE_HOME/config"
+GSETTINGS_BACKEND=keyfile
+XDG_RUNTIME_DIR="$ARTIFACTS/runtime"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+export XDG_CONFIG_HOME GSETTINGS_BACKEND XDG_RUNTIME_DIR
+# The GTK shell publishes this policy to the compositor, overriding its
+# developer timeout. Keep the tour unlocked until its final idle segment.
+gsettings set org.gnome.desktop.session idle-delay 300
+gsettings set org.gnome.desktop.screensaver lock-enabled true
+gsettings set org.gnome.desktop.screensaver lock-delay 0
 # Hermetic shell state: the notification queue (and any future shell
 # state) must resolve under the probe home, never the runner's real
 # ~/.local/state — otherwise ambient entries leak into the capture and
@@ -125,12 +160,23 @@ COMPOSITOR_PID=""
 OWNED_XVFB=""
 BUS_PID=""
 HAVE_FFMPEG=""
+PROBE_PID=""
+REC_PID=""
+REC_FEATURE=""
 
 if command -v ffmpeg >/dev/null 2>&1; then
     HAVE_FFMPEG=1
 fi
 
 cleanup() {
+    if [ -n "$REC_PID" ]; then
+        kill -INT "$REC_PID" 2>/dev/null || true
+        wait "$REC_PID" 2>/dev/null || true
+    fi
+    if [ -n "$PROBE_PID" ]; then
+        kill "$PROBE_PID" 2>/dev/null || true
+        wait "$PROBE_PID" 2>/dev/null || true
+    fi
     if [ -n "$COMPOSITOR_PID" ] && kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
         kill "$COMPOSITOR_PID" 2>/dev/null || true
         wait "$COMPOSITOR_PID" 2>/dev/null || true
@@ -194,18 +240,27 @@ if ! display_works; then
 fi
 echo "tuna-capture: display $DISPLAY geometry $(xdotool getdisplaygeometry)"
 
-echo "tuna-capture: building"
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
-    -p tuna-compositor -p tuna-shell-host
+if [ -z "$BIN_DIR" ]; then
+    echo "tuna-capture: building GTK session"
+    cargo build --locked --quiet --manifest-path "$ROOT/Cargo.toml" \
+        -p tuna-compositor -p tuna-shell-gtk
+    BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
+fi
+BIN_DIR="$(cd "$BIN_DIR" && pwd)"
+for bin in tuna-compositor tuna-shell-gtk; do
+    test -x "$BIN_DIR/$bin" || {
+        echo "tuna-capture: missing executable $BIN_DIR/$bin" >&2
+        exit 1
+    }
+    "$BIN_DIR/$bin" --version
+done >"$ARTIFACTS/versions.txt"
+sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-shell-gtk" \
+    >"$ARTIFACTS/binaries.sha256"
 
-# Short idle timeout so the lock-screen segment engages by holding still.
-# Production default (five minutes) applies whenever this is unset.
-TUNA_IDLE_TIMEOUT_MS=15000
-export TUNA_IDLE_TIMEOUT_MS
 
 echo "tuna-capture: starting compositor on socket $SOCKET"
-"$ROOT/target/debug/tuna-compositor" --socket "$SOCKET" \
-    --shell-bin "$ROOT/target/debug/tuna-shell-host" \
+env -u WAYLAND_DISPLAY "$BIN_DIR/tuna-compositor" --socket "$SOCKET" --width "$WIDTH" --height "$HEIGHT" \
+    --shell-bin "$BIN_DIR/tuna-shell-gtk" \
     >"$LOG" 2>&1 &
 COMPOSITOR_PID=$!
 
@@ -230,12 +285,37 @@ fi
 xdotool windowfocus --sync "$WID"
 xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2)) click 1
 sleep 3
+for _ in $(seq 1 60); do
+    if grep -q 'tuna-shell-gtk: keybindings:' "$LOG"; then
+        break
+    fi
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || exit 1
+    sleep 1
+done
+grep -q 'tuna-shell-gtk: keybindings:' "$LOG" || {
+    echo "tuna-capture: GTK shell never became ready" >&2
+    exit 1
+}
+xdotool key Escape
+assert_state C-DESKTOP '.overview_open == false and .locked == false' "GTK desktop ready"
+env -u DISPLAY WAYLAND_DISPLAY="$SOCKET" /usr/bin/python3 \
+    "$PROBE_HOME/application.py" "$ARTIFACTS/seed-marker" "Tuna Desktop capture fixture" \
+    >"$ARTIFACTS/application.log" 2>&1 &
+PROBE_PID=$!
+for _ in $(seq 1 30); do
+    test -s "$ARTIFACTS/seed-marker" && break
+    sleep 0.2
+done
+test -s "$ARTIFACTS/seed-marker" || {
+    echo "tuna-capture: GTK fixture did not map" >&2
+    exit 1
+}
+assert_state C-SEED '(.windows | length) == 1' "seed window managed"
+sleep 1
 
 # --- media helpers -------------------------------------------------------
 # record_start <feature>: begin ffmpeg x11grab into <feature>.raw.mp4.
 # record_stop: stop the recorder and remux to <feature>.mp4.
-REC_PID=""
-REC_FEATURE=""
 
 record_start() {
     REC_FEATURE="$1"
@@ -290,6 +370,8 @@ check_media() {
 # --- segment: overview ---------------------------------------------------
 record_start "overview"
 xdotool key Super_L
+assert_state C-OVERVIEW '.overview_progress == 1 and (.previews | length) > 0' "overview with a real preview"
+keep_state overview-state
 sleep 2
 record_stop
 shot "overview"
@@ -321,16 +403,20 @@ if [ -z "$LAUNCHED" ]; then
 fi
 xdotool key Escape
 sleep 1
+assert_state C-LAUNCH '.overview_open == false and (.windows | length) == 2' "launched GTK window managed"
+keep_state app-launch-state
 record_stop
 shot "app-launch"
 
 # --- segment: tiling-scroll ------------------------------------------------
-# Strip-mode flip plus one width preset step on the empty session.
+# Both real fixture windows are present when the strip mode and width change.
 record_start "tiling-scroll"
 xdotool key Super_L+Shift+T
 sleep 2
 xdotool key Super_L+R
 sleep 2
+assert_state C-SCROLL '.session_mode == "scroll"' "scroll layout active"
+keep_state tiling-scroll-state
 record_stop
 shot "tiling-scroll"
 
@@ -338,22 +424,23 @@ shot "tiling-scroll"
 # Post a banner over the bus the shell serves, then hold the frame so the
 # clip shows it stacked over the session.
 record_start "notifications"
-gdbus call --session \
+NOTIFY_RESULT="$(gdbus call --session \
     --dest org.freedesktop.Notifications \
     --object-path /org/freedesktop/Notifications \
     --method org.freedesktop.Notifications.Notify \
     "tuna-capture" 0 "" "Capture demo" "A notification banner, pinned for the walkthrough." \
-    "[]" "{}" 8000 >/dev/null
+    "[]" "{}" 8000)"
 sleep 5
 record_stop
 shot "notifications"
+NOTIFICATION_ID="${NOTIFY_RESULT#* }"
+NOTIFICATION_ID="${NOTIFICATION_ID%%,*}"
+gdbus call --session --dest org.freedesktop.Notifications \
+    --object-path /org/freedesktop/Notifications \
+    --method org.freedesktop.Notifications.CloseNotification "$NOTIFICATION_ID" >/dev/null
 
 # --- segment: quick-settings -------------------------------------------------
-# No unified quick-settings panel exists yet; the panel status tiles open
-# menus carrying the quick toggles. Click the network tile (rightmost dot,
-# strip index 0) to open its menu; its radio toggle keeps the menu open
-# on the pending face for the shot. (The power tile sits one dot left and
-# would arm the lock instead.)
+# Open the GTK panel's unified quick-settings popover.
 record_start "quick-settings"
 xdotool mousemove --window "$WID" 1263 16 click 1
 sleep 2
@@ -363,10 +450,17 @@ xdotool key Escape
 sleep 1
 
 # --- segment: lock-screen (last: the session stays locked) -----------------
-# Idle-driven: the compositor started with a short TUNA_IDLE_TIMEOUT_MS,
-# so holding still past the timeout engages the lock with no input at all.
+# Change the same GSettings policy a user controls, then require actual lock.
 record_start "lock-screen"
-sleep 25
+gsettings set org.gnome.desktop.session idle-delay 10
+assert_state C-LOCK '.locked == true' "idle lock engaged" 45
+xdotool mousemove --window "$WID" 640 400 click 1
+assert_state C-WAKE '.locked == true and .idle_blank_alpha == 0' "locked screen awake"
+sleep 1
+# The first input wakes the blanked output; a separate key lifts the curtain.
+xdotool key space
+sleep 2
+keep_state lock-state
 record_stop
 shot "lock-screen"
 if grep -q "panicked" "$LOG"; then

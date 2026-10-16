@@ -30,12 +30,19 @@ not provide Marlin or physical hardware qualification.
    login screen lists Tuna Desktop on a real install and every binary's
    `--version` matches the tag.
 7. Capture the demo media from the same tag:
-   `scripts/tuna-capture --artifacts walkthrough-media` — records the
-   six-feature core tour (clip plus still per segment) and checks the
-   segment/template contract. The capture is hermetic (private bus,
-   probe home, isolated shell state), so a rerun on an unchanged
-   feature must reproduce the previous release's shots: diff the new
-   stills against the prior release's before uploading.
+   `scripts/tuna-capture --bin-dir /usr/bin --artifacts walkthrough-media`
+   captures the installed release's GTK shell and six-feature core tour
+   (clip plus still per segment), and checks the segment/template contract.
+   Without `--bin-dir`, it builds debug binaries for development only.
+   The capture uses real GTK fixture windows, a private bus and isolated
+   runtime/configuration/state; it records binary versions and SHA256 hashes.
+   Install `ffmpeg`, `Xvfb`, `xdotool`, `jq`, GLib's `gsettings`/`gdbus`,
+   and `/usr/bin/python3` with GTK 4 introspection for this capture.
+   The recorded state must reach overview, two managed application windows,
+   scroll layout, and an awake locked session; successful file creation alone
+   is not feature proof.
+   Review every still before uploading. Diff against the prior release's
+   stills when available; missing old media is not comparison evidence.
 8. Attach the `.deb`, the notes, and the twelve media files
    (`<segment>.mp4` + `<segment>.png` per segment) to the release,
    e.g. `gh release upload vX.Y.Z walkthrough-media/*.mp4
