@@ -27,8 +27,10 @@ Shell's icons from `icons/` into a GResource.
 `tuna-shell-host` (app discovery, control client, notifications store,
 tray watcher), `tuna-shell-control`, GTK4, libadwaita, gtk4-layer-shell
 (not packaged on Ubuntu 24.04; see `scripts/ci-install-gtk4-layer-shell`)
-and gtk4-session-lock. Proven end to end by `scripts/tuna-gtk-shell-proof`
-and `scripts/tuna-scale-proof`.
+and gtk4-session-lock. Proven end to end by `scripts/tuna-gtk-shell-proof`,
+`scripts/tuna-scale-proof` and `scripts/tuna-slow-portal-proof`. The shell
+never uses xdg-desktop-portal (`src/portal_opt_out.rs`): it starts before
+graphical-session.target, so portal activation could block its startup.
 
 ## Docs
 
