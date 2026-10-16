@@ -8,7 +8,8 @@
 # 1280x800 stills (T-<section>.png) into the tuna-tour artifact. This
 # downloads that artifact for <run-id> and copies the six README stills
 # into docs/walkthrough/hero-*.png (recompressed with optipng when it is
-# installed), failing if any is missing so the set is never partial.
+# installed), failing if any is missing, or if the tour never saw its
+# view on screen (capture-timing.json), so the set is never partial.
 # A fresh run: gh workflow run ci.yml --ref main. Then update the
 # provenance in docs/walkthrough/README-media.md.
 set -eu
@@ -20,11 +21,11 @@ RUN=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --repo) REPO="$2"; shift 2 ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
         *) RUN="$1"; shift ;;
     esac
 done
-[ -n "$RUN" ] || { sed -n '2,13p' "$0" >&2; exit 2; }
+[ -n "$RUN" ] || { sed -n '2,14p' "$0" >&2; exit 2; }
 
 # hero name:tour still
 SET="hero-overview:overview-windows hero-app-grid:app-grid
@@ -39,6 +40,17 @@ for pair in $SET; do
         echo "tuna-hero-media: run $RUN has no T-${pair#*:}.png" >&2
         exit 1
     fi
+done
+# The tour lists stills whose view never appeared on screen.
+unconfirmed="$(python3 -c 'import json, sys
+print(" ".join(json.load(open(sys.argv[1])).get("unconfirmed_stills", [])))' \
+    "$WORK/capture-timing.json")"
+for pair in $SET; do
+    case " $unconfirmed " in
+        *" ${pair#*:} "*)
+            echo "tuna-hero-media: run $RUN never showed the ${pair#*:} view" >&2
+            exit 1 ;;
+    esac
 done
 for pair in $SET; do
     dst="$ROOT/docs/walkthrough/${pair%%:*}.png"

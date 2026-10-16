@@ -1044,6 +1044,64 @@ class TourRecorderTests(unittest.TestCase):
         self.assertIn('qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core', workflow)
 
 
+def tour_frame(fill, boxes=()):
+    """A WIDTH x HEIGHT RGB frame: fill, then (x0, y0, x1, y1, rgb) boxes."""
+    w = lane.WIDTH
+    px = bytearray(bytes(fill) * (w * lane.HEIGHT))
+    for x0, y0, x1, y1, rgb in boxes:
+        row = bytes(rgb) * (x1 - x0)
+        for y in range(y0, y1):
+            px[(y * w + x0) * 3:(y * w + x1) * 3] = row
+    return bytes(px)
+
+
+class TourViewPredicates(unittest.TestCase):
+    GREY, NAVY, WHITE = (36, 36, 40), (8, 24, 52), (250, 250, 250)
+    WINDOWS = (190, 140, 1085, 690, WHITE)
+    SWITCHER = [WINDOWS, (358, 307, 922, 492, GREY), (376, 325, 536, 425, WHITE),
+                (584, 325, 696, 425, WHITE), (749, 325, 900, 425, WHITE)]
+
+    def views(self, px):
+        return [name for name in ("overview_windows_shown", "switcher_shown", "desktop_shown")
+                if getattr(lane, name)(px)]
+
+    def test_overview_with_window_previews(self):
+        frame = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY), (440, 420, 840, 670, self.WHITE)])
+        self.assertEqual(self.views(frame), ["overview_windows_shown"])
+
+    def test_search_and_app_grid_are_not_the_window_overview(self):
+        icons = [(x, y, x + 48, y + 48, (200, 60, 40)) for x in range(170, 1110, 125) for y in (270, 395)]
+        self.assertEqual(self.views(tour_frame(self.GREY, icons)), [])
+        self.assertEqual(self.views(tour_frame(self.GREY)), [])
+
+    def test_switcher_island_over_windows(self):
+        self.assertEqual(self.views(tour_frame(self.NAVY, self.SWITCHER)), ["switcher_shown"])
+
+    def test_desktop_and_calendar_are_not_the_switcher(self):
+        self.assertEqual(self.views(tour_frame(self.NAVY, [self.WINDOWS])), ["desktop_shown"])
+        calendar = tour_frame(self.NAVY, [(263, 38, 1017, 531, self.GREY)])
+        self.assertEqual(self.views(calendar), ["desktop_shown"])
+
+    def test_await_still_waits_for_the_view_and_flags_one_that_never_appears(self):
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        probes = [tour_frame(self.NAVY, [self.WINDOWS]), tour_frame(self.NAVY, self.SWITCHER)]
+        def command(name, **args):
+            path = Path(args["filename"])
+            if path.name == "probe.ppm":
+                path.write_bytes(header + (probes.pop(0) if len(probes) > 1 else probes[0]))
+            else:
+                path.write_bytes(b"png pixels")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory, timeout=1)
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            self.assertFalse(recorder.await_still("overview-windows", lane.overview_windows_shown,
+                                                  timeout=0.05, settle=0))
+            self.assertEqual(recorder.stills, {"alt-tab": 0, "overview-windows": 1})
+            self.assertEqual(recorder.unconfirmed, ["overview-windows"])
+            self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
+                             ["f000000.png", "f000001.png"])
+            recorder.close()
+
 
 class SleepAuthRetirementTests(unittest.TestCase):
     def setUp(self):
