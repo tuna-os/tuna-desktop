@@ -333,11 +333,6 @@ impl Service {
         let Some(conn) = self.conn.borrow().clone() else {
             return;
         };
-        let params = glib::VariantDict::new(None);
-        params.insert("timestamp", time);
-        params.insert("action-mode", mode);
-        params.insert("device-node", "");
-        params.insert("device-id", 0u32);
         let _ = conn.emit_signal(
             Some(&sender),
             PATH,
@@ -347,9 +342,21 @@ impl Service {
             } else {
                 "AcceleratorActivated"
             },
-            Some(&(action, params.end()).to_variant()),
+            Some(&accelerator_signal_body(action, time, mode)),
         );
     }
+}
+
+/// The `(ua{sv})` body of AcceleratorActivated/AcceleratorDeactivated;
+/// a `(u32, Variant)` tuple would box the dictionary as `(uv)`, which
+/// GNOME's portal drops.
+fn accelerator_signal_body(action: u32, time: u32, mode: u32) -> glib::Variant {
+    let params = glib::VariantDict::new(None);
+    params.insert("timestamp", time);
+    params.insert("action-mode", mode);
+    params.insert("device-node", "");
+    params.insert("device-id", 0u32);
+    glib::Variant::tuple_from_iter([action.to_variant(), params.end()])
 }
 
 /// Unpack ShowOSD's `a{sv}` the way shellDBus.js does.
@@ -587,6 +594,16 @@ mod tests {
         let request = parse_osd(&dict.end());
         assert_eq!(request.label.as_deref(), Some("English (US)"));
         assert_eq!(request.icon, None);
+    }
+
+    #[test]
+    fn accelerator_signal_body_matches_the_introspected_signature() {
+        let body = accelerator_signal_body(7, 1234, 2);
+        assert_eq!(body.type_().as_str(), "(ua{sv})");
+        assert_eq!(body.child_value(0).get::<u32>(), Some(7));
+        let params = glib::VariantDict::new(Some(&body.child_value(1)));
+        assert_eq!(params.lookup::<u32>("timestamp").ok().flatten(), Some(1234));
+        assert_eq!(params.lookup::<u32>("action-mode").ok().flatten(), Some(2));
     }
 
     #[test]
