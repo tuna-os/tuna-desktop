@@ -229,13 +229,11 @@ impl PropertyMenu {
                 } else if name == PANEL {
                     let ours = Some(owner.as_str()) == signal.connection.unique_name().as_deref();
                     menu.owned.set(ours);
-                    menu.model.borrow_mut().reset();
+                    panel_owner_changed(&mut menu.model.borrow_mut(), ours);
                     menu.retire_query();
                     if ours {
                         menu.had_panel.set(true);
                         menu.release_offered.set(false);
-                        // Query after this ownership reset. Fresh FocusIn and
-                        // cached RegisterProperties may arrive before its reply.
                         menu.query_engine(signal.connection, generation);
                     } else {
                         menu.hide_candidates();
@@ -913,6 +911,16 @@ impl PropertyMenu {
         self.rows(&self.content, &items);
     }
 }
+/// IBus answers RequestName, then sends FocusIn + RegisterProperties straight
+/// from its owner-changed handler, and only broadcasts NameOwnerChanged from an
+/// idle queue. So the graph present when our own acquisition is signalled is
+/// the fresh one; only a loss discards it (a lost panel is sent nothing, so the
+/// graph is already empty by the time the name comes back).
+fn panel_owner_changed(model: &mut Properties, ours: bool) {
+    if !ours {
+        model.reset();
+    }
+}
 fn engine_name(value: &glib::Variant) -> Option<String> {
     if value.size() > wire::MAX_BYTES {
         return None;
@@ -973,6 +981,32 @@ fn expose_toggle_action(button: &gtk::CheckButton) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn own_panel_signal_after_ibus_resent_graph_keeps_it_and_loss_clears_it() {
+        let mut model = Properties::default();
+        // Reacquire order on the IBus bus: reply, FocusIn, RegisterProperties,
+        // then the queued NameOwnerChanged naming us.
+        model.initial_engine("pinyin".into());
+        model.focus_in("/org/freedesktop/IBus/InputContext_7".into());
+        let mode = Property {
+            key: "InputMode".into(),
+            kind: Kind::Toggle,
+            label: "中".into(),
+            symbol: Some("中".into()),
+            tooltip: String::new(),
+            sensitive: true,
+            visible: true,
+            state: 0,
+            children: vec![],
+        };
+        model.register(vec![mode.clone()]);
+        panel_owner_changed(&mut model, true);
+        assert_eq!(model.engine.as_deref(), Some("pinyin"));
+        assert!(model.context.is_some());
+        assert_eq!(model.items, vec![mode]);
+        panel_owner_changed(&mut model, false);
+        assert!(model.engine.is_none() && model.context.is_none() && model.items.is_empty());
+    }
     #[test]
     fn current_expired_reply_cleans_up_but_stale_reply_cannot_touch_new_refresh() {
         let mut refresh = Refresh {
