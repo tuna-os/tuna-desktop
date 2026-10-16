@@ -122,7 +122,17 @@ def activate(application):
     window = Gtk.ApplicationWindow(application=application, title=title)
     window.set_default_size(540, 360)
     window.set_child(Gtk.Label(label=title))
-    window.connect("map", lambda *_: pathlib.Path(marker).write_text("mapped\n"))
+    def mapped(widget):
+        clock = widget.get_frame_clock()
+
+        def painted(frame_clock):
+            frame_clock.disconnect(handler)
+            pathlib.Path(marker).write_text("painted\n")
+
+        handler = clock.connect("after-paint", painted)
+        widget.queue_draw()
+
+    window.connect("map", mapped)
     window.present()
 
 app.connect("activate", activate)
@@ -302,12 +312,14 @@ env -u DISPLAY WAYLAND_DISPLAY="$SOCKET" /usr/bin/python3 \
     "$PROBE_HOME/application.py" "$ARTIFACTS/seed-marker" "Tuna Desktop capture fixture" \
     >"$ARTIFACTS/application.log" 2>&1 &
 PROBE_PID=$!
-for _ in $(seq 1 30); do
+# Mapping precedes the first buffer; cold software shaders can take seconds.
+for _ in $(seq 1 150); do
     test -s "$ARTIFACTS/seed-marker" && break
+    kill -0 "$PROBE_PID" 2>/dev/null || break
     sleep 0.2
 done
 test -s "$ARTIFACTS/seed-marker" || {
-    echo "tuna-capture: GTK fixture did not map" >&2
+    echo "tuna-capture: GTK fixture did not paint its first frame" >&2
     exit 1
 }
 assert_state C-SEED '(.windows | length) == 1' "seed window managed"
@@ -386,18 +398,14 @@ sleep 1
 xdotool type "tunaterm"
 sleep 2
 xdotool key Return
-sleep 3
-LAUNCHED=""
-for _ in $(seq 1 6); do
-    if [ -f "$MARKER" ]; then
-        LAUNCHED=1
-        break
-    fi
-    xdotool key Return
-    sleep 3
+# Admit exactly one launch and wait for its first frame, not another Return.
+for _ in $(seq 1 150); do
+    test -s "$MARKER" && break
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || break
+    sleep 0.2
 done
-if [ -z "$LAUNCHED" ]; then
-    echo "tuna-capture: probe app never launched (no marker at $MARKER)" >&2
+if [ ! -s "$MARKER" ]; then
+    echo "tuna-capture: probe app never painted (no marker at $MARKER)" >&2
     tail -30 "$LOG" >&2 || true
     exit 1
 fi
