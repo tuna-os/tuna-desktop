@@ -68,3 +68,11 @@ and the `Outputs` message are byte-for-byte unchanged. The compositor sends it
 only to peers advertising minor 37 or later; an empty list explicitly revokes
 earlier authority, and nested sessions never send a non-empty one. Decoding
 rejects more than 64 records (`DecodeError::CollectionTooLong`).
+
+`Message::MonitorIdentityInventory { outputs: Vec<MonitorIdentityInfo> }`
+follows it in 0.37: for each owned output, the unchanged `NativeOutputInfo`
+plus optional `EdidIdentityInfo` (PNP vendor, product and serial text, the
+serial-quality flag, block count and SHA-256 of the exact kernel EDID bytes).
+The metadata is read once at connector discovery and never confers authority
+or restore admission. Decoding rejects more than 64 records and malformed
+vendor/product/serial text.

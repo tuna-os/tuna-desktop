@@ -34,6 +34,8 @@ pub struct OutputSnapshot {
     pub connector: String,
     pub make: String,
     pub model: String,
+    /// Actual EDID serial text/number, empty when EDID is unavailable.
+    pub serial: String,
     /// Mode in physical pixels, refresh in mHz.
     pub width: i32,
     pub height: i32,
@@ -417,8 +419,7 @@ impl DisplayConfig {
                 o.connector.clone(),
                 o.make.clone(),
                 o.model.clone(),
-                // Mutter's serial; the connector keeps session restore stable.
-                o.connector.clone(),
+                o.serial.clone(),
             );
             let builtin = is_laptop_panel(&o.connector);
             let display_name = if builtin {
@@ -1182,6 +1183,7 @@ mod tests {
             connector: connector.into(),
             make: String::new(),
             model: String::new(),
+            serial: String::new(),
             width: 1920,
             height: 1080,
             refresh_mhz: 60_000,
@@ -1191,6 +1193,29 @@ mod tests {
             primary: true,
             transform: 0,
         }
+    }
+
+    #[test]
+    fn current_state_exports_actual_serial_and_never_substitutes_connector() {
+        let mut output = snapshot("eDP-1");
+        output.make = "DEL".into();
+        output.model = "Panel".into();
+        output.serial = "S-123".into();
+        let outputs = Arc::new(Mutex::new(vec![output]));
+        let (to_loop, _receiver) = calloop::channel::channel();
+        let config = DisplayConfig {
+            outputs: outputs.clone(),
+            to_loop,
+            orientation: Default::default(),
+        };
+        let (_, monitors, _, _) = config.get_current_state().unwrap();
+        assert_eq!(
+            monitors[0].names,
+            ("eDP-1".into(), "DEL".into(), "Panel".into(), "S-123".into())
+        );
+        outputs.lock().unwrap()[0].serial.clear();
+        let (_, monitors, _, _) = config.get_current_state().unwrap();
+        assert_eq!(monitors[0].names.3, "");
     }
 
     fn logical(connector: &str, scale: f64) -> LogicalMonitorConfiguration {

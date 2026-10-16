@@ -172,6 +172,8 @@ impl ProtocolVersion {
     /// `PointerTimeout` messages (hover click's chooser and GNOME's pie
     /// timer). Positional: both peers ship together.
     /// `0.37` appends NativeOutputInventory without altering OutputInfo.
+    /// `0.37` also appends MonitorIdentityInventory: optional EDID metadata
+    /// beside an unchanged native owner body.
     pub const CURRENT: Self = Self {
         major: 0,
         minor: 37,
@@ -260,6 +262,24 @@ pub struct NativeOutputInfo {
     pub connector_sysfs: String,
     pub connector_device: u64,
     pub connector_inode: u64,
+}
+
+/// Optional kernel-observed EDID metadata, never authority or restore admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdidIdentityInfo {
+    pub vendor: String,
+    pub product: String,
+    pub serial: String,
+    /// Intrinsic serial quality only; consumers must separately reject duplicates.
+    pub meaningful_serial: bool,
+    pub sha256: [u8; 32],
+    pub blocks: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorIdentityInfo {
+    pub owner: NativeOutputInfo,
+    pub edid: Option<EdidIdentityInfo>,
 }
 
 /// One ordered state mutation between two snapshot revisions.
@@ -793,6 +813,8 @@ pub enum Message {
     /// Full actual native authority; empty explicitly revokes prior authority.
     /// Append-only, sent only to peers advertising minor >=37.
     NativeOutputInventory { outputs: Vec<NativeOutputInfo> },
+    /// Since 0.37: optional EDID identity alongside an unchanged native owner body.
+    MonitorIdentityInventory { outputs: Vec<MonitorIdentityInfo> },
 }
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
@@ -1602,6 +1624,37 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
                 check_title(&output.connector_sysfs)?;
             }
         }
+        Message::MonitorIdentityInventory { outputs } => {
+            if outputs.len() > 64 {
+                return Err(DecodeError::CollectionTooLong {
+                    len: outputs.len(),
+                    max: 64,
+                });
+            }
+            for output in outputs {
+                check_title(&output.owner.name)?;
+                check_title(&output.owner.connector_sysfs)?;
+                if let Some(edid) = &output.edid {
+                    if edid.vendor.len() != 3
+                        || !edid.vendor.bytes().all(|v| v.is_ascii_uppercase())
+                        || edid.product.is_empty()
+                        || edid.product.len() > 13
+                        || edid.serial.is_empty()
+                        || edid.serial.len() > 13
+                        || !(1..=256).contains(&edid.blocks)
+                        || !edid
+                            .product
+                            .bytes()
+                            .chain(edid.serial.bytes())
+                            .all(|v| (32..=126).contains(&v))
+                    {
+                        return Err(DecodeError::Malformed(
+                            postcard::Error::DeserializeBadEncoding,
+                        ));
+                    }
+                }
+            }
+        }
         // Names and values share the title bound: short by nature.
         Message::Environment { vars } => {
             for (name, value) in vars {
@@ -1667,6 +1720,78 @@ mod tests {
             })),
             Err(DecodeError::CollectionTooLong { len: 65, max: 64 })
         ));
+    }
+
+    #[test]
+    fn optional_monitor_identity_is_bounded_without_changing_native_owner_body() {
+        let owner = NativeOutputInfo {
+            name: "n".into(),
+            drm_device: 1,
+            connector_id: 2,
+            connector_sysfs: "p".into(),
+            connector_device: 3,
+            connector_inode: 4,
+        };
+        // Skip the append-only variant ordinal only; every positional
+        // inventory/owner body byte stays identical.
+        let native = encode_frame(&Message::NativeOutputInventory {
+            outputs: vec![owner.clone()],
+        });
+        assert_eq!(&native[5..], &[1, 1, b'n', 1, 2, 1, b'p', 3, 4]);
+        let mut output = MonitorIdentityInfo {
+            owner,
+            edid: Some(EdidIdentityInfo {
+                vendor: "DEL".into(),
+                product: "Panel".into(),
+                serial: "0x00000000".into(),
+                meaningful_serial: false,
+                sha256: [1; 32],
+                blocks: 1,
+            }),
+        };
+        roundtrip(&Message::MonitorIdentityInventory {
+            outputs: vec![output.clone()],
+        });
+        output.edid = None;
+        roundtrip(&Message::MonitorIdentityInventory {
+            outputs: vec![output.clone()],
+        });
+        assert!(matches!(
+            decode_frame(&encode_frame(&Message::MonitorIdentityInventory {
+                outputs: vec![output.clone(); 65]
+            })),
+            Err(DecodeError::CollectionTooLong { len: 65, max: 64 })
+        ));
+        output.edid = Some(EdidIdentityInfo {
+            vendor: "DEL".into(),
+            product: "x".repeat(14),
+            serial: "S".into(),
+            meaningful_serial: true,
+            sha256: [2; 32],
+            blocks: 1,
+        });
+        assert!(
+            decode_frame(&encode_frame(&Message::MonitorIdentityInventory {
+                outputs: vec![output.clone()]
+            }))
+            .is_err()
+        );
+        output.edid.as_mut().unwrap().product = "Panel".into();
+        output.edid.as_mut().unwrap().serial = "bad\nserial".into();
+        assert!(
+            decode_frame(&encode_frame(&Message::MonitorIdentityInventory {
+                outputs: vec![output.clone()]
+            }))
+            .is_err()
+        );
+        output.edid.as_mut().unwrap().serial = "S".into();
+        output.edid.as_mut().unwrap().blocks = 257;
+        assert!(
+            decode_frame(&encode_frame(&Message::MonitorIdentityInventory {
+                outputs: vec![output]
+            }))
+            .is_err()
+        );
     }
 
     fn sample_token() -> ActivationToken {

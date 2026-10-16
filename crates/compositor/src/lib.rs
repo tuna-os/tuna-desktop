@@ -75,6 +75,8 @@ pub mod lockdown;
 pub mod magnifier;
 pub mod minimize;
 pub mod modal_dim;
+#[cfg(feature = "drm")]
+pub mod monitor_edid;
 pub mod monitors;
 pub mod mutter;
 pub mod native_output;

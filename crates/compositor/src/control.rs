@@ -547,6 +547,20 @@ impl<'a> Session<'a> {
         })
     }
 
+    /// Send optional EDID metadata for the owned native outputs (0.37
+    /// peers only). Metadata never confers authority or restore admission.
+    pub fn send_monitor_identities(
+        &mut self,
+        outputs: &[tuna_shell_control::MonitorIdentityInfo],
+    ) -> Result<(), ControlError> {
+        if self.peer_minor < 37 {
+            return Ok(());
+        }
+        self.conn.write_frame(&Message::MonitorIdentityInventory {
+            outputs: outputs.to_vec(),
+        })
+    }
+
     /// The latest `SetIdleTimeout` the shell sent, once (#63).
     pub fn take_idle_timeout(&mut self) -> Option<u64> {
         self.idle_timeout.take()
@@ -985,6 +999,7 @@ impl<'a> Session<'a> {
             | Message::Overview { .. }
             | Message::Switcher { .. }
             | Message::NativeOutputInventory { .. }
+            | Message::MonitorIdentityInventory { .. }
             | Message::Outputs { .. }
             | Message::Environment { .. }
             | Message::OverviewPreviews { .. }
@@ -1034,6 +1049,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::Overview { .. } => "Overview",
         Message::Switcher { .. } => "Switcher",
         Message::NativeOutputInventory { .. } => "NativeOutputInventory",
+        Message::MonitorIdentityInventory { .. } => "MonitorIdentityInventory",
         Message::Outputs { .. } => "Outputs",
         Message::Environment { .. } => "Environment",
         Message::OverviewPreviews { .. } => "OverviewPreviews",
@@ -1423,11 +1439,13 @@ pub struct ControlHub {
     /// whenever it differs from `outputs_sent`.
     outputs: Vec<OutputInfo>,
     native_outputs: Vec<tuna_shell_control::NativeOutputInfo>,
+    monitor_identities: Vec<tuna_shell_control::MonitorIdentityInfo>,
     pointer_output: Option<String>,
     /// Inventory value every live session holds; a mismatch means a
     /// broadcast is still owed (or a newcomer joined mid-state).
     outputs_sent: Vec<OutputInfo>,
     native_outputs_sent: Vec<tuna_shell_control::NativeOutputInfo>,
+    monitor_identities_sent: Vec<tuna_shell_control::MonitorIdentityInfo>,
     /// Session environment for launched apps (#59), and the last value
     /// every live session holds.
     environment: Vec<(String, String)>,
@@ -1513,9 +1531,11 @@ impl ControlHub {
             menu_queue: Vec::new(),
             outputs: Vec::new(),
             native_outputs: Vec::new(),
+            monitor_identities: Vec::new(),
             pointer_output: None,
             outputs_sent: Vec::new(),
             native_outputs_sent: Vec::new(),
+            monitor_identities_sent: Vec::new(),
             environment: Vec::new(),
             environment_sent: Vec::new(),
             previews: (Vec::new(), None),
@@ -1706,6 +1726,16 @@ impl ControlHub {
     /// sessions always set an empty inventory.
     pub fn set_native_outputs(&mut self, outputs: Vec<tuna_shell_control::NativeOutputInfo>) {
         self.native_outputs = outputs;
+    }
+
+    /// Refresh the optional EDID metadata for the owned native outputs;
+    /// the next [`poll`](Self::poll) broadcasts a change as
+    /// [`Message::MonitorIdentityInventory`].
+    pub fn set_monitor_identities(
+        &mut self,
+        outputs: Vec<tuna_shell_control::MonitorIdentityInfo>,
+    ) {
+        self.monitor_identities = outputs;
     }
 
     /// Set the session environment (#59); the next [`poll`](Self::poll)
@@ -2084,6 +2114,20 @@ impl ControlHub {
                 self.previews_sent = self.previews.clone();
             }
         }
+        if self.monitor_identities != self.monitor_identities_sent {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session
+                    .send_monitor_identities(&self.monitor_identities)
+                    .is_err()
+                {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                self.monitor_identities_sent = self.monitor_identities.clone();
+            }
+        }
         if self.native_outputs != self.native_outputs_sent {
             let mut all_sent = true;
             for session in &mut self.sessions {
@@ -2186,6 +2230,9 @@ impl ControlHub {
                 // nothing for an empty inventory to revoke.
                 if !self.native_outputs.is_empty() {
                     let _ = session.send_native_outputs(&self.native_outputs);
+                }
+                if !self.monitor_identities.is_empty() {
+                    let _ = session.send_monitor_identities(&self.monitor_identities);
                 }
                 if !self.outputs.is_empty() {
                     let _ = session.send_outputs(&self.outputs);

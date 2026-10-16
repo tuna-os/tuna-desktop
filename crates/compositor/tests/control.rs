@@ -661,3 +661,48 @@ fn native_owner_inventory_is_minor_gated_and_empty_revocation_is_real_wire() {
         assert_eq!(client_read(&mut client), Message::Overview { open: true });
     }
 }
+
+#[test]
+fn optional_monitor_identity_is_minor37_gated_and_empty_revocation_is_real_wire() {
+    let info = tuna_shell_control::MonitorIdentityInfo {
+        owner: tuna_shell_control::NativeOutputInfo {
+            name: "eDP-1".into(),
+            drm_device: 226,
+            connector_id: 39,
+            connector_sysfs: "/sys/owned/connector".into(),
+            connector_device: 1,
+            connector_inode: 2,
+        },
+        edid: None,
+    };
+    for minor in [35, 36, 37] {
+        let (conn, mut client) = pair();
+        client_write(
+            &mut client,
+            &Message::Hello {
+                version: ProtocolVersion::new(CURRENT_VERSION.major, minor),
+            },
+        );
+        let mut session = Session::handshake(conn, &StateModel::new()).unwrap();
+        assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+        assert!(matches!(client_read(&mut client), Message::Snapshot { .. }));
+        session
+            .send_monitor_identities(std::slice::from_ref(&info))
+            .unwrap();
+        session.send_monitor_identities(&[]).unwrap();
+        session.send_overview(true).unwrap();
+        if minor >= 37 {
+            assert_eq!(
+                client_read(&mut client),
+                Message::MonitorIdentityInventory {
+                    outputs: vec![info.clone()]
+                }
+            );
+            assert_eq!(
+                client_read(&mut client),
+                Message::MonitorIdentityInventory { outputs: vec![] }
+            );
+        }
+        assert_eq!(client_read(&mut client), Message::Overview { open: true });
+    }
+}
