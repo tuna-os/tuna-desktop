@@ -84,10 +84,18 @@ pub enum Action {
     /// The next or previous keyboard input source.
     NextInputSource,
     PreviousInputSource,
-    /// Switch to a workspace: first, last, or one step left/right.
+    /// Switch to a workspace: first, last, numbered, or one step
+    /// left/right.
     Workspace(Target),
     /// Move the focused window there and follow it.
     MoveToWorkspace(Target),
+    /// GNOME's `show-desktop`: hide the workspace's windows, or bring
+    /// them back.
+    ShowDesktop,
+    /// Any other window-manager key on the focused window (fullscreen,
+    /// above, sticky, raise/lower, axis maximize, monitor and placement
+    /// moves).
+    Window(tuna_shell_control::WindowAction),
 }
 
 /// A workspace a key goes to.
@@ -97,13 +105,17 @@ pub enum Target {
     Last,
     Left,
     Right,
+    /// `switch-to-workspace-N` / `move-to-workspace-N` (1-based, 2–12).
+    Number(u8),
 }
 
 impl Target {
     /// The workspace id for this target, from `active` among `workspaces`
     /// with windows on `occupied`. GNOME's workspaces are dynamic: one
     /// empty workspace always follows the last occupied one, and that is
-    /// where Last goes; Right past the end is the next new one.
+    /// where Last goes; Right past the end is the next new one. A
+    /// numbered workspace past the last one does not exist, so its key
+    /// does nothing (Mutter).
     pub fn resolve(self, active: u32, workspaces: &[u32], occupied: &[u32]) -> Option<u32> {
         let first = workspaces.iter().copied().min().unwrap_or(0);
         let trailing = occupied.iter().copied().max().map_or(0, |m| m + 1);
@@ -118,6 +130,10 @@ impl Target {
             Target::Last => Some(last),
             Target::Left => (active > first).then(|| active - 1),
             Target::Right => Some(active + 1),
+            Target::Number(n) => {
+                let index = u32::from(n).checked_sub(1)?;
+                (index <= last).then_some(index)
+            }
         }
     }
 }
@@ -482,7 +498,129 @@ fn specs() -> Vec<Spec> {
                 "<Control><Shift><Alt>Right",
             ],
         ),
+        wm("show-desktop", Action::ShowDesktop, vec![]),
     ]);
+    // The rest of GNOME 51's window keys: every default is empty except
+    // the monitor moves (`<Super><Shift>` plus an arrow).
+    {
+        use tuna_shell_control::{Direction, Gravity, WindowAction as W};
+        for (key, action, defaults) in [
+            ("toggle-fullscreen", W::ToggleFullscreen, vec![]),
+            ("toggle-above", W::ToggleAbove, vec![]),
+            ("toggle-on-all-workspaces", W::ToggleSticky, vec![]),
+            ("raise", W::Raise, vec![]),
+            ("lower", W::Lower, vec![]),
+            ("raise-or-lower", W::RaiseOrLower, vec![]),
+            ("maximize-vertically", W::MaximizeVertically, vec![]),
+            ("maximize-horizontally", W::MaximizeHorizontally, vec![]),
+            (
+                "move-to-monitor-left",
+                W::MoveToMonitor {
+                    direction: Direction::Left,
+                },
+                vec!["<Super><Shift>Left"],
+            ),
+            (
+                "move-to-monitor-right",
+                W::MoveToMonitor {
+                    direction: Direction::Right,
+                },
+                vec!["<Super><Shift>Right"],
+            ),
+            (
+                "move-to-monitor-up",
+                W::MoveToMonitor {
+                    direction: Direction::Up,
+                },
+                vec!["<Super><Shift>Up"],
+            ),
+            (
+                "move-to-monitor-down",
+                W::MoveToMonitor {
+                    direction: Direction::Down,
+                },
+                vec!["<Super><Shift>Down"],
+            ),
+            (
+                "move-to-corner-nw",
+                W::MoveTo {
+                    gravity: Gravity::NorthWest,
+                },
+                vec![],
+            ),
+            (
+                "move-to-corner-ne",
+                W::MoveTo {
+                    gravity: Gravity::NorthEast,
+                },
+                vec![],
+            ),
+            (
+                "move-to-corner-sw",
+                W::MoveTo {
+                    gravity: Gravity::SouthWest,
+                },
+                vec![],
+            ),
+            (
+                "move-to-corner-se",
+                W::MoveTo {
+                    gravity: Gravity::SouthEast,
+                },
+                vec![],
+            ),
+            (
+                "move-to-side-n",
+                W::MoveTo {
+                    gravity: Gravity::North,
+                },
+                vec![],
+            ),
+            (
+                "move-to-side-s",
+                W::MoveTo {
+                    gravity: Gravity::South,
+                },
+                vec![],
+            ),
+            (
+                "move-to-side-e",
+                W::MoveTo {
+                    gravity: Gravity::East,
+                },
+                vec![],
+            ),
+            (
+                "move-to-side-w",
+                W::MoveTo {
+                    gravity: Gravity::West,
+                },
+                vec![],
+            ),
+            (
+                "move-to-center",
+                W::MoveTo {
+                    gravity: Gravity::Center,
+                },
+                vec![],
+            ),
+        ] {
+            specs.push(wm(key, Action::Window(action), defaults));
+        }
+    }
+    // Numbered workspaces 2–12 (1 is First above); GNOME binds none.
+    for n in 2..=12u8 {
+        specs.push(wm(
+            &format!("switch-to-workspace-{n}"),
+            Action::Workspace(Target::Number(n)),
+            vec![],
+        ));
+        specs.push(wm(
+            &format!("move-to-workspace-{n}"),
+            Action::MoveToWorkspace(Target::Number(n)),
+            vec![],
+        ));
+    }
     for n in 1..=9u8 {
         specs.push(Spec {
             schema: Schema::Shell,
@@ -685,6 +823,10 @@ mod tests {
         assert_eq!(Target::Right.resolve(2, &ws, &[0]), Some(3));
         // Everything on the first workspace: Last is the empty one after.
         assert_eq!(Target::Last.resolve(0, &[0], &[0]), Some(1));
+        // Numbered workspaces exist up to the trailing empty one.
+        assert_eq!(Target::Number(2).resolve(0, &ws, &[0, 1]), Some(1));
+        assert_eq!(Target::Number(3).resolve(0, &ws, &[0, 1]), Some(2));
+        assert_eq!(Target::Number(5).resolve(0, &ws, &[0, 1]), None);
     }
 
     #[test]
@@ -801,6 +943,28 @@ mod tests {
             ]
         );
         assert_eq!(find(Action::Workspace(Target::Left))[0], "<Super>Page_Up");
+        // The rest of GNOME 51's window keys: only monitor moves bind.
+        use tuna_shell_control::{Direction, Gravity, WindowAction as W};
+        assert_eq!(
+            find(Action::Window(W::MoveToMonitor {
+                direction: Direction::Left
+            })),
+            ["<Super><Shift>Left"]
+        );
+        assert_eq!(
+            find(Action::Window(W::MoveToMonitor {
+                direction: Direction::Down
+            })),
+            ["<Super><Shift>Down"]
+        );
+        assert!(find(Action::ShowDesktop).is_empty());
+        assert!(find(Action::Window(W::ToggleFullscreen)).is_empty());
+        assert!(find(Action::Window(W::MoveTo {
+            gravity: Gravity::Center
+        }))
+        .is_empty());
+        assert!(find(Action::Workspace(Target::Number(12))).is_empty());
+        assert!(find(Action::MoveToWorkspace(Target::Number(2))).is_empty());
         let brightness = all
             .iter()
             .find(|b| b.action == Action::BrightnessUp)

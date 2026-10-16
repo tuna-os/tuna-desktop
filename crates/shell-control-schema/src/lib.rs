@@ -171,9 +171,13 @@ impl ProtocolVersion {
     /// command and the compositor-to-shell `DwellClickType` and
     /// `PointerTimeout` messages (hover click's chooser and GNOME's pie
     /// timer). Positional: both peers ship together.
+    /// `0.38` appends GNOME's window-manager focus and mouse preferences
+    /// to `InputSettings`, the `ToggleShowDesktop` command, and the
+    /// fullscreen, raise/lower, axis-maximize, monitor and placement keys
+    /// to `WindowAction` (#347), all last.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 36,
+        minor: 38,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -402,6 +406,9 @@ pub enum CommandKind {
     SetWellbeingEffects { grayscale: bool, fade: bool },
     /// The hover-click chooser picked the click the next dwell makes.
     SetDwellClickType { click: DwellClick },
+    /// GNOME's `show-desktop` key: hide every window on the active
+    /// workspace, or bring the ones it hid back.
+    ToggleShowDesktop,
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -530,6 +537,54 @@ pub enum WindowAction {
     ToggleTiledLeft,
     /// Tile the right half, or untile (`toggle-tiled-right`).
     ToggleTiledRight,
+    /// Fullscreen, or leave it (`toggle-fullscreen`).
+    ToggleFullscreen,
+    /// Raise to the top of its layer (`raise`).
+    Raise,
+    /// Lower to the bottom (`lower`).
+    Lower,
+    /// Lower when nothing shown covers it, else raise (`raise-or-lower`).
+    RaiseOrLower,
+    /// Fill the work area's height, or give it back
+    /// (`maximize-vertically`).
+    MaximizeVertically,
+    /// Fill the work area's width, or give it back
+    /// (`maximize-horizontally`).
+    MaximizeHorizontally,
+    /// Move to the neighboring monitor (`move-to-monitor-*`).
+    MoveToMonitor {
+        /// Which neighbor.
+        direction: Direction,
+    },
+    /// Move to a corner, a side or the center of the work area
+    /// (`move-to-corner-*`, `move-to-side-*`, `move-to-center`).
+    MoveTo {
+        /// Where.
+        gravity: Gravity,
+    },
+}
+
+/// A neighbor direction (monitors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// A spot in the work area a window moves to: Mutter's gravities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Gravity {
+    NorthWest,
+    North,
+    NorthEast,
+    West,
+    Center,
+    East,
+    SouthWest,
+    South,
+    SouthEast,
 }
 
 /// Grabbed accelerators held at once.
@@ -939,6 +994,9 @@ pub struct InputSettings {
     /// GNOME's pointer accessibility aids.
     #[serde(default)]
     pub pointer_aids: PointerAids,
+    /// GNOME window-manager focus and mouse preferences (0.38, #347).
+    #[serde(default)]
+    pub wm_preferences: WmPreferences,
 }
 
 /// GNOME's `org.gnome.desktop.a11y.mouse`, flattened for the compositor.
@@ -977,6 +1035,94 @@ impl Default for PointerAids {
             gesture_double: Some(DwellDirection::Up),
             gesture_drag: Some(DwellDirection::Down),
             gesture_secondary: Some(DwellDirection::Right),
+        }
+    }
+}
+
+/// `org.gnome.desktop.wm.preferences focus-mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FocusMode {
+    /// Focus on click (GNOME's default).
+    #[default]
+    Click,
+    /// The window under the pointer takes focus; the desktop keeps it.
+    Sloppy,
+    /// The window under the pointer takes focus; the desktop takes it
+    /// away.
+    Mouse,
+}
+
+impl FocusMode {
+    /// The GSettings nick (`click`, `sloppy`, `mouse`); unknown nicks
+    /// are GNOME's default.
+    pub fn from_nick(nick: &str) -> Self {
+        match nick {
+            "sloppy" => Self::Sloppy,
+            "mouse" => Self::Mouse,
+            _ => Self::Click,
+        }
+    }
+}
+
+/// `org.gnome.desktop.wm.preferences focus-new-windows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FocusNewWindows {
+    /// New windows take focus (GNOME's default).
+    #[default]
+    Smart,
+    /// New windows do not take focus from a focused window; they open
+    /// just below it.
+    Strict,
+}
+
+impl FocusNewWindows {
+    /// The GSettings nick; unknown nicks are GNOME's default.
+    pub fn from_nick(nick: &str) -> Self {
+        if nick == "strict" {
+            Self::Strict
+        } else {
+            Self::Smart
+        }
+    }
+}
+
+/// GNOME's window-manager focus and mouse preferences
+/// (`org.gnome.desktop.wm.preferences`, plus Mutter's
+/// `focus-change-on-pointer-rest`), flattened for the compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WmPreferences {
+    /// `focus-mode`.
+    pub focus_mode: FocusMode,
+    /// `org.gnome.mutter focus-change-on-pointer-rest`: pointer focus
+    /// waits for the pointer to stop.
+    pub focus_change_on_pointer_rest: bool,
+    /// `focus-new-windows`.
+    pub focus_new_windows: FocusNewWindows,
+    /// `auto-raise` and `auto-raise-delay` (milliseconds).
+    pub auto_raise: bool,
+    pub auto_raise_delay_ms: u32,
+    /// `raise-on-click`.
+    pub raise_on_click: bool,
+    /// `mouse-button-modifier` as `MOD_*` bits; 0 disables modifier
+    /// drags.
+    pub mouse_button_modifier: u32,
+    /// `resize-with-right-button`: the modifier plus the right button
+    /// resizes (and the middle one opens the window menu).
+    pub resize_with_right_button: bool,
+}
+
+impl Default for WmPreferences {
+    /// GNOME 51's defaults.
+    fn default() -> Self {
+        Self {
+            focus_mode: FocusMode::Click,
+            focus_change_on_pointer_rest: true,
+            focus_new_windows: FocusNewWindows::Smart,
+            auto_raise: false,
+            auto_raise_delay_ms: 500,
+            raise_on_click: true,
+            mouse_button_modifier: MOD_LOGO,
+            resize_with_right_button: false,
         }
     }
 }
@@ -1081,6 +1227,7 @@ impl Default for InputSettings {
             locate_pointer: false,
             locate_pointer_key: default_locate_pointer_key(),
             pointer_aids: PointerAids::default(),
+            wm_preferences: WmPreferences::default(),
         }
     }
 }
@@ -1743,8 +1890,83 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_36() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 36));
+    fn current_version_is_0_38() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 38));
+    }
+
+    #[test]
+    fn wm_preferences_survive_the_positional_control_wire() {
+        for wm_preferences in [
+            WmPreferences::default(),
+            WmPreferences {
+                focus_mode: FocusMode::Mouse,
+                focus_change_on_pointer_rest: false,
+                focus_new_windows: FocusNewWindows::Strict,
+                auto_raise: true,
+                auto_raise_delay_ms: 250,
+                raise_on_click: false,
+                mouse_button_modifier: MOD_ALT,
+                resize_with_right_button: true,
+            },
+        ] {
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                    wm_preferences,
+                    ..Default::default()
+                })),
+            });
+        }
+        roundtrip(&Message::Command {
+            id: 2,
+            kind: CommandKind::ToggleShowDesktop,
+        });
+    }
+
+    #[test]
+    fn new_window_actions_survive_the_control_wire() {
+        let mut actions = vec![
+            WindowAction::ToggleFullscreen,
+            WindowAction::Raise,
+            WindowAction::Lower,
+            WindowAction::RaiseOrLower,
+            WindowAction::MaximizeVertically,
+            WindowAction::MaximizeHorizontally,
+        ];
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            actions.push(WindowAction::MoveToMonitor { direction });
+        }
+        for gravity in [Gravity::NorthWest, Gravity::Center, Gravity::SouthEast] {
+            actions.push(WindowAction::MoveTo { gravity });
+        }
+        for action in actions {
+            roundtrip(&Message::Command {
+                id: 4,
+                kind: CommandKind::WindowAction { window: 7, action },
+            });
+        }
+    }
+
+    #[test]
+    fn wm_preferences_default_to_gnome_51_and_parse_its_nicks() {
+        let wm = WmPreferences::default();
+        assert_eq!(wm.focus_mode, FocusMode::Click);
+        assert!(wm.raise_on_click && wm.focus_change_on_pointer_rest && !wm.auto_raise);
+        assert_eq!(wm.mouse_button_modifier, MOD_LOGO);
+        assert_eq!(InputSettings::default().wm_preferences, wm);
+        assert_eq!(FocusMode::from_nick("sloppy"), FocusMode::Sloppy);
+        assert_eq!(FocusMode::from_nick("mouse"), FocusMode::Mouse);
+        assert_eq!(FocusMode::from_nick("bogus"), FocusMode::Click);
+        assert_eq!(
+            FocusNewWindows::from_nick("strict"),
+            FocusNewWindows::Strict
+        );
+        assert_eq!(FocusNewWindows::from_nick("smart"), FocusNewWindows::Smart);
     }
 
     #[test]

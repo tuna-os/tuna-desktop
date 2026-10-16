@@ -346,6 +346,8 @@ pub struct Session<'a> {
     dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Input-source switches the shell asked for (`true` backward).
     input_source_switches: Vec<bool>,
+    /// `ToggleShowDesktop` requests, drained by the hub.
+    show_desktop_toggles: u32,
     /// The switcher's thumbnail frames, when the shell sent new ones.
     switcher_thumbnails: Option<Vec<tuna_shell_control::SwitcherThumbnail>>,
     /// The shell's switcher keys, until the runtime drains them.
@@ -442,6 +444,7 @@ impl<'a> Session<'a> {
             screenshot_pointer: None,
             dwell_click: None,
             input_source_switches: Vec::new(),
+            show_desktop_toggles: 0,
             switcher_thumbnails: None,
             switcher_keys: None,
             lockdown: LockdownPolicy::default(),
@@ -806,6 +809,17 @@ impl<'a> Session<'a> {
                 kind: CommandKind::SwitchInputSource { backward },
             } => {
                 self.input_source_switches.push(backward);
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::ToggleShowDesktop,
+            } => {
+                self.show_desktop_toggles = self.show_desktop_toggles.saturating_add(1);
                 self.conn.write_frame(&Message::CommandResult {
                     id,
                     status: CommandStatus::Applied,
@@ -1194,6 +1208,7 @@ fn apply_command(
         | CommandKind::MoveScreenshotPointer { .. }
         | CommandKind::SetScreenReader { .. }
         | CommandKind::SetDwellClickType { .. }
+        | CommandKind::ToggleShowDesktop
         | CommandKind::SetInputSettings(_) => (CommandStatus::Applied, None),
         CommandKind::Lock => {
             // Manual lock from the shell (session-lock set path):
@@ -1246,6 +1261,8 @@ pub struct PollOutcome {
     pub shortcut_consent: Vec<(u64, bool)>,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
+    /// How many times the shell pressed `show-desktop`.
+    pub show_desktop_toggles: u32,
     /// New switcher thumbnail frames, if the shell sent any.
     pub switcher_thumbnails: Option<Vec<tuna_shell_control::SwitcherThumbnail>>,
     /// The shell's switcher keys, if it sent new ones.
@@ -1906,6 +1923,9 @@ impl ControlHub {
                     outcome
                         .input_source_switches
                         .extend(std::mem::take(&mut session.input_source_switches));
+                    outcome.show_desktop_toggles = outcome
+                        .show_desktop_toggles
+                        .saturating_add(std::mem::take(&mut session.show_desktop_toggles));
                     if let Some(thumbnails) = session.switcher_thumbnails.take() {
                         outcome.switcher_thumbnails = Some(thumbnails);
                     }

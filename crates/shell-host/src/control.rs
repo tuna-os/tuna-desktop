@@ -738,6 +738,17 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// GNOME's `show-desktop` key: hide the active workspace's windows,
+    /// or bring them back. Returns the request id.
+    pub fn toggle_show_desktop(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::ToggleShowDesktop,
+        })?;
+        Ok(id)
+    }
+
     /// Offer the lock screen's password (ext-session-lock prompt). The
     /// compositor verifies it off its loop (PAM or greetd) and answers
     /// `Applied` once the session is unlocked or `Denied` when the

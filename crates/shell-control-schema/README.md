@@ -12,7 +12,7 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.36).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.38).
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
@@ -57,3 +57,11 @@ appended after `keyboard_aids`; `CommandKind::SetDwellClickType` is appended
 for the hover-click chooser, and the compositor reports
 `Message::DwellClickType` and `Message::PointerTimeout` (pie timer) as the
 last two message variants. Positional: both peers ship together.
+
+## Window-manager preferences (0.38)
+
+The WM shortcut and focus preferences in #347 append `WmPreferences` to
+`InputSettings`, `ToggleShowDesktop` to commands, and the new window actions.
+Minor 0.37 is reserved for the native-display stack (#706–#713). This branch
+must be restacked onto that stack before landing so its positional variants
+follow the complete 0.37 schema rather than colliding with it.
