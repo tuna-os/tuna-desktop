@@ -25,6 +25,9 @@ zbus = { workspace = true }
 # attempt deadline (Timer + race), via zbus's own async-io/futures-lite.
 async-io = "2.6"
 futures-lite = "2.6.1"
+# ApplyMonitorsConfig waits for the loop's actual completion without
+# blocking the D-Bus executor.
+async-channel = "2"
 png = "0.18"
 # GNOME's cursor themes (#342): Xcursor files, parsed only; theme
 # lookup and inheritance are our own (src/cursor.rs).

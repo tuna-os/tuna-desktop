@@ -114,6 +114,12 @@ install -m0644 share/compat/wayland-sessions/roost.desktop "$STAGE/usr/share/way
 install -m0644 share/compat/pam.d/roost-lock "$STAGE/etc/pam.d/roost-lock"
 echo /etc/pam.d/roost-lock >>"$STAGE/DEBIAN/conffiles"
 # tuna-rename: keep-end
+# Original root and vendored MIT notices are part of the installed payload.
+install -Dm0644 LICENSE "$STAGE/usr/share/licenses/tuna-desktop/LICENSE"
+for dependency in drm drm-ffi; do
+    install -Dm0644 "third-party/$dependency/LICENSE" \
+        "$STAGE/usr/share/licenses/tuna-desktop/$dependency/LICENSE"
+done
 
 # Agreement check: the stamped binaries must report the stamped version.
 for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-greeter; do

@@ -689,6 +689,8 @@ pub struct Runtime {
     casts: Vec<crate::screencast::Cast>,
     /// Monitor list the Mutter D-Bus side serves.
     cast_outputs: crate::mutter::Outputs,
+    /// Serial-coherent DisplayConfig publication over `cast_outputs`.
+    display_publication: crate::mutter::DisplayPublication,
     /// Orientation lock plus the latest accelerometer sample (#345).
     orientation: crate::orientation::OrientationPolicy,
     /// Flags shared with the Mutter D-Bus thread (managed property,
@@ -781,6 +783,9 @@ pub struct Runtime {
     proof_swipe_last: String,
     #[cfg(feature = "drm")]
     performance_trace: crate::performance_trace::Trace,
+    /// Bumped by every applied display layout; native completions queued
+    /// under an older layout retire without submitting successors.
+    display_layout_generation: u64,
 }
 
 /// Control socket path for a session: alongside the Wayland socket in the
@@ -867,12 +872,22 @@ impl Runtime {
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 handle
                     .insert_source(sources.drm, |event, metadata, rt: &mut Runtime| {
+                        let layout_generation = rt.display_layout_generation;
                         let flip = match &mut rt.backend {
-                            Backend::Drm(drm) => drm.on_drm_event(event, metadata),
+                            Backend::Drm(drm) => {
+                                drm.on_drm_event(event, metadata, layout_generation)
+                            }
                             Backend::Winit(_) => None,
                         };
                         if let Some(flip) = flip {
                             rt.page_flipped(flip);
+                        }
+                    })
+                    .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                handle
+                    .insert_source(sources.udev, |event, _, rt: &mut Runtime| {
+                        if let Backend::Drm(drm) = &mut rt.backend {
+                            drm.on_udev_event(event);
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
@@ -1084,6 +1099,7 @@ impl Runtime {
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen
         // sharing through the stock GNOME portal.
         let cast_outputs: crate::mutter::Outputs = Default::default();
+        let display_publication = crate::mutter::DisplayPublication::new(cast_outputs.clone());
         let orientation_share: std::sync::Arc<crate::orientation::OrientationShare> =
             Default::default();
         let night_light_share: std::sync::Arc<crate::night_light::NightLightShare> =
@@ -1096,6 +1112,7 @@ impl Runtime {
             .insert_source(
                 crate::mutter::start(
                     cast_outputs.clone(),
+                    display_publication.clone(),
                     introspect.windows.clone(),
                     capture_authority.clone(),
                     display.handle(),
@@ -1275,6 +1292,7 @@ impl Runtime {
             pipewire: None,
             casts: Vec::new(),
             cast_outputs,
+            display_publication,
             orientation: Default::default(),
             orientation_share,
             night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
@@ -1300,6 +1318,7 @@ impl Runtime {
             proof_swipe_last: String::new(),
             #[cfg(feature = "drm")]
             performance_trace: crate::performance_trace::Trace::from_env(),
+            display_layout_generation: 1,
         };
         runtime.animation_clock =
             crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
@@ -2388,6 +2407,11 @@ impl Runtime {
                 Backend::Winit(_) => None::<u64>,
             })
             .flatten());
+        doc["native_kernel_commits"] = match &self.backend {
+            #[cfg(feature = "drm")]
+            Backend::Drm(drm) => drm.kernel_commit_observation(self.display_layout_generation),
+            Backend::Winit(_) => serde_json::Value::Null,
+        };
         doc["pointer_position"] = serde_json::json!((!self.is_locked()).then(|| {
             let pos = self.manager.pointer_pos();
             [pos.x, pos.y]
@@ -3169,6 +3193,10 @@ impl Runtime {
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
+                // No capture from an unaccepted or revoked monitor inventory.
+                if !drm.monitor_inventory_available() {
+                    return None;
+                }
                 let crate::drm::DrmBackend {
                     renderer, outputs, ..
                 } = &mut **drm;
@@ -3609,17 +3637,46 @@ impl Runtime {
             crate::mutter::ToLoop::ApplyMonitors {
                 configs,
                 persistent,
+                serial,
+                deadline,
+                reply,
             } => {
-                self.apply_monitors(&configs);
-                if persistent {
-                    match crate::monitors::save(&configs) {
-                        Ok(path) => eprintln!(
-                            "tuna-compositor: display settings saved to {}",
-                            path.display()
-                        ),
-                        Err(e) => eprintln!("tuna-compositor: display settings not saved: {e}"),
-                    }
-                }
+                let admitted = self.display_publication.completion_admitted(
+                    serial,
+                    deadline,
+                    std::time::Instant::now(),
+                    &reply,
+                );
+                let native_available = match &self.backend {
+                    #[cfg(feature = "drm")]
+                    Backend::Drm(drm) => drm.monitor_inventory_available(),
+                    Backend::Winit(_) => true,
+                };
+                let result = if !admitted || !native_available {
+                    Err("original display configuration no longer current")
+                } else {
+                    // Scale, position and rotation only; never modes,
+                    // mirroring or disabling.
+                    self.apply_monitors(&configs).and_then(|()| {
+                        self.manager.reapply_derived_layouts(&mut self.state);
+                        crate::layer::arrange_after_commit(&self.state);
+                        self.triggers.cancel();
+                        self.publish_cast_outputs();
+                        if persistent {
+                            crate::monitors::save(&configs)
+                                .map(|_| ())
+                                .map_err(|_| "display settings could not be saved")
+                        } else {
+                            Ok(())
+                        }
+                    })
+                };
+                let result = if reply.is_closed() || std::time::Instant::now() > deadline {
+                    Err("display configuration completion expired")
+                } else {
+                    result
+                };
+                let _ = reply.try_send(result);
             }
         }
     }
@@ -3782,7 +3839,10 @@ impl Runtime {
     /// Layout, rendering and the per-window client scale follow on the
     /// next frame. The sensor may immediately override a built-in
     /// panel's rotation while orientation lock is off (#345).
-    fn apply_monitors(&mut self, configs: &[crate::monitors::MonitorConfig]) {
+    fn apply_monitors(
+        &mut self,
+        configs: &[crate::monitors::MonitorConfig],
+    ) -> Result<(), &'static str> {
         // GNOME's ScreenTransition: picture the old layout first.
         let before = (self.state.hot_corner_outputs(), self.scale.to_bits());
         let snapshots = if self.transitions.wants_screen_snapshot() {
@@ -3790,10 +3850,11 @@ impl Runtime {
         } else {
             Vec::new()
         };
-        self.arrange_monitors(configs);
+        self.arrange_monitors(configs)?;
         if (self.state.hot_corner_outputs(), self.scale.to_bits()) != before {
             self.transitions.screen_changed(snapshots);
         }
+        Ok(())
     }
 
     /// Each output's current picture (`None`: the nested window), for
@@ -3814,7 +3875,10 @@ impl Runtime {
             .collect()
     }
 
-    fn arrange_monitors(&mut self, configs: &[crate::monitors::MonitorConfig]) {
+    fn arrange_monitors(
+        &mut self,
+        configs: &[crate::monitors::MonitorConfig],
+    ) -> Result<(), &'static str> {
         let scale_of = |s: f64| {
             if s == 1.0 {
                 Scale::Integer(1)
@@ -3822,6 +3886,67 @@ impl Runtime {
                 Scale::Fractional(s)
             }
         };
+        let primary = crate::monitors::requested_primary(configs)?;
+        if !self
+            .state
+            .output_entries()
+            .iter()
+            .any(|(name, _, _, _)| name == primary)
+        {
+            return Err("primary output is no longer present");
+        }
+        for config in configs {
+            let Some((_, output, _, _)) = self
+                .state
+                .output_entries()
+                .into_iter()
+                .find(|(name, _, _, _)| name == &config.connector)
+            else {
+                return Err("output is no longer present");
+            };
+            let mode = output.current_mode().ok_or("output mode unavailable")?;
+            let (width, height) = crate::orientation::logical_extent(
+                mode.size.w,
+                mode.size.h,
+                config.scale,
+                config.transform,
+            );
+            if !(1.0..=4.0).contains(&config.scale)
+                || config.x.checked_add(width).is_none()
+                || config.y.checked_add(height).is_none()
+            {
+                return Err("invalid logical monitor geometry");
+            }
+        }
+        if matches!(&self.backend, Backend::Winit(_))
+            && configs.iter().any(|config| config.x != 0 || config.y != 0)
+        {
+            return Err("nested output placement is not supported");
+        }
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &self.backend {
+            if configs.iter().any(|config| {
+                !drm.outputs
+                    .iter()
+                    .any(|output| output.name == config.connector)
+            }) {
+                return Err("native output is no longer present");
+            }
+        }
+        let generation = self
+            .display_layout_generation
+            .checked_add(1)
+            .ok_or("display layout generation exhausted")?;
+        #[cfg(feature = "drm")]
+        let original_pointer_outputs: Vec<_> = self
+            .state
+            .hot_corner_outputs()
+            .into_iter()
+            .map(|(rect, _)| rect)
+            .collect();
+        #[cfg(feature = "drm")]
+        self.performance_trace.cancel();
+        self.display_layout_generation = generation;
         for config in configs {
             self.manual_transforms
                 .insert(config.connector.clone(), config.transform);
@@ -3829,9 +3954,7 @@ impl Runtime {
         match &mut self.backend {
             Backend::Winit(backend) => {
                 // One nested output: take the first arrangement entry.
-                let Some(config) = configs.first() else {
-                    return;
-                };
+                let config = configs.first().ok_or("no monitor configuration")?;
                 self.scale = clamp_scale(config.scale);
                 if let Some(output) = self.state.primary_output() {
                     output.change_current_state(None, None, Some(scale_of(self.scale)), None);
@@ -3848,6 +3971,14 @@ impl Runtime {
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
+                let index = drm
+                    .outputs
+                    .iter()
+                    .position(|output| output.name == primary)
+                    .ok_or("primary native output unavailable")?;
+                // Retain surfaces and queued-origin receipts; reorder only
+                // the inventory after the request was checked.
+                drm.outputs[..=index].rotate_right(1);
                 for config in configs {
                     let Some(out) = drm.outputs.iter_mut().find(|o| o.name == config.connector)
                     else {
@@ -3874,9 +4005,22 @@ impl Runtime {
                 }
             }
         }
-        if let Some(first) = configs.first() {
-            self.state.set_preferred_scale(clamp_scale(first.scale));
+        self.state.set_primary(primary);
+        if let Some(selected) = configs.iter().find(|config| config.primary) {
+            self.state.set_preferred_scale(clamp_scale(selected.scale));
         }
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &mut self.backend {
+            let position =
+                crate::drm::clamp_to_outputs(self.manager.pointer_pos(), &drm.output_rects());
+            self.manager.rebase_pointer_for_topology(
+                &self.state,
+                &original_pointer_outputs,
+                position,
+            );
+            drm.set_pointer(self.manager.pointer_pos());
+        }
+        Ok(())
     }
 
     /// Keep the D-Bus side's monitor list current (cheap when unchanged).
@@ -3918,9 +4062,14 @@ impl Runtime {
     fn publish_cast_outputs(&self) {
         self.introspect
             .publish_screen_size(self.state.desktop_size());
-        let snapshot: Vec<crate::mutter::OutputSnapshot> = self
-            .state
-            .output_entries()
+        // A revoked or not-yet-accepted native inventory publishes no
+        // active outputs (never stale ones under a new serial).
+        let active_entries = match &self.backend {
+            #[cfg(feature = "drm")]
+            Backend::Drm(drm) if !drm.monitor_inventory_available() => Vec::new(),
+            _ => self.state.output_entries(),
+        };
+        let snapshot: Vec<crate::mutter::OutputSnapshot> = active_entries
             .into_iter()
             .filter_map(|(name, output, loc, primary)| {
                 let mode = output.current_mode()?;
@@ -3949,10 +4098,8 @@ impl Runtime {
                 })
             })
             .collect();
-        if let Ok(mut current) = self.cast_outputs.lock() {
-            if *current != snapshot {
-                *current = snapshot;
-            }
+        if let Err(error) = self.display_publication.publish(snapshot) {
+            eprintln!("tuna-compositor: display publication failed: {error}");
         }
         // Windows for Introspect (signals only on change).
         let model = self.manager.model();
@@ -4109,6 +4256,139 @@ impl Runtime {
         match self.control.next_poll(self.manager.model()) {
             Some(after) => wake.min(after),
             None => wake,
+        }
+    }
+
+    /// Drain real discovery completion before publishing the new topology.
+    /// The backend alone mutates KMS; this thread then reconciles every public
+    /// surface/global/layout/capture view before restoring native authority.
+    #[cfg(feature = "drm")]
+    fn reconcile_native_monitors(&mut self) {
+        let completion = match &mut self.backend {
+            Backend::Drm(drm) => {
+                if let Err(error) = drm.start_monitor_refresh() {
+                    eprintln!("tuna-compositor: monitor acquisition failed: {error}");
+                }
+                let resource_failure = drm.poll_monitor_discovery().and_then(|discovery| {
+                    discovery
+                        .and_then(|discovery| drm.reconcile_monitor_resources(discovery))
+                        .err()
+                });
+                resource_failure
+                    .map(Err)
+                    .or_else(|| drm.poll_monitor_scanout_completion())
+            }
+            Backend::Winit(_) => return,
+        };
+        if completion.is_some() {
+            self.performance_trace.cancel();
+        }
+        let actual = match &self.backend {
+            Backend::Drm(drm) if drm.monitor_layout_available() => drm
+                .outputs
+                .iter()
+                .map(|out| {
+                    let (width, height) = out.logical_size();
+                    (out.name.clone(), out.output.clone(), out.loc, width, height)
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let previous = self.state.output_entries();
+        let changed = previous.len() != actual.len()
+            || actual.iter().any(|(name, output, loc, _, _)| {
+                !previous.iter().any(|(old_name, old_output, old_loc, _)| {
+                    old_name == name && old_output == output && old_loc == loc
+                })
+            });
+        if changed {
+            let original_pointer_outputs: Vec<_> = self
+                .state
+                .hot_corner_outputs()
+                .into_iter()
+                .map(|(rect, _)| rect)
+                .collect();
+            // Monitor/area grants refer to the original pixel layout. Close
+            // those exact streams rather than silently move the capture grant
+            // onto a replacement connector/global or differently sized scene.
+            self.casts.retain(|cast| {
+                if matches!(&cast.target, crate::mutter::CastTarget::Window(_)) {
+                    return true;
+                }
+                if let Some(grant) = self.cast_grants.remove(&cast.session_id) {
+                    grant.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                cast.close();
+                false
+            });
+            for (name, old_output, _, _) in &previous {
+                let retained = actual
+                    .iter()
+                    .any(|(live, output, _, _, _)| live == name && output == old_output);
+                if retained {
+                    continue;
+                }
+                self.state.retire_lock_output(name);
+            }
+            // Register survivors/new outputs before migrating removed windows.
+            // Existing entries stay until migration knows both slices.
+            for (name, output, loc, width, height) in &actual {
+                match previous.iter().find(|(old_name, _, _, _)| old_name == name) {
+                    Some((_, old_output, _, _)) if old_output != output => {
+                        self.state
+                            .replace_output_protocol(name, output.clone(), *width, *height);
+                    }
+                    Some(_) => self
+                        .state
+                        .add_output(name, Some(output.clone()), *width, *height),
+                    None => {
+                        let global = output.create_global::<State>(&self.display.handle());
+                        self.state
+                            .add_output(name, Some(output.clone()), *width, *height);
+                        self.state.note_output_global(name, global);
+                    }
+                }
+                self.state.set_output_location(name, *loc);
+            }
+            let surviving: Vec<_> = actual.iter().map(|(name, ..)| name.clone()).collect();
+            let migration_available = self.state.select_reconciled_primary(&surviving);
+            for (name, _, _, _) in &previous {
+                if actual.iter().any(|(live, _, _, _, _)| live == name) {
+                    continue;
+                }
+                if migration_available {
+                    self.manager.migrate_output_windows(&mut self.state, name);
+                }
+                self.state.remove_output(name);
+            }
+            self.manager.reapply_derived_layouts(&mut self.state);
+            crate::layer::arrange_after_commit(&self.state);
+            self.triggers.cancel();
+            // The backend clamps against the actual resource inventory.
+            let pointer = match &self.backend {
+                Backend::Drm(drm) => drm.pointer(),
+                _ => self.manager.pointer_pos(),
+            };
+            self.manager.rebase_pointer_for_topology(
+                &self.state,
+                &original_pointer_outputs,
+                pointer,
+            );
+            self.publish_cast_outputs();
+        }
+        if let Some(completion) = completion {
+            match completion {
+                Ok(ticket) => {
+                    if let Backend::Drm(drm) = &mut self.backend {
+                        if !drm.finish_monitor_reconciliation(ticket) {
+                            eprintln!(
+                                "tuna-compositor: monitor reconciliation lost original authority"
+                            );
+                        }
+                    }
+                }
+                Err(error) => eprintln!("tuna-compositor: monitor reconciliation failed: {error}"),
+            }
         }
     }
 
@@ -4297,6 +4577,8 @@ impl Runtime {
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        #[cfg(feature = "drm")]
+        self.reconcile_native_monitors();
         self.manager.reconcile(&mut self.state);
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
@@ -4772,6 +5054,9 @@ impl Runtime {
                 Kind::Vsync | Kind::HwCompletion,
             ),
         };
+        if let Some(ids) = flip.surface_ids.as_ref() {
+            self.state.presented_surface_membership(&flip.output, ids);
+        }
         if let Some(mut feedback) = flip.feedback {
             feedback.presented::<_, Monotonic>(
                 time,
@@ -4780,7 +5065,9 @@ impl Runtime {
                 flags,
             );
         }
-        if flip.primary {
+        if flip.queued_origin.is_some_and(|origin| {
+            origin.primary_for(flip.completed, self.display_layout_generation)
+        }) {
             self.performance_trace.presented(flip.time, flip.sequence);
             let roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
             self.state.refresh_cycle(&roots, time, flip.refresh);
@@ -4955,6 +5242,7 @@ impl Runtime {
                 let damage = Rectangle::from_size(size);
                 let drawn;
                 let presented_cursor;
+                let presented_ids;
                 {
                     let (renderer, mut framebuffer) = backend
                         .bind()
@@ -5061,6 +5349,7 @@ impl Runtime {
                         &previews,
                     )?;
                     drawn = FrameCost::new(&drew, &elements.owners, &[damage], size);
+                    presented_ids = scene_surface_ids(&elements, &previews, damage, view.scale);
                     crate::cursor::draw(&mut frame, &cursor, view.scale, &[damage])
                         .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     let _ = frame
@@ -5072,6 +5361,10 @@ impl Runtime {
                 backend
                     .submit(Some(&[damage]))
                     .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                if let Some(output) = self.state.primary_output() {
+                    self.state
+                        .presented_surface_membership(&output, &presented_ids);
+                }
                 if let Some(surface) = &presented_cursor {
                     crate::cursor::Cursor::frame_done(
                         &crate::cursor::Pointer::Surface(surface.clone()),
@@ -5097,6 +5390,13 @@ impl Runtime {
                     return Ok(());
                 }
                 let pointer = drm.pointer();
+                let monitor_epoch = drm.pending_monitor_epoch();
+                let Some(commit_epoch) = drm.monitor_commit_epoch() else {
+                    self.performance_trace.cancel();
+                    return Ok(());
+                };
+                let commit_device = drm.drm.device_id();
+                let layout_generation = self.display_layout_generation;
                 let crate::drm::DrmBackend {
                     renderer, outputs, ..
                 } = &mut **drm;
@@ -5112,6 +5412,7 @@ impl Runtime {
                     rects.iter().position(|r| r.contains(*at)).unwrap_or(0)
                 };
                 let mut queued = false;
+                let mut failed_monitor_queues = Vec::new();
                 let mut cursor_presented = false;
                 for (index, out) in outputs.iter_mut().enumerate() {
                     // Display-paced: one frame in flight per output.
@@ -5341,8 +5642,14 @@ impl Runtime {
                             .finish()
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?
                     };
+                    let Some(cookie) = crate::drm_commit::next_cookie() else {
+                        failed_monitor_queues.push(u32::from(out.crtc));
+                        out.last_frame = None;
+                        out.damage_tracker = None;
+                        continue;
+                    };
                     let feedback = crate::frame_timing::take_feedback(&mine, &out.output);
-                    if let Err(e) = out.surface.queue_buffer(
+                    if let Err(e) = out.surface.queue_buffer_with_cookie(
                         Some(sync),
                         Some(crate::native_repaint::scanout_damage_rotated(
                             &damage,
@@ -5350,13 +5657,34 @@ impl Runtime {
                             (logical.w, logical.h),
                         )),
                         feedback,
+                        cookie,
                     ) {
+                        out.kernel_queue_error_count =
+                            out.kernel_queue_error_count.saturating_add(1);
                         eprintln!("tuna-compositor: drm: queue_buffer {}: {e}", out.name);
+                        failed_monitor_queues.push(u32::from(out.crtc));
                         // Never reuse history after an unsubmitted partial update.
                         out.last_frame = None;
                         out.damage_tracker = None;
                         continue;
                     }
+                    // Membership follows the complete submitted scene; it is
+                    // published only when this frame's kernel flip completes.
+                    out.pending_surface_ids = scene_surface_ids(
+                        &elements,
+                        &previews,
+                        Rectangle::from_size(size),
+                        view.scale,
+                    );
+                    out.pending_origin = Some(crate::monitor_scanout::Queued {
+                        primary: index == 0,
+                        layout_generation,
+                        monitor_epoch,
+                        cookie,
+                        crtc: u32::from(out.crtc),
+                        device: commit_device,
+                        commit_epoch,
+                    });
                     out.trace_wake_submission();
                     out.pending = true;
                     if index == 0 {
@@ -5376,6 +5704,9 @@ impl Runtime {
                     out.last_frame = Some(signature);
                     self.frame_costs.insert(out.name.clone(), cost);
                     queued = true;
+                }
+                for crtc in failed_monitor_queues {
+                    drm.monitor_queue_failed(crtc);
                 }
                 send_surface_scales(&self.state, &self.manager);
                 if queued {
@@ -5635,6 +5966,29 @@ struct Scene {
     /// The window each of `elements` belongs to (popups included), for
     /// reporting which windows occlusion hid; `None` for layers.
     owners: Vec<Option<u64>>,
+}
+
+/// Membership follows the complete submitted scene, not just incremental
+/// damage. Wayland IDs survive rescaling, so real preview/subsurface roots
+/// participate too. Occlusion does not turn a mapped output into another one.
+fn scene_surface_ids(
+    scene: &Scene,
+    previews: &[PreviewElement],
+    clip: Rectangle<i32, smithay::utils::Physical>,
+    scale: f64,
+) -> Vec<smithay::backend::renderer::element::Id> {
+    use smithay::backend::renderer::element::Element;
+    let mut ids = std::collections::HashSet::new();
+    for element in scene.elements.iter().chain(&scene.top).chain(previews) {
+        if element
+            .geometry(scale.into())
+            .intersection(clip)
+            .is_some_and(|area| !area.is_empty())
+        {
+            ids.insert(element.id().clone());
+        }
+    }
+    ids.into_iter().collect()
 }
 
 /// A size-change snapshot, drawn at scale 1.

@@ -544,6 +544,57 @@ impl WindowManager {
         self.pointer_pos
     }
 
+    /// Rebase only a point retired by the actual output union. This is an
+    /// internal seat location hint, not client motion, focus, relative input
+    /// or a borrowed cursor warp; it also applies while the session is locked.
+    pub fn rebase_pointer_for_topology(
+        &mut self,
+        state: &State,
+        original_outputs: &[Rectangle<i32, Logical>],
+        position: Point<f64, Logical>,
+    ) -> bool {
+        use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
+        let outputs = state.hot_corner_outputs();
+        let contains = |point| {
+            outputs
+                .iter()
+                .any(|(rect, _)| rect.to_f64().contains(point))
+        };
+        if contains(self.pointer_pos) || !contains(position) {
+            return false;
+        }
+        let retired_point = original_outputs
+            .iter()
+            .any(|rect| rect.to_f64().contains(self.pointer_pos));
+        if let Some(pointer) = self.pointer.as_ref() {
+            if let Some(surface) = pointer.current_focus().filter(|_| retired_point) {
+                // Snapshot the migrated geometry/input before entering the
+                // constraint mutex. Never broaden unresolved or over-budget
+                // geometry, and never deactivate an eligible pending constraint.
+                let snapshot = self.effective_constraint_region(state, &surface);
+                with_pointer_constraint(&surface, pointer, |constraint| {
+                    let Some(constraint) = constraint else { return };
+                    if constraint.is_active()
+                        && (matches!(&*constraint, PointerConstraint::Locked(_))
+                            || snapshot.is_none_or(|(origin, region)| {
+                                let region = region.with_constraint(constraint.region());
+                                !region.contains(self.pointer_pos - origin)
+                                    || !region.contains(position - origin)
+                            }))
+                    {
+                        // The fixed point/region became unusable on real
+                        // topology loss. Preserve Smithay's one-shot and
+                        // persistent semantics and its protocol notification.
+                        constraint.deactivate();
+                    }
+                });
+            }
+            pointer.set_location(position);
+        }
+        self.pointer_pos = position;
+        true
+    }
+
     /// Whether the seat's Num Lock is on (Mouse Keys stand aside).
     pub fn num_lock(&self) -> bool {
         self.keyboard

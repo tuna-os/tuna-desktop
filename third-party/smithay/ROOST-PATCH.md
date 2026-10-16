@@ -63,3 +63,15 @@ crates/compositor/tests/data_device.rs cover pointer and touch drags, with
 and without an icon or a source, and a normal drop that can still Finish.
 The isolated diff is retained in DND-CANCEL-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+The additive commit-cookie source slice introduces a separate cookie-preserving
+notifier sharing the exact original FD/token owner. Existing event types and old
+notifier remain unchanged. New atomic/legacy surface methods carry nonzero scalar
+u64 userdata into the actual event-generating ioctl. GBM records an accepted cookie
+only when that ioctl succeeds; a software queued successor has no accepted cookie.
+Matching completion checks precede any slot movement or implicit successor submit.
+Discard/reset revoke accepted cookies. Existing noncookie callers retain old behavior.
+Both drm0.14.1 and drm-ffi0.9.1 are exact local dual patches for the workspace AND
+standalone excluded Smithay; full CI metadata proves source selection before tests.
+Roost's original FD/true CRTC/lifecycle/layout/software-cookie checks provide the
+consumer join; current framebuffer readback remains independent additional evidence.
