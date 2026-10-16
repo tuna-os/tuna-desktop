@@ -223,9 +223,20 @@ impl PreviewChrome {
         // A transparent full-output buffer still shades every pixel on
         // transition frames. Keep the same widgets and output positions,
         // but allocate only their union, including CSS shadows.
+        // child_position() reads the allocation, which does not exist
+        // yet for these new children. The stored layout transform is
+        // already the translation supplied to put(); None is identity.
+        let position = |child: &gtk::Widget| {
+            let (x, y) = self
+                .fixed
+                .child_transform(child)
+                .map(|transform| transform.to_translate())
+                .unwrap_or((0.0, 0.0));
+            (f64::from(x), f64::from(y))
+        };
         let children = std::iter::successors(self.fixed.first_child(), |w| w.next_sibling());
         let bounds = chrome_bounds(children.map(|child| {
-            let (x, y) = self.fixed.child_position(&child);
+            let (x, y) = position(&child);
             let (_, width, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
             let (_, height, _, _) = child.measure(gtk::Orientation::Vertical, width);
             (x, y, width, height)
@@ -236,7 +247,7 @@ impl PreviewChrome {
         };
         let mut child = self.fixed.first_child();
         while let Some(widget) = child {
-            let (x, y) = self.fixed.child_position(&widget);
+            let (x, y) = position(&widget);
             self.fixed.move_(
                 &widget,
                 x - f64::from(bounds.x()),
