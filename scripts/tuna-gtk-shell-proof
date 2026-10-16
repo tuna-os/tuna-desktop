@@ -3412,15 +3412,15 @@ shell_bus=$(tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -oE "Ad
 # agent's own MaxAccuracyLevel reports the new ceiling before asking it
 # to authorize, so the answer reflects the setting rather than the race.
 agent_ceiling() {
-    local want="$1" got=""
+    ceiling_got=""
     for _ in $(seq 1 20); do
-        got=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+        ceiling_got=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
             --object-path /org/freedesktop/GeoClue2/Agent \
             --method org.freedesktop.DBus.Properties.Get org.freedesktop.GeoClue2.Agent MaxAccuracyLevel 2>&1)
-        echo "$got" | grep -qE "^\(<(uint32 )?$want>,\)$" && return 0
+        echo "$ceiling_got" | grep -qE "^\(<(uint32 )?$1>,\)$" && return 0
         sleep 0.25
     done
-    echo "$got"
+    echo "$ceiling_got"
     return 1
 }
 ceiling=$(agent_ceiling 8) ||
