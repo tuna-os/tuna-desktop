@@ -276,13 +276,15 @@ wrect() {
 # The first mapped size races the initial configure; wait for settle.
 sleep 2
 rect1="$(wrect)" && sleep 1 && rect2="$(wrect)"
-[ -n "$rect1" ] && [ "$rect1" = "$rect2" ] ||
+if [ -z "$rect1" ] || [ "$rect1" != "$rect2" ]; then
     fail M-FOCUS "window geometry never settled ($rect1 vs $rect2)"
+fi
 # shellcheck disable=SC2086
 set -- $rect2
 wx=$1 wy=$2 ww=$3 wh=$4
-[ "$wh" -ge 300 ] && [ "$wh" -le 600 ] ||
+if [ "$wh" -lt 300 ] || [ "$wh" -gt 600 ]; then
     fail M-FOCUS "unexpected window height $wh (want the 420px test layout)"
+fi
 cx=$((wx + ww / 2)) cy=$((wy + wh / 2))
 xdotool mousemove --window "$WID" "$cx" "$cy" click 1
 sleep 1
