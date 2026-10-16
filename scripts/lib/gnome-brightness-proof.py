@@ -128,7 +128,7 @@ def drain(context,deadline,budget):
         context.iteration(False);budget[0]-=1
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--out',required=True);parser.add_argument('--controlled-root');parser.add_argument('--device');parser.add_argument('--shell-executable',required=True);parser.add_argument('--shell-pid',type=int);parser.add_argument('--shell-start',type=int);parser.add_argument('--compositor-pid',type=int);parser.add_argument('--compositor-start',type=int);parser.add_argument('--session-id')
+    parser=argparse.ArgumentParser();parser.add_argument('--out',required=True);parser.add_argument('--controlled-root');parser.add_argument('--device');parser.add_argument('--other-device');parser.add_argument('--shell-executable',required=True);parser.add_argument('--shell-pid',type=int);parser.add_argument('--shell-start',type=int);parser.add_argument('--compositor-pid',type=int);parser.add_argument('--compositor-start',type=int);parser.add_argument('--session-id')
     args=parser.parse_args();bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
     identity=principal(bus,args.shell_executable)
     if not args.controlled_root:
@@ -176,7 +176,8 @@ def main():
             maximum=read('max_brightness');kind=backlight_type(device/'type');minimum=floor(maximum,kind)
             manifest=controlled_manifest(os.environ['TUNA_BACKLIGHT_TEST_CONNECTORS'])
             parent=(device/'device').resolve();metadata=parent.stat()
-            if len(manifest)!=1 or manifest[0]['connector_sysfs']!=str(parent) or (manifest[0]['connector_device'],manifest[0]['connector_inode'])!=(metadata.st_dev,metadata.st_ino) or manifest[0]['connector_id']!=scalar(parent/'connector_id'):raise RuntimeError('controlled actual associated authority mismatch')
+            matching=[m for m in manifest if m['connector_sysfs']==str(parent) and (m['connector_device'],m['connector_inode'])==(metadata.st_dev,metadata.st_ino) and m['connector_id']==scalar(parent/'connector_id')]
+            if len(matching)!=1:raise RuntimeError('controlled actual associated authority mismatch')
             result['controlled_authority']=manifest
             baseline=read('brightness');relative=(baseline-minimum)/(maximum-minimum)
             def observe(expected):
@@ -204,6 +205,30 @@ def main():
             request('SetAutoBrightnessTarget',0.8);observe(absolute(0.8+relative-0.5))
             request('SetAutoBrightnessTarget',-1.0);observe(baseline)
             request('SetAutoBrightnessTarget',float('nan'),True);observe(baseline)
+            if args.other_device:
+                other_dev=root/args.other_device
+                other_parent=(other_dev/'device').resolve();other_meta=other_parent.stat()
+                other_match=[m for m in manifest if m['connector_sysfs']==str(other_parent) and (m['connector_device'],m['connector_inode'])==(other_meta.st_dev,other_meta.st_ino) and m['connector_id']==scalar(other_parent/'connector_id')]
+                if len(other_match)!=1:raise RuntimeError('controlled other output authority mismatch')
+                other_read=lambda name:scalar(other_dev/name)
+                other_max=other_read('max_brightness');other_kind=backlight_type(other_dev/'type');other_min=floor(other_max,other_kind)
+                other_base=other_read('brightness');other_rel=(other_base-other_min)/(other_max-other_min)
+                other_abs=lambda lvl:other_min+int((other_max-other_min)*max(0,min(1,lvl))+0.5)
+                request('SetDimming',True);observe(absolute(min(idle,relative)))
+                other_dimmed=other_abs(min(idle,other_rel))
+                deadline=time.monotonic()+5
+                while other_read('brightness')!=other_dimmed and time.monotonic()<deadline:time.sleep(0.02)
+                if other_read('brightness')!=other_dimmed:raise RuntimeError(f'second output failed to dim: got {other_read("brightness")}, expected {other_dimmed}')
+                ext_a=baseline-100 if baseline>minimum+150 else baseline+100
+                (device/'brightness').write_text(f'{ext_a}\n')
+                request('SetAutoBrightnessTarget',0.8)
+                deadline=time.monotonic()+5
+                while other_read('brightness')!=other_base and time.monotonic()<deadline:time.sleep(0.02)
+                receipts.append(dict(test='multi-output-dim-cancel',other_device=args.other_device,other_baseline=other_base,other_dimmed=other_dimmed,actual_restored=other_read('brightness'),expected_restored=other_base))
+                if other_read('brightness')!=other_base:raise RuntimeError(f'second output was not restored after external change on first: got {other_read("brightness")}, expected {other_base}')
+                request('SetAutoBrightnessTarget',-1.0)
+                (device/'brightness').write_text(f'{baseline}\n')
+                request('SetDimming',False);observe(baseline)
             # Genuine session-bus error paths against the controlled logind fixture.
             # These are adapter tests, never evidence of physical hardware.
             mode=root/'.tuna-brightness-failure'

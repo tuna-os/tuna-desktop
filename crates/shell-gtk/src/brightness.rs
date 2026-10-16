@@ -586,4 +586,38 @@ mod tests {
         assert!(!m.policy.dimming);
         assert_eq!(m.user_level(None), Some(490.0 / 990.0));
     }
+    #[test]
+    fn external_change_on_one_output_cancels_dimming_and_restores_other_outputs() {
+        let mut m = Model::default();
+        m.refresh(vec![
+            device("a", "eDP-1", 700),
+            device("b", "HDMI-A-1", 700),
+        ]);
+        m.policy.dimming = true;
+        let targets = m.targets().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].1, 307);
+        assert_eq!(targets[1].1, 307);
+        m.acknowledge(&targets[0].0, 307, 307, None).unwrap();
+        m.acknowledge(&targets[1].0, 307, 307, None).unwrap();
+        // Both devices now have applied = 307.
+        // Externally modify device A to 500, while B remains at 307.
+        let changed = m.refresh(vec![
+            device("a", "eDP-1", 500),
+            device("b", "HDMI-A-1", 307),
+        ]);
+        assert!(changed);
+        // Dimming is canceled globally.
+        assert!(!m.policy.dimming);
+        // Targets must reconcile B back to user intent (700), while A stays at 500.
+        let targets = m.targets().unwrap();
+        let pending: Vec<_> = targets
+            .into_iter()
+            .filter(|(d, n)| d.current != *n)
+            .collect();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.name, "b");
+        assert_eq!(pending[0].0.current, 307);
+        assert_eq!(pending[0].1, 700);
+    }
 }
