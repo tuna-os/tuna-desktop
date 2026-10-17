@@ -77,6 +77,7 @@ pub mod minimize;
 pub mod modal_dim;
 pub mod monitors;
 pub mod mutter;
+pub mod native_output;
 #[cfg(feature = "drm")]
 mod native_repaint;
 pub mod night_light;
