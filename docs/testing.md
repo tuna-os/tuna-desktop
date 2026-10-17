@@ -64,6 +64,9 @@ the unprivileged package builder. Its key includes the installed native
 package inventory, and its target is never shared with Ubuntu. Restoration
 precedes the existing builder ownership change; package build, installation
 and version checks still run.
+Both paths are derived inside the container from the shell's
+`GITHUB_WORKSPACE` and published through `GITHUB_ENV`, rather than using
+the host-side `github.workspace` expression for container build paths.
 
 When diagnosing misses, inspect the cache action's primary/restore keys,
 hit status, archive size and transfer times before increasing storage.
