@@ -100,6 +100,12 @@ locally to be sure the test really ran:
 TUNA_REQUIRE_PAM_WRAPPER=1 cargo test --workspace
 ```
 
+`scripts/tuna-auth-owner-ci-proof <artifact-directory>` runs the actual
+native ownership and private PAM retirement cases. Its PID readiness
+markers are published only after complete PID contents are written.
+Artifacts retain supervised test-client panics and early compositor exit
+status; a compiled test or cache hit is not a substitute for these cases.
+
 Run one crate with `cargo test -p <package>` (package names are in each
 crate's `README.md`, for example `cargo test -p tuna-compositor`).
 

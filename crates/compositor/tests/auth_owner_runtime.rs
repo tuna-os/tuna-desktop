@@ -601,7 +601,10 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             .spawn()
             .unwrap(),
     );
-    std::fs::write(root.path().join("compositor-pid"), child.0.id().to_string()).unwrap();
+    publish_json(
+        &root.path().join("compositor-pid"),
+        &serde_json::json!(child.0.id()),
+    );
     while !root.path().join("success.json").exists() {
         let status = child.0.try_wait().unwrap();
         assert!(
