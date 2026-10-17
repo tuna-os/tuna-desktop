@@ -587,6 +587,8 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             ])
             .arg(std::env::current_exe().unwrap())
             .env(ROLE, role)
+            // The supervised peer is libtest too; retain its panic in compositor.log.
+            .env("RUST_TEST_NOCAPTURE", "1")
             .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
             .env("TUNA_AUTH_OWNER_ROOT", root.path())
             .env("XDG_RUNTIME_DIR", root.path())
