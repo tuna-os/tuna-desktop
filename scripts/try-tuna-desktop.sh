@@ -214,7 +214,7 @@ if [[ "$NEED_CREATE" == "1" ]]; then
     note "build interrupted (attempt $attempt/3) — resuming..."
     RESUME_ARGS=(--resume)
   done
-  [[ "${CREATED:-0}" == "1" ]] || { corral delete "$VM" >/dev/null 2>&1 || true; die "VM creation failed after 3 attempts — inspect with: corral logs $VM"; }
+  [[ "${CREATED:-0}" == "1" ]] || { corral delete "$VM" >/dev/null 2>&1 || true; die "VM creation failed after 3 attempts — inspect with: corral logs $VM (if the same layer fails every time, the local image cache is corrupt: podman rmi $IMAGE and re-run)"; }
   note "starting $VM..."
   corral start "$VM" >/dev/null 2>&1 || true
   sleep 3
