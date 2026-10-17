@@ -51,6 +51,7 @@ value and apply after completion. Individual backlight scalar reads and the
 inventory are bounded; rejected inventory preserves the user baseline while
 withholding capability. This does not claim blocking filesystem metadata calls
 have a real-time deadline.
+The controlled proof waits for every associated output's readback before issuing the next policy request, including outputs already at their expected floor.
 
 `G-BRIGHTNESS-CONTRACT` exercises the real session-bus adapter against an
 explicitly synthetic associated sysfs/logind fixture: user baseline, dim/restore,
