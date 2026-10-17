@@ -10,6 +10,14 @@ Our v1 goal is [GNOME 51 parity plus better responsiveness at matching CPU](docs
 
 ## Quickstart
 
+- **Test-drive in a VM (one command):**
+  On Linux or macOS, evaluate Tuna Desktop without installing packages or building:
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/try-tuna-desktop | bash
+  ```
+
+  Downloads Corral (checksum-verified), pulls and cosign-verifies the published TunaOS image, and launches Tuna Desktop in local QEMU with a local-only browser console over noVNC. Stop anytime with Ctrl-C. See `scripts/try-tuna-desktop` for options.
 - **Install:** [docs/install.md](docs/install.md) covers the Debian-format
   package, building from source and greetd wiring. The experimental TunaOS
   Marlin image is in [packaging/README.md](packaging/README.md).
