@@ -3404,7 +3404,11 @@ fn main() -> glib::ExitCode {
         .application_id("org.tuna.Shell")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    privacy_portal::start(&app);
+    // GApplication's RUN_FIRST startup handler completes GTK/libadwaita's
+    // VFS initialization before this worker can construct dconf settings.
+    // Otherwise GTK can own the VFS once-init and wait for GIO's module
+    // mutex while dconf owns that mutex and waits for the same VFS once-init.
+    app.connect_startup(privacy_portal::start);
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
 }
