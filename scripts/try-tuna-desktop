@@ -155,35 +155,61 @@ cosign verify "$PINNED" \
 note "signature verified."
 
 # --- boot -------------------------------------------------------------------
-if ! corral list 2>/dev/null | grep -q "^${VM}[[:space:]].*Running"; then
-  if ! corral list 2>/dev/null | grep -q "^${VM}[[:space:]]"; then
-    # bootc install partitions a disk and writes a bootloader, which needs
-    # root: run the local build under sudo unless already root.
-    SUDO_ARGS=()
-    if [[ "$(id -u)" != "0" ]]; then
-      command -v sudo >/dev/null 2>&1 || die "sudo not found and not running as root — bootc needs root to build the VM disk; install sudo or re-run as root"
-      SUDO_ARGS+=(--sudo)
-    fi
-    note "building $PINNED into VM $VM (this downloads GBs on first run; sudo may prompt)..."
-    # Layer downloads can truncate mid-pull (GBs over the network); resume
-    # the interrupted build instead of starting over.
-    RESUME_ARGS=()
-    for attempt in 1 2 3; do
-      if corral bootc create "$VM" --image "$PINNED" --disk "$DISK" --mem "$MEM" --cpu "$CPUS" \
-        "${SUDO_ARGS[@]}" "${RESUME_ARGS[@]}"; then
-        CREATED=1
-        break
+vm_running() { corral list 2>/dev/null | grep -q "^${VM}[[:space:]].*Running"; }
+vm_exists() { corral list 2>/dev/null | grep -q "^${VM}[[:space:]]"; }
+# Image the VM was built from (empty when unknown — never delete on unknown).
+built_image() { corral bootc status 2>/dev/null | awk -v vm="$VM" '$1 == vm {print $3}'; }
+
+NEED_CREATE=0
+if ! vm_running; then
+  if vm_exists; then
+    BUILT="$(built_image)"
+    if [[ -n "$BUILT" && "$BUILT" != "$PINNED" && "$BUILT" != "$IMAGE" ]]; then
+      note "$VM was built from $BUILT — rebuilding from $PINNED..."
+      corral delete "$VM" >/dev/null 2>&1 || true
+      NEED_CREATE=1
+    else
+      note "starting existing $VM (built from ${BUILT:-unknown image})..."
+      corral start "$VM" >/dev/null 2>&1 || true
+      sleep 3
+      if ! vm_running; then
+        note "$VM will not start — deleting the broken VM and rebuilding..."
+        corral delete "$VM" >/dev/null 2>&1 || true
+        NEED_CREATE=1
       fi
-      [[ "$attempt" == "3" ]] && break
-      note "build interrupted (attempt $attempt/3) — resuming..."
-      RESUME_ARGS=(--resume create)
-    done
-    [[ "${CREATED:-0}" == "1" ]] || { corral delete "$VM" >/dev/null 2>&1 || true; die "VM creation failed after 3 attempts — inspect with: corral logs $VM"; }
+    fi
+  else
+    NEED_CREATE=1
   fi
+fi
+
+if [[ "$NEED_CREATE" == "1" ]]; then
+  # bootc install partitions a disk and writes a bootloader, which needs
+  # root: run the local build under sudo unless already root.
+  SUDO_ARGS=()
+  if [[ "$(id -u)" != "0" ]]; then
+    command -v sudo >/dev/null 2>&1 || die "sudo not found and not running as root — bootc needs root to build the VM disk; install sudo or re-run as root"
+    SUDO_ARGS+=(--sudo)
+  fi
+  note "building $PINNED into VM $VM (this downloads GBs on first run; sudo may prompt)..."
+  # Layer downloads can truncate mid-pull (GBs over the network); resume
+  # the interrupted build instead of starting over.
+  RESUME_ARGS=()
+  for attempt in 1 2 3; do
+    if corral bootc create "$VM" --image "$PINNED" --disk "$DISK" --mem "$MEM" --cpu "$CPUS" \
+      "${SUDO_ARGS[@]}" "${RESUME_ARGS[@]}"; then
+      CREATED=1
+      break
+    fi
+    [[ "$attempt" == "3" ]] && break
+    note "build interrupted (attempt $attempt/3) — resuming..."
+    RESUME_ARGS=(--resume create)
+  done
+  [[ "${CREATED:-0}" == "1" ]] || { corral delete "$VM" >/dev/null 2>&1 || true; die "VM creation failed after 3 attempts — inspect with: corral logs $VM"; }
   note "starting $VM..."
   corral start "$VM" >/dev/null 2>&1 || true
   sleep 3
-  corral list 2>/dev/null | grep -q "^${VM}[[:space:]].*Running" \
+  vm_running \
     || die "$VM is not Running after start — inspect with: corral logs $VM"
 fi
 
