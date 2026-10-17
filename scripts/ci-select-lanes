@@ -5,8 +5,8 @@ Usage:
   scripts/ci-select-lanes [--event NAME] [--run-number N] [--size K] [--changed FILE|-]
 
 Prints `lanes=<JSON array>` for $GITHUB_OUTPUT; the reason goes to
-stderr and, when set, $GITHUB_STEP_SUMMARY. The `check` job always runs
-and is not a lane.
+stderr and, when set, $GITHUB_STEP_SUMMARY. The `select-lanes` and `check`
+jobs always run and are not proof lanes.
 
 push, schedule and workflow_dispatch run every lane. A pull_request runs
 what its changed files (`git diff --name-only HEAD^1 HEAD` on the merge
@@ -30,8 +30,7 @@ import os
 import subprocess
 import sys
 
-# ci.yml job ids, in workflow order. scripts/lib/ci-select-lanes-tests.py
-# keeps this list and the workflow's lane conditions identical.
+# Selectable ci.yml proof jobs, in workflow order.
 LANES = [
     "fprint-phase-proof", "journey", "app-content", "scroll-proof", "drm-smoke",
     "grid-cancel-comparison", "greeter", "gtk-shell",
