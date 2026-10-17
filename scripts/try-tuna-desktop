@@ -80,6 +80,9 @@ fi
 # podman builds the bootable disk from the OCI image (corral bootc shells
 # to it; privileged container ops may ask for sudo).
 command -v podman >/dev/null 2>&1 || die "podman not found — install it with: sudo apt install podman (Linux) or brew install podman && podman machine init (macOS)"
+if ! podman unshare cat /proc/self/uid_map >/dev/null 2>&1; then
+  die "podman cannot create a user namespace (rootless setup is broken) — fix one of: install uid helpers (sudo apt install uidmap); give yourself subordinate IDs (sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \$USER, then log back in); restore setuid on the helpers (sudo chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap); on Debian enable unprivileged namespaces (sudo sysctl kernel.unprivileged_userns_clone=1). Original error above, if any, came from: podman unshare cat /proc/self/uid_map"
+fi
 
 # cosign verifies the image signature before anything boots from it.
 command -v cosign >/dev/null 2>&1 || die "cosign not found — install it with: brew install cosign (macOS) or: go install github.com/sigstore/cosign/v2/cmd/cosign@latest (Linux)"
