@@ -7798,6 +7798,28 @@ for key in screen-brightness-up-monitor screen-brightness-down-monitor screen-br
     gsettings reset org.gnome.shell.keybindings "$key"
 done
 # Controlled backlight/logind policy test; no physical brightness claim.
+# Global brightness is the maximum user level across outputs. The controller
+# preserves each output's ratio, so with the second fixture at 700/1000 the
+# primary's 50% slider request is intentionally below 50% of its range.
+expected_primary="$("$PY" - "$BACKLIGHT" "$ARTIFACTS/backlight/aaa-other" <<'PY_EXPECTED'
+import pathlib
+import sys
+
+def scalar(path):
+    return int(path.read_text().strip())
+
+def reading(path):
+    maximum = scalar(path / "max_brightness")
+    minimum = max(1, maximum // 100)
+    relative = (scalar(path / "brightness") - minimum) / (maximum - minimum)
+    return maximum, minimum, relative
+
+primary_max, primary_min, primary_relative = reading(pathlib.Path(sys.argv[1]))
+_, _, other_relative = reading(pathlib.Path(sys.argv[2]))
+target = 0.5 * primary_relative / max(primary_relative, other_relative)
+print(primary_min + int((primary_max - primary_min) * target + 0.5))
+PY_EXPECTED
+)"
 # Close whatever the monitor-key sequence left open (the corner click
 # toggles), then open quick settings so the Brightness slider is showing.
 xdotool key Escape
@@ -7806,8 +7828,9 @@ open_qs
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-brightness-policy.json" 20 \
     --set Brightness 50 || fail G-BRIGHTNESS-CONTRACT "could not set associated user brightness"
 end=$(($(date +%s) + 10))
-until [ "$(cat "$BACKLIGHT/brightness")" = 510 ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
-[ "$(cat "$BACKLIGHT/brightness")" = 510 ] || fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing"
+until [ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+[ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] ||
+    fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing (expected $expected_primary)"
 "$PY" "$ROOT/scripts/lib/gnome-brightness-proof.py" --out "$ARTIFACTS/brightness-controlled.json" \
     --controlled-root "$ARTIFACTS/backlight" --device tuna-bl --other-device aaa-other \
     --shell-executable "$privacy_expected_shell" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||

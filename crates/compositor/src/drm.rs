@@ -125,6 +125,9 @@ pub struct DrmBackend {
     pub libinput: Libinput,
     /// Whether the session currently owns the VT.
     pub active: bool,
+    /// Native ownership epoch: bumped on every VT pause and sleep, so
+    /// each re-acquisition is distinct (see `native_ownership_generation`).
+    ownership_generation: u64,
     sleep_reset_pending: bool,
     wake_scanout_blocked: bool,
     wake_event_traces: u8,
@@ -228,6 +231,14 @@ impl DrmBackend {
             .filter(|owner| owner.drm_device == device)
             .cloned()
             .collect()
+    }
+
+    /// Native ownership epoch for brightness authority: `None` while the
+    /// VT is not ours; every re-acquisition (VT switch back, resume from
+    /// sleep) is a new generation that revokes facts and grants admitted
+    /// under the previous one.
+    pub fn native_ownership_generation(&self) -> Option<u64> {
+        (self.active && self.drm.is_active()).then_some(self.ownership_generation)
     }
 
     /// Cached discovery metadata, gated by active VT, the original KMS FD,
@@ -492,6 +503,7 @@ impl DrmBackend {
                 outputs,
                 libinput,
                 active: true,
+                ownership_generation: 1,
                 sleep_reset_pending: false,
                 wake_scanout_blocked: false,
                 wake_event_traces: 0,
@@ -536,6 +548,8 @@ impl DrmBackend {
             SessionEvent::PauseSession => {
                 eprintln!("tuna-compositor: drm: session paused");
                 self.active = false;
+                // Re-acquiring the VT starts a new ownership generation.
+                self.ownership_generation = self.ownership_generation.saturating_add(1);
                 self.libinput.suspend();
                 self.drm.pause();
             }
@@ -563,6 +577,8 @@ impl DrmBackend {
 
     /// Recover scanout after real system sleep, independently of VT events.
     pub fn resume_from_sleep(&mut self) {
+        // Connectors and backlights may have changed while asleep.
+        self.ownership_generation = self.ownership_generation.saturating_add(1);
         self.wake_scanout_blocked = true;
         if !self.active {
             // Never program KMS off-seat; retain the wake until activation.
