@@ -8209,7 +8209,8 @@ done
 # Global brightness is the maximum user level across outputs. The controller
 # preserves each output's ratio, so with the second fixture at 700/1000 the
 # primary's 50% slider request is intentionally below 50% of its range.
-expected_primary="$("$PY" - "$BACKLIGHT" "$ARTIFACTS/backlight/aaa-other" <<'PY_EXPECTED'
+# Wait for both readbacks: the primary can already equal its floor while the other output is still applying.
+expected_levels="$("$PY" - "$BACKLIGHT" "$ARTIFACTS/backlight/aaa-other" <<'PY_EXPECTED'
 import pathlib
 import sys
 
@@ -8223,11 +8224,16 @@ def reading(path):
     return maximum, minimum, relative
 
 primary_max, primary_min, primary_relative = reading(pathlib.Path(sys.argv[1]))
-_, _, other_relative = reading(pathlib.Path(sys.argv[2]))
-target = 0.5 * primary_relative / max(primary_relative, other_relative)
-print(primary_min + int((primary_max - primary_min) * target + 0.5))
+other_max, other_min, other_relative = reading(pathlib.Path(sys.argv[2]))
+global_relative = max(primary_relative, other_relative)
+scale = 0.5 / global_relative if global_relative > 0 else 0
+primary_target = primary_min + int((primary_max - primary_min) * primary_relative * scale + 0.5)
+other_target = other_min + int((other_max - other_min) * other_relative * scale + 0.5)
+print(primary_target, other_target)
 PY_EXPECTED
 )"
+expected_primary="$(printf '%s\n' "$expected_levels" | cut -d ' ' -f1)"
+expected_other="$(printf '%s\n' "$expected_levels" | cut -d ' ' -f2)"
 # Close whatever the monitor-key sequence left open (the corner click
 # toggles), then open quick settings so the Brightness slider is showing.
 xdotool key Escape
@@ -8236,9 +8242,12 @@ open_qs
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-brightness-policy.json" 20 \
     --set Brightness 50 || fail G-BRIGHTNESS-CONTRACT "could not set associated user brightness"
 end=$(($(date +%s) + 10))
-until [ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
-[ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] ||
-    fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing (expected $expected_primary)"
+until [ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] &&
+    [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" = "$expected_other" ] ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+[ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] &&
+    [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" = "$expected_other" ] ||
+    fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing (expected $expected_primary/$expected_other)"
 "$PY" "$ROOT/scripts/lib/gnome-brightness-proof.py" --out "$ARTIFACTS/brightness-controlled.json" \
     --controlled-root "$ARTIFACTS/backlight" --device tuna-bl --other-device aaa-other \
     --shell-executable "$privacy_expected_shell" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||
