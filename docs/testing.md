@@ -9,13 +9,13 @@ first; each proof below names anything extra it needs.
 ## Which lanes a pull request runs
 
 Every push to `main`, the nightly schedule and `workflow_dispatch` run
-every job. A pull request always runs `check`; the first step of `check`
-(`scripts/ci-select-lanes`) diffs the PR against its base and picks the
-proof lanes the change can affect:
+every proof lane. Both `select-lanes` and `check` always run. The lightweight
+`select-lanes` job runs `scripts/ci-select-lanes`, diffs the PR against its
+base, and picks the proof lanes the change can affect:
 
 - `ci.yml`, `scripts/ci-*`, `Cargo.toml`, `Cargo.lock`, `third-party/` or
   `scripts/tuna-nested`: every lane.
-- docs, other workflows, `fuzz/` and the script self-tests: `check` only.
+- docs, other workflows, `fuzz/` and the script self-tests: no proof lanes.
 - a lane's own proof script, reference fixtures or packaging: that lane
   (plus the lanes whose artifacts it needs).
 - anything else (crates, `share/`, other scripts): `gtk-shell` plus a
@@ -24,14 +24,50 @@ proof lanes the change can affect:
   (default 2); each push to a PR covers a different slice and `main` runs
   them all after merge.
 
-The step summary of `check` names the chosen lanes and why. `ci-gate`
-reports one status for the run: it fails when any job failed or was
-cancelled. To run every lane on a branch, dispatch `ci` on it.
+The step summary of `select-lanes` names the chosen lanes and why.
+Independent lanes start after selection, without waiting for workspace
+tests. GTK, grid comparison and fingerprint admission still require the
+successful current-run `check`; the ledger also consumes its test list,
+and image publication waits for it. Package and screenshot consumers still
+wait for their producing proof jobs.
+
+`ci-gate` requires both infrastructure jobs to succeed and fails when any
+selected job fails or is cancelled. Only unselected proof lanes may be
+skipped. To run every lane on a branch, dispatch `ci` on it.
+
+## Dependency caches
+
+Rust caches remain job-specific; no cache hit skips Cargo, executable
+admission or a proof. Only non-PR runs on `refs/heads/main` may save them.
+PRs and branch dispatches restore main's compatible caches without
+creating competing branch copies. New keys need a successful main job
+to seed them; the first run after a key change can be cold.
+
+Ubuntu keys include the native distro ID/version in addition to the
+pinned cache action's compiler, architecture, environment and dependency
+identity. `check` includes the standalone `third-party/reis` and
+`third-party/smithay` targets. Grid comparison has separate cached
+old/fixed targets under `target/ci-grid`, keyed to its reviewed old source;
+fingerprint uses `target/ci-fprint`. Setting `CARGO_TARGET_DIR` opts these
+two proof scripts into persistent build targets; without it, local runs
+keep isolated targets inside their fresh artifact directory. Receipts,
+admissions and verdicts are always freshly produced outside the cache.
+
+The Arch job shares an explicit Cargo home between cache restoration and
+the unprivileged package builder. Its key includes the installed native
+package inventory, and its target is never shared with Ubuntu. Restoration
+precedes the existing builder ownership change; package build, installation
+and version checks still run.
+
+When diagnosing misses, inspect the cache action's primary/restore keys,
+hit status, archive size and transfer times before increasing storage.
+Job/profile/native-environment caches are deliberately separate; a single
+shared key can retain an incomplete first-writer snapshot. OCI/ORAS or
+resumed VM sessions do not replace fresh source/package/runtime proofs.
 
 ## Before opening a PR
 
-The `check` job is the gate every other job waits on. Run its four steps
-in this order:
+Run the workspace checks locally before opening a PR:
 
 ```sh
 cargo fmt --all -- --check
