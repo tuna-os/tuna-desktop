@@ -84,6 +84,15 @@ if ! podman unshare cat /proc/self/uid_map >/dev/null 2>&1; then
   die "podman cannot create a user namespace (rootless setup is broken) — fix one of: install uid helpers (sudo apt install uidmap); give yourself subordinate IDs (sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \$USER, then log back in); restore setuid on the helpers (sudo chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap); on Debian enable unprivileged namespaces (sudo sysctl kernel.unprivileged_userns_clone=1). Original error above, if any, came from: podman unshare cat /proc/self/uid_map"
 fi
 
+# The image pull (~2GB) plus the VM disk need headroom; fail here with
+# cleanup directions instead of mid-build with a truncated layer.
+for _dir in "$HOME" "${TMPDIR:-/tmp}"; do
+  _avail_kb="$(df -k --output=avail "$_dir" 2>/dev/null | tail -n 1)"
+  if [[ -n "$_avail_kb" && "$_avail_kb" -lt 10485760 ]]; then
+    die "only $((_avail_kb / 1024)) MiB free on $_dir — need ~10 GiB for the image layers and VM disk; free space (empty trash, podman system prune, flatpak uninstall --unused) and re-run"
+  fi
+done
+
 # cosign verifies the image signature before anything boots from it.
 command -v cosign >/dev/null 2>&1 || die "cosign not found — install it with: brew install cosign (macOS, or any distro via linuxbrew) or: go install github.com/sigstore/cosign/v2/cmd/cosign@latest (Linux)"
 
@@ -203,7 +212,7 @@ if [[ "$NEED_CREATE" == "1" ]]; then
     fi
     [[ "$attempt" == "3" ]] && break
     note "build interrupted (attempt $attempt/3) — resuming..."
-    RESUME_ARGS=(--resume create)
+    RESUME_ARGS=(--resume)
   done
   [[ "${CREATED:-0}" == "1" ]] || { corral delete "$VM" >/dev/null 2>&1 || true; die "VM creation failed after 3 attempts — inspect with: corral logs $VM"; }
   note "starting $VM..."
