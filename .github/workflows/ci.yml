@@ -875,8 +875,6 @@ jobs:
     timeout-minutes: 40
     container: archlinux:latest
     env:
-      CARGO_HOME: ${{ github.workspace }}/target/ci-arch-cargo
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-arch
       RUSTUP_TOOLCHAIN: stable
     steps:
       - run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf clang pipewire gtk4 gtk4-layer-shell libadwaita libsecret libcanberra sound-theme-freedesktop libxkbcommon libxkbcommon-x11 mesa wayland dbus glib2 seatd libinput systemd-libs libdrm namcap
@@ -885,12 +883,15 @@ jobs:
         id: arch-native
         shell: bash
         run: |
+          export CARGO_HOME="$GITHUB_WORKSPACE/target/ci-arch-cargo"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/ci-arch"
+          printf 'CARGO_HOME=%s\nCARGO_TARGET_DIR=%s\n' "$CARGO_HOME" "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
           native_key=$( { cat /etc/os-release; pacman -Q; } | sha256sum | cut -d ' ' -f 1)
           printf 'key=%s\n' "$native_key" >> "$GITHUB_OUTPUT"
           mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: arch-${{ steps.arch-native.outputs.key }}
+          key: arch-container-${{ steps.arch-native.outputs.key }}
           workspaces: . -> target/ci-arch
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}

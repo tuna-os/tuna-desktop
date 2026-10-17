@@ -587,6 +587,8 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             ])
             .arg(std::env::current_exe().unwrap())
             .env(ROLE, role)
+            // The supervised peer is libtest too; retain its panic in compositor.log.
+            .env("RUST_TEST_NOCAPTURE", "1")
             .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
             .env("TUNA_AUTH_OWNER_ROOT", root.path())
             .env("XDG_RUNTIME_DIR", root.path())
@@ -599,11 +601,15 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             .spawn()
             .unwrap(),
     );
-    std::fs::write(root.path().join("compositor-pid"), child.0.id().to_string()).unwrap();
+    publish_json(
+        &root.path().join("compositor-pid"),
+        &serde_json::json!(child.0.id()),
+    );
     while !root.path().join("success.json").exists() {
+        let status = child.0.try_wait().unwrap();
         assert!(
-            child.0.try_wait().unwrap().is_none(),
-            "actual compositor exited before proof"
+            status.is_none(),
+            "actual compositor exited before proof: {status:?}"
         );
         assert!(Instant::now() < end, "actual runtime proof deadline");
         std::thread::sleep(Duration::from_millis(10));

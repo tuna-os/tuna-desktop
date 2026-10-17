@@ -43,6 +43,12 @@ PRs and branch dispatches restore main's compatible caches without
 creating competing branch copies. New keys need a successful main job
 to seed them; the first run after a key change can be cold.
 
+The same writer policy and native-platform separation apply to measured
+coverage, fuzzing, nested stress and visual capture. Workflows without a
+main-push trigger seed on their existing scheduled or manual main runs;
+their branch runs remain restore-only. The two fuzz targets retain their
+shared nightly dependency cache, separate from other jobs and profiles.
+
 Ubuntu keys include the native distro ID/version in addition to the
 pinned cache action's compiler, architecture, environment and dependency
 identity. `check` includes the standalone `third-party/reis` and
@@ -58,6 +64,9 @@ the unprivileged package builder. Its key includes the installed native
 package inventory, and its target is never shared with Ubuntu. Restoration
 precedes the existing builder ownership change; package build, installation
 and version checks still run.
+Both paths are derived inside the container from the shell's
+`GITHUB_WORKSPACE` and published through `GITHUB_ENV`, rather than using
+the host-side `github.workspace` expression for container build paths.
 
 When diagnosing misses, inspect the cache action's primary/restore keys,
 hit status, archive size and transfer times before increasing storage.
@@ -90,6 +99,12 @@ locally to be sure the test really ran:
 ```sh
 TUNA_REQUIRE_PAM_WRAPPER=1 cargo test --workspace
 ```
+
+`scripts/tuna-auth-owner-ci-proof <artifact-directory>` runs the actual
+native ownership and private PAM retirement cases. Its PID readiness
+markers are published only after complete PID contents are written.
+Artifacts retain supervised test-client panics and early compositor exit
+status; a compiled test or cache hit is not a substitute for these cases.
 
 Run one crate with `cargo test -p <package>` (package names are in each
 crate's `README.md`, for example `cargo test -p tuna-compositor`).
