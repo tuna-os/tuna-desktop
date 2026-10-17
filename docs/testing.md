@@ -43,6 +43,12 @@ PRs and branch dispatches restore main's compatible caches without
 creating competing branch copies. New keys need a successful main job
 to seed them; the first run after a key change can be cold.
 
+The same writer policy and native-platform separation apply to measured
+coverage, fuzzing, nested stress and visual capture. Workflows without a
+main-push trigger seed on their existing scheduled or manual main runs;
+their branch runs remain restore-only. The two fuzz targets retain their
+shared nightly dependency cache, separate from other jobs and profiles.
+
 Ubuntu keys include the native distro ID/version in addition to the
 pinned cache action's compiler, architecture, environment and dependency
 identity. `check` includes the standalone `third-party/reis` and
