@@ -64,9 +64,13 @@ the unprivileged package builder. Its key includes the installed native
 package inventory, and its target is never shared with Ubuntu. Restoration
 precedes the existing builder ownership change; package build, installation
 and version checks still run.
-Both paths are derived inside the container from the shell's
-`GITHUB_WORKSPACE` and published through `GITHUB_ENV`, rather than using
-the host-side `github.workspace` expression for container build paths.
+Both paths are derived inside the container and published through
+`GITHUB_ENV`, rather than using the host-side `github.workspace` expression.
+The target stays under `GITHUB_WORKSPACE`; Cargo home lives under
+`RUNNER_TEMP`, outside the workspace. The pinned cache action excludes
+dependency manifests inside the workspace by default, so putting Cargo
+home there would prune registry crates and their compiled dependencies.
+After restoration, both the workspace and Cargo home become builder-owned.
 
 When diagnosing misses, inspect the cache action's primary/restore keys,
 hit status, archive size and transfer times before increasing storage.

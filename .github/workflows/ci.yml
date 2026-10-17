@@ -883,7 +883,9 @@ jobs:
         id: arch-native
         shell: bash
         run: |
-          export CARGO_HOME="$GITHUB_WORKSPACE/target/ci-arch-cargo"
+          # Keep registry manifests outside the workspace: rust-cache treats
+          # all manifests below it as local crates and excludes them by default.
+          export CARGO_HOME="$RUNNER_TEMP/ci-arch-cargo"
           export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/ci-arch"
           printf 'CARGO_HOME=%s\nCARGO_TARGET_DIR=%s\n' "$CARGO_HOME" "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
           native_key=$( { cat /etc/os-release; pacman -Q; } | sha256sum | cut -d ' ' -f 1)
@@ -891,13 +893,13 @@ jobs:
           mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: arch-container-${{ steps.arch-native.outputs.key }}
+          key: arch-container-v2-${{ steps.arch-native.outputs.key }}
           workspaces: . -> target/ci-arch
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - run: |
           useradd -m builder
-          chown -R builder "$GITHUB_WORKSPACE"
+          chown -R builder "$GITHUB_WORKSPACE" "$CARGO_HOME"
           su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && CARGO_HOME='$CARGO_HOME' CARGO_TARGET_DIR='$CARGO_TARGET_DIR' RUSTUP_TOOLCHAIN=stable TUNA_LOCAL_SRC='$GITHUB_WORKSPACE' makepkg -f --noconfirm"
       - run: |
           pkg=$(ls packaging/arch/tuna-desktop-[0-9]*.pkg.tar.zst)
