@@ -601,9 +601,10 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
     );
     std::fs::write(root.path().join("compositor-pid"), child.0.id().to_string()).unwrap();
     while !root.path().join("success.json").exists() {
+        let status = child.0.try_wait().unwrap();
         assert!(
-            child.0.try_wait().unwrap().is_none(),
-            "actual compositor exited before proof"
+            status.is_none(),
+            "actual compositor exited before proof: {status:?}"
         );
         assert!(Instant::now() < end, "actual runtime proof deadline");
         std::thread::sleep(Duration::from_millis(10));
