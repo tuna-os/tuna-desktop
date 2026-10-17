@@ -51,4 +51,12 @@ class Identity(unittest.TestCase):
   self.assertEqual(receipt['observed']['status'],'completed')
   self.assertEqual(receipt['observed']['commit_sha'],'a'*40)
   self.assertNotIn('private_payload',receipt['observed'])
+ def test_schedule_event_admitted(self):
+  r,j,c=self.fixtures()
+  r['event']='schedule'
+  self.assertEqual(i.validate_identity(r,j,c,'a'*40,17,2,'schedule')['tree'],'b'*40)
+ def test_unsupported_event_rejected(self):
+  r,j,c=self.fixtures()
+  r['event']='fork'
+  with self.assertRaises(ValueError):i.validate_identity(r,j,c,'a'*40,17,2,'fork')
 if __name__=='__main__':unittest.main()
