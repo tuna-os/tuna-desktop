@@ -86,7 +86,7 @@ fi
 
 # The image pull (~2GB) plus the VM disk need headroom; fail here with
 # cleanup directions instead of mid-build with a truncated layer.
-for _dir in "$HOME" "${TMPDIR:-/tmp}"; do
+for _dir in "$HOME" /var/tmp; do
   _avail_kb="$(df -k --output=avail "$_dir" 2>/dev/null | tail -n 1)"
   if [[ -n "$_avail_kb" && "$_avail_kb" -lt 10485760 ]]; then
     die "only $((_avail_kb / 1024)) MiB free on $_dir — need ~10 GiB for the image layers and VM disk; free space (empty trash, podman system prune, flatpak uninstall --unused) and re-run"
