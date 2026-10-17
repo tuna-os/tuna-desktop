@@ -157,8 +157,16 @@ note "signature verified."
 # --- boot -------------------------------------------------------------------
 if ! corral list 2>/dev/null | grep -q "^${VM}[[:space:]].*Running"; then
   if ! corral list 2>/dev/null | grep -q "^${VM}[[:space:]]"; then
-    note "building $PINNED into VM $VM (this downloads GBs on first run)..."
+    # bootc install partitions a disk and writes a bootloader, which needs
+    # root: run the local build under sudo unless already root.
+    SUDO_ARGS=()
+    if [[ "$(id -u)" != "0" ]]; then
+      command -v sudo >/dev/null 2>&1 || die "sudo not found and not running as root — bootc needs root to build the VM disk; install sudo or re-run as root"
+      SUDO_ARGS+=(--sudo)
+    fi
+    note "building $PINNED into VM $VM (this downloads GBs on first run; sudo may prompt)..."
     corral bootc create "$VM" --image "$PINNED" --disk "$DISK" --mem "$MEM" --cpu "$CPUS" \
+      "${SUDO_ARGS[@]}" \
       || die "VM creation failed"
   fi
   note "starting $VM..."
