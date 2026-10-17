@@ -9,9 +9,8 @@
 # QEMU process, disk lock, or listening port remains.
 #
 # Options (env vars):
-#   TRY_TUNA_IMAGE   OCI tag to try (default: ghcr.io/tuna-os/marlin:tuna, the
-#                    v1 release tag — the `roost` flavor renamed; `marlin:roost`
-#                    stays published as the same digest during the transition).
+#   TRY_TUNA_IMAGE   OCI tag to try (default: ghcr.io/tuna-os/marlin:tuna,
+#                    the v1 release tag).
 #                    The tag is resolved to a digest after pulling, the digest
 #                    is cosign-verified, and the VM boots image@digest — never
 #                    a floating tag.
