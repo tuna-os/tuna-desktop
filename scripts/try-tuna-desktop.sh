@@ -60,7 +60,7 @@ if ! command -v "$qemu_bin" >/dev/null 2>&1 && ! command -v qemu-system-x86_64 >
   if [[ "$os" == "darwin" ]]; then
     die "QEMU not found — install it with: brew install qemu"
   fi
-  die "QEMU not found — install it with: sudo apt install qemu-system-x86 qemu-utils (Debian/Ubuntu) or sudo dnf install qemu-kvm qemu-img (Fedora)"
+  die "QEMU not found — install it with: sudo apt install qemu-system-x86 qemu-utils (Debian/Ubuntu); sudo dnf install qemu-kvm qemu-img (Fedora); sudo pacman -S qemu-desktop qemu-img (Arch); or brew install qemu (macOS, or any distro when the system package manager is unavailable, e.g. immutable/atomic desktops)"
 fi
 command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found — it ships with the QEMU packages above"
 
@@ -85,7 +85,7 @@ if ! podman unshare cat /proc/self/uid_map >/dev/null 2>&1; then
 fi
 
 # cosign verifies the image signature before anything boots from it.
-command -v cosign >/dev/null 2>&1 || die "cosign not found — install it with: brew install cosign (macOS) or: go install github.com/sigstore/cosign/v2/cmd/cosign@latest (Linux)"
+command -v cosign >/dev/null 2>&1 || die "cosign not found — install it with: brew install cosign (macOS, or any distro via linuxbrew) or: go install github.com/sigstore/cosign/v2/cmd/cosign@latest (Linux)"
 
 # Corral itself, verified the same way scripts/install.sh does it.
 if ! command -v corral >/dev/null 2>&1; then
