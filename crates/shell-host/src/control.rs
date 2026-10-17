@@ -225,6 +225,7 @@ pub struct ControlClient {
     /// and never edits it.
     outputs: Vec<OutputInfo>,
     native_outputs: Vec<tuna_shell_control::NativeOutputInfo>,
+    monitor_identities: Vec<tuna_shell_control::MonitorIdentityInfo>,
     pointer_output: Option<String>,
     /// Session environment from the compositor (#59).
     environment: Vec<(String, String)>,
@@ -276,6 +277,7 @@ impl ControlClient {
             locked: false,
             outputs: Vec::new(),
             native_outputs: Vec::new(),
+            monitor_identities: Vec::new(),
             pointer_output: None,
             environment: Vec::new(),
             overview_previews: (Vec::new(), None),
@@ -373,6 +375,10 @@ impl ControlClient {
         self.pointer_output.as_deref()
     }
 
+    pub fn monitor_identities(&self) -> &[tuna_shell_control::MonitorIdentityInfo] {
+        &self.monitor_identities
+    }
+
     pub fn native_outputs(&self) -> &[tuna_shell_control::NativeOutputInfo] {
         &self.native_outputs
     }
@@ -397,6 +403,7 @@ impl ControlClient {
     pub fn await_hello(&mut self) -> Result<(), ControlError> {
         self.input_method_admission = InputMethodAdmission::AwaitHello;
         self.native_outputs.clear();
+        self.monitor_identities.clear();
         match self.read_frame()? {
             Message::Hello { version } => {
                 if version.is_compatible_with(&CURRENT_VERSION) {
@@ -824,6 +831,7 @@ impl ControlClient {
             {
                 self.input_method_admission = InputMethodAdmission::AwaitHello;
                 self.native_outputs.clear();
+                self.monitor_identities.clear();
                 self.wellbeing_applied = None;
                 self.wellbeing_pending = None;
                 self.read_buf.clear();
@@ -852,6 +860,7 @@ impl ControlClient {
                 if !transient {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                     self.native_outputs.clear();
+                    self.monitor_identities.clear();
                 }
                 Err(e)
             }
@@ -868,6 +877,7 @@ impl ControlClient {
                 } else {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                     self.native_outputs.clear();
+                    self.monitor_identities.clear();
                     // Same-major decode already passed, so this is a newer
                     // minor we cannot speak: report it as typed, keep the
                     // model state untouched; input-method admission fails closed.
@@ -935,6 +945,12 @@ impl ControlClient {
                     }
                 }
                 Ok(Handled::CommandResult { id, status })
+            }
+            Message::MonitorIdentityInventory { outputs } => {
+                self.monitor_identities = outputs;
+                Ok(Handled::Outputs {
+                    count: self.monitor_identities.len(),
+                })
             }
             Message::NativeOutputInventory { outputs } => {
                 self.native_outputs = outputs;
@@ -1075,6 +1091,7 @@ impl ControlClient {
                 if kind == ErrorKind::IncompatibleVersion {
                     self.input_method_admission = InputMethodAdmission::AwaitHello;
                     self.native_outputs.clear();
+                    self.monitor_identities.clear();
                 }
                 if kind == ErrorKind::RevisionGap {
                     // Compositor-side gap signal: same handling as a local
@@ -1134,6 +1151,7 @@ impl ControlClient {
     fn reconnect(&mut self) -> Result<(), ControlError> {
         self.input_method_admission = InputMethodAdmission::AwaitHello;
         self.native_outputs.clear();
+        self.monitor_identities.clear();
         let path = self.socket_path.clone().ok_or_else(|| {
             ControlError::Unexpected("reconnect without a socket path".to_owned())
         })?;
@@ -1182,6 +1200,7 @@ impl ControlClient {
                 Ok(0) => {
                     self.closed = true;
                     self.native_outputs.clear();
+                    self.monitor_identities.clear();
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "control connection closed",
@@ -1196,6 +1215,7 @@ impl ControlClient {
                     ) {
                         self.closed = true;
                         self.native_outputs.clear();
+                        self.monitor_identities.clear();
                     }
                     return Err(ControlError::Io(e));
                 }
@@ -1254,6 +1274,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::Overview { .. } => "Overview",
         Message::Switcher { .. } => "Switcher",
         Message::NativeOutputInventory { .. } => "NativeOutputInventory",
+        Message::MonitorIdentityInventory { .. } => "MonitorIdentityInventory",
         Message::Outputs { .. } => "Outputs",
         Message::Environment { .. } => "Environment",
         Message::OverviewPreviews { .. } => "OverviewPreviews",
@@ -1714,6 +1735,50 @@ mod tests {
     }
 
     #[test]
+    fn optional_identity_none_and_revocation_preserve_owner_outputs_and_revision() {
+        let (mut client, mut peer) = handshook();
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().unwrap();
+        let owner = tuna_shell_control::NativeOutputInfo {
+            name: "eDP-1".into(),
+            drm_device: 226,
+            connector_id: 39,
+            connector_sysfs: "/sys/owned/connector".into(),
+            connector_device: 1,
+            connector_inode: 2,
+        };
+        server_write(
+            &mut peer,
+            &Message::NativeOutputInventory {
+                outputs: vec![owner.clone()],
+            },
+        );
+        client.poll().unwrap();
+        let info = tuna_shell_control::MonitorIdentityInfo {
+            owner: owner.clone(),
+            edid: None,
+        };
+        server_write(
+            &mut peer,
+            &Message::MonitorIdentityInventory {
+                outputs: vec![info.clone()],
+            },
+        );
+        client.poll().unwrap();
+        assert_eq!(client.monitor_identities(), &[info]);
+        assert_eq!(client.native_outputs(), std::slice::from_ref(&owner));
+        server_write(
+            &mut peer,
+            &Message::MonitorIdentityInventory { outputs: vec![] },
+        );
+        client.poll().unwrap();
+        assert!(client.monitor_identities().is_empty());
+        assert_eq!(client.native_outputs(), &[owner]);
+        assert!(client.outputs().is_empty());
+        assert_eq!(client.revision(), Some(7));
+    }
+
+    #[test]
     fn native_owner_inventory_revocation_never_rewrites_legacy_outputs_or_revision() {
         let (mut client, mut peer) = handshook();
         server_write(&mut peer, &snapshot_rev7());
@@ -1785,10 +1850,22 @@ mod tests {
                 outputs: vec![owner.clone()],
             },
         );
+        let info = tuna_shell_control::MonitorIdentityInfo {
+            owner: owner.clone(),
+            edid: None,
+        };
+        server_write(
+            &mut server1,
+            &Message::MonitorIdentityInventory {
+                outputs: vec![info.clone()],
+            },
+        );
+        client.poll().unwrap();
         client.poll().unwrap();
         assert_eq!(client.native_outputs(), &[owner]);
+        assert_eq!(client.monitor_identities(), &[info]);
 
-        // Transport loss and socket gone: redial fails, native_outputs must be cleared.
+        // Transport loss and socket gone: redial fails, native_outputs and monitor_identities must be cleared.
         drop(server1);
         drop(listener);
         std::fs::remove_file(&path).expect("remove socket");
@@ -1796,6 +1873,10 @@ mod tests {
         assert!(
             client.native_outputs().is_empty(),
             "failed redial must clear connection-scoped native outputs"
+        );
+        assert!(
+            client.monitor_identities().is_empty(),
+            "failed redial must clear connection-scoped monitor identities"
         );
     }
 

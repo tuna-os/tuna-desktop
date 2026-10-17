@@ -12,6 +12,8 @@ smithay.workspace = true
 libc = "0.2"
 # Native color settings live on one owned GLib worker, never the frame thread.
 gio = "0.22"
+# Exact original kernel EDID bytes, separate from mutable connector names.
+sha2 = "=0.10.9"
 libloading = "0.9"
 # GNOME's monitors.xml (per-output scale and layout, #59).
 roxmltree = "0.21"
