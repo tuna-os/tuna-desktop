@@ -6,8 +6,11 @@ Usage: tuna-service-stubs.py BACKLIGHT_DIR [POWER_LOG]
 Serves, on the bus at $DBUS_SYSTEM_BUS_ADDRESS (a private bus the proof
 starts), just enough of each daemon behind GNOME 51's quick settings:
 
-- NetworkManager: WirelessEnabled (rw), Connectivity (full) and
-  PrimaryConnection, GetDevices with one ethernet and one wifi device.
+- NetworkManager: WirelessEnabled (rw), WwanEnabled (rw, writes
+  timestamped to $TUNA_STUB_NM_LOG), Connectivity (full) and
+  PrimaryConnection, GetDevices with one ethernet, one wifi and one
+  modem device (wwan0, up on its ExampleTel gsm profile with APN
+  internet.example; org.tuna.Proof.Network.WwanPresent toggles it).
   The ethernet device is up on its one saved profile ("Wired connection
   1"); Device.Disconnect takes it down and ActivateConnection brings it
   back, both appended to $TUNA_STUB_NM_LOG. The wifi device sees four access
@@ -42,6 +45,7 @@ way it sees the real daemons'. The proof reads state back with gdbus.
 """
 import os
 import sys
+import time
 
 from gi.repository import Gio, GLib
 
@@ -64,6 +68,7 @@ XML = """
       <arg type="o" direction="out"/>
     </method>
     <property name="WirelessEnabled" type="b" access="readwrite"/>
+    <property name="WwanEnabled" type="b" access="readwrite"/>
     <property name="NetworkingEnabled" type="b" access="read"/>
     <property name="Connectivity" type="u" access="read"/>
     <property name="PrimaryConnection" type="o" access="read"/>
@@ -72,6 +77,7 @@ XML = """
     <method name="RequestSecrets"><arg type="s" direction="in"/><arg type="u" direction="in"/></method>
     <method name="DeleteSecrets"><arg type="s" direction="in"/></method>
     <method name="SecondWired"><arg type="b" direction="in"/></method>
+    <method name="WwanPresent"><arg type="b" direction="in"/></method>
   </interface>
   <interface name="org.freedesktop.NetworkManager.Connection.Active">
     <property name="Connection" type="o" access="read"/>
@@ -84,9 +90,17 @@ XML = """
     <property name="DeviceType" type="u" access="read"/>
     <property name="Interface" type="s" access="read"/>
     <property name="State" type="u" access="read"/>
+    <property name="Udi" type="s" access="read"/>
     <property name="AvailableConnections" type="ao" access="read"/>
     <property name="ActiveConnection" type="o" access="read"/>
     <method name="Disconnect"/>
+  </interface>
+  <interface name="org.freedesktop.NetworkManager.Device.Modem">
+    <property name="ModemCapabilities" type="u" access="read"/>
+    <property name="CurrentCapabilities" type="u" access="read"/>
+    <property name="DeviceId" type="s" access="read"/>
+    <property name="OperatorCode" type="s" access="read"/>
+    <property name="Apn" type="s" access="read"/>
   </interface>
   <interface name="org.freedesktop.NetworkManager.Device.Wireless">
     <method name="RequestScan"><arg type="a{sv}" direction="in"/></method>
@@ -166,7 +180,12 @@ NM = "/org/freedesktop/NetworkManager"
 DEV_ETH = NM + "/Devices/1"
 DEV_WIFI = NM + "/Devices/2"
 DEV_ETH2 = NM + "/Devices/3"
+DEV_WWAN = NM + "/Devices/4"
+WWAN_CONN = NM + "/Settings/4"
+WWAN_ACTIVE = NM + "/ActiveConnection/4"
+MM_MODEM = "/org/freedesktop/ModemManager1/Modem/0"
 second_wired = False
+wwan_present = True
 APS = [
     # path suffix, ssid, strength, flags, rsn flags
     (1, "Tuna Desktop Home", 70, 1, 0x188),
@@ -181,6 +200,7 @@ WIRED_CONN = NM + "/Settings/3"
 WIRED_ACTIVE = NM + "/ActiveConnection/3"
 DEVICE = "org.freedesktop.NetworkManager.Device"
 WIRELESS = "org.freedesktop.NetworkManager.Device.Wireless"
+NM_MODEM = "org.freedesktop.NetworkManager.Device.Modem"
 HCI = "/org/bluez/hci0"
 BT_DEVICES = [
     # path suffix, alias, icon, paired, connected
@@ -195,20 +215,37 @@ SESSION = "/org/freedesktop/login1/session/auto"
 state = {
     (NM, "org.freedesktop.NetworkManager"): {
         "WirelessEnabled": GLib.Variant("b", True),
+        "WwanEnabled": GLib.Variant("b", True),
         "NetworkingEnabled": GLib.Variant("b", True),
         "Connectivity": GLib.Variant("u", 4),
         "PrimaryConnection": GLib.Variant("o", WIRED_ACTIVE)},
+    (DEV_WWAN, "org.freedesktop.NetworkManager.Device"): {
+        "DeviceType": GLib.Variant("u", 8), "Interface": GLib.Variant("s", "wwan0"), "State": GLib.Variant("u", 100),
+        "Udi": GLib.Variant("s", MM_MODEM),
+        "AvailableConnections": GLib.Variant("ao", [WWAN_CONN]),
+        "ActiveConnection": GLib.Variant("o", WWAN_ACTIVE)},
+    (DEV_WWAN, NM_MODEM): {
+        "ModemCapabilities": GLib.Variant("u", 12),
+        "CurrentCapabilities": GLib.Variant("u", 12),
+        "DeviceId": GLib.Variant("s", "359762080000001"),
+        "OperatorCode": GLib.Variant("s", "310260"),
+        "Apn": GLib.Variant("s", "internet.example")},
+    (WWAN_ACTIVE, "org.freedesktop.NetworkManager.Connection.Active"): {
+        "Connection": GLib.Variant("o", WWAN_CONN), "State": GLib.Variant("u", 2)},
     (DEV_ETH, "org.freedesktop.NetworkManager.Device"): {
         "DeviceType": GLib.Variant("u", 1), "Interface": GLib.Variant("s", "enp1s0"), "State": GLib.Variant("u", 100),
+        "Udi": GLib.Variant("s", "/sys/devices/pci0000:00/enp1s0"),
         "AvailableConnections": GLib.Variant("ao", [WIRED_CONN]),
         "ActiveConnection": GLib.Variant("o", WIRED_ACTIVE)},
     (DEV_ETH2, DEVICE): {
         "DeviceType": GLib.Variant("u", 1), "Interface": GLib.Variant("s", "enp2s0"), "State": GLib.Variant("u", 30),
+        "Udi": GLib.Variant("s", "/sys/devices/pci0000:00/enp2s0"),
         "AvailableConnections": GLib.Variant("ao", []), "ActiveConnection": GLib.Variant("o", "/")},
     (WIRED_ACTIVE, "org.freedesktop.NetworkManager.Connection.Active"): {
         "Connection": GLib.Variant("o", WIRED_CONN), "State": GLib.Variant("u", 2)},
     (DEV_WIFI, "org.freedesktop.NetworkManager.Device"): {
         "DeviceType": GLib.Variant("u", 2), "Interface": GLib.Variant("s", "wlp1s0"), "State": GLib.Variant("u", 30),
+        "Udi": GLib.Variant("s", "/sys/devices/pci0000:00/wlp1s0"),
         "AvailableConnections": GLib.Variant("ao", [HOME_CONN]),
         "ActiveConnection": GLib.Variant("o", "/")},
     (DEV_WIFI, WIRELESS): {
@@ -310,17 +347,20 @@ def proof_request(c, kind, flags, delete=False):
 
 
 def method_call(c, sender, path, iface, method, params, invocation):
-    global second_wired
+    global second_wired, wwan_present
     if iface == "org.tuna.Proof.Network":
         if method == "SecondWired":
             second_wired = params.unpack()[0]
             c.emit_signal(None, NM, "org.freedesktop.NetworkManager", "DeviceAdded" if second_wired else "DeviceRemoved", GLib.Variant("(o)", (DEV_ETH2,)))
+        elif method == "WwanPresent":
+            wwan_present = params.unpack()[0]
+            c.emit_signal(None, NM, "org.freedesktop.NetworkManager", "DeviceAdded" if wwan_present else "DeviceRemoved", GLib.Variant("(o)", (DEV_WWAN,)))
         else:
             args = params.unpack()
             proof_request(c, args[0], args[1] if len(args) > 1 else 0, method == "DeleteSecrets")
         invocation.return_value(None)
     elif method == "GetDevices":
-        invocation.return_value(GLib.Variant("(ao)", ([DEV_ETH, DEV_WIFI] + ([DEV_ETH2] if second_wired else []),)))
+        invocation.return_value(GLib.Variant("(ao)", ([DEV_ETH, DEV_WIFI] + ([DEV_ETH2] if second_wired else []) + ([DEV_WWAN] if wwan_present else []),)))
     elif method == "Register":
         agents.append(sender)
         invocation.return_value(None)
@@ -398,6 +438,12 @@ def method_call(c, sender, path, iface, method, params, invocation):
                            "type": GLib.Variant("s", "802-3-ethernet"),
                            "timestamp": GLib.Variant("t", 1790000000)},
         },)))
+    elif method == "GetSettings" and path == WWAN_CONN:
+        invocation.return_value(GLib.Variant("(a{sa{sv}})", ({
+            "connection": {"id": GLib.Variant("s", "ExampleTel"),
+                           "type": GLib.Variant("s", "gsm")},
+            "gsm": {"apn": GLib.Variant("s", "internet.example")},
+        },)))
     elif method == "GetSettings":
         invocation.return_value(GLib.Variant("(a{sa{sv}})", ({
             "connection": {"id": GLib.Variant("s", "Tuna Desktop Home"),
@@ -468,6 +514,11 @@ def get_property(c, sender, path, iface, prop):
 
 def set_property(c, sender, path, iface, prop, value):
     state[(path, iface)][prop] = value
+    if path == NM and prop == "WwanEnabled":
+        log = os.environ.get("TUNA_STUB_NM_LOG")
+        if log:
+            with open(log, "a") as fh:
+                fh.write(f"{time.time():.3f} WwanEnabled {str(value.unpack()).lower()}\n")
     c.emit_signal(None, path, "org.freedesktop.DBus.Properties", "PropertiesChanged",
                   GLib.Variant("(sa{sv}as)", (iface, {prop: value}, [])))
     return True
@@ -489,7 +540,11 @@ SERVICES = {
         (NM + "/AgentManager", "org.freedesktop.NetworkManager.AgentManager"),
         (HOME_CONN, "org.freedesktop.NetworkManager.Settings.Connection"),
         (WIRED_CONN, "org.freedesktop.NetworkManager.Settings.Connection"),
+        (WWAN_CONN, "org.freedesktop.NetworkManager.Settings.Connection"),
         (WIRED_ACTIVE, "org.freedesktop.NetworkManager.Connection.Active"),
+        (WWAN_ACTIVE, "org.freedesktop.NetworkManager.Connection.Active"),
+        (DEV_WWAN, "org.freedesktop.NetworkManager.Device"),
+        (DEV_WWAN, "org.freedesktop.NetworkManager.Device.Modem"),
         *[(AP_PATH.format(n), "org.freedesktop.NetworkManager.AccessPoint") for n, *_ in APS],
     ]),
     "bluez": (["org.bluez"], [

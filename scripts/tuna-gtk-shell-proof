@@ -72,6 +72,15 @@
 #   G-QS-BRIGHTNESS  the brightness slider sets the backlight via logind
 #   G-QS-VOLUME      the volume slider sets the PipeWire sink volume
 #   G-QS-MIC         recording shows the microphone indicator and slider
+#   G-QS-WWAN        the Mobile Network menu lists the modem with its live
+#                    operator, signal and APN; the tile flips WwanEnabled
+#   G-QS-WWAN-ABSENT without modems the tile hides; without ModemManager
+#                    the rows honestly show no signal or operator
+#   G-QS-LOCATION    the shell registers its GeoClue agent, InUse lights
+#                    the panel, and AuthorizeApp answers from the store
+#                    under the Settings-owned master switch and ceiling
+#   G-QS-LOCATION-ABSENT without GeoClue the indicator hides while the
+#                    switch keeps gating grants and unknown apps stay denied
 #   G-QS-ABSENT      with the daemons gone, their tiles hide (no hang)
 #   G-GL-WINDOW      a GTK window on the GL renderer maps and paints
 #                    (linux-dmabuf, #89)
@@ -422,6 +431,7 @@ OWNED_XVFB=""
 COMPOSITOR_PID=""
 STUBS_PID=""
 CUPS_STUB_PID=""
+WWANLOC_STUB_PID=""
 SYSBUS_PID=""
 ACCEL_PID=""
 CAL_PID=""
@@ -468,6 +478,7 @@ cleanup() {
     if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
     if [ -n "$STUBS_PID" ]; then kill "$STUBS_PID" 2>/dev/null || true; fi
     if [ -n "$CUPS_STUB_PID" ]; then kill "$CUPS_STUB_PID" 2>/dev/null || true; fi
+    if [ -n "$WWANLOC_STUB_PID" ]; then kill "$WWANLOC_STUB_PID" 2>/dev/null || true; fi
     if [ -n "$PROVIDER_PID" ]; then kill "$PROVIDER_PID" 2>/dev/null || true; fi
     if [ -n "$TRAY_PID" ]; then kill "$TRAY_PID" 2>/dev/null || true; fi
     # shellcheck disable=SC2086
@@ -834,6 +845,17 @@ TUNA_STUB_BT_LOG="$ARTIFACTS/bt-calls"
 export TUNA_STUB_NM_LOG TUNA_STUB_BT_LOG
 "$PY" "$ROOT/scripts/lib/tuna-service-stubs.py" "$BACKLIGHT" >"$ARTIFACTS/stubs.log" 2>&1 &
 STUBS_PID=$!
+# The WWAN/location menu talks ModemManager and GeoClue here (G-QS-WWAN,
+# G-QS-LOCATION); the stub timestamps every read, registration and write,
+# like the NM/BlueZ stub logs.
+TUNA_STUB_WWANLOC_LOG="$ARTIFACTS/wwanloc-calls"
+export TUNA_STUB_WWANLOC_LOG
+"$PY" "$ROOT/scripts/lib/tuna-wwan-location-stub.py" "$TUNA_STUB_WWANLOC_LOG" \
+    >"$ARTIFACTS/wwanloc-stub.log" 2>&1 &
+WWANLOC_STUB_PID=$!
+for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/wwanloc-stub.log" 2>/dev/null && break; sleep 0.5; done
+grep -q ready "$ARTIFACTS/wwanloc-stub.log" 2>/dev/null ||
+    fail G-QS-WWAN "the ModemManager/GeoClue stub did not start"
 # Own PermissionStore before portals can auto-activate the real daemon.
 "$PY" "$ROOT/scripts/lib/tuna-permission-store-stub.py" "$ARTIFACTS/shortcut-permissions.json" >"$ARTIFACTS/permission-store.log" 2>&1 &
 PERMISSIONS_PID=$!
@@ -3225,6 +3247,392 @@ scrot "$ARTIFACTS/16-quick-settings-toggled.png" >/dev/null
 xdotool key Escape
 sleep 1
 
+# WWAN (#362): the modem lists with its live ModemManager enrichment
+# (operator, connected state) and its connection's APN; the tile flips
+# NetworkManager's master WwanEnabled switch.
+wwan_checked() {
+    jq -e --arg want "$2" 'any(.[]; .name == "Mobile Network" and .role == "toggle button"
+        and (.checked | tostring) == $want)' "$1" >/dev/null
+}
+open_qs
+wl_mark=$(wc -l < "$TUNA_STUB_WWANLOC_LOG")
+qs_press "Mobile Network Menu" wwan-menu || fail G-QS-WWAN "could not open the Mobile Network menu"
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-menu.json" 20 ||
+    fail G-QS-WWAN "accessibility dump failed"
+scrot "$ARTIFACTS/16c-wwan-menu.png" >/dev/null
+tail -n +"$((wl_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ Modem3gpp.Get OperatorName$" ||
+    fail G-QS-WWAN "opening the menu did not re-read the 3GPP operator"
+# Invented shapes stay rejected: no OperatorName on base Modem, no
+# Modem path on NM Device.Modem (the shell reads Udi + Modem3gpp).
+if tail -n +"$((wl_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ Modem.Get OperatorName$"; then
+    fail G-QS-WWAN "shell read OperatorName from base Modem instead of Modem3gpp"
+fi
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager/Devices/4 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.NetworkManager.Device.Modem Modem \
+    >/dev/null 2>&1 && fail G-QS-WWAN "stub answers invented Device.Modem.Modem"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.ModemManager1 \
+    --object-path /org/freedesktop/ModemManager1/Modem/0 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.ModemManager1.Modem OperatorName \
+    >/dev/null 2>&1 && fail G-QS-WWAN "stub answers invented Modem.OperatorName"
+# Real linkage reads back: Udi names the modem, 3GPP names the operator.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager/Devices/4 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.NetworkManager.Device Udi \
+    2>/dev/null | grep -q "ModemManager1/Modem/0" ||
+    fail G-QS-WWAN "Device.Udi does not name the ModemManager modem"
+# Menu-lifetime split: if the menu did not stay open for the dump, say so
+# instead of misattributing bare-desktop evidence to row population.
+showing "$ARTIFACTS/a11y-qs-wwan-menu.json" "Mobile Network Settings" ||
+    fail G-QS-WWAN "the Mobile Network menu did not stay open for the dump (menu lifetime, not rows)"
+jq -e 'any(.[]; .showing and (.name | contains("ExampleTel")))' \
+    "$ARTIFACTS/a11y-qs-wwan-menu.json" >/dev/null ||
+    fail G-QS-WWAN "no ExampleTel operator in the Mobile Network menu"
+jq -e 'any(.[]; .showing and (.name | contains("APN internet.example")))' \
+    "$ARTIFACTS/a11y-qs-wwan-menu.json" >/dev/null ||
+    fail G-QS-WWAN "no APN internet.example in the Mobile Network menu"
+wwan_checked "$ARTIFACTS/a11y-qs-wwan-menu.json" true ||
+    fail G-QS-WWAN "the Mobile Network tile is not checked with WwanEnabled on"
+# The tile flips the master switch; the stub's timestamped log and a
+# read-back prove the write reached NetworkManager.
+nm_mark=$(wc -l < "$TUNA_STUB_NM_LOG")
+qs_press "Mobile Network" wwan-off || fail G-QS-WWAN "could not press the Mobile Network tile"
+for _ in $(seq 1 20); do
+    tail -n +"$((nm_mark + 1))" "$TUNA_STUB_NM_LOG" 2>/dev/null | grep -qE "^[0-9.]+ WwanEnabled false$" && break
+    sleep 0.5
+done
+tail -n +"$((nm_mark + 1))" "$TUNA_STUB_NM_LOG" | grep -qE "^[0-9.]+ WwanEnabled false$" ||
+    fail G-QS-WWAN "the tile did not switch WwanEnabled off"
+sysprop org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+    org.freedesktop.NetworkManager WwanEnabled | grep -q false ||
+    fail G-QS-WWAN "NetworkManager's WwanEnabled is still true"
+wwan_off_ok=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-off.json" 20 ||
+        fail G-QS-WWAN "accessibility dump failed"
+    if wwan_checked "$ARTIFACTS/a11y-qs-wwan-off.json" false; then wwan_off_ok=1; break; fi
+    sleep 1
+done
+[ -n "$wwan_off_ok" ] || fail G-QS-WWAN "the Mobile Network tile stayed checked with WwanEnabled off"
+qs_press "Mobile Network" wwan-on || fail G-QS-WWAN "could not press the Mobile Network tile back on"
+for _ in $(seq 1 20); do
+    tail -n +"$((nm_mark + 1))" "$TUNA_STUB_NM_LOG" 2>/dev/null | grep -qE "^[0-9.]+ WwanEnabled true$" && break
+    sleep 0.5
+done
+sysprop org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+    org.freedesktop.NetworkManager WwanEnabled | grep -q true ||
+    fail G-QS-WWAN "NetworkManager's WwanEnabled did not come back on"
+pass G-QS-WWAN "the Mobile Network menu lists the modem with live operator and APN, and the tile flips WwanEnabled"
+sleep 1
+xdotool key Escape
+sleep 1
+
+# Without modems the tile hides (no stale rows); without ModemManager
+# the rows honestly show the interface with no signal or operator.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager --method org.tuna.Proof.Network.WwanPresent false >/dev/null ||
+    fail G-QS-WWAN-ABSENT "could not remove the stub modem"
+open_qs
+wwan_gone=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-gone.json" 20 ||
+        fail G-QS-WWAN-ABSENT "accessibility dump failed (shell hung?)"
+    if ! showing "$ARTIFACTS/a11y-qs-wwan-gone.json" "Mobile Network"; then wwan_gone=1; break; fi
+    sleep 1
+done
+scrot "$ARTIFACTS/16d-wwan-absent.png" >/dev/null
+[ -n "$wwan_gone" ] || fail G-QS-WWAN-ABSENT "the Mobile Network tile stayed with no modems"
+if showing "$ARTIFACTS/a11y-qs-wwan-gone.json" "ExampleTel"; then
+    fail G-QS-WWAN-ABSENT "stale operator still listed with no modems"
+fi
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager --method org.tuna.Proof.Network.WwanPresent true >/dev/null ||
+    fail G-QS-WWAN-ABSENT "could not restore the stub modem"
+wwan_back=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-back.json" 20 ||
+        fail G-QS-WWAN-ABSENT "accessibility dump failed (shell hung?)"
+    if showing "$ARTIFACTS/a11y-qs-wwan-back.json" "Mobile Network"; then wwan_back=1; break; fi
+    sleep 1
+done
+[ -n "$wwan_back" ] || fail G-QS-WWAN-ABSENT "the Mobile Network tile did not come back with its modem"
+# ModemManager gone: the interface row stays, honestly blank.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.ModemManagerPresent false >/dev/null ||
+    fail G-QS-WWAN-ABSENT "could not release the stub ModemManager name"
+qs_press "Mobile Network Menu" wwan-mm-gone || fail G-QS-WWAN-ABSENT "could not open the Mobile Network menu"
+mm_blank=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-mm-gone.json" 20 ||
+        fail G-QS-WWAN-ABSENT "accessibility dump failed (shell hung?)"
+    if jq -e 'any(.[]; .showing and (.name | contains("wwan0")))' \
+        "$ARTIFACTS/a11y-qs-wwan-mm-gone.json" >/dev/null &&
+        ! jq -e 'any(.[]; .showing and (.name | contains("ExampleTel")))' \
+        "$ARTIFACTS/a11y-qs-wwan-mm-gone.json" >/dev/null; then mm_blank=1; break; fi
+    sleep 1
+done
+[ -n "$mm_blank" ] || fail G-QS-WWAN-ABSENT "the modem row still names its operator with ModemManager gone"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.ModemManagerPresent true >/dev/null ||
+    fail G-QS-WWAN-ABSENT "could not restore the stub ModemManager name"
+pass G-QS-WWAN-ABSENT "without modems the tile hides, and without ModemManager the row shows no signal or operator"
+sleep 1
+xdotool key Escape
+sleep 1
+
+# Location (#362): the shell's agent registers with GeoClue, InUse
+# lights the panel, and AuthorizeApp answers from the permission store
+# under the Settings-owned master switch and ceiling (GNOME keeps the
+# switch in Settings, so the proof writes it like Settings does, as
+# the DND gate writes show-banners).
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION "could not switch location on"
+gsettings set org.gnome.system.location max-accuracy-level 'exact' ||
+    fail G-QS-LOCATION "could not set the accuracy ceiling"
+# Re-appearing GeoClue gets a fresh registration: only post-mark
+# AddAgent lines prove the agent registers live.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent false >/dev/null ||
+    fail G-QS-LOCATION "could not release the stub GeoClue name"
+sleep 1
+geo_mark=$(wc -l < "$TUNA_STUB_WWANLOC_LOG")
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent true >/dev/null ||
+    fail G-QS-LOCATION "could not restore the stub GeoClue name"
+for _ in $(seq 1 20); do
+    tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" 2>/dev/null | grep -qE "^[0-9.]+ AddAgent tuna-shell from " && break
+    sleep 0.5
+done
+tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ AddAgent tuna-shell from " ||
+    fail G-QS-LOCATION "the shell did not register its GeoClue agent on appearance"
+shell_bus=$(tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -oE "AddAgent tuna-shell from [^ ]+" | tail -1 | awk '{print $4}')
+[ -n "$shell_bus" ] || fail G-QS-LOCATION "no agent bus name in the GeoClue log"
+# dconf delivers the write to the shell asynchronously: wait until the
+# agent's own MaxAccuracyLevel reports the new ceiling before asking it
+# to authorize, so the answer reflects the setting rather than the race.
+agent_ceiling() {
+    ceiling_got=""
+    for _ in $(seq 1 20); do
+        ceiling_got=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+            --object-path /org/freedesktop/GeoClue2/Agent \
+            --method org.freedesktop.DBus.Properties.Get org.freedesktop.GeoClue2.Agent MaxAccuracyLevel 2>&1)
+        echo "$ceiling_got" | grep -qE "^\(<(uint32 )?$1>,\)$" && return 0
+        sleep 0.25
+    done
+    echo "$ceiling_got"
+    return 1
+}
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION "the agent never reported the exact ceiling: $ceiling"
+# InUse lights the panel indicator; clearing it darkens it again.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<true>" >/dev/null ||
+    fail G-QS-LOCATION "could not set GeoClue InUse"
+in_use=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-inuse.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if showing "$ARTIFACTS/a11y-qs-location-inuse.json" "Location in use"; then in_use=1; break; fi
+    sleep 1
+done
+[ -n "$in_use" ] || fail G-QS-LOCATION "no Location in use indicator while GeoClue is in use"
+scrot "$ARTIFACTS/16e-location.png" >/dev/null
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<false>" >/dev/null ||
+    fail G-QS-LOCATION "could not clear GeoClue InUse"
+in_use_dark=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-idle.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if ! showing "$ARTIFACTS/a11y-qs-location-idle.json" "Location in use"; then in_use_dark=1; break; fi
+    sleep 1
+done
+[ -n "$in_use_dark" ] || fail G-QS-LOCATION "the Location indicator stayed after GeoClue went idle"
+# Authorization end to end: a stored EXACT grant for an installed app
+# authorizes at the request; the ceiling clamps it; first-use known
+# apps prompt (deny/allow flows through); unknown apps are denied.
+# Proof apps live in $XDG_DATA_HOME (the shell's user data dir), like
+# every other tuna-probe desktop file above.
+printf '[Desktop Entry]\nName=Proof Location App\nType=Application\nExec=/bin/true\n' \
+    >"$XDG_DATA_HOME/applications/proof-location-app.desktop"
+printf '[Desktop Entry]\nName=Proof Location Stranger\nType=Application\nExec=/bin/true\n' \
+    >"$XDG_DATA_HOME/applications/proof-location-stranger.desktop"
+printf '[Desktop Entry]\nName=Proof Location Newcomer\nType=Application\nExec=/bin/true\n' \
+    >"$XDG_DATA_HOME/applications/proof-location-newcomer.desktop"
+gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore \
+    --object-path /org/freedesktop/impl/portal/PermissionStore \
+    --method org.freedesktop.impl.portal.PermissionStore.SetPermission \
+    location true location proof-location-app '["EXACT", "1700000000"]' >/dev/null ||
+    fail G-QS-LOCATION "could not seed the location permission store"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION "stored EXACT grant answered $auth, not (true, 8)"
+gsettings set org.gnome.system.location max-accuracy-level 'city' ||
+    fail G-QS-LOCATION "could not lower the accuracy ceiling"
+ceiling=$(agent_ceiling 4) ||
+    fail G-QS-LOCATION "the agent never reported the city ceiling: $ceiling"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(true, (uint32 )?4\)" ||
+    fail G-QS-LOCATION "city ceiling answered $auth, not (true, 4)"
+gsettings set org.gnome.system.location max-accuracy-level 'exact' ||
+    fail G-QS-LOCATION "could not restore the accuracy ceiling"
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION "the agent never reported the exact ceiling: $ceiling"
+# First use prompts: the stranger's request surfaces the consent
+# dialog; denying answers denied and saves the denial.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-stranger 8 \
+    --timeout 30 >"$ARTIFACTS/location-stranger-auth.txt" 2>&1 &
+stranger_pid=$!
+prompt_shown=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-prompt.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if jq -e 'any(.[]; .showing and (.name | contains("to access your location?")))' \
+        "$ARTIFACTS/a11y-location-prompt.json" >/dev/null; then prompt_shown=1; break; fi
+    sleep 1
+done
+[ -n "$prompt_shown" ] || { kill "$stranger_pid" 2>/dev/null; fail G-QS-LOCATION "first-use request did not surface a consent prompt"; }
+scrot "$ARTIFACTS/16g-location-prompt.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-deny.json" 20 \
+    --press "Deny" >/dev/null ||
+    { kill "$stranger_pid" 2>/dev/null; fail G-QS-LOCATION "could not press Deny on the consent prompt"; }
+wait "$stranger_pid"
+auth=$(cat "$ARTIFACTS/location-stranger-auth.txt")
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION "denied first-use answered $auth, not (false, 0)"
+# Allowing a different newcomer grants at the request (and saves it:
+# asking again answers from the store without a prompt).
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-newcomer 8 \
+    --timeout 30 >"$ARTIFACTS/location-newcomer-auth.txt" 2>&1 &
+newcomer_pid=$!
+prompt_shown=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-prompt-allow.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if jq -e 'any(.[]; .showing and (.name | contains("to access your location?")))' \
+        "$ARTIFACTS/a11y-location-prompt-allow.json" >/dev/null; then prompt_shown=1; break; fi
+    sleep 1
+done
+[ -n "$prompt_shown" ] || { kill "$newcomer_pid" 2>/dev/null; fail G-QS-LOCATION "newcomer request did not surface a consent prompt"; }
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-allow.json" 20 \
+    --press "Allow" >/dev/null ||
+    { kill "$newcomer_pid" 2>/dev/null; fail G-QS-LOCATION "could not press Allow on the consent prompt"; }
+wait "$newcomer_pid"
+auth=$(cat "$ARTIFACTS/location-newcomer-auth.txt")
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION "allowed first-use answered $auth, not (true, 8)"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-newcomer 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION "saved newcomer grant answered $auth, not (true, 8)"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp no-such-app-xyz 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION "unknown app answered $auth, not denied"
+# Switching off denies live: the stored grant stops authorizing and the
+# indicator stays dark even while GeoClue reports in use.
+gsettings set org.gnome.system.location enabled false ||
+    fail G-QS-LOCATION "could not switch location off"
+ceiling=$(agent_ceiling 0) ||
+    fail G-QS-LOCATION "the agent never reported the switch off: $ceiling"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION "stored grant answered $auth with the switch off, not denied"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<true>" >/dev/null ||
+    fail G-QS-LOCATION "could not set GeoClue InUse"
+off_dark=""
+for _ in $(seq 1 10); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-off.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if ! showing "$ARTIFACTS/a11y-qs-location-off.json" "Location in use"; then
+        # Absence must hold, not merely race the signal: one more dump.
+        sleep 1
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-off.json" 20 ||
+            fail G-QS-LOCATION "accessibility dump failed"
+        if ! showing "$ARTIFACTS/a11y-qs-location-off.json" "Location in use"; then off_dark=1; break; fi
+    fi
+    sleep 1
+done
+[ -n "$off_dark" ] || fail G-QS-LOCATION "the Location indicator lit with the switch off"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<false>" >/dev/null ||
+    fail G-QS-LOCATION "could not clear GeoClue InUse"
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION "could not switch location back on"
+pass G-QS-LOCATION "the agent registers, InUse lights the panel, AuthorizeApp answers from the store under the switch and ceiling, and first use prompts with deny/allow flowing through"
+
+# Without GeoClue the indicator hides while the switch keeps gating
+# grants and unknown apps stay denied.
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION-ABSENT "could not switch location on"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent false >/dev/null ||
+    fail G-QS-LOCATION-ABSENT "could not release the stub GeoClue name"
+loc_dark=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-absent.json" 20 ||
+        fail G-QS-LOCATION-ABSENT "accessibility dump failed (shell hung?)"
+    if ! showing "$ARTIFACTS/a11y-qs-location-absent.json" "Location in use"; then loc_dark=1; break; fi
+    sleep 1
+done
+scrot "$ARTIFACTS/16f-location-absent.png" >/dev/null
+[ -n "$loc_dark" ] || fail G-QS-LOCATION-ABSENT "the Location indicator stayed with GeoClue gone"
+# The switch still gates the agent with the daemon gone: off denies the
+# stored grant, on restores it, and unknown apps stay denied throughout.
+gsettings set org.gnome.system.location enabled false ||
+    fail G-QS-LOCATION-ABSENT "could not switch location off"
+ceiling=$(agent_ceiling 0) ||
+    fail G-QS-LOCATION-ABSENT "the agent never reported the switch off: $ceiling"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch off, not denied"
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION-ABSENT "could not switch location back on"
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION-ABSENT "the agent never reported the switch back on: $ceiling"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch back on, not (true, 8)"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp no-such-app-xyz 8 2>&1) ||
+    fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION-ABSENT "unknown app answered $auth, not denied"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent true >/dev/null ||
+    fail G-QS-LOCATION-ABSENT "could not restore the stub GeoClue name"
+pass G-QS-LOCATION-ABSENT "without GeoClue the indicator hides while the switch gates grants and unknown apps stay denied"
+
 kill "$STUBS_PID" 2>/dev/null || true
 STUBS_PID=""
 sleep 2
@@ -3233,7 +3641,7 @@ open_qs
 scrot "$ARTIFACTS/18-quick-settings-absent.png" >/dev/null
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-absent.json" 20 ||
     fail G-QS-ABSENT "accessibility dump failed (shell hung?)"
-for label in "Wi-Fi" "Bluetooth" "Power Mode"; do
+for label in "Wi-Fi" "Bluetooth" "Mobile Network" "Power Mode"; do
     if showing "$ARTIFACTS/a11y-qs-absent.json" "$label"; then
         fail G-QS-ABSENT "'$label' still showing with its daemon gone"
     fi
