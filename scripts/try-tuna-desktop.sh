@@ -165,9 +165,20 @@ if ! corral list 2>/dev/null | grep -q "^${VM}[[:space:]].*Running"; then
       SUDO_ARGS+=(--sudo)
     fi
     note "building $PINNED into VM $VM (this downloads GBs on first run; sudo may prompt)..."
-    corral bootc create "$VM" --image "$PINNED" --disk "$DISK" --mem "$MEM" --cpu "$CPUS" \
-      "${SUDO_ARGS[@]}" \
-      || die "VM creation failed"
+    # Layer downloads can truncate mid-pull (GBs over the network); resume
+    # the interrupted build instead of starting over.
+    RESUME_ARGS=()
+    for attempt in 1 2 3; do
+      if corral bootc create "$VM" --image "$PINNED" --disk "$DISK" --mem "$MEM" --cpu "$CPUS" \
+        "${SUDO_ARGS[@]}" "${RESUME_ARGS[@]}"; then
+        CREATED=1
+        break
+      fi
+      [[ "$attempt" == "3" ]] && break
+      note "build interrupted (attempt $attempt/3) — resuming..."
+      RESUME_ARGS=(--resume create)
+    done
+    [[ "${CREATED:-0}" == "1" ]] || { corral delete "$VM" >/dev/null 2>&1 || true; die "VM creation failed after 3 attempts — inspect with: corral logs $VM"; }
   fi
   note "starting $VM..."
   corral start "$VM" >/dev/null 2>&1 || true
