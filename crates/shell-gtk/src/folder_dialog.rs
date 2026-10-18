@@ -24,7 +24,7 @@ type OnRemove = Rc<dyn Fn(String, String)>;
 const DIALOG_W: i32 = 722;
 const DIALOG_H: i32 = 720;
 /// The panel stays clear of the shade; the dialog sits 24px under it.
-const PANEL_H: i32 = 32;
+const PANEL_H: i32 = tuna_shell_control::PANEL_HEIGHT as i32;
 const TOP: i32 = 24;
 
 /// Renames the open folder.

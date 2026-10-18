@@ -1420,7 +1420,11 @@ fn quick_settings_popover(
                 gtk::prelude::WidgetExt::display(popup).monitor_at_surface(surface)
             }) {
                 // Reserve the panel and the popup's padding, border and gap.
-                let panel_height = parent.as_ref().map_or(32, |widget| widget.height());
+                let panel_height = parent
+                    .as_ref()
+                    .map_or(tuna_shell_control::PANEL_HEIGHT as i32, |widget| {
+                        widget.height()
+                    });
                 scroll.set_max_content_height(
                     (monitor.geometry().height() - panel_height - 64).max(1),
                 );
