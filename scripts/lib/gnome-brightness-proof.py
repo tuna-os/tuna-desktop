@@ -183,28 +183,7 @@ def main():
             def observe(expected):
                 actual=read('brightness');receipts[-1]['actual_brightness']=actual;receipts[-1]['expected_brightness']=expected
                 if actual!=expected:raise RuntimeError(f'actual brightness={actual}, expected={expected}')
-            # Source policy's ordinary installed idle setting, not an invented target.
-            settings=Gio.Settings.new('org.gnome.settings-daemon.plugins.power');idle=settings.get_int('idle-brightness')/100
-            absolute=lambda level:minimum+int((maximum-minimum)*max(0,min(1,level))+0.5)
-            request('SetDimming',True);observe(absolute(min(idle,relative)))
-            saved_idle=settings.get_int('idle-brightness');settings_restore=(settings,saved_idle)
-            changed_idle=20 if saved_idle!=20 else 40
-            if not settings.set_int('idle-brightness',changed_idle):raise RuntimeError('live idle setting refused')
-            Gio.Settings.sync()
-            deadline=time.monotonic()+5
-            expected=absolute(min(changed_idle/100,relative))
-            while read('brightness')!=expected and time.monotonic()<deadline:time.sleep(0.02)
-            receipts.append(dict(setting='idle-brightness',before=saved_idle,after=changed_idle,actual_brightness=read('brightness'),expected_brightness=expected))
-            if read('brightness')!=expected:raise RuntimeError('live dimmed idle setting did not reach actual backlight')
-            if not settings.set_int('idle-brightness',saved_idle):raise RuntimeError('live idle restore refused')
-            Gio.Settings.sync()
-            deadline=time.monotonic()+5
-            while read('brightness')!=absolute(min(idle,relative)) and time.monotonic()<deadline:time.sleep(0.02)
-            if read('brightness')!=absolute(min(idle,relative)):raise RuntimeError('live idle restoration did not reach actual backlight')
-            request('SetDimming',False);observe(baseline)
-            request('SetAutoBrightnessTarget',0.8);observe(absolute(0.8+relative-0.5))
-            request('SetAutoBrightnessTarget',-1.0);observe(baseline)
-            request('SetAutoBrightnessTarget',float('nan'),True);observe(baseline)
+            other_dev=None;other_read=None;other_base=None;other_rel=None;other_abs=None
             if args.other_device:
                 other_dev=root/args.other_device
                 other_parent=(other_dev/'device').resolve();other_meta=other_parent.stat()
@@ -214,6 +193,34 @@ def main():
                 other_max=other_read('max_brightness');other_kind=backlight_type(other_dev/'type');other_min=floor(other_max,other_kind)
                 other_base=other_read('brightness');other_rel=(other_base-other_min)/(other_max-other_min)
                 other_abs=lambda lvl:other_min+int((other_max-other_min)*max(0,min(1,lvl))+0.5)
+            def wait_for(expected,other_expected=None):
+                deadline=time.monotonic()+5
+                while (read('brightness')!=expected or (other_expected is not None and other_read('brightness')!=other_expected)) and time.monotonic()<deadline:time.sleep(0.02)
+                actual=read('brightness')
+                if actual!=expected:raise RuntimeError(f'actual brightness={actual}, expected={expected}')
+                if other_expected is not None and other_read('brightness')!=other_expected:raise RuntimeError(f'actual other brightness={other_read("brightness")}, expected={other_expected}')
+            # Source policy's ordinary installed idle setting, not an invented target.
+            settings=Gio.Settings.new('org.gnome.settings-daemon.plugins.power');idle=settings.get_int('idle-brightness')/100
+            absolute=lambda level:minimum+int((maximum-minimum)*max(0,min(1,level))+0.5)
+            request('SetDimming',True);observe(absolute(min(idle,relative)))
+            saved_idle=settings.get_int('idle-brightness');settings_restore=(settings,saved_idle)
+            changed_idle=20 if saved_idle!=20 else 40
+            if not settings.set_int('idle-brightness',changed_idle):raise RuntimeError('live idle setting refused')
+            Gio.Settings.sync()
+            expected=absolute(min(changed_idle/100,relative));expected_other=other_abs(min(changed_idle/100,other_rel)) if other_abs else None
+            wait_for(expected,expected_other)
+            receipt=dict(setting='idle-brightness',before=saved_idle,after=changed_idle,actual_brightness=read('brightness'),expected_brightness=expected)
+            if expected_other is not None:receipt.update(actual_other_brightness=other_read('brightness'),expected_other_brightness=expected_other)
+            receipts.append(receipt)
+            if not settings.set_int('idle-brightness',saved_idle):raise RuntimeError('live idle restore refused')
+            Gio.Settings.sync()
+            restore_expected=absolute(min(idle,relative));restore_other=other_abs(min(idle,other_rel)) if other_abs else None
+            wait_for(restore_expected,restore_other)
+            request('SetDimming',False);observe(baseline)
+            request('SetAutoBrightnessTarget',0.8);observe(absolute(0.8+relative-0.5))
+            request('SetAutoBrightnessTarget',-1.0);observe(baseline)
+            request('SetAutoBrightnessTarget',float('nan'),True);observe(baseline)
+            if args.other_device:
                 request('SetDimming',True);observe(absolute(min(idle,relative)))
                 other_dimmed=other_abs(min(idle,other_rel))
                 deadline=time.monotonic()+5

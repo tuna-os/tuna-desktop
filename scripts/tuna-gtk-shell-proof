@@ -8245,9 +8245,10 @@ end=$(($(date +%s) + 10))
 until [ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] &&
     [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" = "$expected_other" ] ||
     [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
-[ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] &&
-    [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" = "$expected_other" ] ||
+if [ "$(cat "$BACKLIGHT/brightness")" != "$expected_primary" ] ||
+    [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" != "$expected_other" ]; then
     fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing (expected $expected_primary/$expected_other)"
+fi
 "$PY" "$ROOT/scripts/lib/gnome-brightness-proof.py" --out "$ARTIFACTS/brightness-controlled.json" \
     --controlled-root "$ARTIFACTS/backlight" --device tuna-bl --other-device aaa-other \
     --shell-executable "$privacy_expected_shell" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||
