@@ -22,7 +22,7 @@ whole workspace:
 sudo apt-get install -y \
   libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev \
   libxkbcommon-dev pkg-config libgtk-4-dev libpipewire-0.3-dev \
-  libadwaita-1-dev libpam-wrapper \
+  libadwaita-1-dev libpam-wrapper libclang-dev \
   meson ninja-build libwayland-dev wayland-protocols
 scripts/ci-install-gtk4-layer-shell
 ```
