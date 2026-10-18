@@ -8,9 +8,10 @@
 //!
 //! The loop shape follows upstream `examples/minimal.rs` at the pinned
 //! revision (manual repaint each round, toplevels stacked at the origin);
-//! damage tracking arrives with a later task. Layer-shell is served from
-//! [`State`](crate::State) (see [`crate::layer`]) so the supervised panel
-//! attaches over this same display.
+//! damage-tracked repaints use the same [`native_repaint`](crate::native_repaint)
+//! machinery as the native path, so an unchanged signature submits nothing.
+//! Layer-shell is served from [`State`](crate::State) (see [`crate::layer`])
+//! so the supervised panel attaches over this same display.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -723,6 +724,13 @@ pub struct Runtime {
     switcher_thumbnails: Vec<tuna_shell_control::SwitcherThumbnail>,
     /// What each output's last drawn frame cost, by output name (#503).
     frame_costs: std::collections::BTreeMap<String, FrameCost>,
+    /// Nested output's damage history across submitted frames. None
+    /// means unknown: the next frame paints complete (first frame,
+    /// resize, or any global drawing change), like the native path.
+    winit_tracker: Option<smithay::backend::renderer::damage::OutputDamageTracker>,
+    /// Signature of the last presented nested frame; unchanged means
+    /// no client, cursor, or effect moved, so the tick submits nothing.
+    winit_signature: Option<crate::native_repaint::FrameSignature>,
     /// When hidden windows last got their throttled frame callbacks
     /// ([`HIDDEN_FRAME_INTERVAL`](crate::occlusion::HIDDEN_FRAME_INTERVAL)).
     hidden_beat: Option<Instant>,
@@ -822,6 +830,14 @@ impl Drop for Runtime {
 fn unlock_outcome(authenticated: bool, denied: bool) -> (bool, bool) {
     (authenticated, authenticated && !denied)
 }
+
+/// A presented nested frame: its repaint region, cost, and cursor surface.
+/// `None` means the tick submitted nothing (unchanged signature).
+type PresentedFrame = Option<(
+    Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
+    crate::occlusion::FrameCost,
+    Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+)>;
 
 impl Runtime {
     /// Build the session: display plus globals, output, backend window,
@@ -1237,6 +1253,8 @@ impl Runtime {
             overview_drag: None,
             switcher_thumbnails: Vec::new(),
             frame_costs: std::collections::BTreeMap::new(),
+            winit_tracker: None,
+            winit_signature: None,
             hidden_beat: None,
             hidden_waiting: false,
             active_at: Instant::now(),
@@ -1376,6 +1394,10 @@ impl Runtime {
                 }
                 let (lw, lh) = logical_size(size.w, size.h, self.scale);
                 self.state.set_output_size(lw, lh);
+                // A new size invalidates buffer-age history: the next
+                // frame paints complete.
+                self.winit_tracker = None;
+                self.winit_signature = None;
             }
             WinitEvent::CloseRequested => self.exit = true,
             WinitEvent::Input(event) => {
@@ -4715,9 +4737,8 @@ impl Runtime {
             Backend::Winit(backend) => {
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
-                let damage = Rectangle::from_size(size);
-                let drawn;
-                let presented_cursor;
+                let age = backend.buffer_age().unwrap_or(0);
+                let mut presented: PresentedFrame = None;
                 {
                     let (renderer, mut framebuffer) = backend
                         .bind()
@@ -4796,62 +4817,161 @@ impl Runtime {
                         cursor_now,
                         accent,
                     );
-                    presented_cursor = crate::cursor::presented_surface(
+                    let presented_cursor = crate::cursor::presented_surface(
                         &cursor,
                         &cursor_what,
                         view.scale,
                         Rectangle::from_size(size),
                     );
-                    // The winit EGL surface presents bottom-up (see the
-                    // Y-flip in the backend's own damage path), so the
-                    // output transform mirrors vertically; placements
-                    // stay top-down.
-                    let mut frame = renderer
-                        .render(&mut framebuffer, size, Transform::Flipped180)
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                    let drew = draw_scene(
-                        &mut frame,
+                    use crate::native_repaint::{FrameSignature, Tracked};
+                    // Tracked damage, like the native path: one damage
+                    // computation over front-to-back passes, then draw
+                    // and submit only that region. An unchanged
+                    // signature submits nothing, so idle clients keep
+                    // their cadence instead of repainting every tick.
+                    let [cursor_images, cursor_surface] =
+                        crate::cursor::tracked(&cursor, view.scale, Rectangle::from_size(size));
+                    let passes = [
+                        Tracked::pass(&paper, 1.0),
+                        Tracked::pass(&previews, view.scale),
+                        Tracked::pass(&elements.elements, view.scale),
+                        Tracked::pass(&elements.tile, 1.0),
+                        Tracked::pass(&elements.top, view.scale),
+                        elements
+                            .bell
+                            .iter()
+                            .rev()
+                            .map(|(_, e)| Tracked::new(e, 1.0))
+                            .collect(),
+                        elements
+                            .snapshots
+                            .iter()
+                            .rev()
+                            .map(|(_, e, _)| Tracked::new(e, 1.0))
+                            .collect(),
+                        Tracked::pass(&elements.flashes, 1.0),
+                        Tracked::pass(&elements.effects.textures, 1.0),
+                        Tracked::pass(&elements.effects.solids, 1.0),
+                        cursor_images,
+                        cursor_surface,
+                    ];
+                    let signature = FrameSignature {
+                        size: (size.w, size.h),
+                        location: (0, 0),
+                        scale: view.scale,
+                        transform: 0,
+                        locked,
                         background,
-                        &paper,
-                        &elements,
-                        Target {
-                            damage: &[damage],
-                            scale: view.scale,
-                            blank_alpha,
-                            tint: night_tint.as_ref(),
-                        },
-                        &decor,
-                        &previews,
-                    )?;
-                    drawn = FrameCost::new(&drew, &elements.owners, &[damage], size);
-                    crate::cursor::draw(&mut frame, &cursor, view.scale, &[damage])
+                        blank_alpha,
+                        accent,
+                        decor: decor.clone(),
+                        above: elements.above,
+                        effects: elements
+                            .brightness
+                            .iter()
+                            .copied()
+                            .chain(elements.snapshots.iter().map(|s| s.2))
+                            .map(f32::to_bits)
+                            .chain(self.night_light.effect_bits())
+                            .chain(wellbeing.bits())
+                            .collect(),
+                        groups: FrameSignature::groups(&passes),
+                    };
+                    let mut roots: Vec<_> =
+                        crate::frame_timing::drawn_roots(&self.state, &self.manager, locked)
+                            .into_iter()
+                            .map(|(surface, _)| surface)
+                            .collect();
+                    roots.extend(lock_surface.clone());
+                    roots.extend(presented_cursor.clone());
+                    let timing = crate::frame_timing::pending_callbacks(&roots);
+                    // Proof harnesses drive time manually and count
+                    // presented frames for liveness; a manually-stepped
+                    // clock presents every tick, like before.
+                    let present = self.animation_clock.is_manual()
+                        || crate::native_repaint::needs_repaint(
+                            self.winit_signature.as_ref(),
+                            &signature,
+                            timing,
+                        );
+                    let reset = self
+                        .winit_signature
+                        .as_ref()
+                        .is_none_or(|old| !signature.same_global_drawing(old));
+                    if reset {
+                        self.winit_tracker = None;
+                    }
+                    if present {
+                        let tracker = self.winit_tracker.get_or_insert_with(|| {
+                            smithay::backend::renderer::damage::OutputDamageTracker::new(
+                                size,
+                                1.0,
+                                Transform::Normal,
+                            )
+                        });
+                        let damage = crate::native_repaint::damage_region(
+                            tracker,
+                            if reset { 0 } else { age },
+                            &passes,
+                        )
                         .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                    let _ = frame
-                        .finish()
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        self.winit_signature = Some(signature);
+                        // The winit EGL surface presents bottom-up (see the
+                        // Y-flip in the backend's own damage path), so the
+                        // output transform mirrors vertically; placements
+                        // stay top-down.
+                        let mut frame = renderer
+                            .render(&mut framebuffer, size, Transform::Flipped180)
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let drew = draw_scene(
+                            &mut frame,
+                            background,
+                            &paper,
+                            &elements,
+                            Target {
+                                damage: &damage,
+                                scale: view.scale,
+                                blank_alpha,
+                                tint: night_tint.as_ref(),
+                            },
+                            &decor,
+                            &previews,
+                        )?;
+                        crate::cursor::draw(&mut frame, &cursor, view.scale, &damage)
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let _ = frame
+                            .finish()
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
+                        presented = Some((damage, cost, presented_cursor));
+                    }
                 }
-                self.frame_costs.insert("winit".to_owned(), drawn);
-                send_surface_scales(&self.state, &self.manager);
-                backend
-                    .submit(Some(&[damage]))
-                    .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                if let Some(surface) = &presented_cursor {
-                    crate::cursor::Cursor::frame_done(
-                        &crate::cursor::Pointer::Surface(surface.clone()),
-                        cursor_now,
+                if let Some((damage, drawn, presented_cursor)) = presented {
+                    self.frame_costs.insert("winit".to_owned(), drawn);
+                    send_surface_scales(&self.state, &self.manager);
+                    backend
+                        .submit(Some(&damage))
+                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    if let Some(surface) = &presented_cursor {
+                        crate::cursor::Cursor::frame_done(
+                            &crate::cursor::Pointer::Surface(surface.clone()),
+                            cursor_now,
+                        );
+                    }
+                    // The host took the frame: presentation feedback,
+                    // fifo barriers and commit timers (#89).
+                    crate::frame_timing::present_nested_frame_with_cursor(
+                        &mut self.state,
+                        &self.manager,
+                        locked,
+                        self.stats.frames,
+                        presented_cursor,
                     );
+                    self.stats.frames += 1;
+                    true
+                } else {
+                    false
                 }
-                // The host took the frame: presentation feedback,
-                // fifo barriers and commit timers (#89).
-                crate::frame_timing::present_nested_frame_with_cursor(
-                    &mut self.state,
-                    &self.manager,
-                    locked,
-                    self.stats.frames,
-                    presented_cursor,
-                );
-                self.stats.frames += 1;
-                true
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
