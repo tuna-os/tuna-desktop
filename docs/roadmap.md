@@ -151,6 +151,13 @@ commit completions.
 - Milestone 3 (provenance/image): #759 (supply chain), image work in tunaos.
 - Milestone 4 (checklist): unblocked by Waves 1–3.
 
+### Far-future backlog (post-1.0, not scheduled)
+
+- High-performance GDM replacement: a from-scratch login experience
+  matching GDM (fingerprint, smartcard, a11y, i18n, session handoff)
+  without the GNOME weight. Deferred: the greeter moves to stock GDM
+  for v1, which already provides all of the above.
+
 ## Spek and plan registry
 
 | ID | Spek | Purpose | Depends on | Release relationship |
