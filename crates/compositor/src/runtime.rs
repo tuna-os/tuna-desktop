@@ -4885,11 +4885,15 @@ impl Runtime {
                     roots.extend(lock_surface.clone());
                     roots.extend(presented_cursor.clone());
                     let timing = crate::frame_timing::pending_callbacks(&roots);
-                    let present = crate::native_repaint::needs_repaint(
-                        self.winit_signature.as_ref(),
-                        &signature,
-                        timing,
-                    );
+                    // Proof harnesses drive time manually and count
+                    // presented frames for liveness; a manually-stepped
+                    // clock presents every tick, like before.
+                    let present = self.animation_clock.is_manual()
+                        || crate::native_repaint::needs_repaint(
+                            self.winit_signature.as_ref(),
+                            &signature,
+                            timing,
+                        );
                     let reset = self
                         .winit_signature
                         .as_ref()
