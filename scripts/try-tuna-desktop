@@ -21,6 +21,10 @@
 #   TRY_TUNA_DISK    guest disk (default: 40G)
 #   TRY_TUNA_PORT    local port for the console (default: 8006)
 #   TRY_TUNA_NO_OPEN=1  don't open a browser; just print the console URL
+#   TRY_TUNA_USER    username to log in with after boot (optional; also
+#                    needs TRY_TUNA_PASSWORD unless the account has none —
+#                    the image must already contain the account)
+#   TRY_TUNA_PASSWORD  password for TRY_TUNA_USER (optional, may be empty)
 #
 # Trust story: this pipe-to-bash fetch is TLS-only (same shape as
 # scripts/install.sh). Everything it puts on your machine afterwards is
@@ -60,7 +64,7 @@ if ! command -v "$qemu_bin" >/dev/null 2>&1 && ! command -v qemu-system-x86_64 >
   if [[ "$os" == "darwin" ]]; then
     die "QEMU not found — install it with: brew install qemu"
   fi
-  die "QEMU not found — install it with: sudo apt install qemu-system-x86 qemu-utils (Debian/Ubuntu) or sudo dnf install qemu-kvm qemu-img (Fedora)"
+  die "QEMU not found — install it with: sudo apt install qemu-system-x86 qemu-utils (Debian/Ubuntu); sudo dnf install qemu-kvm qemu-img (Fedora); sudo pacman -S qemu-desktop qemu-img (Arch); or brew install qemu (macOS, or any distro when the system package manager is unavailable, e.g. immutable/atomic desktops)"
 fi
 command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found — it ships with the QEMU packages above"
 
@@ -84,8 +88,17 @@ if ! podman unshare cat /proc/self/uid_map >/dev/null 2>&1; then
   die "podman cannot create a user namespace (rootless setup is broken) — fix one of: install uid helpers (sudo apt install uidmap); give yourself subordinate IDs (sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \$USER, then log back in); restore setuid on the helpers (sudo chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap); on Debian enable unprivileged namespaces (sudo sysctl kernel.unprivileged_userns_clone=1). Original error above, if any, came from: podman unshare cat /proc/self/uid_map"
 fi
 
+# The image pull (~2GB) plus the VM disk need headroom; fail here with
+# cleanup directions instead of mid-build with a truncated layer.
+for _dir in "$HOME" /var/tmp; do
+  _avail_kb="$(df -k --output=avail "$_dir" 2>/dev/null | tail -n 1)"
+  if [[ -n "$_avail_kb" && "$_avail_kb" -lt 10485760 ]]; then
+    die "only $((_avail_kb / 1024)) MiB free on $_dir — need ~10 GiB for the image layers and VM disk; free space (empty trash, podman system prune, flatpak uninstall --unused) and re-run"
+  fi
+done
+
 # cosign verifies the image signature before anything boots from it.
-command -v cosign >/dev/null 2>&1 || die "cosign not found — install it with: brew install cosign (macOS) or: go install github.com/sigstore/cosign/v2/cmd/cosign@latest (Linux)"
+command -v cosign >/dev/null 2>&1 || die "cosign not found — install it with: brew install cosign (macOS, or any distro via linuxbrew) or: go install github.com/sigstore/cosign/v2/cmd/cosign@latest (Linux)"
 
 # Corral itself, verified the same way scripts/install.sh does it.
 if ! command -v corral >/dev/null 2>&1; then
@@ -106,8 +119,12 @@ if ! corral plugin list 2>/dev/null | grep -q '^bootc'; then
   note "installing corral bootc plugin (checksum-verified)..."
   corral plugin install bootc || die "bootc plugin install failed"
 fi
+# Marlin needs the composefs-capable plugin (0.3.0+); update is a no-op when
+# already current. Pinned installs are left alone.
+if ! corral plugin list 2>/dev/null | grep -q 'pinned'; then
+  corral plugin update bootc >/dev/null 2>&1 || true
+fi
 corral bootc --help >/dev/null 2>&1 || die "corral bootc plugin not working after install — check: corral plugin list"
-
 stop_web() { [[ -n "$WEB_PID" ]] && kill "$WEB_PID" 2>/dev/null || true; WEB_PID=""; }
 cleanup() {
   echo "" >&2
@@ -155,16 +172,61 @@ cosign verify "$PINNED" \
 note "signature verified."
 
 # --- boot -------------------------------------------------------------------
-if ! corral list 2>/dev/null | grep -q "^${VM}[[:space:]].*Running"; then
-  if ! corral list 2>/dev/null | grep -q "^${VM}[[:space:]]"; then
-    note "building $PINNED into VM $VM (this downloads GBs on first run)..."
-    corral bootc create "$VM" --image "$PINNED" --disk "$DISK" --mem "$MEM" --cpu "$CPUS" \
-      || die "VM creation failed"
+vm_running() { corral list 2>/dev/null | grep -q "^${VM}[[:space:]].*Running"; }
+vm_exists() { corral list 2>/dev/null | grep -q "^${VM}[[:space:]]"; }
+# Image the VM was built from (empty when unknown — never delete on unknown).
+built_image() { corral bootc status 2>/dev/null | awk -v vm="$VM" '$1 == vm {print $3}'; }
+
+NEED_CREATE=0
+if ! vm_running; then
+  if vm_exists; then
+    BUILT="$(built_image)"
+    if [[ -n "$BUILT" && "$BUILT" != "$PINNED" && "$BUILT" != "$IMAGE" ]]; then
+      note "$VM was built from $BUILT — rebuilding from $PINNED..."
+      corral delete "$VM" >/dev/null 2>&1 || true
+      NEED_CREATE=1
+    else
+      note "starting existing $VM (built from ${BUILT:-unknown image})..."
+      corral start "$VM" >/dev/null 2>&1 || true
+      sleep 3
+      if ! vm_running; then
+        note "$VM will not start — deleting the broken VM and rebuilding..."
+        corral delete "$VM" >/dev/null 2>&1 || true
+        NEED_CREATE=1
+      fi
+    fi
+  else
+    NEED_CREATE=1
   fi
+fi
+
+if [[ "$NEED_CREATE" == "1" ]]; then
+  # bootc install partitions a disk and writes a bootloader, which needs
+  # root: run the local build under sudo unless already root.
+  SUDO_ARGS=()
+  if [[ "$(id -u)" != "0" ]]; then
+    command -v sudo >/dev/null 2>&1 || die "sudo not found and not running as root — bootc needs root to build the VM disk; install sudo or re-run as root"
+    SUDO_ARGS+=(--sudo)
+  fi
+  note "building $PINNED into VM $VM (this downloads GBs on first run; sudo may prompt)..."
+  # Layer downloads can truncate mid-pull (GBs over the network); resume
+  # the interrupted build instead of starting over.
+  RESUME_ARGS=()
+  for attempt in 1 2 3; do
+    if corral bootc create "$VM" --image "$PINNED" --disk "$DISK" --mem "$MEM" --cpu "$CPUS" \
+      "${SUDO_ARGS[@]}" "${RESUME_ARGS[@]}"; then
+      CREATED=1
+      break
+    fi
+    [[ "$attempt" == "3" ]] && break
+    note "build interrupted (attempt $attempt/3) — resuming..."
+    RESUME_ARGS=(--resume)
+  done
+  [[ "${CREATED:-0}" == "1" ]] || { corral delete "$VM" >/dev/null 2>&1 || true; die "VM creation failed after 3 attempts — inspect with: corral logs $VM (same layer every time: clear both image caches, podman rmi $IMAGE and sudo podman rmi $IMAGE, and re-run; still failing with fresh pulls means the published image is not installable — report its digest, see tuna-os/tunaOS#3378)"; }
   note "starting $VM..."
   corral start "$VM" >/dev/null 2>&1 || true
   sleep 3
-  corral list 2>/dev/null | grep -q "^${VM}[[:space:]].*Running" \
+  vm_running \
     || die "$VM is not Running after start — inspect with: corral logs $VM"
 fi
 
@@ -204,6 +266,37 @@ cat <<EOF
     console: $CONSOLE_URL
     (a browser tab should have opened; Ctrl-C here stops the VM cleanly)
 EOF
+
+# --- auto-login (optional) -----------------------------------------------------
+# Types the greeter credentials over the emulated keyboard and checks the
+# result with a screenshot. The greeter takes username, then password on the
+# next screen; the session dropdown defaults to Tuna Desktop.
+if [[ -n "${TRY_TUNA_USER:-}" ]]; then
+  note "waiting for the greeter..."
+  GREETER_UP=0
+  for _ in $(seq 1 36); do
+    if corral screenshot "$VM" --require-paint >/dev/null 2>&1; then
+      GREETER_UP=1
+      break
+    fi
+    sleep 5
+  done
+  [[ "$GREETER_UP" == "1" ]] || die "greeter never painted — inspect with: corral screenshot $VM"
+  sleep 10
+  corral type "$VM" "$TRY_TUNA_USER" || die "username contains characters outside the US keyboard — retype it with plain ASCII"
+  sleep 1
+  corral key "$VM" ret || die "could not press Enter"
+  sleep 5
+  if [[ -n "${TRY_TUNA_PASSWORD:-}" ]]; then
+    corral type "$VM" "$TRY_TUNA_PASSWORD" || die "password contains characters outside the US keyboard"
+    sleep 1
+  fi
+  corral key "$VM" ret || die "could not press Enter"
+  note "logged in as $TRY_TUNA_USER (if the account exists with that password); verifying desktop..."
+  sleep 30
+  SHOT="$(corral screenshot "$VM" --require-paint 2>&1)" || die "no painted desktop after login — credentials may be wrong; inspect with: corral screenshot $VM"
+  note "desktop painted: $SHOT"
+fi
 
 trap cleanup INT TERM
 # Foreground wait: Ctrl-C lands in cleanup, which stops the VM and the web
