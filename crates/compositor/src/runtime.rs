@@ -831,6 +831,14 @@ fn unlock_outcome(authenticated: bool, denied: bool) -> (bool, bool) {
     (authenticated, authenticated && !denied)
 }
 
+/// A presented nested frame: its repaint region, cost, and cursor surface.
+/// `None` means the tick submitted nothing (unchanged signature).
+type PresentedFrame = Option<(
+    Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
+    crate::occlusion::FrameCost,
+    Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+)>;
+
 impl Runtime {
     /// Build the session: display plus globals, output, backend window,
     /// and private socket. Does not run the loop (see [`run`]).
@@ -4730,11 +4738,7 @@ impl Runtime {
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
                 let age = backend.buffer_age().unwrap_or(0);
-                let mut presented: Option<(
-                    Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
-                    crate::occlusion::FrameCost,
-                    Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
-                )> = None;
+                let mut presented: PresentedFrame = None;
                 {
                     let (renderer, mut framebuffer) = backend
                         .bind()
