@@ -224,6 +224,9 @@ pub fn deny_all_tokens(_: &ActivationToken, _: Option<&str>) -> bool {
 /// Outcome of [`Session::handle_next`]: what one inbound frame produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handled {
+    /// A brightness journal request was queued for asynchronous
+    /// validation; no write grant yet.
+    BrightnessQueued,
     /// A shell command was answered with `CommandResult`.
     CommandResult {
         /// Echo of the shell's request id.
@@ -290,6 +293,43 @@ pub struct AuthLease {
     owner: AuthOwner,
 }
 
+/// A brightness journal request, as the shell sent it.
+#[derive(Clone, Debug)]
+pub enum BrightnessRequest {
+    Init {
+        request: u64,
+        readings: Vec<tuna_shell_control::BrightnessReading>,
+        idle: f64,
+    },
+    Begin {
+        request: u64,
+        source: tuna_shell_control::BrightnessSource,
+        targets: Vec<tuna_shell_control::BrightnessTarget>,
+    },
+    Complete {
+        request: u64,
+        grant: tuna_shell_control::BrightnessGrant,
+        observations: Vec<tuna_shell_control::BrightnessObservation>,
+    },
+}
+
+impl BrightnessRequest {
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Init { request, .. }
+            | Self::Begin { request, .. }
+            | Self::Complete { request, .. } => *request,
+        }
+    }
+}
+
+/// A journal request bound to the authority it arrived under.
+#[derive(Clone, Debug)]
+pub struct OwnedBrightnessRequest {
+    pub authority: crate::brightness_journal::Authority,
+    pub request: BrightnessRequest,
+}
+
 /// Authenticated control session over a [`ControlConn`].
 ///
 /// The session owns the connection, the token-check hook, the per-window
@@ -303,6 +343,10 @@ pub struct AuthLease {
 pub struct Session<'a> {
     connection_id: u64,
     auth_owner: Option<AuthOwner>,
+    /// Journal authority while this connection holds it (set by the hub).
+    brightness_authority: Option<crate::brightness_journal::Authority>,
+    /// One journal request awaiting the runtime, drained by the hub.
+    brightness_request: Option<OwnedBrightnessRequest>,
     auth_lease: Option<AuthLease>,
     conn: ControlConn,
     validator: TokenValidator<'a>,
@@ -424,6 +468,8 @@ impl<'a> Session<'a> {
         let mut session = Self {
             connection_id: 0,
             auth_owner: None,
+            brightness_authority: None,
+            brightness_request: None,
             auth_lease: None,
             conn,
             validator: Box::new(validator),
@@ -698,6 +744,37 @@ impl<'a> Session<'a> {
                 Ok(Emitted::Snapshot { revision })
             }
         }
+    }
+
+    /// Queue one journal request for the runtime's asynchronous
+    /// validation, or refuse it: older peers get `UnknownCommand`, and a
+    /// connection without journal authority (or one request already
+    /// queued) gets an `Authority` reply.
+    fn queue_brightness(&mut self, request: BrightnessRequest) -> Result<Handled, ControlError> {
+        if self.peer_minor < 37 {
+            self.conn.write_frame(&Message::Error {
+                kind: ErrorKind::UnknownCommand,
+                message: "brightness journal requires negotiated minor 37".into(),
+            })?;
+            return Ok(Handled::ErrorSent {
+                kind: ErrorKind::UnknownCommand,
+            });
+        }
+        if let Some(authority) = self.brightness_authority {
+            if self.brightness_request.is_none() {
+                self.brightness_request = Some(OwnedBrightnessRequest { authority, request });
+                return Ok(Handled::BrightnessQueued);
+            }
+        }
+        self.conn.write_frame(&Message::BrightnessJournalReply {
+            request: request.id(),
+            grant: None,
+            error: Some(tuna_shell_control::BrightnessJournalError::Authority),
+            state: None,
+        })?;
+        Ok(Handled::ErrorSent {
+            kind: ErrorKind::UnknownCommand,
+        })
     }
 
     /// Read one inbound frame and act on it:
@@ -1030,7 +1107,36 @@ impl<'a> Session<'a> {
                     .write_frame(&Message::CommandResult { id, status })?;
                 Ok(Handled::CommandResult { id, applied })
             }
-            Message::Snapshot { .. }
+            Message::BrightnessJournalInit {
+                request,
+                readings,
+                idle,
+            } => self.queue_brightness(BrightnessRequest::Init {
+                request,
+                readings,
+                idle,
+            }),
+            Message::BrightnessJournalBegin {
+                request,
+                source,
+                targets,
+            } => self.queue_brightness(BrightnessRequest::Begin {
+                request,
+                source,
+                targets,
+            }),
+            Message::BrightnessJournalComplete {
+                request,
+                grant,
+                observations,
+            } => self.queue_brightness(BrightnessRequest::Complete {
+                request,
+                grant,
+                observations,
+            }),
+            Message::BrightnessJournalState { .. }
+            | Message::BrightnessJournalReply { .. }
+            | Message::Snapshot { .. }
             | Message::Changes { .. }
             | Message::CommandResult { .. }
             | Message::Overview { .. }
@@ -1101,6 +1207,11 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
         Message::PointerTimeout { .. } => "PointerTimeout",
+        Message::BrightnessJournalInit { .. } => "BrightnessJournalInit",
+        Message::BrightnessJournalBegin { .. } => "BrightnessJournalBegin",
+        Message::BrightnessJournalComplete { .. } => "BrightnessJournalComplete",
+        Message::BrightnessJournalState { .. } => "BrightnessJournalState",
+        Message::BrightnessJournalReply { .. } => "BrightnessJournalReply",
     }
 }
 
@@ -1300,6 +1411,8 @@ pub fn our_version() -> ProtocolVersion {
 /// (runtime sends the polite client close).
 #[derive(Debug, Default)]
 pub struct PollOutcome {
+    /// Brightness journal requests from the authorized connection.
+    pub brightness: Vec<OwnedBrightnessRequest>,
     /// Windows to focus and raise.
     pub activated: Vec<u64>,
     /// Windows to ask to close.
@@ -1502,6 +1615,11 @@ pub struct ControlHub {
     /// Peer pid per live session, index-aligned with `sessions`, so a
     /// gate change evicts sessions the new gate no longer admits.
     session_peers: Vec<Option<PeerCred>>,
+    /// The connection id holding the brightness journal, if any.
+    brightness_connection: Option<u64>,
+    /// Journal state to deliver, and what that connection last received.
+    brightness_state: Option<tuna_shell_control::BrightnessJournalSnapshot>,
+    brightness_state_sent: Option<(u64, tuna_shell_control::BrightnessJournalSnapshot)>,
     /// Peer credentials of `pending` / `fresh`, index-aligned.
     pending_peers: Vec<Option<PeerCred>>,
     fresh_peers: Vec<Option<PeerCred>>,
@@ -1586,6 +1704,9 @@ impl ControlHub {
             auth_owner: None,
             auth_owner_configured: false,
             session_peers: Vec::new(),
+            brightness_connection: None,
+            brightness_state: None,
+            brightness_state_sent: None,
             pending_peers: Vec::new(),
             fresh_peers: Vec::new(),
             refused: 0,
@@ -1616,6 +1737,63 @@ impl ControlHub {
         self.pending_peers.clear();
         self.fresh.clear();
         self.fresh_peers.clear();
+        self.brightness_connection = None;
+    }
+
+    /// The brightness journal's authority: the supervised shell's exact
+    /// child generation and the one connection admitted for it. `None`
+    /// whenever that child, its connection or the peer gate changed.
+    pub fn brightness_authority(&self) -> Option<crate::brightness_journal::Authority> {
+        let owner = self.auth_owner?;
+        let connection = self.brightness_connection?;
+        let uid = our_uid();
+        self.sessions
+            .iter()
+            .zip(&self.session_peers)
+            .any(|(session, peer)| {
+                session.connection_id == connection
+                    && session.peer_minor >= 37
+                    && session.auth_owner == Some(owner)
+                    && PeerGate::Pid(owner.pid).admits(*peer, uid)
+                    && self.gate.admits(*peer, uid)
+            })
+            .then_some(crate::brightness_journal::Authority {
+                child_generation: owner.generation,
+                connection_generation: connection,
+            })
+    }
+
+    /// The journal state the next [`poll`](Self::poll) sends to the
+    /// authorized connection when it changed.
+    pub fn set_brightness_state(&mut self, state: tuna_shell_control::BrightnessJournalSnapshot) {
+        self.brightness_state = Some(state);
+    }
+
+    /// Send one journal reply or state to the connection `authority`
+    /// names, never to a replacement. A failed (possibly partial) write
+    /// drops that connection and its authority.
+    pub fn finish_brightness(
+        &mut self,
+        authority: crate::brightness_journal::Authority,
+        message: &Message,
+    ) -> bool {
+        if self.brightness_authority() != Some(authority) {
+            return false;
+        }
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|s| s.connection_id == authority.connection_generation)
+        else {
+            return false;
+        };
+        if self.sessions[index].conn.write_frame(message).is_ok() {
+            return true;
+        }
+        self.sessions.swap_remove(index);
+        self.session_peers.swap_remove(index);
+        self.brightness_connection = None;
+        false
     }
     /// The trusted runtime must derive these values from its exact matched Slot.
     /// This lease routes a conversation; it cannot grant unlock or free that Slot.
@@ -2000,6 +2178,14 @@ impl ControlHub {
         self.advance_pending(model);
         self.pending = std::mem::take(&mut self.fresh);
         self.pending_peers = std::mem::take(&mut self.fresh_peers);
+        if self.brightness_authority().is_none() {
+            self.brightness_connection = None;
+        }
+        let brightness_authority = self.brightness_authority();
+        for session in &mut self.sessions {
+            session.brightness_authority =
+                brightness_authority.filter(|a| a.connection_generation == session.connection_id);
+        }
         let mut outcome = PollOutcome::default();
         let mut i = 0;
         while i < self.sessions.len() {
@@ -2032,6 +2218,7 @@ impl ControlHub {
                         outcome.accelerators = Some(list);
                     }
                     outcome.window_actions.extend(session.take_window_actions());
+                    outcome.brightness.extend(session.brightness_request.take());
                     outcome
                         .shortcut_consent
                         .extend(std::mem::take(&mut session.shortcut_consent));
@@ -2236,6 +2423,17 @@ impl ControlHub {
                 let _ = session.send_window_menu(&menu);
             }
         }
+        // Recovery metadata only; it carries no hardware helper grant.
+        if let (Some(authority), Some(state)) =
+            (self.brightness_authority(), self.brightness_state.clone())
+        {
+            let receipt = (authority.connection_generation, state.clone());
+            if self.brightness_state_sent.as_ref() != Some(&receipt)
+                && self.finish_brightness(authority, &Message::BrightnessJournalState { state })
+            {
+                self.brightness_state_sent = Some(receipt);
+            }
+        }
     }
 
     /// Try each aged peer's handshake once. Peers were accepted a full
@@ -2303,6 +2501,18 @@ impl ControlHub {
                 }
                 session.connection_id = connection_id;
                 session.auth_owner = self.auth_owner;
+                // The first current-minor connection of the supervised
+                // shell's exact owner generation holds the brightness
+                // journal; nothing else ever acquires it.
+                if self.brightness_connection.is_none()
+                    && session.peer_minor >= 37
+                    && self.auth_owner.is_some_and(|owner| {
+                        session.auth_owner == Some(owner)
+                            && PeerGate::Pid(owner.pid).admits(peer, our_uid())
+                    })
+                {
+                    self.brightness_connection = Some(connection_id);
+                }
                 self.sessions.push(session);
                 self.session_peers.push(peer);
             }
@@ -2894,5 +3104,257 @@ mod auth_origin_tests {
         assert_eq!(hub.sessions.len(), 1);
         assert!(hub.next_connection.is_none());
         assert!(hub.refused_count() > 0);
+    }
+}
+
+#[cfg(test)]
+mod brightness_connection_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hub = ControlHub::bind(
+            dir.path().join("control"),
+            std::rc::Rc::new(TokenStore::new()),
+            "seat0",
+        )
+        .unwrap();
+        (dir, hub, StateModel::default())
+    }
+
+    /// The supervised shell is this test process, at `generation`.
+    fn supervise(hub: &mut ControlHub, generation: u64) {
+        hub.set_peer_gate(PeerGate::Pid(std::process::id()));
+        hub.set_auth_owner(Some(AuthOwner {
+            pid: std::process::id(),
+            generation,
+        }));
+    }
+
+    fn join(dir: &tempfile::TempDir, hub: &mut ControlHub, model: &mut StateModel) -> UnixStream {
+        let mut client = UnixStream::connect(dir.path().join("control")).unwrap();
+        client
+            .write_all(&tuna_shell_control::encode_frame(&Message::Hello {
+                version: CURRENT_VERSION,
+            }))
+            .unwrap();
+        hub.poll(model);
+        hub.poll(model);
+        client
+    }
+
+    fn empty_state() -> tuna_shell_control::BrightnessJournalSnapshot {
+        crate::brightness_journal::Journal::default()
+            .snapshot()
+            .into()
+    }
+
+    #[test]
+    fn only_one_supervised_connection_can_receive_a_grant() {
+        let (dir, mut hub, mut model) = setup();
+        supervise(&mut hub, 1);
+        let _first = join(&dir, &mut hub, &mut model);
+        let original = hub.brightness_authority().unwrap();
+        assert_eq!(original.child_generation, 1);
+        let _other = join(&dir, &mut hub, &mut model);
+        assert_eq!(hub.brightness_authority(), Some(original));
+        assert_eq!(
+            hub.sessions
+                .iter()
+                .filter(|v| v.brightness_authority.is_some())
+                .count(),
+            1
+        );
+        // A replacement child (new generation) revokes the original.
+        supervise(&mut hub, 2);
+        assert!(hub.brightness_authority().is_none());
+        let _replacement = join(&dir, &mut hub, &mut model);
+        let replacement = hub.brightness_authority().unwrap();
+        assert_ne!(replacement, original);
+        assert_eq!(replacement.child_generation, 2);
+        assert!(!hub.finish_brightness(
+            original,
+            &Message::BrightnessJournalState {
+                state: empty_state()
+            }
+        ));
+        assert_eq!(hub.brightness_authority(), Some(replacement));
+    }
+
+    #[test]
+    fn broken_original_reply_drops_connection_and_never_retargets_replacement() {
+        let (dir, mut hub, mut model) = setup();
+        supervise(&mut hub, 1);
+        let client = join(&dir, &mut hub, &mut model);
+        let original = hub.brightness_authority().unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        let reply = Message::BrightnessJournalReply {
+            request: 1,
+            grant: Some(tuna_shell_control::BrightnessGrant {
+                transaction: 1,
+                revision: 1,
+            }),
+            error: None,
+            state: None,
+        };
+        assert!(!hub.finish_brightness(original, &reply));
+        assert!(hub.brightness_authority().is_none());
+        let _replacement = join(&dir, &mut hub, &mut model);
+        assert!(!hub.finish_brightness(original, &reply));
+        assert_ne!(hub.brightness_authority(), Some(original));
+    }
+
+    #[test]
+    fn unsupervised_and_overflow_connections_never_acquire_journal_authority() {
+        let (dir, mut hub, mut model) = setup();
+        let _dev = join(&dir, &mut hub, &mut model);
+        assert!(hub.brightness_authority().is_none());
+        supervise(&mut hub, 1);
+        hub.next_connection = None;
+        let _overflow = join(&dir, &mut hub, &mut model);
+        assert!(hub.brightness_authority().is_none());
+    }
+
+    #[test]
+    fn partial_original_reply_drops_socket_without_replaying_to_replacement() {
+        use std::os::fd::AsRawFd;
+        let (dir, mut hub, mut model) = setup();
+        supervise(&mut hub, 1);
+        let mut client = join(&dir, &mut hub, &mut model);
+        client.set_nonblocking(true).unwrap();
+        let mut scratch = [0u8; 8192];
+        while client.read(&mut scratch).is_ok_and(|n| n != 0) {}
+        let original = hub.brightness_authority().unwrap();
+        let server = &hub
+            .sessions
+            .iter()
+            .find(|s| s.brightness_authority == Some(original))
+            .unwrap()
+            .conn
+            .stream;
+        let size: libc::c_int = 4096;
+        // SAFETY: the held UnixStream owns the fd; size is a valid int.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    server.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let mut state = empty_state();
+        state.readings = (1..=64)
+            .map(|id| tuna_shell_control::BrightnessReading {
+                binding: tuna_shell_control::BrightnessBinding {
+                    output: tuna_shell_control::NativeOutputInfo {
+                        name: "n".repeat(512),
+                        drm_device: 226,
+                        connector_id: id,
+                        connector_sysfs: "s".repeat(512),
+                        connector_device: 1,
+                        connector_inode: 2,
+                    },
+                    ownership_generation: 1,
+                    backlight: "b".repeat(128),
+                    device: 1,
+                    inode: 4,
+                    minimum: 0,
+                    maximum: 1000,
+                },
+                user: 700,
+                user_known: true,
+                measured_candidate: None,
+                measured_restoration: None,
+                applied: 700,
+                ratio: 1.0,
+            })
+            .collect();
+        let message = Message::BrightnessJournalReply {
+            request: 1,
+            grant: Some(tuna_shell_control::BrightnessGrant {
+                transaction: 1,
+                revision: 1,
+            }),
+            error: None,
+            state: Some(state),
+        };
+        let frame_len = tuna_shell_control::encode_frame(&message).len();
+        assert!(!hub.finish_brightness(original, &message));
+        assert!(hub.brightness_authority().is_none());
+        let mut received = Vec::new();
+        loop {
+            match client.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&scratch[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("original partial socket read failed: {error}"),
+            }
+        }
+        assert!(!received.is_empty() && received.len() < frame_len);
+        let _replacement = join(&dir, &mut hub, &mut model);
+        let replacement = hub.brightness_authority().unwrap();
+        assert_ne!(original, replacement);
+        assert!(!hub.finish_brightness(original, &message));
+        assert_eq!(hub.brightness_authority(), Some(replacement));
+    }
+
+    #[test]
+    fn older_peers_get_unknown_command_and_unauthorized_peers_an_authority_reply() {
+        for minor in [35, 36, 37] {
+            let (dir, mut hub, mut model) = setup();
+            let mut stream = UnixStream::connect(dir.path().join("control")).unwrap();
+            stream
+                .write_all(&tuna_shell_control::encode_frame(&Message::Hello {
+                    version: ProtocolVersion {
+                        major: CURRENT_VERSION.major,
+                        minor,
+                    },
+                }))
+                .unwrap();
+            hub.poll(&mut model);
+            hub.poll(&mut model);
+            let mut conn = ControlConn::new(stream).unwrap();
+            while conn.read_frame().is_ok() {}
+            conn.write_frame(&Message::BrightnessJournalInit {
+                request: 1,
+                readings: Vec::new(),
+                idle: 0.3,
+            })
+            .unwrap();
+            hub.poll(&mut model);
+            let reply = conn.read_frame().unwrap();
+            if minor < 37 {
+                assert!(matches!(
+                    reply,
+                    Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    reply,
+                    Message::BrightnessJournalReply {
+                        grant: None,
+                        error: Some(tuna_shell_control::BrightnessJournalError::Authority),
+                        state: None,
+                        ..
+                    }
+                ));
+            }
+            assert!(hub
+                .sessions
+                .iter()
+                .all(|session| session.brightness_request.is_none()));
+            assert!(hub.brightness_authority().is_none());
+        }
     }
 }

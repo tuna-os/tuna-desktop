@@ -19,7 +19,7 @@ namespace={'ET':ET,'NAME':'org.gnome.Shell.Brightness','os':os,'stat':stat,'json
 function=next(node for node in parsed.body if isinstance(node,ast.FunctionDef) and node.name=='schema')
 exec(compile(ast.Module(body=[function],type_ignores=[]),'<actual-schema-parser>','exec'),namespace)
 schema=namespace['schema']
-for name in ['scalar','retain','process','principal','available','signal_receipt','drain','floor','controlled_manifest','backlight_type','overridden_backlight_environment']:
+for name in ['scalar','retain','process','principal','available','signal_receipt','drain','wait_for_readbacks','floor','controlled_manifest','backlight_type','overridden_backlight_environment']:
     node=next(node for node in parsed.body if isinstance(node,ast.FunctionDef) and node.name==name)
     exec(compile(ast.Module(body=[node],type_ignores=[]),'<actual-bounded-proof-io>','exec'),namespace)
 scalar=namespace['scalar'];retain=namespace['retain']
@@ -176,5 +176,16 @@ class ActualControlledAuthority(unittest.TestCase):
             def replace(fd,count):
                 raw=read(fd,count);os.replace(replacement,path);return raw
             with mock.patch.object(os,'read',side_effect=replace),self.assertRaises(RuntimeError):namespace['controlled_manifest'](path)
+    def test_readback_wait_requires_every_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            paths=[root/'first',root/'second']
+            for path,value in zip(paths,[10,20]):
+                path.mkdir();(path/'brightness').write_text(str(value))
+            wait=namespace['wait_for_readbacks']
+            self.assertEqual(wait(paths,[10,20],0),[10,20])
+            (paths[1]/'brightness').write_text('21')
+            self.assertEqual(wait(paths,[10,20],0),[10,21])
+
 
 if __name__=='__main__':unittest.main()

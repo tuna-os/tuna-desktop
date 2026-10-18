@@ -5,6 +5,8 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+# Bounded backlight reads for the brightness journal's off-loop validator.
+tuna-backlight = { path = "../backlight", version = "0.1.0" }
 smithay.workspace = true
 # Lock-screen PAM (unlock under GDM, where no greetd runs): libpam is
 # loaded at run time, so builds need no PAM headers and a system without

@@ -615,6 +615,13 @@ pub struct Runtime {
     control: ControlHub,
     shell: ShellDriver,
     orca: crate::orca::Reader,
+    /// Session-only brightness journal: committed user intent, policy and
+    /// the pending write, bound to the supervised shell's connection.
+    brightness_journal: crate::brightness_journal::Journal,
+    /// Off-loop sysfs validator for journal requests.
+    brightness_hardware: crate::brightness_hardware::Worker,
+    /// gnome-settings-daemon power provider identity, observed off-loop.
+    brightness_provider: crate::brightness_provider::Observer,
     /// The IBus bridge, when IBus is installed.
     ime: Option<crate::ime::ImeBridge>,
     overlay: Overlay,
@@ -1194,6 +1201,11 @@ impl Runtime {
             .insert_source(wake_source, |_, _, _: &mut Runtime| {})
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let loop_handle = event_loop.handle();
+        #[cfg(feature = "drm")]
+        let native_brightness = matches!(backend, Backend::Drm(_));
+        #[cfg(not(feature = "drm"))]
+        let native_brightness = false;
+        let brightness_wake = wake.clone();
         let mut runtime = Runtime {
             display,
             state,
@@ -1257,6 +1269,9 @@ impl Runtime {
             input_aids: aids::RuntimeAids::default(),
             dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name),
+            brightness_journal: crate::brightness_journal::Journal::default(),
+            brightness_hardware: crate::brightness_hardware::Worker::start(brightness_wake),
+            brightness_provider: crate::brightness_provider::Observer::start(native_brightness),
             pipewire: None,
             casts: Vec::new(),
             cast_outputs,
@@ -4097,6 +4112,176 @@ impl Runtime {
         }
     }
 
+    /// The journal snapshot the shell may recover from, with the cached
+    /// provider (gnome-settings-daemon) identity.
+    fn brightness_state(&self) -> tuna_shell_control::BrightnessJournalSnapshot {
+        let mut state: tuna_shell_control::BrightnessJournalSnapshot =
+            self.brightness_journal.snapshot().into();
+        state.provider =
+            self.brightness_provider
+                .fact()
+                .map(|v| tuna_shell_control::BrightnessProvider {
+                    unique: v.unique,
+                    epoch: v.epoch,
+                    uid: v.uid,
+                    pid: v.pid,
+                    start: v.start,
+                });
+        state
+    }
+
+    /// Admit validated journal results and hand new requests to the
+    /// validator. Cached authority and bounded queues only: no bus, proc
+    /// or sysfs calls on the loop thread.
+    fn poll_brightness(&mut self, requests: Vec<crate::control::OwnedBrightnessRequest>) {
+        use crate::brightness_journal::{Error, Source};
+        use crate::control::BrightnessRequest;
+        // Validator facts older than this cannot admit a grant or receipt.
+        const FACT_TTL: Duration = Duration::from_secs(2);
+        let fresh = |facts: &[crate::brightness_journal::FreshReadback]| {
+            let now = Instant::now();
+            facts.iter().all(|v| {
+                now.checked_duration_since(v.checked_at)
+                    .is_some_and(|age| age <= FACT_TTL)
+            })
+        };
+        let authority = self.control.brightness_authority();
+        self.brightness_journal.authority(authority);
+        self.brightness_journal.expire(Instant::now());
+        let provider = self.brightness_provider.fact();
+        self.brightness_journal
+            .provider(provider.as_ref().map(|v| v.epoch));
+        while let Some(validated) = self.brightness_hardware.poll() {
+            let original = validated.original;
+            if Some(original.authority) != authority {
+                continue;
+            }
+            // Each result is admitted afresh: earlier reply writes cannot
+            // extend the facts' age.
+            let provider = self.brightness_provider.fact();
+            self.brightness_journal
+                .provider(provider.as_ref().map(|v| v.epoch));
+            let request = original.request.id();
+            let facts = if self.brightness_hardware.authority().as_ref() != Some(&validated.native)
+            {
+                Err(Error::Binding)
+            } else {
+                validated.facts
+            };
+            let failed_completion = match &original.request {
+                BrightnessRequest::Complete { grant, .. } => Some((*grant).into()),
+                _ => None,
+            };
+            let facts = facts.and_then(|facts| {
+                if fresh(&facts) {
+                    Ok(facts)
+                } else {
+                    Err(Error::Stale)
+                }
+            });
+            let mut grant = None;
+            let result = facts.and_then(|facts| match original.request {
+                BrightnessRequest::Init { idle, .. } => self.brightness_journal.reconcile(
+                    original.authority,
+                    validated.native.generation,
+                    &facts,
+                    Instant::now(),
+                    idle,
+                ),
+                BrightnessRequest::Begin {
+                    source, targets, ..
+                } => {
+                    let targets = targets.into_iter().map(Into::into).collect();
+                    let provider = self.brightness_provider.fact();
+                    self.brightness_journal
+                        .provider(provider.as_ref().map(|v| v.epoch));
+                    let source = Source::admitted(
+                        source,
+                        provider.as_ref().map(|v| (v.unique.as_str(), v.epoch)),
+                    )?;
+                    let admitted = self.brightness_journal.begin(
+                        original.authority,
+                        source,
+                        targets,
+                        &facts,
+                        Instant::now(),
+                    )?;
+                    grant = Some(admitted.into());
+                    Ok(())
+                }
+                BrightnessRequest::Complete {
+                    grant,
+                    observations,
+                    ..
+                } => {
+                    // The helper's success and the independent readback
+                    // are both required; equal values alone are not success.
+                    let owned = facts.iter().map(|v| v.binding.clone()).collect::<Vec<_>>();
+                    let mut observed = Vec::with_capacity(observations.len());
+                    for value in observations {
+                        let mut value: crate::brightness_journal::Observation = value.into();
+                        let actual = facts
+                            .iter()
+                            .find(|v| v.binding == value.binding)
+                            .ok_or(Error::Incomplete)?
+                            .actual;
+                        value.helper_succeeded &= actual == value.actual;
+                        value.actual = actual;
+                        observed.push(value);
+                    }
+                    let provider = self.brightness_provider.fact();
+                    self.brightness_journal
+                        .provider(provider.as_ref().map(|v| v.epoch));
+                    if !fresh(&facts) {
+                        return Err(Error::Stale);
+                    }
+                    self.brightness_journal.complete(
+                        original.authority,
+                        grant.into(),
+                        &owned,
+                        observed,
+                    )
+                }
+            });
+            if result.is_err() {
+                if let Some(grant) = failed_completion {
+                    let _ = self
+                        .brightness_journal
+                        .fail_completion(original.authority, grant);
+                }
+            }
+            let message = tuna_shell_control::Message::BrightnessJournalReply {
+                request,
+                grant,
+                error: result.err().map(Into::into),
+                state: Some(self.brightness_state()),
+            };
+            if !self.control.finish_brightness(original.authority, &message) {
+                self.brightness_journal
+                    .authority(self.control.brightness_authority());
+            }
+        }
+        for original in requests {
+            if Some(original.authority) != self.control.brightness_authority() {
+                continue;
+            }
+            let request = original.request.id();
+            if let Err(error) = self.brightness_hardware.submit(original.clone()) {
+                let message = tuna_shell_control::Message::BrightnessJournalReply {
+                    request,
+                    grant: None,
+                    error: Some(error.into()),
+                    state: Some(self.brightness_state()),
+                };
+                if !self.control.finish_brightness(original.authority, &message) {
+                    self.brightness_journal
+                        .authority(self.control.brightness_authority());
+                }
+            }
+        }
+        self.control.set_brightness_state(self.brightness_state());
+    }
+
     fn tick(&mut self) -> Result<bool, RuntimeError> {
         if self.blank_stale || !self.blank_watched {
             self.blank_stale = false;
@@ -4144,7 +4329,24 @@ impl Runtime {
         if let Backend::Drm(drm) = &self.backend {
             native_outputs = drm.native_outputs();
         }
+        #[allow(unused_mut)]
+        let mut native_brightness = None;
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &self.backend {
+            // Facts and grants live only within one native ownership
+            // generation; nested sessions publish none.
+            native_brightness = drm.native_ownership_generation().map(|generation| {
+                crate::brightness_hardware::NativeAuthority {
+                    generation,
+                    outputs: native_outputs.clone(),
+                }
+            });
+        }
         self.control.set_native_outputs(native_outputs);
+        self.brightness_hardware.publish(native_brightness);
+        self.brightness_journal
+            .native_generation(self.brightness_hardware.authority().map(|v| v.generation));
+        self.control.set_brightness_state(self.brightness_state());
         #[allow(unused_mut)]
         let mut monitor_identities = Vec::new();
         #[cfg(feature = "drm")]
@@ -4172,6 +4374,7 @@ impl Runtime {
                 .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
         );
         let outcome = self.control.poll(self.manager.model_mut());
+        self.poll_brightness(outcome.brightness);
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
         }

@@ -127,6 +127,15 @@ def drain(context,deadline,budget):
         if budget[0]<=0 or time.monotonic()>=deadline:raise RuntimeError('bounded signal dispatch exhausted')
         context.iteration(False);budget[0]-=1
 
+def wait_for_readbacks(paths,expected,timeout=5):
+    deadline=time.monotonic()+timeout
+    while True:
+        actual=[scalar(path/'brightness') for path in paths]
+        if actual==expected or time.monotonic()>=deadline:
+            return actual
+        time.sleep(0.02)
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--out',required=True);parser.add_argument('--controlled-root');parser.add_argument('--device');parser.add_argument('--other-device');parser.add_argument('--shell-executable',required=True);parser.add_argument('--shell-pid',type=int);parser.add_argument('--shell-start',type=int);parser.add_argument('--compositor-pid',type=int);parser.add_argument('--compositor-start',type=int);parser.add_argument('--session-id')
     args=parser.parse_args();bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
@@ -186,34 +195,52 @@ def main():
             # Source policy's ordinary installed idle setting, not an invented target.
             settings=Gio.Settings.new('org.gnome.settings-daemon.plugins.power');idle=settings.get_int('idle-brightness')/100
             absolute=lambda level:minimum+int((maximum-minimum)*max(0,min(1,level))+0.5)
+            output_paths=[device]
+            other_dev=root/args.other_device if args.other_device else None
+            other_min=other_max=other_rel=other_base=other_abs=None
+            if other_dev is not None:
+                other_max=scalar(other_dev/'max_brightness')
+                other_kind=backlight_type(other_dev/'type')
+                other_min=floor(other_max,other_kind)
+                other_read=lambda name:scalar(other_dev/name)
+                other_base=other_read('brightness')
+                other_rel=(other_base-other_min)/(other_max-other_min)
+                other_abs=lambda level:other_min+int((other_max-other_min)*max(0,min(1,level))+0.5)
+                output_paths.append(other_dev)
+
+
+            if other_dev is not None:
+                other_parent=(other_dev/'device').resolve();other_meta=other_parent.stat()
+                other_match=[m for m in manifest if m['connector_sysfs']==str(other_parent) and (m['connector_device'],m['connector_inode'])==(other_meta.st_dev,other_meta.st_ino) and m['connector_id']==scalar(other_parent/'connector_id')]
+                if len(other_match)!=1:raise RuntimeError('controlled other output authority mismatch')
+                other_dimmed=other_abs(min(idle,other_rel))
+
             request('SetDimming',True);observe(absolute(min(idle,relative)))
             saved_idle=settings.get_int('idle-brightness');settings_restore=(settings,saved_idle)
             changed_idle=20 if saved_idle!=20 else 40
             if not settings.set_int('idle-brightness',changed_idle):raise RuntimeError('live idle setting refused')
             Gio.Settings.sync()
-            deadline=time.monotonic()+5
             expected=absolute(min(changed_idle/100,relative))
-            while read('brightness')!=expected and time.monotonic()<deadline:time.sleep(0.02)
-            receipts.append(dict(setting='idle-brightness',before=saved_idle,after=changed_idle,actual_brightness=read('brightness'),expected_brightness=expected))
-            if read('brightness')!=expected:raise RuntimeError('live dimmed idle setting did not reach actual backlight')
+            expected_outputs=[expected]
+            if other_dev is not None:
+                expected_outputs.append(other_abs(min(changed_idle/100,other_rel)))
+            actual=wait_for_readbacks(output_paths,expected_outputs)
+            receipts.append(dict(setting='idle-brightness',before=saved_idle,after=changed_idle,actual_brightness=actual[0],expected_brightness=expected))
+            if actual!=expected_outputs:raise RuntimeError(f'live idle setting did not reach actual backlights: got {actual}, expected {expected_outputs}')
             if not settings.set_int('idle-brightness',saved_idle):raise RuntimeError('live idle restore refused')
             Gio.Settings.sync()
-            deadline=time.monotonic()+5
-            while read('brightness')!=absolute(min(idle,relative)) and time.monotonic()<deadline:time.sleep(0.02)
-            if read('brightness')!=absolute(min(idle,relative)):raise RuntimeError('live idle restoration did not reach actual backlight')
+            expected=absolute(min(idle,relative))
+            expected_outputs=[expected]
+            if other_dev is not None:
+                expected_outputs.append(other_abs(min(idle,other_rel)))
+            actual=wait_for_readbacks(output_paths,expected_outputs)
+            if actual!=expected_outputs:raise RuntimeError(f'live idle restoration did not reach actual backlights: got {actual}, expected {expected_outputs}')
+
             request('SetDimming',False);observe(baseline)
             request('SetAutoBrightnessTarget',0.8);observe(absolute(0.8+relative-0.5))
             request('SetAutoBrightnessTarget',-1.0);observe(baseline)
             request('SetAutoBrightnessTarget',float('nan'),True);observe(baseline)
-            if args.other_device:
-                other_dev=root/args.other_device
-                other_parent=(other_dev/'device').resolve();other_meta=other_parent.stat()
-                other_match=[m for m in manifest if m['connector_sysfs']==str(other_parent) and (m['connector_device'],m['connector_inode'])==(other_meta.st_dev,other_meta.st_ino) and m['connector_id']==scalar(other_parent/'connector_id')]
-                if len(other_match)!=1:raise RuntimeError('controlled other output authority mismatch')
-                other_read=lambda name:scalar(other_dev/name)
-                other_max=other_read('max_brightness');other_kind=backlight_type(other_dev/'type');other_min=floor(other_max,other_kind)
-                other_base=other_read('brightness');other_rel=(other_base-other_min)/(other_max-other_min)
-                other_abs=lambda lvl:other_min+int((other_max-other_min)*max(0,min(1,lvl))+0.5)
+            if other_dev is not None:
                 request('SetDimming',True);observe(absolute(min(idle,relative)))
                 other_dimmed=other_abs(min(idle,other_rel))
                 deadline=time.monotonic()+5

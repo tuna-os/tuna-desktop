@@ -17,6 +17,7 @@ mod accessibility;
 mod audio_state;
 mod background_settings;
 mod brightness;
+mod brightness_journal_client;
 mod brightness_service;
 mod bt_menu;
 mod calendar;
@@ -132,6 +133,8 @@ struct Drained {
     dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Pointer accessibility timeouts for the pie timer, in order.
     pointer_timeouts: Vec<PointerTimeout>,
+    /// Brightness journal replies read on a connection that stayed usable.
+    brightness_replies: Vec<tuna_shell_host::control::BrightnessReply>,
 }
 
 /// One pointer accessibility timeout report: kind, duration when it
@@ -222,6 +225,11 @@ fn drain(
             }
             Handled::AcceleratorDeactivated { action, time, mode } => {
                 out.accelerators.push((action, time, mode, true));
+            }
+            Handled::BrightnessJournal { .. } => {
+                while let Some(reply) = control.take_brightness_reply() {
+                    out.brightness_replies.push(reply);
+                }
             }
             Handled::CommandResult { id, status } => out.results.push((
                 id,
@@ -1633,7 +1641,47 @@ fn build(app: &adw::Application) {
             s.settings_schema()
                 .is_some_and(|schema| schema.has_key("idle-brightness"))
         });
+    // The journal bridge only ever uses the current connection: a send
+    // failure shuts that stream down (no replay onto a replacement), and
+    // the poll path redials with fresh authority.
+    let brightness_bridge = brightness_journal_client::Bridge {
+        snapshot: {
+            let weak = Rc::downgrade(&shell);
+            Rc::new(move || {
+                let shell = weak.upgrade()?;
+                let shell = shell.try_borrow().ok()?;
+                shell.control.as_ref()?.brightness_state().cloned()
+            })
+        },
+        send: {
+            let weak = Rc::downgrade(&shell);
+            Rc::new(move |command| {
+                let shell = weak.upgrade().ok_or("brightness shell unavailable")?;
+                let mut shell = shell
+                    .try_borrow_mut()
+                    .map_err(|_| "brightness control busy")?;
+                let control = shell
+                    .control
+                    .as_mut()
+                    .ok_or("brightness control unavailable")?;
+                match command {
+                    brightness_journal_client::Command::Initialize { readings, idle } => {
+                        control.initialize_brightness(readings, idle)
+                    }
+                    brightness_journal_client::Command::Begin { source, targets } => {
+                        control.begin_brightness(source, targets)
+                    }
+                    brightness_journal_client::Command::Complete {
+                        grant,
+                        observations,
+                    } => control.complete_brightness(grant, observations),
+                }
+                .map_err(|_| "brightness control send failed".into())
+            })
+        },
+    };
     let brightness_controller = brightness_service::start(
+        brightness_bridge,
         {
             let weak = Rc::downgrade(&shell);
             Rc::new(move || {
@@ -3047,6 +3095,7 @@ fn build(app: &adw::Application) {
                 (chrome.clone(), notify.clone(), switcher_ui.clone());
             let shell_rc = shell_rc.clone();
             let resync_after = resync_after.clone();
+            let brightness_journal = brightness_controller.clone();
             Rc::new(move |drained: Drained| {
                 let Drained {
                     results,
@@ -3057,6 +3106,7 @@ fn build(app: &adw::Application) {
                     aid_switches,
                     dwell_click,
                     pointer_timeouts,
+                    brightness_replies,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -3115,6 +3165,9 @@ fn build(app: &adw::Application) {
                 }
                 for (index, count) in popups {
                     workspace_popup.display(index, count);
+                }
+                for reply in brightness_replies {
+                    brightness_journal.journal_reply(reply);
                 }
                 for (aid, enabled) in aid_switches {
                     kbd_a11y_dialog.switched(aid, enabled, locked);
@@ -3236,6 +3289,11 @@ fn build(app: &adw::Application) {
                 };
                 let (before, was_closed) = (control.connection_generation(), control.is_closed());
                 let (handled, usable) = drain(control, &notify, &mut drained);
+                if control.is_closed() || !usable {
+                    // Replies from a connection that ended carry no
+                    // authority; the redial acquires its own.
+                    drained.brightness_replies.clear();
+                }
                 let (generation, closed) = (control.connection_generation(), control.is_closed());
                 let link = if closed {
                     Link::Redial

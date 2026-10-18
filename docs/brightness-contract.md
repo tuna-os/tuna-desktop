@@ -51,6 +51,7 @@ value and apply after completion. Individual backlight scalar reads and the
 inventory are bounded; rejected inventory preserves the user baseline while
 withholding capability. This does not claim blocking filesystem metadata calls
 have a real-time deadline.
+The controlled proof waits for every associated output's readback before issuing the next policy request, including outputs already at their expected floor.
 
 `G-BRIGHTNESS-CONTRACT` exercises the real session-bus adapter against an
 explicitly synthetic associated sysfs/logind fixture: user baseline, dim/restore,
@@ -61,10 +62,35 @@ shell owner PID/UID/start identity, requiring empty inventory, false capability,
 unsupported positive operations and successful harmless resets. Neither proves
 real panel luminance or physical logind permissions.
 
+## Session journal across shell restarts
+
+The compositor keeps a session-only brightness journal so a restarted shell
+recovers committed user intent instead of re-reading a dimmed panel as the
+user's choice. It never writes hardware and never authorizes restoration
+across sessions or from disk. Control protocol 0.37 carries it as five
+messages: the shell's `BrightnessJournalInit` snapshot, a `Begin` write
+intent, a `Complete` receipt with the helper result and readbacks, and the
+compositor's `State` and `Reply`.
+
+Journal authority is the supervised shell's exact child generation plus the
+first 0.37 connection of that child (`ControlHub::brightness_authority`). Any
+other connection, a replacement child, a changed peer gate or a failed reply
+write revokes it; replies and state never retarget a replacement connection,
+and the shell never resends a journal frame on a redialled stream. Every
+request is validated off the loop thread (`brightness_hardware`) against the
+owned connector inventory of the current native ownership generation, which
+changes on every VT re-acquisition and resume. Facts older than two seconds,
+a changed generation or binding, or an unproven provider identity refuse the
+request. A grant is issued only after the pending targets are recorded and
+before any helper call; completion needs both the helper's success and an
+independent readback. Power-policy updates are admitted only from the
+installed GNOME power provider whose bus owner, UID, PID and start time were
+observed off the loop (`brightness_provider`).
+
 Issue #355 remains open for physical hardware, connector association on other
-backlight topologies, persistence across shell restart, cloned-monitor policy,
-ambient sensor integration, actual blank/display power-save, idle/suspend and
-battery/AC policy, external service and shipped-image qualification.
+backlight topologies, cloned-monitor policy, ambient sensor integration,
+actual blank/display power-save, idle/suspend and battery/AC policy, external
+service and shipped-image qualification.
 
 Primary contracts and formulas: GNOME Shell 51.0
 [`org.gnome.Shell.Brightness.xml`](https://github.com/GNOME/gnome-shell/blob/51.0/data/dbus-interfaces/org.gnome.Shell.Brightness.xml),

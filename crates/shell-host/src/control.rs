@@ -64,6 +64,11 @@ pub const REDIAL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handled {
     ScreenReader(tuna_shell_control::ScreenReaderState),
+    /// A brightness journal state (`request: None`) or reply arrived;
+    /// replies wait in [`ControlClient::take_brightness_reply`].
+    BrightnessJournal {
+        request: Option<u64>,
+    },
     /// Compositor greeted back (e.g. after a resnapshot re-hello); the
     /// awaited full snapshot still follows.
     Hello,
@@ -210,6 +215,15 @@ enum InputMethodAdmission {
     Ready,
 }
 
+/// One brightness journal reply from the compositor.
+#[derive(Clone, Debug)]
+pub struct BrightnessReply {
+    pub request: u64,
+    pub grant: Option<tuna_shell_control::BrightnessGrant>,
+    pub error: Option<tuna_shell_control::BrightnessJournalError>,
+    pub state: Option<tuna_shell_control::BrightnessJournalSnapshot>,
+}
+
 /// Shell-side control client over a connected Unix socket.
 pub struct ControlClient {
     stream: UnixStream,
@@ -236,6 +250,12 @@ pub struct ControlClient {
     outputs: Vec<OutputInfo>,
     native_outputs: Vec<tuna_shell_control::NativeOutputInfo>,
     monitor_identities: Vec<tuna_shell_control::MonitorIdentityInfo>,
+    /// Last brightness journal request id (never reused).
+    brightness_request_id: u64,
+    /// Latest journal state from the compositor, for this connection.
+    brightness_state: Option<tuna_shell_control::BrightnessJournalSnapshot>,
+    /// Unread journal replies, bounded at eight.
+    brightness_replies: std::collections::VecDeque<BrightnessReply>,
     pointer_output: Option<String>,
     /// Session environment from the compositor (#59).
     environment: Vec<(String, String)>,
@@ -288,6 +308,9 @@ impl ControlClient {
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             monitor_identities: Vec::new(),
+            brightness_request_id: 0,
+            brightness_state: None,
+            brightness_replies: std::collections::VecDeque::new(),
             pointer_output: None,
             environment: Vec::new(),
             overview_previews: (Vec::new(), None),
@@ -676,6 +699,70 @@ impl ControlClient {
         Ok(id)
     }
 
+    fn brightness_request(&mut self) -> Result<u64, ControlError> {
+        self.brightness_request_id =
+            self.brightness_request_id.checked_add(1).ok_or_else(|| {
+                ControlError::Unexpected("brightness request generation exhausted".into())
+            })?;
+        Ok(self.brightness_request_id)
+    }
+
+    /// The compositor's latest session-only brightness journal state.
+    pub fn brightness_state(&self) -> Option<&tuna_shell_control::BrightnessJournalSnapshot> {
+        self.brightness_state.as_ref()
+    }
+
+    /// The oldest unread brightness journal reply.
+    pub fn take_brightness_reply(&mut self) -> Option<BrightnessReply> {
+        self.brightness_replies.pop_front()
+    }
+
+    /// Hand the compositor the original kernel brightness snapshot.
+    pub fn initialize_brightness(
+        &mut self,
+        readings: Vec<tuna_shell_control::BrightnessReading>,
+        idle: f64,
+    ) -> Result<u64, ControlError> {
+        let request = self.brightness_request()?;
+        self.write_brightness(&Message::BrightnessJournalInit {
+            request,
+            readings,
+            idle,
+        })?;
+        Ok(request)
+    }
+
+    /// Submit a write intent only. Callers MUST wait for the matching
+    /// successful grant reply before invoking a hardware helper.
+    pub fn begin_brightness(
+        &mut self,
+        source: tuna_shell_control::BrightnessSource,
+        targets: Vec<tuna_shell_control::BrightnessTarget>,
+    ) -> Result<u64, ControlError> {
+        let request = self.brightness_request()?;
+        self.write_brightness(&Message::BrightnessJournalBegin {
+            request,
+            source,
+            targets,
+        })?;
+        Ok(request)
+    }
+
+    /// Report a granted write's helper result and independent readbacks.
+    pub fn complete_brightness(
+        &mut self,
+        grant: tuna_shell_control::BrightnessGrant,
+        observations: Vec<tuna_shell_control::BrightnessObservation>,
+    ) -> Result<u64, ControlError> {
+        let request = self.brightness_request()?;
+        self.write_brightness(&Message::BrightnessJournalComplete {
+            request,
+            grant,
+            observations,
+        })?;
+        Ok(request)
+    }
+
     /// Make `workspace` active (GNOME's workspace keys). Returns the
     /// request id.
     pub fn focus_workspace(&mut self, workspace: u32) -> Result<u64, ControlError> {
@@ -957,6 +1044,34 @@ impl ControlClient {
                 }
                 Ok(Handled::CommandResult { id, status })
             }
+            Message::BrightnessJournalState { state } => {
+                self.brightness_state = Some(state);
+                Ok(Handled::BrightnessJournal { request: None })
+            }
+            Message::BrightnessJournalReply {
+                request,
+                grant,
+                error,
+                state,
+            } => {
+                if self.brightness_replies.len() >= 8 {
+                    return Err(ControlError::Unexpected(
+                        "brightness reply queue full".into(),
+                    ));
+                }
+                if let Some(state) = state.as_ref() {
+                    self.brightness_state = Some(state.clone());
+                }
+                self.brightness_replies.push_back(BrightnessReply {
+                    request,
+                    grant,
+                    error,
+                    state,
+                });
+                Ok(Handled::BrightnessJournal {
+                    request: Some(request),
+                })
+            }
             Message::MonitorIdentityInventory { outputs } => {
                 self.monitor_identities = outputs;
                 Ok(Handled::Outputs {
@@ -1122,6 +1237,11 @@ impl ControlClient {
             Message::Command { id, .. } => Err(ControlError::Unexpected(format!(
                 "compositor sent shell-side Command id {id}"
             ))),
+            Message::BrightnessJournalInit { .. }
+            | Message::BrightnessJournalBegin { .. }
+            | Message::BrightnessJournalComplete { .. } => Err(ControlError::Unexpected(
+                "compositor sent shell-side brightness request".into(),
+            )),
         }
     }
 
@@ -1154,6 +1274,24 @@ impl ControlClient {
         }
     }
 
+    /// Write one brightness journal frame on this connection only. Unlike
+    /// [`write_message`](Self::write_message) it never redials and
+    /// resends: an intent or receipt must not reach a replacement
+    /// connection that holds different authority. A failed or partial
+    /// write (including `WouldBlock`) shuts the stream down, so the
+    /// compositor never parses a truncated frame and the next poll
+    /// redials with fresh authority.
+    fn write_brightness(&mut self, msg: &Message) -> Result<(), ControlError> {
+        let frame = tuna_shell_control::encode_frame(msg);
+        if let Err(error) = self.stream.write_all(&frame) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            self.brightness_state = None;
+            self.brightness_replies.clear();
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     /// Redial the hub after an eviction: fresh stream, cleared buffers
     /// and revision, then `Hello` — the resync signal, which the hub
     /// answers with its own `Hello` plus a full snapshot through the
@@ -1179,6 +1317,10 @@ impl ControlClient {
         self.wellbeing_applied = None;
         self.wellbeing_pending = None;
         self.read_buf.clear();
+        // A new connection acquires its own journal authority; nothing
+        // the previous one granted or reported carries over.
+        self.brightness_state = None;
+        self.brightness_replies.clear();
         self.revision = None;
         self.needs_snapshot = true;
         let frame = tuna_shell_control::encode_frame(&Message::Hello {
@@ -1303,6 +1445,11 @@ fn message_label(msg: &Message) -> &'static str {
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
         Message::PointerTimeout { .. } => "PointerTimeout",
+        Message::BrightnessJournalInit { .. } => "BrightnessJournalInit",
+        Message::BrightnessJournalBegin { .. } => "BrightnessJournalBegin",
+        Message::BrightnessJournalComplete { .. } => "BrightnessJournalComplete",
+        Message::BrightnessJournalState { .. } => "BrightnessJournalState",
+        Message::BrightnessJournalReply { .. } => "BrightnessJournalReply",
     }
 }
 

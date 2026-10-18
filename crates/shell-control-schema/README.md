@@ -83,3 +83,11 @@ atomic grab replacement with GNOME's `IGNORE_AUTOREPEAT` and
 `TRIGGER_RELEASE` flags (`SUPPORTED_GRAB_FLAGS`; anything else, or more than
 `MAX_ACCELERATORS`, fails decoding), and the release of a `TRIGGER_RELEASE`
 grab's press. The legacy `SetAccelerators` body is unchanged.
+
+The session-only brightness journal follows in 0.37 (`src/brightness.rs`):
+`BrightnessJournalInit`, `BrightnessJournalBegin` and
+`BrightnessJournalComplete` from the shell, `BrightnessJournalState` and
+`BrightnessJournalReply` from the compositor. Readings, targets and
+observations are bounded at 64 with title-bounded names and paths. Because
+they carry `f64` ratios and policy, `Message` is `PartialEq` but no longer
+`Eq`. See [the brightness contract](../../docs/brightness-contract.md).

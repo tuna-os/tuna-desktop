@@ -25,7 +25,8 @@ Tests are inline in `src/lib.rs`.
 
 ## Dependents
 
-`tuna-shell-gtk` (brightness policy and `org.gnome.Shell.Brightness`).
+`tuna-shell-gtk` (brightness policy and `org.gnome.Shell.Brightness`) and
+`tuna-compositor` (the brightness journal's off-loop validator).
 
 ## Docs
 
