@@ -21,6 +21,10 @@
 #   TRY_TUNA_DISK    guest disk (default: 40G)
 #   TRY_TUNA_PORT    local port for the console (default: 8006)
 #   TRY_TUNA_NO_OPEN=1  don't open a browser; just print the console URL
+#   TRY_TUNA_USER    username to log in with after boot (optional; also
+#                    needs TRY_TUNA_PASSWORD unless the account has none —
+#                    the image must already contain the account)
+#   TRY_TUNA_PASSWORD  password for TRY_TUNA_USER (optional, may be empty)
 #
 # Trust story: this pipe-to-bash fetch is TLS-only (same shape as
 # scripts/install.sh). Everything it puts on your machine afterwards is
@@ -115,8 +119,12 @@ if ! corral plugin list 2>/dev/null | grep -q '^bootc'; then
   note "installing corral bootc plugin (checksum-verified)..."
   corral plugin install bootc || die "bootc plugin install failed"
 fi
+# Marlin needs the composefs-capable plugin (0.3.0+); update is a no-op when
+# already current. Pinned installs are left alone.
+if ! corral plugin list 2>/dev/null | grep -q 'pinned'; then
+  corral plugin update bootc >/dev/null 2>&1 || true
+fi
 corral bootc --help >/dev/null 2>&1 || die "corral bootc plugin not working after install — check: corral plugin list"
-
 stop_web() { [[ -n "$WEB_PID" ]] && kill "$WEB_PID" 2>/dev/null || true; WEB_PID=""; }
 cleanup() {
   echo "" >&2
@@ -258,6 +266,37 @@ cat <<EOF
     console: $CONSOLE_URL
     (a browser tab should have opened; Ctrl-C here stops the VM cleanly)
 EOF
+
+# --- auto-login (optional) -----------------------------------------------------
+# Types the greeter credentials over the emulated keyboard and checks the
+# result with a screenshot. The greeter takes username, then password on the
+# next screen; the session dropdown defaults to Tuna Desktop.
+if [[ -n "${TRY_TUNA_USER:-}" ]]; then
+  note "waiting for the greeter..."
+  GREETER_UP=0
+  for _ in $(seq 1 36); do
+    if corral screenshot "$VM" --require-paint >/dev/null 2>&1; then
+      GREETER_UP=1
+      break
+    fi
+    sleep 5
+  done
+  [[ "$GREETER_UP" == "1" ]] || die "greeter never painted — inspect with: corral screenshot $VM"
+  sleep 10
+  corral type "$VM" "$TRY_TUNA_USER" || die "username contains characters outside the US keyboard — retype it with plain ASCII"
+  sleep 1
+  corral key "$VM" ret || die "could not press Enter"
+  sleep 5
+  if [[ -n "${TRY_TUNA_PASSWORD:-}" ]]; then
+    corral type "$VM" "$TRY_TUNA_PASSWORD" || die "password contains characters outside the US keyboard"
+    sleep 1
+  fi
+  corral key "$VM" ret || die "could not press Enter"
+  note "logged in as $TRY_TUNA_USER (if the account exists with that password); verifying desktop..."
+  sleep 30
+  SHOT="$(corral screenshot "$VM" --require-paint 2>&1)" || die "no painted desktop after login — credentials may be wrong; inspect with: corral screenshot $VM"
+  note "desktop painted: $SHOT"
+fi
 
 trap cleanup INT TERM
 # Foreground wait: Ctrl-C lands in cleanup, which stops the VM and the web
