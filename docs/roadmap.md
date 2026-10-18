@@ -139,7 +139,7 @@ commit completions.
 
 | Issue | Decision needed |
 | --- | --- |
-| #505 | Confirm v1.0.0-beta.1 counts as the transition release, then schedule roost-compat removal |
+| #505 | Confirm v1.0.0-beta.1 counts as the transition release, then schedule tuna-compat removal |
 | #737 | 167 Python tests omitted from CI — include, explicitly exclude, or split the suites |
 | #733 | Remainder after the token half lands via #758 |
 | #564 follow-up | Triage the 8 warnings (zbus/zvariant unmaintained, cgmath unsound) that the new gate leaves advisory |
