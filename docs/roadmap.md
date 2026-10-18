@@ -84,7 +84,72 @@ flowchart LR
   S4 --> S5
 ```
 
+
 Specs 002 and 003 may proceed in parallel after the 001 compositor/control contract is stable. Spec 004 may prototype service/accessibility work earlier, but its production acceptance depends on shell and hardware behavior. Spec 006 is the integration and release dossier. Spec 005 is optional post-core work and is not a prerequisite for 1.0 unless release scope explicitly changes.
+
+## Near-term delivery queue
+
+Ordered by unblocking, from the 2026-10-18 review (119 open issues, 13 open
+PRs). Each wave lands before the next starts, so CI failures stay
+attributable to one change at a time.
+
+```mermaid
+flowchart LR
+  W1[Wave 1: green PRs] --> W2[Wave 2: backlight stack]
+  W2 --> W3[Wave 3: stale content PRs]
+  W1 --> D[Decisions]
+  D --> W3
+```
+
+### Wave 1 — merge on green (no code changes needed)
+
+| PR | What | State |
+| --- | --- | --- |
+| #758 | CI least-privilege tokens + checkout hygiene (closes #623) | CI running |
+| #759 | RUSTSEC advisory gate (closes #564) | CI running |
+| #719 | Perf: bound overview chrome buffers (draft) | Needs rebase + undraft (owner) |
+
+### Wave 2 — backlight stack, bottom-up (each rebases onto the landed parent)
+
+The brightness/backlight PRs form one stack; merging out of order rebuilds
+every child. Land strictly in this order, rebasing each onto its parent:
+
+1. #706 brightness-contract (rebase fixes its ledger failure: the WWAN
+   assertions landed on main after the branch)
+2. #707 monitor-identity (CONFLICTING — retarget onto landed #706)
+3. #708 accelerator-release (retarget onto landed #707; has journey +
+   coverage failures to re-evaluate after rebase)
+4. #713 native-lifecycle, split 5/5 of #469 (rebase onto main; needs
+   lane-owner review + headed VM proof before merge)
+
+#710 (brightness-journal) already landed mid-stack. #713 stays held for
+owner review even when green — it binds display lifecycle to kernel
+commit completions.
+
+### Wave 3 — stale content PRs (rebase first, then diagnose what remains)
+
+| PR | What | Known state |
+| --- | --- | --- |
+| #547 | Perf regression gate (draft) | Old journey failure; rebase, then judge |
+| #561 | Multitasking prefs (draft) | CONFLICTING; rebase, then judge |
+| #458 | GNOME SVG backgrounds (draft) | CONFLICTING; rebase, then judge |
+| #453 | Orca native keyboard (draft) | CONFLICTING; rebase, then judge |
+
+### Decisions (blocking Wave 3 and cleanup)
+
+| Issue | Decision needed |
+| --- | --- |
+| #505 | Confirm v1.0.0-beta.1 counts as the transition release, then schedule roost-compat removal |
+| #737 | 167 Python tests omitted from CI — include, explicitly exclude, or split the suites |
+| #733 | Remainder after the token half lands via #758 |
+| #564 follow-up | Triage the 8 warnings (zbus/zvariant unmaintained, cgmath unsound) that the new gate leaves advisory |
+
+### v1 milestone mapping
+
+- Milestone 1 (GNOME 51 capabilities): Wave 2 stack, #458, #453.
+- Milestone 2 (performance vs GNOME): #719, #547.
+- Milestone 3 (provenance/image): #759 (supply chain), image work in tunaos.
+- Milestone 4 (checklist): unblocked by Waves 1–3.
 
 ## Spek and plan registry
 
