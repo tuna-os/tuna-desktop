@@ -56,6 +56,10 @@ const XML: &str = r#"<node>
       <arg name="action" type="u"/>
       <arg name="parameters" type="a{sv}"/>
     </signal>
+    <signal name="AcceleratorDeactivated">
+      <arg name="action" type="u"/>
+      <arg name="parameters" type="a{sv}"/>
+    </signal>
     <property name="Mode" type="s" access="read"/>
     <property name="OverviewActive" type="b" access="read"/>
     <property name="ShellVersion" type="s" access="read"/>
@@ -68,8 +72,8 @@ pub trait ShellActions {
     fn focus_search(&self);
     fn show_applications(&self);
     fn overview_active(&self) -> bool;
-    /// Hand the compositor the full set of grabs.
-    fn set_accelerators(&self, accelerators: Vec<tuna_shell_control::Accelerator>);
+    /// Hand the compositor the full set of grabs with their flags.
+    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>);
 }
 
 /// Parse a GNOME accelerator string (`<Super>p`, `XF86AudioRaiseVolume`)
@@ -115,6 +119,8 @@ struct Grab {
     keysym: u32,
     mods: u32,
     modes: u32,
+    /// GNOME's MetaKeyBindingFlags, within `SUPPORTED_GRAB_FLAGS`.
+    flags: u32,
 }
 
 /// Every grab by action id (Mutter's keybinding actions).
@@ -127,9 +133,19 @@ struct Grabs {
 }
 
 impl Grabs {
-    /// Grab `accelerator` for `sender`: the new action id, or 0 when it
-    /// does not parse or is grabbed already (as Mutter answers).
+    /// Grab `accelerator` for `sender` without GNOME flags.
+    #[cfg(test)]
     fn grab(&mut self, sender: &str, accelerator: &str, modes: u32) -> u32 {
+        self.grab_with_flags(sender, accelerator, modes, 0)
+    }
+
+    /// Grab `accelerator` for `sender` with GNOME's MetaKeyBindingFlags:
+    /// the new action id, or 0 when it does not parse, is grabbed
+    /// already, or carries an unsupported flag (as Mutter answers).
+    fn grab_with_flags(&mut self, sender: &str, accelerator: &str, modes: u32, flags: u32) -> u32 {
+        if flags & !tuna_shell_control::SUPPORTED_GRAB_FLAGS != 0 {
+            return 0;
+        }
         let Some((keysym, mods)) = parse_accelerator(accelerator) else {
             return 0;
         };
@@ -165,6 +181,7 @@ impl Grabs {
                 keysym,
                 mods,
                 modes,
+                flags,
             },
         );
         self.next
@@ -225,11 +242,26 @@ pub struct Service {
 }
 
 impl Service {
-    /// Hand the compositor every grab: callers' and the shell's own.
+    /// Hand the compositor every grab: callers' (with their GNOME flags)
+    /// and the shell's own.
     fn push(&self) {
-        let mut list = self.grabs.borrow().list();
-        list.extend(self.internal.borrow().iter().copied());
-        self.actions.set_accelerators(list);
+        let grabs = self.grabs.borrow();
+        let mut typed: Vec<_> = grabs
+            .list()
+            .into_iter()
+            .map(|accelerator| tuna_shell_control::AcceleratorGrab {
+                flags: grabs.by_action[&accelerator.action].flags,
+                accelerator,
+            })
+            .collect();
+        drop(grabs);
+        typed.extend(self.internal.borrow().iter().copied().map(|accelerator| {
+            tuna_shell_control::AcceleratorGrab {
+                accelerator,
+                flags: 0,
+            }
+        }));
+        self.actions.set_accelerator_grabs(typed);
     }
 
     /// Bind the shell's own keys: `accelerators[i]` with its modes runs
@@ -267,7 +299,21 @@ impl Service {
     /// a caller's is signalled to that caller, as GNOME does (unicast
     /// AcceleratorActivated).
     pub fn accelerator_activated(&self, action: u32, time: u32, mode: u32) {
+        self.accelerator_event(action, time, mode, false);
+    }
+
+    /// A `GRAB_TRIGGER_RELEASE` grab's key was released: signalled to
+    /// its caller as AcceleratorDeactivated. The shell's own bindings
+    /// act on press only.
+    pub fn accelerator_deactivated(&self, action: u32, time: u32, mode: u32) {
+        self.accelerator_event(action, time, mode, true);
+    }
+
+    fn accelerator_event(&self, action: u32, time: u32, mode: u32, released: bool) {
         if action >= INTERNAL_BASE {
+            if released {
+                return;
+            }
             let index = self.internal_indices.borrow().get(&action).copied();
             let run = self.on_internal.borrow().clone();
             if let (Some(index), Some(run)) = (index, run) {
@@ -287,19 +333,30 @@ impl Service {
         let Some(conn) = self.conn.borrow().clone() else {
             return;
         };
-        let params = glib::VariantDict::new(None);
-        params.insert("timestamp", time);
-        params.insert("action-mode", mode);
-        params.insert("device-node", "");
-        params.insert("device-id", 0u32);
         let _ = conn.emit_signal(
             Some(&sender),
             PATH,
             "org.gnome.Shell",
-            "AcceleratorActivated",
-            Some(&(action, params.end()).to_variant()),
+            if released {
+                "AcceleratorDeactivated"
+            } else {
+                "AcceleratorActivated"
+            },
+            Some(&accelerator_signal_body(action, time, mode)),
         );
     }
+}
+
+/// The `(ua{sv})` body of AcceleratorActivated/AcceleratorDeactivated;
+/// a `(u32, Variant)` tuple would box the dictionary as `(uv)`, which
+/// GNOME's portal drops.
+fn accelerator_signal_body(action: u32, time: u32, mode: u32) -> glib::Variant {
+    let params = glib::VariantDict::new(None);
+    params.insert("timestamp", time);
+    params.insert("action-mode", mode);
+    params.insert("device-node", "");
+    params.insert("device-id", 0u32);
+    glib::Variant::tuple_from_iter([action.to_variant(), params.end()])
 }
 
 /// Unpack ShowOSD's `a{sv}` the way shellDBus.js does.
@@ -401,7 +458,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                             None
                         }
                         "GrabAccelerator" => {
-                            let Some((accel, modes, _flags)) = params.get::<(String, u32, u32)>()
+                            let Some((accel, modes, flags)) = params.get::<(String, u32, u32)>()
                             else {
                                 invocation.return_dbus_error(
                                     "org.freedesktop.DBus.Error.InvalidArgs",
@@ -409,7 +466,10 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                                 );
                                 return;
                             };
-                            let action = grabs_svc.grabs.borrow_mut().grab(&sender, &accel, modes);
+                            let action = grabs_svc
+                                .grabs
+                                .borrow_mut()
+                                .grab_with_flags(&sender, &accel, modes, flags);
                             grabs_svc.push();
                             Some((action,).to_variant())
                         }
@@ -424,7 +484,9 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                             let actions: Vec<u32> = {
                                 let mut grabs = grabs_svc.grabs.borrow_mut();
                                 list.iter()
-                                    .map(|(accel, modes, _)| grabs.grab(&sender, accel, *modes))
+                                    .map(|(accel, modes, flags)| {
+                                        grabs.grab_with_flags(&sender, accel, *modes, *flags)
+                                    })
                                     .collect()
                             };
                             grabs_svc.push();
@@ -535,6 +597,16 @@ mod tests {
     }
 
     #[test]
+    fn accelerator_signal_body_matches_the_introspected_signature() {
+        let body = accelerator_signal_body(7, 1234, 2);
+        assert_eq!(body.type_().as_str(), "(ua{sv})");
+        assert_eq!(body.child_value(0).get::<u32>(), Some(7));
+        let params = glib::VariantDict::new(Some(&body.child_value(1)));
+        assert_eq!(params.lookup::<u32>("timestamp").ok().flatten(), Some(1234));
+        assert_eq!(params.lookup::<u32>("action-mode").ok().flatten(), Some(2));
+    }
+
+    #[test]
     fn accelerators_parse_like_gnome() {
         let (vol, mods) = parse_accelerator("XF86AudioRaiseVolume").unwrap();
         assert_eq!((vol, mods), (0x1008FF13, 0));
@@ -590,8 +662,8 @@ mod tests {
         fn overview_active(&self) -> bool {
             false
         }
-        fn set_accelerators(&self, accelerators: Vec<tuna_shell_control::Accelerator>) {
-            *self.0.borrow_mut() = accelerators;
+        fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
+            *self.0.borrow_mut() = grabs.into_iter().map(|g| g.accelerator).collect();
         }
     }
 
@@ -671,5 +743,40 @@ mod tests {
         );
         assert!(actions.0.borrow().is_empty());
         service.accelerator_activated(u32::MAX - 1, 1, tuna_shell_control::MODE_NORMAL);
+    }
+}
+
+#[cfg(test)]
+mod grab_flag_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_flags_return_zero_without_installing_and_reply_indexes_remain_stable() {
+        let mut grabs = Grabs::default();
+        let requests = [("r", 128), ("s", 8), ("t", 16), ("r", 128), ("u", 0)];
+        let actions: Vec<_> = requests
+            .iter()
+            .map(|(key, flags)| grabs.grab_with_flags(":1.70", key, 1, *flags))
+            .collect();
+        assert_eq!(actions, [1, 0, 2, 0, 3]);
+        assert_eq!(grabs.by_action.len(), 3);
+        assert!(!grabs
+            .by_action
+            .values()
+            .any(|grab| grab.keysym == u32::from(b's')));
+        assert_eq!(grabs.by_action[&1].flags, 128);
+        for flags in [1, 2, 4, 8, 32, 64, 256, u32::MAX] {
+            assert_eq!(grabs.grab_with_flags(":1.71", "v", 1, flags), 0);
+        }
+    }
+
+    #[test]
+    fn exhausted_action_ids_do_not_recycle_into_old_or_internal_owners() {
+        let mut grabs = Grabs {
+            next: INTERNAL_BASE - 1,
+            ..Default::default()
+        };
+        assert_eq!(grabs.grab_with_flags(":1.72", "r", 1, 128), 0);
+        assert!(grabs.by_action.is_empty());
     }
 }
