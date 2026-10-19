@@ -125,16 +125,7 @@ def session_identity():
     stat_text=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
     return {'owner':owner,'pid':pid,'start_time':stat_text[19],'executable':str(exe),'sha256':hashlib.sha256(exe.read_bytes()).hexdigest(),'compositor_pid':int(stat_text[1])}
 
-def activate_chooser(find_chooser, process, original, label):
-    global _ACTIVE_END
-    # GNOME's chooser is GtkFlowBoxChild with an overridden accessible role.
-    # Its generic Action indices enumerate muxer actions, not child::activate.
-    # Retain that real inventory and activate the documented Enter keybinding.
-    # These chooser accessibles do not honor programmatic focus grabs, so
-    # focus is acquired with genuine Tab key events through the verified
-    # keyboard host instead. Traversal sends only real Tabs, activation is
-    # exactly one genuine Return, and every resolved accessible is re-read
-    # live because the thumbnail panel rebuilds children asynchronously.
+def verified_host():
     hosts = subprocess.check_output(['xdotool', 'search', '--onlyvisible', '--name', '^Smithay'], text=True, timeout=budget('xdotool search Smithay host')).split()
     if len(hosts) != 1:
         raise RuntimeError('expected exactly one actual Smithay keyboard host')
@@ -146,6 +137,32 @@ def activate_chooser(find_chooser, process, original, label):
               'sha256': hashlib.sha256(executable.read_bytes()).hexdigest()}
     if actual != ORIGINAL_HOST:
         raise RuntimeError('keyboard host identity changed from the original candidate compositor')
+    return host, actual
+
+
+def park_pointer_for_pixels():
+    host, original = verified_host()
+    subprocess.run(['xdotool', 'mousemove', '--window', host, '640', '16'],
+                   check=True, timeout=budget('park actual SVG proof pointer', 5))
+    wait_for(lambda: scene().get('pointer_position') == [640.0, 16.0],
+             'actual pointer did not reach the excluded panel area', 5)
+    if verified_host() != (host, original):
+        raise RuntimeError('pointer host identity changed during movement')
+    return {'host': original, 'window': int(host), 'pointer_position': [640.0, 16.0]}
+
+
+def activate_chooser(find_chooser, process, original, label):
+    global _ACTIVE_END
+    # GNOME's chooser is GtkFlowBoxChild with an overridden accessible role.
+    # Its generic Action indices enumerate muxer actions, not child::activate.
+    # Retain that real inventory and activate the documented Enter keybinding.
+    # These chooser accessibles do not honor programmatic focus grabs, so
+    # focus is acquired with genuine Tab key events through the verified
+    # keyboard host instead. Traversal sends only real Tabs, activation is
+    # exactly one genuine Return, and every resolved accessible is re-read
+    # live because the thumbnail panel rebuilds children asynchronously.
+    host, actual = verified_host()
+    pid, start = actual['pid'], actual['start_ticks']
     subprocess.run(['xdotool', 'windowfocus', '--sync', host], check=True, timeout=min(5, budget('xdotool focus Smithay host')))
     control = None
     actions = None
@@ -302,8 +319,16 @@ def pixels(style,label):
     if len(ink)<100:raise RuntimeError('independent native fonts produced no actual text ink')
     points.update(ink[::max(1,len(ink)//100)])
     path=OUT/f'{PHASE}-{label}-desktop.png'
+    # Keep the real cursor outside the unchanged wallpaper sample domain.
+    # Moving it physically avoids treating a cursor pixel as an SVG mismatch.
+    pointer = park_pointer_for_pixels()
+    (OUT/f'{PHASE}-{label}-pointer.json').write_text(json.dumps(pointer,indent=2))
     def correct():
-        subprocess.run(['scrot','-o',str(path)],check=True)
+        if scene().get('pointer_position') != pointer['pointer_position']:
+            raise RuntimeError('actual pointer left the excluded panel area')
+        subprocess.run(['scrot','-o',str(path)],check=True,timeout=budget('SVG desktop screenshot'))
+        if scene().get('pointer_position') != pointer['pointer_position']:
+            raise RuntimeError('actual pointer moved during SVG screenshot')
         image=GdkPixbuf.Pixbuf.new_from_file(str(path));data=image.get_pixels();stride=image.get_rowstride();channels=image.get_n_channels()
         if image.get_width()!=1280 or image.get_height()!=800:raise RuntimeError('wrong actual screenshot dimensions')
         observed=[]

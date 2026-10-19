@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Generated caches retain strict identity and native/package provenance."""
 import ast
+import hashlib
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -156,6 +158,77 @@ class NativeCacheDirectoryTests(unittest.TestCase):
         self.assertEqual(native.FcStrListNext.call_count, 16384)
         native.FcStrListDone.assert_called_once_with(2)
         native.FcConfigDestroy.assert_called_once_with(1)
+
+
+class SvgPointerCaptureTests(unittest.TestCase):
+    def helpers(self, original=None):
+        path = Path(__file__).with_name('tuna-stock-svg-proof.py')
+        tree = ast.parse(path.read_text())
+        nodes = [next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+                 for name in ('verified_host', 'park_pointer_for_pixels')]
+        pid = os.getpid()
+        executable = Path(f'/proc/{pid}/exe').resolve(strict=True)
+        actual = {'pid': pid, 'executable': str(executable),
+                  'start_ticks': Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19],
+                  'sha256': hashlib.sha256(executable.read_bytes()).hexdigest()}
+        scope = {'subprocess': subprocess, 'Path': Path, 'hashlib': hashlib,
+                 'ORIGINAL_HOST': original or actual, 'budget': lambda label, cap=10: cap}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), scope)
+        return scope, actual
+
+    def test_host_requires_original_pid_start_executable_and_hash(self):
+        scope, actual = self.helpers()
+        with patch.object(subprocess, 'check_output', side_effect=['41\n', str(os.getpid())]):
+            self.assertEqual(scope['verified_host'](), ('41', actual))
+        for field, value in [('pid', 1), ('start_ticks', '0'), ('executable', '/other'), ('sha256', '0' * 64)]:
+            scope, _ = self.helpers({**actual, field: value})
+            with self.subTest(field=field), patch.object(subprocess, 'check_output',
+                    side_effect=['41\n', str(os.getpid())]), self.assertRaises(RuntimeError):
+                scope['verified_host']()
+
+    def test_nonunique_host_is_rejected(self):
+        scope, _ = self.helpers()
+        for hosts in ('', '41 42'):
+            with self.subTest(hosts=hosts), patch.object(subprocess, 'check_output', return_value=hosts), \
+                    self.assertRaises(RuntimeError):
+                scope['verified_host']()
+
+    def test_physical_motion_and_observed_position_are_required(self):
+        scope, actual = self.helpers()
+        def wait(predicate, label, seconds):
+            self.assertEqual(seconds, 5)
+            if not predicate(): raise RuntimeError(label)
+        scope.update(verified_host=lambda: ('41', actual), wait_for=wait,
+                     scene=lambda: {'pointer_position': [640.0, 16.0]})
+        with patch.object(subprocess, 'run') as run:
+            receipt = scope['park_pointer_for_pixels']()
+        run.assert_called_once_with(['xdotool', 'mousemove', '--window', '41', '640', '16'],
+                                    check=True, timeout=5)
+        self.assertEqual(receipt['host'], actual)
+        scope['scene'] = lambda: {'pointer_position': [640.0, 400.0]}
+        with patch.object(subprocess, 'run'), self.assertRaises(RuntimeError):
+            scope['park_pointer_for_pixels']()
+
+    def test_failed_input_and_replaced_host_fail_closed(self):
+        scope, actual = self.helpers()
+        scope.update(verified_host=lambda: ('41', actual), wait_for=lambda *args: None)
+        with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('xdotool', 5)), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            scope['park_pointer_for_pixels']()
+        hosts = iter([('41', actual), ('42', actual)])
+        scope['verified_host'] = lambda: next(hosts)
+        with patch.object(subprocess, 'run'), self.assertRaises(RuntimeError):
+            scope['park_pointer_for_pixels']()
+
+    def test_capture_checks_pointer_and_keeps_original_samples_and_tolerance(self):
+        source = Path(__file__).with_name('tuna-stock-svg-proof.py').read_text()
+        self.assertIn('for y in range(60,800,23) for x in range(10,1280,17)', source)
+        self.assertIn("<=1 for p in observed", source)
+        self.assertIn("differ from the actual independent native-loader reference',35)", source)
+        capture = source[source.index('def pixels('):source.index('def fallback(')]
+        self.assertEqual(capture.count("scene().get('pointer_position') != pointer['pointer_position']"), 2)
+        self.assertIn('pointer = park_pointer_for_pixels()', capture)
+        self.assertIn("timeout=budget('SVG desktop screenshot')", capture)
 
 
 if __name__ == '__main__':
