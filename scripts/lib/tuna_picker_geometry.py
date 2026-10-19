@@ -5,6 +5,30 @@ def application_id(pid, start_time):
     return f"org.example.TunaPickerUnrelated.p{pid}.s{start_time}"
 
 
+def new_parent_window(scene, previous_ids, *, mode, xid, app_id):
+    """Admit one newly mapped parent, never a prior caller's recycled XID.
+
+    Snapshot compositor IDs before creating the GTK parent. Xwayland can reuse
+    an XID while the compositor's last published scene still contains the old
+    window. A compositor ID already present before creation cannot identify
+    this new caller. This is initial admission only; the admitted identity stays
+    fixed throughout all later input, parenting and ownership assertions.
+    """
+    if mode not in ("x11", "wayland"):
+        raise ValueError("Unknown picker parent mode")
+    if mode == "x11" and (type(xid) is not int or xid <= 0):
+        return None
+    if mode == "wayland" and (not isinstance(app_id, str) or not app_id):
+        return None
+    candidates = [window for window in scene["windows"]
+                  if type(window.get("id")) is int and window["id"] > 0
+                  and window["id"] not in previous_ids
+                  and (window.get("x11_window_id") == xid if mode == "x11"
+                       else window.get("app_id") == app_id
+                       and window.get("x11_window_id") is None)]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def committed_window(scene, record, *, pid, uid, start_time, parent_id):
     """Return B only after its mapped allocation matches committed placement.
 
