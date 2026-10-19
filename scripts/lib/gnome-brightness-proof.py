@@ -147,8 +147,14 @@ def main():
     def request(method,value,expected_failure=False):
         if signal_overflow[0]:raise RuntimeError('original signal receipt overflow')
         before=available(bus,owner);stamp=time.monotonic_ns();failed=None;signal_before=len(signals)
+        receipt=dict(method=method,value='NaN' if isinstance(value,float) and value!=value else value,
+                     before_capability=before,started_ns=stamp,user_signals_before=signal_before)
+        receipts.append(receipt)
         try:call(bus,owner,PATH,NAME,method,GLib.Variant('(b)' if method=='SetDimming' else '(d)',(value,)))
-        except GLib.Error as error:failed=Gio.DBusError.get_remote_error(error) or f'{error.domain}:{error.code}'
+        except GLib.Error as error:
+            failed=Gio.DBusError.get_remote_error(error) or f'{error.domain}:{error.code}'
+            receipt['error_detail']=str(error)[:512]
+        receipt.update(error=failed,call_ended_ns=time.monotonic_ns(),expected_failure=expected_failure)
         if bool(failed)!=expected_failure:raise RuntimeError(f'{method}: expected_failure={expected_failure}, actual={failed}')
         context=GLib.MainContext.default()
         until=time.monotonic()+0.15;budget=[100]
@@ -158,8 +164,7 @@ def main():
         if signal_overflow[0]:raise RuntimeError('original signal receipt overflow')
         if len(signals)!=signal_before:raise RuntimeError('policy/reset/refusal incorrectly emitted a user BrightnessChanged signal')
         if principal(bus,args.shell_executable)!=identity:raise RuntimeError('original shell principal changed')
-        receipts.append(dict(method=method,value='NaN' if isinstance(value,float) and value!=value else value,
-                             before_capability=before,after_capability=available(bus,owner),started_ns=stamp,ended_ns=time.monotonic_ns(),error=failed,user_signals_before=signal_before,user_signals_after=len(signals)))
+        receipt.update(after_capability=available(bus,owner),ended_ns=time.monotonic_ns(),user_signals_after=len(signals))
     result=dict(principal=identity,session_id=args.session_id,native=not bool(args.controlled_root),backlight_root=str(root),backlights=entries,observations=receipts,
                 limitation='Actual interface and unsupported-hardware VM proof only; controlled sysfs/logind policy receipts are synthetic, not physical hardware qualification.')
     primary=None;settings_restore=None

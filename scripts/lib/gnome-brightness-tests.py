@@ -177,4 +177,50 @@ class ActualControlledAuthority(unittest.TestCase):
                 raw=read(fd,count);os.replace(replacement,path);return raw
             with mock.patch.object(os,'read',side_effect=replace),self.assertRaises(RuntimeError):namespace['controlled_manifest'](path)
 
+class FailedRequestReceipt(unittest.TestCase):
+    def request(self,error=None):
+        class WireError(Exception):
+            domain='wire';code=1
+        errors=[];calls=[];clock=[0]
+        def monotonic():
+            clock[0]+=1
+            return clock[0]
+        def call(*args):
+            calls.append(args)
+            if error is not None:raise WireError(error)
+        scope=dict(namespace,receipts=errors,signals=[],signal_overflow=[False],bus=object(),owner=':1.42',
+                   call=call,available=lambda *args:True,principal=lambda *args:'original',identity='original',
+                   args=SimpleNamespace(shell_executable='/actual/shell'),
+                   time=SimpleNamespace(monotonic=monotonic,monotonic_ns=lambda:100),
+                   GLib=SimpleNamespace(Error=WireError,Variant=lambda signature,args:args,
+                                        MainContext=SimpleNamespace(default=lambda:object())),
+                   Gio=SimpleNamespace(DBusError=SimpleNamespace(get_remote_error=lambda error:'org.gnome.Shell.Brightness.Error.Failed')))
+        node=next(node for node in ast.walk(parsed) if isinstance(node,ast.FunctionDef) and node.name=='request')
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'<actual-request-receipt>','exec'),scope)
+        return scope['request'],errors,calls
+    def test_unexpected_failure_is_retained_before_refusal_without_retry(self):
+        request,receipts,calls=self.request('brightness update already pending')
+        with self.assertRaises(RuntimeError):request('SetDimming',False)
+        self.assertEqual(len(calls),1);self.assertEqual(len(receipts),1)
+        self.assertEqual(receipts[0]['error_detail'],'brightness update already pending')
+        self.assertFalse(receipts[0]['value']);self.assertFalse(receipts[0]['expected_failure'])
+        self.assertNotIn('ended_ns',receipts[0])
+    def test_error_detail_is_bounded(self):
+        request,receipts,_=self.request('x'*1024)
+        with self.assertRaises(RuntimeError):request('SetDimming',False)
+        self.assertEqual(len(receipts[0]['error_detail']),512)
+    def test_missing_expected_failure_still_refuses_and_retains_actual_success(self):
+        request,receipts,calls=self.request()
+        with self.assertRaises(RuntimeError):request('SetDimming',True,True)
+        self.assertIsNone(receipts[0]['error']);self.assertTrue(receipts[0]['expected_failure'])
+        self.assertEqual(len(calls),1)
+    def test_expected_failure_and_success_keep_final_signal_receipt(self):
+        for error in (None,'controlled denial'):
+            request,receipts,calls=self.request(error)
+            request('SetDimming',True,error is not None)
+            self.assertEqual(len(calls),1);self.assertEqual(len(receipts),1)
+            self.assertEqual(receipts[0]['user_signals_after'],0)
+            self.assertTrue(receipts[0]['after_capability'])
+            self.assertIn('ended_ns',receipts[0])
+
 if __name__=='__main__':unittest.main()
