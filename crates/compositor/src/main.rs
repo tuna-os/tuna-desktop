@@ -121,6 +121,10 @@ fn main() -> ExitCode {
             }
         }
     }
+    if let Err(error) = tuna_compositor::user_upgrade::prepare() {
+        eprintln!("tuna-compositor: {error}");
+        return ExitCode::FAILURE;
+    }
     println!(
         "tuna-compositor: nested session on {} ({}x{})",
         session.socket_name, session.width, session.height

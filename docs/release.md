@@ -75,9 +75,16 @@ a beta does not claim the gates in the [roadmap](roadmap.md#global-decision-gate
 
 ## Upgrade and uninstall
 
-Upgrading installs the newer package over the older one; user configuration
-and application data are preserved. Uninstalling removes the Tuna Desktop-owned
-program files and the session entry; user configuration and application data
+Follow the [legacy-upgrade and recovery guide](legacy-upgrade.md) before
+qualifying an upgrade. Require the exact two-file transition allowance,
+non-destructive settings behavior and manager-specific modified/deleted
+configuration evidence. Real GDM remembered-name/reselection, a running old
+compositor's unlock, Arch replacement and Marlin activation/rollback need
+their own native results; archive, user-namespace dpkg and private-PAM
+mechanisms cannot stand in for those tests. Do not remove the bridge based
+only on elapsed releases or the fact that the beta was installed.
+
+Uninstalling removes the Tuna Desktop-owned program files and session entries; user configuration and application data
 are preserved.
 
 ## Recovering from a bad release

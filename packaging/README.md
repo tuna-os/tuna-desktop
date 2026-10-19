@@ -48,16 +48,26 @@ sudo bootc switch ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview:latest
 
 <!-- tuna-rename: keep-begin -->
 
-Tuna Desktop was called Roost until #505. The package is now
-`tuna-desktop` (not `tuna`: Fedora and others ship an unrelated `tuna`),
-and both packages declare `replaces`/`conflicts`/`provides=roost`, so an
-upgrade swaps it in place. The beta's one-release compatibility layer
-(the `/usr/bin/roost-*` symlinks, the `roost.desktop` session entry, the
-`roost-lock` PAM service, the `ROOST_*` environment names, and the old
-per-user directory adoption) was removed after that release: fresh
-installs carry no `roost` names, and only the package relations above
-still mention it. GDM users who upgraded through the beta keep their
-remembered session because the beta's entry carried them over to `tuna`.
+The rename landed in #536; #505 tracks its compatibility transition. The
+package is `tuna-desktop` (not `tuna`: Fedora ships an unrelated package),
+with replacement/conflict/provision relations for `roost`. Those relations
+do not migrate a saved login choice, user data or a running executable.
+
+Fresh and upgraded packages temporarily retain exactly two regular legacy
+paths: `/usr/share/wayland-sessions/roost.desktop` and
+`/etc/pam.d/roost-lock`. The hidden session entry executes `tuna-session`;
+it does **not** change GDM's remembered desktop-file name. Explicitly choose
+**Tuna Desktop** at a later login and verify the next login remembers it.
+The old PAM name remains necessary for an already-running pre-rename
+compositor. Old binary symlinks and `ROOST_*` environment aliases stay removed.
+
+The compositor startup guard adopts safe old-only settings with relative
+links, including when the beta was installed but never launched. It stops
+on conflicting or unsafe state instead of overwriting, merging or deleting
+data. Debian conffiles, Arch backup files and Marlin deployments have
+different preservation/recovery behavior; none is replaced with a cleanup
+hook. Read the [upgrade and recovery guide](../docs/legacy-upgrade.md),
+including its explicitly unqualified native routes and bridge-removal gates.
 <!-- tuna-rename: keep-end -->
 
 Other branches rename themselves with `scripts/rename-to-tuna`.
