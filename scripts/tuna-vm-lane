@@ -661,6 +661,22 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         return (before["state"]["windows"] == after["state"]["windows"]
                 and identities(before) == identities(after))
 
+    def same_apps_after_navigation(before, after):
+        # Intentional activation may raise an existing window before VT starts.
+        # Ignore only that ordering here; keep every window field and the exact
+        # original process identities. Later VT/sleep comparisons stay ordered.
+        if before["session"] != after["session"]:
+            return False
+        normalized = []
+        for value in (before, after):
+            windows = value["state"]["windows"]
+            ids = [window["id"] for window in windows]
+            if any(type(identity) is not int or identity <= 0 for identity in ids) or len(set(ids)) != len(ids):
+                return False
+            normalized.append({**value, "state": {**value["state"],
+                               "windows": sorted(windows, key=lambda window: window["id"])}})
+        return same_apps(*normalized)
+
     def changed_pixels(left, right, rect):
         if left[:2] != right[:2]:
             raise RuntimeError("client repaint frame dimensions changed")
@@ -1166,8 +1182,30 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
 
                             def open_quick():
                                 qmp.keys("meta_l", "s")
+                                return public_focus()
+                            open_quick()
+                            # Do not assume which public item GTK initially focused.
+                            # Discover the exact public target by physical Tab,
+                            # then record only the final single-Tab speech trigger.
+                            def prepare_public_tab_capture(label, role):
+                                for _ in range(16):
+                                    qmp.keys("tab")
+                                    actual = public_focus()
+                                    if any(node["label"] == label and node["role"] == role and node["focused"]
+                                           for node in actual["focus"]["public_controls"]):
+                                        break
+                                else:
+                                    raise RuntimeError("bounded physical Tab cycle did not reach the original public target")
+                                qmp.keys("shift", "tab")
+                                previous = public_focus()
+                                if any(node["label"] == label and node["role"] == role and node["focused"]
+                                       for node in previous["focus"]["public_controls"]):
+                                    raise RuntimeError("physical reverse Tab did not leave the original public target")
+                            prepare_public_tab_capture("Take Screenshot", "push button")
+                            def focus_screenshot():
+                                qmp.keys("tab")
                                 return public_focus("Take Screenshot")
-                            public_capture("orca-quick-settings-open", "take screenshot", open_quick)
+                            public_capture("orca-quick-settings-screenshot", "take screenshot", focus_screenshot)
                             # Discover the actual tab route before starting the fixed
                             # bounded public capture; the final single Tab is the recorded
                             # trigger. No guessed service-dependent button ordering.
@@ -1700,6 +1738,12 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     # Capture the stable desktop after the final key OSD has disappeared.
     time.sleep(2)
 
+    # Public keyboard navigation above legitimately raises original windows.
+    # Freeze the exact post-navigation stack before testing lifecycle restoration.
+    before_vt = inventory("before-vt-baseline")
+    if not same_apps_after_navigation(before, before_vt):
+        raise RuntimeError("public navigation changed original app or process identity")
+    before = before_vt
     base_frame = frame("before-vt")
     vt = int(before["session"]["VTNr"])
     away = 2 if vt != 2 else 3

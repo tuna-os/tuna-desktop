@@ -1338,6 +1338,67 @@ class PublicOrcaNavigation(unittest.TestCase):
         self.assertEqual([tuple(ast.literal_eval(arg) for arg in n.args) for n in calls], [("tab",)])
         # Clock/source policy only: an actual VM still must qualify the fresh recording.
 
+    def tab_preparation(self, observations):
+        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        tree = ast.parse(file.read_text())
+        helper = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                      and n.name == "prepare_public_tab_capture")
+        keys = []
+        def public_focus():
+            value = next(observations)
+            if isinstance(value, Exception):
+                raise value
+            return {"focus": {"public_controls": value}}
+        scope = {"qmp": SimpleNamespace(keys=lambda *chord: keys.append(chord)),
+                 "public_focus": public_focus}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(file), "exec"), scope)
+        return scope[helper.name], keys
+
+    def test_screenshot_route_requires_exact_label_role_focus_and_reverse_departure(self):
+        target = {"label": "Take Screenshot", "role": "push button", "focused": True}
+        observations = [[{**target, "label": "Mute"}], [{**target, "role": "slider"}],
+                        [{**target, "focused": False}], [target], [{**target, "label": "Settings"}]]
+        prepare, keys = self.tab_preparation(iter(observations))
+        prepare("Take Screenshot", "push button")
+        self.assertEqual(keys, [("tab",)] * 4 + [("shift", "tab")])
+
+    def test_screenshot_route_stays_bounded_and_rejects_failed_departure(self):
+        prepare, keys = self.tab_preparation(iter([[]] * 16))
+        with self.assertRaisesRegex(RuntimeError, "bounded physical Tab"):
+            prepare("Take Screenshot", "push button")
+        self.assertEqual(keys, [("tab",)] * 16)
+        target = {"label": "Take Screenshot", "role": "push button", "focused": True}
+        prepare, keys = self.tab_preparation(iter([[target], [target]]))
+        with self.assertRaisesRegex(RuntimeError, "reverse Tab"):
+            prepare("Take Screenshot", "push button")
+        self.assertEqual(keys, [("tab",), ("shift", "tab")])
+
+    def test_screenshot_route_preserves_original_identity_refusal(self):
+        original = RuntimeError("public navigation changed original reader/shell authority")
+        prepare, keys = self.tab_preparation(iter([original]))
+        with self.assertRaises(RuntimeError) as raised:
+            prepare("Take Screenshot", "push button")
+        self.assertIs(raised.exception, original)
+        self.assertEqual(keys, [("tab",)])
+
+    def test_screenshot_speech_capture_has_one_physical_tab_and_exact_target(self):
+        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        tree = ast.parse(file.read_text())
+        focus = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                     and n.name == "focus_screenshot")
+        keys, targets = [], []
+        scope = {"qmp": SimpleNamespace(keys=lambda *chord: keys.append(chord)),
+                 "public_focus": lambda label: targets.append(label) or "exact receipt"}
+        exec(compile(ast.Module(body=[focus], type_ignores=[]), str(file), "exec"), scope)
+        self.assertEqual(scope[focus.name](), "exact receipt")
+        self.assertEqual(keys, [("tab",)])
+        self.assertEqual(targets, ["Take Screenshot"])
+        capture = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                       and isinstance(n.func, ast.Name) and n.func.id == "public_capture"
+                       and ast.literal_eval(n.args[0]) == "orca-quick-settings-screenshot")
+        self.assertEqual([ast.unparse(arg) for arg in capture.args[1:]],
+                         ["'take screenshot'", "focus_screenshot"])
+
     def test_navigation_actions_are_physical_and_capture_failure_always_closes(self):
         file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
         tree = ast.parse(file.read_text())
@@ -1359,6 +1420,70 @@ class PublicOrcaNavigation(unittest.TestCase):
             call = next(n for n in ast.walk(helper) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "keys")
             self.assertEqual(tuple(ast.literal_eval(arg) for arg in call.args), chord)
         # Actual source contracts/fault ordering only; the genuine VM must still qualify navigation.
+
+
+class LifecyclePostNavigationBaseline(unittest.TestCase):
+    def policy(self):
+        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        tree = ast.parse(file.read_text())
+        helpers = [next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+                   for name in ("same_apps", "same_apps_after_navigation")]
+        scope = {"guest_role": lane.guest_role}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), str(file), "exec"), scope)
+        return scope
+
+    def receipts(self):
+        before = {"session": {"Id": "1", "User": "1000", "VTNr": "1"}, "state": {"windows": [
+            {"id": 1, "app_id": "org.gnome.DiskUtility", "rect": [1, 2, 3, 4], "workspace": 0},
+            {"id": 2, "app_id": "org.gnome.SystemMonitor", "rect": [5, 6, 7, 8], "workspace": 0}]},
+            "processes": [{"executable": "tuna-compositor", "pid": 10, "uid": 1000, "start_ticks": 100},
+                          {"executable": "tuna-shell-gtk", "pid": 11, "uid": 1000, "start_ticks": 101}]}
+        after = json.loads(json.dumps(before))
+        after["state"]["windows"].reverse()
+        return before, after
+
+    def test_only_pre_lifecycle_stack_order_may_change(self):
+        policy = self.policy()
+        before, after = self.receipts()
+        self.assertTrue(policy["same_apps_after_navigation"](before, after))
+        self.assertFalse(policy["same_apps"](before, after))
+        self.assertTrue(policy["same_apps"](after, after))
+
+    def test_replaced_missing_duplicate_or_mutated_windows_fail(self):
+        policy = self.policy()
+        for change in (lambda w: w.pop(), lambda w: w.append(w[0]),
+                       lambda w: w[0].update(id=3), lambda w: w[0].update(id=True),
+                       lambda w: w[0].update(app_id="other"), lambda w: w[0].update(workspace=1),
+                       lambda w: w[0].update(rect=[1, 2, 3, 5])):
+            before, after = self.receipts()
+            change(after["state"]["windows"])
+            self.assertFalse(policy["same_apps_after_navigation"](before, after))
+
+    def test_original_process_pid_uid_start_ticks_and_shell_stay_required(self):
+        policy = self.policy()
+        for field, value in (("pid", 12), ("uid", 0), ("start_ticks", 102)):
+            before, after = self.receipts()
+            after["processes"][1][field] = value
+            self.assertFalse(policy["same_apps_after_navigation"](before, after))
+        before, after = self.receipts()
+        after["processes"].pop()
+        self.assertFalse(policy["same_apps_after_navigation"](before, after))
+
+    def test_original_session_identity_stays_required(self):
+        before, after = self.receipts()
+        after["session"]["Id"] = "2"
+        self.assertFalse(self.policy()["same_apps_after_navigation"](before, after))
+
+    def test_fresh_baseline_is_validated_before_replacing_original(self):
+        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        source = file.read_text()
+        self.assertLess(source.index('before_vt = inventory("before-vt-baseline")'),
+                        source.index('if not same_apps_after_navigation(before, before_vt):'))
+        self.assertLess(source.index('if not same_apps_after_navigation(before, before_vt):'),
+                        source.index('before = before_vt'))
+        self.assertLess(source.index('before = before_vt'), source.index('base_frame = frame("before-vt")'))
+        self.assertIn('same_apps(before, after_vt)', source)
+        self.assertIn('same_apps(before, pending_auth)', source)
 
 
 class ControlledOverviewDiagnostic(unittest.TestCase):
