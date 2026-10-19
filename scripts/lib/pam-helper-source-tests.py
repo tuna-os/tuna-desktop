@@ -8,7 +8,6 @@ ROOT = Path(__file__).resolve().parents[2]
 class SourceContracts(unittest.TestCase):
     def test_fixed_helper_entry_precedes_any_desktop_initialization(self):
         main = (ROOT / 'crates/compositor/src/main.rs').read_text().split('fn main() -> ExitCode {', 1)[1]
-        self.assertLess(main.index('pam_helper::entry()'), main.index('legacy::import_env'))
         self.assertLess(main.index('pam_helper::entry()'), main.index('NestedSession::default_for_pid'))
         self.assertIn('std::env::args_os().count() != 2', main)
 

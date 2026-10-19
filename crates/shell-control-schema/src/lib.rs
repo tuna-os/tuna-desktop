@@ -10,7 +10,6 @@
 //! rejected before any postcard decoding happens.
 
 pub mod background;
-pub mod legacy;
 pub mod motion;
 pub use motion::{MotionLevel, MotionPolicy};
 

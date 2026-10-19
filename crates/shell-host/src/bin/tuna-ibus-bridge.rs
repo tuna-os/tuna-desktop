@@ -113,8 +113,6 @@ fn main() {
         println!("tuna-ibus-bridge {}", release_version());
         return;
     }
-    // The old name's environment, for one release (#505).
-    tuna_shell_control::legacy::import_env("tuna-ibus-bridge");
     if let Err(e) = run() {
         eprintln!("tuna-ibus-bridge: {e}");
         std::process::exit(1);

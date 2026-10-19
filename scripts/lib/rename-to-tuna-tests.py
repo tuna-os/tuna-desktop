@@ -71,8 +71,6 @@ class Rules(unittest.TestCase):
         ("sed -E 's/^Name=(Tuna Desktop|Roost)$/x/' roost.desktop", "sed -E 's/^Name=(Tuna Desktop|Roost)$/x/' tuna.desktop"),
         ('names = [n for n in (b"Tuna Desktop", b"Roost") if ok(n)]', 'names = [n for n in (b"Tuna Desktop", b"Roost") if ok(n)]'),
         ("# Old packages still say Roost; either works.", "# Old packages still say Roost; either works."),
-        ('install -m0644 share/compat/pam.d/roost-lock "$STAGE/etc/pam.d/tuna-lock"',
-         'install -m0644 share/compat/pam.d/roost-lock "$STAGE/etc/pam.d/tuna-lock"'),
         # Markers.
         ('const OLD: &str = "ROOST_"; // tuna-rename: keep', 'const OLD: &str = "ROOST_"; // tuna-rename: keep'),
     ]
@@ -96,7 +94,7 @@ class Rules(unittest.TestCase):
         self.assertEqual(R.rename_path("scripts/lib/roost-test-window.py"), "scripts/lib/tuna-test-window.py")
         self.assertEqual(R.rename_path("share/wayland-sessions/roost.desktop"), "share/wayland-sessions/tuna.desktop")
         for kept in ("docs/perf/2026-10-04-x/roost-report.json", "third-party/smithay/ROOST-PATCH.md",
-                     "share/compat/pam.d/roost-lock", ".spektacular/x/roost.md",
+                     ".spektacular/x/roost.md",
                      "tests/protocols/marlin-roost-wayland-info.txt", "scripts/rename-to-tuna"):
             self.assertTrue(R.kept_path(kept), kept)
         self.assertFalse(R.kept_path("docs/perfect.md"))
@@ -110,7 +108,6 @@ FIXTURE = {
     "scripts/roost-journey": '#!/bin/sh\nexec target/debug/roost-compositor --title "Roost"\n',
     "scripts/lib/roost-test-window.py": "APP_ID = 'roost-test-alpha'\n",
     "share/wayland-sessions/roost.desktop": "[Desktop Entry]\nName=Roost\nExec=roost-session\nDesktopNames=Roost;GNOME;\n",
-    "share/compat/wayland-sessions/roost.desktop": "[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\n",
     "docs/perf/2026-10-06/roost/report.json": '{"desktop": "roost"}\n',
     "docs/guide.md": "Run Roost. Logs: https://github.com/hanthor/roost-desktop/actions/runs/1\n",
     "third-party/lib/ROOST-PATCH.md": "Roost patch.\n",
@@ -167,7 +164,6 @@ class Checkout(unittest.TestCase):
 
     def test_rename_then_rerun_is_a_noop(self):
         kept = {rel: FIXTURE[rel] for rel in (
-            "share/compat/wayland-sessions/roost.desktop",
             "docs/perf/2026-10-06/roost/report.json",
             "third-party/lib/ROOST-PATCH.md",
             "packaging/compat.sh",
