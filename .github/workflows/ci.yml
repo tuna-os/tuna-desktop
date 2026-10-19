@@ -128,6 +128,13 @@ jobs:
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
       - run: python3 scripts/tests/test_wb_shell_contract.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
+      # Gate proofs and contract suites omitted from CI (#737).
+      - run: python3 scripts/tests/test_wb_notice_button_mapping.py
+      - run: python3 scripts/lib/tuna-datetime-proof-tests.py
+      - run: python3 scripts/lib/test_tuna_sound_consumers_proof.py
+      - run: python3 scripts/lib/tuna-wellbeing-action-proof-tests.py
+      - run: python3 scripts/lib/tuna-wellbeing-probe-bind-tests.py
+      - run: python3 scripts/lib/xkeycode-tap-tests.py
       - run: /usr/bin/python3 scripts/tests/test_night_light_reader_contract.py
       - name: Check benchmark export provenance and owned resource cleanup
         run: |
