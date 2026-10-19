@@ -172,9 +172,11 @@ impl ProtocolVersion {
     /// `PointerTimeout` messages (hover click's chooser and GNOME's pie
     /// timer). Positional: both peers ship together.
     /// `0.37` appends NativeOutputInventory without altering OutputInfo.
+    /// `0.38` appends typed accelerator grabs
+    /// (`SetAcceleratorGrabs`) and `AcceleratorDeactivated`.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 37,
+        minor: 38,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -418,6 +420,9 @@ pub enum CommandKind {
     SetWellbeingEffects { grayscale: bool, fade: bool },
     /// The hover-click chooser picked the click the next dwell makes.
     SetDwellClickType { click: DwellClick },
+    /// Since 0.38: atomic full accelerator replacement with GNOME grab
+    /// flags, at most [`MAX_ACCELERATORS`]; supersedes `SetAccelerators`.
+    SetAcceleratorGrabs { grabs: Vec<AcceleratorGrab> },
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -577,6 +582,24 @@ pub struct Accelerator {
     pub mods: u32,
     /// Action modes it applies in: a combination of the `MODE_*` bits.
     pub modes: u32,
+}
+
+/// GNOME MetaKeyBindingFlags supported for external accelerator grabs:
+/// duplicate key-downs of a held grab do not activate again.
+pub const GRAB_IGNORE_AUTOREPEAT: u32 = 1 << 4;
+/// GNOME MetaKeyBindingFlags: the release of the grabbed press is
+/// reported as `AcceleratorDeactivated`.
+pub const GRAB_TRIGGER_RELEASE: u32 = 1 << 7;
+/// Every flag [`AcceleratorGrab::flags`] may carry.
+pub const SUPPORTED_GRAB_FLAGS: u32 = GRAB_IGNORE_AUTOREPEAT | GRAB_TRIGGER_RELEASE;
+
+/// One grab with its GNOME flags. A separate type, so the legacy
+/// [`Accelerator`] wire body stays unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceleratorGrab {
+    pub accelerator: Accelerator,
+    /// A combination of [`SUPPORTED_GRAB_FLAGS`].
+    pub flags: u32,
 }
 
 /// A secret on the wire (the lock screen's password). `Debug` never
@@ -793,6 +816,9 @@ pub enum Message {
     /// Full actual native authority; empty explicitly revokes prior authority.
     /// Append-only, sent only to peers advertising minor >=37.
     NativeOutputInventory { outputs: Vec<NativeOutputInfo> },
+    /// Since 0.38: release of an originally admitted press of a grab
+    /// carrying [`GRAB_TRIGGER_RELEASE`] (GNOME's AcceleratorDeactivated).
+    AcceleratorDeactivated { action: u32, time: u32, mode: u32 },
 }
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
@@ -1572,8 +1598,19 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
                 postcard::Error::DeserializeBadEncoding,
             ));
         }
+        Message::Command {
+            kind: CommandKind::SetAcceleratorGrabs { grabs },
+            ..
+        } if grabs.len() > MAX_ACCELERATORS
+            || grabs.iter().any(|g| g.flags & !SUPPORTED_GRAB_FLAGS != 0) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
         Message::Hello { .. }
         | Message::AcceleratorActivated { .. }
+        | Message::AcceleratorDeactivated { .. }
         | Message::WindowMenu { .. }
         | Message::WorkspacePopup { .. }
         | Message::PointerOutput { .. }
@@ -1811,8 +1848,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_37() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 37));
+    fn current_version_is_0_38() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 38));
     }
 
     #[test]
@@ -2602,5 +2639,91 @@ mod sensitive_frame_tests {
     fn oversize_input_and_body_overhead_fail_closed_without_panic() {
         assert!(encode_unlock_frame(1, Secret("p".repeat(MAX_FRAME_BYTES + 1))).is_err());
         assert!(encode_unlock_frame(u64::MAX, Secret("p".repeat(MAX_FRAME_BYTES))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod accelerator_release_wire_tests {
+    use super::*;
+    fn grab(flags: u32) -> AcceleratorGrab {
+        AcceleratorGrab {
+            accelerator: Accelerator {
+                action: 7,
+                keysym: 114,
+                mods: 0,
+                modes: MODE_NORMAL,
+            },
+            flags,
+        }
+    }
+    #[test]
+    fn typed_grab_and_release_roundtrip_without_changing_legacy() {
+        for message in [
+            Message::Command {
+                id: 9,
+                kind: CommandKind::SetAcceleratorGrabs {
+                    grabs: vec![grab(GRAB_TRIGGER_RELEASE | GRAB_IGNORE_AUTOREPEAT)],
+                },
+            },
+            Message::AcceleratorDeactivated {
+                action: 7,
+                time: 200,
+                mode: MODE_NORMAL,
+            },
+            Message::Command {
+                id: 10,
+                kind: CommandKind::SetAccelerators {
+                    accelerators: vec![grab(0).accelerator],
+                },
+            },
+        ] {
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+    }
+    #[test]
+    fn typed_grab_decode_rejects_unknown_flags_and_oversized_lists() {
+        for grabs in [vec![grab(1 << 3)], vec![grab(0); MAX_ACCELERATORS + 1]] {
+            assert!(decode_frame(&encode_frame(&Message::Command {
+                id: 11,
+                kind: CommandKind::SetAcceleratorGrabs { grabs }
+            }))
+            .is_err());
+        }
+    }
+    #[test]
+    fn appended_variants_follow_the_0_36_positions() {
+        let index = |message: &Message| encode_frame(message)[4];
+        let last = index(&Message::PointerTimeout {
+            kind: PointerTimeoutKind::Dwell,
+            duration_ms: None,
+            clicked: false,
+            x: 0,
+            y: 0,
+        });
+        for (offset, message) in [
+            Message::NativeOutputInventory {
+                outputs: Vec::new(),
+            },
+            Message::AcceleratorDeactivated {
+                action: 7,
+                time: 200,
+                mode: MODE_NORMAL,
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(index(message), last + 1 + offset as u8);
+        }
+        let command = |kind: CommandKind| {
+            let mut buffer = [0_u8; 64];
+            postcard::to_slice(&kind, &mut buffer).unwrap()[0]
+        };
+        assert_eq!(
+            command(CommandKind::SetAcceleratorGrabs { grabs: Vec::new() }),
+            command(CommandKind::SetDwellClickType {
+                click: DwellClick::Primary,
+            }) + 1
+        );
     }
 }

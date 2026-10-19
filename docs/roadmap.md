@@ -5,35 +5,37 @@ This page holds the [public 12-month roadmap](#public-roadmap) (dated priorities
 **Status:** Active. Tier 1 (nested developer preview) is implemented; tier 2 (daily-driver candidate) is open. Work items live as GitHub issues on the [Tuna Desktop roadmap project board](https://github.com/users/hanthor/projects/4); this document keeps the program structure, gates, and traceability.
 **Architecture:** [Program architecture](architecture.md)  
 **Parity target:** GNOME 51 on the Marlin image family. Decided 2026-10-01. The published Marlin GNOME image measured on 2026-10-04 contains GNOME Shell 50.5, so GNOME 51 comparison evidence must identify its separately upgraded reference payload.
-**Target platform:** TunaOS Marlin (Arch Linux base, bootc image), as a Tuna Desktop flavor alongside the GNOME flavor. Reference and candidate run on the same VM image family so comparisons are like for like.  
+**Target platform:** v1 targets every TunaOS variant, each qualified from its own image digest or explicitly unsupported with a recorded reason ([ADR 0008](adr/0008-v1-beta-track-and-release-scope.md)). Marlin remains the GNOME 51 parity/performance comparator; reference and candidate use the same VM image family.
 **Planning system:** Spektacular spec → plan → implement. Every delivery unit has a spek, a reviewed implementation plan, evidence, and an explicit gate.
 
 ## Public roadmap
 
-This roadmap covers October 2026–October 2027. Updated 2026-10-08. Tuna Desktop was previously named Roost; the code and packages were renamed in [#505](https://github.com/tuna-os/tuna-desktop/issues/505), while dated evidence keeps the old name ([#504](https://github.com/tuna-os/tuna-desktop/issues/504)). This is the public contribution roadmap; [program gates and requirement traceability](#delivery-tiers) describe the acceptance process. Work and evidence live on the [roadmap board](https://github.com/users/hanthor/projects/4). Dates are planning windows, and release qualification depends on evidence.
+This roadmap covers October 2026–October 2027. Updated 2026-10-19. Tuna Desktop was previously named Roost; the code and packages were renamed in [#536](https://github.com/tuna-os/tuna-desktop/pull/536), while dated evidence keeps the old name ([#504](https://github.com/tuna-os/tuna-desktop/issues/504)). This is the public contribution roadmap; [program gates and requirement traceability](#delivery-tiers) describe the acceptance process. Work and evidence live on the [roadmap board](https://github.com/users/hanthor/projects/4). Dates are planning windows, and release qualification depends on evidence.
 
 ### Current status
 
 Tuna Desktop has a nested developer preview, an actual Marlin VM test lane, and a signed experimental amd64 Marlin Tuna Desktop image. The daily-driver candidate remains open. TunaOS merged the flavor, then named Tuna Desktop, in [PR #2991](https://github.com/tuna-os/tunaOS/pull/2991). Its qualified image passed an actual AWS KubeVirt bootc switch, shipped greeter selection and PAM login ([retained evidence](marlin/2026-10-04-flavor-acceptance/README.md)); the installed `0.1.0-2` package is pinned to Tuna Desktop `c28f96eb` and needs a refresh with later fixes before endurance qualification. GNOME 51 remains the comparison baseline. The published Marlin GNOME image measured on 2026-10-04 still contains GNOME Shell 50.5; GNOME 51 comparisons require a separately recorded, fully upgraded reference payload. A build or merged feature alone does not establish parity or release readiness.
 
-The latest GitHub release entry is [v0.0.0-ci, “Demo media bundle”](https://github.com/tuna-os/tuna-desktop/releases/tag/v0.0.0-ci), published 2026-10-01. It contains screenshots and videos, not an installable desktop release. The six session binaries use development package version 0.1.0. The [README](../README.md) now shows real screenshots and an overview recording.
+The latest installable prerelease is [v1.0.0-beta.1](https://github.com/tuna-os/tuna-desktop/releases/tag/v1.0.0-beta.1), published 2026-10-15, with an amd64 Debian-format package targeting Ubuntu 26.04. The [release notes](https://github.com/tuna-os/tuna-desktop/releases/tag/v1.0.0-beta.1) identify the tag, package hash, exact CI and qualification limits; [installation guidance](install.md) describes supported routes. Debian 13 needs a separately qualified backport and artifact. This beta claims no v1 checklist item. The older [v0.0.0-ci media bundle](https://github.com/tuna-os/tuna-desktop/releases/tag/v0.0.0-ci) remains documentation media, not an installable release.
 
-At this update, GitHub reports three contributor entries, zero stars and zero forks. The media release assets have one download in total. Media downloads are not package installs, and none of these counts measures active users. Package-download and installed-user metrics are unavailable; Tuna Desktop does not collect usage telemetry. These dated counts are a starting record, not an adoption claim.
+On 2026-10-19, the GitHub release API reports **3 downloads of the beta package** and **7 downloads across the older media bundle's assets**. These are separate asset-download counts, not installs or active users. Installed-user metrics remain unavailable; Tuna Desktop does not collect usage telemetry. The [adoption tracker #652](https://github.com/tuna-os/tuna-desktop/issues/652) owns supported configurations, tester feedback and maintainer continuity.
 
 ### Direction: GNOME's functionality, better performance
 
-Tuna Desktop aims to do everything GNOME 51 does and to run lighter than GNOME on the same machine. Parity at rest is close: most screens are within 0.1–1.7% of GNOME 51's pixels. Performance is not there yet. On the 2026-10-04 paired Marlin VM run, memory matched GNOME, but median CPU was 159% of a core against GNOME's 19%, and the median overview response was 382 ms against 159 ms. Closing and reversing that gap is a release requirement, tracked in [#503](https://github.com/tuna-os/tuna-desktop/issues/503).
+Tuna Desktop aims to match GNOME 51 capabilities while beating its responsiveness and matching CPU and memory on the same machine. [ADR 0008](adr/0008-v1-beta-track-and-release-scope.md) leaves GPU and total-power comparisons as follow-up work; it does not waive CPU, memory or latency. The [v1 checklist](v1.md) remains open.
+
+Performance has improved since the October 4 baseline, but the gap is not closed. The recorded [#696 paired Marlin measurement](perf/2026-10-15-cpu-parity-attribution.md#paired-marlin-results-run-38927781532-exact-candidate-ae9bd5fe) reports whole-trace CPU of 28.3% for Tuna versus 22.8% for GNOME. [#719's bounded overview chrome](perf/2026-10-16-preview-chrome-bounds.md) is now merged; its local overview result is not whole-trace or GNOME parity. [#503](https://github.com/tuna-os/tuna-desktop/issues/503) remains the performance outcome, and [#547](https://github.com/tuna-os/tuna-desktop/pull/547) is the unmerged regression-gate implementation for [#315](https://github.com/tuna-os/tuna-desktop/issues/315). A passing regression budget above ratio 1.0 must never be presented as meeting v1.
 
 ### Next three months: through 2027-01-04
 
 1. Finish and validate the core shell journeys: workspace insertion, app-grid hover/page behavior, notifications, shortcut consent, IME caret placement and live settings interoperability. Keep concrete GNOME differences in the [parity ledger](parity-ledger.md) and pixel comparisons in [GNOME parity captures](gnome-parity.md), with actual graphical acceptance evidence.
 2. Complete secure screen sharing and RemoteDesktop integration ([#61](https://github.com/tuna-os/tuna-desktop/issues/61)). Require real GNOME portal consent, authenticated ownership, disconnect and lock revocation, and verified input delivery for each advertised capability.
-3. Refresh and qualify the admitted signed amd64 Marlin Tuna Desktop image: current-source package, clean installation, graphical login, portals, PAM, boot and update/rollback evidence. Initial flavor admission and boot/login acceptance are complete ([#69](https://github.com/tuna-os/tuna-desktop/issues/69)); later source fixes and endurance qualification remain open. This scope adds no ISO or LUKS matrix cells.
+3. Refresh and qualify the admitted signed amd64 Marlin Tuna Desktop image: current-source package, clean installation, graphical login, portals, PAM, boot and update/rollback evidence. Historical flavor admission and boot/login evidence ([#69](https://github.com/tuna-os/tuna-desktop/issues/69)) does not qualify a later package. In parallel, record each other TunaOS variant's install, real-greeter login, session, portals and lock/unlock evidence against its own image digest, or its explicit unsupported reason (ADR 0008). This does not invent new ISO or LUKS acceptance cells.
 4. Run the actual 24-hour endurance and comparable performance work ([#203](https://github.com/tuna-os/tuna-desktop/issues/203), [#73](https://github.com/tuna-os/tuna-desktop/issues/73)). Record binary/image provenance, resource growth, frame pacing and failures. Investigate measured regressions before making performance parity claims.
 5. Record session lifecycle qualification ([#62](https://github.com/tuna-os/tuna-desktop/issues/62), [#68](https://github.com/tuna-os/tuna-desktop/issues/68)): real VM suspend/resume, VT switching, logout and fail-closed lock behavior, plus the separate physical GPU/driver and mixed-display support matrix. AWS KubeVirt VM evidence covers its own profile only.
 6. Port every GNOME 51 animation ([epic #492](https://github.com/tuna-os/tuna-desktop/issues/492), [spec](../.spektacular/specs/20261008122728-6ac4a932-gnome-animation-parity.md)). An audit on 2026-10-08 found 6 of GNOME 51's 54 animations ported and 7 partial. Deliver, in order: GNOME's motion policy (reduced motion keeps fades, slow-down factor) and a deterministic test clock; window open and close; minimize; maximize and tiling; workspace slide and swipe; modal dimming; overview corrections; app grid; menus and transient surfaces; lock screen and desktop transitions. Each family needs a CI gate and a paired GNOME 51 capture, and must cost less CPU than GNOME.
 7. Beat GNOME 51 on CPU, frame pacing and overview response on the same Marlin VM ([#503](https://github.com/tuna-os/tuna-desktop/issues/503)). Profile first, then set regression gates ([#315](https://github.com/tuna-os/tuna-desktop/issues/315)).
-8. Finish the rename to Tuna Desktop and bring the docs in line with the code: user-facing names ([#504](https://github.com/tuna-os/tuna-desktop/issues/504)), a coordinated internal and package rename ([#505](https://github.com/tuna-os/tuna-desktop/issues/505)), current screenshots ([#506](https://github.com/tuna-os/tuna-desktop/issues/506)) and complete parity-ledger rows for every open GNOME 51 gap ([#507](https://github.com/tuna-os/tuna-desktop/issues/507)).
+8. Finish the remaining transition work after the rename: [#505](https://github.com/tuna-os/tuna-desktop/issues/505) owns the decision and coordinated removal of compatibility aliases, [#506](https://github.com/tuna-os/tuna-desktop/issues/506) owns current media provenance, and [#577](https://github.com/tuna-os/tuna-desktop/issues/577) links the remaining capability and release qualifications. The rename itself already landed in #536; do not reimplement it.
 
 ### Six to twelve months: 2027-04-04–2027-10-04
 
@@ -47,7 +49,7 @@ A 1.0 release requires the [global decision gates](#global-decision-gates). This
 
 ### Known limitations and scope
 
-Screen-reader speech, physical GPU/VT/suspend behavior, GPU memory/frame pacing and completed 24-hour endurance are not established by nested graphical tests. Settings support is key-specific; see the [compatibility map](settings-map.md). Modern RemoteDesktop features must remain unadvertised until implemented and tested. Exact visual parity requires paired captures from the declared reference version.
+Screen-reader speech, physical GPU/VT/suspend behavior and completed 24-hour endurance are not established by nested graphical tests. ADR 0008 permits named emulated-device evidence for its listed hardware-only rows while retaining their implementation requirements; physical qualification remains explicitly separate. GPU and total-power comparisons are follow-up, not current v1 gates. Settings support is key-specific; see the [compatibility map](settings-map.md). Modern RemoteDesktop features must remain unadvertised until implemented and tested. Exact visual parity requires paired captures from the declared reference version.
 
 Public extension APIs remain optional later work, outside the initial core release unless scope changes through the recorded decision process. In-process shell extensions, an unbounded plugin authority model and unsupported platform claims are outside this roadmap. No shipped feature deprecation is scheduled; protocol version changes must preserve the documented compatibility contract or explicitly reject incompatible peers.
 
@@ -89,67 +91,46 @@ Specs 002 and 003 may proceed in parallel after the 001 compositor/control contr
 
 ## Near-term delivery queue
 
-Ordered by unblocking, from the 2026-10-18 review (119 open issues, 13 open
-PRs). Each wave lands before the next starts, so CI failures stay
-attributable to one change at a time.
+Snapshot: **2026-10-19**, reviewed against main `da4dee0a` and the actual open PR heads, changed files and CI jobs. There were 113 open issues and eight open PRs at the start of the pass; #764 has since merged. Counts and CI are a dated snapshot: check the linked PR before acting. A green ancestor, closed PR, merged stack branch or bot label is not qualification of current main.
 
-```mermaid
-flowchart LR
-  W1[Wave 1: green PRs] --> W2[Wave 2: backlight stack]
-  W2 --> W3[Wave 3: stale content PRs]
-  W1 --> D[Decisions]
-  D --> W3
-```
+### Landed foundations
 
-### Wave 1 — merge on green (no code changes needed)
+- #758/#763: checkout/token handling; #759/#767/#769: RustSec gate and its API permissions. The remaining least-privilege/fork-compatible replacement is #766.
+- #765: all six previously omitted Python gate suites are wired into CI; #737 is closed. #733's checkout and registry-token work is also closed.
+- #706: bounded native brightness contract. #355 remains open for the complete power-policy and shipped-image outcome.
+- #719: bounded transparent overview chrome. #503's paired performance target remains open.
+- #764: pinned nightly fuzz toolchain update, landed after exact-head CI and decoder fuzz passed.
 
-| PR | What | State |
+### Current PR work, ordered by dependencies and evidence
+
+| PR | Scope | Landing requirement |
 | --- | --- | --- |
-| #758 | CI least-privilege tokens + checkout hygiene (closes #623) | CI running |
-| #759 | RUSTSEC advisory gate (closes #564) | CI running |
-| #719 | Perf: bound overview chrome buffers (draft) | Needs rebase + undraft (owner) |
+| [#766](https://github.com/tuna-os/tuna-desktop/pull/766) | Tokenless fail-closed RustSec gate | Current-main refresh removes redundant Checks/Issues write grants; fresh exact-head CI before landing. |
+| [#768](https://github.com/tuna-os/tuna-desktop/pull/768) | `freedesktop-desktop-entry` 0.8.4 | Review the lockfile delta and resolve installed-journey wellbeing fade-off failure; preserve the pixel assertion. |
+| [#547](https://github.com/tuna-os/tuna-desktop/pull/547) | Performance budgets / #315, #503 | Validate the repeatable paired measurements, ratchet and fresh CI; the refreshed candidate rejects invalid/non-finite budgets and weakened pair counts. Passing a budget does not close #503. |
+| [#708](https://github.com/tuna-os/tuna-desktop/pull/708) | Accelerator flags and release events / #395 | Reconstruct its dependency tree against main, reconcile positional protocol encoding, and prove press/release/repeat/lock plus genuine portal behavior. |
+| [#561](https://github.com/tuna-os/tuna-desktop/pull/561) | WM shortcuts and focus policy / #347 | Resolve main conflicts and coordinate protocol order with #708; require fresh focus and native lifecycle proof. Preserve the issue's unimplemented/unqualified remainder. |
+| [#458](https://github.com/tuna-os/tuna-desktop/pull/458) | Bounded native SVG backgrounds / #452, #360 | Resolve conflicts; qualify packaging, actual native loader/provenance/cleanup, Settings and VM behavior. |
+| [#453](https://github.com/tuna-os/tuna-desktop/pull/453) | Orca native keyboard / #352 | Resolve conflicts and pass both distribution Orca and upstream Orca 51 native lanes, including activation/logout; broader spoken navigation stays open. |
 
-### Wave 2 — backlight stack, bottom-up (each rebases onto the landed parent)
+**Stack correction:** #707 (EDID identity) and #713 (native display lifecycle) are closed **without merging into main**. #710 merged into the accelerator stack branch, not main. They are not shipped prerequisites. Reconstruct or explicitly split the remaining work before retargeting #708; do not bring an unrelated display-lifecycle implementation into main merely to make a stack mergeable. Track full display acceptance in #340 and power acceptance in #355. Schema variants must retain their positional ordering across #708 and #561.
 
-The brightness/backlight PRs form one stack; merging out of order rebuilds
-every child. Land strictly in this order, rebasing each onto its parent:
+All landing candidates need review of the actual final tree, DCO sign-off, and successful relevant CI on that exact head. Do not waive a failed runtime/ownership/lock assertion or mark a draft ready on the strength of unrelated checks. After each merge, observe main CI before attributing later failures to another change.
 
-1. #706 brightness-contract (rebase fixes its ledger failure: the WWAN
-   assertions landed on main after the branch)
-2. #707 monitor-identity (CONFLICTING — retarget onto landed #706)
-3. #708 accelerator-release (retarget onto landed #707; has journey +
-   coverage failures to re-evaluate after rebase)
-4. #713 native-lifecycle, split 5/5 of #469 (rebase onto main; needs
-   lane-owner review + headed VM proof before merge)
+### Issue priorities and release evidence
 
-#710 (brightness-journal) already landed mid-stack. #713 stays held for
-owner review even when green — it binds display lifecycle to kernel
-commit completions.
+1. **Reliable qualification:** #735 tracks the shared CI incident; #747 and #748 hold bounded wellbeing/lifecycle investigations. Diagnose retained failure evidence and preserve fail-closed gates. Close the incident only after the relevant current-main qualification succeeds.
+2. **Capability acceptance:** #577 is the canonical capability/release epic; #367 tracks Settings coverage, #397 actual Core apps, and #492 animation families. Keep linked issues open where implementation or installed/native acceptance remains incomplete; no mass closure from merged code or nested-only ledger rows.
+3. **Performance:** #503 owns the GNOME-relative CPU/latency outcome; #315/#547 own regression budgets. Run comparable fresh measurements after performance changes, then tighten only with evidence.
+4. **Image and recovery:** qualify current packages on Marlin and every other TunaOS variant (or record unsupported reasons), using the beta/release runbook and [v1 checklist](v1.md). Old flavor admission, package build success and a nested tour are distinct evidence.
+5. **Adoption and remaining decisions:** #652 owns the support matrix and tester feedback; #506 owns media provenance. #505 still needs a decision on whether beta.1 is the transition release before removing aliases. Do not schedule compatibility removal implicitly. RustSec maintenance/soundness warnings still need triage under the existing advisory policy.
 
-### Wave 3 — stale content PRs (rebase first, then diagnose what remains)
+### Milestone mapping and dates
 
-| PR | What | Known state |
-| --- | --- | --- |
-| #547 | Perf regression gate (draft) | Old journey failure; rebase, then judge |
-| #561 | Multitasking prefs (draft) | CONFLICTING; rebase, then judge |
-| #458 | GNOME SVG backgrounds (draft) | CONFLICTING; rebase, then judge |
-| #453 | Orca native keyboard (draft) | CONFLICTING; rebase, then judge |
-
-### Decisions (blocking Wave 3 and cleanup)
-
-| Issue | Decision needed |
-| --- | --- |
-| #505 | Confirm v1.0.0-beta.1 counts as the transition release, then schedule tuna-compat removal |
-| #737 | 167 Python tests omitted from CI — include, explicitly exclude, or split the suites |
-| #733 | Remainder after the token half lands via #758 |
-| #564 follow-up | Triage the 8 warnings (zbus/zvariant unmaintained, cgmath unsound) that the new gate leaves advisory |
-
-### v1 milestone mapping
-
-- Milestone 1 (GNOME 51 capabilities): Wave 2 stack, #458, #453.
-- Milestone 2 (performance vs GNOME): #719, #547.
-- Milestone 3 (provenance/image): #759 (supply chain), image work in tunaos.
-- Milestone 4 (checklist): unblocked by Waves 1–3.
+- GNOME 51 capabilities: #577, the accelerator/WM/SVG/Orca candidates and their explicit remaining acceptance work.
+- Performance versus GNOME: #503 and #315; #719 is an implemented optimization, #547 is still a candidate gate.
+- Provenance and images: current package/image qualification for every variant or an unsupported disposition; Marlin remains the comparison platform.
+- Release checklist: publish additional beta tags only from qualified main under ADR 0008. GA has no promised calendar date before [v1](v1.md) and the global gates pass; this refresh does not invent a Q4 commitment.
 
 ### Far-future backlog (post-1.0, not scheduled)
 

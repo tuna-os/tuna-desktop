@@ -115,6 +115,16 @@ pub enum Handled {
         /// The action mode it fired in.
         mode: u32,
     },
+    /// A `GRAB_TRIGGER_RELEASE` grab's key was released (org.gnome.Shell
+    /// AcceleratorDeactivated).
+    AcceleratorDeactivated {
+        /// The grab's action id.
+        action: u32,
+        /// The release event's time in milliseconds.
+        time: u32,
+        /// The action mode of the original press.
+        mode: u32,
+    },
     /// Compositor answered one command; match `id` against the value
     /// [`ControlClient::send_activation`] returned.
     CommandResult {
@@ -645,15 +655,16 @@ impl ControlClient {
     }
 
     /// Replace the compositor's accelerator grabs (org.gnome.Shell's
-    /// GrabAccelerators), the full set each time. Returns the request id.
-    pub fn set_accelerators(
+    /// GrabAccelerators) with their GNOME flags, the full set each time.
+    /// Returns the request id.
+    pub fn set_accelerator_grabs(
         &mut self,
-        accelerators: Vec<tuna_shell_control::Accelerator>,
+        grabs: Vec<tuna_shell_control::AcceleratorGrab>,
     ) -> Result<u64, ControlError> {
         let id = self.alloc_request_id();
         self.write_message(&Message::Command {
             id,
-            kind: CommandKind::SetAccelerators { accelerators },
+            kind: CommandKind::SetAcceleratorGrabs { grabs },
         })?;
         Ok(id)
     }
@@ -1013,6 +1024,10 @@ impl ControlClient {
             Message::WorkspacePopup { index, count } => {
                 Ok(Handled::WorkspacePopup { index, count })
             }
+            Message::AcceleratorDeactivated { action, time, mode } => {
+                // A GRAB_TRIGGER_RELEASE grab's release: UI state only.
+                Ok(Handled::AcceleratorDeactivated { action, time, mode })
+            }
             Message::AcceleratorActivated { action, time, mode } => {
                 // A grabbed key combination: the shell signals its D-Bus
                 // owner. UI state; never touches the model.
@@ -1258,6 +1273,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::Environment { .. } => "Environment",
         Message::OverviewPreviews { .. } => "OverviewPreviews",
         Message::AcceleratorActivated { .. } => "AcceleratorActivated",
+        Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
         Message::ScreenReader { .. } => "ScreenReader",

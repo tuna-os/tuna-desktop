@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Keep cargo-audit failures fatal without publishing a separate GitHub check.
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+exec cargo audit --file "$ROOT/Cargo.lock"
