@@ -362,6 +362,13 @@ impl Shared {
                 // that this read follows actual preview ownership.
                 if op.id > request.id {
                     let request = state.preview.take().unwrap();
+                    // This test seam affects only preview time, after all real
+                    // operation/admission checks above. Completion timestamps
+                    // and subsequent native read deadlines remain real.
+                    #[cfg(test)]
+                    let observed = live_share
+                        .as_ref()
+                        .map_or(observed, |share| share.preview_observed_for_test(observed));
                     let outcome = if observed < request.until {
                         match (&result, live_share.as_ref()) {
                             (Ok(config), Some(share)) => {
@@ -789,7 +796,7 @@ mod tests {
         );
         retired(reader, &events);
     }
-    fn ownership_interleave(equal_clock: bool) {
+    fn ownership_interleave(equal_clock: bool, expire_after_old_read: bool) {
         // This capture precedes creation/admission of the actual blocked read,
         // representing request time captured before its ownership mutex.
         let captured = Instant::now();
@@ -803,6 +810,10 @@ mod tests {
         if !equal_clock {
             assert!(captured < read_time);
         }
+        // Ownership ordering, not CI scheduling, decides this fixture's
+        // five-second preview. Real worker/channel deadlines stay unchanged.
+        // Other fixtures, including native GIO and real expiry, keep real time.
+        share.set_preview_clock_for_test(request_time);
         let future = reader.preview(5, request_time).unwrap();
         {
             let state = reader.shared.state.lock().unwrap();
@@ -818,12 +829,16 @@ mod tests {
             None,
             "equal/early captured time must not make a pre-ownership read fresh"
         );
-        assert_eq!(share.preview_temperature(Instant::now()), None);
+        assert_eq!(share.preview_temperature(request_time), None);
         let mut controller = NightLightController::new(share.clone());
         assert!(controller
-            .tick_at_system_time(std::time::SystemTime::now(), Instant::now())
+            .tick_at_system_time(std::time::SystemTime::now(), request_time)
             .is_none());
         assert!(!share.active(), "old read must not install preview tint");
+        let until = request_time + Duration::from_secs(5);
+        if expire_after_old_read {
+            share.set_preview_clock_for_test(until);
+        }
         let mut fresh = RawSettings::schema_defaults();
         fresh.temperature_k = 3200;
         answers.send(Ok(fresh.into_config())).unwrap();
@@ -834,25 +849,48 @@ mod tests {
             assert!(now < deadline);
             loop_.dispatch(Some(deadline - now), &mut count).unwrap();
         }
+        if expire_after_old_read {
+            assert_eq!(
+                future.reply.lock().unwrap().result,
+                Some(Err(PreviewRejected::Unavailable))
+            );
+            assert_eq!(share.preview_deadline_at(until), None);
+            assert_eq!(share.preview_temperature(until), None);
+            assert!(controller
+                .tick_at_system_time(std::time::SystemTime::now(), until)
+                .is_none());
+            assert!(!share.active(), "expired fresh read must not install tint");
+            retired(reader, &events);
+            return;
+        }
         assert_eq!(future.reply.lock().unwrap().result, Some(Ok(())));
-        assert_eq!(share.preview_temperature(Instant::now()), Some(3200));
+        assert_eq!(share.preview_temperature(request_time), Some(3200));
         assert_eq!(
-            share.preview_deadline(),
+            share.preview_deadline_at(request_time),
             Some(request_time + Duration::from_secs(5))
         );
         assert!(controller
-            .tick_at_system_time(std::time::SystemTime::now(), Instant::now())
+            .tick_at_system_time(std::time::SystemTime::now(), request_time)
             .is_some());
         assert_eq!(share.temperature(), 3200);
+        assert_eq!(share.preview_temperature(until), None);
+        assert!(controller
+            .tick_at_system_time(std::time::SystemTime::now(), until)
+            .is_none());
+        assert!(!share.active(), "preview tint must clear at five seconds");
         retired(reader, &events);
     }
     #[test]
     fn actual_equal_time_read_before_preview_ownership_cannot_grant_or_install_tint() {
-        ownership_interleave(true);
+        ownership_interleave(true, false);
     }
     #[test]
     fn actual_request_time_captured_before_mutex_cannot_admit_intervening_old_read() {
-        ownership_interleave(false);
+        ownership_interleave(false, false);
+    }
+    #[test]
+    fn actual_owned_fresh_read_at_five_second_preview_expiry_rejects_without_tint() {
+        ownership_interleave(true, true);
     }
     #[test]
     fn actual_pending_preview_expiry_is_consumed_before_a_later_valid_read() {

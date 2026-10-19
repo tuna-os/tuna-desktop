@@ -29,6 +29,10 @@ pub const MAX_RESULTS: usize = 6;
 
 /// What the overview asks the rest of the shell to do.
 pub trait OverviewActions {
+    /// CI diagnostic admission only; absent original control always withholds.
+    fn public_navigation_unlocked(&self) -> bool {
+        false
+    }
     /// Close the overview (after a launch or an activation).
     fn close_overview(&self);
     /// Raise an existing window by compositor id.
@@ -48,6 +52,37 @@ pub trait OverviewActions {
     fn set_app_grid(&self, active: bool);
     /// Open the overview (org.gnome.Shell FocusSearch, ShowApplications).
     fn open_overview(&self);
+}
+
+/// Search activation follows the dash's existing-window route. Resolve the
+/// window at activation time, not while building a possibly stale result tile.
+/// The app ID selects a route; the compositor validates the window token.
+/// This uses the latest local snapshot and does not acknowledge actual focus.
+fn activate_search_app(
+    actions: &dyn OverviewActions,
+    entry: &AppEntry,
+    launch: impl FnOnce(&AppEntry) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let app_id = entry
+        .app_id
+        .strip_suffix(".desktop")
+        .unwrap_or(&entry.app_id);
+    let window = actions
+        .running()
+        .into_iter()
+        .filter(|(_, app)| !app_id.is_empty() && app.as_deref() == Some(app_id))
+        .map(|(id, _)| id)
+        // The dash also chooses the first match after sorting by window ID.
+        .min();
+    if let Some(window) = window {
+        // Do not spawn a replacement after a stale/denied activation request.
+        // This uses the same token-validated path as a physical dash click.
+        actions.activate_window(window);
+    } else {
+        launch(entry)?;
+    }
+    actions.close_overview();
+    Ok(())
 }
 
 /// One dash item (`#dash .overview-tile`): the 64px icon in a 76px
@@ -149,6 +184,7 @@ pub struct OverviewUi {
     search_cancel: RefCell<Option<gio::Cancellable>>,
     /// Whether the compositor was last told search is active.
     search_active: std::cell::Cell<bool>,
+    public_diagnostic: RefCell<Option<crate::public_search_diagnostic::Capture>>,
     /// First provider hit, for Enter when no app matches.
     first_remote_hit: Rc<RefCell<Option<(providers::Remote, String)>>>,
     dash: gtk::ApplicationWindow,
@@ -292,6 +328,7 @@ impl OverviewUi {
             remotes,
             search_cancel: RefCell::new(None),
             search_active: std::cell::Cell::new(false),
+            public_diagnostic: RefCell::new(crate::public_search_diagnostic::Capture::new()),
             first_remote_hit: Rc::new(RefCell::new(None)),
             dash,
             dash_row,
@@ -411,11 +448,11 @@ impl OverviewUi {
     }
 
     fn launch(&self, entry: &AppEntry) {
-        if let Err(e) = tuna_shell_host::apps::launch(entry) {
+        if let Err(e) = activate_search_app(self.actions.as_ref(), entry, |entry| {
+            tuna_shell_host::apps::launch(entry).map(|_| ())
+        }) {
             eprintln!("tuna-shell-gtk: launch {}: {e}", entry.app_id);
-            return;
         }
-        self.actions.close_overview();
     }
 
     fn show_results(&self, query: &str) {
@@ -441,13 +478,22 @@ impl OverviewUi {
             let actions = self.actions.clone();
             button.connect_clicked(move |_| {
                 let _ = apps;
-                if tuna_shell_host::apps::launch(&entry).is_ok() {
-                    actions.close_overview();
-                }
+                let _ = activate_search_app(actions.as_ref(), &entry, |entry| {
+                    tuna_shell_host::apps::launch(entry).map(|_| ())
+                });
             });
             self.results.append(&button);
         }
         self.results.set_visible(!hits.is_empty());
+        if let Some(diagnostic) = self.public_diagnostic.borrow_mut().as_mut() {
+            diagnostic.sample(
+                query,
+                apps.apps(),
+                &hits,
+                (self.search.is_visible(), self.results.is_visible()),
+                || self.actions.public_navigation_unlocked(),
+            );
+        }
         self.search_providers(query);
     }
 
@@ -1081,6 +1127,15 @@ impl OverviewUi {
 
     /// Follow the compositor's overview state.
     pub fn set_open(ui: &Rc<RefCell<Self>>, open: bool) {
+        {
+            let me = ui.borrow();
+            let mut slot = me.public_diagnostic.borrow_mut();
+            if let Some(diagnostic) = slot.as_mut() {
+                if !open || !me.actions.public_navigation_unlocked() {
+                    diagnostic.withhold();
+                }
+            }
+        }
         // Changes never rebuild the dash or reset search/visibility. Retain
         // dirty state during a drag so its live source tree survives until end.
         let refresh_folders = {
@@ -2372,5 +2427,155 @@ mod drag_edge_tests {
     fn interior_motion_does_not_start_edge_paging() {
         assert_eq!(drag_edge_transition(-1.0, 640.0, 1280.0), None);
         assert_eq!(drag_edge_transition(0.0, 640.0, 1280.0), None);
+    }
+}
+
+#[cfg(test)]
+mod search_activation_tests {
+    use super::{activate_search_app, AppEntry, OverviewActions};
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Actions {
+        windows: RefCell<Vec<(u64, Option<String>)>>,
+        events: RefCell<Vec<String>>,
+    }
+    impl OverviewActions for Actions {
+        fn running(&self) -> Vec<(u64, Option<String>)> {
+            self.windows.borrow().clone()
+        }
+        fn activate_window(&self, id: u64) {
+            self.events.borrow_mut().push(format!("activate:{id}"));
+        }
+        fn close_overview(&self) {
+            self.events.borrow_mut().push("close".into());
+        }
+        fn set_search(&self, _: bool) {}
+        fn set_app_grid(&self, _: bool) {}
+        fn open_overview(&self) {}
+    }
+    fn entry(id: &str) -> AppEntry {
+        AppEntry {
+            app_id: id.into(),
+            name: "Disks".into(),
+            generic_name: None,
+            keywords: Vec::new(),
+            argv: vec!["gnome-disks".into()],
+            icon: None,
+            categories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exact_running_app_activates_before_close_without_spawning() {
+        let actions = Actions::default();
+        *actions.windows.borrow_mut() = vec![
+            (4, Some("org.tuna.VmInput".into())),
+            (1, Some("org.gnome.DiskUtility".into())),
+        ];
+        for id in ["org.gnome.DiskUtility.desktop", "org.gnome.DiskUtility"] {
+            actions.events.borrow_mut().clear();
+            activate_search_app(&actions, &entry(id), |_| panic!("must not respawn")).unwrap();
+            assert_eq!(*actions.events.borrow(), ["activate:1", "close"]);
+        }
+    }
+
+    #[test]
+    fn removed_or_mismatched_app_falls_back_only_to_original_launcher() {
+        let actions = Actions::default();
+        for windows in [
+            vec![],
+            vec![(1, None)],
+            vec![(1, Some("org.gnome.DiskUtility.Other".into()))],
+            vec![(1, Some("org.gnome.diskutility".into()))],
+            vec![(1, Some("Disks".into()))],
+        ] {
+            *actions.windows.borrow_mut() = windows;
+            actions.events.borrow_mut().clear();
+            activate_search_app(
+                &actions,
+                &entry("org.gnome.DiskUtility.desktop"),
+                |actual| {
+                    assert_eq!(actual.app_id, "org.gnome.DiskUtility.desktop");
+                    assert_eq!(actual.argv, [std::ffi::OsString::from("gnome-disks")]);
+                    actions.events.borrow_mut().push("launch".into());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(*actions.events.borrow(), ["launch", "close"]);
+        }
+    }
+
+    #[test]
+    fn next_activation_uses_fresh_window_snapshot_not_render_time_identity() {
+        let actions = Actions::default();
+        let entry = entry("org.gnome.DiskUtility.desktop");
+        for id in [1, 7] {
+            *actions.windows.borrow_mut() = vec![(id, Some("org.gnome.DiskUtility".into()))];
+            activate_search_app(&actions, &entry, |_| panic!("must not respawn")).unwrap();
+        }
+        actions.windows.borrow_mut().clear();
+        activate_search_app(&actions, &entry, |_| {
+            actions.events.borrow_mut().push("launch".into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            *actions.events.borrow(),
+            [
+                "activate:1",
+                "close",
+                "activate:7",
+                "close",
+                "launch",
+                "close"
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_exact_matches_use_the_same_lowest_id_as_the_dash() {
+        let actions = Actions::default();
+        *actions.windows.borrow_mut() = vec![
+            (7, Some("org.gnome.DiskUtility".into())),
+            (1, Some("org.gnome.DiskUtility".into())),
+        ];
+        activate_search_app(&actions, &entry("org.gnome.DiskUtility.desktop"), |_| {
+            panic!("must not respawn")
+        })
+        .unwrap();
+        assert_eq!(*actions.events.borrow(), ["activate:1", "close"]);
+    }
+
+    #[test]
+    fn empty_or_repeated_desktop_suffix_does_not_activate_an_unrelated_window() {
+        let actions = Actions::default();
+        *actions.windows.borrow_mut() = vec![
+            (1, Some(String::new())),
+            (2, Some("org.gnome.DiskUtility".into())),
+        ];
+        for id in ["", ".desktop", "org.gnome.DiskUtility.desktop.desktop"] {
+            actions.events.borrow_mut().clear();
+            activate_search_app(&actions, &entry(id), |_| {
+                actions.events.borrow_mut().push("launch".into());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(*actions.events.borrow(), ["launch", "close"]);
+        }
+    }
+
+    #[test]
+    fn failed_new_launch_keeps_overview_open() {
+        let actions = Actions::default();
+        let result = activate_search_app(&actions, &entry("org.gnome.DiskUtility.desktop"), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing launcher",
+            ))
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(actions.events.borrow().is_empty());
     }
 }

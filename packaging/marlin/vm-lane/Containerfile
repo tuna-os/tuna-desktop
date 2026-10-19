@@ -35,6 +35,7 @@ COPY packaging/marlin/vm-lane/tuna-vm-session /usr/libexec/tuna-vm-session
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
 COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
+COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
 COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.toml
@@ -50,7 +51,7 @@ RUN pacman -Syu --needed --noconfirm greetd greetd-gtkgreet cage qemu-guest-agen
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && test -f /usr/share/wayland-sessions/tuna.desktop \
-    && chmod 0755 /usr/libexec/tuna-vm-session /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input \
+    && chmod 0755 /usr/libexec/tuna-vm-session /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
     && printf 'tuna-session\n' > /etc/greetd/environments \
     && systemctl disable gdm.service \
     && systemctl mask serial-getty@ttyS0.service \
