@@ -124,7 +124,8 @@ fn is_would_block(e: &ControlError) -> bool {
 #[derive(Default)]
 struct Drained {
     results: Vec<(u64, bool)>,
-    accelerators: Vec<(u32, u32, u32)>,
+    /// Grabbed accelerator presses and releases `(action, time, mode, released)`.
+    accelerators: Vec<(u32, u32, u32, bool)>,
     menus: Vec<tuna_shell_host::control::WindowMenuRequest>,
     consent: Option<Option<(u64, String)>>,
     popups: Vec<(u32, u32)>,
@@ -219,7 +220,10 @@ fn drain(
                 .push((kind, duration_ms, clicked, x, y)),
             Handled::WorkspacePopup { index, count } => out.popups.push((index, count)),
             Handled::Accelerator { action, time, mode } => {
-                out.accelerators.push((action, time, mode));
+                out.accelerators.push((action, time, mode, false));
+            }
+            Handled::AcceleratorDeactivated { action, time, mode } => {
+                out.accelerators.push((action, time, mode, true));
             }
             Handled::CommandResult { id, status } => out.results.push((
                 id,
@@ -369,12 +373,14 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
             .is_some_and(|c| c.model().is_overview_open())
     }
 
-    fn set_accelerators(&self, accelerators: Vec<tuna_shell_control::Accelerator>) {
+    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
         if let Some(control) = self.shell.borrow_mut().control.as_mut() {
             let locked = control.locked();
-            let subset =
-                media_keys::trace_enabled().then(|| media_keys::media_subset(&accelerators));
-            let result = control.set_accelerators(accelerators);
+            let subset = media_keys::trace_enabled().then(|| {
+                let accelerators: Vec<_> = grabs.iter().map(|g| g.accelerator).collect();
+                media_keys::media_subset(&accelerators)
+            });
+            let result = control.set_accelerator_grabs(grabs);
             if let Some(subset) = subset {
                 media_keys::trace(
                     "accelerators-send",
@@ -3198,8 +3204,12 @@ fn build(app: &adw::Application) {
                 } else if let Some(request) = consent {
                     shortcut_consent.sync(request);
                 }
-                for (action, time, mode) in accelerators {
-                    gnome_shell.accelerator_activated(action, time, mode);
+                for (action, time, mode, released) in accelerators {
+                    if released {
+                        gnome_shell.accelerator_deactivated(action, time, mode);
+                    } else {
+                        gnome_shell.accelerator_activated(action, time, mode);
+                    }
                 }
                 for request in menus {
                     window_menu.open(&request);

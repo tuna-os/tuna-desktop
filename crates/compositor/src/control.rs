@@ -328,8 +328,8 @@ pub struct Session<'a> {
     closed: Vec<u64>,
     /// Latest `SetIdleTimeout` from the shell, drained by the hub.
     idle_timeout: Option<u64>,
-    /// The latest SetAccelerators the shell sent, until drained.
-    accelerators: Option<Vec<tuna_shell_control::Accelerator>>,
+    /// The latest accelerator grabs the shell sent, until drained.
+    accelerators: Option<Vec<tuna_shell_control::AcceleratorGrab>>,
     /// Window-menu actions the shell asked for, until drained.
     window_actions: Vec<(u64, tuna_shell_control::WindowAction)>,
     shortcut_consent: Vec<(u64, bool)>,
@@ -574,8 +574,9 @@ impl<'a> Session<'a> {
         self.conn.write_frame(menu)
     }
 
-    /// The latest `SetAccelerators` the shell sent, once.
-    pub fn take_accelerators(&mut self) -> Option<Vec<tuna_shell_control::Accelerator>> {
+    /// The latest accelerator grabs the shell sent (`SetAcceleratorGrabs`,
+    /// or legacy `SetAccelerators` without flags), once.
+    pub fn take_accelerators(&mut self) -> Option<Vec<tuna_shell_control::AcceleratorGrab>> {
         self.accelerators.take()
     }
 
@@ -588,6 +589,21 @@ impl<'a> Session<'a> {
     ) -> Result<(), ControlError> {
         self.conn
             .write_frame(&Message::AcceleratorActivated { action, time, mode })
+    }
+
+    /// Report a `GRAB_TRIGGER_RELEASE` grab's release. Peers older than
+    /// 0.38 cannot decode it and receive nothing.
+    pub fn send_accelerator_deactivated(
+        &mut self,
+        action: u32,
+        time: u32,
+        mode: u32,
+    ) -> Result<(), ControlError> {
+        if self.peer_minor < 38 {
+            return Ok(());
+        }
+        self.conn
+            .write_frame(&Message::AcceleratorDeactivated { action, time, mode })
     }
 
     /// Send where the overview's window previews sit.
@@ -917,7 +933,37 @@ impl<'a> Session<'a> {
             } => {
                 // Session-level grabs, applied by the window manager's
                 // key filter (drained by the hub).
-                self.accelerators = Some(accelerators);
+                // Legacy grabs carry no GNOME flags.
+                self.accelerators = Some(
+                    accelerators
+                        .into_iter()
+                        .map(|accelerator| tuna_shell_control::AcceleratorGrab {
+                            accelerator,
+                            flags: 0,
+                        })
+                        .collect(),
+                );
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::SetAcceleratorGrabs { grabs },
+            } => {
+                if self.peer_minor < 38 {
+                    self.conn.write_frame(&Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        message: "accelerator grab flags require negotiated minor 38".into(),
+                    })?;
+                    return Ok(Handled::ErrorSent {
+                        kind: ErrorKind::UnknownCommand,
+                    });
+                }
+                // Decoding already bounded the list and its flags.
+                self.accelerators = Some(grabs);
                 self.conn.write_frame(&Message::CommandResult {
                     id,
                     status: CommandStatus::Applied,
@@ -989,6 +1035,7 @@ impl<'a> Session<'a> {
             | Message::Environment { .. }
             | Message::OverviewPreviews { .. }
             | Message::AcceleratorActivated { .. }
+            | Message::AcceleratorDeactivated { .. }
             | Message::WindowMenu { .. }
             | Message::WorkspacePopup { .. }
             | Message::PointerOutput { .. }
@@ -1038,6 +1085,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::Environment { .. } => "Environment",
         Message::OverviewPreviews { .. } => "OverviewPreviews",
         Message::AcceleratorActivated { .. } => "AcceleratorActivated",
+        Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
         Message::PointerOutput { .. } => "PointerOutput",
@@ -1213,6 +1261,7 @@ fn apply_command(
         | CommandKind::SetOverviewAppGrid { .. }
         | CommandKind::Unlock { .. }
         | CommandKind::SetAccelerators { .. }
+        | CommandKind::SetAcceleratorGrabs { .. }
         | CommandKind::WindowAction { .. }
         | CommandKind::ShortcutConsent { .. }
         | CommandKind::SwitchInputSource { .. }
@@ -1268,7 +1317,7 @@ pub struct PollOutcome {
     /// The hover-click chooser's pick, if the shell sent one.
     pub dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Accelerator grabs the shell sent, if they changed.
-    pub accelerators: Option<Vec<tuna_shell_control::Accelerator>>,
+    pub accelerators: Option<Vec<tuna_shell_control::AcceleratorGrab>>,
     /// Window-menu actions to carry out.
     pub window_actions: Vec<(u64, tuna_shell_control::WindowAction)>,
     /// Trusted shell decisions for pending inhibitors.
@@ -1414,7 +1463,7 @@ pub struct ControlHub {
     /// every live session exactly once, retained until all sends land.
     switcher_queue: Vec<SwitcherAction>,
     /// Accelerator presses waiting for the next poll.
-    accelerator_queue: Vec<(u32, u32, u32)>,
+    accelerator_queue: Vec<(u32, u32, u32, bool)>,
     /// Window-menu requests waiting for the next poll.
     menu_queue: Vec<Message>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
@@ -1857,7 +1906,18 @@ impl ControlHub {
 
     /// Report a grabbed accelerator's press to the shell on the next poll.
     pub fn queue_accelerator(&mut self, action: u32, time: u32, mode: u32) {
-        self.accelerator_queue.push((action, time, mode));
+        self.accelerator_queue.push((action, time, mode, false));
+    }
+
+    /// Report a `GRAB_TRIGGER_RELEASE` grab's release on the next poll.
+    pub fn queue_accelerator_deactivated(&mut self, action: u32, time: u32, mode: u32) {
+        self.accelerator_queue.push((action, time, mode, true));
+    }
+
+    /// Drop queued presses and releases that the shell has not been
+    /// sent yet (a lock boundary invalidates them).
+    pub fn cancel_pending_accelerators(&mut self) {
+        self.accelerator_queue.clear();
     }
 
     /// Queue one Alt-Tab drive event; the next [`poll`](Self::poll)
@@ -1884,6 +1944,7 @@ impl ControlHub {
     /// this round (for Wayland-side focus) and asked to close (for the
     /// polite client close), so the runtime can apply both.
     pub fn poll(&mut self, model: &mut StateModel) -> PollOutcome {
+        let locked_before = self.locked.get();
         let uid = our_uid();
         while let Ok((stream, _)) = self.listener.accept() {
             let cred = peer_cred(&stream);
@@ -2020,6 +2081,11 @@ impl ControlHub {
                 self.session_peers.swap_remove(i);
             }
         }
+        // A Lock command changes the logical lock before Runtime::engage_lock
+        // runs. Do not broadcast pre-lock presses or releases in that gap.
+        if !locked_before && self.locked.get() {
+            self.cancel_pending_accelerators();
+        }
         self.broadcast();
         outcome
     }
@@ -2127,9 +2193,13 @@ impl ControlHub {
         }
         // Accelerator presses go to every live session once (the shell
         // signals the grabbing D-Bus caller).
-        for (action, time, mode) in std::mem::take(&mut self.accelerator_queue) {
+        for (action, time, mode, released) in std::mem::take(&mut self.accelerator_queue) {
             for session in &mut self.sessions {
-                let _ = session.send_accelerator(action, time, mode);
+                let _ = if released {
+                    session.send_accelerator_deactivated(action, time, mode)
+                } else {
+                    session.send_accelerator(action, time, mode)
+                };
             }
         }
         for menu in std::mem::take(&mut self.menu_queue) {
