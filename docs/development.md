@@ -67,7 +67,7 @@ spektacular version check
 
 ## Project Structure
 
-The project is a Cargo workspace with seven crates. Each crate's `README.md`
+The project is a Cargo workspace with eight crates. Each crate's `README.md`
 lists its purpose, public API, and dependents.
 
 ```
@@ -79,7 +79,8 @@ tuna-desktop/
 │   ├── shell-host/           # tuna-shell-host: original shell binary and shared shell logic
 │   ├── shell-gtk/            # tuna-shell-gtk: GTK4/libadwaita shell (ADR 0006)
 │   ├── greeter/              # tuna-greeter: greetd login greeter
-│   └── wallpaper/            # tuna-wallpaper: wallpaper decoding
+│   ├── wallpaper/            # tuna-wallpaper: wallpaper decoding
+│   └── magnifier/            # tuna-magnifier: shared session magnifier settings
 │
 ├── docs/                     # architecture, roadmap, test strategy, ADRs, guides
 ├── packaging/                # Arch package and Marlin image (scripts/tuna-release builds the .deb)
