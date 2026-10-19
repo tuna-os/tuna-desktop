@@ -4143,6 +4143,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuna-backlight"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tuna-shell-control",
+]
+
+[[package]]
 name = "tuna-compositor"
 version = "0.1.0"
 dependencies = [
@@ -4225,6 +4234,7 @@ dependencies = [
  "pipewire",
  "serde_json",
  "tempfile",
+ "tuna-backlight",
  "tuna-magnifier",
  "tuna-shell-control",
  "tuna-shell-host",
