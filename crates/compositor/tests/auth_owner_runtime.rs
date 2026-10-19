@@ -90,6 +90,11 @@ fn state(root: &Path) -> serde_json::Value {
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(serde_json::Value::Null)
 }
+fn publish_json(path: &Path, receipt: &serde_json::Value) {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(receipt).unwrap()).unwrap();
+    std::fs::rename(tmp, path).unwrap();
+}
 fn client() {
     let root = PathBuf::from(std::env::var_os("TUNA_AUTH_OWNER_ROOT").unwrap());
     wait(|| state(&root)["auth_owner"].is_object());
@@ -105,6 +110,7 @@ fn client() {
         1,
         "redundant manual lock keeps epoch"
     );
+    std::fs::write(root.join("admitted-1"), b"1").unwrap();
     send(
         &mut a,
         1,
@@ -193,6 +199,7 @@ fn client() {
     if std::env::var(ROLE).as_deref() != Ok("3") {
         std::fs::write(root.join("release-2"), b"1").unwrap();
     }
+    std::fs::write(root.join("admitted-2"), b"1").unwrap();
     send(
         &mut replacement,
         3,
@@ -224,17 +231,20 @@ fn client() {
     send(&mut replacement, 12, CommandKind::SetIdleTimeout { ms: 50 });
     result(&mut replacement, 12, true);
     wait(|| state(&root)["locked"] == true && state(&root)["auth_owner"]["epoch"] == 3);
-    std::fs::write(root.join("success.json"),serde_json::to_vec(&serde_json::json!({
-        "supervised_client_pid":std::process::id(), "manual_epoch":1,"unlock_epoch":2,"idle_epoch":3,
-        "concurrent_other_same_id_denied":true,"same_session_excess_denied":true,
-        "replacement_same_id_busy_denied":true,
-        "late_closed_origin_success_denied":std::env::var(ROLE).as_deref()!=Ok("3"),
-        "closed_origin_canceled_retired":std::env::var(ROLE).as_deref()==Ok("3"),
-        "fresh_origin_success":true,
-        "held_self_path_replaced":std::env::var(ROLE).as_deref()==Ok("3"),
-        "origin_loss_wakes_private_pam_without_fixture_release":std::env::var(ROLE).as_deref()==Ok("3"),
-        "scope":if std::env::var(ROLE).as_deref()==Ok("3") { "actual main Runtime PAM: stable held image, old origin denied, actual retirement; not hardware/MFA/S3" } else { "actual nested outer-wrapper ownership; no PAM retirement" }
-    })).unwrap()).unwrap();
+    publish_json(
+        &root.join("success.json"),
+        &serde_json::json!({
+            "supervised_client_pid":std::process::id(), "manual_epoch":1,"unlock_epoch":2,"idle_epoch":3,
+            "concurrent_other_same_id_denied":true,"same_session_excess_denied":true,
+            "replacement_same_id_busy_denied":true,
+            "late_closed_origin_success_denied":std::env::var(ROLE).as_deref()!=Ok("3"),
+            "closed_origin_canceled_retired":std::env::var(ROLE).as_deref()==Ok("3"),
+            "fresh_origin_success":true,
+            "held_self_path_replaced":std::env::var(ROLE).as_deref()==Ok("3"),
+            "origin_loss_wakes_private_pam_without_fixture_release":std::env::var(ROLE).as_deref()==Ok("3"),
+            "scope":if std::env::var(ROLE).as_deref()==Ok("3") { "actual main Runtime PAM: stable held image, old origin denied, actual retirement; not hardware/MFA/S3" } else { "actual nested outer-wrapper ownership; no PAM retirement" }
+        }),
+    );
     // Keep the supervised process alive until parent sends graceful termination.
     std::thread::sleep(Duration::from_secs(2));
 }
@@ -246,6 +256,7 @@ fn epoch_client() {
     send(&mut original, 10, CommandKind::Lock);
     result(&mut original, 10, true);
     wait(|| state(&root)["auth_owner"]["epoch"] == 1 && state(&root)["locked"] == true);
+    std::fs::write(root.join("admitted-1"), b"1").unwrap();
     send(
         &mut original,
         1,
@@ -275,6 +286,7 @@ fn epoch_client() {
     drop(original);
     let mut replacement = connect();
     std::fs::write(root.join("release-2"), b"1").unwrap();
+    std::fs::write(root.join("admitted-2"), b"1").unwrap();
     send(
         &mut replacement,
         1,
@@ -288,18 +300,22 @@ fn epoch_client() {
     result(&mut replacement, 11, true);
     wait(|| state(&root)["locked"] == true && state(&root)["auth_owner"]["epoch"] == 4);
     std::fs::write(root.join("release-3"), b"1").unwrap();
+    std::fs::write(root.join("admitted-3"), b"1").unwrap();
     std::fs::write(root.join("try-sync"), b"1").unwrap();
     wait(|| root.join("sync-result.json").exists());
     let synced: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("sync-result.json")).unwrap()).unwrap();
     assert_eq!(synced["applied"], true);
     wait(|| state(&root)["locked"] == false && state(&root)["auth_owner"]["epoch"] == 5);
-    std::fs::write(root.join("success.json"),serde_json::to_vec(&serde_json::json!({
-        "supervised_client_pid":std::process::id(),"late_epoch_success_denied":true,
-        "busy_public_sync_denied":true,"fresh_origin_success":true,"public_sync_success":true,
-        "manual_epoch":1,"injected_epoch":2,"fresh_epoch":3,"relock_epoch":4,"sync_epoch":5,
-        "scope":"actual runtime controlled epoch injection and public try_unlock; not logind/S3/backend duplicate"
-    })).unwrap()).unwrap();
+    publish_json(
+        &root.join("success.json"),
+        &serde_json::json!({
+            "supervised_client_pid":std::process::id(),"late_epoch_success_denied":true,
+            "busy_public_sync_denied":true,"fresh_origin_success":true,"public_sync_success":true,
+            "manual_epoch":1,"injected_epoch":2,"fresh_epoch":3,"relock_epoch":4,"sync_epoch":5,
+            "scope":"actual runtime controlled epoch injection and public try_unlock; not logind/S3/backend duplicate"
+        }),
+    );
     // Parent admits this live process, copies receipts, then terminates the driver.
     std::thread::sleep(Duration::from_secs(2));
 }
@@ -345,9 +361,16 @@ impl Drop for Artifacts {
     }
 }
 
-fn greetd(listener: UnixListener, root: PathBuf, attempts: usize) {
+fn greetd(listener: UnixListener, root: PathBuf, attempts: usize, deadline: Instant) {
     listener.set_nonblocking(true).unwrap();
     for n in 1..=attempts {
+        // Startup and time between attempts belong to the total parent deadline,
+        // not the backend's per-attempt budget. Only the supervised client can
+        // admit the next attempt in this private fixture directory.
+        while !root.join(format!("admitted-{n}")).exists() {
+            assert!(Instant::now() < deadline, "greetd admission deadline");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let mut connection = None;
         wait(|| match listener.accept() {
             Ok((s, _)) => {
@@ -385,6 +408,7 @@ fn greetd(listener: UnixListener, root: PathBuf, attempts: usize) {
         std::fs::write(root.join(format!("done-{n}")), b"1").unwrap();
     }
 }
+
 #[test]
 fn actual_runtime_owns_delayed_greetd_result_and_lock_epochs() {
     match std::env::var(ROLE).ok().as_deref() {
@@ -483,6 +507,7 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         root: root.path().to_owned(),
         out: std::env::var_os("TUNA_AUTH_OWNER_ARTIFACTS").map(PathBuf::from),
     };
+    let end = Instant::now() + Duration::from_secs(30);
     let socket = root.path().join("greetd.sock");
     let server = if role == "3" {
         None
@@ -490,7 +515,7 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         let listener = UnixListener::bind(&socket).unwrap();
         let server_root = root.path().to_owned();
         Some(std::thread::spawn(move || {
-            greetd(listener, server_root, attempts)
+            greetd(listener, server_root, attempts, end)
         }))
     };
     let owned_bin = root.path().join("compositor-copy");
@@ -562,6 +587,8 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             ])
             .arg(std::env::current_exe().unwrap())
             .env(ROLE, role)
+            // The supervised peer is libtest too; retain its panic in compositor.log.
+            .env("RUST_TEST_NOCAPTURE", "1")
             .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
             .env("TUNA_AUTH_OWNER_ROOT", root.path())
             .env("XDG_RUNTIME_DIR", root.path())
@@ -574,12 +601,15 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             .spawn()
             .unwrap(),
     );
-    std::fs::write(root.path().join("compositor-pid"), child.0.id().to_string()).unwrap();
-    let end = Instant::now() + Duration::from_secs(30);
+    publish_json(
+        &root.path().join("compositor-pid"),
+        &serde_json::json!(child.0.id()),
+    );
     while !root.path().join("success.json").exists() {
+        let status = child.0.try_wait().unwrap();
         assert!(
-            child.0.try_wait().unwrap().is_none(),
-            "actual compositor exited before proof"
+            status.is_none(),
+            "actual compositor exited before proof: {status:?}"
         );
         assert!(Instant::now() < end, "actual runtime proof deadline");
         std::thread::sleep(Duration::from_millis(10));
@@ -627,7 +657,7 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         .to_owned();
     assert_eq!(actual_digest, source_digest, "actual live source image");
     receipt["compositor_sha256"] = serde_json::json!(actual_digest);
-    std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    publish_json(&receipt_path, &receipt);
     println!(
         "auth owner {kind} runtime receipt: {}",
         std::fs::read_to_string(root.path().join("success.json")).unwrap()

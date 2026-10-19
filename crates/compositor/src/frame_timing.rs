@@ -101,9 +101,11 @@ pub fn pending_frame_work(roots: &[WlSurface]) -> bool {
 /// requests belonging to this output's drawn surfaces can require scanout.
 /// A hidden request stays pending until that surface is actually drawn.
 /// Frame callbacks of `throttled` roots (hidden windows) are paid by the
-/// hidden-window beat, not by a scanout: an unchanged output must not
-/// repaint at the display rate while one waits (#503). Their FIFO
-/// barriers and commit timers still advance on each refresh cycle.
+/// hidden-window beat, not by a scanout, also when the window is among
+/// `drawn` (an occluded window on the active workspace is): an unchanged
+/// output must not repaint at the display rate while one waits (#503).
+/// Their FIFO barriers and commit timers still advance on each refresh
+/// cycle.
 #[doc(hidden)]
 pub fn pending_output_work(
     roots: &[WlSurface],
@@ -113,7 +115,9 @@ pub fn pending_output_work(
     roots
         .iter()
         .any(|root| pending_work(std::slice::from_ref(root), !throttled.contains(root), false))
-        || pending_work(drawn, true, true)
+        || drawn
+            .iter()
+            .any(|root| pending_work(std::slice::from_ref(root), !throttled.contains(root), true))
 }
 
 /// Whether any surface tree in `roots` holds an unsent frame callback.

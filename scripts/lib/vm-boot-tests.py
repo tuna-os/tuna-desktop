@@ -418,6 +418,42 @@ class OrcaStagedDiagnostic(unittest.TestCase):
             self.assertIsNone(decode(encode(bad)))
         self.assertIsNone(decode("not-base64"))
         # Fault injection verifies schema bounds; no live guest round trip.
+    def test_native_focus_failures_preserve_only_fixed_types_across_guest_and_host(self):
+        from contextlib import redirect_stdout
+        decode = self.agent_scope("valid_focus_error", "focus_failure_diagnostic")["focus_failure_diagnostic"]
+        for name in ("TypeError", "AttributeError", "CalledProcessError", "TimeoutExpired", "Error"):
+            with self.subTest(error_type=name):
+                scope = self.guest_scope("shell_navigation_focus")
+                scope["orca_observation"] = lambda: {"ready": True, "state": "active", "display": ["wayland-0"]}
+                scope["STATE"] = SimpleNamespace(read_text=lambda: '{"locked": false}')
+                scope["inventory"] = lambda: {"processes": [{"executable": "tuna-shell-gtk", "uid": 1000,
+                                                             "pid": 1083, "start_ticks": 1187}]}
+                scope["OWNER"] = SimpleNamespace(pw_uid=1000)
+                def helper(*args, **kwargs):
+                    raise subprocess.CalledProcessError(1, args,
+                        output=json.dumps({"focus_error_type": name}), stderr="private query and argument")
+                scope["call"] = helper
+                stream = io.StringIO()
+                with redirect_stdout(stream), self.assertRaises(SystemExit) as exited:
+                    scope["shell_navigation_focus"]("shell", 1083, 1187, controlled=True)
+                self.assertEqual(exited.exception.code, 1)
+                encoded = base64.b64encode(stream.getvalue().encode()).decode()
+                self.assertEqual(decode(encoded), {"focus_error_type": name, "focus_stage": "helper"})
+                self.assertNotIn("private", stream.getvalue())
+                # The same errors before/after the helper remain typed failures.
+                error_type = type(name, (Exception,), {})
+                def failed_principal():
+                    raise error_type("private reader observation")
+                scope["orca_observation"] = failed_principal
+                stream = io.StringIO()
+                with redirect_stdout(stream), self.assertRaises(SystemExit) as exited:
+                    scope["shell_navigation_focus"]("shell", controlled=True)
+                self.assertEqual(exited.exception.code, 1)
+                encoded = base64.b64encode(stream.getvalue().encode()).decode()
+                self.assertEqual(decode(encoded), {"focus_error_type": name, "focus_stage": "reader-principal"})
+                self.assertNotIn("private", stream.getvalue())
+        # Injected failure transport only. Genuine AT-SPI navigation still needs CI.
+
     def test_speech_failure_schema_accepts_observation_stage(self):
         scope = self.agent_scope("speech_failure_diagnostic")
         decode = scope["speech_failure_diagnostic"]
@@ -478,6 +514,76 @@ class OrcaStagedDiagnostic(unittest.TestCase):
         with self.assertRaises(ValueError):
             scope["fail_speech"](RuntimeError("x"), cleanup, "private-probe")
         # Fault injection verifies the stage envelope; no genuine recording lifecycle.
+
+
+class ShellStartupDiagnostics(unittest.TestCase):
+    def test_transport_failure_is_retained_and_closed(self):
+        agent = unittest.mock.Mock()
+        agent.run.side_effect = TimeoutError("bounded capture expired")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "stack.json"
+            with patch.object(lane.guest_agent, "GuestAgent", return_value=agent):
+                lane.dump_shell_stack("socket", destination)
+            self.assertEqual(json.loads(destination.read_text()),
+                             {"error": "bounded capture expired"})
+            agent.run.assert_called_once_with("shell-stack", timeout=120)
+            agent.close.assert_called_once()
+
+    def test_backtraces_survive_transport(self):
+        agent = unittest.mock.Mock()
+        observed = {"shells": [{"pid": 1234, "threads": [], "backtraces": "stack"}]}
+        agent.run.return_value = observed
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "stack.json"
+            with patch.object(lane.guest_agent, "GuestAgent", return_value=agent):
+                lane.dump_shell_stack("socket", destination)
+            self.assertEqual(json.loads(destination.read_text()), observed)
+            agent.close.assert_called_once()
+
+    def probe(self, gdb_error=None):
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        function = next(node for node in ast.parse(source.read_text()).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "shell_stack")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for pid, executable in ((1234, "tuna-shell-gtk"), (1235, "unrelated")):
+                process = root / str(pid)
+                process.mkdir()
+                (process / "exe").symlink_to("/usr/bin/" + executable)
+                task = process / "task" / str(pid)
+                task.mkdir(parents=True)
+                for name, text in (("comm", executable), ("wchan", "futex_wait"),
+                                   ("stack", "kernel wait"), ("syscall", "202"),
+                                   ("stat", f"{pid} ({executable}) S")):
+                    (task / name).write_text(text)
+            run = unittest.mock.Mock(return_value=SimpleNamespace(stdout="#0 futex_wait", stderr=""))
+            if gdb_error:
+                run.side_effect = gdb_error
+            scope = {"pathlib": SimpleNamespace(Path=lambda path: root if path == "/proc" else Path(path)),
+                     "os": os,
+                     "OWNER": SimpleNamespace(pw_uid=os.getuid()), "SHELL_GTK": "tuna-shell-gtk",
+                     "subprocess": SimpleNamespace(run=run, TimeoutExpired=lane.subprocess.TimeoutExpired)}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), scope)
+            result = scope["shell_stack"]()
+            run.assert_called_once()
+            command = run.call_args.args[0]
+            self.assertEqual(command[-2:], ["-p", "1234"])
+            self.assertIn("thread apply all bt", command)
+            self.assertIn("set print frame-arguments none", command)
+            self.assertEqual(run.call_args.kwargs["timeout"], 90)
+            return result["shells"][0]
+
+    def test_only_session_shell_is_attached_and_every_thread_is_retained(self):
+        result = self.probe()
+        self.assertEqual(result["pid"], 1234)
+        self.assertEqual(result["threads"][0]["wait_site"], "futex_wait")
+        self.assertEqual(result["threads"][0]["state"], "S")
+        self.assertEqual(result["backtraces"], "#0 futex_wait")
+
+    def test_gdb_failure_preserves_kernel_wait_information(self):
+        result = self.probe(lane.subprocess.TimeoutExpired("gdb", 90))
+        self.assertEqual(result["threads"][0]["wait_site"], "futex_wait")
+        self.assertEqual(result["backtraces"], "unavailable: TimeoutExpired")
 
 
 class OrcaUnreadyDiagnostic(unittest.TestCase):
@@ -2170,6 +2276,64 @@ class TourRecorderTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
         self.assertIn('qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core', workflow)
 
+
+def tour_frame(fill, boxes=()):
+    """A WIDTH x HEIGHT RGB frame: fill, then (x0, y0, x1, y1, rgb) boxes."""
+    w = lane.WIDTH
+    px = bytearray(bytes(fill) * (w * lane.HEIGHT))
+    for x0, y0, x1, y1, rgb in boxes:
+        row = bytes(rgb) * (x1 - x0)
+        for y in range(y0, y1):
+            px[(y * w + x0) * 3:(y * w + x1) * 3] = row
+    return bytes(px)
+
+
+class TourViewPredicates(unittest.TestCase):
+    GREY, NAVY, WHITE = (36, 36, 40), (8, 24, 52), (250, 250, 250)
+    WINDOWS = (190, 140, 1085, 690, WHITE)
+    SWITCHER = [WINDOWS, (358, 307, 922, 492, GREY), (376, 325, 536, 425, WHITE),
+                (584, 325, 696, 425, WHITE), (749, 325, 900, 425, WHITE)]
+
+    def views(self, px):
+        return [name for name in ("overview_windows_shown", "switcher_shown", "desktop_shown")
+                if getattr(lane, name)(px)]
+
+    def test_overview_with_window_previews(self):
+        frame = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY), (440, 420, 840, 670, self.WHITE)])
+        self.assertEqual(self.views(frame), ["overview_windows_shown"])
+
+    def test_search_and_app_grid_are_not_the_window_overview(self):
+        icons = [(x, y, x + 48, y + 48, (200, 60, 40)) for x in range(170, 1110, 125) for y in (270, 395)]
+        self.assertEqual(self.views(tour_frame(self.GREY, icons)), [])
+        self.assertEqual(self.views(tour_frame(self.GREY)), [])
+
+    def test_switcher_island_over_windows(self):
+        self.assertEqual(self.views(tour_frame(self.NAVY, self.SWITCHER)), ["switcher_shown"])
+
+    def test_desktop_and_calendar_are_not_the_switcher(self):
+        self.assertEqual(self.views(tour_frame(self.NAVY, [self.WINDOWS])), ["desktop_shown"])
+        calendar = tour_frame(self.NAVY, [(263, 38, 1017, 531, self.GREY)])
+        self.assertEqual(self.views(calendar), ["desktop_shown"])
+
+    def test_await_still_waits_for_the_view_and_flags_one_that_never_appears(self):
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        probes = [tour_frame(self.NAVY, [self.WINDOWS]), tour_frame(self.NAVY, self.SWITCHER)]
+        def command(name, **args):
+            path = Path(args["filename"])
+            if path.name == "probe.ppm":
+                path.write_bytes(header + (probes.pop(0) if len(probes) > 1 else probes[0]))
+            else:
+                path.write_bytes(b"png pixels")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory, timeout=1)
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            self.assertFalse(recorder.await_still("overview-windows", lane.overview_windows_shown,
+                                                  timeout=0.05, settle=0))
+            self.assertEqual(recorder.stills, {"alt-tab": 0, "overview-windows": 1})
+            self.assertEqual(recorder.unconfirmed, ["overview-windows"])
+            self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
+                             ["f000000.png", "f000001.png"])
+            recorder.close()
 
 
 class SleepAuthRetirementTests(unittest.TestCase):

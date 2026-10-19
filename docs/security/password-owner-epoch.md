@@ -36,6 +36,14 @@ busy denials, origin loss, late success, fresh success, manual lock and idle loc
 Its receipt binds source, binaries and the supervised client's process identity.
 Rust and runtime results remain pending until the exact candidate passes CI.
 
+The fixture keeps a 30-second total parent deadline. Its five-second greetd
+accept budget starts only after the supervised client initiates that numbered
+authentication attempt, not while the compositor is still starting. Each
+cross-process JSON receipt (`success.json`, `epoch-injected.json` and
+`sync-result.json`) is written to a sibling temporary file and renamed into
+place, so existence signals a complete document. These synchronization rules
+do not relax any ownership, lock-epoch or private PAM retirement assertions.
+
 This fixture covers native control IPC under winit and Xvfb. It does not qualify
 the GTK lock screen, installed DRM, physical devices or multiple authentication
 challenges. Existing GTK unlock and Marlin sleep controls remain required.

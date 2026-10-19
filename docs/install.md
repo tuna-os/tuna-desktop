@@ -8,6 +8,16 @@
 > and not yet qualified on real GPUs; the cursor is drawn in software and
 > client cursor images are not composited yet.
 
+## Test-drive in a VM (one command)
+
+To evaluate Tuna Desktop without installing packages or compiling from source:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/try-tuna-desktop | bash
+```
+
+This downloads Corral (checksum-verified), pulls and cosign-verifies the published TunaOS image, and launches Tuna Desktop in local QEMU with a local-only browser console over noVNC. Stop anytime with Ctrl-C. See `scripts/try-tuna-desktop` for options (`TRY_TUNA_MEM`, `TRY_TUNA_PORT`, etc.).
+
 ## From the Debian-format package
 
 The package ships the preferred GTK shell beside the compositor. The first

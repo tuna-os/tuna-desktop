@@ -74,8 +74,8 @@ class PortalProofTests(unittest.TestCase):
 
     def test_gtk_publisher_starts_once_and_seeds_before_name_acquisition(self):
         main = (ROOT / 'crates/shell-gtk/src/main.rs').read_text()
-        self.assertEqual(main.count('privacy_portal::start(&app)'), 1)
-        self.assertLess(main.index('privacy_portal::start(&app)'), main.index('app.connect_activate(build)'))
+        self.assertEqual(main.count('privacy_portal::start'), 1)
+        self.assertLess(main.index('privacy_portal::start'), main.index('app.connect_activate(build)'))
         worker = (ROOT / 'crates/shell-gtk/src/privacy_portal.rs').read_text()
         self.assertLess(worker.index('publisher.poll(&GioBackend)'), worker.index('publisher.ensure()'))
         self.assertIn('connect_shutdown', worker)

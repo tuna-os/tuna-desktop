@@ -27,13 +27,19 @@ jobs:
         target: [control_frame, control_body]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: nightly-2026-10-16
+          toolchain: nightly-2026-10-19
+      - name: Identify native cache platform
+        id: cache-platform
+        run: |
+          . /etc/os-release
+          echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
-          shared-key: control-fuzz
+          shared-key: control-fuzz-${{ steps.cache-platform.outputs.distro }}
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz with address sanitizer and fixed limits
         env:

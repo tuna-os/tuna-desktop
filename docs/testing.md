@@ -9,13 +9,13 @@ first; each proof below names anything extra it needs.
 ## Which lanes a pull request runs
 
 Every push to `main`, the nightly schedule and `workflow_dispatch` run
-every job. A pull request always runs `check`; the first step of `check`
-(`scripts/ci-select-lanes`) diffs the PR against its base and picks the
-proof lanes the change can affect:
+every proof lane. Both `select-lanes` and `check` always run. The lightweight
+`select-lanes` job runs `scripts/ci-select-lanes`, diffs the PR against its
+base, and picks the proof lanes the change can affect:
 
 - `ci.yml`, `scripts/ci-*`, `Cargo.toml`, `Cargo.lock`, `third-party/` or
   `scripts/tuna-nested`: every lane.
-- docs, other workflows, `fuzz/` and the script self-tests: `check` only.
+- docs, other workflows, `fuzz/` and the script self-tests: no proof lanes.
 - a lane's own proof script, reference fixtures or packaging: that lane
   (plus the lanes whose artifacts it needs).
 - anything else (crates, `share/`, other scripts): `gtk-shell` plus a
@@ -24,14 +24,63 @@ proof lanes the change can affect:
   (default 2); each push to a PR covers a different slice and `main` runs
   them all after merge.
 
-The step summary of `check` names the chosen lanes and why. `ci-gate`
-reports one status for the run: it fails when any job failed or was
-cancelled. To run every lane on a branch, dispatch `ci` on it.
+The step summary of `select-lanes` names the chosen lanes and why.
+Independent lanes start after selection, without waiting for workspace
+tests. GTK, grid comparison and fingerprint admission still require the
+successful current-run `check`; the ledger also consumes its test list,
+and image publication waits for it. Package and screenshot consumers still
+wait for their producing proof jobs.
+
+`ci-gate` requires both infrastructure jobs to succeed and fails when any
+selected job fails or is cancelled. Only unselected proof lanes may be
+skipped. To run every lane on a branch, dispatch `ci` on it.
+
+## Dependency caches
+
+Rust caches remain job-specific; no cache hit skips Cargo, executable
+admission or a proof. Only non-PR runs on `refs/heads/main` may save them.
+PRs and branch dispatches restore main's compatible caches without
+creating competing branch copies. New keys need a successful main job
+to seed them; the first run after a key change can be cold.
+
+The same writer policy and native-platform separation apply to measured
+coverage, fuzzing, nested stress and visual capture. Workflows without a
+main-push trigger seed on their existing scheduled or manual main runs;
+their branch runs remain restore-only. The two fuzz targets retain their
+shared nightly dependency cache, separate from other jobs and profiles.
+
+Ubuntu keys include the native distro ID/version in addition to the
+pinned cache action's compiler, architecture, environment and dependency
+identity. `check` includes the standalone `third-party/reis` and
+`third-party/smithay` targets. Grid comparison has separate cached
+old/fixed targets under `target/ci-grid`, keyed to its reviewed old source;
+fingerprint uses `target/ci-fprint`. Setting `CARGO_TARGET_DIR` opts these
+two proof scripts into persistent build targets; without it, local runs
+keep isolated targets inside their fresh artifact directory. Receipts,
+admissions and verdicts are always freshly produced outside the cache.
+
+The Arch job shares an explicit Cargo home between cache restoration and
+the unprivileged package builder. Its key includes the installed native
+package inventory, and its target is never shared with Ubuntu. Restoration
+precedes the existing builder ownership change; package build, installation
+and version checks still run.
+Both paths are derived inside the container and published through
+`GITHUB_ENV`, rather than using the host-side `github.workspace` expression.
+The target stays under `GITHUB_WORKSPACE`; Cargo home lives under
+`RUNNER_TEMP`, outside the workspace. The pinned cache action excludes
+dependency manifests inside the workspace by default, so putting Cargo
+home there would prune registry crates and their compiled dependencies.
+After restoration, both the workspace and Cargo home become builder-owned.
+
+When diagnosing misses, inspect the cache action's primary/restore keys,
+hit status, archive size and transfer times before increasing storage.
+Job/profile/native-environment caches are deliberately separate; a single
+shared key can retain an incomplete first-writer snapshot. OCI/ORAS or
+resumed VM sessions do not replace fresh source/package/runtime proofs.
 
 ## Before opening a PR
 
-The `check` job is the gate every other job waits on. Run its four steps
-in this order:
+Run the workspace checks locally before opening a PR:
 
 ```sh
 cargo fmt --all -- --check
@@ -55,8 +104,20 @@ locally to be sure the test really ran:
 TUNA_REQUIRE_PAM_WRAPPER=1 cargo test --workspace
 ```
 
+`scripts/tuna-auth-owner-ci-proof <artifact-directory>` runs the actual
+native ownership and private PAM retirement cases. Its PID readiness
+markers are published only after complete PID contents are written.
+Artifacts retain supervised test-client panics and early compositor exit
+status; a compiled test or cache hit is not a substitute for these cases.
+
 Run one crate with `cargo test -p <package>` (package names are in each
 crate's `README.md`, for example `cargo test -p tuna-compositor`).
+
+Desktop-entry launch coverage lives in `tuna-shell-host`:
+`cargo test --locked -p tuna-shell-host --lib apps::`.
+It checks quoted multiword and empty arguments, field-code expansion after
+argument grouping, and literal `$HOME` handling. Desktop `Exec` commands are
+parsed as an argument vector, never evaluated by a shell.
 
 ## Nested proofs
 
@@ -66,6 +127,14 @@ and writes frames, logs, and usually an `assertions.txt` into the
 artifacts directory. A nonzero exit is a failure; the frames are for human
 review. CI shellchecks each script before running it.
 
+The native grid-drag cancellation proof holds the pointer button until both
+the compositor reports cancellation and a fresh, complete, owner-bound AT-SPI
+tree restores the normal page arrow without a drag preview. Widget removal
+can invalidate a traversal while GTK processes cancellation; that snapshot
+is rejected, and the existing five-second polling budget must still obtain
+a valid tree. Persistent transport errors, wrong owners and incomplete trees
+cannot satisfy the gate.
+
 | CI job | Command | Extra packages | What it asserts |
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |
@@ -74,6 +143,7 @@ review. CI shellchecks each script before running it.
 | `scroll-proof` | `scripts/tuna-scroll-proof --artifacts scroll-proof-artifacts` | `python3-venv` | Scroll-mode strip: Super+Shift+T, Super+R, wheel scrolling, gap geometry |
 | `gtk-shell` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts` | gtk4-layer-shell (`scripts/ci-install-gtk4-layer-shell`), `xwayland pipewire wireplumber at-spi2-core python3-pyatspi fonts-cantarell ffmpeg libpam-wrapper` and the GStreamer PipeWire plugins; see the job for the full list | GTK shell panel, calendar, quick settings, overview, notifications, lock and unlock, AT-SPI trees; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-scale-proof --artifacts gtk-shell-artifacts/scale` | as above | The same session at 150 percent scale; writes `assertions.txt` |
+| `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
 | `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg`, `linux-modules-extra-$(uname -r)` for vkms | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe` and seatd |
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
@@ -143,6 +213,17 @@ The artifact (`marlin-vm`) holds `serial.log`, `tuna-lines.log` (every
 The manifest records the base image digest, the test image ID, the Tuna Desktop
 package, and the QEMU version. If the run fails or times out (15
 minutes), the script prints the relevant serial lines before exiting.
+
+When the shell has printed but has not logged `keybindings:` within
+20 seconds, a bounded startup watchdog captures
+`shell-startup-stack-1.json` in that boot's artifact directory. It captures
+again at 60 seconds if startup is still stalled. If the shell prints
+nothing, the first capture is 40 seconds after the DRM output appears.
+The CI-only guest layer installs gdb; the dump includes every session
+shell thread's kernel wait site/stack and user backtrace, without frame
+arguments, locals, or debuginfod downloads. Guest transport/debugger errors
+are retained in the JSON instead of hiding the startup failure. This
+diagnostic does not restart the shell or relax any readiness gate.
 
 After the assertions pass, `--tour` records a feature tour. The script
 sends keys and pointer clicks through QMP to open the overview and search,

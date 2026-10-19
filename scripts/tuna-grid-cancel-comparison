@@ -1,5 +1,10 @@
 #!/usr/bin/python3
-"""Build/admit two exact CI sources and run the same real headed drag harness."""
+"""Build/admit two exact CI sources and run the same real headed drag harness.
+
+An explicit CARGO_TARGET_DIR is a persistent build root with separate old/fixed
+subdirectories. Without it, targets remain isolated inside the artifact directory.
+Only Cargo build products belong in that root; admissions and verdicts stay fresh.
+"""
 import argparse
 import ctypes
 import importlib.util
@@ -61,7 +66,9 @@ def cleanup_owned(child, token):
 
 
 def build(source, role, work, ci):
-    target = work / f"target-{role}"
+    target_root = os.environ.get("CARGO_TARGET_DIR")
+    target = (Path(target_root).resolve() / role) if target_root else work / f"target-{role}"
+    target.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, CARGO_TARGET_DIR=str(target), PYTHONDONTWRITEBYTECODE="1",
                CARGO_PROFILE_DEV_DEBUG="0", CARGO_INCREMENTAL="0")
     logs = []
@@ -69,7 +76,7 @@ def build(source, role, work, ci):
         ["-p", "tuna-compositor", "-p", "tuna-shell-gtk", "-p", "tuna-shell-host"],
         ["-p", "tuna-compositor", "--example", "icon-probe", "--example", "shortcut-inhibit-client"],
     )):
-        if shutil.disk_usage(work).free < 3 * 1024 ** 3: raise ValueError("insufficient reserved build capacity")
+        if shutil.disk_usage(target).free < 3 * 1024 ** 3: raise ValueError("insufficient reserved build capacity")
         path = work / f"cargo-{role}-{number}.json"
         with path.open("w") as out:
             subprocess.run(["cargo", "build", "--locked", "--message-format=json", *arguments],

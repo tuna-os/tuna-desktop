@@ -22,7 +22,7 @@ whole workspace:
 sudo apt-get install -y \
   libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev \
   libxkbcommon-dev pkg-config libgtk-4-dev libpipewire-0.3-dev \
-  libadwaita-1-dev libpam-wrapper \
+  libadwaita-1-dev libpam-wrapper libclang-dev \
   meson ninja-build libwayland-dev wayland-protocols
 scripts/ci-install-gtk4-layer-shell
 ```
@@ -67,12 +67,13 @@ spektacular version check
 
 ## Project Structure
 
-The project is a Cargo workspace with six crates. Each crate's `README.md`
+The project is a Cargo workspace with seven crates. Each crate's `README.md`
 lists its purpose, public API, and dependents.
 
 ```
 tuna-desktop/
 ├── crates/
+│   ├── backlight/            # tuna-backlight: bounded backlight/owned-connector reads
 │   ├── compositor/           # tuna-compositor and tuna-session binaries (Smithay)
 │   ├── shell-control-schema/ # tuna-shell-control: compositor/shell IPC protocol
 │   ├── shell-host/           # tuna-shell-host: original shell binary and shared shell logic

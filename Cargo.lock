@@ -2270,9 +2270,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -4143,6 +4143,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuna-backlight"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tuna-shell-control",
+]
+
+[[package]]
 name = "tuna-compositor"
 version = "0.1.0"
 dependencies = [
@@ -4167,6 +4176,7 @@ dependencies = [
  "smithay",
  "tempfile",
  "tuna-greeter",
+ "tuna-magnifier",
  "tuna-shell-control",
  "tuna-wallpaper",
  "wayland-client",
@@ -4187,6 +4197,16 @@ dependencies = [
  "greetd_ipc",
  "gtk4",
  "libadwaita",
+ "tempfile",
+]
+
+[[package]]
+name = "tuna-magnifier"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -4215,6 +4235,8 @@ dependencies = [
  "pipewire",
  "serde_json",
  "tempfile",
+ "tuna-backlight",
+ "tuna-magnifier",
  "tuna-shell-control",
  "tuna-shell-host",
  "unicode-segmentation",

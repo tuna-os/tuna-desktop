@@ -385,6 +385,10 @@ fn a_frame_request_without_pixel_damage_keeps_native_refresh_work_pending() {
         !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
         "a hidden window's callback waits for its beat, not a scanout"
     );
+    assert!(
+        !tuna_compositor::frame_timing::pending_output_work(&roots, &roots, &roots),
+        "an occluded window on the active workspace is drawn yet waits for its beat"
+    );
     assert_eq!(peer.client.frames, 0);
     let output = comp.state.primary_output().unwrap();
     for root in &roots {

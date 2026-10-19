@@ -14,7 +14,8 @@ FOCUS_STAGES = {"arguments", "reader-principal", "helper", "post-observation", "
 
 def valid_focus_error(value):
     types = {"RuntimeError", "ValueError", "OSError", "FileNotFoundError", "ProcessLookupError",
-             "PermissionError", "KeyError", "JSONDecodeError", "UnicodeDecodeError", "RecursionError"}
+             "PermissionError", "KeyError", "JSONDecodeError", "UnicodeDecodeError", "RecursionError",
+             "TypeError", "AttributeError", "CalledProcessError", "TimeoutExpired", "Error"}
     if not isinstance(value, dict):
         return False
     if set(value) == {"focus_error_type"}:

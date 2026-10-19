@@ -1,0 +1,13 @@
+[package]
+name = "tuna-backlight"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Bounded kernel backlight and owned DRM connector observations shared by the Tuna Desktop shell and compositor"
+
+[dependencies]
+libc = "0.2"
+tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile = "3"

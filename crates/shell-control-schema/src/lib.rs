@@ -32,9 +32,10 @@ pub mod layer_namespaces;
 pub use layer_namespaces::{
     BANNER_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE,
     GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE,
-    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE, POLKIT_NAMESPACE,
-    PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
-    SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
+    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE,
+    POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE,
+    SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE, SWITCHER_THUMBNAILS_NAMESPACE,
+    WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
 };
 
 /// Panel height in pixels (compositor ↔ shell contract).
@@ -165,9 +166,15 @@ impl ProtocolVersion {
     /// `0.33` appends cursor theme, size, locate-pointer and its keysym preference.
     /// `0.34` appends keyboard accessibility aids and toggle notifications.
     /// `0.35` appends atomic wellbeing scene effects.
+    /// `0.36` appends GNOME's pointer accessibility aids to
+    /// `InputSettings`, the shell-to-compositor `SetDwellClickType`
+    /// command and the compositor-to-shell `DwellClickType` and
+    /// `PointerTimeout` messages (hover click's chooser and GNOME's pie
+    /// timer). Positional: both peers ship together.
+    /// `0.37` appends NativeOutputInventory without altering OutputInfo.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 35,
+        minor: 37,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -238,6 +245,21 @@ pub struct OutputInfo {
     pub height: i32,
     /// Whether the dock anchors here.
     pub primary: bool,
+}
+
+/// Actual selected native DRM output authority. Missing inventory means no
+/// authority, including nested sessions; connector text alone is insufficient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOutputInfo {
+    pub name: String,
+    /// Actual char-device rdev from the compositor-owned KMS FD.
+    pub drm_device: u64,
+    /// Actual DRM connector object ID, checked against kernel sysfs.
+    pub connector_id: u32,
+    /// Canonical sysfs DRM connector directory under that owned device.
+    pub connector_sysfs: String,
+    pub connector_device: u64,
+    pub connector_inode: u64,
 }
 
 /// One ordered state mutation between two snapshot revisions.
@@ -394,6 +416,8 @@ pub enum CommandKind {
     SetWindowIconGeometries { geometries: Vec<WindowIconGeometry> },
     /// Atomic scene effects from the authenticated shell; cursor excluded.
     SetWellbeingEffects { grayscale: bool, fade: bool },
+    /// The hover-click chooser picked the click the next dwell makes.
+    SetDwellClickType { click: DwellClick },
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -753,6 +777,53 @@ pub enum Message {
     /// two modifiers at once) switched an aid; the shell saves the
     /// setting and confirms it as GNOME does.
     KeyboardAidToggled { aid: KeyboardAid, enabled: bool },
+    /// The click the next dwell makes, whenever it changes (a one-shot
+    /// type returns to a single click once used).
+    DwellClickType { click: DwellClick },
+    /// A pointer accessibility timeout started (`duration_ms` set) at
+    /// the pointer, or stopped (`clicked` when it ran out and acted).
+    /// The shell draws GNOME's pie timer around the pointer.
+    PointerTimeout {
+        kind: PointerTimeoutKind,
+        duration_ms: Option<u32>,
+        clicked: bool,
+        x: i32,
+        y: i32,
+    },
+    /// Full actual native authority; empty explicitly revokes prior authority.
+    /// Append-only, sent only to peers advertising minor >=37.
+    NativeOutputInventory { outputs: Vec<NativeOutputInfo> },
+}
+
+/// The click a hover (dwell) makes: GNOME's dwell click types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DwellClick {
+    #[default]
+    Primary,
+    Double,
+    /// First dwell presses, the next releases.
+    Drag,
+    Secondary,
+}
+
+/// Which pointer accessibility timeout runs (Clutter's timeout types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointerTimeoutKind {
+    /// Simulated secondary click: a held primary button.
+    SecondaryClick,
+    /// Hover click waiting to click.
+    Dwell,
+    /// Hover click waiting for a direction gesture.
+    Gesture,
+}
+
+/// A hover-click gesture direction (`GDesktopMouseDwellDirection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DwellDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// The keyboard aids GNOME lets the keyboard itself switch.
@@ -884,6 +955,49 @@ pub struct InputSettings {
     /// GNOME keyboard accessibility input aids.
     #[serde(default)]
     pub keyboard_aids: KeyboardAids,
+    /// GNOME's pointer accessibility aids.
+    #[serde(default)]
+    pub pointer_aids: PointerAids,
+}
+
+/// GNOME's `org.gnome.desktop.a11y.mouse`, flattened for the compositor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerAids {
+    /// `secondary-click-enabled` and `secondary-click-time` (ms).
+    pub secondary_click: bool,
+    pub secondary_click_ms: u32,
+    /// `dwell-click-enabled`, `dwell-time` (ms) and `dwell-threshold`
+    /// (pixels).
+    pub dwell_click: bool,
+    pub dwell_ms: u32,
+    pub dwell_threshold: u32,
+    /// `dwell-mode`: a direction gesture picks the click, instead of the
+    /// panel chooser (`window`).
+    pub dwell_gesture: bool,
+    /// `dwell-gesture-single`, `-double`, `-drag` and `-secondary`
+    /// (`None` for GNOME's `none`).
+    pub gesture_single: Option<DwellDirection>,
+    pub gesture_double: Option<DwellDirection>,
+    pub gesture_drag: Option<DwellDirection>,
+    pub gesture_secondary: Option<DwellDirection>,
+}
+
+impl Default for PointerAids {
+    /// GNOME 51's defaults.
+    fn default() -> Self {
+        Self {
+            secondary_click: false,
+            secondary_click_ms: 1200,
+            dwell_click: false,
+            dwell_ms: 1200,
+            dwell_threshold: 10,
+            dwell_gesture: false,
+            gesture_single: Some(DwellDirection::Left),
+            gesture_double: Some(DwellDirection::Up),
+            gesture_drag: Some(DwellDirection::Down),
+            gesture_secondary: Some(DwellDirection::Right),
+        }
+    }
 }
 
 /// GNOME's `org.gnome.desktop.a11y.keyboard`, flattened for the
@@ -985,6 +1099,7 @@ impl Default for InputSettings {
             cursor_size: 24,
             locate_pointer: false,
             locate_pointer_key: default_locate_pointer_key(),
+            pointer_aids: PointerAids::default(),
         }
     }
 }
@@ -1140,6 +1255,8 @@ pub struct TokenMeta {
 /// sides can log, count, and drop the offending frame (ADR 0002).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
+    /// A typed collection exceeds its admission bound.
+    CollectionTooLong { len: usize, max: usize },
     /// Fewer than 4 prefix bytes, or a body shorter than the prefix claims.
     Truncated {
         /// Bytes required.
@@ -1176,6 +1293,9 @@ pub enum DecodeError {
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CollectionTooLong { len, max } => {
+                write!(f, "collection of {len} records exceeds {max}")
+            }
             Self::Truncated { expected, actual } => {
                 write!(f, "truncated frame: need {expected} bytes, have {actual}")
             }
@@ -1459,6 +1579,8 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::PointerOutput { .. }
         | Message::ScreenReader { .. }
         | Message::KeyboardAidToggled { .. }
+        | Message::DwellClickType { .. }
+        | Message::PointerTimeout { .. }
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }
         | Message::CommandResult { .. }
@@ -1467,6 +1589,19 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::Switcher { .. }
         | Message::Outputs { .. }
         | Message::OverviewPreviews { .. } => {}
+        // Bounded native authority: at most 64 lit outputs, short names.
+        Message::NativeOutputInventory { outputs } => {
+            if outputs.len() > 64 {
+                return Err(DecodeError::CollectionTooLong {
+                    len: outputs.len(),
+                    max: 64,
+                });
+            }
+            for output in outputs {
+                check_title(&output.name)?;
+                check_title(&output.connector_sysfs)?;
+            }
+        }
         // Names and values share the title bound: short by nature.
         Message::Environment { vars } => {
             for (name, value) in vars {
@@ -1501,6 +1636,37 @@ mod tests {
             name: Some(format!("ws{id}")),
             active: id == 1,
         }
+    }
+
+    #[test]
+    fn native_inventory_is_appended_and_bounds_authority_collection() {
+        let legacy = Message::Outputs {
+            outputs: vec![OutputInfo {
+                name: "n".into(),
+                width: 1,
+                height: 1,
+                primary: true,
+            }],
+        };
+        // Existing Outputs index8 and unchanged positional OutputInfo body.
+        assert_eq!(&encode_frame(&legacy)[4..], &[8, 1, 1, b'n', 2, 2, 1]);
+        let owner = NativeOutputInfo {
+            name: "eDP-1".into(),
+            drm_device: 226,
+            connector_id: 39,
+            connector_sysfs: "/sys/owned/connector".into(),
+            connector_device: 1,
+            connector_inode: 2,
+        };
+        roundtrip(&Message::NativeOutputInventory {
+            outputs: vec![owner.clone()],
+        });
+        assert!(matches!(
+            decode_frame(&encode_frame(&Message::NativeOutputInventory {
+                outputs: vec![owner; 65]
+            })),
+            Err(DecodeError::CollectionTooLong { len: 65, max: 64 })
+        ));
     }
 
     fn sample_token() -> ActivationToken {
@@ -1645,8 +1811,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_35() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 35));
+    fn current_version_is_0_37() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 37));
     }
 
     #[test]
@@ -1892,6 +2058,62 @@ mod tests {
             for enabled in [false, true] {
                 roundtrip(&Message::KeyboardAidToggled { aid, enabled });
             }
+        }
+    }
+
+    #[test]
+    fn pointer_aids_survive_the_positional_control_wire() {
+        roundtrip(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                pointer_aids: PointerAids {
+                    secondary_click: true,
+                    secondary_click_ms: 700,
+                    dwell_click: true,
+                    dwell_ms: 900,
+                    dwell_threshold: 4,
+                    dwell_gesture: true,
+                    gesture_drag: None,
+                    ..PointerAids::default()
+                },
+                keyboard_aids: KeyboardAids {
+                    sticky: true,
+                    ..KeyboardAids::default()
+                },
+                ..InputSettings::default()
+            })),
+        });
+        for click in [
+            DwellClick::Primary,
+            DwellClick::Double,
+            DwellClick::Drag,
+            DwellClick::Secondary,
+        ] {
+            roundtrip(&Message::Command {
+                id: 2,
+                kind: CommandKind::SetDwellClickType { click },
+            });
+            roundtrip(&Message::DwellClickType { click });
+        }
+        for kind in [
+            PointerTimeoutKind::SecondaryClick,
+            PointerTimeoutKind::Dwell,
+            PointerTimeoutKind::Gesture,
+        ] {
+            roundtrip(&Message::PointerTimeout {
+                kind,
+                duration_ms: Some(1200),
+                clicked: false,
+                x: 10,
+                y: -3,
+            });
+            roundtrip(&Message::PointerTimeout {
+                kind,
+                duration_ms: None,
+                clicked: true,
+                x: 0,
+                y: 0,
+            });
         }
     }
 

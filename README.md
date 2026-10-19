@@ -8,8 +8,29 @@ The compositor is a long-lived Rust process built with Smithay. The shell UI run
 
 Our v1 goal is [GNOME 51 parity plus better responsiveness at matching CPU](docs/v1.md) — the checklist stays public and current there.
 
+<!-- hive-contribute-plea: donated-compute appeal, keep in sync across repos -->
+## Contribute compute — no code needed
+
+**[Donate time with your AI CLI](https://hub.tunaos.org/#contribute).**
+
+Your machine runs one task at a time using your signed-in AI coding CLI.
+The relay alternates between eligible **School** (OS) and **Reef** (apps)
+hives after each task. If one hive has no work, the other can continue.
+
+The guide covers prerequisites, verified `just` setup, credentials, provider
+costs, and how to stop with Ctrl+C. Your subscription quota or API charges apply.
+Never post account credentials or API keys in issues or pull requests.
+
 ## Quickstart
 
+- **Test-drive in a VM (one command):**
+  On Linux or macOS, evaluate Tuna Desktop without installing packages or building:
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/try-tuna-desktop | bash
+  ```
+
+  Downloads Corral (checksum-verified), pulls and cosign-verifies the published TunaOS image, and launches Tuna Desktop in local QEMU with a local-only browser console over noVNC. Stop anytime with Ctrl-C. See `scripts/try-tuna-desktop` for options.
 - **Install:** [docs/install.md](docs/install.md) covers the Debian-format
   package, building from source and greetd wiring. The experimental TunaOS
   Marlin image is in [packaging/README.md](packaging/README.md).
@@ -30,11 +51,21 @@ today, in frames the GTK shell proof takes on each change.
 
 ## Screenshots and overview demo
 
-![Tuna Desktop overview with three live window previews](docs/walkthrough/overview-demo.png)
+![Tuna Desktop overview with Disks, System Monitor and Files open on the Marlin wallpaper](docs/walkthrough/hero-overview.png)
 
-| Quick settings | App grid |
+| App grid | Quick settings |
 | --- | --- |
-| ![Tuna Desktop quick settings with volume, brightness and service controls](docs/walkthrough/quick-settings-demo.png) | ![Tuna Desktop app grid](docs/walkthrough/app-grid-demo.png) |
+| ![Tuna Desktop app grid with the apps the Marlin image ships](docs/walkthrough/hero-app-grid.png) | ![Tuna Desktop quick settings with volume, wired network, Night Light, Dark Style and Do Not Disturb](docs/walkthrough/hero-quick-settings.png) |
+
+| Calendar | Alt+Tab |
+| --- | --- |
+| ![Tuna Desktop calendar beside the empty message list](docs/walkthrough/hero-calendar.png) | ![Tuna Desktop Alt+Tab switcher with live window thumbnails](docs/walkthrough/hero-switcher.png) |
+
+![Tuna Desktop lock screen clock over the blurred wallpaper](docs/walkthrough/hero-lock.png)
+
+These are frames from the real TunaOS Marlin image booted in a QEMU VM by
+CI, on its hardware (DRM/KMS) session with the apps the image ships and its
+default wallpaper.
 
 ![Overview demo: open the overview, select a window, and return to the desktop](docs/walkthrough/overview-demo.gif)
 
