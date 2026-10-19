@@ -55,10 +55,11 @@ jobs:
 
   check:
     runs-on: ubuntu-latest
-    # The audit-check action reports as a check run.
+    # The audit-check action reports as a check run and files issues.
     permissions:
       contents: read
       checks: write
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
