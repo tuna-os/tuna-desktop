@@ -189,6 +189,10 @@ def ratio(tuna, gnome, floor):
     return tuna / max(gnome, floor, 1e-9)
 
 
+def finite_number(value, *, positive=False):
+    return type(value) in (int, float) and math.isfinite(value) and (value > 0 if positive else value >= 0)
+
+
 def evaluate(budgets, comparison, min_pairs=3):
     """Check every budget against the median over pairs of the Tuna/GNOME ratio.
 
@@ -202,6 +206,11 @@ def evaluate(budgets, comparison, min_pairs=3):
         row = {"metric": metric, "enforced": bool(budget.get("enforced")), "pairs": len(values),
                "max_ratio": budget["max_ratio"], "ceiling": budget.get("ceiling"),
                "unit": budget.get("unit", "")}
+        if any(not finite_number(value.get(desktop)) for value in values for desktop in DESKTOPS):
+            row.update(status="missing" if row["enforced"] else "warn",
+                       reason="paired measurements must be finite non-negative numbers")
+            rows.append(row)
+            continue
         if len(values) < min_pairs:
             row.update(status="missing" if row["enforced"] else "warn",
                        reason=f"{len(values)} of {min_pairs} required pairs measured")
@@ -282,14 +291,28 @@ def ratchet_violations(base, head, repo_root=None):
             problems.append(f"{metric}: a new budget needs run evidence")
     if head.get("target_ratio", 1.0) > base.get("target_ratio", 1.0):
         problems.append("target_ratio raised")
+    if head.get("min_pairs", 3) < base.get("min_pairs", 3):
+        problems.append("min_pairs lowered: the repeatability requirement must not be weakened")
     return problems
 
 
 def validate(budgets):
     problems = []
-    if budgets.get("schema") != 1 or not isinstance(budgets.get("metrics"), dict):
+    if not isinstance(budgets, dict) or budgets.get("schema") != 1 or not isinstance(budgets.get("metrics"), dict):
         return ["budgets schema 1 with a metrics object required"]
+    if not budgets["metrics"]:
+        problems.append("at least one performance budget required")
+    if not finite_number(budgets.get("target_ratio", 1.0), positive=True):
+        problems.append("target_ratio must be finite and positive")
+    if not finite_number(budgets.get("margin", 0.15)):
+        problems.append("margin must be finite and non-negative")
+    min_pairs = budgets.get("min_pairs", 3)
+    if type(min_pairs) is not int or min_pairs < 3:
+        problems.append("min_pairs must be an integer of at least 3")
     for metric, budget in budgets["metrics"].items():
+        if not isinstance(metric, str) or not isinstance(budget, dict):
+            problems.append(f"{metric}: metric name and budget object required")
+            continue
         parts = metric.split(".")
         known = (len(parts) == 4 and parts[0] == "cpu" and (parts[1] in PHASES or parts[1] == "whole")
                  and parts[2] in ROLES + tuple(AGGREGATES) and parts[3] in ("mean", "p95", "p50")) or \
@@ -298,11 +321,13 @@ def validate(budgets):
         if not known:
             problems.append(f"{metric}: unknown metric")
         value = budget.get("max_ratio")
-        if type(value) not in (int, float) or not value > 0:
-            problems.append(f"{metric}: max_ratio must be positive")
+        if not finite_number(value, positive=True):
+            problems.append(f"{metric}: max_ratio must be finite and positive")
         ceiling = budget.get("ceiling")
-        if ceiling is not None and (type(ceiling) not in (int, float) or not ceiling > 0):
-            problems.append(f"{metric}: ceiling must be positive or null")
+        if ceiling is not None and not finite_number(ceiling, positive=True):
+            problems.append(f"{metric}: ceiling must be finite and positive or null")
+        if not finite_number(budget.get("floor", 0)):
+            problems.append(f"{metric}: floor must be finite and non-negative")
         if type(budget.get("enforced")) is not bool:
             problems.append(f"{metric}: enforced must be true or false")
     return problems

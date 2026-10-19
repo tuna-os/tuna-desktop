@@ -2,6 +2,7 @@
 resolver = "2"
 exclude = ["third-party/reis", "third-party/smithay"]
 members = [
+    "crates/backlight",
     "crates/compositor",
     "crates/shell-control-schema",
     "crates/shell-host",

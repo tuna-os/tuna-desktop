@@ -186,6 +186,15 @@ class Gate(unittest.TestCase):
         rows = self.evaluate(budgets(**{"cpu.overview.total.mean": budget(5.0)}), pairs=2)
         self.assertEqual(rows["cpu.overview.total.mean"]["status"], "missing")
 
+    def test_invalid_measurement_cannot_pass_by_nan_comparison(self):
+        metric = "cpu.overview.total.mean"
+        for value in (float("nan"), float("inf"), -1, True, "1"):
+            for desktop in pb.DESKTOPS:
+                values = [{"gnome": 1, "tuna": 1} for _ in range(3)]
+                values[0][desktop] = value
+                rows = pb.evaluate(budgets(**{metric: budget(2)}), {metric: values})
+                self.assertEqual(rows[0]["status"], "missing", (desktop, value))
+
     def test_cli_exit_status_summary_and_report_only(self):
         with tempfile.TemporaryDirectory() as directory:
             tree(Path(directory) / "artifacts")
@@ -257,6 +266,15 @@ class Ratchet(unittest.TestCase):
         added = lambda m: m.update({"cpu.idle.total.mean": budget(1.5)})
         self.assertEqual(self.check(added), [])
 
+    def test_pair_requirement_cannot_be_lowered(self):
+        base = copy.deepcopy(self.base)
+        base["min_pairs"] = 6
+        head = copy.deepcopy(base)
+        head["min_pairs"] = 3
+        self.assertTrue(any("min_pairs lowered" in p for p in pb.ratchet_violations(base, head)))
+        head["min_pairs"] = 6
+        self.assertEqual(pb.ratchet_violations(base, head), [])
+
 
 class CommittedBudgets(unittest.TestCase):
     def test_committed_file_is_valid_and_every_enforced_budget_is_evidenced(self):
@@ -271,6 +289,33 @@ class CommittedBudgets(unittest.TestCase):
         problems = pb.validate(budgets(**{"cpu.nap.total.mean": budget(1.0),
                                           "cpu.idle.total.mean": budget(0, enforced="yes")}))
         self.assertEqual(len(problems), 3)
+
+    def test_validate_rejects_nonfinite_and_invalid_gate_configuration(self):
+        valid = budgets(**{"cpu.idle.total.mean": budget(1)})
+        for key in ("max_ratio", "ceiling", "floor"):
+            for value in (float("nan"), float("inf"), -1, True, "1"):
+                candidate = copy.deepcopy(valid)
+                candidate["metrics"]["cpu.idle.total.mean"][key] = value
+                self.assertTrue(pb.validate(candidate), (key, value))
+        for key, values in (("min_pairs", (0, 1, 2, 3.0, True, "3")),
+                            ("target_ratio", (0, float("inf"), float("nan"))),
+                            ("margin", (-1, float("inf"), float("nan")))):
+            for value in values:
+                candidate = copy.deepcopy(valid)
+                candidate[key] = value
+                self.assertTrue(pb.validate(candidate), (key, value))
+        for candidate in ([], {"schema": 1, "metrics": {}}, budgets(**{"cpu.idle.total.mean": None})):
+            self.assertTrue(pb.validate(candidate))
+
+    def test_ratchet_cli_rejects_invalid_config_without_comparing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base, head = Path(directory) / "base.json", Path(directory) / "head.json"
+            valid = budgets(**{"cpu.idle.total.mean": budget(1)})
+            base.write_text(json.dumps(valid))
+            invalid = copy.deepcopy(valid)
+            invalid["metrics"]["cpu.idle.total.mean"] = None
+            head.write_text(json.dumps(invalid))
+            self.assertEqual(run_gate(["ratchet", "--base", str(base), "--head", str(head)]), 1)
 
 
 if __name__ == "__main__":

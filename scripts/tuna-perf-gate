@@ -49,7 +49,10 @@ def main(argv=None):
         problems = perf_budget.validate(load(args.budgets))
     elif args.command == "ratchet":
         head = load(args.head)
-        problems = perf_budget.validate(head) + perf_budget.ratchet_violations(load(args.base), head, ROOT)
+        base = load(args.base)
+        problems = perf_budget.validate(head) + perf_budget.validate(base)
+        if not problems:
+            problems = perf_budget.ratchet_violations(base, head, ROOT)
     else:
         budgets = load(args.budgets)
         problems = perf_budget.validate(budgets)
