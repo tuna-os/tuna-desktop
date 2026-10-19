@@ -393,10 +393,18 @@ class ReleaseDelegatePolicy(unittest.TestCase):
             # tuna-rename: keep-begin
             tool('dpkg-deb', '''test "$1" = --root-owner-group
 test "$2" = --build
-test "$(stat -c %a "$3")" = 755
+assert_mode() {
+    actual="$(stat -c %a "$2")"
+    [ "$actual" = "$1" ] || {
+        echo "staged mode $actual, expected $1: $2" >&2
+        exit 1
+    }
+}
+assert_mode 755 "$3"
 for path in usr usr/share usr/share/wayland-sessions etc etc/pam.d; do
-    test "$(stat -c %a "$3/$path")" = 755
+    assert_mode 755 "$3/$path"
 done
+for path in DEBIAN/control DEBIAN/conffiles; do assert_mode 644 "$3/$path"; done
 printf '%s\\n' /etc/pam.d/tuna-lock /etc/pam.d/roost-lock >"$EXPECTED_CONFFILES"
 cmp "$EXPECTED_CONFFILES" "$3/DEBIAN/conffiles"
 for path in usr/share/wayland-sessions/roost.desktop etc/pam.d/roost-lock; do
@@ -426,11 +434,14 @@ cp "$3/DEBIAN/control" "$OUTPUT"''')
                 (theme / entry['path']).unlink()
             output = root / 'control'
             result = subprocess.run(['sh', str(ROOT / 'scripts/tuna-release'), '--allow-dirty', '--out', str(root/'out')], cwd=root, env=dict(os.environ, PATH=str(tools)+':'+os.environ['PATH'], OUTPUT=str(output), EXPECTED_CONFFILES=str(root / 'expected-conffiles')), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, umask=umask)
+            self.release_diagnostics = (f"release exited {result.returncode}\n"
+                                        f"stdout:\n{result.stdout.decode(errors='replace')}\n"
+                                        f"stderr:\n{result.stderr.decode(errors='replace')}")
             return result.returncode, output.read_text() if output.exists() else None
 
     def test_real_release_delegates_locked_all_six_and_abi_closure(self):
         status, control = self.run_release()
-        self.assertEqual(status, 0)
+        self.assertEqual(status, 0, self.release_diagnostics)
         self.assertIn('libc6 (>= 2.36)', control)
         self.assertIn('libgtk4-layer-shell0 (>= 1.1)', control)
         for field in ('Replaces', 'Conflicts', 'Provides'):
@@ -445,7 +456,7 @@ cp "$3/DEBIAN/control" "$OUTPUT"''')
         # The actual shell builder runs; its controlled dpkg delegate asserts
         # stage/ancestor modes, both regular bridges, and exact conffiles above.
         status, control = self.run_release(umask=0o002)
-        self.assertEqual(status, 0)
+        self.assertEqual(status, 0, self.release_diagnostics)
         self.assertIsNotNone(control)
 
     def test_release_rejects_missing_private_cursor_asset(self):

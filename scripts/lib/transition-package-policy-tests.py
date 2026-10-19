@@ -2,9 +2,12 @@
 # tuna-rename: keep-file
 """Real .deb archive/checker regressions for the exact two-file transition.
 
-Uses native cc, dpkg-deb, ldd and desktop-file-validate, without tool mocks.
-These are package-content and staged-Arch tests, not installed upgrade, native
-PAM, GDM, old-compositor unlock, pacman replacement or Marlin qualification.
+Uses native cc, dpkg-deb, ldd and desktop-file-validate. Only the release-builder
+staging regression controls cargo, git and dpkg-shlibdeps, with native ELF
+fixture binaries; the production builder and archive/checker tools stay real.
+These are package-content, release-staging and staged-Arch tests, not full
+release, installed upgrade, native PAM, GDM, old-compositor unlock, pacman
+replacement or Marlin qualification.
 All writes and executions use disposable roots; no host PAM or accounts change.
 """
 import copy
@@ -20,6 +23,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'scripts/check-release-package'
+RELEASE_SCRIPT = ROOT / 'scripts/tuna-release'
 _spec = importlib.util.spec_from_file_location('transition_policy', ROOT / 'scripts/lib/transition-package-policy.py')
 M = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(M)
@@ -171,6 +175,73 @@ Provides: roost
             self.assertEqual(entries['usr/bin/' + name][1][:4], b'\x7fELF')
         self.assertEqual(next(body.decode() for item, body in self.control if item.name == './conffiles'), CONFFILES)
 
+    def test_actual_release_builder_preserves_safe_archive_modes_under_umask_002(self):
+        """Exercise production staging, with controlled build/tag/ABI delegates.
+
+        Native cc-built ELF fixtures replace Cargo output; git supplies the
+        fixture tag and dpkg-shlibdeps supplies a bounded dependency string.
+        Neither dpkg-deb nor the archive, desktop or ELF validators is mocked.
+        This proves staging metadata, not a real release build/ABI closure.
+        """
+        work = self.root / 'release-builder'
+        target = work / 'target/release'
+        target.mkdir(parents=True)
+        for name in BINS:
+            shutil.copyfile(self.elf, target / name)
+        # The actual builder reads checked-in assets and cursor validation;
+        # only its output, build fixtures and staging roots are disposable.
+        for name in ('share', 'packaging', 'scripts'):
+            (work / name).symlink_to(ROOT / name, target_is_directory=True)
+        delegates = work / 'controlled-delegates'
+        delegates.mkdir()
+        commands = {
+            'cargo': '''test "$*" = 'build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter'
+test "$TUNA_VERSION" = '0.1.0-beta.1'
+''',
+            'git': '''test "$*" = 'describe --tags --exact-match --match v[0-9]* HEAD'
+printf '%s\\n' v0.1.0-beta.1
+''',
+            'dpkg-shlibdeps': '''test "$*" = '-O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-greeter -eusr/bin/tuna-wallpaper-svg'
+printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
+''',
+        }
+        for name, body in commands.items():
+            path = delegates / name
+            path.write_text('#!/bin/sh\nset -eu\n' + body)
+            path.chmod(0o755)
+        staging_tmp = work / 'tmp'
+        staging_tmp.mkdir()
+        result = subprocess.run([str(RELEASE_SCRIPT), '--allow-dirty', '--out', str(work / 'dist')],
+            cwd=work, env=dict(os.environ, PATH=str(delegates) + os.pathsep + os.environ['PATH'],
+                               TMPDIR=str(staging_tmp)),
+            text=True, capture_output=True, timeout=60, umask=0o002)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        package = work / 'dist/tuna-desktop_0.1.0~beta.1_amd64.deb'
+        self.assertTrue(package.is_file(), result.stdout)
+        # Inspect original archives, so extraction cannot conceal unsafe modes.
+        data = {item.name.removeprefix('./'): (item, body) for item, body in
+                read_tar(subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(package)]))}
+        control = {item.name.removeprefix('./'): (item, body) for item, body in
+                   read_tar(subprocess.check_output(['dpkg-deb', '--ctrl-tarfile', str(package)]))}
+        for name in ('etc', 'etc/pam.d', 'usr', 'usr/bin', 'usr/share', 'usr/share/wayland-sessions'):
+            with self.subTest(ancestor=name):
+                item, _ = data[name]
+                self.assertTrue(item.isdir())
+                self.assertEqual((item.mode, item.uid, item.gid), (0o755, 0, 0))
+        for name in ('control', 'conffiles'):
+            with self.subTest(control_member=name):
+                item, _ = control[name]
+                self.assertTrue(item.isfile())
+                self.assertEqual((item.mode, item.uid, item.gid), (0o644, 0, 0))
+        self.assertEqual(control['conffiles'][1].decode(), CONFFILES)
+        self.assertEqual({name for name in data if 'roost' in name.lower()}, {OLD_SESSION, OLD_PAM})
+        for name in BINS:
+            self.assertEqual(data['usr/bin/' + name][1][:4], b'\x7fELF')
+        checked = subprocess.run([str(SCRIPT), str(package)],
+            text=True, capture_output=True, timeout=30, umask=0o002)
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        self.assertIn('OK (version 0.1.0~beta.1)', checked.stdout)
+
     def test_actual_loader_rejects_a_version_spoofing_shell_script(self):
         path = 'usr/bin/tuna-shell-gtk'
         self.reject(data=replace(self.data, path, member(path,
@@ -253,7 +324,8 @@ Provides: roost
                 self.reject(control=replace(self.control, 'conffiles', member('conffiles', content)),
                             reason='transition-text-bound' if not content else 'transition-conffiles')
         self.reject(control=replace(self.control, 'conffiles'), reason='transition-conffiles')
-        for kind, mode in ((tarfile.SYMTYPE, 0o644), (tarfile.REGTYPE, 0o600)):
+        for kind, mode in ((tarfile.SYMTYPE, 0o644), (tarfile.REGTYPE, 0o600),
+                           (tarfile.REGTYPE, 0o664)):
             with self.subTest(conffile_kind=kind, mode=mode):
                 self.reject(control=replace(self.control, 'conffiles', member('conffiles', CONFFILES, kind, mode)), reason='transition-regular-mode')
         for hook in ('preinst', 'postinst', 'prerm', 'postrm', 'config', 'triggers'):

@@ -83,8 +83,11 @@ cargo build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT INT TERM
 chmod 0755 "$STAGE"
-# Required policy ancestors are safe regardless of the builder's umask.
-install -d -m0755 "$STAGE/DEBIAN" "$STAGE/usr/bin" "$STAGE/usr/share/wayland-sessions" "$STAGE/etc/pam.d"
+# Name every required policy ancestor: install implementations differ in how
+# implicit parent modes interact with the builder's umask.
+install -d -m0755 "$STAGE/DEBIAN" "$STAGE/usr" "$STAGE/usr/bin" \
+    "$STAGE/usr/share" "$STAGE/usr/share/wayland-sessions" \
+    "$STAGE/etc" "$STAGE/etc/pam.d"
 
 for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-greeter tuna-wallpaper-svg; do
     install -m0755 "target/release/$bin" "$STAGE/usr/bin/$bin"
@@ -111,6 +114,7 @@ install -m0644 share/pam.d/tuna-lock "$STAGE/etc/pam.d/tuna-lock"
 install -m0644 share/compat/pam.d/roost-lock "$STAGE/etc/pam.d/roost-lock"
 printf '%s\n' /etc/pam.d/tuna-lock /etc/pam.d/roost-lock >"$STAGE/DEBIAN/conffiles"
 # tuna-rename: keep-end
+chmod 0644 "$STAGE/DEBIAN/conffiles"
 # Former package control relations permit replacing the installed package.
 LEGACY_PACKAGE=roost  # tuna-rename: keep
 
@@ -161,6 +165,7 @@ Description: Tuna Desktop Wayland desktop session
  Installs the compositor, GTK and legacy shell hosts, session launcher, IBus bridge, and greeter plus
  the login-screen session entry.
 EOF
+chmod 0644 "$STAGE/DEBIAN/control"
 
 mkdir -p "$OUT"
 PKG="$OUT/tuna-desktop_${DEB_VERSION}_amd64.deb"
