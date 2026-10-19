@@ -165,9 +165,13 @@ jobs:
       # Supply-chain gate (#564): fails on RUSTSEC advisories with fixes.
       # Warnings (unmaintained/unsound notices) stay advisory until the
       # zbus/zvariant/cgmath triage lands — see #564.
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Test the tokenless security gate
+        run: python3 scripts/tests/test_ci_security_audit.py
+      # A standalone CLI needs no Checks API write access, including on forks.
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit locked dependencies
+        run: bash scripts/ci-security-audit
       # pam_wrapper runs the lock screen's PAM path for real (#62); it is
       # required here so the test can never silently skip.
       - run: cargo test --workspace
