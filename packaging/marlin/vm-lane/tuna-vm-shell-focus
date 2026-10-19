@@ -19,6 +19,13 @@ import time
 PUBLIC_LABELS = {"Search", "Disks", "Take Screenshot", "Settings", "Lock", "Power Off Menu", "Mute", "Volume"}
 PUBLIC_ROLES = {"entry", "text", "push button", "slider", "frame"}
 
+FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
+                    "desktop-enumeration", "atspi-owner", "bus-connection", "bus-credentials",
+                    "tree-cache", "tree-state", "tree-role", "tree-name", "tree-children",
+                    "controlled-query", "catalog-receipt", "final-principal", "serialization",
+                    "tree-state-flags", "tree-public-control"}
+FOCUS_OPERATION = "arguments"
+
 
 def public_node(name, role, showing, focused, active):
     if name not in PUBLIC_LABELS or role not in PUBLIC_ROLES or not showing:
@@ -114,6 +121,8 @@ def catalog_receipt(pid, uid, ticks):
 
 
 def observe(pid, ticks, executable, display, controlled=False):
+    global FOCUS_OPERATION
+    FOCUS_OPERATION = "imports"
     import gi
     gi.require_version("Atspi", "2.0")
     from gi.repository import Atspi, Gio, GLib
@@ -125,7 +134,9 @@ def observe(pid, ticks, executable, display, controlled=False):
     state = pathlib.Path(f"/run/user/{uid}/tuna-vm-state.json")
     if json.loads(state.read_text())["locked"]:
         raise RuntimeError("locked accessibility trees are never queried")
+    FOCUS_OPERATION = "process-identity"
     original = process_identity(pid, uid, ticks, executable, display)
+    FOCUS_OPERATION = "atspi-timeout"
     Atspi.set_timeout(500, 500)
     deadline = time.monotonic() + 8
     def remaining_budget():
@@ -137,8 +148,12 @@ def observe(pid, ticks, executable, display, controlled=False):
         return max(1, int(remaining * 1000))
 
     def accessibility_query(method, *args):
+        global FOCUS_OPERATION
         timeout = min(500, remaining_budget())
+        operation = FOCUS_OPERATION
+        FOCUS_OPERATION = "atspi-timeout"
         Atspi.set_timeout(timeout, timeout)
+        FOCUS_OPERATION = operation
         result = method(*args)
         remaining_budget()
         return result
@@ -150,6 +165,7 @@ def observe(pid, ticks, executable, display, controlled=False):
         remaining_budget()
         return result
 
+    FOCUS_OPERATION = "desktop-enumeration"
     desktop = accessibility_query(Atspi.get_desktop, 0)
     count = accessibility_query(desktop.get_child_count)
     if count > 64:
@@ -164,10 +180,12 @@ def observe(pid, ticks, executable, display, controlled=False):
     if len(candidates) != 1:
         raise RuntimeError("one original accessibility principal is required")
     app = candidates[0]
+    FOCUS_OPERATION = "atspi-owner"
     owner = app.app.bus_name
     if not isinstance(owner, str) or len(owner) > 64 or re.fullmatch(r":\d+\.\d+", owner) is None:
         raise RuntimeError("accessibility principal lacks a unique bus owner")
     remaining_budget()
+    FOCUS_OPERATION = "bus-connection"
     session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     address = bus_query(session, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", None,
                         GLib.VariantType.new("(s)")).unpack()[0]
@@ -182,6 +200,7 @@ def observe(pid, ticks, executable, display, controlled=False):
         if values != {"GetNameOwner": owner, "GetConnectionUnixProcessID": pid, "GetConnectionUnixUser": uid}:
             raise RuntimeError("original accessibility bus credentials disagree")
         return values
+    FOCUS_OPERATION = "bus-credentials"
     before = credentials()
     nodes, pending, visited = [], [(app, 0)], 0
     search_entries, target = [], {"showing":0,"focused":0,"present":0}
@@ -195,27 +214,40 @@ def observe(pid, ticks, executable, display, controlled=False):
         visited += 1
         if depth > 32:
             raise RuntimeError("accessibility focus tree depth exceeds bound")
+        FOCUS_OPERATION = "tree-cache"
         accessibility_query(node.clear_cache)
+        FOCUS_OPERATION = "tree-state"
         states = accessibility_query(node.get_state_set)
+        FOCUS_OPERATION = "tree-state-flags"
         showing = states.contains(Atspi.StateType.SHOWING)
         if depth and not showing:
             continue
+        FOCUS_OPERATION = "tree-role"
         role = accessibility_query(node.get_role_name)
         if role in PUBLIC_ROLES:
-            record = public_node(accessibility_query(node.get_name), role, showing,
-                                 states.contains(Atspi.StateType.FOCUSED), states.contains(Atspi.StateType.ACTIVE))
+            FOCUS_OPERATION = "tree-name"
+            name = accessibility_query(node.get_name)
+            FOCUS_OPERATION = "tree-state-flags"
+            focused = states.contains(Atspi.StateType.FOCUSED)
+            active = states.contains(Atspi.StateType.ACTIVE)
+            FOCUS_OPERATION = "tree-public-control"
+            record = public_node(name, role, showing, focused, active)
             if record is not None:
                 nodes.append(record)
             if controlled:
+                FOCUS_OPERATION = "tree-name"
                 name = accessibility_query(node.get_name)
                 if name == "Search" and role in {"entry","text"} and showing:
                     search_entries.append(node)
                 if name == "Disks" and role == "push button":
                     target["present"] += 1
                     target["showing"] += int(showing)
+                    FOCUS_OPERATION = "tree-state-flags"
                     target["focused"] += int(states.contains(Atspi.StateType.FOCUSED))
+        FOCUS_OPERATION = "tree-state-flags"
         if controlled and states.contains(Atspi.StateType.FOCUSED):
             focused_roles.append(role if role in PUBLIC_ROLES else "other")
+        FOCUS_OPERATION = "tree-children"
         children = accessibility_query(node.get_child_count)
         if children > 128 or len(pending) + children > 512:
             raise RuntimeError("accessibility focus children exceed bound")
@@ -225,14 +257,18 @@ def observe(pid, ticks, executable, display, controlled=False):
                 pending.append((child, depth + 1))
     diagnostic = None
     if controlled:
+        FOCUS_OPERATION = "controlled-query"
         matches = controlled_query(search_entries, accessibility_query)
         diagnostic = {"known_query_matches":matches,"Disks_result":target,"focused_role_classes":focused_roles}
         if matches is True:
             remaining_budget()
+            FOCUS_OPERATION = "catalog-receipt"
             try: diagnostic["catalog"] = catalog_receipt(pid,uid,ticks)
             except (OSError,ValueError,UnicodeError,RecursionError): diagnostic["catalog"] = {"status":"withheld"}
             remaining_budget()
+    FOCUS_OPERATION = "bus-credentials"
     after = credentials()
+    FOCUS_OPERATION = "final-principal"
     if process_identity(pid, uid, ticks, executable, display) != original or json.loads(state.read_text())["locked"]:
         raise RuntimeError("original focus principal changed or session locked")
     result = {"principal": original, "atspi_owner": owner, "credentials_before": before,
@@ -254,8 +290,13 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) not in (5,6) or (len(sys.argv)==6 and sys.argv[5]!="controlled-overview"):
             raise ValueError("fixed observation mode")
-        print(json.dumps(observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], len(sys.argv)==6)))
+        receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], len(sys.argv)==6)
+        FOCUS_OPERATION = "serialization"
+        print(json.dumps(receipt))
     except Exception as error:
         # No private names/buffers, exception strings, argv or environments.
-        print(json.dumps({"focus_error_type": type(error).__name__}))
+        diagnostic = {"focus_error_type": type(error).__name__}
+        if type(FOCUS_OPERATION) is str and FOCUS_OPERATION in FOCUS_OPERATIONS:
+            diagnostic["focus_operation"] = FOCUS_OPERATION
+        print(json.dumps(diagnostic))
         raise SystemExit(1) from None

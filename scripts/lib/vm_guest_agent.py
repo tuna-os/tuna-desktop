@@ -10,6 +10,11 @@ import time
 
 
 FOCUS_STAGES = {"arguments", "reader-principal", "helper", "post-observation", "disks-evidence"}
+FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
+                    "desktop-enumeration", "atspi-owner", "bus-connection", "bus-credentials",
+                    "tree-cache", "tree-state", "tree-role", "tree-name", "tree-children",
+                    "controlled-query", "catalog-receipt", "final-principal", "serialization",
+                    "tree-state-flags", "tree-public-control"}
 
 
 def valid_focus_error(value):
@@ -20,11 +25,15 @@ def valid_focus_error(value):
         return False
     if set(value) == {"focus_error_type"}:
         staged = False
-    elif set(value) == {"focus_error_type", "focus_stage"}:
+    elif set(value) in ({"focus_error_type", "focus_stage"},
+                         {"focus_error_type", "focus_stage", "focus_operation"}):
         staged = True
     else:
         return False
     if not isinstance(value["focus_error_type"], str) or value["focus_error_type"] not in types:
+        return False
+    if "focus_operation" in value and (value["focus_stage"] != "helper"
+            or type(value["focus_operation"]) is not str or value["focus_operation"] not in FOCUS_OPERATIONS):
         return False
     return not staged or (type(value["focus_stage"]) is str and value["focus_stage"] in FOCUS_STAGES)
 

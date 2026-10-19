@@ -390,7 +390,7 @@ class OrcaStagedDiagnostic(unittest.TestCase):
         tree = ast.parse(source.read_text())
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in set(names)]
         consts = [n for n in tree.body if isinstance(n, ast.Assign)
-                  and any(isinstance(t, ast.Name) and t.id == "FOCUS_STAGES" for t in n.targets)]
+                  and any(isinstance(t, ast.Name) and t.id in {"FOCUS_STAGES", "FOCUS_OPERATIONS"} for t in n.targets)]
         scope = {"json": json, "base64": base64, "binascii": __import__("binascii")}
         exec(compile(ast.Module(body=nodes + consts, type_ignores=[]), str(source), "exec"), scope)
         return scope
@@ -399,7 +399,7 @@ class OrcaStagedDiagnostic(unittest.TestCase):
         tree = ast.parse(source.read_text())
         nodes = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in set(names))
                  or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name)
-                     and t.id in {"FOCUS_ERROR_TYPES", "FOCUS_STAGES"} for t in n.targets))]
+                     and t.id in {"FOCUS_ERROR_TYPES", "FOCUS_STAGES", "FOCUS_OPERATIONS"} for t in n.targets))]
         scope = {"json": json, "subprocess": subprocess}
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
         return scope
@@ -453,6 +453,72 @@ class OrcaStagedDiagnostic(unittest.TestCase):
                 self.assertEqual(decode(encoded), {"focus_error_type": name, "focus_stage": "reader-principal"})
                 self.assertNotIn("private", stream.getvalue())
         # Injected failure transport only. Genuine AT-SPI navigation still needs CI.
+
+    def test_helper_operations_are_fixed_and_survive_only_the_helper_stage(self):
+        from contextlib import redirect_stdout
+        host = self.agent_scope("valid_focus_error", "focus_failure_diagnostic")
+        decode = host["focus_failure_diagnostic"]
+        guest = self.guest_scope("shell_navigation_focus")
+        helper = PublicOrcaNavigation().focus_module()
+        self.assertEqual(helper.FOCUS_OPERATIONS, host["FOCUS_OPERATIONS"])
+        self.assertEqual(helper.FOCUS_OPERATIONS, guest["FOCUS_OPERATIONS"])
+        guest["orca_observation"] = lambda: {"ready": True, "state": "active", "display": ["wayland-0"]}
+        guest["STATE"] = SimpleNamespace(read_text=lambda: '{"locked": false}')
+        guest["inventory"] = lambda: {"processes": [{"executable": "tuna-shell-gtk", "uid": 1000,
+                                                     "pid": 1083, "start_ticks": 1187}]}
+        guest["OWNER"] = SimpleNamespace(pw_uid=1000)
+        for operation in sorted(helper.FOCUS_OPERATIONS):
+            with self.subTest(operation=operation):
+                def failed(*args, **kwargs):
+                    raise subprocess.CalledProcessError(1, args, output=json.dumps({
+                        "focus_error_type": "TypeError", "focus_operation": operation}), stderr="private data")
+                guest["call"] = failed
+                stream = io.StringIO()
+                with redirect_stdout(stream), self.assertRaises(SystemExit) as exited:
+                    guest["shell_navigation_focus"]("shell", 1083, 1187, controlled=True)
+                self.assertEqual(exited.exception.code, 1)
+                expected = {"focus_error_type": "TypeError", "focus_stage": "helper", "focus_operation": operation}
+                self.assertEqual(decode(base64.b64encode(stream.getvalue().encode()).decode()), expected)
+                self.assertNotIn("private", stream.getvalue())
+                self.assertFalse(host["valid_focus_error"](dict(expected, focus_stage="reader-principal")))
+        for operation in ("private entry", ["tree-name"], None, 7):
+            def failed(*args, **kwargs):
+                raise subprocess.CalledProcessError(1, args, output=json.dumps({
+                    "focus_error_type": "TypeError", "focus_operation": operation}))
+            guest["call"] = failed
+            stream = io.StringIO()
+            with redirect_stdout(stream), self.assertRaises(SystemExit) as exited:
+                guest["shell_navigation_focus"]("shell", 1083, 1187, controlled=True)
+            self.assertEqual(exited.exception.code, 1)
+            self.assertEqual(stream.getvalue(), "")
+            self.assertFalse(host["valid_focus_error"]({"focus_error_type": "TypeError",
+                "focus_stage": "helper", "focus_operation": operation}))
+        # Fault-injected transport only; no claim of genuine AT-SPI execution.
+
+    def test_helper_error_serialization_never_emits_exception_details(self):
+        from contextlib import redirect_stdout
+        helper = PublicOrcaNavigation().focus_module()
+        tree = ast.parse(Path(helper.__file__).read_text())
+        main = next(n for n in tree.body if isinstance(n, ast.If) and "__name__" in ast.unparse(n.test))
+        observed = []
+        def failed(*args):
+            observed.append(args)
+            raise TypeError("private query and field value")
+        scope = {"__name__": "__main__", "json": json, "sys": SimpleNamespace(argv=["helper", "1083", "1187", "tuna-shell-gtk", "wayland-0"]),
+                 "observe": failed, "FOCUS_OPERATION": "atspi-owner", "FOCUS_OPERATIONS": helper.FOCUS_OPERATIONS}
+        stream = io.StringIO()
+        with redirect_stdout(stream), self.assertRaises(SystemExit) as exited:
+            exec(compile(ast.Module(body=[main], type_ignores=[]), helper.__file__, "exec"), scope)
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(json.loads(stream.getvalue()), {"focus_error_type": "TypeError", "focus_operation": "atspi-owner"})
+        self.assertNotIn("private", stream.getvalue())
+        # Every marker is a literal phase, never a queried name, argument or path.
+        markers = [n.value.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "FOCUS_OPERATION" for t in n.targets)
+                   and isinstance(n.value, ast.Constant)]
+        self.assertTrue(markers)
+        self.assertTrue(set(markers) <= helper.FOCUS_OPERATIONS)
 
     def test_speech_failure_schema_accepts_observation_stage(self):
         scope = self.agent_scope("speech_failure_diagnostic")
@@ -1018,6 +1084,28 @@ class PublicOrcaNavigation(unittest.TestCase):
         # Source ordering/shared call budget only; synchronous GI connection setup
         # itself is not claimed to have an eight-second hard completion bound.
 
+    def test_focus_query_distinguishes_timeout_setup_from_actual_gi_failure(self):
+        module = self.focus_module()
+        tree = ast.parse(Path(module.__file__).read_text())
+        query = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "accessibility_query")
+        for timeout_fails in (False, True):
+            calls = []
+            def timeout(*args):
+                calls.append("timeout")
+                if timeout_fails:
+                    raise TypeError("private timeout data")
+            def method(*args):
+                calls.append("method")
+                raise TypeError("private native data")
+            scope = {"remaining_budget": lambda: 75, "Atspi": SimpleNamespace(set_timeout=timeout),
+                     "FOCUS_OPERATION": "tree-state"}
+            exec(compile(ast.Module(body=[query], type_ignores=[]), module.__file__, "exec"), scope)
+            with self.assertRaises(TypeError):
+                scope["accessibility_query"](method)
+            self.assertEqual(scope["FOCUS_OPERATION"], "atspi-timeout" if timeout_fails else "tree-state")
+            self.assertEqual(calls, ["timeout"] if timeout_fails else ["timeout", "method"])
+        # Actual helper control flow with injected failures, not a native GI claim.
+
     def test_accessibility_peer_credentials_require_original_owner_pid_and_uid(self):
         module = self.focus_module()
         tree = ast.parse(Path(module.__file__).read_text())
@@ -1156,7 +1244,7 @@ class ControlledOverviewDiagnostic(unittest.TestCase):
         tree=ast.parse(path.read_text())
         fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=="shell_navigation_focus")
         consts=[n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name)
-                and t.id in {"FOCUS_ERROR_TYPES","FOCUS_STAGES"} for t in n.targets)]
+                and t.id in {"FOCUS_ERROR_TYPES","FOCUS_STAGES","FOCUS_OPERATIONS"} for t in n.targets)]
         calls=[]
         for locked in (True,False):
             scope={"orca_observation":lambda:{"ready":True,"state":"active"},"json":json,

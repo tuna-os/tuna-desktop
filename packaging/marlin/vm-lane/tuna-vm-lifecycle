@@ -864,6 +864,11 @@ FOCUS_ERROR_TYPES = {"RuntimeError", "ValueError", "OSError", "FileNotFoundError
                      "TypeError", "AttributeError", "CalledProcessError", "TimeoutExpired",
                      "Error"}  # PyGObject GLib.Error's class name; never its message.
 FOCUS_STAGES = {"arguments", "reader-principal", "helper", "post-observation", "disks-evidence"}
+FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
+                    "desktop-enumeration", "atspi-owner", "bus-connection", "bus-credentials",
+                    "tree-cache", "tree-state", "tree-role", "tree-name", "tree-children",
+                    "controlled-query", "catalog-receipt", "final-principal", "serialization",
+                    "tree-state-flags", "tree-public-control"}
 
 
 def shell_navigation_focus(kind, original_pid=None, original_ticks=None, controlled=False):
@@ -895,10 +900,18 @@ def shell_navigation_focus(kind, original_pid=None, original_ticks=None, control
                 candidate = json.loads((error.stdout or "").strip())
             except (ValueError, TypeError, AttributeError):
                 candidate = None
-            if (isinstance(candidate, dict) and set(candidate) == {"focus_error_type"}
-                    and candidate["focus_error_type"] in FOCUS_ERROR_TYPES):
-                print(json.dumps({"focus_error_type": candidate["focus_error_type"],
-                                  "focus_stage": focus_stage}))
+            if (isinstance(candidate, dict)
+                    and set(candidate) in ({"focus_error_type"}, {"focus_error_type", "focus_operation"})
+                    and type(candidate["focus_error_type"]) is str
+                    and candidate["focus_error_type"] in FOCUS_ERROR_TYPES
+                    and ("focus_operation" not in candidate
+                         or (type(candidate["focus_operation"]) is str
+                             and candidate["focus_operation"] in FOCUS_OPERATIONS))):
+                diagnostic = {"focus_error_type": candidate["focus_error_type"],
+                              "focus_stage": focus_stage}
+                if "focus_operation" in candidate:
+                    diagnostic["focus_operation"] = candidate["focus_operation"]
+                print(json.dumps(diagnostic))
             raise SystemExit(1) from None
         focus_stage = "post-observation"
         receipt = json.loads(raw)
