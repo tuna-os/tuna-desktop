@@ -264,17 +264,17 @@ fn gsettings_fixture_defaults_and_selection() {
         .expect("glib-compile-schemas must be installed");
     assert!(status.success());
 
-    // Memory backend keeps this hermetic (no session bus, no dconf writes).
-    // This is the only GSettings user in this test binary, so the
-    // process-wide backend switch cannot leak into other tests.
-    std::env::set_var("GSETTINGS_BACKEND", "memory");
+    // Own the memory backend instead of mutating process-wide environment:
+    // the included wellbeing unit tests also call GIO from parallel threads.
+    // No session bus or dconf writes are needed by this fixture.
+    let backend = gio::memory_settings_backend_new();
     let default_source = gio::SettingsSchemaSource::default();
     let source =
         gio::SettingsSchemaSource::from_directory(schemas.path(), default_source.as_ref(), false)
             .unwrap();
     let open = |id: &str| {
         let schema = source.lookup(id, true).unwrap();
-        gio::Settings::new_full(&schema, None::<&gio::SettingsBackend>, None)
+        gio::Settings::new_full(&schema, Some(&backend), None)
     };
 
     // Screen-time defaults are the 51.0 tag values.
@@ -286,6 +286,21 @@ fn gsettings_fixture_defaults_and_selection() {
     limits.set_boolean("daily-limit-enabled", true).unwrap();
     let settings = wellbeing::read_screen_time_settings_from(&limits);
     assert!(settings.daily_limit_enabled && settings.daily_limit_secs == 3600);
+
+    // Writes belong to this exact backend, and cannot leak into another
+    // fixture even when both use the same schema and settings path.
+    let schema = source.lookup(wellbeing::SCREEN_TIME_SCHEMA, true).unwrap();
+    let same_backend = gio::Settings::new_full(&schema, Some(&backend), None);
+    assert_eq!(
+        wellbeing::read_screen_time_settings_from(&same_backend),
+        settings
+    );
+    let isolated_backend = gio::memory_settings_backend_new();
+    let isolated = gio::Settings::new_full(&schema, Some(&isolated_backend), None);
+    assert_eq!(
+        wellbeing::read_screen_time_settings_from(&isolated),
+        ScreenTimeSettings::default()
+    );
 
     // Eyesight/movement defaults match the tag (incl. the split toggles).
     let eyesight = wellbeing::read_break_settings_from(&open(BreakType::Eyesight.schema_id()));
