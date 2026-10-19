@@ -1032,6 +1032,10 @@ pub struct NightLightShare {
     disabled_until_tmw: std::sync::Mutex<Option<i64>>,
     /// Live slider preview, if one has not expired yet.
     preview: std::sync::Mutex<Option<Preview>>,
+    /// Only controlled ownership fixtures replace preview time; native reads
+    /// retain their independent real admission/operation deadlines.
+    #[cfg(test)]
+    preview_clock_for_test: std::sync::Mutex<Option<std::time::Instant>>,
     /// Loop wake, connected by the runtime: recording a preview
     /// signals it so an idle desktop applies the preview without
     /// waiting for unrelated input. Disconnected (default) pings
@@ -1048,6 +1052,8 @@ impl Default for NightLightShare {
             temperature: std::sync::atomic::AtomicU32::new(NEUTRAL_TEMPERATURE_K),
             disabled_until_tmw: std::sync::Mutex::new(None),
             preview: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            preview_clock_for_test: std::sync::Mutex::new(None),
             wake: crate::wake::Wake::default(),
             reader: std::sync::Mutex::new(None),
         }
@@ -1087,14 +1093,20 @@ impl NightLightShare {
         temperature_k: u32,
         until: std::time::Instant,
     ) -> Result<(), PreviewRejected> {
-        if std::time::Instant::now() >= until {
+        let observed = std::time::Instant::now();
+        #[cfg(test)]
+        let observed = self.preview_observed_for_test(observed);
+        if observed >= until {
             return Err(PreviewRejected::Unavailable);
         }
         let mut preview = self
             .preview
             .lock()
             .map_err(|_| PreviewRejected::Unavailable)?;
-        if std::time::Instant::now() >= until {
+        let observed = std::time::Instant::now();
+        #[cfg(test)]
+        let observed = self.preview_observed_for_test(observed);
+        if observed >= until {
             return Err(PreviewRejected::Unavailable);
         }
         *preview = Some(Preview {
@@ -1103,6 +1115,22 @@ impl NightLightShare {
         });
         self.wake.signal();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_preview_clock_for_test(&self, now: std::time::Instant) {
+        *self.preview_clock_for_test.lock().unwrap() = Some(now);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_observed_for_test(
+        &self,
+        actual: std::time::Instant,
+    ) -> std::time::Instant {
+        self.preview_clock_for_test
+            .lock()
+            .unwrap()
+            .unwrap_or(actual)
     }
 
     #[cfg(test)]
