@@ -661,3 +661,158 @@ fn native_owner_inventory_is_minor_gated_and_empty_revocation_is_real_wire() {
         assert_eq!(client_read(&mut client), Message::Overview { open: true });
     }
 }
+
+#[test]
+fn pending_accelerator_press_and_release_are_cancelled_before_locked_poll() {
+    use tuna_shell_control::MODE_NORMAL;
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let window = model.insert("private-window", None, 1);
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+    hub.queue_accelerator(13, 5000, MODE_NORMAL);
+    hub.queue_accelerator_deactivated(13, 5001, MODE_NORMAL);
+    hub.cancel_pending_accelerators();
+    hub.set_locked(true);
+    hub.poll(&mut model);
+    let Message::Snapshot {
+        locked, windows, ..
+    } = client_read(&mut client)
+    else {
+        panic!("lock transition must send the privacy snapshot");
+    };
+    assert!(locked);
+    assert!(
+        windows.is_empty(),
+        "locked snapshot cannot disclose window metadata"
+    );
+    client.set_nonblocking(true).unwrap();
+    let mut prefix = [0u8; 4];
+    assert_eq!(
+        client.read_exact(&mut prefix).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    // Unlock cannot resurrect a queued pre-lock event either.
+    hub.set_locked(false);
+    hub.poll(&mut model);
+    client.set_nonblocking(false).unwrap();
+    let Message::Snapshot {
+        locked, windows, ..
+    } = client_read(&mut client)
+    else {
+        panic!("unlock transition must send a fresh snapshot");
+    };
+    assert!(!locked);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].id, window);
+    client.set_nonblocking(true).unwrap();
+    assert_eq!(
+        client.read_exact(&mut prefix).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn actual_lock_command_cancels_pending_accelerators_before_broadcast() {
+    use tuna_shell_control::MODE_NORMAL;
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+    hub.queue_accelerator(13, 5000, MODE_NORMAL);
+    hub.queue_accelerator_deactivated(13, 5001, MODE_NORMAL);
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 23,
+            kind: CommandKind::Lock,
+        },
+    );
+    hub.poll(&mut model);
+    assert_eq!(
+        client_read(&mut client),
+        Message::CommandResult {
+            id: 23,
+            status: CommandStatus::Applied,
+        }
+    );
+    // Drive the next privacy snapshot as the runtime does, without explicitly
+    // cancelling events. Neither this poll nor the Lock poll may send an event.
+    hub.poll(&mut model);
+    assert!(matches!(
+        client_read(&mut client),
+        Message::Snapshot { locked: true, .. }
+    ));
+    client.set_nonblocking(true).unwrap();
+    let mut prefix = [0u8; 4];
+    assert_eq!(
+        client.read_exact(&mut prefix).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn accelerator_release_and_typed_grabs_require_minor38() {
+    use tuna_shell_control::MODE_NORMAL;
+    for minor in [36, 37, 38] {
+        let mut model = StateModel::new();
+        let (conn, mut client) = pair();
+        client_write(
+            &mut client,
+            &Message::Hello {
+                version: ProtocolVersion::new(0, minor),
+            },
+        );
+        let mut session = Session::handshake(conn, &model).unwrap();
+        assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+        assert!(matches!(client_read(&mut client), Message::Snapshot { .. }));
+        session
+            .send_accelerator_deactivated(13, 5001, MODE_NORMAL)
+            .unwrap();
+        session.send_overview(true).unwrap();
+        if minor >= 38 {
+            assert_eq!(
+                client_read(&mut client),
+                Message::AcceleratorDeactivated {
+                    action: 13,
+                    time: 5001,
+                    mode: MODE_NORMAL,
+                }
+            );
+        }
+        assert_eq!(client_read(&mut client), Message::Overview { open: true });
+        client_write(
+            &mut client,
+            &Message::Command {
+                id: 24,
+                kind: CommandKind::SetAcceleratorGrabs { grabs: vec![] },
+            },
+        );
+        session.handle_next(&mut model).unwrap();
+        if minor >= 38 {
+            assert_eq!(
+                client_read(&mut client),
+                Message::CommandResult {
+                    id: 24,
+                    status: CommandStatus::Applied,
+                }
+            );
+            assert_eq!(session.take_accelerators(), Some(vec![]));
+        } else {
+            assert!(matches!(
+                client_read(&mut client),
+                Message::Error {
+                    kind: ErrorKind::UnknownCommand,
+                    ..
+                }
+            ));
+            assert_eq!(session.take_accelerators(), None);
+        }
+    }
+}

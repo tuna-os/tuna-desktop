@@ -12,7 +12,7 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.37).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.38).
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
@@ -68,3 +68,18 @@ and the `Outputs` message are byte-for-byte unchanged. The compositor sends it
 only to peers advertising minor 37 or later; an empty list explicitly revokes
 earlier authority, and nested sessions never send a non-empty one. Decoding
 rejects more than 64 records (`DecodeError::CollectionTooLong`).
+
+
+## Accelerator grab flags and release (0.38)
+
+`CommandKind::SetAcceleratorGrabs { grabs: Vec<AcceleratorGrab> }` and
+`Message::AcceleratorDeactivated { action, time, mode }` append in 0.38:
+atomic grab replacement with GNOME's `IGNORE_AUTOREPEAT` and
+`TRIGGER_RELEASE` flags (`SUPPORTED_GRAB_FLAGS`; anything else, or more than
+`MAX_ACCELERATORS`, fails decoding), and the release of a `TRIGGER_RELEASE`
+grab's press. The legacy `SetAccelerators` body is unchanged.
+
+The compositor sends release events only to peers advertising minor 38 or
+later and rejects typed grabs from older peers. `NativeOutputInventory` stays
+at its shipped 0.37 position; this slice adds no monitor-identity or brightness
+journal messages.

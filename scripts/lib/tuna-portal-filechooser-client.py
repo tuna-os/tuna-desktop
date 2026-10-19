@@ -9,7 +9,7 @@ import sys
 import subprocess
 import time
 from urllib.parse import unquote, urlparse
-from tuna_picker_geometry import committed_window
+from tuna_picker_geometry import committed_window, new_parent_window
 from gi.repository import Gio, GLib
 import gi
 
@@ -150,7 +150,13 @@ def click_parent_content():
     out.with_suffix(".parent-pointer.json").write_text(json.dumps(parent_pointer_probes, indent=2))
     subprocess.run(["xdotool", "click", "1"], env=env, check=True, timeout=5)
 if parent_mode != "none":
-    display = scene()["x11_display"] if parent_mode == "x11" else os.environ.get("WAYLAND_DISPLAY")
+    before_parent = scene()
+    previous_parent_ids = {window["id"] for window in before_parent["windows"]}
+    out.with_suffix(".parent-admission.json").write_text(json.dumps({
+        "previous_window_ids": sorted(previous_parent_ids),
+        "mode": parent_mode, "pid": os.getpid(),
+    }, indent=2))
+    display = before_parent["x11_display"] if parent_mode == "x11" else os.environ.get("WAYLAND_DISPLAY")
     if not display:
         raise RuntimeError("Tuna Desktop did not provide the requested parent display")
     if parent_mode == "x11":
@@ -214,11 +220,10 @@ if parent_mode != "none":
                 GdkWayland.WaylandToplevel.set_application_id(native, parent_app_id)
                 parent_app_id_set = True
             xid = GdkX11.X11Surface.get_xid(native) if parent_mode == "x11" else None
-            candidates = [w for w in scene()["windows"]
-                          if (w.get("x11_window_id") == xid if parent_mode == "x11"
-                              else w.get("app_id") == parent_app_id and w.get("x11_window_id") is None)]
-            if len(candidates) == 1:
-                parent_identity = {"mode": parent_mode, "xid": xid, "id": candidates[0]["id"], "app_id": candidates[0]["app_id"], "pid": os.getpid(), "uid": os.getuid(), "start_ticks": Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19], "display": display, "input_path": str(input_path)}
+            candidate = new_parent_window(scene(), previous_parent_ids,
+                                          mode=parent_mode, xid=xid, app_id=parent_app_id)
+            if candidate is not None:
+                parent_identity = {"mode": parent_mode, "xid": xid, "id": candidate["id"], "app_id": candidate["app_id"], "pid": os.getpid(), "uid": os.getuid(), "start_ticks": Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19], "display": display, "input_path": str(input_path)}
                 if parent_mode == "x11":
                     parent_handle = "x11:" + format(xid, "x")
                 break
