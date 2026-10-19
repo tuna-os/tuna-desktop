@@ -37,9 +37,6 @@ fn main() -> ExitCode {
         }
         return tuna_compositor::pam_helper::entry();
     }
-    // The old name's environment and per-user directories, for one release (#505).
-    tuna_shell_control::legacy::import_env("tuna-compositor");
-    tuna_shell_control::legacy::adopt_dirs("tuna-compositor");
     let mut session = NestedSession::default_for_pid();
     session.xwayland = tuna_compositor::runtime::xwayland_wanted(
         std::env::var_os("TUNA_XWAYLAND"),

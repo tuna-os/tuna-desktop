@@ -247,14 +247,7 @@ class PackagePolicy(unittest.TestCase):
 --ctrl-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./conffiles ;;
 --fsys-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./usr ./etc ;;
 esac''')
-        (self.stage / 'conffiles').write_text('/etc/pam.d/tuna-lock\n/etc/pam.d/roost-lock\n')  # tuna-rename: keep
-        # One release of compatibility with the former name (#505).
-        # tuna-rename: keep-begin
-        for name in ('compositor', 'session', 'shell-gtk', 'shell-host', 'ibus-bridge', 'greeter'):
-            (self.stage / 'usr/bin' / ('roost-' + name)).symlink_to('tuna-' + name)
-        for name in ('usr/share/wayland-sessions/roost.desktop', 'etc/pam.d/roost-lock'):
-            (self.stage / name).write_text((ROOT / 'share/compat' / '/'.join(name.split('/')[-2:])).read_text())
-        # tuna-rename: keep-end
+        (self.stage / 'conffiles').write_text('/etc/pam.d/tuna-lock\n')
         self.tool('ldd', 'echo "libc.so.6 => /lib/libc.so.6 (0)"')
         self.tool('desktop-file-validate', 'exit 0')
 
@@ -292,15 +285,12 @@ esac''')
                 finally:
                     os.umask(previous)
 
-    def test_compatibility_names_required(self):
-        # tuna-rename: keep-begin
-        (self.stage / 'usr/bin/roost-greeter').unlink()
-        self.assertNotEqual(self.check(), 0)
-        (self.stage / 'usr/bin/roost-greeter').symlink_to('tuna-greeter')
-        compat = self.stage / 'usr/share/wayland-sessions/roost.desktop'
-        compat.write_text(compat.read_text().replace('NoDisplay=true\n', ''))
-        self.assertNotEqual(self.check(), 0, 'the compat session entry must stay hidden')
-        # tuna-rename: keep-end
+    def test_no_compatibility_names_shipped(self):
+        # The one-release compatibility layer (#505) is gone: no symlinks,
+        # no session entry, no PAM service under the old name.
+        leftovers = [str(p) for p in self.stage.rglob('*roost*')]  # tuna-rename: keep
+        self.assertEqual(leftovers, [])
+        self.assertEqual(self.check(), 0)
 
     def test_missing_preferred_gtk(self):
         (self.stage / 'usr/bin/tuna-shell-gtk').unlink()
@@ -375,10 +365,6 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path.write_text('#!/bin/sh\necho "' + name + ' 0.1.0"\nexit ' + str(version_exit if name == 'tuna-shell-gtk' else 0) + '\n')
                 path.chmod(0o755)
             for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf'):
-                path = root / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text('fixture\n')
-            for name in ('share/compat/wayland-sessions/roost.desktop', 'share/compat/pam.d/roost-lock'):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('fixture\n')
