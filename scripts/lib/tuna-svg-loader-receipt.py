@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import stat
 import subprocess
+from tuna_svg_resources import fontconfig_cache_directories, resource_package
 import gi
 gi.require_version('GdkPixbuf', '2.0')
 from gi.repository import GdkPixbuf
@@ -48,6 +49,7 @@ for process in receipt['processors']:
     cleanup.append({'pid':process['pid'],'start_ticks':process['start_ticks'],'no_live_original_process':True})
 receipt['owned_processor_cleanup']=cleanup
 packages = set()
+cache_directories = fontconfig_cache_directories()
 for resource in receipt['resources']:
     path = Path(resource['path'])
     unchanged=lambda m:(m.st_dev,m.st_ino,m.st_size,m.st_uid,m.st_mode,m.st_mtime_ns,m.st_ctime_ns)
@@ -93,12 +95,18 @@ for resource in receipt['resources']:
         if (digest.hexdigest()!=resource['sha256'] or unchanged(after)!=unchanged(before)
                 or unchanged(named)!=unchanged(before)):
             raise RuntimeError('actual backend resource differs or changed during verification')
+        if path != HELPER:
+            package, provenance = resource_package(path, resource, before, cache_directories)
+            packages.add(package)
+            # Generated caches name their directory's package, not a file owner.
+            provenance['package'] = subprocess.check_output(['rpm', '-q', package], text=True).strip()
+            resource['package_provenance'] = provenance
+            if provenance['kind'] == 'rpm-payload':
+                resource['rpm_owner'] = provenance['package']
+        if unchanged(os.fstat(fd)) != unchanged(before) or unchanged(path.stat()) != unchanged(before):
+            raise RuntimeError('actual backend resource changed during package verification')
     finally:
         os.close(fd)
-    if path != HELPER:
-        package = subprocess.check_output(['rpm', '-qf', '--qf', '%{NAME}', str(path)], text=True)
-        packages.add(package)
-        resource['rpm_owner'] = subprocess.check_output(['rpm', '-q', package], text=True).strip()
 paths = [r['path'] for r in receipt['resources']]
 if not receipt.get('modern_glycin') or not any('libglycin-2' in p for p in paths) or not any(p['executable'].endswith('/glycin-svg') for p in receipt['processors']):
     raise RuntimeError('candidate did not observe actual modern Glycin SVG stream loader')
