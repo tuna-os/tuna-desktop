@@ -91,7 +91,7 @@ class TraceTests(unittest.TestCase):
         self.assertIn('[ "$(cat "$VOLUME_FILE")" = 0.4200 ] || fail G-MEDIA-VOLUME', section)
         self.assertNotIn('while ', section)
         runtime = (ROOT / 'crates/compositor/src/runtime.rs').read_text()
-        self.assertIn('self.manager.set_accelerators(list);\n            self.manager.trace_media_accelerators(self.is_locked());', runtime)
+        self.assertIn('self.manager.set_accelerator_grabs(list);\n            self.manager.trace_media_accelerators(self.is_locked());', runtime)
         self.assertIn('rm -f "$TUNA_MEDIA_DIAGNOSTICS"\npass G-MEDIA-VOLUME', proof)
         self.assertIn('if locked || !trace_enabled()', (ROOT / 'crates/shell-gtk/src/media_keys.rs').read_text())
 
