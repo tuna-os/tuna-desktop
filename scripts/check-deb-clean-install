@@ -84,12 +84,11 @@ done
 # The compositor prefers tuna-shell-gtk beside itself over tuna-shell-host.
 [ "$(dirname "$(readlink -f "$(command -v tuna-compositor)")")" = "$(dirname "$(readlink -f "$(command -v tuna-shell-gtk)")")" ] \
     || fail "tuna-shell-gtk is not beside tuna-compositor"
-# tuna-rename: keep-begin
-# One release of compatibility (#505): the old names resolve to the new binaries.
-for bin in compositor session shell-gtk shell-host ibus-bridge greeter; do
-    [ "$(readlink -f "/usr/bin/roost-$bin")" = "/usr/bin/tuna-$bin" ] || fail "roost-$bin compat link broken"
-done
-# tuna-rename: keep-end
+# The one-release compatibility names (#505) are gone: nothing under the
+# old name may ship.
+if ls /usr/bin/roost-* >/dev/null 2>&1 || [ -e /usr/share/wayland-sessions/roost.desktop ] || [ -e /etc/pam.d/roost-lock ]; then  # tuna-rename: keep
+    fail "legacy roost names still installed"  # tuna-rename: keep
+fi
 EXEC="$(sed -n "s/^Exec=\([^ ]*\).*/\1/p" /usr/share/wayland-sessions/tuna.desktop)"
 command -v "$EXEC" >/dev/null || fail "session Exec $EXEC not installed"
 for path in /usr/lib/systemd/user/tuna-session.target /etc/pam.d/tuna-lock; do
