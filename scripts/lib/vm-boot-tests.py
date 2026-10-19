@@ -1190,10 +1190,42 @@ class ControlledOverviewDiagnostic(unittest.TestCase):
         entry=Entry()
         query=lambda method,*args:method(*args)
         for entries in ([],[entry,entry]):
-            self.assertIsNone(module.controlled_query(entries,query));self.assertEqual(calls,[])
+            self.assertIsNone(module.controlled_query(entries,query,Text));self.assertEqual(calls,[])
         for count,value,expected in ((0,"private",False),(6,"private",False),(True,"private",False),(5.0,"private",False),(5,"disks",True),(5,"other",False)):
-            calls.clear();self.assertIs(module.controlled_query([entry],query),expected)
+            calls.clear();self.assertIs(module.controlled_query([entry],query,Text),expected)
             self.assertEqual(calls,["interface","count"]+([(0,5)] if type(count) is int and count==5 else []))
+
+    def test_controlled_query_uses_text_interface_despite_accessible_getter_collision(self):
+        module = self.module()
+        calls = []
+        class Accessible:
+            def get_text_iface(self):
+                calls.append("interface")
+                return self
+            def get_text(self):
+                raise AssertionError("deprecated Accessible interface getter must not be called")
+        class Text:
+            @staticmethod
+            def get_character_count(obj):
+                self.assertIs(obj, entry)
+                calls.append("count")
+                return 5
+            @staticmethod
+            def get_text(obj, start, end):
+                self.assertIs(obj, entry)
+                calls.append((start, end))
+                return "disks"
+        entry = Accessible()
+        # This is the actual Python name collision, not a native GI execution.
+        with self.assertRaises(TypeError):
+            entry.get_text(0, 5)
+        self.assertTrue(module.controlled_query([entry], lambda method, *args: method(*args), Text))
+        self.assertEqual(calls, ["interface", "count", (0, 5)])
+        tree = ast.parse(Path(module.__file__).read_text())
+        invocation = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Name) and n.func.id == "controlled_query")
+        self.assertEqual(ast.unparse(invocation.args[2]), "Atspi.Text")
+        # The original uniquely identified Search/five-character guards remain mandatory.
 
     def catalog(self,changes=None,replaced=False):
         module=self.module()

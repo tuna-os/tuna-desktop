@@ -48,18 +48,21 @@ def process_identity(pid, uid, ticks, executable, display):
     return actual
 
 
-def controlled_query(entries, query):
+def controlled_query(entries, query, text_api):
     """Only the unique original public Search control, never arbitrary text."""
     if len(entries) != 1:
         return None
     text = query(entries[0].get_text_iface)
     if text is None:
         return False
-    count = query(text.get_character_count)
+    count = query(text_api.get_character_count, text)
     if type(count) is not int or count != 5:
         return False
     # Five Unicode characters bound transport; compare and immediately discard.
-    return query(text.get_text, 0, 5) == "disks"
+    # Accessible.get_text() is a deprecated interface getter with no offsets.
+    # The native object also implements Text, so use explicit interface dispatch
+    # rather than the colliding Accessible method on the returned object.
+    return query(text_api.get_text, text, 0, 5) == "disks"
 
 
 def resource_key(value):
@@ -258,7 +261,7 @@ def observe(pid, ticks, executable, display, controlled=False):
     diagnostic = None
     if controlled:
         FOCUS_OPERATION = "controlled-query"
-        matches = controlled_query(search_entries, accessibility_query)
+        matches = controlled_query(search_entries, accessibility_query, Atspi.Text)
         diagnostic = {"known_query_matches":matches,"Disks_result":target,"focused_role_classes":focused_roles}
         if matches is True:
             remaining_budget()
