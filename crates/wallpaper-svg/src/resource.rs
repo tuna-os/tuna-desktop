@@ -126,7 +126,7 @@ fn observe_with(
         "path":path.to_string_lossy(), "kind":kind_name, "bytes":bytes,
         "uid":before.uid(), "mode":before.mode(), "dev":before.dev(), "ino":before.ino(),
         "mtime":[before.mtime(),before.mtime_nsec()], "ctime":[before.ctime(),before.ctime_nsec()],
-        "sha256":format!("{:x}",hash.finalize()),
+        "sha256":crate::hash::finalize_hex(hash),
         "member_names_hex":members.iter().map(|name| name.iter().map(|b| format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>(),
     }))
 }
@@ -139,6 +139,18 @@ mod tests {
             bytes: 16,
             members: 2,
         }
+    }
+
+    #[test]
+    fn file_receipt_preserves_leading_zero_sha256_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("leading-zero.conf");
+        std::fs::write(&file, b"286").unwrap();
+        let receipt = observe_with(&file, Kind::File, limits(), || {}).unwrap();
+        assert_eq!(
+            receipt["sha256"],
+            "00328ce57bbc14b33bd6695bc8eb32cdf2fb5f3a7d89ec14a42825e15d39df60"
+        );
     }
 
     #[test]
