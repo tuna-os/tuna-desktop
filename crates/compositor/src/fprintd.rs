@@ -4168,9 +4168,11 @@ mod tests {
         // The same bounded wait admits no new success condition or timeout.
         let fill_deadline = Instant::now() + Duration::from_secs(30);
         let saturated_outq = loop {
+            // Read the monotonic freeze evidence FIRST, then sample output:
+            // a pre-freeze full-buffer sample may already have been drained.
+            let forwarded = stats.c2d_forwarded.load(TestOrdering::Acquire);
             let outq = test_outq(&observe);
             assert!(outq >= 0, "SIOCOUTQ must stay measurable, got {outq}");
-            let forwarded = stats.c2d_forwarded.load(TestOrdering::Acquire);
             if frozen_relay_saturated(outq, capacity, forwarded) {
                 break outq;
             }
