@@ -1,10 +1,13 @@
 # Contributing to Tuna Desktop
 
-Tuna Desktop (formerly Roost) is in active implementation as a nested developer preview (see
-[README.md](README.md) and [the roadmap](docs/roadmap.md#public-roadmap)). A Smithay compositor
-supervises a GTK4/libadwaita shell, session supervisor, greetd greeter, and
-versioned control protocol, tested across nested graphical journeys, AT-SPI
-accessibility, and Marlin VM lanes.
+Tuna Desktop (formerly Roost) is in active implementation, with a nested
+developer preview and experimental installed sessions (see [README.md](README.md)
+and [the roadmap](docs/roadmap.md#public-roadmap)). Its Smithay compositor
+supervises the GTK4/libadwaita shell, the installed-session default described in
+[ADR 0006](docs/adr/0006-gtk4-libadwaita-shell.md). The project also includes a
+session supervisor, greetd greeter and versioned control protocol, tested across
+nested graphical journeys, AT-SPI accessibility and Marlin VM lanes. Daily-driver
+and release qualification remain open.
 
 This guide covers contributing code, tests, documentation, and planning
 artifacts. For complete developer setup and build instructions, see the

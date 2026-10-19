@@ -8,7 +8,7 @@ import tempfile
 import subprocess
 import unittest
 from unittest.mock import patch
-from tuna_picker_geometry import application_id, committed_window
+from tuna_picker_geometry import application_id, committed_window, new_parent_window
 
 spec = importlib.util.spec_from_file_location('finalizer', Path(__file__).with_name('tuna-portal-artifact-finalize.py'))
 f = importlib.util.module_from_spec(spec)
@@ -146,6 +146,40 @@ class FinalizationTests(unittest.TestCase):
         self.assertEqual(len(result['errors']), 1)
         self.assertFalse(result['qualified_finalization'])
         self.assertTrue((self.root / 'artifact-finalization-error.json').is_file())
+
+
+class PickerParentAdmissionTests(unittest.TestCase):
+    def test_recycled_xid_does_not_admit_previous_callers_compositor_id(self):
+        old = dict(id=17, x11_window_id=4194309, app_id="tuna-x11-picker-parent")
+        new = dict(old, id=20)
+        identity = dict(mode="x11", xid=4194309, app_id=None)
+        self.assertIsNone(new_parent_window(dict(windows=[old]), {1, 17, 18}, **identity))
+        self.assertIs(new_parent_window(dict(windows=[old, new]), {1, 17, 18}, **identity), new)
+        self.assertIs(new_parent_window(dict(windows=[new]), {1, 17, 18}, **identity), new)
+
+    def test_same_wayland_app_id_requires_a_new_compositor_window(self):
+        old = dict(id=17, x11_window_id=None, app_id="org.example.TunaWaylandPickerParent")
+        new = dict(old, id=20)
+        identity = dict(mode="wayland", xid=None, app_id=old["app_id"])
+        self.assertIsNone(new_parent_window(dict(windows=[old]), {17}, **identity))
+        self.assertIs(new_parent_window(dict(windows=[old, new]), {17}, **identity), new)
+
+    def test_duplicate_fresh_identity_wrong_transport_and_invalid_ids_are_rejected(self):
+        window = dict(id=20, x11_window_id=4194309, app_id="parent")
+        identity = dict(mode="x11", xid=4194309, app_id=None)
+        self.assertIsNone(new_parent_window(dict(windows=[window, dict(window, id=21)]), set(), **identity))
+        for changed in (dict(window, id=True), dict(window, id=0), dict(window, x11_window_id=None)):
+            self.assertIsNone(new_parent_window(dict(windows=[changed]), set(), **identity))
+        self.assertIsNone(new_parent_window(dict(windows=[window]), set(), mode="wayland", xid=None, app_id="parent"))
+        for xid in (None, True, 0, "4194309"):
+            self.assertIsNone(new_parent_window(dict(windows=[window]), set(), mode="x11", xid=xid, app_id=None))
+
+    def test_actual_client_snapshots_before_creating_parent_and_uses_admission(self):
+        client = Path(__file__).with_name("tuna-portal-filechooser-client.py").read_text()
+        self.assertLess(client.index("previous_parent_ids ="), client.index("parent_window = Gtk.Window("))
+        self.assertIn("new_parent_window(scene(), previous_parent_ids,", client)
+        self.assertIn('"id": candidate["id"]', client)
+        self.assertNotIn("candidates = [w for w in scene()", client)
 
 
 class PickerGeometryTests(unittest.TestCase):

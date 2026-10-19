@@ -209,5 +209,96 @@ fail() { exit 7; }
         self.assertEqual(proc.stdout.splitlines(), ['freeze', 'capture:delay-redue', 'restored'])
 
 
+class DisableFrameBarrier(unittest.TestCase):
+    """Execute the real helper against controlled compositor snapshots.
+
+    A neutral state is published before its framebuffer is submitted. Do not
+    let a snapshot of that old frame admit the subsequent single-shot capture.
+    """
+    @staticmethod
+    def state(frame=40, clock=3000, manual=True, brightness=1.0, animating=False):
+        return {'rendered_frames': frame, 'animation_clock_ms': clock,
+                'animation_clock_manual': manual,
+                'wellbeing_effects': {'desaturation': 0.0,
+                                     'brightness': brightness,
+                                     'animating': animating}}
+
+    def run_helper(self, applied, submitted):
+        source = PROOF.read_text()
+        match = re.search(r'^wb_await_off\(\) \{\n.*?^\}',
+                          source, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        script = r'''set -eu
+SAMPLES="$1"
+CSTATE="$SAMPLES/current.json"
+stage=0
+cstate() {
+    stage=$((stage + 1))
+    for sample in "$SAMPLES/$stage-"*.json; do
+        cp "$sample" "$CSTATE"
+        if jq -e "$1" "$CSTATE" >/dev/null 2>&1; then
+            printf 'observed:%s:%s\n' "$stage" "$(basename "$sample")"
+            return 0
+        fi
+    done
+    return 1
+}
+fail() { printf '%s\n' "$2" >&2; exit 7; }
+''' + match.group(0) + '\nwb_await_off TEST\nprintf "capture-ready\\n"\n'
+        with tempfile.TemporaryDirectory() as directory:
+            for stage, samples in enumerate((applied, submitted), 1):
+                for index, sample in enumerate(samples):
+                    (Path(directory) / f'{stage}-{index}.json').write_text(json.dumps(sample))
+            return subprocess.run(['bash', '-c', script, 'off-test', directory],
+                                  capture_output=True, text=True, timeout=5)
+
+    def test_neutral_state_waits_for_a_new_submitted_frame(self):
+        result = self.run_helper([self.state(brightness=0.6), self.state()],
+                                 [self.state(), self.state(frame=41)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(),
+                         ['observed:1:1-1.json', 'observed:2:2-1.json', 'capture-ready'])
+
+    def test_stalled_counter_never_admits_capture(self):
+        result = self.run_helper([self.state()], [self.state(), self.state()])
+        self.assertEqual(result.returncode, 7)
+        self.assertNotIn('capture-ready', result.stdout)
+
+    def test_fade_out_cannot_settle_without_advancing_the_clock(self):
+        result = self.run_helper([self.state(brightness=0.6, animating=True)],
+                                 [self.state(frame=41)])
+        self.assertEqual(result.returncode, 7)
+        self.assertIn('fade-out found', result.stderr)
+
+    def test_later_frame_must_remain_neutral_and_frozen(self):
+        candidates = [self.state(frame=41, clock=3001),
+                      self.state(frame=41, manual=False),
+                      self.state(frame=41, brightness=0.8),
+                      self.state(frame=41, animating=True),
+                      self.state(frame='41'), self.state(frame=41.5)]
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                result = self.run_helper([self.state()], [candidate])
+                self.assertEqual(result.returncode, 7, result.stdout)
+                self.assertNotIn('capture-ready', result.stdout)
+
+    def test_applied_snapshot_requires_typed_clock_and_counter(self):
+        for key in ('rendered_frames', 'animation_clock_ms'):
+            for value in (None, True, '40', -1, 40.5):
+                candidate = dict(self.state(), **{key: value})
+                with self.subTest(key=key, value=value):
+                    result = self.run_helper([candidate], [self.state(frame=41)])
+                    self.assertEqual(result.returncode, 7, result.stdout)
+                    self.assertIn('typed frozen clock', result.stderr)
+        result = self.run_helper([self.state(manual=False)], [self.state(frame=41)])
+        self.assertEqual(result.returncode, 7)
+
+    def test_every_immediate_off_capture_uses_the_barrier(self):
+        source = PROOF.read_text()
+        for label in ('gray', 'fade', 'both'):
+            self.assertRegex(source, 'wb_await_off G-WELLBEING-PIXEL-' + label.upper()
+                             + r'\nwb_capture ' + label + '-off\n')
+
+
 if __name__ == '__main__':
     unittest.main()

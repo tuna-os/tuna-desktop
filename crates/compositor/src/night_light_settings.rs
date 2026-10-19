@@ -630,15 +630,63 @@ mod tests {
         (share, reader, receive, send, loop_)
     }
     fn completed(reader: &Reader, loop_: &mut calloop::EventLoop<usize>) -> NightLightConfig {
+        completed_with_poll_clock(reader, loop_, Instant::now)
+    }
+    fn completed_with_poll_clock(
+        reader: &Reader,
+        loop_: &mut calloop::EventLoop<usize>,
+        mut poll_now: impl FnMut() -> Instant,
+    ) -> NightLightConfig {
         let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         loop {
-            if let Some(config) = reader.poll(Instant::now()) {
+            if let Some(config) = reader.poll(poll_now()) {
                 return config;
             }
             let now = Instant::now();
             assert!(now < deadline, "actual worker failed to publish completion");
             loop_.dispatch(Some(deadline - now), &mut count).unwrap();
+        }
+    }
+    #[test]
+    fn watch_harness_clock_excludes_unchanged_periodic_completions() {
+        for periodic_due in [false, true] {
+            let (_, reader, events, answers, mut loop_) = controlled();
+            let poll_at = reader.shared.state.lock().unwrap().last.unwrap();
+            let mut initial = RawSettings::schema_defaults();
+            initial.temperature_k = 2700;
+            answers.send(Ok(initial.into_config())).unwrap();
+            assert_eq!(
+                completed_with_poll_clock(&reader, &mut loop_, || poll_at).temperature_k(),
+                2700,
+            );
+            // Deterministically model a contended consumer whose next poll is
+            // delayed beyond READ_INTERVAL, without sleeping or changing the
+            // production timeout. That periodic read is not a watch callback.
+            let now = if periodic_due {
+                poll_at + READ_INTERVAL
+            } else {
+                poll_at
+            };
+            assert!(reader.poll(now).is_none());
+            if periodic_due {
+                assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
+                let mut unchanged = RawSettings::schema_defaults();
+                unchanged.temperature_k = 2700;
+                answers.send(Ok(unchanged.into_config())).unwrap();
+                assert_eq!(
+                    completed_with_poll_clock(&reader, &mut loop_, || poll_at).temperature_k(),
+                    2700,
+                    "a periodic completion can precede the actual settings change",
+                );
+            } else {
+                assert!(
+                    events.try_recv().is_err(),
+                    "frozen poll cannot request a read"
+                );
+                assert!(reader.shared.state.lock().unwrap().active.is_none());
+            }
+            retired(reader, &events);
         }
     }
     /// Observing a quarantined worker's exit only synchronizes the test with
@@ -968,6 +1016,11 @@ mod tests {
             .insert_source(source, |_, _, count| *count += 1)
             .unwrap();
         let share = Arc::new(NightLightShare::default());
+        // Only the genuine GIO changed callback may schedule the second read.
+        // Freeze the consumer's refresh clock before initial admission: real
+        // CI contention must not enqueue a periodic pre-mutation completion.
+        // completed_with_poll_clock still enforces its real bounded deadline.
+        let poll_at = Instant::now();
         let reader = Reader::with_factory(
             &share,
             &wake,
@@ -984,7 +1037,10 @@ mod tests {
             }),
             HARNESS_LIMIT,
         );
-        assert_eq!(completed(&reader, &mut loop_).temperature_k(), 2700);
+        assert_eq!(
+            completed_with_poll_clock(&reader, &mut loop_, || poll_at).temperature_k(),
+            2700,
+        );
         let source = glib::idle_source_new(
             Some("tuna-night-light-native-watch-proof"),
             glib::Priority::DEFAULT,
@@ -1003,7 +1059,10 @@ mod tests {
             },
         );
         source.attach(Some(&reader.shared.context));
-        assert_eq!(completed(&reader, &mut loop_).temperature_k(), 3200);
+        assert_eq!(
+            completed_with_poll_clock(&reader, &mut loop_, || poll_at).temperature_k(),
+            3200,
+        );
         reader.shared.quarantine();
         // Tests may join only after the quit callback has actually executed.
         let deadline = Instant::now() + HARNESS_LIMIT;

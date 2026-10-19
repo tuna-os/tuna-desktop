@@ -172,25 +172,11 @@ fn from_crate_entry(entry: &CrateEntry) -> Option<AppEntry> {
     from_crate_entry_for_launch(entry, false)
 }
 
-// Desktop values are unescaped before Exec tokenization. The desktop-entry
-// crate deliberately keeps Exec raw, but its parse_exec splits quoted words.
+// Since 0.8.4, the desktop-entry decoder unescapes Exec values itself.
+// Only tokenize here: decoding a second time drops quoting backslashes or
+// rejects valid commands containing escaped quotes, dollars or backslashes.
 fn exec_argv(entry: &CrateEntry) -> Option<Vec<OsString>> {
-    let raw = entry.exec()?;
-    let decoded;
-    let command = if raw.contains('\\') {
-        let keyfile = gio::glib::KeyFile::new();
-        keyfile
-            .load_from_data(
-                &format!("[Desktop Entry]\nExec={raw}\n"),
-                gio::glib::KeyFileFlags::NONE,
-            )
-            .ok()?;
-        decoded = keyfile.string("Desktop Entry", "Exec").ok()?;
-        decoded.as_str()
-    } else {
-        raw
-    };
-    let words = gio::glib::shell_parse_argv(command).ok()?;
+    let words = gio::glib::shell_parse_argv(entry.exec()?).ok()?;
     let mut argv = Vec::with_capacity(words.len());
     for word in words {
         match word.to_str()? {
@@ -723,6 +709,36 @@ mod tests {
                 OsString::from("example"),
                 dir.path().join("probe.desktop").into_os_string(),
                 OsString::from("%"),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_desktop_escapes_are_decoded_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_entry(
+            dir.path(),
+            "escaped.desktop",
+            r#"[Desktop Entry]
+Name=Escaped Exec
+Exec=/bin/echo "say \\"hello\\"" "C:\\\\bin" "literal \\$HOME" "a\sb" "line\nbreak"
+Type=Application
+"#,
+        );
+        let apps = discover(&[dir.path().to_owned()]);
+        let entry = apps
+            .iter()
+            .find(|a| a.name == "Escaped Exec")
+            .expect("valid desktop escapes must not hide an application");
+        assert_eq!(
+            entry.argv,
+            vec![
+                OsString::from("/bin/echo"),
+                OsString::from("say \"hello\""),
+                OsString::from(r"C:\bin"),
+                OsString::from("literal $HOME"),
+                OsString::from("a b"),
+                OsString::from("line\nbreak"),
             ]
         );
     }
