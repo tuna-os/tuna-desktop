@@ -1,0 +1,41 @@
+#!/bin/sh
+# ci-install-vkms — require vkms for the running Ubuntu CI kernel.
+# Run after apt-get update. Older Azure kernels package vkms in
+# linux-modules-extra; newer ones include it in linux-modules itself.
+# Do not assume either split, install a different kernel, or mask apt errors.
+# tuna-drm-smoke still requires modprobe, a real vkms card and native proofs.
+set -eu
+LC_ALL=C
+export LC_ALL
+
+command -v modinfo >/dev/null
+kernel="$(uname -r)"
+echo "ci-install-vkms: running kernel $kernel"
+
+if modinfo -k "$kernel" vkms >/dev/null 2>&1; then
+    echo "ci-install-vkms: vkms is already installed"
+    modinfo -k "$kernel" -F filename vkms
+    exit 0
+fi
+
+for package in "linux-modules-extra-$kernel" "linux-modules-$kernel"; do
+    # An unknown package can return success with no policy output; a known
+    # package without an installable version reports Candidate: (none).
+    # A real apt-cache/apt-get failure must remain fatal, not a fallback.
+    policy="$(apt-cache policy "$package")"
+    candidate="$(printf '%s\n' "$policy" | awk '/^[[:space:]]*Candidate:/ {print $2}')"
+    if [ -z "$candidate" ] || [ "$candidate" = '(none)' ]; then
+        echo "ci-install-vkms: no candidate for $package"
+        continue
+    fi
+    echo "ci-install-vkms: installing $package (candidate $candidate)"
+    sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+        -o Acquire::https::Timeout=20 install -y "$package"
+    if modinfo -k "$kernel" vkms >/dev/null 2>&1; then
+        modinfo -k "$kernel" -F filename vkms
+        exit 0
+    fi
+done
+
+echo "ci-install-vkms: vkms is unavailable for running kernel $kernel" >&2
+exit 1
