@@ -5506,15 +5506,27 @@ wb_pixel_preconditions() {
         fail "$WB_GATE" "effects are not neutral at gate start"
 }
 
-# The shell logs its effect request before the compositor applies it, so an
-# off capture taken on the log line alone can bracket the change (gtk-shell
-# 38732705939: brightness 0.6 -> 1.0 across both-off). The animation clock is
-# frozen here, so any fade-out would hold an intermediate value and never
-# reach neutral: waiting for neutral keeps the immediacy proof intact.
+# The shell logs its request before the compositor applies it, and CSTATE
+# publishes the applied effects BEFORE rendering/submitting the next frame.
+# Observe neutral, then a strictly later submitted frame at the same frozen
+# animation time before taking the single-shot pixel proof. Waiting for state
+# alone can still capture the old faded framebuffer (installed CI 39247011409).
+# The clock never advances here: a real fade-out cannot finish and still fails.
 wb_await_off() {
     cstate '.wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1 and .wellbeing_effects.animating == false' \
         "compositor applied the disable" 5 ||
         fail "$1" "the compositor never reached neutral on the frozen clock (fade-out found)"
+    wb_off_sample="$(jq -ce '
+        select(.animation_clock_manual == true) |
+        [.animation_clock_ms, .rendered_frames] |
+        select(all(.[]; type == "number" and . >= 0 and . == floor))
+    ' "$CSTATE")" ||
+        fail "$1" "disable needs a typed frozen clock and submitted-frame counter"
+    wb_off_clock="$(printf '%s\n' "$wb_off_sample" | jq '.[0]')"
+    wb_off_frame="$(printf '%s\n' "$wb_off_sample" | jq '.[1]')"
+    cstate ".animation_clock_manual == true and .animation_clock_ms == $wb_off_clock and (.rendered_frames | type) == \"number\" and .rendered_frames > $wb_off_frame and .rendered_frames == (.rendered_frames | floor) and .wellbeing_effects.desaturation == 0 and .wellbeing_effects.brightness == 1 and .wellbeing_effects.animating == false" \
+        "neutral frame submitted on the frozen clock" 5 ||
+        fail "$1" "no neutral frame was submitted on the unchanged frozen clock"
 }
 
 wb_capture() {

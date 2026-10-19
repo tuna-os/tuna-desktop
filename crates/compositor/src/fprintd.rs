@@ -4007,6 +4007,25 @@ mod tests {
             .expect("phase receipt");
     }
 
+    // A full socket can be transient while the relay has not run yet. Only
+    // the conjunction proves backpressure against the deliberately frozen leg.
+    fn frozen_relay_saturated(outq: i64, capacity: usize, forwarded: usize) -> bool {
+        outq >= 0 && outq as usize >= capacity && forwarded >= 4096
+    }
+
+    #[test]
+    fn saturated_relay_waits_for_both_freeze_and_pending_output() {
+        // Observed CI interleave: full socket, but only handshake/probe bytes
+        // forwarded. It must remain pending until the relay reaches its freeze.
+        assert!(!frozen_relay_saturated(8192, 8192, 331));
+        assert!(!frozen_relay_saturated(8192, 8192, 4095));
+        assert!(!frozen_relay_saturated(0, 8192, 4096));
+        assert!(!frozen_relay_saturated(8191, 8192, 4096));
+        assert!(!frozen_relay_saturated(-1, 8192, 4096));
+        assert!(frozen_relay_saturated(8192, 8192, 4096));
+        assert!(frozen_relay_saturated(8193, 8192, 8192));
+    }
+
     /// Test A — a saturated send parks `close` until fd shutdown, on the
     /// SAME transport a real attempt uses. Phase 1 proves the socket
     /// physics (fill to `EAGAIN`, a blocked sender, shutdown release);
@@ -4144,17 +4163,22 @@ mod tests {
             })
             .expect("big sender spawns");
         // The send MUST fill the transport: 8MB past a frozen drain.
-        // Poll to saturation (must-happen event, bounded wait).
+        // Wait for BOTH relay freeze and socket saturation. Saturation alone
+        // may be transient while the relay thread has not been scheduled yet.
+        // The same bounded wait admits no new success condition or timeout.
         let fill_deadline = Instant::now() + Duration::from_secs(30);
         let saturated_outq = loop {
+            // Read the monotonic freeze evidence FIRST, then sample output:
+            // a pre-freeze full-buffer sample may already have been drained.
+            let forwarded = stats.c2d_forwarded.load(TestOrdering::Acquire);
             let outq = test_outq(&observe);
             assert!(outq >= 0, "SIOCOUTQ must stay measurable, got {outq}");
-            if outq as usize >= capacity {
+            if frozen_relay_saturated(outq, capacity, forwarded) {
                 break outq;
             }
             assert!(
                 Instant::now() < fill_deadline,
-                "saturating send must fill the transport (outq {outq}, capacity {capacity})"
+                "saturating send must fill the frozen transport (outq {outq}, capacity {capacity}, forwarded {forwarded})"
             );
             std::thread::sleep(Duration::from_millis(10));
         };

@@ -60,6 +60,8 @@ struct Shared {
     share: Weak<NightLightShare>,
     /// Admission deadline of every read: [`OPERATION_LIMIT`] in production.
     operation_limit: Duration,
+    #[cfg(test)]
+    startup_phase: std::sync::atomic::AtomicU8,
 }
 trait NativeReader {
     fn read(&mut self) -> Result<NightLightConfig, ReadError>;
@@ -113,11 +115,17 @@ impl Reader {
             wake: wake.clone(),
             share: Arc::downgrade(share),
             operation_limit,
+            #[cfg(test)]
+            startup_phase: std::sync::atomic::AtomicU8::new(0),
         });
         let worker = shared.clone();
         let owner = std::thread::Builder::new()
             .name("tuna-night-light".into())
             .spawn(move || {
+                #[cfg(test)]
+                worker
+                    .startup_phase
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
                 let context = worker.context.clone();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     context.with_thread_default(|| {
@@ -130,6 +138,10 @@ impl Reader {
                                 loop_: loop_.clone(),
                             })
                         });
+                        #[cfg(test)]
+                        worker
+                            .startup_phase
+                            .store(2, std::sync::atomic::Ordering::Relaxed);
                         loop_.run();
                         // Native signal handlers and objects retire on their creator.
                         LOCAL.with(|local| *local.borrow_mut() = None);
@@ -302,6 +314,9 @@ impl Shared {
         self.wake.signal();
     }
     fn run(self: &Arc<Self>, op: Operation) {
+        #[cfg(test)]
+        self.startup_phase
+            .store(3, std::sync::atomic::Ordering::Relaxed);
         if !self.current(op, Instant::now()) {
             return;
         }
@@ -319,8 +334,14 @@ impl Shared {
                         .factory
                         .take()
                         .ok_or_else(|| ReadError("schema unavailable".into()))?;
+                    #[cfg(test)]
+                    self.startup_phase
+                        .store(4, std::sync::atomic::Ordering::Relaxed);
                     local.native = Some(factory(Arc::downgrade(self))?);
                 }
+                #[cfg(test)]
+                self.startup_phase
+                    .store(5, std::sync::atomic::Ordering::Relaxed);
                 local.native.as_mut().unwrap().read()
             })
         }));
@@ -607,6 +628,41 @@ mod tests {
     /// recorded deadline instant, so a longer harness admission changes no
     /// verdict, only how much contention a single read survives.
     const HARNESS_LIMIT: Duration = Duration::from_secs(10);
+    // Failure diagnostics only: these observations never admit a read, retry,
+    // wait for a worker, or alter the fixed harness deadline. The state probe
+    // is nonblocking so a stuck mutex cannot hide the original timeout.
+    fn startup_diagnostic(reader: &Reader, started: Instant) -> String {
+        let now = Instant::now();
+        let phase = match reader
+            .shared
+            .startup_phase
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => "created",
+            1 => "worker-started",
+            2 => "context-ready",
+            3 => "read-dispatched",
+            4 => "factory-entered",
+            5 => "native-read-entered",
+            _ => "invalid-phase",
+        };
+        let state = match reader.shared.state.try_lock() {
+            Ok(state) => format!(
+                "status={:?}, stopped={}, active={:?}, deadline_elapsed={:?}, completion={}",
+                state.status,
+                state.stopped,
+                state.active.map(|op| op.id),
+                state.active.map(|op| now >= op.deadline),
+                state.completion.is_some(),
+            ),
+            Err(error) => format!("state-lock={error:?}"),
+        };
+        format!(
+            "phase={phase}, owner_finished={:?}, elapsed={:?}, {state}",
+            reader.owner.as_ref().map(|owner| owner.is_finished()),
+            now.saturating_duration_since(started),
+        )
+    }
     fn controlled() -> Harness {
         let (wake, source) = Wake::new().unwrap();
         let loop_ = calloop::EventLoop::try_new().unwrap();
@@ -625,20 +681,75 @@ mod tests {
                 creator: std::thread::current().id(),
             }))
         });
+        let started = Instant::now();
         let reader = Reader::with_factory(&share, &wake, factory, HARNESS_LIMIT);
-        assert_eq!(receive.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
+        let event = receive.recv_timeout(HARNESS_LIMIT).unwrap_or_else(|error| {
+            panic!(
+                "initial native read admission failed: {error:?}; {}",
+                startup_diagnostic(&reader, started)
+            )
+        });
+        assert_eq!(event, "entered");
         (share, reader, receive, send, loop_)
     }
     fn completed(reader: &Reader, loop_: &mut calloop::EventLoop<usize>) -> NightLightConfig {
+        completed_with_poll_clock(reader, loop_, Instant::now)
+    }
+    fn completed_with_poll_clock(
+        reader: &Reader,
+        loop_: &mut calloop::EventLoop<usize>,
+        mut poll_now: impl FnMut() -> Instant,
+    ) -> NightLightConfig {
         let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         loop {
-            if let Some(config) = reader.poll(Instant::now()) {
+            if let Some(config) = reader.poll(poll_now()) {
                 return config;
             }
             let now = Instant::now();
             assert!(now < deadline, "actual worker failed to publish completion");
             loop_.dispatch(Some(deadline - now), &mut count).unwrap();
+        }
+    }
+    #[test]
+    fn watch_harness_clock_excludes_unchanged_periodic_completions() {
+        for periodic_due in [false, true] {
+            let (_, reader, events, answers, mut loop_) = controlled();
+            let poll_at = reader.shared.state.lock().unwrap().last.unwrap();
+            let mut initial = RawSettings::schema_defaults();
+            initial.temperature_k = 2700;
+            answers.send(Ok(initial.into_config())).unwrap();
+            assert_eq!(
+                completed_with_poll_clock(&reader, &mut loop_, || poll_at).temperature_k(),
+                2700,
+            );
+            // Deterministically model a contended consumer whose next poll is
+            // delayed beyond READ_INTERVAL, without sleeping or changing the
+            // production timeout. That periodic read is not a watch callback.
+            let now = if periodic_due {
+                poll_at + READ_INTERVAL
+            } else {
+                poll_at
+            };
+            assert!(reader.poll(now).is_none());
+            if periodic_due {
+                assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "entered");
+                let mut unchanged = RawSettings::schema_defaults();
+                unchanged.temperature_k = 2700;
+                answers.send(Ok(unchanged.into_config())).unwrap();
+                assert_eq!(
+                    completed_with_poll_clock(&reader, &mut loop_, || poll_at).temperature_k(),
+                    2700,
+                    "a periodic completion can precede the actual settings change",
+                );
+            } else {
+                assert!(
+                    events.try_recv().is_err(),
+                    "frozen poll cannot request a read"
+                );
+                assert!(reader.shared.state.lock().unwrap().active.is_none());
+            }
+            retired(reader, &events);
         }
     }
     /// Observing a quarantined worker's exit only synchronizes the test with
@@ -648,6 +759,26 @@ mod tests {
         assert_eq!(events.recv_timeout(HARNESS_LIMIT).unwrap(), "retired");
         reader.owner.take().unwrap().join().unwrap();
         reader
+    }
+    #[test]
+    fn startup_diagnostics_observe_without_waiting_or_changing_admission() {
+        let started = Instant::now();
+        let (_, reader, events, answers, _) = controlled();
+        let before = reader.shared.state.lock().unwrap().active.unwrap();
+        let report = startup_diagnostic(&reader, started);
+        assert!(report.contains("phase=native-read-entered"));
+        assert!(report.contains("status=Unavailable"));
+        assert!(report.contains("owner_finished=Some(false)"));
+        let state = reader.shared.state.lock().unwrap();
+        assert!(startup_diagnostic(&reader, started).contains("WouldBlock"));
+        assert_eq!(state.active.unwrap().id, before.id);
+        assert_eq!(state.active.unwrap().deadline, before.deadline);
+        assert!(!state.stopped);
+        drop(state);
+        answers
+            .send(Ok(RawSettings::schema_defaults().into_config()))
+            .unwrap();
+        retired(reader, &events);
     }
     #[test]
     fn actual_blocked_worker_quarantines_once_denies_late_cache_and_preview_without_replacement() {
@@ -968,6 +1099,11 @@ mod tests {
             .insert_source(source, |_, _, count| *count += 1)
             .unwrap();
         let share = Arc::new(NightLightShare::default());
+        // Only the genuine GIO changed callback may schedule the second read.
+        // Freeze the consumer's refresh clock before initial admission: real
+        // CI contention must not enqueue a periodic pre-mutation completion.
+        // completed_with_poll_clock still enforces its real bounded deadline.
+        let poll_at = Instant::now();
         let reader = Reader::with_factory(
             &share,
             &wake,
@@ -984,7 +1120,10 @@ mod tests {
             }),
             HARNESS_LIMIT,
         );
-        assert_eq!(completed(&reader, &mut loop_).temperature_k(), 2700);
+        assert_eq!(
+            completed_with_poll_clock(&reader, &mut loop_, || poll_at).temperature_k(),
+            2700,
+        );
         let source = glib::idle_source_new(
             Some("tuna-night-light-native-watch-proof"),
             glib::Priority::DEFAULT,
@@ -1003,7 +1142,10 @@ mod tests {
             },
         );
         source.attach(Some(&reader.shared.context));
-        assert_eq!(completed(&reader, &mut loop_).temperature_k(), 3200);
+        assert_eq!(
+            completed_with_poll_clock(&reader, &mut loop_, || poll_at).temperature_k(),
+            3200,
+        );
         reader.shared.quarantine();
         // Tests may join only after the quit callback has actually executed.
         let deadline = Instant::now() + HARNESS_LIMIT;
