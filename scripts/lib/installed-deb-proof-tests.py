@@ -366,7 +366,7 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path.write_text('#!/bin/sh\nset -eu\n' + body + '\n')
                 path.chmod(0o755)
             tool('git', 'echo v0.1.0')
-            tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter"')
+            tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter"')
             tool('dpkg-shlibdeps', 'exit 9' if failure == 'shlibs' else ('echo unknown' if failure == 'malformed' else 'echo "shlibs:Depends=libc6 (>= 2.36)"'))
             tool('dpkg-deb', 'test "$1" = --root-owner-group; test "$2" = --build; test "$(stat -c %a "$3")" = 755; cp "$3/DEBIAN/control" "$OUTPUT"')
             for name in M.BINS:

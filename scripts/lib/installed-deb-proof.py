@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 
-BINS = ('tuna-compositor', 'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-ibus-bridge', 'tuna-greeter')
+BINS = ('tuna-compositor', 'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-ibus-bridge', 'tuna-greeter', 'tuna-wallpaper-svg')
 # Distro LLVM exceeds 128 MiB (libLLVM.so.20.1 is 143,545,784 bytes and is
 # mapped by the GTK shell via Mesa); hashing streams in 64 KiB blocks so the
 # cap bounds proof time, not memory.
