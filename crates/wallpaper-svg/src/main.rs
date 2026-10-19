@@ -1,5 +1,6 @@
 //! The compositor never initializes GdkPixbuf, librsvg or FontConfig. This
 //! single-use process decodes a stream without a base URI, like GNOME's loader.
+mod hash;
 mod modern;
 mod provenance;
 mod resource;
@@ -304,7 +305,7 @@ fn backend_identity(modern: bool) -> Result<serde_json::Value, Box<dyn std::erro
         resources.push(observed);
     }
     Ok(
-        serde_json::json!({"kind":"actual no-base SVG stream loader, owned processors, mapped libraries and FontConfig resources", "sha256":format!("{:x}",hash.finalize()), "resources":resources,"processors":processors,"modern_glycin":modern}),
+        serde_json::json!({"kind":"actual no-base SVG stream loader, owned processors, mapped libraries and FontConfig resources", "sha256":hash::finalize_hex(hash), "resources":resources,"processors":processors,"modern_glycin":modern}),
     )
 }
 
