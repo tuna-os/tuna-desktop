@@ -67,12 +67,13 @@ spektacular version check
 
 ## Project Structure
 
-The project is a Cargo workspace with six crates. Each crate's `README.md`
+The project is a Cargo workspace with seven crates. Each crate's `README.md`
 lists its purpose, public API, and dependents.
 
 ```
 tuna-desktop/
 ├── crates/
+│   ├── backlight/            # tuna-backlight: bounded backlight/owned-connector reads
 │   ├── compositor/           # tuna-compositor and tuna-session binaries (Smithay)
 │   ├── shell-control-schema/ # tuna-shell-control: compositor/shell IPC protocol
 │   ├── shell-host/           # tuna-shell-host: original shell binary and shared shell logic
