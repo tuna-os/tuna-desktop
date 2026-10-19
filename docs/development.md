@@ -22,12 +22,15 @@ whole workspace:
 sudo apt-get install -y \
   libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev \
   libxkbcommon-dev pkg-config libgtk-4-dev libpipewire-0.3-dev \
-  libadwaita-1-dev libpam-wrapper libclang-dev \
+  libfontconfig1-dev librsvg2-common libadwaita-1-dev \
+  libpam-wrapper libpam0g-dev libclang-dev zstd \
+  libglib2.0-dev libglib2.0-bin libglib2.0-dev-bin \
+  python3-yaml gsettings-desktop-schemas \
   meson ninja-build libwayland-dev wayland-protocols
 scripts/ci-install-gtk4-layer-shell
 ```
 
-Ubuntu does not package gtk4-layer-shell, which the GTK shell links;
+Ubuntu 24.04 does not package gtk4-layer-shell, which the GTK shell links;
 `scripts/ci-install-gtk4-layer-shell` builds it from source and installs it
 under `/usr/local`. The `pipewire` crate also needs libclang (`libclang-dev`)
 at build time; GitHub's runners have it preinstalled. `libpam-wrapper` is
@@ -48,7 +51,9 @@ On Arch Linux (TunaOS Marlin's base), the `arch-package` CI job builds with:
 ```sh
 sudo pacman -S --needed base-devel git rust pkgconf clang pipewire gtk4 \
   gtk4-layer-shell libadwaita libxkbcommon libxkbcommon-x11 mesa wayland \
-  dbus glib2 seatd libinput systemd-libs libdrm
+  dbus glib2 seatd libinput systemd-libs libdrm \
+  libsecret libcanberra sound-theme-freedesktop gnome-settings-daemon \
+  librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts namcap
 ```
 
 ### Spektacular CLI (planning work only)
@@ -67,8 +72,8 @@ spektacular version check
 
 ## Project Structure
 
-The project is a Cargo workspace with eight crates. Each crate's `README.md`
-lists its purpose, public API, and dependents.
+The project is a Cargo workspace with nine crates. The crate manifests and
+existing crate `README.md` files describe their purpose and dependencies.
 
 ```
 tuna-desktop/
@@ -80,6 +85,7 @@ tuna-desktop/
 │   ├── shell-gtk/            # tuna-shell-gtk: GTK4/libadwaita shell (ADR 0006)
 │   ├── greeter/              # tuna-greeter: greetd login greeter
 │   ├── wallpaper/            # tuna-wallpaper: wallpaper decoding
+│   ├── wallpaper-svg/        # tuna-wallpaper-svg: bounded native stream helper
 │   └── magnifier/            # tuna-magnifier: shared session magnifier settings
 │
 ├── docs/                     # architecture, roadmap, test strategy, ADRs, guides
