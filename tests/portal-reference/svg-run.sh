@@ -7,8 +7,15 @@ if [ "$(id -u)" -eq 0 ]; then
     chown -R --no-dereference tuna-proof:tuna-proof /out
     status=0
     env -u DBUS_SESSION_BUS_ADDRESS -u TUNA_SVG_BUS runuser -u tuna-proof -- "$0" || status=$?
-    chown -R --no-dereference 0:0 /out
-    exit "$status"
+    # Never traverse artifacts while a writer may still be running.
+    if ! jq -e '.qualified_retirement == true' /out/process-retirement.json >/dev/null; then
+        [ "$status" -eq 0 ] || exit "$status"
+        exit 1
+    fi
+    finalization=0
+    python3 /repo/scripts/lib/tuna-portal-artifact-finalize.py /out --proof-status "$status" || finalization=$?
+    [ "$status" -eq 0 ] || exit "$status"
+    exit "$finalization"
 fi
 if [ -z "${TUNA_SVG_BUS:-}" ]; then TUNA_SVG_BUS=1 exec dbus-run-session -- "$0"; fi
 [ "$(id -u)" -eq 1000 ]
@@ -42,27 +49,42 @@ for name in ['org.gnome.desktop.interface', 'org.gnome.mutter',
     print('keys:', ','.join(sorted(schema.list_keys())))
 SCHEMA
 python3 /repo/scripts/lib/tuna-svg-loader-receipt.py > /out/svg-loader-preflight.log 2>&1
-pids=""
-cleanup() { for pid in $pids; do kill "$pid" 2>/dev/null || true; done; }
+cleanup() {
+    local status=$? retirement=0 pid
+    local -a children
+    trap - EXIT
+    # Snapshot current direct jobs, excluding the already-reaped first session.
+    mapfile -t children < <(jobs -p)
+    python3 /repo/scripts/lib/tuna-portal-artifact-retire.py "$$" "${children[@]}" > /out/process-retirement.json || retirement=$?
+    if [ "$retirement" -eq 0 ]; then
+        if [ -n "${compositor_pid:-}" ]; then
+            wait "$compositor_pid" || retirement=$?
+        fi
+        for pid in "${children[@]}"; do wait "$pid" || true; done
+        if [ "$retirement" -ne 0 ]; then
+            printf '{"qualified_retirement":false,"error":"compositor did not exit normally","compositor_status":%d}\n' "$retirement" > /out/process-retirement.json
+        fi
+    fi
+    [ "$status" -eq 0 ] || exit "$status"
+    exit "$retirement"
+}
 trap cleanup EXIT
-Xvfb :99 -screen 0 1280x800x24 -ac -nolisten tcp >/out/xvfb.log 2>&1 & pids="$pids $!"
+Xvfb :99 -screen 0 1280x800x24 -ac -nolisten tcp >/out/xvfb.log 2>&1 &
 sleep 1
 export WAYLAND_DISPLAY=svg-proof GDK_BACKEND=wayland
 export TUNA_COMPOSITOR_STATE=/out/compositor-state.json
 dbus-update-activation-environment DISPLAY WAYLAND_DISPLAY GDK_BACKEND GTK_A11Y GSETTINGS_BACKEND XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME LC_ALL
-env -u WAYLAND_DISPLAY /candidate/usr/bin/tuna-compositor --backend winit --socket svg-proof --width 1280 --height 800 --shell-bin /candidate/usr/bin/tuna-shell-gtk >/out/compositor.log 2>&1 & compositor_pid=$!; pids="$pids $compositor_pid"
+env -u WAYLAND_DISPLAY /candidate/usr/bin/tuna-compositor --backend winit --socket svg-proof --width 1280 --height 800 --shell-bin /candidate/usr/bin/tuna-shell-gtk >/out/compositor.log 2>&1 & compositor_pid=$!
 end=$((SECONDS + 30))
 until [ -S "$XDG_RUNTIME_DIR/svg-proof" ] && [ -s "$TUNA_COMPOSITOR_STATE" ]; do [ "$SECONDS" -lt "$end" ] || exit 1; sleep .1; done
 python3 /repo/scripts/lib/tuna-stock-svg-proof.py initial > /out/journey-initial.log 2>&1
-shell_pid=$(jq -r '.pid' /out/initial-session.json)
-kill "$compositor_pid"
-kill "$shell_pid" 2>/dev/null || true
-wait "$compositor_pid" || true
+python3 /repo/scripts/lib/tuna-portal-artifact-retire.py "$$" "$compositor_pid" > /out/initial-process-retirement.json
+wait "$compositor_pid"
 # Once both actual owners are gone, remove their private stale socket/lock.
 end=$((SECONDS + 15))
 until gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.NameHasOwner org.gnome.Shell | grep -q false; do [ "$SECONDS" -lt "$end" ] || exit 1; sleep .1; done
 rm -f "$XDG_RUNTIME_DIR/svg-proof" "$XDG_RUNTIME_DIR/svg-proof.lock" "$TUNA_COMPOSITOR_STATE"
-env -u WAYLAND_DISPLAY /candidate/usr/bin/tuna-compositor --backend winit --socket svg-proof --width 1280 --height 800 --shell-bin /candidate/usr/bin/tuna-shell-gtk >/out/compositor-restarted.log 2>&1 & pids="$pids $!"
+env -u WAYLAND_DISPLAY /candidate/usr/bin/tuna-compositor --backend winit --socket svg-proof --width 1280 --height 800 --shell-bin /candidate/usr/bin/tuna-shell-gtk >/out/compositor-restarted.log 2>&1 & compositor_pid=$!
 end=$((SECONDS + 30))
 until [ -S "$XDG_RUNTIME_DIR/svg-proof" ] && [ -s "$TUNA_COMPOSITOR_STATE" ]; do [ "$SECONDS" -lt "$end" ] || exit 1; sleep .1; done
 python3 /repo/scripts/lib/tuna-stock-svg-proof.py restarted > /out/journey-restarted.log 2>&1
