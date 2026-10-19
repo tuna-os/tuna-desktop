@@ -8,9 +8,10 @@
 //!
 //! The loop shape follows upstream `examples/minimal.rs` at the pinned
 //! revision (manual repaint each round, toplevels stacked at the origin);
-//! damage tracking arrives with a later task. Layer-shell is served from
-//! [`State`](crate::State) (see [`crate::layer`]) so the supervised panel
-//! attaches over this same display.
+//! damage-tracked repaints use the same [`native_repaint`](crate::native_repaint)
+//! machinery as the native path, so an unchanged signature submits nothing.
+//! Layer-shell is served from [`State`](crate::State) (see [`crate::layer`])
+//! so the supervised panel attaches over this same display.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -627,6 +628,9 @@ pub struct Runtime {
     /// snapshots; the shell never owns it.
     lock: SessionLock,
     blank: crate::lock::IdleBlank,
+    /// GNOME's desktop-level transitions (lock curtain, hot-corner
+    /// ripples, startup, monitor change), sampled once per frame.
+    transitions: crate::transitions::Transitions,
     screenshot_flashes: crate::screenshot_flash::Flashes,
     screenshot_replies: Vec<PendingScreenshotReply>,
     /// Worker threads (idle watches, Orca, wallpaper, Night Light, IME,
@@ -720,6 +724,13 @@ pub struct Runtime {
     switcher_thumbnails: Vec<tuna_shell_control::SwitcherThumbnail>,
     /// What each output's last drawn frame cost, by output name (#503).
     frame_costs: std::collections::BTreeMap<String, FrameCost>,
+    /// Nested output's damage history across submitted frames. None
+    /// means unknown: the next frame paints complete (first frame,
+    /// resize, or any global drawing change), like the native path.
+    winit_tracker: Option<smithay::backend::renderer::damage::OutputDamageTracker>,
+    /// Signature of the last presented nested frame; unchanged means
+    /// no client, cursor, or effect moved, so the tick submits nothing.
+    winit_signature: Option<crate::native_repaint::FrameSignature>,
     /// When hidden windows last got their throttled frame callbacks
     /// ([`HIDDEN_FRAME_INTERVAL`](crate::occlusion::HIDDEN_FRAME_INTERVAL)).
     hidden_beat: Option<Instant>,
@@ -758,6 +769,10 @@ pub struct Runtime {
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
+    /// Screen magnifier (#349): Settings file cache plus each
+    /// output's tracking state. Captures and casts apply it; the
+    /// lock screen never magnifies.
+    magnifier: crate::magnifier::MagnifierState,
     exit: bool,
     stats: RunStats,
     /// `TUNA_COMPOSITOR_STATE` snapshot path (journeys only).
@@ -815,6 +830,14 @@ impl Drop for Runtime {
 fn unlock_outcome(authenticated: bool, denied: bool) -> (bool, bool) {
     (authenticated, authenticated && !denied)
 }
+
+/// A presented nested frame: its repaint region, cost, and cursor surface.
+/// `None` means the tick submitted nothing (unchanged signature).
+type PresentedFrame = Option<(
+    Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
+    crate::occlusion::FrameCost,
+    Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+)>;
 
 impl Runtime {
     /// Build the session: display plus globals, output, backend window,
@@ -1201,6 +1224,7 @@ impl Runtime {
             triggers: TriggerState::default(),
             lock: SessionLock::new(idle_timeout_ms()),
             blank: crate::lock::IdleBlank::default(),
+            transitions: crate::transitions::Transitions::new(Duration::ZERO),
             screenshot_flashes: Default::default(),
             screenshot_replies: Vec::new(),
             wake,
@@ -1229,6 +1253,8 @@ impl Runtime {
             overview_drag: None,
             switcher_thumbnails: Vec::new(),
             frame_costs: std::collections::BTreeMap::new(),
+            winit_tracker: None,
+            winit_signature: None,
             hidden_beat: None,
             hidden_waiting: false,
             active_at: Instant::now(),
@@ -1267,6 +1293,7 @@ impl Runtime {
             unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idle_monitor: crate::idle_monitor::start(),
+            magnifier: crate::magnifier::MagnifierState::new(),
             exit: false,
             stats: RunStats::default(),
             state_path: std::env::var_os("TUNA_COMPOSITOR_STATE")
@@ -1367,6 +1394,10 @@ impl Runtime {
                 }
                 let (lw, lh) = logical_size(size.w, size.h, self.scale);
                 self.state.set_output_size(lw, lh);
+                // A new size invalidates buffer-age history: the next
+                // frame paints complete.
+                self.winit_tracker = None;
+                self.winit_signature = None;
             }
             WinitEvent::CloseRequested => self.exit = true,
             WinitEvent::Input(event) => {
@@ -1405,6 +1436,29 @@ impl Runtime {
         self.blank.alpha(self.lock.idle_ms(self.lock_now_ms()))
     }
 
+    /// GNOME's ripples out of the hot corner of the monitor under `pos`
+    /// (`layout.js` `HotCorner._toggleOverview`).
+    fn ripple_hot_corner(&mut self, pos: Point<f64, Logical>) {
+        let outputs = self.state.hot_corner_outputs();
+        let rtl = self.input_settings.right_to_left;
+        if let Some((corner, mirrored)) = crate::transitions::hot_corner(&outputs, pos, rtl) {
+            self.transitions.ripple(corner, mirrored);
+        }
+    }
+
+    /// Transition counters for the proofs, the wallpaper's included.
+    fn transitions_diagnostics(&self) -> serde_json::Value {
+        let mut doc = self.transitions.diagnostics();
+        let fade = self.wallpaper.fade_stats();
+        doc["wallpaper_crossfade"] = serde_json::json!({
+            "started": fade.started,
+            "animated_frames": fade.animated_frames,
+            "active": fade.active,
+            "value": fade.value,
+        });
+        doc
+    }
+
     /// Whether the session is locked (hub flag: what the snapshots say).
     fn is_locked(&self) -> bool {
         self.control.is_locked()
@@ -1420,6 +1474,10 @@ impl Runtime {
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
         self.lock.lock();
+        // Pre-lock presses never report repeats or releases across the
+        // lock boundary.
+        self.manager.invalidate_held_accelerators();
+        self.control.cancel_pending_accelerators();
         self.cursor.on_lock();
         self.control.set_locked(true);
         let remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
@@ -1774,6 +1832,10 @@ impl Runtime {
             for (action, time, mode) in self.manager.take_accelerators_fired() {
                 self.control.queue_accelerator(action, time, mode);
             }
+            for (action, time, mode) in self.manager.take_accelerators_released() {
+                self.control
+                    .queue_accelerator_deactivated(action, time, mode);
+            }
             return;
         }
         if waking_blank {
@@ -1877,6 +1939,9 @@ impl Runtime {
                         }
                     }
                     self.control.set_overview(!self.control.overview_open());
+                    if let ManagerInput::CornerPressure { pos, .. } = input {
+                        self.ripple_hot_corner(pos);
+                    }
                     #[cfg(feature = "drm")]
                     if matches!(self.backend, Backend::Drm(_)) {
                         self.performance_trace.input(
@@ -1893,6 +1958,9 @@ impl Runtime {
                         if self.manager.fullscreen_at(*pos));
                     if !blocked {
                         self.control.set_overview(true);
+                        if let ManagerInput::Motion { pos, .. } = input {
+                            self.ripple_hot_corner(pos);
+                        }
                     }
                 }
             }
@@ -1916,6 +1984,10 @@ impl Runtime {
             }
             for (action, time, mode) in self.manager.take_accelerators_fired() {
                 self.control.queue_accelerator(action, time, mode);
+            }
+            for (action, time, mode) in self.manager.take_accelerators_released() {
+                self.control
+                    .queue_accelerator_deactivated(action, time, mode);
             }
             for (index, count) in self.manager.take_workspace_popups() {
                 self.control
@@ -2297,6 +2369,7 @@ impl Runtime {
             .manager
             .workspace_slide()
             .snapshot(self.animation_clock.now());
+        doc["transitions"] = self.transitions_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
         doc["animation_slowdown"] = serde_json::json!(motion.slowdown());
@@ -3055,7 +3128,10 @@ impl Runtime {
 
     /// Render one output's current scene (the primary, or `connector`)
     /// offscreen and read it back in `fourcc` byte order (Abgr8888 is
-    /// RGBA in memory, Xrgb8888 is BGRx). Never while locked.
+    /// RGBA in memory, Xrgb8888 is BGRx). Never while locked. When the
+    /// screen magnifier is on (#349), the read-back frame carries the
+    /// magnified view, so screenshots and casts show actual zoomed
+    /// pixels; the lock screen itself never magnifies.
     fn render_pixels(
         &mut self,
         connector: Option<&str>,
@@ -3089,14 +3165,14 @@ impl Runtime {
         let desktop = self.background_desktop();
         let bell = self.bell_frame();
         let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
-        let (renderer, size, view) = match &mut self.backend {
+        let (renderer, size, view, output_name) = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = backend.window_size();
                 let view = View {
                     offset: (0, 0),
                     scale: self.scale,
                 };
-                (backend.renderer(), size, view)
+                (backend.renderer(), size, view, "tuna-0".to_owned())
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
@@ -3111,7 +3187,7 @@ impl Runtime {
                     offset: out.loc,
                     scale: out.scale,
                 };
-                (renderer, out.size, view)
+                (renderer, out.size, view, out.name.clone())
             }
         };
         let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
@@ -3160,7 +3236,7 @@ impl Runtime {
             view,
             overview.is_none(),
             cards,
-            false,
+            None,
         );
         let damage = Rectangle::from_size(size);
         let mut target = renderer.bind(&mut texture).ok()?;
@@ -3189,7 +3265,54 @@ impl Runtime {
             .copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)
             .ok()?;
         let bytes = renderer.map_texture(&mapping).ok()?.to_vec();
+        let bytes = self.apply_magnifier(&output_name, size.w, size.h, view, bytes);
         Some((size.w, size.h, bytes))
+    }
+
+    /// Magnify a read-back frame when the screen magnifier is on
+    /// (#349): pointer, caret and focus positions feed the per-output
+    /// tracking state, and the region of interest rescales onto the
+    /// viewport. Disabled (or unity) passes the frame through
+    /// untouched; a malformed view keeps the original bytes rather
+    /// than failing the capture.
+    fn apply_magnifier(
+        &mut self,
+        output: &str,
+        w: i32,
+        h: i32,
+        view: View,
+        bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        let pointer = self.manager.pointer_pos();
+        let caret = self.state.ime_cursor_rect().map(|rect| {
+            (
+                f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+                f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+            )
+        });
+        let focus = self
+            .manager
+            .model()
+            .focused()
+            .and_then(|id| self.manager.geometry(id))
+            .map(|rect| {
+                (
+                    f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+                    f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+                )
+            });
+        let inputs = crate::magnifier::TrackingInputs {
+            pointer: (pointer.x, pointer.y),
+            caret,
+            focus,
+        };
+        let Some(active) = self
+            .magnifier
+            .view_for(output, w, h, view.scale, view.offset, inputs)
+        else {
+            return bytes;
+        };
+        crate::magnifier::magnify_frame(&bytes, w, h, active).unwrap_or(bytes)
     }
 
     /// Screen-cast work for this tick (#61): start and stop casts the
@@ -3585,7 +3708,7 @@ impl Runtime {
         }
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
-        self.configure_input_aids(&settings.keyboard_aids);
+        self.configure_input_aids(&settings.keyboard_aids, &settings.pointer_aids);
         self.cursor
             .set_theme(&settings.cursor_theme, settings.cursor_size);
         self.cursor.set_locate_pointer(settings.locate_pointer);
@@ -3596,6 +3719,8 @@ impl Runtime {
             .publish_animations_enabled(settings.motion.animations_enabled());
         self.manager
             .set_motion_allowed(settings.motion.allows_motion());
+        self.transitions.set_policy(settings.motion);
+        self.wallpaper.set_policy(settings.motion);
         if !settings.motion.allows_motion() {
             self.overview_motion.snap(self.control.overview_open());
         }
@@ -3665,6 +3790,38 @@ impl Runtime {
     /// next frame. The sensor may immediately override a built-in
     /// panel's rotation while orientation lock is off (#345).
     fn apply_monitors(&mut self, configs: &[crate::monitors::MonitorConfig]) {
+        // GNOME's ScreenTransition: picture the old layout first.
+        let before = (self.state.hot_corner_outputs(), self.scale.to_bits());
+        let snapshots = if self.transitions.wants_screen_snapshot() {
+            self.screen_snapshots()
+        } else {
+            Vec::new()
+        };
+        self.arrange_monitors(configs);
+        if (self.state.hot_corner_outputs(), self.scale.to_bits()) != before {
+            self.transitions.screen_changed(snapshots);
+        }
+    }
+
+    /// Each output's current picture (`None`: the nested window), for
+    /// the monitor-change fade. Empty while locked.
+    fn screen_snapshots(&mut self) -> Vec<(Option<String>, i32, i32, Vec<u8>)> {
+        use smithay::backend::allocator::Fourcc;
+        let names: Vec<Option<String>> = match &self.backend {
+            Backend::Winit(_) => vec![None],
+            #[cfg(feature = "drm")]
+            Backend::Drm(drm) => drm.outputs.iter().map(|o| Some(o.name.clone())).collect(),
+        };
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let (w, h, pixels) = self.render_pixels(name.as_deref(), Fourcc::Xrgb8888)?;
+                Some((name, w, h, pixels))
+            })
+            .collect()
+    }
+
+    fn arrange_monitors(&mut self, configs: &[crate::monitors::MonitorConfig]) {
         let scale_of = |s: f64| {
             if s == 1.0 {
                 Scale::Integer(1)
@@ -3859,6 +4016,8 @@ impl Runtime {
             || self.cursor.animating(clock)
             || self.wellbeing_effects.animating(clock)
             || self.screenshot_flashes.running()
+            || self.transitions.running()
+            || self.wallpaper.fade_stats().active
             || !self.screenshot_replies.is_empty()
             || self.tile_animation.as_ref().is_some_and(|(_, _, start)| {
                 clock.saturating_sub(*start).as_secs_f64()
@@ -3993,6 +4152,13 @@ impl Runtime {
         // short comparison. The inventory is the compositor's tracking
         // handed over as-is — never a parallel database.
         self.control.set_outputs(self.state.output_infos());
+        #[allow(unused_mut)]
+        let mut native_outputs = Vec::new();
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &self.backend {
+            native_outputs = drm.native_outputs();
+        }
+        self.control.set_native_outputs(native_outputs);
         let pointer = self.manager.pointer_pos();
         let output = self
             .state
@@ -4053,6 +4219,9 @@ impl Runtime {
         if let Some(settings) = outcome.input_settings {
             self.apply_input_settings(settings);
         }
+        if let Some(click) = outcome.dwell_click {
+            self.set_dwell_click_type(click);
+        }
         if let Some((grayscale, fade)) = outcome.wellbeing_effects {
             self.wellbeing_effects.set(
                 grayscale,
@@ -4080,7 +4249,7 @@ impl Runtime {
                 });
         }
         if let Some(list) = outcome.accelerators {
-            self.manager.set_accelerators(list);
+            self.manager.set_accelerator_grabs(list);
             self.manager.trace_media_accelerators(self.is_locked());
         }
         for (window, action) in outcome.window_actions {
@@ -4451,6 +4620,24 @@ impl Runtime {
         let blank_alpha = self.blank_alpha();
         let night_gains = self.night_light_tick();
         let show_content = content_visible(locked);
+        let lock_ready = locked
+            && self
+                .state
+                .primary_output_name()
+                .and_then(|name| self.state.lock_surface_for(&name))
+                .is_some();
+        let shell_ready = !crate::layer::layer_layout(&self.state).is_empty();
+        // Animation time, so proofs can sample transitions at exact delays.
+        let now = self.animation_clock.now();
+        if self.animation_clock.is_manual() {
+            self.transitions.skip_startup();
+        }
+        self.wallpaper.set_time(now);
+        self.transitions
+            .advance(now, locked, lock_ready, shell_ready);
+        // While locked the curtain carries the lock surface and its
+        // background; it never uncovers content (`show_content`).
+        let lock_curtain = self.transitions.curtain().filter(|_| locked);
         let overlay_visible = self.overlay.visible;
         let background = if locked {
             // GNOME's lock screen dims the desktop to 65%; without a
@@ -4569,9 +4756,8 @@ impl Runtime {
             Backend::Winit(backend) => {
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
-                let damage = Rectangle::from_size(size);
-                let drawn;
-                let presented_cursor;
+                let age = backend.buffer_age().unwrap_or(0);
+                let mut presented: PresentedFrame = None;
                 {
                     let (renderer, mut framebuffer) = backend
                         .bind()
@@ -4591,7 +4777,10 @@ impl Runtime {
                         view,
                         show_content,
                         overview.as_ref(),
-                        lock_surface.as_ref(),
+                        lock_surface
+                            .as_ref()
+                            .zip(lock_curtain)
+                            .map(|(surface, curtain)| (surface, curtain, size.h)),
                         tile.as_ref()
                             .and_then(|(id, _)| self.manager.surface_of(*id))
                             .as_ref(),
@@ -4627,6 +4816,15 @@ impl Runtime {
                         view,
                         show_paper,
                         cards,
+                        lock_curtain,
+                    );
+                    elements.effects = self.transitions.overlay(
+                        renderer,
+                        &mut self.wallpaper,
+                        view,
+                        size,
+                        background_geometry(size, view, desktop),
+                        None,
                         locked,
                     );
                     let cursor = self.cursor.elements(
@@ -4638,62 +4836,161 @@ impl Runtime {
                         cursor_now,
                         accent,
                     );
-                    presented_cursor = crate::cursor::presented_surface(
+                    let presented_cursor = crate::cursor::presented_surface(
                         &cursor,
                         &cursor_what,
                         view.scale,
                         Rectangle::from_size(size),
                     );
-                    // The winit EGL surface presents bottom-up (see the
-                    // Y-flip in the backend's own damage path), so the
-                    // output transform mirrors vertically; placements
-                    // stay top-down.
-                    let mut frame = renderer
-                        .render(&mut framebuffer, size, Transform::Flipped180)
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                    let drew = draw_scene(
-                        &mut frame,
+                    use crate::native_repaint::{FrameSignature, Tracked};
+                    // Tracked damage, like the native path: one damage
+                    // computation over front-to-back passes, then draw
+                    // and submit only that region. An unchanged
+                    // signature submits nothing, so idle clients keep
+                    // their cadence instead of repainting every tick.
+                    let [cursor_images, cursor_surface] =
+                        crate::cursor::tracked(&cursor, view.scale, Rectangle::from_size(size));
+                    let passes = [
+                        Tracked::pass(&paper, 1.0),
+                        Tracked::pass(&previews, view.scale),
+                        Tracked::pass(&elements.elements, view.scale),
+                        Tracked::pass(&elements.tile, 1.0),
+                        Tracked::pass(&elements.top, view.scale),
+                        elements
+                            .bell
+                            .iter()
+                            .rev()
+                            .map(|(_, e)| Tracked::new(e, 1.0))
+                            .collect(),
+                        elements
+                            .snapshots
+                            .iter()
+                            .rev()
+                            .map(|(_, e, _)| Tracked::new(e, 1.0))
+                            .collect(),
+                        Tracked::pass(&elements.flashes, 1.0),
+                        Tracked::pass(&elements.effects.textures, 1.0),
+                        Tracked::pass(&elements.effects.solids, 1.0),
+                        cursor_images,
+                        cursor_surface,
+                    ];
+                    let signature = FrameSignature {
+                        size: (size.w, size.h),
+                        location: (0, 0),
+                        scale: view.scale,
+                        transform: 0,
+                        locked,
                         background,
-                        &paper,
-                        &elements,
-                        Target {
-                            damage: &[damage],
-                            scale: view.scale,
-                            blank_alpha,
-                            tint: night_tint.as_ref(),
-                        },
-                        &decor,
-                        &previews,
-                    )?;
-                    drawn = FrameCost::new(&drew, &elements.owners, &[damage], size);
-                    crate::cursor::draw(&mut frame, &cursor, view.scale, &[damage])
+                        blank_alpha,
+                        accent,
+                        decor: decor.clone(),
+                        above: elements.above,
+                        effects: elements
+                            .brightness
+                            .iter()
+                            .copied()
+                            .chain(elements.snapshots.iter().map(|s| s.2))
+                            .map(f32::to_bits)
+                            .chain(self.night_light.effect_bits())
+                            .chain(wellbeing.bits())
+                            .collect(),
+                        groups: FrameSignature::groups(&passes),
+                    };
+                    let mut roots: Vec<_> =
+                        crate::frame_timing::drawn_roots(&self.state, &self.manager, locked)
+                            .into_iter()
+                            .map(|(surface, _)| surface)
+                            .collect();
+                    roots.extend(lock_surface.clone());
+                    roots.extend(presented_cursor.clone());
+                    let timing = crate::frame_timing::pending_callbacks(&roots);
+                    // Proof harnesses drive time manually and count
+                    // presented frames for liveness; a manually-stepped
+                    // clock presents every tick, like before.
+                    let present = self.animation_clock.is_manual()
+                        || crate::native_repaint::needs_repaint(
+                            self.winit_signature.as_ref(),
+                            &signature,
+                            timing,
+                        );
+                    let reset = self
+                        .winit_signature
+                        .as_ref()
+                        .is_none_or(|old| !signature.same_global_drawing(old));
+                    if reset {
+                        self.winit_tracker = None;
+                    }
+                    if present {
+                        let tracker = self.winit_tracker.get_or_insert_with(|| {
+                            smithay::backend::renderer::damage::OutputDamageTracker::new(
+                                size,
+                                1.0,
+                                Transform::Normal,
+                            )
+                        });
+                        let damage = crate::native_repaint::damage_region(
+                            tracker,
+                            if reset { 0 } else { age },
+                            &passes,
+                        )
                         .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                    let _ = frame
-                        .finish()
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        self.winit_signature = Some(signature);
+                        // The winit EGL surface presents bottom-up (see the
+                        // Y-flip in the backend's own damage path), so the
+                        // output transform mirrors vertically; placements
+                        // stay top-down.
+                        let mut frame = renderer
+                            .render(&mut framebuffer, size, Transform::Flipped180)
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let drew = draw_scene(
+                            &mut frame,
+                            background,
+                            &paper,
+                            &elements,
+                            Target {
+                                damage: &damage,
+                                scale: view.scale,
+                                blank_alpha,
+                                tint: night_tint.as_ref(),
+                            },
+                            &decor,
+                            &previews,
+                        )?;
+                        crate::cursor::draw(&mut frame, &cursor, view.scale, &damage)
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let _ = frame
+                            .finish()
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
+                        presented = Some((damage, cost, presented_cursor));
+                    }
                 }
-                self.frame_costs.insert("winit".to_owned(), drawn);
-                send_surface_scales(&self.state, &self.manager);
-                backend
-                    .submit(Some(&[damage]))
-                    .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                if let Some(surface) = &presented_cursor {
-                    crate::cursor::Cursor::frame_done(
-                        &crate::cursor::Pointer::Surface(surface.clone()),
-                        cursor_now,
+                if let Some((damage, drawn, presented_cursor)) = presented {
+                    self.frame_costs.insert("winit".to_owned(), drawn);
+                    send_surface_scales(&self.state, &self.manager);
+                    backend
+                        .submit(Some(&damage))
+                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    if let Some(surface) = &presented_cursor {
+                        crate::cursor::Cursor::frame_done(
+                            &crate::cursor::Pointer::Surface(surface.clone()),
+                            cursor_now,
+                        );
+                    }
+                    // The host took the frame: presentation feedback,
+                    // fifo barriers and commit timers (#89).
+                    crate::frame_timing::present_nested_frame_with_cursor(
+                        &mut self.state,
+                        &self.manager,
+                        locked,
+                        self.stats.frames,
+                        presented_cursor,
                     );
+                    self.stats.frames += 1;
+                    true
+                } else {
+                    false
                 }
-                // The host took the frame: presentation feedback,
-                // fifo barriers and commit timers (#89).
-                crate::frame_timing::present_nested_frame_with_cursor(
-                    &mut self.state,
-                    &self.manager,
-                    locked,
-                    self.stats.frames,
-                    presented_cursor,
-                );
-                self.stats.frames += 1;
-                true
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
@@ -4732,6 +5029,13 @@ impl Runtime {
                     let lock_surface = locked
                         .then(|| self.state.lock_surface_for(&out.name))
                         .flatten();
+                    // Rotation (#345): the tracker holds the output
+                    // transform while Smithay renders inverted (see
+                    // `orientation::render_transform`); layout, damage
+                    // and the wallpaper all work in the pre-transform
+                    // frame, whose physical size swaps at 90°/270°.
+                    let output_transform = crate::orientation::smithay_transform(out.transform);
+                    let logical = output_transform.transform_size(size);
                     let mut elements = scene_elements(
                         renderer,
                         &self.manager,
@@ -4739,7 +5043,10 @@ impl Runtime {
                         view,
                         show_content,
                         overview.as_ref(),
-                        lock_surface.as_ref(),
+                        lock_surface
+                            .as_ref()
+                            .zip(lock_curtain)
+                            .map(|(surface, curtain)| (surface, curtain, logical.h)),
                         tile.as_ref()
                             .and_then(|(id, _)| self.manager.surface_of(*id))
                             .as_ref(),
@@ -4768,13 +5075,6 @@ impl Runtime {
                     install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
                     let previews = preview_elements(renderer, &self.manager, view, cards);
-                    // Rotation (#345): the tracker holds the output
-                    // transform while Smithay renders inverted (see
-                    // `orientation::render_transform`); layout, damage
-                    // and the wallpaper all work in the pre-transform
-                    // frame, whose physical size swaps at 90°/270°.
-                    let output_transform = crate::orientation::smithay_transform(out.transform);
-                    let logical = output_transform.transform_size(size);
                     let paper = backdrop(
                         &mut self.wallpaper,
                         renderer,
@@ -4782,6 +5082,15 @@ impl Runtime {
                         view,
                         show_paper,
                         cards,
+                        lock_curtain,
+                    );
+                    elements.effects = self.transitions.overlay(
+                        renderer,
+                        &mut self.wallpaper,
+                        view,
+                        logical,
+                        background_geometry(logical, view, desktop),
+                        Some(out.name.as_str()),
                         locked,
                     );
                     let cursor = self.cursor.elements(
@@ -4793,8 +5102,35 @@ impl Runtime {
                         cursor_now,
                         accent,
                     );
-                    use crate::native_repaint::{ElementSignature, FrameSignature};
-                    let mut signature = FrameSignature {
+                    use crate::native_repaint::{FrameSignature, Tracked};
+                    let [cursor_images, cursor_surface] =
+                        crate::cursor::tracked(&cursor, view.scale, Rectangle::from_size(logical));
+                    // Bottom to top, each pass at the scale it draws with.
+                    let passes = [
+                        Tracked::pass(&paper, 1.0),
+                        Tracked::pass(&previews, view.scale),
+                        Tracked::pass(&elements.elements, view.scale),
+                        Tracked::pass(&elements.tile, 1.0),
+                        Tracked::pass(&elements.top, view.scale),
+                        elements
+                            .bell
+                            .iter()
+                            .rev()
+                            .map(|(_, e)| Tracked::new(e, 1.0))
+                            .collect(),
+                        elements
+                            .snapshots
+                            .iter()
+                            .rev()
+                            .map(|(_, e, _)| Tracked::new(e, 1.0))
+                            .collect(),
+                        Tracked::pass(&elements.flashes, 1.0),
+                        Tracked::pass(&elements.effects.textures, 1.0),
+                        Tracked::pass(&elements.effects.solids, 1.0),
+                        cursor_images,
+                        cursor_surface,
+                    ];
+                    let signature = FrameSignature {
                         size: (size.w, size.h),
                         location: out.loc,
                         scale: out.scale,
@@ -4816,52 +5152,8 @@ impl Runtime {
                             .chain(self.night_light.effect_bits())
                             .chain(wellbeing.bits())
                             .collect(),
-                        groups: vec![
-                            elements
-                                .flashes
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            paper
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            previews
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .elements
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .tile
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            elements
-                                .top
-                                .iter()
-                                .map(|e| ElementSignature::capture(e, view.scale))
-                                .collect(),
-                            elements
-                                .bell
-                                .iter()
-                                .map(|(_, e)| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                            elements
-                                .snapshots
-                                .iter()
-                                .map(|(_, e, _)| ElementSignature::capture(e, 1.0))
-                                .collect(),
-                        ],
+                        groups: FrameSignature::groups(&passes),
                     };
-                    signature.groups.extend(crate::cursor::signatures(
-                        &cursor,
-                        view.scale,
-                        Rectangle::from_size(logical),
-                    ));
                     let presented_cursor = crate::cursor::presented_surface(
                         &cursor,
                         &cursor_what,
@@ -4913,7 +5205,7 @@ impl Runtime {
                     let damage = crate::native_repaint::damage_region(
                         tracker,
                         if reset { 0 } else { usize::from(age) },
-                        &signature,
+                        &passes,
                     )
                     .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     let cost;
@@ -5230,6 +5522,9 @@ struct Scene {
     top: Vec<PreviewElement>,
     /// Capture feedback is painted only on outputs, never into saved pixels.
     flashes: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
+    /// Desktop transitions over the scene, under the screenshot flash
+    /// (`crate::transitions`); output feedback only, never captured.
+    effects: crate::transitions::Overlay,
     bell: Vec<(
         Option<usize>,
         smithay::backend::renderer::element::solid::SolidColorRenderElement,
@@ -5268,6 +5563,7 @@ impl Scene {
             tile: Vec::new(),
             top: Vec::new(),
             flashes: Vec::new(),
+            effects: Default::default(),
             bell: Vec::new(),
             snapshots: Vec::new(),
             brightness: vec![1.0; above],
@@ -5491,20 +5787,25 @@ fn scene_elements(
     view: View,
     show_content: bool,
     overview: Option<&crate::overview::OverviewLayout>,
-    lock: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    lock: Option<(
+        &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        crate::transitions::CurtainFrame,
+        i32,
+    )>,
     split: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
 ) -> Scene {
     if !show_content {
         // Locked: only the shell's lock surface for this output, at its
-        // origin (ext-session-lock); nothing else may show.
+        // origin (ext-session-lock) less the curtain's lift; nothing
+        // else may show.
         return Scene::flat(
-            lock.map(|surface| {
+            lock.map(|(surface, curtain, height)| {
                 render_elements_from_surface_tree(
                     renderer,
                     surface,
-                    (0, 0),
+                    (0, -curtain.lift_px(height)),
                     view.scale,
-                    1.0,
+                    curtain.alpha,
                     Kind::Unspecified,
                 )
             })
@@ -5767,6 +6068,7 @@ fn scene_elements(
         tile: Vec::new(),
         top: Vec::new(),
         flashes: Vec::new(),
+        effects: Default::default(),
         bell: Vec::new(),
         snapshots,
         owners: crate::layer::front_to_back(owners),
@@ -5796,24 +6098,29 @@ fn backdrop(
     view: View,
     show_paper: bool,
     cards: Option<&crate::overview::OverviewLayout>,
-    locked: bool,
+    curtain: Option<crate::transitions::CurtainFrame>,
 ) -> Vec<smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>>
 {
     let size = smithay::utils::Size::<i32, smithay::utils::Physical>::from((
         geometry.physical[0] as i32,
         geometry.physical[1] as i32,
     ));
-    if locked {
+    // Locked: the lock background, on the curtain.
+    if let Some(curtain) = curtain {
         return wallpaper
-            .lock_element(renderer, size.w, size.h, geometry)
+            .lock_element(
+                renderer,
+                size.w,
+                size.h,
+                geometry,
+                curtain.lift_px(size.h),
+                curtain.alpha,
+            )
             .into_iter()
             .collect();
     }
     if show_paper {
-        return wallpaper
-            .element(renderer, size.w, size.h, geometry)
-            .into_iter()
-            .collect();
+        return wallpaper.element(renderer, size.w, size.h, geometry);
     }
     let Some(layout) = cards else {
         return Vec::new();
@@ -5921,6 +6228,8 @@ fn draw_scene(
     });
     let shield_plan = occlusion.plan(1.0, shield.as_slice());
     let flash_plan = occlusion.plan(1.0, &scene.flashes);
+    let effect_solids_plan = occlusion.plan(1.0, &scene.effects.solids);
+    let effect_textures_plan = occlusion.plan(1.0, &scene.effects.textures);
     let fullscreen_bell: Vec<_> = scene
         .bell
         .iter()
@@ -5973,6 +6282,10 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
     frame.clear_tex_program_override();
     draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.textures, &effect_textures_plan)
+        .map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.solids, &effect_solids_plan)
+        .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];

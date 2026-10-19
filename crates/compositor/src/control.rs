@@ -44,11 +44,16 @@ use tuna_shell_control::{
 };
 
 use crate::lockdown::{LockdownPolicy, RestrictedAction};
-use crate::state::{StateChange, StateModel, TokenStore, WindowEntry};
+use crate::state::{StateChange, StateModel, TokenPolicy, TokenStore, WindowEntry};
 
 /// How soon the hub wants another [`ControlHub::poll`] while a handshake
 /// is due or a broadcast is owed after backpressure (one display frame).
 pub const RETRY: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// How often the hub reissues every window's activation token: half the
+/// token lifetime, so the shell always holds one that has not expired.
+pub const TOKEN_REISSUE: std::time::Duration =
+    std::time::Duration::from_millis(TokenPolicy::MAX_AGE_MS / 2);
 
 /// Transport and protocol failures, shared with the shell-host endpoint.
 ///
@@ -316,14 +321,15 @@ pub struct Session<'a> {
     /// snapshot (resnapshot rule for lock transitions): locking strips
     /// window content, unlocking restores it.
     locked_sent: bool,
+    peer_minor: u16,
     /// Window ids the shell asked to close this round (`CloseWindow`
     /// commands the mirror applied). Drained by [`ControlHub::poll`]
     /// so the runtime can send the polite client close.
     closed: Vec<u64>,
     /// Latest `SetIdleTimeout` from the shell, drained by the hub.
     idle_timeout: Option<u64>,
-    /// The latest SetAccelerators the shell sent, until drained.
-    accelerators: Option<Vec<tuna_shell_control::Accelerator>>,
+    /// The latest accelerator grabs the shell sent, until drained.
+    accelerators: Option<Vec<tuna_shell_control::AcceleratorGrab>>,
     /// Window-menu actions the shell asked for, until drained.
     window_actions: Vec<(u64, tuna_shell_control::WindowAction)>,
     shortcut_consent: Vec<(u64, bool)>,
@@ -342,6 +348,8 @@ pub struct Session<'a> {
     icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     screen_reader: Option<bool>,
     screenshot_pointer: Option<(i32, i32)>,
+    /// The hover-click chooser's latest pick, drained by the hub.
+    dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Input-source switches the shell asked for (`true` backward).
     input_source_switches: Vec<bool>,
     /// The switcher's thumbnail frames, when the shell sent new ones.
@@ -424,6 +432,7 @@ impl<'a> Session<'a> {
             overview,
             locked,
             locked_sent,
+            peer_minor: 0,
             closed: Vec::new(),
             idle_timeout: None,
             accelerators: None,
@@ -438,6 +447,7 @@ impl<'a> Session<'a> {
             icon_geometries: None,
             screen_reader: None,
             screenshot_pointer: None,
+            dwell_click: None,
             input_source_switches: Vec::new(),
             switcher_thumbnails: None,
             switcher_keys: None,
@@ -477,6 +487,7 @@ impl<'a> Session<'a> {
                 current: CURRENT_VERSION,
             }));
         }
+        session.peer_minor = version.minor;
         // Same major line: accept any minor (lenient reader on our side).
         session.conn.write_frame(&Message::Hello {
             version: CURRENT_VERSION,
@@ -521,6 +532,21 @@ impl<'a> Session<'a> {
         })
     }
 
+    /// Send the native DRM connector authority inventory. Peers older
+    /// than 0.37 cannot decode it and receive nothing; an empty list
+    /// explicitly revokes authority sent earlier.
+    pub fn send_native_outputs(
+        &mut self,
+        outputs: &[tuna_shell_control::NativeOutputInfo],
+    ) -> Result<(), ControlError> {
+        if self.peer_minor < 37 {
+            return Ok(());
+        }
+        self.conn.write_frame(&Message::NativeOutputInventory {
+            outputs: outputs.to_vec(),
+        })
+    }
+
     /// The latest `SetIdleTimeout` the shell sent, once (#63).
     pub fn take_idle_timeout(&mut self) -> Option<u64> {
         self.idle_timeout.take()
@@ -548,8 +574,9 @@ impl<'a> Session<'a> {
         self.conn.write_frame(menu)
     }
 
-    /// The latest `SetAccelerators` the shell sent, once.
-    pub fn take_accelerators(&mut self) -> Option<Vec<tuna_shell_control::Accelerator>> {
+    /// The latest accelerator grabs the shell sent (`SetAcceleratorGrabs`,
+    /// or legacy `SetAccelerators` without flags), once.
+    pub fn take_accelerators(&mut self) -> Option<Vec<tuna_shell_control::AcceleratorGrab>> {
         self.accelerators.take()
     }
 
@@ -562,6 +589,21 @@ impl<'a> Session<'a> {
     ) -> Result<(), ControlError> {
         self.conn
             .write_frame(&Message::AcceleratorActivated { action, time, mode })
+    }
+
+    /// Report a `GRAB_TRIGGER_RELEASE` grab's release. Peers older than
+    /// 0.38 cannot decode it and receive nothing.
+    pub fn send_accelerator_deactivated(
+        &mut self,
+        action: u32,
+        time: u32,
+        mode: u32,
+    ) -> Result<(), ControlError> {
+        if self.peer_minor < 38 {
+            return Ok(());
+        }
+        self.conn
+            .write_frame(&Message::AcceleratorDeactivated { action, time, mode })
     }
 
     /// Send where the overview's window previews sit.
@@ -719,6 +761,17 @@ impl<'a> Session<'a> {
                     },
                 })?;
                 Ok(Handled::CommandResult { id, applied: valid })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::SetDwellClickType { click },
+            } => {
+                self.dwell_click = Some(click);
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
             }
             Message::Command {
                 id,
@@ -880,7 +933,37 @@ impl<'a> Session<'a> {
             } => {
                 // Session-level grabs, applied by the window manager's
                 // key filter (drained by the hub).
-                self.accelerators = Some(accelerators);
+                // Legacy grabs carry no GNOME flags.
+                self.accelerators = Some(
+                    accelerators
+                        .into_iter()
+                        .map(|accelerator| tuna_shell_control::AcceleratorGrab {
+                            accelerator,
+                            flags: 0,
+                        })
+                        .collect(),
+                );
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::SetAcceleratorGrabs { grabs },
+            } => {
+                if self.peer_minor < 38 {
+                    self.conn.write_frame(&Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        message: "accelerator grab flags require negotiated minor 38".into(),
+                    })?;
+                    return Ok(Handled::ErrorSent {
+                        kind: ErrorKind::UnknownCommand,
+                    });
+                }
+                // Decoding already bounded the list and its flags.
+                self.accelerators = Some(grabs);
                 self.conn.write_frame(&Message::CommandResult {
                     id,
                     status: CommandStatus::Applied,
@@ -947,15 +1030,19 @@ impl<'a> Session<'a> {
             | Message::CommandResult { .. }
             | Message::Overview { .. }
             | Message::Switcher { .. }
+            | Message::NativeOutputInventory { .. }
             | Message::Outputs { .. }
             | Message::Environment { .. }
             | Message::OverviewPreviews { .. }
             | Message::AcceleratorActivated { .. }
+            | Message::AcceleratorDeactivated { .. }
             | Message::WindowMenu { .. }
             | Message::WorkspacePopup { .. }
             | Message::PointerOutput { .. }
             | Message::ScreenReader { .. }
             | Message::KeyboardAidToggled { .. }
+            | Message::DwellClickType { .. }
+            | Message::PointerTimeout { .. }
             | Message::ShortcutConsent { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
@@ -977,6 +1064,7 @@ fn decode_error_to_wire(e: &DecodeError) -> (ErrorKind, String) {
         DecodeError::IncompatibleVersion { .. } => (ErrorKind::IncompatibleVersion, e.to_string()),
         DecodeError::Truncated { .. }
         | DecodeError::Malformed(_)
+        | DecodeError::CollectionTooLong { .. }
         | DecodeError::TitleTooLong { .. } => (ErrorKind::MalformedFrame, e.to_string()),
     }
 }
@@ -992,16 +1080,20 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::Error { .. } => "Error",
         Message::Overview { .. } => "Overview",
         Message::Switcher { .. } => "Switcher",
+        Message::NativeOutputInventory { .. } => "NativeOutputInventory",
         Message::Outputs { .. } => "Outputs",
         Message::Environment { .. } => "Environment",
         Message::OverviewPreviews { .. } => "OverviewPreviews",
         Message::AcceleratorActivated { .. } => "AcceleratorActivated",
+        Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ScreenReader { .. } => "ScreenReader",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
+        Message::DwellClickType { .. } => "DwellClickType",
+        Message::PointerTimeout { .. } => "PointerTimeout",
     }
 }
 
@@ -1119,6 +1211,9 @@ fn apply_command(
                 );
             }
             let _ = model.set_focused(Some(*window));
+            // The token is spent: the next delta carries a fresh one, so
+            // the shell can activate this window again (window cycling).
+            model.reissue(Some(*window));
             (CommandStatus::Applied, None)
         }
         CommandKind::FocusWorkspace { workspace } => {
@@ -1166,6 +1261,7 @@ fn apply_command(
         | CommandKind::SetOverviewAppGrid { .. }
         | CommandKind::Unlock { .. }
         | CommandKind::SetAccelerators { .. }
+        | CommandKind::SetAcceleratorGrabs { .. }
         | CommandKind::WindowAction { .. }
         | CommandKind::ShortcutConsent { .. }
         | CommandKind::SwitchInputSource { .. }
@@ -1175,6 +1271,7 @@ fn apply_command(
         | CommandKind::SetSwitcherKeys { .. }
         | CommandKind::MoveScreenshotPointer { .. }
         | CommandKind::SetScreenReader { .. }
+        | CommandKind::SetDwellClickType { .. }
         | CommandKind::SetInputSettings(_) => (CommandStatus::Applied, None),
         CommandKind::Lock => {
             // Manual lock from the shell (session-lock set path):
@@ -1217,8 +1314,10 @@ pub struct PollOutcome {
     pub icon_geometries: Option<Vec<tuna_shell_control::WindowIconGeometry>>,
     pub screen_reader: Option<bool>,
     pub screenshot_pointer: Option<(i32, i32)>,
+    /// The hover-click chooser's pick, if the shell sent one.
+    pub dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Accelerator grabs the shell sent, if they changed.
-    pub accelerators: Option<Vec<tuna_shell_control::Accelerator>>,
+    pub accelerators: Option<Vec<tuna_shell_control::AcceleratorGrab>>,
     /// Window-menu actions to carry out.
     pub window_actions: Vec<(u64, tuna_shell_control::WindowAction)>,
     /// Trusted shell decisions for pending inhibitors.
@@ -1364,7 +1463,7 @@ pub struct ControlHub {
     /// every live session exactly once, retained until all sends land.
     switcher_queue: Vec<SwitcherAction>,
     /// Accelerator presses waiting for the next poll.
-    accelerator_queue: Vec<(u32, u32, u32)>,
+    accelerator_queue: Vec<(u32, u32, u32, bool)>,
     /// Window-menu requests waiting for the next poll.
     menu_queue: Vec<Message>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
@@ -1372,10 +1471,12 @@ pub struct ControlHub {
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
     /// whenever it differs from `outputs_sent`.
     outputs: Vec<OutputInfo>,
+    native_outputs: Vec<tuna_shell_control::NativeOutputInfo>,
     pointer_output: Option<String>,
     /// Inventory value every live session holds; a mismatch means a
     /// broadcast is still owed (or a newcomer joined mid-state).
     outputs_sent: Vec<OutputInfo>,
+    native_outputs_sent: Vec<tuna_shell_control::NativeOutputInfo>,
     /// Session environment for launched apps (#59), and the last value
     /// every live session holds.
     environment: Vec<(String, String)>,
@@ -1398,6 +1499,9 @@ pub struct ControlHub {
     /// Connections refused by the gate or the pending cap, for
     /// diagnostics (a count only; never peer details).
     refused: u64,
+    /// When every window's activation token was last reissued; see
+    /// [`TOKEN_REISSUE`].
+    tokens_reissued: std::time::Instant,
 }
 
 impl ControlHub {
@@ -1457,8 +1561,10 @@ impl ControlHub {
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
             outputs: Vec::new(),
+            native_outputs: Vec::new(),
             pointer_output: None,
             outputs_sent: Vec::new(),
+            native_outputs_sent: Vec::new(),
             environment: Vec::new(),
             environment_sent: Vec::new(),
             previews: (Vec::new(), None),
@@ -1472,6 +1578,7 @@ impl ControlHub {
             pending_peers: Vec::new(),
             fresh_peers: Vec::new(),
             refused: 0,
+            tokens_reissued: std::time::Instant::now(),
         })
     }
 
@@ -1642,6 +1749,14 @@ impl ControlHub {
         self.outputs = outputs;
     }
 
+    /// Refresh the native DRM connector authority; the next
+    /// [`poll`](Self::poll) broadcasts a change as
+    /// [`Message::NativeOutputInventory`] (empty revokes it). Nested
+    /// sessions always set an empty inventory.
+    pub fn set_native_outputs(&mut self, outputs: Vec<tuna_shell_control::NativeOutputInfo>) {
+        self.native_outputs = outputs;
+    }
+
     /// Set the session environment (#59); the next [`poll`](Self::poll)
     /// broadcasts it when it differs from the last broadcast, and every
     /// newcomer gets it right after the handshake.
@@ -1791,7 +1906,18 @@ impl ControlHub {
 
     /// Report a grabbed accelerator's press to the shell on the next poll.
     pub fn queue_accelerator(&mut self, action: u32, time: u32, mode: u32) {
-        self.accelerator_queue.push((action, time, mode));
+        self.accelerator_queue.push((action, time, mode, false));
+    }
+
+    /// Report a `GRAB_TRIGGER_RELEASE` grab's release on the next poll.
+    pub fn queue_accelerator_deactivated(&mut self, action: u32, time: u32, mode: u32) {
+        self.accelerator_queue.push((action, time, mode, true));
+    }
+
+    /// Drop queued presses and releases that the shell has not been
+    /// sent yet (a lock boundary invalidates them).
+    pub fn cancel_pending_accelerators(&mut self) {
+        self.accelerator_queue.clear();
     }
 
     /// Queue one Alt-Tab drive event; the next [`poll`](Self::poll)
@@ -1818,6 +1944,7 @@ impl ControlHub {
     /// this round (for Wayland-side focus) and asked to close (for the
     /// polite client close), so the runtime can apply both.
     pub fn poll(&mut self, model: &mut StateModel) -> PollOutcome {
+        let locked_before = self.locked.get();
         let uid = our_uid();
         while let Ok((stream, _)) = self.listener.accept() {
             let cred = peer_cred(&stream);
@@ -1833,6 +1960,12 @@ impl ControlHub {
             }
             self.fresh.push(stream);
             self.fresh_peers.push(cred);
+        }
+        // Tokens expire: reissue every window's before the shell's go
+        // stale. Windows that did not change send no delta in between.
+        if self.tokens_reissued.elapsed() >= TOKEN_REISSUE {
+            model.reissue(None);
+            self.tokens_reissued = std::time::Instant::now();
         }
         // A narrowed gate evicts sessions it no longer admits.
         let mut i = 0;
@@ -1933,6 +2066,9 @@ impl ControlHub {
                     if let Some(enabled) = session.screen_reader.take() {
                         outcome.screen_reader = Some(enabled);
                     }
+                    if let Some(click) = session.dwell_click.take() {
+                        outcome.dwell_click = Some(click);
+                    }
                     reply_ok
                 } else {
                     false
@@ -1944,6 +2080,11 @@ impl ControlHub {
                 self.sessions.swap_remove(i);
                 self.session_peers.swap_remove(i);
             }
+        }
+        // A Lock command changes the logical lock before Runtime::engage_lock
+        // runs. Do not broadcast pre-lock presses or releases in that gap.
+        if !locked_before && self.locked.get() {
+            self.cancel_pending_accelerators();
         }
         self.broadcast();
         outcome
@@ -2009,6 +2150,17 @@ impl ControlHub {
                 self.previews_sent = self.previews.clone();
             }
         }
+        if self.native_outputs != self.native_outputs_sent {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session.send_native_outputs(&self.native_outputs).is_err() {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                self.native_outputs_sent = self.native_outputs.clone();
+            }
+        }
         if self.outputs != self.outputs_sent {
             let mut all_sent = true;
             for session in &mut self.sessions {
@@ -2041,9 +2193,13 @@ impl ControlHub {
         }
         // Accelerator presses go to every live session once (the shell
         // signals the grabbing D-Bus caller).
-        for (action, time, mode) in std::mem::take(&mut self.accelerator_queue) {
+        for (action, time, mode, released) in std::mem::take(&mut self.accelerator_queue) {
             for session in &mut self.sessions {
-                let _ = session.send_accelerator(action, time, mode);
+                let _ = if released {
+                    session.send_accelerator_deactivated(action, time, mode)
+                } else {
+                    session.send_accelerator(action, time, mode)
+                };
             }
         }
         for menu in std::mem::take(&mut self.menu_queue) {
@@ -2096,6 +2252,11 @@ impl ControlHub {
                 // send it; the shell keeps its legacy surfaces until a
                 // real one arrives.
                 let _ = session.send_overview(open);
+                // A newcomer holds no native authority yet, so there is
+                // nothing for an empty inventory to revoke.
+                if !self.native_outputs.is_empty() {
+                    let _ = session.send_native_outputs(&self.native_outputs);
+                }
                 if !self.outputs.is_empty() {
                     let _ = session.send_outputs(&self.outputs);
                 }

@@ -28,6 +28,165 @@ def guest_identity(prefix="tuna"):
             "LOCK_PAM": f"/etc/pam.d/{prefix}-lock"}
 
 
+class AudioAmplificationDiagnostics(unittest.TestCase):
+    """Synthetic host-proof regressions; no native audio qualification."""
+    SOURCE = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+
+    def run_audio(self, *, change=None, older=False, dense=False, setup_error=False,
+                  write_error=False):
+        tree = ast.parse(self.SOURCE.read_text())
+        lifecycle = next(node for node in tree.body
+                         if isinstance(node, ast.FunctionDef) and node.name == "run_lifecycle")
+        first = next(i for i, node in enumerate(lifecycle.body)
+                     if isinstance(node, ast.Assign) and any(
+                         isinstance(target, ast.Name) and target.id == "amplified_observations"
+                         for target in node.targets))
+        last = next(i for i in range(first, len(lifecycle.body))
+                    if isinstance(lifecycle.body[i], ast.Try))
+        block = ast.Module(body=lifecycle.body[first:last + 1], type_ignores=[])
+        actions, keys, records, reset_receipts, sleeps = [], [], [], [], []
+        now, case_index = 0.0, -1
+        def monotonic():
+            nonlocal now
+            now += 0.01
+            return now
+        def sleep(seconds):
+            nonlocal now
+            sleeps.append(seconds)
+            if not dense:
+                now += seconds
+        def value(percent, amplified):
+            return {"percent": percent, "amplified": amplified, "muted": False,
+                    "sink_id": 44, "sink_name": "alsa_output.test",
+                    "private_extra": "never-copy-this"}
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = Path(directory) / "audio-amplification-diagnostics.json"
+            legacy = Path(directory) / "audio-amplification.json"
+            def run(action):
+                nonlocal case_index
+                actions.append(action)
+                if action == "audio-amplification-reset":
+                    reset_receipts.append(json.loads(diagnostic.read_text()) if diagnostic.exists() else None)
+                    return {}
+                if action == "audio-amplification-read":
+                    percent = ((98.0, 98.0, 150.0, 98.0) if older else
+                               (100.0, 104.0, 152.52, 100.0))[case_index]
+                    actual = value(percent, case_index in (1, 2))
+                    if case_index == 3 and change:
+                        actual.update(change)
+                    return actual
+                case_index += 1
+                if setup_error and case_index == 3:
+                    raise RuntimeError("private-exception-text")
+                return value(150.0 if case_index == 2 else 98.0, case_index in (1, 2))
+            scope = {**vars(lane), "agent": SimpleNamespace(run=run),
+                     "qmp": SimpleNamespace(keys=lambda key: keys.append(key)),
+                     "evidence": directory, "older_guest": older,
+                     "record": lambda *args: records.append(args),
+                     "time": SimpleNamespace(monotonic=monotonic, sleep=sleep)}
+            if write_error:
+                def receipt_open(path, *args, **kwargs):
+                    if Path(path) == diagnostic:
+                        raise OSError("private-write-error")
+                    return open(path, *args, **kwargs)
+                scope["open"] = receipt_open
+            error = None
+            try:
+                exec(compile(block, str(self.SOURCE), "exec"), scope)
+            except (RuntimeError, OSError) as caught:
+                error = caught
+            return SimpleNamespace(error=error, actions=actions, keys=keys, records=records,
+                resets=reset_receipts, sleeps=sleeps,
+                diagnostic=json.loads(diagnostic.read_text()) if diagnostic.exists() else None,
+                legacy=json.loads(legacy.read_text()) if legacy.exists() else None)
+
+    def test_failed_final_off_retains_exact_predicates_before_reset(self):
+        for mutation, failed in (({"percent": 100.002}, "percent"),
+                                 ({"muted": True}, "unmuted"),
+                                 ({"amplified": True}, "amplified"),
+                                 ({"sink_id": 45}, "same_sink"),
+                                 ({"sink_name": "private-unexpected-name"}, "alsa_output")):
+            with self.subTest(failed=failed):
+                result = self.run_audio(change=mutation)
+                self.assertIsInstance(result.error, RuntimeError)
+                self.assertIsNone(result.legacy)
+                self.assertEqual(result.records, [])
+                self.assertIsNotNone(result.diagnostic)
+                self.assertEqual(result.resets, [result.diagnostic])
+                self.assertEqual([case["passed"] for case in result.diagnostic], [True, True, True, False])
+                final = result.diagnostic[-1]
+                self.assertEqual((final["mode"], final["expected_percent"]), ("off", 100.0))
+                self.assertEqual(final["initial"]["sink_id"], 44)
+                checks = final["samples"][-1]["checks"]
+                self.assertEqual([key for key, passed in checks.items() if not passed], [failed])
+                actual = final["samples"][-1]["actual"]
+                if "percent" in mutation:
+                    self.assertEqual(actual["percent"], mutation["percent"])
+                encoded = json.dumps(result.diagnostic)
+                self.assertNotIn("private", encoded)
+                self.assertNotIn("never-copy-this", encoded)
+
+    def test_success_preserves_legacy_receipt_actions_and_verdict(self):
+        for older in (False, True):
+            with self.subTest(older=older):
+                result = self.run_audio(older=older)
+                self.assertIsNone(result.error)
+                self.assertEqual(len(result.legacy), 4)
+                self.assertEqual([v["percent"] for v in result.legacy],
+                                 [98.0, 98.0, 150.0, 98.0] if older else [100.0, 104.0, 152.52, 100.0])
+                self.assertEqual(result.keys, [] if older else ["volumeup"] * 4)
+                self.assertEqual(result.sleeps, [] if older else [0.3] * 4)
+                self.assertEqual(result.records[0][:2], ("V-AUDIO-AMPLIFICATION", True))
+                self.assertEqual(result.actions[-1], "audio-amplification-reset")
+                self.assertEqual(len(result.actions), 9)
+
+    def test_precision_and_old_guest_range_stay_unchanged(self):
+        for percent, passes in ((100.000001, True), (99.998, False), (100.0012, False)):
+            with self.subTest(percent=percent):
+                result = self.run_audio(change={"percent": percent})
+                self.assertEqual(result.error is None, passes)
+        for percent, passes in ((90.0, True), (106.0, True), (106.001, False)):
+            with self.subTest(older_percent=percent):
+                result = self.run_audio(change={"percent": percent}, older=True)
+                self.assertEqual(result.error is None, passes)
+
+    def test_history_cap_is_only_retention_and_keeps_last_sample(self):
+        result = self.run_audio(change={"percent": 100.002}, dense=True)
+        self.assertIsInstance(result.error, RuntimeError)
+        self.assertIsNotNone(result.diagnostic)
+        final = result.diagnostic[-1]
+        self.assertGreater(final["poll_count"], 64)
+        self.assertEqual(len(final["samples"]), 64)
+        self.assertEqual(final["samples"][-1]["actual"]["percent"], 100.002)
+        self.assertEqual(result.actions.count("audio-amplification-read"), final["poll_count"] + 3)
+        self.assertEqual(result.sleeps.count(0.2), final["poll_count"])
+
+    def test_setup_failure_keeps_completed_cases_without_exception_text(self):
+        result = self.run_audio(setup_error=True)
+        self.assertIsInstance(result.error, RuntimeError)
+        self.assertIsNotNone(result.diagnostic)
+        final = result.diagnostic[-1]
+        self.assertIsNone(final["initial"])
+        self.assertEqual(final["samples"], [])
+        self.assertFalse(final["passed"])
+        self.assertEqual(result.resets, [result.diagnostic])
+        self.assertNotIn("private", json.dumps(result.diagnostic))
+
+    def test_receipt_write_failure_still_resets(self):
+        result = self.run_audio(write_error=True)
+        self.assertIsInstance(result.error, OSError)
+        self.assertEqual(result.actions[-1], "audio-amplification-reset")
+        self.assertEqual(result.resets, [None])
+
+    def test_projection_rejects_private_or_unbounded_values(self):
+        for percent in (float("nan"), float("inf"), 10 ** 1000, True, "private"):
+            sample = lane.amplification_observation({"percent": percent, "muted": "private",
+                "amplified": 1, "sink_id": 10 ** 1000, "sink_name": "private", "extra": "private"})
+            self.assertEqual(sample, {"percent": None, "muted": None, "amplified": None,
+                                      "sink_id": None, "alsa_output": False})
+            json.dumps(sample, allow_nan=False)
+
+
 class DeviceInventoryProjection(unittest.TestCase):
     def inventory(self, state):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
@@ -63,6 +222,76 @@ class DeviceInventoryProjection(unittest.TestCase):
         projected = self.inventory(self.state())["state"]
         self.assertIn("input_devices", projected)
         self.assertIsNone(projected["input_devices"])
+
+
+class ShellStartupDiagnostics(unittest.TestCase):
+    def test_transport_failure_is_retained_and_closed(self):
+        agent = unittest.mock.Mock()
+        agent.run.side_effect = TimeoutError("bounded capture expired")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "stack.json"
+            with patch.object(lane.guest_agent, "GuestAgent", return_value=agent):
+                lane.dump_shell_stack("socket", destination)
+            self.assertEqual(json.loads(destination.read_text()),
+                             {"error": "bounded capture expired"})
+            agent.run.assert_called_once_with("shell-stack", timeout=120)
+            agent.close.assert_called_once()
+
+    def test_backtraces_survive_transport(self):
+        agent = unittest.mock.Mock()
+        observed = {"shells": [{"pid": 1234, "threads": [], "backtraces": "stack"}]}
+        agent.run.return_value = observed
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "stack.json"
+            with patch.object(lane.guest_agent, "GuestAgent", return_value=agent):
+                lane.dump_shell_stack("socket", destination)
+            self.assertEqual(json.loads(destination.read_text()), observed)
+            agent.close.assert_called_once()
+
+    def probe(self, gdb_error=None):
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        function = next(node for node in ast.parse(source.read_text()).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "shell_stack")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for pid, executable in ((1234, "tuna-shell-gtk"), (1235, "unrelated")):
+                process = root / str(pid)
+                process.mkdir()
+                (process / "exe").symlink_to("/usr/bin/" + executable)
+                task = process / "task" / str(pid)
+                task.mkdir(parents=True)
+                for name, text in (("comm", executable), ("wchan", "futex_wait"),
+                                   ("stack", "kernel wait"), ("syscall", "202"),
+                                   ("stat", f"{pid} ({executable}) S")):
+                    (task / name).write_text(text)
+            run = unittest.mock.Mock(return_value=SimpleNamespace(stdout="#0 futex_wait", stderr=""))
+            if gdb_error:
+                run.side_effect = gdb_error
+            scope = {"pathlib": SimpleNamespace(Path=lambda path: root if path == "/proc" else Path(path)),
+                     "os": os,
+                     "OWNER": SimpleNamespace(pw_uid=os.getuid()), "SHELL_GTK": "tuna-shell-gtk",
+                     "subprocess": SimpleNamespace(run=run, TimeoutExpired=lane.subprocess.TimeoutExpired)}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), scope)
+            result = scope["shell_stack"]()
+            run.assert_called_once()
+            command = run.call_args.args[0]
+            self.assertEqual(command[-2:], ["-p", "1234"])
+            self.assertIn("thread apply all bt", command)
+            self.assertIn("set print frame-arguments none", command)
+            self.assertEqual(run.call_args.kwargs["timeout"], 90)
+            return result["shells"][0]
+
+    def test_only_session_shell_is_attached_and_every_thread_is_retained(self):
+        result = self.probe()
+        self.assertEqual(result["pid"], 1234)
+        self.assertEqual(result["threads"][0]["wait_site"], "futex_wait")
+        self.assertEqual(result["threads"][0]["state"], "S")
+        self.assertEqual(result["backtraces"], "#0 futex_wait")
+
+    def test_gdb_failure_preserves_kernel_wait_information(self):
+        result = self.probe(lane.subprocess.TimeoutExpired("gdb", 90))
+        self.assertEqual(result["threads"][0]["wait_site"], "futex_wait")
+        self.assertEqual(result["backtraces"], "unavailable: TimeoutExpired")
 
 
 class OrcaUnreadyDiagnostic(unittest.TestCase):
@@ -1043,6 +1272,64 @@ class TourRecorderTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
         self.assertIn('qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core', workflow)
 
+
+def tour_frame(fill, boxes=()):
+    """A WIDTH x HEIGHT RGB frame: fill, then (x0, y0, x1, y1, rgb) boxes."""
+    w = lane.WIDTH
+    px = bytearray(bytes(fill) * (w * lane.HEIGHT))
+    for x0, y0, x1, y1, rgb in boxes:
+        row = bytes(rgb) * (x1 - x0)
+        for y in range(y0, y1):
+            px[(y * w + x0) * 3:(y * w + x1) * 3] = row
+    return bytes(px)
+
+
+class TourViewPredicates(unittest.TestCase):
+    GREY, NAVY, WHITE = (36, 36, 40), (8, 24, 52), (250, 250, 250)
+    WINDOWS = (190, 140, 1085, 690, WHITE)
+    SWITCHER = [WINDOWS, (358, 307, 922, 492, GREY), (376, 325, 536, 425, WHITE),
+                (584, 325, 696, 425, WHITE), (749, 325, 900, 425, WHITE)]
+
+    def views(self, px):
+        return [name for name in ("overview_windows_shown", "switcher_shown", "desktop_shown")
+                if getattr(lane, name)(px)]
+
+    def test_overview_with_window_previews(self):
+        frame = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY), (440, 420, 840, 670, self.WHITE)])
+        self.assertEqual(self.views(frame), ["overview_windows_shown"])
+
+    def test_search_and_app_grid_are_not_the_window_overview(self):
+        icons = [(x, y, x + 48, y + 48, (200, 60, 40)) for x in range(170, 1110, 125) for y in (270, 395)]
+        self.assertEqual(self.views(tour_frame(self.GREY, icons)), [])
+        self.assertEqual(self.views(tour_frame(self.GREY)), [])
+
+    def test_switcher_island_over_windows(self):
+        self.assertEqual(self.views(tour_frame(self.NAVY, self.SWITCHER)), ["switcher_shown"])
+
+    def test_desktop_and_calendar_are_not_the_switcher(self):
+        self.assertEqual(self.views(tour_frame(self.NAVY, [self.WINDOWS])), ["desktop_shown"])
+        calendar = tour_frame(self.NAVY, [(263, 38, 1017, 531, self.GREY)])
+        self.assertEqual(self.views(calendar), ["desktop_shown"])
+
+    def test_await_still_waits_for_the_view_and_flags_one_that_never_appears(self):
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        probes = [tour_frame(self.NAVY, [self.WINDOWS]), tour_frame(self.NAVY, self.SWITCHER)]
+        def command(name, **args):
+            path = Path(args["filename"])
+            if path.name == "probe.ppm":
+                path.write_bytes(header + (probes.pop(0) if len(probes) > 1 else probes[0]))
+            else:
+                path.write_bytes(b"png pixels")
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory, timeout=1)
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            self.assertFalse(recorder.await_still("overview-windows", lane.overview_windows_shown,
+                                                  timeout=0.05, settle=0))
+            self.assertEqual(recorder.stills, {"alt-tab": 0, "overview-windows": 1})
+            self.assertEqual(recorder.unconfirmed, ["overview-windows"])
+            self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
+                             ["f000000.png", "f000001.png"])
+            recorder.close()
 
 
 class SleepAuthRetirementTests(unittest.TestCase):

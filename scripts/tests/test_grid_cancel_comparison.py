@@ -64,6 +64,15 @@ class Identity(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.validate(run=dict(self.run, **{key: value}))
 
+    def test_schedule_event_admitted(self):
+        run = dict(self.run, event="schedule")
+        self.assertEqual(contract.validate_identity(run, self.jobs, self.commit, self.sha, 100, 1, "schedule")["job_id"], 200)
+
+    def test_unsupported_event_rejected(self):
+        run = dict(self.run, event="fork")
+        with self.assertRaises(ValueError):
+            contract.validate_identity(run, self.jobs, self.commit, self.sha, 100, 1, "fork")
+
     def test_jobs_fail_closed(self):
         for index, key, value in ((0, "name", "foreign"), (0, "status", "queued"),
                                  (0, "head_sha", "c" * 40), (0, "run_id", 101),

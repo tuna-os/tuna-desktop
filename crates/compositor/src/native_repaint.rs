@@ -1,15 +1,77 @@
 //! Compare the complete native scene before acquiring a scanout buffer.
 //! Buffer-age history accounts for every intervening submitted frame; global
 //! drawing changes and reset buffers conservatively require a complete paint.
+//! Within one global drawing, the damage tracker takes each element's own
+//! damage: what a client reported for a surface, not the whole surface.
 
 use smithay::backend::renderer::{
     damage::OutputDamageTracker,
-    element::{Element, Id},
-    utils::CommitCounter,
+    element::{Element, Id, Kind},
+    utils::{CommitCounter, DamageSet},
     Color32F,
 };
 use smithay::output::OutputNoMode;
-use smithay::utils::{Buffer, Physical, Rectangle, Transform};
+use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
+
+/// One drawn element as the damage tracker sees it: at the scale of the
+/// pass that draws it, with the element's own damage history. It claims
+/// no opaque region, so damage beneath it is never dropped.
+#[derive(Clone, Copy)]
+pub(crate) struct Tracked<'a> {
+    element: &'a dyn Element,
+    scale: f64,
+}
+
+impl<'a> Tracked<'a> {
+    pub(crate) fn new(element: &'a dyn Element, scale: f64) -> Self {
+        Self { element, scale }
+    }
+
+    /// A pass's elements, given front to back, bottom to top: an element
+    /// appearing or leaving on top shifts no other element's stacking
+    /// position, so the tracker does not repaint everything beneath it.
+    pub(crate) fn pass<E: Element>(elements: &'a [E], scale: f64) -> Vec<Self> {
+        elements
+            .iter()
+            .rev()
+            .map(|element| Self::new(element, scale))
+            .collect()
+    }
+}
+
+impl Element for Tracked<'_> {
+    fn id(&self) -> &Id {
+        self.element.id()
+    }
+    fn current_commit(&self) -> CommitCounter {
+        self.element.current_commit()
+    }
+    fn location(&self, _scale: Scale<f64>) -> Point<i32, Physical> {
+        self.element.location(self.scale.into())
+    }
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.element.src()
+    }
+    fn transform(&self) -> Transform {
+        self.element.transform()
+    }
+    fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.element.geometry(self.scale.into())
+    }
+    fn damage_since(
+        &self,
+        _scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.element.damage_since(self.scale.into(), commit)
+    }
+    fn alpha(&self) -> f32 {
+        self.element.alpha()
+    }
+    fn kind(&self) -> Kind {
+        self.element.kind()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ElementSignature {
@@ -23,43 +85,18 @@ pub(crate) struct ElementSignature {
 }
 
 impl ElementSignature {
-    pub(crate) fn capture(element: &impl Element, scale: f64) -> Self {
+    pub(crate) fn capture(tracked: &Tracked<'_>) -> Self {
+        let scale = tracked.scale.into();
+        let element = tracked.element;
         Self {
             id: element.id().clone(),
             commit: element.current_commit(),
-            geometry: element.geometry(scale.into()),
+            geometry: element.geometry(scale),
             source: element.src(),
             transform: element.transform(),
             alpha: element.alpha(),
-            opaque: element
-                .opaque_regions(scale.into())
-                .iter()
-                .copied()
-                .collect(),
+            opaque: element.opaque_regions(scale).iter().copied().collect(),
         }
-    }
-}
-
-// Captured geometry is already physical. Default damage_since marks the
-// complete changed element; no opacity is claimed, so hidden damage is retained.
-impl Element for ElementSignature {
-    fn id(&self) -> &Id {
-        &self.id
-    }
-    fn current_commit(&self) -> CommitCounter {
-        self.commit
-    }
-    fn src(&self) -> Rectangle<f64, Buffer> {
-        self.source
-    }
-    fn geometry(&self, _scale: smithay::utils::Scale<f64>) -> Rectangle<i32, Physical> {
-        self.geometry
-    }
-    fn transform(&self) -> Transform {
-        self.transform
-    }
-    fn alpha(&self) -> f32 {
-        self.alpha
     }
 }
 
@@ -82,8 +119,18 @@ pub(crate) struct FrameSignature {
 }
 
 impl FrameSignature {
-    /// Inputs outside the element damage history, or a different pass layout,
-    /// must repaint the complete acquired buffer.
+    /// The signature of `passes`, as [`damage_region`] tracks them.
+    pub(crate) fn groups(passes: &[Vec<Tracked<'_>>]) -> Vec<Vec<ElementSignature>> {
+        passes
+            .iter()
+            .map(|pass| pass.iter().map(ElementSignature::capture).collect())
+            .collect()
+    }
+
+    /// Inputs outside the element damage history must repaint the complete
+    /// acquired buffer. Elements that come, go, move or restack are the
+    /// tracker's; an element whose opaque region changed is not (drawing
+    /// culls beneath opaque regions).
     pub(crate) fn same_global_drawing(&self, old: &Self) -> bool {
         self.size == old.size
             && self.location == old.location
@@ -98,11 +145,11 @@ impl FrameSignature {
             && self.above == old.above
             && self.groups.len() == old.groups.len()
             && self.groups.iter().zip(&old.groups).all(|(new, old)| {
-                new.len() == old.len()
-                    && new
-                        .iter()
-                        .zip(old)
-                        .all(|(new, old)| new.id == old.id && new.opaque == old.opaque)
+                new.iter().all(|new| {
+                    old.iter()
+                        .find(|old| old.id == new.id)
+                        .is_none_or(|old| old.opaque == new.opaque)
+                })
             })
     }
 }
@@ -113,13 +160,15 @@ pub(crate) const MAX_DAMAGE_RECTS: usize = 16;
 
 /// The buffer-age damage as a set of rectangles (#503): a clock tick in
 /// the bar and a progress bar in a window repaint two small areas, not
-/// the bounding box spanning the output.
+/// the bounding box spanning the output. A surface's commit damages what
+/// its client reported, not the whole surface: a ticking graph in a
+/// window repaints the graph.
 pub(crate) fn damage_region(
     tracker: &mut OutputDamageTracker,
     age: usize,
-    signature: &FrameSignature,
+    passes: &[Vec<Tracked<'_>>],
 ) -> Result<Vec<Rectangle<i32, Physical>>, OutputNoMode> {
-    let elements: Vec<_> = signature.groups.iter().flatten().collect();
+    let elements: Vec<_> = passes.iter().flatten().collect();
     let (damage, _) = tracker.damage_output(age, &elements)?;
     // A timing-only request still needs an actual page flip. A minimal repaint
     // submits that real frame rather than manufacturing presentation feedback.
@@ -199,7 +248,7 @@ pub(crate) fn needs_repaint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Kind};
+    use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 
     fn scene() -> FrameSignature {
         FrameSignature {
@@ -216,6 +265,45 @@ mod tests {
             above: 0,
             groups: vec![],
         }
+    }
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Physical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    fn solid(
+        id: &Id,
+        geometry: Rectangle<i32, Physical>,
+        commit: usize,
+    ) -> SolidColorRenderElement {
+        SolidColorRenderElement::new(
+            id.clone(),
+            geometry,
+            commit,
+            Color32F::new(1.0, 0.0, 0.0, 1.0),
+            Kind::Unspecified,
+        )
+    }
+
+    fn sig(element: &impl Element) -> ElementSignature {
+        ElementSignature::capture(&Tracked::new(element, 1.0))
+    }
+
+    /// One pass of `elements`, given front to back.
+    fn damage<E: Element>(
+        tracker: &mut OutputDamageTracker,
+        age: usize,
+        elements: &[E],
+    ) -> Vec<Rectangle<i32, Physical>> {
+        damage_region(tracker, age, &[Tracked::pass(elements, 1.0)]).unwrap()
+    }
+
+    fn contains(rects: &[Rectangle<i32, Physical>], x: i32, y: i32) -> bool {
+        rects.iter().any(|r| r.contains((x, y)))
+    }
+
+    fn area(rects: &[Rectangle<i32, Physical>]) -> i32 {
+        rects.iter().map(|r| r.size.w * r.size.h).sum()
     }
 
     #[test]
@@ -266,19 +354,19 @@ mod tests {
     fn cursor_motion_keeps_buffer_age_history_and_bounds_damage() {
         let id = Id::new();
         let cursor = |x| {
-            let element = SolidColorRenderElement::new(
+            [SolidColorRenderElement::new(
                 id.clone(),
                 Rectangle::new((x, 40).into(), (24, 24).into()),
                 CommitCounter::default(),
                 Color32F::BLACK,
                 Kind::Cursor,
-            );
-            ElementSignature::capture(&element, 1.0)
+            )]
         };
+        let (at_20, at_25) = (cursor(20), cursor(25));
         let mut before = scene();
-        before.groups = vec![vec![cursor(20)]];
+        before.groups = vec![vec![sig(&at_20[0])]];
         let mut after = before.clone();
-        after.groups[0][0] = cursor(25);
+        after.groups[0][0] = sig(&at_25[0]);
         assert!(needs_repaint(Some(&before), &after, false));
         assert!(after.same_global_drawing(&before));
         let mut tracker = OutputDamageTracker::new(
@@ -286,8 +374,8 @@ mod tests {
             1.0,
             Transform::Normal,
         );
-        damage_region(&mut tracker, 0, &before).unwrap();
-        let damage = damage_region(&mut tracker, 1, &after).unwrap();
+        damage(&mut tracker, 0, &at_20);
+        let damage = damage(&mut tracker, 1, &at_25);
         assert!(!damage.is_empty());
         let expected = Rectangle::new((20, 40).into(), (29, 24).into());
         assert!(damage
@@ -301,21 +389,12 @@ mod tests {
     #[test]
     fn buffer_commits_and_geometry_are_part_of_the_image() {
         let id = Id::new();
-        let geo = Rectangle::from_size((40, 30).into());
-        let element = |commit, geometry| {
-            SolidColorRenderElement::new(
-                id.clone(),
-                geometry,
-                commit,
-                Color32F::new(1.0, 1.0, 1.0, 1.0),
-                Kind::Unspecified,
-            )
-        };
+        let geo = rect(0, 0, 40, 30);
         let mut before = scene();
-        before.groups = vec![vec![ElementSignature::capture(&element(0usize, geo), 1.0)]];
+        before.groups = vec![vec![sig(&solid(&id, geo, 0))]];
         for changed in [
-            ElementSignature::capture(&element(1usize, geo), 1.0),
-            ElementSignature::capture(&element(0usize, Rectangle::from_size((41, 30).into())), 1.0),
+            sig(&solid(&id, geo, 1)),
+            sig(&solid(&id, rect(0, 0, 41, 30), 0)),
         ] {
             let mut next = before.clone();
             next.groups[0][0] = changed;
@@ -334,36 +413,21 @@ mod tests {
         let mut pending = scene();
         pending.groups = vec![vec![]];
         assert!(!needs_repaint(Some(&pending), &pending, false));
+        let card = solid(&Id::new(), rect(0, 0, 40, 30), 0);
         let mut ready = pending.clone();
-        ready.groups[0].push(ElementSignature::capture(
-            &SolidColorRenderElement::new(
-                Id::new(),
-                Rectangle::from_size((40, 30).into()),
-                0usize,
-                Color32F::BLACK,
-                Kind::Unspecified,
-            ),
-            1.0,
-        ));
+        ready.groups[0].push(sig(&card));
         assert!(needs_repaint(Some(&pending), &ready, false));
-        assert!(!ready.same_global_drawing(&pending));
+        // The tracker repaints the new card's area; nothing global changed.
+        assert!(ready.same_global_drawing(&pending));
         assert!(!needs_repaint(Some(&ready), &ready, false));
+        let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
+        damage::<SolidColorRenderElement>(&mut tracker, 0, &[]);
+        assert_eq!(damage(&mut tracker, 1, &[card]), vec![rect(0, 0, 40, 30)]);
     }
 
     #[test]
     fn overlapping_elements_and_render_passes_preserve_order() {
-        let element = || {
-            ElementSignature::capture(
-                &SolidColorRenderElement::new(
-                    Id::new(),
-                    Rectangle::from_size((40, 30).into()),
-                    0usize,
-                    Color32F::BLACK,
-                    Kind::Unspecified,
-                ),
-                1.0,
-            )
-        };
+        let element = || sig(&solid(&Id::new(), rect(0, 0, 40, 30), 0));
         let mut before = scene();
         before.groups = vec![vec![element(), element()], vec![]];
         let mut reordered = before.clone();
@@ -380,15 +444,8 @@ mod tests {
 
     #[test]
     fn same_buffer_with_changed_crop_transform_or_opacity_repaints() {
-        let element = SolidColorRenderElement::new(
-            Id::new(),
-            Rectangle::from_size((40, 30).into()),
-            0usize,
-            Color32F::BLACK,
-            Kind::Unspecified,
-        );
         let mut before = scene();
-        before.groups = vec![vec![ElementSignature::capture(&element, 1.0)]];
+        before.groups = vec![vec![sig(&solid(&Id::new(), rect(0, 0, 40, 30), 0))]];
         let mut variants = vec![before.clone(); 3];
         variants[0].groups[0][0].source.loc.x += 1.0;
         variants[1].groups[0][0].transform = Transform::Flipped180;
@@ -397,59 +454,36 @@ mod tests {
             assert!(needs_repaint(Some(&before), &next, false));
         }
     }
-    fn moving_scene(id: &Id, x: i32, commit: usize) -> FrameSignature {
-        let mut next = scene();
-        next.size = (32, 32);
-        next.groups = vec![vec![ElementSignature::capture(
-            &SolidColorRenderElement::new(
-                id.clone(),
-                Rectangle::new((x, 0).into(), (8, 8).into()),
-                commit,
-                Color32F::new(1.0, 0.0, 0.0, 1.0),
-                Kind::Unspecified,
-            ),
-            1.0,
-        )]];
-        next
-    }
 
-    fn contains(rects: &[Rectangle<i32, Physical>], x: i32, y: i32) -> bool {
-        rects.iter().any(|r| r.contains((x, y)))
+    fn moving(id: &Id, x: i32, commit: usize) -> [SolidColorRenderElement; 1] {
+        [solid(id, rect(x, 0, 8, 8), commit)]
     }
 
     #[test]
     fn recycled_buffer_repaints_damage_from_intervening_frames() {
         let id = Id::new();
         let mut tracker = OutputDamageTracker::new((32, 32), 1.0, Transform::Normal);
-        let full = vec![Rectangle::from_size((32, 32).into())];
-        assert_eq!(
-            damage_region(&mut tracker, 0, &moving_scene(&id, 0, 0)).unwrap(),
-            full
-        );
-        damage_region(&mut tracker, 1, &moving_scene(&id, 8, 1)).unwrap();
-        let damage = damage_region(&mut tracker, 2, &moving_scene(&id, 16, 2)).unwrap();
-        assert!(contains(&damage, 1, 1));
-        assert!(contains(&damage, 23, 7));
-        assert!(damage.iter().all(|r| r.size.w < 32 && r.size.h < 32));
-        assert_eq!(
-            damage_region(&mut tracker, 100, &moving_scene(&id, 16, 2)).unwrap(),
-            full
-        );
+        let full = vec![rect(0, 0, 32, 32)];
+        assert_eq!(damage(&mut tracker, 0, &moving(&id, 0, 0)), full);
+        damage(&mut tracker, 1, &moving(&id, 8, 1));
+        let aged = damage(&mut tracker, 2, &moving(&id, 16, 2));
+        assert!(contains(&aged, 1, 1));
+        assert!(contains(&aged, 23, 7));
+        assert!(aged.iter().all(|r| r.size.w < 32 && r.size.h < 32));
+        assert_eq!(damage(&mut tracker, 100, &moving(&id, 16, 2)), full);
     }
 
     #[test]
     fn timing_only_frame_and_removed_elements_keep_correct_damage() {
         let id = Id::new();
         let mut tracker = OutputDamageTracker::new((32, 32), 1.0, Transform::Normal);
-        let mut next = moving_scene(&id, 0, 0);
-        damage_region(&mut tracker, 0, &next).unwrap();
+        damage(&mut tracker, 0, &moving(&id, 0, 0));
         assert_eq!(
-            damage_region(&mut tracker, 1, &next).unwrap(),
-            vec![Rectangle::new((0, 0).into(), (1, 1).into())]
+            damage(&mut tracker, 1, &moving(&id, 0, 0)),
+            vec![rect(0, 0, 1, 1)]
         );
-        next.groups.iter_mut().for_each(Vec::clear);
         assert!(contains(
-            &damage_region(&mut tracker, 1, &next).unwrap(),
+            &damage::<SolidColorRenderElement>(&mut tracker, 1, &[]),
             7,
             7
         ));
@@ -493,14 +527,11 @@ mod tests {
     fn scanout_damage_is_the_repainted_buffer_age_region() {
         let id = Id::new();
         let mut tracker = OutputDamageTracker::new((32, 32), 1.0, Transform::Normal);
-        let full = damage_region(&mut tracker, 0, &moving_scene(&id, 0, 0)).unwrap();
-        assert_eq!(
-            scanout_damage(&full),
-            vec![Rectangle::from_size((32, 32).into())]
-        );
-        damage_region(&mut tracker, 1, &moving_scene(&id, 8, 1)).unwrap();
+        let full = damage(&mut tracker, 0, &moving(&id, 0, 0));
+        assert_eq!(scanout_damage(&full), vec![rect(0, 0, 32, 32)]);
+        damage(&mut tracker, 1, &moving(&id, 8, 1));
         // Two frames back: covers both moves, not the whole plane.
-        let aged = damage_region(&mut tracker, 2, &moving_scene(&id, 16, 2)).unwrap();
+        let aged = damage(&mut tracker, 2, &moving(&id, 16, 2));
         let clips = scanout_damage(&aged);
         assert_eq!(clips, aged);
         assert!(contains(&clips, 1, 1) && contains(&clips, 23, 7));
@@ -509,46 +540,124 @@ mod tests {
 
     /// Two small elements far apart: a clock in the bar and a progress
     /// bar near the bottom.
-    fn scattered_scene(clock: &Id, bar: &Id, commit: usize) -> FrameSignature {
-        let mut next = scene();
-        next.size = (1280, 800);
-        let element = |id: &Id, geo| {
-            ElementSignature::capture(
-                &SolidColorRenderElement::new(
-                    id.clone(),
-                    geo,
-                    commit,
-                    Color32F::new(1.0, 0.0, 0.0, 1.0),
-                    Kind::Unspecified,
-                ),
-                1.0,
-            )
-        };
-        next.groups = vec![vec![
-            element(clock, Rectangle::new((600, 0).into(), (80, 32).into())),
-            element(bar, Rectangle::new((200, 700).into(), (300, 8).into())),
-        ]];
-        next
+    fn scattered(clock: &Id, bar: &Id, commit: usize) -> [SolidColorRenderElement; 2] {
+        [
+            solid(clock, rect(600, 0, 80, 32), commit),
+            solid(bar, rect(200, 700, 300, 8), commit),
+        ]
     }
 
     #[test]
     fn scattered_damage_stays_a_set_of_small_rects() {
         let (clock, bar) = (Id::new(), Id::new());
         let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
-        damage_region(&mut tracker, 0, &scattered_scene(&clock, &bar, 0)).unwrap();
-        let damage = damage_region(&mut tracker, 1, &scattered_scene(&clock, &bar, 1)).unwrap();
-        assert_eq!(damage.len(), 2, "{damage:?}");
-        let area: i32 = damage.iter().map(|r| r.size.w * r.size.h).sum();
+        damage(&mut tracker, 0, &scattered(&clock, &bar, 0));
+        let rects = damage(&mut tracker, 1, &scattered(&clock, &bar, 1));
+        assert_eq!(rects.len(), 2, "{rects:?}");
         assert_eq!(
-            area,
+            area(&rects),
             80 * 32 + 300 * 8,
             "not the bounding box spanning the output"
         );
     }
 
+    /// A client surface whose commits report damage of their own.
+    struct Surface {
+        id: Id,
+        commit: CommitCounter,
+        geometry: Rectangle<i32, Physical>,
+        damage: Rectangle<i32, Physical>,
+    }
+
+    impl Element for Surface {
+        fn id(&self) -> &Id {
+            &self.id
+        }
+        fn current_commit(&self) -> CommitCounter {
+            self.commit
+        }
+        fn src(&self) -> Rectangle<f64, Buffer> {
+            let size = self.geometry.size;
+            Rectangle::from_size((f64::from(size.w), f64::from(size.h)).into())
+        }
+        fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+            Rectangle::new(
+                self.geometry.loc,
+                self.geometry.size.to_f64().upscale(scale).to_i32_round(),
+            )
+        }
+        fn damage_since(
+            &self,
+            scale: Scale<f64>,
+            commit: Option<CommitCounter>,
+        ) -> DamageSet<i32, Physical> {
+            match self.commit.distance(commit) {
+                Some(0) => DamageSet::default(),
+                Some(1) => DamageSet::from_slice(&[Rectangle::new(
+                    self.damage.loc.to_f64().upscale(scale).to_i32_round(),
+                    self.damage.size.to_f64().upscale(scale).to_i32_round(),
+                )]),
+                _ => DamageSet::from_slice(&[Rectangle::from_size(self.geometry(scale).size)]),
+            }
+        }
+    }
+
+    #[test]
+    fn a_surface_commit_repaints_what_its_client_damaged() {
+        // A window of 600x400 whose client redraws a 100x50 graph.
+        let mut window = Surface {
+            id: Id::new(),
+            commit: CommitCounter::default(),
+            geometry: rect(100, 100, 600, 400),
+            damage: rect(20, 30, 100, 50),
+        };
+        let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
+        damage(&mut tracker, 0, std::slice::from_ref(&window));
+        window.commit.increment();
+        let rects = damage(&mut tracker, 1, std::slice::from_ref(&window));
+        assert_eq!(rects, vec![rect(120, 130, 100, 50)]);
+        // Two buffers back, both commits' damage.
+        window.damage = rect(300, 0, 10, 10);
+        window.commit.increment();
+        let aged = damage(&mut tracker, 2, std::slice::from_ref(&window));
+        assert!(contains(&aged, 120, 130) && contains(&aged, 405, 105));
+        assert_eq!(area(&aged), 100 * 50 + 10 * 10);
+        // Drawn at its pass's scale, the damage scales with it.
+        let mut scaled = OutputDamageTracker::new((2560, 1600), 1.0, Transform::Normal);
+        damage_region(&mut scaled, 0, &[vec![Tracked::new(&window, 2.0)]]).unwrap();
+        window.commit.increment();
+        let rects = damage_region(&mut scaled, 1, &[vec![Tracked::new(&window, 2.0)]]).unwrap();
+        assert_eq!(rects, vec![rect(700, 100, 20, 20)]);
+    }
+
+    #[test]
+    fn elements_coming_and_going_on_top_repaint_only_their_area() {
+        let (window, banner) = (Id::new(), Id::new());
+        let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
+        let below = solid(&window, rect(100, 100, 600, 400), 0);
+        let above = solid(&banner, rect(400, 40, 300, 80), 0);
+        damage(&mut tracker, 0, std::slice::from_ref(&below));
+        // Passes are given front to back: the banner over the window.
+        let shown = damage(&mut tracker, 1, &[above.clone(), below.clone()]);
+        assert_eq!(shown, vec![rect(400, 40, 300, 80)]);
+        let hidden = damage(&mut tracker, 1, std::slice::from_ref(&below));
+        assert_eq!(hidden, vec![rect(400, 40, 300, 80)]);
+    }
+
+    #[test]
+    fn restacking_repaints_the_restacked_elements() {
+        let (a, b) = (Id::new(), Id::new());
+        let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
+        let first = solid(&a, rect(0, 0, 100, 100), 0);
+        let second = solid(&b, rect(50, 50, 100, 100), 0);
+        damage(&mut tracker, 0, &[first.clone(), second.clone()]);
+        let rects = damage(&mut tracker, 1, &[second, first]);
+        assert!(contains(&rects, 10, 10) && contains(&rects, 140, 140));
+    }
+
     #[test]
     fn coalesce_merges_overlaps_and_caps_the_rect_count() {
-        let r = |x, y, w, h| Rectangle::<i32, Physical>::new((x, y).into(), (w, h).into());
+        let r = rect;
         // Overlapping rects merge (each pixel painted once); a merge that
         // creates a new overlap merges again; empties drop.
         let merged = coalesce(vec![
@@ -572,8 +681,14 @@ mod tests {
     #[test]
     fn global_drawing_pass_order_and_opacity_changes_reset_buffer_history() {
         let id = Id::new();
-        let before = moving_scene(&id, 0, 0);
-        let moved = moving_scene(&id, 8, 1);
+        let capture = |x, commit| {
+            let mut next = scene();
+            next.size = (32, 32);
+            next.groups = vec![moving(&id, x, commit).iter().map(sig).collect()];
+            next
+        };
+        let before = capture(0, 0);
+        let moved = capture(8, 1);
         assert!(needs_repaint(Some(&before), &moved, false));
         assert!(
             before.same_global_drawing(&moved),
@@ -583,11 +698,9 @@ mod tests {
         variants[0].locked = true;
         variants[1].scale = 2.0;
         variants[2].groups[0][0].opaque.clear();
-        variants[2].groups[0][0]
-            .opaque
-            .push(Rectangle::from_size((1, 1).into()));
-        variants[3].groups[0][0].id = Id::new();
-        for (cause, next) in ["lock", "scale", "opacity", "element identity"]
+        variants[2].groups[0][0].opaque.push(rect(0, 0, 1, 1));
+        variants[3].effects = vec![0.5f32.to_bits()];
+        for (cause, next) in ["lock", "scale", "opacity", "effects"]
             .into_iter()
             .zip(variants)
         {
@@ -596,5 +709,9 @@ mod tests {
                 "{cause} must reset buffer history"
             );
         }
+        // A replaced element is the tracker's: old and new areas repaint.
+        let mut replaced = before.clone();
+        replaced.groups[0][0].id = Id::new();
+        assert!(replaced.same_global_drawing(&before));
     }
 }

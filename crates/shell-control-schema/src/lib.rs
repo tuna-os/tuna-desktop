@@ -32,9 +32,10 @@ pub mod layer_namespaces;
 pub use layer_namespaces::{
     BANNER_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE,
     GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE,
-    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE, POLKIT_NAMESPACE,
-    PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
-    SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
+    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE,
+    POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE,
+    SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE, SWITCHER_THUMBNAILS_NAMESPACE,
+    WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
 };
 
 /// Panel height in pixels (compositor ↔ shell contract).
@@ -165,9 +166,17 @@ impl ProtocolVersion {
     /// `0.33` appends cursor theme, size, locate-pointer and its keysym preference.
     /// `0.34` appends keyboard accessibility aids and toggle notifications.
     /// `0.35` appends atomic wellbeing scene effects.
+    /// `0.36` appends GNOME's pointer accessibility aids to
+    /// `InputSettings`, the shell-to-compositor `SetDwellClickType`
+    /// command and the compositor-to-shell `DwellClickType` and
+    /// `PointerTimeout` messages (hover click's chooser and GNOME's pie
+    /// timer). Positional: both peers ship together.
+    /// `0.37` appends NativeOutputInventory without altering OutputInfo.
+    /// `0.38` appends typed accelerator grabs
+    /// (`SetAcceleratorGrabs`) and `AcceleratorDeactivated`.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 35,
+        minor: 38,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -238,6 +247,21 @@ pub struct OutputInfo {
     pub height: i32,
     /// Whether the dock anchors here.
     pub primary: bool,
+}
+
+/// Actual selected native DRM output authority. Missing inventory means no
+/// authority, including nested sessions; connector text alone is insufficient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOutputInfo {
+    pub name: String,
+    /// Actual char-device rdev from the compositor-owned KMS FD.
+    pub drm_device: u64,
+    /// Actual DRM connector object ID, checked against kernel sysfs.
+    pub connector_id: u32,
+    /// Canonical sysfs DRM connector directory under that owned device.
+    pub connector_sysfs: String,
+    pub connector_device: u64,
+    pub connector_inode: u64,
 }
 
 /// One ordered state mutation between two snapshot revisions.
@@ -394,6 +418,11 @@ pub enum CommandKind {
     SetWindowIconGeometries { geometries: Vec<WindowIconGeometry> },
     /// Atomic scene effects from the authenticated shell; cursor excluded.
     SetWellbeingEffects { grayscale: bool, fade: bool },
+    /// The hover-click chooser picked the click the next dwell makes.
+    SetDwellClickType { click: DwellClick },
+    /// Since 0.38: atomic full accelerator replacement with GNOME grab
+    /// flags, at most [`MAX_ACCELERATORS`]; supersedes `SetAccelerators`.
+    SetAcceleratorGrabs { grabs: Vec<AcceleratorGrab> },
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -553,6 +582,24 @@ pub struct Accelerator {
     pub mods: u32,
     /// Action modes it applies in: a combination of the `MODE_*` bits.
     pub modes: u32,
+}
+
+/// GNOME MetaKeyBindingFlags supported for external accelerator grabs:
+/// duplicate key-downs of a held grab do not activate again.
+pub const GRAB_IGNORE_AUTOREPEAT: u32 = 1 << 4;
+/// GNOME MetaKeyBindingFlags: the release of the grabbed press is
+/// reported as `AcceleratorDeactivated`.
+pub const GRAB_TRIGGER_RELEASE: u32 = 1 << 7;
+/// Every flag [`AcceleratorGrab::flags`] may carry.
+pub const SUPPORTED_GRAB_FLAGS: u32 = GRAB_IGNORE_AUTOREPEAT | GRAB_TRIGGER_RELEASE;
+
+/// One grab with its GNOME flags. A separate type, so the legacy
+/// [`Accelerator`] wire body stays unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceleratorGrab {
+    pub accelerator: Accelerator,
+    /// A combination of [`SUPPORTED_GRAB_FLAGS`].
+    pub flags: u32,
 }
 
 /// A secret on the wire (the lock screen's password). `Debug` never
@@ -753,6 +800,56 @@ pub enum Message {
     /// two modifiers at once) switched an aid; the shell saves the
     /// setting and confirms it as GNOME does.
     KeyboardAidToggled { aid: KeyboardAid, enabled: bool },
+    /// The click the next dwell makes, whenever it changes (a one-shot
+    /// type returns to a single click once used).
+    DwellClickType { click: DwellClick },
+    /// A pointer accessibility timeout started (`duration_ms` set) at
+    /// the pointer, or stopped (`clicked` when it ran out and acted).
+    /// The shell draws GNOME's pie timer around the pointer.
+    PointerTimeout {
+        kind: PointerTimeoutKind,
+        duration_ms: Option<u32>,
+        clicked: bool,
+        x: i32,
+        y: i32,
+    },
+    /// Full actual native authority; empty explicitly revokes prior authority.
+    /// Append-only, sent only to peers advertising minor >=37.
+    NativeOutputInventory { outputs: Vec<NativeOutputInfo> },
+    /// Since 0.38: release of an originally admitted press of a grab
+    /// carrying [`GRAB_TRIGGER_RELEASE`] (GNOME's AcceleratorDeactivated).
+    AcceleratorDeactivated { action: u32, time: u32, mode: u32 },
+}
+
+/// The click a hover (dwell) makes: GNOME's dwell click types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DwellClick {
+    #[default]
+    Primary,
+    Double,
+    /// First dwell presses, the next releases.
+    Drag,
+    Secondary,
+}
+
+/// Which pointer accessibility timeout runs (Clutter's timeout types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointerTimeoutKind {
+    /// Simulated secondary click: a held primary button.
+    SecondaryClick,
+    /// Hover click waiting to click.
+    Dwell,
+    /// Hover click waiting for a direction gesture.
+    Gesture,
+}
+
+/// A hover-click gesture direction (`GDesktopMouseDwellDirection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DwellDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// The keyboard aids GNOME lets the keyboard itself switch.
@@ -884,6 +981,49 @@ pub struct InputSettings {
     /// GNOME keyboard accessibility input aids.
     #[serde(default)]
     pub keyboard_aids: KeyboardAids,
+    /// GNOME's pointer accessibility aids.
+    #[serde(default)]
+    pub pointer_aids: PointerAids,
+}
+
+/// GNOME's `org.gnome.desktop.a11y.mouse`, flattened for the compositor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerAids {
+    /// `secondary-click-enabled` and `secondary-click-time` (ms).
+    pub secondary_click: bool,
+    pub secondary_click_ms: u32,
+    /// `dwell-click-enabled`, `dwell-time` (ms) and `dwell-threshold`
+    /// (pixels).
+    pub dwell_click: bool,
+    pub dwell_ms: u32,
+    pub dwell_threshold: u32,
+    /// `dwell-mode`: a direction gesture picks the click, instead of the
+    /// panel chooser (`window`).
+    pub dwell_gesture: bool,
+    /// `dwell-gesture-single`, `-double`, `-drag` and `-secondary`
+    /// (`None` for GNOME's `none`).
+    pub gesture_single: Option<DwellDirection>,
+    pub gesture_double: Option<DwellDirection>,
+    pub gesture_drag: Option<DwellDirection>,
+    pub gesture_secondary: Option<DwellDirection>,
+}
+
+impl Default for PointerAids {
+    /// GNOME 51's defaults.
+    fn default() -> Self {
+        Self {
+            secondary_click: false,
+            secondary_click_ms: 1200,
+            dwell_click: false,
+            dwell_ms: 1200,
+            dwell_threshold: 10,
+            dwell_gesture: false,
+            gesture_single: Some(DwellDirection::Left),
+            gesture_double: Some(DwellDirection::Up),
+            gesture_drag: Some(DwellDirection::Down),
+            gesture_secondary: Some(DwellDirection::Right),
+        }
+    }
 }
 
 /// GNOME's `org.gnome.desktop.a11y.keyboard`, flattened for the
@@ -985,6 +1125,7 @@ impl Default for InputSettings {
             cursor_size: 24,
             locate_pointer: false,
             locate_pointer_key: default_locate_pointer_key(),
+            pointer_aids: PointerAids::default(),
         }
     }
 }
@@ -1140,6 +1281,8 @@ pub struct TokenMeta {
 /// sides can log, count, and drop the offending frame (ADR 0002).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
+    /// A typed collection exceeds its admission bound.
+    CollectionTooLong { len: usize, max: usize },
     /// Fewer than 4 prefix bytes, or a body shorter than the prefix claims.
     Truncated {
         /// Bytes required.
@@ -1176,6 +1319,9 @@ pub enum DecodeError {
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CollectionTooLong { len, max } => {
+                write!(f, "collection of {len} records exceeds {max}")
+            }
             Self::Truncated { expected, actual } => {
                 write!(f, "truncated frame: need {expected} bytes, have {actual}")
             }
@@ -1452,13 +1598,26 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
                 postcard::Error::DeserializeBadEncoding,
             ));
         }
+        Message::Command {
+            kind: CommandKind::SetAcceleratorGrabs { grabs },
+            ..
+        } if grabs.len() > MAX_ACCELERATORS
+            || grabs.iter().any(|g| g.flags & !SUPPORTED_GRAB_FLAGS != 0) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
         Message::Hello { .. }
         | Message::AcceleratorActivated { .. }
+        | Message::AcceleratorDeactivated { .. }
         | Message::WindowMenu { .. }
         | Message::WorkspacePopup { .. }
         | Message::PointerOutput { .. }
         | Message::ScreenReader { .. }
         | Message::KeyboardAidToggled { .. }
+        | Message::DwellClickType { .. }
+        | Message::PointerTimeout { .. }
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }
         | Message::CommandResult { .. }
@@ -1467,6 +1626,19 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::Switcher { .. }
         | Message::Outputs { .. }
         | Message::OverviewPreviews { .. } => {}
+        // Bounded native authority: at most 64 lit outputs, short names.
+        Message::NativeOutputInventory { outputs } => {
+            if outputs.len() > 64 {
+                return Err(DecodeError::CollectionTooLong {
+                    len: outputs.len(),
+                    max: 64,
+                });
+            }
+            for output in outputs {
+                check_title(&output.name)?;
+                check_title(&output.connector_sysfs)?;
+            }
+        }
         // Names and values share the title bound: short by nature.
         Message::Environment { vars } => {
             for (name, value) in vars {
@@ -1501,6 +1673,37 @@ mod tests {
             name: Some(format!("ws{id}")),
             active: id == 1,
         }
+    }
+
+    #[test]
+    fn native_inventory_is_appended_and_bounds_authority_collection() {
+        let legacy = Message::Outputs {
+            outputs: vec![OutputInfo {
+                name: "n".into(),
+                width: 1,
+                height: 1,
+                primary: true,
+            }],
+        };
+        // Existing Outputs index8 and unchanged positional OutputInfo body.
+        assert_eq!(&encode_frame(&legacy)[4..], &[8, 1, 1, b'n', 2, 2, 1]);
+        let owner = NativeOutputInfo {
+            name: "eDP-1".into(),
+            drm_device: 226,
+            connector_id: 39,
+            connector_sysfs: "/sys/owned/connector".into(),
+            connector_device: 1,
+            connector_inode: 2,
+        };
+        roundtrip(&Message::NativeOutputInventory {
+            outputs: vec![owner.clone()],
+        });
+        assert!(matches!(
+            decode_frame(&encode_frame(&Message::NativeOutputInventory {
+                outputs: vec![owner; 65]
+            })),
+            Err(DecodeError::CollectionTooLong { len: 65, max: 64 })
+        ));
     }
 
     fn sample_token() -> ActivationToken {
@@ -1645,8 +1848,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_35() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 35));
+    fn current_version_is_0_38() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 38));
     }
 
     #[test]
@@ -1892,6 +2095,62 @@ mod tests {
             for enabled in [false, true] {
                 roundtrip(&Message::KeyboardAidToggled { aid, enabled });
             }
+        }
+    }
+
+    #[test]
+    fn pointer_aids_survive_the_positional_control_wire() {
+        roundtrip(&Message::Command {
+            id: 1,
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                pointer_aids: PointerAids {
+                    secondary_click: true,
+                    secondary_click_ms: 700,
+                    dwell_click: true,
+                    dwell_ms: 900,
+                    dwell_threshold: 4,
+                    dwell_gesture: true,
+                    gesture_drag: None,
+                    ..PointerAids::default()
+                },
+                keyboard_aids: KeyboardAids {
+                    sticky: true,
+                    ..KeyboardAids::default()
+                },
+                ..InputSettings::default()
+            })),
+        });
+        for click in [
+            DwellClick::Primary,
+            DwellClick::Double,
+            DwellClick::Drag,
+            DwellClick::Secondary,
+        ] {
+            roundtrip(&Message::Command {
+                id: 2,
+                kind: CommandKind::SetDwellClickType { click },
+            });
+            roundtrip(&Message::DwellClickType { click });
+        }
+        for kind in [
+            PointerTimeoutKind::SecondaryClick,
+            PointerTimeoutKind::Dwell,
+            PointerTimeoutKind::Gesture,
+        ] {
+            roundtrip(&Message::PointerTimeout {
+                kind,
+                duration_ms: Some(1200),
+                clicked: false,
+                x: 10,
+                y: -3,
+            });
+            roundtrip(&Message::PointerTimeout {
+                kind,
+                duration_ms: None,
+                clicked: true,
+                x: 0,
+                y: 0,
+            });
         }
     }
 
@@ -2380,5 +2639,91 @@ mod sensitive_frame_tests {
     fn oversize_input_and_body_overhead_fail_closed_without_panic() {
         assert!(encode_unlock_frame(1, Secret("p".repeat(MAX_FRAME_BYTES + 1))).is_err());
         assert!(encode_unlock_frame(u64::MAX, Secret("p".repeat(MAX_FRAME_BYTES))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod accelerator_release_wire_tests {
+    use super::*;
+    fn grab(flags: u32) -> AcceleratorGrab {
+        AcceleratorGrab {
+            accelerator: Accelerator {
+                action: 7,
+                keysym: 114,
+                mods: 0,
+                modes: MODE_NORMAL,
+            },
+            flags,
+        }
+    }
+    #[test]
+    fn typed_grab_and_release_roundtrip_without_changing_legacy() {
+        for message in [
+            Message::Command {
+                id: 9,
+                kind: CommandKind::SetAcceleratorGrabs {
+                    grabs: vec![grab(GRAB_TRIGGER_RELEASE | GRAB_IGNORE_AUTOREPEAT)],
+                },
+            },
+            Message::AcceleratorDeactivated {
+                action: 7,
+                time: 200,
+                mode: MODE_NORMAL,
+            },
+            Message::Command {
+                id: 10,
+                kind: CommandKind::SetAccelerators {
+                    accelerators: vec![grab(0).accelerator],
+                },
+            },
+        ] {
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+    }
+    #[test]
+    fn typed_grab_decode_rejects_unknown_flags_and_oversized_lists() {
+        for grabs in [vec![grab(1 << 3)], vec![grab(0); MAX_ACCELERATORS + 1]] {
+            assert!(decode_frame(&encode_frame(&Message::Command {
+                id: 11,
+                kind: CommandKind::SetAcceleratorGrabs { grabs }
+            }))
+            .is_err());
+        }
+    }
+    #[test]
+    fn appended_variants_follow_the_0_36_positions() {
+        let index = |message: &Message| encode_frame(message)[4];
+        let last = index(&Message::PointerTimeout {
+            kind: PointerTimeoutKind::Dwell,
+            duration_ms: None,
+            clicked: false,
+            x: 0,
+            y: 0,
+        });
+        for (offset, message) in [
+            Message::NativeOutputInventory {
+                outputs: Vec::new(),
+            },
+            Message::AcceleratorDeactivated {
+                action: 7,
+                time: 200,
+                mode: MODE_NORMAL,
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(index(message), last + 1 + offset as u8);
+        }
+        let command = |kind: CommandKind| {
+            let mut buffer = [0_u8; 64];
+            postcard::to_slice(&kind, &mut buffer).unwrap()[0]
+        };
+        assert_eq!(
+            command(CommandKind::SetAcceleratorGrabs { grabs: Vec::new() }),
+            command(CommandKind::SetDwellClickType {
+                click: DwellClick::Primary,
+            }) + 1
+        );
     }
 }

@@ -17,13 +17,18 @@ fn admitted(w: i64, h: i64) -> bool {
     w > 0 && h > 0 && w <= 7680 && h <= 4320 && w * h * 4 <= 64 * 1024 * 1024
 }
 
+fn normalize_version<'a>(raw: Option<&'a str>, fallback: &'a str) -> &'a str {
+    match raw {
+        Some(v) if !v.is_empty() => v.strip_prefix('v').unwrap_or(v),
+        _ => fallback,
+    }
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!(
             "tuna-wallpaper-svg {}",
-            option_env!("TUNA_VERSION")
-                .unwrap_or(env!("CARGO_PKG_VERSION"))
-                .trim_start_matches('v')
+            normalize_version(option_env!("TUNA_VERSION"), env!("CARGO_PKG_VERSION"))
         );
         return;
     }
@@ -301,4 +306,17 @@ fn backend_identity(modern: bool) -> Result<serde_json::Value, Box<dyn std::erro
     Ok(
         serde_json::json!({"kind":"actual no-base SVG stream loader, owned processors, mapped libraries and FontConfig resources", "sha256":format!("{:x}",hash.finalize()), "resources":resources,"processors":processors,"modern_glycin":modern}),
     )
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::normalize_version;
+
+    #[test]
+    fn helper_version_matches_release_version_contract() {
+        assert_eq!(normalize_version(Some("v1.2.3"), "0.1.0"), "1.2.3");
+        assert_eq!(normalize_version(Some("1.2.3"), "0.1.0"), "1.2.3");
+        assert_eq!(normalize_version(None, "0.1.0"), "0.1.0");
+        assert_eq!(normalize_version(Some(""), "0.1.0"), "0.1.0");
+    }
 }

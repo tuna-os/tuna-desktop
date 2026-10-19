@@ -72,10 +72,12 @@ pub mod introspect;
 pub mod layer;
 pub mod lock;
 pub mod lockdown;
+pub mod magnifier;
 pub mod minimize;
 pub mod modal_dim;
 pub mod monitors;
 pub mod mutter;
+pub mod native_output;
 #[cfg(feature = "drm")]
 mod native_repaint;
 pub mod night_light;
@@ -93,6 +95,7 @@ pub mod pam_conversation;
 pub mod pam_helper;
 #[cfg(feature = "drm")]
 mod performance_trace;
+pub mod pointer_aids;
 pub mod popup;
 pub mod protocols;
 pub mod runtime;
@@ -112,6 +115,7 @@ pub mod spring;
 pub mod state;
 pub mod supervise;
 mod transient_family;
+pub mod transitions;
 pub mod unlock;
 mod wake;
 pub mod wallpaper;

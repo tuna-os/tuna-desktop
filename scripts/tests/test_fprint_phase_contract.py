@@ -64,6 +64,29 @@ class LiveIdentity(unittest.TestCase):
                 validate(r=dict(run, **{key: value}))
         with self.assertRaises(ValueError):
             validate(source=dict(commit, sha="c" * 40))
+    def test_schedule_event_admitted(self):
+        sha = "a" * 40
+        run = dict(id=100, run_attempt=1, repository=dict(full_name=c.REPO),
+                   head_sha=sha, path=c.WORKFLOW, event="schedule",
+                   status="in_progress", conclusion=None)
+        jobs = [dict(id=200, name=c.JOB, status="in_progress", conclusion=None,
+                     head_sha=sha, run_id=100, run_attempt=1),
+                dict(id=201, name="check", status="completed", conclusion="success",
+                     head_sha=sha, run_id=100, run_attempt=1)]
+        commit = dict(sha=sha, tree=dict(sha="b" * 40))
+        self.assertEqual(c.validate_identity(run, jobs, commit, sha, 100, 1, "schedule")["job_id"], 200)
+    def test_unsupported_event_rejected(self):
+        sha = "a" * 40
+        run = dict(id=100, run_attempt=1, repository=dict(full_name=c.REPO),
+                   head_sha=sha, path=c.WORKFLOW, event="fork",
+                   status="in_progress", conclusion=None)
+        jobs = [dict(id=200, name=c.JOB, status="in_progress", conclusion=None,
+                     head_sha=sha, run_id=100, run_attempt=1),
+                dict(id=201, name="check", status="completed", conclusion="success",
+                     head_sha=sha, run_id=100, run_attempt=1)]
+        commit = dict(sha=sha, tree=dict(sha="b" * 40))
+        with self.assertRaises(ValueError):
+            c.validate_identity(run, jobs, commit, sha, 100, 1, "fork")
 
 
 class Contract(unittest.TestCase):

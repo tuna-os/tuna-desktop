@@ -847,6 +847,49 @@ def strip_stop_error(error):
     return result
 
 
+def shell_stack():
+    """Each session shell's threads: name, state, kernel wait and stack,
+    plus user backtraces without arguments, locals or debuginfod traffic."""
+    shells = []
+    for path in pathlib.Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            if (path.stat().st_uid != OWNER.pw_uid
+                    or pathlib.Path(os.readlink(path / "exe")).name != SHELL_GTK):
+                continue
+            tasks = sorted((path / "task").iterdir(), key=lambda task: int(task.name))
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        threads = []
+        for task in tasks:
+            thread = {"tid": int(task.name)}
+            for key, name in (("name", "comm"), ("wait_site", "wchan"),
+                              ("syscall", "syscall"), ("kernel_stack", "stack")):
+                try:
+                    thread[key] = (task / name).read_text().strip()
+                except OSError as error:
+                    thread[key] = f"unavailable: {type(error).__name__}"
+            try:
+                thread["state"] = (task / "stat").read_text().rsplit(")", 1)[1].split()[0]
+            except OSError as error:
+                thread["state"] = f"unavailable: {type(error).__name__}"
+            threads.append(thread)
+        try:
+            gdb = subprocess.run(["gdb", "-nx", "-batch", "-iex", "set debuginfod enabled off",
+                                  "-iex", "set print frame-arguments none",
+                                  "-iex", "set print entry-values no",
+                                  "-ex", "info threads", "-ex", "thread apply all bt",
+                                  "-p", path.name],
+                                 capture_output=True, text=True, timeout=90)
+            # The lane's QGA reply bound is 1 MiB of base64 JSON.
+            backtraces = (gdb.stdout + gdb.stderr)[-196608:]
+        except (OSError, subprocess.TimeoutExpired) as error:
+            backtraces = f"unavailable: {type(error).__name__}"
+        shells.append({"pid": int(path.name), "threads": threads, "backtraces": backtraces})
+    return {"shells": shells}
+
+
 def main():
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
@@ -995,6 +1038,8 @@ def main():
             if process["executable"] == SHELL_GTK:
                 os.kill(process["pid"], 9)
         result = {"killed": "shell"}
+    elif action == "shell-stack":
+        result = shell_stack()
     elif action == "stop-portal":
         call("systemctl", "--user", "stop", "xdg-desktop-portal.service",
              "xdg-desktop-portal-gnome.service", user=True)
@@ -1064,6 +1109,19 @@ def main():
         elif action == "input-buttons":
             result = {key: result[key] for key in
                       ("pid", "buttons", "button_releases", "event_count", "motions", "gtk_version")}
+    elif action == "brightness-contract":
+        original=inventory()
+        shells=[item for item in original["processes"] if item["executable"]=="tuna-shell-gtk"]
+        compositors=[item for item in original["processes"] if item["executable"]=="tuna-compositor"]
+        if len(shells)!=1 or len(compositors)!=1:raise RuntimeError("expected original unique shell and compositor")
+        shell,compositor=shells[0],compositors[0]
+        result=json.loads(call("python3", "/usr/libexec/tuna-brightness-proof",
+            "--out", os.path.join(RUNTIME,"tuna-brightness-native.json"),
+            "--shell-executable", "/usr/bin/tuna-shell-gtk",
+            "--shell-pid",str(shell["pid"]),"--shell-start",str(shell["start_ticks"]),
+            "--compositor-pid",str(compositor["pid"]),"--compositor-start",str(compositor["start_ticks"]),
+            "--session-id",original["session"]["Id"],user=True))
+        result["original_session_inventory"]=original
     elif action == "logout":
         call("loginctl", "terminate-session", inventory()["session"]["Id"])
         result = {"requested": "terminate session"}

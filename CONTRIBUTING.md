@@ -1,14 +1,30 @@
 # Contributing to Tuna Desktop
 
-Tuna Desktop (formerly Roost) is in active implementation as a nested developer preview (see
-[README.md](README.md) and [the roadmap](docs/roadmap.md#public-roadmap)). A Smithay compositor
-supervises a GTK4/libadwaita shell, session supervisor, greetd greeter, and
-versioned control protocol, tested across nested graphical journeys, AT-SPI
-accessibility, and Marlin VM lanes.
+Tuna Desktop (formerly Roost) is in active implementation, with a nested
+developer preview and experimental installed sessions (see [README.md](README.md)
+and [the roadmap](docs/roadmap.md#public-roadmap)). Its Smithay compositor
+supervises the GTK4/libadwaita shell, the installed-session default described in
+[ADR 0006](docs/adr/0006-gtk4-libadwaita-shell.md). The project also includes a
+session supervisor, greetd greeter and versioned control protocol, tested across
+nested graphical journeys, AT-SPI accessibility and Marlin VM lanes. Daily-driver
+and release qualification remain open.
 
 This guide covers contributing code, tests, documentation, and planning
 artifacts. For complete developer setup and build instructions, see the
 [development guide](docs/development.md) and [testing guide](docs/testing.md).
+
+<!-- hive-contribute-plea: donated-compute appeal, keep in sync across repos -->
+## Contribute compute — no code needed
+
+**[Donate time with your AI CLI](https://hub.tunaos.org/#contribute).**
+
+Your machine runs one task at a time using your signed-in AI coding CLI.
+The relay alternates between eligible **School** (OS) and **Reef** (apps)
+hives after each task. If one hive has no work, the other can continue.
+
+The guide covers prerequisites, verified `just` setup, credentials, provider
+costs, and how to stop with Ctrl+C. Your subscription quota or API charges apply.
+Never post account credentials or API keys in issues or pull requests.
 
 ## Before you start
 

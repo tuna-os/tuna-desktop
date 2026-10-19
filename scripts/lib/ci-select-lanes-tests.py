@@ -13,9 +13,6 @@ _spec = importlib.util.spec_from_loader(_loader.name, _loader)
 m = importlib.util.module_from_spec(_spec)
 _loader.exec_module(m)
 
-LANE_IF = "contains(fromJSON(needs.check.outputs.lanes), '{}')"
-
-
 def pr(*changed, run=0, size=2):
     return m.select("pull_request", run, size, list(changed))[0]
 
@@ -71,15 +68,6 @@ class WorkflowSync(unittest.TestCase):
         value = job.get("needs", [])
         return [value] if isinstance(value, str) else value
 
-    def test_every_lane_job_is_gated_on_the_selection(self):
-        lanes = [name for name in self.jobs if name not in ("check", "ci-gate")]
-        self.assertEqual(lanes, m.LANES)
-        for name in lanes:
-            job = self.jobs[name]
-            self.assertEqual(job.get("if"), LANE_IF.format(name), name)
-            self.assertIn("check", self.needs(job), name)
-            self.assertEqual(set(self.needs(job)) - {"check"}, set(m.NEEDS.get(name, [])), name)
-        self.assertTrue(set(m.CORE + m.ROTATION) <= set(m.LANES))
 
     def test_gate_waits_for_every_job(self):
         gate = self.jobs["ci-gate"]

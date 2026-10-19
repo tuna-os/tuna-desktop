@@ -55,11 +55,17 @@ session and through the accessibility bus.
 
 - New build dependency: `gtk4-layer-shell` (packaged on Arch/Marlin; built
   from source on Ubuntu 24.04 CI).
-- Surfaces migrate one at a time while `tuna-shell-host` stays the default
-  shell: panel and quick settings (#55), calendar and notifications (#56),
+- Historical migration: surfaces moved one at a time while `tuna-shell-host`
+  was the default shell: panel and quick settings (#55), calendar and notifications (#56),
   overview with previews and app grid (#54), dock, banners, lock. The
   toolkit-free cores in `tuna-shell-host` (control client, search, tiles,
   notifications center, model) are reused, not rewritten.
-- `TUNA_SHELL_BIN=tuna-shell-gtk` selects the GTK shell today; the default
-  flips when it reaches parity with the surfaces the old shell draws.
+- Current installed-session default (verified 2026-10-19): the compositor
+  resolver prefers `tuna-shell-gtk`, with `tuna-shell-host` as the compatibility
+  fallback. `TUNA_SHELL_BIN=tuna-shell-host` explicitly selects that fallback;
+  an explicit `--shell-bin` takes precedence. See
+  [runtime selection](../../crates/compositor/src/runtime.rs) and
+  [packaging](../../packaging/README.md). The development helper
+  `scripts/tuna-nested` explicitly supplies its legacy shell unless given
+  `--shell-bin`; that helper override is separate from the installed default.
 - The accessibility tree is now testable in CI (#71).

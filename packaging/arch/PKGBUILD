@@ -26,6 +26,7 @@ license=('GPL-3.0-or-later')
 depends=(
     'dbus'
     'glib2'
+    'gnome-settings-daemon'
     'gdk-pixbuf2'
     'librsvg'
     'glycin'

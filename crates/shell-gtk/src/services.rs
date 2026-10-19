@@ -261,6 +261,12 @@ pub struct Widgets {
     pub bt_menu: Rc<crate::bt_menu::BtMenu>,
     pub wired: Tile,
     pub bluetooth: Tile,
+    /// The mobile-broadband tile and its modem menu.
+    pub wwan: Tile,
+    pub wwan_menu: Rc<crate::wwan::WwanMenu>,
+    /// The location agent: the GeoClue2 agent behind the panel's
+    /// in-use indicator (the switch lives in Settings).
+    pub location_agent: Rc<crate::location::LocationAgent>,
     pub power_mode: Tile,
     /// The Power Mode menu: its header icon and one item per profile
     /// (profile name, button, check ornament).
@@ -287,12 +293,13 @@ pub struct Widgets {
     pub sound_list: gtk::Box,
     pub sound_arrow: gtk::ToggleButton,
     pub brightness: gtk::Scale,
+    pub brightness_controller: Rc<crate::brightness_service::Controller>,
 }
 
 /// Wire every service to its widgets. Missing buses leave the tiles
 /// hidden; nothing here blocks.
 pub fn attach(w: &Rc<Widgets>) {
-    for tile in [&w.wifi, &w.wired, &w.bluetooth, &w.power_mode] {
+    for tile in [&w.wifi, &w.wired, &w.bluetooth, &w.wwan, &w.power_mode] {
         tile.present(false);
     }
     // The system bus connection itself is asynchronous too.
@@ -304,6 +311,7 @@ pub fn attach(w: &Rc<Widgets>) {
             Ok(conn) => {
                 network(&conn, &w2);
                 bluetooth(&conn, &w2);
+                location(&conn, &w2);
                 power_profiles(&conn, &w2, 0);
                 brightness(&conn, &w2);
                 battery(&conn, &w2);
@@ -329,6 +337,9 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
                 let on = dict_bool(&props, "WirelessEnabled").unwrap_or(false);
                 // GNOME's subtitle is the connected network's name.
                 w1.wifi_menu.set_enabled(on);
+                // The WWAN tile shows the master modem switch.
+                w1.wwan_menu
+                    .set_enabled(dict_bool(&props, "WwanEnabled").unwrap_or(false));
             });
             // Which tiles exist depends on the devices present.
             let (w, conn) = (w.clone(), conn.clone());
@@ -376,6 +387,7 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
                             w.wifi.present(wifi);
                             w.wifi_menu.attach(&conn, wifi_device.borrow().clone());
                             w.wired_menu.attach(&conn);
+                            w.wwan_menu.attach(&conn);
                             // GNOME's primary network indicator: shown
                             // while the main connection is up.
                             w.panel_network.set_visible(wired && connected);
@@ -397,6 +409,7 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
             } else {
                 w.wifi.present(false);
                 w.wired_menu.detach();
+                w.wwan_menu.detach();
                 w.panel_network.set_visible(false);
             }
         });
@@ -406,6 +419,13 @@ fn network(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
         w.wifi
             .on_user_toggle(move |on| nm.set("WirelessEnabled", on.to_variant()));
     }
+}
+
+/// Location services: export the GeoClue2 agent on the system bus and
+/// follow its `InUse`. Settings owns the GSettings-backed master switch,
+/// which continues to gate the agent even with GeoClue absent.
+fn location(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
+    w.location_agent.attach(conn);
 }
 
 fn bluetooth(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
@@ -605,15 +625,39 @@ pub enum BrightnessStep {
 }
 
 /// GNOME's brightness keys (brightnessManager.js): step the backlight
-/// by a twentieth through logind and return the new level (0..1) for
-/// the OSD, or `None` without a backlight.
-pub fn step_brightness_for(step: BrightnessStep, output: Option<&str>) -> Option<f64> {
+/// by a twentieth through asynchronous logind. The callback receives the
+/// actual verified level (0..1) for the OSD, or an explicit failure.
+pub fn step_brightness_for(
+    step: BrightnessStep,
+    output: Option<&str>,
+    done: Box<dyn FnOnce(Result<f64, String>)>,
+) {
+    use std::os::unix::fs::MetadataExt;
+    if output.is_some() {
+        done(Err(
+            "monitor brightness requires compositor-owned native authority".into(),
+        ));
+        return;
+    }
     let root = std::env::var_os("TUNA_BACKLIGHT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/sys/class/backlight"));
-    let (name, dir) = backlight_for(&root, output)?;
-    let max = read_u32(&dir.join("max_brightness"))?;
-    let now = read_u32(&dir.join("brightness"))?;
+    let Some((name, dir)) = backlight_for(&root, output) else {
+        done(Err("no backlight".into()));
+        return;
+    };
+    let Some(max) = read_u32(&dir.join("max_brightness")) else {
+        done(Err("invalid backlight range".into()));
+        return;
+    };
+    let Some(now) = read_u32(&dir.join("brightness")) else {
+        done(Err("invalid brightness".into()));
+        return;
+    };
+    let Ok(identity) = std::fs::metadata(&dir) else {
+        done(Err("backlight disappeared".into()));
+        return;
+    };
     let current = logic::brightness_percent(now, max);
     let percent = match step {
         BrightnessStep::Up => logic::brightness_step(current, true),
@@ -627,65 +671,156 @@ pub fn step_brightness_for(step: BrightnessStep, output: Option<&str>) -> Option
         }
     };
     let value = logic::brightness_value(percent, max);
-    let conn = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE).ok()?;
-    conn.call(
-        Some(LOGIND_NAME),
-        LOGIND_SESSION_PATH,
-        LOGIND_SESSION_IFACE,
-        "SetBrightness",
-        Some(&("backlight", name.as_str(), value).to_variant()),
-        None,
-        gio::DBusCallFlags::NONE,
-        2000,
-        gio::Cancellable::NONE,
-        |_| {},
-    );
-    Some(percent / 100.0)
+    let device = crate::brightness::Device {
+        name,
+        output: output.unwrap_or("").into(),
+        owner: None,
+        kind: match crate::brightness::BacklightKind::read(&dir.join("type")) {
+            Ok(kind) => kind,
+            Err(error) => {
+                done(Err(error));
+                return;
+            }
+        },
+        path: dir,
+        max,
+        current: now,
+        dev: identity.dev(),
+        inode: identity.ino(),
+    };
+    gio::bus_get(gio::BusType::System, gio::Cancellable::NONE, move |conn| {
+        let Ok(conn) = conn else {
+            done(Err("system bus unavailable".into()));
+            return;
+        };
+        conn.call(
+            Some(LOGIND_NAME),
+            LOGIND_SESSION_PATH,
+            LOGIND_SESSION_IFACE,
+            "SetBrightness",
+            Some(&("backlight", device.name.as_str(), value).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            2000,
+            gio::Cancellable::NONE,
+            move |reply| {
+                done(reply.map_err(|e| e.to_string()).and_then(|_| {
+                    let actual = crate::brightness::readback(&device)?;
+                    if actual != value {
+                        return Err("backlight readback mismatch".into());
+                    }
+                    Ok(logic::brightness_percent(actual, device.max) / 100.0)
+                }));
+            },
+        );
+    });
 }
 
 fn read_u32(path: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    tuna_backlight::scalar(path).ok()
 }
 
 fn brightness(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
-    let Some((name, dir)) = backlight() else {
-        w.brightness_row.set_visible(false);
-        return;
-    };
-    let Some(max) = read_u32(&dir.join("max_brightness")) else {
-        w.brightness_row.set_visible(false);
-        return;
-    };
-    w.brightness_row.set_visible(true);
+    use std::os::unix::fs::MetadataExt;
+    let legacy = backlight()
+        .and_then(|(name, dir)| read_u32(&dir.join("max_brightness")).map(|max| (name, dir, max)));
     let syncing = Rc::new(Cell::new(false));
-    let read = {
-        let (w, dir, syncing) = (w.clone(), dir.clone(), syncing.clone());
-        move || {
-            if let Some(value) = read_u32(&dir.join("brightness")) {
+    let read: Rc<dyn Fn()> = {
+        let (w, legacy, syncing) = (w.clone(), legacy.clone(), syncing.clone());
+        Rc::new(move || {
+            let level = if w.brightness_controller.has_output(None) {
+                w.brightness_controller
+                    .level(None)
+                    .map(|level| 100.0 * level)
+            } else {
+                legacy.as_ref().and_then(|(_, dir, max)| {
+                    read_u32(&dir.join("brightness"))
+                        .map(|value| logic::brightness_percent(value, *max))
+                })
+            };
+            w.brightness_row.set_visible(level.is_some());
+            if let Some(level) = level {
                 syncing.set(true);
-                w.brightness
-                    .set_value(logic::brightness_percent(value, max));
+                w.brightness.set_value(level);
                 syncing.set(false);
             }
-        }
+        })
     };
     read();
-    // Re-read whenever the menu opens: other tools change it too.
-    w.brightness.connect_map(move |_| read());
-    let session = Remote::new(conn, LOGIND_NAME, LOGIND_SESSION_PATH, LOGIND_SESSION_IFACE);
+    let mapped = read.clone();
+    w.brightness.connect_map(move |_| mapped());
+    let weak = Rc::downgrade(w);
+    let poll = read.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+        if weak.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        poll();
+        glib::ControlFlow::Continue
+    });
+    let conn = conn.clone();
+    let controller = w.brightness_controller.clone();
     w.brightness.connect_value_changed(move |s| {
         if syncing.get() {
             return;
         }
-        let value = logic::brightness_value(s.value(), max);
-        let args = ("backlight", name.as_str(), value).to_variant();
-        session.call(
-            LOGIND_SESSION_IFACE,
-            "SetBrightness",
-            Some(args),
-            None,
-            |_| {},
-        );
+        if controller.has_output(None) {
+            controller.user(
+                None,
+                s.value() / 100.0,
+                Box::new(|result| {
+                    if let Err(e) = result {
+                        eprintln!("tuna-shell-gtk: brightness slider: {e}");
+                    }
+                }),
+            );
+        } else if let Some((name, dir, max)) = legacy.as_ref() {
+            let value = logic::brightness_value(s.value(), *max);
+            let Ok(identity) = std::fs::metadata(dir) else {
+                eprintln!("tuna-shell-gtk: legacy brightness device disappeared");
+                return;
+            };
+            let device = crate::brightness::Device {
+                name: name.clone(),
+                output: String::new(),
+                owner: None,
+                kind: match crate::brightness::BacklightKind::read(&dir.join("type")) {
+                    Ok(kind) => kind,
+                    Err(error) => {
+                        eprintln!("tuna-shell-gtk: legacy brightness type: {error}");
+                        return;
+                    }
+                },
+                path: dir.clone(),
+                max: *max,
+                current: 0,
+                dev: identity.dev(),
+                inode: identity.ino(),
+            };
+            if crate::brightness::readback(&device).is_err() {
+                eprintln!("tuna-shell-gtk: legacy brightness pre-admission readback rejected");
+                return;
+            }
+            conn.call(
+                Some(LOGIND_NAME),
+                LOGIND_SESSION_PATH,
+                LOGIND_SESSION_IFACE,
+                "SetBrightness",
+                Some(&("backlight", name.as_str(), value).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                2000,
+                gio::Cancellable::NONE,
+                move |reply| match reply {
+                    Err(e) => eprintln!("tuna-shell-gtk: legacy brightness slider: {e}"),
+                    Ok(_) => {
+                        if crate::brightness::readback(&device) != Ok(value) {
+                            eprintln!("tuna-shell-gtk: legacy brightness slider readback mismatch");
+                        }
+                    }
+                },
+            );
+        }
     });
 }
 

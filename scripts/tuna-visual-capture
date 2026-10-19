@@ -96,7 +96,7 @@ stage_ledger() {
         notifications) echo "P-NT-01 P-NT-02" ;;
         input) echo "P-IN-01" ;;
         system) echo "P-SY-05 P-SY-07 P-LK-01 P-SY-03" ;;
-        settings-a11y) echo "P-ST-01 P-ST-08 P-A11Y-05 P-AN-01" ;;
+        settings-a11y) echo "P-ST-01 P-ST-08 P-A11Y-05 P-A11Y-07 P-AN-01" ;;
         transitions) echo "P-AN-01 P-AN-02 P-AN-04 P-AN-05 P-AN-07 P-AN-09" ;;
         *) echo "" ;;
     esac
@@ -1784,6 +1784,18 @@ EOF2
     gset reset org.gnome.desktop.a11y always-show-universal-access-status 2>/dev/null || true
     sleep 1
 }
+st_settings_dwell_chooser() {
+    gset set org.gnome.desktop.a11y.mouse dwell-mode window || state_fail "dwell-mode unavailable"
+    gset set org.gnome.desktop.a11y.mouse dwell-click-enabled true || state_fail "dwell-click-enabled unavailable"
+    cstate_wait '.input_aids.pointer.dwell_click' 10 || state_fail "hover click did not reach the compositor"
+    a11y a11y-dwell-chooser.json --press "Dwell Click" >/dev/null 2>&1 || state_fail "hover-click chooser did not open"
+    a11y a11y-dwell-choices.json >/dev/null 2>&1
+    require_jq a11y-dwell-choices.json 'any(.[]; .name == "Single Click" and .showing)' "hover-click chooser showing"
+    shot settings-dwell-chooser || state_fail "scrot failed"
+    close_all
+    gset reset org.gnome.desktop.a11y.mouse dwell-click-enabled || state_fail "dwell-click-enabled reset failed"
+    gset reset org.gnome.desktop.a11y.mouse dwell-mode || state_fail "dwell-mode reset failed"
+}
 st_settings_background() {
     ffmpeg -nostdin -loglevel error -y -f lavfi -i color=c=0x2ec27e:s=64x64 -frames:v 1 \
         "$ARTIFACTS/wallpaper-green.png" 2>/dev/null || state_skip "ffmpeg unavailable for wallpaper fixture"
@@ -1807,6 +1819,7 @@ states_settings_a11y() {
     run_state dark-style st_settings_dark
     run_state clock st_settings_clock
     run_state a11y-menu st_settings_a11y_menu
+    run_state dwell-chooser st_settings_dwell_chooser
     run_state background st_settings_background
 }
 

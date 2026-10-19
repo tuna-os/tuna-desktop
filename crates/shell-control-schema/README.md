@@ -12,14 +12,15 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.32).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.38).
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
-  `InputSettings`, `WindowId`, `WorkspaceId`, `dynamic_workspace_count`.
+  `NativeOutputInfo`, `InputSettings`, `WindowId`, `WorkspaceId`,
+  `dynamic_workspace_count`.
 - Tokens and secrets: `ActivationToken`, `TokenMeta`, `Secret`.
 - Switcher and keybindings: `SwitcherAction`, `SwitcherKey`,
   `SwitcherThumbnail`, `WindowAction`, `Accelerator`, and the `MOD_*` and
@@ -49,3 +50,36 @@ and strict trailing-byte rejection remain intact. Both booleans are required;
 postcard rejects values other than 0/1. The authenticated shell sends the full
 pair initially and whenever wellbeing state changes. The compositor owns the
 three-second entry animation and immediate exit; the cursor is excluded.
+
+## Pointer accessibility aids (0.36)
+
+`InputSettings::pointer_aids` (GNOME's `org.gnome.desktop.a11y.mouse`) is
+appended after `keyboard_aids`; `CommandKind::SetDwellClickType` is appended
+for the hover-click chooser, and the compositor reports
+`Message::DwellClickType` and `Message::PointerTimeout` (pie timer) as the
+last two message variants. Positional: both peers ship together.
+
+## Native output inventory (0.37)
+
+`Message::NativeOutputInventory { outputs: Vec<NativeOutputInfo> }` appends
+the compositor-owned DRM connector identity (char-device rdev, connector
+object ID and canonical sysfs object) for each lit native output. `OutputInfo`
+and the `Outputs` message are byte-for-byte unchanged. The compositor sends it
+only to peers advertising minor 37 or later; an empty list explicitly revokes
+earlier authority, and nested sessions never send a non-empty one. Decoding
+rejects more than 64 records (`DecodeError::CollectionTooLong`).
+
+
+## Accelerator grab flags and release (0.38)
+
+`CommandKind::SetAcceleratorGrabs { grabs: Vec<AcceleratorGrab> }` and
+`Message::AcceleratorDeactivated { action, time, mode }` append in 0.38:
+atomic grab replacement with GNOME's `IGNORE_AUTOREPEAT` and
+`TRIGGER_RELEASE` flags (`SUPPORTED_GRAB_FLAGS`; anything else, or more than
+`MAX_ACCELERATORS`, fails decoding), and the release of a `TRIGGER_RELEASE`
+grab's press. The legacy `SetAccelerators` body is unchanged.
+
+The compositor sends release events only to peers advertising minor 38 or
+later and rejects typed grabs from older peers. `NativeOutputInventory` stays
+at its shipped 0.37 position; this slice adds no monitor-identity or brightness
+journal messages.

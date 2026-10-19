@@ -25,7 +25,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | Key | Status | Reason |
 |---|---|---|
 | screen-keyboard-enabled | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| screen-magnifier-enabled | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| screen-magnifier-enabled | Honored (captures/casts) | GTK shell mirrors the switch plus the honored magnifier keys into the session snapshot; compositor screenshots and monitor/area casts magnify per GNOME 51 zoom and tracking. Live presentation, cross-hairs and color-filter keys remain open (#349) |
 | screen-reader-enabled | Honored (hardware session only) | Hardware GTK shell publishes the preference to the compositor, which owns a genuine nonreplacement Orca child bound to its lifetime; nested runtimes refuse activation and never manage host Orca. Genuine Orca activation/logout VM probes are required; Settings UI activation and complete spoken lock/login/shell navigation remain unqualified (#352) |
 ## org.gnome.desktop.a11y.interface
 
@@ -66,7 +66,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | brightness-blue | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | brightness-green | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | brightness-red | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| caret-tracking | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| caret-tracking | Honored (captures/casts) | Text-input caret retargets the magnified region (none/centered/proportional/push, default centered) in screenshots and casts; see screen-magnifier-enabled |
 | color-saturation | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | contrast-blue | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | contrast-green | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
@@ -76,29 +76,29 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | cross-hairs-length | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | cross-hairs-opacity | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 | cross-hairs-thickness | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| focus-tracking | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| focus-tracking | Honored (captures/casts) | Focused window center retargets the magnified region (none/centered/proportional/push, default proportional) in screenshots and casts; see screen-magnifier-enabled |
 | invert-lightness | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| lens-mode | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| mag-factor | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| mouse-tracking | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| screen-position | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| scroll-at-edges | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| lens-mode | Honored (captures/casts) | A non-full-screen viewport centers on the pointer in screenshots and casts, as in GNOME; full-screen lens stays put; see screen-magnifier-enabled |
+| mag-factor | Honored (captures/casts) | Zoom factor 0.1..=32.0 (two decimals, default 2.0) scales the region of interest in screenshots and casts; unity passes frames through; see screen-magnifier-enabled |
+| mouse-tracking | Honored (captures/casts) | Pointer motion retargets the magnified region (none/centered/proportional/push, default proportional) in screenshots and casts; see screen-magnifier-enabled |
+| screen-position | Honored (captures/casts) | Full-screen or half-screen viewport in screenshots and casts; unmagnified halves copy through; see screen-magnifier-enabled |
+| scroll-at-edges | Honored (captures/casts) | Off (default) clamps the region of interest on screen; on lets it scroll past edges with black fill in screenshots and casts; see screen-magnifier-enabled |
 | show-cross-hairs | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
 ## org.gnome.desktop.a11y.mouse
 
 | Key | Status | Reason |
 |---|---|---|
-| click-type-window-visible | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-click-enabled | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-gesture-double | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-gesture-drag | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-gesture-secondary | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-gesture-single | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-mode | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-threshold | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| dwell-time | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| secondary-click-enabled | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| secondary-click-time | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| click-type-window-visible | Ignored | GNOME Shell 51 does not read it either: the chooser follows dwell-click-enabled and dwell-mode |
+| dwell-click-enabled | Honored | Hover click in the compositor's input pipeline, with GNOME's pie timer and panel chooser (G-A11Y-DWELL) |
+| dwell-gesture-double | Honored | Gesture direction for a double click |
+| dwell-gesture-drag | Honored | Gesture direction for a drag |
+| dwell-gesture-secondary | Honored | Gesture direction for a secondary click (G-A11Y-DWELL) |
+| dwell-gesture-single | Honored | Gesture direction for a single click |
+| dwell-mode | Honored | `window` shows the panel's click-type chooser; `gesture` picks the click by direction (G-A11Y-DWELL) |
+| dwell-threshold | Honored | Motion that cancels a dwell or a held secondary click, and a gesture's minimum (G-A11Y-DWELL) |
+| dwell-time | Honored | Live dwell and gesture timeout (G-A11Y-DWELL) |
+| secondary-click-enabled | Honored | A held primary button becomes a secondary click on release (G-A11Y-SECONDARY) |
+| secondary-click-time | Honored | Live hold time (G-A11Y-SECONDARY) |
 ## org.gnome.desktop.app-folders
 
 | Key | Status | Reason |

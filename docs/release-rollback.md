@@ -85,10 +85,12 @@ package made it into a promoted Marlin image digest:
 
 ## 5. Update the public-facing trail
 
-- If `docs/walkthrough.md` was already regenerated for the bad tag
-  (checklist step 9), regenerate it again once the replacement tag is out:
+- Regenerate `walkthrough-media/walkthrough.md` for the replacement tag:
   `scripts/tuna-capture --artifacts walkthrough-media --render-walkthrough
-  vX.Y.Z+1` and commit the result. Don't hand-edit the links.
+  vX.Y.Z+1`, then upload it with that release's replacement media and update
+  the release-notes link. Do not stamp release links into the canonical
+  `docs/walkthrough.md`; its manifest-generated feature tour has a separate
+  [visual capture workflow](visual-capture-refresh.md).
 - Add a line to the replacement version's release notes under "Known
   limitations" or a new "Corrections" heading naming what was wrong with
   the withdrawn tag, so the gap in the version sequence has a public

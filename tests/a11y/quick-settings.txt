@@ -18,6 +18,10 @@ toggle button: Wired
 toggle button: Wired Menu
 toggle button: Bluetooth
 toggle button: Bluetooth Menu
+toggle button: Printers
+toggle button: Printers Menu
+toggle button: Mobile Network
+toggle button: Mobile Network Menu
 toggle button: Power Mode
 toggle button: Power Mode Menu
 toggle button: Night Light

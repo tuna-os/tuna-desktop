@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 static int ask(pam_handle_t *pamh, int count, struct pam_message *messages,
                const char *const *expected) {
@@ -48,16 +49,22 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         const char *root = getenv("TUNA_AUTH_OWNER_ROOT");
         char path[PATH_MAX];
         if (root == NULL || strlen(root) > PATH_MAX - 64) return PAM_SYSTEM_ERR;
+        char pending[PATH_MAX], pid[32];
+        snprintf(pending, sizeof(pending), "%s/started-pending-%ld", root, (long)getpid());
+        int fd = open(pending, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) return PAM_SYSTEM_ERR;
+        int count = snprintf(pid, sizeof(pid), "%ld", (long)getpid());
+        ssize_t written = write(fd, pid, (size_t)count);
+        int closed = close(fd);
+        if (written != count || closed != 0) { unlink(pending); return PAM_SYSTEM_ERR; }
         unsigned attempt = 1;
         for (; attempt <= 4; ++attempt) {
             snprintf(path, sizeof(path), "%s/started-%u", root, attempt);
-            int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-            if (fd >= 0) {
-                char pid[32]; int count = snprintf(pid, sizeof(pid), "%ld", (long)getpid());
-                if (write(fd, pid, (size_t)count) != count) { close(fd); return PAM_SYSTEM_ERR; }
-                close(fd); break;
-            }
+            /* Publish complete PID bytes without replacing another helper's marker. */
+            if (link(pending, path) == 0) break;
+            if (errno != EEXIST) { unlink(pending); return PAM_SYSTEM_ERR; }
         }
+        unlink(pending);
         if (attempt > 4) return PAM_SYSTEM_ERR;
         struct pam_message secret = { PAM_PROMPT_ECHO_OFF, "Controlled password" };
         const char *one[] = { "controlled-only" };
@@ -66,7 +73,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         /* The private helper budget and outer test watchdog bound this fixture. */
         while (access(path, F_OK) != 0) usleep(5000);
         snprintf(path, sizeof(path), "%s/done-%u", root, attempt);
-        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
         if (fd < 0) return PAM_SYSTEM_ERR;
         close(fd);
         return PAM_SUCCESS;
