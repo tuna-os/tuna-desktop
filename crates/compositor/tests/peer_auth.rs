@@ -6,11 +6,11 @@
 //! runs, nobody between restarts, a bounded pending queue, and never a
 //! shared directory.
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tuna_compositor::control::{
     is_private_dir, our_uid, ControlHub, PeerCred, PeerGate, MAX_PENDING_PEERS,
@@ -40,6 +40,30 @@ fn rounds(hub: &mut ControlHub, model: &mut StateModel, n: usize) {
     for _ in 0..n {
         hub.poll(model);
     }
+}
+
+/// Observe retirement before reconnecting. Dropping one shell handle does not
+/// close its socket while another reference is still alive, and nonblocking
+/// polls cannot make that last reference close. A persistent leak must fail.
+fn wait_for_session_retirement(
+    hub: &mut ControlHub,
+    model: &mut StateModel,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        hub.poll(model);
+        if hub.session_count() == 0 && Instant::now() < deadline {
+            return Ok(());
+        }
+        std::thread::sleep(
+            Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{} shell session(s) did not retire", hub.session_count()),
+    ))
 }
 
 /// True when the server closed our end without sending anything.
@@ -129,8 +153,64 @@ fn supervised_shell_pid_is_admitted_and_reconnects() {
         rounds(&mut hub, &mut model, 3);
         assert_eq!(hub.session_count(), 1, "valid shell (re)connect admitted");
         drop(shell);
-        rounds(&mut hub, &mut model, 3);
+        wait_for_session_retirement(&mut hub, &mut model, Duration::from_secs(1))
+            .expect("previous shell session must retire before reconnect");
     }
+}
+
+#[test]
+fn retirement_wait_observes_a_delayed_last_shell_reference() {
+    let (_dir, mut hub, path) = bind();
+    let mut model = StateModel::new();
+    hub.set_peer_gate(PeerGate::Pid(std::process::id()));
+    let mut shell = UnixStream::connect(&path).unwrap();
+    hello(&mut shell);
+    rounds(&mut hub, &mut model, 3);
+    assert_eq!(hub.session_count(), 1);
+
+    let duplicate = shell.try_clone().unwrap();
+    drop(shell);
+    rounds(&mut hub, &mut model, 3);
+    assert_eq!(hub.session_count(), 1, "held reference prevents retirement");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        drop(duplicate);
+    });
+    let retired = wait_for_session_retirement(&mut hub, &mut model, Duration::from_secs(1));
+    release.join().unwrap();
+    retired.expect("last reference closes within the retirement budget");
+    assert_eq!(hub.session_count(), 0);
+
+    let mut shell = UnixStream::connect(&path).unwrap();
+    hello(&mut shell);
+    rounds(&mut hub, &mut model, 3);
+    assert_eq!(hub.session_count(), 1, "only the reconnected shell remains");
+    drop(shell);
+    wait_for_session_retirement(&mut hub, &mut model, Duration::from_secs(1)).unwrap();
+}
+
+#[test]
+fn retirement_wait_rejects_a_persistent_shell_reference() {
+    let (_dir, mut hub, path) = bind();
+    let mut model = StateModel::new();
+    hub.set_peer_gate(PeerGate::Pid(std::process::id()));
+    let mut shell = UnixStream::connect(&path).unwrap();
+    hello(&mut shell);
+    rounds(&mut hub, &mut model, 3);
+    assert_eq!(hub.session_count(), 1);
+
+    let duplicate = shell.try_clone().unwrap();
+    drop(shell);
+    assert_eq!(
+        wait_for_session_retirement(&mut hub, &mut model, Duration::from_millis(20))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(hub.session_count(), 1, "a held socket is not retired");
+    drop(duplicate);
+    wait_for_session_retirement(&mut hub, &mut model, Duration::from_secs(1)).unwrap();
+    assert_eq!(hub.session_count(), 0);
 }
 
 #[test]
