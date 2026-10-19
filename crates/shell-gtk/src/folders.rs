@@ -638,13 +638,33 @@ pub fn rename(id: &str, name: &str) {
 
 /// Retained settings instances subscribe before reading each key. A short-lived
 /// reader can otherwise observe the backend cache before its change dispatch.
-/// Callbacks only mark a cell; the existing UI poll owns graph reconciliation.
+/// Callbacks mark a cell and schedule the [`on_change`](FolderWatch::on_change)
+/// hook from an idle; the overview's sync owns graph reconciliation.
 pub struct FolderWatch {
     root: Option<gio::Settings>,
     backend: Option<gio::SettingsBackend>,
     source: Option<gio::SettingsSchemaSource>,
     children: std::cell::RefCell<std::collections::BTreeMap<String, gio::Settings>>,
-    dirty: std::rc::Rc<std::cell::Cell<bool>>,
+    dirty: std::rc::Rc<Dirty>,
+}
+
+/// A settings change not yet applied to the grid, and who to wake for it.
+#[derive(Default)]
+struct Dirty {
+    set: std::cell::Cell<bool>,
+    notify: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>,
+}
+
+impl Dirty {
+    /// Mark the change and wake the hook once, outside the signal handler.
+    fn mark(&self) {
+        if self.set.replace(true) {
+            return;
+        }
+        if let Some(notify) = self.notify.borrow().clone() {
+            glib::MainContext::ref_thread_default().spawn_local(async move { notify() });
+        }
+    }
 }
 
 impl Default for FolderWatch {
@@ -666,7 +686,7 @@ impl FolderWatch {
         source: Option<gio::SettingsSchemaSource>,
         backend: Option<gio::SettingsBackend>,
     ) -> Self {
-        let dirty = std::rc::Rc::new(std::cell::Cell::new(false));
+        let dirty = std::rc::Rc::new(Dirty::default());
         let root = source.as_ref().and_then(|source| {
             source.lookup(FOLDER_SCHEMA, true)?;
             let schema = source.lookup(SCHEMA, true)?;
@@ -676,7 +696,7 @@ impl FolderWatch {
             let weak = std::rc::Rc::downgrade(&dirty);
             root.connect_changed(Some("folder-children"), move |_, _| {
                 if let Some(dirty) = weak.upgrade() {
-                    dirty.set(true);
+                    dirty.mark();
                 }
             });
         }
@@ -689,6 +709,13 @@ impl FolderWatch {
         };
         watch.reconcile();
         watch
+    }
+
+    /// Run `notify` (from an idle) when a folder setting changes. The
+    /// shell is otherwise only woken by the compositor, which sends
+    /// nothing while its state is unchanged.
+    pub fn on_change(&self, notify: impl Fn() + 'static) {
+        *self.dirty.notify.borrow_mut() = Some(std::rc::Rc::new(notify));
     }
 
     /// Refresh subscriptions even while the overview is closed or dragging.
@@ -713,7 +740,7 @@ impl FolderWatch {
             let weak = std::rc::Rc::downgrade(&self.dirty);
             settings.connect_changed(None, move |_, _| {
                 if let Some(dirty) = weak.upgrade() {
-                    dirty.set(true);
+                    dirty.mark();
                 }
             });
             // GSettings emits changed only for keys read after connecting.
@@ -727,7 +754,7 @@ impl FolderWatch {
     }
 
     pub fn take_dirty(&self) -> bool {
-        self.dirty.replace(false)
+        self.dirty.set.replace(false)
     }
 
     pub fn load(&self) -> Vec<Folder> {
@@ -862,7 +889,10 @@ mod tests {
             backend: None,
             source: None,
             children: Default::default(),
-            dirty: std::rc::Rc::new(std::cell::Cell::new(true)),
+            dirty: std::rc::Rc::new(Dirty {
+                set: std::cell::Cell::new(true),
+                notify: Default::default(),
+            }),
         };
         assert!(!watch.take_dirty_if(false, false));
         assert!(!watch.take_dirty_if(true, true));
@@ -892,7 +922,7 @@ mod tests {
                 );
                 assert!(watch.load().is_empty());
                 root.set_strv("folder-children", ["Live"]).unwrap();
-                dispatch_until(&context, || watch.dirty.get());
+                dispatch_until(&context, || watch.dirty.set.get());
                 watch.reconcile();
                 watch.take_dirty();
                 child.set_string("name", "Changed").unwrap();
@@ -900,7 +930,7 @@ mod tests {
                 child.set_strv("categories", ["Utility"]).unwrap();
                 child.set_strv("excluded-apps", ["two.desktop"]).unwrap();
                 child.set_boolean("translate", false).unwrap();
-                dispatch_until(&context, || watch.dirty.get());
+                dispatch_until(&context, || watch.dirty.set.get());
                 let folders = watch.load();
                 assert_eq!(folders[0].name, "Changed");
                 assert_eq!(folders[0].apps, ["one.desktop"]);
@@ -914,6 +944,38 @@ mod tests {
                     context.iteration(false);
                 }
                 assert!(!watch.take_dirty(), "removed child must no longer notify");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn folder_changes_wake_the_overview_without_compositor_traffic() {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let fixture = TestSchemas::new();
+                let source = fixture.source.clone();
+                let backend = gio::memory_settings_backend_new();
+                let watch = FolderWatch::with_source(Some(source.clone()), Some(backend.clone()));
+                let woken = std::rc::Rc::new(std::cell::Cell::new(0));
+                let counter = woken.clone();
+                watch.on_change(move || counter.set(counter.get() + 1));
+                let root = gio::Settings::new_full(
+                    &source.lookup(SCHEMA, true).unwrap(),
+                    Some(&backend),
+                    None,
+                );
+                root.set_strv("folder-children", ["Live"]).unwrap();
+                dispatch_until(&context, || woken.get() == 1);
+                // Pending changes wake once until the grid takes them.
+                root.set_strv("folder-children", ["Live", "More"]).unwrap();
+                while context.pending() {
+                    context.iteration(false);
+                }
+                assert_eq!(woken.get(), 1);
+                assert!(watch.take_dirty());
+                root.set_strv("folder-children", ["Live"]).unwrap();
+                dispatch_until(&context, || woken.get() == 2);
             })
             .unwrap();
     }
@@ -949,12 +1011,12 @@ mod tests {
             let replacement = dir.join("replacement");
             std::fs::write(&replacement, "[org/gnome/desktop/app-folders]\nfolder-children=['Live']\n[org/gnome/desktop/app-folders/folders/Live]\nname='External'\napps=['one.desktop']\n").unwrap();
             std::fs::rename(&replacement, &path).unwrap();
-            dispatch_until(&context, || watch.dirty.get());
+            dispatch_until(&context, || watch.dirty.set.get());
             assert_eq!(watch.load()[0].name, "External");
             watch.take_dirty();
             std::fs::write(&replacement, "[org/gnome/desktop/app-folders]\nfolder-children=['Live']\n[org/gnome/desktop/app-folders/folders/Live]\nname='Renamed'\napps=['two.desktop']\n").unwrap();
             std::fs::rename(&replacement, &path).unwrap();
-            dispatch_until(&context, || watch.dirty.get());
+            dispatch_until(&context, || watch.dirty.set.get());
             let folders = watch.load();
             assert_eq!(folders[0].name, "Renamed");
             assert_eq!(folders[0].apps, ["two.desktop"]);

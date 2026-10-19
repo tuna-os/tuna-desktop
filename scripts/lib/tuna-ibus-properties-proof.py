@@ -110,7 +110,7 @@ def atspi_child(pid, op, name, role):
     """
     def describe(n):
         states = n.get_state_set()
-        return {"bus": n.app.bus_name, "path": n.path, "role": n.get_role_name(),
+        return {"name": n.get_name(), "bus": n.app.bus_name, "path": n.path, "role": n.get_role_name(),
                 "showing": states.contains(Atspi.StateType.SHOWING),
                 "checked": states.contains(Atspi.StateType.CHECKED),
                 "sensitive": states.contains(Atspi.StateType.SENSITIVE)}
@@ -120,7 +120,9 @@ def atspi_child(pid, op, name, role):
         apps = [a for a in apps if a is not None and live(a) and a.get_process_id() == pid]
         if len(apps) != 1:
             return {"error": f"GTK accessible application not unique ({len(apps)} live)"}
-        if op == "named":
+        if op == "snapshot":
+            found = [n for n in walk(apps[0]) if n.get_name()]
+        elif op == "named":
             found = [n for n in walk(apps[0]) if n.get_name() == name]
         else:
             found = matching(walk(apps[0]), name, role)
@@ -168,6 +170,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
     # The lifecycle drives two real lock/PAM unlock cycles (each phase is also
     # bounded by the harness); with a fresh AT-SPI process per query the whole
     # proof ran past 70 s at its final close (gtk-shell 116808314378).
+    started = time.monotonic()
     deadline = time.monotonic() + (150 if phase_file else 30)
     seen = []
 
@@ -198,11 +201,24 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
                            f"last AT-SPI error: {last_error}")
 
     def press(name, role=None):
-        wait(lambda: len(node(name, role)) == 1)
+        print(f"property press begin {name!r} elapsed={time.monotonic() - started:.3f}s", flush=True)
+        try:
+            wait(lambda: len(node(name, role)) == 1)
+        except RuntimeError:
+            try:
+                snapshot = atspi(pid, "snapshot", "")
+                output.with_suffix(".failure.json").write_text(json.dumps({
+                    "target": name, "elapsed_s": time.monotonic() - started,
+                    "prior_presses": seen, "nodes": snapshot,
+                }, indent=2) + "\n")
+            except (RuntimeError, Transient) as error:
+                print(f"property failure snapshot unavailable: {error}", flush=True)
+            raise
         if identity(pid, False) != basic_origin:
             raise RuntimeError("GTK process changed")
         atspi(pid, "press", name, role)
         seen.append(name)
+        print(f"property press sent {name!r} elapsed={time.monotonic() - started:.3f}s", flush=True)
 
     def heard(line):
         return line in log_path.read_text().splitlines()

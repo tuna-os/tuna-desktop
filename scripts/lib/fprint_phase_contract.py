@@ -46,7 +46,7 @@ def validate_identity(run, jobs, commit, expected_sha, run_id, attempt, event):
     if (run.get("id") != run_id or run.get("run_attempt") != attempt
             or run.get("repository", {}).get("full_name") != REPO
             or run.get("head_sha") != expected_sha or run.get("path") != WORKFLOW
-            or run.get("event") != event or event not in ("workflow_dispatch", "pull_request", "push")
+            or run.get("event") != event or event not in ("workflow_dispatch", "pull_request", "push", "schedule")
             or run.get("status") not in ("in_progress", "queued") or run.get("conclusion") is not None
             or commit.get("sha") != expected_sha):
         # Retain the actual public identity fields and allowed run statuses

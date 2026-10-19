@@ -30,9 +30,16 @@
 #                   them; dragging one out of the folder dialog removes it
 #   G-APP-GRID-PAGES enough apps page the grid: indicators and arrows show,
 #                   and Next Page turns to the second page
+#   G-GRID-PAGE-ANIM a page switch eases over GNOME's 300 ms and the
+#                   arrows fade over 200 ms; with animations off, both jump
 #   G-SEARCH-PROVIDER  typing lists a D-Bus search provider's result (#57)
 #   G-SEARCH-VIEW      while search shows results the workspace view hides
 #   G-SEARCH-ACTIVATE  clicking it calls ActivateResult, closes overview
+#   G-FOLDER-ZOOM  the folder dialog zooms out of its icon and back in
+#                  over 200 ms while the icon fades; with animations off
+#                  it jumps, and Reduced Motion keeps only the fades
+#   G-LAUNCH-ZOOM  launching from the grid zooms the icon out over 250 ms
+#   G-GRID-FADE    Show Apps fades the grid in over 400 ms after 100 ms
 #   G-APP-FOLDERS  GNOME's app-folders settings group the app grid: the
 #                  folder replaces its apps and opens to show them
 #   G-NOTIFY-BANNER  a D-Bus notification shows a banner (#56)
@@ -55,12 +62,25 @@
 #   G-QS-WIFI        the Wi-Fi tile turns NetworkManager's radio off
 #   G-QS-BT-MENU     the Bluetooth menu lists paired devices as GNOME does
 #                    and connects one
+#   G-QS-PRINTERS    the Printers menu lists the CUPS stub's printers;
+#                    the queue window shows GNOME's rows and drives
+#                    Cancel and Test Page through the stub
+#   G-QS-PRINTERS-ABSENT with no print server the menu says so (no hang)
 #   G-QS-BLUETOOTH   the Bluetooth tile powers the BlueZ adapter off
 #   G-QS-POWER       the Power Mode tile switches to power saver
 #   G-QS-DARK        the Dark Style tile writes GNOME's color-scheme key
 #   G-QS-BRIGHTNESS  the brightness slider sets the backlight via logind
 #   G-QS-VOLUME      the volume slider sets the PipeWire sink volume
 #   G-QS-MIC         recording shows the microphone indicator and slider
+#   G-QS-WWAN        the Mobile Network menu lists the modem with its live
+#                    operator, signal and APN; the tile flips WwanEnabled
+#   G-QS-WWAN-ABSENT without modems the tile hides; without ModemManager
+#                    the rows honestly show no signal or operator
+#   G-QS-LOCATION    the shell registers its GeoClue agent, InUse lights
+#                    the panel, and AuthorizeApp answers from the store
+#                    under the Settings-owned master switch and ceiling
+#   G-QS-LOCATION-ABSENT without GeoClue the indicator hides while the
+#                    switch keeps gating grants and unknown apps stay denied
 #   G-QS-ABSENT      with the daemons gone, their tiles hide (no hang)
 #   G-GL-WINDOW      a GTK window on the GL renderer maps and paints
 #                    (linux-dmabuf, #89)
@@ -144,6 +164,18 @@
 #                  lists windows to the portal, and RecordWindow streams
 #                  one window at its own size (#61)
 #   G-SCREENSHOT-WINDOW ScreenshotWindow saves the focused window alone
+#   G-STARTUP-REVEAL the desktop fades in from GNOME's startup cover once
+#                  the shell maps, then nothing animates
+#   G-WALLPAPER-CROSSFADE a new background crossfades over 1000 ms, then
+#                  nothing animates; instant with animations off
+#   G-HOT-CORNER-RIPPLES the hot corner plays GNOME's ripples, none under
+#                  Reduced Motion or with animations off
+#   G-MONITOR-TRANSITION a monitor change fades the old screen out, none
+#                  with animations off
+#   G-LOCK-SLIDE   the lock curtain lowers on lock and lifts after PAM
+#                  unlocks, fades only under Reduced Motion, instant
+#                  with animations off
+#                  (these sample TUNA_ANIMATION_CLOCK at exact delays)
 #   G-DISPLAY-SETTINGS GNOME Settings' ApplyMonitorsConfig changes the
 #                  scale live and saves it to Tuna Desktop's monitors.xml (#59)
 #   G-POWER-MENU   the power button opens GNOME's menu (Suspend,
@@ -321,6 +353,20 @@ echo '["org.tuna.ProofNoFavorite.desktop"]' >"$XDG_DATA_HOME/tuna-shell/favorite
 # Exec leaves a marker, proving search-to-launch end to end.
 PROBE_MARKER="$ARTIFACTS/probe-marker"
 rm -f "$PROBE_MARKER"
+# pyatspi ships with the distro Python, which a user-local Python
+# (Homebrew, pyenv) may shadow on PATH.
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+
+# The shell keeps portal opt-outs privately for its whole lifetime; a
+# desktop-entry child must see exactly the caller's original flag values.
+cat >"$ARTIFACTS/launch-environment.py" <<'PYENV'
+import json, os, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    key: os.environ.get(key) for key in ("GDK_DEBUG", "ADW_DISABLE_PORTAL")
+}, sort_keys=True))
+PYENV
+"$PY" "$ARTIFACTS/launch-environment.py" "$ARTIFACTS/launch-environment-expected.json"
 mkdir -p "$XDG_DATA_HOME/applications"
 # The test windows are apps with (hidden) desktop entries, as most apps
 # are: windows no entry claims would each be an app of their own.
@@ -331,7 +377,7 @@ done
 cat >"$XDG_DATA_HOME/applications/tuna-probe.desktop" <<EOF
 [Desktop Entry]
 Name=Tuna Probe
-Exec=touch $PROBE_MARKER
+Exec=$PY $ARTIFACTS/launch-environment.py $PROBE_MARKER
 Icon=applications-system
 Type=Application
 EOF
@@ -387,6 +433,8 @@ TRAY_PID=""
 OWNED_XVFB=""
 COMPOSITOR_PID=""
 STUBS_PID=""
+CUPS_STUB_PID=""
+WWANLOC_STUB_PID=""
 SYSBUS_PID=""
 ACCEL_PID=""
 CAL_PID=""
@@ -432,6 +480,8 @@ cleanup() {
     fi
     if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
     if [ -n "$STUBS_PID" ]; then kill "$STUBS_PID" 2>/dev/null || true; fi
+    if [ -n "$CUPS_STUB_PID" ]; then kill "$CUPS_STUB_PID" 2>/dev/null || true; fi
+    if [ -n "$WWANLOC_STUB_PID" ]; then kill "$WWANLOC_STUB_PID" 2>/dev/null || true; fi
     if [ -n "$PROVIDER_PID" ]; then kill "$PROVIDER_PID" 2>/dev/null || true; fi
     if [ -n "$TRAY_PID" ]; then kill "$TRAY_PID" 2>/dev/null || true; fi
     # shellcheck disable=SC2086
@@ -443,6 +493,38 @@ cleanup() {
     if [ -n "$SYSBUS_PID" ]; then kill "$SYSBUS_PID" 2>/dev/null || true; fi
 }
 trap cleanup EXIT INT TERM
+# Drive compositor animation time (TUNA_ANIMATION_CLOCK): the first
+# write freezes it, later writes move it to that moment plus N ms, and
+# removing the file resumes real time.
+anim_clock() {
+    printf '%s\n' "$1" >"$TUNA_ANIMATION_CLOCK.tmp"
+    mv "$TUNA_ANIMATION_CLOCK.tmp" "$TUNA_ANIMATION_CLOCK"
+}
+real_clock() {
+    rm -f "$TUNA_ANIMATION_CLOCK"
+    cstate '.animation_clock_manual | not' "real animation clock" 5
+}
+# The family's current value ($2: lift or opacity) within a hair, on the
+# frozen animation clock; $3 another jq field of the family (value).
+tvalue() {
+    cstate "(.transitions.$1.${3:-value} // -9) - ($2) | fabs < 0.002" "$1 ${3:-value} $2" 10
+}
+# One transition family counter from the compositor state:
+# `tval <family> <started|animated_frames>`.
+tval() {
+    jq -r ".transitions.$1.$2" "$CSTATE"
+}
+# The family has settled with more starts than $2 and, when $3 is set,
+# more animated frames than it (animations on) or exactly as many (when
+# $4 is "same": the change was instant).
+tsettled() {
+    if [ "${4:-}" = same ]; then
+        frames=".transitions.$1.animated_frames == $3"
+    else
+        frames=".transitions.$1.animated_frames > $3"
+    fi
+    cstate ".transitions.$1.started > $2 and $frames and (.transitions.$1.active | not)" "$1 settled" "${5:-15}"
+}
 # RGB of one pixel of a PNG, as "r g b".
 px() {
     ffmpeg -loglevel error -i "$1" -vf "crop=1:1:$2:$3" -f rawvideo -pix_fmt rgb24 - |
@@ -480,11 +562,6 @@ cstate() {
 }
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
-
-# pyatspi ships with the distro Python, which a user-local Python
-# (Homebrew, pyenv) may shadow on PATH.
-PY=/usr/bin/python3
-[ -x "$PY" ] || PY=python3
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -679,6 +756,10 @@ echo 1000 >"$BACKLIGHT/max_brightness"
 echo 500 >"$BACKLIGHT/brightness"
 TUNA_BACKLIGHT_ROOT="$ARTIFACTS/backlight"
 export TUNA_BACKLIGHT_ROOT
+TUNA_BACKLIGHT_TEST_CONNECTORS="$ARTIFACTS/controlled-brightness-connectors.json"
+export TUNA_BACKLIGHT_TEST_CONNECTORS
+printf '[]\n' >"$TUNA_BACKLIGHT_TEST_CONNECTORS"
+echo platform >"$BACKLIGHT/type"
 VOLUME_FILE="$ARTIFACTS/volume"
 echo 0.80 >"$VOLUME_FILE"
 VOLUME_MUTED_FILE="$ARTIFACTS/volume-muted"
@@ -771,6 +852,17 @@ TUNA_STUB_BT_LOG="$ARTIFACTS/bt-calls"
 export TUNA_STUB_NM_LOG TUNA_STUB_BT_LOG
 "$PY" "$ROOT/scripts/lib/tuna-service-stubs.py" "$BACKLIGHT" >"$ARTIFACTS/stubs.log" 2>&1 &
 STUBS_PID=$!
+# The WWAN/location menu talks ModemManager and GeoClue here (G-QS-WWAN,
+# G-QS-LOCATION); the stub timestamps every read, registration and write,
+# like the NM/BlueZ stub logs.
+TUNA_STUB_WWANLOC_LOG="$ARTIFACTS/wwanloc-calls"
+export TUNA_STUB_WWANLOC_LOG
+"$PY" "$ROOT/scripts/lib/tuna-wwan-location-stub.py" "$TUNA_STUB_WWANLOC_LOG" \
+    >"$ARTIFACTS/wwanloc-stub.log" 2>&1 &
+WWANLOC_STUB_PID=$!
+for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/wwanloc-stub.log" 2>/dev/null && break; sleep 0.5; done
+grep -q ready "$ARTIFACTS/wwanloc-stub.log" 2>/dev/null ||
+    fail G-QS-WWAN "the ModemManager/GeoClue stub did not start"
 # Own PermissionStore before portals can auto-activate the real daemon.
 "$PY" "$ROOT/scripts/lib/tuna-permission-store-stub.py" "$ARTIFACTS/shortcut-permissions.json" >"$ARTIFACTS/permission-store.log" 2>&1 &
 PERMISSIONS_PID=$!
@@ -790,6 +882,18 @@ EVENTS
     >"$ARTIFACTS/calendar-server.log" 2>&1 &
 CAL_PID=$!
 for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/calendar-server.log" 2>/dev/null && break; sleep 0.5; done
+# The printers menu talks CUPS here (G-QS-PRINTERS); the stub records
+# every operation the shell sends it, like the NM/BlueZ stub logs.
+TUNA_STUB_CUPS_LOG="$ARTIFACTS/cups-calls"
+export TUNA_STUB_CUPS_LOG
+"$PY" "$ROOT/scripts/lib/tuna-cups-stub.py" "$TUNA_STUB_CUPS_LOG" \
+    >"$ARTIFACTS/cups-stub.log" 2>&1 &
+CUPS_STUB_PID=$!
+for _ in $(seq 1 20); do grep -q "^ready port=" "$ARTIFACTS/cups-stub.log" 2>/dev/null && break; sleep 0.5; done
+grep -q "^ready port=" "$ARTIFACTS/cups-stub.log" 2>/dev/null ||
+    fail G-QS-PRINTERS "the CUPS stub did not start"
+CUPS_SERVER="127.0.0.1:$(sed -n 's/^ready port=//p' "$ARTIFACTS/cups-stub.log" | head -1)"
+export CUPS_SERVER
 
 # The full power menu needs a hardware session; logind is the stub.
 TUNA_SESSION_KIND=hardware
@@ -978,6 +1082,11 @@ desk="$(px "$ARTIFACTS/01-panel.png" 300 200)"
 [ "$strip" = "0 0 0" ] || fail G-PANEL "panel strip is '$strip', not black"
 [ "$desk" != "0 0 0" ] || fail G-PANEL "desktop below the panel is black too"
 pass G-PANEL "GTK panel mapped as a black top strip"
+# The comparison slice runs old binaries that predate the transitions.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    tsettled startup 0 0 || fail G-STARTUP-REVEAL "the startup cover did not fade out and settle"
+    pass G-STARTUP-REVEAL "the desktop fades in from GNOME's startup cover, then nothing animates"
+fi
 for label in "Activities" "Date and Time" "System"; do
     jq -e --arg n "$label" 'any(.[]; .name == $n)' "$ARTIFACTS/a11y-panel.json" >/dev/null ||
         fail A11Y-PANEL "no accessible control named '$label'"
@@ -1009,6 +1118,59 @@ while :; do
     [ "$(date +%s)" -ge "$end" ] && fail G-WALLPAPER-URI "escaped filename did not paint blue (double-decode decoy is red): $rgb"
     sleep 0.3
 done
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    # GNOME's background swap keeps both pictures while the old one fades
+    # out over 1000 ms, then nothing animates; with animations off it is
+    # instant. Red is the decoy's colour; it must replace the blue.
+    wait_wallpaper_rgb() {
+        want=$1
+        end=$(($(date +%s) + 15))
+        while :; do
+            scrot -o "$ARTIFACTS/01c-wallpaper-crossfade.png" >/dev/null
+            # shellcheck disable=SC2046 # three RGB channels
+            set -- $(px "$ARTIFACTS/01c-wallpaper-crossfade.png" 10 $((HEIGHT - 10)))
+            case "$want" in
+                red) [ "${1:-0}" -gt 220 ] && [ "${3:-255}" -lt 20 ] && return 0 ;;
+                blue) [ "${1:-255}" -lt 20 ] && [ "${3:-0}" -gt 220 ] && return 0 ;;
+            esac
+            [ "$(date +%s)" -ge "$end" ] && return 1
+            sleep 0.3
+        done
+    }
+    decoy_uri=$("$PY" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' "$wallpaper_decoy")
+    fade_started=$(tval wallpaper_crossfade started)
+    fade_frames=$(tval wallpaper_crossfade animated_frames)
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen wallpaper clock" ||
+        fail G-WALLPAPER-CROSSFADE "the clock file did not freeze animation time"
+    gsettings set org.gnome.desktop.background picture-uri "$decoy_uri"
+    gsettings set org.gnome.desktop.background picture-uri-dark "$decoy_uri"
+    cstate ".transitions.wallpaper_crossfade.started > $fade_started and .transitions.wallpaper_crossfade.active" "crossfade began" ||
+        fail G-WALLPAPER-CROSSFADE "the new background did not start a crossfade"
+    tvalue wallpaper_crossfade 1 || fail G-WALLPAPER-CROSSFADE "the old picture was not fully shown at the start"
+    anim_clock 500
+    tvalue wallpaper_crossfade 0.25 || fail G-WALLPAPER-CROSSFADE "the old picture was not at ease-out-quad 25% 500 ms in"
+    scrot -o "$ARTIFACTS/01d-wallpaper-crossfade-500ms.png" >/dev/null
+    anim_clock 1000
+    tsettled wallpaper_crossfade "$fade_started" "$fade_frames" ||
+        fail G-WALLPAPER-CROSSFADE "the new background did not crossfade and settle"
+    real_clock || fail G-WALLPAPER-CROSSFADE "removing the clock file did not resume real time"
+    wait_wallpaper_rgb red || fail G-WALLPAPER-CROSSFADE "the crossfade did not end on the new picture"
+    gsettings set org.gnome.desktop.interface enable-animations false
+    cstate '(.animations_enabled | not)' "still wallpaper" ||
+        fail G-WALLPAPER-CROSSFADE "enable-animations false did not reach the compositor"
+    fade_started=$(tval wallpaper_crossfade started)
+    fade_frames=$(tval wallpaper_crossfade animated_frames)
+    gsettings set org.gnome.desktop.background picture-uri "$wallpaper_uri"
+    gsettings set org.gnome.desktop.background picture-uri-dark "$wallpaper_uri"
+    tsettled wallpaper_crossfade "$fade_started" "$fade_frames" same ||
+        fail G-WALLPAPER-CROSSFADE "with animations off the swap was not instant"
+    wait_wallpaper_rgb blue || fail G-WALLPAPER-CROSSFADE "the instant swap did not show the new picture"
+    gsettings set org.gnome.desktop.interface enable-animations true
+    cstate '.animations_enabled' "wallpaper motion restored" ||
+        fail G-WALLPAPER-CROSSFADE "enable-animations true did not reach the compositor"
+    pass G-WALLPAPER-CROSSFADE "a new background crossfades over the old one, then nothing animates; instant with animations off"
+fi
 gsettings set org.gnome.desktop.background picture-uri "$wallpaper_before_uri"
 gsettings set org.gnome.desktop.background picture-uri-dark "$wallpaper_before_dark"
 gsettings set org.gnome.desktop.background picture-options "$wallpaper_before_options"
@@ -1576,8 +1738,10 @@ xdotool key Return
 end=$(($(date +%s) + 15))
 until [ -f "$PROBE_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 [ -f "$PROBE_MARKER" ] || fail G-OV-LAUNCH "Enter did not launch the top result"
+cmp -s "$PROBE_MARKER" "$ARTIFACTS/launch-environment-expected.json" ||
+    fail G-OV-LAUNCH "desktop-entry launch inherited shell-private portal flags"
 cstate '.overview_open | not' "closed" || fail G-OV-LAUNCH "overview stayed open after launch"
-pass G-OV-LAUNCH "Enter launches the top result and closes the overview"
+pass G-OV-LAUNCH "Enter launches the top result with the caller's portal flags and closes the overview"
 
 # An app installed while the shell runs is searchable at once (GNOME
 # watches the application directories too).
@@ -1611,6 +1775,46 @@ gsettings set org.gnome.desktop.app-folders folder-children "['ViewportProof']"
 gsettings set "$grid_long_folder" name "$grid_long_name"
 gsettings set "$grid_long_folder" translate false
 gsettings set "$grid_long_folder" apps "['tuna-probe.desktop']"
+
+# The app grid's animations trace their start and settle
+# (TUNA_GRID_TRACE): log_mark, then log_wait for a line after it.
+log_mark() { wc -c <"$LOG"; }
+log_wait() {
+    anim_end=$(($(date +%s) + ${3:-6}))
+    while :; do
+        tail -c +"$(($1 + 1))" "$LOG" | grep -q -- "$2" && return 0
+        [ "$(date +%s)" -gt "$anim_end" ] && return 1
+        sleep 0.2
+    done
+}
+log_has() { tail -c +"$(($1 + 1))" "$LOG" | grep -q -- "$2"; }
+settle_ms() {
+    tail -c +"$(($1 + 1))" "$LOG" | grep -o "grid-anim $2 settle ms=[0-9]*" | tail -1 | sed 's/.*ms=//'
+}
+# Set the motion policy and wait for the shell to apply it (it tells
+# the compositor after its own animations switch).
+motion_policy() {
+    case "$1" in
+    Full)
+        gsettings set org.gnome.desktop.interface enable-animations true
+        gsettings set org.gnome.desktop.a11y.interface reduced-motion 'no-preference'
+        ;;
+    Off)
+        gsettings set org.gnome.desktop.a11y.interface reduced-motion 'no-preference'
+        gsettings set org.gnome.desktop.interface enable-animations false
+        ;;
+    FadesOnly)
+        gsettings set org.gnome.desktop.interface enable-animations true
+        gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
+        ;;
+    esac
+    case "$1" in
+    Full) want=full ;;
+    Off) want=off ;;
+    FadesOnly) want='fade-only' ;;
+    esac
+    cstate ".motion_policy == \"$want\"" "motion policy $want" || fail G-FOLDER-ZOOM "motion policy $want never arrived"
+}
 
 # GNOME's paged app grid: thirty more apps make a second page, with the
 # page indicators and the side arrows; Next Page turns to it.
@@ -1646,15 +1850,54 @@ done
 if showing "$ARTIFACTS/a11y-grid-pages.json" "Previous Page"; then
     fail G-APP-GRID-PAGES "Previous Page shows on the first page"
 fi
+page_mark="$(log_mark)"
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-next.json" 20 \
     --press "Next Page" || fail G-APP-GRID-PAGES "could not press Next Page"
-sleep 1
+# The comparison slice also runs old binaries, which predate the grid's
+# animations; the full gate checks them below.
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then
+    sleep 1
+else
+    log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch never settled"
+    sleep 0.5
+fi
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page2.json" 20 ||
     fail G-APP-GRID-PAGES "accessibility dump failed"
 showing "$ARTIFACTS/a11y-grid-page2.json" "Previous Page" ||
     fail G-APP-GRID-PAGES "Next Page did not turn to the second page"
 scrot "$ARTIFACTS/11d-app-grid-page2.png" >/dev/null
 pass G-APP-GRID-PAGES "thirty more apps page the grid; indicators and arrows show and Next Page turns it"
+
+# GNOME's page switch (iconGrid.js goToPage): 300 ms ease-out-cubic,
+# instead of a spring; the Previous Page arrow fades in over 200 ms.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    log_has "$page_mark" "grid-anim page-switch start ms=300 motion=full" ||
+        fail G-GRID-PAGE-ANIM "the page switch did not start a 300 ms eased slide"
+    page_ms="$(settle_ms "$page_mark" page-switch)"
+    [ "${page_ms:-0}" -ge 290 ] || fail G-GRID-PAGE-ANIM "the page switch settled after ${page_ms:-?} ms, not 300"
+    log_has "$page_mark" "grid-anim page-arrow start ms=200" ||
+        fail G-GRID-PAGE-ANIM "the page arrows did not fade over 200 ms"
+    # With animations off the switch and the arrows jump.
+    motion_policy Off
+    page_mark="$(log_mark)"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-prev-off.json" 20 \
+        --press "Previous Page" || fail G-GRID-PAGE-ANIM "could not press Previous Page"
+    log_wait "$page_mark" "grid-anim page-switch instant motion=off" ||
+        fail G-GRID-PAGE-ANIM "with animations off the page switch still animated"
+    log_has "$page_mark" "grid-anim page-switch start" &&
+        fail G-GRID-PAGE-ANIM "with animations off a page slide started"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page1-off.json" 20 ||
+        fail G-GRID-PAGE-ANIM "accessibility dump failed"
+    showing "$ARTIFACTS/a11y-grid-page1-off.json" "Previous Page" &&
+        fail G-GRID-PAGE-ANIM "with animations off the Previous Page arrow lingered"
+    motion_policy Full
+    page_mark="$(log_mark)"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-next-again.json" 20 \
+        --press "Next Page" || fail G-GRID-PAGE-ANIM "could not return to page two"
+    log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch back never settled"
+    sleep 0.5
+    pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms and the arrows fade over 200 ms; with animations off both jump"
+fi
 
 # Select the rendered icon through actual accessibility bounds, including
 # the descendant button; distribution app catalogs change grid allocation.
@@ -1822,16 +2065,15 @@ fi
 cstate ".client_dnd_active == false and .overview_open and .overview_app_grid and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame) and (.seat_pressed_key_count == $grid_cancel_before_keys)" "folder cancellation before release" || fail G-GRID-DRAG-CANCEL "Escape failed to cancel native drag while keeping grid open"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-release.json"
 scrot "$ARTIFACTS/grid-cancel-before-release.png" >/dev/null
-# GTK hears the compositor's cancel asynchronously; poll its tree (button
-# still held) rather than sampling once right after the compositor state.
+# GTK hears cancel asynchronously and removes preview widgets during traversal.
+# Reject an inconsistent tree, then wait for a fresh complete owner-bound tree
+# within the existing budget, with the pointer button still held.
 end=$(($(date +%s) + 5))
-while :; do
-    grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" || fail G-GRID-DRAG-CANCEL "fresh cancellation tree missing"
-    if showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" &&
-        ! showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; then
-        break
-    fi
-    [ "$(date +%s)" -le "$end" ] || break
+until grid_cancel_dump "$ARTIFACTS/a11y-folder-before-release.json" &&
+    showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" &&
+    ! showing "$ARTIFACTS/a11y-folder-before-release.json" "Next page preview"; do
+    [ "$(date +%s)" -le "$end" ] ||
+        fail G-GRID-DRAG-CANCEL "complete cancellation tree did not restore arrow before release"
     sleep 0.3
 done
 showing "$ARTIFACTS/a11y-folder-before-release.json" "Next Page" || fail G-GRID-DRAG-CANCEL "GTK drag cleanup did not restore arrow before release"
@@ -2179,6 +2421,7 @@ pass G-SEARCH-ACTIVATE "clicking a provider result activates it and closes the o
 xdotool key Super_L
 cstate '.overview_open' "overview" || fail G-OV-APPGRID "overview did not reopen"
 sleep 1
+grid_fade_mark="$(log_mark)"
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid.json" 20 --press "Show Apps" ||
     fail G-OV-APPGRID "could not press Show Apps"
 showing "$ARTIFACTS/a11y-grid.json" "Tuna Probe" ||
@@ -2186,6 +2429,13 @@ showing "$ARTIFACTS/a11y-grid.json" "Tuna Probe" ||
 cstate '.overview_app_grid and .overview_motion.last_morph.cause == "app-grid" and .overview_motion.last_morph.curve == "ease-out-sine" and .overview_motion.last_morph.duration_ms == 250' "picker to grid morph" ||
     fail G-OV-APPGRID "the window picker did not ease into the app grid (250 ms out-sine)"
 pass G-OV-APPGRID "Show Apps eases the window picker into the app grid"
+# GNOME's animateSwitch: the grid fades in over 400 ms after 100 ms.
+log_wait "$grid_fade_mark" "grid-anim grid-fade-in settle" || fail G-GRID-FADE "the grid's fade-in never settled"
+log_has "$grid_fade_mark" "grid-anim grid-fade-in start ms=500 motion=full" ||
+    fail G-GRID-FADE "the grid did not fade in over 400 ms after 100 ms"
+grid_fade_ms="$(settle_ms "$grid_fade_mark" grid-fade-in)"
+[ "${grid_fade_ms:-0}" -ge 490 ] || fail G-GRID-FADE "the grid fade settled after ${grid_fade_ms:-?} ms, not 500"
+pass G-GRID-FADE "Show Apps fades the grid in over GNOME's 400 ms after a 100 ms delay"
 scrot "$ARTIFACTS/11-app-grid.png" >/dev/null
 xdotool key Escape
 
@@ -2229,14 +2479,95 @@ folder_watch_observe remove 'Tuna Probe' 'Probe Tools Live'
 gsettings set "$FOLDER" name 'Probe Tools'
 gsettings set org.gnome.desktop.app-folders folder-children "['ProbeTools']"
 folder_watch_observe readd 'Probe Tools' 'Tuna Probe'
+folder_mark="$(log_mark)"
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-open.json" 20 --press "Probe Tools" ||
     fail G-APP-FOLDERS "could not open the folder"
+# Screenshot the dialog once its zoom has settled.
+log_wait "$folder_mark" "grid-anim folder-zoom-in settle" || fail G-FOLDER-ZOOM "the folder dialog's zoom never settled"
+sleep 0.3
 scrot "$ARTIFACTS/11b-app-folder.png" >/dev/null
 showing "$ARTIFACTS/a11y-folder-open.json" "Tuna Probe" ||
     fail G-APP-FOLDERS "the open folder does not show its app"
 pass G-APP-FOLDERS "GNOME's app folders group the grid and open to their apps"
-xdotool key Escape
-sleep 1
+
+# A click on the shade beside the dialog closes it (Escape may reach
+# the overview first when the dialog has not taken keyboard focus yet).
+folder_shade_click() {
+    xdotool mousemove --window "$WID" 40 $((HEIGHT / 2)) click 1
+}
+# GNOME's _zoomAndFadeIn/_zoomAndFadeOut: 200 ms out of the folder's
+# icon and back, the icon fading out over the first half and back over
+# the last half of the closing.
+log_has "$folder_mark" "grid-anim folder-zoom-in start ms=200 motion=full" ||
+    fail G-FOLDER-ZOOM "opening did not zoom out of the folder icon over 200 ms"
+log_has "$folder_mark" "grid-anim folder-icon start ms=100" ||
+    fail G-FOLDER-ZOOM "the folder icon did not fade out over 100 ms"
+folder_ms="$(settle_ms "$folder_mark" folder-zoom-in)"
+[ "${folder_ms:-0}" -ge 190 ] || fail G-FOLDER-ZOOM "the zoom settled after ${folder_ms:-?} ms, not 200"
+folder_mark="$(log_mark)"
+folder_shade_click
+log_wait "$folder_mark" "grid-anim folder-zoom-out settle" ||
+    fail G-FOLDER-ZOOM "closing did not zoom back into the folder icon"
+log_has "$folder_mark" "grid-anim folder-zoom-out start ms=200 motion=full" ||
+    fail G-FOLDER-ZOOM "closing did not take 200 ms"
+log_has "$folder_mark" "grid-anim folder-icon start ms=200" ||
+    fail G-FOLDER-ZOOM "the folder icon did not fade back over the closing's last 100 ms"
+sleep 0.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-closed.json" 20 ||
+    fail G-FOLDER-ZOOM "accessibility dump failed"
+showing "$ARTIFACTS/a11y-folder-closed.json" "Tuna Probe" &&
+    fail G-FOLDER-ZOOM "the dialog still showed after its zoom settled"
+showing "$ARTIFACTS/a11y-folder-closed.json" "Probe Tools" ||
+    fail G-FOLDER-ZOOM "the grid did not stay open under the closed dialog"
+# Animations off: the dialog jumps open and shut.
+motion_policy Off
+folder_mark="$(log_mark)"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-open-off.json" 20 --press "Probe Tools" ||
+    fail G-FOLDER-ZOOM "could not open the folder with animations off"
+log_wait "$folder_mark" "grid-anim folder-zoom-in instant motion=off" ||
+    fail G-FOLDER-ZOOM "with animations off the dialog still zoomed open"
+showing "$ARTIFACTS/a11y-folder-open-off.json" "Tuna Probe" ||
+    fail G-FOLDER-ZOOM "with animations off the dialog did not show its app"
+folder_mark="$(log_mark)"
+folder_shade_click
+log_wait "$folder_mark" "grid-anim folder-zoom-out instant motion=off" ||
+    fail G-FOLDER-ZOOM "with animations off the dialog still zoomed shut"
+# Reduced Motion: the shade, dialog and icon still fade over 200 ms, but
+# nothing zooms (the zoom part settles at once).
+motion_policy FadesOnly
+folder_mark="$(log_mark)"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-open-reduced.json" 20 --press "Probe Tools" ||
+    fail G-FOLDER-ZOOM "could not open the folder with Reduced Motion"
+log_wait "$folder_mark" "grid-anim folder-zoom-in start ms=200 motion=fade-only" ||
+    fail G-FOLDER-ZOOM "Reduced Motion dropped the dialog's fade"
+log_wait "$folder_mark" "grid-anim folder-zoom-in settle" ||
+    fail G-FOLDER-ZOOM "the Reduced Motion fade never settled"
+pass G-FOLDER-ZOOM "the folder dialog zooms from and back to its icon over 200 ms; off it jumps, Reduced Motion only fades"
+
+# GNOME's launch animation (zoomOutActor): the launched icon grows to
+# three times its size and fades over 250 ms while the overview closes;
+# the dialog closes at once rather than zooming back.
+motion_policy Full
+rm -f "$PROBE_MARKER"
+launch_mark="$(log_mark)"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-launch.json" 20 --press "Tuna Probe" ||
+    fail G-LAUNCH-ZOOM "could not press the folder's app"
+log_wait "$launch_mark" "grid-anim launch-zoom settle" ||
+    fail G-LAUNCH-ZOOM "the launch zoom never settled"
+log_has "$launch_mark" "grid-anim launch-zoom start ms=250 motion=full" ||
+    fail G-LAUNCH-ZOOM "the launch zoom did not run 250 ms"
+launch_ms="$(settle_ms "$launch_mark" launch-zoom)"
+[ "${launch_ms:-0}" -ge 240 ] || fail G-LAUNCH-ZOOM "the launch zoom settled after ${launch_ms:-?} ms, not 250"
+log_has "$launch_mark" "grid-anim folder-zoom-out" &&
+    fail G-LAUNCH-ZOOM "the dialog zoomed back into its icon behind a launch"
+anim_end=$(($(date +%s) + 10))
+until [ -f "$PROBE_MARKER" ] || [ "$(date +%s)" -gt "$anim_end" ]; do sleep 0.3; done
+[ -f "$PROBE_MARKER" ] || fail G-LAUNCH-ZOOM "the folder's app did not launch"
+cstate '.overview_open | not' "closed" || fail G-LAUNCH-ZOOM "the overview stayed open after the launch"
+sleep 0.5
+cstate '.layers | all(.namespace != "tuna-shell-launch-zoom")' "launch zoom gone" ||
+    fail G-LAUNCH-ZOOM "the launch zoom's surface outlived its animation"
+pass G-LAUNCH-ZOOM "a launch from the grid zooms its icon out over 250 ms and leaves nothing behind"
 
 # Notifications (#56). Close whatever the grid left open first (#97).
 xdotool key Escape
@@ -2731,6 +3062,104 @@ showing "$ARTIFACTS/a11y-qs-bt-two.json" "2 Connected" ||
     fail G-QS-BT-MENU "the tile does not count two connected devices"
 pass G-QS-BT-MENU "the Bluetooth menu lists paired devices as GNOME does and connects one"
 
+# Printers (#362 P-ST-10): the menu lists one compact row per printer
+# from the CUPS stub; a row opens the queue window with GNOME's rows
+# (model, location, address, status, ink), the stopped printer's error
+# banner and Restart, the active job with Cancel, and the Test Page,
+# Clean Print Heads, Use Printer by Default, Clear All and Remove
+# Printer actions. The stub's call log proves live discovery and that
+# Cancel and Test Page reach the server.
+# Line-count marker: the panel queries at construction and the tile ticks,
+# so only queries AFTER the press prove the menu-open refresh (f118's
+# presence assertions passed vacuously on startup evidence).
+cups_mark=$(wc -l < "$TUNA_STUB_CUPS_LOG")
+qs_press "Printers Menu" printers-menu || fail G-QS-PRINTERS "could not open the Printers menu"
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-printers-menu.json" 20 ||
+    fail G-QS-PRINTERS "accessibility dump failed"
+scrot "$ARTIFACTS/15d-printers-menu.png" >/dev/null
+tail -n +"$((cups_mark + 1))" "$TUNA_STUB_CUPS_LOG" | grep -qE "^[0-9.]+ CUPS-Get-Printers$" ||
+    fail G-QS-PRINTERS "opening the menu did not query CUPS for printers"
+tail -n +"$((cups_mark + 1))" "$TUNA_STUB_CUPS_LOG" | grep -qE "^[0-9.]+ Get-Jobs " ||
+    fail G-QS-PRINTERS "opening the menu did not query CUPS for jobs"
+# Menu-lifetime split: if the menu did not stay open for the dump, say so
+# instead of misattributing bare-desktop evidence to row population.
+showing "$ARTIFACTS/a11y-qs-printers-menu.json" "Print Settings" ||
+    fail G-QS-PRINTERS "the Printers menu did not stay open for the dump (menu lifetime, not rows)"
+for name in "OfficeJet Pro (Default) — Ready — 1 Job" "LabelPrinter — Stopped" \
+    "Print Settings" "1 Job"; do
+    showing "$ARTIFACTS/a11y-qs-printers-menu.json" "$name" ||
+        fail G-QS-PRINTERS "no '$name' in the Printers menu"
+done
+qs_press "OfficeJet Pro (Default) — Ready — 1 Job" printers-window ||
+    fail G-QS-PRINTERS "could not open the queue window"
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-printers-window.json" 20 ||
+    fail G-QS-PRINTERS "queue window dump failed"
+scrot "$ARTIFACTS/15d-printers-window.png" >/dev/null
+for name in "Printers" "OfficeJet Pro (Default)" "LabelPrinter" "HP OfficeJet Pro 9020" \
+    "Front Office" "usb://HP/OfficeJet%20Pro?serial=CN123" \
+    "Black 80%, Cyan 60%, Magenta 55%, Yellow 40%" "Restart" \
+    "Quarterly Report — proof-user — Printing" "Test Page" "Clean Print Heads" \
+    "Use Printer by Default" "Clear All" "Remove Printer" "No Active Printer Jobs" \
+    "Add Printer…" "Refresh"; do
+    showing "$ARTIFACTS/a11y-qs-printers-window.json" "$name" ||
+        fail G-QS-PRINTERS "no '$name' in the queue window"
+done
+# The stopped printer's banner carries GNOME's restart advice.
+jq -e 'any(.[]; .showing and (.name | contains("Out of paper")))' \
+    "$ARTIFACTS/a11y-qs-printers-window.json" >/dev/null ||
+    fail G-QS-PRINTERS "no Out of paper banner on the stopped printer"
+qs_press "Cancel" printers-cancel || fail G-QS-PRINTERS "could not press Cancel"
+for _ in $(seq 1 20); do grep -qE "^[0-9.]+ Cancel-Job id=42$" "$TUNA_STUB_CUPS_LOG" 2>/dev/null && break; sleep 0.5; done
+grep -qE "^[0-9.]+ Cancel-Job id=42$" "$TUNA_STUB_CUPS_LOG" ||
+    fail G-QS-PRINTERS "Cancel did not reach CUPS as Cancel-Job 42"
+qs_press "Test Page" printers-test || fail G-QS-PRINTERS "could not press Test Page"
+for _ in $(seq 1 20); do grep -qE "^[0-9.]+ Print-Job " "$TUNA_STUB_CUPS_LOG" 2>/dev/null && break; sleep 0.5; done
+grep -qE "^[0-9.]+ Print-Job " "$TUNA_STUB_CUPS_LOG" ||
+    fail G-QS-PRINTERS "Test Page did not reach CUPS as Print-Job"
+qs_press "Close" printers-close || fail G-QS-PRINTERS "could not close the queue window"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-printers-closed.json" 20 ||
+    fail G-QS-PRINTERS "post-close dump failed"
+if showing "$ARTIFACTS/a11y-qs-printers-closed.json" "Quarterly Report — proof-user — Printing"; then
+    fail G-QS-PRINTERS "the queue window is still open after Close"
+fi
+pass G-QS-PRINTERS "the Printers menu lists the print server's printers, and the queue window shows jobs and drives Cancel and Test Page"
+sleep 1
+xdotool key Escape
+sleep 1
+
+# With the print server gone the menu says "No Print Service" (tile and
+# menu agree) instead of hanging or showing stale printers.
+kill "$CUPS_STUB_PID" 2>/dev/null || true
+CUPS_STUB_PID=""
+sleep 1
+open_qs
+qs_press "Printers Menu" printers-absent || fail G-QS-PRINTERS-ABSENT "could not open the Printers menu"
+sleep 2
+absent_ok=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-printers-absent.json" 20 ||
+        fail G-QS-PRINTERS-ABSENT "accessibility dump failed (shell hung?)"
+    # The menu placeholder and the tile subtitle both say it.
+    if [ "$(jq '[.[] | select(.showing and .name == "No Print Service")] | length' \
+        "$ARTIFACTS/a11y-qs-printers-absent.json")" -ge 2 ]; then
+        absent_ok=1
+        break
+    fi
+    sleep 1
+done
+scrot "$ARTIFACTS/15e-printers-absent.png" >/dev/null
+[ -n "$absent_ok" ] || fail G-QS-PRINTERS-ABSENT "tile and menu do not both say No Print Service"
+if showing "$ARTIFACTS/a11y-qs-printers-absent.json" "OfficeJet Pro (Default) — Ready — 1 Job"; then
+    fail G-QS-PRINTERS-ABSENT "stale printers still listed with the server gone"
+fi
+pass G-QS-PRINTERS-ABSENT "without a print server the Printers tile and menu honestly say No Print Service"
+sleep 1
+xdotool key Escape
+sleep 1
+open_qs
+
 # GNOME's sound output menu: both outputs, the default checked; picking
 # one makes it the default.
 qs_press "Open sound output menu" sound-menu || fail G-QS-SOUND-MENU "could not open the sound output menu"
@@ -2825,6 +3254,392 @@ scrot "$ARTIFACTS/16-quick-settings-toggled.png" >/dev/null
 xdotool key Escape
 sleep 1
 
+# WWAN (#362): the modem lists with its live ModemManager enrichment
+# (operator, connected state) and its connection's APN; the tile flips
+# NetworkManager's master WwanEnabled switch.
+wwan_checked() {
+    jq -e --arg want "$2" 'any(.[]; .name == "Mobile Network" and .role == "toggle button"
+        and (.checked | tostring) == $want)' "$1" >/dev/null
+}
+open_qs
+wl_mark=$(wc -l < "$TUNA_STUB_WWANLOC_LOG")
+qs_press "Mobile Network Menu" wwan-menu || fail G-QS-WWAN "could not open the Mobile Network menu"
+sleep 2
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-menu.json" 20 ||
+    fail G-QS-WWAN "accessibility dump failed"
+scrot "$ARTIFACTS/16c-wwan-menu.png" >/dev/null
+tail -n +"$((wl_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ Modem3gpp.Get OperatorName$" ||
+    fail G-QS-WWAN "opening the menu did not re-read the 3GPP operator"
+# Invented shapes stay rejected: no OperatorName on base Modem, no
+# Modem path on NM Device.Modem (the shell reads Udi + Modem3gpp).
+if tail -n +"$((wl_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ Modem.Get OperatorName$"; then
+    fail G-QS-WWAN "shell read OperatorName from base Modem instead of Modem3gpp"
+fi
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager/Devices/4 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.NetworkManager.Device.Modem Modem \
+    >/dev/null 2>&1 && fail G-QS-WWAN "stub answers invented Device.Modem.Modem"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.ModemManager1 \
+    --object-path /org/freedesktop/ModemManager1/Modem/0 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.ModemManager1.Modem OperatorName \
+    >/dev/null 2>&1 && fail G-QS-WWAN "stub answers invented Modem.OperatorName"
+# Real linkage reads back: Udi names the modem, 3GPP names the operator.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager/Devices/4 \
+    --method org.freedesktop.DBus.Properties.Get org.freedesktop.NetworkManager.Device Udi \
+    2>/dev/null | grep -q "ModemManager1/Modem/0" ||
+    fail G-QS-WWAN "Device.Udi does not name the ModemManager modem"
+# Menu-lifetime split: if the menu did not stay open for the dump, say so
+# instead of misattributing bare-desktop evidence to row population.
+showing "$ARTIFACTS/a11y-qs-wwan-menu.json" "Mobile Network Settings" ||
+    fail G-QS-WWAN "the Mobile Network menu did not stay open for the dump (menu lifetime, not rows)"
+jq -e 'any(.[]; .showing and (.name | contains("ExampleTel")))' \
+    "$ARTIFACTS/a11y-qs-wwan-menu.json" >/dev/null ||
+    fail G-QS-WWAN "no ExampleTel operator in the Mobile Network menu"
+jq -e 'any(.[]; .showing and (.name | contains("APN internet.example")))' \
+    "$ARTIFACTS/a11y-qs-wwan-menu.json" >/dev/null ||
+    fail G-QS-WWAN "no APN internet.example in the Mobile Network menu"
+wwan_checked "$ARTIFACTS/a11y-qs-wwan-menu.json" true ||
+    fail G-QS-WWAN "the Mobile Network tile is not checked with WwanEnabled on"
+# The tile flips the master switch; the stub's timestamped log and a
+# read-back prove the write reached NetworkManager.
+nm_mark=$(wc -l < "$TUNA_STUB_NM_LOG")
+qs_press "Mobile Network" wwan-off || fail G-QS-WWAN "could not press the Mobile Network tile"
+for _ in $(seq 1 20); do
+    tail -n +"$((nm_mark + 1))" "$TUNA_STUB_NM_LOG" 2>/dev/null | grep -qE "^[0-9.]+ WwanEnabled false$" && break
+    sleep 0.5
+done
+tail -n +"$((nm_mark + 1))" "$TUNA_STUB_NM_LOG" | grep -qE "^[0-9.]+ WwanEnabled false$" ||
+    fail G-QS-WWAN "the tile did not switch WwanEnabled off"
+sysprop org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+    org.freedesktop.NetworkManager WwanEnabled | grep -q false ||
+    fail G-QS-WWAN "NetworkManager's WwanEnabled is still true"
+wwan_off_ok=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-off.json" 20 ||
+        fail G-QS-WWAN "accessibility dump failed"
+    if wwan_checked "$ARTIFACTS/a11y-qs-wwan-off.json" false; then wwan_off_ok=1; break; fi
+    sleep 1
+done
+[ -n "$wwan_off_ok" ] || fail G-QS-WWAN "the Mobile Network tile stayed checked with WwanEnabled off"
+qs_press "Mobile Network" wwan-on || fail G-QS-WWAN "could not press the Mobile Network tile back on"
+for _ in $(seq 1 20); do
+    tail -n +"$((nm_mark + 1))" "$TUNA_STUB_NM_LOG" 2>/dev/null | grep -qE "^[0-9.]+ WwanEnabled true$" && break
+    sleep 0.5
+done
+sysprop org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+    org.freedesktop.NetworkManager WwanEnabled | grep -q true ||
+    fail G-QS-WWAN "NetworkManager's WwanEnabled did not come back on"
+pass G-QS-WWAN "the Mobile Network menu lists the modem with live operator and APN, and the tile flips WwanEnabled"
+sleep 1
+xdotool key Escape
+sleep 1
+
+# Without modems the tile hides (no stale rows); without ModemManager
+# the rows honestly show the interface with no signal or operator.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager --method org.tuna.Proof.Network.WwanPresent false >/dev/null ||
+    fail G-QS-WWAN-ABSENT "could not remove the stub modem"
+open_qs
+wwan_gone=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-gone.json" 20 ||
+        fail G-QS-WWAN-ABSENT "accessibility dump failed (shell hung?)"
+    if ! showing "$ARTIFACTS/a11y-qs-wwan-gone.json" "Mobile Network"; then wwan_gone=1; break; fi
+    sleep 1
+done
+scrot "$ARTIFACTS/16d-wwan-absent.png" >/dev/null
+[ -n "$wwan_gone" ] || fail G-QS-WWAN-ABSENT "the Mobile Network tile stayed with no modems"
+if showing "$ARTIFACTS/a11y-qs-wwan-gone.json" "ExampleTel"; then
+    fail G-QS-WWAN-ABSENT "stale operator still listed with no modems"
+fi
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.NetworkManager \
+    --object-path /org/freedesktop/NetworkManager --method org.tuna.Proof.Network.WwanPresent true >/dev/null ||
+    fail G-QS-WWAN-ABSENT "could not restore the stub modem"
+wwan_back=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-back.json" 20 ||
+        fail G-QS-WWAN-ABSENT "accessibility dump failed (shell hung?)"
+    if showing "$ARTIFACTS/a11y-qs-wwan-back.json" "Mobile Network"; then wwan_back=1; break; fi
+    sleep 1
+done
+[ -n "$wwan_back" ] || fail G-QS-WWAN-ABSENT "the Mobile Network tile did not come back with its modem"
+# ModemManager gone: the interface row stays, honestly blank.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.ModemManagerPresent false >/dev/null ||
+    fail G-QS-WWAN-ABSENT "could not release the stub ModemManager name"
+qs_press "Mobile Network Menu" wwan-mm-gone || fail G-QS-WWAN-ABSENT "could not open the Mobile Network menu"
+mm_blank=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wwan-mm-gone.json" 20 ||
+        fail G-QS-WWAN-ABSENT "accessibility dump failed (shell hung?)"
+    if jq -e 'any(.[]; .showing and (.name | contains("wwan0")))' \
+        "$ARTIFACTS/a11y-qs-wwan-mm-gone.json" >/dev/null &&
+        ! jq -e 'any(.[]; .showing and (.name | contains("ExampleTel")))' \
+        "$ARTIFACTS/a11y-qs-wwan-mm-gone.json" >/dev/null; then mm_blank=1; break; fi
+    sleep 1
+done
+[ -n "$mm_blank" ] || fail G-QS-WWAN-ABSENT "the modem row still names its operator with ModemManager gone"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.ModemManagerPresent true >/dev/null ||
+    fail G-QS-WWAN-ABSENT "could not restore the stub ModemManager name"
+pass G-QS-WWAN-ABSENT "without modems the tile hides, and without ModemManager the row shows no signal or operator"
+sleep 1
+xdotool key Escape
+sleep 1
+
+# Location (#362): the shell's agent registers with GeoClue, InUse
+# lights the panel, and AuthorizeApp answers from the permission store
+# under the Settings-owned master switch and ceiling (GNOME keeps the
+# switch in Settings, so the proof writes it like Settings does, as
+# the DND gate writes show-banners).
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION "could not switch location on"
+gsettings set org.gnome.system.location max-accuracy-level 'exact' ||
+    fail G-QS-LOCATION "could not set the accuracy ceiling"
+# Re-appearing GeoClue gets a fresh registration: only post-mark
+# AddAgent lines prove the agent registers live.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent false >/dev/null ||
+    fail G-QS-LOCATION "could not release the stub GeoClue name"
+sleep 1
+geo_mark=$(wc -l < "$TUNA_STUB_WWANLOC_LOG")
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent true >/dev/null ||
+    fail G-QS-LOCATION "could not restore the stub GeoClue name"
+for _ in $(seq 1 20); do
+    tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" 2>/dev/null | grep -qE "^[0-9.]+ AddAgent tuna-shell from " && break
+    sleep 0.5
+done
+tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -qE "^[0-9.]+ AddAgent tuna-shell from " ||
+    fail G-QS-LOCATION "the shell did not register its GeoClue agent on appearance"
+shell_bus=$(tail -n +"$((geo_mark + 1))" "$TUNA_STUB_WWANLOC_LOG" | grep -oE "AddAgent tuna-shell from [^ ]+" | tail -1 | awk '{print $4}')
+[ -n "$shell_bus" ] || fail G-QS-LOCATION "no agent bus name in the GeoClue log"
+# dconf delivers the write to the shell asynchronously: wait until the
+# agent's own MaxAccuracyLevel reports the new ceiling before asking it
+# to authorize, so the answer reflects the setting rather than the race.
+agent_ceiling() {
+    ceiling_got=""
+    for _ in $(seq 1 20); do
+        ceiling_got=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+            --object-path /org/freedesktop/GeoClue2/Agent \
+            --method org.freedesktop.DBus.Properties.Get org.freedesktop.GeoClue2.Agent MaxAccuracyLevel 2>&1)
+        echo "$ceiling_got" | grep -qE "^\(<(uint32 )?$1>,\)$" && return 0
+        sleep 0.25
+    done
+    echo "$ceiling_got"
+    return 1
+}
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION "the agent never reported the exact ceiling: $ceiling"
+# InUse lights the panel indicator; clearing it darkens it again.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<true>" >/dev/null ||
+    fail G-QS-LOCATION "could not set GeoClue InUse"
+in_use=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-inuse.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if showing "$ARTIFACTS/a11y-qs-location-inuse.json" "Location in use"; then in_use=1; break; fi
+    sleep 1
+done
+[ -n "$in_use" ] || fail G-QS-LOCATION "no Location in use indicator while GeoClue is in use"
+scrot "$ARTIFACTS/16e-location.png" >/dev/null
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<false>" >/dev/null ||
+    fail G-QS-LOCATION "could not clear GeoClue InUse"
+in_use_dark=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-idle.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if ! showing "$ARTIFACTS/a11y-qs-location-idle.json" "Location in use"; then in_use_dark=1; break; fi
+    sleep 1
+done
+[ -n "$in_use_dark" ] || fail G-QS-LOCATION "the Location indicator stayed after GeoClue went idle"
+# Authorization end to end: a stored EXACT grant for an installed app
+# authorizes at the request; the ceiling clamps it; first-use known
+# apps prompt (deny/allow flows through); unknown apps are denied.
+# Proof apps live in $XDG_DATA_HOME (the shell's user data dir), like
+# every other tuna-probe desktop file above.
+printf '[Desktop Entry]\nName=Proof Location App\nType=Application\nExec=/bin/true\n' \
+    >"$XDG_DATA_HOME/applications/proof-location-app.desktop"
+printf '[Desktop Entry]\nName=Proof Location Stranger\nType=Application\nExec=/bin/true\n' \
+    >"$XDG_DATA_HOME/applications/proof-location-stranger.desktop"
+printf '[Desktop Entry]\nName=Proof Location Newcomer\nType=Application\nExec=/bin/true\n' \
+    >"$XDG_DATA_HOME/applications/proof-location-newcomer.desktop"
+gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore \
+    --object-path /org/freedesktop/impl/portal/PermissionStore \
+    --method org.freedesktop.impl.portal.PermissionStore.SetPermission \
+    location true location proof-location-app '["EXACT", "1700000000"]' >/dev/null ||
+    fail G-QS-LOCATION "could not seed the location permission store"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION "stored EXACT grant answered $auth, not (true, 8)"
+gsettings set org.gnome.system.location max-accuracy-level 'city' ||
+    fail G-QS-LOCATION "could not lower the accuracy ceiling"
+ceiling=$(agent_ceiling 4) ||
+    fail G-QS-LOCATION "the agent never reported the city ceiling: $ceiling"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(true, (uint32 )?4\)" ||
+    fail G-QS-LOCATION "city ceiling answered $auth, not (true, 4)"
+gsettings set org.gnome.system.location max-accuracy-level 'exact' ||
+    fail G-QS-LOCATION "could not restore the accuracy ceiling"
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION "the agent never reported the exact ceiling: $ceiling"
+# First use prompts: the stranger's request surfaces the consent
+# dialog; denying answers denied and saves the denial.
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-stranger 8 \
+    --timeout 30 >"$ARTIFACTS/location-stranger-auth.txt" 2>&1 &
+stranger_pid=$!
+prompt_shown=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-prompt.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if jq -e 'any(.[]; .showing and (.name | contains("to access your location?")))' \
+        "$ARTIFACTS/a11y-location-prompt.json" >/dev/null; then prompt_shown=1; break; fi
+    sleep 1
+done
+[ -n "$prompt_shown" ] || { kill "$stranger_pid" 2>/dev/null; fail G-QS-LOCATION "first-use request did not surface a consent prompt"; }
+scrot "$ARTIFACTS/16g-location-prompt.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-deny.json" 20 \
+    --press "Deny" >/dev/null ||
+    { kill "$stranger_pid" 2>/dev/null; fail G-QS-LOCATION "could not press Deny on the consent prompt"; }
+wait "$stranger_pid"
+auth=$(cat "$ARTIFACTS/location-stranger-auth.txt")
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION "denied first-use answered $auth, not (false, 0)"
+# Allowing a different newcomer grants at the request (and saves it:
+# asking again answers from the store without a prompt).
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-newcomer 8 \
+    --timeout 30 >"$ARTIFACTS/location-newcomer-auth.txt" 2>&1 &
+newcomer_pid=$!
+prompt_shown=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-prompt-allow.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if jq -e 'any(.[]; .showing and (.name | contains("to access your location?")))' \
+        "$ARTIFACTS/a11y-location-prompt-allow.json" >/dev/null; then prompt_shown=1; break; fi
+    sleep 1
+done
+[ -n "$prompt_shown" ] || { kill "$newcomer_pid" 2>/dev/null; fail G-QS-LOCATION "newcomer request did not surface a consent prompt"; }
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-location-allow.json" 20 \
+    --press "Allow" >/dev/null ||
+    { kill "$newcomer_pid" 2>/dev/null; fail G-QS-LOCATION "could not press Allow on the consent prompt"; }
+wait "$newcomer_pid"
+auth=$(cat "$ARTIFACTS/location-newcomer-auth.txt")
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION "allowed first-use answered $auth, not (true, 8)"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-newcomer 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION "saved newcomer grant answered $auth, not (true, 8)"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp no-such-app-xyz 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION "unknown app answered $auth, not denied"
+# Switching off denies live: the stored grant stops authorizing and the
+# indicator stays dark even while GeoClue reports in use.
+gsettings set org.gnome.system.location enabled false ||
+    fail G-QS-LOCATION "could not switch location off"
+ceiling=$(agent_ceiling 0) ||
+    fail G-QS-LOCATION "the agent never reported the switch off: $ceiling"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION "stored grant answered $auth with the switch off, not denied"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<true>" >/dev/null ||
+    fail G-QS-LOCATION "could not set GeoClue InUse"
+off_dark=""
+for _ in $(seq 1 10); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-off.json" 20 ||
+        fail G-QS-LOCATION "accessibility dump failed"
+    if ! showing "$ARTIFACTS/a11y-qs-location-off.json" "Location in use"; then
+        # Absence must hold, not merely race the signal: one more dump.
+        sleep 1
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-off.json" 20 ||
+            fail G-QS-LOCATION "accessibility dump failed"
+        if ! showing "$ARTIFACTS/a11y-qs-location-off.json" "Location in use"; then off_dark=1; break; fi
+    fi
+    sleep 1
+done
+[ -n "$off_dark" ] || fail G-QS-LOCATION "the Location indicator lit with the switch off"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.GeoClue2 \
+    --object-path /org/freedesktop/GeoClue2/Manager --method org.freedesktop.DBus.Properties.Set \
+    org.freedesktop.GeoClue2.Manager InUse "<false>" >/dev/null ||
+    fail G-QS-LOCATION "could not clear GeoClue InUse"
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION "could not switch location back on"
+pass G-QS-LOCATION "the agent registers, InUse lights the panel, AuthorizeApp answers from the store under the switch and ceiling, and first use prompts with deny/allow flowing through"
+
+# Without GeoClue the indicator hides while the switch keeps gating
+# grants and unknown apps stay denied.
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION-ABSENT "could not switch location on"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent false >/dev/null ||
+    fail G-QS-LOCATION-ABSENT "could not release the stub GeoClue name"
+loc_dark=""
+for _ in $(seq 1 15); do
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-location-absent.json" 20 ||
+        fail G-QS-LOCATION-ABSENT "accessibility dump failed (shell hung?)"
+    if ! showing "$ARTIFACTS/a11y-qs-location-absent.json" "Location in use"; then loc_dark=1; break; fi
+    sleep 1
+done
+scrot "$ARTIFACTS/16f-location-absent.png" >/dev/null
+[ -n "$loc_dark" ] || fail G-QS-LOCATION-ABSENT "the Location indicator stayed with GeoClue gone"
+# The switch still gates the agent with the daemon gone: off denies the
+# stored grant, on restores it, and unknown apps stay denied throughout.
+gsettings set org.gnome.system.location enabled false ||
+    fail G-QS-LOCATION-ABSENT "could not switch location off"
+ceiling=$(agent_ceiling 0) ||
+    fail G-QS-LOCATION-ABSENT "the agent never reported the switch off: $ceiling"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch off, not denied"
+gsettings set org.gnome.system.location enabled true ||
+    fail G-QS-LOCATION-ABSENT "could not switch location back on"
+ceiling=$(agent_ceiling 8) ||
+    fail G-QS-LOCATION-ABSENT "the agent never reported the switch back on: $ceiling"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp proof-location-app 8 2>&1) ||
+    fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(true, (uint32 )?8\)" ||
+    fail G-QS-LOCATION-ABSENT "stored grant answered $auth with the switch back on, not (true, 8)"
+auth=$(gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest "$shell_bus" \
+    --object-path /org/freedesktop/GeoClue2/Agent \
+    --method org.freedesktop.GeoClue2.Agent.AuthorizeApp no-such-app-xyz 8 2>&1) ||
+    fail G-QS-LOCATION-ABSENT "AuthorizeApp call failed: $auth"
+echo "$auth" | grep -qE "\(false, (uint32 )?0\)" ||
+    fail G-QS-LOCATION-ABSENT "unknown app answered $auth, not denied"
+gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.tuna.Proof.WwanLocation \
+    --object-path /org/tuna/Proof/WwanLocation --method org.tuna.Proof.WwanLocation.GeoCluePresent true >/dev/null ||
+    fail G-QS-LOCATION-ABSENT "could not restore the stub GeoClue name"
+pass G-QS-LOCATION-ABSENT "without GeoClue the indicator hides while the switch gates grants and unknown apps stay denied"
+
 kill "$STUBS_PID" 2>/dev/null || true
 STUBS_PID=""
 sleep 2
@@ -2833,7 +3648,7 @@ open_qs
 scrot "$ARTIFACTS/18-quick-settings-absent.png" >/dev/null
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-absent.json" 20 ||
     fail G-QS-ABSENT "accessibility dump failed (shell hung?)"
-for label in "Wi-Fi" "Bluetooth" "Power Mode"; do
+for label in "Wi-Fi" "Bluetooth" "Mobile Network" "Power Mode"; do
     if showing "$ARTIFACTS/a11y-qs-absent.json" "$label"; then
         fail G-QS-ABSENT "'$label' still showing with its daemon gone"
     fi
@@ -3363,16 +4178,56 @@ fi
 xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
 gsettings set org.gnome.desktop.interface enable-hot-corners true
 sleep 1
+ripples_started=$(tval hot_corner_ripples started)
+ripples_frames=$(tval hot_corner_ripples animated_frames)
+anim_clock 0
+cstate '.animation_clock_manual' "frozen corner clock" ||
+    fail G-HOT-CORNER-RIPPLES "the clock file did not freeze animation time"
 xdotool mousemove --window "$WID" 1 1
 cstate '.overview_open' "hot corner enabled" ||
     fail G-HOT-CORNER "enabling GNOME hot corners did not open the actual overview"
 cp "$CSTATE" "$ARTIFACTS/hot-corner-enabled.json"
+# The first ring starts at full opacity and is a quarter gone half way.
+tvalue hot_corner_ripples 1 || fail G-HOT-CORNER-RIPPLES "the corner did not start GNOME's ripples"
+anim_clock 415
+tvalue hot_corner_ripples 0.75 || fail G-HOT-CORNER-RIPPLES "the first ring was not at ease-in-quad 75% half way"
+scrot "$ARTIFACTS/hot-corner-ripples-415ms.png" >/dev/null
+anim_clock 1350
+tsettled hot_corner_ripples "$ripples_started" "$ripples_frames" ||
+    fail G-HOT-CORNER-RIPPLES "the corner did not play GNOME's ripples to the end"
 scrot "$ARTIFACTS/hot-corner-enabled.png" >/dev/null
 xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
 xdotool key Escape
+anim_clock 1700
 cstate '.overview_open | not' "hot corner dismissed" ||
     fail G-HOT-CORNER "the corner-opened overview did not close"
+real_clock || fail G-HOT-CORNER-RIPPLES "removing the clock file did not resume real time"
 pass G-HOT-CORNER "live GNOME disable rejects the corner; enable opens the actual overview"
+# Ripples are motion: Reduced Motion drops them, as does animations off.
+for policy in reduce off; do
+    if [ "$policy" = reduce ]; then
+        gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
+        cstate '.motion_policy == "fade-only"' "reduced corner" ||
+            fail G-HOT-CORNER-RIPPLES "Reduced Motion did not reach the compositor"
+    else
+        gsettings set org.gnome.desktop.interface enable-animations false
+        cstate '.motion_policy == "off"' "still corner" ||
+            fail G-HOT-CORNER-RIPPLES "enable-animations false did not reach the compositor"
+    fi
+    ripples_started=$(tval hot_corner_ripples started)
+    xdotool mousemove --window "$WID" 1 1
+    cstate ".overview_open and .transitions.hot_corner_ripples.started == $ripples_started" "corner without ripples ($policy)" ||
+        fail G-HOT-CORNER-RIPPLES "the corner rippled under motion policy $policy"
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+    xdotool key Escape
+    cstate '(.overview_open | not) and .overview_progress == 0' "corner dismissed ($policy)" ||
+        fail G-HOT-CORNER-RIPPLES "the corner-opened overview did not close"
+    gsettings reset org.gnome.desktop.a11y.interface reduced-motion
+    gsettings set org.gnome.desktop.interface enable-animations true
+    cstate '.motion_policy == "full"' "corner motion restored" ||
+        fail G-HOT-CORNER-RIPPLES "the full motion policy did not return"
+done
+pass G-HOT-CORNER-RIPPLES "the hot corner plays GNOME's three ripples on the exact curve and settles; none under Reduced Motion or with animations off"
 
 # GNOME's cursor theme, size and shapes are the compositor's to draw
 # (#342). A proof theme inherits its cursors from a base theme, with
@@ -4163,10 +5018,6 @@ pass G-INTROSPECT-MOTION "GNOME clients receive four enable-animations changes; 
 
 # The proof-driven animation clock samples the overview transition at
 # exact delays: 250 ms each way, so 125 ms is exactly half.
-anim_clock() {
-    printf '%s\n' "$1" >"$TUNA_ANIMATION_CLOCK.tmp"
-    mv "$TUNA_ANIMATION_CLOCK.tmp" "$TUNA_ANIMATION_CLOCK"
-}
 anim_clock 0
 cstate '.animation_clock_manual and .motion_policy == "full" and (.overview_open | not) and .overview_progress == 0' "frozen clock" ||
     fail G-ANIMATION-CLOCK "the clock file did not freeze compositor animation time"
@@ -7324,16 +8175,43 @@ wait_size_marker() {
     return 1
 }
 wait_size_marker ready || fail G-INTROSPECT-SIZE "D-Bus desktop-size observer did not subscribe"
+screen_started=$(tval monitor_change started)
+screen_frames=$(tval monitor_change animated_frames)
+anim_clock 0
+cstate '.animation_clock_manual' "frozen monitor clock" ||
+    fail G-MONITOR-TRANSITION "the clock file did not freeze animation time"
 apply_display 2 1.25 || fail G-DISPLAY-SETTINGS "ApplyMonitorsConfig failed: $(tail -2 "$ARTIFACTS/display-settings.log")"
 cstate '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' "125 percent" ||
     fail G-DISPLAY-SETTINGS "the layout did not follow scale 1.25"
+# GNOME's ScreenTransition: the old screen holds 250 ms, then fades out
+# over the new one for 500 ms.
+cstate ".transitions.monitor_change.started > $screen_started" "monitor transition began" ||
+    fail G-MONITOR-TRANSITION "the monitor change did not picture the old screen"
+tvalue monitor_change 1 || fail G-MONITOR-TRANSITION "the old screen was not held at first"
+anim_clock 500
+tvalue monitor_change 0.25 || fail G-MONITOR-TRANSITION "the old screen was not at ease-out-quad 25% 250 ms into its fade"
+scrot "$ARTIFACTS/24a-monitor-transition-500ms.png" >/dev/null
+anim_clock 750
+tsettled monitor_change "$screen_started" "$screen_frames" ||
+    fail G-MONITOR-TRANSITION "the monitor change did not fade the old screen out and settle"
+real_clock || fail G-MONITOR-TRANSITION "removing the clock file did not resume real time"
 grep -q '<scale>1.25</scale>' "$XDG_CONFIG_HOME/tuna/monitors.xml" 2>/dev/null ||
     fail G-DISPLAY-SETTINGS "the arrangement was not saved to tuna/monitors.xml"
 scrot "$ARTIFACTS/24-scale-125.png" >/dev/null
 wait_size_marker scaled || fail G-INTROSPECT-SIZE "scaled property and notification did not reach the real client"
+gsettings set org.gnome.desktop.interface enable-animations false
+cstate '(.animations_enabled | not)' "still monitors" ||
+    fail G-MONITOR-TRANSITION "enable-animations false did not reach the compositor"
+screen_started=$(tval monitor_change started)
 apply_display 1 1 || fail G-DISPLAY-SETTINGS "restoring scale 1 failed"
 cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)" "100 percent" ||
     fail G-DISPLAY-SETTINGS "the layout did not return to scale 1"
+cstate ".transitions.monitor_change.started == $screen_started and (.transitions.monitor_change.active | not)" "instant monitor change" 5 ||
+    fail G-MONITOR-TRANSITION "the monitor change faded with animations off"
+gsettings set org.gnome.desktop.interface enable-animations true
+cstate '.animations_enabled' "monitor motion restored" ||
+    fail G-MONITOR-TRANSITION "enable-animations true did not reach the compositor"
+pass G-MONITOR-TRANSITION "a monitor change fades the old screen out over 750 ms, then nothing animates; none with animations off"
 pass G-DISPLAY-SETTINGS "ApplyMonitorsConfig changes the scale live and saves it"
 wait "$SIZE_CLIENT" || fail G-INTROSPECT-SIZE "restored desktop size did not reach the D-Bus client"
 pass G-INTROSPECT-SIZE "initial desktop size and two actual scale-change notifications agree"
@@ -7366,13 +8244,31 @@ ln -s "$ARTIFACTS/devices/card0-tuna-0" "$BACKLIGHT/device"
 ln -s "$ARTIFACTS/devices/card0-other" "$ARTIFACTS/backlight/aaa-other/device"
 echo 1000 >"$ARTIFACTS/backlight/aaa-other/max_brightness"
 echo 700 >"$ARTIFACTS/backlight/aaa-other/brightness"
-echo 500 >"$BACKLIGHT/brightness"
+echo 1010 >"$BACKLIGHT/max_brightness"
+echo raw >"$BACKLIGHT/type"
+echo raw >"$ARTIFACTS/backlight/aaa-other/type"
+"$PY" - "$ARTIFACTS/devices/card0-tuna-0" "$ARTIFACTS/devices/card0-other" "$TUNA_BACKLIGHT_TEST_CONNECTORS" <<'PYFIXTURE'
+import json,os,pathlib,sys
+path0=pathlib.Path(sys.argv[1]).resolve()
+path1=pathlib.Path(sys.argv[2]).resolve()
+for path,cid in [(path0,'1'),(path1,'2')]:
+    for name,value in [('connector_id',cid),('status','connected'),('enabled','enabled')]:
+        (path/name).write_text(value+'\n')
+m0=path0.stat()
+m1=path1.stat()
+pathlib.Path(sys.argv[3]).write_text(json.dumps([
+    dict(name='tuna-0',drm_device=0,connector_id=1,connector_sysfs=str(path0),connector_device=m0.st_dev,connector_inode=m0.st_ino),
+    dict(name='other-0',drm_device=0,connector_id=2,connector_sysfs=str(path1),connector_device=m1.st_dev,connector_inode=m1.st_ino),
+]))
+PYFIXTURE
+echo 510 >"$BACKLIGHT/brightness"
 # The per-monitor actions stay on their GNOME defaults
 # (Shift+XF86MonBrightness*): custom chords are covered by
 # SWITCHER-REBIND, and startup grabs avoid mid-run re-grab races.
 sleep 1.5
 xdotool mousemove --window "$WID" 600 450
-for spec in 'XF86MonBrightnessUp:550' 'XF86MonBrightnessDown:500' 'XF86MonBrightnessCycle:550'; do
+# Real GNOME floor..max normalization: 10..1010 gives twenty exact 50-unit steps.
+for spec in 'XF86MonBrightnessUp:560' 'XF86MonBrightnessDown:510' 'XF86MonBrightnessCycle:560'; do
     # One press can land before a grab reaches the compositor; press
     # until the file moves, at most one step per press.
     end=$(($(date +%s) + 15))
@@ -7383,7 +8279,7 @@ for spec in 'XF86MonBrightnessUp:550' 'XF86MonBrightnessDown:500' 'XF86MonBright
     [ "$(cat "$BACKLIGHT/brightness")" = "${spec#*:}" ] || fail G-MONITOR-BRIGHTNESS-KEYS "${spec%%:*} did not set ${spec#*:} on the pointer's monitor"
     [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" = 700 ] || fail G-MONITOR-BRIGHTNESS-KEYS "a different monitor's backlight changed"
 done
-echo 1000 >"$BACKLIGHT/brightness"
+echo 1010 >"$BACKLIGHT/brightness"
 # Cycle through the default chord like up/down above: the custom Super+F3
 # this step used to tap is no longer bound (see the loop comment).
 end=$(($(date +%s) + 15))
@@ -7397,12 +8293,65 @@ done
 for key in screen-brightness-up-monitor screen-brightness-down-monitor screen-brightness-cycle-monitor; do
     gsettings reset org.gnome.shell.keybindings "$key"
 done
+# Controlled backlight/logind policy test; no physical brightness claim.
+# Global brightness is the maximum user level across outputs. The controller
+# preserves each output's ratio, so with the second fixture at 700/1000 the
+# primary's 50% slider request is intentionally below 50% of its range.
+# Wait for both readbacks: the primary can already equal its floor while the other output is still applying.
+expected_levels="$("$PY" - "$BACKLIGHT" "$ARTIFACTS/backlight/aaa-other" <<'PY_EXPECTED'
+import pathlib
+import sys
+
+def scalar(path):
+    return int(path.read_text().strip())
+
+def reading(path):
+    maximum = scalar(path / "max_brightness")
+    minimum = max(1, maximum // 100)
+    relative = (scalar(path / "brightness") - minimum) / (maximum - minimum)
+    return maximum, minimum, relative
+
+primary_max, primary_min, primary_relative = reading(pathlib.Path(sys.argv[1]))
+other_max, other_min, other_relative = reading(pathlib.Path(sys.argv[2]))
+global_relative = max(primary_relative, other_relative)
+scale = 0.5 / global_relative if global_relative > 0 else 0
+primary_target = primary_min + int((primary_max - primary_min) * primary_relative * scale + 0.5)
+other_target = other_min + int((other_max - other_min) * other_relative * scale + 0.5)
+print(primary_target, other_target)
+PY_EXPECTED
+)"
+expected_primary="$(printf '%s\n' "$expected_levels" | cut -d ' ' -f1)"
+expected_other="$(printf '%s\n' "$expected_levels" | cut -d ' ' -f2)"
+# Close whatever the monitor-key sequence left open (the corner click
+# toggles), then open quick settings so the Brightness slider is showing.
+xdotool key Escape
+sleep 1
+open_qs
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-brightness-policy.json" 20 \
+    --set Brightness 50 || fail G-BRIGHTNESS-CONTRACT "could not set associated user brightness"
+end=$(($(date +%s) + 10))
+until [ "$(cat "$BACKLIGHT/brightness")" = "$expected_primary" ] &&
+    [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" = "$expected_other" ] ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+if [ "$(cat "$BACKLIGHT/brightness")" != "$expected_primary" ] ||
+    [ "$(cat "$ARTIFACTS/backlight/aaa-other/brightness")" != "$expected_other" ]; then
+    fail G-BRIGHTNESS-CONTRACT "actual associated user baseline missing (expected $expected_primary/$expected_other)"
+fi
+"$PY" "$ROOT/scripts/lib/gnome-brightness-proof.py" --out "$ARTIFACTS/brightness-controlled.json" \
+    --controlled-root "$ARTIFACTS/backlight" --device tuna-bl --other-device aaa-other \
+    --shell-executable "$privacy_expected_shell" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||
+    fail G-BRIGHTNESS-CONTRACT "controlled policy/readback contract rejected; see retained JSON/log"
+pass G-BRIGHTNESS-CONTRACT "actual original shell wire schema and controlled associated dim/restore/auto/reset readbacks; synthetic sysfs/logind only"
 rm -rf "$ARTIFACTS/backlight/aaa-other"
 pass G-MONITOR-BRIGHTNESS-KEYS "bound monitor up/down/cycle change only the connector under the pointer; cycle wraps"
 # A rebound notification key focuses the active banner's real button.
 # The earlier DND proof intentionally leaves banners disabled. Restore
 # them through the actual quick-settings control before testing focus.
 if [ "$(gsettings get org.gnome.desktop.notifications show-banners)" = false ]; then
+    # The brightness sequence leaves quick settings open, and the corner
+    # click toggles: close anything first so open_qs genuinely reopens.
+    xdotool key Escape
+    sleep 1
     open_qs
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notification-enable.json" 20 --press "Do Not Disturb" || fail G-NOTIFICATION-FOCUS-KEY "could not turn off Do Not Disturb"
     xdotool key Escape
@@ -7662,8 +8611,28 @@ if [ -n "$PAM_ON" ]; then
     pass G-UNLOCK "a wrong password is refused, the right one unlocks through PAM"
     sleep 0.5
     screen_active | grep -q false || fail G-LOCK-KEY "GetActive stayed locked after authentication"
+    curtain_started=$(tval lock_curtain started)
+    curtain_frames=$(tval lock_curtain animated_frames)
+    # GNOME's curtain on the frozen animation clock: it lowers over
+    # 250 ms once the lock surface maps; the session stays hidden.
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen lock clock" ||
+        fail G-LOCK-SLIDE "the clock file did not freeze animation time"
     xdotool key super+l
     cstate '.locked' "Super+L locked" 10 || fail G-LOCK-KEY "Super+L did not lock"
+    cstate ".locked and .transitions.lock_curtain.started > $curtain_started" "curtain lowering" 10 ||
+        fail G-LOCK-SLIDE "the lock curtain did not start lowering"
+    tvalue lock_curtain 1 || fail G-LOCK-SLIDE "the curtain did not start off the top of the screen"
+    anim_clock 125
+    tvalue lock_curtain 0.25 || fail G-LOCK-SLIDE "the curtain was not at ease-out-quad 75% down 125 ms in"
+    scrot "$ARTIFACTS/25a-lock-curtain-125ms.png" >/dev/null
+    anim_clock 250
+    tsettled lock_curtain "$curtain_started" "$curtain_frames" ||
+        fail G-LOCK-SLIDE "the lock curtain did not lower and settle"
+    tvalue lock_curtain 0 || fail G-LOCK-SLIDE "the settled curtain does not cover the screen"
+    cstate '.locked' "still locked after the curtain" 2 || fail G-LOCK-SLIDE "the curtain unlocked the session"
+    curtain_started=$(tval lock_curtain started)
+    curtain_frames=$(tval lock_curtain animated_frames)
     sleep 0.5
     screen_active | grep -q true || fail G-LOCK-KEY "GetActive missed Super+L"
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
@@ -7671,10 +8640,29 @@ if [ -n "$PAM_ON" ]; then
     xdotool type --delay 30 "$UNLOCK_PASSWORD"
     xdotool key Return
     cstate '(.locked | not)' "shortcut lock unlocked through PAM" 15 || fail G-LOCK-KEY "shortcut lock did not unlock"
+    # Only after PAM: the curtain lifts off the session over 300 ms.
+    cstate ".transitions.lock_curtain.started > $curtain_started" "curtain lifting" 10 ||
+        fail G-LOCK-SLIDE "the curtain did not start lifting after unlocking"
+    tvalue lock_curtain 0 || fail G-LOCK-SLIDE "the lift did not start from the covering curtain"
+    anim_clock 400
+    tvalue lock_curtain 0.75 || fail G-LOCK-SLIDE "the curtain was not at ease-out-quad 75% up 150 ms into the lift"
+    scrot "$ARTIFACTS/25b-unlock-curtain-150ms.png" >/dev/null
+    anim_clock 550
+    tsettled lock_curtain "$curtain_started" "$curtain_frames" ||
+        fail G-LOCK-SLIDE "the curtain did not lift and settle after unlocking"
+    cstate '.transitions.lock_curtain.value == null' "curtain gone" 5 ||
+        fail G-LOCK-SLIDE "the lifted curtain is still drawn"
+    real_clock || fail G-LOCK-SLIDE "removing the clock file did not resume real time"
     sleep 0.5
     grep -q 'ActiveChanged.*true' "$ARTIFACTS/screensaver-signals.log" || fail G-LOCK-KEY "no active signal"
     grep -q 'ActiveChanged.*false' "$ARTIFACTS/screensaver-signals.log" || fail G-LOCK-KEY "no inactive signal"
     pass G-LOCK-KEY "Super+L locks; PAM unlocks; ActiveChanged publishes both transitions"
+    # With animations off the curtain moves at once, both ways.
+    gsettings set org.gnome.desktop.interface enable-animations false
+    cstate '(.animations_enabled | not)' "still curtain" ||
+        fail G-LOCK-SLIDE "enable-animations false did not reach the compositor"
+    curtain_started=$(tval lock_curtain started)
+    curtain_frames=$(tval lock_curtain animated_frames)
     # Freeze only the animation clock so a genuine rendered Ctrl ripple
     # remains in flight until the real D-Bus lock. No synthetic frames/time.
     anim_clock 20000
@@ -7691,6 +8679,9 @@ if [ -n "$PAM_ON" ]; then
     gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/ScreenSaver \
         --method org.gnome.ScreenSaver.Lock >/dev/null || fail G-DBUS-LOCK "D-Bus Lock failed"
     cstate '.locked' "D-Bus locked" 5 || fail G-DBUS-LOCK "D-Bus Lock replied without locking"
+    tsettled lock_curtain "$curtain_started" "$curtain_frames" same ||
+        fail G-LOCK-SLIDE "with animations off the curtain did not lower at once"
+    curtain_started=$(tval lock_curtain started)
     cstate '.locked and .animation_clock_manual and has("cursor") and .cursor == null and .pointer_position == null and .pointer_fullscreen_blocked == null' "D-Bus lock redacts active ripple" ||
         fail G-POINTER-TRACE-PRIVATE "D-Bus lock retained cursor activity or pointer coordinates"
     cp "$CSTATE" "$ARTIFACTS/locate-dbus-locked-private.json"
@@ -7709,12 +8700,47 @@ if [ -n "$PAM_ON" ]; then
     xdotool key Return
     cstate '(.locked | not)' "first-printable lock wake authenticated through PAM" 15 ||
         fail G-LOCK-FIRST-PRINTABLE "first wake character was lost, duplicated, or could not authenticate"
+    tsettled lock_curtain "$curtain_started" "$curtain_frames" same ||
+        fail G-LOCK-SLIDE "with animations off the curtain did not lift at once"
+    gsettings set org.gnome.desktop.interface enable-animations true
+    cstate '.motion_policy == "full"' "curtain motion restored" ||
+        fail G-LOCK-SLIDE "enable-animations true did not reach the compositor"
     pass G-LOCK-FIRST-PRINTABLE "a printable wake key becomes exactly one password character and PAM unlocks"
     cstate '(.locked | not) and (.cursor.locate_pointer.active | not) and .cursor.locate_pointer.at == null and .cursor.locate_pointer.count == 0 and .cursor.locate_pointer.frames == 0' "unlock retains no prior ripple" ||
         fail G-POINTER-TRACE-PRIVATE "unlock resurrected pre-lock cursor activity/history"
     cp "$CSTATE" "$ARTIFACTS/locate-after-dbus-unlock.json"
     gsettings set org.gnome.desktop.interface locate-pointer false
     pass G-POINTER-TRACE-PRIVATE "D-Bus lock during an actual rendered frozen-clock ripple redacts cursor diagnostics; unlock retains no activity/history"
+    # Reduced Motion keeps GNOME's opacity change and drops the slide.
+    gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
+    cstate '.motion_policy == "fade-only"' "reduced curtain" ||
+        fail G-LOCK-SLIDE "Reduced Motion did not reach the compositor"
+    curtain_started=$(tval lock_curtain started)
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen reduced lock clock" ||
+        fail G-LOCK-SLIDE "the clock file did not freeze animation time"
+    xdotool key super+l
+    cstate ".locked and .transitions.lock_curtain.started > $curtain_started" "reduced curtain lowering" 10 ||
+        fail G-LOCK-SLIDE "the reduced-motion lock did not start its curtain"
+    anim_clock 125
+    tvalue lock_curtain 0 || fail G-LOCK-SLIDE "the curtain slid under Reduced Motion"
+    tvalue lock_curtain 0.75 alpha || fail G-LOCK-SLIDE "the curtain did not fade in on ease-out-quad under Reduced Motion"
+    anim_clock 250
+    tvalue lock_curtain 1 alpha || fail G-LOCK-SLIDE "the reduced-motion curtain did not settle opaque"
+    real_clock || fail G-LOCK-SLIDE "removing the clock file did not resume real time"
+    sleep 0.5
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
+    sleep 1
+    xdotool type --delay 30 "$UNLOCK_PASSWORD"
+    xdotool key Return
+    cstate '(.locked | not)' "reduced-motion lock unlocked through PAM" 15 ||
+        fail G-LOCK-SLIDE "the reduced-motion lock did not unlock"
+    cstate '(.transitions.lock_curtain.active | not) and .transitions.lock_curtain.value == null' "reduced curtain gone" 5 ||
+        fail G-LOCK-SLIDE "the reduced-motion curtain did not fade off"
+    gsettings reset org.gnome.desktop.a11y.interface reduced-motion
+    cstate '.motion_policy == "full"' "full motion after the curtain" ||
+        fail G-LOCK-SLIDE "the full motion policy did not return"
+    pass G-LOCK-SLIDE "the curtain lowers on lock and lifts only after PAM on GNOME's exact curves; fades only under Reduced Motion; instant with animations off"
 
     pass G-DBUS-LOCK "org.gnome.Shell exposes the screen-saver object and Lock waits for confirmation"
 

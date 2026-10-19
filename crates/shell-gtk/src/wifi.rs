@@ -420,7 +420,7 @@ impl WifiMenu {
                         "tuna-shell-gtk: enterprise Wi-Fi setup is disabled by your administrator."
                     );
                 } else {
-                    let _ = std::process::Command::new("gnome-control-center")
+                    let _ = tuna_shell_host::apps::application_command("gnome-control-center")
                         .args(["wifi", "connect-8021x-wifi", &device, &net.ap])
                         .spawn();
                 }

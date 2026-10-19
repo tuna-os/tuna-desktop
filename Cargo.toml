@@ -2,12 +2,14 @@
 resolver = "2"
 exclude = ["third-party/reis", "third-party/smithay"]
 members = [
+    "crates/backlight",
     "crates/compositor",
     "crates/shell-control-schema",
     "crates/shell-host",
     "crates/greeter",
     "crates/shell-gtk",
     "crates/wallpaper",
+    "crates/magnifier",
 ]
 
 # Pinned per ADR 0001 (docs/adr/0001-nested-backend-smithay-pin.md).

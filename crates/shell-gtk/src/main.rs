@@ -16,21 +16,27 @@
 mod accessibility;
 mod audio_state;
 mod background_settings;
+mod brightness;
+mod brightness_service;
 mod bt_menu;
 mod calendar;
 mod events;
 mod fd_watch;
 mod folder_dialog;
 mod folders;
+mod grid_animation;
+mod grid_pager;
 mod group_animation;
 mod ibus_panel;
 mod ibus_property_menu;
 mod kbd_a11y;
 mod keybindings;
 mod live_apps;
+mod location;
 mod lock;
 mod lockdown;
 mod logic;
+mod magnifier_sync;
 mod media_keys;
 mod motion;
 mod network_agent;
@@ -45,6 +51,7 @@ mod polkit;
 mod portal_opt_out;
 mod power;
 mod preview_chrome;
+mod printers;
 mod privacy;
 mod privacy_portal;
 mod providers;
@@ -67,6 +74,7 @@ mod window_menu;
 mod wired;
 mod ws_dots;
 mod ws_popup;
+mod wwan;
 
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
@@ -116,7 +124,8 @@ fn is_would_block(e: &ControlError) -> bool {
 #[derive(Default)]
 struct Drained {
     results: Vec<(u64, bool)>,
-    accelerators: Vec<(u32, u32, u32)>,
+    /// Grabbed accelerator presses and releases `(action, time, mode, released)`.
+    accelerators: Vec<(u32, u32, u32, bool)>,
     menus: Vec<tuna_shell_host::control::WindowMenuRequest>,
     consent: Option<Option<(u64, String)>>,
     popups: Vec<(u32, u32)>,
@@ -211,7 +220,10 @@ fn drain(
                 .push((kind, duration_ms, clicked, x, y)),
             Handled::WorkspacePopup { index, count } => out.popups.push((index, count)),
             Handled::Accelerator { action, time, mode } => {
-                out.accelerators.push((action, time, mode));
+                out.accelerators.push((action, time, mode, false));
+            }
+            Handled::AcceleratorDeactivated { action, time, mode } => {
+                out.accelerators.push((action, time, mode, true));
             }
             Handled::CommandResult { id, status } => out.results.push((
                 id,
@@ -361,12 +373,14 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
             .is_some_and(|c| c.model().is_overview_open())
     }
 
-    fn set_accelerators(&self, accelerators: Vec<tuna_shell_control::Accelerator>) {
+    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
         if let Some(control) = self.shell.borrow_mut().control.as_mut() {
             let locked = control.locked();
-            let subset =
-                media_keys::trace_enabled().then(|| media_keys::media_subset(&accelerators));
-            let result = control.set_accelerators(accelerators);
+            let subset = media_keys::trace_enabled().then(|| {
+                let accelerators: Vec<_> = grabs.iter().map(|g| g.accelerator).collect();
+                media_keys::media_subset(&accelerators)
+            });
+            let result = control.set_accelerator_grabs(grabs);
             if let Some(subset) = subset {
                 media_keys::trace(
                     "accelerators-send",
@@ -789,6 +803,7 @@ fn qs_round(icon: &str, label: &str) -> gtk::Button {
 struct PanelIcons {
     mic: gtk::Image,
     network: gtk::Image,
+    location: gtk::Image,
     dnd: gtk::Image,
     volume: gtk::Image,
     power_profile: gtk::Image,
@@ -798,9 +813,11 @@ struct PanelIcons {
 }
 
 fn quick_settings_popover(
+    app: &adw::Application,
     shell: &Rc<RefCell<Shell>>,
     notify: &Rc<notify::NotifyUi>,
     power_ui: &Rc<power::PowerUi>,
+    brightness_controller: &Rc<brightness_service::Controller>,
     icons: PanelIcons,
 ) -> gtk::Popover {
     let popover = gtk::Popover::new();
@@ -842,13 +859,13 @@ fn quick_settings_popover(
             eprintln!("tuna-shell-gtk: opening settings is disabled by your administrator.");
             return;
         }
-        let _ = gio::AppInfo::launch_default_for_uri("settings://", None::<&gio::AppLaunchContext>)
-            .or_else(|_| {
-                std::process::Command::new("gnome-control-center")
-                    .spawn()
-                    .map(|_| ())
-                    .map_err(|e| glib::Error::new(gio::IOErrorEnum::Failed, &e.to_string()))
-            });
+        let context = tuna_shell_host::apps::application_launch_context();
+        let _ = gio::AppInfo::launch_default_for_uri("settings://", Some(&context)).or_else(|_| {
+            tuna_shell_host::apps::application_command("gnome-control-center")
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| glib::Error::new(gio::IOErrorEnum::Failed, &e.to_string()))
+        });
     });
     {
         let shell = shell.clone();
@@ -1055,6 +1072,70 @@ fn quick_settings_popover(
     });
     let bluetooth = qs_menu_tile("bluetooth-active-symbolic", "Bluetooth", None, &bt_menu_ui);
     bt_menu.set_tile(bluetooth.clone());
+    // Printers (#362 P-ST-10): the live CUPS queue. The tile's
+    // subtitle tracks the print service; its menu lists one compact
+    // row per printer, refreshed whenever the menu opens. A row, Print
+    // Settings or the toggle opens the queue window with the full
+    // panel; printers have no on/off, so the toggle is momentary.
+    let printers_menu_ui = QsMenu::new("printer-symbolic", "Printers");
+    let printers_menu = printers::PrintersMenu::new(printers_menu_ui.list());
+    printers_menu_ui.separator();
+    let (print_settings, _) = printers_menu_ui.item(None, "Print Settings");
+    print_settings.connect_clicked({
+        let menu = printers_menu.clone();
+        move |_| menu.open_window()
+    });
+    let printers_tile = qs_menu_tile("printer-symbolic", "Printers", None, &printers_menu_ui);
+    printers_menu.set_tile(printers_tile.clone());
+    printers_menu.set_on_open({
+        let popover = popover.clone();
+        move || popover.popdown()
+    });
+    {
+        let menu = printers_menu.clone();
+        printers_menu_ui.revealer.connect_visible_notify(move |r| {
+            if r.is_visible() {
+                menu.refresh();
+            }
+        });
+    }
+    printers_tile.on_user_toggle({
+        let menu = printers_menu.clone();
+        move |on| {
+            if on {
+                menu.open_window();
+            }
+        }
+    });
+    // GNOME's mobile broadband menu: the modems, then Mobile Network
+    // Settings. Opening it re-reads the modems, so a freshly appeared
+    // one lists without waiting for a daemon signal.
+    let wwan_menu_ui = QsMenu::new(
+        "network-cellular-signal-excellent-symbolic",
+        "Mobile Network",
+    );
+    let wwan_menu = wwan::WwanMenu::new(wwan_menu_ui.list());
+    wwan_menu_ui.separator();
+    let (wwan_settings, _) = wwan_menu_ui.item(None, "Mobile Network Settings");
+    wwan_settings.connect_clicked(|_| {
+        // Administrative lockdown (#357) applies inside the helper.
+        lockdown::open_settings_panel(Some("wwan"));
+    });
+    let wwan = qs_menu_tile(
+        "network-cellular-signal-excellent-symbolic",
+        "Mobile Network",
+        None,
+        &wwan_menu_ui,
+    );
+    wwan_menu.set_tile(wwan.clone());
+    {
+        let wwan_menu = wwan_menu.clone();
+        wwan_menu_ui.revealer.connect_visible_notify(move |r| {
+            if r.is_visible() {
+                wwan_menu.refresh();
+            }
+        });
+    }
     let power_menu_ui = QsMenu::new("power-profile-balanced-symbolic", "Power Mode");
     let power_items: Vec<(&'static str, gtk::Button, gtk::Image)> = [
         ("performance", "Performance"),
@@ -1082,14 +1163,38 @@ fn quick_settings_popover(
     let night = qs_tile("night-light-symbolic", "Night Light", None);
     let dark = qs_tile("dark-mode-symbolic", "Dark Style", None);
     let dnd_tile = qs_tile("notifications-disabled-symbolic", "Do Not Disturb", None);
+    // Location services: the GeoClue2 agent behind the panel's in-use
+    // indicator. GNOME puts the master switch in Settings, not quick
+    // settings, so there is no tile: Settings (and the proof) writes
+    // the switch, the agent honors it. First-use consent is the
+    // overlay dialog (unknown apps prompt, the answer is saved).
+    let location_agent = location::LocationAgent::new();
+    location_agent.set_indicator(icons.location);
+    {
+        let prompt = location::LocationPrompt::new(app.upcast_ref());
+        location_agent.on_prompt(move |app_id, req, respond| {
+            prompt.show(app_id, req, respond);
+        });
+    }
     grid.add(&wifi, Some(&wifi_menu_ui));
     grid.add(&wired, Some(&wired_menu_ui));
     grid.add(&bluetooth, Some(&bt_menu_ui));
+    grid.add(&printers_tile, Some(&printers_menu_ui));
+    grid.add(&wwan, Some(&wwan_menu_ui));
     grid.add(&power_mode, Some(&power_menu_ui));
     for tile in [&night, &dark, &dnd_tile] {
         grid.add(tile, None);
     }
-    let (wifi_outer, wired_outer, bluetooth_outer, power_outer, night_outer, dark_outer, dnd_outer) = (
+    let (
+        wifi_outer,
+        wired_outer,
+        bluetooth_outer,
+        power_outer,
+        night_outer,
+        dark_outer,
+        dnd_outer,
+        wwan_outer,
+    ) = (
         wifi.outer.clone(),
         wired.outer.clone(),
         bluetooth.outer.clone(),
@@ -1097,6 +1202,7 @@ fn quick_settings_popover(
         night.outer.clone(),
         dark.outer.clone(),
         dnd_tile.outer.clone(),
+        wwan.outer.clone(),
     );
     // While a toggle menu is open GNOME dims everything else in the
     // panel (brightness -0.4); selecting an item closes the panel, as
@@ -1129,6 +1235,7 @@ fn quick_settings_popover(
         &wifi_menu_ui.revealer,
         &wired_menu_ui.revealer,
         &bt_menu_ui.revealer,
+        &wwan_menu_ui.revealer,
         &sound_menu_ui.revealer,
     ] {
         {
@@ -1148,10 +1255,29 @@ fn quick_settings_popover(
         &all_networks,
         &wired_settings,
         &bt_settings,
+        &wwan_settings,
         &sound_settings,
     ] {
         let popover = popover.clone();
         settings.connect_clicked(move |_| popover.popdown());
+    }
+    // The printers menu dims and resets like the other toggle menus;
+    // kept as its own block so the printers wiring stays additive.
+    {
+        let popover = popover.clone();
+        printers_menu_ui
+            .revealer
+            .connect_visible_notify(move |menu| {
+                if menu.is_visible() {
+                    popover.add_css_class("dimmed");
+                } else {
+                    popover.remove_css_class("dimmed");
+                }
+            });
+    }
+    {
+        let menu = printers_menu_ui.revealer.clone();
+        popover.connect_closed(move |_| menu.set_visible(false));
     }
     let dnd = dnd_tile.button.clone();
 
@@ -1183,6 +1309,9 @@ fn quick_settings_popover(
         bt_menu,
         wired,
         bluetooth,
+        wwan,
+        wwan_menu,
+        location_agent,
         power_mode,
         power_header: power_menu_ui.header_icon.clone(),
         power_items,
@@ -1203,6 +1332,7 @@ fn quick_settings_popover(
         sound_list,
         sound_arrow,
         brightness,
+        brightness_controller: brightness_controller.clone(),
     }));
     // Do Not Disturb drives the shell's notification store (banners
     // held back) and mirrors GNOME's show-banners key.
@@ -1270,6 +1400,7 @@ fn quick_settings_popover(
         &wifi_outer,
         &wired_outer,
         &bluetooth_outer,
+        &wwan_outer,
         &power_outer,
         &night_outer,
         &dark_outer,
@@ -1277,7 +1408,41 @@ fn quick_settings_popover(
     ] {
         tile.add_css_class("qs-dimmable");
     }
-    popover.set_child(Some(&col));
+    // Service-backed tiles may add rows while an inline submenu is open.
+    // Keep the popup on its monitor instead of letting GTK dismiss an
+    // oversized popup; keyboard focus and scrolling still reach every row.
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(600)
+        .child(&col)
+        .build();
+    {
+        let scroll = scroll.clone();
+        popover.connect_show(move |popup| {
+            let parent = popup.parent();
+            let surface = parent
+                .as_ref()
+                .and_then(|widget| widget.native())
+                .and_then(|native| native.surface());
+            if let Some(monitor) = surface.as_ref().and_then(|surface| {
+                gtk::prelude::WidgetExt::display(popup).monitor_at_surface(surface)
+            }) {
+                // Reserve the panel and the popup's padding, border and gap.
+                let panel_height = parent
+                    .as_ref()
+                    .map_or(tuna_shell_control::PANEL_HEIGHT as i32, |widget| {
+                        widget.height()
+                    });
+                scroll.set_max_content_height(
+                    (monitor.geometry().height() - panel_height - 64).max(1),
+                );
+            }
+            scroll.vadjustment().set_value(0.0);
+        });
+    }
+    popover.set_child(Some(&scroll));
     popover
 }
 
@@ -1336,6 +1501,7 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
 
 fn build(app: &adw::Application) {
     accessibility::start_focus_policy();
+    magnifier_sync::start_sync();
     let provider = gtk::CssProvider::new();
     // Shell CSS has GNOME's baseline face/size, but follows the user's font live.
     let apply_font = {
@@ -1509,6 +1675,8 @@ fn build(app: &adw::Application) {
     let panel_mic = status_icon("microphone-sensitivity-medium-symbolic", false);
     panel_mic.update_property(&[gtk::accessible::Property::Label("Microphone in use")]);
     let panel_network = status_icon("network-wired-symbolic", false);
+    let panel_location = status_icon("location-services-active-symbolic", false);
+    panel_location.update_property(&[gtk::accessible::Property::Label("Location in use")]);
     let panel_dnd = status_icon("notifications-disabled-symbolic", false);
     let panel_volume = status_icon("audio-volume-high-symbolic", false);
     let panel_power_profile = status_icon("power-profile-balanced-symbolic", false);
@@ -1559,13 +1727,41 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    let brightness_policy_settings =
+        settings("org.gnome.settings-daemon.plugins.power").filter(|s| {
+            s.settings_schema()
+                .is_some_and(|schema| schema.has_key("idle-brightness"))
+        });
+    let brightness_controller = brightness_service::start(
+        {
+            let weak = Rc::downgrade(&shell);
+            Rc::new(move || {
+                weak.upgrade()
+                    .and_then(|shell| {
+                        let shell = shell.try_borrow().ok()?;
+                        shell.control.as_ref().map(|c| c.native_outputs().to_vec())
+                    })
+                    .unwrap_or_default()
+            })
+        },
+        brightness_policy_settings
+            .as_ref()
+            .map(|s| f64::from(s.int("idle-brightness")) / 100.0)
+            .unwrap_or(0.3),
+    );
+    if let Some(settings) = brightness_policy_settings {
+        brightness_controller.settings(settings);
+    }
     let qs = quick_settings_popover(
+        app,
         &shell,
         &notify,
         &power_ui,
+        &brightness_controller,
         PanelIcons {
             mic: panel_mic,
             network: panel_network,
+            location: panel_location,
             dnd: panel_dnd,
             volume: panel_volume,
             power_profile: panel_power_profile,
@@ -2177,6 +2373,7 @@ fn build(app: &adw::Application) {
             );
             let (apps, notify, osd_ui) = (apps.clone(), notify.clone(), osd_ui.clone());
             let screenshot_ui = screenshot_ui.clone();
+            let brightness_controller = brightness_controller.clone();
             let workspace_popup_keys = workspace_popup.clone();
             let (panel_window_keys, activities_keys, panel_held_keys) =
                 (window.clone(), activities.clone(), panel_held.clone());
@@ -2502,15 +2699,26 @@ fn build(app: &adw::Application) {
                             }
                             _ => services::BrightnessStep::Cycle,
                         };
-                        if let Some(level) = services::step_brightness_for(
-                            step,
-                            output.as_deref().filter(|_| monitor),
-                        ) {
-                            osd_ui.show(&osd::OsdRequest {
+                        let output = output.as_deref().filter(|_| monitor);
+                        let osd = osd_ui.clone();
+                        let show = move |result: Result<f64, String>| match result {
+                            Ok(level) => osd.show(&osd::OsdRequest {
                                 icon: Some("display-brightness-symbolic".into()),
                                 level: Some(level),
                                 ..Default::default()
-                            });
+                            }),
+                            Err(e) => eprintln!("tuna-shell-gtk: brightness key: {e}"),
+                        };
+                        if brightness_controller.has_output(output) {
+                            brightness_controller.step(output, step, Box::new(show));
+                        } else if monitor {
+                            eprintln!(
+                                "tuna-shell-gtk: no authoritative native pointer-output backlight"
+                            );
+                        } else {
+                            // Preserve explicitly global legacy access, but this
+                            // fallback cannot establish the new interface capability.
+                            services::step_brightness_for(step, output, Box::new(show));
                         }
                     }
                 }
@@ -3033,8 +3241,12 @@ fn build(app: &adw::Application) {
                 } else if let Some(request) = consent {
                     shortcut_consent.sync(request);
                 }
-                for (action, time, mode) in accelerators {
-                    gnome_shell.accelerator_activated(action, time, mode);
+                for (action, time, mode, released) in accelerators {
+                    if released {
+                        gnome_shell.accelerator_deactivated(action, time, mode);
+                    } else {
+                        gnome_shell.accelerator_activated(action, time, mode);
+                    }
                 }
                 for request in menus {
                     window_menu.open(&request);
@@ -3274,7 +3486,7 @@ fn main() -> glib::ExitCode {
     tuna_shell_control::legacy::import_env("tuna-shell-gtk");
     glib::set_prgname(Some("tuna-shell-gtk"));
     // GTK and libadwaita must not block startup on portal activation.
-    let portals = std::cell::Cell::new(Some(portal_opt_out::disable()));
+    portal_opt_out::disable();
     // Before any window is realized, so GSK's first renderer follows it.
     if gtk::init().is_ok() {
         if let Some(display) = gtk::gdk::Display::default() {
@@ -3285,13 +3497,11 @@ fn main() -> glib::ExitCode {
         .application_id("org.tuna.Shell")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    // The class handlers (GTK, then libadwaita) ran first.
-    app.connect_startup(move |_| {
-        if let Some(saved) = portals.take() {
-            saved.restore();
-        }
-    });
-    privacy_portal::start(&app);
+    // GApplication's RUN_FIRST startup handler completes GTK/libadwaita's
+    // VFS initialization before this worker can construct dconf settings.
+    // Otherwise GTK can own the VFS once-init and wait for GIO's module
+    // mutex while dconf owns that mutex and waits for the same VFS once-init.
+    app.connect_startup(privacy_portal::start);
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
 }

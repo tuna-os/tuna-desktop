@@ -266,6 +266,17 @@ pub fn resized(
     Rectangle::new((x, y).into(), (w, h).into())
 }
 
+/// A physical key whose press the compositor consumed. `grab` holds the
+/// accelerator grab and its admission generation it fired, or `None`
+/// for a key consumed for another reason (Escape cancelling the strip
+/// pointer); `mode` is the action mode at the press.
+#[derive(Clone, Copy)]
+struct HeldAccelerator {
+    keycode: u32,
+    grab: Option<(tuna_shell_control::AcceleratorGrab, u64)>,
+    mode: u32,
+}
+
 pub struct WindowManager {
     /// Active interactive move/resize, if any (#58).
     grab: Option<PointerGrab>,
@@ -293,11 +304,19 @@ pub struct WindowManager {
     keyboard: Option<KeyboardHandle<State>>,
     pointer: Option<PointerHandle<State>>,
     pointer_pos: Point<f64, Logical>,
-    /// org.gnome.Shell accelerator grabs (GrabAccelerators).
+    /// org.gnome.Shell accelerator grabs (GrabAccelerators), as plain
+    /// accelerators for the wm-key ownership check and traces.
     accelerators: Vec<tuna_shell_control::Accelerator>,
-    /// Keycodes whose press fired an accelerator: their release is
-    /// swallowed too.
-    accel_held: Vec<u32>,
+    /// The same grabs with their GNOME flags and admission generation.
+    accelerator_grabs: Vec<(tuna_shell_control::AcceleratorGrab, u64)>,
+    /// Last admission generation handed out (0 is never admitted).
+    accelerator_generation: u64,
+    /// Keys whose press fired an accelerator (or cancelled the strip
+    /// pointer): their repeats and release are swallowed too.
+    accel_held: Vec<HeldAccelerator>,
+    /// Released GRAB_TRIGGER_RELEASE grabs `(action, time, mode)`,
+    /// drained by the runtime.
+    accel_released: Vec<(u32, u32, u32)>,
     /// Fired accelerators `(action, time, mode)`, drained by the runtime.
     accel_fired: Vec<(u32, u32, u32)>,
     /// Input is going to the session-lock surface.
@@ -569,7 +588,10 @@ impl WindowManager {
             pointer,
             pointer_pos: (0.0, 0.0).into(),
             accelerators: Vec::new(),
+            accelerator_grabs: Vec::new(),
+            accelerator_generation: 0,
             accel_held: Vec::new(),
+            accel_released: Vec::new(),
             accel_fired: Vec::new(),
             lock_input_active: false,
             menu_requests: Vec::new(),
@@ -3330,20 +3352,12 @@ impl WindowManager {
                 keycode.saturating_add(XKB_X11_OFFSET).into(),
                 KeyState::Pressed,
             );
-            self.accel_held.push(keycode);
+            self.accel_held.push(HeldAccelerator {
+                keycode,
+                grab: None,
+                mode: 0,
+            });
             return true;
-        }
-        // A grabbed accelerator's release follows its press: swallowed.
-        if !pressed {
-            if let Some(i) = self.accel_held.iter().position(|k| *k == keycode) {
-                self.accel_held.remove(i);
-                keyboard.input_discard(
-                    state,
-                    keycode.saturating_add(XKB_X11_OFFSET).into(),
-                    KeyState::Released,
-                );
-                return true;
-            }
         }
         let mode = if self.lock_input_active {
             tuna_shell_control::MODE_LOCK_SCREEN
@@ -3354,6 +3368,36 @@ impl WindowManager {
         } else {
             tuna_shell_control::MODE_NORMAL
         };
+        // A grabbed accelerator's release follows its press: swallowed.
+        // The original physical key is always cleared, even after a
+        // rebind or lock; modifiers are not re-resolved (they may be
+        // lifted first). Only a still-installed GRAB_TRIGGER_RELEASE grab
+        // in the press's mode reports the release.
+        if !pressed {
+            if let Some(i) = self
+                .accel_held
+                .iter()
+                .position(|held| held.keycode == keycode)
+            {
+                let held = self.accel_held.remove(i);
+                if let Some(grab) = held.grab {
+                    if self.grab_admitted(&grab)
+                        && held.mode == mode
+                        && grab.0.flags & tuna_shell_control::GRAB_TRIGGER_RELEASE != 0
+                        && !state.shortcuts_inhibited()
+                    {
+                        self.accel_released
+                            .push((grab.0.accelerator.action, time, mode));
+                    }
+                }
+                keyboard.input_discard(
+                    state,
+                    keycode.saturating_add(XKB_X11_OFFSET).into(),
+                    KeyState::Released,
+                );
+                return true;
+            }
+        }
         let mode_mask = if self.lock_input_active {
             tuna_shell_control::MODE_LOCK_SCREEN | tuna_shell_control::MODE_UNLOCK_SCREEN
         } else {
@@ -3362,10 +3406,34 @@ impl WindowManager {
         // A window with approved shortcut inhibition receives the shell's
         // grabbed accelerators too. Lock input always remains compositor-owned.
         let inhibited = !self.lock_input_active && state.shortcuts_inhibited();
-        let grabs: Vec<tuna_shell_control::Accelerator> = if pressed && !inhibited {
-            self.accelerators
+        // A held grab's duplicate key-down keeps its original identity:
+        // it is consumed, activates again only without
+        // GRAB_IGNORE_AUTOREPEAT, and never creates a second release.
+        let held = self
+            .accel_held
+            .iter()
+            .find(|held| held.keycode == keycode)
+            .and_then(|held| held.grab.map(|grab| (grab, held.mode)));
+        if let Some((grab, held_mode)) = held.filter(|_| pressed) {
+            keyboard.input_discard(
+                state,
+                keycode.saturating_add(XKB_X11_OFFSET).into(),
+                KeyState::Pressed,
+            );
+            if grab.0.flags & tuna_shell_control::GRAB_IGNORE_AUTOREPEAT == 0
+                && held_mode == mode
+                && !inhibited
+                && self.grab_admitted(&grab)
+            {
+                self.accel_fired
+                    .push((grab.0.accelerator.action, time, mode));
+            }
+            return true;
+        }
+        let grabs: Vec<(tuna_shell_control::AcceleratorGrab, u64)> = if pressed && !inhibited {
+            self.accelerator_grabs
                 .iter()
-                .filter(|a| a.modes & mode_mask != 0)
+                .filter(|(g, _)| g.accelerator.modes & mode_mask != 0)
                 .copied()
                 .collect()
         } else {
@@ -3376,7 +3444,7 @@ impl WindowManager {
         // `raw - 8` on the wire, so passing our evdev tables through
         // unchanged would mistranslate every key and panic on codes
         // below 8 (Escape, digits) once a client holds keyboard focus.
-        let intercepted = keyboard.input::<u32, _>(
+        let intercepted = keyboard.input::<(tuna_shell_control::AcceleratorGrab, u64), _>(
             state,
             keycode.saturating_add(XKB_X11_OFFSET).into(),
             if pressed {
@@ -3397,36 +3465,47 @@ impl WindowManager {
                     .map(|k| k.raw())
                     .chain(std::iter::once(handle.modified_sym().raw()))
                     .collect();
-                match grabs
-                    .iter()
-                    .find(|a| a.mods == mods && syms.contains(&a.keysym))
-                {
-                    Some(a) => FilterResult::Intercept(a.action),
+                match grabs.iter().find(|(g, _)| {
+                    g.accelerator.mods == mods && syms.contains(&g.accelerator.keysym)
+                }) {
+                    Some(grab) => FilterResult::Intercept(*grab),
                     None => FilterResult::Forward,
                 }
             },
         );
-        if let Some(action) = intercepted {
-            if let Some(a) = grabs
-                .iter()
-                .filter(|_| !self.lock_input_active && media_trace_enabled())
-                .find(|a| {
-                    a.action == action
-                        && matches!(a.keysym, 0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2)
-                })
+        if let Some((grab, generation)) = intercepted {
+            let action = grab.accelerator.action;
+            if !self.lock_input_active
+                && media_trace_enabled()
+                && matches!(
+                    grab.accelerator.keysym,
+                    0x1008ff11 | 0x1008ff12 | 0x1008ff13 | 0x1008ffb2
+                )
             {
                 trace_media(
                     "media-accelerator-fired",
                     serde_json::json!({
-                        "action": action, "keysym": a.keysym, "mods": a.mods, "mode": mode,
+                        "action": action, "keysym": grab.accelerator.keysym,
+                        "mods": grab.accelerator.mods, "mode": mode,
                     }),
                     self.lock_input_active,
                 );
             }
-            self.accel_held.push(keycode);
+            self.accel_held.push(HeldAccelerator {
+                keycode,
+                grab: Some((grab, generation)),
+                mode,
+            });
             self.accel_fired.push((action, time, mode));
         }
         true
+    }
+
+    /// Whether this exact grab (same flags, same admission generation)
+    /// is still installed: a removed or re-created grab never receives
+    /// a repeat or release from an earlier physical press.
+    fn grab_admitted(&self, grab: &(tuna_shell_control::AcceleratorGrab, u64)) -> bool {
+        self.accelerator_grabs.contains(grab)
     }
 
     /// GNOME's Hide: take the window off the screen and hand focus to
@@ -3620,7 +3699,59 @@ impl WindowManager {
 
     /// Replace the accelerator grabs (org.gnome.Shell GrabAccelerators).
     pub fn set_accelerators(&mut self, accelerators: Vec<tuna_shell_control::Accelerator>) {
-        self.accelerators = accelerators;
+        self.set_accelerator_grabs(
+            accelerators
+                .into_iter()
+                .map(|accelerator| tuna_shell_control::AcceleratorGrab {
+                    accelerator,
+                    flags: 0,
+                })
+                .collect(),
+        );
+    }
+
+    /// Atomic replacement (typed GrabAccelerators). Unchanged grabs keep
+    /// their admission generation; removed and re-created grabs get a
+    /// new one, so an earlier physical press cannot report to them.
+    pub fn set_accelerator_grabs(&mut self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
+        let previous = std::mem::take(&mut self.accelerator_grabs);
+        let mut admitted = Vec::new();
+        for grab in grabs
+            .into_iter()
+            .take(tuna_shell_control::MAX_ACCELERATORS)
+            .filter(|g| g.flags & !tuna_shell_control::SUPPORTED_GRAB_FLAGS == 0)
+        {
+            let generation = match previous.iter().find(|(old, _)| *old == grab) {
+                Some((_, generation)) => *generation,
+                None => {
+                    // u64 admissions cannot run out in a session; saturating
+                    // keeps exhaustion from wrapping onto an old generation.
+                    self.accelerator_generation = self.accelerator_generation.saturating_add(1);
+                    self.accelerator_generation
+                }
+            };
+            admitted.push((grab, generation));
+        }
+        self.accelerators = admitted.iter().map(|(g, _)| g.accelerator).collect();
+        self.accelerator_grabs = admitted;
+    }
+
+    /// Crossing the lock boundary invalidates pre-lock repeats and
+    /// releases; the physical keys stay owned until their real release.
+    pub fn invalidate_held_accelerators(&mut self) {
+        for held in &mut self.accel_held {
+            if let Some((_, generation)) = held.grab.as_mut() {
+                *generation = 0;
+            }
+        }
+        self.accel_released.clear();
+        self.accel_fired.clear();
+    }
+
+    /// Releases of GRAB_TRIGGER_RELEASE grabs since the last call:
+    /// `(action, time, mode)`.
+    pub fn take_accelerators_released(&mut self) -> Vec<(u32, u32, u32)> {
+        std::mem::take(&mut self.accel_released)
     }
 
     pub fn trace_media_accelerators(&self, locked: bool) {
@@ -4789,7 +4920,7 @@ impl WindowManager {
         ) = (self.keyboard.clone(), input)
         {
             if !*pressed {
-                self.accel_held.retain(|held| held != keycode);
+                self.accel_held.retain(|held| held.keycode != *keycode);
             }
             keyboard.input_discard(
                 state,

@@ -25,6 +25,8 @@ serde_json.workspace = true
 pipewire = { version = "0.10", features = ["v0_3_33"] }
 tuna-shell-host = { path = "../shell-host", version = "0.1.0" }
 tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+tuna-magnifier = { path = "../magnifier", version = "0.1.0" }
+tuna-backlight = { path = "../backlight", version = "0.1.0" }
 
 [build-dependencies]
 # GNOME Shell's own icons, compiled in as a GResource (build.rs).

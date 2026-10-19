@@ -425,7 +425,9 @@ impl StateModel {
 
     /// Apply a partial [`WindowUpdate`]. Returns false (no bump, no change)
     /// when the id is unknown. A workspace move registers the workspace if
-    /// new. Appends `WindowUpdated`.
+    /// new. Appends `WindowUpdated` when the patch changed the entry; a
+    /// patch restating the entry (the per-tick title sync) bumps nothing,
+    /// so shells are not sent a delta for every window on every tick.
     pub fn update(&mut self, id: u64, patch: WindowUpdate) -> bool {
         if patch
             .workspace
@@ -436,26 +438,45 @@ impl StateModel {
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
+        let mut changed = false;
         if let Some(title) = patch.title {
-            window.title = cap_title(&title);
+            let title = cap_title(&title);
+            if window.title != title {
+                window.title = title;
+                changed = true;
+            }
         }
         if let Some(app_id) = patch.app_id {
-            window.app_id = app_id;
+            if window.app_id != app_id {
+                window.app_id = app_id;
+                changed = true;
+            }
         }
         if let Some(workspace) = patch.workspace {
-            window.workspace = workspace;
+            if window.workspace != workspace {
+                window.workspace = workspace;
+                changed = true;
+            }
         }
         if let Some(active) = patch.active {
-            window.active = active;
+            if window.active != active {
+                window.active = active;
+                changed = true;
+            }
         }
         if let Some(on_all_workspaces) = patch.on_all_workspaces {
-            window.on_all_workspaces = on_all_workspaces;
+            if window.on_all_workspaces != on_all_workspaces {
+                window.on_all_workspaces = on_all_workspaces;
+                changed = true;
+            }
+        }
+        if !changed {
+            return true;
         }
         let window = window.clone();
         if let Some(workspace) = patch.workspace {
             self.register_workspace(workspace);
         }
-        self.windows.insert(id, window.clone());
         self.commit(StateChange::WindowUpdated { window });
         true
     }
@@ -573,6 +594,20 @@ impl StateModel {
                 let window = window.clone();
                 self.commit(StateChange::WindowUpdated { window });
             }
+        }
+    }
+
+    /// Log the unchanged entries again so shells receive fresh activation
+    /// tokens: each `WindowUpdated` delta mints one per window. `None`
+    /// reissues every window. Tokens are one-use and expire, so the
+    /// control hub reissues after an activation and before expiry.
+    pub fn reissue(&mut self, id: Option<u64>) {
+        let windows: Vec<WindowEntry> = match id {
+            Some(id) => self.windows.get(&id).cloned().into_iter().collect(),
+            None => self.windows.values().cloned().collect(),
+        };
+        for window in windows {
+            self.commit(StateChange::WindowUpdated { window });
         }
     }
 
@@ -845,6 +880,66 @@ mod tests {
         assert!(!m.update(999, WindowUpdate::default()));
         assert!(!m.set_focused(Some(999)));
         assert_eq!(m.revision(), 4);
+    }
+
+    #[test]
+    fn restating_a_window_bumps_nothing() {
+        let mut m = StateModel::new();
+        let a = m.insert("a", Some("app"), 1);
+        let rev = m.revision();
+        // The per-tick title sync restates what the model holds.
+        let same = || WindowUpdate {
+            title: Some("a".into()),
+            app_id: Some(Some("app".into())),
+            workspace: Some(1),
+            ..Default::default()
+        };
+        assert!(m.update(a, same()));
+        assert_eq!(m.revision(), rev);
+        assert!(m.changes_since(rev).unwrap().is_empty());
+        // A real change still logs one update.
+        assert!(m.update(
+            a,
+            WindowUpdate {
+                title: Some("b".into()),
+                ..same()
+            }
+        ));
+        assert_eq!(m.revision(), rev + 1);
+        assert!(matches!(
+            &m.changes_since(rev).unwrap()[..],
+            [(_, StateChange::WindowUpdated { window })] if window.title == "b"
+        ));
+    }
+
+    #[test]
+    fn reissue_logs_unchanged_windows_for_fresh_tokens() {
+        let mut m = StateModel::new();
+        let a = m.insert("a", None, 0);
+        let b = m.insert("b", None, 0);
+        let rev = m.revision();
+        m.reissue(Some(a));
+        assert!(matches!(
+            &m.changes_since(rev).unwrap()[..],
+            [(_, StateChange::WindowUpdated { window })] if window.id == a && window.title == "a"
+        ));
+        let rev = m.revision();
+        m.reissue(None);
+        let ids: Vec<u64> = m
+            .changes_since(rev)
+            .unwrap()
+            .iter()
+            .filter_map(|(_, c)| match c {
+                StateChange::WindowUpdated { window } => Some(window.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a) && ids.contains(&b));
+        // Unknown ids reissue nothing.
+        let rev = m.revision();
+        m.reissue(Some(999));
+        assert_eq!(m.revision(), rev);
     }
 
     #[test]

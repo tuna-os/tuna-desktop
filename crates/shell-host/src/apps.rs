@@ -172,31 +172,65 @@ fn from_crate_entry(entry: &CrateEntry) -> Option<AppEntry> {
     from_crate_entry_for_launch(entry, false)
 }
 
+// Desktop values are unescaped before Exec tokenization. The desktop-entry
+// crate deliberately keeps Exec raw, but its parse_exec splits quoted words.
+fn exec_argv(entry: &CrateEntry) -> Option<Vec<OsString>> {
+    let raw = entry.exec()?;
+    let decoded;
+    let command = if raw.contains('\\') {
+        let keyfile = gio::glib::KeyFile::new();
+        keyfile
+            .load_from_data(
+                &format!("[Desktop Entry]\nExec={raw}\n"),
+                gio::glib::KeyFileFlags::NONE,
+            )
+            .ok()?;
+        decoded = keyfile.string("Desktop Entry", "Exec").ok()?;
+        decoded.as_str()
+    } else {
+        raw
+    };
+    let words = gio::glib::shell_parse_argv(command).ok()?;
+    let mut argv = Vec::with_capacity(words.len());
+    for word in words {
+        match word.to_str()? {
+            // No documents or URLs were supplied by this launcher.
+            "%f" | "%F" | "%u" | "%U" | "%d" | "%D" | "%n" | "%N" | "%v" | "%m" => {}
+            "%i" => {
+                if let Some(icon) = entry.icon() {
+                    argv.push(OsString::from("--icon"));
+                    argv.push(OsString::from(icon));
+                }
+            }
+            "%c" => argv.push(OsString::from(entry.name::<&str>(&[])?.as_ref())),
+            "%k" => argv.push(entry.path.as_os_str().to_owned()),
+            text if text.contains('%') => {
+                // %% is literal. Unknown or embedded field codes are invalid.
+                let mut chars = text.chars();
+                let mut expanded = String::with_capacity(text.len());
+                while let Some(ch) = chars.next() {
+                    if ch == '%' && chars.next() != Some('%') {
+                        return None;
+                    }
+                    expanded.push(ch);
+                }
+                argv.push(OsString::from(expanded));
+            }
+            _ => argv.push(word),
+        }
+    }
+    let executable = argv.first()?.to_str()?;
+    if executable.is_empty() || executable.contains('=') {
+        return None;
+    }
+    Some(argv)
+}
+
 fn from_crate_entry_for_launch(entry: &CrateEntry, allow_no_display: bool) -> Option<AppEntry> {
     if entry.hidden() || (!allow_no_display && entry.no_display()) {
         return None;
     }
-    entry.exec()?;
-    let argv: Vec<OsString> = entry
-        .parse_exec()
-        .ok()?
-        .into_iter()
-        .map(|arg| {
-            // The Exec parser splits on whitespace but leaves the
-            // spec's double-quote grouping in place, so a quoted
-            // argument arrives with its quotes attached. Strip one
-            // surrounding pair per argument; without this a probe like
-            // Exec=touch "<marker>" touches a quote-named file.
-            arg.strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-                .unwrap_or(&arg)
-                .to_owned()
-        })
-        .map(OsString::from)
-        .collect();
-    if argv.is_empty() {
-        return None;
-    }
+    let argv = exec_argv(entry)?;
     let app_id = entry.id().to_owned();
     let name = entry
         .name::<&str>(&[])
@@ -347,14 +381,60 @@ pub fn launch_environment() -> Vec<(String, String)> {
     LAUNCH_ENV.lock().map(|env| env.clone()).unwrap_or_default()
 }
 
+/// Caller environment for variables the shell overrides privately. Capture
+/// once before toolkit initialization; never restore them in the live shell.
+static APPLICATION_ENV: std::sync::OnceLock<Vec<(OsString, Option<OsString>)>> =
+    std::sync::OnceLock::new();
+
+/// Preserve the caller's values for child-only restoration. Call once with
+/// values captured before the shell applies private environment overrides.
+pub fn set_application_environment(vars: Vec<(OsString, Option<OsString>)>) {
+    APPLICATION_ENV
+        .set(vars)
+        .expect("application environment must be captured once");
+}
+
+/// A user application command, with session updates and the caller's
+/// original values (including absent variables), not shell-private flags.
+pub fn application_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.envs(launch_environment());
+    if let Some(vars) = APPLICATION_ENV.get() {
+        for (key, value) in vars {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+    }
+    command
+}
+
+/// The same environment boundary for GIO URI/MIME application launches.
+pub fn application_launch_context() -> gio::AppLaunchContext {
+    use gio::prelude::*;
+    let context = gio::AppLaunchContext::new();
+    for (key, value) in launch_environment() {
+        context.setenv(key, value);
+    }
+    if let Some(vars) = APPLICATION_ENV.get() {
+        for (key, value) in vars {
+            match value {
+                Some(value) => context.setenv(key, value),
+                None => context.unsetenv(key),
+            }
+        }
+    }
+    context
+}
+
 pub fn launch(entry: &AppEntry) -> io::Result<Launched> {
     let (program, args) = entry
         .argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty Exec argv"))?;
-    let child = Command::new(program)
+    let child = application_command(program)
         .args(args)
-        .envs(launch_environment())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -456,6 +536,37 @@ mod tests {
     use crate::search::SearchAction;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn application_environment_is_restored_only_for_commands_and_gio_launches() {
+        use gio::prelude::*;
+        use std::ffi::OsStr;
+        let present = "TUNA_TEST_APPLICATION_ENV_PRESENT";
+        let absent = "TUNA_TEST_APPLICATION_ENV_ABSENT";
+        let before = (std::env::var_os(present), std::env::var_os(absent));
+        set_application_environment(vec![
+            (present.into(), Some("caller-value".into())),
+            (absent.into(), None),
+        ]);
+        let command = application_command("/bin/true");
+        let environment: HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            environment.get(OsStr::new(present)),
+            Some(&Some(OsStr::new("caller-value")))
+        );
+        assert_eq!(environment.get(OsStr::new(absent)), Some(&None));
+        let context = application_launch_context();
+        let environment = context.environment();
+        assert!(environment.contains(&format!("{present}=caller-value").into()));
+        assert!(!environment
+            .iter()
+            .any(|value| value.to_string_lossy().starts_with(&format!("{absent}="))));
+        assert_eq!(
+            (std::env::var_os(present), std::env::var_os(absent)),
+            before,
+            "application launches must not mutate the running shell's environment"
+        );
+    }
 
     fn write_entry(dir: &Path, name: &str, body: &str) {
         fs::write(dir.join(name), body).expect("write test entry");
@@ -570,14 +681,12 @@ mod tests {
 
     #[test]
     fn quoted_exec_arg_survives_discovery_unquoted() {
-        // Probe shape from the CI journey: Exec=touch "<abs marker>".
-        // The desktop-entry spec quotes Exec arguments; argv must not
-        // carry the quote characters into the spawn.
+        // Quoting groups spaces without passing quote characters to the child.
         let dir = tempfile::tempdir().expect("tempdir");
         write_entry(
             dir.path(),
             "probe.desktop",
-            "[Desktop Entry]\nName=Tunaterm Probe\nExec=touch \"/tmp/tuna-marker\"\nType=Application\n",
+            "[Desktop Entry]\nName=Tunaterm Probe\nExec=touch \"/tmp/tuna marker\"\nType=Application\n",
         );
         let apps = discover(&[dir.path().to_owned()]);
         let app = apps
@@ -586,9 +695,35 @@ mod tests {
             .expect("probe");
         assert_eq!(
             app.argv,
-            vec![OsString::from("touch"), OsString::from("/tmp/tuna-marker")],
+            vec![OsString::from("touch"), OsString::from("/tmp/tuna marker")],
             "quoted Exec arg keeps its quotes: {:?}",
             app.argv
+        );
+    }
+
+    #[test]
+    fn exec_expands_fields_after_grouping_without_shell_expansion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_entry(
+            dir.path(),
+            "probe.desktop",
+            "[Desktop Entry]\nName=Two Words\nIcon=example\nExec=/bin/echo \"a b\" \"\" \"$HOME\" %c %i %k %U %%\nType=Application\n",
+        );
+        let apps = discover(&[dir.path().to_owned()]);
+        let entry = apps.iter().find(|a| a.name == "Two Words").unwrap();
+        assert_eq!(
+            entry.argv,
+            vec![
+                OsString::from("/bin/echo"),
+                OsString::from("a b"),
+                OsString::new(),
+                OsString::from("$HOME"),
+                OsString::from("Two Words"),
+                OsString::from("--icon"),
+                OsString::from("example"),
+                dir.path().join("probe.desktop").into_os_string(),
+                OsString::from("%"),
+            ]
         );
     }
 
