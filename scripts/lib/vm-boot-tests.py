@@ -1024,6 +1024,36 @@ class PublicOrcaNavigation(unittest.TestCase):
         loader.exec_module(module)
         return module
 
+    def test_native_button_role_alias_preserves_exact_public_focus_target(self):
+        module = self.focus_module()
+        tree = ast.parse(Path(module.__file__).read_text())
+        observe = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "observe")
+        role_assignment = next(n for n in ast.walk(observe) if isinstance(n, ast.Assign)
+                               and any(isinstance(t, ast.Name) and t.id == "role" for t in n.targets))
+        target = next(n for n in ast.walk(observe) if isinstance(n, ast.If)
+                      and ast.dump(n.test) == ast.dump(ast.parse('name == "Disks" and role == "push button"', mode="eval").body))
+        predicate = compile(ast.Expression(target.test), module.__file__, "eval")
+        for native in ("button", "push button", "toggle button", "push button menu", "check box",
+                       "frame", "entry", "link", "Button", "button ", "password text"):
+            scope = {"canonical_role": module.canonical_role,
+                     "accessibility_query": lambda method: method(),
+                     "node": SimpleNamespace(get_role_name=lambda: native)}
+            exec(compile(ast.Module(body=[role_assignment], type_ignores=[]), module.__file__, "exec"), scope)
+            role = scope["role"]
+            button = native in {"button", "push button"}
+            self.assertEqual(eval(predicate, {"name": "Disks", "role": role}), button)
+            self.assertFalse(eval(predicate, {"name": "private filename", "role": role}))
+            if button:
+                self.assertEqual(module.public_node("Disks", role, True, True, False),
+                                 {"label": "Disks", "role": "push button", "focused": True, "active": False})
+                self.assertFalse(module.public_node("Disks", role, True, False, False)["focused"])
+                self.assertIsNone(module.public_node("Disks", role, False, True, False))
+                self.assertIsNone(module.public_node("private filename", role, True, True, False))
+            else:
+                self.assertEqual(role, native, "unrelated roles are not reclassified")
+        # Execute the observer's real role assignment/target predicate; no native
+        # focus qualification is claimed by this vocabulary compatibility test.
+
     def test_focus_receipt_discards_private_names_roles_and_hidden_controls(self):
         module = self.focus_module()
         self.assertEqual(module.public_node("Search", "entry", True, True, False),

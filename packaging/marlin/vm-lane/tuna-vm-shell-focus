@@ -27,6 +27,12 @@ FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
 FOCUS_OPERATION = "arguments"
 
 
+def canonical_role(role):
+    # AT-SPI renamed role 43 to BUTTON while retaining PUSH_BUTTON as an
+    # enum alias. Keep one receipt vocabulary across old/new native versions.
+    return "push button" if role == "button" else role
+
+
 def public_node(name, role, showing, focused, active):
     if name not in PUBLIC_LABELS or role not in PUBLIC_ROLES or not showing:
         return None
@@ -226,7 +232,7 @@ def observe(pid, ticks, executable, display, controlled=False):
         if depth and not showing:
             continue
         FOCUS_OPERATION = "tree-role"
-        role = accessibility_query(node.get_role_name)
+        role = canonical_role(accessibility_query(node.get_role_name))
         if role in PUBLIC_ROLES:
             FOCUS_OPERATION = "tree-name"
             name = accessibility_query(node.get_name)
