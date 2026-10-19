@@ -989,8 +989,10 @@ jobs:
           path: marlin-image-kernels/
           retention-days: 14
       - if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$GHCR_TOKEN" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
           img=ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview
           podman tag marlin-tuna-preview:ci "$img:latest"
           podman tag marlin-tuna-preview:ci "$img:${{ github.sha }}"
