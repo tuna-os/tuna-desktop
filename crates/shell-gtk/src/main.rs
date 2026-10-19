@@ -3455,8 +3455,6 @@ fn main() -> glib::ExitCode {
         println!("tuna-shell-gtk {}", release_version());
         return glib::ExitCode::SUCCESS;
     }
-    // The old name's environment, for one release (#505).
-    tuna_shell_control::legacy::import_env("tuna-shell-gtk");
     glib::set_prgname(Some("tuna-shell-gtk"));
     // GTK and libadwaita must not block startup on portal activation.
     portal_opt_out::disable();

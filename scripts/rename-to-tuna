@@ -30,7 +30,6 @@ Never touched (the keep list):
   comparison.md is generated from those trees by tuna-a11y-baseline,
   which CI checks, and nothing records their hashes);
 - third-party/ (vendored patches) and .spektacular/;
-- share/compat/ (the one-release compatibility files);
 - links to historical GitHub Actions runs, and identifiers that live in
   third-party code (`roost_transport_bounds`, `ROOST-PATCH.md`);
 - any file carrying the marker `tuna-rename: keep-file` in its first
@@ -60,7 +59,6 @@ KEEP_PREFIXES = (
     "third-party/",
     "docs/niri-parity/",
     "docs/marlin/",
-    "share/compat/",
     "scripts/rename-to-tuna",
     "scripts/lib/rename-to-tuna-tests.py",
 )
@@ -88,7 +86,6 @@ PROTECTED = re.compile(
             r"https?://[^\s\"'<>()\[\]]*/actions/runs/[^\s\"'<>()\[\]]*",
             # Paths into kept trees and files.
             r"(?:docs/(?:perf/20[0-9]{2}-|niri-parity/|marlin/)|third-party/)[^\s\"'`<>()\[\],;]*",
-            r"share/compat/[^\s\"'`<>()\[\],;]*",
             r"marlin-roost-wayland-info\.txt",
             # Identifiers defined in third-party code.
             r"roost_transport_bounds",

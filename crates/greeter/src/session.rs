@@ -172,14 +172,14 @@ mod tests {
 
     #[test]
     fn hidden_entries_are_not_listed() {
-        // The old session name's compatibility entry (#505).
-        const COMPAT: &str = include_str!("../../../share/compat/wayland-sessions/roost.desktop");
+        const NODISPLAY: &str =
+            "[Desktop Entry]\nName=Hidden Session\nExec=tuna-session\nNoDisplay=true\n";
         const GONE: &str = "[Desktop Entry]\nName=Gone\nExec=gone\nHidden=true\n";
         const OTHER_GROUP: &str =
             "[Desktop Entry]\nName=Kept\nExec=kept\n[Desktop Action x]\nNoDisplay=true\n";
         let dir = fixture_dir(&[
             ("sway.desktop", SWAY),
-            ("compat.desktop", COMPAT),
+            ("compat.desktop", NODISPLAY),
             ("gone.desktop", GONE),
             ("kept.desktop", OTHER_GROUP),
         ]);
@@ -187,8 +187,9 @@ mod tests {
         let names: Vec<&str> = out.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["Kept", "Sway"]);
         assert_eq!(out.skipped, 0, "hidden is not malformed");
-        // Remembered by a display manager, it still starts the session.
-        let entry = parse_entry(Path::new("compat.desktop"), COMPAT).unwrap();
+        // A NoDisplay entry remembered by a display manager still parses
+        // and starts its session when chosen directly.
+        let entry = parse_entry(Path::new("compat.desktop"), NODISPLAY).unwrap();
         assert_eq!(entry.command, vec!["tuna-session"]);
         assert!(entry.is_default);
     }

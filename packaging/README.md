@@ -47,34 +47,17 @@ sudo bootc switch ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview:latest
 ## Upgrading from the former name
 
 <!-- tuna-rename: keep-begin -->
+
 Tuna Desktop was called Roost until #505. The package is now
 `tuna-desktop` (not `tuna`: Fedora and others ship an unrelated `tuna`),
 and both packages declare `replaces`/`conflicts`/`provides=roost`, so an
-upgrade swaps it in place. For one release the packages also keep:
-
-- `/usr/bin/roost-*` symlinks to the six `tuna-*` binaries, for scripts
-  and greeter configs that name them;
-- `/usr/share/wayland-sessions/roost.desktop`
-  (`share/compat/wayland-sessions/roost.desktop`): a `NoDisplay=true`
-  entry that runs `tuna-session`. GDM remembers each user's last session
-  by file name (`roost`); without this entry those users would silently
-  land in another desktop after the upgrade. `NoDisplay` keeps it out of
-  GDM's and Tuna's session pickers, while GDM still launches it when
-  remembered (only `Hidden=true` would stop that). The visible entry is
-  `tuna.desktop`;
-- `/etc/pam.d/roost-lock` (`share/compat/pam.d/roost-lock`): the lock
-  screen asks PAM for its service by name, and a session started before
-  an in-place upgrade keeps running the old binary, which asks for
-  `roost-lock`. Without the file PAM falls back to `other` (deny on most
-  systems) and that session could not be unlocked. New binaries use
-  `tuna-lock`; both are conffiles.
-
-The binaries still read `ROOST_*` environment variables as `TUNA_*`
-(logging one deprecation line), and adopt per-user state kept under the
-old directory names (`~/.config/roost`, `~/.local/share/roost-shell`,
-`~/.local/state/roost-shell`, ...) by linking the new name to it
-(`crates/shell-control-schema/src/legacy.rs`). All of this goes one
-release after the rename.
+upgrade swaps it in place. The beta's one-release compatibility layer
+(the `/usr/bin/roost-*` symlinks, the `roost.desktop` session entry, the
+`roost-lock` PAM service, the `ROOST_*` environment names, and the old
+per-user directory adoption) was removed after that release: fresh
+installs carry no `roost` names, and only the package relations above
+still mention it. GDM users who upgraded through the beta keep their
+remembered session because the beta's entry carried them over to `tuna`.
+<!-- tuna-rename: keep-end -->
 
 Other branches rename themselves with `scripts/rename-to-tuna`.
-<!-- tuna-rename: keep-end -->

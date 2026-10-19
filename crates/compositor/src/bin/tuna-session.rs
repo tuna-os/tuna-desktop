@@ -92,8 +92,6 @@ fn main() -> ExitCode {
         println!("tuna-session {}", release_version());
         return ExitCode::SUCCESS;
     }
-    // The old name's environment, for one release (#505).
-    tuna_shell_control::legacy::import_env("tuna-session");
     let compositor = resolve_compositor_bin();
     let shell = resolve_shell_bin(None);
     let argv = session_argv(&compositor, &shell, &extra);
