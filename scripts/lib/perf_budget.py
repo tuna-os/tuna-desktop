@@ -161,16 +161,18 @@ def session_metrics(directory):
     return metrics
 
 
-def discover_pairs(root):
-    """Completed GNOME/Tuna pairs under a performance-baseline artifact tree."""
+def discover_pairs(root, profile=None):
+    """Completed pairs, optionally restricted to one calibrated image profile."""
     root = Path(root)
     pairs = []
-    for profile, base in (("diagnostic", root), ("stock", root / "stock")):
+    for candidate, base in (("diagnostic", root), ("stock", root / "stock")):
+        if profile is not None and candidate != profile:
+            continue
         for repeat in (1, 2, 3):
             directory = base if repeat == 1 else base / f"repeat-{repeat}"
             sessions = {desktop: directory / desktop for desktop in DESKTOPS}
             if all((path / "report.json").is_file() for path in sessions.values()):
-                pairs.append({"profile": profile, "repeat": repeat, **sessions})
+                pairs.append({"profile": candidate, "repeat": repeat, **sessions})
     return pairs
 
 
@@ -228,7 +230,11 @@ def evaluate(budgets, comparison, min_pairs=3):
             row.update(status="fail" if row["enforced"] else "warn", reason="; ".join(reasons))
         else:
             row["status"] = "pass"
-        row["meets_target"] = row["ratio"] <= budgets.get("target_ratio", 1.0)
+        # The denominator floor stabilizes the regression budget, not the
+        # match-or-beat target. A quiet but slower desktop must not claim parity.
+        target_ratios = (v["tuna"] / v["gnome"] if v["gnome"] else
+                         (0.0 if v["tuna"] == 0 else math.inf) for v in values)
+        row["meets_target"] = statistics.median(target_ratios) <= budgets.get("target_ratio", 1.0)
         rows.append(row)
     return rows
 
@@ -289,6 +295,8 @@ def ratchet_violations(base, head, repo_root=None):
     for metric, new in sorted(head["metrics"].items()):
         if metric not in base["metrics"] and not RUN_URL.match(str(new.get("evidence", ""))):
             problems.append(f"{metric}: a new budget needs run evidence")
+    if head.get("profile", "stock") != base.get("profile", "stock"):
+        problems.append("profile changed: calibrate a separate budget instead of replacing its comparison population")
     if head.get("target_ratio", 1.0) > base.get("target_ratio", 1.0):
         problems.append("target_ratio raised")
     if head.get("min_pairs", 3) < base.get("min_pairs", 3):
@@ -300,6 +308,8 @@ def validate(budgets):
     problems = []
     if not isinstance(budgets, dict) or budgets.get("schema") != 1 or not isinstance(budgets.get("metrics"), dict):
         return ["budgets schema 1 with a metrics object required"]
+    if budgets.get("profile", "stock") not in ("stock", "diagnostic"):
+        problems.append("profile must name exactly stock or diagnostic")
     if not budgets["metrics"]:
         problems.append("at least one performance budget required")
     if not finite_number(budgets.get("target_ratio", 1.0), positive=True):
@@ -348,7 +358,7 @@ def attribution(comparison):
 
 def markdown(rows, pairs, budgets, comparison=None):
     lines = ["## Performance budgets: Tuna Desktop vs GNOME 51", "",
-             f"{len(pairs)} paired sessions. Ratio is the median over pairs of Tuna / GNOME "
+             f"{len(pairs)} {budgets.get('profile', 'stock')} paired sessions. Ratio is the median over pairs of Tuna / GNOME "
              f"(target <= {budgets.get('target_ratio', 1.0):.2f}). Budgets: `docs/perf/budgets.json`.", "",
              "| Metric | Status | GNOME | Tuna | Ratio | Budget | Ceiling |",
              "|---|---|---:|---:|---:|---:|---:|"]

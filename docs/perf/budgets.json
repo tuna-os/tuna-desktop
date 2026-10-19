@@ -3,7 +3,7 @@
   "target_ratio": 1.0,
   "margin": 0.15,
   "min_pairs": 3,
-  "comparison": "Median over the run's paired sessions of Tuna / max(GNOME, floor). GNOME 51 is the paired session in the same job.",
+  "comparison": "Median over the run's stock-profile paired sessions of Tuna / max(GNOME, floor). GNOME 51 is the paired session in the same job; diagnostic pairs never enter this population.",
   "metrics": {
     "cpu.frames.desktop.mean": {
       "max_ratio": 1.0,
@@ -189,5 +189,6 @@
       "enforced": true,
       "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
     }
-  }
+  },
+  "profile": "stock"
 }

@@ -13,7 +13,9 @@ The roadmap's change control says performance thresholds change only with repeat
 
 ## Decision
 
-Budgets live in `docs/perf/budgets.json`. Each one is a metric for one workload phase, such as the overview phase's total user CPU or the overview response p95. The budget is a ratio to the GNOME 51 session in the same job, plus an optional absolute ceiling. The gate takes the median, over the job's completed pairs, of Tuna / max(GNOME, floor). The floor keeps a near-zero GNOME value (idle CPU) from inflating the ratio.
+Budgets live in `docs/perf/budgets.json`. Each one is a metric for one workload phase, such as the overview phase's total user CPU or the overview response p95. The budget is a ratio to the GNOME 51 session in the same job, plus an optional absolute ceiling. The gate takes the median, over the job's completed stock-profile pairs, of Tuna / max(GNOME, floor). The floor keeps a near-zero GNOME value (idle CPU) from inflating the ratio.
+
+The budget file names its calibrated `profile` (initially `stock`). Checks and proposals use only that profile; diagnostic captures remain available for attribution and cannot substitute for missing stock evidence. Changing the profile requires a separately calibrated budget rather than relabeling the existing gate.
 
 The target ratio is 1.0. The first budgets are the median ratio over the three stock pairs of paired run 38910158684 (trusted main package `78dc07cf`) plus a 15% margin, never below 1.0. That is the first run of the paired route whose observer names every process and whose workload marks every phase on the guest clock; its medians are recorded in [docs/perf/2026-10-15-cpu-parity-attribution.md](../perf/2026-10-15-cpu-parity-attribution.md#budget-baseline-paired-run-38910158684). Absolute ceilings are raised to Tuna's measured value plus the margin where that run already exceeds them. From then on budgets only ratchet tighter:
 
@@ -29,7 +31,7 @@ A nightly scheduled run measures the latest trusted main package and fails on an
 
 - **Absolute thresholds only.** Rejected: runner CPU and QEMU changes would move them, and they say nothing about GNOME parity.
 - **Thresholds at the target (≤ GNOME) from day one.** Rejected: red every night until #503 is done, so a real regression would be invisible.
-- **Fail only after two consecutive regressing nights** (the investigation report's proposal). Not adopted for now. The median over up to six pairs plus the margin absorbs runner variance in one run. Revisit if nightly runs flap.
+- **Fail only after two consecutive regressing nights** (the investigation report's proposal). Not adopted for now. The median over three stock pairs plus the margin absorbs one disturbed pair in one run. Diagnostic-profile pairs stay separate and cannot fill missing stock repeats or change its median. Revisit if nightly runs flap.
 - **Run the paired lane on every PR.** Rejected: one run takes about three hours on a KVM runner, and the org shares 60 job slots.
 
 ## Consequences

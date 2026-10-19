@@ -145,6 +145,34 @@ class Gate(unittest.TestCase):
             self.assertEqual([(p["profile"], p["repeat"]) for p in pairs],
                              [("diagnostic", 1), ("diagnostic", 2), ("diagnostic", 3), ("stock", 1), ("stock", 2)])
 
+    def test_diagnostic_pairs_cannot_supply_missing_stock_repeats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree(root / "artifacts")
+            tree(root / "artifacts" / "stock", pairs=2)
+            path, out = root / "budgets.json", root / "gate.json"
+            path.write_text(json.dumps(budgets(**{"cpu.overview.total.mean": budget(99)})))
+            self.assertEqual(run_gate(["check", "--artifacts", str(root / "artifacts"),
+                                       "--budgets", str(path), "--out", str(out)]), 1)
+            result = json.loads(out.read_text())
+            self.assertEqual(result["profile"], "stock")
+            self.assertEqual(len(result["pairs"]), 2)
+            self.assertEqual(result["results"][0]["status"], "missing")
+
+    def test_diagnostic_values_cannot_hide_stock_regression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree(root / "artifacts", overview_ms=200)
+            tree(root / "artifacts" / "stock", overview_ms=600)
+            path, out = root / "budgets.json", root / "gate.json"
+            path.write_text(json.dumps(budgets(**{"overview.response_ms.p50": budget(2.5)})))
+            self.assertEqual(run_gate(["check", "--artifacts", str(root / "artifacts"),
+                                       "--budgets", str(path), "--out", str(out)]), 1)
+            result = json.loads(out.read_text())
+            self.assertEqual({p["profile"] for p in result["pairs"]}, {"stock"})
+            self.assertEqual(result["results"][0]["status"], "fail")
+            self.assertEqual(result["results"][0]["ratio"], 3.0)
+
     def test_ratio_and_ceiling_pass_and_fail(self):
         rows = self.evaluate(budgets(**{
             "cpu.overview.desktop.mean": budget(1.9),            # 36 / 20 = 1.8
@@ -174,6 +202,30 @@ class Gate(unittest.TestCase):
         rows = self.evaluate(budgets(**{"cpu.overview.desktop.mean": budget(1.9)}), outlier=noisy)
         self.assertEqual(rows["cpu.overview.desktop.mean"]["status"], "pass")
 
+    def test_budget_floor_does_not_claim_the_match_or_beat_target(self):
+        metric = "cpu.idle.desktop.mean"
+        config = budgets(**{metric: budget(1.0, floor=1.0)})
+        for gnome, tuna, meets in ((0.1, 0.5, False), (0.1, 0.1, True),
+                                   (0.0, 0.5, False), (0.0, 0.0, True),
+                                   (0.0, 1e-12, False)):
+            with self.subTest(gnome=gnome, tuna=tuna):
+                values = [{"gnome": gnome, "tuna": tuna}] * 3
+                row = pb.evaluate(config, {metric: values})[0]
+                self.assertEqual(row["status"], "pass")
+                self.assertEqual(row["meets_target"], meets)
+                # Infinite zero-baseline ratios are internal only, never JSON.
+                json.dumps(row, allow_nan=False)
+
+    def test_match_or_beat_target_retains_the_paired_median(self):
+        metric = "cpu.idle.desktop.mean"
+        config = budgets(**{metric: budget(1.0, floor=1.0)})
+        values = [{"gnome": 0.1, "tuna": 0.05},
+                  {"gnome": 0.2, "tuna": 0.2},
+                  {"gnome": 0.0, "tuna": 0.5}]
+        self.assertTrue(pb.evaluate(config, {metric: values})[0]["meets_target"])
+        config["target_ratio"] = 0.9
+        self.assertFalse(pb.evaluate(config, {metric: values})[0]["meets_target"])
+
     def test_provisional_budgets_warn_and_missing_enforced_metrics_fail(self):
         rows = self.evaluate(budgets(**{
             "cpu.overview.total.mean": budget(1.0, enforced=False),
@@ -197,7 +249,7 @@ class Gate(unittest.TestCase):
 
     def test_cli_exit_status_summary_and_report_only(self):
         with tempfile.TemporaryDirectory() as directory:
-            tree(Path(directory) / "artifacts")
+            tree(Path(directory) / "artifacts" / "stock")
             path = Path(directory) / "budgets.json"
             path.write_text(json.dumps(budgets(**{"cpu.overview.total.mean": budget(1.5)})))
             summary, out = Path(directory) / "summary.md", Path(directory) / "gate.json"
@@ -266,6 +318,11 @@ class Ratchet(unittest.TestCase):
         added = lambda m: m.update({"cpu.idle.total.mean": budget(1.5)})
         self.assertEqual(self.check(added), [])
 
+    def test_calibrated_profile_cannot_change(self):
+        head = dict(self.base, profile="diagnostic")
+        self.assertTrue(any("profile changed" in p for p in pb.ratchet_violations(self.base, head)))
+        self.assertEqual(pb.ratchet_violations(self.base, dict(self.base, profile="stock")), [])
+
     def test_pair_requirement_cannot_be_lowered(self):
         base = copy.deepcopy(self.base)
         base["min_pairs"] = 6
@@ -299,7 +356,8 @@ class CommittedBudgets(unittest.TestCase):
                 self.assertTrue(pb.validate(candidate), (key, value))
         for key, values in (("min_pairs", (0, 1, 2, 3.0, True, "3")),
                             ("target_ratio", (0, float("inf"), float("nan"))),
-                            ("margin", (-1, float("inf"), float("nan")))):
+                            ("margin", (-1, float("inf"), float("nan"))),
+                            ("profile", (None, True, "both", "", ["stock"]))):
             for value in values:
                 candidate = copy.deepcopy(valid)
                 candidate[key] = value

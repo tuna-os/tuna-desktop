@@ -60,12 +60,14 @@ It never runs on ordinary pull requests: one run takes about three hours on a KV
 
 The run's summary page and `perf-artifacts/perf-gate.json` in the `marlin-performance` artifact contain:
 
-- **The budget table.** For each metric: the median over pairs of GNOME's value, Tuna's value, and Tuna / max(GNOME, floor), next to the budget ratio and the absolute ceiling. The status is one of these:
+- **The budget table.** For each metric: the median over the selected stock-profile pairs of GNOME's value, Tuna's value, and Tuna / max(GNOME, floor), next to the budget ratio and the absolute ceiling. The status is one of these:
   - `pass`.
   - `fail`: over the ratio or the ceiling.
-  - `missing`: fewer than three pairs measured an enforced metric, which also fails.
+  - `missing`: fewer than three stock-profile pairs measured an enforced metric, which also fails.
   - `warn`: a provisional budget (`enforced: false`) is over its ratio or ceiling, or has too few pairs.
 - **Per-role attribution, for each desktop.** The mean CPU of each phase, split into compositor, shell, xwayland, portals, services and apps. GNOME's compositor and shell are one process (`gnome-shell`), so compare Tuna's "desktop" role (compositor plus shell) against it.
+
+The JSON's `meets_target` separately compares the median paired ratio against the target without a denominator floor. Passing a floor-stabilized idle CPU budget does not establish parity. Two measured zero values meet the target; positive Tuna usage against measured zero GNOME usage does not.
 
 Metric names are `cpu.<phase>.<role>.<stat>`, `overview.response_ms.<stat>` and `frame_pacing.interval_ms.<stat>`. CPU is in percent of one core, summed over the role's processes. Only intervals wholly inside a phase count. A process's first interval after it starts is not counted.
 
@@ -83,6 +85,8 @@ Metric names are `cpu.<phase>.<role>.<stat>`, `overview.response_ms.<stat>` and 
 `cpu.whole.total.p50` matches the whole-run figure in older reports. Frame pacing uses the frame-pacer probe's presentation intervals. Overview response is the QMP-observed upper bound described above.
 
 ### How budgets ratchet
+
+The file-level `profile` names the calibrated comparison population (`stock` for the initial budgets). Only that profile contributes to checks and proposals. Diagnostic results remain separate: they cannot fill missing stock repeats or mask a stock regression. The ratchet rejects changing this population in place.
 
 Each budget has these fields:
 

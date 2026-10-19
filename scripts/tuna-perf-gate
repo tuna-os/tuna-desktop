@@ -59,7 +59,7 @@ def main(argv=None):
         if problems:
             print("\n".join(problems), file=sys.stderr)
             return 2
-        pairs = perf_budget.discover_pairs(args.artifacts)
+        pairs = perf_budget.discover_pairs(args.artifacts, budgets.get("profile", "stock"))
         comparison = perf_budget.compare(pairs)
         rows = perf_budget.evaluate(budgets, comparison, budgets.get("min_pairs", 3))
         if args.command == "propose":
@@ -71,7 +71,7 @@ def main(argv=None):
             with open(args.markdown, "a") as stream:
                 stream.write(summary)
         if args.out:
-            Path(args.out).write_text(json.dumps({"pairs": [{k: str(v) for k, v in p.items()} for p in pairs],
+            Path(args.out).write_text(json.dumps({"profile": budgets.get("profile", "stock"), "pairs": [{k: str(v) for k, v in p.items()} for p in pairs],
                                                   "results": rows, "comparison": comparison,
                                                   "attribution": perf_budget.attribution(comparison)}, indent=2))
         problems = [f"{row['metric']}: {row['status']} ({row.get('reason', '')})"
