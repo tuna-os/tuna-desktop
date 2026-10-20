@@ -14,15 +14,15 @@ Repair upgrades from the desktop's former name so existing users retain access t
 
 - [ ] **Remembered-session access and explicit reselection**
   Users with a remembered legacy session retain access to Tuna Desktop and receive instructions to explicitly select Tuna Desktop; documentation does not claim automatic saved-name migration.
-- [ ] **Non-destructive user-state adoption**
+- [x] **Non-destructive user-state adoption**
   Users with old-only settings, including beta installed but never launched, retain those settings without overwrite, merging or deletion. Existing new-path data and already-adopted state remain intact.
-- [ ] **Safe failure and recovery**
+- [x] **Safe failure and recovery**
   Unsafe ownership, symlink and conflicting-state cases stop with recovery guidance rather than silently creating replacement defaults.
 - [ ] **Administrator authentication policy**
   Upgrades preserve administrator customizations and deliberate removals where the package manager permits; unavoidable temporary retention is explicit.
 - [ ] **Running-session continuity**
   Users whose desktop was already running before the rename can retain access to its required authentication service across the package transition.
-- [ ] **Separate qualification and retirement**
+- [x] **Separate qualification and retirement**
   Debian, Arch and Marlin routes are qualified separately. Untested routes remain explicitly unqualified. Later bridge removal requires verified migration or safe upgrade prerequisites.
 
 ## Constraints
@@ -36,15 +36,15 @@ Repair upgrades from the desktop's former name so existing users retain access t
 
 ## Acceptance Criteria
 
-- [ ] **Exact transition package contents**
+- [x] **Exact transition package contents**
   Packages containing the two regular transition files are accepted; forbidden old binary, session and authentication paths and dangling/invalid transition links are rejected. Fresh-install documentation discloses both retained files.
 - [ ] **Saved-session continuity and reselection**
   A remembered legacy selection remains usable; explicitly selecting Tuna Desktop persists on a second login. Native GDM support remains explicitly unqualified until these outcomes are observed.
-- [ ] **Preserved settings and safe failure**
+- [x] **Preserved settings and safe failure**
   Fresh, old-only, beta-installed-never-launched and previously adopted users retain access to the appropriate data. Existing data is not overwritten, merged or deleted; unsafe/conflicting states stop with recovery guidance; supported adoption leaves downgrade data available.
 - [ ] **Configuration and running-session behavior**
   Upgrade and downgrade preserve unchanged, modified, deleted and obsolete authentication configuration according to the documented package-manager rules. A running old-service consumer can use retained service policy; a missing service and an intentionally denying local policy cannot be bypassed. Native old-compositor unlock remains explicitly unqualified until observed.
-- [ ] **Route-specific evidence and retirement criteria**
+- [x] **Route-specific evidence and retirement criteria**
   Documentation identifies tested package/runtime versions and artifacts, separates Debian, Arch and Marlin outcomes, and lists gaps explicitly. Each bridge's removal requires verified migration or a safe prerequisite for its old consumers across the advertised routes.
 
 ## Technical Approach

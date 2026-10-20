@@ -96,14 +96,14 @@ Preserve old-only settings using non-destructive startup adoption. Preserve fres
 
 ### Milestone 3: Make upgrade and recovery limits explicit
 Users and reviewers can distinguish verified disposable mechanisms from unqualified native routes, with accurate recovery and bridge-retirement requirements. Validation: lifecycle evidence, focused regressions and independent code/evidence review.
-#### - [ ] Phase 3.1: Verify lifecycle behavior and document limits
+#### - [x] Phase 3.1: Verify lifecycle behavior and document limits
 **Repo:** rust-wayland-desktop
 Exercise disposable upgrades, downgrades and running old-service behavior, and explain observed results and safe recovery. Keep all unavailable native routes visibly unqualified and define evidence required to retire the bridge.
 *Technical detail:* [context.md#phase-31](./context.md#phase-31-verify-lifecycle-behavior-and-document-limits)
 **Acceptance criteria**:
-- [ ] Actual dpkg and private-PAM evidence records positive, negative and administrator-policy outcomes without host changes.
-- [ ] Documentation correctly explains explicit reselection, conflicts, package-manager distinctions and bridge retirement.
-- [ ] Independent review receives the scoped patch, manifests, passing/failing checks and exact native gaps.
+- [x] Actual dpkg and private-PAM evidence records positive, negative and administrator-policy outcomes without host changes.
+- [x] Documentation correctly explains explicit reselection, conflicts, package-manager distinctions and bridge retirement.
+- [x] Independent review receives the scoped patch, manifests, passing/failing checks and exact native gaps.
 
 ## Open Questions
 
@@ -117,6 +117,14 @@ No unresolved design questions. Package-manager outcomes and native capability g
 - Claim native GDM, actual old-compositor, Arch or Marlin upgrade qualification without the separately required evidence.
 
 ## Changelog
+
+### FINAL SUMMARY
+
+The implementation retains the two temporary package identities, safely adopts five old-only settings pairs without replacing data, and documents explicit login reselection and recovery. Genuine archive/filesystem tests plus actual disposable dpkg/private-PAM evidence verify the bounded mechanisms. Native GDM, actual old-compositor unlock, Arch replacement and Marlin activation remain unqualified with concrete manual procedures.
+
+**Total phases:** 3/3 completed.
+
+**Notable deviations from the plan:** No migration design change. The unmodified CI candidate is older than the published beta, so the recorded beta-to-candidate operation is a downgrade; a beta-to-newer release path is not qualified. Supporting CI/test repairs are separately audited, and exact final-publication checks remain required before merge.
 
 ### 2026-10-19 — Phase 1.1: Package the exact transition bridge
 
@@ -157,3 +165,36 @@ No unresolved design questions. Package-manager outcomes and native capability g
 - `crates/compositor/src/main.rs`
 
 **Discoveries**: The later state/tuna/session.json feature was introduced after the rename with its current name, so it is not a sixth legacy pair. The guard intentionally does not establish a boundary against later mutations by the same owner or root. Source-only startup ordering and external harness results remain distinct from native session proof.
+
+### 2026-10-20 — Phase 3.1: Verify lifecycle behavior and document limits
+
+**What was done**: Added real disposable dpkg and native private-PAM lifecycle tests with owner-checked isolated roots, explicit deny fallback and typed evidence export after teardown. Corrected upgrade/recovery documentation, explicit session reselection and route-specific qualification limits. Independent review verified 12 dpkg cases and 3 private-PAM cases from the exact-built candidate artifact, with passing native workspace checks and package/journey regressions.
+
+**Deviations**: No migration scope change. The published beta version `1.0.0~beta.1` is newer than the unmodified CI candidate `0.1.0`: beta-to-candidate exercises dpkg downgrade and the reverse exercises upgrade. This does not qualify a beta-to-newer release candidate. Synthetic pre-rename, removed-bridge and changed-policy packages isolate their controls, and the running old-service PAM helper is synthetic; actual GDM, old-compositor, Arch and Marlin routes remain unqualified. Separate backlog-validation fixes make package staging independent of builder umask, retire portal writers before artifact collection, export only bounded manifests, and deterministically shut down two authentication test sockets; no production authentication policy was changed.
+
+**Files changed**:
+- `scripts/lib/legacy-upgrade-lifecycle-tests.py`
+- `scripts/lib/legacy-upgrade-pam-probe.c`
+- `scripts/lib/legacy-upgrade-evidence.py`
+- `scripts/lib/legacy-upgrade-evidence-tests.py`
+- `.github/workflows/ci.yml`
+- `scripts/lib/ci-select-lanes-tests.py`
+- `docs/legacy-upgrade.md`
+- `docs/install.md`
+- `docs/release.md`
+- `docs/roadmap.md`
+- `packaging/README.md`
+- `scripts/tuna-release`
+- `scripts/lib/installed-deb-proof-tests.py`
+- `scripts/lib/tuna-portal-artifact-retire.py`
+- `scripts/lib/tuna-portal-artifact-tests.py`
+- `tests/portal-reference/backgrounds-run.sh`
+- `tests/portal-reference/slideshow-run.sh`
+- `tests/portal-reference/svg-run.sh`
+- `crates/shell-host/src/control.rs`
+
+**Discoveries**: Exact evidence boundaries matter: package-manager mechanism tests do not establish native desktop qualification, and recorded package versions determine actual operation direction. Original beta PAM bytes preserve administrator modification/deletion without forcing a conffile choice; a deliberately changed-policy control retains its prompt/EOF failure and explicit keep-local recovery. These boundaries are documented in the upgrade guide and manual test plan; no additional knowledge-store convention is introduced.
+
+**Verification provenance**: Source `5764d5433d426cd72d04339420458e3c28230049`, tree `469af50ce359f3c49b4d386cf8be8b93b8f2cfc7`, passed all 20 native jobs in [CI 39347223962](https://github.com/tuna-os/tuna-desktop/actions/runs/39347223962). [Lifecycle artifact 12231976713](https://github.com/tuna-os/tuna-desktop/actions/runs/39347223962/artifacts/12231976713), ZIP SHA-256 `06fdbbc25164a8a9e162a7689468c7787d8512accb02ebf8ceb2308249a760c0`, contains 84 flat regular archive members and 91 projected command records. The pinned beta SHA-256 is `b2b9ec7c9c5eb9f0e2003e48e458a440a551836d31a831972b8561a43e15ed01`; exact-built candidate SHA-256 is `4cf37b83c8b4b13f4f240a4565f26ffdf45dfe5b6d60f295f674b962030c84d6`. The lifecycle source SHA-256 is `29d5c8676a1e1f71325df28887819f8ba7e764564e6866ee9223e4274bb2f920`, PAM probe `1f8c22435a09b0ae8f26ab603f22393152d17e2b882479855516e0eead3c5b41`, exporter `bc6da4d26440418986d5bc509fa54e76309fe8ba6d141c0c3831a8c29f5eb861`.
+
+Current source `f9a7db0df2e24b656f6fea634ebe68b4e26d4d22` differs only by 13 test-only socket-fixture insertions in `crates/shell-host/src/control.rs` and evidence wording in `docs/legacy-upgrade.md`; the migration production and lifecycle/exporter sources are byte-identical. Its [native fmt/clippy/workspace check](https://github.com/tuna-os/tuna-desktop/actions/runs/39351757350/job/118397332872) and [coverage](https://github.com/tuna-os/tuna-desktop/actions/runs/39351757504/job/118397332720) passed. Prior coverage failures (corrupt profile output, then an authentication-disconnect fixture race) remain recorded failed attempts; the repaired result does not relabel them. This completion record is not a claim that a later final publication head's native matrix has run: all selected checks on that exact final head remain required before merge.
