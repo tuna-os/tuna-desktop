@@ -64,6 +64,13 @@ RUN set -eux; \
     && grep -qx 'Name=Tuna Desktop (preview)' /usr/share/wayland-sessions/tuna.desktop \
     && test -f /usr/lib/systemd/user/tuna-session.target \
     && test -f /etc/pam.d/tuna-lock \
+    && test ! -L /etc/pam.d/tuna-lock \
+    && for legacy in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock; do test -f "$legacy" && test ! -L "$legacy" && test "$(stat -c '%u:%g %a' "$legacy")" = '0:0 644' && test "$(pacman -Qqo "$legacy")" = tuna-desktop || exit 1; done && : 'tuna-rename: keep' \
+    && grep -qx 'NoDisplay=true' /usr/share/wayland-sessions/roost.desktop && : 'tuna-rename: keep' \
+    && ! grep -q '^Hidden=' /usr/share/wayland-sessions/roost.desktop && : 'tuna-rename: keep' \
+    && for key in 'Exec=tuna-session' 'TryExec=tuna-session' 'DesktopNames=Tuna;GNOME;' 'X-GDM-SessionRegisters=true'; do grep -Fxq "$key" /usr/share/wayland-sessions/roost.desktop || exit 1; done && : 'tuna-rename: keep' \
+    && for service in tuna-lock roost-lock; do test "$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' /etc/pam.d/"$service" | awk '{print $1, $2, $3}')" = "$(printf 'auth include login\naccount include login')" || exit 1; done && : 'tuna-rename: keep' \
+    && test -z "$(find /usr/bin /usr/share/wayland-sessions /etc/pam.d -maxdepth 1 -iname '*roost*' ! -path /usr/share/wayland-sessions/roost.desktop ! -path /etc/pam.d/roost-lock)" && : 'tuna-rename: keep' \
     && test -x /usr/lib/gnome-shell-calendar-server \
     && ldd /usr/lib/gnome-shell-calendar-server >/tmp/tuna-calendar.ldd \
     && cat /tmp/tuna-calendar.ldd \

@@ -119,6 +119,7 @@ pub mod supervise;
 mod transient_family;
 pub mod transitions;
 pub mod unlock;
+pub mod user_upgrade;
 mod wake;
 pub mod wallpaper;
 pub mod wellbeing_effects;

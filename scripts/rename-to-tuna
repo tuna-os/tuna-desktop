@@ -190,7 +190,16 @@ def rename_path_component(name):
     return name.replace("roost", "tuna").replace("Roost", "Tuna").replace("ROOST", "TUNA")
 
 
+COMPAT_FILENAMES = frozenset((
+    "share/compat/wayland-sessions/roost.desktop",
+    "share/compat/pam.d/roost-lock",
+))
+
+
 def rename_path(rel):
+    # Preserve only these two filenames; contents still receive normal checks.
+    if rel in COMPAT_FILENAMES:
+        return rel
     return "/".join(rename_path_component(part) for part in rel.split("/"))
 
 

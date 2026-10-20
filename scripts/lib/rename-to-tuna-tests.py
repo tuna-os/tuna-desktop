@@ -102,12 +102,34 @@ class Rules(unittest.TestCase):
         self.assertFalse(R.kept_path("docs/niri-parity.md"))
 
 
+    def test_only_two_exact_bridge_filenames_survive_rename(self):
+        for path in ('share/compat/wayland-sessions/roost.desktop',
+                     'share/compat/pam.d/roost-lock'):
+            with self.subTest(path=path):
+                self.assertEqual(R.rename_path(path), path)
+                self.assertFalse(R.kept_path(path), 'bridge contents must still be renamed')
+        for old, new in (
+                ('share/compat/wayland-sessions/roost-extra.desktop', 'share/compat/wayland-sessions/tuna-extra.desktop'),
+                ('share/compat/wayland-sessions/roost.desktop.bak', 'share/compat/wayland-sessions/tuna.desktop.bak'),
+                ('share/compat/pam.d/roost-extra', 'share/compat/pam.d/tuna-extra'),
+                ('share/compat/usr/bin/roost-session', 'share/compat/usr/bin/tuna-session'),
+                ('share/compat/roost/roost-lock', 'share/compat/tuna/tuna-lock'),
+                ('other/share/compat/pam.d/roost-lock', 'other/share/compat/pam.d/tuna-lock')):
+            with self.subTest(path=old):
+                self.assertEqual(R.rename_path(old), new)
+                self.assertFalse(R.kept_path(old))
+
+
 FIXTURE = {
     "Cargo.toml": '[package]\nname = "roost-demo"\n',
     "src/main.rs": 'use roost_demo::x;\nfn main() { std::env::var("ROOST_SCALE").ok(); }\n',
     "scripts/roost-journey": '#!/bin/sh\nexec target/debug/roost-compositor --title "Roost"\n',
     "scripts/lib/roost-test-window.py": "APP_ID = 'roost-test-alpha'\n",
     "share/wayland-sessions/roost.desktop": "[Desktop Entry]\nName=Roost\nExec=roost-session\nDesktopNames=Roost;GNOME;\n",
+    "share/compat/wayland-sessions/roost.desktop": "[Desktop Entry]\nName=Roost\nExec=roost-session\nNoDisplay=true\n",
+    "share/compat/pam.d/roost-lock": "# Roost lock\nauth include login\naccount include login\n",
+    "share/compat/wayland-sessions/roost-extra.desktop": "Exec=roost-session\n",
+    "share/compat/usr/bin/roost-session": "#!/bin/sh\nexec roost-compositor\n",
     "docs/perf/2026-10-06/roost/report.json": '{"desktop": "roost"}\n',
     "docs/guide.md": "Run Roost. Logs: https://github.com/hanthor/roost-desktop/actions/runs/1\n",
     "third-party/lib/ROOST-PATCH.md": "Roost patch.\n",
@@ -181,6 +203,14 @@ class Checkout(unittest.TestCase):
         self.assertEqual(self.read("scripts/lib/tuna-new-probe.py"), "print('tuna')\n")
         self.assertEqual(self.read("share/wayland-sessions/tuna.desktop"),
                          "[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\nDesktopNames=Tuna;GNOME;\n")
+        self.assertEqual(self.read("share/compat/wayland-sessions/roost.desktop"),
+                         "[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\nNoDisplay=true\n")
+        self.assertEqual(self.read("share/compat/pam.d/roost-lock"),
+                         "# Tuna Desktop lock\nauth include login\naccount include login\n")
+        self.assertEqual(self.read("share/compat/wayland-sessions/tuna-extra.desktop"), "Exec=tuna-session\n")
+        self.assertEqual(self.read("share/compat/usr/bin/tuna-session"), "#!/bin/sh\nexec tuna-compositor\n")
+        self.assertFalse((self.root / "share/compat/wayland-sessions/tuna.desktop").exists())
+        self.assertFalse((self.root / "share/compat/pam.d/tuna-lock").exists())
         self.assertEqual(self.read("docs/guide.md"),
                          "Run Tuna Desktop. Logs: https://github.com/hanthor/roost-desktop/actions/runs/1\n")
         self.assertEqual(self.read("packaging/PKGBUILD"),

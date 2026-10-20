@@ -38,9 +38,14 @@ sudo apt install ./tuna-desktop_X.Y.Z_amd64.deb
 Dependencies resolve automatically on a target with the declared runtime
 packages available. After installing, the Tuna Desktop session is
 selectable from the login screen. Upgrading installs the newer package over
-the older one with user configuration and application data preserved;
-removing the package drops the Tuna Desktop-owned program files and session entry
-while preserving user data. See `docs/release.md` for the release process.
+the older one; the [legacy-upgrade guide](legacy-upgrade.md) explains the
+temporary two-file bridge, explicit session reselection, preserved settings
+and conflict recovery. Package replacement alone does not qualify login or
+unlock on an existing session. In particular, do not rely on it to repair an
+administrator-removed PAM service. The guide lists the native tests still
+required for each supported route. If you uninstall, removing the package
+drops the Tuna Desktop-owned program files and session entries while
+preserving user data. See `docs/release.md` for the release process.
 
 ## From source
 

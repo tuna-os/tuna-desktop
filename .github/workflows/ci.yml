@@ -327,16 +327,47 @@ jobs:
       # The shell's gio settings read needs glib dev files at build
       # time (check gets them transitively via GTK).
       # Genuine Ubuntu26.04 distro packages, not /usr/local source libraries.
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libsecret-tools gnome-keyring fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk libgtk4-layer-shell-dev dpkg-dev gsettings-desktop-schemas
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libsecret-tools gnome-keyring fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk libgtk4-layer-shell-dev dpkg-dev gsettings-desktop-schemas build-essential desktop-file-utils
       - run: pkg-config --atleast-version=1.1 gtk4-layer-shell-0 && pkg-config --atleast-version=4.12 gtk4 && pkg-config --atleast-version=1.0 libadwaita-1
       - run: shellcheck -x scripts/tuna-journey scripts/tuna-nested scripts/tuna-release scripts/check-release-package scripts/check-deb-clean-install scripts/lib/tuna-introspect.sh scripts/lib/tuna-proof-session-launch scripts/ci-prepare-artifacts
       - run: python3 scripts/lib/installed-deb-proof-tests.py
       - run: python3 scripts/lib/release-deb-ownership-tests.py
       - run: python3 scripts/lib/deb-clean-install-tests.py
+      - run: python3 scripts/lib/transition-package-policy-tests.py
+      - run: python3 scripts/lib/legacy-upgrade-evidence-tests.py
       - run: scripts/tuna-release --allow-dirty --out package-artifacts && scripts/check-release-package package-artifacts/*.deb
       # Install with declared dependencies in a clean distro image; runner
       # development libraries must not conceal missing package dependencies.
       - run: scripts/check-deb-clean-install package-artifacts/*.deb ubuntu:26.04
+      - name: Qualify disposable Debian lifecycle and private PAM mechanisms
+        run: |
+          mkdir -p upgrade-artifacts
+          curl --fail --location --retry 3 \
+            https://github.com/tuna-os/tuna-desktop/releases/download/v1.0.0-beta.1/tuna-desktop_1.0.0.beta.1_amd64.deb \
+            --output "$RUNNER_TEMP/tuna-legacy-beta.deb"
+          echo "b2b9ec7c9c5eb9f0e2003e48e458a440a551836d31a831972b8561a43e15ed01  $RUNNER_TEMP/tuna-legacy-beta.deb" | sha256sum --check
+          # All installs and PAM configuration stay in fresh private roots in
+          # this disposable container. After teardown, export only a bounded,
+          # payload-free result projection; private fixtures stay inaccessible
+          # to the runner. No package binaries or hooks are run.
+          docker run --rm -e DEBIAN_FRONTEND=noninteractive \
+            -v "$PWD:/source:ro" \
+            -v "$RUNNER_TEMP/tuna-legacy-beta.deb:/beta.deb:ro" \
+            -v "$PWD/upgrade-artifacts:/artifacts" ubuntu:26.04 sh -euc '
+              apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+              apt-get install -y --no-install-recommends python3 build-essential libpam0g-dev libpam-modules
+              set -- /source/package-artifacts/*.deb
+              [ "$#" -eq 1 ]
+              python3 /source/scripts/lib/legacy-upgrade-evidence.py \
+                --candidate "$1" --beta /beta.deb --output /artifacts
+            '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: legacy-upgrade-mechanisms
+          path: upgrade-artifacts/legacy-upgrade-results.tar.gz
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: tuna-deb
@@ -982,6 +1013,13 @@ jobs:
           pacman -U --noconfirm "$pkg"
           for bin in tuna-compositor tuna-session tuna-shell-host tuna-greeter tuna-wallpaper-svg; do "$bin" --version; done
           test -f /usr/share/wayland-sessions/tuna.desktop
+          # Exact temporary bridge: installed-layout proof, not an upgrade test.
+          for path in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock; do  # tuna-rename: keep
+            test -f "$path" && test ! -L "$path"
+          done
+          legacy=$(find /usr/bin /usr/share/wayland-sessions /etc/pam.d -maxdepth 1 -iname '*roost*' -print | LC_ALL=C sort)  # tuna-rename: keep
+          expected=$(printf '%s\n' /etc/pam.d/roost-lock /usr/share/wayland-sessions/roost.desktop)  # tuna-rename: keep
+          test "$legacy" = "$expected"
           mkdir -p arch-artifacts && cp "$pkg" arch-artifacts/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

@@ -26,6 +26,7 @@ fail() {
 # replace ownership with that of the checker process.
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 python3 "$ROOT/scripts/lib/release-deb-ownership.py" "$PKG" || fail "archive ownership rejected"
+python3 "$ROOT/scripts/lib/transition-package-policy.py" "$PKG" || fail "transition archive policy rejected"
 
 CONTENTS="$(dpkg-deb -c "$PKG" 2>/dev/null)"
 for path in \
@@ -71,9 +72,10 @@ DEPENDS="$(dpkg-deb -f "$PKG" Depends)"
 for required in 'libgtk4-layer-shell0 (>= 1.1)' 'libgtk-4-1 (>= 4.12)' 'libadwaita-1-0 (>= 1.0)' 'libpam0g' 'gsettings-desktop-schemas' 'gnome-settings-daemon-common'; do
     printf '%s\n' "$DEPENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -Fxq "$required" || fail "missing runtime floor $required"
 done
-[ "$(cat "$DIR/DEBIAN/conffiles" 2>/dev/null || dpkg-deb --ctrl-tarfile "$PKG" | tar -xOf - ./conffiles)" = /etc/pam.d/tuna-lock ] || fail "PAM conffiles missing"
+# Both PAM conffiles and exact bridge contents/modes were checked in the
+# original archives before extraction; no lifecycle hooks are permitted.
 
-# The former package name survives only in the control relations.
+# Former-package relations remain alongside the two retained regular files.
 for field in Replaces Conflicts Provides; do
     [ "$(dpkg-deb -f "$PKG" "$field")" = roost ] || fail "$field must name the former package roost"  # tuna-rename: keep
 done
@@ -83,9 +85,13 @@ done
 # entries ship it and display managers read it; the base-spec validator
 # flags it).
 if command -v desktop-file-validate >/dev/null 2>&1; then
-    DESKTOP_ERRORS="$(desktop-file-validate "$DIR/usr/share/wayland-sessions/tuna.desktop" 2>&1 || true)"
-    DESKTOP_ERRORS="$(printf '%s' "$DESKTOP_ERRORS" | grep -v 'key "DesktopNames"' || true)"
-    [ -z "$DESKTOP_ERRORS" ] || fail "tuna.desktop invalid: $DESKTOP_ERRORS"
+    # tuna-rename: keep-begin
+    for entry in tuna.desktop roost.desktop; do
+        DESKTOP_ERRORS="$(desktop-file-validate "$DIR/usr/share/wayland-sessions/$entry" 2>&1 || true)"
+        DESKTOP_ERRORS="$(printf '%s' "$DESKTOP_ERRORS" | grep -v 'key "DesktopNames"' || true)"
+        [ -z "$DESKTOP_ERRORS" ] || fail "$entry invalid: $DESKTOP_ERRORS"
+    done
+    # tuna-rename: keep-end
 fi
 
 echo "check-release-package: $PKG OK (version $VERSION)"

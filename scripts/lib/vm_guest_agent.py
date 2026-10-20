@@ -100,10 +100,42 @@ def valid_strip_stop_error(value):
     return True
 
 
+def valid_delayed_auth_error(value):
+    """Only fixed observer failure codes and bounded identity comparisons."""
+    types = {"RuntimeError", "ValueError", "TypeError", "KeyError", "IndexError", "AttributeError",
+             "OSError", "FileNotFoundError", "PermissionError", "ProcessLookupError",
+             "JSONDecodeError", "UnicodeDecodeError", "OtherError"}
+    stages = {"arguments", "process-snapshot", "desktop-identity", "sleep-identity",
+              "delay-ownership", "owner-read", "owner-parse", "serialization"}
+    codes = {"process-metadata-invalid": "process-snapshot",
+             "process-identity-changed": "process-snapshot",
+             "desktop-not-unique": "desktop-identity",
+             "desktop-identity-mismatch": "desktop-identity"}
+    base = {"stage", "exception_type", "code"}
+    if type(value) is not dict or not base <= set(value):
+        return False
+    if (any(type(value[key]) is not str for key in base)
+            or value["exception_type"] not in types or value["stage"] not in stages):
+        return False
+    code = value["code"]
+    if code == "observation-exception":
+        return set(value) == base
+    if value["exception_type"] != "RuntimeError" or codes.get(code) != value["stage"]:
+        return False
+    if code != "desktop-not-unique":
+        return set(value) == base
+    if set(value) != base | {"root_count", "expected_desktop_present"}:
+        return False
+    count, present = value["root_count"], value["expected_desktop_present"]
+    return (type(count) is int and 0 <= count <= 65535 and count != 1
+            and type(present) is bool and not (count == 0 and present))
+
+
 # Lifecycle actions whose failure prints one bounded, validated record on
 # stdout; any other action's output (and every stderr) stays private.
 FAILURE_RECORDS = {"orca-read": ("orca_read_error", valid_orca_read_error),
-                   "strip-stop": ("strip_stop_error", valid_strip_stop_error)}
+                   "strip-stop": ("strip_stop_error", valid_strip_stop_error),
+                   "delayed-auth-state": ("delayed_auth_error", valid_delayed_auth_error)}
 def speech_failure_diagnostic(encoded):
     if not isinstance(encoded, str) or len(encoded) > 5464:
         return None
@@ -323,12 +355,20 @@ class GuestAgent:
                                 raise ValueError("failure record exceeds transport bound")
                             output = base64.b64decode(encoded, validate=True)
                             if len(output) <= 4096:
-                                diagnostic = json.loads(output).get(key)
+                                root = json.loads(output)
+                                if action == "delayed-auth-state" and (type(root) is not dict or set(root) != {key}):
+                                    diagnostic = None
+                                else:
+                                    diagnostic = root.get(key)
                             else:
                                 diagnostic = None
                         except (binascii.Error, ValueError, UnicodeDecodeError, AttributeError, TypeError):
                             diagnostic = None
                         if valid(diagnostic):
+                            if action == "delayed-auth-state":
+                                # Preserve the sanitized reason before the lane's
+                                # restore-unlock finally block can itself fail.
+                                print("tuna-vm-lane: delayed-auth-state failure " + json.dumps(diagnostic), flush=True)
                             raise RuntimeError(f"guest lifecycle {action} failed (exit={status.get('exitcode')}): {json.dumps(diagnostic)}")
                     raise RuntimeError(f"guest lifecycle {action} failed (exit={status.get('exitcode')})")
                 return json.loads(base64.b64decode(status.get("out-data", ""), validate=True))

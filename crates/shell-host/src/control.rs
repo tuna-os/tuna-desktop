@@ -2581,6 +2581,12 @@ mod tests {
         let mut client = ControlClient::connect(&path).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         initial_auth_snapshot(&mut client, &mut peer);
+        // Model a concurrent test child's inherited descriptor without forking.
+        // Dropping only `peer` leaves the socket writable while this copy lives;
+        // shutdown must disconnect every descriptor for the same endpoint.
+        let inherited_peer = peer.try_clone().expect("retained peer descriptor");
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         assert!(client.unlock("old-controlled-secret".into()).is_err());
         assert_eq!(
@@ -2601,6 +2607,7 @@ mod tests {
                 }
             }
         );
+        drop(inherited_peer);
     }
     #[test]
     fn partial_authentication_write_closes_uncertain_stream_and_never_contaminates_next() {
@@ -2647,6 +2654,11 @@ mod tests {
     fn uncertain_caller_stream_without_redial_path_stays_closed() {
         let (mut client, mut peer) = pair();
         initial_auth_snapshot(&mut client, &mut peer);
+        // Keep a duplicate alive to exercise the same inherited-fd teardown
+        // hazard without a reconnect path.
+        let inherited_peer = peer.try_clone().expect("retained peer descriptor");
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         assert!(client.unlock("controlled-input".into()).is_err());
         assert!(client
@@ -2654,6 +2666,7 @@ mod tests {
             .is_err());
         assert!(client.poll().is_err());
         assert_eq!(client.connection_generation(), 0);
+        drop(inherited_peer);
     }
 
     #[test]

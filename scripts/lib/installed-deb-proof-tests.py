@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Source-policy negatives for real package scripts; no product build/runtime."""
+"""Unit-only controlled-tool/source policies; not package lifecycle evidence.
+
+Genuine archive/native ELF checks live in transition-package-policy-tests.py.
+"""
 import importlib.util
 import json
 import os
@@ -232,13 +235,26 @@ class PackagePolicy(unittest.TestCase):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('#!/bin/sh\nprintf "%s\\n" "' + name + ' 0.1.0"\n')
             p.chmod(0o755)
-        for name in ('usr/share/wayland-sessions/tuna.desktop', 'usr/lib/systemd/user/tuna-session.target', 'etc/pam.d/tuna-lock'):
-            p = self.stage / name
+        # The policy sees actual tar streams and real bridge bytes, even though
+        # the executable/loader/package commands here remain unit-test doubles.
+        # tuna-rename: keep-begin
+        for installed, source in (
+                ('usr/share/wayland-sessions/tuna.desktop', 'share/wayland-sessions/tuna.desktop'),
+                ('usr/share/wayland-sessions/roost.desktop', 'share/compat/wayland-sessions/roost.desktop'),
+                ('usr/lib/systemd/user/tuna-session.target', 'share/systemd/user/tuna-session.target'),
+                ('etc/pam.d/tuna-lock', 'share/pam.d/tuna-lock'),
+                ('etc/pam.d/roost-lock', 'share/compat/pam.d/roost-lock')):
+            p = self.stage / installed
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text('fixture\n')
+            shutil.copyfile(ROOT / source, p)
+            p.chmod(0o644)
+        # tuna-rename: keep-end
         # Use the real shipped private theme and its integrity manifest rather
         # than bypassing asset admission in these controlled package fixtures.
         copy_shipped_icons(self.stage / 'usr/share/tuna-desktop/icons')
+        for directory in self.stage.rglob('*'):
+            if directory.is_dir() and not directory.is_symlink():
+                directory.chmod(0o755)
         self.env = dict(os.environ, PATH=str(self.tools) + ':' + os.environ['PATH'], FIXTURE=str(self.stage))
         self.tool('dpkg-deb', '''case "$1" in
 -c) find "$FIXTURE" -type f | while read -r path; do echo "-rwxr-xr-x $path"; done ;;
@@ -247,7 +263,8 @@ class PackagePolicy(unittest.TestCase):
 --ctrl-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./conffiles ;;
 --fsys-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./usr ./etc ;;
 esac''')
-        (self.stage / 'conffiles').write_text('/etc/pam.d/tuna-lock\n')
+        (self.stage / 'conffiles').write_text('/etc/pam.d/tuna-lock\n/etc/pam.d/roost-lock\n')  # tuna-rename: keep
+        (self.stage / 'conffiles').chmod(0o644)
         self.tool('ldd', 'echo "libc.so.6 => /lib/libc.so.6 (0)"')
         self.tool('desktop-file-validate', 'exit 0')
 
@@ -285,11 +302,26 @@ esac''')
                 finally:
                     os.umask(previous)
 
-    def test_no_compatibility_names_shipped(self):
-        # The one-release compatibility layer (#505) is gone: no symlinks,
-        # no session entry, no PAM service under the old name.
-        leftovers = [str(p) for p in self.stage.rglob('*roost*')]  # tuna-rename: keep
-        self.assertEqual(leftovers, [])
+    def test_only_retained_legacy_bridge_names_are_admitted(self):
+        # Unit policy assertions; the separate genuine package suite establishes
+        # original archive behavior with native package/loader dependencies.
+        # tuna-rename: keep-begin
+        for forbidden in ('usr/bin/roost-session', 'etc/pam.d/roost-extra',
+                          'usr/share/wayland-sessions/roost-extra.desktop'):
+            with self.subTest(forbidden=forbidden):
+                path = self.stage / forbidden
+                path.write_text('forbidden\n')
+                self.assertNotEqual(self.check(), 0)
+                path.unlink()
+        for retained in ('usr/share/wayland-sessions/roost.desktop', 'etc/pam.d/roost-lock'):
+            with self.subTest(missing=retained):
+                path = self.stage / retained
+                original = path.read_bytes()
+                path.unlink()
+                self.assertNotEqual(self.check(), 0)
+                path.write_bytes(original)
+                path.chmod(0o644)
+        # tuna-rename: keep-end
         self.assertEqual(self.check(), 0)
 
     def test_missing_preferred_gtk(self):
@@ -346,7 +378,7 @@ esac''')
 
 
 class ReleaseDelegatePolicy(unittest.TestCase):
-    def run_release(self, failure='', version_exit=0, missing_cursor=False):
+    def run_release(self, failure='', version_exit=0, missing_cursor=False, umask=-1):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             tools = root / 'tools'
@@ -358,16 +390,39 @@ class ReleaseDelegatePolicy(unittest.TestCase):
             tool('git', 'echo v0.1.0')
             tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter"')
             tool('dpkg-shlibdeps', 'exit 9' if failure == 'shlibs' else ('echo unknown' if failure == 'malformed' else 'echo "shlibs:Depends=libc6 (>= 2.36)"'))
-            tool('dpkg-deb', 'test "$1" = --root-owner-group; test "$2" = --build; test "$(stat -c %a "$3")" = 755; cp "$3/DEBIAN/control" "$OUTPUT"')
+            # tuna-rename: keep-begin
+            tool('dpkg-deb', '''test "$1" = --root-owner-group
+test "$2" = --build
+assert_mode() {
+    actual="$(stat -c %a "$2")"
+    [ "$actual" = "$1" ] || {
+        echo "staged mode $actual, expected $1: $2" >&2
+        exit 1
+    }
+}
+assert_mode 755 "$3"
+for path in usr usr/share usr/share/wayland-sessions etc etc/pam.d; do
+    assert_mode 755 "$3/$path"
+done
+for path in DEBIAN/control DEBIAN/conffiles; do assert_mode 644 "$3/$path"; done
+printf '%s\\n' /etc/pam.d/tuna-lock /etc/pam.d/roost-lock >"$EXPECTED_CONFFILES"
+cmp "$EXPECTED_CONFFILES" "$3/DEBIAN/conffiles"
+for path in usr/share/wayland-sessions/roost.desktop etc/pam.d/roost-lock; do
+    test -f "$3/$path"; test ! -L "$3/$path"; test "$(stat -c %a "$3/$path")" = 644
+done
+for hook in preinst postinst prerm postrm config triggers; do test ! -e "$3/DEBIAN/$hook"; done
+cp "$3/DEBIAN/control" "$OUTPUT"''')
+            # tuna-rename: keep-end
             for name in M.BINS:
                 path = root / 'target/release' / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('#!/bin/sh\necho "' + name + ' 0.1.0"\nexit ' + str(version_exit if name == 'tuna-shell-gtk' else 0) + '\n')
                 path.chmod(0o755)
-            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf'):
+            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf', 'share/compat/wayland-sessions/roost.desktop', 'share/compat/pam.d/roost-lock'):  # tuna-rename: keep
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text('fixture\n')
+                shutil.copyfile(ROOT / name, path)
+                path.chmod(0o644)
             copy_shipped_icons(root / 'share/tuna-desktop/icons')
             checker = root / 'scripts/tuna-cursor-assets-check'
             checker.parent.mkdir(parents=True, exist_ok=True)
@@ -378,12 +433,15 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 entry = next(item for item in manifest['entries'] if item['path'].endswith('.svg'))
                 (theme / entry['path']).unlink()
             output = root / 'control'
-            result = subprocess.run(['sh', str(ROOT / 'scripts/tuna-release'), '--allow-dirty', '--out', str(root/'out')], cwd=root, env=dict(os.environ, PATH=str(tools)+':'+os.environ['PATH'], OUTPUT=str(output)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            result = subprocess.run(['sh', str(ROOT / 'scripts/tuna-release'), '--allow-dirty', '--out', str(root/'out')], cwd=root, env=dict(os.environ, PATH=str(tools)+':'+os.environ['PATH'], OUTPUT=str(output), EXPECTED_CONFFILES=str(root / 'expected-conffiles')), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, umask=umask)
+            self.release_diagnostics = (f"release exited {result.returncode}\n"
+                                        f"stdout:\n{result.stdout.decode(errors='replace')}\n"
+                                        f"stderr:\n{result.stderr.decode(errors='replace')}")
             return result.returncode, output.read_text() if output.exists() else None
 
     def test_real_release_delegates_locked_all_six_and_abi_closure(self):
         status, control = self.run_release()
-        self.assertEqual(status, 0)
+        self.assertEqual(status, 0, self.release_diagnostics)
         self.assertIn('libc6 (>= 2.36)', control)
         self.assertIn('libgtk4-layer-shell0 (>= 1.1)', control)
         for field in ('Replaces', 'Conflicts', 'Provides'):
@@ -393,6 +451,13 @@ class ReleaseDelegatePolicy(unittest.TestCase):
         self.assertIn('gsettings-desktop-schemas', depends)
         self.assertIn('gnome-settings-daemon-common', depends)
         self.assertNotIn('libpam0', depends)
+
+    def test_release_stages_protected_ancestors_under_group_writable_umask(self):
+        # The actual shell builder runs; its controlled dpkg delegate asserts
+        # stage/ancestor modes, both regular bridges, and exact conffiles above.
+        status, control = self.run_release(umask=0o002)
+        self.assertEqual(status, 0, self.release_diagnostics)
+        self.assertIsNotNone(control)
 
     def test_release_rejects_missing_private_cursor_asset(self):
         status, control = self.run_release(missing_cursor=True)

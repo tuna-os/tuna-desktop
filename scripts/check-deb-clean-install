@@ -29,6 +29,10 @@ fail() {
 }
 
 [ -f "$PKG" ] || fail "no package $PKG"
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+# Inspect original archives before either dpkg extraction or container install.
+python3 "$ROOT/scripts/lib/release-deb-ownership.py" "$PKG" || fail "archive ownership rejected"
+python3 "$ROOT/scripts/lib/transition-package-policy.py" "$PKG" || fail "transition archive policy rejected"
 VERSION="$(dpkg-deb -f "$PKG" Version)"
 [ -n "$VERSION" ] || fail "empty Version field"
 # tuna-release writes a SemVer prerelease's hyphen as "~" for dpkg ordering.
@@ -84,11 +88,27 @@ done
 # The compositor prefers tuna-shell-gtk beside itself over tuna-shell-host.
 [ "$(dirname "$(readlink -f "$(command -v tuna-compositor)")")" = "$(dirname "$(readlink -f "$(command -v tuna-shell-gtk)")")" ] \
     || fail "tuna-shell-gtk is not beside tuna-compositor"
-# The one-release compatibility names (#505) are gone: nothing under the
-# old name may ship.
-if ls /usr/bin/roost-* >/dev/null 2>&1 || [ -e /usr/share/wayland-sessions/roost.desktop ] || [ -e /etc/pam.d/roost-lock ]; then  # tuna-rename: keep
-    fail "legacy roost names still installed"  # tuna-rename: keep
-fi
+# Fresh-install contents only: upgrade/PAM/display-manager proofs are separate.
+# tuna-rename: keep-begin
+for path in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock /etc/pam.d/tuna-lock; do
+    [ -f "$path" ] && [ ! -L "$path" ] || fail "invalid retained regular file $path"
+    [ "$(stat -c "%u:%g %a" "$path")" = "0:0 644" ] || fail "$path not root-owned 0644"
+done
+legacy="$(find /usr/bin /usr/share/wayland-sessions /etc/pam.d -maxdepth 1 -iname "*roost*" \
+    ! -path /usr/share/wayland-sessions/roost.desktop ! -path /etc/pam.d/roost-lock)"
+[ -z "$legacy" ] || fail "unexpected legacy paths: $legacy"
+for entry in tuna.desktop roost.desktop; do
+    for line in "Exec=tuna-session" "TryExec=tuna-session" "DesktopNames=Tuna;GNOME;" "X-GDM-SessionRegisters=true"; do
+        grep -Fxq "$line" "/usr/share/wayland-sessions/$entry" || fail "invalid session bridge $entry"
+    done
+done
+grep -Fxq "NoDisplay=true" /usr/share/wayland-sessions/roost.desktop || fail "legacy entry not hidden from menus"
+if grep -q "^Hidden=" /usr/share/wayland-sessions/roost.desktop; then fail "legacy entry disabled"; fi
+for service in tuna-lock roost-lock; do
+    rules="$(sed -e "/^[[:space:]]*#/d" -e "/^[[:space:]]*$/d" /etc/pam.d/"$service" | awk "{print \$1, \$2, \$3}")"
+    [ "$rules" = "$(printf "auth include login\naccount include login")" ] || fail "invalid PAM bridge $service"
+done
+# tuna-rename: keep-end
 EXEC="$(sed -n "s/^Exec=\([^ ]*\).*/\1/p" /usr/share/wayland-sessions/tuna.desktop)"
 command -v "$EXEC" >/dev/null || fail "session Exec $EXEC not installed"
 for path in /usr/lib/systemd/user/tuna-session.target /etc/pam.d/tuna-lock; do
