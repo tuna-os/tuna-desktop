@@ -182,13 +182,35 @@ the login choice; do not purge configuration as a recovery shortcut.
 | Original archive policy and exact bridge | Genuine synthetic `.deb` archives, native fixture ELF binaries and the actual checker; malformed/forbidden/link-path negatives |
 | Arch package contents | Actual `PKGBUILD package()` staging, including permissive builder umask; no pacman transaction |
 | Settings preservation | 39 production-module real-filesystem tests, including conflicts, pinned identities, races and retry; foreign/root/set-id identities modeled |
-| Native compositor startup/readers | Source ordering reviewed; full workspace clippy/tests blocked locally by missing GLib development metadata |
-| Debian lifecycle | 12 actual dpkg user-namespace tests pass with the original published beta and production-assets/synthetic-program candidate; exact built-candidate container evidence is still required |
-| Private PAM | Revised chroot fixture is blocked locally by ambiguous native-library ownership; strict root provenance is required. Positive/negative native authentication awaits disposable-container CI |
+| Native compositor startup/readers | Source ordering reviewed and [native CI workspace formatting, clippy and tests pass](https://github.com/tuna-os/tuna-desktop/actions/runs/39347223962/job/118382996345); this does not establish legacy settings-reader or old-session upgrade behavior |
+| Debian lifecycle | 12 actual dpkg cases pass with the pinned published beta and exact built CI candidate; original archive hashes, version ordering and administrator-policy outcomes are recorded. Synthetic packages isolate pre-rename, removed-layout and changed-policy controls |
+| Private PAM | Three disposable-container cases pass with verified native-library provenance: retained service permits, administrator denial persists, and a missing service reaches private denial. The prestarted executable is a synthetic old-service helper, not an old compositor |
 | GDM saved login/reselection/second login | **Unqualified: requires native GDM evidence** |
 | Running pre-rename compositor lock/unlock | **Unqualified: requires actual old compositor** |
 | Arch replacement/deletion/downgrade | **Unqualified: requires native pacman transactions** |
 | Marlin activation, policy preservation and rollback | **Unqualified: requires native deployment tests** |
+
+The scoped [CI evidence from head `5764d543`](https://github.com/tuna-os/tuna-desktop/actions/runs/39347223962/artifacts/12231976713)
+records all 15 lifecycle/private-PAM cases passing. Its ZIP SHA-256 is
+`06fdbbc25164a8a9e162a7689468c7787d8512accb02ebf8ceb2308249a760c0`.
+The exact built candidate is version `0.1.0`, SHA-256
+`4cf37b83c8b4b13f4f240a4565f26ffdf45dfe5b6d60f295f674b962030c84d6`;
+the published beta is `1.0.0~beta.1`, SHA-256
+`b2b9ec7c9c5eb9f0e2003e48e458a440a551836d31a831972b8561a43e15ed01`.
+Consequently, dpkg classifies beta-to-candidate replacement as a **downgrade**
+and candidate-to-beta replacement as an **upgrade**. These are the observed
+development-package directions, not a beta-to-newer release-candidate upgrade
+qualification. That release path requires its own correctly versioned artifact.
+
+Private-PAM evidence uses Ubuntu 26.04 `libpam0g`/`libpam-modules`
+`1.7.0-5ubuntu3.2` and `libc6` `2.43-2ubuntu2.4`, with library hashes/build IDs
+and verified isolation recorded. Authentication/account results are `0/0` for
+private permit and `7/7` for both denial cases; a loader/system error is not a
+passing denial. The helper retains its executable inode across package
+replacement and initializes PAM afterward. The artifact exports only bounded,
+typed results, hashes and metadata after fixture teardown; private configuration
+bytes and arbitrary command output are excluded. This scoped evidence does not
+replace the remaining PR checks or the four unqualified native routes above.
 
 Source checks, byte-path tests and a compiled old-service fixture cannot replace
 the last four rows. Record exact source/package/image hashes, tool/library
