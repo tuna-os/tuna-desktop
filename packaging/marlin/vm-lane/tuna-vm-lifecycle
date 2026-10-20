@@ -95,7 +95,9 @@ def auth_process(pid):
             with (path / "cmdline").open("rb") as stream:
                 raw = stream.read(4097)
             if len(raw) > 4096 or not raw.endswith(b"\0"):
-                raise RuntimeError("unbounded or partial compositor command metadata")
+                error = RuntimeError("unbounded or partial compositor command metadata")
+                error.delayed_auth_code = "process-metadata-invalid"
+                raise error
             args = raw[:-1].split(b"\0")
             marked = PAM_HELPER_FLAG in args
             private = len(args) == 2 and args[1] == PAM_HELPER_FLAG
@@ -104,7 +106,9 @@ def auth_process(pid):
         if ((first[19], first[1], first[2]) != (second[19], second[1], second[2])
                 or (inode.st_dev, inode.st_ino) != (after.st_dev, after.st_ino)
                 or uid != path.stat().st_uid):
-            raise RuntimeError("authentication process identity changed during read")
+            error = RuntimeError("authentication process identity changed during read")
+            error.delayed_auth_code = "process-identity-changed"
+            raise error
         return {"pid": int(pid), "uid": uid, "ppid": int(first[1]),
                 "pgrp": int(first[2]), "start_ticks": int(first[19]),
                 "executable": executable, "exe_device": inode.st_dev, "exe_inode": inode.st_ino,
@@ -151,25 +155,75 @@ def pam_process_snapshot():
 
 
 def delayed_auth_state(pid, start_ticks):
-    rows = pam_process_snapshot()
-    desktop, helpers = classify_pam_helpers(rows)
-    if desktop is None or (desktop["pid"], desktop["start_ticks"]) != (pid, start_ticks):
-        raise RuntimeError("original desktop identity missing or replaced")
-    sleep_inode = pathlib.Path("/usr/bin/sleep").stat()
-    # pam_exec forks the command and calls setsid() before exec, so the
-    # delay is the helper's direct child leading its own session and group.
-    delays = [row for row in rows if row["executable"] == "sleep" and row["_state"] not in ("Z", "X")
-              and (row["exe_device"], row["exe_inode"]) == (sleep_inode.st_dev, sleep_inode.st_ino)
-              and any(row["uid"] == helper["uid"] and row["ppid"] == helper["pid"]
-                      and row["pgrp"] == row["pid"] and row["start_ticks"] >= helper["start_ticks"]
-                      for helper in helpers)]
-    owner = json.loads(STATE.read_text()).get("auth_owner")
-    pending = type(owner) is dict and owner.get("outer_pending") is True
-    return {"real_pam_delay_running": pending and len(helpers) == 1 and len(delays) == 1,
-            "auth_owner": owner,
-            "compositor": public_auth_identity(desktop),
-            "helpers": [public_auth_identity(row) for row in helpers],
-            "delays": [public_auth_identity(row) for row in delays]}
+    stage = "process-snapshot"
+    try:
+        rows = pam_process_snapshot()
+        stage = "desktop-identity"
+        desktop, helpers = classify_pam_helpers(rows)
+        if desktop is None or (desktop["pid"], desktop["start_ticks"]) != (pid, start_ticks):
+            error = RuntimeError("original desktop identity missing or replaced")
+            error.delayed_auth_code = "desktop-identity-mismatch"
+            if desktop is None:
+                roots = [row for row in rows if row["uid"] == OWNER.pw_uid
+                         and row["executable"] == COMPOSITOR and not row["_marked"]]
+                error.delayed_auth_code = "desktop-not-unique"
+                error.delayed_auth_root_count = min(len(roots), 65535)
+                error.delayed_auth_expected_present = any(
+                    (row["pid"], row["start_ticks"]) == (pid, start_ticks) for row in roots)
+            raise error
+        stage = "sleep-identity"
+        sleep_inode = pathlib.Path("/usr/bin/sleep").stat()
+        # pam_exec forks the command and calls setsid() before exec, so the
+        # delay is the helper's direct child leading its own session and group.
+        stage = "delay-ownership"
+        delays = [row for row in rows if row["executable"] == "sleep" and row["_state"] not in ("Z", "X")
+                  and (row["exe_device"], row["exe_inode"]) == (sleep_inode.st_dev, sleep_inode.st_ino)
+                  and any(row["uid"] == helper["uid"] and row["ppid"] == helper["pid"]
+                          and row["pgrp"] == row["pid"] and row["start_ticks"] >= helper["start_ticks"]
+                          for helper in helpers)]
+        stage = "owner-read"
+        owner_text = STATE.read_text()
+        stage = "owner-parse"
+        owner = json.loads(owner_text).get("auth_owner")
+        pending = type(owner) is dict and owner.get("outer_pending") is True
+        stage = "serialization"
+        return {"real_pam_delay_running": pending and len(helpers) == 1 and len(delays) == 1,
+                "auth_owner": owner,
+                "compositor": public_auth_identity(desktop),
+                "helpers": [public_auth_identity(row) for row in helpers],
+                "delays": [public_auth_identity(row) for row in delays]}
+    except Exception as error:
+        error.delayed_auth_stage = stage
+        raise
+
+
+def delayed_auth_error(error):
+    """Fixed failure codes only; never exception strings, argv or raw stderr."""
+    types = {"RuntimeError", "ValueError", "TypeError", "KeyError", "IndexError", "AttributeError",
+             "OSError", "FileNotFoundError", "PermissionError", "ProcessLookupError",
+             "JSONDecodeError", "UnicodeDecodeError"}
+    stages = {"arguments", "process-snapshot", "desktop-identity", "sleep-identity",
+              "delay-ownership", "owner-read", "owner-parse", "serialization"}
+    codes = {"process-metadata-invalid": "process-snapshot",
+             "process-identity-changed": "process-snapshot",
+             "desktop-not-unique": "desktop-identity",
+             "desktop-identity-mismatch": "desktop-identity"}
+    kind = type(error).__name__
+    stage = getattr(error, "delayed_auth_stage", None)
+    stage = stage if type(stage) is str and stage in stages else "arguments"
+    result = {"stage": stage, "exception_type": kind if kind in types else "OtherError",
+              "code": "observation-exception"}
+    code = getattr(error, "delayed_auth_code", None)
+    if kind == "RuntimeError" and type(code) is str and codes.get(code) == stage:
+        if code == "desktop-not-unique":
+            count = getattr(error, "delayed_auth_root_count", None)
+            present = getattr(error, "delayed_auth_expected_present", None)
+            if (type(count) is not int or not 0 <= count <= 65535 or count == 1
+                    or type(present) is not bool or (count == 0 and present)):
+                return result
+            result.update(root_count=count, expected_desktop_present=present)
+        result["code"] = code
+    return result
 
 
 def auth_retirement_state(record):
@@ -1701,7 +1755,11 @@ print(json.dumps(result))
         service.write_text("auth required pam_exec.so /usr/bin/sleep 8\n" + original)
         result = {"pam": "real stack delayed"}
     elif action == "delayed-auth-state":
-        result = delayed_auth_state(int(sys.argv[2]), int(sys.argv[3]))
+        try:
+            result = delayed_auth_state(int(sys.argv[2]), int(sys.argv[3]))
+        except Exception as error:
+            print(json.dumps({"delayed_auth_error": delayed_auth_error(error)}))
+            raise SystemExit(1)
     elif action == "auth-retirement-state":
         result = auth_retirement_state(json.loads(sys.argv[2]))
     elif action == "deny-unlock":

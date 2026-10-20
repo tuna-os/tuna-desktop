@@ -3350,5 +3350,192 @@ class GreeterSessionList(unittest.TestCase):
 
 
 
+class DelayedAuthFailureDiagnostics(unittest.TestCase):
+    """Pure fixtures and fake QGA responses; never invoke guest or host PAM."""
+    SOURCE = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+
+    def observer(self, rows):
+        names = {"public_auth_identity", "classify_pam_helpers", "delayed_auth_state", "delayed_auth_error"}
+        nodes = [node for node in ast.parse(self.SOURCE.read_text()).body
+                 if isinstance(node, ast.FunctionDef) and node.name in names]
+        scope = {"OWNER": SimpleNamespace(pw_uid=1000), "COMPOSITOR": "tuna-compositor", "json": json,
+                 "pam_process_snapshot": lambda: rows,
+                 "pathlib": SimpleNamespace(Path=lambda _: SimpleNamespace(
+                     stat=lambda: SimpleNamespace(st_dev=1, st_ino=78))),
+                 "STATE": SimpleNamespace(read_text=lambda: json.dumps({"auth_owner": {"outer_pending": True}}))}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(self.SOURCE), "exec"), scope)
+        return scope
+
+    def rows(self):
+        desktop = dict(pid=600, uid=1000, ppid=2, pgrp=2, start_ticks=1500,
+                       executable="tuna-compositor", exe_device=1, exe_inode=77,
+                       _marked=False, _private=False, _state="S")
+        child = dict(desktop, pid=700, ppid=600, pgrp=700, start_ticks=1700)
+        return desktop, child
+
+    def diagnostic(self):
+        return {"stage": "desktop-identity", "exception_type": "RuntimeError",
+                "code": "desktop-not-unique", "root_count": 2, "expected_desktop_present": True}
+
+    def test_real_observer_pre_exec_ambiguity_remains_fatal_with_typed_comparison(self):
+        desktop, child = self.rows()
+        for group in (2, 700):
+            scope = self.observer([desktop, dict(child, pgrp=group)])
+            with self.assertRaisesRegex(RuntimeError, "original desktop identity missing or replaced") as caught:
+                scope["delayed_auth_state"](600, 1500)
+            self.assertEqual(scope["delayed_auth_error"](caught.exception), self.diagnostic())
+
+    def test_missing_or_replaced_desktop_is_still_fatal_and_distinguishable(self):
+        desktop, _ = self.rows()
+        for rows, expected in [([], {**self.diagnostic(), "root_count": 0, "expected_desktop_present": False}),
+                               ([dict(desktop, start_ticks=1501)],
+                                {"stage": "desktop-identity", "exception_type": "RuntimeError",
+                                 "code": "desktop-identity-mismatch"})]:
+            scope = self.observer(rows)
+            with self.assertRaises(RuntimeError) as caught:
+                scope["delayed_auth_state"](600, 1500)
+            self.assertEqual(scope["delayed_auth_error"](caught.exception), expected)
+
+    def test_observer_success_predicate_does_not_change(self):
+        desktop, child = self.rows()
+        helper = dict(child, _marked=True, _private=True)
+        delay = dict(child, pid=701, ppid=700, pgrp=701, start_ticks=1800,
+                     executable="sleep", exe_inode=78)
+        for rows, ready in [([desktop], False), ([desktop, helper], False),
+                            ([desktop, helper, delay], True),
+                            ([desktop, dict(helper, uid=1001), delay], False),
+                            ([desktop, helper, dict(delay, ppid=999)], False)]:
+            self.assertIs(self.observer(rows)["delayed_auth_state"](600, 1500)["real_pam_delay_running"], ready)
+
+    def test_unexpected_exception_text_and_attributes_are_never_copied(self):
+        scope = self.observer([])
+        error = RuntimeError("private exception text")
+        error.delayed_auth_stage = "private stage"
+        error.delayed_auth_code = "private code"
+        self.assertEqual(scope["delayed_auth_error"](error),
+                         {"stage": "arguments", "exception_type": "RuntimeError", "code": "observation-exception"})
+        class PrivateException(Exception):
+            pass
+        self.assertEqual(scope["delayed_auth_error"](PrivateException("private text"))["exception_type"], "OtherError")
+
+    def test_actual_process_reader_failures_have_distinct_fixed_codes(self):
+        node = next(node for node in ast.parse(self.SOURCE.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "auth_process")
+        for metadata, changed_group, code in [(b"", False, "process-metadata-invalid"),
+                (b"/usr/bin/tuna-compositor\0", True, "process-identity-changed")]:
+            reads = [0]
+            class ProcPart:
+                def __init__(self, kind="process"):
+                    self.kind = kind
+                def __truediv__(self, kind):
+                    return ProcPart(kind)
+                def stat(self):
+                    return SimpleNamespace(st_uid=1000, st_dev=1, st_ino=77)
+                def read_text(self):
+                    reads[0] += 1
+                    group = 700 if changed_group and reads[0] > 1 else 2
+                    return "700 (controlled) " + " ".join(["S", "600", str(group)] + ["0"] * 16 + ["1700"])
+                def open(self, mode):
+                    return io.BytesIO(metadata)
+            scope = self.observer([])
+            scope["pathlib"] = SimpleNamespace(Path=lambda path:
+                ProcPart() if str(path).startswith("/proc/") else Path(path))
+            scope["os"] = SimpleNamespace(readlink=lambda _: "/usr/bin/tuna-compositor")
+            scope["PAM_HELPER_FLAG"] = b"--internal-pam-conversation"
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(self.SOURCE), "exec"), scope)
+            scope["pam_process_snapshot"] = lambda: [scope["auth_process"](700)]
+            with self.assertRaises(RuntimeError) as caught:
+                scope["delayed_auth_state"](600, 1500)
+            self.assertEqual(scope["delayed_auth_error"](caught.exception),
+                             {"stage": "process-snapshot", "exception_type": "RuntimeError", "code": code})
+
+    def test_other_read_errors_keep_only_their_fixed_stage_and_type(self):
+        desktop, _ = self.rows()
+        for stage, kind in [("process-snapshot", "PermissionError"),
+                            ("sleep-identity", "FileNotFoundError"),
+                            ("owner-read", "FileNotFoundError"),
+                            ("owner-parse", "JSONDecodeError")]:
+            scope = self.observer([desktop])
+            def fail(error):
+                raise error
+            if stage == "process-snapshot":
+                scope["pam_process_snapshot"] = lambda: fail(PermissionError("private metadata"))
+            elif stage == "sleep-identity":
+                scope["pathlib"] = SimpleNamespace(Path=lambda _: SimpleNamespace(
+                    stat=lambda: fail(FileNotFoundError("private path"))))
+            else:
+                scope["STATE"] = SimpleNamespace(read_text=(lambda: "{private") if stage == "owner-parse"
+                    else lambda: fail(FileNotFoundError("private path")))
+            with self.assertRaises(Exception) as caught:
+                scope["delayed_auth_state"](600, 1500)
+            record = scope["delayed_auth_error"](caught.exception)
+            self.assertEqual(record, {"stage": stage, "exception_type": kind, "code": "observation-exception"})
+            self.assertIn('"stage": "' + stage + '"', self.transport_error({"delayed_auth_error": record}))
+
+    def test_actual_action_emits_bounded_record_then_exits_nonzero(self):
+        import contextlib
+        tree = ast.parse(self.SOURCE.read_text())
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        branch = next(node for node in ast.walk(main) if isinstance(node, ast.If)
+                      and isinstance(node.test, ast.Compare)
+                      and any(isinstance(value, ast.Constant) and value.value == "delayed-auth-state"
+                              for value in node.test.comparators))
+        scope = self.observer([])
+        scope["sys"] = SimpleNamespace(argv=["probe", "delayed-auth-state", "600", "1500"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            exec(compile(ast.Module(body=branch.body, type_ignores=[]), str(self.SOURCE), "exec"), scope)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(json.loads(output.getvalue()), {"delayed_auth_error": {
+            **self.diagnostic(), "root_count": 0, "expected_desktop_present": False}})
+
+    def transport_error(self, payload, **status):
+        import contextlib
+        actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        output = base64.b64encode(json.dumps(payload).encode()).decode()
+        failure = {"exited": True, "exitcode": 1, "out-data": output,
+                   "err-data": base64.b64encode(b"private arbitrary traceback").decode(), **status}
+        output_log = io.StringIO()
+        with contextlib.redirect_stdout(output_log), patch.object(actor, "command", side_effect=[{"pid": 10}, failure]):
+            with self.assertRaises(RuntimeError) as caught:
+                actor.run("delayed-auth-state", 600, 1500)
+        message = str(caught.exception)
+        self.last_transport_log = output_log.getvalue()
+        self.assertNotIn("private", message)
+        self.assertNotIn("private", self.last_transport_log)
+        self.assertIn("failed (exit=1)", message)
+        if message == "guest lifecycle delayed-auth-state failed (exit=1)":
+            self.assertEqual(self.last_transport_log, "")
+        return message
+
+    def test_transport_keeps_failure_and_includes_only_valid_record(self):
+        message = self.transport_error({"delayed_auth_error": self.diagnostic()})
+        self.assertIn('"code": "desktop-not-unique"', message)
+        self.assertIn('"expected_desktop_present": true', message)
+        prefix = "tuna-vm-lane: delayed-auth-state failure "
+        self.assertTrue(self.last_transport_log.startswith(prefix))
+        self.assertEqual(json.loads(self.last_transport_log[len(prefix):]), self.diagnostic())
+
+    def test_transport_rejects_unknown_malformed_unbounded_or_truncated_records(self):
+        record = self.diagnostic()
+        invalid = [None, [], {}, {**record, "extra": "private"},
+                   {**record, "exception_type": "private"}, {**record, "stage": "private"},
+                   {**record, "code": "private"}, {**record, "root_count": True},
+                   {**record, "root_count": -1}, {**record, "root_count": 1},
+                   {**record, "root_count": 0}, {**record, "root_count": 65536},
+                   {**record, "expected_desktop_present": 1},
+                   {**record, "stage": "owner-read"},
+                   {**record, "code": "observation-exception"},
+                   {**record, "exception_type": "OtherError"}]
+        generic = "guest lifecycle delayed-auth-state failed (exit=1)"
+        for value in invalid:
+            self.assertEqual(self.transport_error({"delayed_auth_error": value}), generic)
+        self.assertEqual(self.transport_error({"delayed_auth_error": record, "extra": "private"}), generic)
+        for encoded in ["!", "A" * 5465, base64.b64encode(b"x" * 4097).decode(),
+                        base64.b64encode(b"[]").decode(), base64.b64encode(b"\xff").decode(), None]:
+            self.assertEqual(self.transport_error({}, **{"out-data": encoded}), generic)
+        self.assertEqual(self.transport_error({"delayed_auth_error": record}, **{"out-truncated": True}), generic)
+
+
 if __name__ == "__main__":
     unittest.main()
