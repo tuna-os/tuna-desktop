@@ -334,6 +334,7 @@ jobs:
       - run: python3 scripts/lib/release-deb-ownership-tests.py
       - run: python3 scripts/lib/deb-clean-install-tests.py
       - run: python3 scripts/lib/transition-package-policy-tests.py
+      - run: python3 scripts/lib/legacy-upgrade-evidence-tests.py
       - run: scripts/tuna-release --allow-dirty --out package-artifacts && scripts/check-release-package package-artifacts/*.deb
       # Install with declared dependencies in a clean distro image; runner
       # development libraries must not conceal missing package dependencies.
@@ -346,7 +347,9 @@ jobs:
             --output "$RUNNER_TEMP/tuna-legacy-beta.deb"
           echo "b2b9ec7c9c5eb9f0e2003e48e458a440a551836d31a831972b8561a43e15ed01  $RUNNER_TEMP/tuna-legacy-beta.deb" | sha256sum --check
           # All installs and PAM configuration stay in fresh private roots in
-          # this disposable container. No package binaries or hooks are run.
+          # this disposable container. After teardown, export only a bounded,
+          # payload-free result projection; private fixtures stay inaccessible
+          # to the runner. No package binaries or hooks are run.
           docker run --rm -e DEBIAN_FRONTEND=noninteractive \
             -v "$PWD:/source:ro" \
             -v "$RUNNER_TEMP/tuna-legacy-beta.deb:/beta.deb:ro" \
@@ -355,14 +358,15 @@ jobs:
               apt-get install -y --no-install-recommends python3 build-essential libpam0g-dev libpam-modules
               set -- /source/package-artifacts/*.deb
               [ "$#" -eq 1 ]
-              python3 /source/scripts/lib/legacy-upgrade-lifecycle-tests.py \
-                --candidate "$1" --beta /beta.deb --artifacts /artifacts
+              python3 /source/scripts/lib/legacy-upgrade-evidence.py \
+                --candidate "$1" --beta /beta.deb --output /artifacts
             '
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: legacy-upgrade-mechanisms
-          path: upgrade-artifacts/
+          path: upgrade-artifacts/legacy-upgrade-results.tar.gz
+          if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

@@ -68,7 +68,9 @@ class Selection(unittest.TestCase):
 
     def test_legacy_lifecycle_and_native_pam_helper_always_run_journey(self):
         for path in ('scripts/lib/legacy-upgrade-lifecycle-tests.py',
-                     'scripts/lib/legacy-upgrade-pam-probe.c'):
+                     'scripts/lib/legacy-upgrade-pam-probe.c',
+                     'scripts/lib/legacy-upgrade-evidence.py',
+                     'scripts/lib/legacy-upgrade-evidence-tests.py'):
             for run in (0, 4, 19):
                 with self.subTest(path=path, run=run):
                     self.assertEqual(pr(path, run=run), ['journey'])
