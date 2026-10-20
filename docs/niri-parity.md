@@ -62,7 +62,7 @@ desktops have identical pixels.
 The [difference frames](niri-parity/baseline-233/difference/02-strip-preset-0_32_1280_768.png)
 place niri above Tuna Desktop and amplify their difference four times below.
 The raw [niri frame](niri-parity/baseline-233/niri/02-strip-preset.png) and
-[Tuna Desktop frame](niri-parity/baseline-233/tuna/02-strip-preset.png) are also
+[Tuna Desktop frame](niri-parity/baseline-233/roost/02-strip-preset.png) are also
 retained, with IPC/state JSON alongside each frame.
 
 Timing samples repeat a fresh right-to-left transition for each delay;
