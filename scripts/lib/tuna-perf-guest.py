@@ -61,8 +61,20 @@ def capture_globals(uid):
     return False
 
 
+def diagnostic_counter(fields, index, maximum):
+    """Optional bounded decimal metadata; malformed evidence is never accounting."""
+    if index >= len(fields):
+        return None
+    value = fields[index]
+    if len(value) > 10 or not value.isascii() or not value.isdecimal():
+        return None
+    value = int(value)
+    return value if value <= maximum else None
+
+
 def read_process(path):
-    status = dict(line.split(":", 1) for line in (path / "status").read_text().splitlines() if ":" in line)
+    status_text = (path / "status").read_text()
+    status = dict(line.split(":", 1) for line in status_text.splitlines() if ":" in line)
     # The command field can contain spaces and closing parentheses.
     head, tail = (path / "stat").read_text().rsplit(")", 1)
     fields = tail.split()
@@ -70,6 +82,12 @@ def read_process(path):
         "pid": int(path.name), "uid": int(status["Uid"].split()[0]), "state": fields[0],
         "ppid": int(fields[1]), "start_ticks": int(fields[19]),
         "cpu_ticks": int(fields[11]) + int(fields[12]),
+        # Reuse these reads: no new proc race or diagnostic failure may change
+        # accounting. Presence is not a validated memory value or exit proof.
+        "stat_flags": diagnostic_counter(fields, 6, 0xffffffff),
+        "stat_num_threads": diagnostic_counter(fields, 17, 0x7fffffff),
+        "status_vmrss_present": int("VmRSS" in status) if len(status_text) <= 16384 else None,
+        "status_vmsize_present": int("VmSize" in status) if len(status_text) <= 16384 else None,
         # Names let reports attribute CPU to compositor, shell, Xwayland and
         # portals (#315). comm is the kernel's 15-byte name; cmd is argv[0]'s
         # basename, never the arguments.
@@ -239,7 +257,11 @@ def numeric_identity(row):
     if row is None:
         return None
     return {"pid": row["pid"], "uid": row["uid"], "start_ticks": row["start_ticks"],
-            "state_code": ord(row["state"]) if len(row["state"]) == 1 else None}
+            "state_code": ord(row["state"]) if len(row["state"]) == 1 else None,
+            "stat_flags": row.get("stat_flags"),
+            "stat_num_threads": row.get("stat_num_threads"),
+            "status_vmrss_present": row.get("status_vmrss_present"),
+            "status_vmsize_present": row.get("status_vmsize_present")}
 
 
 def failure_record(stage, error, before, after, after_error=None):

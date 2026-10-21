@@ -150,6 +150,13 @@ counter correlation alone does not establish why a thread ran.
 Failure evidence also retains a fixed collection call-site enum, numeric errno,
 and PID/UID/start-tick/state-code identity before and after a failed observation
 when readable. State codes are the ASCII value of the proc state character.
+Identities also retain unsigned 32-bit `stat_flags`, nonnegative signed 32-bit
+`stat_num_threads`, and numeric `status_vmrss_present`/`status_vmsize_present`
+(1 for an exact field label, 0 for absent). Malformed/out-of-range stat metadata
+is null; status presence is null for records exceeding 16,384 characters.
+These reuse the existing proc reads without changing accounting or its input
+limits. Presence does not validate field values. The observations are not atomic
+and neither flags nor absent memory fields classify an exit or justify a fallback.
 The read stages identify bounded Python proc operations, not a kernel syscall
 trace. No exception text, paths or process names are added to these receipts.
 At most 128 failure receipts are retained per sample, with an explicit overflow

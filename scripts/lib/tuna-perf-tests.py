@@ -835,10 +835,83 @@ class Accounting(unittest.TestCase):
             evidence = result['failure_evidence'][0]
             self.assertEqual(evidence['stage'], 'smaps_rollup_read')
             self.assertEqual(evidence['errno'], 3)
-            self.assertEqual(evidence['before'], dict(pid=1, uid=1000, start_ticks=55, state_code=ord('S')))
+            self.assertEqual(evidence['before'], dict(pid=1, uid=1000, start_ticks=55, state_code=ord('S'),
+                                                     stat_flags=0, stat_num_threads=0,
+                                                     status_vmrss_present=0, status_vmsize_present=0))
             self.assertEqual(evidence['before'], evidence['after'])
             self.assertNotIn('private', json.dumps(evidence))
             self.assertNotIn('command', json.dumps(evidence))
+
+    def test_failure_diagnostic_counter_bounds_and_malformed_values(self):
+        for maximum in (0xffffffff, 0x7fffffff):
+            for token, expected in (('0', 0), (str(maximum), maximum),
+                                    (str(maximum + 1), None), ('-1', None),
+                                    ('+1', None), ('1.0', None), ('private', None),
+                                    ('９', None), ('9' * 10000, None)):
+                with self.subTest(maximum=maximum, token=token[:20]):
+                    self.assertEqual(guest.diagnostic_counter([token], 0, maximum), expected)
+            self.assertIsNone(guest.diagnostic_counter([], 0, maximum))
+
+    def test_failure_metadata_capture_does_not_change_accounting(self):
+        for flags, threads in (('4194308', '3'), ('private', '-1')):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = self.process(root, 1, 0, 1000, 10, 55)
+                head, tail = (path / 'stat').read_text().rsplit(')', 1)
+                fields = tail.split()
+                fields[6], fields[17] = flags, threads
+                (path / 'stat').write_text(head + ') ' + ' '.join(fields))
+                (path / 'status').write_text('Uid: 1000\nVmRSS: 20 kB\nVmSize: 40 kB\n')
+                complete = guest.sample(1000, root)
+                self.assertEqual((complete['pss_kib'], complete['process_count']), (10, 1))
+                self.assertEqual(complete['unreadable'], [])
+                with patch.object(guest, 'read_smaps_rollup', side_effect=ProcessLookupError(3, 'private')):
+                    failed = guest.sample(1000, root)
+                evidence = failed['failure_evidence'][0]
+                before = evidence['before']
+                self.assertEqual(before['stat_flags'], 4194308 if flags.isdecimal() else None)
+                self.assertEqual(before['stat_num_threads'], 3 if threads.isdecimal() else None)
+                self.assertEqual(before['status_vmrss_present'], 1)
+                self.assertEqual(before['status_vmsize_present'], 1)
+                self.assertEqual(before, evidence['after'])
+                self.assertEqual(failed['unreadable'], [{'pid': 1, 'error': 'ProcessLookupError'}])
+                self.assertEqual(failed['process_count'], 0)
+                self.assertNotIn('private', json.dumps(evidence))
+
+    def test_status_presence_is_bounded_and_is_not_memory_validation(self):
+        for suffix, expected in (('', (0, 0)), ('VmRSS: 0 kB\n', (1, 0)),
+                                 ('VmSize: 0 kB\n', (0, 1)),
+                                 ('VmRSS: malformed\nVmSize:\n', (1, 1)),
+                                 ('VmRSS malformed\nPrivateVmSize: 7\n', (0, 0)),
+                                 ('VmRSS: 0 kB\n' + 'x' * 16384, (None, None))):
+            with self.subTest(suffix=suffix[:30]), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = self.process(root, 1, 0, 1000, 10, 55)
+                (path / 'status').write_text('Uid: 1000\n' + suffix)
+                row = guest.numeric_identity(guest.read_process(path))
+                self.assertEqual((row['status_vmrss_present'], row['status_vmsize_present']), expected)
+                self.assertEqual(guest.sample(1000, root)['pss_kib'], 10)
+                # The limit is inclusive; over-limit means unknown, not absent.
+                prefix = 'Uid: 1000\nVmRSS: 0 kB\n'
+                for size in (16384, 16385):
+                    (path / 'status').write_text(prefix + 'x' * (size - len(prefix)))
+                    row = guest.numeric_identity(guest.read_process(path))
+                    self.assertEqual(row['status_vmrss_present'], 1 if size == 16384 else None)
+
+    def test_exit_metadata_does_not_classify_live_states(self):
+        for state in ('S', 'R', 'D', 'Z', 'X', 'x'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = self.process(root, 1, 0, 1000, 10, 55)
+                initial = guest.read_process(path)
+                after = dict(initial, state=state, stat_flags=4, stat_num_threads=1,
+                             status_vmrss_present=0, status_vmsize_present=0)
+                with patch.object(guest, 'read_process', side_effect=[initial, after]), \
+                     patch.object(guest, 'read_smaps_rollup', side_effect=ProcessLookupError(3, 'private')):
+                    result = guest.sample(1000, root)
+                self.assertEqual(result['failure_evidence'][0]['after'], guest.numeric_identity(after))
+                self.assertEqual(bool(result['unreadable']), state in ('S', 'R', 'D'))
+                self.assertEqual(result['process_count'], 0)
 
     def test_failure_evidence_preserves_existing_exit_and_reuse_semantics(self):
         for case in ('exit', 'reuse', 'unreadable'):
