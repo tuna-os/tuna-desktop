@@ -49,3 +49,40 @@ def require_restore_bracket(reference, scene, window_id, normal_rect):
     assert actual[0]['icon'] == expected[0]['icon'], 'restore icon geometry changed during capture'
     windows = [w for w in scene['windows'] if w['id'] == window_id]
     assert len(windows) == 1 and windows[0]['rect'] == normal_rect, 'restore body identity/geometry changed'
+
+
+def switcher_absent(scene):
+    """Exact namespace in the isolated compositor scene; no per-layer PID exists."""
+    layers = scene.get('layers')
+    assert isinstance(layers, list), 'scene layer inventory is missing'
+    for layer in layers:
+        assert isinstance(layer, dict) and isinstance(layer.get('namespace'), str), 'invalid layer identity'
+    return not any(layer['namespace'] == 'tuna-shell-switcher' for layer in layers)
+
+
+def wait_clear_restore(wait, reference, window_id, normal_rect):
+    def ready(scene):
+        require_restore_bracket(reference, scene, window_id, normal_rect)
+        return switcher_absent(scene)
+    return wait(ready, 'restore-close-switcher-absent')
+
+
+def clear_capture(capture, read_scene, validate):
+    """Fail closed if an overlay reappears or actor/clock identity changes."""
+    before = read_scene()
+    validate(before)
+    assert switcher_absent(before), 'switcher present before capture'
+    image = capture()
+    after = read_scene()
+    validate(after)
+    assert switcher_absent(after), 'switcher present after capture'
+    return image
+
+
+def require_destroy_bracket(reference, scene, window_id):
+    assert scene['animation_clock_ms'] == reference['animation_clock_ms'], 'destroy clock changed during capture'
+    assert not scene['windows'], 'live window appeared during retained capture'
+    expected = [e for e in reference['window_lifecycle']['destroying'] if e['window'] == window_id]
+    actual = [e for e in scene['window_lifecycle']['destroying'] if e['window'] == window_id]
+    assert len(expected) == len(actual) == 1 and actual == expected, 'retained actor identity/presentation changed'
+    assert scene['window_lifecycle']['retained_destroy_bytes'] > 0, 'retained actor pixels disappeared'
