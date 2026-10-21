@@ -337,6 +337,7 @@ def login(qmp, observe, paint, *, timeout=120, previous=None, monotonic=time.mon
         if previous is not None:
             _require(type(previous) is dict and previous.get("pass") is True
                      and previous.get("boot_id") == bound["boot_id"], "invalid prior successful login")
+        result["stage"] = "published-payload-before-login"
         proof = read("published")
         result["subject"] = published_subject(proof, expected_image)
         if previous is not None:
@@ -417,6 +418,7 @@ def login(qmp, observe, paint, *, timeout=120, previous=None, monotonic=time.mon
             raise _Rejected("effective published launch evidence rejected") from None
         result["effective_launch_verified"] = result["launch_verdict"]["effective_launch_verified"]
         snapshot("authenticated-desktop")
+        result["stage"] = "published-payload-after-login"
         final_proof = read("published")
         _require(published_subject(final_proof, expected_image) == result["subject"],
                  "published payload changed across authentication")

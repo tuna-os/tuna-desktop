@@ -412,6 +412,24 @@ class LoginFlow(unittest.TestCase):
             fake.transform = reject
             self.failure(fake, "payload")
 
+    def test_payload_observer_failure_retains_exact_public_stage(self):
+        for late in (False, True):
+            fake = Fake()
+            original = fake.observe
+            def observe(action, *, timeout):
+                if action == "published" and (fake.desktop or not late):
+                    raise RuntimeError("private-package-error-do-not-retain")
+                return original(action, timeout=timeout)
+            fake.observe = observe
+            result = self.failure(fake)
+            self.assertEqual(result["stage"], "published-payload-" + ("after" if late else "before") + "-login")
+            self.assertEqual(result["greeter_readiness"]["accepted_ready"], 1)
+            self.assertNotIn("private-package", json.dumps(result))
+            if not late:
+                self.assertFalse(fake.actions)
+                self.assertFalse(result["observations"])
+                self.assertFalse(result["painted_stages"])
+
     def test_wrong_or_unjoined_desktop_is_rejected(self):
         for kind in ("service", "root", "pid-join", "path", "vt", "inactive", "boot"):
             fake = Fake()

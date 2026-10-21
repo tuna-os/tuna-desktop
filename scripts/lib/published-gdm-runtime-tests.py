@@ -143,6 +143,91 @@ class FakeInventory(Inventory):
         return result
 
 
+class PayloadVerificationTests(unittest.TestCase):
+    """Exercise the real inventory/parser and payload loop on bounded fake paths."""
+    def setUp(self):
+        from types import SimpleNamespace
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name); self.root.chmod(0o755)
+        self.path = self.root / "usr/bin/tuna-session"
+        self.path.parent.mkdir(parents=True)
+        self.path.write_bytes(b"original"); self.path.chmod(0o755)
+        self.packages = {"gdm": "51.1-1", "tuna-desktop": "1.0.0beta.1-1",
+                         "gnome-shell": "1:51.1-1", "pam": "1.7.1-1", "other-shipped": "2-1"}
+        self.installed = dict(self.packages)
+        self.raw = None
+        self.queries = []
+        def query(*argv):
+            self.queries.append(argv)
+            self.assertEqual(argv[0], "/usr/bin/pacman")
+            if argv[1:] == ("-Q",):
+                return self.raw if self.raw is not None else "\n".join(f"{k} {v}" for k, v in self.installed.items())
+            self.assertEqual(argv[1:], ("-Qqo", "--", rt.LAUNCHER))
+            return "tuna-desktop"
+        observer = FakeInventory(self.root, lambda args: query("/usr/bin/pacman", *args))
+        self.baseline = {"packages": dict(self.packages), "files": {rt.LAUNCHER: observer.record(rt.LAUNCHER)},
+                         "subject": {"image": "immutable", "platform_digest": "platform"}}
+        self.original = copy.deepcopy(self.baseline)
+        for p in (patch.object(rt, "base_receipt", return_value=self.baseline),
+                  patch.object(rt.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=1000)),
+                  patch.object(rt.Path, "read_text", return_value=BOOT),
+                  patch.object(rt.Collector, "call", side_effect=query),
+                  patch.object(rt, "Inventory", side_effect=lambda root, callback: FakeInventory(self.root, callback))):
+            p.start(); self.addCleanup(p.stop)
+        self.queries.clear()
+
+    def test_fresh_snapshot_accepts_existing_and_additive_packages(self):
+        self.installed["fixture-only"] = "1-1"
+        result = rt.verify_payload()
+        self.assertTrue(result["immutable_verified"])
+        self.assertEqual(result["shipped_package_count"], len(self.packages))
+        self.assertEqual(self.baseline, self.original)
+        self.assertEqual(self.queries, [("/usr/bin/pacman", "-Q"),
+            ("/usr/bin/pacman", "-Qqo", "--", rt.LAUNCHER)])
+
+    def test_changed_or_removed_shipped_packages_fail_without_mutating_baseline(self):
+        for missing in (False, True):
+            self.installed = dict(self.packages)
+            if missing: del self.installed["other-shipped"]
+            else: self.installed["other-shipped"] = "3-1"
+            with self.subTest(missing=missing), self.assertRaisesRegex(ContractError, "shipped package version changed"):
+                rt.verify_payload()
+            self.assertEqual(self.baseline, self.original)
+
+    def test_duplicate_or_malformed_live_snapshot_still_fails(self):
+        valid = "\n".join(f"{k} {v}" for k, v in self.packages.items())
+        for extra in ("\ngdm 51.1-1", "\nmalformed", "\nextra one two"):
+            self.raw = valid + extra
+            with self.subTest(extra=extra), self.assertRaisesRegex(ContractError, "malformed or duplicate"):
+                rt.verify_payload()
+            self.assertEqual(self.baseline, self.original)
+
+    def test_missing_required_package_and_query_failure_still_fail(self):
+        del self.installed["gdm"]
+        with self.assertRaisesRegex(ContractError, "required installed package"):
+            rt.verify_payload()
+        with patch.object(rt.Collector, "call", side_effect=ContractError("runtime read command failed")):
+            with self.assertRaisesRegex(ContractError, "runtime read command failed"):
+                rt.verify_payload()
+
+    def test_changed_file_and_owner_still_fail(self):
+        self.path.write_bytes(b"changed")
+        with self.assertRaisesRegex(ContractError, "protected payload identity changed"):
+            rt.verify_payload()
+        self.path.write_bytes(b"original")
+        with patch.object(FakeInventory, "owner", return_value="other-shipped"):
+            with self.assertRaisesRegex(ContractError, "protected payload identity changed"):
+                rt.verify_payload()
+
+    def test_runtime_policy_override_still_fails(self):
+        path = self.root / "run/gdm/custom.conf"
+        path.parent.mkdir(parents=True); path.write_bytes(b"override")
+        with patch.object(FakeInventory, "owner", side_effect=lambda name:
+                          "tuna-desktop" if name == rt.LAUNCHER else "gdm"):
+            with self.assertRaisesRegex(ContractError, "runtime GDM policy override"):
+                rt.verify_payload()
+
+
 class MountedSearchTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)

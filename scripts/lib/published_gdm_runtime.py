@@ -96,7 +96,11 @@ def verify_payload():
     """
     collector = Collector()
     before = collector.baseline
-    observer = collector.observer
+    # Collector's ownership observer is seeded with the immutable baseline.
+    # Read installed packages into a fresh inventory: reusing that seed makes
+    # every existing package look duplicated, and clearing it would erase the
+    # aliased baseline before the version comparison.
+    observer = Inventory("/", lambda args: collector.call("/usr/bin/pacman", *args))
     observer.packages_inventory()
     require(all(observer.packages.get(k) == v for k, v in before["packages"].items()),
             "shipped package version changed")

@@ -459,3 +459,29 @@ strings. `probe_outcomes` counts returned or exceptional probe outcomes; it does
 not assert that an exceptional guest execution reached a confirmed terminal state. The timeout, shipped payload, PAM, session selection and accessibility
 settings are unchanged. No real picker/password/launch or five-boot pass is
 claimed by the local regression tests; later gates still require actual evidence.
+
+### Second runtime observation and fresh package snapshot
+
+The ordinary [run 39598603993](https://github.com/tuna-os/tuna-desktop/actions/runs/39598603993)
+passed static preflight and accepted the dynamic greeter join on all five boots.
+Each then failed during the first `published` payload observation, before paint,
+UI controls or input. The fully verified artifact (ID `12344812949`, SHA-256
+`56fb3457673fef5e46071079812528880ef4b6405ffde7de1053ac4b56d7567e`)
+retains `accepted_ready=1` and shows that fixed observer as the final QGA command.
+It does not retain the guest exception text or exit status.
+
+A local reproduction using its 719-package baseline exposes a deterministic
+defect in that path: the ownership observer is seeded with baseline packages,
+then a live package parse rejects the first existing name as a duplicate. This
+is a reproduced source defect aligned with the captured phase, not a recovered
+guest exception. Runtime payload verification now parses into a separate fresh
+inventory through the same bounded command callback. The immutable baseline and
+ownership observer are never cleared or partially overwritten. Only a complete
+successful parse reaches the unchanged shipped-version and protected-file checks;
+duplicate/malformed live records, missing or changed packages, altered protected
+files and runtime policy overrides still fail closed. Fixed before/after payload
+stage names preserve that boundary in later receipts without recording stderr.
+
+Synthetic regressions exercise the real inventory parser and verification loop
+on temporary paths. Actual runtime payload verification, controls, password,
+launch and the remaining five-boot/native gates still need fresh CI evidence.
