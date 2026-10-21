@@ -39,6 +39,36 @@ def require(condition, reason):
         raise ContractError(reason)
 
 
+def account(collector, session):
+    """Resolve only the UID of the already selected logind greeter tuple.
+
+    GDM 51.1's launch-environment/dynamic-user-store use gdm-greeter (or a
+    numeric suffix), not the static gdm service account. NSS is a consistency
+    check, never the authority for selecting a session or accepting its unit.
+    Keep the complete selected account snapshot private for repeat comparisons.
+    """
+    collector.remaining()
+    require(type(session) is dict and session.get("Service") == "gdm-launch-environment"
+            and session.get("Class") == "greeter" and session.get("Type") == "wayland"
+            and session.get("Remote") == "no" and session.get("Seat") == "seat0"
+            and session.get("Active") == "yes" and session.get("State") == "active",
+            "caller greeter tuple differs")
+    raw_uid, name = session.get("User"), session.get("Name")
+    require(type(raw_uid) is str and re.fullmatch(r"[1-9][0-9]{0,9}", raw_uid),
+            "invalid dynamic greeter UID")
+    uid = int(raw_uid)
+    require(type(name) is str, "missing dynamic greeter account name")
+    match = re.fullmatch(r"gdm-greeter(?:-([1-9][0-9]{0,5}))?", name)
+    require(uid < 2**32 - 1 and uid != collector.uid and match is not None
+            and (match[1] is None or int(match[1]) >= 2), "wrong dynamic greeter account")
+    by_uid, by_name = pwd.getpwuid(uid), pwd.getpwnam(name)
+    keys = ("pw_name", "pw_uid", "pw_gid", "pw_dir", "pw_shell")
+    first, second = (tuple(getattr(row, key) for key in keys) for row in (by_uid, by_name))
+    require(first == second and first[:2] == (name, uid), "dynamic greeter account mapping differs")
+    collector.remaining()
+    return first
+
+
 def properties(raw, expected):
     require(type(raw) is str and len(raw) <= 8192, "unbounded greeter unit response")
     result = {}
@@ -58,8 +88,9 @@ def display(collector, uid):
     return value
 
 
-def unit(collector, uid, pid):
-    values = properties(collector.call("/usr/bin/runuser", "-u", "gdm", "--",
+def unit(collector, identity, pid):
+    name, uid = identity[:2]
+    values = properties(collector.call("/usr/bin/runuser", "-u", name, "--",
         "/usr/bin/env", "-i", "PATH=/usr/bin", "LC_ALL=C",
         f"XDG_RUNTIME_DIR=/run/user/{uid}",
         f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
@@ -117,12 +148,13 @@ def join_greeter(collector, process, session):
     """Return a copy with an explicitly indirect, independently observed join.
 
     collector.uid is the fixture user; it must never substitute for the actual
-    gdm UID. collector.process(pid, environment=True) supplies an exact shipped
+    greeter UID. collector.process(pid, environment=True) supplies an exact shipped
     executable hash and stable kernel identity. Only allowed environment keys
     from that existing collector are compared; this module reads no environment.
     """
     require(type(process) is dict and type(session) is dict, "missing greeter join inputs")
-    uid = pwd.getpwnam("gdm").pw_uid
+    identity = account(collector, session)
+    name, uid = identity[:2]
     pid = process.get("pid")
     sid = session.get("Id")
     require(type(uid) is int and uid > 0 and uid != collector.uid
@@ -144,23 +176,27 @@ def join_greeter(collector, process, session):
             "unreviewed greeter source versions")
     require(collector.process(pid, environment=True) == process, "original greeter process changed")
     initial_display = display(collector, uid)
-    initial_unit = unit(collector, uid, pid)
+    initial_unit = unit(collector, identity, pid)
+    require(account(collector, session) == identity, "dynamic greeter account changed")
     initial_fragment = immutable_fragment(collector)
     require(initial_display == sid and kernel_group(collector, pid) == initial_unit["ControlGroup"],
             "greeter user-display or kernel cgroup join differs")
     mode_verified(collector, pid)
     # Take another complete independent snapshot around all file/process reads.
     final_display = display(collector, uid)
-    final_unit = unit(collector, uid, pid)
+    require(account(collector, session) == identity, "dynamic greeter account changed")
+    final_unit = unit(collector, identity, pid)
     require(final_display == initial_display and final_unit == initial_unit
             and immutable_fragment(collector) == initial_fragment
             and kernel_group(collector, pid) == final_unit["ControlGroup"],
             "greeter display or user unit changed")
     mode_verified(collector, pid)
     require(collector.process(pid, environment=True) == process, "original greeter process changed")
+    require(account(collector, session) == identity, "dynamic greeter account changed")
     return {**process, "direct_logind_session": direct, "logind_session": initial_display,
             "logind_join_method": METHOD,
-            "greeter_join": {"display": {"uid": uid, "session_id": initial_display},
+            "greeter_join": {"account": {"name": name, "uid": uid, "source": "observed-logind-greeter"},
+                "display": {"uid": uid, "session_id": initial_display},
                 "unit": {"name": UNIT, "main_pid": pid, "control_group": initial_unit["ControlGroup"],
                          "fragment": initial_fragment, "drop_in_paths": [], "active_state": "active",
                          "sub_state": "running"},

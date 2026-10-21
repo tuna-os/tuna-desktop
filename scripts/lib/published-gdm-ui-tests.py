@@ -69,7 +69,7 @@ class Fake:
 
 class Tests(unittest.TestCase):
     def run_fake(self, fake, **kwargs):
-        return ui.observe(123, 456, "c1", backend_factory=lambda remaining: fake,
+        return ui.observe(123, 456, "c1", 120, backend_factory=lambda remaining: fake,
                           identity=kwargs.pop("identity", lambda *a: dict(PRINCIPAL)), **kwargs)
 
     def test_fixture_user_public_only(self):
@@ -195,14 +195,34 @@ class Tests(unittest.TestCase):
         f = Fake([Node("button", "tuna-test")]); f.available = False
         with self.assertRaises(RuntimeError): self.run_fake(f)
 
+    def test_expected_dynamic_uid_must_match_before_bus_reads(self):
+        f = Fake([Node("button", "tuna-test")])
+        with self.assertRaises(ui.Unavailable):
+            self.run_fake(f, identity=lambda *args: {**PRINCIPAL, "uid": 121})
+        self.assertEqual(f.creds, 0)
+
+    def test_process_identity_refuses_wrong_uid_or_non_greeter_account(self):
+        from types import SimpleNamespace
+        for real_uid, name, mapped_uid in ((0, "gdm-greeter", 120), (121, "gdm-greeter", 120),
+                                          (120, "gdm", 120), (120, "tuna-test", 120),
+                                          (120, "gdm-greeter-1", 120), (120, "gdm-greeter", 121)):
+            record = SimpleNamespace(pw_name=name, pw_uid=mapped_uid)
+            with self.subTest(uid=real_uid, name=name), \
+                 patch.object(ui.os, "getuid", return_value=real_uid), \
+                 patch.object(ui.os, "geteuid", return_value=real_uid), \
+                 patch.object(ui.pwd, "getpwuid", return_value=record), \
+                 patch.object(ui.pwd, "getpwnam", return_value=record):
+                with self.assertRaises(ui.Unavailable): ui.process_identity(123, 456, "c1", 120)
+
     def test_invalid_arguments(self):
-        for args in ((True, 456, "c1"), (123, 0, "c1"), (123, 456, "../bad")):
+        for args in ((True, 456, "c1", 120), (123, 0, "c1", 120), (123, 456, "../bad", 120),
+                     (123, 456, "c1", 0), (123, 456, "c1", True)):
             with self.subTest(args=args), self.assertRaises(ui.Unavailable): ui.observe(*args)
 
     def test_cli_fixed_unavailable_without_exception_or_argument_echo(self):
         out = io.StringIO()
         with patch.object(ui, "observe", side_effect=RuntimeError("secret failure")), contextlib.redirect_stdout(out):
-            status = ui.main(["--pid", "123", "--start-ticks", "456", "--session-id", "c1"])
+            status = ui.main(["--pid", "123", "--start-ticks", "456", "--session-id", "c1", "--uid", "120"])
         self.assertEqual(status, 1)
         self.assertEqual(json.loads(out.getvalue()), ui.unavailable())
         self.assertNotIn("secret", out.getvalue())

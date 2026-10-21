@@ -261,4 +261,86 @@ class CollectorBoundaryTests(unittest.TestCase):
 
 
 
+class DynamicGreeterTests(unittest.TestCase):
+    def setUp(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import published_gdm_greeter as join
+        self.join = join
+        self.row = {"Id": "1", "User": "60578", "Name": "gdm-greeter",
+                    "Service": "gdm-launch-environment", "Class": "greeter", "Type": "wayland",
+                    "Remote": "no", "Seat": "seat0", "Active": "yes", "State": "active", "VTNr": "1"}
+        self.account = SimpleNamespace(pw_name="gdm-greeter", pw_uid=60578, pw_gid=65534,
+                                      pw_dir="/run/gdm/gdm-greeter", pw_shell="/usr/bin/nologin")
+        self.principal = {"pid": 930, "uid": 60578, "start_ticks": 100, "executable": "/usr/bin/gnome-shell",
+                          "exe_device": 1, "exe_inode": 2, "logind_session": "1",
+                          "greeter_join": {"account": {"name": "gdm-greeter", "uid": 60578,
+                                                        "source": "observed-logind-greeter"}}}
+        self.c = rt.Collector.__new__(rt.Collector)
+        self.c.uid, self.c.boot_id = 1000, BOOT
+        self.c.remaining = Mock(return_value=12)
+        self.c.manager = Mock(return_value={"pid": 700, "start_ticks": 80, "uid": 0})
+        self.c.sessions = Mock(return_value=[dict(self.row)])
+        self.c.find_process = Mock(return_value=dict(self.principal))
+        self.c.active_vt = Mock(return_value="tty1")
+        for p in (patch.object(join.pwd, "getpwuid", return_value=self.account),
+                  patch.object(join.pwd, "getpwnam", return_value=self.account),
+                  patch.object(join, "join_greeter", side_effect=lambda c, p, r: dict(p))):
+            p.start(); self.addCleanup(p.stop)
+
+    def test_actual_51_1_dynamic_uid_is_selected_from_unique_session(self):
+        result = self.c.greeter()
+        self.assertTrue(result["ready"])
+        self.c.find_process.assert_called_once_with(60578, "/usr/bin/gnome-shell")
+        self.assertTrue(all(call.args == ("gdm-greeter",) for call in self.join.pwd.getpwnam.call_args_list))
+        self.assertEqual(self.c.sessions.call_count, 2)
+        self.assertEqual(self.c.manager.call_count, 2)
+
+    def test_starting_or_missing_greeter_does_not_select_an_account(self):
+        for manager, rows, reason in ((None, [], "manager-starting"), ({"pid": 700}, [], "no-active-greeter")):
+            self.c.manager.return_value = manager; self.c.sessions.return_value = rows
+            result = self.c.greeter()
+            self.assertFalse(result["ready"]); self.assertEqual(result["reason"], reason)
+        self.join.pwd.getpwuid.assert_not_called(); self.c.find_process.assert_not_called()
+
+    def test_ambiguous_wrong_account_and_fixture_uid_are_refused(self):
+        for rows in ([self.row, dict(self.row, Id="3", User="60579")],
+                     [dict(self.row, Name="gdm")], [dict(self.row, User="1000")], [dict(self.row, User="0")]):
+            self.c.sessions.return_value = rows
+            with self.subTest(rows=rows), self.assertRaises(ContractError): self.c.greeter()
+        self.c.find_process.assert_not_called()
+
+    def test_wrong_service_or_class_is_never_selected(self):
+        for key, value in (("Service", "gdm-password"), ("Class", "user"), ("Seat", "seat1"), ("Active", "no")):
+            self.c.sessions.return_value = [dict(self.row, **{key: value})]
+            self.assertFalse(self.c.greeter()["ready"])
+        self.c.find_process.assert_not_called()
+
+    def test_session_uid_vt_and_manager_changes_are_refused(self):
+        from unittest.mock import Mock
+        for changes in ({"User": "60579"}, {"Id": "3"}, {"Name": "gdm-greeter-2"}, {"VTNr": "2"}):
+            self.c.sessions = Mock(side_effect=[[self.row], [dict(self.row, **changes)]])
+            with self.subTest(changes=changes), self.assertRaises(ContractError): self.c.greeter()
+        self.c.sessions = Mock(return_value=[self.row])
+        self.c.manager = Mock(side_effect=[{"pid": 700}, {"pid": 701}])
+        with self.assertRaises(ContractError): self.c.greeter()
+
+    def test_ui_uses_bound_dynamic_account_and_explicit_uid(self):
+        from unittest.mock import Mock
+        ready = {"schema_version": 1, "profile": rt.PROFILE, "ready": True,
+                 "greeter": self.principal, "active_vt": "tty1", "boot_id": BOOT}
+        self.c.greeter = Mock(return_value=ready)
+        public = {k: self.principal[k] for k in ("pid", "uid", "start_ticks", "executable", "exe_device", "exe_inode")}
+        public["session_id"] = "1"
+        self.c.call = Mock(return_value=json.dumps({"available": True, "bus_owner_verified": True,
+                "input_value_observed": False, "principal": public, "controls": []}))
+        self.c.ui()
+        argv = self.c.call.call_args.args
+        self.assertEqual(argv[:4], ("/usr/bin/runuser", "-u", "gdm-greeter", "--"))
+        self.assertEqual(argv[-2:], ("--uid", "60578"))
+        changed = copy.deepcopy(ready); changed["greeter"]["greeter_join"]["account"]["name"] = "gdm-greeter-2"
+        self.c.greeter = Mock(side_effect=[ready, changed])
+        with self.assertRaises(ContractError): self.c.ui()
+
+
 if __name__ == "__main__": unittest.main()

@@ -19,7 +19,9 @@ IMAGE = "ghcr.io/tuna-os/marlin@sha256:" + "c" * 64
 SUBJECT = {"image": IMAGE, "platform_digest": "sha256:" + "d" * 64}
 PRINCIPAL = {"pid": 120, "start_ticks": 90, "uid": 120,
              "executable": "/usr/bin/gnome-shell", "logind_session": "c1",
-             "direct_logind_session": None, "logind_join_method": "logind-user-display-and-gdm-user-unit"}
+             "direct_logind_session": None, "logind_join_method": "logind-user-display-and-gdm-user-unit",
+             "greeter_join": {"account": {"name": "gdm-greeter", "uid": 120,
+                                          "source": "observed-logind-greeter"}}}
 RECTS = {kind: [20 + index * 100, 100, 90, 30]
          for index, kind in enumerate(sorted(gdm.KINDS))}
 
@@ -53,7 +55,7 @@ class Fake:
         self.launch_calls = []
         self.last_inventory = None
         self.boot = BOOT
-        self.principal = dict(PRINCIPAL)
+        self.principal = copy.deepcopy(PRINCIPAL)
         self.owner = {
             "profile": gdm.PROFILE, "boot_id": BOOT, "session_uid": 1000,
             "active_vt": "tty4",
@@ -88,7 +90,7 @@ class Fake:
             if self.menu:
                 kinds.append("tuna-session")
         return {"schema_version": 1, "profile": gdm.PROFILE, "boot_id": self.boot,
-                "greeter": dict(self.principal), "active_vt": "tty1",
+                "greeter": copy.deepcopy(self.principal), "active_vt": "tty1",
                 "bus_owner_verified": True, "input_value_observed": False,
                 "controls": [self.control(kind, enabled=kind != "auth-error") for kind in kinds]}
 
@@ -100,7 +102,7 @@ class Fake:
             self.now += timeout + 1
         if action == "gdm-greeter":
             value = {"schema_version": 1, "profile": gdm.PROFILE, "boot_id": self.boot,
-                     "greeter": dict(self.principal), "active_vt": "tty1", "ready": True,
+                     "greeter": copy.deepcopy(self.principal), "active_vt": "tty1", "ready": True,
                      "desktop_session_present": self.desktop}
         elif action == "gdm-ui":
             value = self.ui()
@@ -222,6 +224,10 @@ class LoginFlow(unittest.TestCase):
         self.assertEqual(fake.frames, ["greeter-before-login", "password-challenge", "picker-open",
                                       "picker-selected", "wrong-password-rejected", "authenticated-desktop"])
         self.assertNotIn("incorrect", json.dumps(result))
+        self.assertEqual(result["greeter_readiness"], {
+            "probe_outcomes": 1, "ready_false": 0, "probe_error": 0,
+            "accepted_ready": 1, "other_not_ready": 0, "rejected_evidence": 0,
+            "last_status": "accepted_ready"})
         budgets = [value for _, value in fake.observations]
         self.assertEqual(budgets, sorted(budgets, reverse=True))
 
@@ -314,6 +320,60 @@ class LoginFlow(unittest.TestCase):
             return value
         fake.transform = replace
         self.failure(fake, "original foreground greeter changed")
+
+    def test_observed_dynamic_account_is_projected_without_private_nss_fields(self):
+        for name in ("gdm-greeter", "gdm-greeter-2", "gdm-greeter-999999"):
+            fake = Fake()
+            account = {"name": name, "uid": 61101, "source": "observed-logind-greeter"}
+            fake.principal.update(uid=61101, greeter_join={
+                "account": {**account, "directory": "private-password-or-environment-home",
+                            "shell": "private-password-or-environment-shell"},
+                "private": "private-password-or-environment-join"})
+            with self.subTest(name=name):
+                result = fake.run()
+                self.assertTrue(result["pass"])
+                self.assertTrue(result["observations"])
+                for observation in result["observations"]:
+                    self.assertEqual(observation["greeter"]["greeter_join"], {"account": account})
+                self.assertNotIn("private-password-or-environment", json.dumps(result))
+
+    def test_observed_dynamic_account_requires_source_family_uid_and_marker(self):
+        changes = [{"name": name} for name in
+                   ("gdm", "root", "gdm-greeter-0", "gdm-greeter-1", "gdm-greeter-02",
+                    "gdm-greeter-1000000", "gdm-greeter\n", "gdm-greeter-2-extra",
+                    "private-password-or-environment-name", None, [])]
+        changes += [{"uid": uid} for uid in (0, True, "120", 120.0, 121)]
+        changes += [{"source": source} for source in
+                    (None, "nss", "observed-logind-greeter\n", "private-password-or-environment-source")]
+        for change in changes:
+            fake = Fake()
+            fake.principal["greeter_join"]["account"].update(change)
+            with self.subTest(change=change):
+                result = self.failure(fake, "invalid observed greeter account")
+            self.assertEqual(result["greeter_readiness"]["last_status"], "rejected_evidence")
+            self.assertFalse(fake.actions)
+        for join in (None, {}, {"account": None}, {"account": {}}):
+            fake = Fake()
+            fake.principal["greeter_join"] = join
+            with self.subTest(join=join):
+                self.failure(fake, "observed greeter account")
+            self.assertFalse(fake.actions)
+
+    def test_observed_account_cannot_change_between_greeter_or_ui_probes(self):
+        for changed_action in ("gdm-greeter", "gdm-ui"):
+            fake = Fake()
+            calls = 0
+            def change_account(action, value):
+                nonlocal calls
+                if action == "gdm-greeter":
+                    calls += 1
+                if calls > 1 and action == changed_action:
+                    value["greeter"]["greeter_join"]["account"]["name"] = "gdm-greeter-2"
+                return value
+            fake.transform = change_account
+            with self.subTest(action=changed_action):
+                self.failure(fake, "original foreground greeter")
+            self.assertFalse(fake.actions)
 
     def test_failed_password_and_late_observations_share_one_deadline(self):
         fake = Fake()
@@ -473,7 +533,134 @@ class LoginFlow(unittest.TestCase):
                     raise RuntimeError("not yet ready")
             return original(action, **kwargs)
         fake.observe = observe
-        self.assertTrue(fake.run()["pass"])
+        result = fake.run()
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["greeter_readiness"], {
+            "probe_outcomes": 2, "ready_false": 0, "probe_error": 1,
+            "accepted_ready": 1, "other_not_ready": 0, "rejected_evidence": 0,
+            "last_status": "accepted_ready"})
+
+    def test_greeter_ready_false_deadline_retains_only_fixed_summary(self):
+        fake = Fake()
+        private = "private-password-or-environment-unknown-guest-status"
+        def unready(action, value):
+            if action == "gdm-greeter":
+                value.update(ready=False, reason=private, stdout=private, stderr=private,
+                             environment={private: private}, last_status=private)
+            return value
+        fake.transform = unready
+        result = self.failure(fake, "deadline")
+        self.assertEqual(result["stage"], "greeter-ready")
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(result["greeter_readiness"], {
+            "probe_outcomes": len(fake.observations), "ready_false": len(fake.observations),
+            "probe_error": 0, "accepted_ready": 0, "other_not_ready": 0,
+            "rejected_evidence": 0, "last_status": "ready_false"})
+        self.assertFalse(fake.actions)
+        self.assertEqual(fake.now, 3)
+        self.assertNotIn(private, json.dumps(result))
+
+    def test_greeter_probe_error_deadline_counts_without_retaining_errors(self):
+        class PrivateObserverError(RuntimeError):
+            pass
+        for exception in (RuntimeError, OSError, PrivateObserverError):
+            fake = Fake()
+            def unavailable(action, value):
+                raise exception("private-password-or-environment-do-not-retain")
+            fake.transform = unavailable
+            with self.subTest(exception=exception.__name__):
+                result = self.failure(fake, "deadline")
+                self.assertEqual(result["greeter_readiness"], {
+                    "probe_outcomes": len(fake.observations), "ready_false": 0,
+                    "probe_error": len(fake.observations), "accepted_ready": 0,
+                    "other_not_ready": 0, "rejected_evidence": 0,
+                    "last_status": "probe_error"})
+                self.assertNotIn("PrivateObserverError", json.dumps(result))
+                self.assertFalse(fake.actions)
+                self.assertEqual(fake.now, 3)
+
+    def test_greeter_readiness_recovers_after_distinct_false_and_error_probes(self):
+        fake = Fake()
+        calls = 0
+        def transient(action, value):
+            nonlocal calls
+            if action == "gdm-greeter":
+                calls += 1
+                if calls == 1:
+                    value["ready"] = False
+                elif calls == 2:
+                    raise OSError("private-password-or-environment-do-not-retain")
+            return value
+        fake.transform = transient
+        result = fake.run(timeout=3)
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["greeter_readiness"], {
+            "probe_outcomes": 3, "ready_false": 1, "probe_error": 1,
+            "accepted_ready": 1, "other_not_ready": 0, "rejected_evidence": 0,
+            "last_status": "accepted_ready"})
+        self.assertEqual((fake.negative_count, fake.positive_count), (1, 1))
+        budgets = [value for _, value in fake.observations]
+        self.assertEqual(budgets, sorted(budgets, reverse=True))
+        self.assertLess(fake.now, 3)
+        self.assertNotIn("private-password-or-environment", json.dumps(result))
+
+    def test_greeter_readiness_counts_saturate_without_ending_the_wait(self):
+        for status in ("ready_false", "probe_error"):
+            fake = Fake()
+            def unavailable(action, value):
+                if status == "probe_error":
+                    raise RuntimeError("private-password-or-environment-do-not-retain")
+                value["ready"] = False
+                return value
+            fake.transform = unavailable
+            with self.subTest(status=status), patch.object(gdm, "READINESS_COUNT_LIMIT", 2):
+                result = self.failure(fake, "deadline")
+            summary = result["greeter_readiness"]
+            self.assertEqual(summary["probe_outcomes"], 2)
+            self.assertEqual(summary[status], 2)
+            self.assertEqual(summary["last_status"], status)
+            self.assertGreater(len(fake.observations), 2)
+            self.assertEqual(fake.now, 3)
+            self.assertEqual(len(summary), 7)
+            self.assertTrue(all(type(value) is int and 0 <= value <= 2
+                                for key, value in summary.items() if key != "last_status"))
+
+    def test_greeter_unknown_readiness_is_not_counted_as_explicit_false(self):
+        for ready in (None, 0, "private-password-or-environment-unknown-ready", []):
+            fake = Fake()
+            fake.transform = lambda action, value: {**value, "ready": ready}
+            with self.subTest(ready=ready):
+                result = self.failure(fake, "deadline")
+            summary = result["greeter_readiness"]
+            self.assertEqual(summary["ready_false"], 0)
+            self.assertEqual(summary["other_not_ready"], len(fake.observations))
+            self.assertEqual(summary["accepted_ready"], 0)
+            self.assertEqual(summary["last_status"], "other_not_ready")
+            self.assertFalse(fake.actions)
+
+    def test_greeter_invalid_ready_evidence_is_recorded_but_never_retried(self):
+        for change in ({"schema_version": True}, {"greeter": {}}, {"desktop_session_present": True}):
+            fake = Fake()
+            fake.transform = lambda action, value: {**value, **change}
+            with self.subTest(change=change):
+                result = self.failure(fake)
+            self.assertEqual(result["greeter_readiness"], {
+                "probe_outcomes": 1, "ready_false": 0, "probe_error": 0,
+                "accepted_ready": 0, "other_not_ready": 0, "rejected_evidence": 1,
+                "last_status": "rejected_evidence"})
+            self.assertEqual(len(fake.observations), 1)
+            self.assertFalse(fake.actions)
+
+    def test_greeter_late_ready_result_is_never_counted_as_accepted(self):
+        fake = Fake()
+        fake.late_action = "gdm-greeter"
+        result = self.failure(fake, "deadline")
+        self.assertEqual(result["greeter_readiness"], {
+            "probe_outcomes": 0, "ready_false": 0, "probe_error": 0,
+            "accepted_ready": 0, "other_not_ready": 0, "rejected_evidence": 0,
+            "last_status": "not_observed"})
+        self.assertEqual(len(fake.observations), 1)
+        self.assertFalse(fake.actions)
 
 
 class HostIntegration(unittest.TestCase):

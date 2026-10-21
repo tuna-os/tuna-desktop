@@ -336,11 +336,16 @@ cannot substitute for any missing gate.
    the read-only inspection container. The fixture build compares `BASE_IMAGE`
    to that subject and runs the complete immutable comparison before and after
    additive fixtures. The host also matches the guest subject to its exact image.
-2. The actual foreground GDM greeter has the GDM UID, immutable GNOME Shell ELF
-   and user unit, unique local Wayland `gdm-launch-environment` greeter session,
+2. The actual foreground GDM greeter UID comes from its unique active local
+   Wayland `gdm-launch-environment` greeter session. The source-supported dynamic
+   account name and UID must agree in both NSS directions; a static `gdm` lookup
+   cannot select it. Its immutable GNOME Shell ELF and user unit,
    logind User.Display, exact `org.gnome.Shell@gdm.service` MainPID/cgroup and
-   observed VT. Two snapshots must match. This is an explicit user-display/unit
-   join; `direct_logind_session` may be absent and is never invented.
+   observed VT must agree. Two account/process/unit snapshots and the surrounding
+   session/manager observations must match. The observer receives the verified
+   account name and explicit UID; its own UID and original shell identity must
+   agree before any bus read. This is an explicit user-display/unit join;
+   `direct_logind_session` may be absent and is never invented.
 3. A read-only AT-SPI protocol observer uses direct bounded Gio D-Bus calls with
    NO_AUTO_START, without native libatspi caches, subscriptions or peer transport.
    It binds each public-tree reference to the verified unique bus owner for that
@@ -389,6 +394,12 @@ not this single field, determines runtime qualification.
   defines the Wayland directory search and selected helper command.
   [Its Wayland helper](https://github.com/GNOME/gdm/blob/8043e3659097c4d39b2ace458cace32d94ac7693/daemon/gdm-wayland-session.c)
   imports the user-manager environment and prefers its PATH for the child.
+  [Its launch environment](https://github.com/GNOME/gdm/blob/8043e3659097c4d39b2ace458cace32d94ac7693/daemon/gdm-launch-environment.c)
+  chooses the preferred `gdm-greeter` name; the
+  [dynamic-user store](https://github.com/GNOME/gdm/blob/8043e3659097c4d39b2ace458cace32d94ac7693/daemon/gdm-dynamic-user-store.c)
+  allocates its UID and can suffix the name for another greeter. Account naming
+  alone is insufficient: the actual session, shipped executable, original
+  user-unit MainPID/cgroup and repeated lifetime checks remain mandatory.
 - [GLib 2.90.1, e05063cc](https://github.com/GNOME/glib/blob/e05063ccc6c8f222465a1080927f4c14349f3de6/gio/gsubprocess.c)
   distinguishes the calling process PATH from the launcher environment. The
   installed `glib2 2.90.1-1` is required. GDM uses flags NONE, so the helper PATH
@@ -427,3 +438,24 @@ keeps the leader unreaped until process-group retirement, including the exited
 leader/descendant-pipe case. This is not a hard realtime bound on all Python,
 filesystem or kernel operations. No observer enables accessibility, debug logging,
 tracing, persistent privileges or host security settings.
+
+### First runtime observation and account-binding correction
+
+The ordinary [run 39591921325](https://github.com/tuna-os/tuna-desktop/actions/runs/39591921325)
+passed preflight and built the additive fixture. All five boots then stopped at
+`greeter-ready` under the existing 120-second login budget. The fully verified
+artifact (ID `12343805037`, SHA-256
+`773a14f728010c260a4fdb1f9ef75d4426ca0ed67aaf3b490103340d0250bd8a`)
+shows a running GDM Wayland greeter, already-started accessibility services and
+continuing QGA calls. It identifies `gdm-greeter`, UID 60578, whereas the original
+collector incorrectly looked up the static `gdm` account. That mismatch alone
+prevents acceptance; the original receipt did not retain failed-probe status,
+so the exact first failed internal check cannot be reconstructed from it.
+
+The correction derives and rechecks the dynamic account as described above.
+A fixed-size, saturating startup readiness summary distinguishes not-ready,
+probe-error and accepted-ready outcomes without storing exception text or guest
+strings. `probe_outcomes` counts returned or exceptional probe outcomes; it does
+not assert that an exceptional guest execution reached a confirmed terminal state. The timeout, shipped payload, PAM, session selection and accessibility
+settings are unchanged. No real picker/password/launch or five-boot pass is
+claimed by the local regression tests; later gates still require actual evidence.

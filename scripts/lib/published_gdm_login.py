@@ -17,10 +17,12 @@ KINDS = frozenset({"fixture-user", "not-listed", "username-entry", "password-ent
                    "session-menu", "tuna-session", "sign-in", "cancel", "auth-error"})
 BOOT_ID = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z")
 SESSION_ID = re.compile(r"[A-Za-z0-9_.-]+\Z")
+GREETER_ACCOUNT = re.compile(r"gdm-greeter(?:-([1-9][0-9]{0,5}))?\Z")
 IMAGE = re.compile(r"ghcr\.io/tuna-os/marlin@sha256:[0-9a-f]{64}\Z")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 IDENTITY_KEYS = ("pid", "start_ticks", "uid", "executable", "logind_session",
                  "direct_logind_session", "logind_join_method")
+READINESS_COUNT_LIMIT = 4096
 
 
 class LoginError(RuntimeError):
@@ -60,6 +62,17 @@ def _principal(value):
     _require(result["logind_join_method"] == "logind-user-display-and-gdm-user-unit"
              and result["direct_logind_session"] in (None, result["logind_session"]),
              "unverified or contradictory greeter session join")
+    join = value.get("greeter_join")
+    _require(type(join) is dict and type(join.get("account")) is dict,
+             "missing observed greeter account")
+    account = join["account"]
+    name = account.get("name")
+    match = GREETER_ACCOUNT.fullmatch(name) if type(name) is str else None
+    _require(match is not None and (match[1] is None or int(match[1]) >= 2)
+             and type(account.get("uid")) is int and account["uid"] == result["uid"]
+             and account.get("source") == "observed-logind-greeter",
+             "invalid observed greeter account")
+    result["greeter_join"] = {"account": {key: account[key] for key in ("name", "uid", "source")}}
     return result
 
 
@@ -166,6 +179,8 @@ def login(qmp, observe, paint, *, timeout=120, previous=None, monotonic=time.mon
     previous is a prior successful return value for same-boot fresh relogin.
     All phases share one absolute deadline. Public fixture values are fixed;
     no credentials, arbitrary guest strings or exception messages are retained.
+    greeter_readiness retains only capped startup outcome counts and a fixed
+    last status; subsequent UI checks do not overwrite that startup summary.
     """
     result = {"schema_version": 1, "profile": PROFILE, "pass": False,
               "stage": "arguments", "observations": [], "painted_stages": [],
@@ -180,6 +195,10 @@ def login(qmp, observe, paint, *, timeout=120, previous=None, monotonic=time.mon
                        "stage": "arguments", "observations": [], "painted_stages": [],
                        "wrong_password_rejected": False, "picker_selected": False,
                        "direct_launcher_exec_observed": False})
+    result["greeter_readiness"] = {
+        "probe_outcomes": 0, "ready_false": 0, "probe_error": 0,
+        "accepted_ready": 0, "other_not_ready": 0, "rejected_evidence": 0,
+        "last_status": "not_observed"}
     try:
         _require(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 600,
                  "invalid login deadline")
@@ -230,8 +249,7 @@ def login(qmp, observe, paint, *, timeout=120, previous=None, monotonic=time.mon
                      "actual retained greeter paint missing")
             result["painted_stages"].append(stage)
 
-        def greeter():
-            value = read("gdm-greeter")
+        def greeter(value):
             _require(type(value) is dict and value.get("profile") == PROFILE
                      and type(value.get("schema_version")) is int and value["schema_version"] == 1,
                      "invalid greeter readiness schema")
@@ -247,7 +265,7 @@ def login(qmp, observe, paint, *, timeout=120, previous=None, monotonic=time.mon
             return current
 
         def ui():
-            ready = greeter()
+            ready = greeter(read("gdm-greeter"))
             if ready is None:
                 return None
             value = validate_ui(read("gdm-ui"), width=width, height=height)
@@ -287,14 +305,32 @@ def login(qmp, observe, paint, *, timeout=120, previous=None, monotonic=time.mon
                            and _control(v, "tuna-session", enabled=False) is None, stage)
 
         result["stage"] = "greeter-ready"
+
+        def record_readiness(status):
+            # Only local status codes and saturating counters survive a poll.
+            # Never retain exception text, guest reasons or a growing history.
+            summary = result["greeter_readiness"]
+            for key in ("probe_outcomes", status):
+                summary[key] = min(summary[key] + 1, READINESS_COUNT_LIMIT)
+            summary["last_status"] = status
+
         while bound is None:
             try:
-                bound = greeter()
+                value = read("gdm-greeter")
             except (OSError, RuntimeError):
-                # A completed read-only guest probe can precede the greeter.
+                # A read-only guest probe can precede the greeter.
                 # No physical input has happened, no transport is replaced,
                 # and malformed returned evidence is never treated as ready.
+                record_readiness("probe_error")
                 remaining()
+            else:
+                try:
+                    bound = greeter(value)
+                except _Rejected:
+                    record_readiness("rejected_evidence")
+                    raise
+                record_readiness("accepted_ready" if bound is not None else
+                                 "ready_false" if value.get("ready") is False else "other_not_ready")
             if bound is None:
                 pause()
         result["boot_id"] = bound["boot_id"]

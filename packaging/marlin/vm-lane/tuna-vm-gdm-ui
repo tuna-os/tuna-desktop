@@ -2,7 +2,8 @@
 """Read-only public GDM controls, bound to the original greeter principal.
 
 The trusted root caller supplies the greeter session and executes this helper as
-gdm with a hard 12-second timeout. Session membership, boot and active VT remain
+the verified dynamic greeter UID under its shared 12-second command budget.
+Session membership, boot and active VT remain
 the caller's responsibility. This helper does not authenticate or perform input.
 No entry name, text, value, length, description, argv or environment is queried.
 English public labels/roles follow GNOME Shell 51.1 commit
@@ -64,10 +65,14 @@ def unavailable():
             "input_value_observed": False, "controls": []}
 
 
-def process_identity(pid, ticks, session_id):
+def process_identity(pid, ticks, session_id, uid):
     """Exact same-user executable identity; no environment or command reads."""
-    uid = pwd.getpwnam("gdm").pw_uid
-    if uid <= 0 or os.getuid() != uid or os.geteuid() != uid:
+    if type(uid) is not int or not 0 < uid < 2**32 - 1 or os.getuid() != uid or os.geteuid() != uid:
+        raise Unavailable()
+    entry = pwd.getpwuid(uid)
+    match = re.fullmatch(r"gdm-greeter(?:-([1-9][0-9]{0,5}))?", entry.pw_name)
+    if (entry.pw_uid != uid or match is None or (match[1] is not None and int(match[1]) < 2)
+            or pwd.getpwnam(entry.pw_name).pw_uid != uid):
         raise Unavailable()
     root = pathlib.Path("/proc") / str(pid)
     def sample():
@@ -269,10 +274,11 @@ def control(backend, node, kind, states):
             **{key: states[key] for key in ("showing", "enabled", "focused", "selected")}}
 
 
-def observe(pid, ticks, session_id, backend_factory=NativeBackend,
+def observe(pid, ticks, session_id, uid, backend_factory=NativeBackend,
             identity=process_identity, clock=time.monotonic):
     if (type(pid) is not int or not 0 < pid < 2**31
             or type(ticks) is not int or not 0 < ticks < 2**64
+            or type(uid) is not int or not 0 < uid < 2**32 - 1
             or type(session_id) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", session_id)):
         raise Unavailable()
     deadline = clock() + BUDGET_SECONDS
@@ -281,7 +287,9 @@ def observe(pid, ticks, session_id, backend_factory=NativeBackend,
         if value <= 0:
             raise Unavailable()
         return max(1, int(value * 1000))
-    original = identity(pid, ticks, session_id)
+    original = identity(pid, ticks, session_id, uid)
+    if original.get("uid") != uid:
+        raise Unavailable()
     backend = backend_factory(remaining)
     backend.existing_bus()
     desktop = backend.desktop()
@@ -353,7 +361,7 @@ def observe(pid, ticks, session_id, backend_factory=NativeBackend,
             or (set(kinds) <= {"auth-error", "cancel"})):
         raise Unavailable()
     remaining()
-    if backend.credentials(owner) != expected or identity(pid, ticks, session_id) != original:
+    if backend.credentials(owner) != expected or identity(pid, ticks, session_id, uid) != original:
         raise Unavailable()
     remaining()
     result = {"schema_version": 1, "profile": "published-gdm", "available": True,
@@ -381,8 +389,9 @@ def main(argv=None):
         parser.add_argument("--pid", required=True, type=int)
         parser.add_argument("--start-ticks", required=True, type=int)
         parser.add_argument("--session-id", required=True)
+        parser.add_argument("--uid", required=True, type=int)
         args = parser.parse_args(argv)
-        result = observe(args.pid, args.start_ticks, args.session_id)
+        result = observe(args.pid, args.start_ticks, args.session_id, args.uid)
         status = 0
     except Exception:
         result, status = unavailable(), 1

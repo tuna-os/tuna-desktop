@@ -43,7 +43,7 @@ ENV_KEYS = frozenset(("PATH", "XDG_DATA_DIRS", "XDG_SESSION_ID", "XDG_SESSION_TY
 BASE = Path("/usr/share/tuna-vm/base-preflight.json")
 SESSION = "/usr/share/wayland-sessions/tuna.desktop"
 LAUNCHER = "/usr/bin/tuna-session"
-SESSION_PROPERTIES = ("Id", "User", "Type", "Class", "Service", "Seat", "Remote", "VTNr",
+SESSION_PROPERTIES = ("Id", "User", "Name", "Type", "Class", "Service", "Seat", "Remote", "VTNr",
                       "Active", "State", "Leader", "Scope")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 BOOT = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z")
@@ -484,22 +484,32 @@ class Collector:
         sessions = self.sessions()
         owned = [row for row in sessions if row.get("User") == str(self.uid)
                  and row.get("Service") == "gdm-password" and row.get("Class") == "user"]
-        gdm_uid = pwd.getpwnam("gdm").pw_uid
-        rows = [row for row in sessions if row.get("User") == str(gdm_uid) and
+        def candidates(values):
+            return [row for row in values if
                 row.get("Service") == "gdm-launch-environment" and row.get("Class") == "greeter"
                 and row.get("Type") == "wayland" and row.get("Remote") == "no"
                 and row.get("Seat") == "seat0" and row.get("Active") == "yes" and
                 row.get("State") == "active"]
-        require(len(rows) <= 1 and gdm_uid > 0, "ambiguous foreground GDM greeter")
+        rows = candidates(sessions)
+        require(len(rows) <= 1, "ambiguous foreground GDM greeter")
         if manager is None or not rows:
             return {"schema_version": 1, "profile": PROFILE, "ready": False,
+                    "reason": "manager-starting" if manager is None else "no-active-greeter",
                     "boot_id": self.boot_id, "desktop_session_present": bool(owned)}
         row = rows[0]
+        from published_gdm_greeter import account, join_greeter
+        identity = account(self, row)
+        gdm_uid = identity[1]
         process = self.find_process(gdm_uid, "/usr/bin/gnome-shell")
-        from published_gdm_greeter import join_greeter
         process = join_greeter(self, process, row)
         vt = self.active_vt()
         require(vt == "tty" + row["VTNr"], "greeter is not foreground")
+        final_sessions = self.sessions()
+        require(candidates(final_sessions) == rows and
+                [r for r in final_sessions if r.get("User") == str(self.uid)
+                 and r.get("Service") == "gdm-password" and r.get("Class") == "user"] == owned
+                and self.manager() == manager and self.active_vt() == vt
+                and account(self, row) == identity, "greeter session or manager changed")
         return {"schema_version": 1, "profile": PROFILE, "ready": True, "boot_id": self.boot_id,
                 "desktop_session_present": bool(owned), "greeter": process, "active_vt": vt}
 
@@ -613,12 +623,13 @@ class Collector:
     def ui(self):
         before = self.greeter()
         principal = before["greeter"]
-        raw = self.call("/usr/bin/runuser", "-u", "gdm", "--", "/usr/bin/env",
+        name = principal["greeter_join"]["account"]["name"]
+        raw = self.call("/usr/bin/runuser", "-u", name, "--", "/usr/bin/env",
                 f"XDG_RUNTIME_DIR=/run/user/{principal['uid']}",
                 f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{principal['uid']}/bus",
                 "/usr/bin/python3", "-B", "/usr/libexec/tuna-vm-gdm-ui",
                 "--pid", str(principal["pid"]), "--start-ticks", str(principal["start_ticks"]),
-                "--session-id", principal["logind_session"])
+                "--session-id", principal["logind_session"], "--uid", str(principal["uid"]))
         value = json.loads(raw)
         observed = value.get("principal", {})
         require(value.get("available") is True and value.get("bus_owner_verified") is True and

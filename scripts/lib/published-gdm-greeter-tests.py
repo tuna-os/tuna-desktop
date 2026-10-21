@@ -12,13 +12,15 @@ from published_dm_contract import ContractError
 
 KERNEL_GROUP = greeter.kernel_group
 MODE_VERIFIED = greeter.mode_verified
-PID, UID, TICKS = 123, 120, 456
+PID, UID, TICKS = 123, 60578, 456
 CGROUP = f"/user.slice/user-{UID}.slice/user@{UID}.service/session.slice/{greeter.UNIT}"
 PROCESS = {"pid": PID, "uid": UID, "start_ticks": TICKS, "ppid": 88,
            "executable": "/usr/bin/gnome-shell", "sha256": "a" * 64,
            "exe_device": 1, "exe_inode": 2, "logind_session": None,
            "environment": {"XDG_SESSION_TYPE": "wayland"}}
-SESSION = {"Id": "c1", "User": str(UID), "Service": "gdm-launch-environment",
+ACCOUNT = SimpleNamespace(pw_name="gdm-greeter", pw_uid=UID, pw_gid=65534,
+                          pw_dir="/run/gdm/gdm-greeter", pw_shell="/usr/bin/nologin")
+SESSION = {"Id": "c1", "User": str(UID), "Name": "gdm-greeter", "Service": "gdm-launch-environment",
            "Class": "greeter", "Type": "wayland", "Remote": "no", "Seat": "seat0",
            "Active": "yes", "State": "active", "VTNr": "2"}
 UNIT = {"MainPID": str(PID), "ControlGroup": CGROUP, "FragmentPath": greeter.FRAGMENT,
@@ -80,7 +82,8 @@ class Tests(unittest.TestCase):
         self.collector = Collector()
         Inventory.instances = []
         Inventory.observed = FILE
-        self.patches = [patch.object(greeter.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=UID)),
+        self.patches = [patch.object(greeter.pwd, "getpwnam", return_value=ACCOUNT),
+                        patch.object(greeter.pwd, "getpwuid", return_value=ACCOUNT),
                         patch.object(greeter, "Inventory", Inventory),
                         patch.object(greeter, "kernel_group", return_value=CGROUP),
                         patch.object(greeter, "mode_verified", return_value=True)]
@@ -110,12 +113,44 @@ class Tests(unittest.TestCase):
         calls = self.collector.calls
         login = ("/usr/bin/loginctl", "show-user", str(UID), "--property=Display")
         self.assertEqual(calls.count(login), 2)
-        expected = ("/usr/bin/runuser", "-u", "gdm", "--", "/usr/bin/env", "-i",
+        expected = ("/usr/bin/runuser", "-u", "gdm-greeter", "--", "/usr/bin/env", "-i",
                     "PATH=/usr/bin", "LC_ALL=C", f"XDG_RUNTIME_DIR=/run/user/{UID}",
                     f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{UID}/bus",
                     "/usr/bin/systemctl", "--user", "show", greeter.UNIT, "--no-pager",
                     *("--property=" + k for k in greeter.PROPERTIES))
         self.assertEqual(calls.count(expected), 2)
+
+    def test_dynamic_account_comes_from_logind_not_static_gdm(self):
+        self.assertEqual(self.join()["greeter_join"]["account"],
+                         {"name": "gdm-greeter", "uid": UID, "source": "observed-logind-greeter"})
+        self.assertTrue(all(call.args == ("gdm-greeter",) for call in greeter.pwd.getpwnam.call_args_list))
+        self.assertTrue(all(call.args == (UID,) for call in greeter.pwd.getpwuid.call_args_list))
+
+    def test_source_supported_suffixed_dynamic_account_is_bound(self):
+        record = SimpleNamespace(**{**vars(ACCOUNT), "pw_name": "gdm-greeter-2"})
+        with patch.object(greeter.pwd, "getpwnam", return_value=record), \
+             patch.object(greeter.pwd, "getpwuid", return_value=record):
+            result = self.join(session={**SESSION, "Name": record.pw_name})
+        self.assertEqual(result["greeter_join"]["account"]["name"], "gdm-greeter-2")
+        self.assertTrue(all(call[2] == "gdm-greeter-2" for call in self.collector.calls if call[0] == "/usr/bin/runuser"))
+
+    def test_wrong_account_name_or_uid_cannot_supply_greeter(self):
+        for key, value in (("Name", "gdm"), ("Name", "root"), ("Name", "tuna-test"),
+                           ("Name", "gdm-greeter-1"), ("Name", "gdm-greeter-02"),
+                           ("User", "0"), ("User", "1000"), ("User", "060578")):
+            with self.subTest(key=key, value=value), self.assertRaises(ContractError):
+                greeter.account(self.collector, {**SESSION, key: value})
+
+    def test_nss_alias_uid_and_account_reuse_fail(self):
+        for key, value in (("pw_name", "other"), ("pw_uid", UID + 1), ("pw_gid", 0),
+                           ("pw_dir", "/changed"), ("pw_shell", "/changed")):
+            changed = SimpleNamespace(**{**vars(ACCOUNT), key: value})
+            with self.subTest(key=key), patch.object(greeter.pwd, "getpwnam", return_value=changed):
+                with self.assertRaises(ContractError): greeter.account(self.collector, SESSION)
+        changed = SimpleNamespace(**{**vars(ACCOUNT), "pw_gid": 1})
+        with patch.object(greeter.pwd, "getpwuid", side_effect=[ACCOUNT, changed]), \
+             patch.object(greeter.pwd, "getpwnam", side_effect=[ACCOUNT, changed]):
+            with self.assertRaises(ContractError): self.join()
 
     def test_existing_direct_join_must_agree(self):
         process = {**PROCESS, "logind_session": "c1"}
