@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -78,7 +79,9 @@ class BudgetTests(unittest.TestCase):
                 subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])
                 time.sleep(60)
             with self.assertRaises(budget.OperationFailure) as caught:
-                budget.supervise(work,lambda:True,work_seconds=.1,cleanup_seconds=.5)
+                # This is a real-OS ownership integration test, not a claim
+                # that a loaded host schedules every departure within 0.5s.
+                budget.supervise(work,lambda:True,work_seconds=.1,cleanup_seconds=budget.CLEANUP_SECONDS)
             row=caught.exception.receipt['trace_failure']
             self.assertEqual(row['start_acceptance'],'uncertain')
             self.assertTrue(row['vm_retirement_required']);self.assertIsNone(effect.poll())
@@ -147,6 +150,44 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(row['stage'],'unknown');self.assertEqual(row['kernel_state'],'uncertain')
         self.assertEqual(row['start_acceptance'],'uncertain')
         diagnostics.encode(caught.exception.receipt,'start')
+    def test_late_observation_never_confirms_cleanup(self):
+        # Advance a logical clock only after the real SIGKILL. No wall-clock
+        # sleep or timeout increase is needed to reproduce missed evidence.
+        original_waitid=os.waitid;original_killpg=os.killpg;original_kill=os.kill
+        clock_offset=[0.0];signaled=[False];advanced=[False];owned={}
+        def remember(pid):
+            if not owned:owned.update(pid=pid,pidfd=os.pidfd_open(pid))
+        def killpg(pid,sig):
+            remember(pid);result=original_killpg(pid,sig);signaled[0]=True;return result
+        def kill(pid,sig):
+            remember(pid);result=original_kill(pid,sig);signaled[0]=True;return result
+        def waitid(*args):
+            if signaled[0] and not advanced[0]:
+                clock_offset[0]+=.51;advanced[0]=True
+            return original_waitid(*args)
+        clock=SimpleNamespace(monotonic=lambda:time.monotonic()+clock_offset[0],sleep=time.sleep)
+        try:
+            with patch.object(budget,'time',clock),patch.object(budget.os,'killpg',side_effect=killpg), \
+                 patch.object(budget.os,'kill',side_effect=kill),patch.object(budget.os,'waitid',side_effect=waitid):
+                with self.assertRaises(budget.OperationFailure) as caught:
+                    budget.supervise(lambda:time.sleep(60),lambda:False,work_seconds=.03,cleanup_seconds=.5)
+            row=caught.exception.receipt['trace_failure']
+            self.assertTrue(advanced[0])
+            self.assertEqual(row['cleanup'],'expired')
+            self.assertEqual(row['helper_retirement'],'unconfirmed')
+            self.assertTrue(row['vm_retirement_required'])
+            # Later identity-bound departure is useful cleanup evidence only;
+            # it must not rewrite the within-budget refusal above.
+            self.assertTrue(budget.select.select([owned['pidfd']],[],[],2)[0])
+            self.assertEqual(row['helper_retirement'],'unconfirmed')
+        finally:
+            if owned:
+                try:signal.pidfd_send_signal(owned['pidfd'],signal.SIGKILL)
+                except ProcessLookupError:pass
+                if budget.select.select([owned['pidfd']],[],[],2)[0]:
+                    try:os.waitpid(owned['pid'],os.WNOHANG)
+                    except ChildProcessError:pass
+                os.close(owned['pidfd'])
     def test_cleanup_expiry_is_failure(self):
         with patch.object(budget,'group_departed',return_value=False):
             with self.assertRaises(budget.OperationFailure) as caught:
@@ -156,10 +197,12 @@ class BudgetTests(unittest.TestCase):
     def test_failure_schema_and_old_reader_fail_closed(self):
         value=budget.receipt('profiler','expired',True,True,False)
         self.assertEqual(diagnostics.decode(diagnostics.encode(value,'start'),'start'),value)
-        # The previous decoder is read from Git without changing this worktree.
-        old=subprocess.check_output(['git','show','HEAD:scripts/lib/perf_trace_diagnostics.py'],cwd=ROOT,text=True)
-        namespace={};exec(compile(old,'old-diagnostic-reader','exec'),namespace)
-        with self.assertRaises(ValueError):namespace['decode'](json.dumps(value),'start')
+        # Frozen actual v1 decoder: independent of checkout HEAD and Git history.
+        old=load('frozen_trace_diagnostics_v1',ROOT/'scripts/lib/fixtures/perf_trace_diagnostics_v1.py')
+        v1={'trace_failure':{'schema':1,'action':'start','stage':'owner-name','error_class':'RuntimeError'}}
+        self.assertEqual(old.decode(json.dumps(v1),'start'),v1)
+        self.assertEqual(diagnostics.decode(json.dumps(v1),'start'),v1)
+        with self.assertRaises(ValueError):old.decode(json.dumps(value),'start')
         for field,item in [('schema',True),('performance_qualified',True),('vm_retirement_required',False),
                            ('cleanup','done'),('start_acceptance','confirmed'),('outcome','success')]:
             invalid=json.loads(json.dumps(value));invalid['trace_failure'][field]=item
