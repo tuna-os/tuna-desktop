@@ -1,0 +1,209 @@
+#!/usr/bin/python3
+"""Copy only existing, bounded restore-close evidence after a failed native proof.
+
+No captures, logs, runtime state, executables, or recursive discovery. The full
+native-minimize artifact is left untouched. This subset is diagnostic evidence,
+not a passing proof or a replacement for the full source-matched archive.
+"""
+import argparse
+import json
+import hashlib
+import re
+import os
+from pathlib import Path
+import stat
+
+IMAGE_LIMIT = 8 * 1024 * 1024
+METADATA_LIMIT = 64 * 1024
+REPORT_LIMIT = 16 * 1024
+TOTAL_LIMIT = 36 * 1024 * 1024
+FILE_LIMIT = 9  # Eight fixed inputs plus the controlled report.
+MEMBERS = (
+    ("frozen/SOURCE_COMMIT", METADATA_LIMIT),
+    ("frozen/manifest.json", METADATA_LIMIT),
+    *((f"{direction}/{name}", limit)
+      for direction in ("ltr", "rtl")
+      for name, limit in (
+          ("manifest.json", METADATA_LIMIT),
+          ("21-interrupted-restore-before.png", IMAGE_LIMIT),
+          ("22-interrupted-restore-retained.png", IMAGE_LIMIT),
+      )),
+)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def open_directory(path):
+    """Reject symlinks in every component, not just the final directory."""
+    path = Path(os.path.abspath(path))
+    fd = os.open("/", DIR_FLAGS)
+    try:
+        for part in path.parts[1:]:
+            next_fd = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_member(source_fd, relative, limit):
+    directory, name = relative.split("/")
+    directory_fd = os.open(directory, DIR_FLAGS, dir_fd=source_fd)
+    try:
+        # NONBLOCK ensures a hostile FIFO cannot hang the diagnostic step.
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=directory_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None, "nonregular"
+            if info.st_size > limit:
+                return None, "oversize"
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                data = stream.read(limit + 1)
+            if len(data) > limit:
+                return None, "oversize"
+            # Do not include a concurrently changed or truncated file.
+            after = os.fstat(fd)
+            if (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns) or len(data) != info.st_size:
+                return None, "changed"
+            return data, "copied"
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory_fd)
+
+
+def sanitize_metadata(relative, data):
+    """Admit only fixed scalar identity fields, never paths or future fields."""
+    def digest(value, length):
+        return isinstance(value, str) and re.fullmatch(f"[0-9a-f]{{{length}}}", value)
+
+    if relative == "frozen/SOURCE_COMMIT":
+        revision = data.decode("ascii").strip()
+        if not digest(revision, 40):
+            raise ValueError("invalid source revision")
+        return (revision + "\n").encode()
+    original = json.loads(data)
+    if not isinstance(original, dict):
+        raise ValueError("invalid manifest")
+    clean = {}
+    for key, length in (
+        ("source_commit", 40), ("source_revision", 40), ("binary_source_revision", 40),
+        ("cargo_lock_sha256", 64), ("proof_sha256", 64), ("client_sha256", 64),
+        ("pixel_helper_sha256", 64),
+    ):
+        if key in original:
+            if not digest(original[key], length):
+                raise ValueError("invalid identity field")
+            clean[key] = original[key]
+    if "source_dirty" in original:
+        if type(original["source_dirty"]) is not bool:
+            raise ValueError("invalid source dirty flag")
+        clean["source_dirty"] = original["source_dirty"]
+    binaries = {}
+    for name in ("tuna-compositor", "tuna-shell-gtk", "tuna-modal-dim-client"):
+        hashes = original.get("sha256", {})
+        records = original.get("binaries", {})
+        if not isinstance(hashes, dict) or not isinstance(records, dict):
+            raise ValueError("invalid binary identities")
+        if name in hashes:
+            value = hashes[name]
+        elif name in records and isinstance(records[name], dict):
+            value = records[name].get("sha256")
+        else:
+            continue
+        if not digest(value, 64):
+            raise ValueError("invalid binary digest")
+        binaries[name] = value
+    clean["binary_sha256"] = binaries
+    clean["direction"] = relative.split("/")[0] if not relative.startswith("frozen/") else "both"
+    return json.dumps(clean, indent=2).encode() + b"\n"
+
+
+def write_member(destination_fd, name, data):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=destination_fd)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+
+
+def bundle(source, destination, outcome):
+    if outcome != "failure":
+        return  # Success must not create a diagnostic artifact.
+    source = Path(os.path.abspath(source))
+    destination = Path(os.path.abspath(destination))
+    if destination == source or source in destination.parents:
+        raise ValueError("diagnostic destination must be outside the full artifact")
+    if len(MEMBERS) + 1 > FILE_LIMIT:
+        raise ValueError("diagnostic allowlist exceeds file cap")
+    source_fd = open_directory(source)
+    try:
+        parent_fd = open_directory(destination.parent)
+        try:
+            os.mkdir(destination.name, mode=0o700, dir_fd=parent_fd)
+            destination_fd = os.open(destination.name, DIR_FLAGS, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        try:
+            entries = []
+            total = 0
+            for relative, limit in MEMBERS:
+                try:
+                    data, status = read_member(source_fd, relative, limit)
+                except FileNotFoundError:
+                    data, status = None, "missing"
+                except OSError:
+                    data, status = None, "unsafe-or-unreadable"
+                entry = {"source": relative}
+                if data is not None:
+                    entry.update(source_bytes=len(data), source_sha256=hashlib.sha256(data).hexdigest())
+                    if not relative.endswith(".png"):
+                        try:
+                            data = sanitize_metadata(relative, data)
+                        except (ValueError, UnicodeError, RecursionError):
+                            data, status = None, "invalid-metadata"
+                        if data is not None and len(data) > METADATA_LIMIT:
+                            data, status = None, "oversize"
+                # Reserve space for the report before admitting any payload.
+                if data is not None and total + len(data) + REPORT_LIMIT > TOTAL_LIMIT:
+                    data, status = None, "total-limit"
+                entry["status"] = status
+                if data is not None:
+                    # Flat, fixed names keep all writes relative to the opened fd.
+                    name = relative.replace("/", "--")
+                    write_member(destination_fd, name, data)
+                    total += len(data)
+                    entry.update(output=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+                entries.append(entry)
+            report = json.dumps({
+                "proof_outcome": "failure",
+                "scope": "existing restore-close diagnostics only; not a passing proof",
+                "limits": {"files": FILE_LIMIT, "image_bytes": IMAGE_LIMIT,
+                           "metadata_bytes": METADATA_LIMIT, "report_bytes": REPORT_LIMIT,
+                           "total_bytes": TOTAL_LIMIT},
+                "copied_bytes": total,
+                "entries": entries,
+            }, indent=2).encode() + b"\n"
+            if len(report) > REPORT_LIMIT or total + len(report) > TOTAL_LIMIT:
+                raise ValueError("diagnostic report exceeds cap")
+            write_member(destination_fd, "report.json", report)
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path)
+    parser.add_argument("destination", type=Path)
+    parser.add_argument("--proof-outcome", required=True, choices=("success", "failure"))
+    args = parser.parse_args()
+    bundle(args.source, args.destination, args.proof_outcome)
+
+
+if __name__ == "__main__":
+    main()
