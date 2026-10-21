@@ -710,6 +710,121 @@ class Accounting(unittest.TestCase):
         (path / "fd/0").touch()
         return path
 
+    def thread(self, process, tid, uid=1000, start=57):
+        path = process / 'task' / str(tid)
+        path.mkdir(parents=True)
+        fields = ['0'] * 50
+        fields[0] = 'S'
+        fields[11], fields[12], fields[19] = '3', '2', str(start)
+        (path / 'stat').write_text(f'{tid} (private thread name) ' + ' '.join(fields))
+        (path / 'status').write_text(f'Name: private thread name\nUid: {uid} {uid} {uid} {uid}\n'
+                                   'voluntary_ctxt_switches: 11\nnonvoluntary_ctxt_switches: 4\n')
+        return path
+
+    def test_thread_diagnostics_opt_in_numeric_and_no_double_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = self.process(root, 1, 0, 1000, 10, 55)
+            self.thread(process, 2)
+            before = guest.sample(1000, root)
+            self.assertNotIn('thread_diagnostics', before['processes'][0])
+            after = guest.sample(1000, root, thread_diagnostics=True)
+            diagnostics = after['processes'][0].pop('thread_diagnostics')
+            self.assertEqual(before, after)
+            self.assertEqual(diagnostics['status'], 'available')
+            self.assertEqual(diagnostics['threads'], [dict(tid=2, start_ticks=57, user_ticks=3,
+                system_ticks=2, voluntary_context_switches=11, involuntary_context_switches=4)])
+            self.assertNotIn('private', json.dumps(diagnostics))
+            self.assertEqual(diagnostics['counter_kind'], 'context-switches-not-wakeups')
+
+    def test_thread_missing_and_permission_denied_are_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = Path(directory)
+            result, attempts = guest.thread_snapshot(process, 1000, 32)
+            self.assertEqual(result['status'], 'unavailable')
+            self.assertEqual(result['threads'], [])
+            self.assertEqual(attempts, 0)
+            with patch.object(guest.os, 'scandir', side_effect=PermissionError('private detail')):
+                result, _ = guest.thread_snapshot(process, 1000, 32)
+            self.assertEqual(result['errors'], [{'error': 'PermissionError'}])
+            self.assertNotIn('private', json.dumps(result))
+
+    def test_thread_invalid_counters_owner_and_identity_are_incomplete(self):
+        for case in ('missing', 'oversized', 'negative', 'uid', 'tid', 'reuse', 'exit'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                process = Path(directory)
+                task = self.thread(process, 2, uid=1001 if case == 'uid' else 1000)
+                if case == 'missing':
+                    (task / 'status').write_text('Uid: 1000\n')
+                if case == 'oversized':
+                    (task / 'status').write_text('x' * 16385)
+                if case == 'negative':
+                    (task / 'status').write_text((task / 'status').read_text().replace(': 11', ': -1'))
+                if case == 'tid':
+                    (task / 'stat').write_text((task / 'stat').read_text().replace('2 (', '3 ('))
+                if case in ('reuse', 'exit'):
+                    first = guest.read_thread(task)
+                    second = (first[0], 'Z' if case == 'exit' else first[1],
+                              dict(first[2], start_ticks=58 if case == 'reuse' else 57))
+                    with patch.object(guest, 'read_thread', side_effect=[first, second]):
+                        result, attempts = guest.thread_snapshot(process, 1000, 32)
+                else:
+                    result, attempts = guest.thread_snapshot(process, 1000, 32)
+                self.assertEqual(result['threads'], [])
+                self.assertEqual(result['status'], 'incomplete')
+                self.assertEqual(attempts, 1)
+                self.assertEqual(len(result['errors']), 1)
+
+    def test_thread_process_reuse_drops_diagnostic_and_accounting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = self.process(root, 1, 0, 1000, 10, 55)
+            self.thread(process, 2)
+            original = guest.thread_snapshot
+            def snapshot(*args):
+                result = original(*args)
+                stat = process / 'stat'
+                stat.write_text(stat.read_text().replace('55', '56'))
+                return result
+            with patch.object(guest, 'thread_snapshot', side_effect=snapshot):
+                result = guest.sample(1000, root, thread_diagnostics=True)
+            self.assertEqual(result['processes'], [])
+            self.assertEqual(result['unreadable'], [{'pid': 1, 'error': 'ProcessIdentityChanged'}])
+
+    def test_thread_caps_bound_reads_and_preserve_process_totals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for pid in range(1, 7):
+                process = self.process(root, pid, 0, 1000, 10, pid)
+                for tid in range(pid * 100, pid * 100 + 35):
+                    self.thread(process, tid)
+            with patch.object(guest, 'read_thread', wraps=guest.read_thread) as read:
+                result = guest.sample(1000, root, thread_diagnostics=True)
+            self.assertEqual(read.call_count, 128 * 2)
+            self.assertEqual(result['pss_kib'], 60)
+            self.assertEqual(result['process_count'], 6)
+            diagnostics = [p['thread_diagnostics'] for p in result['processes']]
+            self.assertEqual(sum(len(d['threads']) for d in diagnostics), 128)
+            self.assertTrue(all(len(d['threads']) <= 32 for d in diagnostics))
+            self.assertTrue(all(d['truncated'] and d['status'] == 'incomplete' for d in diagnostics))
+
+    def test_thread_failures_consume_budget_and_observer_is_excluded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for pid, uid in ((1, 1000), (2, 1000), (3, 1001)):
+                process = self.process(root, pid, 0, uid, 10, pid)
+                self.thread(process, pid, uid)
+            with patch.object(guest, 'thread_snapshot', wraps=guest.thread_snapshot) as snapshot:
+                result = guest.sample(1000, root, observer=1, thread_diagnostics=True)
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertEqual(result['processes'][0]['pid'], 2)
+            with patch.object(guest, 'MAX_THREADS_PER_SAMPLE', 1), \
+                 patch.object(guest, 'read_thread', side_effect=FileNotFoundError) as read:
+                result = guest.sample(1000, root, thread_diagnostics=True)
+            self.assertEqual(read.call_count, 1)
+            self.assertTrue(all(p['thread_diagnostics']['status'] == 'incomplete'
+                                for p in result['processes']))
+
     def test_scope_excludes_other_users_observer_and_descendants(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

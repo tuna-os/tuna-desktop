@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import json
+import itertools
 import os
 import pwd
 import re
@@ -74,6 +75,81 @@ def read_process(path):
         # basename, never the arguments.
         "comm": head.split("(", 1)[1][:15],
     }
+
+
+# Diagnostic-only limits; ordinary process CPU accounting remains unchanged.
+MAX_THREADS_PER_PROCESS = 32
+MAX_THREADS_PER_SAMPLE = 128
+
+
+def bounded_text(path, limit):
+    with path.open(errors="replace") as stream:
+        text = stream.read(limit + 1)
+    if len(text) > limit:
+        raise ValueError("oversized proc record")
+    return text
+
+
+def read_thread(path):
+    """Numeric scheduling counters only: never retain comm, argv or environment."""
+    status = dict(line.split(":", 1) for line in
+                  bounded_text(path / "status", 16384).splitlines() if ":" in line)
+    head, tail = bounded_text(path / "stat", 4096).rsplit(")", 1)
+    fields = tail.split()
+    tid = int(head.split("(", 1)[0])
+    if tid != int(path.name):
+        raise ValueError("thread identity mismatch")
+    row = {
+        "tid": tid, "start_ticks": int(fields[19]),
+        "user_ticks": int(fields[11]), "system_ticks": int(fields[12]),
+        "voluntary_context_switches": int(status["voluntary_ctxt_switches"].strip()),
+        "involuntary_context_switches": int(status["nonvoluntary_ctxt_switches"].strip()),
+    }
+    if any(value < 0 for value in row.values()):
+        raise ValueError("negative proc counter")
+    return int(status["Uid"].split()[0]), fields[0], row
+
+
+def thread_snapshot(path, uid, limit):
+    """Bound work and report races/limits without invalidating process totals.
+
+    Context switches are not wakeup counts or causal stack traces. Match both
+    parent process identity and (tid, start_ticks) before deriving any deltas.
+    """
+    limit = min(MAX_THREADS_PER_PROCESS, max(0, limit))
+    result = {"schema": 1, "threads": [], "errors": [], "truncated": False,
+              "status": "unavailable", "counter_kind": "context-switches-not-wakeups"}
+    if limit == 0:
+        result.update(status="incomplete", truncated=True)
+        return result, 0
+    try:
+        with os.scandir(path / "task") as entries:
+            # Bound enumeration too, including unexpected directory entries.
+            names = [entry.name for entry in itertools.islice(entries, limit + 1)]
+    except OSError as error:
+        result["errors"].append({"error": type(error).__name__})
+        return result, 0
+    result["truncated"] = len(names) > limit
+    attempted = min(len(names), limit)
+    for name in names[:limit]:
+        if not name.isdecimal():
+            result["errors"].append({"error": "InvalidThreadEntry"})
+            continue
+        task = path / "task" / name
+        try:
+            owner, state, row = read_thread(task)
+            owner_after, state_after, after = read_thread(task)
+            if (owner != uid or owner_after != uid or state in ("Z", "X", "x")
+                    or state_after in ("Z", "X", "x")
+                    or row["start_ticks"] != after["start_ticks"]):
+                raise ValueError("thread lifetime changed")
+            result["threads"].append(row)
+        except (OSError, ValueError, KeyError, IndexError) as error:
+            result["errors"].append({"tid": int(name), "error": type(error).__name__})
+    result["threads"].sort(key=lambda row: row["tid"])
+    result["status"] = ("incomplete" if result["errors"] or result["truncated"]
+                        else "available" if result["threads"] else "unavailable")
+    return result, attempted
 
 
 def command_name(path):
@@ -159,7 +235,7 @@ def read_smaps_rollup(path):
             time.sleep(0.0005)
 
 
-def sample(uid, proc=Path("/proc"), observer=None):
+def sample(uid, proc=Path("/proc"), observer=None, thread_diagnostics=False):
     processes, errors = {}, []
     for path in proc.iterdir():
         if not path.name.isdigit():
@@ -177,6 +253,7 @@ def sample(uid, proc=Path("/proc"), observer=None):
             break
         excluded.update(children)
     rows = []
+    thread_budget = MAX_THREADS_PER_SAMPLE
     for pid, row in processes.items():
         if pid in excluded:
             continue
@@ -187,6 +264,9 @@ def sample(uid, proc=Path("/proc"), observer=None):
                        fds=len(list((path / "fd").iterdir())))
             row["drm_clients"], row["drm_errors"] = drm_clients(path)
             row["cmd"] = command_name(path)
+            if thread_diagnostics:
+                row["thread_diagnostics"], attempted = thread_snapshot(path, uid, thread_budget)
+                thread_budget -= attempted
             current_identity = read_process(path)
             if current_identity["start_ticks"] != row["start_ticks"] or current_identity["uid"] != uid:
                 errors.append({"pid": pid, "error": "ProcessIdentityChanged"})
@@ -216,6 +296,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=1)
     ap.add_argument("--user", help="target interactive user; observer may run as root to read protected smaps")
+    ap.add_argument("--thread-diagnostics", action="store_true",
+                    help="bounded numeric per-thread CPU/context-switch counters; no wakeup claim")
     args = ap.parse_args()
     if args.interval <= 0:
         ap.error("interval must be positive")
@@ -226,7 +308,7 @@ def main():
     while True:
         start = time.monotonic()
         boot_start = time.clock_gettime(time.CLOCK_BOOTTIME)
-        row = sample(uid, observer=os.getpid())
+        row = sample(uid, observer=os.getpid(), thread_diagnostics=args.thread_diagnostics)
         current = {(p["pid"], p["start_ticks"]): p["cpu_ticks"] for p in row["processes"]}
         delta = sum(max(0, count - previous.get(key, count)) for key, count in current.items())
         row.update(monotonic_s=start, collection_s=time.monotonic()-start, boottime_s=time.clock_gettime(time.CLOCK_BOOTTIME),

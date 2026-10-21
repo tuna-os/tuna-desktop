@@ -120,3 +120,29 @@ scripts/tuna-perf-gate check --artifacts perf-artifacts
 ```
 
 `check` exits 1 on a regression. Add `--report-only` to only print the tables. A full paired measurement needs KVM, rootful podman and about 40 GB of disk. Follow `performance-baseline.yml` step by step: build the shared preview images, then run `scripts/tuna-perf-profile-pairs stock`, which writes the `perf-artifacts/stock` tree that `check` reads. On a workstation, `scripts/tuna-vm-perf --disk disk.raw --desktop tuna --out <dir>` measures one session, and its `report.json` includes the per-phase, per-role breakdown.
+
+### Bounded per-thread idle diagnostics
+
+The CI-only sampler enables `--thread-diagnostics` for both desktops and both
+profiles without changing the workload, sample interval or budget evaluator.
+Each process sample may include numeric `thread_diagnostics`: TID, start ticks,
+user/system CPU ticks and voluntary/involuntary context-switch counters.
+These counters are **not wakeup counts** or causal stack traces. No thread names,
+command arguments, environment, kernel addresses or arbitrary proc text are added.
+
+Collection is bounded to 32 thread entries per process and 128 per sample,
+including failed/racing reads. Oversized records, unavailable counters,
+permission errors, exits and truncation are explicit. A process whose UID or
+start ticks changes during collection is rejected by the existing identity gate.
+Only compare thread deltas within the same process lifetime and identical
+`(tid, start_ticks)`; do not sum thread CPU with process CPU or treat missing
+counters as zero. Incomplete snapshots are diagnostic evidence, not complete
+thread accounting. The caps can omit relevant tasks: absence from a snapshot
+is not evidence of no scheduling activity. `collection_s` includes this observer
+overhead.
+
+Use the same retained guest idle-phase boundaries for both desktops. Existing
+idle artifacts do not expose compositor frame counts, so these remain unavailable;
+overview response traces and active frame-pacer measurements are not idle-frame
+evidence. Scheduling attribution still requires a fresh paired capture, and a
+counter correlation alone does not establish why a thread ran.
