@@ -466,6 +466,38 @@ class LoginFlow(unittest.TestCase):
             self.assertNotIn("payload_failure", result)
             self.assertNotIn("private", json.dumps(result)); self.assertFalse(fake.actions)
 
+    def test_root_metadata_failure_is_retained_without_continuing_login(self):
+        for late in (False, True):
+            fake = Fake()
+            expected = {"type": "directory", "uid": 0, "gid": 0, "mode": 0o555}
+            failure = {"checkpoint": "protected-payload-identity", "kind": "guard-mismatch",
+                       "protected_record_index": 0, "baseline_files_sha256": "a" * 64,
+                       "root_metadata": {"expected": expected, "observed": dict(expected, mode=0o755),
+                                         "differing_fields": ["mode"]}}
+            def transform(action, value):
+                if action == "published" and (fake.desktop or not late):
+                    return {"schema_version": 1, "profile": gdm.PROFILE,
+                            "immutable_verified": False, "failure": copy.deepcopy(failure)}
+                return value
+            fake.transform = transform
+            result = self.failure(fake, "payload verification failed")
+            self.assertEqual(result["payload_failure"], failure)
+            self.assertEqual(result["stage"], "published-payload-" + ("after" if late else "before") + "-login")
+            if not late: self.assertFalse(fake.actions)
+
+    def test_root_metadata_rejects_private_values_before_receipt_projection(self):
+        fake = Fake()
+        expected = {"type": "directory", "uid": 0, "gid": 0, "mode": 0o555}
+        value = {"schema_version": 1, "profile": gdm.PROFILE, "immutable_verified": False,
+                 "failure": {"checkpoint": "protected-payload-identity", "kind": "guard-mismatch",
+                    "protected_record_index": 0, "baseline_files_sha256": "a" * 64,
+                    "root_metadata": {"expected": expected, "observed": dict(expected, mode="private-mode"),
+                                      "differing_fields": ["mode"]}}}
+        fake.transform = lambda action, original: value if action == "published" else original
+        result = self.failure(fake, "invalid published payload failure evidence")
+        self.assertNotIn("payload_failure", result)
+        self.assertNotIn("private", json.dumps(result)); self.assertFalse(fake.actions)
+
     def test_payload_transport_timeout_is_distinct_from_guest_mismatch(self):
         fake = Fake(); original = fake.observe
         def observe(action, *, timeout):

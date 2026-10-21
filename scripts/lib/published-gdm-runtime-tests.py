@@ -254,6 +254,73 @@ class PayloadVerificationTests(unittest.TestCase):
         self.assertEqual(failure["baseline_files_sha256"], hashlib.sha256(
             json.dumps(self.baseline["files"], sort_keys=True, separators=(",", ":")).encode()).hexdigest())
 
+    def root_baseline(self):
+        self.baseline["files"]["/"] = FakeInventory(self.root, lambda args: "").record("/")
+        self.original = copy.deepcopy(self.baseline)
+
+    def test_root_mode_diagnostic_preserves_exact_fail_closed_comparison(self):
+        self.root_baseline()
+        self.baseline["files"]["/"]["mode"] = 0o555
+        self.original = copy.deepcopy(self.baseline)
+        with self.assertRaisesRegex(ContractError, "protected payload identity changed"):
+            rt.verify_payload()
+        failure = self.report("protected-payload-identity", "guard-mismatch")
+        self.assertEqual(failure["protected_record_index"], 0)
+        self.assertEqual(failure["root_metadata"], {
+            "expected": {"type": "directory", "uid": 0, "gid": 0, "mode": 0o555},
+            "observed": {"type": "directory", "uid": 0, "gid": 0, "mode": 0o755},
+            "differing_fields": ["mode"]})
+
+    def test_root_metadata_differences_are_from_the_actual_compared_records(self):
+        self.root_baseline()
+        original = FakeInventory.record
+        for key, value in (("uid", 10), ("gid", 20), ("mode", 0o777), ("type", "file"),
+                           ("resolved_path", "/private-path"), ("parent_links", ["private-link"]),
+                           ("private-field", "private-content")):
+            def record(observer, name):
+                actual = original(observer, name)
+                return dict(actual, **{key: value}) if name == "/" else actual
+            with self.subTest(key=key), patch.object(FakeInventory, "record", record):
+                failure = self.report("protected-payload-identity", "guard-mismatch")
+                detail = failure["root_metadata"]
+                self.assertEqual(detail["differing_fields"], [key if key in rt.ROOT_RECORD_FIELDS else "record_shape"])
+                self.assertEqual(detail["expected"], {k: self.baseline["files"]["/"][k] for k in rt.ROOT_METADATA_FIELDS})
+                if key in rt.ROOT_METADATA_FIELDS: self.assertEqual(detail["observed"][key], value)
+
+    def test_root_read_failure_and_unchanged_root_have_no_metadata_mismatch(self):
+        self.root_baseline()
+        self.assertTrue(rt.payload_report()["immutable_verified"])
+        original = FakeInventory.record
+        def record(observer, name):
+            if name == "/": raise ContractError("private-root-read")
+            return original(observer, name)
+        with patch.object(FakeInventory, "record", record):
+            failure = self.report("protected-payload-read", "invalid-or-unavailable")
+            self.assertNotIn("root_metadata", failure)
+
+    def test_root_metadata_schema_is_bounded_and_context_bound(self):
+        expected = {"type": "directory", "uid": 0, "gid": 0, "mode": 0o555}
+        value = {"schema_version": 1, "profile": rt.PROFILE, "immutable_verified": False,
+                 "failure": {"checkpoint": "protected-payload-identity", "kind": "guard-mismatch",
+                    "protected_record_index": 0, "baseline_files_sha256": "a" * 64,
+                    "root_metadata": {"expected": expected, "observed": dict(expected, mode=0o755),
+                                      "differing_fields": ["mode"]}}}
+        rt.validate_payload_failure(value)
+        for field, bad in (("uid", True), ("uid", -1), ("gid", 2**32), ("mode", 0o10000),
+                           ("mode", None), ("type", "private-type"), ("private-field", "private-value")):
+            for side in ("expected", "observed"):
+                candidate = copy.deepcopy(value); candidate["failure"]["root_metadata"][side][field] = bad
+                with self.subTest(field=field, side=side), self.assertRaises(ContractError):
+                    rt.validate_payload_failure(candidate)
+        for fields in ([], ["uid"], ["mode", "uid"], ["mode", "mode"], ["private-field"], "mode", [True]):
+            candidate = copy.deepcopy(value); candidate["failure"]["root_metadata"]["differing_fields"] = fields
+            with self.subTest(fields=fields), self.assertRaises(ContractError): rt.validate_payload_failure(candidate)
+        for key, bad in (("protected_record_index", 1), ("kind", "timeout"), ("checkpoint", "protected-payload-read")):
+            candidate = copy.deepcopy(value); candidate["failure"][key] = bad
+            with self.subTest(key=key), self.assertRaises(ContractError): rt.validate_payload_failure(candidate)
+        candidate = copy.deepcopy(value); candidate["failure"]["root_metadata"]["stderr"] = "private"
+        with self.assertRaises(ContractError): rt.validate_payload_failure(candidate)
+
     def test_file_read_error_is_never_reported_as_mismatch(self):
         for error in (PermissionError("private-file"), ContractError("private-contract"), ValueError("private-shape")):
             with self.subTest(error=type(error)), patch.object(FakeInventory, "record", side_effect=error):

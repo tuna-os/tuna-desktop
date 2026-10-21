@@ -52,6 +52,9 @@ PAYLOAD_CHECKPOINTS = frozenset(("collector-initialization", "package-snapshot",
     "runtime-gdm-policy", "observation-deadline", "observer-transport"))
 PAYLOAD_FAILURE_KINDS = frozenset(("guard-mismatch", "invalid-or-unavailable", "timeout",
     "command-unavailable", "output-bound", "retirement-unverified", "transport-or-observer-unavailable"))
+ROOT_METADATA_FIELDS = frozenset(("type", "uid", "gid", "mode"))
+ROOT_RECORD_FIELDS = ROOT_METADATA_FIELDS | {"resolved_path", "parent_links"}
+ROOT_DIFFERING_FIELDS = ROOT_RECORD_FIELDS | {"record_shape"}
 
 
 class ObservationError(ContractError):
@@ -61,13 +64,46 @@ class ObservationError(ContractError):
         self.kind = kind
 
 
+def root_metadata_difference(expected, observed):
+    """Project only fixed root metadata from records already read for comparison."""
+    differing = {key for key in ROOT_RECORD_FIELDS if expected.get(key) != observed.get(key)}
+    if (set(expected) - ROOT_RECORD_FIELDS) != (set(observed) - ROOT_RECORD_FIELDS):
+        differing.add("record_shape")
+    return {"expected": {key: expected.get(key) for key in ROOT_METADATA_FIELDS},
+            "observed": {key: observed.get(key) for key in ROOT_METADATA_FIELDS},
+            "differing_fields": sorted(differing)}
+
+
+def validate_root_metadata(value):
+    require(type(value) is dict and set(value) == {"expected", "observed", "differing_fields"},
+            "invalid root metadata fields")
+    for side in ("expected", "observed"):
+        record = value[side]
+        require(type(record) is dict and set(record) == ROOT_METADATA_FIELDS,
+                "invalid root metadata record")
+        require(type(record["type"]) is str and record["type"] in {"directory", "file", "symlink", "missing"},
+                "invalid root metadata type")
+        for key, maximum in (("uid", 2**32 - 1), ("gid", 2**32 - 1), ("mode", 0o7777)):
+            require(record[key] is None if record["type"] == "missing" else
+                    type(record[key]) is int and 0 <= record[key] <= maximum,
+                    "invalid root metadata number")
+    require(value["expected"]["type"] == "directory", "invalid baseline root type")
+    fields = value["differing_fields"]
+    require(type(fields) is list and 0 < len(fields) <= len(ROOT_DIFFERING_FIELDS)
+            and all(type(key) is str and key in ROOT_DIFFERING_FIELDS for key in fields)
+            and fields == sorted(set(fields)), "invalid root differing fields")
+    require(set(fields) & ROOT_METADATA_FIELDS == {key for key in ROOT_METADATA_FIELDS
+            if value["expected"][key] != value["observed"][key]}, "inconsistent root metadata difference")
+
+
 def validate_payload_failure(value):
     require(type(value) is dict and set(value) == {"schema_version", "profile", "immutable_verified", "failure"}
             and type(value["schema_version"]) is int and value["schema_version"] == 1
             and value["profile"] == PROFILE and value["immutable_verified"] is False,
             "invalid payload failure envelope")
     failure = value["failure"]
-    require(type(failure) is dict and set(failure) == {"checkpoint", "kind", "protected_record_index", "baseline_files_sha256"},
+    required = {"checkpoint", "kind", "protected_record_index", "baseline_files_sha256"}
+    require(type(failure) is dict and set(failure) in (required, required | {"root_metadata"}),
             "invalid payload failure fields")
     checkpoint, kind = failure["checkpoint"], failure["kind"]
     require(type(checkpoint) is str and checkpoint in PAYLOAD_CHECKPOINTS
@@ -84,6 +120,10 @@ def validate_payload_failure(value):
             "runtime-unit-overrides", "runtime-dropins", "runtime-gdm-policy"}, "invalid payload mismatch category")
     require(checkpoint != "observer-transport" or (kind in {"timeout", "transport-or-observer-unavailable"}
             and index is None and digest is None), "invalid payload transport category")
+    if "root_metadata" in failure:
+        require(checkpoint == "protected-payload-identity" and kind == "guard-mismatch" and index == 0,
+                "unbound root metadata")
+        validate_root_metadata(failure["root_metadata"])
     return dict(failure)
 
 
@@ -201,6 +241,8 @@ def verify_payload(*, _diagnostic=None):
         if (_diagnostic is not None and name in owner_query_failures
                 and expected.get("owner") is not None and actual.get("owner") is None):
             _diagnostic["_command_failure"] = owner_query_failures[name]
+        if _diagnostic is not None and name == "/" and actual != expected:
+            _diagnostic["root_metadata"] = root_metadata_difference(expected, actual)
         require(actual == expected, "protected payload identity changed")
     # No boot-generated launch overrides may be hidden by the persistent comparison.
     for root in UNIT_PATHS:

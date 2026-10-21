@@ -516,6 +516,13 @@ contains the following fixed, bounded fields:
 - `baseline_files_sha256`: null before a baseline is available, otherwise SHA-256
   of `json.dumps(files, sort_keys=True, separators=(",", ":")).encode()`.
   Match this digest against the retained preflight before interpreting an index.
+- Optional `root_metadata`: only on a root-record identity mismatch at index zero.
+  `expected` and `observed` each contain only `type`, `uid`, `gid`, and `mode`
+  (integer permission bits, including special bits; null numeric values only for
+  a missing observed root). `differing_fields` is a sorted, unique fixed enum list:
+  those four metadata fields, `resolved_path`, `parent_links`, or `record_shape`.
+  The last three name differences without retaining their values. This uses the
+  exact records already compared, with no additional command, mount or file read.
 
 No path, file content, exception message, stderr, command output, credential or
 environment value is copied into failure evidence. Typed command outcomes avoid
@@ -524,3 +531,22 @@ concrete identity-mismatch claim; expected unowned-file queries do not overwrite
 later mismatch evidence. An unavailable transport cannot establish which guest
 check ran. Existing deadlines, anchored command retirement, payload comparisons,
 PAM, real UI/password requirements and all native/five-boot gates are unchanged.
+
+In ordinary [run 39605965422](https://github.com/tuna-os/tuna-desktop/actions/runs/39605965422),
+all five boots accepted greeter readiness and then reported a
+`protected-payload-identity` / `guard-mismatch` at index zero before UI observation.
+Artifact `12349075991` (SHA-256
+`1c1caaba4a7b5d1a966d08360a0ee0b7b214b9c3256a7e97ee127a8e3d726fdb`)
+binds that index to the root directory record using baseline-files SHA-256
+`81ae6321b29b5c4b195d36758e0088eb0ed945e032af6c5dfad653231595bda3`.
+The packaged root record is a directory, UID/GID zero and mode 0555. That run did
+not retain the differing live field. Successful before/after fixture comparisons
+precede bootc's disk installation; the serial log later shows composefs boot.
+This bounds the observed change between the post-fixture comparison and the
+booted pre-login check, without determining whether installation or boot caused
+it. The published fixture, install workflow and QEMU boot path contain no explicit
+guest-root chmod/chown.
+The new root metadata projection is diagnostic only: exact root equality still
+fails closed. Neither a live mode of 0755 nor an acceptable mount conversion is
+established by the existing artifact, and synthetic metadata tests are not runtime
+evidence.
