@@ -240,6 +240,10 @@ def cancelled_sleep_auth_retirement(trace, expected, current_epoch, original, ph
             or physical["delay_absent"] is not True or physical["owned_group_members"] != []
             or not auth_uint(current_epoch) or current_epoch <= expected["epoch"]):
         return None
+    # One stderr write can span interleaved journal records. Reassemble
+    # by session PID before parsing either the receipt or its shell denial;
+    # incomplete or malformed records still fail the strict matcher below.
+    trace = '\n'.join(session_records(trace))
     prefix = 'tuna-compositor: lock authentication owned retirement '
     keys = {'pid', 'joined_ok', 'retired', 'authenticated', 'denied', 'cancel_requested', 'reported_ok',
             'applied', 'attempt_serial', 'attempt_epoch', 'current_epoch', 'origin', 'locked_after'}

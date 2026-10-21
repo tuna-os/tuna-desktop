@@ -2854,7 +2854,60 @@ class PrivatePamSleepControls(unittest.TestCase):
                           origin=dict(connection=4, request=12), locked_after=True)
 
     def trace(self, event=None, denial=None):
-        return 'tuna-compositor: lock authentication owned retirement ' + json.dumps(self.event if event is None else event) + '\n' + (self.legacy.denial if denial is None else denial)
+        return ('tuna-vm-session[600]: tuna-compositor: lock authentication owned retirement '
+                + json.dumps(self.event if event is None else event) + '\n'
+                + 'tuna-vm-session[601]: ' + (self.legacy.denial if denial is None else denial))
+
+    def fragmented_trace(self, event=None):
+        # Run 39584168097 sheared the JSON after {, "applied and ".
+        # Sanitized identities; unrelated processes interleave both records.
+        payload = json.dumps(self.event if event is None else event,
+                             sort_keys=True, separators=(',', ':'))
+        return '\n'.join([
+            'tuna-vm-session[601]: tuna-shell-gtk: lock command result applied=',
+            'tuna-vm-session[600]: tuna-compositor: lock authentication owned retirement {',
+            'NetworkManager[702]: state changed',
+            'tuna-vm-session[602]: tuna-ibus-bridge: text field ',
+            'tuna-vm-session[600]: "applied',
+            'tuna-vm-session[601]: false request_id=',
+            'tuna-vm-session[602]: focused',
+            'tuna-vm-session[600]: "',
+            'tuna-vm-session[601]: 12',
+            'tuna-vm-session[600]: ' + payload[len('{"applied"'):],
+        ])
+
+    def test_fragmented_interleaved_retirement_and_denial_reassemble(self):
+        serial = self.fragmented_trace()
+        records = lane.session_records(serial)
+        self.assertEqual(len(records), 3)
+        self.assertIn(self.legacy.denial, records)
+        self.assertIn('tuna-ibus-bridge: text field focused', records)
+        self.assertLess(sum(map(len, records)), len(serial))
+        self.assertEqual(self.match(trace=serial), self.event)
+
+    def test_fragmented_wrong_identity_or_retirement_still_refused(self):
+        for key, value in [('pid', 601), ('attempt_serial', 10), ('attempt_epoch', 6),
+                           ('current_epoch', 9), ('origin', {'connection': 5, 'request': 12}),
+                           ('origin', {'connection': 4, 'request': 13}), ('retired', False),
+                           ('denied', False), ('authenticated', True), ('applied', True)]:
+            with self.subTest(key=key, value=value):
+                self.assertIsNone(self.match(trace=self.fragmented_trace({**self.event, key: value})))
+
+    def test_fragmented_incomplete_malformed_duplicate_or_mixed_records_refused(self):
+        serial = self.fragmented_trace()
+        incomplete = serial.rsplit('\n', 1)[0]
+        invalid = [incomplete, incomplete + '\n' + self.trace(),
+                   serial.replace('"retired":true}', '"retired":tru}'),
+                   serial + '\n' + self.trace(),
+                   serial.replace('tuna-vm-session[600]: :false', 'tuna-vm-session[603]: :false'),
+                   serial.replace('tuna-vm-session[600]: "applied', 'tuna-vm-session[603]: "applied'),
+                   serial.replace('tuna-vm-session[600]: "applied',
+                                  'tuna-vm-session[600]: tuna-compositor: unrelated record\n'
+                                  'tuna-vm-session[600]: "applied'),
+                   serial.replace('tuna-vm-session[601]: 12', 'tuna-vm-session[603]: 12')]
+        for trace in invalid:
+            with self.subTest(trace=trace):
+                self.assertIsNone(self.match(trace=trace))
 
     def match(self, trace=None, original=None, physical=None, current=8):
         return lane.cancelled_sleep_auth_retirement(self.trace() if trace is None else trace,
