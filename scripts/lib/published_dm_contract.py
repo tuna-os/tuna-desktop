@@ -476,8 +476,8 @@ class Inventory:
             self.packages[fields[0]] = fields[1]
         if not all(name in self.packages for name in ("gdm", "tuna-desktop", "gnome-shell", "pam")):
             raise ContractError("required installed package is missing")
-        if "roost" in self.packages:
-            raise ContractError("legacy roost package is installed beside tuna-desktop")
+        if "roost" in self.packages:  # tuna-rename: keep
+            raise ContractError("legacy roost package is installed beside tuna-desktop")  # tuna-rename: keep
 
     def pam_closure(self, service, expected_owner=None, visiting=()):
         if service in visiting:
@@ -620,7 +620,7 @@ def validate_report(report):
                 or not DIGEST.fullmatch(subject["platform_digest"])):
         raise ContractError("the declared immutable image subject is missing")
     files, packages, pam = report["files"], report["packages"], report.get("pam")
-    if (not {"gdm", "tuna-desktop", "gnome-shell", "pam"} <= packages.keys() or "roost" in packages
+    if (not {"gdm", "tuna-desktop", "gnome-shell", "pam"} <= packages.keys() or "roost" in packages  # tuna-rename: keep
             or any(not isinstance(name, str) or not name or not isinstance(version, str) or not version
                    for name, version in packages.items())):
         raise ContractError("required installed package evidence is incomplete")

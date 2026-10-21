@@ -65,6 +65,12 @@ jobs:
           sudo podman pull "ghcr.io/tuna-os/marlin@$digest"
           test "$(sudo podman image inspect "ghcr.io/tuna-os/marlin@$digest" --format '{{.Digest}}')" = "$digest"
           echo "$digest" | tee /mnt/vm/published-digest
+          # Inspect the original image before any fixture build or installation.
+          # The runner verifies raw registry/config digests and the restricted
+          # container's image ID; a static pass is not desktop qualification.
+          mkdir -p published-vm-artifacts
+          sudo -n /usr/bin/python3 -I -S -B scripts/tuna-published-preflight --image "ghcr.io/tuna-os/marlin@$digest" \
+            --out published-vm-artifacts
           sudo podman build -f packaging/marlin/vm-lane/Containerfile.published \
             --build-arg "BASE_IMAGE=ghcr.io/tuna-os/marlin@$digest" \
             -t localhost/marlin-tuna-published-fixtures:ci .

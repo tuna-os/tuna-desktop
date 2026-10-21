@@ -287,7 +287,7 @@ class MountedInventory(unittest.TestCase):
 
     def test_missing_required_package_and_legacy_provides_fail(self):
         del self.packages["tuna-desktop"]
-        self.packages["roost"] = "1.0-1"
+        self.packages["roost"] = "1.0-1"  # tuna-rename: keep
         self.assert_refused("required installed package")
 
     def test_wrong_file_owner_fails_even_if_package_present(self):
