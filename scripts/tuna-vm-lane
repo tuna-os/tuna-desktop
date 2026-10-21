@@ -52,6 +52,7 @@ import time
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "lib"))
+import published_gdm_login
 _loader = importlib.machinery.SourceFileLoader("tuna_baseline",
                                                os.path.join(HERE, "tuna-baseline"))
 _spec = importlib.util.spec_from_loader("tuna_baseline", _loader)
@@ -611,10 +612,22 @@ def retain_amplification_sample(case, actual, checks):
 
 
 def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None, strip_edge=False,
-                  published=False, orca_contract="distribution"):
+                  published=False, orca_contract="distribution", display_manager_profile="current-greetd",
+                  login_receipt=None):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
     evidence = os.path.join(out, "lifecycle")
     os.makedirs(evidence, exist_ok=True)
+    gdm_profile = display_manager_profile == "published-gdm"
+    if gdm_profile:
+        if not login_receipt or login_receipt.get("pass") is not True:
+            raise RuntimeError("published lifecycle requires the actual successful GDM login receipt")
+        agent = PublishedSessionAgent(agent, login_receipt)
+        with open(os.path.join(evidence, "pam-coverage.json"), "w") as stream:
+            json.dump({"profile": display_manager_profile, "shipped_pam_unchanged": True,
+                       "not_exercised": ["V-SLEEP-AUTH-FAIL-CLOSED", "V-AUTH-FAIL-CLOSED"],
+                       "reason": "modified-PAM adversarial probes belong to current-greetd; "
+                                 "published GDM password rejection/recovery is observed through its shipped UI"},
+                      stream, indent=2)
 
     def inventory(label, deadline=None):
         # Other lifecycle callers retain their original default behavior.
@@ -870,13 +883,14 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     expected = {"tuna-compositor", "tuna-shell-gtk", "gnome-disks", "gnome-system-monitor", "nautilus"}
     nonroot = (before["probe_uid"] == 0 and before["session_uid"] != 0
                and before["session"]["User"] == str(before["session_uid"])
-               and before["session"]["Service"] == "greetd"
+               and before["session"]["Service"] == ("gdm-password" if gdm_profile else "greetd")
                and all(p["uid"] == before["session_uid"] for p in before["processes"]))
     intact = expected <= {guest_role(p["executable"]) for p in before["processes"]} and len(before["state"]["windows"]) >= 3
-    record("V-LIFECYCLE-OWNER", nonroot and intact, "root probe, non-root greetd session and three real app processes/surfaces")
+    record("V-LIFECYCLE-OWNER", nonroot and intact,
+           "root probe, non-root " + display_manager_profile + " session and three real app processes/surfaces")
     if not nonroot or not intact or before["state"]["locked"]:
         raise RuntimeError("lifecycle preconditions failed")
-    if published:
+    if published and not gdm_profile:
         # The published flavor ships a released shell and fixture image that
         # predate the brightness contract proof; qualify it on the current build.
         record("V-BRIGHTNESS-CONTRACT", True,
@@ -1750,10 +1764,16 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     before = before_vt
     base_frame = frame("before-vt")
     vt = int(before["session"]["VTNr"])
-    away = 2 if vt != 2 else 3
+    away = published_away_vt(before) if gdm_profile else (2 if vt != 2 else 3)
     offset = len(read_text(serial_path))
     switched = agent.run("vt", away)
     time.sleep(2)
+    if gdm_profile:
+        # Only this intentional away stage permits an inactive original owner;
+        # ordinary inventory remains foreground-strict before and after it.
+        away_state = agent.inventory_away(away)
+        with open(os.path.join(evidence, "vt-away-identity.json"), "w") as stream:
+            json.dump(away_state, stream, indent=2)
     frame("vt-away")
     returned = agent.run("vt", vt)
     time.sleep(3)
@@ -1885,7 +1905,23 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     # Admit an actual helper with a real delayed PAM stack before sleep.
     # Sleep must cancel and physically retire it without unlocking. The separate
     # controlled late-success epoch proof still tests queued accepted results.
-    if sleep_auth_qualifies(published, before["state"]):
+    if gdm_profile:
+        # Qualify native S3 and fresh shipped-PAM unlock without modifying PAM.
+        # No stale-attempt assertion is emitted: that adversarial fixture is
+        # outside the immutable published profile and its omission is retained.
+        agent.run("lock")
+        await_state(lambda state: state["state"]["locked"])
+        resumed = suspend_and_check()
+        qmp.keys("esc")
+        qmp.keys("ret")
+        time.sleep(1)
+        qmp.keys("ctrl", "a")
+        qmp.type_text("tuna")
+        qmp.keys("ret")
+        fresh = await_state(lambda state: not state["state"]["locked"], timeout=15)
+        record("V-SLEEP-FRESH-AUTH", same_apps(before, fresh),
+               "unchanged shipped PAM accepts a fresh correct password after real S3; same original session")
+    elif sleep_auth_qualifies(published, before["state"]):
         # The published guest ships a released compositor that predates the
         # auth_owner snapshot, so the owned stale-attempt proof cannot bind.
         # Still exercise real lock → S3 → fresh unlock and client repaint.
@@ -2019,24 +2055,25 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
            and varied_mask(frame("locked-vt")),
            "VT away/back while locked repaints the mask and preserves app/process identities")
 
-    agent.run("deny-unlock")
-    try:
-        qmp.keys("esc")
-        qmp.keys("ret")
-        time.sleep(1)
-        qmp.keys("ctrl", "a")
-        qmp.type_text("tuna")
-        auth_offset = len(read_text(serial_path))
-        qmp.keys("ret")
-        time.sleep(12)
-        denied = inventory("pam-denied")
-        auth_records = session_records(read_text(serial_path)[auth_offset:])
-        attempted = (any("tuna-shell-gtk: lock password submitted" in line for line in auth_records)
-                     and any("tuna-shell-gtk: lock command result applied=false" in line for line in auth_records))
-        record("V-AUTH-FAIL-CLOSED", attempted and denied["state"]["locked"] and same_apps(before, denied),
-               "fresh submitted/refused milestones: real pam_deny service rejects the correct fixture password; apps remain inaccessible")
-    finally:
-        agent.run("restore-unlock")
+    if not gdm_profile:
+        agent.run("deny-unlock")
+        try:
+            qmp.keys("esc")
+            qmp.keys("ret")
+            time.sleep(1)
+            qmp.keys("ctrl", "a")
+            qmp.type_text("tuna")
+            auth_offset = len(read_text(serial_path))
+            qmp.keys("ret")
+            time.sleep(12)
+            denied = inventory("pam-denied")
+            auth_records = session_records(read_text(serial_path)[auth_offset:])
+            attempted = (any("tuna-shell-gtk: lock password submitted" in line for line in auth_records)
+                         and any("tuna-shell-gtk: lock command result applied=false" in line for line in auth_records))
+            record("V-AUTH-FAIL-CLOSED", attempted and denied["state"]["locked"] and same_apps(before, denied),
+                   "fresh submitted/refused milestones: real pam_deny service rejects the correct fixture password; apps remain inaccessible")
+        finally:
+            agent.run("restore-unlock")
     agent.run("stop-portal")
     agent.run("kill-shell")
     killed_mask = varied_mask(frame("shell-killed"))
@@ -2069,42 +2106,42 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         departing_orca = await_orca(True)
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
             json.dump(departing_orca, stream, indent=2)
-    agent.run("logout")
-    deadline = time.monotonic() + 30
-    greeter = {}
-    greeter_visible = False
-    # The published lane keeps the greeter frame that preceded login. Its
-    # shipped stylesheet paints the variant wallpaper, so the repainted
-    # greeter must match that frame; the CI image's own stylesheet has a
-    # #222226 window background with light controls/text instead. Process
-    # startup, a black scanout or a uniform fill can pass neither.
-    reference_path = os.path.join(out, "greeter-before-login.ppm")
-    reference = read_ppm(reference_path) if os.path.exists(reference_path) else None
-    while time.monotonic() < deadline:
-        greeter = agent.run("greeter")
-        if greeter["greetd_active"] and greeter["greeter_pids"] and not greeter["compositor_pids"]:
-            image = frame("logout-greeter")
-            width, height, pixels = image
-            colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
-                      for y in range(0, height, 8) for x in range(0, width, 8)}
-            if reference is not None:
-                changed = difference(reference, image)
-                greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": len(colors)}
-                greeter_visible = changed < 0.05 and len(colors) >= 8
-            else:
-                background = sum(all(abs(pixels[i + channel] - value) <= 4
-                                     for channel, value in enumerate((34, 34, 38)))
-                                 for i in range(0, len(pixels), 3)) / (width * height)
-                light = sum(min(pixels[i:i + 3]) > 160 for i in range(0, len(pixels), 3))
-                greeter["paint"] = {"background_fraction": background, "light_pixels": light}
-                greeter_visible = background > 0.25 and light >= 100
-            if greeter_visible:
-                break
-        time.sleep(0.5)
-    with open(os.path.join(evidence, "greeter.json"), "w") as stream:
-        json.dump(greeter, stream, indent=2)
-    record("V-LOGOUT", greeter_visible,
-           "real session termination returns to a painted gtkgreet surface under active greetd, with no original compositor")
+    if gdm_profile:
+        published_logout(qmp, agent.raw, out, login_receipt, record)
+        greeter_visible = True
+    else:
+        agent.run("logout")
+        deadline = time.monotonic() + 30
+        greeter = {}
+        greeter_visible = False
+        # The legacy shipped greetd lane retains its original pixel reference.
+        reference_path = os.path.join(out, "greeter-before-login.ppm")
+        reference = read_ppm(reference_path) if os.path.exists(reference_path) else None
+        while time.monotonic() < deadline:
+            greeter = agent.run("greeter")
+            if greeter["greetd_active"] and greeter["greeter_pids"] and not greeter["compositor_pids"]:
+                image = frame("logout-greeter")
+                width, height, pixels = image
+                colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+                          for y in range(0, height, 8) for x in range(0, width, 8)}
+                if reference is not None:
+                    changed = difference(reference, image)
+                    greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": len(colors)}
+                    greeter_visible = changed < 0.05 and len(colors) >= 8
+                else:
+                    background = sum(all(abs(pixels[i + channel] - value) <= 4
+                                         for channel, value in enumerate((34, 34, 38)))
+                                     for i in range(0, len(pixels), 3)) / (width * height)
+                    light = sum(min(pixels[i:i + 3]) > 160 for i in range(0, len(pixels), 3))
+                    greeter["paint"] = {"background_fraction": background, "light_pixels": light}
+                    greeter_visible = background > 0.25 and light >= 100
+                if greeter_visible:
+                    break
+            time.sleep(0.5)
+        with open(os.path.join(evidence, "greeter.json"), "w") as stream:
+            json.dump(greeter, stream, indent=2)
+        record("V-LOGOUT", greeter_visible,
+               "real session termination returns to a painted gtkgreet surface under active greetd, with no original compositor")
     if older_guest:
         with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:
             json.dump({"predates_instrumentation": True}, stream, indent=2)
@@ -2122,7 +2159,219 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             raise RuntimeError("Orca survived the hardware session logout")
     if not greeter_visible:
         raise RuntimeError("live gtkgreet did not paint its actual visible surface after logout")
-    record("V-LIFECYCLE", True, "all lifecycle operations completed; individual assertions remain mandatory")
+    if gdm_profile:
+        fresh_login = gdm_login(qmp, agent.raw, out, record, previous=login_receipt)
+        # A fresh identity alone cannot qualify the new desktop's native paint.
+        qmp.keys("esc")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            after = agent.raw.run("inventory", timeout=deadline - time.monotonic())
+            if time.monotonic() >= deadline:
+                raise RuntimeError("fresh relogin native observation deadline expired")
+            identity = published_gdm_login.validate_owner(after, fresh_login["boot_id"])
+            if identity != fresh_login["session_identity"]:
+                raise RuntimeError("fresh relogin desktop identity changed")
+            frame("relogin-native")
+            native, detail = check_panel(os.path.join(evidence, "relogin-native.ppm"))
+            if time.monotonic() >= deadline:
+                raise RuntimeError("fresh relogin native observation deadline expired")
+            if native and any(p["executable"] == "tuna-shell-gtk" and p["uid"] == identity["uid"]
+                              for p in after["processes"]):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("fresh GDM relogin never painted its actual native desktop")
+        record("V-RELOGIN", True, "same boot, fresh password-authenticated GDM session/compositor and native shell paint: " + detail)
+    record("V-LIFECYCLE", True,
+           "all in-profile lifecycle operations completed; individual assertions and explicit coverage remain mandatory")
+
+
+class PublishedSessionAgent:
+    """Keep every lifecycle inventory bound to the original GDM identity."""
+
+    def __init__(self, raw, receipt):
+        self.raw, self.receipt = raw, receipt
+
+    def inventory_away(self, target, **kwargs):
+        value = self.raw.run("inventory", **kwargs)
+        identity = published_gdm_login.validate_owner(
+            value, self.receipt["boot_id"], require_active=False, away_vt=target)
+        if identity != self.receipt["session_identity"]:
+            raise RuntimeError("original published desktop session or compositor changed while VT-away")
+        return value
+
+    def run(self, action, *arguments, **kwargs):
+        if action in {"delay-unlock", "deny-unlock", "restore-unlock"}:
+            raise RuntimeError("published profile cannot modify shipped PAM")
+        value = self.raw.run(action, *arguments, **kwargs)
+        if action == "inventory":
+            identity = published_gdm_login.validate_owner(value, self.receipt["boot_id"])
+            if identity != self.receipt["session_identity"]:
+                raise RuntimeError("original published desktop session or compositor changed")
+        return value
+
+
+def published_away_vt(inventory):
+    """Choose an observed unused VT, preserving GDM's independently placed greeter."""
+    occupied = inventory.get("occupied_vts")
+    if (type(occupied) is not list or not occupied
+            or any(type(vt) is not int or vt <= 0 for vt in occupied)
+            or len(set(occupied)) != len(occupied)):
+        raise RuntimeError("missing or invalid observed seat VT inventory")
+    current = int(inventory["session"]["VTNr"])
+    if current not in occupied or not 1 <= current <= 12:
+        raise RuntimeError("original GDM VT is outside the verified test range")
+    for candidate in range(1, 13):
+        if candidate not in occupied:
+            return candidate
+    raise RuntimeError("no unoccupied test VT observed")
+
+
+def gdm_paint(qmp, out, stage, *, timeout):
+    """Retain actual native scanout; public semantic controls prove its meaning."""
+    if not re.fullmatch(r"[a-z-]+", stage):
+        raise ValueError("invalid bounded GDM frame stage")
+    os.makedirs(out, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    ppm = os.path.join(out, stage + ".ppm")
+    png = os.path.join(out, stage + ".png")
+    while time.monotonic() < deadline:
+        sock = getattr(qmp, "sock", None)
+        old_timeout = sock.gettimeout() if sock is not None else None
+        try:
+            if sock is not None:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise RuntimeError("GDM frame deadline expired")
+                sock.settimeout(min(old_timeout, budget) if old_timeout is not None else budget)
+            qmp.cmd("screendump", filename=ppm, format="ppm")
+            width, height, pixels = read_ppm(ppm)
+            colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+                      for y in range(0, height, 8) for x in range(0, width, 8)}
+            if ((width, height) == (WIDTH, HEIGHT) and len(pixels) == width * height * 3
+                    and len(colors) >= 8):
+                qmp.cmd("screendump", filename=png, format="png")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("GDM frame deadline expired")
+                return {"painted": True}
+        finally:
+            if sock is not None:
+                sock.settimeout(old_timeout)
+        time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+    raise RuntimeError("actual nonblank GDM scanout was not observed")
+
+
+def gdm_login(qmp, agent, out, record, previous=None, timeout=120, expected_image=None):
+    if previous is not None and expected_image is None:
+        expected_image = previous.get("subject", {}).get("image")
+    if expected_image is None:
+        raise RuntimeError("published GDM login requires the host's exact immutable image")
+    phase = "gdm-relogin" if previous is not None else "gdm-login"
+    destination = os.path.join(out, phase)
+    os.makedirs(destination, exist_ok=True)
+    receipt = {}
+    try:
+        result = published_gdm_login.login(
+            qmp, agent.run, lambda stage, **kw: gdm_paint(qmp, destination, stage, **kw),
+            previous=previous, receipt=receipt, timeout=timeout, width=WIDTH, height=HEIGHT,
+            expected_image=expected_image)
+        record("V-GDM-RELOGIN" if previous is not None else "V-GDM-LOGIN", True,
+               "visible shipped GDM user/password flow and verified non-root gdm-password Tuna session")
+        if previous is None:
+            record("V-GREETER-LIST", result["picker_selected"],
+                   "actual GDM menu opens, Tuna Desktop is selected, reopened and observed selected")
+            record("V-GDM-PASSWORD-REJECTION", result["wrong_password_rejected"],
+                   "one wrong password rejected by shipped GDM, no desktop appeared; correct password recovered")
+        record("V-GDM-RELOGIN-LAUNCH" if previous is not None else "V-GDM-EFFECTIVE-LAUNCH",
+               result["effective_launch_verified"],
+               "actual UI/password, immutable files and runtime search/process joins; reviewed GDM/Tuna source informs launch inference; historical exec not observed")
+        return result
+    except (OSError, ValueError, RuntimeError):
+        record("V-GDM-RELOGIN" if previous is not None else "V-GDM-LOGIN", False,
+               "shipped GDM flow failed; bounded public phase evidence retained")
+        raise
+    finally:
+        with open(os.path.join(destination, "receipt.json"), "w") as stream:
+            json.dump(receipt, stream, indent=2)
+
+
+def initial_gdm_login(qmp, agent_path, out, record, timeout=120, expected_image=None):
+    # The constructor's synchronization has its own five-second upper bound.
+    # It may be retried only before a guest-exec was submitted; a poisoned
+    # guest-exec transport is never silently replaced and its action repeated.
+    deadline = time.monotonic() + timeout
+    while deadline - time.monotonic() > 5:
+        try:
+            agent = guest_agent.GuestAgent(agent_path)
+        except (OSError, RuntimeError, ValueError):
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+            continue
+        try:
+            return gdm_login(qmp, agent, out, record, timeout=deadline - time.monotonic(),
+                             expected_image=expected_image)
+        finally:
+            agent.close()
+    raise RuntimeError("guest transport did not synchronize within the GDM login deadline")
+
+
+def published_logout(qmp, agent, out, previous, record):
+    """Observe exact original teardown and a real foreground painted GDM UI."""
+    destination = os.path.join(out, "gdm-logout")
+    os.makedirs(destination, exist_ok=True)
+    original = {"boot_id": previous["boot_id"], "session_identity": previous["session_identity"]}
+    argument = json.dumps(original, separators=(",", ":"))
+    receipt = {"profile": "published-gdm", "original": original, "pass": False}
+    deadline = time.monotonic() + 60
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise RuntimeError("published logout deadline expired")
+        return budget
+    try:
+        agent.run("logout", argument, timeout=remaining())
+        while True:
+            departed = agent.run("gdm-departed", argument, timeout=remaining())
+            remaining()
+            if (type(departed) is not dict or departed.get("profile") != "published-gdm"
+                    or departed.get("boot_id") != original["boot_id"]):
+                raise RuntimeError("logout observation identity differs")
+            if (departed.get("original_session_gone") is True
+                    and departed.get("original_compositor_gone") is True):
+                break
+            time.sleep(min(0.2, remaining()))
+        while True:
+            ready = agent.run("gdm-greeter", timeout=remaining())
+            remaining()
+            if type(ready) is not dict:
+                raise RuntimeError("invalid logout greeter observation")
+            if (ready.get("profile") == "published-gdm" and ready.get("boot_id") == original["boot_id"]
+                    and ready.get("desktop_session_present") is False and ready.get("ready") is True):
+                ui = published_gdm_login.validate_ui(agent.run("gdm-ui", timeout=remaining()),
+                                                    width=WIDTH, height=HEIGHT)
+                remaining()
+                ready_principal = published_gdm_login._principal(ready.get("greeter"))
+                if (ui["boot_id"] != original["boot_id"] or ui["greeter"] != ready_principal
+                        or ui["active_vt"] != ready.get("active_vt")):
+                    raise RuntimeError("logout UI principal is not the actual foreground greeter")
+                if not any(control["showing"] and control["enabled"] and control["kind"] in
+                           {"fixture-user", "not-listed", "username-entry", "password-entry"}
+                           for control in ui["controls"]):
+                    raise RuntimeError("logout greeter has no visible public authentication control")
+                receipt["greeter_ui"] = ui
+                break
+            time.sleep(min(0.2, remaining()))
+        gdm_paint(qmp, destination, "logout-greeter", timeout=remaining())
+        remaining()
+        receipt.update(original_session_gone=True, original_compositor_gone=True)
+        receipt["pass"] = True
+        record("V-LOGOUT", True, "original GDM session and exact compositor retired; live foreground GDM greeter painted")
+        return receipt
+    except (OSError, ValueError, RuntimeError):
+        record("V-LOGOUT", False, "exact published session teardown and painted GDM greeter were not both verified")
+        raise
+    finally:
+        with open(os.path.join(destination, "receipt.json"), "w") as stream:
+            json.dump(receipt, stream, indent=2)
 
 
 GREETER_SESSION_NAME = "Tuna Desktop"
@@ -2839,6 +3088,8 @@ def repeat_boots(args):
         target = out if index == args.boots else os.path.join(out, f"repeat-{index:02d}")
         command = [sys.executable, __file__, "--disk", args.disk, "--out", target,
                    "--timeout", str(args.timeout)]
+        profile = getattr(args, "display_manager_profile", "current-greetd")
+        command.extend(["--display-manager-profile", profile])
         if args.tour and index == args.boots:
             command.append("--tour")
         if getattr(args, "strip_image", None) and index == args.boots:
@@ -2859,6 +3110,8 @@ def repeat_boots(args):
             sys.exit(f"tuna-vm-lane: boot {index} produced no manifest")
         with open(path) as stream:
             manifest = json.load(stream)
+        if profile == "published-gdm" and manifest.get("display_manager_profile") != profile:
+            sys.exit("tuna-vm-lane: repeated boot lost its explicit published GDM profile")
         manifests.append(manifest)
         for name, assertion in manifest["assertions"].items():
             combined[name] = combined.get(name, True) and assertion["pass"]
@@ -2876,7 +3129,7 @@ def repeat_boots(args):
     successful_boots = sum(result["returncode"] == 0 for result in boot_results)
     combined["V-REPEAT"] = successful_boots == args.boots and all(combined.values())
     with open(os.path.join(out, "repeat-manifest.json"), "w") as stream:
-        json.dump({"requested_boots": args.boots, "boots": manifests,
+        json.dump({"requested_boots": args.boots, "display_manager_profile": profile, "boots": manifests,
                    "assertion_coverage": coverage, "boot_results": boot_results}, stream, indent=2)
     with open(os.path.join(out, "assertions.txt"), "w") as stream:
         for name, passed in combined.items():
@@ -2905,7 +3158,9 @@ def main():
     ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
     ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
     ap.add_argument("--greeter-login", action="store_true",
-                    help="enter fixture credentials through the shipped graphical greetd greeter")
+                    help="enter fixture credentials through the selected shipped graphical greeter")
+    ap.add_argument("--display-manager-profile", choices=("current-greetd", "published-gdm"),
+                    default="current-greetd", help="explicit display-manager backend; published GDM always requires real UI login")
     ap.add_argument("--require-kvm", action="store_true",
                     help="refuse emulation when the qualification profile requires KVM")
     ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
@@ -2914,6 +3169,12 @@ def main():
     ap.add_argument("--boots", type=int, default=1,
                     help="repeat pristine snapshot boots; tour only on the last boot")
     a = ap.parse_args()
+    published_image = None
+    if a.display_manager_profile == "published-gdm":
+        images = [value.partition("=")[2] for value in a.meta if value.partition("=")[0] == "published_image"]
+        if len(images) != 1 or not published_gdm_login.IMAGE.fullmatch(images[0]):
+            ap.error("published-gdm requires exactly one --meta published_image=ghcr.io/tuna-os/marlin@sha256:<digest>")
+        published_image = images[0]
     strip_image = None
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
@@ -2951,10 +3212,19 @@ def main():
     panel_desc = "never checked"
     tour_serial_end = None
     manager_ready = False
+    login_receipt = None
     try:
         qmp = baseline.Qmp(qmp_path)
         login_ok = True
-        if a.greeter_login:
+        if a.display_manager_profile == "published-gdm":
+            try:
+                login_receipt = initial_gdm_login(qmp, agent_path, out, record, timeout=min(120, a.timeout),
+                                                  expected_image=published_image)
+                login_ok = login_receipt["pass"]
+            except (OSError, RuntimeError, ValueError) as error:
+                record("V-GDM-LOGIN", False, str(error))
+                login_ok = False
+        elif a.greeter_login:
             try:
                 login_ok = greetd_login(qmp, agent_path, out, record)
             except (OSError, RuntimeError, ValueError) as error:
@@ -3029,11 +3299,15 @@ def main():
             try:
                 agent = guest_agent.GuestAgent(agent_path)
                 owner = agent.run("inventory")
-                manager_ready = (owner["probe_uid"] == 0 and owner["session_uid"] != 0
-                                 and owner["session"]["User"] == str(owner["session_uid"])
-                                 and owner["session"]["Service"] == "greetd"
-                                 and any(guest_role(p["executable"]) == "tuna-compositor" and p["uid"] == owner["session_uid"]
-                                         for p in owner["processes"]))
+                if a.display_manager_profile == "published-gdm":
+                    identity = published_gdm_login.validate_owner(owner, login_receipt["boot_id"])
+                    manager_ready = (owner["probe_uid"] == 0 and identity == login_receipt["session_identity"])
+                else:
+                    manager_ready = (owner["probe_uid"] == 0 and owner["session_uid"] != 0
+                                     and owner["session"]["User"] == str(owner["session_uid"])
+                                     and owner["session"]["Service"] == "greetd"
+                                     and any(guest_role(p["executable"]) == "tuna-compositor" and p["uid"] == owner["session_uid"]
+                                             for p in owner["processes"]))
                 with open(os.path.join(out, "session-owner.json"), "w") as stream:
                     json.dump(owner, stream, indent=2)
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
@@ -3050,7 +3324,8 @@ def main():
                     try:
                         run_lifecycle(qmp, agent, out, serial_path, record, strip_image=strip_image,
                                       reconnect=lambda: guest_agent.GuestAgent(agent_path), strip_edge=a.strip_edge,
-                                      published=a.greeter_login, orca_contract=a.orca_contract)
+                                      published=a.greeter_login, orca_contract=a.orca_contract,
+                                      display_manager_profile=a.display_manager_profile, login_receipt=login_receipt)
                     finally:
                         agent.close()
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:
@@ -3095,7 +3370,7 @@ def main():
         results["V-PANEL"] = (False, results["V-PANEL"][1] + "; Tuna Desktop lost the display"
                               + (" to a GDM greeter session" if greeter else ""))
     record("V-DISPLAY-MANAGER", manager_ready,
-           "real logind greetd session and non-root compositor UID verified; intentional lifecycle VT pauses are permitted")
+           "real logind " + a.display_manager_profile + " session and non-root compositor UID verified; intentional lifecycle VT pauses are permitted")
     for name in PORTAL_PROBES:
         record(f"V-{name.upper()}", f"tuna-vm-health: {name} ready" in text and (name != "portal" or "tuna-vm-health: portal-gnome ready" in text),
                f"guest user bus {name} activation responds")
@@ -3120,7 +3395,9 @@ def main():
     manifest = {
         "lane": "marlin-vm",
         "orca_contract": a.orca_contract,
-        "session": ("published Tuna Desktop flavor via shipped gtkgreet PAM login, DRM/KMS backend"
+        "session": ("published Tuna Desktop via shipped GDM picker/password login, DRM/KMS backend"
+                    if a.display_manager_profile == "published-gdm" else
+                    "published Tuna Desktop flavor via shipped gtkgreet PAM login, DRM/KMS backend"
                     if a.greeter_login else "Tuna Desktop (preview) via CI-only greetd initial session, DRM/KMS backend"),
         "disk": os.path.basename(a.disk),
         "resolution": f"{WIDTH}x{HEIGHT}",
@@ -3137,6 +3414,14 @@ def main():
     for kv in a.meta:
         key, _, value = kv.partition("=")
         manifest[key] = value
+    # Metadata must not relabel the actually executed backend.
+    manifest["display_manager_profile"] = a.display_manager_profile
+    if a.display_manager_profile == "published-gdm":
+        manifest["display_manager_proof"] = {
+            "login_receipt": "gdm-login/receipt.json", "pass": bool(login_receipt and login_receipt.get("pass")),
+            "launch_verdict": login_receipt.get("launch_verdict") if login_receipt else None,
+            "direct_launcher_exec_observed": False,
+        }
     with open(os.path.join(out, "manifest.json"), "w") as fh:
         json.dump(manifest, fh, indent=2)
     for name in os.listdir(scratch):

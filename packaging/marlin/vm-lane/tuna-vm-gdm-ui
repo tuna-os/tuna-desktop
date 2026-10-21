@@ -1,0 +1,405 @@
+#!/usr/bin/python3
+"""Read-only public GDM controls, bound to the original greeter principal.
+
+The trusted root caller supplies the greeter session and executes this helper as
+the verified dynamic greeter UID under its shared 12-second command budget.
+Session membership, boot and active VT remain
+the caller's responsibility. This helper does not authenticate or perform input.
+No entry name, text, value, length, description, argv or environment is queried.
+English public labels/roles follow GNOME Shell 51.1 commit
+33da06854e229c256afd5872fedd83c28cbfa176 (loginDialog/authPrompt/authMenuButton).
+Its Username hint is a relation target, not a normal StEntry child. Without a
+separately exposed public prompt, manual username entry deliberately fails closed.
+"""
+import argparse
+import json
+import os
+import pathlib
+import pwd
+import re
+import signal
+import stat
+import sys
+import time
+
+
+MAX_NODES = 256
+MAX_CHILDREN = 64
+MAX_DEPTH = 20
+MAX_CONTROLS = 16
+MAX_OUTPUT = 16384
+BUDGET_SECONDS = 8
+NAME_ROLES = frozenset(("button", "toggle-button", "menu", "menu-item", "radio-menu-item",
+                        "check-menu-item", "list-item", "radio-button", "label"))
+INPUT_ROLES = frozenset(("entry", "password-entry", "text"))
+LABELS = {
+    "tuna-test": "fixture-user",
+    "Not listed?": "not-listed",
+    "Login Options": "session-menu",
+    "Tuna Desktop": "tuna-session",
+    "Submit": "sign-in",
+    "Back": "cancel",
+    "Sorry, that didn’t work. Please try again.": "auth-error",
+    "Sorry, that didn't work. Please try again.": "auth-error",
+    "Authentication error": "auth-error",
+}
+USERNAME_LABELS = frozenset(("Username:", "Username", "User Name:"))
+ROLE_KINDS = {
+    "fixture-user": {"button", "list-item"},
+    "not-listed": {"button"},
+    "session-menu": {"menu"},
+    "tuna-session": {"menu-item", "radio-menu-item", "check-menu-item", "radio-button"},
+    "sign-in": {"button"},
+    "cancel": {"button"},
+    "auth-error": {"label"},
+}
+
+
+class Unavailable(RuntimeError):
+    """Never serialize exception messages or untrusted accessibility content."""
+
+
+def unavailable():
+    return {"schema_version": 1, "profile": "published-gdm", "available": False,
+            "reason": "greeter-accessibility-unavailable", "bus_owner_verified": False,
+            "input_value_observed": False, "controls": []}
+
+
+def process_identity(pid, ticks, session_id, uid):
+    """Exact same-user executable identity; no environment or command reads."""
+    if type(uid) is not int or not 0 < uid < 2**32 - 1 or os.getuid() != uid or os.geteuid() != uid:
+        raise Unavailable()
+    entry = pwd.getpwuid(uid)
+    match = re.fullmatch(r"gdm-greeter(?:-([1-9][0-9]{0,5}))?", entry.pw_name)
+    if (entry.pw_uid != uid or match is None or (match[1] is not None and int(match[1]) < 2)
+            or pwd.getpwnam(entry.pw_name).pw_uid != uid):
+        raise Unavailable()
+    root = pathlib.Path("/proc") / str(pid)
+    def sample():
+        fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
+        mapped = (root / "exe").stat()
+        return (root.stat().st_uid, int(fields[19]), os.readlink(root / "exe"),
+                mapped.st_dev, mapped.st_ino, mapped.st_mode, mapped.st_uid,
+                mapped.st_size, mapped.st_mtime_ns, mapped.st_ctime_ns)
+    before = sample()
+    named = pathlib.Path("/usr/bin/gnome-shell").lstat()
+    after = sample()
+    if (before != after or before[:3] != (uid, ticks, "/usr/bin/gnome-shell")
+            or not stat.S_ISREG(named.st_mode) or named.st_uid != 0
+            or named.st_mode & 0o022
+            or before[3:] != (named.st_dev, named.st_ino, named.st_mode, named.st_uid,
+                              named.st_size, named.st_mtime_ns, named.st_ctime_ns)):
+        raise Unavailable()
+    return {"pid": pid, "uid": uid, "start_ticks": ticks,
+            "executable": "/usr/bin/gnome-shell", "exe_device": named.st_dev,
+            "exe_inode": named.st_ino, "session_id": session_id,
+            "session_id_source": "trusted-root-collector"}
+
+
+class NativeBackend:
+    """Direct fixed AT-SPI D-Bus reads; no libatspi cache/signals/P2P.
+
+    Numeric role/state constants are from at-spi2-core 2.62.1 atspi-constants.h.
+    No Atspi library is imported or initialized. Only Gio/GLib transport is used.
+    """
+    ACCESSIBLE = "org.a11y.atspi.Accessible"
+    ROOT_PATH = "/org/a11y/atspi/accessible/root"
+    ROLES = {8: "check-menu-item", 29: "label", 32: "list-item", 33: "menu",
+             35: "menu-item", 40: "password-entry", 43: "button", 44: "radio-button",
+             45: "radio-menu-item", 61: "text", 62: "toggle-button", 79: "entry"}
+    STATES = {"checked": 4, "defunct": 6, "editable": 7, "enabled": 8,
+              "focused": 12, "selected": 23, "showing": 25}
+
+    def __init__(self, remaining):
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib = Gio, GLib
+        self.remaining = remaining
+        self.bus = None
+        self.bound_owner = None
+        self.roles = {}
+        self.reply_bytes = 0
+        self.calls = 0
+
+    def dbus(self, connection, destination, path, interface, method, args=None, signature=None):
+        self.calls += 1
+        if self.calls > 1500:
+            raise Unavailable()
+        result = connection.call_sync(destination, path, interface, method, args,
+            self.GLib.VariantType.new(signature) if signature else None,
+            self.Gio.DBusCallFlags.NO_AUTO_START, min(500, self.remaining()), None)
+        self.remaining()
+        # Reject unsupported serialized replies before unpacking/retaining them.
+        size = result.get_size()
+        self.reply_bytes += size
+        if size > 4096 or self.reply_bytes > 131072:
+            raise Unavailable()
+        return result.unpack()[0]
+
+    def owner(self, connection, name):
+        value = self.dbus(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus", "GetNameOwner", self.GLib.Variant("(s)", (name,)), "(s)")
+        if type(value) is not str or not re.fullmatch(r":\d+\.\d+", value) or len(value) > 64:
+            raise Unavailable()
+        return value
+
+    def existing_bus(self):
+        session_address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+        if session_address != f"unix:path=/run/user/{os.getuid()}/bus":
+            raise Unavailable()
+        flags = (self.Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                 | self.Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION)
+        self.session = self.Gio.DBusConnection.new_for_address_sync(session_address, flags, None, None)
+        self.a11y_owner = self.owner(self.session, "org.a11y.Bus")
+        address = self.dbus(self.session, self.a11y_owner, "/org/a11y/bus", "org.a11y.Bus",
+                            "GetAddress", signature="(s)")
+        if (not isinstance(address, str) or not 0 < len(address) <= 4096
+                or not address.startswith("unix:") or ";" in address
+                or any(ord(char) < 32 for char in address)):
+            raise Unavailable()
+        self.bus = self.Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+        self.registry_owner = self.owner(self.bus, "org.a11y.atspi.Registry")
+        self.remaining()
+
+    def node(self, value):
+        if (type(value) not in (tuple, list) or len(value) != 2 or
+                type(value[0]) is not str or not re.fullmatch(r":\d+\.\d+", value[0]) or
+                len(value[0]) > 64 or type(value[1]) is not str or len(value[1]) > 512 or
+                not re.fullmatch(r"/[A-Za-z0-9_/]+", value[1]) or "//" in value[1]):
+            raise Unavailable()
+        return tuple(value)
+
+    def metadata_node(self, node):
+        node = self.node(node)
+        if self.bound_owner is None:
+            if node != (self.registry_owner, self.ROOT_PATH):
+                raise Unavailable()
+        elif node[0] != self.bound_owner:
+            raise Unavailable()
+        return node
+
+    def bind_owner(self, owner):
+        if self.bound_owner is not None or not re.fullmatch(r":\d+\.\d+", owner):
+            raise Unavailable()
+        self.bound_owner = owner
+
+    def desktop(self):
+        return (self.registry_owner, self.ROOT_PATH)
+
+    def property(self, node, name):
+        owner, path = self.metadata_node(node)
+        return self.dbus(self.bus, owner, path, "org.freedesktop.DBus.Properties", "Get",
+            self.GLib.Variant("(ss)", (self.ACCESSIBLE, name)), "(v)")
+
+    def accessible(self, node, method, signature, args=None):
+        owner, path = self.metadata_node(node)
+        return self.dbus(self.bus, owner, path, self.ACCESSIBLE, method, args, signature)
+
+    def child_count(self, node):
+        if self.roles.get(tuple(node)) in INPUT_ROLES:
+            raise Unavailable()
+        return self.property(node, "ChildCount")
+
+    def child(self, node, index):
+        if self.roles.get(tuple(node)) in INPUT_ROLES:
+            raise Unavailable()
+        child = self.node(self.accessible(node, "GetChildAtIndex", "((so))",
+                          self.GLib.Variant("(i)", (index,))))
+        if self.bound_owner is not None and child[0] != self.bound_owner:
+            raise Unavailable()
+        return child
+
+    def pid(self, node):
+        # Before selecting the one application, only the bus daemon's public
+        # connection credentials are read. No foreign application metadata.
+        owner, _ = self.node(node)
+        return self.dbus(self.bus, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus", "GetConnectionUnixProcessID",
+            self.GLib.Variant("(s)", (owner,)), "(u)")
+
+    def app_owner(self, node):
+        return self.node(node)[0]
+
+    def credentials(self, owner):
+        if (self.owner(self.session, "org.a11y.Bus") != self.a11y_owner
+                or self.owner(self.bus, "org.a11y.atspi.Registry") != self.registry_owner):
+            raise Unavailable()
+        result = {}
+        for method in ("GetNameOwner", "GetConnectionUnixProcessID", "GetConnectionUnixUser"):
+            result[method] = self.dbus(self.bus, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus", method, self.GLib.Variant("(s)", (owner,)),
+                "(s)" if method == "GetNameOwner" else "(u)")
+        return result
+
+    def inspect(self, node):
+        role = self.accessible(node, "GetRole", "(u)")
+        words = self.accessible(node, "GetState", "(au)")
+        if (type(role) is not int or not 0 <= role < 256 or type(words) not in (list, tuple)
+                or len(words) != 2 or any(type(v) is not int or not 0 <= v < 2**32 for v in words)):
+            raise Unavailable()
+        bits = words[0] | words[1] << 32
+        def flag(name): return bool(bits & (1 << self.STATES[name]))
+        if flag("defunct"):
+            raise Unavailable()
+        canonical = self.ROLES.get(role, "other")
+        self.roles[tuple(node)] = canonical
+        return canonical, {"showing": flag("showing"), "enabled": flag("enabled"),
+                           "focused": flag("focused"), "selected": flag("selected") or flag("checked"),
+                           "editable": flag("editable")}
+
+    def public_name(self, node):
+        if self.roles.get(tuple(node)) not in NAME_ROLES:
+            raise Unavailable()
+        return self.property(node, "Name")
+
+    def rect(self, node):
+        owner, path = self.metadata_node(node)
+        value = self.dbus(self.bus, owner, path, "org.a11y.atspi.Component", "GetExtents",
+                          self.GLib.Variant("(u)", (0,)), "((iiii))")
+        return list(value)
+
+
+def count(value, limit):
+    if type(value) is not int or not 0 <= value <= limit:
+        raise Unavailable()
+    return value
+
+
+def control(backend, node, kind, states):
+    rect = backend.rect(node)
+    if (type(rect) is not list or len(rect) != 4
+            or any(type(x) is not int or abs(x) > 65536 for x in rect)
+            or rect[2] <= 0 or rect[3] <= 0):
+        raise Unavailable()
+    return {"kind": kind, "rect": rect,
+            **{key: states[key] for key in ("showing", "enabled", "focused", "selected")}}
+
+
+def observe(pid, ticks, session_id, uid, backend_factory=NativeBackend,
+            identity=process_identity, clock=time.monotonic):
+    if (type(pid) is not int or not 0 < pid < 2**31
+            or type(ticks) is not int or not 0 < ticks < 2**64
+            or type(uid) is not int or not 0 < uid < 2**32 - 1
+            or type(session_id) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", session_id)):
+        raise Unavailable()
+    deadline = clock() + BUDGET_SECONDS
+    def remaining():
+        value = deadline - clock()
+        if value <= 0:
+            raise Unavailable()
+        return max(1, int(value * 1000))
+    original = identity(pid, ticks, session_id, uid)
+    if original.get("uid") != uid:
+        raise Unavailable()
+    backend = backend_factory(remaining)
+    backend.existing_bus()
+    desktop = backend.desktop()
+    candidates = []
+    for index in range(count(backend.child_count(desktop), MAX_CHILDREN)):
+        remaining()
+        app = backend.child(desktop, index)
+        if app is not None and backend.pid(app) == pid:
+            candidates.append(app)
+    if len(candidates) != 1:
+        raise Unavailable()
+    app = candidates[0]
+    owner = backend.app_owner(app)
+    if type(owner) is not str or not re.fullmatch(r":\d+\.\d+", owner) or len(owner) > 64:
+        raise Unavailable()
+    expected = {"GetNameOwner": owner, "GetConnectionUnixProcessID": pid,
+                "GetConnectionUnixUser": original["uid"]}
+    if backend.credentials(owner) != expected:
+        raise Unavailable()
+    backend.bind_owner(owner)
+    pending, visited, controls, username_fields = [(app, 0)], 0, [], []
+    username_prompt = False
+    while pending:
+        remaining()
+        node, depth = pending.pop()
+        visited += 1
+        if visited > MAX_NODES or depth > MAX_DEPTH:
+            raise Unavailable()
+        role, states = backend.inspect(node)
+        if set(states) != {"showing", "enabled", "focused", "selected", "editable"} or any(type(v) is not bool for v in states.values()):
+            raise Unavailable()
+        if depth and not states["showing"]:
+            continue
+        if states["editable"] and role not in INPUT_ROLES:
+            raise Unavailable()
+        if role in INPUT_ROLES:
+            # Do not ask an entry for its name, text/value, length OR children:
+            # child labels can themselves be projections of entered secrets.
+            if states["showing"]:
+                if role == "password-entry":
+                    controls.append(control(backend, node, "password-entry", states))
+                elif role == "entry" or states["editable"]:
+                    username_fields.append((node, states))
+            continue
+        if role in NAME_ROLES and states["showing"]:
+            name = backend.public_name(node)
+            if type(name) is not str or len(name) > 128:
+                raise Unavailable()
+            if role == "label" and name in USERNAME_LABELS:
+                username_prompt = True
+            kind = LABELS.get(name)
+            if kind is not None and role in ROLE_KINDS[kind]:
+                controls.append(control(backend, node, kind, states))
+        children = count(backend.child_count(node), MAX_CHILDREN)
+        if len(pending) + children + visited > MAX_NODES:
+            raise Unavailable()
+        for index in reversed(range(children)):
+            child = backend.child(node, index)
+            if child is None:
+                raise Unavailable()
+            pending.append((child, depth + 1))
+    if username_fields:
+        if not username_prompt or len(username_fields) != 1:
+            raise Unavailable()
+        controls.append(control(backend, username_fields[0][0], "username-entry", username_fields[0][1]))
+    kinds = [item["kind"] for item in controls]
+    if (not controls or len(controls) > MAX_CONTROLS or len(set(kinds)) != len(kinds)
+            or ("username-entry" in kinds and "password-entry" in kinds)
+            or (set(kinds) <= {"auth-error", "cancel"})):
+        raise Unavailable()
+    remaining()
+    if backend.credentials(owner) != expected or identity(pid, ticks, session_id, uid) != original:
+        raise Unavailable()
+    remaining()
+    result = {"schema_version": 1, "profile": "published-gdm", "available": True,
+              "bus_owner_verified": True, "input_value_observed": False,
+              "principal": original, "bus_owner": owner, "controls": controls}
+    if len(json.dumps(result).encode()) > MAX_OUTPUT:
+        raise Unavailable()
+    return result
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Unavailable()
+
+
+def main(argv=None):
+    # A process-level backstop; the root collector must also apply its own hard
+    # timeout because a wedged native synchronous GI call can defer Python signals.
+    def expired(signum, frame):
+        raise Unavailable()
+    signal.signal(signal.SIGALRM, expired)
+    signal.alarm(10)
+    try:
+        parser = Parser(add_help=False)
+        parser.add_argument("--pid", required=True, type=int)
+        parser.add_argument("--start-ticks", required=True, type=int)
+        parser.add_argument("--session-id", required=True)
+        parser.add_argument("--uid", required=True, type=int)
+        args = parser.parse_args(argv)
+        result = observe(args.pid, args.start_ticks, args.session_id, args.uid)
+        status = 0
+    except Exception:
+        result, status = unavailable(), 1
+    finally:
+        signal.alarm(0)
+    print(json.dumps(result, sort_keys=True))
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

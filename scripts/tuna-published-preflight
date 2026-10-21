@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""Bind a bounded, read-only GDM inventory to an immutable published image.
+
+Host-side orchestration only. This never installs fixtures or qualifies a
+desktop. Raw tool diagnostics/configuration are deliberately not artifacts.
+"""
+import sys
+sys.dont_write_bytecode = True
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import published_dm_contract as contract
+
+REPOSITORY = "ghcr.io/tuna-os/marlin"
+PODMAN = ["/usr/bin/podman", "--remote=false"]
+SKOPEO = "/usr/bin/skopeo"
+MAX_METADATA = 2 * 1024 * 1024
+MAX_REPORT = 8 * 1024 * 1024
+MAX_STDERR = 64 * 1024
+INDEX_TYPES = {"application/vnd.oci.image.index.v1+json",
+               "application/vnd.docker.distribution.manifest.list.v2+json"}
+MANIFEST_TYPES = {"application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json"}
+CONFIG_TYPES = {"application/vnd.oci.image.config.v1+json",
+                "application/vnd.docker.container.image.v1+json"}
+ENVIRONMENT = ["PATH=/usr/bin", "LC_ALL=C.UTF-8", "PYTHONDONTWRITEBYTECODE=1",
+               "HOME=/nonexistent", "HOSTNAME=tuna-inventory", "container=podman"]
+
+
+class Failure(ValueError):
+    """A fixed, non-sensitive error code suitable for artifact output."""
+
+
+def digest(data):
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def valid_digest(value):
+    return isinstance(value, str) and contract.DIGEST.fullmatch(value)
+
+
+def image_id(value):
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+        value = "sha256:" + value
+    if not valid_digest(value):
+        raise Failure("invalid-image-id")
+    return value
+
+
+def decode(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise Failure("duplicate-json-key")
+            result[key] = value
+        return result
+    try:
+        return json.loads(raw, object_pairs_hook=pairs,
+                          parse_constant=lambda _: (_ for _ in ()).throw(Failure("nonfinite-json")))
+    except (ValueError, UnicodeError, RecursionError) as error:
+        if isinstance(error, Failure):
+            raise
+        raise Failure("invalid-json") from None
+
+
+def descriptor(value, media_types):
+    if (not isinstance(value, dict) or not valid_digest(value.get("digest"))
+            or type(value.get("size")) is not int or not 0 < value["size"] <= MAX_METADATA
+            or value.get("mediaType") not in media_types or value.get("urls")):
+        raise Failure("invalid-metadata-descriptor")
+    return value
+
+
+def verify_blob(raw, expected_digest, expected_size=None):
+    if digest(raw) != expected_digest or (expected_size is not None and len(raw) != expected_size):
+        raise Failure("metadata-content-digest-or-size-mismatch")
+    value = decode(raw)
+    if not isinstance(value, dict):
+        raise Failure("metadata-object-required")
+    return value
+
+
+def group_is_live(pgid):
+    """Linux-only: zombies cannot execute or create a late container.
+
+    The caller must retain its session leader unreaped throughout this scan,
+    so that this process-group ID cannot be recycled. Unknown proc state fails
+    closed. No inspection or signalling of unrelated groups is permitted.
+    """
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            value = (entry / "stat").read_text()
+        except FileNotFoundError:
+            continue  # A process that vanished cannot perform further work.
+        fields = value[value.rfind(")") + 2:].split()
+        if len(fields) < 4:
+            raise Failure("unreadable-process-group-state")
+        if int(fields[2]) == pgid and fields[0] not in ("Z", "X"):
+            return True
+    return False
+
+
+class Commands:
+    """Same-UID children; retire an anchored group before reaping its leader."""
+    def __init__(self, observations):
+        self.observations = observations
+        self.deadline = time.monotonic() + 300
+        self.cleanup_deadline = None
+        self.settled = True
+        self.unsettled = []  # Preserve unreaped anchors until supervisor exit.
+
+    def retire(self, process, end):
+        # Popen.poll/wait/communicate must NOT precede this operation: even an
+        # exited leader anchors the PGID until reaped (waitid uses WNOWAIT).
+        while time.monotonic() < end:
+            if os.getpgid(process.pid) != process.pid:
+                raise Failure("command-group-anchor-lost")
+            os.killpg(process.pid, signal.SIGKILL)
+            if not group_is_live(process.pid):
+                status = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if status is not None:
+                    process.wait()  # Already a zombie; this reaps, never waits for work.
+                    return
+            time.sleep(min(0.01, max(0, end - time.monotonic())))
+        raise Failure("command-group-retirement-unverified")
+
+    def __call__(self, stage, argv, limit=MAX_METADATA, timeout=30, allow_failure=False):
+        if not self.settled:
+            raise Failure("prior-command-group-unsettled")
+        cleanup = stage.startswith("container-cleanup")
+        now = time.monotonic()
+        if cleanup and self.cleanup_deadline is None:
+            self.cleanup_deadline = now + 20
+        end = min(now + timeout, self.cleanup_deadline if cleanup else self.deadline)
+        if end <= now:
+            raise Failure("cleanup-deadline" if cleanup else "preflight-deadline")
+        # Retirement is INSIDE both the per-command and shared command budget.
+        work_end = end - min(2, (end - now) / 2)
+        observation = {"stage": stage, "stderr": {"policy": "content-suppressed"}}
+        self.observations.append(observation)
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        process = None
+        try:
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, start_new_session=True,
+                                       env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+                while True:
+                    remaining = work_end - time.monotonic()
+                    if remaining <= 0:
+                        raise Failure("command-timeout")
+                    for key, _ in selector.select(min(remaining, 0.02)):
+                        block = os.read(key.fileobj.fileno(), 65536)
+                        if not block:
+                            selector.unregister(key.fileobj)
+                            continue
+                        ceiling = limit if key.data == "stdout" else MAX_STDERR
+                        if len(buffers[key.data]) + len(block) > ceiling:
+                            raise Failure(key.data + "-limit")
+                        buffers[key.data].extend(block)
+                    status = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    if status is not None and not selector.get_map():
+                        returncode = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+                        break
+            observation["exit_code"] = returncode
+            observation["classification"] = "completed" if returncode == 0 else "tool-error"
+            if returncode and not allow_failure:
+                raise Failure("command-failed")
+            return bytes(buffers["stdout"]), returncode
+        except Failure as error:
+            observation["classification"] = str(error)
+            raise
+        except (OSError, subprocess.SubprocessError):
+            observation["classification"] = "command-unavailable-or-timeout"
+            raise Failure("command-unavailable-or-timeout") from None
+        finally:
+            retired = True
+            if process is not None:
+                try:
+                    self.retire(process, end)
+                    observation["command_group_retired"] = True
+                except (Failure, OSError, ValueError):
+                    retired = self.settled = False
+                    self.unsettled.append(process)
+                    observation["command_group_retired"] = False
+                process.stdout.close()
+                process.stderr.close()
+            observation["stdout_bytes"] = len(buffers["stdout"])
+            observation["stderr"].update(bytes=len(buffers["stderr"]), sha256=digest(buffers["stderr"]))
+            observation["stderr"]["scope"] = "complete-stream" if "exit_code" in observation else "captured-prefix"
+            if not retired:
+                raise Failure("command-group-retirement-unverified") from None
+
+
+class ReceiptFile:
+    """An existing direct output directory; no root path traversal/truncation."""
+    def __init__(self, out):
+        self.fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if os.fstat(self.fd).st_mode & 0o022:
+            os.close(self.fd)
+            raise Failure("unsafe-artifact-directory")
+
+    def write(self, data):
+        name = ".preflight-" + uuid.uuid4().hex + ".tmp"
+        fd = None
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o644, dir_fd=self.fd)
+            os.fchmod(fd, 0o644)  # The existing unprivileged artifact uploader reads it.
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                fd = None
+                stream.write(data + "\n")
+            os.replace(name, "published-image-preflight.json", src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(name, dir_fd=self.fd)
+            except FileNotFoundError:
+                pass
+            os.close(self.fd)
+
+
+def verify_registry(run, image):
+    wanted = image.rsplit("@", 1)[1]
+    raw, _ = run("registry-subject", [SKOPEO, "inspect", "--no-creds", "--raw", "docker://" + image])
+    root = verify_blob(raw, wanted)
+    if type(root.get("schemaVersion")) is not int or root["schemaVersion"] != 2:
+        raise Failure("unsupported-manifest-schema")
+    platform_digest, platform_raw = wanted, raw
+    if root.get("mediaType") in INDEX_TYPES:
+        manifests = root.get("manifests")
+        if not isinstance(manifests, list):
+            raise Failure("missing-platform-descriptors")
+        matches = [entry for entry in manifests if isinstance(entry, dict)
+                   and isinstance(entry.get("platform"), dict)
+                   and entry["platform"].get("os") == "linux"
+                   and entry["platform"].get("architecture") == "amd64"
+                   and entry["platform"].get("variant", "") in ("", "v1")]
+        if len(matches) != 1:
+            raise Failure("ambiguous-or-missing-amd64-platform")
+        selected = descriptor(matches[0], MANIFEST_TYPES)
+        platform_digest = selected["digest"]
+        platform_raw, _ = run("registry-platform", [SKOPEO, "inspect", "--no-creds", "--raw",
+                                                     "docker://" + REPOSITORY + "@" + platform_digest])
+        manifest = verify_blob(platform_raw, platform_digest, selected["size"])
+    else:
+        manifest = root
+    if (manifest.get("mediaType") not in MANIFEST_TYPES or type(manifest.get("schemaVersion")) is not int
+            or manifest["schemaVersion"] != 2):
+        raise Failure("unsupported-platform-manifest")
+    config = descriptor(manifest.get("config"), CONFIG_TYPES)
+    config_raw, _ = run("registry-config", [SKOPEO, "inspect", "--no-creds", "--config", "--raw",
+                                            "docker://" + REPOSITORY + "@" + platform_digest])
+    config_data = verify_blob(config_raw, config["digest"], config["size"])
+    rootfs = config_data.get("rootfs", {})
+    layers = manifest.get("layers")
+    diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
+    if (config_data.get("architecture") != "amd64" or config_data.get("os") != "linux"
+            or rootfs.get("type") != "layers" or not isinstance(diff_ids, list) or not diff_ids
+            or not all(valid_digest(item) for item in diff_ids) or not isinstance(layers, list)
+            or len(layers) != len(diff_ids) or any(not isinstance(item, dict)
+                or not valid_digest(item.get("digest")) for item in layers)):
+        raise Failure("invalid-amd64-config-rootfs-binding")
+    return {"image": image, "platform_digest": platform_digest, "config_digest": config["digest"],
+            "architecture": "amd64", "os": "linux", "rootfs_diff_ids": diff_ids,
+            "subject_bytes": len(raw), "platform_bytes": len(platform_raw), "config_bytes": len(config_raw)}
+
+
+def single_inspect(raw):
+    values = decode(raw)
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        raise Failure("invalid-inspect-object")
+    return values[0]
+
+
+def verify_local_image(value, binding):
+    if (image_id(value.get("Id")) != binding["config_digest"] or value.get("Architecture") != "amd64"
+            or value.get("Os") != "linux" or value.get("RootFS", {}).get("Layers") != binding["rootfs_diff_ids"]
+            or value.get("Digest") not in (binding["image"].rsplit("@", 1)[1], binding["platform_digest"])):
+        raise Failure("local-image-binding-mismatch")
+
+
+def container_command(binding, source, target, name):
+    prelude = ("import os,runpy,sys; p=" + repr(target) + "; "
+               "assert os.path.realpath(p)==p, 'helper-mount-alias'; "
+               "sys.argv[0]=p+'/tuna-published-dm-inventory'; "
+               "runpy.run_path(sys.argv[0],run_name='__main__')")
+    arguments = ["-I", "-S", "-B", "-c", prelude, "--profile", "published-gdm", "--image", binding["image"],
+                 "--platform-digest", binding["platform_digest"]]
+    argv = PODMAN + ["create", "--name=" + name, "--pull=never", "--read-only", "--read-only-tmpfs=false",
+                    "--image-volume=ignore", "--network=none", "--cap-drop=all",
+                    "--security-opt=no-new-privileges", "--user=0:0", "--unsetenv-all", "--http-proxy=false",
+                    "--no-healthcheck", "--systemd=false", "--log-driver=none", "--timeout=150",
+                    "--pid=private", "--ipc=private", "--uts=private", "--pids-limit=64",
+                    "--hostname=tuna-inventory", "--workdir=/", "--entrypoint=/usr/bin/python3",
+                    "--label=org.tuna.preflight.owner=" + target,
+                    "--mount=type=bind,src=" + str(source) + ",dst=" + target + ",ro=true"]
+    for variable in ENVIRONMENT:
+        argv.append("--env=" + variable)
+    return argv + [binding["config_digest"]] + arguments, arguments
+
+
+def verify_container(value, cid, binding, source, target, arguments, exited=None):
+    host = value.get("HostConfig", {})
+    config = value.get("Config", {})
+    mounts = value.get("Mounts")
+    state = value.get("State", {})
+    if (value.get("Id") != cid or image_id(value.get("Image")) != binding["config_digest"]
+            or value.get("Path") != "/usr/bin/python3" or value.get("Args") != arguments
+            or host.get("ReadonlyRootfs") is not True or host.get("NetworkMode") != "none"
+            or host.get("Privileged") is not False or host.get("Tmpfs") not in ({}, None)
+            or any(host.get(key) != "private" for key in ("PidMode", "IpcMode", "UTSMode"))
+            or type(host.get("PidsLimit")) is not int or host["PidsLimit"] != 64
+            or host.get("LogConfig", {}).get("Type") != "none"
+            or any(key not in value or value[key] not in ([], None) for key in ("EffectiveCaps", "BoundingCaps"))
+            or not isinstance(host.get("SecurityOpt"), list)
+            or host["SecurityOpt"] not in (["no-new-privileges"], ["no-new-privileges=true"])
+            or config.get("User") != "0:0" or sorted(config.get("Env", [])) != sorted(ENVIRONMENT)
+            or config.get("Labels", {}).get("org.tuna.preflight.owner") != target
+            or not isinstance(config.get("Healthcheck"), dict) or config["Healthcheck"].get("Test") != ["NONE"]
+            or config.get("StartupHealthCheck") is not None or config.get("SystemdMode", False) is not False
+            or type(config.get("Timeout")) is not int or config["Timeout"] != 150
+            or not isinstance(mounts, list) or len(mounts) != 1):
+        raise Failure("container-isolation-or-image-binding-mismatch")
+    mount = mounts[0]
+    if (mount.get("Type") != "bind" or mount.get("Source") != str(source)
+            or mount.get("Destination") != target or mount.get("RW") is not False):
+        raise Failure("container-helper-mount-mismatch")
+    if exited is None:
+        if state.get("Status") != "created" or state.get("Running") is not False:
+            raise Failure("container-was-started-before-verification")
+    elif (state.get("Status") not in ("stopped", "exited") or state.get("Running") is not False
+          or state.get("OOMKilled") is not False or state.get("Error") != ""
+          or type(state.get("ExitCode")) is not int or state["ExitCode"] != exited):
+        raise Failure("container-exit-status-mismatch")
+
+
+def verify_ownership(value, cid, binding, source, target, arguments, name):
+    """A label alone is never authority to remove a container."""
+    mounts = value.get("Mounts")
+    if (value.get("Id") != cid or value.get("Name", "").lstrip("/") != name
+            or image_id(value.get("Image")) != binding["config_digest"]
+            or value.get("Config", {}).get("Labels", {}).get("org.tuna.preflight.owner") != target
+            or value.get("Path") != "/usr/bin/python3" or value.get("Args") != arguments
+            or not isinstance(mounts, list) or len(mounts) != 1
+            or mounts[0].get("Type") != "bind" or mounts[0].get("Source") != str(source)
+            or mounts[0].get("Destination") != target):
+        raise Failure("container-create-association-mismatch")
+
+
+def sanitize_inventory(value):
+    """Retain only helper-schema metadata; no file contents or free-form errors."""
+    if not isinstance(value, dict):
+        raise Failure("inventory-object-required")
+    allowed = {"schema_version", "profile", "evidence_kind", "runtime_qualified", "effective_launch_verified",
+               "unverified_checks", "static_inventory_ready", "packages", "files", "pam", "subject",
+               "gdm_login_defaults"}
+    result = {key: value[key] for key in allowed if key in value}
+    errors = value.get("errors", [])
+    result["errors"] = ["inventory-check-failed"] * min(len(errors) if isinstance(errors, list) else 1, 256)
+    def text(item, pattern, bound=512):
+        if not isinstance(item, str) or len(item) > bound or not re.fullmatch(pattern, item):
+            raise Failure("unsafe-inventory-metadata")
+        return item
+    path_pattern = r"[A-Za-z0-9_./@+:-]+"
+    token_pattern = r"[A-Za-z0-9_.@+:-]+"
+    for name, version in result.get("packages", {}).items():
+        text(name, token_pattern)
+        text(version, token_pattern)
+    safe_files = {}
+    for name, item in result.get("files", {}).items():
+        text(name, path_pattern)
+        if not name.startswith("/") or not isinstance(item, dict):
+            raise Failure("unsafe-inventory-file-metadata")
+        safe = {}
+        for field in ("resolved_path", "target", "type", "sha256", "owner"):
+            if field in item:
+                safe[field] = text(item[field], path_pattern) if item[field] is not None else None
+        for field in ("mode", "uid", "gid", "size"):
+            if field in item:
+                if type(item[field]) is not int or not 0 <= item[field] <= 2**63 - 1:
+                    raise Failure("unsafe-inventory-numeric-metadata")
+                safe[field] = item[field]
+        if "entries" in item:
+            safe["entries"] = [text(entry, token_pattern) for entry in item["entries"]]
+        if "parent_links" in item:
+            safe["parent_links"] = [{"path": text(link["path"], path_pattern),
+                                      "target": text(link["target"], path_pattern)} for link in item["parent_links"]]
+        safe_files[name] = safe
+    result["files"] = safe_files
+    safe_pam = {}
+    for name, item in result.get("pam", {}).items():
+        text(name, token_pattern)
+        modules = []
+        for module in item["modules"]:
+            if type(module["present"]) is not bool or type(module["optional_absence"]) is not bool:
+                raise Failure("unsafe-inventory-pam-metadata")
+            modules.append({"path": text(module["path"], path_pattern), "present": module["present"],
+                            "optional_absence": module["optional_absence"]})
+        safe_pam[name] = {"effective_path": text(item["effective_path"], path_pattern),
+                          "includes": [text(entry, token_pattern) for entry in item["includes"]], "modules": modules}
+    result["pam"] = safe_pam
+    subject = result.get("subject", {})
+    result["subject"] = {"image": text(subject.get("image", ""), path_pattern),
+                          "platform_digest": text(subject.get("platform_digest", ""), token_pattern),
+                          "binding": "caller-declared; independently joined by host receipt"}
+    for field in ("profile", "evidence_kind"):
+        if field in result:
+            text(result[field], token_pattern)
+    if "unverified_checks" in result:
+        result["unverified_checks"] = [text(item, token_pattern) for item in result["unverified_checks"]]
+    defaults = result.get("gdm_login_defaults", {})
+    result["gdm_login_defaults"] = {key: defaults[key] for key in contract.DISABLED_LOGIN_DEFAULTS if key in defaults}
+    if any(type(item) is not bool for item in result["gdm_login_defaults"].values()):
+        raise Failure("unsafe-inventory-default-metadata")
+    for field in ("runtime_qualified", "effective_launch_verified", "static_inventory_ready"):
+        if field in result and type(result[field]) is not bool:
+            raise Failure("unsafe-inventory-verdict-metadata")
+    if "schema_version" in result and type(result["schema_version"]) is not int:
+        raise Failure("unsafe-inventory-schema-metadata")
+    encoded = json.dumps(result, ensure_ascii=True).encode()
+    if len(encoded) > MAX_REPORT:
+        raise Failure("sanitized-report-limit")
+    return result
+
+
+def execute(image, out, run=None):
+    receipt = {"schema_version": 1, "status": "failed", "image_binding_verified": False,
+               "effective_launch_verified": False, "runtime_qualified": False, "commands": [],
+               "timeouts": {"shared_main_seconds": 300, "shared_cleanup_seconds": 20, "container_seconds": 150}}
+    artifact = ReceiptFile(out)
+    run = run or Commands(receipt["commands"])
+    cid, target, binding, cid_owned = None, None, None, False
+    try:
+        binding = verify_registry(run, image)
+        receipt["binding"] = binding
+        raw, _ = run("local-image", PODMAN + ["image", "inspect", image])
+        verify_local_image(single_inspect(raw), binding)
+        scripts = Path(__file__).resolve().parent
+        names = ("tuna-published-dm-inventory", "lib/published_dm_contract.py")
+        helpers = {name: digest((scripts / name).read_bytes()) for name in names}
+        receipt["helper_sha256"] = helpers
+        receipt["runner_sha256"] = digest(Path(__file__).read_bytes())
+        with tempfile.TemporaryDirectory(prefix="tuna-published-preflight-") as directory:
+            source = Path(directory)
+            (source / "lib").mkdir()
+            for name in names:
+                shutil.copyfile(scripts / name, source / name)
+                if digest((source / name).read_bytes()) != helpers[name]:
+                    raise Failure("helper-copy-digest-mismatch")
+                (source / name).chmod(0o444)
+            (source / "lib").chmod(0o555)
+            source.chmod(0o555)
+            unique = uuid.uuid4().hex
+            target = "/__tuna_inventory_" + unique
+            name = "tuna-inventory-" + unique
+            command, arguments = container_command(binding, source, target, name)
+            receipt.update(create_confirmed=False, container_cleanup_terminal=False)
+            raw, _ = run("container-create", command, limit=1024)
+            candidate = raw.decode("ascii").strip()
+            if not re.fullmatch(r"[0-9a-f]{64}", candidate):
+                raise Failure("invalid-created-container-id")
+            cid = candidate
+            receipt["create_confirmed"] = True
+            raw, _ = run("container-inspect-before", PODMAN + ["container", "inspect", cid])
+            observed = single_inspect(raw)
+            verify_ownership(observed, cid, binding, source, target, arguments, name)
+            cid_owned = True
+            verify_container(observed, cid, binding, source, target, arguments)
+            receipt["container"] = {"id": cid, "image_id": binding["config_digest"], "network": "none",
+                                    "read_only_root": True, "read_only_helper": True, "capabilities": [],
+                                    "no_new_privileges": True, "interpreter": "/usr/bin/python3",
+                                    "python_flags": ["-I", "-S", "-B"], "pre_start_verified": True,
+                                    "create_association_verified": True,
+                                    "observed_invocation": {"path": observed["Path"], "args": observed["Args"],
+                                        "mount_destination": observed["Mounts"][0]["Destination"],
+                                        "user": observed["Config"]["User"],
+                                        "environment_keys": [item.split("=", 1)[0] for item in ENVIRONMENT]}}
+            raw, exit_code = run("inventory", PODMAN + ["start", "--attach", cid], limit=MAX_REPORT,
+                                 timeout=180, allow_failure=True)
+            parse_failure = None
+            try:
+                report = decode(raw)
+                receipt["inventory"] = sanitize_inventory(report)
+            except (Failure, TypeError, KeyError, AttributeError):
+                parse_failure = Failure("invalid-or-unsafe-inventory-output")
+            raw, _ = run("container-inspect-after", PODMAN + ["container", "inspect", cid])
+            verify_container(single_inspect(raw), cid, binding, source, target, arguments, exited=exit_code)
+            receipt["container"].update(post_exit_verified=True, exit_code=exit_code)
+            receipt["image_binding_verified"] = True
+            if parse_failure:
+                raise parse_failure
+            if report.get("subject", {}).get("image") != image or report.get("subject", {}).get("platform_digest") != binding["platform_digest"]:
+                raise Failure("inventory-subject-mismatch")
+            receipt["inventory_subject_join_verified"] = True
+            if exit_code:
+                raise Failure("static-inventory-rejected")
+            try:
+                contract.validate_report(report)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise Failure("static-inventory-invalid") from None
+            if any(digest((scripts / name).read_bytes()) != sha for name, sha in helpers.items()):
+                raise Failure("helper-source-changed")
+            receipt["status"] = "static-inventory-passed"
+    except Failure as error:
+        receipt["failure_code"] = str(error)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        receipt["failure_code"] = "unexpected-preflight-data-or-io"
+    finally:
+        commands_settled = getattr(run, "settled", True)
+        receipt["command_groups_settled"] = commands_settled
+        if not commands_settled:
+            receipt.update(status="failed", failure_code="command-group-retirement-unverified",
+                           container_cleanup_terminal=False)
+            cid = None
+        if not cid_owned:
+            cid = None
+        # An uncertain create may have left unregistered storage state. There
+        # is no recovery by name, no absence inference, and no retry/start.
+        if receipt.get("create_confirmed") is False:
+            receipt.update(status="failed", container_cleanup_terminal=False,
+                           create_uncertainty="disposable-runner-residual-state-unconfirmed")
+        if cid:
+            try:
+                run("container-cleanup", PODMAN + ["rm", "--force", cid], timeout=20)
+                _, exists = run("container-cleanup-confirm-absent", PODMAN + ["container", "exists", cid],
+                                allow_failure=True, timeout=20)
+                if exists != 1:
+                    raise Failure("container-removal-not-confirmed")
+                receipt["container_removed"] = True
+                receipt["container_cleanup_terminal"] = True
+            except (Failure, OSError):
+                receipt.update(status="failed", failure_code="container-cleanup-failed", container_removed=False)
+        if getattr(run, "settled", True) is not True:
+            receipt.update(status="failed", command_groups_settled=False, container_cleanup_terminal=False)
+        data = json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=True)
+        if len(data.encode()) > MAX_REPORT + 256 * 1024:
+            receipt.pop("inventory", None)
+            receipt.update(status="failed", failure_code="final-artifact-limit")
+            data = json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=True)
+        artifact.write(data)
+    return 0 if receipt["status"] == "static-inventory-passed" else 1
+
+
+def verify_supervisor_host():
+    # Observe existing authority only. Never grant a capability or reconfigure
+    # the host. Podman otherwise may enter its rootless/re-exec path as UID 0.
+    if sys.platform != "linux" or os.geteuid() != 0:
+        raise Failure("rootful-linux-supervisor-required")
+    matches = re.findall(r"^CapEff:\s+([0-9a-fA-F]{16})$", Path("/proc/self/status").read_text(), re.MULTILINE)
+    if len(matches) != 1 or not int(matches[0], 16) & (1 << 21):  # Existing CAP_SYS_ADMIN.
+        raise Failure("rootful-linux-supervisor-required")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    args = parser.parse_args(argv)
+    if not args.image.startswith(REPOSITORY + "@") or not valid_digest(args.image.split("@", 1)[1]):
+        parser.error("an immutable ghcr.io/tuna-os/marlin sha256 reference is required")
+    if args.out != Path("published-vm-artifacts"):
+        parser.error("the existing published-vm-artifacts directory is required")
+    try:
+        verify_supervisor_host()
+    except (Failure, OSError):
+        parser.error("the existing rootful Linux CI sudo boundary is required")
+    os.environ.clear()
+    os.umask(0o077)
+    try:
+        code = execute(args.image, args.out)
+    except (Failure, OSError):
+        print("published image preflight: safe artifact output unavailable", file=sys.stderr)
+        return 1
+    print("published image preflight: " + ("static inventory passed" if code == 0 else "failed; see bounded artifact"))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

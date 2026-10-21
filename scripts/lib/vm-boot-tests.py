@@ -24,7 +24,7 @@ loader.exec_module(lane)
 def guest_identity(prefix="tuna"):
     """The lifecycle helper's shipped-identity globals for a guest prefix."""
     compositor = f"{prefix}-compositor"
-    return {"PREFIX": prefix, "COMPOSITOR": compositor, "COMPOSITOR_COMM": compositor[:15],
+    return {"DISPLAY_MANAGER_PROFILE": "current-greetd", "PREFIX": prefix, "COMPOSITOR": compositor, "COMPOSITOR_COMM": compositor[:15],
             "SHELL_GTK": f"{prefix}-shell-gtk", "NESTED": f"{prefix}-nested-",
             "LOCK_PAM": f"/etc/pam.d/{prefix}-lock"}
 
@@ -197,7 +197,7 @@ class DeviceInventoryProjection(unittest.TestCase):
             if args[1] == "list-sessions":
                 return "1 1000 tuna-test seat0 tty1"
             return "Id=1\nVTNr=1\nUser=1000\nService=greetd\nType=wayland\nClass=user"
-        scope = {"json": json, "STATE": SimpleNamespace(read_text=lambda: json.dumps(state)),
+        scope = {"DISPLAY_MANAGER_PROFILE": "current-greetd", "json": json, "STATE": SimpleNamespace(read_text=lambda: json.dumps(state)),
                  "pathlib": SimpleNamespace(Path=lambda _: SimpleNamespace(iterdir=lambda: [])),
                  "OWNER": SimpleNamespace(pw_uid=1000),
                  "os": SimpleNamespace(geteuid=lambda: 0), "call": call,
@@ -1097,7 +1097,7 @@ class OrcaReadChurn(unittest.TestCase):
                 "pointer_position", "native_relative_motion_count", "input_devices")}))
             empty_proc = Path(directory, "proc")
             empty_proc.mkdir()
-            scope = {"json": json, "STATE": state, "call": call, "os": lane.os,
+            scope = {"DISPLAY_MANAGER_PROFILE": "current-greetd", "json": json, "STATE": state, "call": call, "os": lane.os,
                      "OWNER": SimpleNamespace(pw_uid=1000),
                      "pathlib": SimpleNamespace(Path=lambda path: empty_proc),
                      "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
@@ -1119,7 +1119,7 @@ class OrcaReadChurn(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory, "state")
             state.write_text(json.dumps({"screen_reader_pid": 41, "screen_reader_state": "starting"}))
-            scope = {"json": json, "STATE": state, "call": call, "shlex": shlex,
+            scope = {"DISPLAY_MANAGER_PROFILE": "current-greetd", "json": json, "STATE": state, "call": call, "shlex": shlex,
                      "subprocess": lane.subprocess, "owned_orca_observation": owned,
                      "orca_child_diagnostic": lambda *_: {"status": "observed"}}
             observe = self.load("orca_observation", scope)

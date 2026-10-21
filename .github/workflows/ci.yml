@@ -93,6 +93,12 @@ jobs:
       - run: scripts/rename-to-tuna --check --no-cargo
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
+      - run: python3 scripts/lib/published-dm-contract-tests.py
+      - run: python3 scripts/lib/published-preflight-tests.py
+      - run: python3 scripts/lib/published-gdm-runtime-tests.py
+      - run: python3 scripts/lib/published-gdm-greeter-tests.py
+      - run: python3 scripts/lib/published-gdm-ui-tests.py
+      - run: python3 scripts/lib/published-gdm-login-tests.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py

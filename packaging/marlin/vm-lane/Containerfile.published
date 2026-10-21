@@ -9,42 +9,39 @@ RUN pacman -Sy --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-pr
     && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build
 
 FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
 COPY --from=constraint-builder /usr/libexec/tuna-vm-constraints /usr/libexec/tuna-vm-constraints
 COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm-constraints
 
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
-COPY packaging/marlin/vm-lane/tuna-vm-profile /usr/libexec/tuna-vm-profile
-COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
+COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
+COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
+COPY packaging/marlin/vm-lane/tuna-vm-published.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
+COPY packaging/marlin/vm-lane/tuna-vm-gdm-ui /usr/libexec/tuna-vm-gdm-ui
+COPY scripts/lib/published_dm_contract.py scripts/lib/published_gdm_runtime.py scripts/lib/published_gdm_greeter.py /usr/libexec/tuna-vm-lib/
+COPY published-vm-artifacts/published-image-preflight.json /usr/share/tuna-vm/base-preflight.json
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.toml
 COPY packaging/marlin/vm-lane/tuna-vm-health /usr/libexec/tuna-vm-health
 COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tuna-vm-health.service
 
-# The greeter's session list (/etc/greetd/environments) is not asserted here:
-# what gtkgreet lists is a qualification check (V-GREETER-LIST) on the booted
-# image, so a wrong entry fails that check instead of the fixture build.
-RUN mkdir -p /usr/share/tuna-vm \
+# This receipt comes from the original immutable image before any fixture work.
+# Both checks compare every protected byte/owner/mode and shipped package version.
+# No AccountsService session preset, PAM replacement, GDM debug toggle or wrapper.
+RUN python3 -B /usr/libexec/tuna-vm-lib/published_gdm_runtime.py --fixture-image "$BASE_IMAGE" \
     && pacman -Q tuna-desktop > /usr/share/tuna-vm/shipped-package.txt \
     && pacman -Q > /usr/share/tuna-vm/shipped-packages.txt \
-    && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor \
-         /usr/bin/tuna-shell-host /usr/bin/tuna-shell-gtk \
-         /usr/bin/tuna-ibus-bridge /usr/bin/tuna-greeter \
-         /usr/share/wayland-sessions/tuna.desktop \
-         /usr/libexec/tunaos/greetd-session /etc/greetd/config.toml /etc/greetd/gtkgreet.css \
-         /etc/greetd/environments > /usr/share/tuna-vm/shipped-payload.sha256 \
-    && test "$(readlink -f /bin/sh)" = /usr/bin/bash \
-    && grep -q '/usr/libexec/tunaos/greetd-session' /etc/greetd/config.toml \
-    && ! grep -q '\[initial_session\]' /etc/greetd/config.toml \
     && pacman -Sy --noconfirm \
-    && pacman -S --needed --noconfirm qemu-guest-agent python python-gobject grim wtype wayland-utils gnome-disk-utility gnome-system-monitor \
+    && pacman -S --needed --noconfirm qemu-guest-agent python python-gobject python-cairo gdb grim wtype wayland-utils gnome-disk-utility gnome-system-monitor \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
-    && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input \
-    && printf 'L+ /var/home/tuna-test/.profile - tuna-test tuna-test - /usr/libexec/tuna-vm-profile\n' >> /usr/lib/tmpfiles.d/tuna-vm-lane.conf \
+    && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-gdm-ui /usr/libexec/tuna-vm-shell-focus \
+    && printf 'published-gdm\n' > /usr/share/tuna-vm/display-manager-profile \
+    && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' "$(id -u tuna-test)" > /usr/share/tuna-vm/environment.conf \
     && systemctl enable tuna-vm-health.service \
     && systemctl add-wants multi-user.target qemu-guest-agent.service \
-    && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
+    && python3 -B /usr/libexec/tuna-vm-lib/published_gdm_runtime.py --fixture-image "$BASE_IMAGE" --snapshot \
     && pacman -Q > /usr/share/tuna-vm/fixture-packages.txt \
     && python3 -c 'from pathlib import Path; p=Path("/usr/share/tuna-vm"); before=set((p/"shipped-packages.txt").read_text().splitlines()); after=set((p/"fixture-packages.txt").read_text().splitlines()); assert before <= after, "fixture installation changed shipped package versions"'
 
