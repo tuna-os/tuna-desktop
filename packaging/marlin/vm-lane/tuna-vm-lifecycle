@@ -1413,7 +1413,7 @@ def main():
             raise RuntimeError("published qualification cannot mutate shipped PAM")
         if action in ("gdm-greeter", "gdm-ui", "gdm-departed", "logout", "published"):
             if action == "published":
-                result = gdm_runtime.verify_payload()
+                result = gdm_runtime.payload_report()
             else:
                 collector = gdm_runtime.Collector()
                 if action == "gdm-greeter":

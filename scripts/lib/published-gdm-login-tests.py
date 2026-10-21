@@ -424,11 +424,58 @@ class LoginFlow(unittest.TestCase):
             result = self.failure(fake)
             self.assertEqual(result["stage"], "published-payload-" + ("after" if late else "before") + "-login")
             self.assertEqual(result["greeter_readiness"]["accepted_ready"], 1)
+            self.assertEqual(result["payload_failure"], {"checkpoint": "observer-transport",
+                "kind": "transport-or-observer-unavailable", "protected_record_index": None,
+                "baseline_files_sha256": None})
             self.assertNotIn("private-package", json.dumps(result))
             if not late:
                 self.assertFalse(fake.actions)
                 self.assertFalse(result["observations"])
                 self.assertFalse(result["painted_stages"])
+
+    def test_structured_payload_failures_are_projected_and_halt_before_input(self):
+        for late in (False, True):
+            fake = Fake()
+            failure = {"checkpoint": "protected-payload-identity", "kind": "guard-mismatch",
+                       "protected_record_index": 5, "baseline_files_sha256": "a" * 64}
+            def transform(action, value):
+                if action == "published" and (fake.desktop or not late):
+                    return {"schema_version": 1, "profile": gdm.PROFILE,
+                            "immutable_verified": False, "failure": dict(failure)}
+                return value
+            fake.transform = transform
+            result = self.failure(fake, "payload verification failed")
+            self.assertEqual(result["payload_failure"], failure)
+            self.assertEqual(result["stage"], "published-payload-" + ("after" if late else "before") + "-login")
+            if not late:
+                self.assertFalse(fake.actions)
+                self.assertFalse(result["painted_stages"])
+
+    def test_malformed_failure_envelopes_never_retain_private_content_or_pass(self):
+        for change in (lambda v: v.update(immutable_verified=True),
+                       lambda v: v["failure"].update(kind="private-error"),
+                       lambda v: v["failure"].update(stderr="private-stderr"),
+                       lambda v: v.update(stderr="private-stderr")):
+            fake = Fake()
+            value = {"schema_version": 1, "profile": gdm.PROFILE, "immutable_verified": False,
+                     "failure": {"checkpoint": "package-snapshot", "kind": "invalid-or-unavailable",
+                                 "protected_record_index": None, "baseline_files_sha256": "a" * 64}}
+            change(value)
+            fake.transform = lambda action, original: value if action == "published" else original
+            result = self.failure(fake, "invalid published payload failure evidence")
+            self.assertNotIn("payload_failure", result)
+            self.assertNotIn("private", json.dumps(result)); self.assertFalse(fake.actions)
+
+    def test_payload_transport_timeout_is_distinct_from_guest_mismatch(self):
+        fake = Fake(); original = fake.observe
+        def observe(action, *, timeout):
+            if action == "published": raise TimeoutError("private-transport")
+            return original(action, timeout=timeout)
+        fake.observe = observe
+        result = self.failure(fake)
+        self.assertEqual(result["payload_failure"]["kind"], "timeout")
+        self.assertEqual(result["payload_failure"]["checkpoint"], "observer-transport")
+        self.assertNotIn("private", json.dumps(result)); self.assertFalse(fake.actions)
 
     def test_wrong_or_unjoined_desktop_is_rejected(self):
         for kind in ("service", "root", "pid-join", "path", "vt", "inactive", "boot"):

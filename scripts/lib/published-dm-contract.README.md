@@ -485,3 +485,42 @@ stage names preserve that boundary in later receipts without recording stderr.
 Synthetic regressions exercise the real inventory parser and verification loop
 on temporary paths. Actual runtime payload verification, controls, password,
 launch and the remaining five-boot/native gates still need fresh CI evidence.
+
+### Third runtime observation and diagnostic failure envelopes
+
+The ordinary [run 39601289897](https://github.com/tuna-os/tuna-desktop/actions/runs/39601289897)
+also stopped on all five boots at `published-payload-before-login`, after accepting
+greeter readiness. Artifact `12347435038` (SHA-256
+`aa738e89fc4c97fbac6f543eb6682c4faddfcf13db251b9e3b4a69c6ec210005`)
+preserves that phase and the final `published` QGA invocation, but no guest exit
+status or exception. The earlier package-snapshot defect and its regression fix
+remain independently established; this new evidence does not identify the next
+failing guard. No package/file policy is relaxed on a guessed cause.
+
+The fixed `published` lifecycle action now returns a failure envelope if payload
+verification raises. Its transport may exit successfully to deliver that JSON;
+`immutable_verified=false` is mandatory, and the host validates the exact failure
+schema and halts. This is diagnostic delivery, never successful qualification.
+Direct `verify_payload()` callers retain exception behavior. The envelope has only
+`schema_version`, `profile`, `immutable_verified`, and `failure`; that last object
+contains the following fixed, bounded fields:
+
+- `checkpoint`: collector initialization, package snapshot, shipped versions,
+  protected payload read/identity, runtime units/drop-ins/GDM policy, deadline,
+  or the host observer-transport boundary.
+- `kind`: `guard-mismatch` only at an explicit comparison; otherwise
+  `invalid-or-unavailable`, `timeout`, `command-unavailable`, `output-bound`,
+  `retirement-unverified`, or `transport-or-observer-unavailable`.
+- `protected_record_index`: null, or an integer below 65536 indexing the sorted
+  keys of the immutable baseline `files` object for a protected-file checkpoint.
+- `baseline_files_sha256`: null before a baseline is available, otherwise SHA-256
+  of `json.dumps(files, sort_keys=True, separators=(",", ":")).encode()`.
+  Match this digest against the retained preflight before interpreting an index.
+
+No path, file content, exception message, stderr, command output, credential or
+environment value is copied into failure evidence. Typed command outcomes avoid
+substring matching. A failed required-owner query cannot silently become a
+concrete identity-mismatch claim; expected unowned-file queries do not overwrite
+later mismatch evidence. An unavailable transport cannot establish which guest
+check ran. Existing deadlines, anchored command retirement, payload comparisons,
+PAM, real UI/password requirements and all native/five-boot gates are unchanged.

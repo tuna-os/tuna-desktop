@@ -227,6 +227,126 @@ class PayloadVerificationTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "runtime GDM policy override"):
                 rt.verify_payload()
 
+    def test_payload_report_preserves_success(self):
+        self.assertEqual(rt.payload_report(), rt.verify_payload())
+
+    def report(self, checkpoint, kind):
+        value = rt.payload_report()
+        self.assertIs(value["immutable_verified"], False)
+        failure = rt.validate_payload_failure(value)
+        self.assertEqual((failure["checkpoint"], failure["kind"]), (checkpoint, kind))
+        self.assertNotIn("private", json.dumps(value))
+        self.assertNotIn(rt.LAUNCHER, json.dumps(value))
+        self.assertEqual(self.baseline, self.original)
+        return failure
+
+    def test_parser_failure_and_package_mismatch_have_distinct_categories(self):
+        self.raw = "private-malformed-package-record"
+        self.report("package-snapshot", "invalid-or-unavailable")
+        self.raw = None; self.installed["other-shipped"] = "different"
+        self.report("shipped-package-versions", "guard-mismatch")
+
+    def test_file_mismatch_index_is_bound_to_canonical_baseline(self):
+        import hashlib
+        self.path.write_bytes(b"changed")
+        failure = self.report("protected-payload-identity", "guard-mismatch")
+        self.assertEqual(failure["protected_record_index"], 0)
+        self.assertEqual(failure["baseline_files_sha256"], hashlib.sha256(
+            json.dumps(self.baseline["files"], sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+
+    def test_file_read_error_is_never_reported_as_mismatch(self):
+        for error in (PermissionError("private-file"), ContractError("private-contract"), ValueError("private-shape")):
+            with self.subTest(error=type(error)), patch.object(FakeInventory, "record", side_effect=error):
+                self.report("protected-payload-read", "invalid-or-unavailable")
+
+    def test_command_outcomes_survive_swallowed_owner_query_errors(self):
+        for kind in ("timeout", "command-unavailable", "output-bound", "retirement-unverified"):
+            for owner_query in (False, True):
+                def command(*argv):
+                    if owner_query and argv[1:] == ("-Q",):
+                        return "\n".join(f"{k} {v}" for k, v in self.packages.items())
+                    raise rt.ObservationError(kind, "private-command-error")
+                with self.subTest(kind=kind, owner_query=owner_query), patch.object(rt.Collector, "call", side_effect=command):
+                    self.report("protected-payload-identity" if owner_query else "package-snapshot", kind)
+
+    def test_expected_unowned_file_does_not_mislabel_later_mismatch(self):
+        self.baseline["files"][rt.LAUNCHER]["owner"] = None
+        self.original = copy.deepcopy(self.baseline)
+        def command(*argv):
+            if argv[1:] == ("-Q",):
+                return "\n".join(f"{k} {v}" for k, v in self.packages.items())
+            raise rt.ObservationError("command-unavailable", "private-unowned-file")
+        with patch.object(rt.Collector, "call", side_effect=command):
+            self.assertTrue(rt.payload_report()["immutable_verified"])
+            self.path.write_bytes(b"changed")
+            self.report("protected-payload-identity", "guard-mismatch")
+
+    def test_initialization_deadline_and_policy_categories_are_fixed(self):
+        with patch.object(rt, "base_receipt", side_effect=OSError("private-baseline")):
+            failure = self.report("collector-initialization", "invalid-or-unavailable")
+            self.assertIsNone(failure["baseline_files_sha256"])
+        with patch.object(rt.Collector, "remaining", side_effect=rt.ObservationError("timeout", "private-deadline")):
+            self.report("observation-deadline", "timeout")
+        for path, category in (("run/systemd/system/gdm.service", "runtime-unit-overrides"),
+                               ("run/systemd/system/gdm.service.d/override.conf", "runtime-dropins"),
+                               ("run/gdm/custom.conf", "runtime-gdm-policy")):
+            target = self.root / path; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(b"private-policy")
+            with self.subTest(path=path), patch.object(FakeInventory, "owner", side_effect=lambda name:
+                    "tuna-desktop" if name == rt.LAUNCHER else "gdm"):
+                self.report(category, "guard-mismatch")
+            target.unlink()
+
+    def test_failure_schema_rejects_unbound_index_private_fields_and_success(self):
+        value = {"schema_version": 1, "profile": rt.PROFILE, "immutable_verified": False,
+                 "failure": {"checkpoint": "protected-payload-identity", "kind": "guard-mismatch",
+                             "protected_record_index": 0, "baseline_files_sha256": "a" * 64}}
+        rt.validate_payload_failure(value)
+        for key, bad in (("checkpoint", "private-stage"), ("kind", "private-error"),
+                         ("protected_record_index", True), ("protected_record_index", -1),
+                         ("protected_record_index", 65536), ("protected_record_index", None),
+                         ("baseline_files_sha256", None), ("baseline_files_sha256", "private-digest")):
+            candidate = copy.deepcopy(value); candidate["failure"][key] = bad
+            with self.subTest(key=key, bad=bad), self.assertRaises(ContractError): rt.validate_payload_failure(candidate)
+        for change in (lambda v: v.update(immutable_verified=True),
+                       lambda v: v["failure"].update(stderr="private-stderr"),
+                       lambda v: v.update(stderr="private-stderr")):
+            candidate = copy.deepcopy(value); change(candidate)
+            with self.assertRaises(ContractError): rt.validate_payload_failure(candidate)
+
+    def test_dropin_record_read_contract_error_is_not_a_mismatch(self):
+        target = next(root for root in rt.DROPIN_ROOTS if root.startswith("/run/"))
+        completed_trees = set()
+        original_tree, original_record = FakeInventory.tree, FakeInventory.record
+        def tree(observer, name, visiting=()):
+            original_tree(observer, name, visiting)
+            completed_trees.add(name)
+        def record(observer, name):
+            if name == target and name in completed_trees:
+                raise ContractError("private-post-tree-read-error")
+            return original_record(observer, name)
+        with patch.object(FakeInventory, "tree", tree), patch.object(FakeInventory, "record", record):
+            self.report("runtime-dropins", "invalid-or-unavailable")
+
+    def test_actual_lifecycle_published_branch_serializes_failure_envelope(self):
+        import ast
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        path = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        with path.open() as stream:
+            main = next(n for n in ast.parse(stream.read()).body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        expected = {"schema_version": 1, "profile": rt.PROFILE, "immutable_verified": False,
+                    "failure": {"checkpoint": "collector-initialization", "kind": "invalid-or-unavailable",
+                                "protected_record_index": None, "baseline_files_sha256": None}}
+        namespace = {"sys": SimpleNamespace(argv=[str(path), "published"]), "json": json,
+                     "os": SimpleNamespace(geteuid=lambda: 0), "OWNER": SimpleNamespace(pw_uid=1000),
+                     "DISPLAY_MANAGER_PROFILE": rt.PROFILE,
+                     "gdm_runtime": SimpleNamespace(payload_report=lambda: expected)}
+        exec(compile(ast.Module(body=[main], type_ignores=[]), str(path), "exec"), namespace)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output): namespace["main"]()
+        self.assertEqual(json.loads(output.getvalue()), expected)
+
 
 class MountedSearchTests(unittest.TestCase):
     def setUp(self):

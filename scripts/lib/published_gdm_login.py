@@ -9,7 +9,7 @@ import re
 import time
 
 from published_dm_contract import ContractError, validate_session
-from published_gdm_runtime import validate_launch
+from published_gdm_runtime import validate_launch, validate_payload_failure
 
 
 PROFILE = "published-gdm"
@@ -216,8 +216,22 @@ def login(qmp, observe, paint, *, timeout=120, previous=None, monotonic=time.mon
             return budget
 
         def read(action):
-            value = observe(action, timeout=remaining())
-            remaining()
+            try:
+                value = observe(action, timeout=remaining())
+                remaining()
+            except Exception as error:
+                if action == "published":
+                    result["payload_failure"] = {"checkpoint": "observer-transport",
+                        "kind": "timeout" if isinstance(error, (_Rejected, TimeoutError)) else "transport-or-observer-unavailable",
+                        "protected_record_index": None, "baseline_files_sha256": None}
+                raise
+            if action == "published" and type(value) is dict and "failure" in value:
+                try:
+                    failure = validate_payload_failure(value)
+                except ContractError:
+                    raise _Rejected("invalid published payload failure evidence") from None
+                result["payload_failure"] = failure
+                raise _Rejected("published payload verification failed")
             return value
 
         def pause():

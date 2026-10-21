@@ -47,6 +47,67 @@ SESSION_PROPERTIES = ("Id", "User", "Name", "Type", "Class", "Service", "Seat", 
                       "Active", "State", "Leader", "Scope")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 BOOT = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z")
+PAYLOAD_CHECKPOINTS = frozenset(("collector-initialization", "package-snapshot", "shipped-package-versions",
+    "protected-payload-read", "protected-payload-identity", "runtime-unit-overrides", "runtime-dropins",
+    "runtime-gdm-policy", "observation-deadline", "observer-transport"))
+PAYLOAD_FAILURE_KINDS = frozenset(("guard-mismatch", "invalid-or-unavailable", "timeout",
+    "command-unavailable", "output-bound", "retirement-unverified", "transport-or-observer-unavailable"))
+
+
+class ObservationError(ContractError):
+    """Typed fixed command outcome; callers never need to inspect error text."""
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+
+def validate_payload_failure(value):
+    require(type(value) is dict and set(value) == {"schema_version", "profile", "immutable_verified", "failure"}
+            and type(value["schema_version"]) is int and value["schema_version"] == 1
+            and value["profile"] == PROFILE and value["immutable_verified"] is False,
+            "invalid payload failure envelope")
+    failure = value["failure"]
+    require(type(failure) is dict and set(failure) == {"checkpoint", "kind", "protected_record_index", "baseline_files_sha256"},
+            "invalid payload failure fields")
+    checkpoint, kind = failure["checkpoint"], failure["kind"]
+    require(type(checkpoint) is str and checkpoint in PAYLOAD_CHECKPOINTS
+            and type(kind) is str and kind in PAYLOAD_FAILURE_KINDS, "invalid payload failure category")
+    index, digest = failure["protected_record_index"], failure["baseline_files_sha256"]
+    require(digest is None or (type(digest) is str and HEX.fullmatch(digest)), "invalid payload baseline digest")
+    require(index is None or (type(index) is int and 0 <= index < 65536 and digest is not None
+            and checkpoint in {"protected-payload-read", "protected-payload-identity"}), "invalid payload record index")
+    require(checkpoint not in {"protected-payload-read", "protected-payload-identity"} or index is not None,
+            "missing payload record index")
+    require(checkpoint in {"collector-initialization", "observer-transport"} or digest is not None,
+            "missing payload baseline digest")
+    require(kind != "guard-mismatch" or checkpoint in {"shipped-package-versions", "protected-payload-identity",
+            "runtime-unit-overrides", "runtime-dropins", "runtime-gdm-policy"}, "invalid payload mismatch category")
+    require(checkpoint != "observer-transport" or (kind in {"timeout", "transport-or-observer-unavailable"}
+            and index is None and digest is None), "invalid payload transport category")
+    return dict(failure)
+
+
+def payload_report():
+    """Return only fixed failure categories, never exception text or guest paths."""
+    diagnostic = {"checkpoint": "collector-initialization", "kind": "invalid-or-unavailable",
+                  "protected_record_index": None, "baseline_files_sha256": None}
+    try:
+        return verify_payload(_diagnostic=diagnostic)
+    except Exception as error:
+        # A package-owner query can be swallowed by Inventory.owner. Preserve
+        # its typed outcome rather than misreporting the resulting None owner.
+        command_kind = diagnostic.pop("_command_failure", None)
+        if command_kind is not None:
+            diagnostic["kind"] = command_kind
+        elif isinstance(error, ObservationError):
+            diagnostic["kind"] = error.kind
+        elif isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+            diagnostic["kind"] = "timeout"
+        elif not isinstance(error, ContractError):
+            diagnostic["kind"] = "invalid-or-unavailable"
+        result = {"schema_version": 1, "profile": PROFILE, "immutable_verified": False, "failure": diagnostic}
+        validate_payload_failure(result)
+        return result
 
 
 def require(value, reason):
@@ -88,7 +149,7 @@ def fixture_verify(image, output=None):
             "subject": before["subject"], "package": "tuna-desktop " + before["packages"]["tuna-desktop"]}
 
 
-def verify_payload():
+def verify_payload(*, _diagnostic=None):
     """Rehash immutable protected files; runtime /run policy is checked separately.
 
     Runtime mount points may differ from a quiescent container. The exact persistent
@@ -96,34 +157,73 @@ def verify_payload():
     """
     collector = Collector()
     before = collector.baseline
+    def checkpoint(name, index=None, kind="invalid-or-unavailable"):
+        if _diagnostic is not None:
+            _diagnostic.update(checkpoint=name, kind=kind, protected_record_index=index)
+    if _diagnostic is not None:
+        _diagnostic["baseline_files_sha256"] = hashlib.sha256(
+            json.dumps(before["files"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    owner_query_failures = {}
+    def package_query(args):
+        try:
+            return collector.call("/usr/bin/pacman", *args)
+        except (ContractError, OSError, subprocess.SubprocessError) as error:
+            if _diagnostic is not None:
+                kind = (error.kind if isinstance(error, ObservationError) else
+                    "timeout" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else "command-unavailable")
+                if args == ["-Q"]:
+                    _diagnostic["_command_failure"] = kind
+                elif len(args) == 3 and args[:2] == ["-Qqo", "--"] and args[2] in before["files"]:
+                    owner_query_failures[args[2]] = kind
+            raise
     # Collector's ownership observer is seeded with the immutable baseline.
     # Read installed packages into a fresh inventory: reusing that seed makes
     # every existing package look duplicated, and clearing it would erase the
     # aliased baseline before the version comparison.
-    observer = Inventory("/", lambda args: collector.call("/usr/bin/pacman", *args))
+    observer = Inventory("/", package_query)
+    checkpoint("package-snapshot")
     observer.packages_inventory()
+    require(len(before["files"]) <= 65536, "protected inventory exceeds diagnostic index bound")
+    checkpoint("shipped-package-versions", kind="guard-mismatch")
     require(all(observer.packages.get(k) == v for k, v in before["packages"].items()),
             "shipped package version changed")
-    for name, expected in before["files"].items():
+    for index, name in enumerate(sorted(before["files"])):
+        expected = before["files"][name]
+        checkpoint("observation-deadline")
         collector.remaining()
         if name == "/run" or name.startswith("/run/"):
             continue
+        checkpoint("protected-payload-read", index)
         if "entries" in expected:
             observer.tree(name)
         actual = observer.record(name)
+        checkpoint("protected-payload-identity", index, "guard-mismatch")
+        if (_diagnostic is not None and name in owner_query_failures
+                and expected.get("owner") is not None and actual.get("owner") is None):
+            _diagnostic["_command_failure"] = owner_query_failures[name]
         require(actual == expected, "protected payload identity changed")
     # No boot-generated launch overrides may be hidden by the persistent comparison.
     for root in UNIT_PATHS:
         if root.startswith("/run/"):
             for basename in ("gdm.service", "display-manager.service"):
-                require(observer.record(root + "/" + basename)["type"] == "missing",
+                checkpoint("runtime-unit-overrides")
+                actual = observer.record(root + "/" + basename)
+                checkpoint("runtime-unit-overrides", kind="guard-mismatch")
+                require(actual["type"] == "missing",
                         "runtime display-manager unit override")
     for root in DROPIN_ROOTS:
         if root.startswith("/run/"):
+            checkpoint("runtime-dropins")
             observer.tree(root)
-            require(observer.record(root)["type"] in ("missing", "directory") and
-                    not observer.record(root).get("entries"), "runtime display-manager drop-in")
-    require(observer.record("/run/gdm/custom.conf")["type"] == "missing", "runtime GDM policy override")
+            actual = observer.record(root)
+            checkpoint("runtime-dropins", kind="guard-mismatch")
+            require(actual["type"] in ("missing", "directory") and
+                    not actual.get("entries"), "runtime display-manager drop-in")
+    checkpoint("runtime-gdm-policy")
+    policy = observer.record("/run/gdm/custom.conf")
+    checkpoint("runtime-gdm-policy", kind="guard-mismatch")
+    require(policy["type"] == "missing", "runtime GDM policy override")
+    checkpoint("observation-deadline")
     collector.remaining()
     return {"profile": PROFILE, "immutable_verified": True,
             "subject": before["subject"], "package": "tuna-desktop " + before["packages"]["tuna-desktop"],
@@ -287,9 +387,11 @@ class Collector:
         require(BOOT.fullmatch(self.boot_id), "invalid boot ID")
 
     def remaining(self):
-        require(not getattr(self, "poisoned", False), "runtime collector is unsettled")
+        if getattr(self, "poisoned", False):
+            raise ObservationError("retirement-unverified", "runtime collector is unsettled")
         budget = self.deadline - time.monotonic()
-        require(budget > 0, "runtime observation deadline exceeded")
+        if budget <= 0:
+            raise ObservationError("timeout", "runtime observation deadline exceeded")
         return budget
 
     def live_group(self, group):
@@ -330,7 +432,8 @@ class Collector:
                 selector.register(pipe, selectors.EVENT_READ, name)
             while True:
                 remaining = command_deadline - time.monotonic()
-                require(remaining > 0, "runtime command deadline exceeded")
+                if remaining <= 0:
+                    raise ObservationError("timeout", "runtime command deadline exceeded")
                 for key, _ in selector.select(min(remaining, 0.05)):
                     name = key.data
                     chunk = os.read(key.fd, min(65536, limits[name] - len(outputs[name]) + 1))
@@ -338,11 +441,12 @@ class Collector:
                         selector.unregister(key.fileobj)
                     else:
                         outputs[name].extend(chunk)
-                        require(len(outputs[name]) <= limits[name], "runtime command output exceeds bound")
+                        if len(outputs[name]) > limits[name]:
+                            raise ObservationError("output-bound", "runtime command output exceeds bound")
                 exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
                 if exited is not None and not selector.get_map():
-                    require(exited.si_code == os.CLD_EXITED and exited.si_status == 0,
-                            "runtime read command failed")
+                    if exited.si_code != os.CLD_EXITED or exited.si_status != 0:
+                        raise ObservationError("command-unavailable", "runtime read command failed")
                     break
         finally:
             selector.close()
@@ -360,9 +464,11 @@ class Collector:
                     require(self.deadline - time.monotonic() > 0.01, "runtime command group unsettled")
                     time.sleep(0.01)
                 process.wait(timeout=max(0.001, self.deadline - time.monotonic()))
-            except BaseException:
+            except BaseException as error:
                 self.poisoned = True
                 _UNSETTLED_COMMANDS.append(process)
+                if isinstance(error, Exception):
+                    raise ObservationError("retirement-unverified", "runtime command group unsettled") from None
                 raise
         self.remaining()
         return bytes(outputs["stdout"]).decode().strip()
