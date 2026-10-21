@@ -223,4 +223,73 @@ class FailedRequestReceipt(unittest.TestCase):
             self.assertTrue(receipts[0]['after_capability'])
             self.assertIn('ended_ns',receipts[0])
 
+class IdleRestoreAdmission(unittest.TestCase):
+    class WireError(Exception):
+        def __init__(self,message='brightness update already pending',remote='org.gnome.Shell.Brightness.Error.Failed'):
+            self.remote=remote
+            self.message=f'GDBus.Error:{remote}: {message}'
+            super().__init__(self.message)
+
+    def helper(self,clock=lambda:0):
+        scope=dict(namespace,time=SimpleNamespace(monotonic=clock,monotonic_ns=lambda:100),
+                   GLib=SimpleNamespace(Error=self.WireError),
+                   Gio=SimpleNamespace(DBusError=SimpleNamespace(get_remote_error=lambda error:error.remote)))
+        node=next(node for node in parsed.body if isinstance(node,ast.FunctionDef) and node.name=='idle_restore_call')
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'<actual-idle-restore-admission>','exec'),scope)
+        return scope['idle_restore_call']
+
+    def test_busy_then_success_retains_refusal_without_duplicate_acceptance(self):
+        invoke=mock.Mock(side_effect=[self.WireError(), 'accepted'])
+        verify=mock.Mock();attempts=[]
+        self.assertEqual(self.helper()(invoke,verify,attempts),'accepted')
+        self.assertEqual(invoke.call_count,2)
+        self.assertEqual(verify.call_count,3)
+        self.assertTrue(attempts[0]['busy_refused'])
+        self.assertIsNone(attempts[1]['error'])
+        self.assertEqual(sum(row['error'] is None for row in attempts),1)
+
+    def test_permanent_busy_is_bounded_by_attempts_and_shared_deadline(self):
+        invoke=mock.Mock(side_effect=self.WireError());attempts=[]
+        with self.assertRaisesRegex(RuntimeError,'within bounds'):
+            self.helper()(invoke,lambda deadline:None,attempts)
+        self.assertEqual(invoke.call_count,100)
+        self.assertEqual(len(attempts),100)
+        ticks=iter([0,0,0,5]);invoke.reset_mock();attempts=[]
+        with self.assertRaisesRegex(RuntimeError,'within bounds'):
+            self.helper(lambda:next(ticks))(invoke,lambda deadline:None,attempts)
+        self.assertEqual(invoke.call_count,1)
+
+    def test_unrelated_or_lookalike_error_is_not_retried(self):
+        for error in (self.WireError('hardware failure'),self.WireError('brightness update already pending extra'),
+                      self.WireError(remote='org.other.Failed')):
+            invoke=mock.Mock(side_effect=error);attempts=[]
+            with self.subTest(error=error),self.assertRaises(self.WireError):
+                self.helper()(invoke,lambda deadline:None,attempts)
+            self.assertEqual(invoke.call_count,1)
+            self.assertNotIn('busy_refused',attempts[0])
+
+    def test_principal_or_signal_failure_blocks_admission(self):
+        invoke=mock.Mock();attempts=[]
+        with self.assertRaisesRegex(RuntimeError,'identity'):
+            self.helper()(invoke,mock.Mock(side_effect=RuntimeError('identity')),attempts)
+        invoke.assert_not_called()
+        self.assertEqual(attempts,[])
+
+    def test_late_verification_fails_without_repeating_accepted_operation(self):
+        clock=[0];checks=[0];invoke=mock.Mock(return_value='accepted');attempts=[]
+        def verify(deadline):
+            checks[0]+=1
+            if checks[0]==2:clock[0]=6
+        with self.assertRaisesRegex(RuntimeError,'verification deadline exceeded'):
+            self.helper(lambda:clock[0])(invoke,verify,attempts)
+        self.assertEqual(invoke.call_count,1)
+        self.assertIsNone(attempts[0]['error'])
+
+    def test_accepted_operation_past_deadline_is_not_retried(self):
+        ticks=iter([0,0,0,6]);invoke=mock.Mock(return_value='accepted');attempts=[]
+        with self.assertRaisesRegex(RuntimeError,'deadline exceeded'):
+            self.helper(lambda:next(ticks))(invoke,lambda deadline:None,attempts)
+        self.assertEqual(invoke.call_count,1)
+        self.assertIsNone(attempts[0]['error'])
+
 if __name__=='__main__':unittest.main()

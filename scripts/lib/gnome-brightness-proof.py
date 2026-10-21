@@ -12,8 +12,8 @@ from gi.repository import Gio, GLib
 NAME='org.gnome.Shell.Brightness'
 PATH='/org/gnome/Shell/Brightness'
 
-def call(bus,dest,path,interface,method,args=None):
-    return bus.call_sync(dest,path,interface,method,args,None,Gio.DBusCallFlags.NONE,5000,None)
+def call(bus,dest,path,interface,method,args=None,timeout=5000):
+    return bus.call_sync(dest,path,interface,method,args,None,Gio.DBusCallFlags.NONE,timeout,None)
 
 def schema(xml):
     if len(xml.encode())>65536:raise RuntimeError('introspection exceeds bound')
@@ -127,6 +127,40 @@ def drain(context,deadline,budget):
         if budget[0]<=0 or time.monotonic()>=deadline:raise RuntimeError('bounded signal dispatch exhausted')
         context.iteration(False);budget[0]-=1
 
+def idle_restore_call(invoke, verify, attempts):
+    """Retry only a side-effect-free busy refusal at the post-settings boundary.
+
+    Sysfs readback can precede the owned logind completion callback. Each
+    rejected admission is retained; one accepted call ends the loop. The same
+    deadline gates principal/signal verification and bounds each admission call.
+    """
+    deadline=time.monotonic()+5
+    for index in range(100):
+        if time.monotonic()>=deadline:break
+        verify(deadline)
+        remaining=deadline-time.monotonic()
+        if remaining<=0:break
+        receipt=dict(attempt=index+1,started_ns=time.monotonic_ns())
+        attempts.append(receipt)
+        try:
+            value=invoke(max(1,int(remaining*1000)))
+        except GLib.Error as error:
+            remote=Gio.DBusError.get_remote_error(error)
+            receipt.update(error=remote,ended_ns=time.monotonic_ns())
+            # Failed is shared with genuine hardware errors: require the exact
+            # service message as well, never a substring or a generic failure.
+            if (remote!='org.gnome.Shell.Brightness.Error.Failed' or
+                    error.message!='GDBus.Error:org.gnome.Shell.Brightness.Error.Failed: brightness update already pending'):
+                raise
+            receipt['busy_refused']=True
+            continue
+        receipt.update(error=None,ended_ns=time.monotonic_ns())
+        if time.monotonic()>deadline:raise RuntimeError('idle restore completion deadline exceeded')
+        verify(deadline)
+        if time.monotonic()>deadline:raise RuntimeError('idle restore verification deadline exceeded')
+        return value
+    raise RuntimeError('idle restore busy admission did not complete within bounds')
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--out',required=True);parser.add_argument('--controlled-root');parser.add_argument('--device');parser.add_argument('--other-device');parser.add_argument('--shell-executable',required=True);parser.add_argument('--shell-pid',type=int);parser.add_argument('--shell-start',type=int);parser.add_argument('--compositor-pid',type=int);parser.add_argument('--compositor-start',type=int);parser.add_argument('--session-id')
     args=parser.parse_args();bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
@@ -144,13 +178,25 @@ def main():
         for index,entry in enumerate(root.iterdir()):
             if index>=64:raise RuntimeError('actual backlight inventory exceeds bound')
             entries.append(dict(name=entry.name,path=str(entry.resolve())))
-    def request(method,value,expected_failure=False):
+    def request(method,value,expected_failure=False,after_idle_restore=False):
         if signal_overflow[0]:raise RuntimeError('original signal receipt overflow')
         before=available(bus,owner);stamp=time.monotonic_ns();failed=None;signal_before=len(signals)
         receipt=dict(method=method,value='NaN' if isinstance(value,float) and value!=value else value,
                      before_capability=before,started_ns=stamp,user_signals_before=signal_before)
         receipts.append(receipt)
-        try:call(bus,owner,PATH,NAME,method,GLib.Variant('(b)' if method=='SetDimming' else '(d)',(value,)))
+        def invoke(timeout):
+            return call(bus,owner,PATH,NAME,method,GLib.Variant('(b)' if method=='SetDimming' else '(d)',(value,)),timeout)
+        try:
+            if after_idle_restore:
+                if not args.controlled_root or method!='SetDimming' or value is not False or expected_failure:
+                    raise RuntimeError('invalid idle restore retry boundary')
+                budget=[100]
+                def verify(deadline):
+                    drain(GLib.MainContext.default(),deadline,budget)
+                    if signal_overflow[0] or len(signals)!=signal_before:raise RuntimeError('idle restore emitted a user signal')
+                    if principal(bus,args.shell_executable)!=identity:raise RuntimeError('original shell principal changed')
+                idle_restore_call(invoke,verify,receipt.setdefault('admission_attempts',[]))
+            else:invoke(5000)
         except GLib.Error as error:
             failed=Gio.DBusError.get_remote_error(error) or f'{error.domain}:{error.code}'
             receipt['error_detail']=str(error)[:512]
@@ -221,7 +267,7 @@ def main():
             Gio.Settings.sync()
             restore_expected=absolute(min(idle,relative));restore_other=other_abs(min(idle,other_rel)) if other_abs else None
             wait_for(restore_expected,restore_other)
-            request('SetDimming',False);observe(baseline)
+            request('SetDimming',False,after_idle_restore=True);observe(baseline)
             request('SetAutoBrightnessTarget',0.8);observe(absolute(0.8+relative-0.5))
             request('SetAutoBrightnessTarget',-1.0);observe(baseline)
             request('SetAutoBrightnessTarget',float('nan'),True);observe(baseline)
