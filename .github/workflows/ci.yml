@@ -72,7 +72,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
@@ -277,7 +277,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           workspaces: . -> target/ci-fprint
@@ -314,7 +314,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
@@ -440,7 +440,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
@@ -476,7 +476,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
@@ -518,7 +518,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
@@ -568,7 +568,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}-old-da1b7c40c7cc69f5800970e61cffa3d4e95c3f65
           workspaces: |
@@ -626,7 +626,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
@@ -674,7 +674,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
@@ -997,7 +997,7 @@ jobs:
           native_key=$( { cat /etc/os-release; pacman -Q; } | sha256sum | cut -d ' ' -f 1)
           printf 'key=%s\n' "$native_key" >> "$GITHUB_OUTPUT"
           mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: arch-container-v2-${{ steps.arch-native.outputs.key }}
           workspaces: . -> target/ci-arch
