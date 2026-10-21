@@ -42,6 +42,21 @@ def validate_saved_pixels(baseline, candidate, regions, desaturation, brightness
     return PIXELS.verify(baseline, candidate, [r for r in regions if r['kind'] != 'cursor'], desaturation, brightness, required_kinds=frozenset(('texture', 'solid')))
 
 
+def settle_native_map(wait, advance):
+    mapped = wait(lambda d: len(d['windows']) == 1, 'native-map')
+    window_id = mapped['windows'][0]['id']
+    # Model admission precedes the first attached client buffer. The map
+    # animation starts only after that buffer is rendered, so advancing the
+    # manual clock at model admission can freeze a newly started animation.
+    wait(lambda d: any(run['window'] == window_id
+                       for run in d['window_lifecycle']['opening']),
+         'native-map-started')
+    advance(1000)
+    return wait(lambda d: len(d['windows']) == 1
+                and d['windows'][0]['id'] == window_id
+                and not d['window_lifecycle']['opening'], 'native-map-settled')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bin-dir', type=Path, required=True)
@@ -178,9 +193,7 @@ def main():
         assert [int(geometry[k]) for k in ('X', 'Y', 'WIDTH', 'HEIGHT')] == [0, 0, 1280, 800]
         client = spawn([str(client_exe), 'surface', '32'], 'color-client', {'WAYLAND_DISPLAY': 'wellbeing-proof'})
         identities.append(identity(client.pid, client_exe))
-        wait(lambda d: len(d['windows']) == 1, 'native-map')
-        advance(1000)
-        settled = wait(lambda d: not d['window_lifecycle']['opening'], 'native-map-settled')
+        settled = settle_native_map(wait, advance)
         x, y, w, h = settled['windows'][0]['rect']
         px, py = x + w // 2, y + h // 2
         keys('mousemove', '--window', host[0], px, py)
