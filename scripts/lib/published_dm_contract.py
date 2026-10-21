@@ -35,6 +35,7 @@ REQUIRED_OWNERS = {
     "/usr/lib/systemd/user/tuna-session.target": "tuna-desktop",
     "/usr/bin/gdm": "gdm",
     "/usr/bin/gnome-shell": "gnome-shell",
+    "/usr/lib/systemd/user/org.gnome.Shell@.service": "gnome-shell",
     "/usr/lib/gdm-session-worker": "gdm",
     "/usr/lib/gdm-wayland-session": "gdm",
     GDM_UNIT: "gdm",

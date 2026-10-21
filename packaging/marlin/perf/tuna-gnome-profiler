@@ -10,6 +10,7 @@ import stat
 import subprocess
 import time
 import sys
+import perf_operation_budget as operation
 from perf_trace_diagnostics import Context, encode
 from gnome_failed_capture import identity, process_start, read_marker, write_marker, failed_source
 
@@ -93,7 +94,7 @@ def mutter_libraries_provenance(pid, context=None):
     identities = mapping_identities()
     if context is not None:context.stage="mutter-package-query"
     package = subprocess.check_output(
-        ["/usr/bin/pacman", "-Q", "mutter"], text=True, timeout=5).strip()
+        ["/usr/bin/pacman", "-Q", "mutter"], text=True, timeout=operation.remaining(5)).strip()
     if context is not None:context.stage="mutter-package-validation"
     if not re.fullmatch(r"mutter 51\.0-[A-Za-z0-9.+_]+", package):
         raise RuntimeError("mapped Mutter provenance requires the pinned ABI-51 package")
@@ -106,7 +107,7 @@ def mutter_libraries_provenance(pid, context=None):
             raise RuntimeError("mapped Mutter library is not owned by root")
         if context is not None:context.stage="mutter-owner-query"
         owner = subprocess.check_output(
-            ["/usr/bin/pacman", "-Qqo", result["path"]], text=True, timeout=5).strip()
+            ["/usr/bin/pacman", "-Qqo", result["path"]], text=True, timeout=operation.remaining(5)).strip()
         if context is not None:context.stage="mutter-owner-validation"
         if owner != "mutter":
             raise RuntimeError("mapped Mutter library belongs to a different package")
@@ -142,7 +143,7 @@ def main(context):
                              "org.freedesktop.DBus", method,
                              GLib.Variant("(s)", (argument,)),
                              GLib.VariantType.new(signature),
-                             Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+                             Gio.DBusCallFlags.NONE, max(1, int(operation.remaining(5)*1000)), None).unpack()[0]
 
     context.stage="owner-name"
     owner = credentials("GetNameOwner", "(s)", PEER)
@@ -161,7 +162,7 @@ def main(context):
 
     context.public["principal"]={"uid":uid,"pid":pid,"owner":owner}
     context.stage="shell-version"
-    version = subprocess.check_output([str(installed), "--version"], text=True, timeout=5).strip()
+    version = subprocess.check_output([str(installed), "--version"], text=True, timeout=operation.remaining(5)).strip()
     if version != "GNOME Shell 51.0":
         raise RuntimeError("frame ownership analysis requires the pinned GNOME Shell 51.0")
 
@@ -185,7 +186,7 @@ def main(context):
             bus.call_with_unix_fd_list_sync(
                 owner, OBJECT, INTERFACE, "Start",
                 GLib.Variant("(a{sv}h)", ({"tuna-require-drained": GLib.Variant("b", True)}, index)), GLib.VariantType.new("()"),
-                Gio.DBusCallFlags.NONE, 10000, descriptors, None)
+                Gio.DBusCallFlags.NONE, max(1, int(operation.remaining(10)*1000)), descriptors, None)
             started = True
             context.stage="ownership-marker"
             with marker.open("x") as stream:
@@ -206,7 +207,7 @@ def main(context):
             if started:
                 context.stage="cleanup-stop"
                 bus.call_sync(owner, OBJECT, INTERFACE, "Stop", None,
-                              GLib.VariantType.new("()"), Gio.DBusCallFlags.NONE, 5000, None)
+                              GLib.VariantType.new("()"), Gio.DBusCallFlags.NONE, max(1, int(operation.remaining(5)*1000)), None)
             context.stage="cleanup-capture"
             capture.unlink()
             context.stage=original_stage
@@ -280,6 +281,7 @@ def run():
         return
     context=Context(action)
     try:
+        operation.adopt_profiler_budget()
         main(context)
     except Exception as error:
         glib_type=remote=None

@@ -1,9 +1,13 @@
-# Published GDM preflight prototype
+# Published GDM qualification evidence
 
-This is a **review-stage static helper and workflow preflight**. It has not been run against
-the complete published Marlin filesystem. Passing its synthetic tests does not
-establish real-image compatibility, password authentication, a visible desktop,
-or release qualification.
+The original workflow preflight passed on immutable Marlin image
+`sha256:db5bef1da75117080e937273c1c3e5852673dc7a20306481cbcc50eeeba78c4d`
+in [ordinary PR CI run 39576885270](https://github.com/tuna-os/tuna-desktop/actions/runs/39576885270).
+That receipt proved a complete mounted static inventory and image binding;
+it did not qualify password login, effective launch or the desktop. The added
+runtime integration described below has only synthetic tests so far. Its new
+required greeter unit record deliberately requires a fresh preflight; the old
+passing receipt cannot satisfy the expanded contract.
 
 ## Explicit contracts
 
@@ -17,10 +21,10 @@ The installed, GDM-owned `/usr/share/gdm/gdm.schemas` is hashed and must provide
 unambiguous boolean-false defaults for both login-enable keys; omitted keys in
 `custom.conf` do not silently assume those defaults.
 
-`current-greetd` is a separate **pure session contract only**. It retains the
-current lane's greetd PAM service and VT 1 assumption. Existing current-build
-and runtime login harness behavior remains unchanged. The published workflow
-adds only a static pre-fixture gate; its old greetd fixture guard still applies.
+`current-greetd` remains the explicit default current-build lane, with its own
+greetd PAM service, VT 1 and fault-injection fixtures. The published workflow
+explicitly selects `published-gdm`; backend selection is never guessed from
+residual files. Published fixtures use the shipped GDM path described below.
 
 `validate_session()` consumes one caller-observed logind/process tuple. For GDM
 it takes the positive VT from that tuple instead of assuming VT 1. The caller
@@ -86,9 +90,10 @@ pristine image with a live mutable boot and interpret failure as an image bug.
 
 ## Untested assumptions and deliberately narrow support
 
-- The exact installed GDM/package/PAM ownership and merged file layout have not
-  been verified by this helper. Earlier individual-layer findings are only
-  evidence for planning the checks, not a passing receipt.
+- The original static contract has a complete-image CI receipt for the digest
+  above. Newly required paths and all runtime integration assumptions still
+  require real-image execution. Earlier partial-layer findings never substitute
+  for that new run.
 - GDM executable/helper paths, the Tuna entry values and the service directive
   allowlist are explicit Arch/GDM expectations. Package updates may require a
   reviewed contract change. Generic `service.d` drop-ins, additional GDM
@@ -119,8 +124,7 @@ pristine image with a live mutable boot and interpret failure as an image bug.
   `TryExec=tuna-session`. This prototype verifies those exact bytes and the
   owned `/usr/bin/tuna-session`, but **does not bind GDM's effective PATH to that
   executable**. A higher-priority shadow binary is not ruled out by this
-  inventory. Before runtime wiring can qualify a launch, the coherent harness
-  must verify the actual launcher executable/environment and its relationship
+  inventory. The separate runtime method below must verify the actual launcher executable/environment and its relationship
   to the observed compositor, or add a reviewed effective-launch static check.
   Checking only a guessed finite list of PATH directories would not close this
   gap. `static_inventory_ready` must not be used as proof of that launch binding.
@@ -135,8 +139,10 @@ pristine image with a live mutable boot and interpret failure as an image bug.
 `sudo -n /usr/bin/python3 -I -S -B scripts/tuna-published-preflight
 --image <immutable-reference> --out published-vm-artifacts` is called immediately after the existing immutable pull/inspect check and before
 `Containerfile.published` is built. No fixture installation precedes this report.
-The workflow's triggers, permissions, time limits, upload path and old greetd
-guard are unchanged. Both pure suites run beside the existing VM unit tests.
+The workflow's triggers, permissions, time limits and upload path are unchanged.
+The obsolete published greetd guard is replaced by the strict GDM fixture and
+runtime contracts below; the current-build greetd path is retained. All six
+preflight/contract/runtime pure suites run beside the existing VM unit tests.
 The unprivileged workflow creates the existing artifact directory first. Only
 this fixed checked-out supervisor crosses the existing CI sudo boundary; its
 fixed Podman/Skopeo children execute directly with the same UID. Podman is
@@ -256,7 +262,7 @@ root-owned output-directory creation occurs. If the output directory itself is
 unsafe/unavailable, the runner refuses with a fixed message rather than following
 it, and cannot promise a report there. A static failure prevents
 fixture creation. A static pass leaves `effective_launch_verified=false` and
-`runtime_qualified=false`, and still reaches the unchanged greetd fixture guard.
+`runtime_qualified=false`, and proceeds to the separately checked fixture/runtime path.
 
 ### Supported API evidence and runtime limitation
 
@@ -299,13 +305,19 @@ individual Tuna payload layer, which likewise is not final-filesystem proof.
 Known alternative session-directory checks were motivated by upstream GDM
 source and cached-binary strings. They are intentionally conservative: upstream
 main's complete search order was **not** established for this exact installed
-GDM build. Effective search order and environment remain explicitly unresolved.
+GDM build during the static investigation. The static receipt still leaves
+effective search and environment unresolved; the separate runtime method below
+uses pinned 51.1 source and actual environment/candidate observations.
 
 ## Local tests
 
 ```
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/lib/published-dm-contract-tests.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/lib/published-preflight-tests.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/lib/published-gdm-runtime-tests.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/lib/published-gdm-greeter-tests.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/lib/published-gdm-ui-tests.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/lib/published-gdm-login-tests.py
 ```
 
 Tests use temporary synthetic trees and fake read-only package-query responses.
@@ -313,3 +325,105 @@ They never execute fake payloads, install packages, invoke PAM, start a display
 manager, authenticate, or alter a real image. UID/GID are modeled in returned
 fixture records without chown. The fixtures are test data only; they are not
 injected into a qualification image.
+
+## Published runtime method (local integration, not yet runtime-qualified)
+
+The named method is `gdm-51.1-observed-selection-source-informed-launch-v1`.
+It requires every observation below. A static pass or a visually plausible screen
+cannot substitute for any missing gate.
+
+1. The original preflight receipt joins the index, platform and config digests to
+   the read-only inspection container. The fixture build compares `BASE_IMAGE`
+   to that subject and runs the complete immutable comparison before and after
+   additive fixtures. The host also matches the guest subject to its exact image.
+2. The actual foreground GDM greeter has the GDM UID, immutable GNOME Shell ELF
+   and user unit, unique local Wayland `gdm-launch-environment` greeter session,
+   logind User.Display, exact `org.gnome.Shell@gdm.service` MainPID/cgroup and
+   observed VT. Two snapshots must match. This is an explicit user-display/unit
+   join; `direct_logind_session` may be absent and is never invented.
+3. A read-only AT-SPI protocol observer uses direct bounded Gio D-Bus calls with
+   NO_AUTO_START, without native libatspi caches, subscriptions or peer transport.
+   It binds each public-tree reference to the verified unique bus owner for that
+   same process using actual owner PID/UID. The bus/registry must already exist.
+   The host uses physical QMP input to choose the fixture user, observe a password
+   challenge, open the real picker, select Tuna Desktop, reopen it and observe
+   its checked state. Retained painted frames supplement semantic observations.
+   Entry names, text, values, lengths and children are not queried. Unsupported
+   manual username hints, missing accessibility or ambiguous controls fail closed.
+4. One wrong public fixture password must produce an actual rejection while no
+   fixture desktop exists. A correct public fixture password must then create
+   a nonroot `gdm-password` session with the original compositor's direct kernel
+   PID-to-logind-session join and actual foreground VT. No autologin is allowed.
+5. Observed GDM `XDG_DATA_DIRS` determines all reviewed Wayland and X11 search
+   candidates. Some GDM consumers pass a null type, so both sets are inspected;
+   requiring a unique Tuna entry avoids guessing the enabled-type ordering. Every alternative `tuna.desktop` is absent; the effective entry and
+   launcher retain their original hash/owner/mode. GDM's TryExec PATH, the
+   Wayland helper's executable-search PATH, and the imported child PATH are
+   separately observed and resolved, with trusted ancestors and no earlier
+   shadow candidates. The fixture never normalizes any of these variables.
+6. The original GDM → worker → Wayland helper → compositor parent chain has
+   stable PID/start/UID/PPID/executable inode/hash/session and fixed-key environment.
+   The helper's exact known command and compositor's release-launcher argv are
+   checked without retaining arbitrary argv. All identities, command checks and
+   resolution candidates are reread before accepting the observation.
+7. Runtime protected-file/package comparisons bracket each authentication; the
+   final relogin follows the native lifecycle. `/run` mount metadata is not compared with a quiescent image;
+   runtime GDM configuration/unit overrides are separately refused. Native DRM,
+   paint, input, suspend, lock, VT, shell-recovery and session teardown gates remain.
+   Logout requires the original session and PID/start identity to disappear, a
+   real foreground GDM tree and paint, then a fresh picker/password login with a
+   new session/compositor and native desktop paint. VT-away accepts inactive/online
+   only in its explicit observation stage and uses an observed unoccupied VT.
+
+Only this joined runtime method can set `effective_launch_verified=true`.
+Its receipt always retains `direct_launcher_exec_observed=false` and
+`source_build_reproduced=false`, with separate observed and inferred lists.
+The historical launcher exec is inferred from the actual selection, command,
+immutable payload, search environment and process/session chain. It is not a
+syscall trace or a reproducible-build attestation. The final native lane result,
+not this single field, determines runtime qualification.
+
+### Pinned source assumptions
+
+- [GDM 51.1, 8043e365](https://github.com/GNOME/gdm/blob/8043e3659097c4d39b2ace458cace32d94ac7693/daemon/gdm-session.c)
+  defines the Wayland directory search and selected helper command.
+  [Its Wayland helper](https://github.com/GNOME/gdm/blob/8043e3659097c4d39b2ace458cace32d94ac7693/daemon/gdm-wayland-session.c)
+  imports the user-manager environment and prefers its PATH for the child.
+- [GLib 2.90.1, e05063cc](https://github.com/GNOME/glib/blob/e05063ccc6c8f222465a1080927f4c14349f3de6/gio/gsubprocess.c)
+  distinguishes the calling process PATH from the launcher environment. The
+  installed `glib2 2.90.1-1` is required. GDM uses flags NONE, so the helper PATH
+  resolves `tuna-session`; imported child PATH is independently checked, not
+  mistaken for the earlier lookup.
+- [GNOME Session 51.0, aed00cf1](https://github.com/GNOME/gnome-session/blob/aed00cf18229a98231c23e14f5798ddb918c4956/gnome-session/gsm-systemd.c)
+  explains the User.Display join for user services. [Shell 51.1, 33da0685](https://github.com/GNOME/gnome-shell/blob/33da06854e229c256afd5872fedd83c28cbfa176/data/org.gnome.Shell%40.service.in)
+  defines the GDM shell template. Its exact installed `/usr/lib` path must be
+  present in the new preflight; source install intent alone is insufficient.
+- [Tuna v1.0.0-beta.1, d28578e5](https://github.com/tuna-os/tuna-desktop/blob/d28578e590ff85a1616db7d6dcc0d7603bb86b31/crates/compositor/src/bin/tuna-session.rs)
+  replaces itself with the sibling compositor and pins its shell argument.
+  Release recipe metadata corroborates that source version but does not attest
+  the installed ELF build. The method pins reviewed installed executable hashes
+  and package versions; changed bytes require review instead of accepting a
+  matching version string. Legacy shell override imports and dynamic-loader
+  overrides are rejected without retaining their values.
+
+### Deliberate fixture and coverage split
+
+Published fixtures add the public `tuna-test` account, independent observer/input
+helpers, QGA, native-test dependencies, serial forwarding, and only three existing
+telemetry keys through that user's `environment.d`: `TUNA_COMPOSITOR_STATE`,
+`TUNA_LOCK_TRACE`, `TUNA_POINTER_TRACE`. No session preset, PATH assignment, GDM
+setting, shipped launcher wrapper or PAM replacement is installed. Complete
+protected payload comparisons run after fixture installation and at runtime.
+
+Current-build greetd retains its separate PAM deny/delay fault injection.
+Published GDM refuses those mutation actions at both host and guest boundaries;
+its receipt explicitly lacks that injected-failure coverage. Real wrong-password
+rejection/recovery is tested against shipped GDM policy. No skipped fault-injection
+assertion is relabeled as passing.
+
+Collector subprocess pipes are capped while reading and commands share one
+cooperative deadline with reserved retirement time. The same-privilege collector
+keeps the leader unreaped until process-group retirement, including the exited
+leader/descendant-pipe case. This is not a hard realtime bound on all Python,
+filesystem or kernel operations. No observer enables accessibility, debug logging,
+tracing, persistent privileges or host security settings.

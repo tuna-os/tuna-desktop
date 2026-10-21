@@ -1,0 +1,5 @@
+# Public fixture account home and telemetry only. GDM selection remains real UI.
+d /var/home/tuna-test 0700 tuna-test tuna-test -
+d /var/home/tuna-test/.config 0700 tuna-test tuna-test -
+d /var/home/tuna-test/.config/environment.d 0700 tuna-test tuna-test -
+L+ /var/home/tuna-test/.config/environment.d/90-tuna-vm.conf - tuna-test tuna-test - /usr/share/tuna-vm/environment.conf

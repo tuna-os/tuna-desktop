@@ -4,6 +4,7 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+import perf_operation_budget as operation
 
 ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('drained_decoder',ROOT/'scripts/lib/gnome_sysprof.py')
@@ -262,7 +263,7 @@ class WriterClosure(unittest.TestCase):
             source={'qualified':False,'pid':pid,'process_start':start,'capture_identity':capture.identity(path.stat())}
             raw=mock.Mock(side_effect=AssertionError('unclosed raw MUST NOT be read'))
             clock=iter([0,1,7])
-            ns={'Path':lambda _:path,'pwd':SimpleNamespace(getpwnam=lambda _:SimpleNamespace(pw_uid=uid)),
+            ns={'operation':operation,'Path':lambda _:path,'pwd':SimpleNamespace(getpwnam=lambda _:SimpleNamespace(pw_uid=uid)),
                 'subprocess':SimpleNamespace(run=lambda *a,**kw:SimpleNamespace(stdout=json.dumps(source)),CalledProcessError=RuntimeError),
                 'json':json,'os':os,'stat':stat,'process_start':capture.process_start,'read_raw':raw,
                 'capture_writers':lambda *a:[{'fd':3,'flags':1}],
@@ -300,7 +301,7 @@ class FailureTransport(unittest.TestCase):
                 self.assertEqual(owner,0);capture.validate_receipt(value)
                 receipts[str(name)]=copy.deepcopy(value)
             ns={name:getattr(capture,name) for name in ('validate_receipt','process_start','read_raw','identity','checked_file')}
-            ns.update(Path=lambda name:path if name.endswith('.syscap') else Path(directory)/'receipt',
+            ns.update(operation=operation,Path=lambda name:path if name.endswith('.syscap') else Path(directory)/'receipt',
                       pwd=SimpleNamespace(getpwnam=lambda _:SimpleNamespace(pw_uid=uid)),
                       subprocess=SimpleNamespace(run=lambda *a,**kw:SimpleNamespace(stdout=json.dumps(payload)),CalledProcessError=RuntimeError),
                       json=json,os=os,stat=stat,time=time,base64=__import__('base64'),

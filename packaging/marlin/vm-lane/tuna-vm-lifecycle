@@ -26,6 +26,13 @@ RECORDING_STATE = RECORDING_DIR / "current.json"
 OWNER = pwd.getpwnam("tuna-test")
 RUNTIME = f"/run/user/{OWNER.pw_uid}"
 STATE = pathlib.Path(RUNTIME, "tuna-vm-state.json")
+PROFILE_FILE = pathlib.Path("/usr/share/tuna-vm/display-manager-profile")
+DISPLAY_MANAGER_PROFILE = PROFILE_FILE.read_text().strip() if PROFILE_FILE.exists() else "current-greetd"
+if DISPLAY_MANAGER_PROFILE not in ("current-greetd", "published-gdm"):
+    raise RuntimeError("unsupported explicit display-manager profile")
+if DISPLAY_MANAGER_PROFILE == "published-gdm":
+    sys.path.insert(0, "/usr/libexec/tuna-vm-lib")
+    import published_gdm_runtime as gdm_runtime
 # tuna-rename: keep-begin
 # The published flavor can still ship the package from before the rename
 # (#505) until `tuna-desktop` lands there. That guest's binaries, nested
@@ -293,6 +300,14 @@ def inventory():
                               "executable": executable, "start_ticks": int(stat[19])})
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
+    if DISPLAY_MANAGER_PROFILE == "published-gdm":
+        observed = gdm_runtime.Collector().desktop()
+        return observed | {"probe_uid": os.geteuid(),
+            "state": {k: state[k] for k in ("locked", "windows", "focused", "active_workspace")}
+                     | {k: state.get(k) for k in ("overview_open", "pointer_position",
+                         "native_relative_motion_count", "input_devices", "mouse_left_handed",
+                         "touchpad_left_handed", "hot_corners", "auth_owner")},
+            "processes": sorted(processes, key=lambda item: item["pid"])}
     sessions = [line.split() for line in call("loginctl", "list-sessions",
                                              "--no-legend", "--no-pager").splitlines()]
     owned = []
@@ -1393,6 +1408,25 @@ def main():
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
     action = sys.argv[1]
+    if DISPLAY_MANAGER_PROFILE == "published-gdm":
+        if action in ("deny-unlock", "delay-unlock", "restore-unlock"):
+            raise RuntimeError("published qualification cannot mutate shipped PAM")
+        if action in ("gdm-greeter", "gdm-ui", "gdm-departed", "logout", "published"):
+            if action == "published":
+                result = gdm_runtime.verify_payload()
+            else:
+                collector = gdm_runtime.Collector()
+                if action == "gdm-greeter":
+                    result = collector.greeter()
+                elif action == "gdm-ui":
+                    result = collector.ui()
+                else:
+                    if len(sys.argv) != 3:
+                        raise ValueError("original session identity is required")
+                    result = getattr(collector, "departed" if action == "gdm-departed" else "logout")(
+                        json.loads(sys.argv[2]))
+            print(json.dumps(result))
+            return
     if action == "background-diagnostics":
         inventory()  # Verify the original actual greetd owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))

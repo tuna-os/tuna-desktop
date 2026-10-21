@@ -95,6 +95,10 @@ jobs:
       - run: python3 scripts/lib/vm-boot-tests.py
       - run: python3 scripts/lib/published-dm-contract-tests.py
       - run: python3 scripts/lib/published-preflight-tests.py
+      - run: python3 scripts/lib/published-gdm-runtime-tests.py
+      - run: python3 scripts/lib/published-gdm-greeter-tests.py
+      - run: python3 scripts/lib/published-gdm-ui-tests.py
+      - run: python3 scripts/lib/published-gdm-login-tests.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
@@ -145,6 +149,7 @@ jobs:
           /usr/bin/python3 scripts/lib/tuna-corral-ssh-export-tests.py
       - run: python3 scripts/lib/tuna-perf-repeatability-tests.py
       - run: python3 scripts/lib/tuna-perf-gate-tests.py
+      - run: python3 scripts/lib/perf-operation-budget-tests.py
       # Performance budgets only ratchet tighter; any change cites a run and
       # loosening needs an ADR (docs/perf/README.md, roadmap change control).
       - name: Check the performance budget ratchet

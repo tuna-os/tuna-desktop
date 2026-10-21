@@ -120,3 +120,46 @@ scripts/tuna-perf-gate check --artifacts perf-artifacts
 ```
 
 `check` exits 1 on a regression. Add `--report-only` to only print the tables. A full paired measurement needs KVM, rootful podman and about 40 GB of disk. Follow `performance-baseline.yml` step by step: build the shared preview images, then run `scripts/tuna-perf-profile-pairs stock`, which writes the `perf-artifacts/stock` tree that `check` reads. On a workstation, `scripts/tuna-vm-perf --disk disk.raw --desktop tuna --out <dir>` measures one session, and its `report.json` includes the per-phase, per-role breakdown.
+
+### Bounded per-thread idle diagnostics
+
+The CI-only sampler enables `--thread-diagnostics` for both desktops and both
+profiles without changing the workload, sample interval or budget evaluator.
+Each process sample may include numeric `thread_diagnostics`: TID, start ticks,
+user/system CPU ticks and voluntary/involuntary context-switch counters.
+These counters are **not wakeup counts** or causal stack traces. No thread names,
+command arguments, environment, kernel addresses or arbitrary proc text are added.
+
+Collection is bounded to 32 thread entries per process and 128 per sample,
+including failed/racing reads. Oversized records, unavailable counters,
+permission errors, exits and truncation are explicit. A process whose UID or
+start ticks changes during collection is rejected by the existing identity gate.
+Only compare thread deltas within the same process lifetime and identical
+`(tid, start_ticks)`; do not sum thread CPU with process CPU or treat missing
+counters as zero. Incomplete snapshots are diagnostic evidence, not complete
+thread accounting. The caps can omit relevant tasks: absence from a snapshot
+is not evidence of no scheduling activity. `collection_s` includes this observer
+overhead.
+
+Use the same retained guest idle-phase boundaries for both desktops. Existing
+idle artifacts do not expose compositor frame counts, so these remain unavailable;
+overview response traces and active frame-pacer measurements are not idle-frame
+evidence. Scheduling attribution still requires a fresh paired capture, and a
+counter correlation alone does not establish why a thread ran.
+
+Failure evidence also retains a fixed collection call-site enum, numeric errno,
+and PID/UID/start-tick/state-code identity before and after a failed observation
+when readable. State codes are the ASCII value of the proc state character.
+Identities also retain unsigned 32-bit `stat_flags`, nonnegative signed 32-bit
+`stat_num_threads`, and numeric `status_vmrss_present`/`status_vmsize_present`
+(1 for an exact field label, 0 for absent). Malformed/out-of-range stat metadata
+is null; status presence is null for records exceeding 16,384 characters.
+These reuse the existing proc reads without changing accounting or its input
+limits. Presence does not validate field values. The observations are not atomic
+and neither flags nor absent memory fields classify an exit or justify a fallback.
+The read stages identify bounded Python proc operations, not a kernel syscall
+trace. No exception text, paths or process names are added to these receipts.
+At most 128 failure receipts are retained per sample, with an explicit overflow
+count; the original unreadable list and complete-sample gate are not truncated
+or relaxed. Existing explicitly observed exits remain excluded from accounting,
+now with a diagnostic receipt; persistent unreadable identities still fail.

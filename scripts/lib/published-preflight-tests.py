@@ -520,8 +520,12 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn("cron: '17 2 * * *'", text)
         self.assertIn("if: always()", text)
         containerfile = (ROOT / "packaging/marlin/vm-lane/Containerfile.published").read_text()
-        self.assertIn("/usr/libexec/tunaos/greetd-session /etc/greetd/config.toml /etc/greetd/gtkgreet.css", containerfile)
-        self.assertIn("! grep -q '\\[initial_session\\]'", containerfile)
+        self.assertNotIn("/etc/greetd/config.toml", containerfile)
+        self.assertEqual(containerfile.count('--fixture-image "$BASE_IMAGE"'), 2)
+        self.assertIn("--display-manager-profile published-gdm", text)
+        self.assertIn("COPY published-vm-artifacts/published-image-preflight.json", containerfile)
+        self.assertNotIn("COPY packaging/marlin/vm-lane/tuna-vm-profile", containerfile)
+        self.assertNotIn("COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles", containerfile)
 
     def test_both_pure_suites_are_wired_beside_existing_vm_tests(self):
         text = (ROOT / ".github/workflows/ci.yml").read_text()

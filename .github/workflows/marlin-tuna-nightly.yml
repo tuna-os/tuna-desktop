@@ -96,7 +96,7 @@ jobs:
       - name: Real shipped greeter PAM login, semantic tour and lifecycle
         run: >-
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out published-vm-artifacts
-          --boots 5 --greeter-login --require-kvm --tour
+          --boots 5 --greeter-login --display-manager-profile published-gdm --require-kvm --tour
           --meta "published_image=ghcr.io/tuna-os/marlin@$(cat /mnt/vm/published-digest)"
           --meta "fixture_image_id=$(cat /mnt/vm/fixture-image-id)"
           --meta "shipped_tuna_package=$(cat /mnt/vm/shipped-package)"
