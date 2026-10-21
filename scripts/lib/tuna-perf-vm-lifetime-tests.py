@@ -74,6 +74,12 @@ class Lifetime(unittest.TestCase):
                 child.kill(); child.wait(); child.stdout.close(); handoff.close()
 
     def test_original_main_finally_preserves_primary_metric_exception(self):
+        self.exercise_original_main_finally(start_uncertain=False)
+
+    def test_uncertain_start_skips_observer_commands_but_retires_owned_vm(self):
+        self.exercise_original_main_finally(start_uncertain=True)
+
+    def exercise_original_main_finally(self, start_uncertain):
         source = ast.parse((ROOT / 'scripts/tuna-vm-perf').read_text())
         main = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
         original_try = next(n for n in main.body if isinstance(n, ast.Try))
@@ -81,6 +87,10 @@ class Lifetime(unittest.TestCase):
         actual = ast.fix_missing_locations(ast.Module(body=[ast.Try(body=body, handlers=original_try.handlers,
                    orelse=[], finalbody=original_try.finalbody)], type_ignores=[]))
         original = RuntimeError('original private metric error')
+        observer_calls = []
+        def guest_probe(agent, action):
+            observer_calls.append(action)
+            raise RuntimeError('controlled observer cleanup failure')
         with tempfile.TemporaryDirectory() as directory:
             handoff = life.Handoff(directory, 'diagnostic', 'gnome', 1); child = self.child()
             class Agent:
@@ -89,12 +99,14 @@ class Lifetime(unittest.TestCase):
                 handoff.attach(child)
                 scope = {'original': original, 'primary': None, 'vm': child, 'agent': Agent(),
                          'handoff': handoff, 'gnome_trace_active': False,
+                         'gnome_start_uncertain': start_uncertain, 'guest_probe': guest_probe,
                          'out': Path(directory), 'corral': None, 'json': json,
                          'args': types.SimpleNamespace(desktop='gnome', gnome_profile='diagnostic', corral_vm=None),
                          'cleanup_owned_vm': life.cleanup_owned_vm, 'sys': sys}
                 with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(RuntimeError) as raised:
                     exec(compile(actual, 'actual-worker-finally', 'exec'), scope)
                 self.assertIs(raised.exception, original)
+                self.assertEqual(observer_calls, [] if start_uncertain else ['kernel-trace-stop'])
                 self.assertIsNotNone(child.returncode)
                 self.assertEqual(life.read_receipt(handoff.path, private=True)['state'], 'reaped')
                 self.assertNotIn('private', err.getvalue())

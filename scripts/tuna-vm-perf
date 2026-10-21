@@ -13,6 +13,7 @@ import statistics
 import subprocess
 import sys
 import time
+import select
 sys.dont_write_bytecode=True
 
 HERE = Path(__file__).resolve().parent
@@ -24,6 +25,8 @@ sys.path.insert(0, str(HERE / "lib"))
 from gnome_reference import validate_image, validate_reference, same_reference, trace_required, idle_pss, idle_memory, read_image
 from tuna_overview_receipts import validate_capture as validate_tuna_overview
 from vm_guest_agent import GuestAgent  # noqa: E402
+from perf_operation_budget import WORK_SECONDS, CLEANUP_SECONDS
+from perf_vm_lifetime import Handoff
 from perf_trace_diagnostics import decode as decode_trace_failure, MAX_BYTES as TRACE_FAILURE_BYTES
 from gnome_failed_capture import validate_receipt as validate_failed_capture, validate_chunk as validate_failed_chunk
 from gnome_stop_boundary import capture_stop_boundary_evidence
@@ -31,7 +34,7 @@ from gnome_sysprof import capture_boundary_evidence, decode as decode_gnome_sysp
 from perf_budget import phase_cpu  # noqa: E402
 
 
-def guest_probe(agent, action, index=None, out=None):
+def guest_probe(agent, action, index=None, out=None, start_owner=None):
     """Only this immutable CI helper is executed; no command/path input."""
     if action not in ("clock", "notify", "frames", "reference-image", "stock-reference", "gnome-trace-start",
                       "gnome-trace-stop", "gnome-trace-read",
@@ -52,11 +55,24 @@ def guest_probe(agent, action, index=None, out=None):
         if type(index) is not int or not 0 <= index < 1024:
             raise ValueError("kernel capture chunk index outside the bounded file")
         arguments += ["--index", str(index)]
+    supervised = action == "gnome-trace-start" and start_owner is not None
+    if supervised:
+        if (not isinstance(start_owner, Handoff) or start_owner.child is None or start_owner.pidfd is None
+                or start_owner.child.poll() is not None
+                or select.select([start_owner.pidfd], [], [], 0)[0]):
+            raise RuntimeError("supervised start requires original live disposable QEMU child")
+        arguments.append("--supervised-start")
     pid = agent.command("guest-exec", path="/usr/libexec/tuna-perf-phase",
                         arg=arguments, **{"capture-output": True})["pid"]
-    deadline = time.monotonic() + (30 if action in ("gnome-trace-stop","gnome-trace-failed-stop") else 100 if action == "stock-reference" else 20)
+    deadline = time.monotonic() + (WORK_SECONDS + CLEANUP_SECONDS if supervised else 30 if action in ("gnome-trace-stop","gnome-trace-failed-stop") else 100 if action == "stock-reference" else 20)
     while time.monotonic() < deadline:
-        status = agent.command("guest-exec-status", pid=pid)
+        try:
+            status = agent.command("guest-exec-status", pid=pid, **({"deadline": deadline} if supervised else {}))
+            if not isinstance(status, dict) or type(status.get("exited")) is not bool:
+                raise ValueError("invalid guest execution status")
+        except BaseException:
+            if supervised and out is not None:retain_unobserved_start(out, pid)
+            raise
         if status["exited"]:
             if status.get("exitcode") != 0 or status.get("out-truncated") or status.get("err-truncated"):
                 # Fixed observer actions do not accept application text. Keep
@@ -90,8 +106,16 @@ def guest_probe(agent, action, index=None, out=None):
                 if type(identity) is not int or not 1 <= identity <= 0xffffffff:
                     raise ValueError("invalid accepted notification ID")
             return result
-        time.sleep(.1)
+        time.sleep(min(.1, max(0, deadline-time.monotonic())) if supervised else .1)
+    if supervised and out is not None:
+        retain_unobserved_start(out, pid)
     raise RuntimeError(f"guest performance {action} timed out")
+
+
+def retain_unobserved_start(out, pid):
+    (out / 'gnome-trace-start-unobserved.json').write_text(json.dumps({
+        'schema': 2, 'guest_pid': pid, 'terminal_observed': False,
+        'vm_retirement_required': True, 'performance_qualified': False}))
 
 
 def retain_trace_failure(status,action,out):
@@ -478,6 +502,8 @@ def main():
     if args.guest_aggregate_cpu and (not args.corral_vm or args.gnome_profile!='stock' or args.corral_user!='root' or
             not all((args.corral_export_dir,args.corral_import_receipt,args.corral_candidate_sha,args.corral_package_run,args.tuna_payload,args.tuna_selection))):
         ap.error('guest aggregate requires original stock Corral image/package/import/key intent')
+    if trace_required(args.desktop, args.gnome_profile) and (args.corral_vm or not args.owned_vm_handoff):
+        raise RuntimeError("supervised diagnostic trace requires original disposable local QEMU handoff; remote cleanup guarantee unsupported")
     expected_image = read_image(args.reference_image, args.gnome_profile) if args.reference_image else None
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -494,6 +520,7 @@ def main():
     observations, phases, guest_phases, notifications = [], {}, {}, []
     agent = None
     gnome_trace_active = False
+    gnome_start_uncertain = False
     gnome_trace_summary = None
     tuna_overview_original = None
     tuna_overview_summary = None
@@ -583,7 +610,9 @@ def main():
             time.sleep(8)
         guest_phases["typing_end"] = guest_probe(agent, "clock")["boottime_s"]
         if trace_required(args.desktop, args.gnome_profile):
-            guest_probe(agent, "gnome-trace-start", out=out)
+            gnome_start_uncertain = True
+            guest_probe(agent, "gnome-trace-start", out=out, start_owner=handoff)
+            gnome_start_uncertain = False
             gnome_trace_active = True
             time.sleep(1)  # Preserve pre-input scopes after the actual drained boundary.
         if args.desktop == 'tuna':
@@ -732,7 +761,7 @@ def main():
                 except Exception:
                     # Fixed diagnostics only; preserve the original metric error.
                     print("GNOME profile cleanup failed", file=sys.stderr)
-            if agent is not None and args.desktop == "gnome":
+            if agent is not None and args.desktop == "gnome" and not gnome_start_uncertain:
                 try:
                     observer = guest_probe(agent, "kernel-trace-stop")["kernel_trace"]
                     if not (out / "kernel-vblank-source.json").exists():

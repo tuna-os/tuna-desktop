@@ -62,6 +62,8 @@ def validate(value, action):
     if type(action) is not str or action not in ACTIONS or not isinstance(value,dict) or set(value)!={'trace_failure'}:
         raise ValueError('invalid fixed trace failure envelope')
     row=value['trace_failure']
+    if isinstance(row,dict) and type(row.get('schema')) is int and row['schema']==2:
+        return validate_operation_failure(value, action)
     if not isinstance(row,dict) or set(row)-{'schema','action','stage','error_class','glib','principal','modules','shell_version','component','payload_rejected','subprocess_returncode','drained_failure'}:
         raise ValueError('unknown trace diagnostic fields')
     if row.get('schema')!=1 or type(row.get('schema')) is not int or row.get('action')!=action or type(row.get('stage')) is not str or row['stage'] not in STAGES or type(row.get('error_class')) is not str or row['error_class'] not in CLASSES:
@@ -158,3 +160,27 @@ class Context:
                     expected='org.freedesktop.DBus.Error.TimedOut' if known=='stop-timeout' else 'org.freedesktop.DBus.Error.Failed'
                     if known is not None and row['glib']['remote_name']==expected:row['drained_failure']=known
         return {'trace_failure':row}
+
+
+def validate_operation_failure(value, action):
+    row=value['trace_failure']
+    if (set(row)!={'schema','action','stage','outcome','helper_retirement','kernel_state',
+                   'start_acceptance','cleanup','vm_retirement_required','performance_qualified'}
+            or action!='start' or row['action']!='start'
+            or row['stage'] not in {'provenance','kernel-start','profiler','complete','unknown'}
+            or row['outcome'] not in {'expired','failed'}
+            or row['helper_retirement'] not in {'confirmed','unconfirmed'}
+            or row['kernel_state'] not in {'not-entered','entered-with-marker','entered-without-marker','uncertain'}
+            or row['start_acceptance'] not in {'not-sent','uncertain'}
+            or row['cleanup'] not in {'helpers-retired','expired'}
+            or row['vm_retirement_required'] is not True or row['performance_qualified'] is not False):
+        raise ValueError('invalid versioned operation failure')
+    if (row['helper_retirement']=='confirmed') != (row['cleanup']=='helpers-retired'):
+        raise ValueError('inconsistent operation retirement')
+    if (row['stage'] in {'profiler','complete','unknown'}) != (row['start_acceptance']=='uncertain'):
+        raise ValueError('inconsistent Start acceptance')
+    if (row['stage']=='unknown') != (row['kernel_state']=='uncertain'):
+        raise ValueError('inconsistent unknown operation state')
+    if (row['stage']=='provenance') != (row['kernel_state']=='not-entered'):
+        raise ValueError('inconsistent kernel entry')
+    return value
