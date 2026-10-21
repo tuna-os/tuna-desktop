@@ -705,13 +705,28 @@ jobs:
         run: |
           /usr/bin/python3 scripts/tests/test_minimize_ci_freeze.py
           /usr/bin/python3 scripts/tests/test_minimize_brightness_controls.py
+          /usr/bin/python3 scripts/tests/test_minimize_failure_bundle.py
       - name: Prove source-matched native minimize and restore in LTR and RTL
+        id: native_minimize
         run: scripts/tuna-minimize-ci-proof "$RUNNER_TEMP/native-minimize"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: native-minimize-proof
           path: ${{ runner.temp }}/native-minimize/
+          retention-days: 14
+      # A small failure-only subset can be retrieved without the full binaries.
+      # Keep the full native-minimize-proof upload above unchanged.
+      - name: Collect bounded native minimize failure diagnostics
+        id: minimize_failure_bundle
+        if: failure() && steps.native_minimize.outcome == 'failure'
+        run: /usr/bin/python3 scripts/tuna-minimize-failure-bundle "$RUNNER_TEMP/native-minimize" "$RUNNER_TEMP/native-minimize-failure" --proof-outcome failure
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: failure() && steps.native_minimize.outcome == 'failure' && steps.minimize_failure_bundle.outcome == 'success'
+        with:
+          name: native-minimize-failure-diagnostics
+          path: ${{ runner.temp }}/native-minimize-failure/
+          if-no-files-found: error
           retention-days: 14
       - name: Check wellbeing proof admission
         run: |
