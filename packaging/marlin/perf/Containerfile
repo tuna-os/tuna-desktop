@@ -20,6 +20,7 @@ COPY packaging/marlin/perf/tuna-gnome-profiler /usr/libexec/tuna-gnome-profiler
 COPY scripts/lib/gnome_reference.py /usr/libexec/gnome_reference.py
 COPY packaging/marlin/perf/tuna-gnome-reference /usr/libexec/tuna-gnome-reference
 COPY scripts/lib/perf_trace_diagnostics.py /usr/libexec/perf_trace_diagnostics.py
+COPY scripts/lib/perf_operation_budget.py /usr/libexec/perf_operation_budget.py
 COPY scripts/lib/gnome_failed_capture.py /usr/libexec/gnome_failed_capture.py
 COPY packaging/marlin/perf/tuna-perf.service /usr/lib/systemd/system/tuna-perf.service
 RUN case "$DESKTOP" in gnome|tuna) ;; *) exit 1 ;; esac && \
