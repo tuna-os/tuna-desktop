@@ -22,7 +22,8 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from minimize_body_pixel import (unobscured_body_point, require_rgb, require_restore_bracket,
-                                 wait_clear_restore, clear_capture, require_destroy_bracket)
+                                 wait_clear_restore, clear_capture, require_destroy_bracket,
+                                 wait_clock_frames, minimize_quarter, minimize_capture)
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("--bin-dir", type=Path, required=True)
 p.add_argument("--artifacts", type=Path, required=True)
@@ -120,9 +121,8 @@ def move(ms):
     ms+=clock_shift
     temp = art / "clock.tmp"
     temp.write_text(str(ms))
-    before = json.loads(state.read_text())["rendered_frames"]
     temp.replace(clock)
-    wait(lambda d:d["animation_clock_ms"] >= clock_base + ms and d["rendered_frames"] >= before+2, f"clock-{ms}")
+    wait_clock_frames(wait, clock_base + ms, f"clock-{ms}")
 def settle_extra(ms):
     global clock_shift
     clock_shift+=ms
@@ -272,8 +272,15 @@ try:
     center=(target[0]+32,target[1]+32)
     assert dash_source.getpixel(center)==(127,211,33),(target,center,dash_source.getpixel(center))
     move(1050)
-    q=wait(lambda d:d["window_lifecycle"]["minimizing"],"dash-minimize-quarter")["window_lifecycle"]["minimizing"][0]
-    check_pixel(screenshot("05-dash-minimize-quarter"),q["rect"],q["alpha"])
+    quarter=wait(lambda d:minimize_quarter(d,wid,target),"dash-minimize-quarter")
+    q=quarter["window_lifecycle"]["minimizing"][0]
+    def dash_capture_scene(label):
+        scene=json.loads(state.read_text())
+        (art / f"05-dash-minimize-quarter-{label}.json").write_text(json.dumps(scene,indent=2))
+        return scene
+    image=minimize_capture(lambda:screenshot("05-dash-minimize-quarter"),
+                           dash_capture_scene,quarter,wid,target)
+    check_pixel(image,q["rect"],q["alpha"])
     move(1350)
     wait(lambda d:not d["window_lifecycle"]["minimizing"],"dash-minimize-finished")
     restore();move(1750)

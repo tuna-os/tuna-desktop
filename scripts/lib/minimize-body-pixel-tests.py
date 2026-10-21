@@ -6,7 +6,8 @@ import sys
 import unittest
 sys.dont_write_bytecode = True
 from minimize_body_pixel import (unobscured_body_point, require_rgb, require_restore_bracket,
-                                 switcher_absent, wait_clear_restore, clear_capture, require_destroy_bracket)
+                                 switcher_absent, wait_clear_restore, clear_capture, require_destroy_bracket,
+                                 wait_clock_frames, minimize_quarter, minimize_capture)
 
 
 class BodyPixel(unittest.TestCase):
@@ -149,6 +150,89 @@ class ClearRestoreCapture(unittest.TestCase):
         self.assertFalse(switcher_absent(self.fading()))
         for scene in ({},{'layers':None},{'layers':[{}]}):
             with self.assertRaises(AssertionError):switcher_absent(scene)
+
+class ManualClockCapture(unittest.TestCase):
+    def scene(self, clock=2652, frame=408, alpha=45/255):
+        return {'animation_clock_ms': clock, 'rendered_frames': frame,
+                'window_lifecycle': {'minimizing': [{'window': 1, 'alpha': alpha,
+                    'duration_ms': 400, 'icon': [572, 706, 64, 64], 'live': True,
+                    'monitor_sized': False, 'rect': [540, 624, 141, 114]}]}}
+
+    def waiter(self, scenes, evidence):
+        stream = iter(scenes)
+        def wait(predicate, label):
+            for scene in stream:
+                if predicate(scene):
+                    evidence[label] = scene
+                    return scene
+            raise AssertionError('timed out: ' + label)
+        return wait
+
+    def test_new_clock_with_stale_lifecycle_and_pre_poll_frames_cannot_settle(self):
+        # Actual failure: frame 404 at old clock, then frame 406 acknowledges
+        # the new clock but still publishes the full-size/full-alpha actor.
+        old = self.scene(2552, 404, 1)
+        unrelated = self.scene(2552, 405, 1)
+        ack = self.scene(2652, 406, 1)
+        ack['window_lifecycle']['minimizing'][0]['rect'] = [390, 241, 500, 350]
+        settled = self.scene()
+        evidence = {}
+        result = wait_clock_frames(self.waiter([old, unrelated, ack,
+                                  self.scene(frame=407), settled], evidence), 2652, 'clock-1050')
+        self.assertIs(result, settled)
+        self.assertIs(evidence['clock-1050-ack'], ack)
+        self.assertIs(evidence['clock-1050'], settled)
+        self.assertFalse(minimize_quarter(ack, 1, [572, 706, 64, 64]))
+        self.assertTrue(minimize_quarter(result, 1, [572, 706, 64, 64]))
+        with self.assertRaisesRegex(AssertionError, 'timed out'):
+            wait_clock_frames(self.waiter([old, unrelated, ack, self.scene(frame=407)], {}),
+                              2652, 'incomplete')
+
+    def test_wrong_clock_cannot_acknowledge_or_settle(self):
+        with self.assertRaisesRegex(AssertionError, 'timed out'):
+            wait_clock_frames(self.waiter([self.scene(2653, 999)], {}), 2652, 'wrong')
+        with self.assertRaisesRegex(AssertionError, 'clock changed'):
+            wait_clock_frames(self.waiter([self.scene(frame=406), self.scene(2653, 999)], {}),
+                              2652, 'changed')
+
+    def test_quarter_requires_exact_single_identity_icon_duration_and_alpha(self):
+        for change in ('missing', 'duplicate', 'window', 'icon', 'duration_ms', 'alpha'):
+            scene = self.scene()
+            actors = scene['window_lifecycle']['minimizing']
+            if change == 'missing': actors.clear()
+            elif change == 'duplicate': actors.append(copy.deepcopy(actors[0]))
+            else: actors[0][change] = {'window': 2, 'icon': [0, 0, 64, 64],
+                                     'duration_ms': 401, 'alpha': 1}[change]
+            with self.subTest(change=change):
+                self.assertFalse(minimize_quarter(scene, 1, [572, 706, 64, 64]))
+
+    def test_both_capture_brackets_reject_clock_identity_and_presentation_changes(self):
+        reference = self.scene()
+        changes = {'window': 2, 'rect': [541, 624, 141, 114], 'alpha': 45/255 + 1e-6,
+                   'icon': [573, 706, 64, 64], 'duration_ms': 401,
+                   'live': False, 'monitor_sized': True}
+        for field in ('clock', *changes):
+            scene = copy.deepcopy(reference)
+            if field == 'clock': scene['animation_clock_ms'] += 1
+            else: scene['window_lifecycle']['minimizing'][0][field] = changes[field]
+            for scenes in ([scene, reference], [reference, scene]):
+                with self.subTest(field=field, before=scenes[0] is scene), self.assertRaises(AssertionError):
+                    minimize_capture(lambda: 'pixels', Mock(side_effect=scenes), reference,
+                                     1, [572, 706, 64, 64])
+
+    def test_valid_capture_preserves_pixels_and_corruption_still_fails(self):
+        reference = self.scene()
+        read = Mock(side_effect=[reference, copy.deepcopy(reference)])
+        capture = Mock(return_value=(52, 101, 164))
+        pixels = minimize_capture(capture, read, reference, 1, [572, 706, 64, 64])
+        capture.assert_called_once()
+        self.assertEqual([call.args for call in read.call_args_list], [('before',), ('after',)])
+        require_rgb(pixels, (52, 101, 164), 'valid bracket')
+        corrupted = minimize_capture(lambda: (57, 101, 164), lambda _: reference,
+                                     reference, 1, [572, 706, 64, 64])
+        with self.assertRaises(AssertionError):
+            require_rgb(corrupted, (52, 101, 164), 'corrupted pixel after valid bracket')
+
 
 if __name__ == '__main__':
     unittest.main()
