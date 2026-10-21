@@ -235,6 +235,20 @@ def read_smaps_rollup(path):
             time.sleep(0.0005)
 
 
+def numeric_identity(row):
+    if row is None:
+        return None
+    return {"pid": row["pid"], "uid": row["uid"], "start_ticks": row["start_ticks"],
+            "state_code": ord(row["state"]) if len(row["state"]) == 1 else None}
+
+
+def failure_record(stage, error, before, after, after_error=None):
+    """Fixed call-site enum and numeric identity/errno; no exception text/paths."""
+    return {"stage": stage, "errno": getattr(error, "errno", None),
+            "before": numeric_identity(before), "after": numeric_identity(after),
+            "after_errno": getattr(after_error, "errno", None)}
+
+
 def sample(uid, proc=Path("/proc"), observer=None, thread_diagnostics=False):
     processes, errors = {}, []
     for path in proc.iterdir():
@@ -253,40 +267,63 @@ def sample(uid, proc=Path("/proc"), observer=None, thread_diagnostics=False):
             break
         excluded.update(children)
     rows = []
+    failures = []
+    failure_overflow = 0
     thread_budget = MAX_THREADS_PER_SAMPLE
     for pid, row in processes.items():
         if pid in excluded:
             continue
         path = proc / str(pid)
+        stage = "smaps_rollup_read"
         try:
             memory = dict(line.split(":", 1) for line in read_smaps_rollup(path).splitlines() if ":" in line)
-            row.update(pss_kib=int(memory["Pss"].split()[0]), rss_kib=int(memory["Rss"].split()[0]),
-                       fds=len(list((path / "fd").iterdir())))
+            stage = "smaps_rollup_parse"
+            row.update(pss_kib=int(memory["Pss"].split()[0]), rss_kib=int(memory["Rss"].split()[0]))
+            stage = "fd_enumeration"
+            row["fds"] = len(list((path / "fd").iterdir()))
+            stage = "drm_read"
             row["drm_clients"], row["drm_errors"] = drm_clients(path)
+            stage = "command_read"
             row["cmd"] = command_name(path)
             if thread_diagnostics:
+                stage = "thread_read"
                 row["thread_diagnostics"], attempted = thread_snapshot(path, uid, thread_budget)
                 thread_budget -= attempted
+            stage = "identity_recheck"
             current_identity = read_process(path)
             if current_identity["start_ticks"] != row["start_ticks"] or current_identity["uid"] != uid:
+                if len(failures) < 128:
+                    failures.append(failure_record(stage, None, row, current_identity))
+                else:
+                    failure_overflow += 1
                 errors.append({"pid": pid, "error": "ProcessIdentityChanged"})
                 continue
             rows.append(row)
         except (OSError, ValueError, KeyError) as error:
+            identity = None
+            identity_error = None
+            exited = False
             try:
                 identity = read_process(path)
-                if identity["state"] in ("Z", "X", "x"):
-                    continue  # Exited processes can retain /proc entries until reaped.
-            except (FileNotFoundError, ProcessLookupError):
-                continue  # Ordinary process exit during a non-atomic sample.
-            except (OSError, ValueError, KeyError, IndexError):
-                pass
+                exited = identity["state"] in ("Z", "X", "x")
+            except (FileNotFoundError, ProcessLookupError) as observed:
+                identity_error = observed
+                exited = True
+            except (OSError, ValueError, KeyError, IndexError) as observed:
+                identity_error = observed
+            if len(failures) < 128:
+                failures.append(failure_record(stage, error, row, identity, identity_error))
+            else:
+                failure_overflow += 1
+            if exited:
+                continue  # Preserve the existing explicit exit accounting rule.
             errors.append({"pid": pid, "error": type(error).__name__})
     drm = unique_drm_clients(rows)
     drm_errors = [{"pid": row["pid"], "error": error} for row in rows for error in row["drm_errors"]]
     gpu = {"clients": drm, "errors": drm_errors,
            "status": "incomplete" if drm_errors else ("available" if any(c["memory_bytes"] for c in drm) else "unavailable")}
     return {"uid": uid, "processes": rows, "unreadable": errors, "drm_memory": gpu,
+            "failure_evidence": failures, "failure_evidence_overflow": failure_overflow,
             "pss_kib": sum(row["pss_kib"] for row in rows),
             "rss_kib": sum(row["rss_kib"] for row in rows),
             "fds": sum(row["fds"] for row in rows), "process_count": len(rows)}

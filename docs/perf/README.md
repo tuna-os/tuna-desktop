@@ -146,3 +146,13 @@ idle artifacts do not expose compositor frame counts, so these remain unavailabl
 overview response traces and active frame-pacer measurements are not idle-frame
 evidence. Scheduling attribution still requires a fresh paired capture, and a
 counter correlation alone does not establish why a thread ran.
+
+Failure evidence also retains a fixed collection call-site enum, numeric errno,
+and PID/UID/start-tick/state-code identity before and after a failed observation
+when readable. State codes are the ASCII value of the proc state character.
+The read stages identify bounded Python proc operations, not a kernel syscall
+trace. No exception text, paths or process names are added to these receipts.
+At most 128 failure receipts are retained per sample, with an explicit overflow
+count; the original unreadable list and complete-sample gate are not truncated
+or relaxed. Existing explicitly observed exits remain excluded from accounting,
+now with a diagnostic receipt; persistent unreadable identities still fail.

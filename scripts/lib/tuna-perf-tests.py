@@ -825,6 +825,55 @@ class Accounting(unittest.TestCase):
             self.assertTrue(all(p['thread_diagnostics']['status'] == 'incomplete'
                                 for p in result['processes']))
 
+    def test_failure_evidence_retains_numeric_errno_and_lifetime_without_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.process(root, 1, 0, 1000, 10, 55)
+            with patch.object(guest, 'read_smaps_rollup', side_effect=ProcessLookupError(3, 'private path')):
+                result = guest.sample(1000, root)
+            self.assertEqual(result['unreadable'], [{'pid': 1, 'error': 'ProcessLookupError'}])
+            evidence = result['failure_evidence'][0]
+            self.assertEqual(evidence['stage'], 'smaps_rollup_read')
+            self.assertEqual(evidence['errno'], 3)
+            self.assertEqual(evidence['before'], dict(pid=1, uid=1000, start_ticks=55, state_code=ord('S')))
+            self.assertEqual(evidence['before'], evidence['after'])
+            self.assertNotIn('private', json.dumps(evidence))
+            self.assertNotIn('command', json.dumps(evidence))
+
+    def test_failure_evidence_preserves_existing_exit_and_reuse_semantics(self):
+        for case in ('exit', 'reuse', 'unreadable'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                process = self.process(root, 1, 0, 1000, 10, 55)
+                initial = guest.read_process(process)
+                after = (ProcessLookupError(3, 'gone') if case == 'exit' else
+                         PermissionError(13, 'private') if case == 'unreadable' else
+                         dict(initial, start_ticks=99))
+                with patch.object(guest, 'read_process', side_effect=[initial, after]), \
+                     patch.object(guest, 'read_smaps_rollup', side_effect=ProcessLookupError(3, 'private')):
+                    result = guest.sample(1000, root)
+                evidence = result['failure_evidence'][0]
+                self.assertEqual(evidence['before']['start_ticks'], 55)
+                if case == 'reuse':
+                    self.assertEqual(evidence['after']['start_ticks'], 99)
+                else:
+                    self.assertIsNone(evidence['after'])
+                    self.assertEqual(evidence['after_errno'], 3 if case == 'exit' else 13)
+                self.assertEqual(bool(result['unreadable']), case != 'exit')
+                self.assertEqual(result['process_count'], 0)
+
+    def test_failure_evidence_is_bounded_without_truncating_gate_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for pid in range(1, 131):
+                self.process(root, pid, 0, 1000, 10, pid)
+            with patch.object(guest, 'read_smaps_rollup', side_effect=PermissionError(13, 'private')):
+                result = guest.sample(1000, root)
+            self.assertEqual(len(result['failure_evidence']), 128)
+            self.assertEqual(result['failure_evidence_overflow'], 2)
+            self.assertEqual(len(result['unreadable']), 130)
+            self.assertEqual(result['process_count'], 0)
+
     def test_scope_excludes_other_users_observer_and_descendants(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
