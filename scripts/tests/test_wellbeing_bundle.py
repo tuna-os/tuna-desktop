@@ -114,5 +114,51 @@ class BundleAdmission(unittest.TestCase):
         self.assertIn('libc::getppid()', peer)
 
 
+class NativeMapBarrier(unittest.TestCase):
+    def setUp(self):
+        import runpy
+        self.settle = runpy.run_path(str(ROOT / 'scripts/tuna-wellbeing-proof'))['settle_native_map']
+
+    @staticmethod
+    def state(window=1, opening=()):
+        return {'windows': [] if window is None else [{'id': window}],
+                'window_lifecycle': {'opening': [{'window': n} for n in opening]}}
+
+    def test_model_admission_does_not_advance_clock_before_first_buffer(self):
+        events = []
+        def wait(check, label):
+            events.append(label)
+            if label == 'native-map':
+                doc = self.state()
+            elif label == 'native-map-started':
+                self.assertNotIn('advance', events)
+                self.assertFalse(check(self.state()))
+                self.assertFalse(check(self.state(opening=(2,))))
+                doc = self.state(opening=(1,))
+            else:
+                self.assertFalse(check(self.state(opening=(1,))))
+                self.assertFalse(check(self.state(window=None)))
+                self.assertFalse(check(self.state(window=2)))
+                doc = self.state()
+            self.assertTrue(check(doc))
+            return doc
+        def advance(delta):
+            self.assertEqual(delta, 1000)
+            events.append('advance')
+        self.assertEqual(self.settle(wait, advance), self.state())
+        self.assertEqual(events, ['native-map', 'native-map-started', 'advance', 'native-map-settled'])
+
+    def test_missing_map_start_fails_without_advancing(self):
+        def wait(check, label):
+            if label == 'native-map':
+                return self.state()
+            self.assertFalse(check(self.state()))
+            raise AssertionError('timed out: ' + label)
+        def advance(_):
+            self.fail('clock advanced before native map started')
+        with self.assertRaisesRegex(AssertionError, 'native-map-started'):
+            self.settle(wait, advance)
+
+
 if __name__ == '__main__':
     unittest.main()
