@@ -356,12 +356,17 @@ The lane then sends 1,000 notifications and closes each over D-Bus.
 
 The per-change smoke uses ten measured rounds; nightly uses 300. The
 report retains PSS/RSS, file descriptors and descendant process counts
-for the compositor and supervised shell after each round. Final PSS must
-stay within warmup PSS × 1.25 + 64 MiB, and fd count within warmup + 32.
-These diagnostic bounds catch unbounded growth in this workload; they
-are separate from the GNOME performance targets in #73. A panic, lost
-input response, orphaned window or hung worker fails the lane. Logs,
-metrics, final state, assertions and the exact source revision are kept.
+for the compositor and supervised shell after each round. A descendant
+can exit between the process-tree snapshot and its `/proc` read, which
+answers `ENOENT` or `ESRCH`; such a pid is counted whole or not at all
+and recorded as `exited_processes` beside `sampled_processes`, while a
+process that is still running and cannot be read fails the lane. Final
+PSS must stay within warmup PSS × 1.25 + 64 MiB, and fd count within
+warmup + 32. These diagnostic bounds catch unbounded growth in this
+workload; they are separate from the GNOME performance targets in #73.
+A panic, lost input response, orphaned window or hung worker fails the
+lane. Logs, metrics, final state, assertions and the exact source
+revision are kept.
 
 Run it on a development host after building the compositor and GTK shell:
 
