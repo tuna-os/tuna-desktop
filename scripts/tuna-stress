@@ -109,7 +109,27 @@ def wait_for(condition, timeout=30):
     raise RuntimeError("condition exceeded its wall-clock deadline")
 
 
-def metrics(root_pid):
+def read_smaps_rollup(proc):
+    """Bound a transient ESRCH while a process releases or replaces its mm."""
+    for attempt in range(3):
+        try:
+            return (proc / "smaps_rollup").read_text()
+        except ProcessLookupError:
+            if attempt == 2:
+                raise
+            time.sleep(0.0005)
+
+
+def has_exited(proc, states=("Z", "X", "x")):
+    """Whether a pid left the tree between the ps snapshot and the /proc read."""
+    try:
+        stat = (proc / "stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return stat.rpartition(")")[2].split()[0] in states
+
+
+def metrics(root_pid, proc_root=Path("/proc")):
     pairs = subprocess.check_output(["ps", "-eo", "pid=,ppid="], text=True)
     children = {root_pid}
     edges = [tuple(map(int, line.split())) for line in pairs.splitlines()]
@@ -118,22 +138,31 @@ def metrics(root_pid):
         if expanded == children:
             break
         children = expanded
-    pss, rss, fds = 0, 0, 0
-    for pid in children:
-        proc = Path(f"/proc/{pid}")
+    pss, rss, fds, sampled, exited = 0, 0, 0, 0, 0
+    for pid in sorted(children):
+        proc = proc_root / str(pid)
         try:
             values = {}
-            for line in (proc / "smaps_rollup").read_text().splitlines():
+            for line in read_smaps_rollup(proc).splitlines():
                 parts = line.split()
-                if parts[0] in ("Pss:", "Rss:"):
+                if parts and parts[0] in ("Pss:", "Rss:"):
                     values[parts[0]] = int(parts[1])
-            pss += values.get("Pss:", 0)
-            rss += values.get("Rss:", 0)
-            fds += len(list((proc / "fd").iterdir()))
-        except FileNotFoundError:
-            pass
+            # A churn client can exit mid-sample; count it whole or not at all.
+            open_fds = len(list((proc / "fd").iterdir()))
+        except (FileNotFoundError, ProcessLookupError):
+            # Only an actual exit excuses missing data: a live process that
+            # cannot be read stays a harness failure.
+            if not has_exited(proc):
+                raise
+            exited += 1
+            continue
+        pss += values.get("Pss:", 0)
+        rss += values.get("Rss:", 0)
+        fds += open_fds
+        sampled += 1
     return {"elapsed_s": time.monotonic(), "pss_kib": pss, "rss_kib": rss,
-            "fds": fds, "processes": len(children)}
+            "fds": fds, "processes": len(children), "sampled_processes": sampled,
+            "exited_processes": exited}
 
 
 def run(args):

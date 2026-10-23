@@ -92,6 +92,7 @@ jobs:
       - run: python3 scripts/lib/rename-to-tuna-tests.py
       - run: scripts/rename-to-tuna --check --no-cargo
       - run: python3 scripts/lib/tuna-soak-tests.py
+      - run: python3 scripts/lib/tuna-stress-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
