@@ -33,6 +33,7 @@ import select
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -63,9 +64,10 @@ if not client_bin.exists():
 for binary in (compositor_bin, client_bin):
     assert binary.is_file(), f"missing {binary}"
 
-runtime = art / "runtime"
-shutil.rmtree(runtime, ignore_errors=True)
-runtime.mkdir(mode=0o700)
+# Unix socket paths cap at 108 bytes (SUN_LEN); a runtime below a CI
+# checkout's artifacts directory is too deep for the Wayland socket.
+runtime = Path(tempfile.mkdtemp(prefix="tuna-session-restore.", dir="/tmp"))
+(art / "runtime-directory.txt").write_text(f"{runtime}\n")
 data = art / "data"
 shutil.rmtree(data, ignore_errors=True)
 store = data / "tuna" / "window-sessions.json"
@@ -83,7 +85,7 @@ SOCKET = "tuna-session-restore-proof"
 
 children = []
 logs = []
-receipt = {"scope": __doc__.splitlines()[0], "runs": []}
+receipt = {"scope": __doc__.splitlines()[0], "runtime_directory": str(runtime), "runs": []}
 
 
 def spawn(argv, name, extra=None, **kw):
