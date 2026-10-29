@@ -1,0 +1,289 @@
+#!/usr/bin/python3
+"""Window session save and restore across a compositor restart (P-SY-08, #338).
+
+Usage: scripts/tuna-session-restore-proof --artifacts DIR [--bin-dir DIR]
+
+Runs the real tuna-compositor nested on a private Xvfb display with a
+private runtime, session bus and XDG_DATA_HOME, and a Wayland client
+(crates/compositor/examples/tuna-session-restore-client.rs) that opens an
+xdg-session-management session with two toplevels, as an app opting in
+does on GNOME 51. Real pointer and keyboard input (xdotool on the nested
+window) moves and resizes `main` with the client's own move/resize
+requests, sends it to the second workspace with Super+Shift+Page_Down and
+maximizes `aux` with Super+Up. SIGTERM ends the compositor (and so the
+client), as logout does; the compositor is started again and the client
+reconnects with its session id and asks to restore both windows before
+their first commit.
+
+  G-SESSION-RESTORE        the restarted compositor puts `main` back at
+                           its moved and resized geometry on workspace 2,
+                           and the client hears `restored` before the first
+                           configure, which carries the saved size
+  G-SESSION-RESTORE-STATE  `aux` comes back maximized on workspace 1
+  G-SESSION-RESTORE-OPTIN  the same app without a session is placed as
+                           usual: nothing is restored for it
+
+Without --bin-dir the compositor and client are built into the Cargo target
+directory first. Assertions go to DIR/assertions.txt for the parity ledger.
+"""
+import argparse
+import json
+import os
+import select
+import shutil
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+WIDTH, HEIGHT, PANEL = 1280, 800, 32
+APP_ID = "org.tuna.SessionRestoreProof"
+
+parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--artifacts", type=Path, required=True)
+parser.add_argument("--bin-dir", type=Path)
+args = parser.parse_args()
+art = args.artifacts.resolve()
+art.mkdir(parents=True, exist_ok=True)
+for stale in ("assertions.txt", "receipt.json"):
+    (art / stale).unlink(missing_ok=True)
+
+if args.bin_dir:
+    bins = args.bin_dir.resolve()
+else:
+    subprocess.run(["cargo", "build", "--quiet", "-p", "tuna-compositor", "--bin", "tuna-compositor",
+                    "--example", "tuna-session-restore-client"], cwd=ROOT, check=True)
+    target = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")
+    bins = (target if target.is_absolute() else ROOT / target) / "debug"
+compositor_bin = bins / "tuna-compositor"
+client_bin = bins / "tuna-session-restore-client"
+if not client_bin.exists():
+    client_bin = bins / "examples" / "tuna-session-restore-client"
+for binary in (compositor_bin, client_bin):
+    assert binary.is_file(), f"missing {binary}"
+
+runtime = art / "runtime"
+shutil.rmtree(runtime, ignore_errors=True)
+runtime.mkdir(mode=0o700)
+data = art / "data"
+shutil.rmtree(data, ignore_errors=True)
+store = data / "tuna" / "window-sessions.json"
+state = art / "state.json"
+stub_shell = art / "stub-shell"
+stub_shell.write_text("#!/bin/sh\nexec sleep 2147483647\n")
+stub_shell.chmod(0o755)
+
+env = {k: v for k, v in os.environ.items()
+       if k not in ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DBUS_SESSION_BUS_ADDRESS", "AT_SPI_BUS_ADDRESS")}
+env.update(XDG_RUNTIME_DIR=str(runtime), XDG_CONFIG_HOME=str(art / "config"), XDG_DATA_HOME=str(data),
+           XDG_STATE_HOME=str(art / "state-home"), GSETTINGS_BACKEND="keyfile", LIBGL_ALWAYS_SOFTWARE="1",
+           TUNA_XWAYLAND="0", TUNA_COMPOSITOR_STATE=str(state))
+SOCKET = "tuna-session-restore-proof"
+
+children = []
+logs = []
+receipt = {"scope": __doc__.splitlines()[0], "runs": []}
+
+
+def spawn(argv, name, extra=None, **kw):
+    log = (art / f"{name}.log").open("wb")
+    logs.append(log)
+    proc = subprocess.Popen(argv, env=env | (extra or {}), stdout=log, stderr=log, start_new_session=True, **kw)
+    children.append(proc)
+    return proc
+
+
+def wait(check, label, seconds=20):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            result = check()
+            if result:
+                return result
+        except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+            pass
+        time.sleep(0.05)
+    raise AssertionError(f"timed out: {label}; see {art}")
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def run(argv):
+    return subprocess.check_output(argv, env=env, text=True, stderr=subprocess.STDOUT, timeout=10).strip()
+
+
+def proof_windows(document):
+    return sorted((w for w in document["windows"] if w.get("app_id") == APP_ID), key=lambda w: w["id"])
+
+
+def settle(check, label):
+    """Wait for `check(state)` to hold, then return that state."""
+    return wait(lambda: (doc if check(doc := read(state)) else False), label)
+
+
+def start_compositor(name):
+    state.unlink(missing_ok=True)
+    proc = spawn([str(compositor_bin), "--backend", "winit", "--width", str(WIDTH), "--height", str(HEIGHT),
+                  "--socket", SOCKET, "--shell-bin", str(stub_shell)], name)
+    settle(lambda d: d["rendered_frames"] >= 1, f"{name} ready")
+    window = wait(lambda: run(["xdotool", "search", "--pid", str(proc.pid), "--name", "Smithay"]), f"{name} window")
+    window = window.splitlines()[0]
+    run(["xdotool", "windowfocus", "--sync", window])
+    return proc, window
+
+
+def start_client(name, *extra):
+    report = art / f"{name}.json"
+    report.unlink(missing_ok=True)
+    proc = spawn([str(client_bin), "--report", str(report), *extra], name, {"WAYLAND_DISPLAY": SOCKET})
+    return proc, report
+
+
+def drag(window, start, end):
+    run(["xdotool", "mousemove", "--window", window, str(start[0]), str(start[1])])
+    time.sleep(0.2)
+    run(["xdotool", "mousedown", "1"])
+    time.sleep(0.2)
+    steps = 6
+    for step in range(1, steps + 1):
+        x = start[0] + (end[0] - start[0]) * step // steps
+        y = start[1] + (end[1] - start[1]) * step // steps
+        run(["xdotool", "mousemove", "--window", window, str(x), str(y)])
+        time.sleep(0.05)
+    time.sleep(0.2)
+    run(["xdotool", "mouseup", "1"])
+
+
+def stop(proc, label, seconds=15):
+    proc.send_signal(signal.SIGTERM)
+    try:
+        return proc.wait(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"{label} did not exit on SIGTERM")
+
+
+def first(events, prefix):
+    return next((i for i, e in enumerate(events) if e.startswith(prefix)), None)
+
+
+success = False
+try:
+    bus = runtime / "bus"
+    spawn(["dbus-daemon", "--session", "--nofork", f"--address=unix:path={bus}"], "bus")
+    wait(bus.exists, "session bus")
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    r, w = os.pipe()
+    spawn(["Xvfb", "-displayfd", str(w), "-screen", "0", f"{WIDTH}x{HEIGHT}x24", "-nolisten", "tcp", "-noreset"],
+          "xvfb", pass_fds=(w,))
+    os.close(w)
+    number = b""
+    deadline = time.monotonic() + 10
+    while not number.endswith(b"\n"):
+        assert select.select([r], [], [], max(0, deadline - time.monotonic()))[0], "Xvfb readiness timeout"
+        chunk = os.read(r, 32)
+        assert chunk, "Xvfb closed before readiness"
+        number += chunk
+    os.close(r)
+    env["DISPLAY"] = ":" + number.decode().strip()
+
+    # Run 1: the app opens a session; the user arranges its windows.
+    core, window = start_compositor("compositor-1")
+    client, report = start_client("client-1")
+    session_id = wait(lambda: read(report)["session_id"], "session created")
+    placed = settle(lambda d: len(proof_windows(d)) == 2 and all(w["rect"][2:] == [420, 300] for w in proof_windows(d)),
+                    "both windows placed")
+    main, aux = proof_windows(placed)
+    x, y, mw, mh = main["rect"]
+    ax, ay, aw, ah = aux["rect"]
+    # Header-bar drag on a part of main that aux (mapped above it, either
+    # centred or cascaded) does not cover.
+    grip = next(p for p in ((x + 20, y + 20), (x + mw - 40, y + 20), (x + 20, y + mh - 40), (x + mw - 40, y + mh - 40))
+                if not (ax <= p[0] < ax + aw and ay <= p[1] < ay + ah))
+    receipt["placed"] = {"windows": proof_windows(placed), "grip": grip}
+    drag(window, grip, (grip[0] - 300, grip[1] - 150))
+    moved = settle(lambda d: proof_windows(d)[0]["rect"][:2] == [x - 300, y - 150], "main moved")
+    x, y, mw, mh = proof_windows(moved)[0]["rect"]
+    # Bottom-right corner drag: main was raised by the click.
+    drag(window, (x + mw - 6, y + mh - 6), (x + mw - 6 + 180, y + mh - 6 + 120))
+    resized = settle(lambda d: proof_windows(d)[0]["rect"] == [x, y, mw + 180, mh + 120], "main resized")
+    assert "move main" in read(report)["events"] and "resize main" in read(report)["events"]
+    assert resized["focused"] == main["id"], "main is focused after the drags"
+    run(["xdotool", "key", "--clearmodifiers", "super+shift+Next"])
+    settle(lambda d: proof_windows(d)[0]["workspace"] == 1, "main on the second workspace")
+    run(["xdotool", "key", "--clearmodifiers", "super+Prior"])
+    settle(lambda d: d["active_workspace"] == 0, "back on the first workspace")
+    run(["xdotool", "mousemove", "--window", window, str(ax + aw // 2), str(ay + ah // 2), "click", "1"])
+    settle(lambda d: d["focused"] == aux["id"], "aux focused")
+    run(["xdotool", "key", "--clearmodifiers", "super+Up"])
+    arranged = settle(lambda d: proof_windows(d)[1]["rect"] == [0, PANEL, WIDTH, HEIGHT - PANEL], "aux maximized")
+    saved_main = proof_windows(arranged)[0]
+    receipt["runs"].append({"arranged": proof_windows(arranged), "session_id": session_id})
+
+    # Logout: SIGTERM ends the compositor, which writes the store; the
+    # client loses its display and exits.
+    assert stop(core, "compositor-1") == 0, "compositor-1 exited uncleanly"
+    assert client.wait(timeout=10) == 0, "client-1 did not exit with its display"
+    saved = read(store)
+    toplevels = saved["sessions"][session_id]["toplevels"]
+    assert toplevels["main"]["state"] == 1 and toplevels["main"]["floating-rect"] == saved_main["rect"], toplevels
+    assert toplevels["main"]["workspace"] == 1, toplevels
+    assert toplevels["aux"]["state"] == 2, toplevels
+    receipt["store"] = saved
+
+    # Run 2: login again; the app comes back with its session id.
+    core, window = start_compositor("compositor-2")
+    client, report = start_client("client-2", "--session", session_id)
+    restored = settle(lambda d: len(proof_windows(d)) == 2 and d["active_workspace"] == 0, "restored windows mapped")
+    events = wait(lambda: (e if all(first(e := read(report)["events"], f"configure {n}") is not None for n in ("main", "aux")) else False),
+                  "restored windows configured")
+    main, aux = proof_windows(restored)
+    assert "session restored" in events and "session created" not in events, events
+    for name in ("main", "aux"):
+        assert f"restored {name}" in events, events
+        assert events.index(f"restored {name}") < first(events, f"configure {name}"), events
+    assert events[first(events, "configure main")] == f"configure main {saved_main['rect'][2]}x{saved_main['rect'][3]}", events
+    assert main["rect"] == saved_main["rect"], (main, saved_main)
+    assert main["workspace"] == 1, main
+    assert restored["focused"] != main["id"], "a window restored to another workspace is not focused"
+    assert aux["rect"] == [0, PANEL, WIDTH, HEIGHT - PANEL] and aux["workspace"] == 0, aux
+    receipt["runs"].append({"restored": proof_windows(restored), "events": events})
+
+    # The same app without a session: placed as usual, nothing restored.
+    plain, plain_report = start_client("client-3", "--no-session")
+    mixed = settle(lambda d: len(proof_windows(d)) == 4 and all(w["rect"][2:] == [420, 300] for w in proof_windows(d)[2:]),
+                   "unsessioned windows placed")
+    fresh = proof_windows(mixed)[2:]
+    plain_events = read(plain_report)["events"]
+    assert not any(e.startswith(("restored", "session")) for e in plain_events), plain_events
+    assert all(w["workspace"] == 0 for w in fresh), fresh
+    assert all(w["rect"] != saved_main["rect"] for w in fresh), fresh
+    assert core.poll() is None, "compositor-2 exited"
+    receipt["runs"].append({"opt_out": fresh, "events": plain_events})
+    success = True
+finally:
+    for proc in reversed(children):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    for log in logs:
+        log.close()
+    shutil.rmtree(runtime, ignore_errors=True)
+    receipt["passed"] = success
+    (art / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+
+(art / "assertions.txt").write_text(
+    "G-SESSION-RESTORE pass a restarted compositor restores the session window's moved and resized geometry "
+    "and workspace; restored precedes the first configure, which carries the saved size\n"
+    "G-SESSION-RESTORE-STATE pass a maximized session window comes back maximized on its workspace\n"
+    "G-SESSION-RESTORE-OPTIN pass the same app without a session is placed as usual, nothing restored\n")
+print(f"session restore proof passed: {art}")

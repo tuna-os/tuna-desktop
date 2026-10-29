@@ -78,6 +78,7 @@ OWNED = [
     ("scripts/tuna-gtk-shell-proof", ["gtk-shell", "journey"]),
     ("scripts/tuna-scale-proof", ["gtk-shell"]),
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
+    ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
     ("scripts/tuna-walkthrough", ["gtk-shell"]),
     ("scripts/tuna-gtk-accessibility-proof", ["gtk-shell"]),
     ("scripts/tuna-a11y-golden", ["gtk-shell"]),

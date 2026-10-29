@@ -848,6 +848,10 @@ impl Drop for Runtime {
         // Every exit path drops the runtime, including SIGTERM from logind's
         // session stop or the supervisor.
         self.orca.shutdown();
+        // Window sessions (P-SY-08): record every window still in one and
+        // write the store before the clients lose their windows, as
+        // Mutter does when its display closes at logout.
+        self.manager.save_window_sessions(&mut self.state);
         if let Some(worker) = &self.unlock_worker {
             worker.cancel.cancel();
         }
@@ -899,6 +903,9 @@ impl Runtime {
             Display::new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let dh = display.handle();
         let mut state = State::new(&dh);
+        if let Some(path) = crate::xdg_session::default_store_path() {
+            state.window_sessions_mut().attach_store(path);
+        }
         let event_loop = EventLoop::try_new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let choice = session.backend.resolve(has_host_display());
         let backend = match choice {
@@ -4343,6 +4350,8 @@ impl Runtime {
             // pointer-rest poll and auto-raise.
             self.wm_preferences.next_deadline(now),
             self.manager.focus_deadline(),
+            // Window sessions are written 3 s after a change (Mutter).
+            self.state.window_sessions().save_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -4408,6 +4417,7 @@ impl Runtime {
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]

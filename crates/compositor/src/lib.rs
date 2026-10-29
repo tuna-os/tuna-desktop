@@ -114,7 +114,6 @@ pub mod screenshot;
 pub mod screenshot_flash;
 pub mod session_lock;
 pub mod session_manager;
-pub mod session_restore;
 pub mod session_services;
 pub mod size_change;
 #[cfg(feature = "drm")]
@@ -141,6 +140,7 @@ pub mod workspace_tracker;
 mod x11_icons;
 #[cfg(feature = "xwayland")]
 pub mod x11_interop;
+pub mod xdg_session;
 pub mod xwayland;
 
 /// One compositor-tracked output: protocol handle plus geometry.
@@ -237,6 +237,8 @@ pub struct State {
     pub(crate) frame_timing: frame_timing::FrameTiming,
     /// ext-session-lock-v1: the shell's lock screen surfaces.
     pub(crate) lock_protocol: session_lock::LockProtocol,
+    /// xdg-session-management v1: window sessions (P-SY-08, #338).
+    pub(crate) window_sessions: xdg_session::WindowSessions,
     /// Running X11 window manager, once the compatibility server is
     /// up (xwayland feature only).
     #[cfg(feature = "xwayland")]
@@ -409,7 +411,9 @@ impl XdgShellHandler for State {
         &mut self.xdg_shell_state
     }
 
-    fn new_toplevel(&mut self, _surface: ToplevelSurface) {}
+    fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        xdg_session::track_initial_commit(surface.wl_surface());
+    }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let parent = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
@@ -877,6 +881,17 @@ impl State {
             .wl_surface()
             .clone()
     }
+
+    /// Window sessions (xdg-session-management): the store and the
+    /// sessions clients hold.
+    pub fn window_sessions(&self) -> &xdg_session::WindowSessions {
+        &self.window_sessions
+    }
+
+    /// Window sessions, to attach the store or save it.
+    pub fn window_sessions_mut(&mut self) -> &mut xdg_session::WindowSessions {
+        &mut self.window_sessions
+    }
 }
 
 delegate_xdg_shell!(State);
@@ -937,6 +952,7 @@ impl State {
             protocols: protocols::Protocols::new(dh),
             frame_timing: frame_timing::FrameTiming::new(dh),
             lock_protocol: session_lock::LockProtocol::new(dh),
+            window_sessions: xdg_session::WindowSessions::new(dh),
             #[cfg(feature = "xwayland")]
             xwm: None,
             #[cfg(feature = "xwayland")]

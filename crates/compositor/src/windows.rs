@@ -72,6 +72,7 @@ use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use crate::{
     state::{StateModel, WindowUpdate},
+    xdg_session::{ToplevelState, WindowState},
     State, WindowRequest,
 };
 use tuna_shell_control::{switcher_keys, SwitcherAction, PANEL_HEIGHT};
@@ -1422,6 +1423,10 @@ impl WindowManager {
                 self.pointer_motion(state, pos, time);
             }
         }
+        // Toplevels of window sessions the client let go are recorded
+        // while their windows are still managed (a disconnect drops the
+        // session and the windows in one dispatch).
+        self.record_released_sessions(state);
         let live: Vec<ToplevelSurface> = state.toplevels();
         let mut seen = Vec::with_capacity(live.len());
         for surface in &live {
@@ -1436,6 +1441,7 @@ impl WindowManager {
                 }
             }
         }
+        self.apply_mapped_session_restores(state);
         for (surface, id) in &self.surface_index {
             self.model.set_icon(*id, state.window_icons.get(surface));
         }
@@ -1630,6 +1636,15 @@ impl WindowManager {
             },
         );
         self.place_transient(surface, id);
+        // A window its session restores (xdg-session-management): the
+        // client hears `restored` before the configure carrying it.
+        if let Some(restore) = state.window_sessions.take_restore(surface.wl_surface()) {
+            restore.announce();
+            self.apply_session_restore(state, id, &restore.state);
+            if let Some(window) = self.windows.get_mut(&id) {
+                window.minimized = restore.state.minimized;
+            }
+        }
         self.finish_map(state, id);
         id
     }
@@ -1656,7 +1671,14 @@ impl WindowManager {
         if self.mode == SessionMode::Scroll {
             self.apply_layout(state, id, WindowLayout::Strip);
         }
-        if self.hidden_by_minimize().contains(&id) {
+        // Minimized windows, and windows restored to another workspace,
+        // map without focus (Mutter focuses only what it shows).
+        let elsewhere = !self.on_all_workspaces(id)
+            && self
+                .model
+                .window(id)
+                .is_some_and(|entry| entry.workspace != self.model.active_workspace());
+        if elsewhere || self.hidden_by_minimize().contains(&id) {
             self.configure(id, false);
             return;
         }
@@ -1815,6 +1837,140 @@ impl WindowManager {
                 window.unplaced = false;
             }
         }
+    }
+
+    /// What a window session remembers of `id` (Mutter's
+    /// `meta_wayland_xdg_session_state_save_window`): its state with the
+    /// rectangle, the floating one to return to, minimized, workspace
+    /// and output. A window never placed records nothing to restore.
+    fn session_snapshot(&self, outputs: &[crate::OutputEntry], id: u64) -> Option<ToplevelState> {
+        let window = self.windows.get(&id)?;
+        let entry = self.model.window(id)?;
+        let geometry = window.geometry;
+        let (state, floating_rect, tiled_rect) = match window.layout {
+            WindowLayout::Floating if window.unplaced => (WindowState::None, None, None),
+            WindowLayout::Floating => (WindowState::Floating, Some(geometry), None),
+            // A scroll-mode column has no GNOME counterpart: it is
+            // remembered as the floating window it was.
+            WindowLayout::Strip => (
+                WindowState::Floating,
+                Some(window.restore.unwrap_or(geometry)),
+                None,
+            ),
+            WindowLayout::Maximized => (WindowState::Maximized, window.restore, Some(geometry)),
+            WindowLayout::Tiled(TileSide::Left) => {
+                (WindowState::TiledLeft, window.restore, Some(geometry))
+            }
+            WindowLayout::Tiled(TileSide::Right) => {
+                (WindowState::TiledRight, window.restore, Some(geometry))
+            }
+            WindowLayout::Fullscreen => (WindowState::Fullscreen, window.restore, Some(geometry)),
+        };
+        Some(ToplevelState {
+            state,
+            floating_rect,
+            tiled_rect,
+            minimized: window.minimized,
+            workspace: if window.sticky {
+                -1
+            } else {
+                i32::try_from(entry.workspace).unwrap_or(-1)
+            },
+            output: crate::xdg_session::output_at(outputs, geometry).map(|o| o.name.clone()),
+        })
+    }
+
+    /// Put a window back as its session remembers it (Mutter's
+    /// `meta_wayland_xdg_session_state_restore_window`): its workspace
+    /// first, then its floating rectangle (moved onto an output when
+    /// none shows it any more), then its state. Minimized is the
+    /// caller's: a window being mapped just starts hidden.
+    fn apply_session_restore(&mut self, state: &mut State, id: u64, saved: &ToplevelState) {
+        if let Ok(workspace) = u32::try_from(saved.workspace) {
+            self.model.update(
+                id,
+                WindowUpdate {
+                    workspace: Some(workspace),
+                    ..Default::default()
+                },
+            );
+        }
+        let floating = saved.floating_rect.map(|rect| {
+            crate::xdg_session::constrain_restored(
+                &state.outputs,
+                rect,
+                saved.output.as_deref(),
+                WORK_AREA_TOP,
+            )
+        });
+        if let (Some(rect), Some(window)) = (floating, self.windows.get_mut(&id)) {
+            window.geometry = rect;
+            window.unplaced = false;
+        }
+        match saved.state {
+            WindowState::None | WindowState::Floating => {}
+            WindowState::Maximized => {
+                self.set_maximized(state, id, true);
+            }
+            WindowState::TiledLeft => {
+                self.set_tiled(state, id, TileSide::Left);
+            }
+            WindowState::TiledRight => {
+                self.set_tiled(state, id, TileSide::Right);
+            }
+            WindowState::Fullscreen => {
+                self.set_fullscreen(state, id, true);
+            }
+        }
+        eprintln!(
+            "tuna-compositor: window {id} restored from its session ({:?})",
+            saved.state
+        );
+    }
+
+    /// Restores asked for windows already mapped (the client created the
+    /// toplevel, then asked before its first commit).
+    fn apply_mapped_session_restores(&mut self, state: &mut State) {
+        let index = &self.surface_index;
+        let ready = state
+            .window_sessions
+            .take_mapped_restores(|surface| index.contains_key(surface));
+        for restore in ready {
+            let Some(id) = self.surface_index.get(&restore.surface).copied() else {
+                continue;
+            };
+            restore.announce();
+            self.apply_session_restore(state, id, &restore.state);
+            if restore.state.minimized {
+                self.minimize(state, id);
+            }
+            let focused = self.model.focused() == Some(id);
+            self.configure(id, focused);
+        }
+    }
+
+    /// Record the windows of sessions their clients let go.
+    fn record_released_sessions(&self, state: &mut State) {
+        let outputs = &state.outputs;
+        let index = &self.surface_index;
+        state.window_sessions.record_finalizing(|surface| {
+            index
+                .get(surface)
+                .and_then(|id| self.session_snapshot(outputs, *id))
+        });
+    }
+
+    /// Record every window in a session and write the store now: the
+    /// compositor is exiting. Mutter's display unmanages (and so
+    /// records) every window before its context saves synchronously.
+    pub fn save_window_sessions(&self, state: &mut State) {
+        let outputs = &state.outputs;
+        state.window_sessions.record_all(|surface| {
+            self.surface_index
+                .get(surface)
+                .and_then(|id| self.session_snapshot(outputs, *id))
+        });
+        state.window_sessions.save_now();
     }
 
     /// Next cascaded floating geometry.
@@ -2039,6 +2195,25 @@ impl WindowManager {
     /// to the topmost remaining window, if any. In scroll mode the
     /// remaining columns close ranks behind it.
     fn unmap(&mut self, state: &mut State, id: u64) {
+        // Its window session keeps the window's last state (Mutter
+        // records it when the window is unmanaged).
+        if let Some(surface) = self
+            .windows
+            .get(&id)
+            .filter(|window| {
+                matches!(
+                    window.surface.underlying_surface(),
+                    WindowSurface::Wayland(_)
+                )
+            })
+            .and_then(|window| window.surface.wl_surface())
+            .map(|surface| surface.into_owned())
+        {
+            if state.window_sessions.is_bound(&surface) {
+                let snapshot = self.session_snapshot(&state.outputs, id);
+                state.window_sessions.record_unmapped(&surface, snapshot);
+            }
+        }
         if let Some(entry) = self.model.window(id) {
             let dialog_or_splash = self.windows.get(&id).is_some_and(|window| {
                 match window.surface.underlying_surface() {
