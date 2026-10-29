@@ -603,8 +603,9 @@ grab 20-lock M-LOCK
 greens="$("$PY" "$PIX" count "$ARTIFACTS/20-lock.ppm" $GREEN 10)"
 # shellcheck disable=SC2086
 oranges="$("$PY" "$PIX" count "$ARTIFACTS/20-lock.ppm" $ORANGE 10)"
-[ "$greens" -eq 0 ] && [ "$oranges" -eq 0 ] ||
+if [ "$greens" -ne 0 ] || [ "$oranges" -ne 0 ]; then
     fail M-LOCK "locked frame shows $greens green and $oranges orange probe pixels"
+fi
 pass M-LOCK "the magnified locked frame holds no window pixels"
 
 cp "$CSTATE" "$ARTIFACTS/final-state.json"
