@@ -107,8 +107,9 @@
 #                  reset to GNOME 51's defaults (#343); the native VM lane
 #                  proves libinput device state
 #   G-INPUT-SOURCE-MRU Super+Space flips between the two most recent
-#                  sources, the held popup steps through the MRU list,
-#                  and mru-sources keeps the order (#346)
+#                  sources (also when Super is up before the popup holds
+#                  the keyboard), the held popup steps through the MRU
+#                  list, and mru-sources keeps the order (#346)
 #   G-INPUT-PER-WINDOW per-window: each window restores its own source on
 #                  focus, new windows start on the first (#346)
 #   G-NUMLOCK      Num Lock changes save numlock-state only while
@@ -4318,6 +4319,26 @@ cstate '.keyboard.layout == "English (US)"' "tap to the previous source" ||
 xdotool key super+space
 cstate '.keyboard.layout == "German"' "tap back" ||
     fail G-INPUT-SOURCE-MRU "a second tap did not flip back"
+# A tap whose popup takes the keyboard only after Super is up, as on a
+# loaded runner (runs 40842699440 and 40846223707 left it open): the
+# shell stays stopped until the compositor has seen the release. GNOME
+# checks the modifiers when its grab lands, on every show, and picks.
+mru_shell="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" ||
+    fail G-INPUT-SOURCE-MRU "expected exactly one owned shell"
+case "$mru_shell" in ''|*[!0-9]*) fail G-INPUT-SOURCE-MRU "expected exactly one owned shell" ;; esac
+for mru_expected in "English (US)" "German"; do
+    mru_releases="$(grep -c 'modifier super keycode=[0-9]* pressed=false' "$LOG")"
+    kill -STOP "$mru_shell"
+    xdotool key super+space
+    end=$(($(date +%s) + 10))
+    until [ "$(grep -c 'modifier super keycode=[0-9]* pressed=false' "$LOG")" -gt "$mru_releases" ] ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.1; done
+    kill -CONT "$mru_shell"
+    [ "$(grep -c 'modifier super keycode=[0-9]* pressed=false' "$LOG")" -gt "$mru_releases" ] ||
+        fail G-INPUT-SOURCE-MRU "the compositor never saw Super released"
+    cstate ".keyboard.layout == \"$mru_expected\"" "late-grab tap to $mru_expected" ||
+        fail G-INPUT-SOURCE-MRU "a tap released before the switcher held the keyboard did not pick $mru_expected"
+done
 # Held: the popup lists the sources most recent first; a second press
 # steps to the third, releasing Super picks it.
 xdotool keydown Super_L
