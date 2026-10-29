@@ -142,9 +142,9 @@ impl OsdUi {
         self.level.set_visible(request.level.is_some());
         let max = request.max_level.filter(|m| *m > 0.0).unwrap_or(1.0);
         let level = request.level.unwrap_or(0.0);
-        // A showing OSD eases the bar to the new level (`setLevel`); a
-        // hidden one jumps there.
-        let shown = self.window.is_visible() && self.window.opacity() > 0.0;
+        // `setLevel`: a visible OSD (fading out included) eases the bar to
+        // the new level; a hidden one jumps there.
+        let shown = self.window.is_visible();
         let from = if shown { self.value.get().0 } else { level };
         self.value.set((from, max));
         // The first visible row carries no bottom margin (St's
@@ -158,29 +158,26 @@ impl OsdUi {
         // Shrink to the new content: a layer surface keeps its last size
         // unless asked for its natural one.
         self.window.set_default_size(1, 1);
-        // Fade in from wherever a fade-out left it.
-        let opacity = if self.window.is_visible() {
-            self.window.opacity()
-        } else {
-            0.0
-        };
-        self.window.set_opacity(opacity);
+        // `OsdWindow.show`: only a hidden OSD fades in. A visible one keeps
+        // its opacity transition, so a fade-out under way still completes
+        // and hides it (`_hide` → `_reset`) while the re-armed timeout
+        // below runs on, exactly as GNOME Shell 51 does.
+        if !shown {
+            self.window.set_opacity(0.0);
+        }
         self.window.present();
-        if opacity < 1.0 {
+        if !shown {
             let window = self.window.downgrade();
             self.fade.play(
                 &self.window,
                 transient::OSD_MS,
                 move |t| {
                     if let Some(w) = window.upgrade() {
-                        w.set_opacity(transient::fade(opacity, 1.0, t));
+                        w.set_opacity(transient::fade(0.0, 1.0, t));
                     }
                 },
                 || {},
             );
-        } else {
-            // Cancel a fade-out that has not moved yet.
-            self.fade.stop();
         }
         {
             let (value, area) = (self.value.clone(), self.level.downgrade());
@@ -483,5 +480,100 @@ mod gtk_countdown_tests {
         );
         ui.window.close();
         println!("COUNTDOWN-OSD pass actual GTK StopCountdown hides owned display/timer; refreshed and foreign volume/brightness tokens preserved; repeated stop inert; foreign timeout executes");
+    }
+}
+
+#[cfg(test)]
+mod gtk_fade_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Run the main loop until `done` or `limit`; the time it took.
+    fn pump_until(limit: Duration, mut done: impl FnMut() -> bool) -> Option<Duration> {
+        let context = glib::MainContext::default();
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if done() {
+                return Some(start.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        None
+    }
+
+    fn request(label: &str, level: f64) -> OsdRequest {
+        OsdRequest {
+            icon: Some("audio-volume-high-symbolic".into()),
+            label: Some(label.into()),
+            level: Some(level),
+            max_level: Some(1.0),
+        }
+    }
+
+    /// gnome-shell 51.0 `osdWindow.js`: `show()` on a visible OSD (one
+    /// fading out included) neither fades it back in nor stops the fade,
+    /// so the fade-out completes and `_reset` hides it; the content and
+    /// the level ease still apply and the 1500 ms timeout is re-armed.
+    #[test]
+    #[ignore = "requires owned Xvfb/private D-Bus and explicit OSD fade admission"]
+    fn actual_gtk_show_during_fade_out_lets_the_fade_complete() {
+        assert_eq!(std::env::var("TUNA_REQUIRE_OSD_FADE").as_deref(), Ok("1"));
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        gtk::init().expect("actual GTK display required");
+        let app = gtk::Application::builder()
+            .application_id("org.tuna.OsdFadeProof")
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let ui = OsdUi::build(&app, false);
+        ui.show(&request("Volume", 0.2));
+        assert!(ui.window.is_visible());
+        assert_eq!(ui.window.opacity(), 0.0, "a hidden OSD fades in from 0");
+        pump_until(Duration::from_secs(2), || ui.window.opacity() >= 1.0)
+            .expect("the OSD never finished fading in");
+        // The 1500 ms timeout starts the fade-out (`_hide`).
+        pump_until(Duration::from_secs(4), || ui.hide.borrow().is_none())
+            .expect("the hide timeout never fired");
+        assert!(ui.window.is_visible(), "the fade-out hides only at its end");
+        let at_show = ui.window.opacity();
+        ui.show(&request("Brightness", 0.8));
+        assert_eq!(ui.label.text().as_str(), "Brightness");
+        assert!(ui.hide.borrow().is_some(), "show re-arms the timeout");
+        let from = ui.value.get().0;
+        assert!(from < 0.8, "a visible OSD eases its level from where it is");
+        let mut highest = ui.window.opacity();
+        let mut eased = false;
+        let hidden = pump_until(Duration::from_millis(1000), || {
+            highest = highest.max(ui.window.opacity());
+            eased |= ui.value.get().0 > from;
+            !ui.window.is_visible()
+        })
+        .expect("the fade-out did not complete after a show during it");
+        assert!(
+            highest <= at_show,
+            "the fade-out reversed: {highest} > {at_show}"
+        );
+        assert!(eased, "the level did not ease toward the new value");
+        assert!(
+            ui.hide.borrow().is_some(),
+            "the re-armed timeout outlives the hide"
+        );
+        // The re-armed timeout later runs `_hide` on the hidden OSD.
+        pump_until(Duration::from_secs(3), || ui.hide.borrow().is_none())
+            .expect("the re-armed timeout never fired");
+        assert!(!ui.window.is_visible());
+        assert!(ui.current.borrow().is_none());
+        // Shown again once hidden, it fades in from 0.
+        ui.show(&request("Volume", 0.5));
+        assert!(ui.window.is_visible());
+        assert_eq!(ui.window.opacity(), 0.0);
+        assert_eq!(ui.value.get().0, 0.5, "a hidden OSD's level jumps");
+        ui.window.close();
+        println!(
+            "OSD-FADE-OUT pass show during fade-out kept opacity <= {at_show:.3}, hid after {} ms, re-armed timeout fired on the hidden OSD, level eased",
+            hidden.as_millis()
+        );
     }
 }

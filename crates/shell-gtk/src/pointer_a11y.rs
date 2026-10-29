@@ -100,7 +100,7 @@ impl DwellChooser {
     pub fn new(pick: Rc<dyn Fn(DwellClick)>) -> Rc<Self> {
         let icon = gtk::Image::from_icon_name(icon_of(DwellClick::Primary));
         icon.add_css_class("system-status-icon");
-        let popover = gtk::Popover::new();
+        let popover = crate::transient::MenuPopover::new_popover();
         popover.add_css_class("panel-menu");
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let button = gtk::MenuButton::builder()

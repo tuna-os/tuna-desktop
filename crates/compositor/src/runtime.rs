@@ -633,6 +633,8 @@ pub struct Runtime {
     /// ripples, startup, monitor change), sampled once per frame.
     transitions: crate::transitions::Transitions,
     screenshot_flashes: crate::screenshot_flash::Flashes,
+    /// Closing GTK panel menus (`crate::menu_close`), drawn over the bar.
+    menu_close: crate::menu_close::MenuClose,
     screenshot_replies: Vec<PendingScreenshotReply>,
     /// Worker threads (idle watches, Orca, wallpaper, Night Light, IME,
     /// X11 icons, PAM, logind) ping the loop through this (#503).
@@ -1237,6 +1239,7 @@ impl Runtime {
             blank: crate::lock::IdleBlank::default(),
             transitions: crate::transitions::Transitions::new(Duration::ZERO),
             screenshot_flashes: Default::default(),
+            menu_close: Default::default(),
             screenshot_replies: Vec::new(),
             // GNOME's focus policy keys, read on their own GIO thread as
             // Mutter reads them in-process (prefs.c); changes wake the loop.
@@ -2390,6 +2393,7 @@ impl Runtime {
             "focus_change_on_pointer_rest": focus_policy.focus_change_on_pointer_rest,
         });
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
+        doc["menu_close"] = self.menu_close.to_json();
         doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
             .frame_costs
@@ -3261,6 +3265,7 @@ impl Runtime {
         let mut elements = scene_elements(
             renderer,
             &self.manager,
+            &self.menu_close,
             &self.state,
             view,
             true,
@@ -4080,6 +4085,7 @@ impl Runtime {
             || self.cursor.animating(clock)
             || self.wellbeing_effects.animating(clock)
             || self.screenshot_flashes.running()
+            || self.menu_close.running()
             || self.transitions.running()
             || self.wallpaper.fade_stats().active
             || !self.screenshot_replies.is_empty()
@@ -4788,6 +4794,13 @@ impl Runtime {
             allowed,
             self.input_settings.right_to_left,
         );
+        self.menu_close.step(
+            renderer,
+            &self.state,
+            now,
+            self.input_settings.motion,
+            allowed,
+        );
         // The tint program is compiled once per renderer and cached;
         // a compile failure draws this frame untinted.
         let night_tint =
@@ -4873,6 +4886,7 @@ impl Runtime {
                     let mut elements = scene_elements(
                         renderer,
                         &self.manager,
+                        &self.menu_close,
                         &self.state,
                         view,
                         show_content,
@@ -5139,6 +5153,7 @@ impl Runtime {
                     let mut elements = scene_elements(
                         renderer,
                         &self.manager,
+                        &self.menu_close,
                         &self.state,
                         view,
                         show_content,
@@ -5883,6 +5898,7 @@ fn focus_ring_elements(
 fn scene_elements(
     renderer: &mut GlesRenderer,
     manager: &WindowManager,
+    menu_close: &crate::menu_close::MenuClose,
     state: &State,
     view: View,
     show_content: bool,
@@ -6137,6 +6153,14 @@ fn scene_elements(
                 popup.origin,
                 1.0,
                 1.0,
+            );
+        }
+        // Panel menus closing over the bar they hang off.
+        for ghost in menu_close.ghosts_of(&surface) {
+            snapshots.extend(
+                menu_close
+                    .element(ghost, renderer, view)
+                    .map(|e| (elements.len(), e, 1.0)),
             );
         }
     }

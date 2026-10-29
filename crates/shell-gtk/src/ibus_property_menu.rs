@@ -131,7 +131,7 @@ impl PropertyMenu {
         button.set_label("Input Method");
         button.set_tooltip_text(Some("Input method properties"));
         button.set_visible(false);
-        let popover = gtk::Popover::new();
+        let popover = crate::transient::MenuPopover::new_popover();
         let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
         popover.set_child(Some(&content));
         button.set_popover(Some(&popover));
