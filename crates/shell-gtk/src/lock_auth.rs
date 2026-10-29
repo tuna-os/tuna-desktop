@@ -1326,6 +1326,48 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_key_then_submit_before_the_query_answers_it_once() {
+        let host = Fake::new();
+        let mut m = AuthMachine::new(1.0);
+        // `_onKeyPress`: `_showPrompt()` resets and begins, then
+        // `startPreemptiveInput(unichar)`; the reset's clearing comes
+        // before the wake character is inserted.
+        m.show_prompt(&host, true);
+        let e = m.take_effects();
+        assert!(e.contains(&Effect::ClearEntry));
+        assert!(m.view().sensitive, "the wake key's entry takes input");
+        let pw = host.begins()[0].1;
+        host.take();
+        m.text_changed(true); // the wake character
+        m.submit(&host, "wake-and-rest".into());
+        assert!(host.take().is_empty());
+        m.event(&host, pw, PW, &query(1, "Password:", true));
+        assert_eq!(host.take(), vec![Call::Answer(1, "wake-and-rest".into())]);
+        assert!(
+            !m.take_effects().contains(&Effect::ClearEntry),
+            "nothing typed is cleared"
+        );
+        assert!(m.result(&host, pw, true));
+    }
+
+    #[test]
+    fn a_wake_key_survives_the_first_query() {
+        let host = Fake::new();
+        let mut m = AuthMachine::new(1.0);
+        m.show_prompt(&host, true);
+        let pw = host.begins()[0].1;
+        host.take();
+        m.take_effects();
+        m.text_changed(true);
+        m.event(&host, pw, PW, &query(1, "Password:", true));
+        let e = m.take_effects();
+        assert!(!e.contains(&Effect::ClearEntry), "the wake character stays");
+        assert!(m.view().sensitive);
+        m.submit(&host, "wake-and-rest".into());
+        assert_eq!(host.take(), vec![Call::Answer(1, "wake-and-rest".into())]);
+    }
+
+    #[test]
     fn preemptive_answer_goes_to_the_first_query_only() {
         let host = Fake::new();
         let mut m = AuthMachine::new(1.0);

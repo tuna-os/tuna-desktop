@@ -139,7 +139,27 @@ impl PromptEntry {
         // The inactive entry keeps no copy of what was typed.
         old.set_text("");
         if focused {
-            self.current().grab_focus();
+            self.focus();
+        }
+    }
+
+    /// Give the shown entry the keyboard focus without selecting what is
+    /// typed (Clutter's `grab_key_focus`). GtkText's `grab_focus` selects
+    /// all whenever the focus was not inside it, including when it was
+    /// the text itself, so a re-focus while typing would have the next
+    /// key replace the start of the answer (the wake character).
+    fn focus(&self) {
+        match self
+            .editable()
+            .delegate()
+            .and_then(|d| d.downcast::<gtk::Text>().ok())
+        {
+            Some(text) => {
+                text.grab_focus_without_selecting();
+            }
+            None => {
+                self.current().grab_focus();
+            }
         }
     }
 
@@ -462,7 +482,7 @@ impl LockUi {
                     Effect::Focus => {
                         for screen in screens.iter() {
                             if view.sensitive && screen.curtain.active() == Page::Prompt {
-                                screen.entry.current().grab_focus();
+                                screen.entry.focus();
                             }
                         }
                     }
@@ -514,11 +534,14 @@ impl LockUi {
     fn lift(self: &Rc<Self>, curtain: &Curtain, entry: &PromptEntry, preemptive: Option<char>) {
         curtain.show_page(Page::Prompt);
         self.drive(|auth, port| auth.show_prompt(port, preemptive.is_some()));
-        entry.current().grab_focus();
+        entry.focus();
         if let Some(c) = preemptive {
+            // `startPreemptiveInput(unichar)`: inserted after the reset, at
+            // the end of whatever the reset kept.
             let editable = entry.editable();
-            editable.set_text(&c.to_string());
-            editable.set_position(-1);
+            let mut position = editable.text().chars().count() as i32;
+            editable.insert_text(&c.to_string(), &mut position);
+            editable.set_position(position);
         }
     }
 
@@ -881,7 +904,7 @@ impl LockUi {
                     if curtain.swipe_end("drag", velocity, distance.get(), false)
                         == Some(Page::Prompt)
                     {
-                        entry.current().grab_focus();
+                        entry.focus();
                     }
                 });
             }
@@ -1105,12 +1128,12 @@ mod auth_transport_ui_tests {
     }
 
     /// Lift the curtain as a click does and return (password, fingerprint).
-    fn lift(ui: &Rc<LockUi>, calls: &Calls) -> (u64, u64) {
+    fn lift(ui: &Rc<LockUi>, calls: &Calls, key: Option<char>) -> (u64, u64) {
         let (curtain, entry) = {
             let screens = ui.screens.borrow();
             (screens[0].curtain.clone(), screens[0].entry.clone())
         };
-        ui.lift(&curtain, &entry, None);
+        ui.lift(&curtain, &entry, key);
         let begins = calls.begins.borrow();
         let n = begins.len();
         assert!(n >= 2);
@@ -1155,7 +1178,7 @@ mod auth_transport_ui_tests {
             ui.command_result(fingerprint, false);
             assert!(ui.auth.borrow().legacy());
         };
-        let (password, fingerprint) = lift(&ui, &calls);
+        let (password, fingerprint) = lift(&ui, &calls, None);
         fall_back(&ui, password, fingerprint);
         let entry = ui.screens.borrow()[0].entry.password.clone();
         let pending = || ui.auth.borrow().legacy_pending();
@@ -1193,7 +1216,7 @@ mod auth_transport_ui_tests {
         );
         assert!(calls.answers.borrow().is_empty());
         ui.resume_verification();
-        let (password, fingerprint) = lift(&ui, &calls);
+        let (password, fingerprint) = lift(&ui, &calls, None);
         fall_back(&ui, password, fingerprint);
         entry.set_text("explicit-fresh-input");
         entry.emit_by_name::<()>("activate", &[]);
@@ -1213,7 +1236,9 @@ mod auth_transport_ui_tests {
         ));
         let calls = Rc::new(Calls::default());
         let (ui, window) = lock_ui(&calls);
-        let (password, fingerprint) = lift(&ui, &calls);
+        // A printable key lifts the curtain and starts the answer
+        // (`_onKeyPress` → `startPreemptiveInput`).
+        let (password, fingerprint) = lift(&ui, &calls, Some('f'));
         let (entry, cancel, message, next) = {
             let s = &ui.screens.borrow()[0];
             (
@@ -1241,7 +1266,14 @@ mod auth_transport_ui_tests {
         assert_eq!(placeholder(&shown(&entry)).as_deref(), Some("Password"));
         assert!(shown(&entry).is_sensitive());
         assert!(!back_targetable());
-        entry.password.set_text("first-secret");
+        // The question refocused the entry: the wake character is kept,
+        // unselected, so the next keys follow it.
+        let typing = entry.editable();
+        assert_eq!(typing.text(), "f");
+        assert_eq!(typing.selection_bounds(), None);
+        assert_eq!(typing.position(), 1);
+        let mut at = typing.position();
+        typing.insert_text("irst-secret", &mut at);
         next.emit_clicked();
         assert_eq!(
             *calls.answers.borrow(),
