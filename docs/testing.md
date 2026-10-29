@@ -78,9 +78,44 @@ Job/profile/native-environment caches are deliberately separate; a single
 shared key can retain an incomplete first-writer snapshot. OCI/ORAS or
 resumed VM sessions do not replace fresh source/package/runtime proofs.
 
+## Local iteration with `just`
+
+Iterate locally before pushing; a local loop is much faster than a CI
+round trip. The [`justfile`](../justfile) wraps the commands below with the
+settings local builds need (`just` lists the recipes):
+
+| Recipe | Runs |
+|---|---|
+| `just check` | `fmt-check`, `clippy` and `test`, like the `check` job's core |
+| `just test [cargo args]` | `cargo test --workspace`, or e.g. `just test -p tuna-compositor --lib orca::` |
+| `just clippy` / `just fmt` / `just build [args]` | the matching cargo command |
+| `just proof <name> [args]` | `scripts/tuna-<name> --artifacts <tmp>`, e.g. `just proof gtk-shell-proof` |
+| `just ci-artifacts <run> [name]` | downloads a CI run's artifacts and prints the directory |
+| `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |
+
+Every build uses its own checkout's `target/` (an inherited
+`CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one),
+two jobs, no incremental state, and waits on one machine-wide lock
+(`/tmp/tuna-local-build.lock`), so builds from parallel worktrees queue
+instead of exhausting memory.
+
+Cleanup is automatic where it is safe:
+
+- a passing `just proof` deletes its artifacts; a failing one keeps them
+  and prints the path;
+- `just gc` deletes the targets of worktrees whose pull request is merged
+  or closed, removes those worktrees when they have no uncommitted
+  changes, and expires `just ci-artifacts` downloads after six hours. It
+  never touches the main checkout or the worktree it runs from;
+- any build recipe runs `just gc` first when less than 20 GiB of disk is
+  free (`TUNA_MIN_FREE_GB`).
+
+VM lanes need KVM, so they run in CI's `marlin-vm` jobs or on a Corral
+VM, not through these recipes.
+
 ## Before opening a PR
 
-Run the workspace checks locally before opening a PR:
+Run the workspace checks locally before opening a PR (`just check`):
 
 ```sh
 cargo fmt --all -- --check
