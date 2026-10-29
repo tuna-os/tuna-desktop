@@ -22,7 +22,8 @@ pub struct WacomInfo {
 
 type DatabaseNew = unsafe extern "C" fn() -> *mut c_void;
 type DatabaseDestroy = unsafe extern "C" fn(*mut c_void);
-type NewFromPath = unsafe extern "C" fn(*const c_void, *const c_char, c_int, *mut c_void) -> *mut c_void;
+type NewFromPath =
+    unsafe extern "C" fn(*const c_void, *const c_char, c_int, *mut c_void) -> *mut c_void;
 type GetString = unsafe extern "C" fn(*const c_void) -> *const c_char;
 type GetFlags = unsafe extern "C" fn(*const c_void) -> c_int;
 type Destroy = unsafe extern "C" fn(*mut c_void);
@@ -56,12 +57,17 @@ impl Libwacom {
                 (!ptr.is_null()).then_some(ptr)
             };
             let loaded = (|| {
-                let database_new: DatabaseNew = std::mem::transmute(symbol(c"libwacom_database_new")?);
-                let database_destroy: DatabaseDestroy = std::mem::transmute(symbol(c"libwacom_database_destroy")?);
-                let new_from_path: NewFromPath = std::mem::transmute(symbol(c"libwacom_new_from_path")?);
+                let database_new: DatabaseNew =
+                    std::mem::transmute(symbol(c"libwacom_database_new")?);
+                let database_destroy: DatabaseDestroy =
+                    std::mem::transmute(symbol(c"libwacom_database_destroy")?);
+                let new_from_path: NewFromPath =
+                    std::mem::transmute(symbol(c"libwacom_new_from_path")?);
                 let get_name: GetString = std::mem::transmute(symbol(c"libwacom_get_name")?);
-                let get_layout: GetString = std::mem::transmute(symbol(c"libwacom_get_layout_filename")?);
-                let get_integration: GetFlags = std::mem::transmute(symbol(c"libwacom_get_integration_flags")?);
+                let get_layout: GetString =
+                    std::mem::transmute(symbol(c"libwacom_get_layout_filename")?);
+                let get_integration: GetFlags =
+                    std::mem::transmute(symbol(c"libwacom_get_integration_flags")?);
                 let destroy: Destroy = std::mem::transmute(symbol(c"libwacom_destroy")?);
                 let db = database_new();
                 (!db.is_null()).then_some(Self {
@@ -88,11 +94,14 @@ impl Libwacom {
         // SAFETY: `db` lives as long as `self`; the device is destroyed
         // before returning and its strings are copied first.
         unsafe {
-            let device = (self.new_from_path)(self.db, path.as_ptr(), WFALLBACK_NONE, std::ptr::null_mut());
+            let device =
+                (self.new_from_path)(self.db, path.as_ptr(), WFALLBACK_NONE, std::ptr::null_mut());
             if device.is_null() {
                 return None;
             }
-            let string = |ptr: *const c_char| (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_string_lossy().into_owned());
+            let string = |ptr: *const c_char| {
+                (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_string_lossy().into_owned())
+            };
             let info = WacomInfo {
                 name: string((self.get_name)(device)).unwrap_or_default(),
                 layout: string((self.get_layout)(device)).filter(|path| !path.is_empty()),

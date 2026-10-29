@@ -219,7 +219,10 @@ impl Reader {
                         .write_output(&path, &output)
                 });
                 if let Err(error) = result {
-                    eprintln!("tuna-compositor: tablet: could not write {path} output: {}", error.0);
+                    eprintln!(
+                        "tuna-compositor: tablet: could not write {path} output: {}",
+                        error.0
+                    );
                 }
                 glib::ControlFlow::Break
             },
@@ -516,7 +519,11 @@ impl GioReader {
     }
 }
 
-fn nick<T>(settings: &gio::Settings, key: &str, parse: fn(&str) -> Option<T>) -> Result<T, ReadError> {
+fn nick<T>(
+    settings: &gio::Settings,
+    key: &str,
+    parse: fn(&str) -> Option<T>,
+) -> Result<T, ReadError> {
     settings
         .value(key)
         .get::<String>()
@@ -549,8 +556,12 @@ impl NativeReader for GioReader {
                         .set_value("pressure-curve", &vec![0i32, 75, 25, 100].to_variant())
                         .unwrap();
                     settings.set_string("button-action", "back").unwrap();
-                    settings.set_string("tertiary-button-action", "keybinding").unwrap();
-                    settings.set_string("tertiary-button-keybinding", "<Control>z").unwrap();
+                    settings
+                        .set_string("tertiary-button-action", "keybinding")
+                        .unwrap();
+                    settings
+                        .set_string("tertiary-button-keybinding", "<Control>z")
+                        .unwrap();
                 }
                 Kind::PadButton => {
                     settings.set_string("action", "keybinding").unwrap();
@@ -591,7 +602,9 @@ impl NativeReader for GioReader {
                             // Mutter's automatic mapping: no user value.
                             output: settings
                                 .user_value("output")
-                                .map(|value| value.get::<Vec<String>>().ok_or_else(|| bad("output")))
+                                .map(|value| {
+                                    value.get::<Vec<String>>().ok_or_else(|| bad("output"))
+                                })
                                 .transpose()?,
                             mapping: nick(&settings, "mapping", Mapping::from_nick)?,
                             area: settings
@@ -621,7 +634,11 @@ impl NativeReader for GioReader {
                                 "eraser-button-action",
                                 ButtonAction::from_nick,
                             )?,
-                            button_action: nick(&settings, "button-action", ButtonAction::from_nick)?,
+                            button_action: nick(
+                                &settings,
+                                "button-action",
+                                ButtonAction::from_nick,
+                            )?,
                             secondary_button_action: nick(
                                 &settings,
                                 "secondary-button-action",
@@ -632,7 +649,9 @@ impl NativeReader for GioReader {
                                 "tertiary-button-action",
                                 ButtonAction::from_nick,
                             )?,
-                            eraser_button_keybinding: settings.string("eraser-button-keybinding").into(),
+                            eraser_button_keybinding: settings
+                                .string("eraser-button-keybinding")
+                                .into(),
                             button_keybinding: settings.string("button-keybinding").into(),
                             secondary_button_keybinding: settings
                                 .string("secondary-button-keybinding")
@@ -677,7 +696,8 @@ mod tests {
 
     /// gsettings-desktop-schemas 51's tablet, stylus and pad-button
     /// schemas, as installed (relocatable, the enums from gdesktop-enums.h).
-    const SCHEMAS: &str = include_str!("../../../tests/settings/gnome51-peripherals-tablet.gschema.xml");
+    const SCHEMAS: &str =
+        include_str!("../../../tests/settings/gnome51-peripherals-tablet.gschema.xml");
 
     fn wake_loop() -> (Wake, calloop::EventLoop<'static, usize>) {
         let (wake, source) = Wake::new().unwrap();
@@ -722,7 +742,11 @@ mod tests {
         )
     }
 
-    fn completed(reader: &Reader, loop_: &mut calloop::EventLoop<usize>, poll_at: Instant) -> Snapshot {
+    fn completed(
+        reader: &Reader,
+        loop_: &mut calloop::EventLoop<usize>,
+        poll_at: Instant,
+    ) -> Snapshot {
         let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         loop {
@@ -768,7 +792,14 @@ mod tests {
             glib::Priority::DEFAULT,
             || {
                 LOCAL.with(|local| {
-                    local.borrow().as_ref().unwrap().native.as_ref().unwrap().change();
+                    local
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .native
+                        .as_ref()
+                        .unwrap()
+                        .change();
                 });
                 glib::ControlFlow::Break
             },
@@ -795,10 +826,17 @@ mod tests {
             }
         );
         // switch-monitor's write lands like any change: the next read has it.
-        reader.set_output(TABLET_PATH.into(), [String::new(), String::new(), String::new()]);
+        reader.set_output(
+            TABLET_PATH.into(),
+            [String::new(), String::new(), String::new()],
+        );
         let written = loop {
             let snapshot = completed(&reader, &mut loop_, poll_at);
-            if snapshot.tablets[TABLET_PATH].output.as_ref().is_some_and(|o| o.len() == 3) {
+            if snapshot.tablets[TABLET_PATH]
+                .output
+                .as_ref()
+                .is_some_and(|o| o.len() == 3)
+            {
                 break snapshot;
             }
         };
@@ -836,7 +874,8 @@ mod tests {
                 "<key name=\"keep-aspect\" type=\"s\">\n      <default>'no'</default>",
             ),
         );
-        assert!(SCHEMAS.contains("<key name=\"keep-aspect\" type=\"b\">\n      <default>false</default>"));
+        assert!(SCHEMAS
+            .contains("<key name=\"keep-aspect\" type=\"b\">\n      <default>false</default>"));
         let (wake, mut loop_) = wake_loop();
         let reader = gio_reader(&wake, dir.path().to_path_buf());
         reader.want(wanted(&[(Kind::Tablet, TABLET_PATH)]), Instant::now());

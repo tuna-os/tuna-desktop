@@ -39,19 +39,23 @@ use smithay::reexports::input::event::tablet_tool::{
 use smithay::reexports::input::event::{pointer::ButtonState, EventTrait};
 use smithay::reexports::input::AsRaw;
 use smithay::utils::{Logical, Point};
-use smithay::wayland::tablet_manager::{TabletDescriptor, TabletPadDescriptor, TabletPadGroupDescriptor};
-use tuna_shell_control::{PadOsd, PadOsdButton, PadOsdEvent, PadOsdLabels, PadOsdPad, PadOsdTarget};
+use smithay::wayland::tablet_manager::{
+    TabletDescriptor, TabletPadDescriptor, TabletPadGroupDescriptor,
+};
+use tuna_shell_control::{
+    PadOsd, PadOsdButton, PadOsdEvent, PadOsdLabels, PadOsdPad, PadOsdTarget,
+};
 
 use super::libwacom::{Libwacom, WacomInfo};
 use crate::tablet::{
-    map_tool_button, stylus_pressure, stylus_settings_path, tablet_settings_path, ButtonAction, DeviceMapping,
-    EraserButtonMode, Mapping, Monitor, PressureCurve, StylusSettings, TabletEvent, TabletIdentity,
-    TabletSettings, ToolAxes, ToolButton, BTN_STYLUS3,
+    map_tool_button, stylus_pressure, stylus_settings_path, tablet_settings_path, ButtonAction,
+    DeviceMapping, EraserButtonMode, Mapping, Monitor, PressureCurve, StylusSettings, TabletEvent,
+    TabletIdentity, TabletSettings, ToolAxes, ToolButton, BTN_STYLUS3,
 };
 use crate::tablet_actions::{
-    cycle_monitor, feature_directions, feature_label, group_switch_osd, mode_switch_label, pad_button_label,
-    pad_button_outcome, pad_button_settings_path, pad_feature_settings_path, DirectionTracker, PadButtonOutcome,
-    PadDirection, PadFeature,
+    cycle_monitor, feature_directions, feature_label, group_switch_osd, mode_switch_label,
+    pad_button_label, pad_button_outcome, pad_button_settings_path, pad_feature_settings_path,
+    DirectionTracker, PadButtonOutcome, PadDirection, PadFeature,
 };
 use crate::tablet_settings::{Kind, Snapshot};
 
@@ -112,7 +116,9 @@ impl PadDevice {
 
     /// libwacom's name, else the device's (`pretty_name` fallbacks).
     fn pretty_name(&self) -> &str {
-        self.wacom.as_ref().map_or(self.desc.name.as_str(), |w| w.name.as_str())
+        self.wacom
+            .as_ref()
+            .map_or(self.desc.name.as_str(), |w| w.name.as_str())
     }
 
     fn button_settings_path(&self, button: u32) -> String {
@@ -123,7 +129,10 @@ impl PadDevice {
     fn feature_paths(&self) -> Vec<String> {
         let mut paths = Vec::new();
         for group in &self.desc.groups {
-            for (feature, numbers) in [(PadFeature::Ring, &group.rings), (PadFeature::Strip, &group.strips)] {
+            for (feature, numbers) in [
+                (PadFeature::Ring, &group.rings),
+                (PadFeature::Strip, &group.strips),
+            ] {
                 for number in numbers {
                     for mode in 0..group.modes.max(1) {
                         for direction in feature_directions(feature) {
@@ -314,7 +323,9 @@ impl CurrentTool {
     fn axes<E: TabletToolEventTrait>(&self, event: &E) -> ToolAxes {
         let tool = &self.tool;
         ToolAxes {
-            pressure: tool.has_pressure().then(|| self.curve.translate(event.pressure())),
+            pressure: tool
+                .has_pressure()
+                .then(|| self.curve.translate(event.pressure())),
             distance: tool.has_distance().then(|| event.distance()),
             tilt: tool.has_tilt().then(|| (event.tilt_x(), event.tilt_y())),
             rotation: tool.has_rotation().then(|| event.rotation()),
@@ -422,7 +433,8 @@ impl Tablets {
                 wacom,
                 group_modes: vec![0; desc.groups.len()],
             });
-            self.events.push(TabletEvent::PadAdded { pad: desc, tablet });
+            self.events
+                .push(TabletEvent::PadAdded { pad: desc, tablet });
         }
     }
 
@@ -475,7 +487,11 @@ impl Tablets {
     /// `apply_mappable_device_settings` for one tablet: mapping, area,
     /// keep-aspect, left-handed.
     fn apply_tablet(tablet: &mut TabletDevice, snapshot: &Snapshot, monitors: &[Monitor]) {
-        let settings = snapshot.tablets.get(&tablet.path).cloned().unwrap_or_default();
+        let settings = snapshot
+            .tablets
+            .get(&tablet.path)
+            .cloned()
+            .unwrap_or_default();
         let (mapping, picked) = DeviceMapping::new(&tablet.identity, &settings, monitors);
         let mapped_to = picked.map(|index| monitors[index].connector.clone());
         let changed = tablet.applied.as_ref() != Some(&settings)
@@ -533,7 +549,12 @@ impl Tablets {
             Self::apply_tablet(tablet, &self.settings, &self.monitors);
             let name = tablet.identity.name.clone();
             if let Some(tool) = &mut tablet.tool {
-                let settings = self.settings.styluses.get(&tool.path).cloned().unwrap_or_default();
+                let settings = self
+                    .settings
+                    .styluses
+                    .get(&tool.path)
+                    .cloned()
+                    .unwrap_or_default();
                 tool.apply(&settings, &name);
             }
         }
@@ -541,7 +562,10 @@ impl Tablets {
             let path = tablet_settings_path(pad.device.id_vendor(), pad.device.id_product());
             if let Some(settings) = self.settings.tablets.get(&path) {
                 if pad.device.config_left_handed_is_available() {
-                    let _ = pad.device.clone().config_left_handed_set(settings.left_handed);
+                    let _ = pad
+                        .device
+                        .clone()
+                        .config_left_handed_set(settings.left_handed);
                 }
             }
         }
@@ -623,7 +647,12 @@ impl Tablets {
                 };
                 // Applied at once from the last read; a first tool's own
                 // path reads in the background and applies when it lands.
-                let settings = self.settings.styluses.get(&current.path).cloned().unwrap_or_default();
+                let settings = self
+                    .settings
+                    .styluses
+                    .get(&current.path)
+                    .cloned()
+                    .unwrap_or_default();
                 current.apply(&settings, &tablet.identity.name);
                 eprintln!(
                     "tuna-compositor: tablet: {} tool {:?} serial={:x} in proximity",
@@ -705,7 +734,12 @@ impl Tablets {
                     .then_some(BTN_STYLUS3);
                 let pressed = event.button_state() == ButtonState::Pressed;
                 let desc = current.desc.clone();
-                match map_tool_button(event.button(), &settings, eraser_button, current.mouse_or_lens) {
+                match map_tool_button(
+                    event.button(),
+                    &settings,
+                    eraser_button,
+                    current.mouse_or_lens,
+                ) {
                     ToolButton::Tip => self.events.push(TabletEvent::Tip {
                         tablet: tablet.desc.clone(),
                         tool: desc,
@@ -731,18 +765,20 @@ impl Tablets {
                                     cycle = Some((
                                         tablet.vendor,
                                         tablet.product,
-                                        tablet
-                                            .wacom
-                                            .as_ref()
-                                            .map_or_else(|| tablet.identity.name.clone(), |w| w.name.clone()),
+                                        tablet.wacom.as_ref().map_or_else(
+                                            || tablet.identity.name.clone(),
+                                            |w| w.name.clone(),
+                                        ),
                                         tablet.wacom.as_ref().is_some_and(|w| w.integrated),
                                     ));
                                 }
-                                ButtonAction::Keybinding => self.events.push(TabletEvent::EmulateKeybinding {
-                                    accel,
-                                    pressed,
-                                    time,
-                                }),
+                                ButtonAction::Keybinding => {
+                                    self.events.push(TabletEvent::EmulateKeybinding {
+                                        accel,
+                                        pressed,
+                                        time,
+                                    })
+                                }
                                 _ => {}
                             }
                         }
@@ -762,7 +798,12 @@ impl Tablets {
     /// say so on screen.
     fn cycle_output(&mut self, vendor: u32, product: u32, name: &str, integrated: bool) {
         let path = tablet_settings_path(vendor, product);
-        let settings = self.settings.tablets.get(&path).cloned().unwrap_or_default();
+        let settings = self
+            .settings
+            .tablets
+            .get(&path)
+            .cloned()
+            .unwrap_or_default();
         // meta_tablet_action_mapper_find_monitor: exactly three values,
         // not all empty, naming a monitor's EDID.
         let current = settings
@@ -779,7 +820,11 @@ impl Tablets {
         };
         let output = next.map_or_else(Default::default, |index| {
             let monitor = &self.monitors[index];
-            [monitor.vendor.clone(), monitor.product.clone(), monitor.serial.clone()]
+            [
+                monitor.vendor.clone(),
+                monitor.product.clone(),
+                monitor.serial.clone(),
+            ]
         });
         let connector = next.map(|index| self.monitors[index].connector.clone());
         eprintln!(
@@ -805,7 +850,14 @@ impl Tablets {
     }
 
     /// `meta_pad_action_mapper_handle_button`; `true` when taken.
-    fn pad_button_action(&mut self, index: usize, button: u32, pressed: bool, mode: u32, time: u32) -> bool {
+    fn pad_button_action(
+        &mut self,
+        index: usize,
+        button: u32,
+        pressed: bool,
+        mode: u32,
+        time: u32,
+    ) -> bool {
         if let Some(group) = self.pads[index].mode_switch_group(button) {
             let n_modes = self.pads[index].desc.groups[group].modes;
             if pressed && n_modes > 0 {
@@ -839,12 +891,17 @@ impl Tablets {
             }
             PadButtonOutcome::Help => {
                 if pressed {
-                    self.events.push(TabletEvent::RequestPadOsd { pad: pad.id, time });
+                    self.events
+                        .push(TabletEvent::RequestPadOsd { pad: pad.id, time });
                 }
                 true
             }
             PadButtonOutcome::Keybinding(accel) => {
-                self.events.push(TabletEvent::EmulateKeybinding { accel, pressed, time });
+                self.events.push(TabletEvent::EmulateKeybinding {
+                    accel,
+                    pressed,
+                    time,
+                });
                 true
             }
         }
@@ -956,7 +1013,8 @@ impl Tablets {
                         event: PadOsdEvent::Ring { ring, mode },
                         time,
                     });
-                } else if !self.pad_feature_action(index, PadFeature::Ring, ring, mode, angle, time) {
+                } else if !self.pad_feature_action(index, PadFeature::Ring, ring, mode, angle, time)
+                {
                     self.events.push(TabletEvent::PadRing {
                         pad: self.pads[index].desc.clone(),
                         ring,
@@ -974,7 +1032,14 @@ impl Tablets {
                         event: PadOsdEvent::Strip { strip, mode },
                         time,
                     });
-                } else if !self.pad_feature_action(index, PadFeature::Strip, strip, mode, position, time) {
+                } else if !self.pad_feature_action(
+                    index,
+                    PadFeature::Strip,
+                    strip,
+                    mode,
+                    position,
+                    time,
+                ) {
                     self.events.push(TabletEvent::PadStrip {
                         pad: self.pads[index].desc.clone(),
                         strip,
@@ -990,7 +1055,10 @@ impl Tablets {
 
     /// Every pad the shell may ask an OSD for: id and device node.
     pub fn pad_targets(&self) -> Vec<(u32, String)> {
-        self.pads.iter().map(|p| (p.id, p.devnode.clone())).collect()
+        self.pads
+            .iter()
+            .map(|p| (p.id, p.devnode.clone()))
+            .collect()
     }
 
     /// The pad a shell request names.
@@ -1062,7 +1130,13 @@ impl Tablets {
     /// (`meta_pad_action_mapper_get_button_label`, `get_feature_label`).
     pub fn pad_osd_labels(&self, pad: u32) -> Option<(TabletPadDescriptor, PadOsdLabels)> {
         let device = self.pads.iter().find(|p| p.id == pad)?;
-        let label = |path: String| self.settings.pad_buttons.get(&path).cloned().unwrap_or_default();
+        let label = |path: String| {
+            self.settings
+                .pad_buttons
+                .get(&path)
+                .cloned()
+                .unwrap_or_default()
+        };
         let buttons = (0..device.desc.buttons)
             .map(|button| match device.mode_switch_group(button) {
                 Some(group) => PadOsdButton {

@@ -89,7 +89,10 @@ pub fn parse_accelerator(accel: &str) -> Option<KeyCombo> {
                 }
                 None => {
                     // An unknown `<…>`: skipped through its `>`.
-                    let end = rest.iter().position(|b| *b == b'>').map_or(rest.len(), |p| p + 1);
+                    let end = rest
+                        .iter()
+                        .position(|b| *b == b'>')
+                        .map_or(rest.len(), |p| p + 1);
                     rest = &rest[end..];
                 }
             }
@@ -103,7 +106,10 @@ pub fn parse_accelerator(accel: &str) -> Option<KeyCombo> {
                 && bytes[3].is_ascii_hexdigit()
             {
                 // strtoul: the leading hex digits.
-                let digits: String = name[2..].chars().take_while(char::is_ascii_hexdigit).collect();
+                let digits: String = name[2..]
+                    .chars()
+                    .take_while(char::is_ascii_hexdigit)
+                    .collect();
                 combo.keycode = u32::from_str_radix(&digits, 16).unwrap_or(u32::MAX);
                 return Some(combo);
             }
@@ -111,7 +117,8 @@ pub fn parse_accelerator(accel: &str) -> Option<KeyCombo> {
                 combo.keysym = KEY_ABOVE_TAB;
                 return Some(combo);
             }
-            let lookup = |name: &str| xkb::keysym_from_name(name, xkb::KEYSYM_CASE_INSENSITIVE).raw();
+            let lookup =
+                |name: &str| xkb::keysym_from_name(name, xkb::KEYSYM_CASE_INSENSITIVE).raw();
             let keysym = match lookup(name) {
                 0 => lookup(&format!("XF86{name}")),
                 keysym => keysym,
@@ -285,7 +292,13 @@ pub struct DirectionTracker {
 impl DirectionTracker {
     /// `value` is libinput's ring angle in degrees or strip position,
     /// negative when the finger lifted.
-    pub fn direction(&mut self, pad: u32, feature: PadFeature, number: u32, value: f64) -> Option<PadDirection> {
+    pub fn direction(
+        &mut self,
+        pad: u32,
+        feature: PadFeature,
+        number: u32,
+        value: f64,
+    ) -> Option<PadDirection> {
         let (inc, dec, wraparound) = match feature {
             PadFeature::Ring => (PadDirection::Cw, PadDirection::Ccw, true),
             PadFeature::Strip => (PadDirection::Down, PadDirection::Up, false),
@@ -362,14 +375,20 @@ pub fn feature_label(settings: Option<&PadButtonSettings>) -> Option<String> {
 
 /// `meta_display_notify_pad_group_switch`'s OSD text.
 pub fn group_switch_osd(name: &str, mode: u32, n_modes: u32) -> String {
-    let dots: Vec<&str> = (0..n_modes).map(|i| if i == mode { "●" } else { "○" }).collect();
+    let dots: Vec<&str> = (0..n_modes)
+        .map(|i| if i == mode { "●" } else { "○" })
+        .collect();
     format!("{name}\n\n{}", dots.join(" "))
 }
 
 /// `cycle_logical_monitors`: from the monitor `output` names (`None` for
 /// the span of all monitors) to the next. Integrated tablets skip the
 /// span. `None` result is the span; with no monitors there is nothing.
-pub fn cycle_monitor(current: Option<usize>, count: usize, skip_all: bool) -> Option<Option<usize>> {
+pub fn cycle_monitor(
+    current: Option<usize>,
+    count: usize,
+    skip_all: bool,
+) -> Option<Option<usize>> {
     if count == 0 {
         return None;
     }
@@ -391,16 +410,32 @@ mod tests {
         let combo = parse_accelerator("<Primary><Shift>z").unwrap();
         assert_eq!(combo.keysym, KEY_z);
         assert_eq!(combo.modifiers, CONTROL_MASK | SHIFT_MASK);
-        assert_eq!(parse_accelerator("<ctl><Alt>Delete").unwrap().modifiers, CONTROL_MASK | MOD1_MASK);
+        assert_eq!(
+            parse_accelerator("<ctl><Alt>Delete").unwrap().modifiers,
+            CONTROL_MASK | MOD1_MASK
+        );
         assert_eq!(parse_accelerator("<Super>a").unwrap().modifiers, SUPER_MASK);
         assert_eq!(parse_accelerator("<Mod4>a").unwrap().modifiers, MOD4_MASK);
         assert_eq!(parse_accelerator("<Meta>a").unwrap().modifiers, META_MASK);
         // Case-insensitive names, the XF86 fallback, unknown tokens skipped.
         assert_eq!(parse_accelerator("<Bogus>F5").unwrap().keysym, KEY_F5);
-        assert_eq!(parse_accelerator("AudioMute").unwrap().keysym, KEY_XF86AudioMute);
-        assert_eq!(parse_accelerator("Above_Tab").unwrap().keysym, KEY_ABOVE_TAB);
+        assert_eq!(
+            parse_accelerator("AudioMute").unwrap().keysym,
+            KEY_XF86AudioMute
+        );
+        assert_eq!(
+            parse_accelerator("Above_Tab").unwrap().keysym,
+            KEY_ABOVE_TAB
+        );
         assert_eq!(parse_accelerator("0x26").unwrap().keycode, 0x26);
-        assert_eq!(parse_accelerator("disabled"), Some(KeyCombo { keysym: 0, keycode: 0, modifiers: 0 }));
+        assert_eq!(
+            parse_accelerator("disabled"),
+            Some(KeyCombo {
+                keysym: 0,
+                keycode: 0,
+                modifiers: 0
+            })
+        );
         assert_eq!(parse_accelerator("<Control>NotAKey"), None);
     }
 
@@ -409,17 +444,32 @@ mod tests {
         assert_eq!(
             keybinding_steps("<Control><Super>z", true).unwrap(),
             vec![
-                KeyvalStep { keysym: KEY_Control_L, pressed: true },
-                KeyvalStep { keysym: KEY_z, pressed: true },
+                KeyvalStep {
+                    keysym: KEY_Control_L,
+                    pressed: true
+                },
+                KeyvalStep {
+                    keysym: KEY_z,
+                    pressed: true
+                },
             ],
             "Mutter 51 emulates no Super"
         );
         assert_eq!(
             keybinding_steps("<Shift><Alt>Tab", false).unwrap(),
             vec![
-                KeyvalStep { keysym: KEY_Tab, pressed: false },
-                KeyvalStep { keysym: KEY_Shift_L, pressed: false },
-                KeyvalStep { keysym: KEY_Alt_L, pressed: false },
+                KeyvalStep {
+                    keysym: KEY_Tab,
+                    pressed: false
+                },
+                KeyvalStep {
+                    keysym: KEY_Shift_L,
+                    pressed: false
+                },
+                KeyvalStep {
+                    keysym: KEY_Alt_L,
+                    pressed: false
+                },
             ]
         );
         assert_eq!(keybinding_steps("", true), Some(Vec::new()));
@@ -447,18 +497,36 @@ mod tests {
         let mut tracker = DirectionTracker::default();
         // The first event of a feature only records it.
         assert_eq!(tracker.direction(1, PadFeature::Ring, 0, 10.0), None);
-        assert_eq!(tracker.direction(1, PadFeature::Ring, 0, 20.0), Some(PadDirection::Cw));
-        assert_eq!(tracker.direction(1, PadFeature::Ring, 0, 15.0), Some(PadDirection::Ccw));
+        assert_eq!(
+            tracker.direction(1, PadFeature::Ring, 0, 20.0),
+            Some(PadDirection::Cw)
+        );
+        assert_eq!(
+            tracker.direction(1, PadFeature::Ring, 0, 15.0),
+            Some(PadDirection::Ccw)
+        );
         // Wrapping past 0° is still clockwise.
-        assert_eq!(tracker.direction(1, PadFeature::Ring, 0, 350.0), Some(PadDirection::Ccw));
-        assert_eq!(tracker.direction(1, PadFeature::Ring, 0, 5.0), Some(PadDirection::Cw));
+        assert_eq!(
+            tracker.direction(1, PadFeature::Ring, 0, 350.0),
+            Some(PadDirection::Ccw)
+        );
+        assert_eq!(
+            tracker.direction(1, PadFeature::Ring, 0, 5.0),
+            Some(PadDirection::Cw)
+        );
         // A lifted finger (-1) and the next touch give nothing.
         assert_eq!(tracker.direction(1, PadFeature::Ring, 0, -1.0), None);
         assert_eq!(tracker.direction(1, PadFeature::Ring, 0, 90.0), None);
         // Another feature restarts; strips grow downwards.
         assert_eq!(tracker.direction(1, PadFeature::Strip, 0, 0.5), None);
-        assert_eq!(tracker.direction(1, PadFeature::Strip, 0, 0.6), Some(PadDirection::Down));
-        assert_eq!(tracker.direction(1, PadFeature::Strip, 0, 0.2), Some(PadDirection::Up));
+        assert_eq!(
+            tracker.direction(1, PadFeature::Strip, 0, 0.6),
+            Some(PadDirection::Down)
+        );
+        assert_eq!(
+            tracker.direction(1, PadFeature::Strip, 0, 0.2),
+            Some(PadDirection::Up)
+        );
         assert_eq!(tracker.direction(2, PadFeature::Strip, 0, 0.3), None);
     }
 
@@ -471,13 +539,19 @@ mod tests {
             action: PadButtonAction::Keybinding,
             keybinding: "<Control>z".into(),
         };
-        assert_eq!(pad_button_outcome(&keys), PadButtonOutcome::Keybinding("<Control>z".into()));
+        assert_eq!(
+            pad_button_outcome(&keys),
+            PadButtonOutcome::Keybinding("<Control>z".into())
+        );
         assert_eq!(pad_button_label(&keys).as_deref(), Some("<Control>z"));
         let help = PadButtonSettings {
             action: PadButtonAction::Help,
             keybinding: String::new(),
         };
-        assert_eq!(pad_button_label(&help).as_deref(), Some("Show on-screen help"));
+        assert_eq!(
+            pad_button_label(&help).as_deref(),
+            Some("Show on-screen help")
+        );
         assert_eq!(mode_switch_label(1, 2), "Mode Switch (Group 1)");
         assert_eq!(mode_switch_label(0, 1), "Mode Switch");
         assert_eq!(feature_label(Some(&none)), None);

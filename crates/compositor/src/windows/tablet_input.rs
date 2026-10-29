@@ -149,7 +149,12 @@ impl WindowManager {
 
     /// Show the tool's cursor at `pos` (Mutter hides the pointer and draws
     /// the tool's own sprite); over no client surface, the default arrow.
-    fn tablet_cursor(state: &mut State, tool: &TabletToolDescriptor, pos: Point<f64, Logical>, over: bool) {
+    fn tablet_cursor(
+        state: &mut State,
+        tool: &TabletToolDescriptor,
+        pos: Point<f64, Logical>,
+        over: bool,
+    ) {
         if !over {
             state
                 .tablet_cursor_images
@@ -160,7 +165,12 @@ impl WindowManager {
 
     /// Route one tablet event. `lock` is the session-lock surface while
     /// locked: then it alone hears tools, as it alone hears the pointer.
-    pub fn tablet_input(&mut self, state: &mut State, event: TabletEvent, lock: Option<&WlSurface>) {
+    pub fn tablet_input(
+        &mut self,
+        state: &mut State,
+        event: TabletEvent,
+        lock: Option<&WlSurface>,
+    ) {
         let dh = state.dh.clone();
         let seat = state.seat.tablet_seat();
         match event {
@@ -197,14 +207,22 @@ impl WindowManager {
                 let target = self.tablet_target(state, pos, lock);
                 Self::tablet_cursor(state, &tool, pos, target.is_some());
                 if let Some(target) = target {
-                    focus
-                        .handle
-                        .proximity_in(pos, target.clone(), &tablet, SERIAL_COUNTER.next_serial(), time);
+                    focus.handle.proximity_in(
+                        pos,
+                        target.clone(),
+                        &tablet,
+                        SERIAL_COUNTER.next_serial(),
+                        time,
+                    );
                     // The first frame's axes follow in a motion frame.
                     focus.queue_axes(&axes);
-                    focus
-                        .handle
-                        .motion(pos, Some(target), &tablet, SERIAL_COUNTER.next_serial(), time);
+                    focus.handle.motion(
+                        pos,
+                        Some(target),
+                        &tablet,
+                        SERIAL_COUNTER.next_serial(),
+                        time,
+                    );
                 }
                 self.tablet.tools.insert(tool, focus);
             }

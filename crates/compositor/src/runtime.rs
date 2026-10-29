@@ -5094,7 +5094,11 @@ impl Runtime {
             self.active_at = Instant::now();
         }
         let event = match event {
-            TabletEvent::EmulateKeybinding { accel, pressed, time } => {
+            TabletEvent::EmulateKeybinding {
+                accel,
+                pressed,
+                time,
+            } => {
                 self.emulate_keybinding(&accel, pressed, time);
                 return;
             }
@@ -5102,12 +5106,17 @@ impl Runtime {
                 self.tablet_settings.set_output(path, output);
                 return;
             }
-            TabletEvent::ShowOsd { connector, icon, label } => {
-                self.control.queue_message(tuna_shell_control::Message::ShowOsd {
-                    connector,
-                    icon: icon.into(),
-                    label,
-                });
+            TabletEvent::ShowOsd {
+                connector,
+                icon,
+                label,
+            } => {
+                self.control
+                    .queue_message(tuna_shell_control::Message::ShowOsd {
+                        connector,
+                        icon: icon.into(),
+                        label,
+                    });
                 return;
             }
             TabletEvent::RequestPadOsd { pad, .. } => {
@@ -5170,8 +5179,11 @@ impl Runtime {
     /// layout, with Shift or Level 3 held around it for a higher level;
     /// a duplicate press or unmatched release is ignored.
     fn notify_keyval(&mut self, keysym: u32, pressed: bool, time: u32) {
-        let Some((keycode, level)) = self.manager.keycode_for_keysym(&mut self.state, keysym) else {
-            eprintln!("tuna-compositor: tablet: no keycode found for keyval {keysym:x} in current group");
+        let Some((keycode, level)) = self.manager.keycode_for_keysym(&mut self.state, keysym)
+        else {
+            eprintln!(
+                "tuna-compositor: tablet: no keycode found for keyval {keysym:x} in current group"
+            );
             return;
         };
         let admitted = if pressed {

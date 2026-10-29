@@ -119,7 +119,10 @@ pub enum TabletEvent {
     /// `switch-monitor` picked the next output: write the tablet's
     /// `output` setting at `path` (vendor, product, serial; all empty is
     /// the span of every monitor).
-    SetOutput { path: String, output: [String; 3] },
+    SetOutput {
+        path: String,
+        output: [String; 3],
+    },
     /// `meta_display_show_osd`: icon and text on a monitor (`None` is the
     /// current one).
     ShowOsd {
@@ -128,7 +131,10 @@ pub enum TabletEvent {
         label: String,
     },
     /// The `help` pad action: show this pad's OSD.
-    RequestPadOsd { pad: u32, time: u32 },
+    RequestPadOsd {
+        pad: u32,
+        time: u32,
+    },
     /// A pad event while the pad OSD is shown: the shell's, not a client's.
     PadOsdInput {
         pad: u32,
@@ -136,7 +142,9 @@ pub enum TabletEvent {
         time: u32,
     },
     /// The shown pad OSD's pad is gone.
-    ClosePadOsd { pad: u32 },
+    ClosePadOsd {
+        pad: u32,
+    },
 }
 
 impl TabletEvent {
@@ -352,7 +360,10 @@ impl Default for StylusSettings {
 /// stored values are rejected (the tool keeps what it had).
 pub fn stylus_pressure(settings: &StylusSettings, eraser: bool) -> Option<([f64; 4], [f64; 2])> {
     let (curve, range) = if eraser {
-        (&settings.eraser_pressure_curve, &settings.eraser_pressure_range)
+        (
+            &settings.eraser_pressure_curve,
+            &settings.eraser_pressure_range,
+        )
     } else {
         (&settings.pressure_curve, &settings.pressure_range)
     };
@@ -552,7 +563,10 @@ pub fn map_tool_button(
     mouse_or_lens: bool,
 ) -> ToolButton {
     let (action, keybinding) = if eraser_button == Some(evdev) {
-        (settings.eraser_button_action, &settings.eraser_button_keybinding)
+        (
+            settings.eraser_button_action,
+            &settings.eraser_button_keybinding,
+        )
     } else {
         // meta_evdev_tool_button_to_clutter, then the slots
         // set_stylus_button_map fills from the settings keys. Codes with
@@ -567,14 +581,23 @@ pub fn map_tool_button(
         let keyed = if mouse_or_lens {
             match clutter {
                 3 => Some((settings.button_action, &settings.button_keybinding)),
-                2 => Some((settings.secondary_button_action, &settings.secondary_button_keybinding)),
+                2 => Some((
+                    settings.secondary_button_action,
+                    &settings.secondary_button_keybinding,
+                )),
                 _ => None,
             }
         } else {
             match clutter {
                 2 => Some((settings.button_action, &settings.button_keybinding)),
-                3 => Some((settings.secondary_button_action, &settings.secondary_button_keybinding)),
-                8 => Some((settings.tertiary_button_action, &settings.tertiary_button_keybinding)),
+                3 => Some((
+                    settings.secondary_button_action,
+                    &settings.secondary_button_keybinding,
+                )),
+                8 => Some((
+                    settings.tertiary_button_action,
+                    &settings.tertiary_button_keybinding,
+                )),
                 _ => None,
             }
         };
@@ -622,7 +645,8 @@ fn match_config(output: &[String], monitor: &Monitor, monitors: &[Monitor]) -> b
     if output.len() < 3 || output[..3].iter().all(String::is_empty) {
         return false;
     }
-    let same = |m: &Monitor| m.vendor == output[0] && m.product == output[1] && m.serial == output[2];
+    let same =
+        |m: &Monitor| m.vendor == output[0] && m.product == output[1] && m.serial == output[2];
     if !same(monitor) {
         return false;
     }
@@ -882,7 +906,10 @@ mod tests {
 
     #[test]
     fn automatic_external_tablets_span_the_desktop_and_a_set_output_picks_one() {
-        let monitors = [monitor("DP-1", 0, 1920, 1080), monitor("HDMI-A-1", 1920, 1280, 1024)];
+        let monitors = [
+            monitor("DP-1", 0, 1920, 1080),
+            monitor("HDMI-A-1", 1920, 1280, 1024),
+        ];
         // Automatic: no name or size matches, the whole desktop.
         let (mapping, picked) = DeviceMapping::new(&pen(), &TabletSettings::default(), &monitors);
         assert_eq!(picked, None);
@@ -902,9 +929,15 @@ mod tests {
         let (mapping, picked) = DeviceMapping::new(&pen(), &settings, &monitors);
         assert_eq!(picked, Some(1));
         assert_eq!(mapping.translate((0.0, 0.0), stage), (1920.0, 0.0).into());
-        assert_eq!(mapping.translate((1.0, 1.0), stage), (3200.0, 1024.0).into());
+        assert_eq!(
+            mapping.translate((1.0, 1.0), stage),
+            (3200.0, 1024.0).into()
+        );
         // Never leaves the mapped monitor.
-        assert_eq!(mapping.translate((1.0, 1.0), stage), mapping.translate((1.0, 1.0), stage));
+        assert_eq!(
+            mapping.translate((1.0, 1.0), stage),
+            mapping.translate((1.0, 1.0), stage)
+        );
         // An unknown monitor falls back to the whole desktop.
         let settings = TabletSettings {
             output: Some(vec!["XYZ".into(), "Nope".into(), "1".into()]),
@@ -934,10 +967,19 @@ mod tests {
                 connector.to_owned(),
             ]
         };
-        assert_eq!(pick_monitor(&pen(), Some(&output("DP-2")), &monitors), Some(1));
-        assert_eq!(pick_monitor(&pen(), Some(&output("DP-1")), &monitors), Some(0));
+        assert_eq!(
+            pick_monitor(&pen(), Some(&output("DP-2")), &monitors),
+            Some(1)
+        );
+        assert_eq!(
+            pick_monitor(&pen(), Some(&output("DP-1")), &monitors),
+            Some(0)
+        );
         // Three values match the first twin.
-        assert_eq!(pick_monitor(&pen(), Some(&output("DP-2")[..3]), &monitors), Some(0));
+        assert_eq!(
+            pick_monitor(&pen(), Some(&output("DP-2")[..3]), &monitors),
+            Some(0)
+        );
     }
 
     #[test]
@@ -961,7 +1003,10 @@ mod tests {
         assert_eq!(pick_monitor(&by_size, None, &monitors), Some(1));
         // A set output wins over the guess.
         let settings_output = vec!["GSM".into(), "LG ULTRAFINE".into(), "DP-1".into()];
-        assert_eq!(pick_monitor(&by_name, Some(&settings_output), &monitors), Some(0));
+        assert_eq!(
+            pick_monitor(&by_name, Some(&settings_output), &monitors),
+            Some(0)
+        );
     }
 
     #[test]
@@ -978,7 +1023,10 @@ mod tests {
         let stage = stage_size(&monitors);
         // Mutter's 90° matrix: the tablet's top-left lands top-right.
         assert_eq!(mapping.translate((0.0, 0.0), stage), (1080.0, 0.0).into());
-        assert_eq!(mapping.translate((1.0, 0.0), stage), (1080.0, 1920.0).into());
+        assert_eq!(
+            mapping.translate((1.0, 0.0), stage),
+            (1080.0, 1920.0).into()
+        );
     }
 
     #[test]
@@ -1095,10 +1143,22 @@ mod tests {
         let defaults = StylusSettings::default();
         // GNOME 51: the lower button right-clicks, the upper middle-clicks,
         // the third (default) acts as the tip.
-        assert_eq!(map_tool_button(BTN_STYLUS, &defaults, None, false), ToolButton::Button(BTN_STYLUS2));
-        assert_eq!(map_tool_button(BTN_STYLUS2, &defaults, None, false), ToolButton::Button(BTN_STYLUS));
-        assert_eq!(map_tool_button(BTN_STYLUS3, &defaults, None, false), ToolButton::Tip);
-        assert_eq!(map_tool_button(BTN_TOUCH, &defaults, None, false), ToolButton::Tip);
+        assert_eq!(
+            map_tool_button(BTN_STYLUS, &defaults, None, false),
+            ToolButton::Button(BTN_STYLUS2)
+        );
+        assert_eq!(
+            map_tool_button(BTN_STYLUS2, &defaults, None, false),
+            ToolButton::Button(BTN_STYLUS)
+        );
+        assert_eq!(
+            map_tool_button(BTN_STYLUS3, &defaults, None, false),
+            ToolButton::Tip
+        );
+        assert_eq!(
+            map_tool_button(BTN_TOUCH, &defaults, None, false),
+            ToolButton::Tip
+        );
         let custom = StylusSettings {
             button_action: ButtonAction::Back,
             secondary_button_action: ButtonAction::Forward,
@@ -1108,8 +1168,14 @@ mod tests {
             tertiary_button_keybinding: "unused".into(),
             ..StylusSettings::default()
         };
-        assert_eq!(map_tool_button(BTN_STYLUS, &custom, None, false), ToolButton::Button(BTN_BACK));
-        assert_eq!(map_tool_button(BTN_STYLUS2, &custom, None, false), ToolButton::Button(BTN_FORWARD));
+        assert_eq!(
+            map_tool_button(BTN_STYLUS, &custom, None, false),
+            ToolButton::Button(BTN_BACK)
+        );
+        assert_eq!(
+            map_tool_button(BTN_STYLUS2, &custom, None, false),
+            ToolButton::Button(BTN_FORWARD)
+        );
         assert_eq!(
             map_tool_button(BTN_STYLUS3, &custom, None, false),
             ToolButton::Action(ButtonAction::SwitchMonitor, String::new())
@@ -1129,11 +1195,20 @@ mod tests {
             ToolButton::Action(ButtonAction::Keybinding, "<Alt>Tab".into())
         );
         // Mouse and lens tools: primary key on the right button.
-        assert_eq!(map_tool_button(BTN_STYLUS2, &custom, None, true), ToolButton::Button(BTN_BACK));
-        assert_eq!(map_tool_button(BTN_STYLUS, &custom, None, true), ToolButton::Button(BTN_FORWARD));
+        assert_eq!(
+            map_tool_button(BTN_STYLUS2, &custom, None, true),
+            ToolButton::Button(BTN_BACK)
+        );
+        assert_eq!(
+            map_tool_button(BTN_STYLUS, &custom, None, true),
+            ToolButton::Button(BTN_FORWARD)
+        );
         // Mouse-tool buttons map through their pointer slots; anything
         // else hits no slot and acts as the primary button.
-        assert_eq!(map_tool_button(BTN_RIGHT, &custom, None, true), ToolButton::Button(BTN_BACK));
+        assert_eq!(
+            map_tool_button(BTN_RIGHT, &custom, None, true),
+            ToolButton::Button(BTN_BACK)
+        );
         assert_eq!(map_tool_button(0x113, &custom, None, true), ToolButton::Tip);
     }
 }

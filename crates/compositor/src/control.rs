@@ -1079,7 +1079,11 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
-                kind: CommandKind::RequestPadOsd { target, edition_mode },
+                kind:
+                    CommandKind::RequestPadOsd {
+                        target,
+                        edition_mode,
+                    },
             } => {
                 // padOsd.js `ShowAsync`: an unknown pad is "Invalid params";
                 // never over the lock screen.
@@ -1100,7 +1104,8 @@ impl<'a> Session<'a> {
                     },
                 };
                 let applied = status == CommandStatus::Applied;
-                self.conn.write_frame(&Message::CommandResult { id, status })?;
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
                 Ok(Handled::CommandResult { id, applied })
             }
             Message::Command {
