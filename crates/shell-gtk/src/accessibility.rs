@@ -61,7 +61,7 @@ fn indicator_visible(always: bool, mut active: impl Iterator<Item = bool>) -> bo
 }
 
 pub fn menu() -> gtk::MenuButton {
-    let popover = gtk::Popover::new();
+    let popover = crate::transient::MenuPopover::new_popover();
     let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
     column.set_halign(gtk::Align::Start);
     column.set_margin_top(12);
