@@ -36,6 +36,13 @@ Kernel uninterruptible states, detached PAM module processes and external daemon
 state are outside a universal process-group retirement guarantee. Actual installed
 stacks require separate service/device cleanup qualification.
 
+The supervisor reads EOF on the helper's pipes as the helper being gone and kills
+its process group at once. The helper therefore never closes its conversation
+pipes itself; only the kernel closes them, after the process has finished
+exiting. An early close let that kill land during exit work: in instrumented
+builds it truncated the helper's coverage profile and failed the measured
+coverage merge.
+
 Answers use private stdin, not argv, environment, logs or temporary files.
 Owned answer/transport buffers are wiped and diagnostics redact values. Core dumps
 are disabled in the helper. PAM modules own successful callback response buffers;

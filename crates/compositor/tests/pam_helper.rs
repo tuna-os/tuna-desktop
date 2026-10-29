@@ -401,6 +401,31 @@ fn raw_negative_cases() {
                 }
             }
         }
+        if matches!(mode, "oversized-header" | "wrong-uid") {
+            // The helper rejects on its own. Its conversation EOF must come from
+            // the kernel's exit-time close, which runs only after the process
+            // released its address space (stat vsize 0), never from an early
+            // close while exit work still runs: Supervisor kills the group on
+            // EOF, which would cut that work short (an instrumented build
+            // writes its coverage profile there).
+            let error = raw_read(&mut output, &mut [0], transport_deadline).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.id()))
+                .expect("unreaped helper keeps its /proc entry");
+            let vsize: u64 = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .nth(20)
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                vsize, 0,
+                "{mode}: helper closed its conversation while its process still ran"
+            );
+        }
         drop(input);
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {

@@ -7,6 +7,7 @@ use crate::pam_cancel::Cancellation;
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::{self, Read, Write};
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
@@ -817,9 +818,10 @@ type Start =
     unsafe extern "C" fn(*const c_char, *const c_char, *const PamConv, *mut *mut c_void) -> c_int;
 type PamFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type GetItem = unsafe extern "C" fn(*const c_void, c_int, *mut *const c_void) -> c_int;
+/// The conversation pipes are never closed by the helper; see `run_helper`.
 struct Exchange {
-    input: std::fs::File,
-    output: std::fs::File,
+    input: ManuallyDrop<std::fs::File>,
+    output: ManuallyDrop<std::fs::File>,
     identity: Identity,
     deadline: Instant,
     sequence: u32,
@@ -893,7 +895,7 @@ unsafe fn exchange_messages(
     }
     let styles: Vec<_> = messages.iter().map(|message| message.style).collect();
     if send(
-        &mut exchange.output,
+        &mut *exchange.output,
         &Reply::Challenge {
             identity: exchange.identity.clone(),
             sequence: exchange.sequence,
@@ -905,7 +907,7 @@ unsafe fn exchange_messages(
     {
         return 19;
     }
-    let answers = match receive(&mut exchange.input, exchange.deadline) {
+    let answers = match receive(&mut *exchange.input, exchange.deadline) {
         Ok(Request::Answers {
             identity,
             sequence,
@@ -954,8 +956,13 @@ unsafe fn free_responses(out: *mut PamResponse, filled: usize) {
 fn run_helper() -> io::Result<bool> {
     let started = Instant::now();
     // SAFETY: the fixed early helper entry point exclusively owns these pipes.
-    let mut input = unsafe { std::fs::File::from_raw_fd(0) };
-    let output = unsafe { std::fs::File::from_raw_fd(1) };
+    // They are deliberately never closed here: the Supervisor reads EOF as the
+    // helper being gone and then kills its process group. Only the kernel
+    // closes them, once the process has finished exiting, so that kill cannot
+    // cut short exit-time work (an instrumented build writes its coverage
+    // profile there; a truncated profile breaks the measured-coverage merge).
+    let mut input = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+    let output = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
     for descriptor in [input.as_raw_fd(), output.as_raw_fd()] {
         // Require the private pipe topology used by Supervisor, never a tty,
         // credential file or public diagnostic output stream.
@@ -980,7 +987,7 @@ fn run_helper() -> io::Result<bool> {
         service,
         user,
         budget_ms,
-    } = receive(&mut input, started + MAX_BUDGET)?
+    } = receive(&mut *input, started + MAX_BUDGET)?
     else {
         return Err(invalid());
     };
@@ -1049,7 +1056,7 @@ fn run_helper() -> io::Result<bool> {
     };
     let mut exchange = exchange.into_inner().map_err(|_| invalid())?;
     send(
-        &mut exchange.output,
+        &mut *exchange.output,
         &Reply::Result {
             identity: exchange.identity.clone(),
             authenticated,

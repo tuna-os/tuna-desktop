@@ -137,6 +137,12 @@ The floors guard this documented source-file measurement scope; they do not
 claim branch coverage, GUI journey coverage or complete security boundary
 cases. Those remaining gates stay tracked by #8.
 
+Every instrumented process writes its `.profraw` profile while it exits, and
+`llvm-profdata` rejects the whole merge if any profile is truncated. A test or
+supervisor must not SIGKILL an instrumented child that may already be exiting.
+A process that tells its owner it is done (for example by closing a pipe) must
+do so only when it has finished exiting.
+
 The measured coverage lane requires complete security evidence before a green
 run: exact source revision, compiler and observer versions, kernel and installed
 packages, a reproduction command requiring PAM wrapper support, executed test
