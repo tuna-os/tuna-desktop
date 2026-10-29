@@ -38,7 +38,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::drm::control::{
     self, connector, crtc, Device as ControlDevice, ModeTypeFlags,
 };
-use smithay::reexports::input::event::tablet_tool::TabletToolEventTrait;
+use smithay::reexports::input::event::TabletToolEvent;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
@@ -1300,20 +1300,23 @@ impl DrmBackend {
                 }]
             }
             // Drawing tablets (P-IN-05): queued for the window manager.
+            // Wrap the event, never `into_tablet_tool_event`: input 0.9
+            // builds the enum from the raw pointer and then drops (and
+            // destroys) the event it came from.
             InputEvent::TabletToolAxis { event } => {
-                self.tablet_tool(TabletToolEventTrait::into_tablet_tool_event(event));
+                self.tablet_tool(TabletToolEvent::Axis(event));
                 Vec::new()
             }
             InputEvent::TabletToolProximity { event } => {
-                self.tablet_tool(TabletToolEventTrait::into_tablet_tool_event(event));
+                self.tablet_tool(TabletToolEvent::Proximity(event));
                 Vec::new()
             }
             InputEvent::TabletToolTip { event } => {
-                self.tablet_tool(TabletToolEventTrait::into_tablet_tool_event(event));
+                self.tablet_tool(TabletToolEvent::Tip(event));
                 Vec::new()
             }
             InputEvent::TabletToolButton { event } => {
-                self.tablet_tool(TabletToolEventTrait::into_tablet_tool_event(event));
+                self.tablet_tool(TabletToolEvent::Button(event));
                 Vec::new()
             }
             InputEvent::Special(event) => {

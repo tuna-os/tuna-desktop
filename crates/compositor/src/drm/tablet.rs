@@ -376,6 +376,10 @@ impl Tablets {
             let group = device.device_group();
             for pad in &self.pads {
                 if pad.device.device_group() == group {
+                    eprintln!(
+                        "tuna-compositor: tablet: pad {} paired={}",
+                        pad.desc.name, desc.name
+                    );
                     self.events.push(TabletEvent::PadAdded {
                         pad: pad.desc.clone(),
                         tablet: Some(desc.clone()),
@@ -485,11 +489,12 @@ impl Tablets {
         let device = &mut tablet.device;
         if let Some(area) = settings.area() {
             if device.config_calibration_has_matrix() {
+                // libinput reports no default matrix when it is the
+                // identity; restoring the default then means the identity.
                 let matrix = crate::tablet::area_matrix(area)
-                    .or_else(|| device.config_calibration_default_matrix());
-                if let Some(matrix) = matrix {
-                    let _ = device.config_calibration_set_matrix(matrix);
-                }
+                    .or_else(|| device.config_calibration_default_matrix())
+                    .unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+                let _ = device.config_calibration_set_matrix(matrix);
             }
         }
         if device.config_left_handed_is_available() {
@@ -629,7 +634,14 @@ impl Tablets {
                     tablet.pos = pointer;
                 }
                 let relative = mouse_or_lens || tablet.mapping.mode == Mapping::Relative;
-                let pos = Self::position(tablet, &event, relative, monitors);
+                // Mutter moves nothing on proximity (process_device_event
+                // only notifies it): libinput's delta on entering is the jump
+                // from where the tool left, which relative mode must drop.
+                let pos = if relative {
+                    tablet.pos
+                } else {
+                    Self::position(tablet, &event, relative, monitors)
+                };
                 let axes = current.axes(&event);
                 tablet.tool = Some(current);
                 self.events.push(TabletEvent::ProximityIn {

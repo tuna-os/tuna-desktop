@@ -747,7 +747,8 @@ impl SeatHandler for State {
         // Text inputs must be enabled anew after `enter` (#349).
         self.protocols.text_inputs.focus_changed();
         // Pads follow keyboard focus (meta_wayland_tablet_seat_set_pad_focus).
-        self.sync_tablet_pads();
+        // The keyboard is still locked here, so pass the new focus on.
+        self.focus_tablet_pads(focused);
     }
 
     /// A client set the cursor (wl_pointer.set_cursor or a
@@ -766,8 +767,14 @@ impl State {
     /// without a connected tablet has no focus (Mutter's
     /// `meta_wayland_tablet_pad_set_focus`).
     pub(crate) fn sync_tablet_pads(&mut self) {
-        use smithay::wayland::tablet_manager::TabletSeatTrait;
         let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        self.focus_tablet_pads(focus.as_ref());
+    }
+
+    /// Never call `KeyboardHandle::current_focus` from here: inside
+    /// `SeatHandler::focus_changed` the keyboard's lock is held.
+    fn focus_tablet_pads(&mut self, focus: Option<&wl_surface::WlSurface>) {
+        use smithay::wayland::tablet_manager::TabletSeatTrait;
         let tablets = self.seat.tablet_seat();
         // libinput's clock: the mode switch time on a focus change.
         let time = smithay::utils::Clock::<smithay::utils::Monotonic>::new()
@@ -779,7 +786,7 @@ impl State {
             };
             let tablet = tablet.as_ref().and_then(|t| tablets.get_tablet(t));
             handle.set_focus(
-                focus.as_ref(),
+                focus,
                 tablet.as_ref(),
                 smithay::utils::SERIAL_COUNTER.next_serial(),
                 time,

@@ -646,4 +646,296 @@ COLORD_PID=""
 kill "$SYSTEM_BUS_PID" 2>/dev/null || true
 SYSTEM_BUS_PID=""
 
+# Drawing tablets (P-IN-05, #344), emulated per ADR 0008: uinput devices
+# exactly as the wacom driver creates them for a Cintiq 22HD, a GTK 4
+# stylus client, GNOME 51's tablet settings in a private keyfile, and the
+# GTK shell (whose pad OSD the help button opens).
+kill "$DBUS_PID" 2>/dev/null || true
+TABLET_LOG="$ARTIFACTS/compositor-tablet.log"
+CSTATE="$ARTIFACTS/compositor-state-tablet.json"
+CLIENT_LOG="$ARTIFACTS/tablet-client.jsonl"
+EMU_OUT="$ARTIFACTS/tablet-emulator.log"
+mkdir -p "$ARTIFACTS/config-tablet" "$ARTIFACTS/schemas-tablet"
+cp "$ROOT/tests/settings/gnome51-peripherals-tablet.gschema.xml" "$ARTIFACTS/schemas-tablet/"
+glib-compile-schemas "$ARTIFACTS/schemas-tablet"
+GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas-tablet${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+GSETTINGS_BACKEND=keyfile
+XDG_CONFIG_HOME="$ARTIFACTS/config-tablet"
+export GSETTINGS_SCHEMA_DIR GSETTINGS_BACKEND XDG_CONFIG_HOME
+dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$ARTIFACTS/dbus-tablet.txt"
+DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p "$ARTIFACTS/dbus-tablet.txt")"
+DBUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-tablet.txt")"
+export DBUS_SESSION_BUS_ADDRESS
+LOG="$TABLET_LOG"
+env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+    "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-tablet \
+    --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >"$TABLET_LOG" 2>&1 &
+COMP_PID=$!
+# state JQ [SECONDS]: the compositor state satisfies JQ in time.
+state() {
+    end=$(($(date +%s) + ${2:-10}))
+    until [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1; do
+        kill -0 "$COMP_PID" 2>/dev/null || return 1
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.1
+    done
+}
+state '.display_config.serial >= 1 and (.layers | length > 0)' 30 ||
+    fail D-TABLET "the tablet session never lit its output"
+state '.layers | any(.namespace == "tuna-panel")' 30 || fail D-TABLET "the GTK shell never mapped its panel"
+
+# The emulator answers one line per command on the pipe. Only uinput
+# needs root; the pipe and the log stay ours.
+mkfifo "$ARTIFACTS/tablet-emulator.fifo"
+# shellcheck disable=SC2024
+sudo python3 "$ROOT/scripts/lib/tuna-uinput-tablet.py" <"$ARTIFACTS/tablet-emulator.fifo" >"$EMU_OUT" 2>&1 &
+EMU_PID=$!
+exec 8>"$ARTIFACTS/tablet-emulator.fifo"
+emu_sent=0
+emu() {
+    echo "$*" >&8
+    emu_sent=$((emu_sent + 1))
+    end=$(($(date +%s) + 10))
+    until [ "$(grep -c '^ok$' "$EMU_OUT")" -ge "$emu_sent" ]; do
+        grep -q '^error' "$EMU_OUT" && fail D-TABLET "emulator: $(grep '^error' "$EMU_OUT" | tail -1)"
+        [ "$(date +%s)" -le "$end" ] || fail D-TABLET "emulator did not answer '$*'"
+        sleep 0.05
+    done
+    sleep 0.1
+}
+TPATH=/org/gnome/desktop/peripherals/tablets/056a:00fa/
+SPATH=/org/gnome/desktop/peripherals/stylus/2f4a1c3/
+tset() { gsettings set "org.gnome.desktop.peripherals.tablet:$TPATH" "$@"; }
+sset() { gsettings set "org.gnome.desktop.peripherals.tablet.stylus:$SPATH" "$@"; }
+pset() { gsettings set "org.gnome.desktop.peripherals.tablet.pad-button:$TPATH$1/" "$2" "$3"; }
+
+state '(.tablets.tablets | length == 1) and (.tablets.pads | length == 1)' 15 ||
+    fail D-TABLET "the emulated pen and pad did not appear"
+state '.tablets.tablets[0].libwacom == "Wacom Cintiq 22HD" and .tablets.pads[0].libwacom == "Wacom Cintiq 22HD"
+       and (.tablets.pads[0].layout | endswith("cintiq-22hd.svg")) and .tablets.pads[0].buttons == 18' ||
+    fail D-TABLET "libwacom does not know the emulated model: $(jq -c .tablets "$CSTATE")"
+# libinput adds the pen and the pad in either order; the pad pairs with
+# its pen as soon as both are there.
+grep -q 'pad Wacom Cintiq 22HD Pad .*paired=Wacom Cintiq 22HD Pen' "$TABLET_LOG" ||
+    fail D-TABLET "the pad was not paired with its pen through the libinput device group"
+PAD_ID="$(jq -r '.tablets.pads[0].id' "$CSTATE")"
+PAD_NODE="$(jq -r '.tablets.pads[0].devnode' "$CSTATE")"
+
+env -u DISPLAY XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-tablet GDK_BACKEND=wayland \
+    python3 "$ROOT/scripts/lib/tuna-tablet-client.py" >"$CLIENT_LOG" 2>"$ARTIFACTS/tablet-client.stderr" &
+CLIENT_PID=$!
+# client PYTHON [SECONDS]: a client record since the last mark satisfies
+# PYTHON (r is the record, W and H the window size).
+client_mark=0
+mark() { client_mark=$(wc -l <"$CLIENT_LOG"); }
+client() {
+    end=$(($(date +%s) + ${2:-5}))
+    until python3 - "$CLIENT_LOG" "$client_mark" "$1" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+ready = [json.loads(l) for l in lines if '"ready"' in l]
+W, H = (ready[0]["width"], ready[0]["height"]) if ready else (0, 0)
+records = [json.loads(l) for l in lines[int(sys.argv[2]):]]
+sys.exit(0 if any(eval(sys.argv[3], {}, {"r": r, "W": W, "H": H}) for r in records) else 1)
+PY
+    do
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.1
+    done
+}
+client 'r["event"] == "ready" and W > 0' 20 || fail D-TABLET "the GTK client never mapped: $(tail -3 "$ARTIFACTS/tablet-client.stderr")"
+client "r['event'] == 'ready' and W == $MODE_W" || fail D-TABLET "the client is not fullscreen on the ${MODE_W}px output"
+near() { echo "abs(r['x'] - $1) <= 3 and abs(r['y'] - $2) <= 3"; }
+
+# Absolute mapping over the whole display, hovering then drawing.
+mark
+emu tool pen
+emu pen 0.5 0.25 0 10 -5 20
+client "r['event'] in ('proximity', 'motion') and r['tool'] == 'pen' and $(near 'W * 0.5' 'H * 0.25') and r['distance'] is not None" ||
+    fail D-TABLET "hover did not reach the client at the tablet's position: $(tail -2 "$CLIENT_LOG")"
+mark
+emu pen 0.5 0.5 0.5 10 -5 0
+# GDK reports tilt over -90..90 degrees as -1..1 (gdkdevice-wayland.c).
+client "r['event'] == 'down' and $(near 'W * 0.5' 'H * 0.5') and abs(r['pressure'] - 0.25) < 0.04 and abs(r['xtilt'] - 10.05 / 90) < 0.006 and abs(r['ytilt'] + 5.03 / 90) < 0.006" ||
+    fail D-TABLET "the tip did not go down with GNOME's default pressure curve and the tilt: $(tail -2 "$CLIENT_LOG")"
+mark
+emu pen 0.75 0.5 0.8
+client "r['event'] == 'motion' and $(near 'W * 0.75' 'H * 0.5') and abs(r['pressure'] - 0.64) < 0.05" ||
+    fail D-TABLET "drawing motion lost position or pressure: $(tail -2 "$CLIENT_LOG")"
+mark
+emu pen 0.75 0.5 0
+client "r['event'] == 'up'" || fail D-TABLET "the tip never came up"
+mark
+emu tool eraser
+emu pen 0.25 0.5 0
+client "r['tool'] == 'eraser' and $(near 'W * 0.25' 'H * 0.5')" || fail D-TABLET "the eraser end did not reach the client as an eraser"
+emu tool out
+pass D-TABLET "libwacom Cintiq 22HD pen and pad paired; GTK GestureStylus saw position, pressure through GNOME's curve, tilt, distance, pen and eraser"
+
+# GNOME's area (calibration matrix) and keep-aspect, then the output key.
+tset area "[0.25, 0.25, 0.0, 0.0]"
+state '.tablets.tablets[0].area == [0.25, 0.25, 0, 0] and .tablets.tablets[0].calibration[0] == 2' ||
+    fail D-TABLET "the area did not reach libinput's calibration: $(jq -c '.tablets.tablets[0]' "$CSTATE")"
+AREA_MATRIX="$(jq -c '.tablets.tablets[0].calibration' "$CSTATE")"
+mark
+emu tool pen
+emu pen 0.375 0.5 0
+client "$(near 'W * 0.25' 'H * 0.5')" || fail D-TABLET "the area did not remap the pen: $(tail -1 "$CLIENT_LOG")"
+emu tool out
+tset area "[0.0, 0.0, 0.0, 0.0]"
+state '.tablets.tablets[0].calibration == null' || fail D-TABLET "an empty area did not clear the calibration"
+tset keep-aspect true
+state '.tablets.tablets[0].keep_aspect_ratio > 0' || fail D-TABLET "keep-aspect did not apply"
+mark
+emu tool pen
+emu pen 0.6 0.5 0
+client "abs(r['x'] - W * 0.6 * (477 / 269) / (W / H)) <= 4 and abs(r['y'] - H * 0.5) <= 3" ||
+    fail D-TABLET "keep-aspect did not stretch the pen to the display's aspect: $(tail -1 "$CLIENT_LOG")"
+emu tool out
+tset keep-aspect false
+gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
+    --method org.gnome.Mutter.DisplayConfig.GetCurrentState >"$ARTIFACTS/tablet-display.txt"
+EDID="$(python3 - "$ARTIFACTS/tablet-display.txt" "$CONNECTOR" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+spec = re.search(r"\(\('%s', '([^']*)', '([^']*)', '([^']*)'\)" % re.escape(sys.argv[2]), text)
+print("['%s', '%s', '%s']" % spec.groups())
+PY
+)" || fail D-TABLET "no monitor identity for $CONNECTOR"
+tset output "$EDID"
+state ".tablets.tablets[0].output == \"$CONNECTOR\"" || fail D-TABLET "output $EDID did not map the tablet to $CONNECTOR"
+tset output "['', '', '']"
+state '.tablets.tablets[0].output == null' || fail D-TABLET "an empty output did not map the whole desktop"
+pass D-TABLET "area calibration $AREA_MATRIX remapped, keep-aspect stretched, output $EDID mapped to $CONNECTOR"
+
+# Stylus actions: switch-monitor cycles the output and shows the OSD;
+# keybinding types into the focused client.
+sset secondary-button-action switch-monitor
+sset button-action keybinding
+sset button-keybinding '<Shift>x'
+sleep 0.5
+emu tool pen
+emu pen 0.5 0.5 0
+emu stylus BTN_STYLUS2 1
+emu stylus BTN_STYLUS2 0
+state ".tablets.tablets[0].output == \"$CONNECTOR\"" ||
+    fail D-TABLET "switch-monitor did not cycle from all monitors to $CONNECTOR"
+[ "$(gsettings get "org.gnome.desktop.peripherals.tablet:$TPATH" output)" = "$EDID" ] ||
+    fail D-TABLET "switch-monitor did not store the output: $(gsettings get "org.gnome.desktop.peripherals.tablet:$TPATH" output)"
+grep -q "tablet: Wacom Cintiq 22HD switch-monitor to $CONNECTOR" "$TABLET_LOG" || fail D-TABLET "no switch-monitor notification"
+mark
+emu stylus BTN_STYLUS 1
+emu stylus BTN_STYLUS 0
+client "r['event'] == 'key' and r['key'] == 'X' and r['shift']" ||
+    fail D-TABLET "the stylus keybinding did not type <Shift>x: $(tail -2 "$CLIENT_LOG")"
+emu tool out
+
+# Pad actions: a button keybinding, a strip keybinding by direction, and
+# switch-monitor (integrated: never the span of all monitors).
+pset buttonC action keybinding
+pset buttonC keybinding '<Control>b'
+pset stripA-up-mode-0 keybinding 'Up'
+pset stripA-down-mode-0 keybinding 'Down'
+pset buttonD action switch-monitor
+sleep 0.5
+mark
+emu pad 2 1
+emu pad 2 0
+client "r['event'] == 'key' and r['key'] == 'b' and r['control']" ||
+    fail D-TABLET "the pad keybinding did not type <Control>b: $(tail -2 "$CLIENT_LOG")"
+mark
+emu strip 0 3
+emu strip 0 6
+client "r['event'] == 'key' and r['key'] == 'Down'" || fail D-TABLET "a strip moving down did not type Down"
+mark
+emu strip 0 2
+emu strip 0 -1
+client "r['event'] == 'key' and r['key'] == 'Up'" || fail D-TABLET "a strip moving up did not type Up"
+# On an integrated tablet the cycle skips the span of all monitors
+# (cycle_logical_monitors): with one monitor it comes back to it.
+switches=$(grep -c "switch-monitor to $CONNECTOR" "$TABLET_LOG")
+emu pad 3 1
+emu pad 3 0
+sleep 0.5
+[ "$(grep -c "switch-monitor to $CONNECTOR" "$TABLET_LOG")" -eq $((switches + 1)) ] ||
+    fail D-TABLET "the integrated tablet's pad switch-monitor did not cycle back to $CONNECTOR"
+state ".tablets.tablets[0].output == \"$CONNECTOR\"" || fail D-TABLET "the integrated tablet's pad switch-monitor left $CONNECTOR"
+pass D-TABLET "stylus switch-monitor cycled all monitors -> $CONNECTOR and stored it; stylus <Shift>x, pad <Control>b, strip Up/Down typed into the client; pad switch-monitor skipped the span"
+
+# The pad OSD: the help button, then GNOME Settings' D-Bus request.
+pset buttonB action help
+sleep 0.5
+emu pad 1 1
+emu pad 1 0
+state ".tablets.pad_osd == $PAD_ID and (.layers | any(.namespace == \"tuna-pad-osd\"))" ||
+    fail D-TABLET "the help button did not show the pad OSD: $(grep 'pad OSD' "$TABLET_LOG" | tail -2)"
+mark
+emu pad 2 1
+emu pad 2 0
+sleep 0.5
+client "r['event'] == 'key'" 1 && fail D-TABLET "a pad button reached the client under the pad OSD"
+emu key KEY_ESC
+state '.tablets.pad_osd == null and (.layers | all(.namespace != "tuna-pad-osd"))' ||
+    fail D-TABLET "a key did not close the pad OSD"
+if gdbus call --session --dest org.gnome.Shell.Wacom.PadOsd --object-path /org/gnome/Shell/Wacom \
+    --method org.gnome.Shell.Wacom.PadOsd.Show /dev/input/event999 false >"$ARTIFACTS/padosd-invalid.txt" 2>&1; then
+    fail D-TABLET "PadOsd.Show accepted an unknown device"
+fi
+grep -q 'Invalid params' "$ARTIFACTS/padosd-invalid.txt" || fail D-TABLET "PadOsd.Show error: $(cat "$ARTIFACTS/padosd-invalid.txt")"
+gdbus call --session --dest org.gnome.Shell.Wacom.PadOsd --object-path /org/gnome/Shell/Wacom \
+    --method org.gnome.Shell.Wacom.PadOsd.Show "$PAD_NODE" true >"$ARTIFACTS/padosd-show.txt" 2>&1 ||
+    fail D-TABLET "PadOsd.Show failed: $(cat "$ARTIFACTS/padosd-show.txt")"
+state ".tablets.pad_osd == $PAD_ID and (.layers | any(.namespace == \"tuna-pad-osd\"))" ||
+    fail D-TABLET "PadOsd.Show did not open the OSD"
+grep -q 'pad OSD for Wacom Cintiq 22HD Pad (.*cintiq-22hd.svg) edition=true' "$TABLET_LOG" ||
+    fail D-TABLET "PadOsd.Show did not ask for edition mode"
+emu key KEY_ESC
+state '.tablets.pad_osd == null' || fail D-TABLET "Escape did not close the edition OSD"
+pass D-TABLET "pad OSD shown by the help button and PadOsd.Show (edition), pad buttons captured, closed by a key; unknown device refused"
+
+# Relative mapping: the pen moves the cursor from where it is.
+tset mapping relative
+state '.tablets.tablets[0].mapping == "relative"' || fail D-TABLET "relative mapping did not apply"
+mark
+emu tool pen
+emu pen 0.9 0.9 0
+emu pen 0.95 0.9 0
+client "r['event'] == 'motion' and r['x'] < W * 0.85" ||
+    fail D-TABLET "relative mode followed the tablet's absolute position: $(tail -2 "$CLIENT_LOG")"
+emu tool out
+tset mapping absolute
+
+# Hotplug: unplugged and back.
+emu unplug
+state '(.tablets.tablets | length == 0) and (.tablets.pads | length == 0)' || fail D-TABLET "unplug left devices behind"
+emu plug
+state '(.tablets.tablets | length == 1) and (.tablets.pads | length == 1)' 15 || fail D-TABLET "replug did not bring the devices back"
+
+# Locked: the lock surface alone hears the pen.
+gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver \
+    --method org.gnome.ScreenSaver.Lock >/dev/null 2>&1 || fail D-TABLET "could not lock"
+state '.locked' || fail D-TABLET "the session did not lock"
+sleep 1
+mark
+emu tool pen
+emu pen 0.5 0.5 0
+emu pen 0.5 0.5 0.5
+emu pen 0.5 0.5 0
+emu tool out
+sleep 0.5
+client "r['event'] != 'ready'" 1 && fail D-TABLET "the pen reached the client while locked: $(tail -2 "$CLIENT_LOG")"
+pass D-TABLET "relative mapping moved from the cursor; unplug/replug; nothing reached the client while locked"
+
+kill "$CLIENT_PID" 2>/dev/null || true
+CLIENT_PID=""
+exec 8>&-
+wait "$EMU_PID" 2>/dev/null || true
+EMU_PID=""
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$TABLET_LOG"; then fail D-NOPANIC "panic in the tablet session"; fi
+
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"
