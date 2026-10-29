@@ -5874,6 +5874,10 @@ impl WindowManager {
             "repeat_rate": self.repeat.0,
             "repeat_delay": self.repeat.1,
             "num_lock": keyboard.modifier_state().num_lock,
+            // Bumped per applied keymap, so a proof can wait for a reload
+            // before pressing a lock key (a reload between a lock key's
+            // press and release keeps the lock, as in mutter).
+            "keymap_generation": self.keymap_generation,
         })
     }
 

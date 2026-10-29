@@ -4403,10 +4403,17 @@ fi
 xdotool key Num_Lock
 cstate '.keyboard.num_lock == true' "Num Lock on" || fail G-NUMLOCK "Num_Lock did not lock Num Lock"
 numlock_wait true || fail G-NUMLOCK "the compositor did not save numlock-state true"
+# Wait for each reload to land: a keymap applied between a lock key's
+# press and its release keeps the lock (Num Lock unlocks on release), so
+# a Num_Lock typed while the reset is still in flight can be lost.
+keymap_generation="$(jq '.keyboard.keymap_generation' "$CSTATE")"
 gsettings set org.gnome.desktop.input-sources xkb-options "['compose:ralt']"
-cstate '.keyboard.num_lock == true and .keyboard.layout == "English (US)"' "reload keeps Num Lock" ||
+cstate ".keyboard.keymap_generation > $keymap_generation and .keyboard.num_lock == true and .keyboard.layout == \"English (US)\"" "reload keeps Num Lock" ||
     fail G-NUMLOCK "a keymap reload dropped Num Lock or the active source"
+keymap_generation="$(jq '.keyboard.keymap_generation' "$CSTATE")"
 gsettings reset org.gnome.desktop.input-sources xkb-options
+cstate ".keyboard.keymap_generation > $keymap_generation and .keyboard.num_lock == true" "reset reload keeps Num Lock" ||
+    fail G-NUMLOCK "resetting xkb-options did not reload the keymap with Num Lock kept"
 xdotool key Num_Lock
 cstate '.keyboard.num_lock == false' "Num Lock off again" || fail G-NUMLOCK "Num_Lock did not unlock Num Lock"
 numlock_wait false || fail G-NUMLOCK "the compositor did not save numlock-state false"
