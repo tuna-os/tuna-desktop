@@ -7060,7 +7060,7 @@ mod tests {
         }
 
         /// Flood through the host: ten thousand notifies keep the
-        /// banner paint rows bounded, newest-kept, and stable — the
+        /// banner paint rows bounded, queue-ordered, and stable — the
         /// same key twice with no mutation between, and the panel
         /// marker tracks the capped unread count within one tick.
         #[test]
@@ -7092,11 +7092,11 @@ mod tests {
                     MAX_BANNERS,
                     "paint rows never grow past the cap"
                 );
-                let newest: Vec<u64> = guard.banners().iter().map(|n| n.id).collect();
+                let queued: Vec<u64> = guard.banners().iter().map(|n| n.id).collect();
                 assert_eq!(
                     rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-                    newest,
-                    "paint rows track the newest banners"
+                    queued,
+                    "paint rows track the queued banners"
                 );
                 // No mutation between builds: the key is stable.
                 assert_eq!(rows, banner_key_rows(&guard), "paint rows stable at rest");
