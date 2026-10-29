@@ -12,6 +12,8 @@
 //! and focused; titles are read from the surface role data; stacking is
 //! insertion order with focus raising to top. All code here is original.
 
+mod tablet_input;
+
 use std::collections::{HashMap, HashSet};
 
 /// Fixed audio-key observations only; no arbitrary key or application data.
@@ -396,6 +398,8 @@ pub struct WindowManager {
     accel_fired: Vec<(u32, u32, u32)>,
     /// Input is going to the session-lock surface.
     lock_input_active: bool,
+    /// Tablet tools in proximity (P-IN-05).
+    tablet: tablet_input::TabletFocus,
     /// Window-menu requests `(window, x, y)` in global logical pixels,
     /// drained by the runtime for the shell.
     menu_requests: Vec<(u64, i32, i32)>,
@@ -708,6 +712,7 @@ impl WindowManager {
             accel_released: Vec::new(),
             accel_fired: Vec::new(),
             lock_input_active: false,
+            tablet: tablet_input::TabletFocus::default(),
             menu_requests: Vec::new(),
             last_active_workspace: None,
             switcher_opener: 0,

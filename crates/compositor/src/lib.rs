@@ -127,6 +127,8 @@ pub mod slideshow;
 pub mod spring;
 pub mod state;
 pub mod supervise;
+pub mod tablet;
+pub(crate) mod tablet_settings;
 mod transient_family;
 pub mod transitions;
 pub mod unlock;
@@ -196,6 +198,22 @@ pub struct State {
     /// What the client under the pointer asked the cursor to be: a
     /// `wp_cursor_shape_v1` shape, its own surface, or hidden (#342).
     pub(crate) cursor_image: smithay::input::pointer::CursorImageStatus,
+    /// The tablet tool in proximity and where it is: its cursor replaces
+    /// the pointer's while it hovers, as Mutter draws the tool's sprite.
+    pub(crate) tablet_cursor: Option<(
+        smithay::backend::input::TabletToolDescriptor,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+    )>,
+    /// Each tablet tool's cursor, as its client last set it.
+    pub(crate) tablet_cursor_images: std::collections::HashMap<
+        smithay::backend::input::TabletToolDescriptor,
+        smithay::input::pointer::CursorImageStatus,
+    >,
+    /// Connected pads and the tablet each is paired with.
+    pub(crate) tablet_pads: Vec<(
+        smithay::wayland::tablet_manager::TabletPadDescriptor,
+        Option<smithay::wayland::tablet_manager::TabletDescriptor>,
+    )>,
     /// Middle-click primary selection beside the clipboard.
     primary_selection_state: PrimarySelectionState,
     pub(crate) panel_surfaces: Vec<layer::PanelSurface>,
@@ -727,6 +745,8 @@ impl SeatHandler for State {
         }
         // Text inputs must be enabled anew after `enter` (#349).
         self.protocols.text_inputs.focus_changed();
+        // Pads follow keyboard focus (meta_wayland_tablet_seat_set_pad_focus).
+        self.sync_tablet_pads();
     }
 
     /// A client set the cursor (wl_pointer.set_cursor or a
@@ -737,6 +757,33 @@ impl SeatHandler for State {
         image: smithay::input::pointer::CursorImageStatus,
     ) {
         self.cursor_image = image;
+    }
+}
+
+impl State {
+    /// Give every pad the keyboard focus, paired with its tablet; a pad
+    /// without a connected tablet has no focus (Mutter's
+    /// `meta_wayland_tablet_pad_set_focus`).
+    pub(crate) fn sync_tablet_pads(&mut self) {
+        use smithay::wayland::tablet_manager::TabletSeatTrait;
+        let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        let tablets = self.seat.tablet_seat();
+        // libinput's clock: the mode switch time on a focus change.
+        let time = smithay::utils::Clock::<smithay::utils::Monotonic>::new()
+            .now()
+            .as_millis();
+        for (pad, tablet) in &self.tablet_pads {
+            let Some(handle) = tablets.get_pad(pad) else {
+                continue;
+            };
+            let tablet = tablet.as_ref().and_then(|t| tablets.get_tablet(t));
+            handle.set_focus(
+                focus.as_ref(),
+                tablet.as_ref(),
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+                time,
+            );
+        }
     }
 }
 
@@ -945,6 +992,9 @@ impl State {
             data_device_state: DataDeviceState::new::<State>(dh),
             dnd_icon: None,
             cursor_image: smithay::input::pointer::CursorImageStatus::default_named(),
+            tablet_cursor: None,
+            tablet_cursor_images: std::collections::HashMap::new(),
+            tablet_pads: Vec::new(),
             primary_selection_state: PrimarySelectionState::new::<State>(dh),
             panel_surfaces: Vec::new(),
             dead_layer_surfaces: std::collections::HashSet::new(),

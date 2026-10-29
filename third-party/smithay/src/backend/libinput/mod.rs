@@ -609,7 +609,9 @@ impl InputBackend for LibinputInputBackend {
 
     type SwitchToggleEvent = event::switch::SwitchToggleEvent;
 
-    type SpecialEvent = backend::UnusedEvent;
+    /// Tablet pad events (buttons, rings, strips), which have no generic
+    /// [`InputEvent`] variant.
+    type SpecialEvent = event::TabletPadEvent;
 }
 
 impl From<event::keyboard::KeyState> for backend::KeyState {
@@ -865,6 +867,9 @@ impl EventSource for LibinputInputBackend {
                             trace!("Unknown libinput switch event");
                         }
                     },
+                    libinput::Event::TabletPad(pad_event) => {
+                        callback(InputEvent::Special(pad_event), &mut ());
+                    }
                     _ => {} //FIXME: What to do with the rest.
                 }
             }

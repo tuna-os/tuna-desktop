@@ -728,6 +728,9 @@ pub struct Runtime {
     wm_preferences: crate::wm_preferences::Reader,
     /// Last reported reader status, so a change logs once.
     wm_preferences_status: Option<crate::night_light_settings::CacheStatus>,
+    /// GNOME's per-device tablet and stylus settings (owned GIO reader).
+    tablet_settings: crate::tablet_settings::Reader,
+    tablet_settings_status: Option<crate::night_light_settings::CacheStatus>,
     /// Configured transform per connector (Settings/monitors.xml):
     /// the sensor overrides these live but never rewrites them.
     manual_transforms: std::collections::HashMap<String, u32>,
@@ -1014,6 +1017,20 @@ impl Runtime {
                                 }
                             }
                             rt.on_backend_input(input);
+                        }
+                        // Tablets (P-IN-05) after the dispatch's other input,
+                        // in their own order; their settings paths follow
+                        // hotplug and tool changes.
+                        let tablet_events = match &mut rt.backend {
+                            Backend::Drm(drm) => {
+                                rt.tablet_settings
+                                    .want(drm.tablet_settings_wanted(), Instant::now());
+                                drm.take_tablet_events()
+                            }
+                            Backend::Winit(_) => Vec::new(),
+                        };
+                        for event in tablet_events {
+                            rt.on_tablet_input(event);
                         }
                         // The window manager has the final say (a locked
                         // pointer stays put): the drawn cursor follows it.
@@ -1338,6 +1355,10 @@ impl Runtime {
             // Mutter reads them in-process (prefs.c); changes wake the loop.
             wm_preferences: crate::wm_preferences::Reader::new(&wake),
             wm_preferences_status: None,
+            // Tablet and stylus settings, read on their own GIO thread as
+            // Mutter's meta-input-settings.c reads them in-process.
+            tablet_settings: crate::tablet_settings::Reader::new(&wake),
+            tablet_settings_status: None,
             numlock: {
                 let wake = wake.clone();
                 crate::numlock::NumlockMemory::start(crate::numlock::CliStore, move || {
@@ -2724,6 +2745,10 @@ impl Runtime {
         // Canonical view AND column spring state, outside the large scene macro.
         doc["strip_animating"] = serde_json::Value::Bool(self.manager.strip_animating());
         doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &self.backend {
+            doc["tablets"] = drm.tablets_introspect();
+        }
         let doc = doc.to_string();
         if doc == self.state_last {
             return;
@@ -4451,6 +4476,8 @@ impl Runtime {
             // GNOME focus policy: the bounded settings re-read, the
             // pointer-rest poll and auto-raise.
             self.wm_preferences.next_deadline(now),
+            // Tablet and stylus settings: the bounded re-read.
+            self.tablet_settings.next_deadline(now),
             self.manager.focus_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
@@ -4523,6 +4550,7 @@ impl Runtime {
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
+        self.tablet_settings_tick();
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
@@ -5017,6 +5045,58 @@ impl Runtime {
         }
     }
 
+    /// GNOME's tablet and stylus settings (P-IN-05): hand a completed
+    /// read to the hardware tablets, which apply what changed.
+    fn tablet_settings_tick(&mut self) {
+        let now = Instant::now();
+        let snapshot = self.tablet_settings.poll(now);
+        let status = self.tablet_settings.status();
+        if self.tablet_settings_status != Some(status) {
+            if status == crate::night_light_settings::CacheStatus::Quarantined {
+                eprintln!(
+                    "tuna-compositor: tablet settings cache {status:?}; retaining the applied settings"
+                );
+            }
+            self.tablet_settings_status = Some(status);
+        }
+        #[cfg(feature = "drm")]
+        if let (Some(snapshot), Backend::Drm(drm)) = (snapshot, &mut self.backend) {
+            drm.set_tablet_settings(snapshot);
+        }
+    }
+
+    /// One tablet event (P-IN-05): activity like any input; while locked
+    /// only the lock surface hears tools; a waking blank takes the event.
+    fn on_tablet_input(&mut self, event: crate::tablet::TabletEvent) {
+        if let Some(time) = event.time() {
+            let waking_blank = self.blank_alpha() > 0.0;
+            self.lock.note_input(u64::from(time));
+            self.idle_since = Instant::now();
+            self.idle_monitor.activity();
+            self.active_at = Instant::now();
+            if waking_blank && !matches!(event, crate::tablet::TabletEvent::ProximityOut { .. }) {
+                return;
+            }
+        }
+        if self.is_locked() {
+            let surface = self
+                .state
+                .primary_output_name()
+                .and_then(|name| self.state.lock_surface_for(&name));
+            let hotplug = event.time().is_none();
+            match surface {
+                Some(surface) => self
+                    .manager
+                    .tablet_input(&mut self.state, event, Some(&surface)),
+                // No lock surface: devices still come and go, nothing else lands.
+                None if hotplug => self.manager.tablet_input(&mut self.state, event, None),
+                None => {}
+            }
+            return;
+        }
+        self.manager.tablet_input(&mut self.state, event, None);
+    }
+
     /// GNOME's focus policy (P-WM-09): install a completed settings read,
     /// then repick the pointer window (a crossing without motion) and run
     /// the pointer-rest and auto-raise timers. Native reads stay on the
@@ -5212,7 +5292,26 @@ impl Runtime {
         // The pointer is the compositor's to draw (#342): hidden while
         // locked or blanked, as the software pointer always was.
         let cursor_shown = !locked && blank_alpha < 1.0;
-        let cursor_what = if cursor_shown {
+        // A tablet tool in proximity draws its own cursor where it is, and
+        // the pointer's is hidden meanwhile (Mutter's tool sprite).
+        let tablet_cursor = self
+            .state
+            .tablet_cursor
+            .as_ref()
+            .filter(|_| cursor_shown)
+            .map(|(tool, pos)| {
+                let image = self
+                    .state
+                    .tablet_cursor_images
+                    .get(tool)
+                    .cloned()
+                    .unwrap_or_else(smithay::input::pointer::CursorImageStatus::default_named);
+                (crate::cursor::Pointer::resolve(&image, None, true), *pos)
+            });
+        let cursor_pos_override = tablet_cursor.as_ref().map(|(_, pos)| *pos);
+        let cursor_what = if let Some((what, _)) = tablet_cursor {
+            what
+        } else if cursor_shown {
             crate::cursor::Pointer::resolve(
                 &self.state.cursor_image,
                 self.manager.grab_cursor(),
@@ -5323,7 +5422,7 @@ impl Runtime {
                     let cursor = self.cursor.elements(
                         renderer,
                         &cursor_what,
-                        self.manager.pointer_pos(),
+                        cursor_pos_override.unwrap_or_else(|| self.manager.pointer_pos()),
                         Rectangle::from_size(size.to_f64().to_logical(view.scale).to_i32_round()),
                         view.scale,
                         cursor_now,
@@ -5677,7 +5776,7 @@ impl Runtime {
                     let cursor = self.cursor.elements(
                         renderer,
                         &cursor_what,
-                        pointer,
+                        cursor_pos_override.unwrap_or(pointer),
                         Rectangle::new(out.loc.into(), out.logical_size().into()),
                         out.scale,
                         cursor_now,

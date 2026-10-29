@@ -73,6 +73,7 @@ and this page together.
 | zwp_input_method_manager_v2 | 1 | IMEs such as fcitx5; candidate popups are tracked like any popup |
 | zwp_pointer_gestures_v1 | 3 | swipes reach apps; three-finger swipes are the shell's (overview, workspaces) |
 | zwp_relative_pointer_manager_v1 | 1 | raw motion from the DRM backend |
+| zwp_tablet_manager_v2 | 2 | tablets, tools (pressure, tilt, distance, buttons, tool cursors) and pads (buttons, rings, strips, mode groups) from libinput on the DRM backend; the vendored Smithay adds pads and version 2 (`third-party/smithay/TABLET-PAD-API-PATCH.diff`); pad dials need libinput bindings newer than the pinned input 0.9 (#344) |
 | zwp_pointer_constraints_v1 | 1 | a locked pointer stays put; a confined one stays in its window |
 | ext_session_lock_manager_v1 | 1 | the shell's lock screen; only the supervised shell's lock is granted, and only a password the compositor verified unlocks |
 | wp_presentation | 2 | CLOCK_MONOTONIC, as Mutter; see frame timing below |
@@ -156,7 +157,6 @@ GNOME's version.
 | xdg_wm_base | 7 | 6 | Smithay 0.7 creates the global at 6 and implements nothing newer; bumps with Smithay (#89) |
 | wl_seat | 10 | 9 | Smithay 0.7 creates the seat at 9 and implements nothing newer; bumps with Smithay (#89) |
 | zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
-| zwp_tablet_manager_v2 | 2 | missing | Smithay 0.7 implements manager v1 only, and tablet events from libinput are not routed yet (the input path carries pointer, keys and swipes); needs the hardware lane (#68, #89) |
 | zxdg_exporter_v1, zxdg_importer_v1 | 1 | missing | GTK3 exports with v1; Smithay 0.7 implements v2 only and keeps its handle table private, so a v1 handle could not be imported by the portal's v2 (#61) |
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
 | wp_color_manager_v1 (v2), wp_color_representation_manager_v1 | 2, 1 | missing | not in Smithay 0.7: needs a colour-managed renderer (ICC/HDR, YUV conversion); the GLES path is sRGB only (#89) |

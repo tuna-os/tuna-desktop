@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -38,6 +38,20 @@ impl<D: Device> From<&D> for TabletDescriptor {
     }
 }
 
+/// The device node behind an evdev sysfs path (`.../input/inputN/eventM`
+/// is `/dev/input/eventM`), as Mutter sends `clutter_input_device_get_device_node`.
+pub(super) fn device_node(syspath: &Path) -> Option<String> {
+    let name = syspath.file_name()?.to_str()?;
+    name.starts_with("event").then(|| format!("/dev/input/{name}"))
+}
+
+/// The kernel bus type (`BUS_*` of linux/input.h) of an evdev sysfs path,
+/// read from its parent input device's `id/bustype`.
+fn bustype(syspath: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(syspath.join("device/id/bustype")).ok()?;
+    u32::from_str_radix(text.trim(), 16).ok().filter(|bus| *bus != 0)
+}
+
 #[derive(Debug, Default)]
 struct Tablet {
     instances: Vec<Weak<ZwpTabletV2>>,
@@ -70,12 +84,25 @@ impl TabletHandle {
 
         wl_tablet.name(tablet.name.clone());
 
+        // `usb_id` is (product, vendor); the event is id(vid, pid).
         if let Some((id_product, id_vendor)) = tablet.usb_id {
-            wl_tablet.id(id_product, id_vendor);
+            wl_tablet.id(id_vendor, id_product);
         }
 
-        if let Some(syspath) = tablet.syspath.as_ref().and_then(|p| p.to_str()) {
-            wl_tablet.path(syspath.to_owned());
+        if let Some(node) = tablet.syspath.as_deref().and_then(device_node) {
+            wl_tablet.path(node);
+        }
+
+        if wl_tablet.version() >= u32::from(zwp_tablet_v2::EVT_BUSTYPE_SINCE) {
+            // The protocol's enum names the kernel BUS_* values it knows.
+            if let Some(bus) = tablet
+                .syspath
+                .as_deref()
+                .and_then(bustype)
+                .and_then(|bus| zwp_tablet_v2::Bustype::try_from(bus).ok())
+            {
+                wl_tablet.bustype(bus);
+            }
         }
 
         wl_tablet.done();
@@ -83,20 +110,31 @@ impl TabletHandle {
         self.inner.lock().unwrap().instances.push(wl_tablet.downgrade());
     }
 
-    pub(super) fn with_focused_tablet<F>(&self, focus: &WlSurface, cb: F)
-    where
-        F: Fn(&ZwpTabletV2),
-    {
-        if let Some(instance) = self
-            .inner
+    /// The tablet object `client` holds for this device, if any.
+    pub(super) fn instance_for(&self, client: &WlSurface) -> Option<ZwpTabletV2> {
+        self.inner
             .lock()
             .unwrap()
             .instances
             .iter()
-            .find(|i| i.id().same_client_as(&focus.id()))
+            .find(|i| i.id().same_client_as(&client.id()))
             .and_then(|t| t.upgrade().ok())
-        {
+    }
+
+    pub(super) fn with_focused_tablet<F>(&self, focus: &WlSurface, cb: F)
+    where
+        F: Fn(&ZwpTabletV2),
+    {
+        if let Some(instance) = self.instance_for(focus) {
             cb(&instance);
+        }
+    }
+
+    /// Tell every client the device is gone; its objects go inert.
+    pub(super) fn removed(&self) {
+        let instances = std::mem::take(&mut self.inner.lock().unwrap().instances);
+        for instance in instances.iter().filter_map(|i| i.upgrade().ok()) {
+            instance.removed();
         }
     }
 }
