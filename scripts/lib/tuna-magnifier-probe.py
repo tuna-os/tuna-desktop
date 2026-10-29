@@ -4,14 +4,14 @@
 Usage: tuna-magnifier-probe.py LOG [REQUESTS]
 
 Maps one Gtk.Window (app id tuna-magnifier-probe) holding a "Probe"
-button, a drawing area painted green (#26a269) on its left half and
-orange (#e66100) on its right half, and an entry. GTK's own AT-SPI
+button, an area filled green (#26a269) on its left half and orange
+(#e66100) on its right half, and an entry. GTK's own AT-SPI
 bridge stays on, so focus and caret events are real. Appends JSON lines
 to LOG:
 
   {"bounds": {"button": [x, y, w, h], "area": [...], "entry": [...]}}
-      once mapped, in window (frame) coordinates, which is what AT-SPI
-      window extents and the compositor's window rect share;
+      once mapped, in window (frame) coordinates, the frame the
+      compositor's window rect gives (titlebar included);
   {"click": [x, y]}  for every primary press on the area, area-local;
   {"text": "..."}    for every entry change.
 
@@ -35,8 +35,6 @@ from gi.repository import GLib, Gtk  # noqa: E402
 
 LOG = Path(sys.argv[1])
 REQUESTS = sys.argv[2] if len(sys.argv) > 2 else None
-GREEN = (0x26 / 255, 0xA2 / 255, 0x69 / 255)
-ORANGE = (0xE6 / 255, 0x61 / 255, 0x00 / 255)
 
 
 def log(record):
@@ -44,13 +42,12 @@ def log(record):
         out.write(json.dumps(record) + "\n")
 
 
-def draw(_area, cr, width, height):
-    cr.set_source_rgb(*GREEN)
-    cr.rectangle(0, 0, width / 2, height)
-    cr.fill()
-    cr.set_source_rgb(*ORANGE)
-    cr.rectangle(width / 2, 0, width - width / 2, height)
-    cr.fill()
+# CSS fills, not a cairo draw func: PyGObject's cairo converter
+# (python3-gi-cairo) is not part of the proof's dependencies.
+CSS = """
+.probe-green { background: #26a269; }
+.probe-orange { background: #e66100; }
+"""
 
 
 def bounds(widget, window):
@@ -74,12 +71,23 @@ def build(loop):
     button = Gtk.Button(label="Probe")
     button.set_halign(Gtk.Align.START)
     box.append(button)
-    area = Gtk.DrawingArea()
-    area.set_content_width(600)
-    area.set_content_height(240)
+    provider = Gtk.CssProvider()
+    if hasattr(provider, "load_from_string"):  # GTK 4.12+
+        provider.load_from_string(CSS)
+    else:
+        provider.load_from_data(CSS, -1)
+    Gtk.StyleContext.add_provider_for_display(
+        win.get_display(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+    area = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, homogeneous=True)
+    area.set_size_request(600, 240)
     area.set_hexpand(True)
     area.set_vexpand(True)
-    area.set_draw_func(draw)
+    for css_class in ("probe-green", "probe-orange"):
+        half = Gtk.Box()
+        half.add_css_class(css_class)
+        half.set_hexpand(True)
+        area.append(half)
     click = Gtk.GestureClick(button=1)
     click.connect("pressed", lambda _g, _n, x, y: log({"click": [x, y]}))
     area.add_controller(click)

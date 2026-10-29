@@ -410,15 +410,15 @@ bounds() {
 set -- $(bounds area); AX=$((PX + $1)) AY=$((PY0 + $2)) AW=$3 AH=$4
 [ -n "$AH" ] || fail M-ATSPI-FOCUS "the probe never reported widget bounds"
 # shellcheck disable=SC2046
-set -- $(bounds button); BCX=$((PX + $1 + $3 / 2)) BCY=$((PY0 + $2 + $4 / 2))
+set -- $(bounds button); BCY=$((PY0 + $2 + $4 / 2))
 # shellcheck disable=SC2046
-set -- $(bounds entry); ECX=$((PX + $1 + $3 / 2)) ECY=$((PY0 + $2 + $4 / 2))
+set -- $(bounds entry); ECY=$((PY0 + $2 + $4 / 2))
 CX=$((AX + AW / 2)) CY=$((AY + AH / 2))
 WCX=$((PX + PW / 2)) WCY=$((PY0 + PH / 2))
 if close "$BCY" "$WCY" 20 || close "$ECY" "$WCY" 20; then
     fail M-ATSPI-FOCUS "widget centres too close to the window centre to tell apart"
 fi
-# Activate the window with a click on the drawing area (not focusable,
+# Activate the window with a click on the colour area (not focusable,
 # so GTK keeps its own focus widget).
 xdotool mousemove --window "$WID" "$CX" "$CY" click 1
 cstate '.focused_app_id == "tuna-magnifier-probe"' "probe focused" 10 ||
@@ -435,17 +435,43 @@ focus_widget() {
     fail M-ATSPI-FOCUS "probe never acknowledged $1"
 }
 centered_on() {
-    cstate "$REGION.center as \$c | ((\$c[0] - $1) | fabs) <= 3 and ((\$c[1] - $2) | fabs) <= 3" 20
+    cstate "$REGION.center as \$c | ((\$c[0] - $1) | fabs) <= 2 and ((\$c[1] - $2) | fabs) <= 2" 20
 }
-focus_widget focus-entry
-centered_on "$ECX" "$ECY" ||
-    fail M-ATSPI-FOCUS "focusing the entry did not center the view on ($ECX, $ECY); window centre is ($WCX, $WCY)"
-cp "$CSTATE" "$ARTIFACTS/atspi-entry-state.json"
-focus_widget focus-button
-centered_on "$BCX" "$BCY" ||
-    fail M-ATSPI-FOCUS "focusing the button did not center the view on ($BCX, $BCY); window centre is ($WCX, $WCY)"
-cp "$CSTATE" "$ARTIFACTS/atspi-button-state.json"
-pass M-ATSPI-FOCUS "AT-SPI focus centers the view on the entry ($ECX,$ECY) then the button ($BCX,$BCY), not the window centre ($WCX,$WCY)"
+# The focused accessible's own window extents, as GNOME's _updateFocus
+# reads them (they need not match the GTK widget bounds: CI saw the
+# entry's AT-SPI centre 9 px right of its widget centre), converted to
+# a global centre "X Y" through the window's frame origin.
+atspi_focus_centre() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-magnifier-probe "$ARTIFACTS/a11y-$1.json" 20 \
+        --pid "$CLIENT_PID" >/dev/null 2>&1 || fail M-ATSPI-FOCUS "no AT-SPI tree from the probe for $1"
+    jq -r "[.[] | select(.focused == true and .bounds != null)] | last | .bounds // empty |
+        \"\(.[0] * 2 + .[2] + $((2 * PX))) \(.[1] * 2 + .[3] + $((2 * PY0)))\"" "$ARTIFACTS/a11y-$1.json" |
+        awk '{ printf "%d %d\n", $1 / 2, $2 / 2 }'
+}
+# focus_gate REQUEST NAME GTK_X GTK_Y GTK_W GTK_H (window coordinates)
+focus_gate() {
+    focus_widget "$1"
+    sleep 0.5
+    centre="$(atspi_focus_centre "$2")"
+    [ -n "$centre" ] || fail M-ATSPI-FOCUS "no focused accessible after $1"
+    # shellcheck disable=SC2086
+    set -- "$@" $centre
+    # The focused accessible must be the requested widget (or inside it).
+    if [ "$7" -lt $((PX + $3)) ] || [ "$7" -ge $((PX + $3 + $5)) ] ||
+        [ "$8" -lt $((PY0 + $4)) ] || [ "$8" -ge $((PY0 + $4 + $6)) ]; then
+        fail M-ATSPI-FOCUS "the focused accessible centre ($7, $8) is outside the $2"
+    fi
+    centered_on "$7" "$8" ||
+        fail M-ATSPI-FOCUS "focusing the $2 did not center the view on its AT-SPI centre ($7, $8); window centre is ($WCX, $WCY)"
+    cp "$CSTATE" "$ARTIFACTS/atspi-$2-state.json"
+    FOCUS_SEEN="$FOCUS_SEEN $2 ($7,$8)"
+}
+FOCUS_SEEN=""
+# shellcheck disable=SC2046
+focus_gate focus-entry entry $(bounds entry)
+# shellcheck disable=SC2046
+focus_gate focus-button button $(bounds button)
+pass M-ATSPI-FOCUS "AT-SPI focus centers the view on the${FOCUS_SEEN}, not the window centre ($WCX,$WCY)"
 
 # M-LIVE: factor 2, centered mouse tracking, pointer on the boundary
 # between the probe's green and orange halves. The ROI is 640x400
