@@ -193,6 +193,17 @@ impl Properties {
             None => self.exhausted = true,
         }
     }
+    /// Retire every captured action but keep the graph; the next render
+    /// issues fresh tokens for it.
+    fn retire(&mut self) {
+        match self.epoch.checked_add(1) {
+            Some(epoch) => self.epoch = epoch,
+            None => {
+                self.exhausted = true;
+                self.items.clear();
+            }
+        }
+    }
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -201,9 +212,20 @@ impl Properties {
         self.engine = None;
         self.context = None;
     }
+    /// GlobalEngineChanged. ibus-daemon's switch first registers an empty
+    /// list on the focused context straight to the panel (inputcontext.c
+    /// `new_engine_cb`: disable, then `unset_engine`), but sends this signal
+    /// from its idle dispatch queue (dbusimpl.c
+    /// `bus_dbus_impl_dispatch_message_by_rule`), so the new engine's own
+    /// RegisterProperties can arrive first. Every item present now was
+    /// registered after that empty list, by the new engine: keep it.
     pub fn engine(&mut self, engine: Option<String>) {
         // A real activation edge can reuse the same engine identifier.
-        self.invalidate();
+        if engine.is_some() {
+            self.retire();
+        } else {
+            self.invalidate();
+        }
         self.engine = engine;
     }
     pub fn initial_engine(&mut self, engine: String) {
@@ -211,13 +233,7 @@ impl Properties {
             self.engine = Some(engine);
             // No callback from an engine-less graph could act. Still invalidate
             // captured widgets before publishing the actionable graph.
-            match self.epoch.checked_add(1) {
-                Some(epoch) => self.epoch = epoch,
-                None => {
-                    self.exhausted = true;
-                    self.items.clear();
-                }
-            }
+            self.retire();
         }
     }
     pub fn focus_in(&mut self, context: String) {
@@ -378,6 +394,35 @@ mod tests {
         model.register(parse_list(&wire_list(vec![wire("x", 0, 0, vec![])])).unwrap());
         model.focus_out("/context/stale");
         assert_eq!(model.activate(&model.token("x")), [("x".into(), 0)]);
+    }
+    #[test]
+    fn engine_signal_after_the_new_engines_list_keeps_that_list() {
+        // ibus-daemon registers an empty list straight to the panel before it
+        // switches the focused context's engine, but queues GlobalEngineChanged
+        // for idle dispatch: the new engine's list can come first (gtk-shell
+        // 123290380707 showed an empty menu for tuna-test-alternate).
+        let mut state = model(vec![wire("old", 0, 0, vec![])]);
+        let old = state.token("old");
+        state.register(vec![]);
+        state.register(vec![]);
+        state.register(parse_list(&wire_list(vec![wire("new", 0, 0, vec![])])).unwrap());
+        let early = state.token("new");
+        state.engine(Some("alternate".into()));
+        assert_eq!(state.engine.as_deref(), Some("alternate"));
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].key, "new");
+        assert!(state.activate(&old).is_empty());
+        assert!(state.activate(&early).is_empty());
+        assert_eq!(state.activate(&state.token("new")), [("new".into(), 0)]);
+        // The usual order: the signal between the empty list and the new one.
+        state.register(vec![]);
+        state.engine(Some("engine".into()));
+        assert!(state.items.is_empty());
+        state.register(parse_list(&wire_list(vec![wire("x", 0, 0, vec![])])).unwrap());
+        assert_eq!(state.activate(&state.token("x")), [("x".into(), 0)]);
+        // Without an engine nothing remains to show or act on.
+        state.engine(None);
+        assert!(state.items.is_empty());
     }
     #[test]
     fn initial_engine_reply_preserves_only_current_context_graph() {

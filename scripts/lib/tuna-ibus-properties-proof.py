@@ -46,17 +46,17 @@ def identity(pid, with_hash=True):
 def live(node):
     """A reference libatspi can still query.
 
-    libatspi disposes an application object when a NameOwnerChanged names its
-    bus name as the old owner, but keeps the disposed object in its process-wide
-    table: every later reference resolved through it fails for the rest of that
-    process ('The application no longer exists', with 'hash_table != NULL'
-    warnings). gtk-shell 116720252865 retried such a walk until its deadline,
-    and gtk-shell 116769499648 saw the shell's own application disposed this
-    way right after the popover opened. So every query and press runs in a
-    fresh short-lived process (atspi_child), like tuna-a11y-dump.py, and this
-    long-lived driver never holds libatspi state. A defunct reference is not
-    part of the live tree. The owned shell's own exit or replacement still
-    fails through identity() and the unique live application check.
+    libatspi disposes an application object in its own process but keeps it
+    in its process-wide table: every later reference resolved through it
+    fails for the rest of that process ('The application no longer exists',
+    with 'hash_table != NULL' warnings). With GTK before 4.17.1 that happens
+    whenever the shell hides a window (see owned_application), so gtk-shell
+    116720252865 retried such a walk until its deadline and gtk-shell
+    116769499648 lost the shell right after the popover opened. So every
+    query and press runs in a fresh short-lived process (atspi_child), like
+    tuna-a11y-dump.py, and this long-lived driver never holds libatspi state.
+    A defunct reference is not part of the live tree. The owned shell's own
+    exit or replacement still fails through identity() and owned_application.
     """
     try:
         node.get_role()
@@ -98,7 +98,61 @@ def matching(nodes, name, role=None):
 
 
 class Transient(Exception):
-    """An AT-SPI walk met a node disposed under it; the caller may retry."""
+    """This read says nothing about the tree (a node or the application was
+    disposed under the walk); the caller reads again. A press is Transient
+    only when no action was sent."""
+
+
+def a11y_connection():
+    # The same bus libatspi resolves: AT_SPI_BUS_ADDRESS, else org.a11y.Bus.
+    address = os.environ.get("AT_SPI_BUS_ADDRESS") or Gio.bus_get_sync(
+        Gio.BusType.SESSION, None).call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus",
+        "GetAddress", None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 2000,
+        None).unpack()[0]
+    return Gio.DBusConnection.new_for_address_sync(address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+        | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+
+
+def application_gone(error):
+    """libatspi refused the call itself: ATSPI_ERROR_APPLICATION_GONE, code 0
+    of "atspi_error" (at-spi2-core atspi-misc-private.h), raised by its
+    check_app() before any D-Bus traffic for an application object this
+    process disposed. A reply from the application is never this error."""
+    return error.domain == "atspi_error" and error.code == 0
+
+
+def owned_application(roots, pid, bus_pid):
+    """(bus name, libatspi root) of the one live application whose
+    connection is `pid`.
+
+    `roots` pairs each registry child's bus name with libatspi's root for it;
+    `bus_pid` asks the bus daemon which process owns a bus name (None when
+    none does). GTK before 4.17.1 (GTK f7f158b6) announces a hidden window
+    as a ChildrenChanged on its application root that names the root itself
+    as the removed child. Once GetItems has cached that root's children,
+    libatspi 2.52 (cache_process_children_changed) then disposes the whole
+    application in this process, although it never left the bus (gtk-shell
+    123281544604: 'not unique (0 live)' right after the indicator press).
+    Only such a disposal of a name the bus still binds to `pid` is
+    transient; absence, a duplicate or the application's own errors fail.
+    """
+    found, disposed = [], []
+    for bus_name, root in roots:
+        try:
+            root.get_role()
+            root.get_child_count()
+        except GLib.Error as error:
+            if application_gone(error):
+                disposed.append(bus_name)
+            continue
+        if root.get_process_id() == pid:
+            found.append((bus_name, root))
+    if len(found) == 1:
+        return found[0]
+    if not found and any(bus_pid(bus_name) == pid for bus_name in disposed):
+        raise Transient(f"libatspi disposed the live GTK application {disposed} in this process")
+    raise RuntimeError(f"GTK accessible application not unique ({len(found)} live)")
 
 
 def atspi_child(pid, op, name, role):
@@ -114,26 +168,55 @@ def atspi_child(pid, op, name, role):
                 "showing": states.contains(Atspi.StateType.SHOWING),
                 "checked": states.contains(Atspi.StateType.CHECKED),
                 "sensitive": states.contains(Atspi.StateType.SENSITIVE)}
+    bus = []
+    def bus_pid(bus_name):
+        try:
+            if not bus:
+                bus.append(a11y_connection())
+            return bus[0].call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                "GetConnectionUnixProcessID", GLib.Variant("(s)", (bus_name,)), GLib.VariantType.new("(u)"),
+                Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+        except GLib.Error:
+            return None
     try:
         desktop = Atspi.get_desktop(0)
-        apps = [desktop.get_child_at_index(i) for i in range(desktop.get_child_count())]
-        apps = [a for a in apps if a is not None and live(a) and a.get_process_id() == pid]
-        if len(apps) != 1:
-            return {"error": f"GTK accessible application not unique ({len(apps)} live)"}
+        roots = []
+        for i in range(desktop.get_child_count()):
+            root = desktop.get_child_at_index(i)
+            if root is not None:
+                # Read at once: disposing an application clears its root's app.
+                roots.append((root.app.bus_name, root))
+        app_bus, app = owned_application(roots, pid, bus_pid)
         if op == "snapshot":
-            found = [n for n in walk(apps[0]) if n.get_name()]
+            found = [n for n in walk(app) if n.get_name()]
         elif op == "named":
-            found = [n for n in walk(apps[0]) if n.get_name() == name]
+            found = [n for n in walk(app) if n.get_name() == name]
         else:
-            found = matching(walk(apps[0]), name, role)
+            found = matching(walk(app), name, role)
+        # walk() skips what it cannot query: the read is complete only if
+        # libatspi kept the application throughout.
+        owned_application([(app_bus, app)], pid, bus_pid)
         result = {"matches": [describe(n) for n in found]}
         if op == "press":
             if len(found) != 1:
                 return {"error": "ambiguous property action"}
             action = found[0].get_action_iface()
-            if action is None or action.get_n_actions() < 1 or not action.do_action(0):
+            if action is None or action.get_n_actions() < 1:
+                return {"error": "accessible action rejected"}
+            try:
+                sent = action.do_action(0)
+            except GLib.Error as error:
+                if application_gone(error):
+                    raise Transient(f"libatspi disposed the GTK application before {name!r} was pressed")
+                # The action may have reached GTK: never repeat it.
+                return {"error": f"accessible action failed: {error.message}"}
+            if not sent:
                 return {"error": "accessible action rejected"}
         return result
+    except Transient as error:
+        return {"transient": str(error)}
+    except RuntimeError as error:
+        return {"error": str(error)}
     except GLib.Error as error:
         return {"transient": error.message}
 
@@ -144,6 +227,9 @@ def atspi(pid, op, name, role=None):
             [sys.executable, __file__, "--atspi", str(pid), op, name, role or ""],
             capture_output=True, text=True, timeout=15)
     except subprocess.TimeoutExpired:
+        if op == "press":
+            # The action may already have been sent: never repeat it.
+            raise RuntimeError(f"AT-SPI press {name!r} timed out")
         raise Transient(f"AT-SPI {op} {name!r} timed out")
     try:
         reply = json.loads(done.stdout.strip().splitlines()[-1])
@@ -174,10 +260,20 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
     deadline = time.monotonic() + (150 if phase_file else 30)
     seen = []
 
-    def node(name, role=None):
+    def read(op, name, role=None):
         if identity(pid, False) != basic_origin:
             raise RuntimeError("GTK process changed")
-        return atspi(pid, "query", name, role)
+        return atspi(pid, op, name, role)
+
+    def node(name, role=None):
+        # A transient read says nothing about the tree: read it again, so
+        # neither a positive nor an absence check decides on it.
+        reads = []
+        def complete():
+            reads.append(read("query", name, role))
+            return True
+        wait(complete)
+        return reads[-1]
 
     def wait(predicate):
         last_error = None
@@ -188,8 +284,13 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             except Transient as error:
                 # GTK rebuilds the menu on every property update; a walk can
                 # meet a child disposed under it ("The application no longer
-                # exists", gtk-shell 38757056152). node() rechecks the GTK
-                # process identity first, so a real exit still fails.
+                # exists", gtk-shell 38757056152), and GTK < 4.17.1 makes
+                # libatspi dispose the whole application (owned_application).
+                # read() rechecks the GTK process identity first, so a real
+                # exit still fails.
+                if str(error) != last_error:
+                    print(f"property AT-SPI transient elapsed={time.monotonic() - started:.3f}s: {error}",
+                          flush=True)
                 last_error = str(error)
             except GLib.Error as error:
                 # Bus predicates in this process, e.g. the panel name briefly
@@ -214,9 +315,9 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
             except (RuntimeError, Transient) as error:
                 print(f"property failure snapshot unavailable: {error}", flush=True)
             raise
-        if identity(pid, False) != basic_origin:
-            raise RuntimeError("GTK process changed")
-        atspi(pid, "press", name, role)
+        # Transient only when the child sent no action (its libatspi lost the
+        # application before DoAction); a sent or uncertain press fails.
+        wait(lambda: bool(read("press", name, role)))
         seen.append(name)
         print(f"property press sent {name!r} elapsed={time.monotonic() - started:.3f}s", flush=True)
 
@@ -242,14 +343,7 @@ def run(pid, log_path, output, expected_shell, engine_pid, phase_file=None, gtk_
                           "org.freedesktop.DBus", "GetNameOwner",
                           GLib.Variant("(s)", ("org.freedesktop.IBus.Panel",)),
                           GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
-    # The same bus libatspi resolves: AT_SPI_BUS_ADDRESS, else org.a11y.Bus.
-    a11y_address = os.environ.get("AT_SPI_BUS_ADDRESS") or Gio.bus_get_sync(
-        Gio.BusType.SESSION, None).call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus",
-        "GetAddress", None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 2000,
-        None).unpack()[0]
-    a11y = Gio.DBusConnection.new_for_address_sync(a11y_address,
-        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
-        | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+    a11y = a11y_connection()
 
     def stale_call(held):
         # The held address's own Action, as a held libatspi reference would
