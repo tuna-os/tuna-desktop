@@ -85,6 +85,8 @@ struct Client {
     /// (button, pressed) in arrival order.
     pointer_buttons: Vec<(u32, bool)>,
     pointer_press_serial: Option<u32>,
+    /// Pointer events in arrival order: 'e' enter, 'b' button, 'a' axis.
+    pointer_order: Vec<char>,
     /// Every advertised toplevel size, in arrival order.
     configure_sizes: Vec<(i32, i32)>,
     /// Every advertised toplevel state array (raw wire bytes), in
@@ -293,9 +295,15 @@ impl Dispatch<WlPointer, ()> for Client {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            PointerEvent::Enter { .. } => state.pointer_enters += 1,
+            PointerEvent::Enter { .. } => {
+                state.pointer_enters += 1;
+                state.pointer_order.push('e');
+            }
             PointerEvent::Motion { .. } => state.pointer_motions += 1,
-            PointerEvent::Axis { .. } => state.pointer_axes += 1,
+            PointerEvent::Axis { .. } => {
+                state.pointer_axes += 1;
+                state.pointer_order.push('a');
+            }
             PointerEvent::Button {
                 button,
                 state: button_state,
@@ -304,6 +312,7 @@ impl Dispatch<WlPointer, ()> for Client {
             } => {
                 let pressed = matches!(button_state, WEnum::Value(ClientButtonState::Pressed));
                 state.pointer_buttons.push((button, pressed));
+                state.pointer_order.push('b');
                 if pressed {
                     state.pointer_press_serial = Some(serial);
                 }
@@ -3758,6 +3767,106 @@ fn same_focused_window_click_restores_keyboard_after_lock_ownership() {
         "the former lock owner hears no unlocked keys"
     );
     assert_eq!(f.manager.model().focused(), Some(f.id_a));
+}
+
+/// A lock surface mapped under a pointer that has not moved since (Super+L
+/// with the mouse still) gets the first press, release and scroll: the
+/// pointer enters it before the press, so the unlock dialog's click and
+/// drag are never lost to a focusless implicit grab (#502).
+#[test]
+fn stationary_pointer_press_enters_the_lock_surface_before_delivery() {
+    let mut f = two_windows();
+    f.manager
+        .pointer_motion(&mut f.comp.state, alpha_only(), 5000);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    f.client_b.pointer_order.clear();
+    f.client_b.pointer_buttons.clear();
+    let buttons_a = f.client_a.pointer_buttons.len();
+    // Beta stands in for the session-lock surface; no motion follows.
+    let lock_surface = f.manager.surface_of(f.id_b).unwrap();
+    for (pressed, time) in [(true, 5001), (false, 5002)] {
+        f.manager.lock_input(
+            &mut f.comp.state,
+            &lock_surface,
+            ManagerInput::Button {
+                button: BTN_LEFT,
+                pressed,
+                time,
+            },
+        );
+    }
+    f.manager.lock_input(
+        &mut f.comp.state,
+        &lock_surface,
+        ManagerInput::Axis {
+            horizontal: 0.0,
+            vertical: 120.0,
+            time: 5003,
+        },
+    );
+    pump(&mut f.comp, &mut f.queue_b, &mut f.client_b, |c| {
+        c.pointer_buttons.len() >= 2 && c.pointer_axes > 0
+    });
+    assert_eq!(
+        f.client_b.pointer_buttons,
+        vec![(BTN_LEFT, true), (BTN_LEFT, false)]
+    );
+    assert_eq!(
+        f.client_b.pointer_order.first(),
+        Some(&'e'),
+        "the lock surface is entered before the press: {:?}",
+        f.client_b.pointer_order
+    );
+    assert_eq!(
+        f.client_b
+            .pointer_order
+            .iter()
+            .filter(|e| **e == 'e')
+            .count(),
+        1,
+        "one enter, then the press, release and scroll land on it: {:?}",
+        f.client_b.pointer_order
+    );
+    assert!(f.client_b.pointer_order.ends_with(&['b', 'b', 'a']));
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(
+        f.client_a.pointer_buttons.len(),
+        buttons_a,
+        "nothing behind the lock hears the press"
+    );
+}
+
+/// A button already held on another surface keeps its implicit grab: the
+/// lock surface is not entered under it, so a held press is never torn
+/// from the surface it began on.
+#[test]
+fn lock_pointer_enter_never_steals_a_held_grab() {
+    let mut f = two_windows();
+    f.manager
+        .pointer_motion(&mut f.comp.state, alpha_only(), 5000);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 5001);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    let enters_b = f.client_b.pointer_enters;
+    let buttons_b = f.client_b.pointer_buttons.len();
+    let lock_surface = f.manager.surface_of(f.id_b).unwrap();
+    f.manager.lock_input(
+        &mut f.comp.state,
+        &lock_surface,
+        ManagerInput::Axis {
+            horizontal: 0.0,
+            vertical: 120.0,
+            time: 5002,
+        },
+    );
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(
+        f.client_b.pointer_enters, enters_b,
+        "no enter while a button is held elsewhere"
+    );
+    assert_eq!(f.client_b.pointer_buttons.len(), buttons_b);
 }
 
 #[test]
