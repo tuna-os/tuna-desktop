@@ -4288,6 +4288,7 @@ dependencies = [
  "libadwaita",
  "libc",
  "pipewire",
+ "roxmltree",
  "serde_json",
  "tempfile",
  "tuna-backlight",

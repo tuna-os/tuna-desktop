@@ -86,6 +86,7 @@ pub mod native_output;
 mod native_repaint;
 pub mod night_light;
 pub(crate) mod night_light_settings;
+pub mod numlock;
 mod occlusion;
 pub mod orca;
 pub mod orientation;

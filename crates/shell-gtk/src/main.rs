@@ -29,6 +29,7 @@ mod grid_pager;
 mod group_animation;
 mod ibus_panel;
 mod ibus_property_menu;
+mod input_sources;
 mod kbd_a11y;
 mod keybindings;
 mod live_apps;
@@ -2370,9 +2371,29 @@ fn build(app: &adw::Application) {
     // GNOME's workspace switcher popup.
     let workspace_popup = ws_popup::WorkspacePopup::new(app.upcast_ref());
 
+    // GNOME's input-source policy (#346): MRU switching with its popup,
+    // per-window sources, saved order. It drives the compositor's keymap
+    // layouts with relative SwitchInputSource steps.
+    let input_sources = {
+        let shell = shell.clone();
+        input_sources::InputSources::new(
+            app.upcast_ref(),
+            Rc::new(move |backward| {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    let _ = control.switch_input_source(backward);
+                }
+            }),
+        )
+    };
+
     // GNOME Shell's own keybindings (org.gnome.shell.keybindings).
     {
+        // The accelerator that fired, for the input-source popup's
+        // modifier (SwitcherPopup.show's binding mask).
+        let fired_accelerator: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let run: Rc<dyn Fn(keybindings::Action, u32)> = {
+            let input_sources = input_sources.clone();
+            let fired_accelerator = fired_accelerator.clone();
             let (shell, overview_ui, clock, system) = (
                 shell.clone(),
                 overview_ui.clone(),
@@ -2508,10 +2529,12 @@ fn build(app: &adw::Application) {
                     Action::Screenshot => take_screenshot(false, notify.clone()),
                     Action::ScreenshotWindow => take_screenshot(true, notify.clone()),
                     Action::NextInputSource | Action::PreviousInputSource => {
-                        if let Some(control) = shell.borrow_mut().control.as_mut() {
-                            let _ =
-                                control.switch_input_source(action == Action::PreviousInputSource);
-                        }
+                        let accelerator = fired_accelerator.borrow().clone();
+                        input_sources.binding(
+                            action == Action::PreviousInputSource,
+                            mode,
+                            &accelerator,
+                        );
                     }
                     Action::Close => {
                         let mut shell = shell.borrow_mut();
@@ -2757,11 +2780,16 @@ fn build(app: &adw::Application) {
                         .collect::<Vec<_>>()
                 );
                 let actions: Vec<keybindings::Action> = list.iter().map(|b| b.action).collect();
+                let accels_for_run = accels.clone();
                 let run = run.clone();
+                let fired_accelerator = fired_accelerator.clone();
                 gnome_shell.set_internal(
                     &accels,
                     Rc::new(move |i, mode| {
                         if let Some(action) = actions.get(i) {
+                            if let Some((accelerator, _)) = accels_for_run.get(i) {
+                                *fired_accelerator.borrow_mut() = accelerator.clone();
+                            }
                             run(*action, mode);
                         }
                     }),
@@ -2898,6 +2926,7 @@ fn build(app: &adw::Application) {
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
         let send: Rc<dyn Fn()> = {
             let (shell, all) = (shell.clone(), all.clone());
+            let input_sources = input_sources.clone();
             Rc::new(move || {
                 let mut out = tuna_shell_control::InputSettings::default();
                 if let Some(sources) = all[0].as_ref() {
@@ -3051,9 +3080,16 @@ fn build(app: &adw::Application) {
                 }
                 out.keyboard_aids = kbd_a11y::read(all[9].as_ref());
                 out.pointer_aids = pointer_a11y::read(all[10].as_ref());
+                let keymap = (
+                    out.xkb_layout.clone(),
+                    out.xkb_variant.clone(),
+                    out.xkb_options.clone(),
+                );
                 if let Some(control) = shell.borrow_mut().control.as_mut() {
                     let _ = control.set_input_settings(out);
                 }
+                // After the keymap it may have changed: MRU, per-window.
+                input_sources.sync(keymap);
             })
         };
         send();
@@ -3221,6 +3257,7 @@ fn build(app: &adw::Application) {
         let sync: Rc<dyn Fn(Drained)> = {
             let (chrome, notify, switcher_ui) =
                 (chrome.clone(), notify.clone(), switcher_ui.clone());
+            let input_sources = input_sources.clone();
             let shell_rc = shell_rc.clone();
             let resync_after = resync_after.clone();
             Rc::new(move |drained: Drained| {
@@ -3263,7 +3300,21 @@ fn build(app: &adw::Application) {
                     .control
                     .as_ref()
                     .is_some_and(|c| c.model().is_overview_open());
+                // GNOME's per-window source follows the focus window, the
+                // overview counting as one more (`_getCurrentWindow`).
+                let holder = if open {
+                    Some(input_sources::Holder::Overview)
+                } else {
+                    shell.control.as_ref().and_then(|c| {
+                        c.model()
+                            .windows()
+                            .iter()
+                            .find(|w| w.active)
+                            .map(|w| input_sources::Holder::Window(w.id))
+                    })
+                };
                 drop(shell);
+                input_sources.focus(holder);
                 if locked {
                     notify.release_focus();
                     release_panel_focus(&panel_focus_window, &panel_focus_held);

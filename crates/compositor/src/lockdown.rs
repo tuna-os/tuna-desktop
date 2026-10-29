@@ -435,7 +435,7 @@ pub fn read_bool_via_command(program: &str, args: &[&str], timeout: Duration) ->
 }
 
 /// Whether a session bus is plausibly reachable for a `gsettings` read.
-fn session_bus_present() -> bool {
+pub(crate) fn session_bus_present() -> bool {
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
         return true;
     }

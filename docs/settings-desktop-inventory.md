@@ -193,12 +193,12 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| current | Ignored | Tuna Desktop uses sources/options and its active input state; this ancillary metadata/policy is not consumed |
-| mru-sources | Ignored | Tuna Desktop uses sources/options and its active input state; this ancillary metadata/policy is not consumed |
-| per-window | Ignored | Tuna Desktop uses sources/options and its active input state; this ancillary metadata/policy is not consumed |
-| show-all-sources | Ignored | Tuna Desktop uses sources/options and its active input state; this ancillary metadata/policy is not consumed |
+| current | Ignored | Deprecated and ignored in GNOME 51 (schema text); gnome-shell 51.0 never reads it, and the active source is the shell's MRU front instead |
+| mru-sources | Honored (GTK shell) | GNOME 51's MRU order (keyboard.js `_updateMruSources`/`_updateMruSettings`): seeds the order at start, saved on every interactive switch; Super+Space flips between the two most recent sources and the held popup steps through it (G-INPUT-SOURCE-MRU, #346). XKB sources only: IBus sources take no part |
+| per-window | Honored (GTK shell) | Each focused window, and the overview, restores the source last active in it; a window seen first starts on the first source; off forgets (keyboard.js `_setPerWindowInputSource`; G-INPUT-PER-WINDOW, #346) |
+| show-all-sources | Ignored | Read only by GNOME Settings' input-source chooser (schema: "available for choosing in System Settings"); gnome-shell and mutter 51 never read it, so the desktop has nothing to do |
 | sources | Honored | Live compositor XKB keymap; IBus sources use bridge |
-| xkb-model | Ignored | Tuna Desktop uses sources/options and its active input state; this ancillary metadata/policy is not consumed |
+| xkb-model | Ignored | gnome-shell 51 passes it into the keymap (`KeyboardManager.setKeyboardModel`); Tuna's `InputSettings` wire carries no model field, so the compositor compiles xkbcommon's default model. Needs `InputSettings.xkb_model` (#346) |
 | xkb-options | Honored | Live compositor XKB keymap; IBus sources use bridge |
 ## org.gnome.desktop.interface
 
@@ -297,8 +297,8 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | Key | Status | Reason |
 |---|---|---|
 | delay | Honored | Live compositor seat repeat policy |
-| numlock-state | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| remember-numlock-state | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| numlock-state | Honored | The compositor restores it at startup while remember-numlock-state is set and saves every Num Lock change into it, as mutter 51's meta-input-settings.c does; keymap reloads keep the lock (G-NUMLOCK, #346) |
+| remember-numlock-state | Honored | Gates the compositor's Num Lock restore and saves, read per save as mutter 51 reads it (G-NUMLOCK, #346) |
 | repeat | Honored | Live compositor seat repeat policy |
 | repeat-interval | Honored | Live compositor seat repeat policy |
 ## org.gnome.desktop.peripherals.mouse
@@ -580,8 +580,8 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | switch-applications-backward | Honored | Live shell accelerator registration and compositor dispatch |
 | switch-group | Honored | Live shell accelerator registration and compositor dispatch |
 | switch-group-backward | Honored | Live shell accelerator registration and compositor dispatch |
-| switch-input-source | Honored | Live shell accelerator registration and compositor dispatch |
-| switch-input-source-backward | Honored | Live shell accelerator registration and compositor dispatch |
+| switch-input-source | Honored | Live shell accelerator: GNOME 51's MRU switcher popup (quick tap picks the second most recent source; held, each press steps and releasing the modifier picks; another shell popup or the lock screen steps by position) (#346) |
+| switch-input-source-backward | Honored | Live shell accelerator: the MRU popup starting on the least recent source and stepping backward (#346) |
 | switch-panels | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | switch-panels-backward | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | switch-to-workspace-1 | Honored | Live shell accelerator registration and compositor dispatch |
