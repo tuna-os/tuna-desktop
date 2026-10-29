@@ -8565,31 +8565,39 @@ power_baseline="$(cat "$BACKLIGHT/brightness")"
 power_other="$ARTIFACTS/backlight/aaa-other"
 power_other_baseline="$(cat "$power_other/brightness")"
 power_idle="$(gsettings get org.gnome.settings-daemon.plugins.power idle-brightness)"
-gsettings set org.gnome.settings-daemon.plugins.power idle-brightness 1
-power_dimmed="$("$PY" - "$BACKLIGHT" "$power_other" <<'PY_DIMMED'
+power_idle="${power_idle##* }"
+power_dimmed="$("$PY" - "$power_idle" "$BACKLIGHT" "$power_other" <<'PY_DIMMED'
 import pathlib
 import sys
 
-def dimmed(path):
+def dimmed(path, idle):
     maximum = int((path / "max_brightness").read_text().strip())
     minimum = max(1, maximum // 100)
     level = (int((path / "brightness").read_text().strip()) - minimum) / (maximum - minimum)
-    return minimum + int((maximum - minimum) * min(0.01, level) + 0.5)
+    return minimum + int((maximum - minimum) * min(idle, level) + 0.5)
 
-print(*(dimmed(pathlib.Path(arg)) for arg in sys.argv[1:]))
+paths = [pathlib.Path(arg) for arg in sys.argv[2:]]
+print(*(dimmed(path, idle) for idle in (0.01, int(sys.argv[1]) / 100) for path in paths))
 PY_DIMMED
 )"
-power_dimmed_primary="${power_dimmed%% *}"
-power_dimmed_other="${power_dimmed##* }"
+read -r power_dimmed_primary power_dimmed_other power_restored_primary power_restored_other <<EOF
+$power_dimmed
+EOF
 [ "$power_dimmed_other" -lt "$power_other_baseline" ] ||
     fail G-POWER-SAVE-MODE "no output above the 1% idle level to dim ($power_other_baseline)"
+# Restoring idle-brightness while dimmed must visibly move the dim level, so
+# the shell's live idle transaction is observed to land before teardown.
+[ "$power_restored_other" != "$power_dimmed_other" ] ||
+    fail G-POWER-SAVE-MODE "idle-brightness $power_idle and 1 dim aaa-other alike ($power_dimmed_other)"
+gsettings set org.gnome.settings-daemon.plugins.power idle-brightness 1
 [ "$(power_save_get)" = "(<0>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not start on"
 shell_dimming true || fail G-POWER-SAVE-MODE "SetDimming(true) refused"
 end=$(($(date +%s) + 10))
 until [ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
-[ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] &&
-    [ "$(cat "$BACKLIGHT/brightness")" = "$power_dimmed_primary" ] ||
+if ! { [ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] &&
+    [ "$(cat "$BACKLIGHT/brightness")" = "$power_dimmed_primary" ]; }; then
     fail G-POWER-SAVE-MODE "idle dim did not clip to $power_dimmed_primary/$power_dimmed_other (from $power_baseline/$power_other_baseline)"
+fi
 power_save_set 3 || fail G-POWER-SAVE-MODE "PowerSaveMode 3 refused"
 [ "$(power_save_get)" = "(<3>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not read back 3"
 cstate '.power_save_mode == 3' "power save off" 5 || fail G-POWER-SAVE-MODE "compositor did not apply PowerSaveMode 3"
@@ -8609,16 +8617,38 @@ power_save_set 0 || fail G-POWER-SAVE-MODE "PowerSaveMode 0 refused"
 [ "$(power_save_get)" = "(<0>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not read back 0"
 cstate ".power_save_mode == 0 and .rendered_frames > $power_frames" "unblanked repaint" 5 ||
     fail G-POWER-SAVE-MODE "unblanking did not repaint"
-shell_dimming false || fail G-POWER-SAVE-MODE "SetDimming(false) refused"
-end=$(($(date +%s) + 10))
-until [ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] &&
-    [ "$(cat "$power_other/brightness")" = "$power_other_baseline" ] ||
-    [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
-[ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] &&
-    [ "$(cat "$power_other/brightness")" = "$power_other_baseline" ] ||
-    fail G-POWER-SAVE-MODE "undimming did not restore the user baseline $power_baseline/$power_other_baseline"
+# Restore idle-brightness while still dimmed: the shell follows the key live
+# and rewrites every backlight. Waiting for the restored dim level means that
+# write landed before the fixture is removed below (CI 40822050751 removed
+# aaa-other while that write's brightness.tmp was being created).
 gsettings set org.gnome.settings-daemon.plugins.power idle-brightness "$power_idle"
-pass G-POWER-SAVE-MODE "gsd idle sequence: Shell.Brightness dim, DisplayConfig PowerSaveMode 3 stops scanout (-1 ignored), 0 repaints, undim restores baseline; nested, no CRTC off"
+end=$(($(date +%s) + 10))
+until [ "$(cat "$power_other/brightness")" = "$power_restored_other" ] &&
+    [ "$(cat "$BACKLIGHT/brightness")" = "$power_restored_primary" ] ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+if ! { [ "$(cat "$power_other/brightness")" = "$power_restored_other" ] &&
+    [ "$(cat "$BACKLIGHT/brightness")" = "$power_restored_primary" ]; }; then
+    fail G-POWER-SAVE-MODE "restoring idle-brightness $power_idle did not clip to $power_restored_primary/$power_restored_other"
+fi
+# The idle transaction may still be completing its readback; the shell refuses
+# a concurrent request as pending, and its reply comes only after its own
+# transaction completes, so an accepted undim leaves no write in flight.
+end=$(($(date +%s) + 10))
+until power_undim_error="$(gdbus call --session --dest org.gnome.Shell.Brightness \
+    --object-path /org/gnome/Shell/Brightness \
+    --method org.gnome.Shell.Brightness.SetDimming false 2>&1 >/dev/null)"; do
+    case "$power_undim_error" in
+        *"brightness update already pending"*) ;;
+        *) fail G-POWER-SAVE-MODE "SetDimming(false) refused: $power_undim_error" ;;
+    esac
+    [ "$(date +%s)" -le "$end" ] || fail G-POWER-SAVE-MODE "SetDimming(false) stayed pending"
+    sleep 0.2
+done
+if ! { [ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] &&
+    [ "$(cat "$power_other/brightness")" = "$power_other_baseline" ]; }; then
+    fail G-POWER-SAVE-MODE "undimming did not restore the user baseline $power_baseline/$power_other_baseline"
+fi
+pass G-POWER-SAVE-MODE "gsd idle sequence: Shell.Brightness dim, DisplayConfig PowerSaveMode 3 stops scanout (-1 ignored), 0 repaints, live idle restore and undim restore baseline; nested, no CRTC off"
 rm -rf "$ARTIFACTS/backlight/aaa-other"
 pass G-MONITOR-BRIGHTNESS-KEYS "bound monitor up/down/cycle change only the connector under the pointer; cycle wraps"
 # A rebound notification key focuses the active banner's real button.
