@@ -613,10 +613,13 @@ impl Pointer {
 /// The cursor elements of one output's frame, drawn above everything.
 #[derive(Default)]
 pub struct CursorElements {
-    /// Locate-pointer ripples and theme images, physical (scale 1).
+    /// Locate-pointer ripples (the first [`ripples`](Self::ripples))
+    /// then theme images, physical (scale 1).
     pub images: Vec<MemoryRenderBufferRenderElement<GlesRenderer>>,
     /// A client's cursor surface, drawn at the output scale.
     pub surface: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    /// How many leading `images` are ripples rather than the pointer.
+    pub ripples: usize,
 }
 
 /// GNOME's cursor theme state and locate-pointer, owned by the runtime.
@@ -759,7 +762,6 @@ impl Cursor {
         now: Duration,
         accent: [f32; 3],
     ) -> CursorElements {
-        let mut out = CursorElements::default();
         let on_output = output.to_f64().contains(pointer);
         let to_physical = |p: Point<f64, Logical>| -> Point<f64, Physical> {
             (
@@ -768,6 +770,55 @@ impl Cursor {
             )
                 .into()
         };
+        let (mut out, shown) = self.sprite(renderer, what, to_physical(pointer), scale, now);
+        // GNOME draws the ripples above the windows, under the pointer.
+        let ripples = self.locate.elements(renderer, now, accent, scale, |p| {
+            output.to_f64().contains(p).then(|| to_physical(p))
+        });
+        if !ripples.is_empty() {
+            self.locate.frames += 1;
+        }
+        out.ripples = ripples.len();
+        out.images.splice(0..0, ripples);
+        if on_output {
+            self.shown = Some(shown);
+        }
+        out
+    }
+
+    /// The pointer image alone with its hotspot at `hotspot` (physical
+    /// pixels of the target) drawn at `scale`: the screen magnifier's
+    /// zoomed sprite (#349), as gnome-shell scales its `MouseSpriteContent`
+    /// by the magnification. Theme images rasterize at `scale`, so they
+    /// stay sharp; ripples and the shown-state record are left to
+    /// [`elements`](Self::elements).
+    pub fn sprite_at(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        what: &Pointer,
+        hotspot: Point<f64, Physical>,
+        scale: f64,
+        now: Duration,
+    ) -> CursorElements {
+        self.sprite(renderer, what, hotspot, scale, now).0
+    }
+
+    /// The logical size of the pointer image last shown, for the
+    /// magnifier's push tracking (GNOME's `_mouseSourceActor` size).
+    pub fn sprite_logical(&self) -> Option<(f64, f64)> {
+        self.shown.as_ref().and_then(|shown| shown.logical)
+    }
+
+    /// The pointer image with its hotspot at `hotspot` (physical).
+    fn sprite(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        what: &Pointer,
+        hotspot: Point<f64, Physical>,
+        scale: f64,
+        now: Duration,
+    ) -> (CursorElements, Shown) {
+        let mut out = CursorElements::default();
         let mut shown = Shown {
             kind: "hidden",
             name: None,
@@ -796,7 +847,8 @@ impl Cursor {
                 let index = animation_frame(&loaded.delays, elapsed);
                 let frame = &loaded.frames[index];
                 let ((w, h), (hx, hy)) = frame.image.logical(size);
-                let at = to_physical(pointer - Point::from((hx, hy)));
+                let at: Point<f64, Physical> =
+                    (hotspot.x - hx * scale, hotspot.y - hy * scale).into();
                 let physical = (
                     (w * scale).round().max(1.0) as i32,
                     (h * scale).round().max(1.0) as i32,
@@ -829,14 +881,18 @@ impl Cursor {
                 };
             }
             Pointer::Surface(surface) => {
-                let hotspot = smithay::wayland::compositor::with_states(surface, |states| {
+                let offset = smithay::wayland::compositor::with_states(surface, |states| {
                     states
                         .data_map
                         .get::<CursorImageSurfaceData>()
                         .and_then(|d| d.lock().ok().map(|a| a.hotspot))
                 })
                 .unwrap_or_default();
-                let at = to_physical(pointer - hotspot.to_f64());
+                let at: Point<f64, Physical> = (
+                    hotspot.x - f64::from(offset.x) * scale,
+                    hotspot.y - f64::from(offset.y) * scale,
+                )
+                    .into();
                 out.surface = render_elements_from_surface_tree(
                     renderer,
                     surface,
@@ -860,18 +916,7 @@ impl Cursor {
                 };
             }
         }
-        // GNOME draws the ripples above the windows, under the pointer.
-        let ripples = self.locate.elements(renderer, now, accent, scale, |p| {
-            output.to_f64().contains(p).then(|| to_physical(p))
-        });
-        if !ripples.is_empty() {
-            self.locate.frames += 1;
-        }
-        out.images.splice(0..0, ripples);
-        if on_output {
-            self.shown = Some(shown);
-        }
-        out
+        (out, shown)
     }
 
     /// Hand a client cursor surface its frame callbacks after a frame
@@ -965,6 +1010,41 @@ pub fn draw(
     use smithay::backend::renderer::utils::draw_render_elements;
     if !elements.images.is_empty() {
         draw_render_elements::<GlesRenderer, _, _>(frame, 1.0, &elements.images, damage)?;
+    }
+    if !elements.surface.is_empty() {
+        draw_render_elements::<GlesRenderer, _, _>(frame, scale, &elements.surface, damage)?;
+    }
+    Ok(())
+}
+
+/// Only the locate-pointer ripples. Under the screen magnifier (#349)
+/// they belong to the magnified scene, as GNOME's ripples live in the
+/// cloned `uiGroup`.
+pub fn draw_ripples(
+    frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+    elements: &CursorElements,
+    damage: &[Rectangle<i32, Physical>],
+) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+    use smithay::backend::renderer::utils::draw_render_elements;
+    let ripples = &elements.images[..elements.ripples.min(elements.images.len())];
+    if !ripples.is_empty() {
+        draw_render_elements::<GlesRenderer, _, _>(frame, 1.0, ripples, damage)?;
+    }
+    Ok(())
+}
+
+/// Only the pointer image: the system cursor the magnifier shows
+/// outside its zoom region (#349).
+pub fn draw_sprite(
+    frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+    elements: &CursorElements,
+    scale: f64,
+    damage: &[Rectangle<i32, Physical>],
+) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+    use smithay::backend::renderer::utils::draw_render_elements;
+    let sprite = &elements.images[elements.ripples.min(elements.images.len())..];
+    if !sprite.is_empty() {
+        draw_render_elements::<GlesRenderer, _, _>(frame, 1.0, sprite, damage)?;
     }
     if !elements.surface.is_empty() {
         draw_render_elements::<GlesRenderer, _, _>(frame, scale, &elements.surface, damage)?;

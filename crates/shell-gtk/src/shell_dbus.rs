@@ -229,8 +229,9 @@ pub const INTERNAL_BASE: u32 = 0x4000_0000;
 pub struct Service {
     conn: RefCell<Option<gio::DBusConnection>>,
     grabs: RefCell<Grabs>,
-    /// The shell's own keybindings, ids from [`INTERNAL_BASE`].
-    internal: RefCell<Vec<tuna_shell_control::Accelerator>>,
+    /// The shell's own keybindings, ids from [`INTERNAL_BASE`], with
+    /// their GNOME grab flags.
+    internal: RefCell<Vec<tuna_shell_control::AcceleratorGrab>>,
     /// Monotonic action identities; retired generations are never reused.
     next_internal: Cell<u32>,
     internal_indices: RefCell<BTreeMap<u32, usize>>,
@@ -255,22 +256,17 @@ impl Service {
             })
             .collect();
         drop(grabs);
-        typed.extend(self.internal.borrow().iter().copied().map(|accelerator| {
-            tuna_shell_control::AcceleratorGrab {
-                accelerator,
-                flags: 0,
-            }
-        }));
+        typed.extend(self.internal.borrow().iter().copied());
         self.actions.set_accelerator_grabs(typed);
     }
 
-    /// Bind the shell's own keys: `accelerators[i]` with its modes runs
-    /// `run(i, mode)`. Keys that do not parse are skipped.
-    pub fn set_internal(&self, accelerators: &[(String, u32)], run: InternalRun) {
+    /// Bind the shell's own keys: `accelerators[i]` (accelerator, modes,
+    /// grab flags) runs `run(i, mode)`. Keys that do not parse are skipped.
+    pub fn set_internal(&self, accelerators: &[(String, u32, u32)], run: InternalRun) {
         let mut list = Vec::new();
         let mut reserved = Vec::new();
         let mut indices = BTreeMap::new();
-        for (i, (accel, modes)) in accelerators.iter().enumerate() {
+        for (i, (accel, modes, flags)) in accelerators.iter().enumerate() {
             if let Some((keysym, mods)) = parse_accelerator(accel) {
                 let action = self.next_internal.get();
                 let Some(next) = action.checked_add(1) else {
@@ -280,11 +276,14 @@ impl Service {
                 self.next_internal.set(next);
                 reserved.push((keysym, mods));
                 indices.insert(action, i);
-                list.push(tuna_shell_control::Accelerator {
-                    action,
-                    keysym,
-                    mods,
-                    modes: *modes,
+                list.push(tuna_shell_control::AcceleratorGrab {
+                    accelerator: tuna_shell_control::Accelerator {
+                        action,
+                        keysym,
+                        mods,
+                        modes: *modes,
+                    },
+                    flags: *flags,
                 });
             }
         }
@@ -690,6 +689,7 @@ mod tests {
             &[(
                 "XF86AudioRaiseVolume".into(),
                 tuna_shell_control::MODE_NORMAL,
+                0,
             )],
             Rc::new(move |index, mode| calls.borrow_mut().push((index, mode))),
         );
@@ -701,8 +701,8 @@ mod tests {
         let calls = new_calls.clone();
         service.set_internal(
             &[
-                ("not a key".into(), tuna_shell_control::MODE_NORMAL),
-                ("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL),
+                ("not a key".into(), tuna_shell_control::MODE_NORMAL, 0),
+                ("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL, 0),
             ],
             Rc::new(move |index, mode| calls.borrow_mut().push((index, mode))),
         );
@@ -727,10 +727,11 @@ mod tests {
         service.next_internal.set(u32::MAX - 1);
         service.set_internal(
             &[
-                ("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL),
+                ("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL, 0),
                 (
                     "XF86AudioRaiseVolume".into(),
                     tuna_shell_control::MODE_NORMAL,
+                    0,
                 ),
             ],
             Rc::new(|_, _| {}),
@@ -738,7 +739,7 @@ mod tests {
         assert_eq!(actions.0.borrow().len(), 1);
         assert_eq!(actions.0.borrow()[0].action, u32::MAX - 1);
         service.set_internal(
-            &[("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL)],
+            &[("XF86AudioMute".into(), tuna_shell_control::MODE_NORMAL, 0)],
             Rc::new(|_, _| panic!("exhausted binding ran")),
         );
         assert!(actions.0.borrow().is_empty());

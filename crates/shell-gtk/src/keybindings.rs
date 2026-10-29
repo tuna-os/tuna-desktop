@@ -60,6 +60,12 @@ pub enum Action {
     FocusActiveNotification,
     ShiftOverviewUp,
     ShiftOverviewDown,
+    /// `gsd-media-keys`' `magnifier`: flip `screen-magnifier-enabled`.
+    ToggleMagnifier,
+    /// `magnifier-zoom-in` / `magnifier-zoom-out`: one rounded step.
+    MagnifierZoom {
+        zoom_in: bool,
+    },
     /// GNOME's Ctrl+Alt+Tab "Switch system controls"
     /// (`switch-panels`): move keyboard focus into the top bar, where
     /// Tab/arrows walk every control and Enter activates it. GNOME
@@ -357,6 +363,21 @@ fn specs() -> Vec<Spec> {
         specs.push(media(key, action, vec![]));
         specs.push(media(&format!("{key}-static"), action, defaults));
     }
+    // The magnifier keys (`shortcuts-list.h`: SHELL_ACTION_MODE_ALL),
+    // GNOME 51 defaults in `org.gnome.settings-daemon.plugins.media-keys`.
+    specs.extend([
+        media("magnifier", Action::ToggleMagnifier, vec!["<Alt><Super>8"]),
+        media(
+            "magnifier-zoom-in",
+            Action::MagnifierZoom { zoom_in: true },
+            vec!["<Alt><Super>equal"],
+        ),
+        media(
+            "magnifier-zoom-out",
+            Action::MagnifierZoom { zoom_in: false },
+            vec!["<Alt><Super>minus"],
+        ),
+    ]);
     // GNOME's window-manager keys (Super+PageUp/PageDown and Alt+Tab
     // stay the compositor's own; it drops its defaults for the rest
     // once these are grabbed, so they rebind).
@@ -506,12 +527,26 @@ fn specs() -> Vec<Spec> {
     specs
 }
 
-/// A bound accelerator: its action, accelerator string and modes.
+/// A bound accelerator: its action, accelerator string, modes and
+/// GNOME grab flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub action: Action,
     pub accelerator: String,
     pub modes: u32,
+    pub flags: u32,
+}
+
+impl Action {
+    /// The `MetaKeyBindingFlags` GNOME grabs this action with: the
+    /// magnifier toggle ignores autorepeat (`shortcuts-list.h` at
+    /// gsd 51.0), so holding the chord flips it once.
+    pub fn grab_flags(self) -> u32 {
+        match self {
+            Action::ToggleMagnifier => tuna_shell_control::GRAB_IGNORE_AUTOREPEAT,
+            _ => 0,
+        }
+    }
 }
 
 /// The current bindings: each key's accelerators from its GNOME schema
@@ -545,6 +580,7 @@ pub fn bindings(
                     action: spec.action,
                     accelerator,
                     modes: spec.modes,
+                    flags: spec.action.grab_flags(),
                 })
         })
         .collect()
@@ -745,6 +781,33 @@ mod tests {
             ["XF86AudioRaiseVolume", "<Ctrl>XF86AudioRaiseVolume",]
         );
         assert_eq!(find(Action::VolumeMute), ["XF86AudioMute"]);
+        assert_eq!(find(Action::ToggleMagnifier), ["<Alt><Super>8"]);
+        assert_eq!(
+            find(Action::MagnifierZoom { zoom_in: true }),
+            ["<Alt><Super>equal"]
+        );
+        assert_eq!(
+            find(Action::MagnifierZoom { zoom_in: false }),
+            ["<Alt><Super>minus"]
+        );
+        for binding in all.iter().filter(|b| {
+            matches!(
+                b.action,
+                Action::ToggleMagnifier | Action::MagnifierZoom { .. }
+            )
+        }) {
+            // SHELL_ACTION_MODE_ALL: they work on the lock screen too.
+            assert_eq!(binding.modes, ALL);
+            let ignores_repeat = binding.action == Action::ToggleMagnifier;
+            assert_eq!(
+                binding.flags & tuna_shell_control::GRAB_IGNORE_AUTOREPEAT != 0,
+                ignores_repeat
+            );
+        }
+        assert!(all
+            .iter()
+            .filter(|b| !matches!(b.action, Action::ToggleMagnifier))
+            .all(|b| b.flags == 0));
         assert_eq!(find(Action::VolumeMuteQuiet), ["<Alt>XF86AudioMute"]);
         assert_eq!(
             find(Action::VolumeUpQuiet),

@@ -65,6 +65,7 @@ pub mod cursor;
 mod cursor_svg;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub(crate) mod focus_caret;
 pub mod focus_policy;
 pub mod fprintd;
 pub mod frame_timing;

@@ -581,6 +581,15 @@ pub fn restore_env(prev: Option<OsString>) {
     }
 }
 
+/// AT-SPI focus and caret for the magnifier (#349): the arrival number
+/// last taken and where it landed, global logical. Extents convert
+/// once, on arrival, as GNOME's handlers do.
+#[derive(Debug, Default)]
+struct AtspiPoints {
+    focus: (u64, Option<(f64, f64)>),
+    caret: (u64, Option<(f64, f64)>),
+}
+
 /// Live nested session: display, protocol state, backend, and outputs.
 /// Output handles live in the state's inventory (entry zero is the
 /// primary); the runtime reaches them through [`State`] accessors.
@@ -788,9 +797,16 @@ pub struct Runtime {
     /// org.gnome.SessionManager's inhibitors and session activity.
     session_manager: crate::session_manager::Share,
     /// Screen magnifier (#349): Settings file cache plus each
-    /// output's tracking state. Captures and casts apply it; the
-    /// lock screen never magnifies.
+    /// output's zoom region, drawn live, in captures and casts, and
+    /// on the lock screen (whose frame holds nothing but the lock UI).
     magnifier: crate::magnifier::MagnifierState,
+    /// The magnified frame's offscreen scene and zoom textures.
+    zoom_targets: crate::magnifier::ZoomTargets,
+    /// AT-SPI focus and caret events for magnifier tracking.
+    focus_caret: crate::focus_caret::FocusCaretTracker,
+    /// The last AT-SPI events taken (arrival numbers) and where they
+    /// mapped at arrival, global logical.
+    atspi_points: AtspiPoints,
     exit: bool,
     stats: RunStats,
     /// `TUNA_COMPOSITOR_STATE` snapshot path (journeys only).
@@ -927,6 +943,11 @@ impl Runtime {
                             && crate::layer::exclusive_popup_keyboard_layer(&rt.state).is_none();
                         let corner_layout = rt.state.hot_corner_outputs();
                         rt.triggers.set_pressure_only(true);
+                        let touch = matches!(
+                            event,
+                            smithay::backend::input::InputEvent::TouchDown { .. }
+                                | smithay::backend::input::InputEvent::TouchMotion { .. }
+                        );
                         let inputs = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 drm.set_hot_corner_active(corners_active);
@@ -935,6 +956,7 @@ impl Runtime {
                             Backend::Winit(_) => Vec::new(),
                         };
                         for input in inputs {
+                            let input = if touch { rt.unzoom_touch(input) } else { input };
                             if let ManagerInput::Button {
                                 button,
                                 pressed: false,
@@ -1337,6 +1359,9 @@ impl Runtime {
             idle_monitor: crate::idle_monitor::start(),
             session_manager: crate::session_manager::start(),
             magnifier: crate::magnifier::MagnifierState::new(),
+            zoom_targets: crate::magnifier::ZoomTargets::default(),
+            focus_caret: crate::focus_caret::FocusCaretTracker::default(),
+            atspi_points: AtspiPoints::default(),
             exit: false,
             stats: RunStats::default(),
             state_path: std::env::var_os("TUNA_COMPOSITOR_STATE")
@@ -1453,11 +1478,40 @@ impl Runtime {
                     #[cfg(feature = "drm")]
                     Backend::Drm(_) => return,
                 };
+                let touch = matches!(
+                    event,
+                    smithay::backend::input::InputEvent::TouchDown { .. }
+                        | smithay::backend::input::InputEvent::TouchMotion { .. }
+                );
                 for input in translate_input(event, area) {
+                    let input = if touch {
+                        self.unzoom_touch(input)
+                    } else {
+                        input
+                    };
                     self.on_backend_input(input);
                 }
             }
             WinitEvent::Redraw | WinitEvent::Focus(_) => {}
+        }
+    }
+
+    /// A touch point lands on what the screen magnifier shows under the
+    /// finger (#349), and the zoom holds still under it rather than
+    /// chasing the pointer the touch moves. Pointer devices stay in
+    /// unmagnified coordinates, as in GNOME: their sprite is drawn
+    /// where the position maps, so clicks already hit what it shows.
+    fn unzoom_touch(&mut self, input: ManagerInput) -> ManagerInput {
+        match input {
+            ManagerInput::Motion { pos, time } if self.magnifier.config().active() => {
+                let (x, y) = self.magnifier.unzoom((pos.x, pos.y));
+                self.magnifier.hold_pointer((x, y));
+                ManagerInput::Motion {
+                    pos: (x, y).into(),
+                    time,
+                }
+            }
+            other => other,
         }
     }
 
@@ -2475,6 +2529,8 @@ impl Runtime {
         doc["cursor"] = self
             .cursor
             .diagnostics(self.animation_clock.now(), self.is_locked());
+        // The zoom region's geometry only (#349): no frame content.
+        doc["magnifier"] = self.magnifier.diagnostics();
         doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());
         doc["screen_reader_state"] = serde_json::json!(self.orca.state());
         doc["a11y_keyboard"] = self
@@ -3226,9 +3282,9 @@ impl Runtime {
     /// Render one output's current scene (the primary, or `connector`)
     /// offscreen and read it back in `fourcc` byte order (Abgr8888 is
     /// RGBA in memory, Xrgb8888 is BGRx). Never while locked. When the
-    /// screen magnifier is on (#349), the read-back frame carries the
-    /// magnified view, so screenshots and casts show actual zoomed
-    /// pixels; the lock screen itself never magnifies.
+    /// screen magnifier is on (#349), the frame goes through the same
+    /// zoom passes as the display, so screenshots and casts show the
+    /// zoom region as seen (without the pointer sprite).
     fn render_pixels(
         &mut self,
         connector: Option<&str>,
@@ -3262,6 +3318,8 @@ impl Runtime {
         let desktop = self.background_desktop();
         let bell = self.bell_frame();
         let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
+        let zoom_inputs = self.magnifier_inputs();
+        let zoom_now = self.animation_clock.now();
         let (renderer, size, view, output_name) = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = backend.window_size();
@@ -3336,82 +3394,206 @@ impl Runtime {
             cards,
             None,
         );
-        let damage = Rectangle::from_size(size);
+        let full = Rectangle::from_size(size);
+        let zoom_plan = self.magnifier.plan_for(
+            crate::magnifier::OutputFrame {
+                name: &output_name,
+                size: (size.w, size.h),
+                scale: view.scale,
+                offset: view.offset,
+            },
+            zoom_inputs,
+            accent,
+        );
+        let zoom_program = zoom_plan
+            .as_ref()
+            .filter(|plan| !plan.effects.identity)
+            .and_then(|_| crate::magnifier::effects_program(renderer));
+        // The magnifier's passes (#349): captures and casts carry the
+        // zoom region as shown, without the pointer sprite.
+        let zoomed = match zoom_plan.as_ref() {
+            Some(plan) => {
+                let (scene, zoom, _) = zoom_passes(
+                    renderer,
+                    &mut self.zoom_targets,
+                    &mut self.cursor,
+                    &output_name,
+                    plan,
+                    &crate::cursor::Pointer::Hidden,
+                    view.scale,
+                    zoom_now,
+                    &crate::cursor::CursorElements::default(),
+                    |frame, damage| {
+                        draw_scene(
+                            frame,
+                            background,
+                            &paper,
+                            &elements,
+                            Target {
+                                output: full,
+                                damage,
+                                scale: view.scale,
+                                blank_alpha,
+                                tint: color_effect.as_ref(),
+                            },
+                            &decor,
+                            &previews,
+                        )
+                    },
+                )
+                .ok()?;
+                Some((plan, scene, zoom))
+            }
+            None => None,
+        };
         let mut target = renderer.bind(&mut texture).ok()?;
         {
             let mut frame = renderer.render(&mut target, size, Transform::Normal).ok()?;
-            draw_scene(
-                &mut frame,
-                background,
-                &paper,
-                &elements,
-                Target {
-                    output: damage,
-                    damage: &[damage],
-                    scale: view.scale,
-                    blank_alpha,
-                    // Captures stay untinted, like GNOME's (gamma
-                    // applies past the framebuffer).
-                    tint: color_effect.as_ref(),
-                },
-                &decor,
-                &previews,
-            )
-            .ok()?;
+            if let Some((plan, scene, zoom)) = zoomed {
+                crate::magnifier::present(
+                    &mut frame,
+                    &scene,
+                    &zoom,
+                    plan,
+                    zoom_program.as_ref(),
+                    None,
+                )
+                .ok()?;
+            } else {
+                draw_scene(
+                    &mut frame,
+                    background,
+                    &paper,
+                    &elements,
+                    Target {
+                        output: full,
+                        damage: &[full],
+                        scale: view.scale,
+                        blank_alpha,
+                        // Captures stay untinted, like GNOME's (gamma
+                        // applies past the framebuffer).
+                        tint: color_effect.as_ref(),
+                    },
+                    &decor,
+                    &previews,
+                )
+                .ok()?;
+            }
             let _ = frame.finish().ok()?;
         }
         let mapping = renderer
             .copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)
             .ok()?;
         let bytes = renderer.map_texture(&mapping).ok()?.to_vec();
-        let bytes = self.apply_magnifier(&output_name, size.w, size.h, view, bytes);
         Some((size.w, size.h, bytes))
     }
 
-    /// Magnify a read-back frame when the screen magnifier is on
-    /// (#349): pointer, caret and focus positions feed the per-output
-    /// tracking state, and the region of interest rescales onto the
-    /// viewport. Disabled (or unity) passes the frame through
-    /// untouched; a malformed view keeps the original bytes rather
-    /// than failing the capture.
-    fn apply_magnifier(
-        &mut self,
-        output: &str,
-        w: i32,
-        h: i32,
-        view: View,
-        bytes: Vec<u8>,
-    ) -> Vec<u8> {
-        let pointer = self.manager.pointer_pos();
-        let caret = self.state.ime_cursor_rect().map(|rect| {
-            (
-                f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
-                f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
-            )
-        });
-        let focus = self
-            .manager
-            .model()
-            .focused()
-            .and_then(|id| self.manager.geometry(id))
-            .map(|rect| {
-                (
-                    f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
-                    f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
-                )
+    /// The screen magnifier's tracking points this frame (#349), in
+    /// global logical pixels: the pointer; the caret from AT-SPI and
+    /// from the text-input rectangle (its origin, as GNOME takes the
+    /// caret extents' x and y); the focus from AT-SPI (the widget's
+    /// center) and the focused window's center. While locked only the
+    /// lock surface's own AT-SPI events count, so nothing behind the
+    /// lock steers the view.
+    fn magnifier_inputs(&mut self) -> crate::magnifier::TrackingInputs {
+        let locked = self.is_locked();
+        self.focus_caret.sync(
+            self.magnifier.wants_focus_events(),
+            self.magnifier.wants_caret_events(),
+            &self.wake,
+        );
+        let origin = self.keyboard_focus_origin(locked);
+        let take = |seen: &mut (u64, Option<(f64, f64)>),
+                    event: Option<crate::focus_caret::Extents>,
+                    center: bool| {
+            let Some(event) = event else {
+                *seen = (0, None);
+                return;
+            };
+            if event.seq == seen.0 {
+                return;
+            }
+            let point = origin.and_then(|((ox, oy), pid, lock)| {
+                let ours = u32::try_from(pid).ok() == event.pid;
+                (!lock || ours).then(|| {
+                    let (x, y, w, h) = event.rect;
+                    let (dx, dy) = if center {
+                        (f64::from(w) / 2.0, f64::from(h) / 2.0)
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    (ox + f64::from(x) + dx, oy + f64::from(y) + dy)
+                })
             });
-        let inputs = crate::magnifier::TrackingInputs {
+            *seen = (event.seq, point);
+        };
+        take(&mut self.atspi_points.focus, self.focus_caret.focus(), true);
+        take(
+            &mut self.atspi_points.caret,
+            self.focus_caret.caret(),
+            false,
+        );
+        let text_caret = if locked {
+            None
+        } else {
+            self.state
+                .ime_cursor_rect()
+                .map(|rect| (f64::from(rect.loc.x), f64::from(rect.loc.y)))
+        };
+        let window = if locked {
+            None
+        } else {
+            self.manager
+                .model()
+                .focused()
+                .and_then(|id| self.manager.geometry(id))
+                .map(|rect| {
+                    (
+                        f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+                        f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+                    )
+                })
+        };
+        let pointer = self.manager.pointer_pos();
+        crate::magnifier::TrackingInputs {
             pointer: (pointer.x, pointer.y),
-            caret,
-            focus,
-        };
-        let Some(active) = self
-            .magnifier
-            .view_for(output, w, h, view.scale, view.offset, inputs)
-        else {
-            return bytes;
-        };
-        crate::magnifier::magnify_frame(&bytes, w, h, active).unwrap_or(bytes)
+            caret: [self.atspi_points.caret.1, text_caret],
+            focus: [self.atspi_points.focus.1, window],
+            cursor: self.cursor.sprite_logical().unwrap_or((0.0, 0.0)),
+            now: self.animation_clock.now(),
+            motion: self.input_settings.motion,
+        }
+    }
+
+    /// The keyboard-focused surface's frame origin (what AT-SPI window
+    /// coordinates are relative to: Mutter's client content rect is the
+    /// frame rect), global logical, with its client's pid and whether
+    /// it is the lock surface. Unlocked that is a toplevel window;
+    /// locked, only the lock surface. Shell layers and popups map
+    /// nothing.
+    fn keyboard_focus_origin(&self, locked: bool) -> Option<((f64, f64), i32, bool)> {
+        let surface = self.state.seat.get_keyboard()?.current_focus()?;
+        let pid = smithay::reexports::wayland_server::Resource::client(&surface)
+            .and_then(|client| client.get_credentials(&self.display.handle()).ok())
+            .map(|credentials| credentials.pid)?;
+        if locked {
+            let loc = self
+                .state
+                .output_entries()
+                .into_iter()
+                .find_map(|(name, _, loc, _)| {
+                    (self.state.lock_surface_for(&name).as_ref() == Some(&surface)).then_some(loc)
+                })?;
+            return Some(((f64::from(loc.0), f64::from(loc.1)), pid, true));
+        }
+        let frame = self
+            .manager
+            .render_entries()
+            .into_iter()
+            .find_map(|(id, _, geo)| {
+                (self.manager.surface_of(id).as_ref() == Some(&surface)).then_some(geo)
+            })?;
+        Some(((f64::from(frame.loc.x), f64::from(frame.loc.y)), pid, false))
     }
 
     /// Screen-cast work for this tick (#61): start and stop casts the
@@ -4149,6 +4331,7 @@ impl Runtime {
             || self.manager.window_lifecycle().running()
             || self.manager.modal_dim().running()
             || self.cursor.animating(clock)
+            || self.magnifier.animating(clock)
             || self.wellbeing_effects.animating(clock)
             || self.screenshot_flashes.running()
             || self.menu_close.running()
@@ -4954,6 +5137,12 @@ impl Runtime {
             self.power_save_frame_beat();
             return Ok(());
         }
+        // Screen magnifier (#349): this frame's tracking points; the
+        // offscreen textures go away while it is off.
+        let zoom_inputs = self.magnifier_inputs();
+        if !self.magnifier.config().active() {
+            self.zoom_targets.clear();
+        }
         let queued = match &mut self.backend {
             Backend::Winit(backend) => {
                 backend.window().set_cursor_visible(false);
@@ -5039,6 +5228,18 @@ impl Runtime {
                         cursor_now,
                         accent,
                     );
+                    // Screen magnifier (#349): the zoom region drawn
+                    // over this output, locked or not.
+                    let zoom_plan = self.magnifier.plan_for(
+                        crate::magnifier::OutputFrame {
+                            name: "tuna-0",
+                            size: (size.w, size.h),
+                            scale: view.scale,
+                            offset: (0, 0),
+                        },
+                        zoom_inputs,
+                        accent,
+                    );
                     let presented_cursor = crate::cursor::presented_surface(
                         &cursor,
                         &cursor_what,
@@ -5096,6 +5297,7 @@ impl Runtime {
                             .map(f32::to_bits)
                             .chain(self.night_light.effect_bits())
                             .chain(wellbeing.bits())
+                            .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
                         groups: FrameSignature::groups(&passes),
                     };
@@ -5137,7 +5339,49 @@ impl Runtime {
                             &passes,
                         )
                         .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        // A magnified frame repaints whole: any change
+                        // moves under the zoom.
+                        let damage = if zoom_plan.is_some() {
+                            vec![Rectangle::from_size(size)]
+                        } else {
+                            damage
+                        };
                         self.winit_signature = Some(signature);
+                        let zoom_program = zoom_plan
+                            .as_ref()
+                            .filter(|plan| !plan.effects.identity)
+                            .and_then(|_| crate::magnifier::effects_program(renderer));
+                        let zoomed = match zoom_plan.as_ref() {
+                            Some(plan) => Some(zoom_passes(
+                                renderer,
+                                &mut self.zoom_targets,
+                                &mut self.cursor,
+                                "tuna-0",
+                                plan,
+                                &cursor_what,
+                                view.scale,
+                                cursor_now,
+                                &cursor,
+                                |frame, damage| {
+                                    draw_scene(
+                                        frame,
+                                        background,
+                                        &paper,
+                                        &elements,
+                                        Target {
+                                            output: Rectangle::from_size(size),
+                                            damage,
+                                            scale: view.scale,
+                                            blank_alpha,
+                                            tint: night_tint.as_ref(),
+                                        },
+                                        &decor,
+                                        &previews,
+                                    )
+                                },
+                            )?),
+                            None => None,
+                        };
                         // The winit EGL surface presents bottom-up (see the
                         // Y-flip in the backend's own damage path), so the
                         // output transform mirrors vertically; placements
@@ -5145,23 +5389,40 @@ impl Runtime {
                         let mut frame = renderer
                             .render(&mut framebuffer, size, Transform::Flipped180)
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                        let drew = draw_scene(
-                            &mut frame,
-                            background,
-                            &paper,
-                            &elements,
-                            Target {
-                                output: Rectangle::from_size(size),
-                                damage: &damage,
-                                scale: view.scale,
-                                blank_alpha,
-                                tint: night_tint.as_ref(),
-                            },
-                            &decor,
-                            &previews,
-                        )?;
-                        crate::cursor::draw(&mut frame, &cursor, view.scale, &damage)
-                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let drew = match (zoom_plan.as_ref(), zoomed) {
+                            (Some(plan), Some((scene, zoom, drew))) => {
+                                crate::magnifier::present(
+                                    &mut frame,
+                                    &scene,
+                                    &zoom,
+                                    plan,
+                                    zoom_program.as_ref(),
+                                    Some((&cursor, view.scale)),
+                                )
+                                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                                drew
+                            }
+                            _ => {
+                                let drew = draw_scene(
+                                    &mut frame,
+                                    background,
+                                    &paper,
+                                    &elements,
+                                    Target {
+                                        output: Rectangle::from_size(size),
+                                        damage: &damage,
+                                        scale: view.scale,
+                                        blank_alpha,
+                                        tint: night_tint.as_ref(),
+                                    },
+                                    &decor,
+                                    &previews,
+                                )?;
+                                crate::cursor::draw(&mut frame, &cursor, view.scale, &damage)
+                                    .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                                drew
+                            }
+                        };
                         let _ = frame
                             .finish()
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
@@ -5307,6 +5568,18 @@ impl Runtime {
                         cursor_now,
                         accent,
                     );
+                    // Screen magnifier (#349): this output's zoom
+                    // region, in the pre-transform frame.
+                    let zoom_plan = self.magnifier.plan_for(
+                        crate::magnifier::OutputFrame {
+                            name: &out.name,
+                            size: (logical.w, logical.h),
+                            scale: out.scale,
+                            offset: out.loc,
+                        },
+                        zoom_inputs,
+                        accent,
+                    );
                     use crate::native_repaint::{FrameSignature, Tracked};
                     let [cursor_images, cursor_surface] =
                         crate::cursor::tracked(&cursor, view.scale, Rectangle::from_size(logical));
@@ -5356,6 +5629,7 @@ impl Runtime {
                             // repaints, an unchanged filter sleeps.
                             .chain(self.night_light.effect_bits())
                             .chain(wellbeing.bits())
+                            .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
                         groups: FrameSignature::groups(&passes),
                     };
@@ -5413,6 +5687,47 @@ impl Runtime {
                         &passes,
                     )
                     .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    // A magnified frame repaints whole.
+                    let damage = if zoom_plan.is_some() {
+                        vec![Rectangle::from_size(logical)]
+                    } else {
+                        damage
+                    };
+                    let zoom_program = zoom_plan
+                        .as_ref()
+                        .filter(|plan| !plan.effects.identity)
+                        .and_then(|_| crate::magnifier::effects_program(renderer));
+                    let zoomed = match zoom_plan.as_ref() {
+                        Some(plan) => Some(zoom_passes(
+                            renderer,
+                            &mut self.zoom_targets,
+                            &mut self.cursor,
+                            &out.name,
+                            plan,
+                            &cursor_what,
+                            view.scale,
+                            cursor_now,
+                            &cursor,
+                            |frame, damage| {
+                                draw_scene(
+                                    frame,
+                                    background,
+                                    &paper,
+                                    &elements,
+                                    Target {
+                                        output: Rectangle::from_size(logical),
+                                        damage,
+                                        scale: view.scale,
+                                        blank_alpha,
+                                        tint: night_tint.as_ref(),
+                                    },
+                                    &decor,
+                                    &previews,
+                                )
+                            },
+                        )?),
+                        None => None,
+                    };
                     let cost;
                     let sync = {
                         let mut target = renderer
@@ -5425,26 +5740,43 @@ impl Runtime {
                                 crate::orientation::render_transform(out.transform),
                             )
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                        let drew = draw_scene(
-                            &mut frame,
-                            background,
-                            &paper,
-                            &elements,
-                            Target {
-                                output: Rectangle::from_size(logical),
-                                damage: &damage,
-                                scale: view.scale,
-                                blank_alpha,
-                                tint: night_tint.as_ref(),
-                            },
-                            &decor,
-                            &previews,
-                        )?;
+                        let drew = match (zoom_plan.as_ref(), zoomed) {
+                            (Some(plan), Some((scene, zoom, drew))) => {
+                                crate::magnifier::present(
+                                    &mut frame,
+                                    &scene,
+                                    &zoom,
+                                    plan,
+                                    zoom_program.as_ref(),
+                                    Some((&cursor, view.scale)),
+                                )
+                                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                                drew
+                            }
+                            _ => {
+                                let drew = draw_scene(
+                                    &mut frame,
+                                    background,
+                                    &paper,
+                                    &elements,
+                                    Target {
+                                        output: Rectangle::from_size(logical),
+                                        damage: &damage,
+                                        scale: view.scale,
+                                        blank_alpha,
+                                        tint: night_tint.as_ref(),
+                                    },
+                                    &decor,
+                                    &previews,
+                                )?;
+                                // The pointer on top (no host cursor on bare
+                                // hardware); hidden while locked (#342).
+                                crate::cursor::draw(&mut frame, &cursor, view.scale, &damage)
+                                    .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                                drew
+                            }
+                        };
                         cost = FrameCost::new(&drew, &elements.owners, &damage, size);
-                        // The pointer on top (no host cursor on bare
-                        // hardware); hidden while locked (#342).
-                        crate::cursor::draw(&mut frame, &cursor, view.scale, &damage)
-                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         frame
                             .finish()
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?
@@ -6554,6 +6886,68 @@ fn draw_scene(
         culled: occlusion.culled(),
         scene_visible,
     })
+}
+
+/// The screen magnifier's offscreen passes (#349): the unmagnified
+/// scene (`draw` paints it at full damage) plus the locate-pointer
+/// ripples into the scene texture, then the zoom region with the
+/// pointer sprite magnified at `scale × factor`. Returns both textures
+/// for [`crate::magnifier::present`] and the scene pass's report.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn zoom_passes(
+    renderer: &mut GlesRenderer,
+    targets: &mut crate::magnifier::ZoomTargets,
+    cursor: &mut crate::cursor::Cursor,
+    output: &str,
+    plan: &crate::magnifier::ZoomPlan,
+    pointer: &crate::cursor::Pointer,
+    scale: f64,
+    now: Duration,
+    ripples: &crate::cursor::CursorElements,
+    draw: impl FnOnce(
+        &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        &[Rectangle<i32, smithay::utils::Physical>],
+    ) -> Result<crate::occlusion::Drawn, RuntimeError>,
+) -> Result<
+    (
+        smithay::backend::renderer::gles::GlesTexture,
+        smithay::backend::renderer::gles::GlesTexture,
+        crate::occlusion::Drawn,
+    ),
+    RuntimeError,
+> {
+    let error =
+        |e: smithay::backend::renderer::gles::GlesError| RuntimeError::Dispatch(e.to_string());
+    let (mut scene, mut zoom) = targets.textures(renderer, output, plan).map_err(error)?;
+    let full: Rectangle<i32, smithay::utils::Physical> =
+        Rectangle::from_size((plan.output.0, plan.output.1).into());
+    let drawn = {
+        let mut target = renderer.bind(&mut scene).map_err(error)?;
+        let mut frame = renderer
+            .render(&mut target, full.size, Transform::Normal)
+            .map_err(error)?;
+        let drawn = draw(&mut frame, &[full])?;
+        crate::cursor::draw_ripples(&mut frame, ripples, &[full]).map_err(error)?;
+        let _ = frame.finish().map_err(error)?;
+        drawn
+    };
+    let magnified = scale * plan.view.mag;
+    let sprite = (!matches!(pointer, crate::cursor::Pointer::Hidden)).then(|| {
+        let hotspot = (
+            plan.sprite.0 - f64::from(plan.content.0),
+            plan.sprite.1 - f64::from(plan.content.1),
+        );
+        cursor.sprite_at(renderer, pointer, hotspot.into(), magnified, now)
+    });
+    crate::magnifier::compose_zoom(
+        renderer,
+        &scene,
+        &mut zoom,
+        plan,
+        sprite.as_ref().map(|sprite| (sprite, magnified)),
+    )
+    .map_err(error)?;
+    Ok((scene, zoom, drawn))
 }
 
 /// One drawn item of the scene's window/layer pass: a surface element or
