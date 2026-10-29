@@ -793,20 +793,7 @@ fn follow_logind_session(session: zbus::blocking::Connection) -> bool {
     let Ok(system) = zbus::blocking::Connection::system() else {
         return true;
     };
-    let Ok(manager) = zbus::blocking::Proxy::new(
-        &system,
-        "org.freedesktop.login1",
-        "/org/freedesktop/login1",
-        "org.freedesktop.login1.Manager",
-    ) else {
-        return true;
-    };
-    let path: zbus::Result<zbus::zvariant::OwnedObjectPath> = match std::env::var("XDG_SESSION_ID")
-    {
-        Ok(id) if !id.is_empty() => manager.call("GetSession", &(id.as_str(),)),
-        _ => manager.call("GetSessionByPID", &(std::process::id(),)),
-    };
-    let Ok(path) = path else {
+    let Ok(path) = crate::logind_session::current_session_path(&system) else {
         return true;
     };
     let Ok(logind_session) = zbus::blocking::Proxy::new(
