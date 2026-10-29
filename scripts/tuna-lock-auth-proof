@@ -182,7 +182,8 @@ finish() {
     owned_pids
     swept=""
     while read -r pid; do
-        kill "$pid" 2>/dev/null && swept="$swept $pid"
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo gone)"
+        kill "$pid" 2>/dev/null && swept="$swept $pid:$comm"
     done <"$ARTIFACTS/owned-pids.txt"
     [ -n "$swept" ] && sleep 1
     while read -r pid; do kill -9 "$pid" 2>/dev/null; done <"$ARTIFACTS/owned-pids.txt"
@@ -735,7 +736,7 @@ for try in 1 2 3; do
             fail E-MAX-TRIES "no-match $try was not reported"
     fi
 done
-twait "$m" "message type=problem text=$MAX_TRIES" 15 >/dev/null ||
+maxline="$(twait "$m" "message type=problem text=$MAX_TRIES" 15)" ||
     fail E-MAX-TRIES "the maximum-attempts message was not shown"
 sleep 0.3
 dump E-1-max-tries
@@ -748,7 +749,12 @@ twaitre "$m" "result service=fingerprint request=[0-9]+ applied=false$" 10 >/dev
 for _ in $(seq 1 50); do fp_order "$ft" VerifyStop Release && break; sleep 0.2; done
 fp_order "$ft" VerifyStop Release || fail E-MAX-TRIES "no VerifyStop/Release after the third no-match: $(fp_calls "$ft")"
 fp_order "$f" Claim VerifyStart VerifyStop Release || fail E-MAX-TRIES "fprintd order: $(fp_calls "$f")"
-still_locked 2.5 || fail E-MAX-TRIES "max tries unlocked the session"
+# The last allowed failure ends the whole verification: once the message
+# has been read, authPrompt.js reset() begins again (and unlockDialog.js
+# _fail may bring the clock back). Answers typed before that are lost.
+twaitre "$maxline" "begin service=password request=[0-9]+$" 20 >/dev/null ||
+    fail E-MAX-TRIES "verification did not begin again after the last allowed failure"
+still_locked 1 || fail E-MAX-TRIES "max tries unlocked the session"
 dump E-2-after
 shot E-2-after
 after_max="the prompt stayed up"
