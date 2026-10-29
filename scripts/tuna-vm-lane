@@ -3356,7 +3356,8 @@ def finish_constraint_proof(agent, qmp, original_mouse, evidence, report):
         raise RuntimeError("actual constraint cleanup failed: " + json.dumps(cleanup_errors))
 
 
-def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False):
+def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
+         observer_records=None):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
@@ -3387,6 +3388,13 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
                      "-chardev", f"socket,path={agent_path},server=on,wait=off,id=tuna-qga",
                      "-device", "virtserialport,chardev=tuna-qga,name=org.qemu.guest_agent.0",
                      "-D", os.path.join(out, "qemu-gpu-resource.log")])
+    if observer_records:
+        if not guest_agent:
+            raise ValueError("observer records share the guest agent's virtio-serial bus")
+        # Perf observer records bypass the 8250 serial console: its per-byte
+        # port I/O stalled QEMU's main loop and the measured frames.
+        qemu.extend(["-chardev", f"file,path={observer_records},id=tuna-perf",
+                     "-device", "virtserialport,chardev=tuna-perf,name=org.tuna.perf.0"])
     if kvm:
         qemu[1:1] = ["-enable-kvm", "-cpu", "host"]
     log(f"booting {disk} (kvm={kvm})")

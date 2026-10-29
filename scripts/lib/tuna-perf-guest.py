@@ -12,7 +12,28 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
+import sys
 import time
+
+# The host harness attaches a virtio-serial port with this name (QEMU file
+# chardev). Records written to journald were forwarded to the emulated 8250
+# serial console, whose per-byte port I/O stalled QEMU's main loop and the
+# measured frames 0-0.3 s after every record (run 40931135786). Guests without
+# the port (Corral) keep records in the unit's journal, read over SSH.
+RECORD_PORT = Path("/dev/virtio-ports/org.tuna.perf.0")
+
+
+def record_sink(port=RECORD_PORT):
+    """The records channel and its name; never both the port and the journal."""
+    if port.exists():
+        return open(port, "w", encoding="utf-8"), "virtio-serial"
+    return sys.stdout, "journal"
+
+
+def emit(sink, line):
+    """One whole newline-terminated record per flush."""
+    sink.write(line + "\n")
+    sink.flush()
 
 
 def global_records(raw, socket_name):
@@ -26,7 +47,7 @@ def global_records(raw, socket_name):
              "socket": socket_name, "data": part} for index, part in enumerate(parts)]
 
 
-def capture_globals(uid):
+def capture_globals(uid, sink):
     runtime = Path(f"/run/user/{uid}")
     if not runtime.is_dir():
         return False
@@ -54,7 +75,7 @@ def capture_globals(uid):
             staged.write_text(json.dumps({"uid": uid, "socket": path.name}))
             staged.replace(marker)
             for record in global_records(raw, path.name):
-                print("tuna-perf-globals: " + json.dumps(record), flush=True)
+                emit(sink, "tuna-perf-globals: " + json.dumps(record))
             return True
         except (FileNotFoundError, ConnectionError, subprocess.TimeoutExpired):
             continue  # The graphical session may still be starting.
@@ -377,11 +398,12 @@ def sample(uid, proc=Path("/proc"), observer=None, thread_diagnostics=False):
 
 
 def sample_line(row):
-    """One journal line carrying its own digest.
+    """One record line carrying its own digest.
 
-    The serial console can drop a run of bytes inside a line and still leave
+    The serial console once dropped a run of bytes inside a line and still left
     valid JSON (run 40914419860: '"cpu_ticks":47,…,"cmd"' became
-    '"cpu_ticksmd"'), so the host keeps only records whose digest matches.
+    '"cpu_ticksmd"'). Every channel keeps the digest: the host rejects a
+    record whose digest does not match, and a gap in `seq` as a lost record.
     """
     payload = json.dumps(row, separators=(",", ":"))
     return f"tuna-perf-sample: {payload} sha256={hashlib.sha256(payload.encode()).hexdigest()}"
@@ -400,7 +422,10 @@ def main():
     previous, previous_at, previous_boot_at = {}, None, None
     globals_captured = False
     ticks = os.sysconf("SC_CLK_TCK")
-    while True:
+    sink, channel = record_sink()
+    # One line on the journal (and so the serial console) names the channel.
+    print(f"tuna-perf-observer: records on {channel}", flush=True)
+    for seq in itertools.count():
         start = time.monotonic()
         boot_start = time.clock_gettime(time.CLOCK_BOOTTIME)
         row = sample(uid, observer=os.getpid(), thread_diagnostics=args.thread_diagnostics)
@@ -411,10 +436,11 @@ def main():
                                                   if previous_at is not None else None),
                    departed_processes=len(previous.keys() - current.keys()))
         row["cpu_interval_start_boottime_s"] = previous_boot_at
-        print(sample_line(row), flush=True)
+        row["seq"] = seq
+        emit(sink, sample_line(row))
         previous, previous_at, previous_boot_at = current, start, boot_start
         if not globals_captured:
-            globals_captured = capture_globals(uid)
+            globals_captured = capture_globals(uid, sink)
         time.sleep(max(0, args.interval - (time.monotonic() - start)))
 
 

@@ -2225,6 +2225,19 @@ class BootApi(unittest.TestCase):
             command = spawn.call_args.args[0]
             self.assertIn("virtio-serial-pci", command)
             self.assertIn("virtserialport,chardev=tuna-qga,name=org.qemu.guest_agent.0", command)
+            self.assertFalse(any("tuna-perf" in value for value in command))
+
+    def test_observer_records_get_their_own_virtio_port_not_the_serial_console(self):
+        # Run 40931135786: records forwarded to the 8250 console stalled frames.
+        with patch.object(lane.os.path, "exists", return_value=True), patch.object(lane.os, "access", return_value=True), patch.object(lane.subprocess, "Popen") as spawn:
+            lane.boot("disk.raw", "/out", "/scratch", 30, guest_agent=True, observer_records="/out/observer-records.log")
+            command = spawn.call_args.args[0]
+            self.assertEqual(command.count("virtio-serial-pci"), 1)
+            self.assertIn("file,path=/out/observer-records.log,id=tuna-perf", command)
+            self.assertIn("virtserialport,chardev=tuna-perf,name=org.tuna.perf.0", command)
+            self.assertEqual(command[command.index("-serial") + 1], "file:/out/serial.log")
+            with self.assertRaises(ValueError):
+                lane.boot("disk.raw", "/out", "/scratch", 30, observer_records="/out/observer-records.log")
 
 
 class NativeMouseSelection(unittest.TestCase):

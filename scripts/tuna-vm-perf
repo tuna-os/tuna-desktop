@@ -338,25 +338,27 @@ def presentation_summary(trace):
             "scope": "Native SHM xdg-toplevel with alternating damage, paced by wl_surface.frame. wp_presentation timestamps measure this client's presentation cadence, not compositor input-to-frame tracing. Hardware flags and unknown refresh are explicit."}
 
 
-def raw_samples(serial):
-    """Only records whose digest matches what the observer printed.
+def raw_samples(records):
+    """Every complete observer record, in emission order, or an error.
 
-    The serial console drops runs of bytes inside lines; usually the JSON
-    then fails to parse, but run 40914419860 kept a valid record missing a
-    process's cpu_ticks. A record without a matching digest is dropped like
-    an unparseable one.
+    Records travel on a virtio-serial port (local QEMU) or the observer unit's
+    journal (Corral), never the serial console, which dropped runs of bytes
+    inside lines (run 40914419860 kept valid JSON missing a process's
+    cpu_ticks). Neither channel drops bytes, so a digest mismatch is a corrupt
+    record and a gap in `seq` a lost or reordered one; both fail the session.
+    The last line is still being written until its newline arrives.
     """
     result = []
-    for line in serial.splitlines():
+    for line in records.split("\n")[:-1]:
         if "tuna-perf-sample: " not in line:
             continue
         payload, separator, digest = line.split("tuna-perf-sample: ", 1)[1].rstrip().rpartition(" sha256=")
         if not separator or hashlib.sha256(payload.encode()).hexdigest() != digest:
-            continue
-        try:
-            result.append(json.loads(payload))
-        except json.JSONDecodeError:
-            continue
+            raise ValueError(f"observer record after seq {len(result) - 1} fails its digest")
+        record = json.loads(payload)
+        if record.get("seq") != len(result):
+            raise ValueError(f"observer record seq {record.get('seq')!r} where {len(result)} was due: lost or reordered")
+        result.append(record)
     return result
 
 
@@ -397,9 +399,9 @@ def idle_cpu(samples, start, end):
     return distribution(values)
 
 
-def raw_globals(serial):
+def raw_globals(records):
     parts = {}
-    for line in serial.splitlines():
+    for line in records.splitlines():
         if "tuna-perf-globals: " not in line:
             continue
         record = json.loads(line.split("tuna-perf-globals: ", 1)[1])
@@ -542,12 +544,20 @@ def main():
             corral = Session(args.corral_context,args.corral_namespace,args.corral_vm,args.corral_user,
                              args.corral_key,args.corral_known_hosts,out)
             qmp=corral.connect_display();agent=corral;kvm=True
-            def read_serial():return corral.samples()
+            def read_records():return corral.samples()
         else:
+            # The QEMU file chardev behind the guest's org.tuna.perf.0 port; the
+            # serial console keeps boot and session logs only.
+            records_path = out / "observer-records.log"
             vm, qmp_path, serial_path, kvm, agent_path = lane.boot(
-                os.path.abspath(args.disk), str(out), str(scratch), args.timeout, guest_agent=True)
+                os.path.abspath(args.disk), str(out), str(scratch), args.timeout, guest_agent=True,
+                observer_records=str(records_path))
             qmp = lane.baseline.Qmp(qmp_path)
-            def read_serial():return lane.read_text(serial_path)
+            def read_records():
+                try:
+                    return records_path.read_bytes().decode("utf-8", "replace")
+                except FileNotFoundError:
+                    return ""
         started = time.monotonic()
         if handoff is not None:
             handoff.attach(vm)
@@ -555,7 +565,7 @@ def main():
             raise RuntimeError("paired performance comparison requires actual KVM")
         ready = False
         while time.monotonic()-started < args.timeout and (vm is None or vm.poll() is None):
-            if raw_samples(read_serial()):
+            if raw_samples(read_records()):
                 qmp.keys("esc")
                 time.sleep(2)
                 path = scratch / "ready.ppm"
@@ -565,7 +575,8 @@ def main():
                     break
             time.sleep(2)
         if not ready:
-            raise RuntimeError("the guest never displayed its desktop panel")
+            raise RuntimeError("the guest never displayed its desktop panel" if raw_samples(read_records())
+                               else "no observer records arrived (virtio port org.tuna.perf.0 or unit journal)")
         panel_upper_s = time.monotonic()-started
         if corral is not None:
             corral.metadata['desktop_before']=corral.desktop(args.desktop)
@@ -704,16 +715,16 @@ def main():
             same_reference(original_reference, final_reference, 'stock')
         if validate_image(guest_probe(agent, 'reference-image')['reference_image'], args.gnome_profile) != reference_image:
             raise ValueError('reference image changed during workload')
-        serial = read_serial()
-        (out / "sampler-journal.txt").write_text(serial)
+        records = read_records()
         if corral is not None:
+            (out / "sampler-journal.txt").write_text(records)
             corral.verify()
             if corral.desktop(args.desktop)!=corral.metadata['desktop_before']:
                 raise ValueError('selected desktop compositor changed during acquisition')
-        samples = raw_samples(serial)
+        samples = raw_samples(records)
         if not samples or any(s["unreadable"] for s in samples):
-            raise RuntimeError("resource samples are missing or incomplete; inspect raw serial")
-        globals_text, globals_meta = raw_globals(serial)
+            raise RuntimeError("resource samples are missing or incomplete; inspect the observer records")
+        globals_text, globals_meta = raw_globals(records)
         if presentation.get("socket") != globals_meta["socket"]:
             raise RuntimeError("presentation probe did not use the captured desktop socket")
         (out / "wayland-info.txt").write_text(globals_text)
