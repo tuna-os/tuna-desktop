@@ -430,6 +430,26 @@ fn primary_removal_reapplies_maximized_against_new_primary() {
     assert_eq!(f.manager.model().windows().count(), 2);
 }
 
+/// A new mode resizes an output in place (GNOME Settings' resolution
+/// change): maximized windows re-fit the new size, as the DRM backend
+/// re-applies derived layouts when an output's size changes.
+#[test]
+fn mode_change_refits_maximized_to_the_new_size() {
+    let mut f = two_windows_dual();
+    assert!(f.manager.set_maximized(&mut f.comp.state, f.id_a, true));
+    let maxed = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!((maxed.size.w, maxed.size.h), (1280, 768));
+
+    f.comp.state.add_output("left", None, 800, 600);
+    // Stale until re-applied: still the old mode's work area.
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), maxed);
+
+    let applied = f.manager.reapply_derived_layouts(&mut f.comp.state);
+    assert_eq!(applied, 1, "maximized window re-resolved");
+    let refit = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!((refit.size.w, refit.size.h), (800, 568));
+}
+
 #[test]
 fn migrate_unknown_output_moves_nothing() {
     let mut f = two_windows_dual();

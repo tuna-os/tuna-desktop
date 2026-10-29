@@ -333,6 +333,8 @@ pub struct Session<'a> {
     /// Window-menu actions the shell asked for, until drained.
     window_actions: Vec<(u64, tuna_shell_control::WindowAction)>,
     shortcut_consent: Vec<(u64, bool)>,
+    /// Display-change dialog answers (`true` keeps), drained by the hub.
+    display_change: Vec<bool>,
     /// Latest `SetOverviewSearch` from the shell, drained by the hub.
     overview_search: Option<bool>,
     /// Latest `SetOverviewAppGrid` from the shell, drained by the hub.
@@ -438,6 +440,7 @@ impl<'a> Session<'a> {
             accelerators: None,
             window_actions: Vec::new(),
             shortcut_consent: Vec::new(),
+            display_change: Vec::new(),
             overview_search: None,
             overview_app_grid: None,
             unlock_request: None,
@@ -570,7 +573,12 @@ impl<'a> Session<'a> {
     }
 
     /// Ask the shell to draw GNOME's window menu.
+    /// Peers older than 0.42 cannot decode `ConfirmDisplayChange` and
+    /// receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
+        if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
+            return Ok(());
+        }
         self.conn.write_frame(menu)
     }
 
@@ -909,6 +917,19 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::CompleteDisplayChange { keep },
+            } => {
+                if !self.locked.get() {
+                    self.display_change.push(keep);
+                }
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1044,6 +1065,7 @@ impl<'a> Session<'a> {
             | Message::DwellClickType { .. }
             | Message::PointerTimeout { .. }
             | Message::ShortcutConsent { .. }
+            | Message::ConfirmDisplayChange { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1090,6 +1112,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::WorkspacePopup { .. } => "WorkspacePopup",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
+        Message::ConfirmDisplayChange { .. } => "ConfirmDisplayChange",
         Message::ScreenReader { .. } => "ScreenReader",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
@@ -1264,6 +1287,7 @@ fn apply_command(
         | CommandKind::SetAcceleratorGrabs { .. }
         | CommandKind::WindowAction { .. }
         | CommandKind::ShortcutConsent { .. }
+        | CommandKind::CompleteDisplayChange { .. }
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1322,6 +1346,8 @@ pub struct PollOutcome {
     pub window_actions: Vec<(u64, tuna_shell_control::WindowAction)>,
     /// Trusted shell decisions for pending inhibitors.
     pub shortcut_consent: Vec<(u64, bool)>,
+    /// Display-change dialog answers (`true` = Keep Changes), in order.
+    pub display_change: Vec<bool>,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -2015,6 +2041,9 @@ impl ControlHub {
                     outcome
                         .shortcut_consent
                         .extend(std::mem::take(&mut session.shortcut_consent));
+                    outcome
+                        .display_change
+                        .extend(std::mem::take(&mut session.display_change));
                     outcome
                         .input_source_switches
                         .extend(std::mem::take(&mut session.input_source_switches));

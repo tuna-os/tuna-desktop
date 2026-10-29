@@ -14,6 +14,10 @@
 #   D-FRAMES   a real active Wayland client receives 240 page-flip presentations
 #   D-SCALE    a GNOME monitors.xml giving the connector scale 2 is
 #              honored: logical layout at half the mode size, frames flip
+#   D-MODES    GNOME Settings' DisplayConfig lists the connector's modes;
+#              ApplyMonitorsConfig switches the CRTC to another mode (the
+#              kernel reports it, frames keep flipping) and an unconfirmed
+#              persistent change reverts after Mutter's 20 s (#340)
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
 # Needs root (sudo) for modprobe and seatd. Exits nonzero on any failure.
 set -eu
@@ -25,7 +29,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,17p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,21p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -40,9 +44,11 @@ STATE="$ARTIFACTS/shell-state.json"
 CSTATE="$ARTIFACTS/compositor-state.json"
 SEATD_PID=""
 COMP_PID=""
+DBUS_PID=""
 
 cleanup() {
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
+    if [ -n "$DBUS_PID" ]; then kill "$DBUS_PID" 2>/dev/null || true; fi
     if [ -n "$SEATD_PID" ]; then sudo kill "$SEATD_PID" 2>/dev/null || true; fi
     # Put a stopped system seatd back exactly as we found it.
     if [ -n "$SYSTEM_SEATD" ]; then sudo systemctl start seatd 2>/dev/null || true; fi
@@ -277,5 +283,121 @@ if [ -z "$scaled_frames" ] || [ "$scaled_frames" -lt 240 ]; then
     fail D-SCALE "expected frames at scale 2, got '${scaled_frames:-none}'"
 fi
 pass D-SCALE "monitors.xml scale 2 on $CONNECTOR: $half logical px wide, $scaled_frames frames"
+
+# Modes from GNOME Settings (#340): the same connector with no stored
+# configuration, its DisplayConfig on a private session bus.
+MODES_LOG="$ARTIFACTS/compositor-modes.log"
+CSTATE="$ARTIFACTS/compositor-state-modes.json"
+mkdir -p "$ARTIFACTS/config-modes"
+dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$ARTIFACTS/dbus-modes.txt"
+DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p "$ARTIFACTS/dbus-modes.txt")"
+DBUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-modes.txt")"
+export DBUS_SESSION_BUS_ADDRESS
+env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RUNTIME" XDG_CONFIG_HOME="$ARTIFACTS/config-modes" \
+    XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+    "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-modes \
+    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$MODES_LOG" 2>&1 &
+COMP_PID=$!
+LOG="$MODES_LOG"
+display_call() {
+    method="$1"
+    shift
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method "org.gnome.Mutter.DisplayConfig.$method" "$@"
+}
+# apply_mode METHOD MODE: one logical monitor at scale 1 in MODE, with
+# the serial GetCurrentState reports, as GNOME Settings sends it.
+apply_mode() {
+    serial="$(display_call GetCurrentState | sed -n 's/^(uint32 \([0-9]*\),.*/\1/p')"
+    [ -n "$serial" ] || return 1
+    display_call ApplyMonitorsConfig "$serial" "$1" \
+        "[(0, 0, 1.0, uint32 0, true, [('$CONNECTOR', '$2', {'color-mode': <uint32 0>, 'underscanning': <false>})])]" \
+        "@a{sv} {}" >>"$ARTIFACTS/display-modes.log" 2>&1
+}
+# wait_crtc MODE TIMEOUT: the kernel reports the CRTC in MODE, the
+# advertised current mode agrees and the layout is that wide.
+wait_crtc() {
+    width="${1%%x*}"
+    end=$(($(date +%s) + $2))
+    until [ -s "$CSTATE" ] && jq -e --arg c "$CONNECTOR" --arg m "$1" --argjson w "$width" \
+        '(.display_config.monitors[] | select(.connector == $c) | .crtc_mode == $m and .mode == $m)
+         and (.layers | any(.rect[2] == $w))' "$CSTATE" >/dev/null 2>&1; do
+        kill -0 "$COMP_PID" 2>/dev/null || return 1
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.2
+    done
+}
+end=$(($(date +%s) + 30))
+until grep -q 'serving org.gnome.Mutter.DisplayConfig' "$MODES_LOG" 2>/dev/null &&
+    [ -s "$CSTATE" ] && jq -e '.display_config.serial >= 1 and (.layers | length > 0)' "$CSTATE" >/dev/null 2>&1; do
+    kill -0 "$COMP_PID" 2>/dev/null || fail D-MODES "compositor exited"
+    [ "$(date +%s)" -le "$end" ] || fail D-MODES "DisplayConfig never served the monitor"
+    sleep 0.2
+done
+display_call GetCurrentState >"$ARTIFACTS/modes-state.txt" 2>&1 ||
+    fail D-MODES "GetCurrentState failed: $(tail -2 "$ARTIFACTS/modes-state.txt")"
+# The kernel's mode list as Mutter advertises it: the current and
+# preferred mode, and another resolution to switch to (800x600 when the
+# connector has it).
+picked="$(python3 - "$ARTIFACTS/modes-state.txt" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+modes = re.findall(
+    r"\('(\d+)x(\d+)(i?)@([\d.]+)', \d+, \d+, [\d.e+-]+, [\d.e+-]+, \[[^\]]*\], \{([^}]*)\}\)", text)
+ids = [(f"{w}x{h}{i}@{r}", int(w), int(h), i, props) for w, h, i, r, props in modes]
+current = [m for m in ids if "'is-current': <true>" in m[4]]
+preferred = [m for m in ids if "'is-preferred': <true>" in m[4]]
+assert len(ids) > 1, f"only {len(ids)} advertised modes"
+assert len(current) == 1 and len(preferred) == 1, (current, preferred)
+others = [m for m in ids if not m[3] and (m[1], m[2]) != (current[0][1], current[0][2])]
+target = next((m for m in others if (m[1], m[2]) == (800, 600)), others[0] if others else None)
+assert target is not None, "no other resolution"
+print(current[0][0], target[0], len(ids))
+PY
+)" || fail D-MODES "GetCurrentState does not list the connector's modes: $(head -c 2000 "$ARTIFACTS/modes-state.txt")"
+ORIGINAL_MODE="${picked%% *}"
+rest="${picked#* }"
+TARGET_MODE="${rest%% *}"
+MODE_COUNT="${rest#* }"
+wait_crtc "$ORIGINAL_MODE" 10 || fail D-MODES "the CRTC does not run the advertised current mode $ORIGINAL_MODE"
+# Verify refuses a mode the connector lacks, as Mutter does.
+if apply_mode 0 "123x45@60.000"; then fail D-MODES "an unknown mode verified"; fi
+tail -2 "$ARTIFACTS/display-modes.log" | grep -q "InvalidArgs.*Invalid mode '123x45@60.000' specified" ||
+    fail D-MODES "an unknown mode was not refused: $(tail -2 "$ARTIFACTS/display-modes.log")"
+# Temporary: the CRTC switches (atomic test first) and frames flip on.
+frames_before=$(jq -er '.rendered_frames' "$CSTATE")
+apply_mode 1 "$TARGET_MODE" || fail D-MODES "ApplyMonitorsConfig $TARGET_MODE failed: $(tail -2 "$ARTIFACTS/display-modes.log")"
+wait_crtc "$TARGET_MODE" 10 || fail D-MODES "the kernel did not report the CRTC in $TARGET_MODE"
+end=$(($(date +%s) + 10))
+until [ "$(jq -er '.rendered_frames' "$CSTATE")" -gt "$frames_before" ]; do
+    [ "$(date +%s)" -le "$end" ] || fail D-MODES "no frame flipped in $TARGET_MODE"
+    sleep 0.2
+done
+cp "$CSTATE" "$ARTIFACTS/modes-switched.json"
+# Persistent and unanswered (no GNOME Shell dialog here): the CRTC
+# returns to the original mode, then Mutter's timeout reverts to the
+# configuration before it.
+apply_mode 2 "$ORIGINAL_MODE" || fail D-MODES "persistent $ORIGINAL_MODE failed: $(tail -2 "$ARTIFACTS/display-modes.log")"
+wait_crtc "$ORIGINAL_MODE" 10 || fail D-MODES "the persistent change did not reach the CRTC"
+changed_at=$(date +%s)
+jq -e '.display_config.awaiting_confirmation' "$CSTATE" >/dev/null ||
+    fail D-MODES "the persistent change did not await confirmation"
+wait_crtc "$TARGET_MODE" 30 || fail D-MODES "the unconfirmed change did not revert the CRTC to $TARGET_MODE"
+elapsed=$(($(date +%s) - changed_at))
+[ "$elapsed" -ge 18 ] || fail D-MODES "the change reverted after ${elapsed}s, before Mutter's 20 second timeout"
+[ ! -e "$ARTIFACTS/config-modes/tuna/monitors.xml" ] || fail D-MODES "an unconfirmed change was saved"
+# Back to the original mode for a clean exit.
+apply_mode 1 "$ORIGINAL_MODE" || fail D-MODES "restoring $ORIGINAL_MODE failed"
+wait_crtc "$ORIGINAL_MODE" 10 || fail D-MODES "the CRTC did not return to $ORIGINAL_MODE"
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$MODES_LOG"; then fail D-NOPANIC "panic in the mode-change session"; fi
+pass D-MODES "$MODE_COUNT advertised modes on $CONNECTOR; CRTC $ORIGINAL_MODE -> $TARGET_MODE by ApplyMonitorsConfig with frames flipping, unconfirmed persistent $ORIGINAL_MODE reverted after ${elapsed}s"
 
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"

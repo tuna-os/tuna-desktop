@@ -35,7 +35,9 @@ use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier}
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
+use smithay::reexports::drm::control::{
+    self, connector, crtc, Device as ControlDevice, ModeTypeFlags,
+};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
@@ -63,7 +65,7 @@ pub struct PageFlip {
     pub refresh: std::time::Duration,
 }
 
-/// One lit connector.
+/// One connector with a CRTC.
 pub struct DrmOutput {
     /// Inventory name, e.g. `eDP-1`.
     pub name: String,
@@ -75,6 +77,12 @@ pub struct DrmOutput {
     pub surface: ScanoutSurface,
     /// Protocol output advertised to clients.
     pub output: Output,
+    /// The connector's modes in Mutter's order (#340), each with the
+    /// kernel mode it programs, and which one is preferred.
+    pub modes: Vec<(crate::display_config::ModeSpec, control::Mode)>,
+    pub preferred_mode: usize,
+    /// Physical size in millimetres (the preferred-scale DPI).
+    pub size_mm: (i32, i32),
     /// Mode size in physical pixels.
     pub size: Size<i32, Physical>,
     /// Top-left in the global logical space: GNOME's arrangement from
@@ -84,11 +92,41 @@ pub struct DrmOutput {
     pub scale: f64,
     /// DisplayConfig transform (0-7) from monitors.xml or Settings, #345.
     pub transform: u32,
+    /// Lit; GNOME Settings switched it off when false (#340).
+    pub enabled: bool,
+    /// The connector leading the mirrored logical monitor this output
+    /// clones (same region, scale and mode size); not a wl_output.
+    pub mirror_of: Option<String>,
+    /// The mode a just-applied mode change replaced, until its first
+    /// commit succeeds: a refused commit returns to it.
+    rollback_mode: Option<control::Mode>,
+    /// A refused commit restored the previous mode since the runtime
+    /// last looked ([`DrmBackend::take_mode_reverted`]).
+    mode_reverted: bool,
     /// A frame is queued and its page flip has not completed yet.
     pub pending: bool,
     pub(crate) last_frame: Option<crate::native_repaint::FrameSignature>,
     pub(crate) damage_tracker: Option<smithay::backend::renderer::damage::OutputDamageTracker>,
     wake_trace: bool,
+}
+
+/// Mutter's mode spec of a kernel mode: resolution, refresh rate as
+/// `meta_calculate_drm_mode_refresh_rate` computes it, interlacing.
+pub fn mode_spec(mode: &control::Mode) -> crate::display_config::ModeSpec {
+    let (width, height) = mode.size();
+    let (_, _, htotal) = mode.hsync();
+    let (_, _, vtotal) = mode.vsync();
+    crate::display_config::ModeSpec {
+        width: i32::from(width),
+        height: i32::from(height),
+        refresh: crate::display_config::drm_refresh_rate(
+            mode.clock(),
+            htotal,
+            vtotal,
+            mode.vscan(),
+        ),
+        interlaced: mode.flags().bits() & crate::display_config::DRM_MODE_FLAG_INTERLACE != 0,
+    }
 }
 
 impl DrmOutput {
@@ -108,6 +146,104 @@ impl DrmOutput {
     /// 90°/270° rotation).
     pub fn logical_size(&self) -> (i32, i32) {
         crate::orientation::logical_extent(self.size.w, self.size.h, self.scale, self.transform)
+    }
+
+    /// Shown as its own wl_output: lit and not a mirror clone.
+    pub fn is_leader(&self) -> bool {
+        self.enabled && self.mirror_of.is_none()
+    }
+
+    /// The output whose lock surface this one shows: a clone shows its
+    /// leader's.
+    pub fn logical_name(&self) -> &str {
+        self.mirror_of.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Position of the mode the CRTC is set to (or about to be) in
+    /// [`modes`](Self::modes).
+    fn current_mode_index(&self) -> Option<usize> {
+        let mode = self.surface.pending_mode();
+        self.modes.iter().position(|(_, m)| *m == mode).or_else(|| {
+            let spec = mode_spec(&mode);
+            self.modes.iter().position(|(s, _)| s.equals(&spec))
+        })
+    }
+
+    /// Keep the current `mode` as the wl_output's only mode, flagged
+    /// preferred when it is the monitor's preferred one: Mutter's
+    /// wl_output sends the current mode alone, never the list
+    /// (`meta-wayland-outputs.c`).
+    fn advertise_mode(&self, mode: control::Mode) {
+        let mode = Mode::from(mode);
+        for other in self.output.modes() {
+            if other != mode {
+                self.output.delete_mode(other);
+            }
+        }
+        if self
+            .modes
+            .get(self.preferred_mode)
+            .is_some_and(|(_, preferred)| Mode::from(*preferred) == mode)
+        {
+            self.output.set_preferred(mode);
+        }
+    }
+
+    /// Turn the CRTC off (GNOME Settings disabled the monitor): queued
+    /// frames are dropped, never presented.
+    fn switch_off(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        for mut feedback in self.surface.discard_pending_frames() {
+            feedback.discarded();
+        }
+        if let Err(error) = self.surface.surface().clear() {
+            eprintln!("tuna-compositor: drm: {} off: {error}", self.name);
+        }
+        self.surface.reset_buffers();
+        self.enabled = false;
+        self.mirror_of = None;
+        self.rollback_mode = None;
+        self.pending = false;
+        self.last_frame = None;
+        self.damage_tracker = None;
+    }
+
+    /// A frame in a new mode reached the hardware: the mode stays.
+    pub fn mode_committed(&mut self) {
+        self.rollback_mode = None;
+    }
+
+    /// The first commit in a new mode failed although the atomic test
+    /// passed: return to the mode it replaced (Mutter falls back the
+    /// same way when a modeset fails). Returns whether it did.
+    pub fn revert_failed_mode(&mut self) -> bool {
+        let Some(old) = self.rollback_mode.take() else {
+            return false;
+        };
+        let failed = mode_spec(&self.surface.pending_mode()).id();
+        if let Err(error) = self.surface.use_mode(old) {
+            eprintln!(
+                "tuna-compositor: drm: {}: restoring the previous mode failed: {error}",
+                self.name
+            );
+            return false;
+        }
+        let (w, h) = old.size();
+        self.size = (i32::from(w), i32::from(h)).into();
+        self.output
+            .change_current_state(Some(Mode::from(old)), None, None, None);
+        self.advertise_mode(old);
+        self.last_frame = None;
+        self.damage_tracker = None;
+        self.mode_reverted = true;
+        eprintln!(
+            "tuna-compositor: drm: {}: commit of {failed} failed; back to {}",
+            self.name,
+            mode_spec(&old).id()
+        );
+        true
     }
 }
 
@@ -141,6 +277,8 @@ pub struct DrmBackend {
     /// libinput devices, for GNOME's touchpad and mouse settings (#60).
     devices: Vec<smithay::reexports::input::Device>,
     input_settings: tuna_shell_control::InputSettings,
+    /// Bumped by every applied layout or reverted mode (#340).
+    layout_generation: u64,
 }
 
 /// Event sources the runtime installs on its loop.
@@ -282,7 +420,6 @@ impl DrmBackend {
             .filter(|device| *device == drm.device_id());
         let mut used: Vec<crtc::Handle> = Vec::new();
         let mut outputs = Vec::new();
-        let mut next_x = 0;
         for handle in resources.connectors() {
             let Ok(info) = drm.get_connector(*handle, false) else {
                 continue;
@@ -290,15 +427,32 @@ impl DrmBackend {
             if info.state() != connector::State::Connected {
                 continue;
             }
-            let Some(mode) = info
+            // Mutter's monitor modes (#340): every connector mode,
+            // deduplicated and sorted; the session starts in the
+            // preferred one.
+            let crtc_modes: Vec<crate::display_config::CrtcMode> = info
                 .modes()
                 .iter()
-                .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-                .or_else(|| info.modes().first())
-                .copied()
+                .map(|m| crate::display_config::CrtcMode {
+                    spec: mode_spec(m),
+                    flags: m.flags().bits(),
+                })
+                .collect();
+            let kernel_preferred = info
+                .modes()
+                .iter()
+                .position(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED));
+            let Some(listed) = crate::display_config::monitor_modes(&crtc_modes, kernel_preferred)
             else {
                 continue;
             };
+            let modes: Vec<(crate::display_config::ModeSpec, control::Mode)> = listed
+                .modes
+                .iter()
+                .map(|&i| (crtc_modes[i].spec, info.modes()[i]))
+                .collect();
+            let preferred_mode = listed.preferred;
+            let mode = modes[preferred_mode].1;
             let crtc = info
                 .encoders()
                 .iter()
@@ -364,68 +518,22 @@ impl DrmBackend {
                 native_owner,
                 surface,
                 output,
+                modes,
+                preferred_mode,
+                size_mm: (mm_w as i32, mm_h as i32),
                 size,
                 loc: (0, 0),
                 scale: 1.0,
                 transform: 0,
+                enabled: true,
+                mirror_of: None,
+                rollback_mode: None,
+                mode_reverted: false,
                 pending: false,
                 last_frame: None,
                 damage_tracker: None,
                 wake_trace: false,
             });
-        }
-        // GNOME's arrangement for exactly these connectors (#59): scale
-        // and logical position per output; without one, TUNA_SCALE (or
-        // 1) and left-to-right logical placement.
-        let names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
-        let arrangement = crate::monitors::load(&names);
-        let fallback_scale = std::env::var("TUNA_SCALE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map(crate::runtime::clamp_scale)
-            .unwrap_or(1.0);
-        for out in outputs.iter_mut() {
-            match arrangement.get(&out.name) {
-                Some(config) => {
-                    out.scale = crate::runtime::clamp_scale(config.scale);
-                    out.loc = (config.x, config.y);
-                    out.transform = config.transform;
-                }
-                None => {
-                    out.scale = fallback_scale;
-                    out.loc = (next_x, 0);
-                }
-            }
-            if !crate::orientation::transform_is_supported(out.transform) {
-                eprintln!(
-                    "tuna-compositor: drm: output {}: transform {} unsupported, staying normal",
-                    out.name, out.transform
-                );
-                out.transform = 0;
-            }
-            next_x = next_x.max(out.loc.0 + out.logical_size().0);
-            out.output.change_current_state(
-                None,
-                Some(crate::orientation::smithay_transform(out.transform)),
-                Some(if out.scale == 1.0 {
-                    smithay::output::Scale::Integer(1)
-                } else {
-                    smithay::output::Scale::Fractional(out.scale)
-                }),
-                Some(out.loc.into()),
-            );
-            eprintln!(
-                "tuna-compositor: drm: output {} {}x{} at {},{} scale {} transform {}",
-                out.name, out.size.w, out.size.h, out.loc.0, out.loc.1, out.scale, out.transform
-            );
-        }
-        // GNOME's primary monitor first: it carries the top bar.
-        if let Some(primary) = outputs
-            .iter()
-            .position(|o| arrangement.get(&o.name).is_some_and(|c| c.primary))
-        {
-            let primary = outputs.remove(primary);
-            outputs.insert(0, primary);
         }
         if outputs.is_empty() {
             return Err(DrmInitError(format!(
@@ -433,40 +541,92 @@ impl DrmBackend {
                 path.display()
             )));
         }
+        // GNOME's configuration for exactly these connectors (#59,
+        // #340): modes, scale, position, rotation, mirrors and switched
+        // off monitors; the rest at TUNA_SCALE (or 1), left to right.
+        let names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
+        let stored = crate::monitors::load(&names);
+        let fallback_scale = std::env::var("TUNA_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(crate::runtime::clamp_scale)
+            .unwrap_or(1.0);
+        let connectors: Vec<crate::display_config::StartupConnector> = outputs
+            .iter()
+            .map(|o| crate::display_config::StartupConnector {
+                name: o.name.clone(),
+                modes: o.modes.iter().map(|(spec, _)| *spec).collect(),
+                preferred: o.preferred_mode,
+            })
+            .collect();
+        let layouts =
+            crate::display_config::startup_layouts(stored.as_ref(), &connectors, fallback_scale);
 
         let mut libinput = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
         libinput
             .udev_assign_seat(&seat)
             .map_err(|()| DrmInitError(format!("libinput: cannot assign seat {seat}")))?;
         let input = LibinputInputBackend::new(libinput.clone());
-        let (first_w, first_h) = outputs[0].logical_size();
-        let first_loc = outputs[0].loc;
+        let mut backend = Self {
+            session,
+            drm,
+            renderer,
+            outputs,
+            libinput,
+            active: true,
+            sleep_reset_pending: false,
+            powered_off: false,
+            outputs_disabled: false,
+            wake_scanout_blocked: false,
+            wake_event_traces: 0,
+            pointer: (0.0, 0.0).into(),
+            ctrl: false,
+            alt: false,
+            devices: Vec::new(),
+            input_settings: Default::default(),
+            corner_pressure: Default::default(),
+            hot_corner_active: true,
+            relative_motion_events: 0,
+            layout_generation: 0,
+        };
+        if let Err(error) = backend.apply_layout(&layouts) {
+            // A stored mode the kernel refused: Mutter falls back to its
+            // default configuration the same way.
+            eprintln!("tuna-compositor: drm: stored display configuration not applied: {error}");
+            let linear = crate::display_config::startup_layouts(None, &connectors, fallback_scale);
+            backend
+                .apply_layout(&linear)
+                .map_err(|e| DrmInitError(format!("output layout: {e}")))?;
+        }
+        for out in &backend.outputs {
+            if !out.enabled {
+                eprintln!("tuna-compositor: drm: connector {} switched off", out.name);
+                continue;
+            }
+            eprintln!(
+                "tuna-compositor: drm: output {} {}x{} at {},{} scale {} transform {}{}",
+                out.name,
+                out.size.w,
+                out.size.h,
+                out.loc.0,
+                out.loc.1,
+                out.scale,
+                out.transform,
+                out.mirror_of
+                    .as_ref()
+                    .map(|leader| format!(" mirroring {leader}"))
+                    .unwrap_or_default(),
+            );
+        }
+        let (first_w, first_h) = backend.outputs[0].logical_size();
+        let first_loc = backend.outputs[0].loc;
+        backend.pointer = (
+            f64::from(first_loc.0) + f64::from(first_w) / 2.0,
+            f64::from(first_loc.1) + f64::from(first_h) / 2.0,
+        )
+            .into();
         Ok((
-            Self {
-                session,
-                drm,
-                renderer,
-                outputs,
-                libinput,
-                active: true,
-                sleep_reset_pending: false,
-                powered_off: false,
-                outputs_disabled: false,
-                wake_scanout_blocked: false,
-                wake_event_traces: 0,
-                pointer: (
-                    f64::from(first_loc.0) + f64::from(first_w) / 2.0,
-                    f64::from(first_loc.1) + f64::from(first_h) / 2.0,
-                )
-                    .into(),
-                ctrl: false,
-                alt: false,
-                devices: Vec::new(),
-                input_settings: Default::default(),
-                corner_pressure: Default::default(),
-                hot_corner_active: true,
-                relative_motion_events: 0,
-            },
+            backend,
             DrmSources {
                 session: session_notifier,
                 drm: drm_notifier,
@@ -475,10 +635,245 @@ impl DrmBackend {
         ))
     }
 
+    /// Apply a layout (#340), all or nothing. Every new mode is tested
+    /// on the hardware first: Smithay's `use_mode` makes an atomic
+    /// TEST_ONLY commit with a test buffer and keeps the old mode when
+    /// the kernel refuses; one refusal returns every output already
+    /// switched to its previous mode. Then outputs switch off, the rest
+    /// take their position, scale, rotation and mirror leader, and the
+    /// primary leader moves first. The next frame commits the modes;
+    /// should that commit still fail, the output returns to its old
+    /// mode ([`DrmOutput::revert_failed_mode`]).
+    pub fn apply_layout(
+        &mut self,
+        layouts: &[crate::display_config::OutputLayout],
+    ) -> Result<(), String> {
+        let mut plan = Vec::with_capacity(layouts.len());
+        for layout in layouts {
+            let index = self
+                .outputs
+                .iter()
+                .position(|o| o.name == layout.connector)
+                .ok_or_else(|| format!("connector '{}' not found", layout.connector))?;
+            let target = match &layout.enabled {
+                None => None,
+                Some(enabled) => {
+                    let out = &self.outputs[index];
+                    let mode = match enabled.mode {
+                        None => out.surface.pending_mode(),
+                        Some(spec) => out
+                            .modes
+                            .iter()
+                            .find(|(s, _)| s.equals(&spec))
+                            .map(|(_, m)| *m)
+                            .ok_or_else(|| {
+                                format!("mode {} not available on {}", spec.id(), out.name)
+                            })?,
+                    };
+                    Some((enabled, mode))
+                }
+            };
+            plan.push((index, target));
+        }
+        if plan.iter().all(|(_, target)| target.is_none()) {
+            return Err("at least one output must stay on".into());
+        }
+        // Test phase: nothing visible changes yet.
+        let mut tested: Vec<(usize, control::Mode)> = Vec::new();
+        for (index, target) in &plan {
+            let Some((_, mode)) = target else {
+                continue;
+            };
+            let result = {
+                let out = &mut self.outputs[*index];
+                let old = out.surface.pending_mode();
+                if old == *mode && out.enabled {
+                    continue;
+                }
+                out.surface.use_mode(*mode).map(|()| old).map_err(|error| {
+                    format!(
+                        "{}: the kernel refused {}: {error}",
+                        out.name,
+                        mode_spec(mode).id()
+                    )
+                })
+            };
+            match result {
+                Ok(old) => tested.push((*index, old)),
+                Err(message) => {
+                    for (index, old) in tested.into_iter().rev() {
+                        let _ = self.outputs[index].surface.use_mode(old);
+                    }
+                    return Err(message);
+                }
+            }
+        }
+        // Commit phase.
+        for (index, target) in plan {
+            let out = &mut self.outputs[index];
+            let Some((layout, mode)) = target else {
+                out.switch_off();
+                continue;
+            };
+            let replaced = tested
+                .iter()
+                .find(|(i, _)| *i == index)
+                .map(|(_, old)| *old);
+            if !out.enabled {
+                out.surface.reset_buffers();
+                out.pending = false;
+                out.rollback_mode = None;
+            } else if replaced.is_some() {
+                out.rollback_mode = replaced;
+            }
+            out.enabled = true;
+            out.mirror_of = layout.mirror_of.clone();
+            let (w, h) = mode.size();
+            out.size = (i32::from(w), i32::from(h)).into();
+            out.scale = crate::runtime::clamp_scale(layout.scale);
+            out.loc = layout.loc;
+            out.transform = if crate::orientation::transform_is_supported(layout.transform) {
+                layout.transform
+            } else {
+                0
+            };
+            out.output.change_current_state(
+                Some(Mode::from(mode)),
+                Some(crate::orientation::smithay_transform(out.transform)),
+                Some(if out.scale == 1.0 {
+                    smithay::output::Scale::Integer(1)
+                } else {
+                    smithay::output::Scale::Fractional(out.scale)
+                }),
+                Some(out.loc.into()),
+            );
+            out.advertise_mode(mode);
+            out.last_frame = None;
+            out.damage_tracker = None;
+        }
+        // GNOME's primary monitor first: it carries the top bar and
+        // paces the frame clock.
+        let primary = layouts.iter().find(|l| {
+            l.enabled
+                .as_ref()
+                .is_some_and(|e| e.primary && e.mirror_of.is_none())
+        });
+        if let Some(position) =
+            primary.and_then(|p| self.outputs.iter().position(|o| o.name == p.connector))
+        {
+            let primary = self.outputs.remove(position);
+            self.outputs.insert(0, primary);
+        }
+        self.layout_generation += 1;
+        Ok(())
+    }
+
+    /// Bumped by every applied layout and reverted mode: the runtime
+    /// republishes the display state when it moves.
+    pub fn layout_generation(&self) -> u64 {
+        self.layout_generation
+    }
+
+    /// Whether a refused commit restored an output's previous mode
+    /// since the last call.
+    pub fn take_mode_reverted(&mut self) -> bool {
+        let mut reverted = false;
+        for out in &mut self.outputs {
+            reverted |= std::mem::take(&mut out.mode_reverted);
+        }
+        if reverted {
+            self.layout_generation += 1;
+        }
+        reverted
+    }
+
+    /// What `org.gnome.Mutter.DisplayConfig` reports (#340): every
+    /// connector with its modes, and one logical monitor per lit leader
+    /// with its clones. The primary leader is first.
+    pub fn display_state(&self) -> crate::display_config::DisplayState {
+        use crate::display_config::{DisplayState, LogicalState, MonitorState};
+        let monitors = self
+            .outputs
+            .iter()
+            .map(|out| {
+                let properties = out.output.physical_properties();
+                let builtin = crate::orientation::is_builtin_panel(&out.name);
+                MonitorState {
+                    spec: crate::monitors::MonitorSpec {
+                        connector: out.name.clone(),
+                        vendor: properties.make,
+                        product: properties.model.clone(),
+                        // Mutter's serial; the connector keeps session
+                        // restore stable.
+                        serial: out.name.clone(),
+                    },
+                    display_name: if builtin {
+                        "Built-in display".to_owned()
+                    } else {
+                        properties.model
+                    },
+                    builtin,
+                    width_mm: out.size_mm.0,
+                    height_mm: out.size_mm.1,
+                    modes: out.modes.iter().map(|(spec, _)| *spec).collect(),
+                    preferred: out.preferred_mode,
+                    current: out.enabled.then(|| out.current_mode_index()).flatten(),
+                }
+            })
+            .collect();
+        let logical = self
+            .outputs
+            .iter()
+            .filter(|out| out.is_leader())
+            .enumerate()
+            .map(|(index, leader)| LogicalState {
+                x: leader.loc.0,
+                y: leader.loc.1,
+                scale: leader.scale,
+                transform: leader.transform,
+                primary: index == 0,
+                monitors: std::iter::once(leader.name.clone())
+                    .chain(
+                        self.outputs
+                            .iter()
+                            .filter(|o| {
+                                o.enabled && o.mirror_of.as_deref() == Some(leader.name.as_str())
+                            })
+                            .map(|o| o.name.clone()),
+                    )
+                    .collect(),
+            })
+            .collect();
+        DisplayState {
+            serial: 0,
+            monitors,
+            logical,
+        }
+    }
+
+    /// The mode each CRTC is actually set to, as the kernel reports it
+    /// (`drmModeGetCrtc`): what the DRM smoke proof compares against
+    /// the mode GNOME Settings asked for.
+    pub fn crtc_modes(&self) -> Vec<(String, Option<String>)> {
+        self.outputs
+            .iter()
+            .map(|out| {
+                let mode = self
+                    .drm
+                    .get_crtc(out.crtc)
+                    .ok()
+                    .and_then(|info| info.mode())
+                    .map(|mode| mode_spec(&mode).id());
+                (out.name.clone(), mode)
+            })
+            .collect()
+    }
+
     /// Output rectangles in the global logical space.
     pub fn output_rects(&self) -> Vec<Rectangle<i32, Logical>> {
         self.outputs
             .iter()
+            .filter(|o| o.enabled)
             .map(|o| Rectangle::new(o.loc.into(), o.logical_size().into()))
             .collect()
     }

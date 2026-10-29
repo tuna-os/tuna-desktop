@@ -29,12 +29,12 @@ pub const MAX_TITLE_LEN: usize = 512;
 
 pub mod layer_namespaces;
 pub use layer_namespaces::{
-    BANNER_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE,
-    GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE,
-    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_NAMESPACE,
-    POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE,
-    SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE, SWITCHER_THUMBNAILS_NAMESPACE,
-    WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
+    BANNER_NAMESPACE, DISPLAY_CHANGE_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE,
+    FOLDER_DIALOG_NAMESPACE, GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE,
+    KBD_A11Y_NAMESPACE, NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE,
+    PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
+    SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
+    SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
 };
 
 /// Panel height in pixels (compositor ↔ shell contract).
@@ -183,9 +183,11 @@ impl ProtocolVersion {
     /// postcard peers must ship together.
     /// `0.41` appends mutter's `center-new-windows` to InputSettings;
     /// positional postcard peers must ship together.
+    /// `0.42` appends GNOME's display-change confirmation: compositor-to-shell
+    /// `ConfirmDisplayChange` and shell-to-compositor `CompleteDisplayChange`.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 41,
+        minor: 42,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -432,6 +434,9 @@ pub enum CommandKind {
     /// Since 0.38: atomic full accelerator replacement with GNOME grab
     /// flags, at most [`MAX_ACCELERATORS`]; supersedes `SetAccelerators`.
     SetAcceleratorGrabs { grabs: Vec<AcceleratorGrab> },
+    /// Since 0.42: the display-change dialog's answer (GNOME's
+    /// `complete_display_change`): Keep Changes = true, Revert Settings = false.
+    CompleteDisplayChange { keep: bool },
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -828,6 +833,10 @@ pub enum Message {
     /// Since 0.38: release of an originally admitted press of a grab
     /// carrying [`GRAB_TRIGGER_RELEASE`] (GNOME's AcceleratorDeactivated).
     AcceleratorDeactivated { action: u32, time: u32, mode: u32 },
+    /// Since 0.42: show GNOME's "Keep these display settings?" dialog with
+    /// this countdown; a newer one replaces an open dialog and restarts it.
+    /// Sent only to peers advertising minor >=41.
+    ConfirmDisplayChange { timeout_secs: u32 },
 }
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
@@ -1831,6 +1840,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         Message::Hello { .. }
         | Message::AcceleratorActivated { .. }
         | Message::AcceleratorDeactivated { .. }
+        | Message::ConfirmDisplayChange { .. }
         | Message::WindowMenu { .. }
         | Message::WorkspacePopup { .. }
         | Message::PointerOutput { .. }
@@ -2085,7 +2095,7 @@ mod tests {
 
     #[test]
     fn current_version_is_0_41() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 41));
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 42));
     }
 
     #[test]
@@ -3094,6 +3104,7 @@ mod accelerator_release_wire_tests {
                 time: 200,
                 mode: MODE_NORMAL,
             },
+            Message::ConfirmDisplayChange { timeout_secs: 20 },
         ]
         .iter()
         .enumerate()
@@ -3110,5 +3121,18 @@ mod accelerator_release_wire_tests {
                 click: DwellClick::Primary,
             }) + 1
         );
+        assert_eq!(
+            command(CommandKind::CompleteDisplayChange { keep: true }),
+            command(CommandKind::SetAcceleratorGrabs { grabs: Vec::new() }) + 1
+        );
+        for message in [
+            Message::ConfirmDisplayChange { timeout_secs: 20 },
+            Message::Command {
+                id: 12,
+                kind: CommandKind::CompleteDisplayChange { keep: false },
+            },
+        ] {
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
     }
 }

@@ -194,8 +194,11 @@
 #                  unlocks, fades only under Reduced Motion, instant
 #                  with animations off
 #                  (these sample TUNA_ANIMATION_CLOCK at exact delays)
-#   G-DISPLAY-SETTINGS GNOME Settings' ApplyMonitorsConfig changes the
-#                  scale live and saves it to Tuna Desktop's monitors.xml (#59)
+#   G-DISPLAY-SETTINGS GNOME Settings' DisplayConfig as Mutter 51 answers
+#                  it: modes and scales listed, verify/stale/bad-mode
+#                  errors, temporary changes unsaved, persistent ones
+#                  kept by GNOME Shell's dialog into monitors.xml or
+#                  reverted by Revert Settings or the 20 s timeout (#59, #340)
 #   G-POWER-MENU   the power button opens GNOME's menu (Suspend,
 #                  Restart…, Power Off…, Log Out…) (#62)
 #   G-POWER-ESCAPE Escape dismisses the end-session dialog (it holds the
@@ -8927,14 +8930,72 @@ else
     echo "tuna-gtk-shell-proof: G-SCREENCAST skipped (no pipewire, wireplumber or gstreamer)"
 fi
 
-# Display settings (#59): what GNOME Settings' Displays panel sends.
+# Display settings (#59, #340): what GNOME Settings' Displays panel
+# sends, against Mutter 51's DisplayConfig semantics.
+DISPLAY_LOG="$ARTIFACTS/display-settings.log"
+display_state() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.GetCurrentState
+}
+display_serial() {
+    display_state | sed -n 's/^(uint32 \([0-9]*\),.*/\1/p'
+}
+# apply_display METHOD SCALE [MODE] [SERIAL]: the configuration serial
+# comes from GetCurrentState, as GNOME Settings reads it.
 apply_display() {
+    serial="${4:-$(display_serial)}"
+    [ -n "$serial" ] || return 1
     gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
         --object-path /org/gnome/Mutter/DisplayConfig \
         --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
-        -- 0 "$1" "[(0, 0, $2, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', @a{sv} {})])]" \
-        "@a{sv} {}" >>"$ARTIFACTS/display-settings.log" 2>&1
+        "$serial" "$1" "[(0, 0, $2, uint32 0, true, [('tuna-0', '${3:-${WIDTH}x${HEIGHT}@60.000}', {'color-mode': <uint32 0>, 'underscanning': <false>})])]" \
+        "@a{sv} {}" >>"$DISPLAY_LOG" 2>&1
 }
+# GNOME Shell's "Keep these display settings?" dialog: wait until it
+# shows its countdown, then press NAME as a screen-reader user would.
+display_dialog_press() {
+    end=$(($(date +%s) + 10))
+    until "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-display-change-$2.json" 5 >/dev/null 2>&1 &&
+        showing "$ARTIFACTS/a11y-display-change-$2.json" "$1"; do
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.3
+    done
+    jq -e 'any(.[]; .showing and (.name | test("^Settings changes will revert in [0-9]+ seconds?$")))' \
+        "$ARTIFACTS/a11y-display-change-$2.json" >/dev/null || return 1
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-display-change-$2-pressed.json" 5 \
+        --press "$1" >/dev/null 2>&1
+}
+# GetCurrentState lists the nested monitor's mode with Mutter's flags
+# and the scales Mutter 51 computes for 1280x800.
+display_state >"$ARTIFACTS/display-state.txt" 2>&1 ||
+    fail G-DISPLAY-SETTINGS "GetCurrentState failed: $(tail -2 "$ARTIFACTS/display-state.txt")"
+if ! { grep -qF "('${WIDTH}x${HEIGHT}@60.000', ${WIDTH}, ${HEIGHT}, 60.0, 1.0, [1.0, 1.25, 1.3333333730697632, 1.6666666269302368]" "$ARTIFACTS/display-state.txt" &&
+    grep -qF "'is-current': <true>" "$ARTIFACTS/display-state.txt" &&
+    grep -qF "'is-preferred': <true>" "$ARTIFACTS/display-state.txt" &&
+    grep -qF "{'layout-mode': <uint32 1>}" "$ARTIFACTS/display-state.txt"; }; then
+    fail G-DISPLAY-SETTINGS "GetCurrentState is not Mutter's: $(cat "$ARTIFACTS/display-state.txt")"
+fi
+serial=$(display_serial)
+[ -n "$serial" ] || fail G-DISPLAY-SETTINGS "no configuration serial"
+# Verify (method 0) checks without changing anything; Mutter's errors.
+apply_display 0 1 "640x480@60.000" &&
+    fail G-DISPLAY-SETTINGS "an unknown mode verified"
+tail -2 "$DISPLAY_LOG" | grep -q "InvalidArgs.*Invalid mode '640x480@60.000' specified" ||
+    fail G-DISPLAY-SETTINGS "an unknown mode was not refused as Mutter does: $(tail -2 "$DISPLAY_LOG")"
+apply_display 0 1.5 &&
+    fail G-DISPLAY-SETTINGS "an unsupported scale verified"
+tail -2 "$DISPLAY_LOG" | grep -q "Scale 1.5 not valid for resolution ${WIDTH}x${HEIGHT}" ||
+    fail G-DISPLAY-SETTINGS "scale 1.5 was not refused as Mutter does: $(tail -2 "$DISPLAY_LOG")"
+apply_display 1 1 "" "$((serial + 1))" &&
+    fail G-DISPLAY-SETTINGS "a stale serial was accepted"
+tail -2 "$DISPLAY_LOG" | grep -q "AccessDenied.*stale information" ||
+    fail G-DISPLAY-SETTINGS "a stale serial was not AccessDenied: $(tail -2 "$DISPLAY_LOG")"
+apply_display 0 1.25 || fail G-DISPLAY-SETTINGS "a valid configuration did not verify: $(tail -2 "$DISPLAY_LOG")"
+if ! { [ "$(display_serial)" = "$serial" ] && [ ! -e "$XDG_CONFIG_HOME/tuna/monitors.xml" ] &&
+    cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)" "verify changes nothing" 5; }; then
+    fail G-DISPLAY-SETTINGS "verifying changed the configuration"
+fi
 # The observer must subscribe before the actual display configuration changes.
 python3 "$ROOT/scripts/lib/tuna-introspect-size-client.py" \
     "$ARTIFACTS/introspect-size.json" "$WIDTH" "$HEIGHT" \
@@ -8954,9 +9015,19 @@ screen_frames=$(tval monitor_change animated_frames)
 anim_clock 0
 cstate '.animation_clock_manual' "frozen monitor clock" ||
     fail G-MONITOR-TRANSITION "the clock file did not freeze animation time"
-apply_display 2 1.25 || fail G-DISPLAY-SETTINGS "ApplyMonitorsConfig failed: $(tail -2 "$ARTIFACTS/display-settings.log")"
+# Persistent (method 2), as GNOME Settings' Apply sends it: applied at
+# once, saved only once GNOME Shell's dialog keeps it.
+apply_display 2 1.25 || fail G-DISPLAY-SETTINGS "ApplyMonitorsConfig failed: $(tail -2 "$DISPLAY_LOG")"
 cstate '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' "125 percent" ||
     fail G-DISPLAY-SETTINGS "the layout did not follow scale 1.25"
+cstate '.display_config.awaiting_confirmation' "awaiting confirmation" 5 ||
+    fail G-DISPLAY-SETTINGS "a persistent change did not await confirmation"
+[ ! -e "$XDG_CONFIG_HOME/tuna/monitors.xml" ] ||
+    fail G-DISPLAY-SETTINGS "a persistent change was saved before GNOME Shell's dialog kept it"
+display_dialog_press "Keep Changes" keep ||
+    fail G-DISPLAY-SETTINGS "GNOME Shell's Keep these display settings? dialog did not offer Keep Changes"
+cstate '(.display_config.awaiting_confirmation | not)' "kept" 5 ||
+    fail G-DISPLAY-SETTINGS "Keep Changes did not confirm the change"
 # GNOME's ScreenTransition: the old screen holds 250 ms, then fades out
 # over the new one for 500 ms.
 cstate ".transitions.monitor_change.started > $screen_started" "monitor transition began" ||
@@ -8971,24 +9042,66 @@ tsettled monitor_change "$screen_started" "$screen_frames" ||
 real_clock || fail G-MONITOR-TRANSITION "removing the clock file did not resume real time"
 grep -q '<scale>1.25</scale>' "$XDG_CONFIG_HOME/tuna/monitors.xml" 2>/dev/null ||
     fail G-DISPLAY-SETTINGS "the arrangement was not saved to tuna/monitors.xml"
+# Mutter's monitors.xml: layout mode, full monitor spec, the mode.
+for element in '<layoutmode>logical</layoutmode>' '<connector>tuna-0</connector>' \
+    '<vendor>Tuna Desktop</vendor>' "<width>${WIDTH}</width>" "<height>${HEIGHT}</height>" \
+    '<rate>60.000</rate>' '<primary>yes</primary>'; do
+    grep -qF "$element" "$XDG_CONFIG_HOME/tuna/monitors.xml" ||
+        fail G-DISPLAY-SETTINGS "tuna/monitors.xml lacks Mutter's $element"
+done
+cp "$XDG_CONFIG_HOME/tuna/monitors.xml" "$ARTIFACTS/monitors-kept.xml"
 scrot "$ARTIFACTS/24-scale-125.png" >/dev/null
 wait_size_marker scaled || fail G-INTROSPECT-SIZE "scaled property and notification did not reach the real client"
 gsettings set org.gnome.desktop.interface enable-animations false
 cstate '(.animations_enabled | not)' "still monitors" ||
     fail G-MONITOR-TRANSITION "enable-animations false did not reach the compositor"
 screen_started=$(tval monitor_change started)
+# Temporary (method 1): applied, never confirmed nor saved.
 apply_display 1 1 || fail G-DISPLAY-SETTINGS "restoring scale 1 failed"
 cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)" "100 percent" ||
     fail G-DISPLAY-SETTINGS "the layout did not return to scale 1"
 cstate ".transitions.monitor_change.started == $screen_started and (.transitions.monitor_change.active | not)" "instant monitor change" 5 ||
     fail G-MONITOR-TRANSITION "the monitor change faded with animations off"
+if ! { cstate '(.display_config.awaiting_confirmation | not)' "temporary" 5 &&
+    cmp -s "$XDG_CONFIG_HOME/tuna/monitors.xml" "$ARTIFACTS/monitors-kept.xml"; }; then
+    fail G-DISPLAY-SETTINGS "a temporary change asked for confirmation or was saved"
+fi
 gsettings set org.gnome.desktop.interface enable-animations true
 cstate '.animations_enabled' "monitor motion restored" ||
     fail G-MONITOR-TRANSITION "enable-animations true did not reach the compositor"
 pass G-MONITOR-TRANSITION "a monitor change fades the old screen out over 750 ms, then nothing animates; none with animations off"
-pass G-DISPLAY-SETTINGS "ApplyMonitorsConfig changes the scale live and saves it"
 wait "$SIZE_CLIENT" || fail G-INTROSPECT-SIZE "restored desktop size did not reach the D-Bus client"
 pass G-INTROSPECT-SIZE "initial desktop size and two actual scale-change notifications agree"
+# Revert Settings returns the configuration before the change at once.
+apply_display 2 1.25 || fail G-DISPLAY-SETTINGS "the second persistent change failed: $(tail -2 "$DISPLAY_LOG")"
+cstate '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' "125 percent again" ||
+    fail G-DISPLAY-SETTINGS "the layout did not follow scale 1.25 again"
+display_dialog_press "Revert Settings" revert ||
+    fail G-DISPLAY-SETTINGS "GNOME Shell's dialog did not offer Revert Settings"
+cstate "(.layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)) and (.display_config.awaiting_confirmation | not)" "reverted" 5 ||
+    fail G-DISPLAY-SETTINGS "Revert Settings did not restore scale 1"
+cmp -s "$XDG_CONFIG_HOME/tuna/monitors.xml" "$ARTIFACTS/monitors-kept.xml" ||
+    fail G-DISPLAY-SETTINGS "a reverted change was saved"
+# Unanswered, Mutter reverts after its 20 second timeout and the
+# dialog's countdown closes it.
+apply_display 2 1.25 || fail G-DISPLAY-SETTINGS "the third persistent change failed: $(tail -2 "$DISPLAY_LOG")"
+cstate '(.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)) and .display_config.awaiting_confirmation' "awaiting the timeout" ||
+    fail G-DISPLAY-SETTINGS "the third persistent change did not apply"
+changed_at=$(date +%s)
+cstate "(.layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)) and (.display_config.awaiting_confirmation | not)" "timed out" 30 ||
+    fail G-DISPLAY-SETTINGS "an unanswered change did not revert"
+elapsed=$(($(date +%s) - changed_at))
+[ "$elapsed" -ge 18 ] || fail G-DISPLAY-SETTINGS "the change reverted after ${elapsed}s, before Mutter's 20 second timeout"
+# The dialog's own one-second countdown started just after the change.
+end=$(($(date +%s) + 5))
+until "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-display-change-expired.json" 5 >/dev/null 2>&1 &&
+    hidden "$ARTIFACTS/a11y-display-change-expired.json" "Keep Changes"; do
+    [ "$(date +%s)" -le "$end" ] || fail G-DISPLAY-SETTINGS "the confirmation dialog outlived its countdown"
+    sleep 0.5
+done
+cmp -s "$XDG_CONFIG_HOME/tuna/monitors.xml" "$ARTIFACTS/monitors-kept.xml" ||
+    fail G-DISPLAY-SETTINGS "a timed-out change was saved"
+pass G-DISPLAY-SETTINGS "GetCurrentState lists Mutter's modes and scales; verify, stale serials and bad modes answer like Mutter; temporary applies unsaved; persistent applies, awaits GNOME Shell's dialog, saves Mutter's monitors.xml on Keep Changes and reverts on Revert Settings or after 20 s"
 
 # Power (#62), against the logind stub (restarted: G-QS-ABSENT stopped
 # it). The proof runs the shell as a hardware session for the full menu.

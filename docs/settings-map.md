@@ -97,7 +97,7 @@ Proof V-GSD-PLUGINS checks every started plugin's process, user, unit and bus na
 | File | Status | Notes |
 |---|---|---|
 | ~/.config/monitors.xml | Honored | The arrangement for the lit connectors sets each output's scale, position and primary monitor (hardware sessions). Proof D-SCALE |
-| GNOME Settings' Displays panel | Partial | ApplyMonitorsConfig over org.gnome.Mutter.DisplayConfig changes scale and position live; "keep changes" saves to ~/.config/tuna/monitors.xml, which Tuna Desktop reads before GNOME's file (GNOME's own file is never rewritten). Proof G-DISPLAY-SETTINGS |
+| GNOME Settings' Displays panel | Partial | org.gnome.Mutter.DisplayConfig as Mutter 51: every mode, refresh rate and scale listed; resolution, refresh, scale, position, rotation, primary, mirroring and switching monitors off apply live; persistent changes await GNOME Shell's "Keep these display settings?" dialog (20 s revert) and are kept in Mutter's monitors.xml format in ~/.config/tuna/monitors.xml, read before GNOME's file. Proof G-DISPLAY-SETTINGS, D-MODES |
 
 ## Window management and input
 

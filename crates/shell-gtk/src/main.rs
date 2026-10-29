@@ -21,6 +21,7 @@ mod brightness;
 mod brightness_service;
 mod bt_menu;
 mod calendar;
+mod display_change;
 mod events;
 mod fd_watch;
 mod folder_dialog;
@@ -133,6 +134,8 @@ struct Drained {
     accelerators: Vec<(u32, u32, u32, bool)>,
     menus: Vec<tuna_shell_host::control::WindowMenuRequest>,
     consent: Option<Option<(u64, String)>>,
+    /// The latest display-change confirmation countdown, in seconds.
+    display_change: Option<u32>,
     popups: Vec<(u32, u32)>,
     aid_switches: Vec<(tuna_shell_control::KeyboardAid, bool)>,
     /// The click the next hover click makes, when the compositor changed it.
@@ -203,6 +206,7 @@ fn drain(
             }
             Handled::WindowMenu(request) => out.menus.push(request),
             Handled::ShortcutConsent(request) => out.consent = Some(request),
+            Handled::ConfirmDisplayChange(secs) => out.display_change = Some(secs),
             Handled::ScreenReader(state) => {
                 if matches!(
                     state,
@@ -3254,6 +3258,17 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    let display_change_dialog = {
+        let shell = shell.clone();
+        display_change::DisplayChange::new(
+            app.upcast_ref(),
+            Rc::new(move |keep| {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    let _ = control.complete_display_change(keep);
+                }
+            }),
+        )
+    };
     let kbd_a11y_dialog = kbd_a11y::KbdA11yDialog::new(app.upcast_ref());
     let pie_timer = pointer_a11y::PieTimer::new(app.upcast_ref());
     // Compositor state: the control socket is drained whenever it is
@@ -3318,6 +3333,7 @@ fn build(app: &adw::Application) {
                     accelerators,
                     menus,
                     consent,
+                    display_change,
                     popups,
                     aid_switches,
                     dwell_click,
@@ -3381,6 +3397,11 @@ fn build(app: &adw::Application) {
                     shortcut_consent.dismiss();
                 } else if let Some(request) = consent {
                     shortcut_consent.sync(request);
+                }
+                if locked {
+                    display_change_dialog.close();
+                } else if let Some(secs) = display_change {
+                    display_change_dialog.show(secs);
                 }
                 for (action, time, mode, released) in accelerators {
                     if released {
