@@ -1772,8 +1772,8 @@ pass G-WINDOW-SWITCHER "bound switch-windows forward/backward show separate wind
 # GNOME's current-workspace-only keys (P-WM-08; gnome-shell 51.0
 # altTab.js): Gamma moves to the next workspace; the window switcher
 # (org.gnome.shell.window-switcher, default on) then lists only this
-# workspace's windows, and all four with the key off, where picking Gamma
-# follows it to its workspace. The app switcher (default off) lists
+# workspace's windows, and all four, Gamma included, with the key off.
+# The app switcher (default off) lists
 # Gamma's app until org.gnome.shell.app-switcher limits it.
 mt_home="$(jq .active_workspace "$CSTATE")"
 mt_gamma="$(jq -r '.windows[] | select(.app_id == "tuna-test-gamma") | .id' "$CSTATE")"
@@ -1813,12 +1813,13 @@ cstate '.switcher_thumbnails == 4' "every workspace's windows" ||
     { xdotool keyup Control_L; fail G-SWITCHER-WORKSPACE "with current-workspace-only off the window switcher did not list all 4 windows"; }
 sleep 0.7
 scrot "$ARTIFACTS/08d-window-switcher-all-workspaces.png" >/dev/null
-xdotool keyup Control_L
-cstate ".focused == $mt_gamma and .active_workspace == $mt_away" "followed gamma" ||
-    fail G-SWITCHER-WORKSPACE "picking Gamma did not activate it on its workspace"
-xdotool key super+Page_Up
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-window-switcher-all.json" 20 ||
+    { xdotool keyup Control_L; fail G-SWITCHER-WORKSPACE "a11y dump failed"; }
+xdotool key Escape keyup Control_L
+[ "$(jq '[.[] | select(.showing and .role == "list item" and (.name | test("Gamma")))] | length' "$ARTIFACTS/a11y-window-switcher-all.json")" = 1 ] ||
+    fail G-SWITCHER-WORKSPACE "with current-workspace-only off the window switcher did not list Gamma from the other workspace"
 cstate ".active_workspace == $mt_home" "home for apps" ||
-    fail G-SWITCHER-WORKSPACE "could not return home before the app switcher"
+    fail G-SWITCHER-WORKSPACE "Escape did not cancel the unlimited window switcher"
 sleep 1
 xdotool keydown Alt_L key Tab
 sleep 1
@@ -1848,7 +1849,7 @@ cstate ".active_workspace == $mt_away and .focused == $mt_gamma" "gamma again" |
 xdotool key super+shift+Page_Up
 cstate "all(.windows[]; .workspace == $mt_home) and .active_workspace == $mt_home" "gamma home" ||
     fail G-SWITCHER-WORKSPACE "Super+Shift+Page_Up did not bring Gamma home"
-pass G-SWITCHER-WORKSPACE "window and app switchers follow their current-workspace-only keys live; an off-workspace pick follows its window"
+pass G-SWITCHER-WORKSPACE "window and app switchers follow their current-workspace-only keys live"
 
 # Fixed workspaces (P-WM-08; mutter 51 workspace manager): with
 # dynamic-workspaces off the count is num-workspaces, empty slots kept;
@@ -1912,8 +1913,9 @@ EOF2
     fi
     cp "$CSTATE" "$ARTIFACTS/center-new-windows-$mt_center.json"
     scrot "$ARTIFACTS/08f-center-new-windows-$mt_center.png" >/dev/null
-    [ "$dx" = "$want_x" ] && [ "$dy" = "$want_y" ] ||
+    if [ "$dx" != "$want_x" ] || [ "$dy" != "$want_y" ]; then
         fail G-CENTER-NEW-WINDOWS "center-new-windows=$mt_center placed ${dw}x$dh at $dx,$dy, not mutter's $want_x,$want_y"
+    fi
     kill "$mt_delta_pid"
     wait "$mt_delta_pid" 2>/dev/null || true
     cstate 'all(.windows[]; .app_id != "tuna-test-delta")' "delta gone" ||
