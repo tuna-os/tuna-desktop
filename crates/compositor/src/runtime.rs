@@ -783,6 +783,8 @@ pub struct Runtime {
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
+    /// org.gnome.SessionManager's inhibitors and session activity.
+    session_manager: crate::session_manager::Share,
     /// Screen magnifier (#349): Settings file cache plus each
     /// output's tracking state. Captures and casts apply it; the
     /// lock screen never magnifies.
@@ -1325,6 +1327,7 @@ impl Runtime {
             unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idle_monitor: crate::idle_monitor::start(),
+            session_manager: crate::session_manager::start(),
             magnifier: crate::magnifier::MagnifierState::new(),
             exit: false,
             stats: RunStats::default(),
@@ -3120,6 +3123,7 @@ impl Runtime {
                 &[],
                 &elements,
                 Target {
+                    output: Rectangle::from_size(size),
                     damage: &[Rectangle::from_size(size)],
                     scale,
                     blank_alpha: 0.0,
@@ -3331,6 +3335,7 @@ impl Runtime {
                 &paper,
                 &elements,
                 Target {
+                    output: damage,
                     damage: &[damage],
                     scale: view.scale,
                     blank_alpha,
@@ -4491,8 +4496,10 @@ impl Runtime {
         // A live idle inhibitor (video, presentation) counts as activity,
         // and so does its end: the loop may have slept through the
         // inhibited stretch, so the idle clock restarts when it ends
-        // instead of the session locking at once (#503).
-        let inhibited = self.state.idle_inhibited();
+        // instead of the session locking at once (#503). An idle
+        // inhibitor held through org.gnome.SessionManager (a portal or
+        // org.freedesktop.ScreenSaver caller) counts the same way.
+        let inhibited = self.state.idle_inhibited() || self.session_manager.idle_inhibited();
         if self
             .lock
             .inhibitor_activity(self.idle_inhibited, inhibited, self.lock_now_ms())
@@ -4602,7 +4609,9 @@ impl Runtime {
                 self.active_x11_client = None;
                 self.x11_failed = false;
                 self.pending_x11_client = None;
-                self.state.xwm = None;
+                if self.state.xwm.take().is_some() {
+                    crate::session_services::x11_display_closed();
+                }
                 if let Some(ime) = &mut self.ime {
                     ime.set_ready_x11_display(None);
                 }
@@ -5126,6 +5135,7 @@ impl Runtime {
                             &paper,
                             &elements,
                             Target {
+                                output: Rectangle::from_size(size),
                                 damage: &damage,
                                 scale: view.scale,
                                 blank_alpha,
@@ -5405,6 +5415,7 @@ impl Runtime {
                             &paper,
                             &elements,
                             Target {
+                                output: Rectangle::from_size(logical),
                                 damage: &damage,
                                 scale: view.scale,
                                 blank_alpha,
@@ -6378,6 +6389,8 @@ fn backdrop(
 /// What one frame redraws, and at which scale.
 #[derive(Debug, Clone, Copy)]
 struct Target<'a> {
+    /// The whole frame in physical pixels (rotated outputs swap its size).
+    output: Rectangle<i32, smithay::utils::Physical>,
     damage: &'a [Rectangle<i32, smithay::utils::Physical>],
     scale: f64,
     blank_alpha: f32,
@@ -6399,6 +6412,7 @@ fn draw_scene(
     use crate::occlusion::{draw_planned, Drawn, Occlusion};
     use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Id, Kind};
     let Target {
+        output,
         damage,
         scale,
         blank_alpha,
@@ -6435,13 +6449,13 @@ fn draw_scene(
     // Plan top to bottom (#503): each element repaints only damage that
     // no opaque element above it covers, so stacked windows and the
     // wallpaper under an opaque window are skipped.
-    let mut occlusion = Occlusion::new(damage);
-    let bounds = damage.iter().copied().reduce(Rectangle::merge);
+    let mut occlusion = Occlusion::new(output, damage);
     thread_local! { static SHIELD: Id = Id::new(); }
-    let shield = bounds.filter(|_| blank_alpha > 0.0).map(|bounds| {
+    // The blank covers the whole output; only its damage is repainted.
+    let shield = (blank_alpha > 0.0).then(|| {
         SolidColorRenderElement::new(
             SHIELD.with(Clone::clone),
-            bounds,
+            output,
             0usize,
             Color32F::new(0.0, 0.0, 0.0, blank_alpha),
             Kind::Unspecified,
@@ -6468,9 +6482,9 @@ fn draw_scene(
     let mut under = scene_slots(scene.elements.len() - split, split, true, &snapshot_at);
     insert_bell_slots(&mut over, scene);
     insert_bell_slots(&mut under, scene);
-    let over_plan = plan_slots(&mut occlusion, scale, scene, &over);
+    let (over_plan, over_shown) = plan_slots(&mut occlusion, scale, scene, &over);
     let tile_plan = occlusion.plan(1.0, &scene.tile);
-    let under_plan = plan_slots(&mut occlusion, scale, scene, &under);
+    let (under_plan, under_shown) = plan_slots(&mut occlusion, scale, scene, &under);
     let previews_plan = occlusion.plan(scale, previews);
     // Solid shapes under the surfaces (overview cards, hover ring).
     let decor_plan: Vec<_> = decor
@@ -6510,13 +6524,13 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
-    for (slot, visible) in over
+    for (slot, shown) in over
         .iter()
-        .zip(&over_plan)
-        .chain(under.iter().zip(&under_plan))
+        .zip(&over_shown)
+        .chain(under.iter().zip(&under_shown))
     {
         if let SceneSlot::Element(index) = slot {
-            scene_visible[*index] = !visible.is_empty();
+            scene_visible[*index] = *shown;
         }
     }
     Ok(Drawn {
@@ -6565,26 +6579,30 @@ fn scene_slots(
     slots
 }
 
+/// Each slot's repaint plan, and whether it shows on the output.
 fn plan_slots(
     occlusion: &mut crate::occlusion::Occlusion,
     scale: f64,
     scene: &Scene,
     slots: &[SceneSlot],
-) -> Vec<Vec<Rectangle<i32, smithay::utils::Physical>>> {
+) -> (Vec<Vec<crate::occlusion::PhysicalRect>>, Vec<bool>) {
     slots
         .iter()
-        .map(|slot| match *slot {
-            SceneSlot::Element(index) => occlusion
-                .plan(scale, std::slice::from_ref(&scene.elements[index]))
-                .remove(0),
-            SceneSlot::Bell(k) => occlusion
-                .plan(1.0, std::slice::from_ref(&scene.bell[k].1))
-                .remove(0),
-            SceneSlot::Snapshot(k) => occlusion
-                .plan(1.0, std::slice::from_ref(&scene.snapshots[k].1))
-                .remove(0),
+        .map(|slot| {
+            let plan = match *slot {
+                SceneSlot::Element(index) => occlusion
+                    .plan(scale, std::slice::from_ref(&scene.elements[index]))
+                    .remove(0),
+                SceneSlot::Bell(k) => occlusion
+                    .plan(1.0, std::slice::from_ref(&scene.bell[k].1))
+                    .remove(0),
+                SceneSlot::Snapshot(k) => occlusion
+                    .plan(1.0, std::slice::from_ref(&scene.snapshots[k].1))
+                    .remove(0),
+            };
+            (plan, occlusion.shown())
         })
-        .collect()
+        .unzip()
 }
 
 fn draw_slots(

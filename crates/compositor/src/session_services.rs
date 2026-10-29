@@ -96,17 +96,181 @@ fn bus_import_args(vars: &[(&str, &str)]) -> Vec<String> {
 /// Holds the systemd graphical session open for the DRM runtime's lifetime.
 pub struct SessionServices {
     alive: Arc<AtomicBool>,
+    leader: Option<Leader>,
 }
 impl Drop for SessionServices {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
+        HARDWARE_SESSION.store(false, Ordering::Release);
         let _ = run("systemctl", &argv(STOP_TARGET));
+        if let Some(leader) = self.leader.take() {
+            // gnome-session 51's leader on session end: start the shutdown
+            // target, then hang up the FIFO the monitor watches (which
+            // starts it again on a crash, when this never runs). Stopping
+            // tuna-session.target alone leaves gnome-session.target and
+            // with it graphical-session.target and the plugins running.
+            let _ = run("systemctl", &argv(SHUTDOWN_GNOME_SESSION));
+            drop(leader);
+        }
     }
 }
 
 const STOP_TARGET: &[&str] = &["--user", "--no-block", "stop", "tuna-session.target"];
 /// Enqueue the start job without waiting for it; the worker waits.
 const QUEUE_TARGET: &[&str] = &["--user", "--no-block", "start", "tuna-session.target"];
+/// `leader_term_or_int_signal_cb` in gnome-session 51 `leader-systemd.c`.
+const SHUTDOWN_GNOME_SESSION: &[&str] = &[
+    "--user",
+    "--no-block",
+    "--job-mode=replace-irreversibly",
+    "start",
+    "gnome-session-shutdown.target",
+];
+
+/// gnome-session 51 names the leader FIFO in `leader-systemd.c` and
+/// `gnome-session-ctl.c`.
+const LEADER_FIFO: &str = "gnome-session-leader-fifo";
+
+/// The session leader's end of GNOME's session monitor. tuna-session.target
+/// pulls in gnome-session.target (for the settings daemon plugins, whose
+/// units require gnome-session-initialized.target); that target binds to
+/// gnome-session-monitor.service, which runs `gnome-session-ctl --monitor`
+/// on the read end of the FIFO and starts gnome-session-shutdown.target
+/// when the writer hangs up. gnome-session 51's leader holds the write end
+/// for the session's life; the compositor is the Tuna session's leader, so
+/// its exit, clean or not, stops those targets and the plugins with them.
+struct Leader {
+    slot: Arc<std::sync::Mutex<LeaderSlot>>,
+}
+
+#[derive(Default)]
+struct LeaderSlot {
+    fifo: Option<std::fs::File>,
+    released: bool,
+}
+
+impl Leader {
+    /// Create the FIFO like the GNOME leader (mode 0666, an existing one
+    /// reused) and open its write end on a thread: the open waits for the
+    /// monitor's read end.
+    fn hold(path: std::path::PathBuf) -> Self {
+        let slot: Arc<std::sync::Mutex<LeaderSlot>> = Default::default();
+        let held = slot.clone();
+        let _ = std::thread::Builder::new()
+            .name("tuna-session-leader".into())
+            .spawn(move || {
+                use std::os::unix::ffi::OsStrExt;
+                let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+                    return;
+                };
+                // SAFETY: `name` is a valid NUL-terminated path.
+                if unsafe { libc::mkfifo(name.as_ptr(), 0o666) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EEXIST) {
+                        eprintln!("tuna-compositor: session services: leader FIFO: {error}");
+                        return;
+                    }
+                }
+                let fifo = match std::fs::OpenOptions::new().write(true).open(&path) {
+                    Ok(fifo) => fifo,
+                    Err(error) => {
+                        eprintln!("tuna-compositor: session services: leader FIFO: {error}");
+                        return;
+                    }
+                };
+                use std::os::unix::fs::FileTypeExt;
+                if !fifo.metadata().is_ok_and(|m| m.file_type().is_fifo()) {
+                    eprintln!("tuna-compositor: session services: leader FIFO is not a FIFO");
+                    return;
+                }
+                if let Ok(mut slot) = held.lock() {
+                    if !slot.released {
+                        slot.fifo = Some(fifo);
+                        eprintln!(
+                            "tuna-compositor: session services: holding the session leader FIFO"
+                        );
+                    }
+                }
+            });
+        Self { slot }
+    }
+}
+
+impl Drop for Leader {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            slot.released = true;
+            slot.fifo = None;
+        }
+    }
+}
+
+/// Whether this process published a hardware session (X11 service
+/// targets follow Xwayland only there).
+static HARDWARE_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// GNOME Shell 51 starts gnome-session-x11-services-ready.target once
+/// Xwayland's display is set up, which brings gsd-xsettings up
+/// (`windowManager.js` `_startX11Services`, mode "fail"). Mutter has
+/// already published `DISPLAY`; Tuna publishes it when the display
+/// becomes ready.
+fn x11_ready_calls(display: u32) -> Vec<(&'static str, Vec<String>)> {
+    let value = format!(":{display}");
+    let vars = [("DISPLAY", value.as_str())];
+    vec![
+        ("systemctl", systemd_import_args(&vars)),
+        ("gdbus", bus_import_args(&vars)),
+        (
+            "systemctl",
+            argv(&[
+                "--user",
+                "--no-block",
+                "--job-mode=fail",
+                "start",
+                "gnome-session-x11-services-ready.target",
+            ]),
+        ),
+    ]
+}
+
+/// `_stopX11Services`: the display closed.
+fn x11_closed_calls() -> Vec<(&'static str, Vec<String>)> {
+    vec![(
+        "systemctl",
+        argv(&[
+            "--user",
+            "--no-block",
+            "--job-mode=fail",
+            "stop",
+            "gnome-session-x11-services.target",
+        ]),
+    )]
+}
+
+fn run_detached(calls: Vec<(&'static str, Vec<String>)>) {
+    if !HARDWARE_SESSION.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("tuna-x11-services".into())
+        .spawn(move || {
+            for (program, args) in calls {
+                if !run(program, &args) {
+                    eprintln!("tuna-compositor: session services: X11 services: {program} failed");
+                }
+            }
+        });
+}
+
+/// Xwayland's window manager is up on `:display`.
+pub fn x11_display_ready(display: u32) {
+    run_detached(x11_ready_calls(display));
+}
+
+/// Xwayland went away.
+pub fn x11_display_closed() {
+    run_detached(x11_closed_calls());
+}
 
 /// The session worker. The graphical session starts as soon as activated
 /// services can see the display; it never waits on the shell. On
@@ -233,8 +397,9 @@ fn register_with_gdm(run: &mut Runner<'_>) {
 /// Called only for the actual DRM backend, before its shell is started.
 pub fn publish(socket: &str) -> SessionServices {
     let alive = Arc::new(AtomicBool::new(true));
-    let guard = SessionServices {
+    let mut guard = SessionServices {
         alive: alive.clone(),
+        leader: None,
     };
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
         .ok()
@@ -257,6 +422,17 @@ pub fn publish(socket: &str) -> SessionServices {
     // dbus-daemon leaves the caller hanging for the whole D-Bus timeout.
     if systemd && !run("systemctl", &argv(QUEUE_TARGET)) {
         eprintln!("tuna-compositor: session services: graphical target could not be queued");
+    }
+    if systemd {
+        HARDWARE_SESSION.store(true, Ordering::Release);
+        match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+            Some(dir) => {
+                guard.leader = Some(Leader::hold(std::path::Path::new(&dir).join(LEADER_FIFO)))
+            }
+            None => eprintln!(
+                "tuna-compositor: session services: no XDG_RUNTIME_DIR for the leader FIFO"
+            ),
+        }
     }
     std::thread::spawn(move || bring_up(&alive, &mut run, &mut std::thread::sleep));
     guard
@@ -401,5 +577,125 @@ mod tests {
                 "systemctl --user --no-block stop tuna-session.target"
             ]
         );
+    }
+
+    #[test]
+    fn the_leader_fifo_hangs_up_for_the_monitor_when_the_session_ends() {
+        use std::io::Read;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEADER_FIFO);
+        let leader = Leader::hold(path.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::metadata(&path).is_ok_and(|m| m.file_type().is_fifo()) {
+            assert!(std::time::Instant::now() < deadline, "no leader FIFO");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // gnome-session-ctl --monitor's side: a blocking read-only open,
+        // then a read that returns at the writer's hang-up.
+        let (done, hung_up) = std::sync::mpsc::channel();
+        let monitor = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut fifo = std::fs::File::open(&path).unwrap();
+                let mut byte = [0u8; 1];
+                let read = fifo.read(&mut byte).unwrap();
+                done.send(read).unwrap();
+            }
+        });
+        let held = std::time::Instant::now() + Duration::from_secs(5);
+        while leader.slot.lock().unwrap().fifo.is_none() {
+            assert!(
+                std::time::Instant::now() < held,
+                "leader never held the FIFO"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(hung_up.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(leader);
+        assert_eq!(hung_up.recv_timeout(Duration::from_secs(5)), Ok(0));
+        monitor.join().unwrap();
+    }
+
+    #[test]
+    fn xwayland_drives_gnome_shells_x11_service_targets() {
+        let ready: Vec<String> = x11_ready_calls(2)
+            .into_iter()
+            .map(|(program, args)| line(program, &args))
+            .collect();
+        assert_eq!(
+            ready,
+            [
+                "systemctl --user set-environment DISPLAY=:2",
+                "gdbus call --session --dest org.freedesktop.DBus --object-path \
+                 /org/freedesktop/DBus --method \
+                 org.freedesktop.DBus.UpdateActivationEnvironment {'DISPLAY': ':2'}",
+                "systemctl --user --no-block --job-mode=fail start \
+                 gnome-session-x11-services-ready.target",
+            ]
+        );
+        let closed: Vec<String> = x11_closed_calls()
+            .into_iter()
+            .map(|(program, args)| line(program, &args))
+            .collect();
+        assert_eq!(
+            closed,
+            ["systemctl --user --no-block --job-mode=fail stop gnome-session-x11-services.target"]
+        );
+    }
+
+    /// `Wants=` units of the shipped session target.
+    fn wanted() -> Vec<String> {
+        include_str!("../../../share/systemd/user/tuna-session.target")
+            .lines()
+            .filter_map(|line| line.strip_prefix("Wants="))
+            .flat_map(|units| units.split_whitespace().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn the_session_target_starts_gnome_51s_plugins_except_those_tuna_owns() {
+        let wanted = wanted();
+        // gnome-session 51 gnome-session-basic-services.target and
+        // gnome-session-services.target, minus Tuna's own services.
+        for plugin in [
+            "Datetime",
+            "Housekeeping",
+            "Keyboard",
+            "Power",
+            "PrintNotifications",
+            "Rfkill",
+            "ScreensaverProxy",
+            "Sharing",
+            "Smartcard",
+            "Sound",
+            "UsbProtection",
+            "Wwan",
+        ] {
+            let unit = format!("org.gnome.SettingsDaemon.{plugin}.target");
+            assert!(wanted.contains(&unit), "{unit} is not started: {wanted:?}");
+        }
+        // The compositor owns org.gnome.SettingsDaemon.Color (Night
+        // Light); the shell binds the media keys natively and the
+        // compositor runs Orca, which gsd-a11y-settings would start again.
+        for owned in ["Color", "MediaKeys", "A11ySettings"] {
+            let unit = format!("org.gnome.SettingsDaemon.{owned}.target");
+            assert!(!wanted.contains(&unit), "{unit} conflicts with Tuna");
+        }
+        // XSettings follows Xwayland (gnome-session-x11-services.target),
+        // and the whole service sets would start the conflicting plugins.
+        for indirect in [
+            "org.gnome.SettingsDaemon.XSettings.target",
+            "gnome-session-basic-services.target",
+            "gnome-session-services.target",
+        ] {
+            assert!(!wanted.iter().any(|u| u == indirect), "{indirect} wanted");
+        }
+        // Every plugin target is Requisite= gnome-session-initialized.target,
+        // itself Requisite= gnome-session.target: same transaction.
+        assert!(wanted
+            .iter()
+            .any(|u| u == "gnome-session-initialized.target"));
+        assert!(wanted.iter().any(|u| u == "gnome-session.target"));
     }
 }

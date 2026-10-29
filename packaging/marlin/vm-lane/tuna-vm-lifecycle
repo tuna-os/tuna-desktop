@@ -6,6 +6,7 @@ import stat as file_stat
 import os
 import pathlib
 import pwd
+import signal
 import subprocess
 import sys
 import time
@@ -469,7 +470,7 @@ def inventory():
                      | {k: state.get(k) for k in ("overview_open", "pointer_position",
                                                   "native_relative_motion_count", "input_devices",
                                                   "mouse_left_handed", "touchpad_left_handed",
-                                                  "hot_corners", "auth_owner")},
+                                                  "hot_corners", "auth_owner", "power_save_mode")},
             "processes": sorted(processes, key=lambda item: item["pid"])}
 
 
@@ -480,6 +481,108 @@ def owned_compositor(processes):
     if len(candidates) != 1:
         raise RuntimeError("one original same-user compositor is required")
     return candidates[0]
+
+
+# GNOME 51 settings daemon plugins the Tuna session starts through GNOME's own
+# user units (share/systemd/user/tuna-session.target, #355), and the ones whose
+# service Tuna Desktop provides itself.
+GSD_STARTED = ("Datetime", "Housekeeping", "Keyboard", "Power", "PrintNotifications", "Rfkill",
+               "ScreensaverProxy", "Sharing", "Smartcard", "Sound", "UsbProtection", "Wwan")
+GSD_TUNA_OWNED = ("A11ySettings", "MediaKeys")
+LEADER_FIFO = f"{RUNTIME}/gnome-session-leader-fifo"
+GSD_POWER_MONITOR = pathlib.Path("/run/tuna-vm-gsd-power-monitor.log")
+GSD_POWER_STATE = pathlib.Path("/run/tuna-vm-gsd-power-state.json")
+
+
+def gsd_executable(plugin):
+    """`gsd-<plugin>` as gnome-settings-daemon 51 plugins/meson.build names it."""
+    return "gsd-" + "".join(("-" if index and char.isupper() else "") + char.lower()
+                            for index, char in enumerate(plugin))
+
+
+def bus_owner(name):
+    """(unique name, pid) of the session-bus owner of `name`, else None."""
+    try:
+        owner = shlex.split(call("busctl", "--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                 "org.freedesktop.DBus", "GetNameOwner", "s", name, user=True))
+    except subprocess.CalledProcessError:
+        return None
+    if len(owner) != 2 or owner[0] != "s":
+        raise RuntimeError(f"unexpected owner reply for {name}")
+    pid = call("busctl", "--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+               "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", owner[1], user=True).split()
+    if len(pid) != 2 or pid[0] != "u":
+        raise RuntimeError(f"unexpected pid reply for {name}")
+    return [owner[1], int(pid[1])]
+
+
+def user_unit(unit):
+    shown = call("systemctl", "--user", "show", unit, "--property=LoadState",
+                 "--property=ActiveState", "--property=MainPID", user=True)
+    return dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
+
+
+def gsd_plugins():
+    """Each started plugin is the packaged gsd binary, running as the session
+    user under its own unit and owning its bus name; Tuna's own services keep
+    theirs; the compositor holds the session leader FIFO."""
+    compositor = owned_compositor(inventory()["processes"])
+    started = {}
+    for plugin in GSD_STARTED:
+        name = f"org.gnome.SettingsDaemon.{plugin}"
+        row = {"unit": user_unit(name + ".service"), "owner": bus_owner(name)}
+        if row["owner"]:
+            proc = pathlib.Path(f"/proc/{row['owner'][1]}")
+            executable = os.readlink(proc / "exe")
+            row.update(uid=proc.stat().st_uid, executable=executable,
+                       package=call("pacman", "-Qqo", executable, check=False))
+        row["ok"] = (row["unit"].get("ActiveState") == "active" and row["owner"] is not None
+                     and row["unit"].get("MainPID") == str(row["owner"][1])
+                     and row.get("uid") == OWNER.pw_uid
+                     and pathlib.Path(row.get("executable", "")).name == gsd_executable(plugin)
+                     and row.get("package") == "gnome-settings-daemon")
+        started[plugin] = row
+    color = bus_owner("org.gnome.SettingsDaemon.Color")
+    tuna = {"Color": {"owner": color, "ok": color is not None and color[1] == compositor["pid"]}}
+    for plugin in GSD_TUNA_OWNED:
+        name = f"org.gnome.SettingsDaemon.{plugin}"
+        owner, unit = bus_owner(name), user_unit(name + ".service")
+        tuna[plugin] = {"owner": owner, "unit": unit,
+                        "ok": owner is None and unit.get("ActiveState") != "active"}
+    targets = {unit: user_unit(unit).get("ActiveState") for unit in (
+        "tuna-session.target", "gnome-session.target", "gnome-session-initialized.target",
+        "gnome-session-monitor.service")}
+    fds = pathlib.Path(f"/proc/{compositor['pid']}/fd")
+    leader = any(os.readlink(fd) == LEADER_FIFO for fd in fds.iterdir())
+    # XSettings follows Xwayland; record it without requiring an X11 client.
+    xsettings = user_unit("org.gnome.SettingsDaemon.XSettings.service")
+    return {"started": started, "tuna": tuna, "targets": targets, "leader_fifo_held": leader,
+            "xsettings": xsettings, "x11_ready": json.loads(STATE.read_text()).get("x11_ready"),
+            "pass": (all(row["ok"] for row in started.values())
+                     and all(row["ok"] for row in tuna.values())
+                     and all(state == "active" for state in targets.values()) and leader)}
+
+
+def gsd_power_calls(text):
+    """gsd-power's SetDimming and PowerSaveMode writes from dbus-monitor's
+    text output, in bus order."""
+    calls, block = [], []
+    for line in text.splitlines() + [""]:
+        if line.startswith((" ", "\t")):
+            block.append(line.strip())
+            continue
+        if block and block[0].startswith("method call "):
+            header = dict(part.split("=", 1) for part in block[0].replace(";", " ").split() if "=" in part)
+            args = block[1:]
+            if header.get("member") == "SetDimming" and args:
+                calls.append({"sender": header.get("sender"), "time": float(header.get("time", 0)),
+                              "call": "SetDimming", "value": args[0] == "boolean true"})
+            elif (header.get("member") == "Set" and len(args) == 3
+                  and args[1] == 'string "PowerSaveMode"'):
+                calls.append({"sender": header.get("sender"), "time": float(header.get("time", 0)),
+                              "call": "PowerSaveMode", "value": int(args[2].split()[-1])})
+        block = [line] if line else []
+    return calls
 
 
 def orca_read_error(error):
@@ -2033,6 +2136,42 @@ print(json.dumps(result))
             "--compositor-pid",str(compositor["pid"]),"--compositor-start",str(compositor["start_ticks"]),
             "--session-id",original["session"]["Id"],user=True))
         result["original_session_inventory"]=original
+    elif action == "gsd-plugins":
+        result = gsd_plugins()
+    elif action == "gsd-power-idle-start":
+        # Watch gsd-power's own calls, then shorten GNOME's idle delay. The
+        # harness's last input preceded this; nothing touches input until wake.
+        power = bus_owner("org.gnome.SettingsDaemon.Power")
+        if power is None:
+            raise RuntimeError("gsd-power owns no bus name")
+        original = call("gsettings", "get", "org.gnome.desktop.session", "idle-delay", user=True)
+        with GSD_POWER_MONITOR.open("w") as log:
+            monitor = subprocess.Popen(
+                ["runuser", "-u", OWNER.pw_name, "--", "env", f"XDG_RUNTIME_DIR={RUNTIME}",
+                 f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus", "dbus-monitor", "--session",
+                 "type='method_call',interface='org.gnome.Shell.Brightness',member='SetDimming'",
+                 "type='method_call',interface='org.freedesktop.DBus.Properties',member='Set',"
+                 "path='/org/gnome/Mutter/DisplayConfig'"],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.DEVNULL, start_new_session=True)
+        GSD_POWER_STATE.write_text(json.dumps({"original": original, "monitor_pid": monitor.pid}))
+        time.sleep(1)
+        if monitor.poll() is not None:
+            raise RuntimeError("dbus-monitor exited")
+        call("gsettings", "set", "org.gnome.desktop.session", "idle-delay", "uint32 20", user=True)
+        result = {"power_owner": power, "original_idle_delay": original,
+                  "idle_delay": call("gsettings", "get", "org.gnome.desktop.session", "idle-delay", user=True)}
+    elif action == "gsd-power-idle-stop":
+        saved = json.loads(GSD_POWER_STATE.read_text())
+        call("gsettings", "set", "org.gnome.desktop.session", "idle-delay", saved["original"], user=True)
+        try:
+            os.killpg(saved["monitor_pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        text = GSD_POWER_MONITOR.read_text(errors="replace")[:262144]
+        result = {"power_owner": bus_owner("org.gnome.SettingsDaemon.Power"),
+                  "calls": gsd_power_calls(text),
+                  "restored_idle_delay": call("gsettings", "get", "org.gnome.desktop.session",
+                                              "idle-delay", user=True)}
     elif action == "logout":
         call("loginctl", "terminate-session", inventory()["session"]["Id"])
         result = {"requested": "terminate session"}

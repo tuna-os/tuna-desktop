@@ -170,7 +170,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| automatic-timezone | Ignored | Time service is external; Tuna Desktop has no automatic timezone policy |
+| automatic-timezone | Honored (gsd-datetime, unqualified) | gnome-settings-daemon 51's datetime plugin, started by the Tuna session (V-GSD-PLUGINS), applies it through Geoclue and timedated; the time zone change itself is unproven |
 ## org.gnome.desktop.default-applications.office.calendar
 
 | Key | Status | Reason |
@@ -403,18 +403,18 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | disable-microphone | Honored | GTK shell mutes every PipeWire Audio/Source while set and re-mutes bypass attempts; explicit restore unmutes only tracker-muted nodes. GNOME publishes this key to Lockdown with no enforcer; enforcement here is Tuna-defined. See privacy-enforcement.md |
 | disable-sound-output | Honored | GTK shell mutes every PipeWire Audio/Sink while set and re-mutes bypass attempts; explicit restore unmutes only tracker-muted nodes. GNOME publishes this key to Lockdown with no enforcer; enforcement here is Tuna-defined. See privacy-enforcement.md |
 | hide-identity | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
-| old-files-age | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
+| old-files-age | Honored (gsd-housekeeping, unqualified) | gnome-settings-daemon 51's housekeeping plugin, started by the Tuna session (V-GSD-PLUGINS), purges old trash and temporary files; purging is unproven |
 | privacy-screen | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
 | recent-files-max-age | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | remember-app-usage | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
 | remember-recent-files | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
-| remove-old-temp-files | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
-| remove-old-trash-files | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
+| remove-old-temp-files | Honored (gsd-housekeeping, unqualified) | gnome-settings-daemon 51's housekeeping plugin, started by the Tuna session (V-GSD-PLUGINS), purges old temporary files; purging is unproven |
+| remove-old-trash-files | Honored (gsd-housekeeping, unqualified) | gnome-settings-daemon 51's housekeeping plugin, started by the Tuna session (V-GSD-PLUGINS), purges old trash; purging is unproven |
 | report-technical-problems | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
 | send-software-usage-stats | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
 | show-full-name-in-top-bar | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
-| usb-protection | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
-| usb-protection-level | Ignored | Tuna Desktop has no privacy retention/location/cleanup policy consumer; applications may implement their own |
+| usb-protection | Honored (gsd-usb-protection, unqualified) | gnome-settings-daemon 51's usb-protection plugin, started by the Tuna session (V-GSD-PLUGINS), applies it only through a running USBGuard daemon; unproven |
+| usb-protection-level | Honored (gsd-usb-protection, unqualified) | gnome-settings-daemon 51's usb-protection plugin, started by the Tuna session (V-GSD-PLUGINS), applies it only through a running USBGuard daemon; unproven |
 ## org.gnome.desktop.remote-desktop.rdp
 
 | Key | Status | Reason |
@@ -497,7 +497,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| idle-delay | Honored | Live compositor idle policy |
+| idle-delay | Honored | Live compositor idle policy; gsd-power dims at half the delay and blanks after the shield (V-GSD-POWER-IDLE) |
 | save-restore | Ignored | Tuna Desktop session does not consume this legacy session preference |
 | session-name | Ignored | Tuna Desktop session does not consume this legacy session preference |
 ## org.gnome.desktop.sound

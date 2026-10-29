@@ -288,8 +288,10 @@ live motion policy: animations off snaps everything, Reduced Motion
 The compositor state (`TUNA_COMPOSITOR_STATE`) carries `frame_cost`, one
 entry per output describing its last drawn frame: `rendered` and `culled`
 element counts, `damage_rects` and `damage_area` against `output_area`,
-and the window ids that were `drawn_windows` or wholly `culled_windows`
-(hidden behind opaque surfaces). `throttled_windows` lists the windows
+and the window ids the frame shows (`drawn_windows`) or wholly hides
+behind opaque surfaces (`culled_windows`). Both cover the whole output, so
+a frame that repaints only the panel or the cursor still lists the windows
+it leaves on screen as drawn. `throttled_windows` lists the windows
 whose frame callbacks run at the hidden rate (about 1 Hz): off the scene
 or wholly culled, unless the overview, the switcher or a cast shows them.
 Proof `G-OCCLUSION-CULL` fullscreens an opaque window over another and

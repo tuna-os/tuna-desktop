@@ -25,18 +25,25 @@ pub(crate) type PhysicalRect = Rectangle<i32, Physical>;
 /// The damage still to be painted, walked from the topmost element down.
 #[derive(Debug, Clone)]
 pub(crate) struct Occlusion {
+    /// The frame's whole area, damaged or not.
+    output: PhysicalRect,
     damage: Vec<PhysicalRect>,
-    /// Opaque area of the elements visited so far (all above the next).
+    /// Opaque area of the elements visited so far (all above the next),
+    /// damaged or not: drawing only ever uses it inside the damage, and
+    /// [`Occlusion::shown`] needs all of it.
     covered: Vec<PhysicalRect>,
+    shown: bool,
     rendered: usize,
     culled: usize,
 }
 
 impl Occlusion {
-    pub(crate) fn new(damage: &[PhysicalRect]) -> Self {
+    pub(crate) fn new(output: PhysicalRect, damage: &[PhysicalRect]) -> Self {
         Self {
+            output,
             damage: damage.iter().copied().filter(|r| !r.is_empty()).collect(),
             covered: Vec::new(),
+            shown: false,
             rendered: 0,
             culled: 0,
         }
@@ -61,18 +68,33 @@ impl Occlusion {
         } else {
             Rectangle::subtract_rects_many(clipped, self.covered.iter().copied())
         };
-        if visible.is_empty() {
-            self.culled += 1;
-            return visible;
-        }
-        self.rendered += 1;
+        // A frame that repaints only part of the output (the panel, the
+        // cursor) still shows what it leaves alone: whether the element
+        // shows is decided over the whole output, not the damage.
+        self.shown = !visible.is_empty()
+            || geometry.intersection(self.output).is_some_and(|on_output| {
+                self.covered.is_empty()
+                    || !Rectangle::subtract_rects_many([on_output], self.covered.iter().copied())
+                        .is_empty()
+            });
         // Rounding in scaled elements may overshoot by a pixel; an element
         // never hides more than it draws.
         self.covered.extend(opaque.into_iter().filter_map(|mut r| {
             r.loc += geometry.loc;
             r.intersection(geometry)
         }));
+        if visible.is_empty() {
+            self.culled += 1;
+        } else {
+            self.rendered += 1;
+        }
         visible
+    }
+
+    /// Whether some of the element last visited shows on the output, not
+    /// under an opaque element above it, whether or not it was repainted.
+    pub(crate) fn shown(&self) -> bool {
+        self.shown
     }
 
     /// A solid fill (`frame.clear`) over `rects`: returns what to fill,
@@ -84,7 +106,7 @@ impl Occlusion {
             .collect::<Vec<_>>();
         let visible = Rectangle::subtract_rects_many(clipped, self.covered.iter().copied());
         if opaque {
-            self.covered.extend(visible.iter().copied());
+            self.covered.extend(rects.iter().copied());
         }
         visible
     }
@@ -152,7 +174,8 @@ where
 }
 
 /// What one drawn frame did: elements repainted and culled, and for each
-/// scene element (front to back) whether any of it was drawn.
+/// scene element (front to back) whether any of it shows on the output
+/// ([`Occlusion::shown`]), repainted this frame or not.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Drawn {
     pub rendered: usize,
@@ -169,9 +192,11 @@ pub(crate) struct FrameCost {
     pub damage_rects: usize,
     pub damage_area: i64,
     pub output_area: i64,
-    /// Windows with at least one element drawn.
+    /// Windows with at least one element showing on the output, whether
+    /// or not this frame's damage repainted them.
     pub drawn_windows: Vec<u64>,
-    /// Windows in the scene with every element culled.
+    /// Windows in the scene with every element under opaque elements
+    /// above them.
     pub culled_windows: Vec<u64>,
 }
 
@@ -294,7 +319,7 @@ mod tests {
 
     #[test]
     fn fullscreen_opaque_window_culls_everything_beneath() {
-        let mut occlusion = Occlusion::new(&[full()]);
+        let mut occlusion = Occlusion::new(full(), &[full()]);
         // Front to back: fullscreen window, two stacked windows, wallpaper.
         let scene = [
             solid(full(), 1.0),
@@ -312,21 +337,21 @@ mod tests {
 
     #[test]
     fn translucent_elements_never_hide_what_is_beneath() {
-        let mut occlusion = Occlusion::new(&[full()]);
+        let mut occlusion = Occlusion::new(full(), &[full()]);
         let plan = occlusion.plan(1.0, &[solid(full(), 0.5), solid(rect(10, 10, 50, 50), 1.0)]);
         assert_eq!(plan[0], vec![full()]);
         assert_eq!(plan[1], vec![rect(10, 10, 50, 50)]);
         assert_eq!(occlusion.culled(), 0);
         // A surface element at alpha < 1 (fading, overview previews)
         // reports no opaque regions; the visitor trusts that.
-        let mut occlusion = Occlusion::new(&[full()]);
+        let mut occlusion = Occlusion::new(full(), &[full()]);
         occlusion.visit(full(), std::iter::empty());
         assert_eq!(occlusion.visit(full(), std::iter::empty()), vec![full()]);
     }
 
     #[test]
     fn partially_covered_element_repaints_only_its_uncovered_part() {
-        let mut occlusion = Occlusion::new(&[full()]);
+        let mut occlusion = Occlusion::new(full(), &[full()]);
         occlusion.visit(rect(0, 0, 640, 800), [rect(0, 0, 640, 800)]);
         let visible = occlusion.visit(rect(320, 100, 640, 400), std::iter::empty());
         assert_eq!(area(&visible), 320 * 400);
@@ -336,7 +361,7 @@ mod tests {
     #[test]
     fn client_opaque_region_excludes_shadow_margins() {
         // A CSD window: 24px shadow all round, opaque only inside it.
-        let mut occlusion = Occlusion::new(&[full()]);
+        let mut occlusion = Occlusion::new(full(), &[full()]);
         let window = rect(100, 100, 688, 468);
         occlusion.visit(window, [rect(24, 24, 640, 420)]);
         let below = occlusion.visit(window, std::iter::empty());
@@ -350,7 +375,7 @@ mod tests {
 
     #[test]
     fn opaque_regions_are_clipped_to_the_element() {
-        let mut occlusion = Occlusion::new(&[full()]);
+        let mut occlusion = Occlusion::new(full(), &[full()]);
         // A rounding overshoot claiming one pixel past the right edge.
         occlusion.visit(rect(0, 0, 100, 100), [rect(0, 0, 101, 100)]);
         assert_eq!(
@@ -363,7 +388,7 @@ mod tests {
     fn only_damage_is_repainted_and_disjoint_rects_stay_separate() {
         let clock = rect(600, 0, 80, 32);
         let progress = rect(200, 700, 300, 8);
-        let mut occlusion = Occlusion::new(&[clock, progress]);
+        let mut occlusion = Occlusion::new(full(), &[clock, progress]);
         let plan = occlusion.plan(
             1.0,
             &[solid(rect(100, 300, 640, 420), 1.0), solid(full(), 1.0)],
@@ -375,15 +400,40 @@ mod tests {
         );
         assert_eq!(plan[1], vec![clock]);
         assert_eq!(occlusion.culled(), 0);
-        // A window entirely outside the damage is culled.
+        // A window entirely outside the damage is culled, yet it shows.
+        let mut occlusion = Occlusion::new(full(), &[clock]);
         assert!(occlusion
             .visit(rect(0, 100, 50, 50), std::iter::empty())
             .is_empty());
+        assert!(occlusion.shown());
+    }
+
+    #[test]
+    fn a_partial_frame_decides_what_shows_over_the_whole_output() {
+        // The panel repaints alone over an opaque fullscreen window and
+        // the window it hides (the frame after G-OCCLUSION-CULL's
+        // fullscreen request).
+        let panel = rect(0, 0, 1280, 38);
+        let mut occlusion = Occlusion::new(full(), &[panel]);
+        assert_eq!(occlusion.visit(panel, [rect(0, 0, 1280, 38)]), vec![panel]);
+        assert!(occlusion.shown());
+        assert!(occlusion.visit(full(), [full()]).is_empty());
+        assert!(occlusion.shown(), "the fullscreen window still shows");
+        assert!(occlusion
+            .visit(rect(470, 356, 640, 420), [rect(0, 0, 640, 420)])
+            .is_empty());
+        assert!(!occlusion.shown(), "the window beneath it is hidden");
+        assert_eq!((occlusion.rendered(), occlusion.culled()), (1, 2));
+        // Off the output is not shown, whatever covers it.
+        assert!(occlusion
+            .visit(rect(1280, 0, 640, 420), std::iter::empty())
+            .is_empty());
+        assert!(!occlusion.shown());
     }
 
     #[test]
     fn opaque_fills_cover_and_translucent_fills_do_not() {
-        let mut occlusion = Occlusion::new(&[full()]);
+        let mut occlusion = Occlusion::new(full(), &[full()]);
         let strip = [rect(0, 0, 1280, 100)];
         assert_eq!(occlusion.visit_fill(&strip, false), strip.to_vec());
         assert_eq!(area(&occlusion.uncovered()), 1280 * 800);
@@ -442,7 +492,7 @@ mod tests {
             (0, 0).into(),
             (1.5, 1.0),
         );
-        let mut occlusion = Occlusion::new(&[full()]);
+        let mut occlusion = Occlusion::new(full(), &[full()]);
         occlusion.plan(1.0, std::slice::from_ref(&element));
         assert!(occlusion
             .visit(rect(0, 0, 600, 300), std::iter::empty())

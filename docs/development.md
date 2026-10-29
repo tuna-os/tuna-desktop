@@ -52,7 +52,7 @@ On Arch Linux (TunaOS Marlin's base), the `arch-package` CI job builds with:
 sudo pacman -S --needed base-devel git rust pkgconf clang pipewire gtk4 \
   gtk4-layer-shell libadwaita libxkbcommon libxkbcommon-x11 mesa wayland \
   dbus glib2 seatd libinput systemd-libs libdrm \
-  libsecret libcanberra sound-theme-freedesktop gnome-settings-daemon \
+  libsecret libcanberra sound-theme-freedesktop gnome-settings-daemon gnome-session \
   librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts namcap
 ```
 
