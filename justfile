@@ -13,9 +13,10 @@ export CARGO_BUILD_JOBS := env("CARGO_BUILD_JOBS", "2")
 export CARGO_TARGET_DIR := env("TUNA_TARGET_DIR", justfile_directory() / "target")
 
 # Cargo builds from every worktree on the machine queue on one lock, so
-# concurrent builds don't exhaust memory.
-lock := "flock " + env("TUNA_BUILD_LOCK", "/tmp/tuna-local-build.lock")
-proof_lock := "flock " + env("TUNA_PROOF_LOCK", "/tmp/tuna-local-proof.lock")
+# concurrent builds don't exhaust memory. `-o` closes the lock before the
+# command runs, so a daemon it leaves behind can't keep holding the lock.
+lock := "flock -o " + env("TUNA_BUILD_LOCK", "/tmp/tuna-local-build.lock")
+proof_lock := "flock -o " + env("TUNA_PROOF_LOCK", "/tmp/tuna-local-proof.lock")
 # Below this much free disk (GiB), builds run `gc` first.
 min_free_gb := env("TUNA_MIN_FREE_GB", "20")
 # Downloaded CI artifacts live here and expire after `artifact_ttl_min`.
@@ -75,6 +76,27 @@ proof name *args: _disk
     else
         set --                         # the proof keeps no artifacts
     fi
+    # Every process the proof starts inherits this marker, including daemons
+    # that detach from it (ibus-daemon --daemonize, dbus-daemon --fork);
+    # whatever still carries it when the proof ends is stopped.
+    export TUNA_PROOF_RUN="$art"
+    leftovers() {
+        local p
+        for p in /proc/[0-9]*; do
+            if grep -qzx "TUNA_PROOF_RUN=$art" "$p/environ" 2>/dev/null; then echo "${p#/proc/}"; fi
+        done
+    }
+    reap() {
+        local pids
+        pids=$(leftovers)
+        [ -n "$pids" ] || return 0
+        echo "proof {{name}}: stopping leftover processes: $(echo $pids)" >&2
+        kill $pids 2>/dev/null || true
+        sleep 2
+        pids=$(leftovers)
+        [ -z "$pids" ] || kill -9 $pids 2>/dev/null || true
+    }
+    trap reap EXIT
     # One proof at a time machine-wide (Xvfb, CPU); builds keep their own lock.
     if {{proof_lock}} "$script" "$@" {{args}}; then
         rm -rf "$art"
