@@ -36,8 +36,9 @@
 #     D-FINGERPRINT the reader hint shows; a no-match is reported, a match
 #                   unlocks; Claim/VerifyStart/VerifyStop/Release in order
 #   G-LOCK-AUTH-FPRINT-MAXTRIES
-#     E-MAX-TRIES   three no-matches end fingerprint with the max-attempts
-#                   message (swipe reader hint); the password still unlocks
+#     E-MAX-TRIES   three no-matches show the max-attempts message and end
+#                   fingerprint unavailable; the prompt stays (no clock, no
+#                   restart, typed text kept) and the password unlocks
 #   G-LOCK-AUTH-NO-PRINTS
 #     F-NO-PRINTS   without enrolled prints there is no hint and no claim;
 #                   the password unlocks
@@ -432,7 +433,9 @@ unlock_with_code() {
 for tool in Xvfb xdotool ffmpeg jq gdbus dbus-daemon cc; do
     command -v "$tool" >/dev/null 2>&1 || fail SETUP "$tool is required"
 done
-[ -e "$PAM_WRAPPER_LIB" ] && [ -e "$PAM_MATRIX" ] || fail SETUP "pam_wrapper and pam_matrix are required"
+if [ ! -e "$PAM_WRAPPER_LIB" ] || [ ! -e "$PAM_MATRIX" ]; then
+    fail SETUP "pam_wrapper and pam_matrix are required"
+fi
 
 if [ -x /usr/libexec/at-spi-bus-launcher ]; then
     /usr/libexec/at-spi-bus-launcher --launch-immediately >"$ARTIFACTS/atspi.log" 2>&1 &
@@ -720,12 +723,23 @@ cwait "$m" ".event == \"retired\" and .service == \"password\" and .request == $
 pass D-FINGERPRINT "hint '$HINT_PRESS'; a no-match shows '$NO_MATCH'; a match unlocks; fprintd $(fp_calls "$f")"
 
 # --- E: three no-matches (swipe reader), then the password --------------
+# GNOME 51 on the unlock screen: GDM reports PAM_MAXTRIES as
+# service-unavailable with the max-tries message (gdm-session.c
+# report_and_stop_conversation, TOO_MANY_RETRIES); authServices.js
+# _canRetry always retries when reauthOnly and authServicesLegacy.js
+# _handleOnConversationStopped returns early for an unavailable service.
+# So the message wiggles, fingerprint stops, the password prompt stays
+# (typed text kept, no new verification) and the clock does not come back.
 CURRENT_CASE=E-MAX-TRIES
 fp SetScanType swipe >/dev/null
 lock_session
 m="$(mark)"; f="$(fp_mark)"
 lift
 twait "$m" "message type=hint text=$HINT_SWIPE" 20 >/dev/null || fail E-MAX-TRIES "no swipe-reader hint"
+await_step1 20 || fail E-MAX-TRIES "the prompt is not asking for the Password"
+# Half the password is typed before the last scan fails; GNOME keeps it.
+half=$((${#PASSWORD} / 2))
+xdotool type --delay 40 "${PASSWORD:0:$half}"
 for try in 1 2 3; do
     fp_until '.claimed and .action == "verify" and (.verify_done | not)' 15 ||
         fail E-MAX-TRIES "fprintd was not verifying for try $try"
@@ -742,31 +756,38 @@ sleep 0.3
 dump E-1-max-tries
 shot E-1-max-tries
 showing E-1-max-tries "$MAX_TRIES" || fail E-MAX-TRIES "the maximum-attempts message is not on screen"
+cwait "$m" '.event == "unavailable" and .service == "fingerprint" and .sent' 10 ||
+    fail E-MAX-TRIES "fingerprint did not end unavailable (GDM's TOO_MANY_RETRIES) after three no-matches"
 twaitre "$m" "result service=fingerprint request=[0-9]+ applied=false$" 10 >/dev/null ||
     fail E-MAX-TRIES "fingerprint did not end Denied after three no-matches"
-# The third no-match's attempt is stopped and released (GNOME may begin
-# a fresh verification afterwards, so the claim itself is not polled).
 for _ in $(seq 1 50); do fp_order "$ft" VerifyStop Release && break; sleep 0.2; done
 fp_order "$ft" VerifyStop Release || fail E-MAX-TRIES "no VerifyStop/Release after the third no-match: $(fp_calls "$ft")"
 fp_order "$f" Claim VerifyStart VerifyStop Release || fail E-MAX-TRIES "fprintd order: $(fp_calls "$f")"
-# The last allowed failure ends the whole verification: once the message
-# has been read, authPrompt.js reset() begins again (and unlockDialog.js
-# _fail may bring the clock back). Answers typed before that are lost.
-twaitre "$maxline" "begin service=password request=[0-9]+$" 20 >/dev/null ||
-    fail E-MAX-TRIES "verification did not begin again after the last allowed failure"
-still_locked 1 || fail E-MAX-TRIES "max tries unlocked the session"
+# Past the message's read time (48 ms a character, at least 2 s) and
+# GNOME's 10 s pending-message bound: nothing restarted.
+sleep 11
+fr="$(fp_mark)"
+sleep 1
+fp_state | jq -e '(.claimed | not)' >/dev/null || fail E-MAX-TRIES "fprintd was claimed again after max tries"
+fp_order "$ft" "Claim" && fail E-MAX-TRIES "fingerprint began again after max tries: $(fp_calls "$ft")"
+[ -z "$(fp_calls "$fr")" ] || fail E-MAX-TRIES "fprintd calls after max tries: $(fp_calls "$fr")"
+if twaitre "$maxline" "(begin|result) service=password request=[0-9]+" 0 >/dev/null 2>&1; then
+    fail E-MAX-TRIES "the password verification was restarted after max tries"
+fi
+still_locked 0 || fail E-MAX-TRIES "max tries unlocked the session"
 dump E-2-after
 shot E-2-after
-after_max="the prompt stayed up"
-if hidden E-2-after "Password"; then
-    # GNOME's hard reset after the last allowed failure shows the clock
-    # (authPrompt.js reset -> 'failed' -> unlockDialog.js _fail).
-    after_max="the clock came back and was lifted again"
-    lift
-fi
-to_code_step
+showing E-2-after "Password" || fail E-MAX-TRIES "the prompt went back to the clock after max tries"
+hidden E-2-after "$MAX_TRIES" || fail E-MAX-TRIES "the maximum-attempts message outstayed its read time"
+# The rest of the password completes what was typed before max tries.
+m2="$(mark)"
+answer "${PASSWORD:$half}"
+twait "$m2" "answer service=password step=1" 10 >/dev/null ||
+    fail E-MAX-TRIES "the password answer was not sent"
+twait "$m2" "query service=password step=2 secret=false question=Verification code" 20 >/dev/null ||
+    fail E-MAX-TRIES "the password typed across max tries was not accepted (no Verification code step)"
 unlock_with_code
-pass E-MAX-TRIES "three no-matches end fingerprint with the max-attempts message ($after_max); '$HINT_SWIPE' for a swipe reader; the password then unlocks"
+pass E-MAX-TRIES "three no-matches show the max-attempts message and end fingerprint unavailable (GDM TOO_MANY_RETRIES); fprintd stays released, the password conversation is not restarted and the prompt stays (no clock); text typed before max tries completes the password; '$HINT_SWIPE' for a swipe reader"
 
 # --- F: no enrolled prints ----------------------------------------------
 CURRENT_CASE=F-NO-PRINTS

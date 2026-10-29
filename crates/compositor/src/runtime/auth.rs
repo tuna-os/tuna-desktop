@@ -697,7 +697,14 @@ impl Runtime {
             });
             return;
         }
-        if end == FingerprintEnd::Unavailable && !conversation.canceled && live {
+        // GDM 51 reports PAM_MAXTRIES like an unavailable service, with
+        // the max-tries message (gdm-session.c `report_and_stop_conversation`,
+        // GDM_SESSION_WORKER_ERROR_TOO_MANY_RETRIES): GNOME keeps the
+        // password prompt and leaves fingerprint off until the next reset.
+        if matches!(end, FingerprintEnd::Unavailable | FingerprintEnd::Failed)
+            && !conversation.canceled
+            && live
+        {
             self.send_auth(origin, AuthService::Fingerprint, AuthEvent::Unavailable);
         }
         self.control.finish_unlock(origin, false);

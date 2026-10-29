@@ -63,7 +63,12 @@ loop directly over fprintd's D-Bus API on its own Slot
 when a reader is present and the user enrolled a print, and makes up to
 three scans of at most 30 s. Each finished non-matching scan reports
 "Failed to match fingerprint"; retry statuses report pam_fprintd's message;
-after three failures GDM's max-tries message ends the conversation. A
+after three failures GDM's max-tries message ends the conversation and the
+service becomes unavailable, as GDM 51 reports `PAM_MAXTRIES`
+(`report_and_stop_conversation`, `TOO_MANY_RETRIES`): the shell keeps the
+password prompt as it is and begins fingerprint again only after the next
+reset or a return to the clock (gnome-shell 51 `authServices.js` `_canRetry`
+always retries on the unlock screen). A
 timed-out scan reports "Verification timed out" and the service becomes
 unavailable, as `PAM_AUTHINFO_UNAVAIL` does in GDM. `FingerprintScan`
 carries the reader's `scan-type` for GNOME's "(or place finger on reader)"

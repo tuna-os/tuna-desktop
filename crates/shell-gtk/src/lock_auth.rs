@@ -1667,25 +1667,84 @@ mod tests {
         assert_eq!(host.take(), vec![Call::Answer(1, "visible".into())]);
     }
 
+    /// GDM 51 reports `PAM_MAXTRIES` as service-unavailable with the
+    /// max-tries message (gdm-session.c `report_and_stop_conversation`);
+    /// on the unlock screen authServices.js `_canRetry` always retries and
+    /// authServicesLegacy.js `_handleOnConversationStopped` returns early
+    /// for an unavailable service, so the prompt stays and fingerprint
+    /// stays off until the next reset.
     #[test]
-    fn fingerprint_max_tries_soft_resets() {
+    fn fingerprint_max_tries_stops_fingerprint_and_keeps_the_prompt() {
+        let max = "You reached the maximum fingerprint authentication attempts, please try another method";
         let host = Fake::new();
         let mut m = AuthMachine::new(1.0);
         let (pw, fp) = started(&mut m, &host);
-        m.event(&host, fp, FP, &problem("You reached the maximum fingerprint authentication attempts, please try another method"));
+        m.event(&host, pw, PW, &query(1, "Password:", true));
+        m.text_changed(true);
         m.take_effects();
+        m.event(&host, fp, FP, &problem(max));
+        m.event(&host, fp, FP, &AuthEvent::Unavailable);
         m.result(&host, fp, false);
         let e = m.take_effects();
+        assert!(e.contains(&Effect::WiggleMessage), "the message wiggles");
+        assert!(e.contains(&Effect::Announce(max.into())));
         assert!(
-            !e.contains(&Effect::WiggleEntry),
-            "the entry was not asking"
+            !e.iter()
+                .any(|e| matches!(e, Effect::ClearEntry | Effect::WiggleEntry)),
+            "the typed password stays: {e:?}"
         );
-        let wait = timers(&e)[0].0;
+        assert_eq!(m.view().message, Some((max.into(), MessageKind::Error)));
+        // Its read time passes; nothing cancels or begins again.
+        let mut pending = timers(&e);
+        while let Some((token, _)) = pending.pop() {
+            m.timeout(&host, token);
+            pending.extend(timers(&m.take_effects()));
+        }
+        assert_eq!(m.view().message, None);
+        assert!(host.take().is_empty(), "no cancel, no restart");
+        let v = m.view();
+        assert_eq!(
+            (v.secret, v.hint.as_str(), v.sensitive),
+            (true, "Password", true)
+        );
+        assert_eq!(m.prompt_step(), 1);
+        m.submit(&host, "secret".into());
+        assert_eq!(host.take(), vec![Call::Answer(1, "secret".into())]);
+        // A password failure's reset tries the reader again.
+        m.event(&host, pw, PW, &problem("Sorry"));
+        m.result(&host, pw, false);
+        let wait = timers(&m.take_effects())
+            .into_iter()
+            .find(|(_, ms)| *ms == WAIT_PENDING_MESSAGES_MS)
+            .unwrap()
+            .0;
         host.take();
         m.timeout(&host, wait);
+        let services: Vec<AuthService> = host.begins().iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            services,
+            vec![AuthService::Password, AuthService::Fingerprint]
+        );
+    }
+
+    #[test]
+    fn fingerprint_max_tries_then_the_clock_offers_fingerprint_again() {
+        let host = Fake::new();
+        let mut m = AuthMachine::new(1.0);
+        let (pw, fp) = started(&mut m, &host);
+        m.event(&host, fp, FP, &problem("max"));
+        m.event(&host, fp, FP, &AuthEvent::Unavailable);
+        m.result(&host, fp, false);
+        host.take();
+        assert!(m.cancel(&host), "step 0: Escape returns to the clock");
         assert_eq!(host.take(), vec![Call::Cancel]);
         m.result(&host, pw, false);
-        assert_eq!(host.begins().len(), 2);
+        m.show_prompt(&host, false);
+        let services: Vec<AuthService> = host.begins().iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            services,
+            vec![AuthService::Password, AuthService::Fingerprint]
+        );
     }
 
     #[test]

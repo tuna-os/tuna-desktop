@@ -171,7 +171,8 @@ pub enum FingerprintStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FingerprintEnd {
     Matched,
-    /// Every scan failed to match (`PAM_MAXTRIES`).
+    /// Every scan failed to match (`PAM_MAXTRIES`): after the max-tries
+    /// problem, GDM's service-unavailable (TOO_MANY_RETRIES) as well.
     Failed,
     /// No daemon, reader or enrolled print, a timed-out scan or a daemon
     /// error (`PAM_AUTHINFO_UNAVAIL`): GDM's service-unavailable.
