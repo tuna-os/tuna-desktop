@@ -67,6 +67,7 @@ package versions are mapped so the final `X.Y.Z` always upgrades over them:
 | Tag | `--version` | Debian `Version` | Arch `pkgver` (`_semver` in `packaging/arch/PKGBUILD`) |
 |---|---|---|---|
 | `v1.0.0-beta.1` | `1.0.0-beta.1` | `1.0.0~beta.1` | `1.0.0beta.1` |
+| `v1.0.0-beta.2` | `1.0.0-beta.2` | `1.0.0~beta.2` | `1.0.0beta.2` |
 | `v1.0.0` | `1.0.0` | `1.0.0` | `1.0.0` |
 
 Publish it as a GitHub prerelease (`gh release create vX.Y.Z-beta.N
