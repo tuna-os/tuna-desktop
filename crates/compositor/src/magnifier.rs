@@ -1605,7 +1605,7 @@ mod tests {
             .unwrap();
         assert_eq!(roi_origin(&view), (400.0, 300.0));
         // An AT-SPI widget focus that arrives later wins over the
-        // unchanged window center.
+        // unchanged window center: (300, 250) less half the 400x300 ROI.
         let view = state
             .view_for(
                 output("tuna-0", 800, 600),
@@ -1615,7 +1615,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(roi_origin(&view), (200.0, 150.0));
+        assert_eq!(roi_origin(&view), (100.0, 100.0));
     }
 
     #[test]
