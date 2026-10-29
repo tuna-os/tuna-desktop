@@ -11,8 +11,20 @@
 #   M-SETTINGS Settings writes reach the session snapshot the compositor reads
 #   M-ZOOM     2x zoom doubles a real panel edge; clamped ROI, bg elsewhere
 #   M-TRACK    moving the pointer moves the magnified view
-#   M-FOCUS    focused-window tracking centers the view with mouse tracking off
+#   M-FOCUS    focused-window tracking centers the view with mouse tracking
+#              off (window-centre fallback: the window runs with GTK_A11Y=none)
+#   M-ATSPI-FOCUS AT-SPI focus events center the view on the focused GTK widget
+# Live output frames (x11grab of the nested window, so the magnified
+# pointer sprite is in them, unlike captures):
+#   M-LIVE     factor 2 around the pointer doubles a known two-colour widget
+#   M-CLICK    a click under the magnified sprite lands on the widget it shows
+#   M-KEYS     Super+Alt+8 toggles, Super+Alt+=/- step the zoom factor
+#   M-CURSOR   the magnified sprite's footprint is twice the unmagnified one
+#   M-INVERT   invert-lightness recolours the magnified pixels
+#   M-CROSSHAIRS cross-hairs drawn through the magnified pointer
+#   M-HALF     left-half screen position: zoom on the left, desktop on the right
 #   M-DISABLE  disabling restores the unmagnified frame
+#   M-LOCK     the locked frame (magnified) holds only lock UI, no window pixels
 # Writes assertions.txt for the parity ledger.
 set -eu
 
@@ -29,7 +41,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,18p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,28p' "$0"; exit 0 ;;
         *) echo "tuna-magnifier-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -268,7 +280,9 @@ snapshot '.mouse_tracking == "none" and .focus_tracking == "centered"' ||
     fail M-FOCUS "tracking-mode writes never reached the snapshot"
 SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
 [ -n "$SOCKET_NAME" ] || fail M-FOCUS "no nested socket in the log"
-WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" Alpha "#3584e4" \
+# GTK_A11Y=none: no AT-SPI focus events, so the view can only come from
+# the focused-window centre fallback this gate is about.
+GTK_A11Y=none WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" Alpha "#3584e4" \
     >"$ARTIFACTS/window-Alpha.log" 2>&1 &
 CLIENT_PID=$!
 cstate '.windows | any(.app_id == "tuna-test-alpha")' "window" ||
@@ -317,6 +331,254 @@ else
 fi
 pass M-FOCUS "focus tracking centers the magnified view on the focused window"
 
+# ---- Live output frames from here on: x11grab of the nested window
+# shows the real output, magnified pointer sprite included.
+PIX="$ROOT/scripts/lib/tuna-magnifier-pixels.py"
+REGION='.magnifier.regions["tuna-0"]'
+GREEN="38 162 105"
+ORANGE="230 97 0"
+grab() {
+    sleep 0.6 # 100 ms scroll animations plus a presented frame
+    geom="$(xdotool getwindowgeometry --shell "$WID")"
+    gx="$(echo "$geom" | sed -n 's/^X=//p')"
+    gy="$(echo "$geom" | sed -n 's/^Y=//p')"
+    ffmpeg -loglevel error -y -f x11grab -draw_mouse 0 -video_size "${WIDTH}x${HEIGHT}" \
+        -i "$DISPLAY+$gx,$gy" -frames:v 1 "$ARTIFACTS/$1.png" ||
+        fail "$2" "x11grab of the nested window failed for $1"
+    ffmpeg -loglevel error -y -i "$ARTIFACTS/$1.png" "$ARTIFACTS/$1.ppm" ||
+        fail "$2" "PPM conversion failed for $1"
+}
+# expect GATE LABEL X Y "R G B" TOL WHAT: live pixel near a colour.
+expect() {
+    # shellcheck disable=SC2046
+    set -- "$1" "$2" "$3" "$4" "$5" "$6" "$7" $(px "$ARTIFACTS/$2.png" "$3" "$4")
+    # shellcheck disable=SC2086
+    near "$8" "$9" "${10}" $5 "$6" ||
+        fail "$1" "$2 ($3,$4) is $8 $9 ${10}, not $7 ($5)"
+}
+# reject GATE LABEL X Y "R G B" TOL WHAT: live pixel not that colour.
+reject() {
+    # shellcheck disable=SC2046
+    set -- "$1" "$2" "$3" "$4" "$5" "$6" "$7" $(px "$ARTIFACTS/$2.png" "$3" "$4")
+    # shellcheck disable=SC2086
+    if near "$8" "$9" "${10}" $5 "$6"; then
+        fail "$1" "$2 ($3,$4) is $8 $9 ${10}: still $7"
+    fi
+}
+# close A B TOL: |A - B| <= TOL (integers).
+close() { [ $(($1 - $2)) -le "$3" ] && [ $(($2 - $1)) -le "$3" ]; }
+point() {
+    xdotool mousemove --window "$WID" "$1" "$2"
+    cstate ".pointer_position == [$1, $2]" 10 || fail "$3" "pointer never reached ($1, $2)"
+}
+
+# M-ATSPI-FOCUS: a GTK window with its AT-SPI bridge on; focus moves
+# between two widgets and the view centers on each widget's centre,
+# not on the window centre M-FOCUS proves.
+kill "$CLIENT_PID" 2>/dev/null || true
+wait "$CLIENT_PID" 2>/dev/null || true
+CLIENT_PID=""
+cstate '.windows | all(.app_id != "tuna-test-alpha")' "Alpha closed" ||
+    fail M-ATSPI-FOCUS "the M-FOCUS window never unmapped"
+gsettings set org.gnome.desktop.a11y.magnifier mag-factor 4.0
+snapshot '.mag_factor == 4.0 and .mouse_tracking == "none" and .focus_tracking == "centered"' ||
+    fail M-ATSPI-FOCUS "factor 4 never reached the snapshot"
+PROBE_LOG="$ARTIFACTS/probe.jsonl"
+PROBE_REQ="$ARTIFACTS/probe-request.json"
+: >"$PROBE_LOG"
+WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-magnifier-probe.py" \
+    "$PROBE_LOG" "$PROBE_REQ" >"$ARTIFACTS/probe.log" 2>&1 &
+CLIENT_PID=$!
+cstate '.windows | any(.app_id == "tuna-magnifier-probe")' "probe window" ||
+    fail M-ATSPI-FOCUS "the probe window never mapped"
+prect() {
+    jq -r '.windows[] | select(.app_id == "tuna-magnifier-probe") | .rect | "\(.[0]) \(.[1]) \(.[2]) \(.[3])"' "$CSTATE"
+}
+sleep 2
+rect1="$(prect)" && sleep 1 && rect2="$(prect)"
+if [ -z "$rect1" ] || [ "$rect1" != "$rect2" ]; then
+    fail M-ATSPI-FOCUS "probe geometry never settled ($rect1 vs $rect2)"
+fi
+# shellcheck disable=SC2086
+set -- $rect2
+PX=$1 PY0=$2 PW=$3 PH=$4
+for _ in $(seq 1 50); do grep -q '"bounds"' "$PROBE_LOG" && break; sleep 0.2; done
+bounds() {
+    jq -rs "map(select(.bounds)) | last | .bounds.$1 | @tsv" "$PROBE_LOG"
+}
+# shellcheck disable=SC2046
+set -- $(bounds area); AX=$((PX + $1)) AY=$((PY0 + $2)) AW=$3 AH=$4
+[ -n "$AH" ] || fail M-ATSPI-FOCUS "the probe never reported widget bounds"
+# shellcheck disable=SC2046
+set -- $(bounds button); BCX=$((PX + $1 + $3 / 2)) BCY=$((PY0 + $2 + $4 / 2))
+# shellcheck disable=SC2046
+set -- $(bounds entry); ECX=$((PX + $1 + $3 / 2)) ECY=$((PY0 + $2 + $4 / 2))
+CX=$((AX + AW / 2)) CY=$((AY + AH / 2))
+WCX=$((PX + PW / 2)) WCY=$((PY0 + PH / 2))
+if close "$BCY" "$WCY" 20 || close "$ECY" "$WCY" 20; then
+    fail M-ATSPI-FOCUS "widget centres too close to the window centre to tell apart"
+fi
+# Activate the window with a click on the drawing area (not focusable,
+# so GTK keeps its own focus widget).
+xdotool mousemove --window "$WID" "$CX" "$CY" click 1
+cstate '.focused_app_id == "tuna-magnifier-probe"' "probe focused" 10 ||
+    fail M-ATSPI-FOCUS "the probe window never took keyboard focus"
+generation=0
+focus_widget() {
+    generation=$((generation + 1))
+    printf '{"generation": %s, "request": "%s"}\n' "$generation" "$1" >"$PROBE_REQ.tmp"
+    mv "$PROBE_REQ.tmp" "$PROBE_REQ"
+    for _ in $(seq 1 100); do
+        [ "$(cat "$PROBE_REQ.ack" 2>/dev/null)" = "$generation" ] && return 0
+        sleep 0.1
+    done
+    fail M-ATSPI-FOCUS "probe never acknowledged $1"
+}
+centered_on() {
+    cstate "$REGION.center as \$c | ((\$c[0] - $1) | fabs) <= 3 and ((\$c[1] - $2) | fabs) <= 3" 20
+}
+focus_widget focus-entry
+centered_on "$ECX" "$ECY" ||
+    fail M-ATSPI-FOCUS "focusing the entry did not center the view on ($ECX, $ECY); window centre is ($WCX, $WCY)"
+cp "$CSTATE" "$ARTIFACTS/atspi-entry-state.json"
+focus_widget focus-button
+centered_on "$BCX" "$BCY" ||
+    fail M-ATSPI-FOCUS "focusing the button did not center the view on ($BCX, $BCY); window centre is ($WCX, $WCY)"
+cp "$CSTATE" "$ARTIFACTS/atspi-button-state.json"
+pass M-ATSPI-FOCUS "AT-SPI focus centers the view on the entry ($ECX,$ECY) then the button ($BCX,$BCY), not the window centre ($WCX,$WCY)"
+
+# M-LIVE: factor 2, centered mouse tracking, pointer on the boundary
+# between the probe's green and orange halves. The ROI is 640x400
+# around it, so output row 520 shows source row CY+60 and each half,
+# AW/2 wide in the source, spans AW output pixels.
+if [ "$AW" -gt 620 ] || [ "$AH" -lt 140 ]; then
+    fail M-LIVE "probe drawing area ${AW}x${AH} does not fit the 2x layout"
+fi
+gsettings set org.gnome.desktop.a11y.magnifier focus-tracking 'none'
+gsettings set org.gnome.desktop.a11y.magnifier mouse-tracking 'centered'
+gsettings set org.gnome.desktop.a11y.magnifier mag-factor 2.0
+snapshot '.mag_factor == 2.0 and .mouse_tracking == "centered" and .focus_tracking == "none"' ||
+    fail M-LIVE "tracking writes never reached the snapshot"
+point "$CX" "$CY" M-LIVE
+cstate "$REGION.roi as \$r | ((\$r[0] - $((CX - 320))) | fabs) <= 1 and ((\$r[1] - $((CY - 200))) | fabs) <= 1 and \$r[2] == 640 and \$r[3] == 400" 10 ||
+    fail M-LIVE "ROI is not the unclamped 640x400 around ($CX, $CY)"
+grab 10-live M-LIVE
+# shellcheck disable=SC2086,SC2046
+set -- $("$PY" "$PIX" run "$ARTIFACTS/10-live.ppm" 520 $GREEN 24); gs=$1 ge=$2
+# shellcheck disable=SC2086,SC2046
+set -- $("$PY" "$PIX" run "$ARTIFACTS/10-live.ppm" 520 $ORANGE 24); os=$1 oe=$2
+if ! { close "$ge" 639 3 && close "$os" 640 3; }; then
+    fail M-LIVE "green/orange boundary at $ge/$os, expected the output centre 640"
+fi
+if ! { close $((ge - gs + 1)) "$AW" 4 && close $((oe - os + 1)) "$AW" 4; }; then
+    fail M-LIVE "halves span $((ge - gs + 1)) and $((oe - os + 1)) px, expected 2 x $((AW / 2))"
+fi
+pass M-LIVE "factor 2 around the pointer: green $gs-$ge, orange $os-$oe for a ${AW}px area"
+
+# M-CLICK: the sprite sits on the output centre; what it covers there
+# is what the click hits.
+GX=$((AX + AW / 4)) OX=$((AX + 3 * AW / 4))
+point "$GX" "$CY" M-CLICK
+grab 11-click-green M-CLICK
+expect M-CLICK 11-click-green 620 400 "$GREEN" 16 "green beside the magnified sprite"
+xdotool click 1
+point "$OX" "$CY" M-CLICK
+grab 11-click-orange M-CLICK
+expect M-CLICK 11-click-orange 620 400 "$ORANGE" 16 "orange beside the magnified sprite"
+xdotool click 1
+for _ in $(seq 1 50); do [ "$(grep -c '"click"' "$PROBE_LOG")" -ge 2 ] && break; sleep 0.1; done
+clicks="$(jq -rs '[.[] | select(.click) | .click | map(round) | "\(.[0]) \(.[1])"] | join(" ")' "$PROBE_LOG")"
+# shellcheck disable=SC2086
+set -- $clicks
+[ $# -ge 4 ] || fail M-CLICK "the probe logged clicks '$clicks', expected two after the activation"
+shift $(($# - 4))
+if ! { close "$1" $((AW / 4)) 2 && close "$2" $((AH / 2)) 2 &&
+    close "$3" $((3 * AW / 4)) 2 && close "$4" $((AH / 2)) 2; }; then
+    fail M-CLICK "clicks landed at ($1,$2) and ($3,$4), expected ($((AW / 4)),$((AH / 2))) and ($((3 * AW / 4)),$((AH / 2)))"
+fi
+pass M-CLICK "clicks under the magnified sprite hit the green ($1,$2) and orange ($3,$4) halves it showed"
+
+# M-KEYS / M-CURSOR: gsd-media-keys' chords through the nested seat.
+point "$GX" "$CY" M-KEYS
+xdotool key --clearmodifiers super+alt+8
+snapshot '.enabled == false' || fail M-KEYS "Super+Alt+8 did not turn the magnifier off"
+cstate '.magnifier.active == false' 10 || fail M-KEYS "the compositor kept magnifying after Super+Alt+8"
+grab 12-keys-off M-KEYS
+reject M-KEYS 12-keys-off 20 520 "$GREEN" 16 "magnified (off frame)"
+xdotool key --clearmodifiers super+alt+8
+snapshot '.enabled == true' || fail M-KEYS "a second Super+Alt+8 did not turn the magnifier on"
+cstate '.magnifier.active == true' 10 || fail M-KEYS "the compositor did not magnify after Super+Alt+8"
+grab 13-keys-on M-KEYS
+# shellcheck disable=SC2086,SC2046
+set -- $("$PY" "$PIX" footprint "$ARTIFACTS/12-keys-off.ppm" "$GX" "$CY" $GREEN 60); w0=$1 h0=$2
+# shellcheck disable=SC2086,SC2046
+set -- $("$PY" "$PIX" footprint "$ARTIFACTS/13-keys-on.ppm" 640 400 $GREEN 60); w1=$1 h1=$2
+if [ "$w0" -lt 8 ] || [ "$h0" -lt 8 ]; then
+    fail M-CURSOR "no pointer sprite at ($GX,$CY) in the unmagnified frame (${w0}x${h0})"
+fi
+if ! { close "$w1" $((2 * w0)) 4 && close "$h1" $((2 * h0)) 4; }; then
+    fail M-CURSOR "magnified sprite is ${w1}x${h1}, expected twice ${w0}x${h0}"
+fi
+pass M-CURSOR "sprite footprint ${w0}x${h0} unmagnified, ${w1}x${h1} at factor 2"
+point "$CX" "$CY" M-KEYS
+xdotool key --clearmodifiers super+alt+equal
+snapshot '.mag_factor == 3.0' || fail M-KEYS "Super+Alt+= did not step the factor to 3"
+cstate "$REGION.mag == 3" 10 || fail M-KEYS "the zoom region never reached factor 3"
+grab 14-zoom-in M-KEYS
+# Factor 3: the green half (300 source px) now covers the left edge.
+expect M-KEYS 14-zoom-in 20 520 "$GREEN" 16 "green at the left edge at factor 3"
+xdotool key --clearmodifiers super+alt+minus
+snapshot '.mag_factor == 2.0' || fail M-KEYS "Super+Alt+- did not step the factor back to 2"
+cstate "$REGION.mag == 2" 10 || fail M-KEYS "the zoom region never returned to factor 2"
+grab 15-zoom-out M-KEYS
+# shellcheck disable=SC2086,SC2046
+set -- $("$PY" "$PIX" run "$ARTIFACTS/15-zoom-out.ppm" 520 $GREEN 24)
+close $(($2 - $1 + 1)) "$AW" 4 || fail M-KEYS "green spans $(($2 - $1 + 1)) px after Super+Alt+-, expected $AW"
+pass M-KEYS "Super+Alt+8 toggles off and on; Super+Alt+= / - step 2 -> 3 -> 2 with the pixels to match"
+
+# M-INVERT: Shell.InvertLightnessEffect, every channel + (1 - 2L).
+gsettings set org.gnome.desktop.a11y.magnifier invert-lightness true
+snapshot '.invert_lightness == true' || fail M-INVERT "invert-lightness never reached the snapshot"
+grab 16-invert M-INVERT
+expect M-INVERT 16-invert 440 520 "93 217 160" 14 "inverted green"
+expect M-INVERT 16-invert 840 520 "255 122 25" 14 "inverted orange"
+gsettings set org.gnome.desktop.a11y.magnifier invert-lightness false
+snapshot '.invert_lightness == false' || fail M-INVERT "invert-lightness never reset"
+pass M-INVERT "invert lightness turns green into 93 217 160 and orange into 255 122 25"
+
+# M-CROSSHAIRS: opaque red hairs through the magnified pointer.
+gsettings set org.gnome.desktop.a11y.magnifier cross-hairs-color '#ff0000'
+gsettings set org.gnome.desktop.a11y.magnifier cross-hairs-opacity 1.0
+gsettings set org.gnome.desktop.a11y.magnifier cross-hairs-thickness 8
+gsettings set org.gnome.desktop.a11y.magnifier cross-hairs-clip false
+gsettings set org.gnome.desktop.a11y.magnifier show-cross-hairs true
+snapshot '.show_cross_hairs == true and .cross_hairs_opacity == 1.0 and .cross_hairs_thickness == 8' ||
+    fail M-CROSSHAIRS "cross-hairs keys never reached the snapshot"
+grab 17-crosshairs M-CROSSHAIRS
+expect M-CROSSHAIRS 17-crosshairs 440 400 "255 0 0" 30 "the horizontal hair"
+expect M-CROSSHAIRS 17-crosshairs 640 300 "255 0 0" 30 "the vertical hair"
+expect M-CROSSHAIRS 17-crosshairs 440 440 "$GREEN" 16 "green beside the hair"
+gsettings set org.gnome.desktop.a11y.magnifier show-cross-hairs false
+snapshot '.show_cross_hairs == false' || fail M-CROSSHAIRS "show-cross-hairs never reset"
+pass M-CROSSHAIRS "red hairs cross at the magnified pointer over the zoomed content"
+
+# M-HALF: left half magnified (ROI 320x400 around the pointer), right
+# half the unmagnified desktop.
+gsettings set org.gnome.desktop.a11y.magnifier screen-position 'left-half'
+snapshot '.screen_position == "left-half"' || fail M-HALF "screen-position never reached the snapshot"
+cstate "$REGION.viewport == [0, 0, 640, 800]" 10 || fail M-HALF "viewport is not the left half"
+grab 18-half M-HALF
+expect M-HALF 18-half 10 520 "$GREEN" 16 "zoomed green at the left edge"
+expect M-HALF 18-half 380 520 "$ORANGE" 16 "zoomed orange right of the half centre"
+rx=$((CX + 100))
+[ "$rx" -ge 660 ] || rx=660
+[ "$rx" -le $((AX + AW - 10)) ] || fail M-HALF "probe area ends before x 660; no unmagnified sample"
+expect M-HALF 18-half "$rx" $((CY + 60)) "$ORANGE" 16 "the unmagnified probe in the right half"
+reject M-HALF 18-half 1270 $((CY + 60)) "$ORANGE" 16 "magnified content at the right edge"
+gsettings set org.gnome.desktop.a11y.magnifier screen-position 'full-screen'
+snapshot '.screen_position == "full-screen"' || fail M-HALF "screen-position never reset"
+pass M-HALF "left-half view zooms beside the unmagnified right half"
+
 gsettings set org.gnome.desktop.a11y.applications screen-magnifier-enabled false
 snapshot '.enabled == false' || fail M-DISABLE "disabling never reached the snapshot"
 capture 05-disable M-DISABLE
@@ -326,6 +588,24 @@ set -- $(px "$ARTIFACTS/05-disable.png" 300 48); DR=$1 DG=$2 DB=$3
 near "$DR" "$DG" "$DB" "$GR" "$GG" "$GB" 12 ||
     fail M-DISABLE "(300,48) is $DR $DG $DB after disable, not background ($BG)"
 pass M-DISABLE "disabling restores the unmagnified frame"
+
+# M-LOCK: magnify again and lock; the frame holds only the lock UI,
+# none of the probe window's green or orange behind it.
+gsettings set org.gnome.desktop.a11y.applications screen-magnifier-enabled true
+snapshot '.enabled == true' || fail M-LOCK "re-enabling never reached the snapshot"
+cstate '.magnifier.active == true' 10 || fail M-LOCK "the compositor did not magnify again"
+xdotool key --clearmodifiers super+l
+cstate '.locked == true' 15 || fail M-LOCK "Super+L did not lock the session"
+sleep 2
+cstate '.magnifier.active == true' 10 || fail M-LOCK "the magnifier switched off on lock"
+grab 20-lock M-LOCK
+# shellcheck disable=SC2086
+greens="$("$PY" "$PIX" count "$ARTIFACTS/20-lock.ppm" $GREEN 10)"
+# shellcheck disable=SC2086
+oranges="$("$PY" "$PIX" count "$ARTIFACTS/20-lock.ppm" $ORANGE 10)"
+[ "$greens" -eq 0 ] && [ "$oranges" -eq 0 ] ||
+    fail M-LOCK "locked frame shows $greens green and $oranges orange probe pixels"
+pass M-LOCK "the magnified locked frame holds no window pixels"
 
 cp "$CSTATE" "$ARTIFACTS/final-state.json"
 grep -qi panicked "$LOG" && fail M-NOPANIC "panic in nested log"
