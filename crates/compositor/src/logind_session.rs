@@ -191,7 +191,8 @@ mod monitor {
         }
 
         fn wait_for(mut done: impl FnMut() -> bool) -> bool {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            // Generous for a loaded CI runner; a pass returns at once.
+            let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
                 if done() {
                     return true;
@@ -215,7 +216,7 @@ mod monitor {
             let connect = || {
                 zbus::blocking::connection::Builder::address(address.trim())
                     .unwrap()
-                    .method_timeout(Duration::from_secs(2))
+                    .method_timeout(Duration::from_secs(10))
                     .build()
                     .unwrap()
             };
@@ -258,7 +259,11 @@ mod monitor {
             session.report_locked(true);
             session.report_locked(true);
             session.report_locked(false);
-            assert!(wait_for(|| hints.lock().unwrap().len() >= 3));
+            assert!(
+                wait_for(|| hints.lock().unwrap().len() >= 3),
+                "logind received {:?}",
+                hints.lock().unwrap()
+            );
             std::thread::sleep(Duration::from_millis(100));
             assert_eq!(
                 *hints.lock().unwrap(),
