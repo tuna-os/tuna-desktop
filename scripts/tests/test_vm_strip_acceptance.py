@@ -275,6 +275,30 @@ class Tests(unittest.TestCase):
         motion = source.index("move(x + (12 if delta > 0 else -12), y)", press)
         self.assertLess(pressed, motion)
 
+    def test_super_drag_holds_super_in_the_seat_before_the_press(self):
+        # Keyboard and tablet are separate guest devices with no mutual
+        # ordering: the press must follow an observed seat-held Super, and
+        # the drop and Super release are each observed in turn.
+        source = Path(proof.__file__).read_text()
+        start = source.index("super_key(True)\n")
+        held = source.index("held_keys(sample) == 1 and unclaimed(sample)", start)
+        press = source.index("button(True)", start)
+        preview = source.index("before_beta(sample, found) and unclaimed(sample)", start)
+        drop = source.index("button(False)", start)
+        release = source.index("super_key(False)", start)
+        released = source.index("held_keys(sample) == 0 and unclaimed(sample)", start)
+        capture = source.index("capture('08-super-drag-reorder', returned)", start)
+        self.assertLess(held, press)
+        self.assertLess(press, preview)
+        self.assertLess(preview, drop)
+        self.assertLess(drop, release)
+        self.assertLess(release, released)
+        self.assertLess(released, capture)
+        self.assertLess(source.index("capture('07-vt-cancel', returned)"), start)
+        self.assertIn("('move_requests', 'resize_requests', 'delivered_buttons')", source)
+        self.assertIn('"seat_pressed_key_count"', (Path(proof.__file__).resolve().parents[2]
+                      / 'packaging/marlin/vm-lane/tuna-vm-lifecycle').read_text())
+
 
 class EndpointEvidence(unittest.TestCase):
     def test_storage_failure_preserves_exact_primary_endpoint_exception(self):

@@ -623,6 +623,76 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             raise RuntimeError('VT cancellation committed a column move')
         button(False)
         capture('07-vt-cancel', returned)
+        # Compositor-owned Super+drag (GNOME's and niri's modifier move): the
+        # press lands in Alpha's body, where the client starts no move, so
+        # only the compositor can carry Alpha back before Beta; the client
+        # sees neither the press nor its release.
+        current = windows(returned, original, edge=edge)
+        rect, beta_rect = current['alpha']['rect'], current['beta']['rect']
+        if rect[0] <= beta_rect[0]:
+            raise RuntimeError('Super drag control did not start after Beta')
+        grab_x = min(1250, rect[0] + rect[2] - 24)
+        grab_y = rect[1] + rect[3] // 2
+        if not (max(rect[0], 0) < grab_x < rect[0] + rect[2] - 16 and rect[1] + 40 < grab_y):
+            raise RuntimeError('actual Super drag body target is not visible')
+        move(grab_x, grab_y)
+        button(True)
+        button(False)
+        clicked = ready('scroll', extra=lambda sample, found: (
+            sample['inventory']['state']['focused'] == found['alpha']['id']
+            and sample['fixture']['windows']['alpha']['delivered_buttons'] > returned['fixture']['windows']['alpha']['delivered_buttons']))
+        current = windows(clicked, original, edge=edge)
+        rect, beta_rect = current['alpha']['rect'], current['beta']['rect']
+        grab_x = min(1250, rect[0] + rect[2] - 24)
+        if not max(rect[0], 0) < grab_x < rect[0] + rect[2] - 16:
+            raise RuntimeError('actual Super drag body target left the viewport')
+        target_x = max(20, min(1260, beta_rect[0] + beta_rect[2] // 2 - 48 - rect[2] // 2 + grab_x - rect[0]))
+        move(grab_x, grab_y)
+        clicked_counts = clicked['fixture']['windows']['alpha']
+        def unclaimed(sample):
+            counts = sample['fixture']['windows']['alpha']
+            return all(counts[field] == clicked_counts[field] for field in ('move_requests', 'resize_requests', 'delivered_buttons'))
+        def held_keys(sample):
+            count = sample['inventory']['state'].get('seat_pressed_key_count')
+            if type(count) is not int or count < 0:
+                raise RuntimeError('genuine compositor held-key count missing')
+            return count
+        if held_keys(clicked) != 0:
+            raise RuntimeError('a key was already held before the Super drag')
+        def super_key(down):
+            transport.command('input-send-event', events=[
+                {'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': 'meta_l'}}}])
+        super_key(True)
+        super_released = False
+        try:
+            # Keyboard and tablet are separate guest devices: see the
+            # compositor seat hold Super before the tablet press, or the
+            # press could land as a plain client click.
+            ready('scroll', extra=lambda sample, found: held_keys(sample) == 1 and unclaimed(sample))
+            button(True)
+            move(grab_x - 12, grab_y)
+            ready('scroll', extra=lambda sample, found: (
+                (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id'] and unclaimed(sample)))
+            move(target_x, grab_y)
+            ready('scroll', extra=lambda sample, found: before_beta(sample, found) and unclaimed(sample))
+            button(False)
+            ready('scroll', extra=lambda sample, found: (
+                sample['inventory']['state']['tile_preview'] is None and unclaimed(sample)
+                and found['alpha']['rect'][0] < found['beta']['rect'][0]))
+            super_key(False)
+            super_released = True
+            # The press disarmed the Super tap, so its release opens no
+            # overview (windows() rejects one). The release need not repaint
+            # anything: wait on the seat, not on a newer frame.
+            returned = ready('scroll', extra=lambda sample, found: (
+                held_keys(sample) == 0 and unclaimed(sample)
+                and found['alpha']['rect'][0] < found['beta']['rect'][0]))
+        finally:
+            if not super_released:
+                super_key(False)
+        if {role: item['rect'][2:] for role, item in windows(returned, original, edge=edge).items()} != {role: item['rect'][2:] for role, item in current.items()}:
+            raise RuntimeError('Super drag reorder changed actual column sizes')
+        capture('08-super-drag-reorder', returned)
         if edge:
             before_edge = returned
             before_found = windows(before_edge, original, edge=True)
@@ -638,7 +708,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             receipt['stationary_edge'] = {'observations': observations,
                 'stationary_input_verified': True, 'sampled_not_every_frame': True,
                 'presented_latency_qualified': False}
-            capture('08-stationary-delta-revealed', terminal, 'delta')
+            capture('09-stationary-delta-revealed', terminal, 'delta')
             final = windows(terminal, original, edge=True)
             bar = terminal['inventory']['state']['tile_preview']['rect']
             delta_rect = final['delta']['rect']
@@ -648,14 +718,14 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             returned = ready('scroll', terminal, extra=lambda sample, found:
                 sample['inventory']['state']['tile_preview'] is None and
                 found['alpha']['rect'][0] > found['delta']['rect'][0])
-            capture('09-stationary-matching-release', returned)
+            capture('10-stationary-matching-release', returned)
         chord('meta_l', 'shift', 't')
         restored = ready('gnome', returned)
         if {w['id']: w['workspace'] for w in restored['inventory']['state']['windows']} != initial_ids:
             raise RuntimeError('mode restore changed actual native identities')
         if {w['id']: w['rect'] for w in restored['inventory']['state']['windows']} != initial_rects:
             raise RuntimeError('mode restore lost independent floating rectangles')
-        capture('10-floating-restored' if edge else '08-floating-restored', restored)
+        capture('11-floating-restored' if edge else '09-floating-restored', restored)
         if time.monotonic() >= deadline:
             raise TimeoutError('installed strip completion exceeded absolute deadline')
         receipt['completed'] = True
