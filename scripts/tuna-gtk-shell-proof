@@ -9591,6 +9591,8 @@ if [ -n "$PAM_ON" ]; then
         fail G-LOCK-CURTAIN-POLICY "the reduced-motion prompt did not settle"
     curtain_here
     xdotool key Escape
+    curtain line "ease to=clock from=1.0000 duration=300 nominal=300 mode=ease-out-quad motion=false clock=manual" ||
+        fail G-LOCK-CURTAIN-POLICY "under Reduced Motion Escape did not start the 300 ms fade back"
     curtain_after 150
     curtain frame 0.25 false ||
         fail G-LOCK-CURTAIN-POLICY "under Reduced Motion Escape did not fade the clock back in place"
@@ -9673,6 +9675,8 @@ if [ -n "$PAM_ON" ]; then
         # shellcheck disable=SC2086 # END DURATION PROGRESS VELOCITY
         set -- $curtain_result
         curtain_end=$1 curtain_ms=$2 curtain_progress=$3 curtain_velocity=$4
+        curtain line "mode=ease-out-cubic motion=true clock=manual" ||
+            fail G-LOCK-CURTAIN-DRAG "a flick's release did not ease out cubic on the frozen clock"
         curtain_after $((${curtain_ms%.*} + 1))
         if [ "$curtain_end" = 1 ] &&
             "$PY" -c 'import sys; sys.exit(not (float(sys.argv[1]) >= 0.3 and float(sys.argv[2]) < 0.5))' \
@@ -9687,6 +9691,8 @@ if [ -n "$PAM_ON" ]; then
         if [ "$curtain_end" = 1 ]; then
             curtain_here
             xdotool key Escape
+            curtain line "ease to=clock from=1.0000 duration=300 nominal=300 mode=ease-out-quad motion=true clock=manual" ||
+                fail G-LOCK-CURTAIN-DRAG "Escape did not start the clock back after a flick"
             curtain_after 300
             curtain line "settled page=clock progress=0.0000" ||
                 fail G-LOCK-CURTAIN-DRAG "Escape did not bring the clock back after a flick"
@@ -9697,6 +9703,8 @@ if [ -n "$PAM_ON" ]; then
     scrot "$ARTIFACTS/29d-unlock-dialog-flicked.png" >/dev/null
     curtain_here
     xdotool key Escape
+    curtain line "ease to=clock from=1.0000 duration=300 nominal=300 mode=ease-out-quad motion=true clock=manual" ||
+        fail G-LOCK-CURTAIN-DRAG "Escape did not start the clock back after the flick"
     curtain_after 300
     curtain line "settled page=clock progress=0.0000" ||
         fail G-LOCK-CURTAIN-DRAG "Escape did not bring the clock back after the flick"
@@ -9717,6 +9725,8 @@ if [ -n "$PAM_ON" ]; then
     curtain_end=$1 curtain_ms=$2
     [ "$curtain_end" = 1 ] ||
         fail G-LOCK-CURTAIN-DRAG "a slow release past half way did not settle on the prompt ($curtain_result)"
+    curtain line "mode=ease-out-cubic motion=true clock=manual" ||
+        fail G-LOCK-CURTAIN-DRAG "the release past half way did not ease out cubic on the frozen clock"
     curtain_after 100
     curtain eased 100 true >/dev/null ||
         fail G-LOCK-CURTAIN-DRAG "100 ms into the release the prompt was off GNOME's ease-out cubic"
