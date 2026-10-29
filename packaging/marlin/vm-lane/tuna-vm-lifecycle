@@ -576,13 +576,21 @@ POWER_BUTTON_SESSION_RULES = (
     "type='method_call',interface='org.gnome.SessionManager',member='Shutdown'",
     "type='method_call',interface='org.gnome.SessionManager.EndSessionDialog'",
     "type='signal',interface='org.gnome.SessionManager.EndSessionDialog'")
-# logind power requests and their error replies (gsd-media-keys'
-# logind_power_action: PowerOffWithFlags/SuspendWithFlags/HibernateWithFlags).
+# logind power requests, their error replies and logind's own announcement
+# that it is about to act (gsd-media-keys' logind_power_action:
+# PowerOffWithFlags/SuspendWithFlags/HibernateWithFlags). gsd passes no reply
+# callback, so GDBus sends these calls NO_REPLY_EXPECTED and logind answers
+# nothing, not even a refusal: a refused request shows as a call that
+# PrepareForShutdown/PrepareForSleep never follows while PreparingForShutdown
+# stays false.
 POWER_BUTTON_LOGIND_CALLS = ("PowerOff", "PowerOffWithFlags", "Suspend", "SuspendWithFlags",
                              "Hibernate", "HibernateWithFlags")
+POWER_BUTTON_LOGIND_PREPARE = ("PrepareForShutdown", "PrepareForSleep")
 POWER_BUTTON_SYSTEM_RULES = tuple(
     f"type='method_call',interface='org.freedesktop.login1.Manager',member='{member}'"
-    for member in POWER_BUTTON_LOGIND_CALLS) + ("type='error'",)
+    for member in POWER_BUTTON_LOGIND_CALLS) + tuple(
+    f"type='signal',interface='org.freedesktop.login1.Manager',member='{member}'"
+    for member in POWER_BUTTON_LOGIND_PREPARE) + ("type='error'",)
 POWER_BUTTON_ACTIONS = ("interactive", "nothing")
 # A block inhibitor on shutdown held by the fixture itself (root): since
 # systemd 257 a strong block inhibitor refuses PowerOffWithFlags without
@@ -726,6 +734,13 @@ def logind_inhibitors():
     return [dict(zip(("what", "who", "why", "mode", "uid", "pid"), row)) for row in listed["data"][0]]
 
 
+def logind_preparing_for_shutdown():
+    """logind's PreparingForShutdown: true once it has begun a power-off."""
+    return json.loads(call("busctl", "--system", "--json=short", "get-property", "org.freedesktop.login1",
+                           "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                           "PreparingForShutdown"))["data"]
+
+
 def hostname_chassis():
     """hostnamed's Chassis property, which gsd reads once at startup."""
     return json.loads(call("busctl", "--system", "--json=short", "get-property", "org.freedesktop.hostname1",
@@ -807,6 +822,10 @@ def power_button_observe():
     return {"session_count": len(session), "system_count": len(system), "grabs": grabs,
             "activations": activations, "shutdowns": shutdowns, "dialog": dialog, "system": power_calls,
             "media_keys": gsd_plugin_row("MediaKeys"), "inhibitors": logind_inhibitors(),
+            "prepare": [{"index": m["index"], "member": m["member"], "args": m["args"][:1]}
+                        for m in system if m["type"] == "signal"
+                        and m["member"] in POWER_BUTTON_LOGIND_PREPARE],
+            "preparing_for_shutdown": logind_preparing_for_shutdown(),
             "session_user": OWNER.pw_name, "session_uid": OWNER.pw_uid,
             "owners": {"shell": bus_owner("org.gnome.Shell"),
                        "session_manager": bus_owner("org.gnome.SessionManager")},

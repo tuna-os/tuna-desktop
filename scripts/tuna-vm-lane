@@ -2244,7 +2244,6 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         owns_line = "tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings"
         dialog_line = "tuna-shell-gtk: end-session dialog: Power Off opened over D-Bus"
         key_what = {"handle-power-key", "handle-suspend-key", "handle-hibernate-key"}
-        refusals = ("org.freedesktop.login1.BlockedByInhibitorLock", "org.freedesktop.DBus.Error.AccessDenied")
 
         def key_inhibitor(observed, pid):
             return next((row for row in observed["inhibitors"]
@@ -2413,9 +2412,14 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             # gsd 51 on a vm chassis calls PowerOffWithFlags(0) without
             # SD_LOGIND_SKIP_INHIBITORS; the fixture's own block inhibitor
             # makes logind refuse it, so the VM stays up to record the gate.
+            # gsd passes no reply callback (logind_power_action), so GDBus
+            # marks the call NO_REPLY_EXPECTED and logind sends no refusal
+            # (CI run 40830470213 captured the call, never a reply): the
+            # refusal is that logind never announces PrepareForShutdown and
+            # PreparingForShutdown stays false with the inhibitor held.
             case = power_button["cases"]["vm"] = {}
             blocked = False
-            mark = None
+            pressed = None
             try:
                 case["block"] = agent.run("power-button-block", "start")
                 blocked = True
@@ -2424,39 +2428,40 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                 deadline = pressed + 10
                 while True:
                     observed = agent.run("power-button-observe")
-                    refused = [call for call in since(observed, mark, "system", "system")
-                               if call["member"] == "PowerOffWithFlags" and call["sender_pid"] == gsd[1]
-                               and call["args"] == ["uint64 0"] and call["reply"] is not None
-                               and call["reply"]["type"] == "error" and call["reply"]["error_name"] in refusals
-                               and (call["reply"]["message"] or "").endswith("due to active block inhibitor")]
+                    requested = [call for call in since(observed, mark, "system", "system")
+                                 if call["member"] == "PowerOffWithFlags" and call["sender_pid"] == gsd[1]
+                                 and call["args"] == ["uint64 0"]]
                     if not quiet(observed, mark):
                         case["last"] = observed
                         raise RuntimeError("vm chassis power key opened the end-session path")
-                    if activated(observed, mark, action_id, gsd) and refused:
+                    if activated(observed, mark, action_id, gsd) and requested:
                         break
                     if time.monotonic() >= deadline:
                         case["last"] = observed
                         raise RuntimeError("gsd-media-keys did not request logind power-off on the vm chassis")
                     time.sleep(0.2)
-                case["refused"] = refused
+                case["requested"] = requested
                 time.sleep(max(0.0, pressed + 5 - time.monotonic()))
                 status = qmp.cmd("query-status")["status"]
                 observed = agent.run("power-button-observe")
                 calls = since(observed, mark, "system", "system")
-                case.update(status=status, logind=calls)
+                prepare = since(observed, mark, "prepare", "system")
+                held = any(row["mode"] == "block" and row["who"] == "tuna-vm-lane"
+                           and "shutdown" in row["what"].split(":") for row in observed["inhibitors"])
+                case.update(status=status, logind=calls, prepare=prepare,
+                            preparing_for_shutdown=observed["preparing_for_shutdown"], block_held=held)
                 if (status != "running" or identity(inventory("power-button-vm-after")) != identity_before
-                        or not quiet(observed, mark)
-                        or any(call not in refused for call in calls)):
+                        or not quiet(observed, mark) or prepare or observed["preparing_for_shutdown"] is not False
+                        or not held
+                        or any(call["member"] != "PowerOffWithFlags" or call["sender_pid"] != gsd[1]
+                               or (call["reply"] is not None and call["reply"]["type"] != "error")
+                               for call in calls)):
                     raise RuntimeError("vm chassis power key disturbed the session beyond the refused power-off")
             finally:
-                # Releasing the block under a still-pending (polkit) request
-                # would power off: let logind answer every request first.
-                deadline = time.monotonic() + 10
-                while mark is not None and time.monotonic() < deadline:
-                    observed = agent.run("power-button-observe")
-                    if all(call["reply"] is not None for call in since(observed, mark, "system", "system")):
-                        break
-                    time.sleep(0.2)
+                # logind answers inhibited requests at once; the 5 s window
+                # above already covers it. Never release the block earlier.
+                if pressed is not None:
+                    time.sleep(max(0.0, pressed + 5 - time.monotonic()))
                 if blocked:
                     agent.run("power-button-block", "stop")
                 agent.run("power-button-action", "restore")
