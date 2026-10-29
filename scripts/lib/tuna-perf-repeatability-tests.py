@@ -61,7 +61,7 @@ if name=='tuna-vm-perf':
 
 
 class Repeatability(unittest.TestCase):
-    def execute(self, failure=None, image_failure=False, receipt_failure=False):
+    def execute(self, failure=None, image_failure=False, receipt_failure=False, thread_diagnostics=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             commands = root / 'commands'
@@ -89,11 +89,14 @@ class Repeatability(unittest.TestCase):
             receipts = root / 'receipts.jsonl'
             env = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
                        RECEIPTS=str(receipts), GITHUB_SHA='controlled-source', FAIL_CASE=failure or '', FAIL_IMAGE_BUILD='1' if image_failure else '')
+            env.pop('PERF_THREAD_DIAGNOSTICS', None)
+            if thread_diagnostics is not None:
+                env['PERF_THREAD_DIAGNOSTICS'] = thread_diagnostics
             results = [subprocess.run(['bash', '-c', measurement_script(profile)], cwd=root, env=env,
                                       capture_output=True, text=True, timeout=30) for profile in ('diagnostic', 'stock')]
             result = next((r for r in results if r.returncode), results[-1])
             statuses = [json.loads((root / path / 'acquisition-status.json').read_text()) if (root / path / 'acquisition-status.json').exists() else None for path in ('perf-artifacts', 'perf-artifacts/stock')]
-            rows = [json.loads(line) for line in receipts.read_text().splitlines()]
+            rows = [json.loads(line) for line in receipts.read_text().splitlines()] if receipts.exists() else []
             artifacts = sorted(str(path.relative_to(root)) for path in (root / 'perf-artifacts').rglob('controlled-command-receipt.json'))
             return result, rows, artifacts, statuses
 
@@ -191,6 +194,40 @@ class Repeatability(unittest.TestCase):
         self.assertIn('        if: always()\n', suffix)
         self.assertIn('          path: perf-artifacts\n', suffix)
         self.assertIn('- run: python3 scripts/lib/tuna-perf-repeatability-tests.py', source)
+
+    def test_gated_stock_observer_never_records_thread_diagnostics(self):
+        # #782: ~45 KiB per-second thread-diagnostic records, forwarded to the
+        # serial console, stalled every GNOME session they measured.
+        service = (ROOT / 'packaging/marlin/perf/tuna-perf.service').read_text()
+        self.assertNotIn('--thread-diagnostics', service)
+        container = (ROOT / 'packaging/marlin/perf/Containerfile').read_text()
+        self.assertIn('ARG PERF_THREAD_DIAGNOSTICS=false', container)
+        result, rows, artifacts, statuses = self.execute()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        builds = [row['args'] for row in rows if row['command'] == 'sudo' and row['args'][:2] == ['podman', 'build']
+                  and 'packaging/marlin/perf/Containerfile' in row['args']]
+        self.assertEqual(len(builds), 12)
+        self.assertTrue(all('PERF_THREAD_DIAGNOSTICS=false' in args for args in builds))
+        for row in rows:
+            if row['command'] == 'tuna-vm-perf':
+                self.assertIn('observer_thread_diagnostics=false', row['meta'])
+
+    def test_thread_diagnostics_are_refused_for_stock_before_any_acquisition(self):
+        result, rows, artifacts, statuses = self.execute(thread_diagnostics='true')
+        self.assertEqual(result.returncode, 2)
+        cases = [row['case'] for row in rows if row['command'] == 'tuna-vm-perf']
+        self.assertTrue(cases and all(case.startswith('diagnostic:') for case in cases))
+        self.assertFalse(any(row['command'] == 'sudo' and 'localhost/marlin-tuna-preview:stock' in ' '.join(row['args'])
+                             for row in rows))
+        self.assertIsNone(statuses[1])
+        for value in ('yes', '1', ''):
+            with self.subTest(value=value):
+                result, rows, artifacts, statuses = self.execute(thread_diagnostics=value)
+                if value:
+                    self.assertEqual(result.returncode, 2)
+                    self.assertFalse(any(row['command'] == 'tuna-vm-perf' for row in rows))
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

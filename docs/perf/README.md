@@ -8,9 +8,9 @@ The CI-only observer reads every process with the test user's UID, including act
 
 DRM memory observations follow the [kernel's client usage format](https://www.kernel.org/doc/html/v6.9/gpu/drm-usage-stats.html). The observer retains only driver/device/client identity and standardized memory counters, normalized to bytes. Shared or duplicated handles for the same DRM client are counted once; distinct clients can still account the same shared buffer. Reports therefore label sums as **client-accounted bytes**, preserve each memory region and counter separately, and do not claim unique physical GPU usage. An unsupported driver reports `unavailable`; malformed or unreadable counters report `incomplete`. Neither contributes a measured zero. A supported counter explicitly containing zero remains a valid observation. These counters cover the test UID only and do not measure software renderer memory beyond PSS or memory owned by root services. Actual hardware accounting still requires a qualified run; virtual Bochs scanout may expose none.
 
-The host waits for an actual rendered black panel, allows an equal 30-second post-panel settle, measures 30 seconds without input, runs the native frame-pacer probe, opens Disks, System Monitor and Files by typing in the search, toggles the overview ten times, switches workspaces ten times, cycles windows with Alt+Tab ten times, sends ten notifications one second apart, then keeps a final 30-second settle. Each of these phases is bounded by guest-clock markers in `guest-phases.json`, and `report.json` breaks CPU down per phase and per process role (`phase_cpu_observed_percent`). Raw serial, resource samples, input observations, notification IDs, screenshots and per-session reports are retained for 14 days. The p50/p95/p99 summaries state sample counts; whole-run CPU summaries include startup and workload.
+The host waits for an actual rendered black panel, allows an equal 30-second post-panel settle, measures 30 seconds without input, runs the native frame-pacer probe, opens Disks, System Monitor and Files by typing in the search, toggles the overview ten times, switches workspaces ten times, cycles windows with Alt+Tab ten times, sends one unmeasured warm-up round and then three measured rounds of ten notifications one second apart, then keeps a final 30-second settle. Each of these phases is bounded by guest-clock markers in `guest-phases.json` (`notifications_warmup_start` marks the warm-up round, which lies outside every phase), and `report.json` breaks CPU down per phase and per process role (`phase_cpu_observed_percent`). Raw serial, resource samples, input observations, notification IDs, screenshots and per-session reports are retained for 14 days. The p50/p95/p99 summaries state sample counts; whole-run CPU summaries include startup and workload.
 
-The CI-only guest agent runs only the fixed `/usr/libexec/tuna-perf-phase` helper. It marks the idle boundaries with the guest's CLOCK_BOOTTIME, matching the observer's own clock. Idle CPU excludes any interval crossing either boundary, and fewer than 20 complete intervals fail the measurement. Host phase timestamps remain separate provenance. The fixture sends notifications to the actual interactive user's Notifications service and requires ten distinct nonzero uint32 IDs; the service's acceptance and first frame are retained. Acceptance is a workload record, not a claim of notification input-to-frame latency. Guest-agent packages, helper and service are fixture-only and installed identically in both sessions.
+The CI-only guest agent runs only the fixed `/usr/libexec/tuna-perf-phase` helper. It marks the idle boundaries with the guest's CLOCK_BOOTTIME, matching the observer's own clock. Idle CPU excludes any interval crossing either boundary, and fewer than 20 complete intervals fail the measurement. Host phase timestamps remain separate provenance. The fixture sends notifications to the actual interactive user's Notifications service and requires forty distinct nonzero uint32 IDs (warm-up and measured rounds); the service's acceptance and first frame are retained. Acceptance is a workload record, not a claim of notification input-to-frame latency. Guest-agent packages, helper and service are fixture-only and installed identically in both sessions.
 
 Input timings bound the response observed through QMP captures. Each observation records a conservative lower bound, upper bound and capture duration. QMP key injection, capture/poll overhead and host scheduling affect these measurements; they are **not** compositor input-to-frame tracing or a frame-pacing measurement. The software/guest path, only one boot, potentially unavailable DRM memory counters, and missing 24-hour soak remain limitations. The regression budgets below are GNOME-relative ratchets ([ADR 0009](../adr/0009-performance-regression-budgets.md)), not a release claim of parity.
 
@@ -66,6 +66,8 @@ The run's summary page and `perf-artifacts/perf-gate.json` in the `marlin-perfor
   - `missing`: fewer than three stock-profile pairs measured an enforced metric, which also fails.
   - `warn`: a provisional budget (`enforced: false`) is over its ratio or ceiling, or has too few pairs.
 - **Per-role attribution, for each desktop.** The mean CPU of each phase, split into compositor, shell, xwayland, portals, services and apps. GNOME's compositor and shell are one process (`gnome-shell`), so compare Tuna's "desktop" role (compositor plus shell) against it.
+- **A 90% confidence interval for every ratio.** A seeded block bootstrap (1000 replicates, blocks of three 1 s intervals) resamples the pairs and, inside each session, the phase's intervals or observations, and recomputes the gated statistic. The same artifact always gives the same interval. `unstable` marks a decision whose interval straddles the budget: the run cannot tell that metric's pass from its fail. The status still follows the point estimate, so the interval loosens nothing.
+- **The host CPU model and refused sessions.** GitHub's KVM runners vary (EPYC 7763, EPYC 9V74, EPYC 9V45, Xeon 8370C), and some ratios move by host class; compare runs on the same class. A session whose observer wrote records over 32 KiB, or ran with per-thread diagnostics, is refused with its reason: such an observer perturbs what it measures (#782). Its pair then counts as unmeasured.
 
 The JSON's `meets_target` separately compares the median paired ratio against the target without a denominator floor. Passing a floor-stabilized idle CPU budget does not establish parity. Two measured zero values meet the target; positive Tuna usage against measured zero GNOME usage does not.
 
@@ -79,7 +81,7 @@ Metric names are `cpu.<phase>.<role>.<stat>`, `overview.response_ms.<stat>` and 
 | `overview` | Ten overview open/close cycles |
 | `workspaces` | Ten workspace switches each way (animations) |
 | `window_cycling` | Ten Alt+Tab presses across three app windows |
-| `notifications` | Ten notifications one second apart (banner animations) |
+| `notifications` | Three rounds of ten notifications one second apart (banner animations), after one unmeasured warm-up round |
 | `settle` | 30 s without input, three apps open |
 
 `cpu.whole.total.p50` matches the whole-run figure in older reports. Frame pacing uses the frame-pacer probe's presentation intervals. Overview response is the QMP-observed upper bound described above.
@@ -105,7 +107,7 @@ The first budgets are the median ratios over the three stock pairs of [paired ru
   mv budgets.new.json docs/perf/budgets.json
   ```
 
-  This lowers each budget to the measured ratio plus the margin, never below 1.0, and never raises one. Commit the result with the run linked in the PR. Enforcing a provisional budget is also a tightening.
+  This lowers each budget to the measured ratio plus the margin, never below 1.0, and never raises one. When the run's 90% interval reaches above the point ratio, its upper bound is used instead, so one quiet run cannot set a budget inside its own noise. Commit the result with the run linked in the PR. Enforcing a provisional budget is also a tightening.
 - **Loosening** (a higher ratio, ceiling or floor, dropping `enforced`, or removing a budget) needs a new ADR under `docs/adr/`, referenced from the budget's `adr` field, as the roadmap's change control requires. CI's ratchet check (`scripts/tuna-perf-gate ratchet --base <main's budgets.json>`) refuses any change that is not backed by new run evidence, and any loosening without that ADR.
 
 Every budget in the baseline is enforced, since that run measured each one in three pairs. A budget added later without three measured pairs starts provisional (`enforced: false`) and is enforced from the first run that measures it.
@@ -121,10 +123,19 @@ scripts/tuna-perf-gate check --artifacts perf-artifacts
 
 `check` exits 1 on a regression. Add `--report-only` to only print the tables. A full paired measurement needs KVM, rootful podman and about 40 GB of disk. Follow `performance-baseline.yml` step by step: build the shared preview images, then run `scripts/tuna-perf-profile-pairs stock`, which writes the `perf-artifacts/stock` tree that `check` reads. On a workstation, `scripts/tuna-vm-perf --disk disk.raw --desktop tuna --out <dir>` measures one session, and its `report.json` includes the per-phase, per-role breakdown.
 
-### Bounded per-thread idle diagnostics
+### Bounded per-thread idle diagnostics (diagnostic profile, opt-in)
 
-The CI-only sampler enables `--thread-diagnostics` for both desktops and both
-profiles without changing the workload, sample interval or budget evaluator.
+The CI-only sampler takes `--thread-diagnostics` only when a dispatch sets
+`thread_diagnostics: true`, and only for the diagnostic profile:
+`scripts/tuna-perf-profile-pairs` refuses it for the gated stock profile and the
+gate refuses any session recorded with it. Each record grows to about 45 KiB a
+second, close to journald's 48 KiB line limit, and is forwarded to the serial
+console. From its introduction (2026-10-22) until it became opt-in, every GNOME
+session stalled (incomplete frame-pacer presentation, notification calls timing
+out after 15 s, truncated sample lines) and the nightly lane measured nothing; see
+the [2026-10-29 gate variance report](2026-10-29-gate-variance.md). The workload,
+sample interval and budget evaluator are unchanged when it is enabled.
+
 Each process sample may include numeric `thread_diagnostics`: TID, start ticks,
 user/system CPU ticks and voluntary/involuntary context-switch counters.
 These counters are **not wakeup counts** or causal stack traces. No thread names,

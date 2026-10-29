@@ -63,6 +63,11 @@ on:
         required: false
         type: boolean
         default: true
+      thread_diagnostics:
+        description: Per-thread observer counters in the diagnostic profile only (never the gated stock profile; #782)
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -252,6 +257,8 @@ jobs:
           retention-days: 7
       - name: Measure three alternating diagnostic pairs
         if: ${{ !inputs.export_only }}
+        env:
+          PERF_THREAD_DIAGNOSTICS: ${{ inputs.thread_diagnostics && 'true' || 'false' }}
         run: scripts/tuna-perf-profile-pairs diagnostic
       - name: Measure three alternating stock pairs
         # A rejected diagnostic capture stays a failed step. Stock still runs

@@ -31,7 +31,7 @@ from perf_trace_diagnostics import decode as decode_trace_failure, MAX_BYTES as 
 from gnome_failed_capture import validate_receipt as validate_failed_capture, validate_chunk as validate_failed_chunk
 from gnome_stop_boundary import capture_stop_boundary_evidence
 from gnome_sysprof import capture_boundary_evidence, decode as decode_gnome_sysprof, required_scope_counts, overview_frame_bounds, frame_source_evidence  # noqa: E402
-from perf_budget import phase_cpu  # noqa: E402
+from perf_budget import phase_cpu, NOTIFICATIONS_PER_ROUND, NOTIFICATION_ROUNDS  # noqa: E402
 
 
 def guest_probe(agent, action, index=None, out=None, start_owner=None):
@@ -44,7 +44,7 @@ def guest_probe(agent, action, index=None, out=None, start_owner=None):
         raise ValueError("unsupported performance probe")
     arguments = [action]
     if action == "notify":
-        if type(index) is not int or not 0 <= index < 10:
+        if type(index) is not int or not 0 <= index < NOTIFICATIONS_PER_ROUND * (1 + NOTIFICATION_ROUNDS):
             raise ValueError("notification index outside the fixed workload")
         arguments += ["--index", str(index)]
     if action in ("gnome-trace-read","gnome-trace-failed-stop-read"):
@@ -669,16 +669,21 @@ def main():
             time.sleep(1)
         guest_phases["window_cycling_end"] = guest_probe(agent, "clock")["boottime_s"]
         phases["workload_end"] = time.clock_gettime(time.CLOCK_BOOTTIME)
-        guest_phases["notifications_start"] = guest_probe(agent, "clock")["boottime_s"]
-        for index in range(10):
+        # Warm-up round outside the phase window: the first banner, the
+        # notification source and lazily built widgets (and this screenshot's
+        # host capture), then NOTIFICATION_ROUNDS measured rounds (#782).
+        guest_phases["notifications_warmup_start"] = guest_probe(agent, "clock")["boottime_s"]
+        for index in range(NOTIFICATIONS_PER_ROUND * (1 + NOTIFICATION_ROUNDS)):
+            if index == NOTIFICATIONS_PER_ROUND:
+                guest_phases["notifications_start"] = guest_probe(agent, "clock")["boottime_s"]
             notifications.append(dict(index=index, **guest_probe(agent, "notify", index)))
             if index == 0:
                 time.sleep(.5)
                 qmp.frame(str(out / "notification-first.png"))
             time.sleep(1)
         guest_phases["notifications_end"] = guest_probe(agent, "clock")["boottime_s"]
-        if len({row["notification_id"] for row in notifications}) != 10:
-            raise RuntimeError("notification workload did not accept ten distinct notifications")
+        if len({row["notification_id"] for row in notifications}) != len(notifications):
+            raise RuntimeError("notification workload did not accept distinct notifications")
         guest_phases["settle_start"] = guest_probe(agent, "clock")["boottime_s"]
         time.sleep(30)
         guest_phases["settle_end"] = guest_probe(agent, "clock")["boottime_s"]

@@ -46,7 +46,8 @@ def stock_reference():
 
 
 def notify(index):
-    if not 0 <= index < 10:
+    # One warm-up and three measured rounds of ten (perf_budget.NOTIFICATION_ROUNDS).
+    if not 0 <= index < 40:
         raise ValueError("notification index outside the fixed workload")
     uid = pwd.getpwnam("tuna-test").pw_uid
     result = subprocess.run([

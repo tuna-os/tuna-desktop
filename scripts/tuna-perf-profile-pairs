@@ -4,6 +4,14 @@ set -euo pipefail
 [[ $# == 1 ]] || exit 2
 profile=$1
 case "$profile" in diagnostic|stock) ;; *) exit 2 ;; esac
+# Per-thread observer records tripled the per-second serial console output and
+# stalled the GNOME sessions they measured (#782): diagnostic profile only.
+thread_diagnostics=${PERF_THREAD_DIAGNOSTICS:-false}
+case "$thread_diagnostics" in
+  false) ;;
+  true) [[ "$profile" == diagnostic ]] || { echo 'thread diagnostics are refused for the gated stock profile' >&2; exit 2; } ;;
+  *) exit 2 ;;
+esac
 if [[ "$profile" == stock ]]; then
   # Read only the original diagnostic finite status and every reached child
   # departure receipt before ANY stock image/disk operation. No orphan guesses.
@@ -70,7 +78,7 @@ for repeat in 1 2 3; do
     case_index=$((case_index + 1))
     image="localhost/marlin-$desktop-perf:ci"
     stage="image-build"
-    sudo podman build -f packaging/marlin/perf/Containerfile --build-arg "BASE_IMAGE=localhost/marlin-tuna-preview:$profile" --build-arg DESKTOP="$desktop" -t "$image" .
+    sudo podman build -f packaging/marlin/perf/Containerfile --build-arg "BASE_IMAGE=localhost/marlin-tuna-preview:$profile" --build-arg DESKTOP="$desktop" --build-arg "PERF_THREAD_DIAGNOSTICS=$thread_diagnostics" -t "$image" .
     fixture_image_id=$(sudo podman inspect "$image" --format '{{.Id}}')
     probe='if grep -A8 "^\[composefs\]" /usr/lib/ostree/prepare-root.conf 2>/dev/null | grep -qiE "enabled[[:space:]]*=[[:space:]]*(yes|true|1|signed)" || ls /usr/lib/systemd/boot/efi/systemd-boot*.efi >/dev/null 2>&1; then echo --composefs-backend; fi; grep -A8 "^\[composefs\]" /usr/lib/ostree/prepare-root.conf 2>/dev/null | grep -qiE "enabled[[:space:]]*=[[:space:]]*(yes|true|1|signed)" && echo "--filesystem ext4" || true'
     stage="image-probe"
@@ -83,7 +91,7 @@ for repeat in 1 2 3; do
     stage="disk-owner"
     sudo chown "$(id -u):$(id -g)" /mnt/perf/disk.raw
     stage="measurement"
-    scripts/tuna-vm-perf --owned-vm-handoff --disk /mnt/perf/disk.raw --desktop "$desktop" --gnome-profile "$profile" --reference-image "$profile_root/reference-image.json" --out "$result_root/$desktop" --tuna-payload perf-artifacts/package-payload.json --tuna-selection perf-artifacts/package-selection.json --meta "fixture_image_id=$fixture_image_id" --meta "base_digest=$(cat base-digest)" --meta "shared_image_id=$(cat "shared-image-id-$profile")" --meta "observer_revision=$GITHUB_SHA" --meta "acquisition_repeat=$repeat" --meta "acquisition_order=$order" --meta "reference_kind=$reference_kind" --meta "gnome_profile=$profile"
+    scripts/tuna-vm-perf --owned-vm-handoff --disk /mnt/perf/disk.raw --desktop "$desktop" --gnome-profile "$profile" --reference-image "$profile_root/reference-image.json" --out "$result_root/$desktop" --tuna-payload perf-artifacts/package-payload.json --tuna-selection perf-artifacts/package-selection.json --meta "fixture_image_id=$fixture_image_id" --meta "base_digest=$(cat base-digest)" --meta "shared_image_id=$(cat "shared-image-id-$profile")" --meta "observer_revision=$GITHUB_SHA" --meta "acquisition_repeat=$repeat" --meta "acquisition_order=$order" --meta "reference_kind=$reference_kind" --meta "gnome_profile=$profile" --meta "observer_thread_diagnostics=$thread_diagnostics"
     stage="disk-remove"
     rm /mnt/perf/disk.raw
     stage="image-remove"

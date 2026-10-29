@@ -1208,9 +1208,16 @@ class Accounting(unittest.TestCase):
         for identity in (0, True, None, 0x100000000):
             with self.subTest(identity=identity), self.assertRaisesRegex(ValueError, "notification ID"):
                 host.guest_probe(Agent({"boottime_s": 100, "notification_id": identity}), "notify", 0)
-        for action, index in (("exec", None), ("notify", -1), ("notify", 10), ("notify", True)):
+        # One warm-up plus NOTIFICATION_ROUNDS measured rounds; the guest helper
+        # accepts exactly the host workload's indices (#782).
+        bound = host.NOTIFICATIONS_PER_ROUND * (1 + host.NOTIFICATION_ROUNDS)
+        self.assertEqual(bound, 40)
+        for action, index in (("exec", None), ("notify", -1), ("notify", bound), ("notify", True)):
             with self.assertRaises(ValueError):
                 host.guest_probe(agent, action, index)
+        for index in (-1, bound):
+            with self.assertRaisesRegex(ValueError, "outside the fixed workload"):
+                phase.notify(index)
 
 
 

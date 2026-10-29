@@ -60,18 +60,30 @@ def main(argv=None):
             print("\n".join(problems), file=sys.stderr)
             return 2
         pairs = perf_budget.discover_pairs(args.artifacts, budgets.get("profile", "stock"))
-        comparison = perf_budget.compare(pairs)
-        rows = perf_budget.evaluate(budgets, comparison, budgets.get("min_pairs", 3))
+        # A pair measured by a perturbing observer never enters the comparison:
+        # too few remaining pairs fail the enforced budgets as missing.
+        pairs, refused = perf_budget.qualify(pairs)
+        series = perf_budget.pair_series(pairs)
+        comparison = perf_budget.compare(pairs, series)
+        intervals = perf_budget.confidence(budgets, series)
+        rows = perf_budget.evaluate(budgets, comparison, budgets.get("min_pairs", 3), intervals)
         if args.command == "propose":
             print(json.dumps(perf_budget.propose(budgets, rows, args.margin, args.evidence), indent=2))
             return 0
-        summary = perf_budget.markdown(rows, pairs, budgets, comparison)
+        hosts = sorted({host for pair in pairs for desktop in perf_budget.DESKTOPS
+                        if (host := perf_budget.host_cpu(pair[desktop]))})
+        summary = perf_budget.markdown(rows, pairs, budgets, comparison, refused, hosts)
         print(summary)
         if args.markdown:
             with open(args.markdown, "a") as stream:
                 stream.write(summary)
         if args.out:
             Path(args.out).write_text(json.dumps({"profile": budgets.get("profile", "stock"), "pairs": [{k: str(v) for k, v in p.items()} for p in pairs],
+                                                  "refused_sessions": refused, "host_cpu": hosts,
+                                                  "bootstrap": {"replicates": perf_budget.BOOTSTRAP_REPLICATES,
+                                                                "seed": perf_budget.BOOTSTRAP_SEED,
+                                                                "block_intervals": perf_budget.BOOTSTRAP_BLOCK,
+                                                                "level": perf_budget.CONFIDENCE},
                                                   "results": rows, "comparison": comparison,
                                                   "attribution": perf_budget.attribution(comparison)}, indent=2))
         problems = [f"{row['metric']}: {row['status']} ({row.get('reason', '')})"
