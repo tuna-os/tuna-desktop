@@ -937,9 +937,9 @@ fn quick_settings_popover(
         let popover = popover.clone();
         power_menu.connect_visible_notify(move |menu| {
             if menu.is_visible() {
-                popover.add_css_class("dimmed");
+                popover.add_css_class("qs-dimmed");
             } else {
-                popover.remove_css_class("dimmed");
+                popover.remove_css_class("qs-dimmed");
             }
         });
     }
@@ -1216,9 +1216,9 @@ fn quick_settings_popover(
         let popover = popover.clone();
         power_menu_ui.revealer.connect_visible_notify(move |menu| {
             if menu.is_visible() {
-                popover.add_css_class("dimmed");
+                popover.add_css_class("qs-dimmed");
             } else {
-                popover.remove_css_class("dimmed");
+                popover.remove_css_class("qs-dimmed");
             }
         });
     }
@@ -1247,9 +1247,9 @@ fn quick_settings_popover(
             let popover = popover.clone();
             menu.connect_visible_notify(move |menu| {
                 if menu.is_visible() {
-                    popover.add_css_class("dimmed");
+                    popover.add_css_class("qs-dimmed");
                 } else {
-                    popover.remove_css_class("dimmed");
+                    popover.remove_css_class("qs-dimmed");
                 }
             });
         }
@@ -1274,9 +1274,9 @@ fn quick_settings_popover(
             .revealer
             .connect_visible_notify(move |menu| {
                 if menu.is_visible() {
-                    popover.add_css_class("dimmed");
+                    popover.add_css_class("qs-dimmed");
                 } else {
-                    popover.remove_css_class("dimmed");
+                    popover.remove_css_class("qs-dimmed");
                 }
             });
     }
