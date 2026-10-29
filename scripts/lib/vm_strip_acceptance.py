@@ -822,6 +822,15 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             move(rect[0] + 24, rect[1] + 20)
             button(True)
             move(rect[0] + 36, rect[1] + 20)
+            # The virtual tablet reports position and buttons together: a
+            # motion queued behind a press the guest has not read yet carries
+            # the press along. Run 40891830621 pressed at x=1278.9, past every
+            # window, so no drag began. See Alpha's titlebar drag own the
+            # pointer before the edge motion.
+            ready('scroll', extra=lambda sample, found: (
+                sample['fixture']['windows']['alpha']['move_requests']
+                > before_edge['fixture']['windows']['alpha']['move_requests']
+                and (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id']))
             # ONE movement into the band; the following observer has no input
             # capability and cannot repeatedly drive the viewport itself.
             move(1279, rect[1] + 20)
