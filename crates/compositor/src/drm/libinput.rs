@@ -491,7 +491,13 @@ fn apply_scroll_button(device: &mut li::Device, emulation: shell::ScrollWheelEmu
         }
         return;
     }
-    let _ = device.config_scroll_set_button(button);
+    // libinput rejects a button the device lacks (INVALID); Mutter ignores
+    // that and the device keeps its previous scroll button.
+    report(
+        device.config_scroll_set_button(button),
+        device,
+        "scroll-wheel emulation button",
+    );
     let _ = device.config_scroll_set_button_lock(if emulation.lock {
         li::ScrollButtonLockState::Enabled
     } else {
@@ -613,6 +619,15 @@ pub fn device_state(device: &li::Device) -> serde_json::Value {
     let drag_lock =
         unsafe { li::ffi::libinput_device_config_tap_get_drag_lock_enabled(device.as_raw_mut()) };
     let mode = device.config_send_events_mode();
+    // Which of BTN_LEFT..BTN_TASK the device has: a scroll-wheel emulation
+    // button is only accepted where it exists.
+    let buttons: Vec<u32> = if caps.pointer {
+        (0x110..=0x117)
+            .filter(|&code| device.pointer_has_button(code) == Ok(true))
+            .collect()
+    } else {
+        Vec::new()
+    };
     serde_json::json!({
         "name": device.name(),
         "kind": caps.kind(),
@@ -654,6 +669,7 @@ pub fn device_state(device: &li::Device) -> serde_json::Value {
         "scroll_method": device.config_scroll_method().map(scroll_method_name),
         "scroll_methods": device.config_scroll_methods().into_iter().map(scroll_method_name).collect::<Vec<_>>(),
         "scroll_button": device.config_scroll_button(),
+        "pointer_buttons": buttons,
         "scroll_button_lock": device.config_scroll_button_lock() == li::ScrollButtonLockState::Enabled,
     })
 }

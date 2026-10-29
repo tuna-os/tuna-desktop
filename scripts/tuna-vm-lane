@@ -818,7 +818,11 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                     mice = [d for d in devices
                             if not d.get("trackball") and not d.get("pointing_stick")]
                     middled = [d for d in mice if d.get("middle_emulation_available")]
-                    wheeled = [d for d in mice if "on-button-down" in d.get("scroll_methods", ())]
+                    # libinput accepts a scroll button only on a device that
+                    # has it (the guest's VMMouse has no BTN_MIDDLE): gate on
+                    # button scrolling and on BTN_MIDDLE (GNOME button 2).
+                    wheeled = [d for d in mice if "on-button-down" in d.get("scroll_methods", ())
+                               and 0x112 in d.get("pointer_buttons", ())]
                     return (bool(accel)
                             and all(abs(d["accel_speed"] - speed) < 0.05 for d in accel)
                             and all(d["natural_scroll"] is natural for d in devices
