@@ -212,6 +212,13 @@
 #   G-WM-KEYS      Alt+Space, Alt+F10, Super+End/Home (wm keybindings)
 #   G-WM-REBIND    GNOME's maximize key rebinds through its settings:
 #                  the old chord stops, the new one maximizes
+#   G-FOCUS-SLOPPY GNOME's focus-mode sloppy: entering a window focuses
+#                  it without raising; the desktop keeps focus
+#   G-FOCUS-AUTORAISE auto-raise lifts the entered window after its delay
+#   G-FOCUS-MOUSE  focus-mode mouse: the desktop drops focus
+#   G-FOCUS-RAISE-ON-CLICK raise-on-click false focuses without raising
+#   G-FOCUS-MODIFIER mouse-button-modifier <Alt> moves windows, Super no
+#                  longer does; resize-with-right-button swaps resize/menu
 #   G-SIZE-CHANGE-ANIM maximize, unmaximize, half-tiling and a client's
 #                  fullscreen ease 250 ms from the old frame (#496), never
 #                  stretching new content; fade-only under Reduced Motion,
@@ -6992,6 +6999,178 @@ sleep 1
 gsettings reset org.gnome.desktop.wm.keybindings switch-applications
 sleep 1
 pass G-SWITCHER-REBIND "GNOME's switch-applications rebinds: Ctrl+J steps and commits, Alt+Tab goes to apps"
+
+# GNOME's focus policy (org.gnome.desktop.wm.preferences, P-WM-09), which
+# the compositor reads live as Mutter does: sloppy focus follows the
+# pointer into a window without raising it and keeps focus over the
+# desktop; auto-raise lifts the entered window after auto-raise-delay;
+# mouse focus drops focus over the desktop; raise-on-click off focuses
+# without raising; mouse-button-modifier moves the window drag from Super
+# to Alt and resize-with-right-button swaps the resize and menu buttons.
+# Two dedicated windows keep the earlier fixtures' stacking untouched.
+FOCUS_POINTS="$ROOT/scripts/lib/tuna-focus-points.py"
+fp_pids=""
+for fp_title in "Focus One" "Focus Two"; do
+    WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
+        "$fp_title" '#613583' >"$ARTIFACTS/window-$fp_title.log" 2>&1 &
+    fp_pids="$fp_pids $!"
+    fp_app="tuna-test-$(echo "$fp_title" | tr '[:upper:]' '[:lower:]')"
+    cstate ".focused_app_id == \"$fp_app\"" "$fp_title mapped" ||
+        fail G-FOCUS-SLOPPY "the $fp_title window never mapped focused"
+done
+fp_ids="$(jq -r '[.windows[] | select(.app_id // "" | startswith("tuna-test-focus ")) | .id] | join(" ")' "$CSTATE")"
+[ "$(echo "$fp_ids" | wc -w)" = 2 ] || fail G-FOCUS-SLOPPY "expected the two focus-policy windows, got '$fp_ids'"
+fp_policy() {
+    # $1 jq on .focus_policy, $2 label, $3 gate, $4 failure message
+    cstate ".focus_policy | $1" "$2" || fail "$3" "$4"
+}
+fp_beneath() {
+    # shellcheck disable=SC2086 # the window id list
+    "$PY" "$FOCUS_POINTS" "$CSTATE" beneath $fp_ids
+}
+fp_desktop() {
+    read -r fp_dx fp_dy <<EOF
+$("$PY" "$FOCUS_POINTS" "$CSTATE" desktop "$WIDTH" "$HEIGHT")
+EOF
+    [ -n "$fp_dy" ] || fail "$1" "no bare desktop point to move the pointer to"
+    xdotool mousemove --window "$WID" "$fp_dx" "$fp_dy"
+}
+gsettings set org.gnome.desktop.wm.preferences focus-mode sloppy
+fp_policy '.focus_mode == "sloppy"' "sloppy" G-FOCUS-SLOPPY "focus-mode sloppy never reached the compositor"
+read -r fp_id fp_x fp_y <<EOF
+$(fp_beneath)
+EOF
+[ -n "$fp_y" ] || fail G-FOCUS-SLOPPY "no unfocused window lies beneath another with a visible point"
+xdotool mousemove --window "$WID" "$fp_x" "$fp_y"
+cstate ".focused == $fp_id" "sloppy enter" ||
+    fail G-FOCUS-SLOPPY "sloppy focus did not focus the window the pointer entered"
+sleep 1
+cstate ".focused == $fp_id and .stacking[-1] != $fp_id" "sloppy not raised" 2 ||
+    fail G-FOCUS-SLOPPY "sloppy focus raised the entered window"
+fp_desktop G-FOCUS-SLOPPY
+sleep 1
+cstate ".focused == $fp_id" "sloppy desktop" 2 ||
+    fail G-FOCUS-SLOPPY "sloppy focus dropped focus over the desktop"
+pass G-FOCUS-SLOPPY "sloppy focus follows the pointer into a window without raising it and keeps it over the desktop"
+
+# Back onto the top window (focus without raise), so the lower one can be
+# entered again for auto-raise.
+fp_top="$(jq -r '.stacking[-1]' "$CSTATE")"
+read -r fp_x fp_y <<EOF
+$("$PY" "$FOCUS_POINTS" "$CSTATE" visible "$fp_top")
+EOF
+xdotool mousemove --window "$WID" "$fp_x" "$fp_y"
+cstate ".focused == $fp_top" "top focused" || fail G-FOCUS-AUTORAISE "sloppy focus did not return to the top window"
+gsettings set org.gnome.desktop.wm.preferences auto-raise-delay 600
+gsettings set org.gnome.desktop.wm.preferences auto-raise true
+fp_policy '.auto_raise and .auto_raise_delay_ms == 600' "auto-raise" G-FOCUS-AUTORAISE "auto-raise never reached the compositor"
+read -r fp_id fp_x fp_y <<EOF
+$(fp_beneath)
+EOF
+[ -n "$fp_y" ] || fail G-FOCUS-AUTORAISE "no lower window to enter"
+xdotool mousemove --window "$WID" "$fp_x" "$fp_y"
+fp_t0="$(date +%s%N)"
+cstate ".stacking[-1] == $fp_id and .focused == $fp_id" "auto-raised" 5 ||
+    fail G-FOCUS-AUTORAISE "the entered window was not raised after auto-raise-delay"
+fp_ms=$((($(date +%s%N) - fp_t0) / 1000000))
+# Observed by polling, so never earlier than the raise itself; the 100 ms
+# margin covers the enter preceding the clock read.
+[ "$fp_ms" -ge 500 ] || fail G-FOCUS-AUTORAISE "raised after ${fp_ms} ms, before the 600 ms auto-raise-delay"
+gsettings reset org.gnome.desktop.wm.preferences auto-raise
+gsettings reset org.gnome.desktop.wm.preferences auto-raise-delay
+pass G-FOCUS-AUTORAISE "auto-raise lifts the sloppily focused window after auto-raise-delay (${fp_ms} ms observed)"
+
+gsettings set org.gnome.desktop.wm.preferences focus-mode mouse
+fp_policy '.focus_mode == "mouse" and (.auto_raise | not)' "mouse" G-FOCUS-MOUSE "focus-mode mouse never reached the compositor"
+read -r fp_id fp_x fp_y <<EOF
+$(fp_beneath)
+EOF
+[ -n "$fp_y" ] || fail G-FOCUS-MOUSE "no lower window to enter"
+xdotool mousemove --window "$WID" "$fp_x" "$fp_y"
+cstate ".focused == $fp_id" "mouse enter" || fail G-FOCUS-MOUSE "mouse focus did not focus the entered window"
+fp_desktop G-FOCUS-MOUSE
+cstate '.focused == null' "mouse desktop" || fail G-FOCUS-MOUSE "mouse focus kept focus over the desktop"
+pass G-FOCUS-MOUSE "mouse focus focuses the entered window and drops focus over the desktop"
+
+gsettings set org.gnome.desktop.wm.preferences focus-mode click
+gsettings set org.gnome.desktop.wm.preferences raise-on-click false
+fp_policy '.focus_mode == "click" and (.raise_on_click | not)' "no raise" G-FOCUS-RAISE-ON-CLICK "raise-on-click false never reached the compositor"
+read -r fp_id fp_x fp_y <<EOF
+$(fp_beneath)
+EOF
+[ -n "$fp_y" ] || fail G-FOCUS-RAISE-ON-CLICK "no lower window to click"
+xdotool mousemove --window "$WID" "$fp_x" "$fp_y"
+sleep 1
+cstate '.focused == null' "click hover" 2 || fail G-FOCUS-RAISE-ON-CLICK "click focus followed the pointer"
+xdotool click 1
+cstate ".focused == $fp_id" "clicked" || fail G-FOCUS-RAISE-ON-CLICK "the click did not focus the window"
+sleep 1
+cstate ".focused == $fp_id and .stacking[-1] != $fp_id" "clicked beneath" 2 ||
+    fail G-FOCUS-RAISE-ON-CLICK "raise-on-click false still raised the clicked window"
+gsettings reset org.gnome.desktop.wm.preferences raise-on-click
+fp_policy '.raise_on_click' "raise" G-FOCUS-RAISE-ON-CLICK "raise-on-click true never reached the compositor"
+xdotool click 1
+cstate ".stacking[-1] == $fp_id" "click raised" ||
+    fail G-FOCUS-RAISE-ON-CLICK "with raise-on-click back on, clicking the focused window did not raise it"
+pass G-FOCUS-RAISE-ON-CLICK "raise-on-click false focuses the clicked window beneath; true raises it"
+
+# mouse-button-modifier '<Alt>': Super+drag is an ordinary client drag,
+# Alt+drag moves the window; resize-with-right-button: Alt+right resizes
+# from the pressed third and Alt+middle opens the window menu.
+gsettings set org.gnome.desktop.wm.preferences mouse-button-modifier '<Alt>'
+fp_policy '.modifier == 8' "alt modifier" G-FOCUS-MODIFIER "mouse-button-modifier <Alt> never reached the compositor"
+fp_rect() {
+    jq -r ".windows[] | select(.id == $fp_id) | .rect | \"\(.[0]) \(.[1]) \(.[2]) \(.[3])\"" "$CSTATE"
+}
+read -r fp_rx fp_ry fp_rw fp_rh <<EOF
+$(fp_rect)
+EOF
+read -r fp_x fp_y <<EOF
+$("$PY" "$FOCUS_POINTS" "$CSTATE" visible "$fp_id")
+EOF
+[ -n "$fp_y" ] || fail G-FOCUS-MODIFIER "no visible point on the raised window"
+xdotool mousemove --window "$WID" "$fp_x" "$fp_y" keydown Super_L mousedown 1
+xdotool mousemove_relative -- 40 30
+xdotool mouseup 1 keyup Super_L
+sleep 1
+cstate ".windows | any(.id == $fp_id and .rect[0] == $fp_rx and .rect[1] == $fp_ry)" "super is a click" 2 ||
+    fail G-FOCUS-MODIFIER "Super+drag still moved the window after the modifier became Alt"
+cstate '.overview_open | not' "no overview" 2 || fail G-FOCUS-MODIFIER "Super+click opened the overview"
+xdotool mousemove --window "$WID" "$fp_x" "$fp_y" keydown Alt_L mousedown 1
+xdotool mousemove_relative -- 40 30
+xdotool mouseup 1 keyup Alt_L
+cstate ".windows | any(.id == $fp_id and .rect[0] == $((fp_rx + 40)) and .rect[1] == $((fp_ry + 30)))" "alt drag" ||
+    fail G-FOCUS-MODIFIER "Alt+drag did not move the window by the drag distance"
+gsettings set org.gnome.desktop.wm.preferences resize-with-right-button true
+fp_policy '.resize_with_right_button' "right resize" G-FOCUS-MODIFIER "resize-with-right-button never reached the compositor"
+read -r fp_x fp_y <<EOF
+$("$PY" "$FOCUS_POINTS" "$CSTATE" visible "$fp_id" br)
+EOF
+[ -n "$fp_y" ] || fail G-FOCUS-MODIFIER "no visible point in the window's bottom-right third"
+xdotool mousemove --window "$WID" "$fp_x" "$fp_y" keydown Alt_L mousedown 3
+xdotool mousemove_relative -- 30 20
+xdotool mouseup 3 keyup Alt_L
+cstate ".windows | any(.id == $fp_id and .rect[2] == $((fp_rw + 30)) and .rect[3] == $((fp_rh + 20)))" "alt right resize" ||
+    fail G-FOCUS-MODIFIER "Alt+right did not resize the window from its bottom-right third"
+xdotool keydown Alt_L click 2 keyup Alt_L
+sleep 1.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-focus-modifier-menu.json" 20 ||
+    fail G-FOCUS-MODIFIER "accessibility dump failed"
+showing "$ARTIFACTS/a11y-focus-modifier-menu.json" "Hide" ||
+    fail G-FOCUS-MODIFIER "Alt+middle opened no window menu with resize-with-right-button"
+xdotool key Escape
+sleep 1
+pass G-FOCUS-MODIFIER "mouse-button-modifier <Alt> moves windows (Super no longer does); resize-with-right-button resizes on the right button and shows the menu on the middle one"
+for fp_key in focus-mode auto-raise auto-raise-delay raise-on-click mouse-button-modifier resize-with-right-button; do
+    gsettings reset org.gnome.desktop.wm.preferences "$fp_key"
+done
+fp_policy '.focus_mode == "click" and .raise_on_click and .modifier == 64 and (.resize_with_right_button | not) and (.auto_raise | not)' \
+    "defaults" G-FOCUS-MODIFIER "the focus policy did not return to GNOME's defaults"
+# shellcheck disable=SC2086 # the fixture pid list
+kill $fp_pids 2>/dev/null || true
+cstate '.windows | all(.app_id // "" | startswith("tuna-test-focus ") | not)' "focus windows closed" ||
+    fail G-FOCUS-MODIFIER "the focus-policy windows did not close"
+sleep 1
 
 # GNOME's input methods: IBus composes in a GTK app, with
 # tuna-ibus-bridge as IBus's client (GNOME Shell's part). A test engine

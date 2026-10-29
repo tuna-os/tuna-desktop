@@ -693,6 +693,10 @@ pub struct Runtime {
     /// The controller also owns the live state shared with the D-Bus
     /// thread (active, temperature, "disabled until tomorrow").
     night_light: crate::night_light::NightLightController,
+    /// `org.gnome.desktop.wm.preferences` focus keys (owned GIO reader).
+    wm_preferences: crate::wm_preferences::Reader,
+    /// Last reported reader status, so a change logs once.
+    wm_preferences_status: Option<crate::night_light_settings::CacheStatus>,
     /// Configured transform per connector (Settings/monitors.xml):
     /// the sensor overrides these live but never rewrites them.
     manual_transforms: std::collections::HashMap<String, u32>,
@@ -1234,6 +1238,10 @@ impl Runtime {
             transitions: crate::transitions::Transitions::new(Duration::ZERO),
             screenshot_flashes: Default::default(),
             screenshot_replies: Vec::new(),
+            // GNOME's focus policy keys, read on their own GIO thread as
+            // Mutter reads them in-process (prefs.c); changes wake the loop.
+            wm_preferences: crate::wm_preferences::Reader::new(&wake),
+            wm_preferences_status: None,
             wake,
             lockdown_refresh_at: Instant::now(),
             xwayland: XWaylandSupervisor::new(),
@@ -2358,6 +2366,18 @@ impl Runtime {
         });
         // Overdraw per output for the last drawn frame (#503).
         doc["workspaces"] = serde_json::json!(model.workspaces());
+        // Bottom-to-top stacking and GNOME's live focus policy (P-WM-09).
+        doc["stacking"] = serde_json::json!(self.manager.stacking_order());
+        let focus_policy = self.manager.focus_policy();
+        doc["focus_policy"] = serde_json::json!({
+            "focus_mode": focus_policy.mode.as_str(),
+            "auto_raise": focus_policy.auto_raise,
+            "auto_raise_delay_ms": focus_policy.auto_raise_delay.as_millis() as u64,
+            "raise_on_click": focus_policy.raise_on_click,
+            "modifier": focus_policy.modifier,
+            "resize_with_right_button": focus_policy.resize_with_right_button,
+            "focus_change_on_pointer_rest": focus_policy.focus_change_on_pointer_rest,
+        });
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
         doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
@@ -4100,6 +4120,10 @@ impl Runtime {
             // restoring obligation) and the bounded settings re-read.
             self.night_light.next_deadline(),
             self.state.protocols.bell.player_deadline(),
+            // GNOME focus policy: the bounded settings re-read, the
+            // pointer-rest poll and auto-raise.
+            self.wm_preferences.next_deadline(now),
+            self.manager.focus_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -4160,6 +4184,7 @@ impl Runtime {
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        self.focus_policy_tick();
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
@@ -4621,6 +4646,37 @@ impl Runtime {
             self.performance_trace.presented(flip.time, flip.sequence);
             let roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
             self.state.refresh_cycle(&roots, time, flip.refresh);
+        }
+    }
+
+    /// GNOME's focus policy (P-WM-09): install a completed settings read,
+    /// then repick the pointer window (a crossing without motion) and run
+    /// the pointer-rest and auto-raise timers. Native reads stay on the
+    /// owned GIO worker; a missing schema keeps GNOME 51's defaults.
+    fn focus_policy_tick(&mut self) {
+        let now = Instant::now();
+        let raw = self.wm_preferences.poll(now);
+        let status = self.wm_preferences.status();
+        if self.wm_preferences_status != Some(status) {
+            if matches!(
+                status,
+                crate::night_light_settings::CacheStatus::Unavailable
+                    | crate::night_light_settings::CacheStatus::Quarantined
+            ) {
+                eprintln!(
+                    "tuna-compositor: wm preferences cache {status:?}; retaining the prior focus policy"
+                );
+            }
+            self.wm_preferences_status = Some(status);
+        }
+        if let Some(raw) = raw {
+            let mut policy = self.manager.focus_policy();
+            policy.apply(&raw);
+            self.manager.set_focus_policy(policy);
+        }
+        if !self.is_locked() {
+            self.manager.repick_pointer_window(&mut self.state);
+            self.manager.run_focus_timers(&mut self.state, now);
         }
     }
 

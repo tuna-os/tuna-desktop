@@ -65,6 +65,7 @@ pub mod cursor;
 mod cursor_svg;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub mod focus_policy;
 pub mod fprintd;
 pub mod frame_timing;
 pub mod idle_monitor;
@@ -126,6 +127,7 @@ pub mod wellbeing_effects;
 pub mod window_icons;
 pub mod window_lifecycle;
 pub mod windows;
+pub(crate) mod wm_preferences;
 pub mod workspace_policy;
 pub mod workspace_slide;
 pub mod workspace_tracker;

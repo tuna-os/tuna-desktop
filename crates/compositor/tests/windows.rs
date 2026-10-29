@@ -18,6 +18,7 @@ use smithay::desktop::WindowSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{IsAlive, Logical, Point};
 use smithay::wayland::seat::WaylandFocus;
+use tuna_compositor::focus_policy::{FocusMode, FocusPolicy};
 use tuna_compositor::layer::OVERVIEW_NAMESPACE;
 use tuna_compositor::windows::{
     ManagerInput, SessionMode, TileSide, WindowLayout, WindowManager, ALT_LEFT_KEYCODE,
@@ -533,6 +534,250 @@ fn focus_follows_clicks_not_motion() {
     f.manager
         .pointer_motion(&mut f.comp.state, alpha_only(), 1003);
     assert_eq!(f.manager.model().focused(), Some(f.id_b));
+}
+
+/// GNOME's focus policy with the pointer-rest delay off unless asked.
+fn policy(mode: FocusMode) -> FocusPolicy {
+    FocusPolicy {
+        mode,
+        focus_change_on_pointer_rest: false,
+        ..FocusPolicy::default()
+    }
+}
+
+/// A point on neither window (alpha 0,0-800,600; beta 50,50-850,650).
+fn desktop() -> Point<f64, Logical> {
+    (1000.0, 700.0).into()
+}
+
+fn top(f: &Fixture) -> Option<u64> {
+    f.manager.stacking_order().last().copied()
+}
+
+#[test]
+fn sloppy_focus_follows_enter_without_raising_and_keeps_focus_on_the_desktop() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
+    f.manager.set_focus_policy(policy(FocusMode::Sloppy));
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    let enters = f.client_a.keyboard_enters.len();
+    f.manager.pointer_motion(&mut f.comp.state, beta_only(), 1);
+    f.manager.pointer_motion(&mut f.comp.state, alpha_only(), 2);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+    assert_eq!(top(&f), Some(f.id_b), "sloppy focus never raises");
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert!(
+        f.client_a.keyboard_enters.len() > enters,
+        "the entered window's client takes the keyboard"
+    );
+    f.manager.pointer_motion(&mut f.comp.state, desktop(), 3);
+    assert_eq!(
+        f.manager.model().focused(),
+        Some(f.id_a),
+        "sloppy keeps focus over the desktop"
+    );
+    // Back to click focus: hovering changes nothing again.
+    f.manager.set_focus_policy(policy(FocusMode::Click));
+    f.manager.pointer_motion(&mut f.comp.state, beta_only(), 4);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+}
+
+#[test]
+fn mouse_focus_unfocuses_when_the_pointer_reaches_no_window() {
+    let mut f = two_windows();
+    f.manager.set_focus_policy(policy(FocusMode::Mouse));
+    f.manager.pointer_motion(&mut f.comp.state, alpha_only(), 1);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+    f.manager.pointer_motion(&mut f.comp.state, desktop(), 2);
+    assert_eq!(f.manager.model().focused(), None);
+    f.manager.pointer_motion(&mut f.comp.state, beta_only(), 3);
+    assert_eq!(f.manager.model().focused(), Some(f.id_b));
+}
+
+#[test]
+fn pointer_rest_focuses_only_once_the_pointer_stops() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
+    f.manager.set_focus_policy(FocusPolicy {
+        mode: FocusMode::Sloppy,
+        ..FocusPolicy::default()
+    });
+    f.manager.pointer_motion(&mut f.comp.state, beta_only(), 1);
+    f.manager.pointer_motion(&mut f.comp.state, alpha_only(), 2);
+    assert_eq!(f.manager.model().focused(), Some(f.id_b), "not yet rested");
+    let first = f.manager.focus_deadline().expect("a rest check is queued");
+    // Still moving inside alpha at the check: it polls again.
+    f.manager
+        .pointer_motion(&mut f.comp.state, (20.0, 20.0).into(), 3);
+    f.manager.run_focus_timers(&mut f.comp.state, first);
+    assert_eq!(f.manager.model().focused(), Some(f.id_b));
+    let second = f.manager.focus_deadline().expect("polled again");
+    assert!(second > first);
+    f.manager.run_focus_timers(&mut f.comp.state, second);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+    assert_eq!(f.manager.focus_deadline(), None);
+}
+
+#[test]
+fn auto_raise_raises_after_its_delay_only_under_the_pointer() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
+    f.manager.set_focus_policy(FocusPolicy {
+        auto_raise: true,
+        auto_raise_delay: std::time::Duration::from_millis(300),
+        ..policy(FocusMode::Sloppy)
+    });
+    f.manager.pointer_motion(&mut f.comp.state, beta_only(), 1);
+    f.manager.pointer_motion(&mut f.comp.state, alpha_only(), 2);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+    assert_eq!(top(&f), Some(f.id_b), "not raised before the delay");
+    let due = f.manager.focus_deadline().expect("auto-raise queued");
+    f.manager
+        .run_focus_timers(&mut f.comp.state, due - std::time::Duration::from_millis(1));
+    assert_eq!(top(&f), Some(f.id_b));
+    f.manager.run_focus_timers(&mut f.comp.state, due);
+    assert_eq!(top(&f), Some(f.id_a), "auto-raised after 300 ms");
+    // Beta, entered and left before its delay, is not raised.
+    f.manager.pointer_motion(&mut f.comp.state, beta_only(), 3);
+    assert_eq!(f.manager.model().focused(), Some(f.id_b));
+    f.manager.pointer_motion(&mut f.comp.state, desktop(), 4);
+    let due = f
+        .manager
+        .focus_deadline()
+        .expect("beta's auto-raise queued");
+    f.manager.run_focus_timers(&mut f.comp.state, due);
+    assert_eq!(
+        top(&f),
+        Some(f.id_a),
+        "no raise once the pointer left the window"
+    );
+    assert_eq!(f.manager.focus_deadline(), None);
+    // Click focus never auto-raises.
+    f.manager.set_focus_policy(FocusPolicy {
+        auto_raise: true,
+        ..policy(FocusMode::Click)
+    });
+    f.manager.pointer_motion(&mut f.comp.state, alpha_only(), 6);
+    assert_eq!(f.manager.focus_deadline(), None);
+}
+
+#[test]
+fn raise_on_click_off_focuses_without_raising_and_still_delivers() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
+    f.manager.set_focus_policy(FocusPolicy {
+        raise_on_click: false,
+        ..policy(FocusMode::Click)
+    });
+    f.manager.pointer_motion(&mut f.comp.state, alpha_only(), 1);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 2);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 3);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+    assert_eq!(top(&f), Some(f.id_b), "clicked window stays beneath");
+    pump(&mut f.comp, &mut f.queue_a, &mut f.client_a, |c| {
+        c.pointer_buttons.len() >= 2
+    });
+    assert_eq!(
+        f.client_a.pointer_buttons,
+        vec![(BTN_LEFT, true), (BTN_LEFT, false)]
+    );
+    // raise-on-click back on: a click raises the already focused window.
+    f.manager.set_focus_policy(policy(FocusMode::Click));
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 4);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 5);
+    assert_eq!(top(&f), Some(f.id_a));
+}
+
+#[test]
+fn shell_activation_raises_even_without_raise_on_click() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
+    f.manager.set_focus_policy(FocusPolicy {
+        raise_on_click: false,
+        ..policy(FocusMode::Click)
+    });
+    // The shell's activation is Mutter's pager activation: raised.
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    assert_eq!(top(&f), Some(f.id_a));
+}
+
+#[test]
+fn short_modifier_grab_raises_at_release_without_raise_on_click() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
+    f.manager.set_focus_policy(FocusPolicy {
+        raise_on_click: false,
+        ..policy(FocusMode::Click)
+    });
+    // A real output: drops away from its edges never snap.
+    f.comp.state.set_output_size(1280, 800);
+    let start = f.manager.geometry(f.id_a).unwrap();
+    // Left of beta (x < 50), well below the top-edge snap.
+    f.manager
+        .pointer_motion(&mut f.comp.state, (20.0, 300.0).into(), 1);
+    press(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    // Moved 20 px: a real drag, never raised.
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 2);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+    assert_eq!(
+        top(&f),
+        Some(f.id_b),
+        "the grab does not raise at its start"
+    );
+    f.manager
+        .pointer_motion(&mut f.comp.state, (40.0, 300.0).into(), 3);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 4);
+    assert_eq!(
+        f.manager.geometry(f.id_a).unwrap().loc,
+        start.loc + Point::from((20, 0))
+    );
+    assert_eq!(top(&f), Some(f.id_b));
+    // Moved under 8 px: raised when released.
+    f.manager
+        .pointer_motion(&mut f.comp.state, (40.0, 310.0).into(), 5);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 6);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (44.0, 313.0).into(), 7);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 8);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    assert_eq!(top(&f), Some(f.id_a));
+    assert!(
+        f.client_a.pointer_buttons.is_empty(),
+        "modifier presses stay with the compositor"
+    );
+}
+
+#[test]
+fn activation_focus_stays_until_the_pointer_travels_fifty_pixels() {
+    let mut f = two_windows();
+    f.manager.set_focus_policy(policy(FocusMode::Sloppy));
+    f.manager.pointer_motion(&mut f.comp.state, beta_only(), 1);
+    assert_eq!(f.manager.model().focused(), Some(f.id_b));
+    // Alt+Tab-style activation of alpha while the pointer rests on beta.
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    f.manager.repick_pointer_window(&mut f.comp.state);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (810.0, 130.0).into(), 2);
+    assert_eq!(
+        f.manager.model().focused(),
+        Some(f.id_a),
+        "30 px of motion inside beta keeps the activated window"
+    );
+    f.manager
+        .pointer_motion(&mut f.comp.state, (810.0, 160.0).into(), 3);
+    assert_eq!(
+        f.manager.model().focused(),
+        Some(f.id_b),
+        "past 50 px the window under the pointer takes focus"
+    );
 }
 
 #[test]
