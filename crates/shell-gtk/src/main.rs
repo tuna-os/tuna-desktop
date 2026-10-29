@@ -2893,6 +2893,8 @@ fn build(app: &adw::Application) {
             "org.gnome.mutter",
             kbd_a11y::SCHEMA,
             pointer_a11y::SCHEMA,
+            "org.gnome.desktop.peripherals.trackball",
+            "org.gnome.desktop.peripherals.pointingstick",
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -2923,14 +2925,76 @@ fn build(app: &adw::Application) {
                     out.touchpad_natural_scroll = pad.boolean("natural-scroll");
                     out.touchpad_speed_milli = (pad.double("speed") * 1000.0).round() as i32;
                     out.disable_while_typing = pad.boolean("disable-while-typing");
+                    out.touchpad = tuna_shell_control::TouchpadSettings {
+                        send_events: tuna_shell_control::SendEvents::from_gsettings(
+                            &pad.string("send-events"),
+                        ),
+                        click_method: tuna_shell_control::TouchpadClickMethod::from_gsettings(
+                            &pad.string("click-method"),
+                        ),
+                        edge_scrolling: pad.boolean("edge-scrolling-enabled"),
+                        two_finger_scrolling: pad.boolean("two-finger-scrolling-enabled"),
+                        tap_and_drag: pad.boolean("tap-and-drag"),
+                        tap_and_drag_lock: pad.boolean("tap-and-drag-lock"),
+                        tap_button_map: tuna_shell_control::TapButtonMap::from_gsettings(
+                            &pad.string("tap-button-map"),
+                        ),
+                        middle_click_emulation: pad.boolean("middle-click-emulation"),
+                        accel_profile: tuna_shell_control::PointerAccelProfile::from_gsettings(
+                            &pad.string("accel-profile"),
+                        ),
+                    };
                 }
+                // GNOME's 0..24 `scroll-wheel-emulation-button` and its lock;
+                // the mouse schema gained them in gsettings-desktop-schemas 51.
+                let wheel_emulation = |s: &gio::Settings| {
+                    let has = |key| {
+                        s.settings_schema()
+                            .is_some_and(|schema| schema.has_key(key))
+                    };
+                    tuna_shell_control::ScrollWheelEmulation {
+                        button: if has("scroll-wheel-emulation-button") {
+                            u32::try_from(s.int("scroll-wheel-emulation-button")).unwrap_or(0)
+                        } else {
+                            0
+                        },
+                        lock: has("scroll-wheel-emulation-button-lock")
+                            && s.boolean("scroll-wheel-emulation-button-lock"),
+                    }
+                };
                 if let Some(mouse) = all[3].as_ref() {
                     out.mouse_natural_scroll = mouse.boolean("natural-scroll");
                     out.mouse_speed_milli = (mouse.double("speed") * 1000.0).round() as i32;
                     out.mouse_left_handed = mouse.boolean("left-handed");
-                    out.mouse_accel_profile = tuna_shell_control::MouseAccelProfile::from_gsettings(
-                        &mouse.string("accel-profile"),
-                    );
+                    out.mouse_accel_profile =
+                        tuna_shell_control::PointerAccelProfile::from_gsettings(
+                            &mouse.string("accel-profile"),
+                        );
+                    out.mouse = tuna_shell_control::MouseSettings {
+                        middle_click_emulation: mouse.boolean("middle-click-emulation"),
+                        scroll_wheel_emulation: wheel_emulation(mouse),
+                    };
+                }
+                if let Some(trackball) = all[11].as_ref() {
+                    out.trackball = tuna_shell_control::TrackballSettings {
+                        accel_profile: tuna_shell_control::PointerAccelProfile::from_gsettings(
+                            &trackball.string("accel-profile"),
+                        ),
+                        middle_click_emulation: trackball.boolean("middle-click-emulation"),
+                        scroll_wheel_emulation: wheel_emulation(trackball),
+                    };
+                }
+                if let Some(stick) = all[12].as_ref() {
+                    out.pointing_stick = tuna_shell_control::PointingStickSettings {
+                        speed_milli: (stick.double("speed") * 1000.0).round() as i32,
+                        accel_profile: tuna_shell_control::PointerAccelProfile::from_gsettings(
+                            &stick.string("accel-profile"),
+                        ),
+                        scroll_method:
+                            tuna_shell_control::PointingStickScrollMethod::from_gsettings(
+                                &stick.string("scroll-method"),
+                            ),
+                    };
                 }
                 out.touchpad_left_handed = logic::touchpad_left_handed(
                     all[2]

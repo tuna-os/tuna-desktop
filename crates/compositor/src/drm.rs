@@ -42,6 +42,8 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 
 use crate::windows::ManagerInput;
 
+pub mod libinput;
+
 /// Scanout surface type: GBM buffers on the DRM device, each queued
 /// frame carrying the presentation feedback of what it drew (#89).
 pub type ScanoutSurface = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, OutputPresentationFeedback>;
@@ -674,14 +676,25 @@ impl DrmBackend {
                 }
                 inputs
             }
-            InputEvent::DeviceAdded { mut device } => {
-                apply_libinput(&self.input_settings, &mut device);
+            InputEvent::DeviceAdded { device } => {
+                // Mutter counts a two-finger touchpad before applying its settings.
                 self.devices.push(device);
+                let two_finger = self.two_finger_available();
+                if let Some(device) = self.devices.last_mut() {
+                    libinput::apply(&self.input_settings, device, two_finger);
+                }
                 Vec::new()
             }
             InputEvent::DeviceRemoved { device } => {
                 self.corner_pressure.reset();
+                let had_two_finger = self.two_finger_available();
                 self.devices.retain(|d| *d != device);
+                // Mutter reapplies every setting once the last touchpad that
+                // scrolls with two fingers leaves (edge scrolling may return).
+                if had_two_finger && !self.two_finger_available() {
+                    let settings = self.input_settings.clone();
+                    self.apply_input_settings(&settings);
+                }
                 Vec::new()
             }
             // Touchpad swipes (#60): three fingers are the shell's.
@@ -784,45 +797,22 @@ impl DrmBackend {
             self.corner_pressure.reset();
         }
         self.input_settings = settings.clone();
+        let two_finger = self.two_finger_available();
         for device in &mut self.devices {
-            apply_libinput(settings, device);
+            libinput::apply(settings, device, two_finger);
         }
     }
 
-    /// Live libinput state for every tracked device (#343): names and
-    /// capability kinds plus the configuration libinput itself reports
-    /// back, with per-option availability, so proofs assert applied
-    /// device state rather than the settings echo and unsupported
-    /// options are visible instead of silently ignored. No input
-    /// content, only configuration.
+    /// Whether any present touchpad scrolls with two fingers (Mutter's
+    /// `two_finger_devices`), which makes edge scrolling yield.
+    fn two_finger_available(&self) -> bool {
+        self.devices.iter().any(libinput::has_two_finger_scroll)
+    }
+
+    /// Live libinput state for every tracked device (#343), see
+    /// [`libinput::device_state`].
     pub fn input_device_states(&self) -> Vec<serde_json::Value> {
-        self.devices
-            .iter()
-            .map(|device| {
-                let kind = match pointer_kind(device) {
-                    PointerKind::Touchpad => "touchpad",
-                    PointerKind::Pointer => "pointer",
-                    PointerKind::Other => "other",
-                };
-                serde_json::json!({
-                    "name": device.name(),
-                    "kind": kind,
-                    "tap_fingers": device.config_tap_finger_count(),
-                    "left_handed": device.config_left_handed(),
-                    "handed_available": device.config_left_handed_is_available(),
-                    "tap_enabled": device.config_tap_enabled(),
-                    "natural_scroll": device.config_scroll_natural_scroll_enabled(),
-                    "natural_available": device.config_scroll_has_natural_scroll(),
-                    "accel_speed": device.config_accel_speed(),
-                    "accel_available": device.config_accel_is_available(),
-                    "accel_profile": device.config_accel_profile().map(accel_profile_name),
-                    "accel_profiles": device.config_accel_profiles().into_iter().map(accel_profile_name).collect::<Vec<_>>(),
-                    "accel_custom_supported_by_compositor": false,
-                    "dwt_enabled": device.config_dwt_enabled(),
-                    "dwt_available": device.config_dwt_is_available(),
-                })
-            })
-            .collect()
+        self.devices.iter().map(libinput::device_state).collect()
     }
 
     /// Move the drawn cursor to where the window manager put the pointer.
@@ -897,225 +887,6 @@ mod wake_event_tests {
     }
 }
 
-/// Which GNOME settings family a libinput device takes (#343): touchpads
-/// take the touchpad keys, every other pointer (mice, trackballs,
-/// pointing sticks) the mouse keys, as Mutter maps POINTER minus
-/// TOUCHPAD onto the mouse schema. Known gap: Mutter gives pointing
-/// sticks their own speed, which needs a wire field (#343 follow-up).
-/// Keyboards and tablets take none of these keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PointerKind {
-    Touchpad,
-    Pointer,
-    Other,
-}
-
-/// One device's libinput configuration, resolved from GNOME's settings
-/// for its [`PointerKind`]. `None` tap/disable-while-typing means the
-/// device family has no such key.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LibinputPolicy {
-    pub left_handed: bool,
-    pub tap_to_click: Option<bool>,
-    pub natural_scroll: bool,
-    pub speed: f64,
-    pub disable_while_typing: Option<bool>,
-}
-
-/// Classify a libinput device the way [`apply_libinput`] does.
-pub fn pointer_kind(device: &smithay::reexports::input::Device) -> PointerKind {
-    if device.config_tap_finger_count() > 0 {
-        PointerKind::Touchpad
-    } else if device.has_capability(smithay::reexports::input::DeviceCapability::Pointer) {
-        PointerKind::Pointer
-    } else {
-        PointerKind::Other
-    }
-}
-
-/// Resolve the libinput configuration for one device kind from GNOME's
-/// settings. `None` leaves the device alone. Speed is GNOME's -1..1.
-pub fn libinput_policy(
-    settings: &tuna_shell_control::InputSettings,
-    kind: PointerKind,
-) -> Option<LibinputPolicy> {
-    let speed = |milli: i32| f64::from(milli.clamp(-1000, 1000)) / 1000.0;
-    match kind {
-        PointerKind::Touchpad => Some(LibinputPolicy {
-            left_handed: settings.touchpad_left_handed,
-            tap_to_click: Some(settings.tap_to_click),
-            natural_scroll: settings.touchpad_natural_scroll,
-            speed: speed(settings.touchpad_speed_milli),
-            disable_while_typing: Some(settings.disable_while_typing),
-        }),
-        PointerKind::Pointer => Some(LibinputPolicy {
-            left_handed: settings.mouse_left_handed,
-            tap_to_click: None,
-            natural_scroll: settings.mouse_natural_scroll,
-            speed: speed(settings.mouse_speed_milli),
-            disable_while_typing: None,
-        }),
-        PointerKind::Other => None,
-    }
-}
-
-/// One device's libinput configuration from GNOME's settings, as Mutter
-/// applies them (niri's `apply_libinput_settings` shape): touchpads get
-/// tap-to-click, natural scroll, disable-while-typing and their speed;
-/// other pointers their natural scroll and speed.
-fn apply_libinput(
-    settings: &tuna_shell_control::InputSettings,
-    device: &mut smithay::reexports::input::Device,
-) {
-    let Some(policy) = libinput_policy(settings, pointer_kind(device)) else {
-        return;
-    };
-    apply_handedness(device, policy.left_handed);
-    if let Some(tap) = policy.tap_to_click {
-        let _ = device.config_tap_set_enabled(tap);
-    }
-    let _ = device.config_scroll_set_natural_scroll_enabled(policy.natural_scroll);
-    if let Some(dwt) = policy.disable_while_typing {
-        let _ = device.config_dwt_set_enabled(dwt);
-    }
-    let _ = device.config_accel_set_speed(policy.speed);
-    if is_mouse_for_accel(device) {
-        apply_mouse_accel_profile(device, settings.mouse_accel_profile);
-    }
-}
-
-fn accel_profile_name(profile: smithay::reexports::input::AccelProfile) -> &'static str {
-    use smithay::reexports::input::AccelProfile;
-    match profile {
-        AccelProfile::Flat => "flat",
-        AccelProfile::Adaptive => "adaptive",
-        _ => "unknown",
-    }
-}
-
-/// Mutter excludes touchpads, trackballs and pointing sticks from the mouse
-/// profile, consulting the udev device and its immediate parent for the latter.
-fn is_mouse_for_accel(device: &smithay::reexports::input::Device) -> bool {
-    if pointer_kind(device) != PointerKind::Pointer {
-        return false;
-    }
-    // This device was created by the libinput udev context used by this backend.
-    let udev = unsafe { device.udev_device() };
-    udev.as_ref().is_none_or(|dev| {
-        dev.property_value("ID_INPUT_TRACKBALL").is_none()
-            && dev.property_value("ID_INPUT_POINTINGSTICK").is_none()
-            && dev.parent().as_ref().is_none_or(|parent| {
-                parent.property_value("ID_INPUT_TRACKBALL").is_none()
-                    && parent.property_value("ID_INPUT_POINTINGSTICK").is_none()
-            })
-    })
-}
-
-fn resolve_mouse_accel_profile(
-    requested: tuna_shell_control::MouseAccelProfile,
-    available: &[smithay::reexports::input::AccelProfile],
-    default: Option<smithay::reexports::input::AccelProfile>,
-) -> Option<smithay::reexports::input::AccelProfile> {
-    use smithay::reexports::input::AccelProfile;
-    use tuna_shell_control::MouseAccelProfile;
-    let desired = match requested {
-        MouseAccelProfile::Flat => Some(AccelProfile::Flat),
-        MouseAccelProfile::Adaptive => Some(AccelProfile::Adaptive),
-        MouseAccelProfile::Default | MouseAccelProfile::Custom => None,
-    };
-    desired
-        .filter(|profile| available.contains(profile))
-        .or(default)
-}
-
-#[cfg(test)]
-mod mouse_accel_tests {
-    use super::resolve_mouse_accel_profile;
-    use smithay::reexports::input::AccelProfile::{Adaptive, Flat};
-    use tuna_shell_control::MouseAccelProfile;
-
-    #[test]
-    fn supported_profiles_and_unsupported_fallback_use_device_default() {
-        let available = [Flat, Adaptive];
-        assert_eq!(
-            resolve_mouse_accel_profile(MouseAccelProfile::Default, &available, Some(Adaptive)),
-            Some(Adaptive)
-        );
-        assert_eq!(
-            resolve_mouse_accel_profile(MouseAccelProfile::Flat, &available, Some(Adaptive)),
-            Some(Flat)
-        );
-        assert_eq!(
-            resolve_mouse_accel_profile(MouseAccelProfile::Adaptive, &available, Some(Flat)),
-            Some(Adaptive)
-        );
-        assert_eq!(
-            resolve_mouse_accel_profile(MouseAccelProfile::Flat, &[Adaptive], Some(Adaptive)),
-            Some(Adaptive)
-        );
-        assert_eq!(
-            resolve_mouse_accel_profile(MouseAccelProfile::Custom, &available, Some(Adaptive)),
-            Some(Adaptive)
-        );
-        assert_eq!(
-            resolve_mouse_accel_profile(MouseAccelProfile::Flat, &[], None),
-            None
-        );
-    }
-}
-
-fn apply_mouse_accel_profile(
-    device: &mut smithay::reexports::input::Device,
-    requested: tuna_shell_control::MouseAccelProfile,
-) {
-    let available = device.config_accel_profiles();
-    let selected =
-        resolve_mouse_accel_profile(requested, &available, device.config_accel_default_profile());
-    if requested == tuna_shell_control::MouseAccelProfile::Custom {
-        eprintln!("tuna-compositor: libinput: custom mouse acceleration is unsupported by the compositor for {}; using device default", device.name());
-    } else if matches!(
-        requested,
-        tuna_shell_control::MouseAccelProfile::Flat
-            | tuna_shell_control::MouseAccelProfile::Adaptive
-    ) && selected
-        != match requested {
-            tuna_shell_control::MouseAccelProfile::Flat => {
-                Some(smithay::reexports::input::AccelProfile::Flat)
-            }
-            tuna_shell_control::MouseAccelProfile::Adaptive => {
-                Some(smithay::reexports::input::AccelProfile::Adaptive)
-            }
-            _ => None,
-        }
-    {
-        eprintln!("tuna-compositor: libinput: requested mouse acceleration profile unsupported for {}; using device default", device.name());
-    }
-    if let Some(profile) = selected {
-        if let Err(error) = device.config_accel_set_profile(profile) {
-            eprintln!(
-                "tuna-compositor: libinput: mouse acceleration profile rejected for {}: {error:?}",
-                device.name()
-            );
-        }
-    }
-}
-
-fn apply_handedness(device: &smithay::reexports::input::Device, left_handed: bool) {
-    if device.config_left_handed_is_available() {
-        if let Err(error) = device.config_left_handed_set(left_handed) {
-            eprintln!(
-                "tuna-compositor: libinput: primary button setting rejected for {}: {error:?}",
-                device.name()
-            );
-        }
-    } else if left_handed {
-        eprintln!(
-            "tuna-compositor: libinput: primary button swapping unsupported for {}",
-            device.name()
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1143,69 +914,5 @@ mod tests {
         // Far left: onto the left edge of the first output.
         let left = clamp_to_outputs((-50.0, 10.0).into(), &outputs);
         assert_eq!(left, (0.0, 10.0).into());
-    }
-
-    /// Distinct touchpad and mouse settings, so a swapped family shows.
-    fn pointer_settings() -> tuna_shell_control::InputSettings {
-        tuna_shell_control::InputSettings {
-            tap_to_click: true,
-            touchpad_natural_scroll: true,
-            touchpad_speed_milli: -500,
-            disable_while_typing: false,
-            touchpad_left_handed: true,
-            mouse_natural_scroll: false,
-            mouse_speed_milli: 250,
-            mouse_left_handed: false,
-            ..tuna_shell_control::InputSettings::default()
-        }
-    }
-
-    #[test]
-    fn touchpad_policy_carries_the_touchpad_keys() {
-        let policy = libinput_policy(&pointer_settings(), PointerKind::Touchpad).unwrap();
-        assert!(policy.left_handed);
-        assert_eq!(policy.tap_to_click, Some(true));
-        assert!(policy.natural_scroll);
-        assert_eq!(policy.speed, -0.5);
-        assert_eq!(policy.disable_while_typing, Some(false));
-    }
-
-    #[test]
-    fn pointer_policy_carries_the_mouse_keys() {
-        // Mice, trackballs and pointing sticks all take the mouse
-        // keys, as Mutter maps POINTER minus TOUCHPAD (#343).
-        let policy = libinput_policy(&pointer_settings(), PointerKind::Pointer).unwrap();
-        assert!(!policy.left_handed);
-        assert_eq!(policy.tap_to_click, None);
-        assert!(!policy.natural_scroll);
-        assert_eq!(policy.speed, 0.25);
-        assert_eq!(policy.disable_while_typing, None);
-    }
-
-    #[test]
-    fn other_devices_are_left_alone() {
-        assert_eq!(
-            libinput_policy(&pointer_settings(), PointerKind::Other),
-            None
-        );
-    }
-
-    #[test]
-    fn pointer_speed_clamps_to_gnomes_range() {
-        let mut settings = pointer_settings();
-        settings.mouse_speed_milli = 5000;
-        settings.touchpad_speed_milli = -5000;
-        assert_eq!(
-            libinput_policy(&settings, PointerKind::Pointer)
-                .unwrap()
-                .speed,
-            1.0
-        );
-        assert_eq!(
-            libinput_policy(&settings, PointerKind::Touchpad)
-                .unwrap()
-                .speed,
-            -1.0
-        );
     }
 }

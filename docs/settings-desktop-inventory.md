@@ -304,23 +304,23 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | Key | Status | Reason |
 |---|---|---|
 | accel-profile | Honored | `default`, `flat` and `adaptive` reach libinput live and on hotplug for mice only (trackballs and pointing sticks excluded, as in Mutter); a profile the device lacks and `custom` fall back to the device default, since the compositor's libinput bindings cannot set custom curves. Native VM proof V-POINTER-LIVE checks flat then adaptive on the live device |
-| custom-accel-config | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| custom-accel-config | Ignored | The pinned libinput bindings (input-sys 1.19) cannot set custom acceleration curves; `accel-profile` `custom` falls back to the device default and each device reports `accel_custom_supported_by_compositor: false` |
 | double-click | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | drag-threshold | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | left-handed | Honored | Live GNOME boolean reaches libinput; native VM proof V-MOUSE-HANDEDNESS covers false/true/false on the same compositor |
-| middle-click-emulation | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| middle-click-emulation | Honored | Live and on hotplug for mice only (not touchpads, trackballs or pointing sticks, as Mutter 51) where libinput offers it; native VM proof V-POINTER-LIVE checks the live device readback on and off |
 | natural-scroll | Honored | Live libinput policy on hardware devices |
-| scroll-wheel-emulation-button | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| scroll-wheel-emulation-button-lock | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| scroll-wheel-emulation-button | Honored | Mice only, as Mutter 51: a nonzero GNOME button selects libinput's on-button-down scrolling with that button (Mutter's button-to-evdev mapping), 0 turns button scrolling off. Native VM proof V-POINTER-LIVE checks button 2 then off where the guest schema has the GNOME 51 key |
+| scroll-wheel-emulation-button-lock | Honored | Applied with `scroll-wheel-emulation-button` to mice as libinput's scroll button lock; V-POINTER-LIVE checks it on then off where the guest schema has the GNOME 51 key |
 | speed | Honored | Live libinput policy on hardware devices |
 ## org.gnome.desktop.peripherals.pointingstick
 
 | Key | Status | Reason |
 |---|---|---|
-| accel-profile | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| custom-accel-config | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| scroll-method | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| speed | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| accel-profile | Honored | `default`, `flat` and `adaptive` reach libinput live and on hotplug for pointing sticks (udev `ID_INPUT_POINTINGSTICK`, as Mutter 51); a profile the device lacks and `custom` fall back to the device default. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no pointing stick in the VM) |
+| custom-accel-config | Ignored | The pinned libinput bindings (input-sys 1.19) cannot set custom acceleration curves; `custom` falls back to the device default and each device reports `accel_custom_supported_by_compositor: false` |
+| scroll-method | Honored | `default` (device default), `none` and `on-button-down` reach libinput live and on hotplug for pointing sticks, as Mutter 51. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no pointing stick in the VM) |
+| speed | Honored | Pointing sticks take this speed instead of the mouse speed, live and on hotplug, as Mutter 51. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no pointing stick in the VM) |
 ## org.gnome.desktop.peripherals.tablet
 
 | Key | Status | Reason |
@@ -362,23 +362,23 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| accel-profile | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| click-method | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| custom-accel-config | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| accel-profile | Honored | `default`, `flat` and `adaptive` reach libinput live and on hotplug for touchpads, as Mutter 51; a profile the device lacks and `custom` fall back to the device default. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
+| click-method | Honored | `default` (device default), `none`, `areas` and `fingers` reach libinput's click method live and on hotplug for touchpads, as Mutter 51. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
+| custom-accel-config | Ignored | The pinned libinput bindings (input-sys 1.19) cannot set custom acceleration curves; `custom` falls back to the device default and each device reports `accel_custom_supported_by_compositor: false` |
 | disable-while-typing | Honored | Live libinput policy, including hotplug |
-| disable-while-typing-timeout | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| edge-scrolling-enabled | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| disable-while-typing-timeout | Ignored | Mutter 51 sets it with `libinput_device_config_dwt_set_timeout`, which the pinned libinput bindings (input-sys 1.19) lack; libinput's own timeout applies and each device reports `dwt_timeout_supported_by_compositor: false` |
+| edge-scrolling-enabled | Honored | Live and on hotplug for touchpads, replaying Mutter 51's two-finger-then-edge sequence: edge scrolling yields while both keys are on and any touchpad scrolls with two fingers, and settings reapply when the last such touchpad leaves. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
 | left-handed | Honored | Live left/right/mouse enum reaches libinput, including the hotplug path; physical touchpad and hotplug qualification remain open |
-| middle-click-emulation | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| middle-click-emulation | Honored | Live and on hotplug for touchpads where libinput offers it, as Mutter 51. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
 | natural-scroll | Honored | Live libinput policy, including hotplug |
 | scroll-speed | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| send-events | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| send-events | Honored | `enabled`, `disabled` and `disabled-on-external-mouse` reach libinput's send-events mode live and on hotplug for touchpads, as Mutter 51; libinput itself suspends and resumes the touchpad as external mice come and go. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
 | speed | Honored | Live libinput policy, including hotplug |
-| tap-and-drag | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| tap-and-drag-lock | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| tap-button-map | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| tap-and-drag | Honored | Live and on hotplug for touchpads with tapping, as Mutter 51. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
+| tap-and-drag-lock | Honored (timeout drag lock) | Live and on hotplug for touchpads with tapping. The pinned bindings name only libinput's original timeout drag lock, while Mutter 51 asks libinput for sticky drag lock; each device reports the live `tap_drag_lock` mode and `tap_drag_lock_sticky_supported_by_compositor: false`. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
+| tap-button-map | Honored | `default` (device default), `lrm` and `lmr` reach libinput live and on hotplug for touchpads with tapping, as Mutter 51. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
 | tap-to-click | Honored | Live libinput policy, including hotplug |
-| two-finger-scrolling-enabled | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| two-finger-scrolling-enabled | Honored | Live and on hotplug for touchpads, with `edge-scrolling-enabled` in Mutter 51's order (two-finger wins when both are on). G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no touchpad in the VM) |
 ## org.gnome.desktop.peripherals.touchscreen
 
 | Key | Status | Reason |
@@ -388,11 +388,11 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| accel-profile | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| custom-accel-config | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| middle-click-emulation | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| scroll-wheel-emulation-button | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
-| scroll-wheel-emulation-button-lock | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| accel-profile | Honored | `default`, `flat` and `adaptive` reach libinput live and on hotplug for trackballs (udev `ID_INPUT_TRACKBALL`, as Mutter 51); a profile the device lacks and `custom` fall back to the device default. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no trackball in the VM) |
+| custom-accel-config | Ignored | The pinned libinput bindings (input-sys 1.19) cannot set custom acceleration curves; `custom` falls back to the device default and each device reports `accel_custom_supported_by_compositor: false` |
+| middle-click-emulation | Honored | Live and on hotplug for trackballs where libinput offers it, as Mutter 51. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no trackball in the VM) |
+| scroll-wheel-emulation-button | Honored | Trackballs take libinput's on-button-down scrolling with this GNOME button (0 turns it off), live and on hotplug, as Mutter 51. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no trackball in the VM) |
+| scroll-wheel-emulation-button-lock | Honored | Applied with `scroll-wheel-emulation-button` to trackballs as libinput's scroll button lock. G-SETTINGS-POINTER proves the key reaches the compositor; device application is unit-tested only (no trackball in the VM) |
 ## org.gnome.desktop.privacy
 
 | Key | Status | Reason |

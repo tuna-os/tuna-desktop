@@ -97,6 +97,12 @@
 #   G-SETTINGS-INPUT GNOME's input sources set the keymap (Super+Space
 #                  switches), repeat-interval the repeat rate, and
 #                  enable-hot-corners the hot corner (#60)
+#   G-SETTINGS-POINTER GNOME's touchpad, mouse, trackball and pointing-stick
+#                  keys (send-events, click method, scroll methods, tap
+#                  options, middle-click and scroll-wheel emulation,
+#                  per-class acceleration) reach the compositor live and
+#                  reset to GNOME 51's defaults (#343); the native VM lane
+#                  proves libinput device state
 #   G-A11Y-STICKY  Sticky Keys: a tapped Shift latches for one key, two
 #                  taps lock, two modifiers at once switch the aid off (#350)
 #   G-A11Y-SHORTCUTS Shift five times / held eight seconds switch Sticky /
@@ -4517,6 +4523,88 @@ gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us')]"
 cstate '.keyboard.layouts == ["English (US)"]' "one source" ||
     fail G-SETTINGS-INPUT "the keymap did not return to us"
 pass G-SETTINGS-INPUT "input sources, Super+Space, key repeat and the hot corner follow GNOME"
+
+# GNOME's per-class pointer device keys (#343) reach the compositor's
+# settings live. The nested session has no libinput devices; V-POINTER-LIVE
+# proves applied device state on the native VM's mouse.
+set_pointer_keys() {
+    gsettings set org.gnome.desktop.peripherals.touchpad send-events disabled-on-external-mouse
+    gsettings set org.gnome.desktop.peripherals.touchpad click-method areas
+    gsettings set org.gnome.desktop.peripherals.touchpad edge-scrolling-enabled true
+    gsettings set org.gnome.desktop.peripherals.touchpad two-finger-scrolling-enabled false
+    gsettings set org.gnome.desktop.peripherals.touchpad tap-and-drag false
+    gsettings set org.gnome.desktop.peripherals.touchpad tap-and-drag-lock true
+    gsettings set org.gnome.desktop.peripherals.touchpad tap-button-map lmr
+    gsettings set org.gnome.desktop.peripherals.touchpad middle-click-emulation true
+    gsettings set org.gnome.desktop.peripherals.touchpad accel-profile flat
+    gsettings set org.gnome.desktop.peripherals.mouse middle-click-emulation true
+    gsettings set org.gnome.desktop.peripherals.trackball accel-profile adaptive
+    gsettings set org.gnome.desktop.peripherals.trackball middle-click-emulation true
+    gsettings set org.gnome.desktop.peripherals.trackball scroll-wheel-emulation-button 8
+    gsettings set org.gnome.desktop.peripherals.trackball scroll-wheel-emulation-button-lock true
+    gsettings set org.gnome.desktop.peripherals.pointingstick speed -0.5
+    gsettings set org.gnome.desktop.peripherals.pointingstick accel-profile flat
+    gsettings set org.gnome.desktop.peripherals.pointingstick scroll-method none
+}
+reset_pointer_keys() {
+    for key in send-events click-method edge-scrolling-enabled two-finger-scrolling-enabled \
+        tap-and-drag tap-and-drag-lock tap-button-map middle-click-emulation accel-profile; do
+        gsettings reset org.gnome.desktop.peripherals.touchpad "$key"
+    done
+    # shellcheck disable=SC2086 # the optional key list splits on purpose
+    for key in middle-click-emulation $pointer_mouse_wheel_keys; do
+        gsettings reset org.gnome.desktop.peripherals.mouse "$key"
+    done
+    for key in accel-profile middle-click-emulation scroll-wheel-emulation-button \
+        scroll-wheel-emulation-button-lock; do
+        gsettings reset org.gnome.desktop.peripherals.trackball "$key"
+    done
+    for key in speed accel-profile scroll-method; do
+        gsettings reset org.gnome.desktop.peripherals.pointingstick "$key"
+    done
+}
+# The mouse schema gained scroll-wheel emulation in gsettings-desktop-schemas
+# 51; older hosts lack the keys, and the shell then keeps GNOME's default.
+pointer_mouse_wheel_keys=""
+pointer_mouse_wheel='{"button":0,"lock":false}'
+pointer_wheel_note="host mouse schema predates scroll-wheel emulation"
+if gsettings list-keys org.gnome.desktop.peripherals.mouse | grep -qx scroll-wheel-emulation-button; then
+    pointer_mouse_wheel_keys="scroll-wheel-emulation-button scroll-wheel-emulation-button-lock"
+    pointer_mouse_wheel='{"button":2,"lock":true}'
+    pointer_wheel_note="mouse scroll-wheel emulation included"
+fi
+set_pointer_keys
+if [ -n "$pointer_mouse_wheel_keys" ]; then
+    gsettings set org.gnome.desktop.peripherals.mouse scroll-wheel-emulation-button 2
+    gsettings set org.gnome.desktop.peripherals.mouse scroll-wheel-emulation-button-lock true
+fi
+cstate ".pointer_device_settings == {
+    \"mouse_accel_profile\": \"Default\",
+    \"touchpad\": {\"send_events\": \"DisabledOnExternalMouse\", \"click_method\": \"Areas\",
+        \"edge_scrolling\": true, \"two_finger_scrolling\": false, \"tap_and_drag\": false,
+        \"tap_and_drag_lock\": true, \"tap_button_map\": \"Lmr\",
+        \"middle_click_emulation\": true, \"accel_profile\": \"Flat\"},
+    \"mouse\": {\"middle_click_emulation\": true, \"scroll_wheel_emulation\": $pointer_mouse_wheel},
+    \"trackball\": {\"accel_profile\": \"Adaptive\", \"middle_click_emulation\": true,
+        \"scroll_wheel_emulation\": {\"button\": 8, \"lock\": true}},
+    \"pointing_stick\": {\"speed_milli\": -500, \"accel_profile\": \"Flat\", \"scroll_method\": \"None\"}}" \
+    "pointer device keys applied" ||
+    fail G-SETTINGS-POINTER "GNOME's touchpad, mouse, trackball and pointing-stick keys did not reach the compositor"
+cp "$CSTATE" "$ARTIFACTS/pointer-device-settings.json"
+reset_pointer_keys
+cstate '.pointer_device_settings == {
+    "mouse_accel_profile": "Default",
+    "touchpad": {"send_events": "Enabled", "click_method": "Fingers",
+        "edge_scrolling": false, "two_finger_scrolling": true, "tap_and_drag": true,
+        "tap_and_drag_lock": false, "tap_button_map": "Default",
+        "middle_click_emulation": false, "accel_profile": "Default"},
+    "mouse": {"middle_click_emulation": false, "scroll_wheel_emulation": {"button": 0, "lock": false}},
+    "trackball": {"accel_profile": "Default", "middle_click_emulation": false,
+        "scroll_wheel_emulation": {"button": 0, "lock": false}},
+    "pointing_stick": {"speed_milli": 0, "accel_profile": "Default", "scroll_method": "Default"}}' \
+    "pointer device keys reset" ||
+    fail G-SETTINGS-POINTER "resetting the pointer device keys did not restore GNOME 51 defaults"
+pass G-SETTINGS-POINTER "touchpad, mouse, trackball and pointing-stick keys reach the compositor live and reset to GNOME 51 defaults; $pointer_wheel_note"
 
 # GNOME's keyboard accessibility aids (#350). Real key events from the
 # host X server pass through the compositor's input pipeline into a
