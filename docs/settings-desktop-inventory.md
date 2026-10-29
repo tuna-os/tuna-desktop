@@ -27,7 +27,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | Key | Status | Reason |
 |---|---|---|
 | screen-keyboard-enabled | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| screen-magnifier-enabled | Honored (captures/casts) | GTK shell mirrors the switch plus the honored magnifier keys into the session snapshot; compositor screenshots and monitor/area casts magnify per GNOME 51 zoom and tracking. Live presentation, cross-hairs and color-filter keys remain open (#349) |
+| screen-magnifier-enabled | Honored | GTK shell mirrors the switch plus every org.gnome.desktop.a11y.magnifier key into the session snapshot; the compositor draws GNOME 51's ZoomRegion on every output frame (zoom, tracking, cross-hairs, color effects, magnified pointer sprite), and captures/casts read back the same passes; Super+Alt+8 toggles it (M-KEYS). Accepted differences: per-monitor regions, touch mapped through the zoom, window-centre fallback for non-AT-SPI apps, shell popover focus untracked (#349) |
 | screen-reader-enabled | Honored (hardware session only) | Hardware GTK shell publishes the preference to the compositor, which owns a genuine nonreplacement Orca child bound to its lifetime; nested runtimes refuse activation and never manage host Orca. Genuine Orca activation/logout VM probes are required; Settings UI activation and complete spoken lock/login/shell navigation remain unqualified (#352) |
 ## org.gnome.desktop.a11y.interface
 
@@ -65,27 +65,27 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| brightness-blue | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| brightness-green | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| brightness-red | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| caret-tracking | Honored (captures/casts) | Text-input caret retargets the magnified region (none/centered/proportional/push, default centered) in screenshots and casts; see screen-magnifier-enabled |
-| color-saturation | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| contrast-blue | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| contrast-green | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| contrast-red | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| cross-hairs-clip | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| cross-hairs-color | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| cross-hairs-length | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| cross-hairs-opacity | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| cross-hairs-thickness | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| focus-tracking | Honored (captures/casts) | Focused window center retargets the magnified region (none/centered/proportional/push, default proportional) in screenshots and casts; see screen-magnifier-enabled |
-| invert-lightness | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
-| lens-mode | Honored (captures/casts) | A non-full-screen viewport centers on the pointer in screenshots and casts, as in GNOME; full-screen lens stays put; see screen-magnifier-enabled |
-| mag-factor | Honored (captures/casts) | Zoom factor 0.1..=32.0 (two decimals, default 2.0) scales the region of interest in screenshots and casts; unity passes frames through; see screen-magnifier-enabled |
-| mouse-tracking | Honored (captures/casts) | Pointer motion retargets the magnified region (none/centered/proportional/push, default proportional) in screenshots and casts; see screen-magnifier-enabled |
-| screen-position | Honored (captures/casts) | Full-screen or half-screen viewport in screenshots and casts; unmagnified halves copy through; see screen-magnifier-enabled |
-| scroll-at-edges | Honored (captures/casts) | Off (default) clamps the region of interest on screen; on lets it scroll past edges with black fill in screenshots and casts; see screen-magnifier-enabled |
-| show-cross-hairs | Ignored | Tuna Desktop has no equivalent compositor accessibility feature; toolkit support is listed separately |
+| brightness-blue | Honored | Shell.BrightnessContrast blue brightness (-1..1) on the live zoom region, captures and casts; see screen-magnifier-enabled |
+| brightness-green | Honored | Green brightness on the live zoom region, captures and casts; see screen-magnifier-enabled |
+| brightness-red | Honored | Red brightness on the live zoom region, captures and casts; see screen-magnifier-enabled |
+| caret-tracking | Honored | AT-SPI caret events (and the text-input caret rectangle) retarget the live zoom region after GNOME's 1 s pointer rest (none/centered/proportional/push, default centered); see screen-magnifier-enabled |
+| color-saturation | Honored | Clutter.DesaturateEffect (0 gray..1 unchanged) on the live zoom region; see screen-magnifier-enabled |
+| contrast-blue | Honored | Blue contrast (-1..1) on the live zoom region, captures and casts; see screen-magnifier-enabled |
+| contrast-green | Honored | Green contrast on the live zoom region, captures and casts; see screen-magnifier-enabled |
+| contrast-red | Honored | Red contrast on the live zoom region, captures and casts; see screen-magnifier-enabled |
+| cross-hairs-clip | Honored | Leaves GNOME's 100x100 hole around the magnified pointer; see screen-magnifier-enabled |
+| cross-hairs-color | Honored | Hair color, parsed like Cogl.Color.from_string (M-CROSSHAIRS); see screen-magnifier-enabled |
+| cross-hairs-length | Honored | Hair length 20..4096 device pixels; see screen-magnifier-enabled |
+| cross-hairs-opacity | Honored | Hair opacity 0..1 (M-CROSSHAIRS); see screen-magnifier-enabled |
+| cross-hairs-thickness | Honored | Hair thickness in logical pixels (M-CROSSHAIRS); see screen-magnifier-enabled |
+| focus-tracking | Honored | AT-SPI focus events center on the focused widget (M-ATSPI-FOCUS); apps without AT-SPI fall back to the focused window centre (M-FOCUS) (none/centered/proportional/push, default proportional); see screen-magnifier-enabled |
+| invert-lightness | Honored | Shell.InvertLightnessEffect on the live zoom region (M-INVERT); see screen-magnifier-enabled |
+| lens-mode | Honored | A non-full-screen viewport centers on the tracked point, as in GNOME; full-screen lens stays put; see screen-magnifier-enabled |
+| mag-factor | Honored | Zoom factor 0.1..=32.0 (two decimals, default 2.0) on the live output (M-LIVE, M-CURSOR), animated over 100 ms; Super+Alt+=/- step it (M-KEYS); see screen-magnifier-enabled |
+| mouse-tracking | Honored | Pointer motion retargets the live zoom region (none/centered/proportional/push, default proportional; M-TRACK, M-LIVE); see screen-magnifier-enabled |
+| screen-position | Honored | Full-screen or half-screen viewport on the live output; the other half shows the unmagnified desktop (M-HALF); see screen-magnifier-enabled |
+| scroll-at-edges | Honored | Off (default) clamps the region of interest on screen; on lets it scroll past edges over the system background; see screen-magnifier-enabled |
+| show-cross-hairs | Honored | Cross-hairs through the magnified pointer on the live output (M-CROSSHAIRS); see screen-magnifier-enabled |
 ## org.gnome.desktop.a11y.mouse
 
 | Key | Status | Reason |
