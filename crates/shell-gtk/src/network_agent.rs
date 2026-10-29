@@ -138,14 +138,6 @@ pub fn reveal_toggle_visibility(currently_visible: bool, reveal_allowed: bool) -
     reveal_allowed && !currently_visible
 }
 
-/// GSettings for the lockdown schema when installed; `None` keeps the
-/// shell running without it (same guard as the shell's `settings()`).
-fn lockdown_settings() -> Option<gio::Settings> {
-    let source = gio::SettingsSchemaSource::default()?;
-    source.lookup(crate::lockdown::SCHEMA, true)?;
-    Some(gio::Settings::new(crate::lockdown::SCHEMA))
-}
-
 struct Pending {
     invocation: gio::DBusMethodInvocation,
     connection: glib::Variant,
@@ -253,7 +245,7 @@ impl NetworkAgent {
         agent.window.add_controller(keys);
         // Administrative lockdown (#357 follow-up): live-reset open
         // secret entries when `disable-show-password` flips (GNOME 51).
-        if let Some(lockdown) = lockdown_settings() {
+        if let Some(lockdown) = crate::lockdown::settings() {
             let weak = Rc::downgrade(&agent);
             lockdown.connect_changed(None, move |_, _| {
                 if let Some(a) = weak.upgrade() {

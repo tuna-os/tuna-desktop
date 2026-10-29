@@ -214,6 +214,9 @@ impl PolkitAgent {
         entry.add_css_class("prompt-dialog-password-entry");
         entry.set_halign(gtk::Align::Center);
         entry.set_property("placeholder-text", "Password");
+        // GNOME's polkit dialog is an StPasswordEntry: peek icon shown
+        // unless `disable-show-password` denies, live (#357).
+        crate::lockdown::bind_password_entry(&entry);
         entry.update_property(&[gtk::accessible::Property::Label("Password")]);
         content.append(&entry);
         let error = gtk::Label::new(None);

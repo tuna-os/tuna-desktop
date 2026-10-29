@@ -944,6 +944,29 @@ window.tuna-end-session {
   background-color: rgba(121, 160, 208, 0.12);
 }
 
+/* GNOME 51's Run a Command dialog (_dialogs.scss .run-dialog): a 24em
+   card, the entry padded 12px x 9px, a caption-sized dimmed hint. */
+.tuna-run-dialog .run-dialog {
+  min-width: 352px;
+  padding-bottom: 6px;
+}
+.tuna-run-dialog entry.run-dialog-entry {
+  min-height: 19px;
+  padding: 12px 9px;
+  border-radius: 8px;
+  background-color: #404045;
+  color: #fafafb;
+  box-shadow: none;
+  outline: none;
+}
+.tuna-run-dialog entry.run-dialog-entry:focus-within {
+  box-shadow: inset 0 0 0 2px rgba(121, 160, 208, 0.8);
+}
+.tuna-run-dialog .run-dialog-description {
+  font-size: 9pt;
+  color: #c4c4c7;
+}
+
 /* App-grid folders (GNOME 51): the 2x2 collage sits bare on the tile. */
 .folder-collage {
   min-width: 64px;

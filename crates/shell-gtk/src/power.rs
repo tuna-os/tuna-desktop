@@ -82,34 +82,33 @@ pub fn menu_actions(nested: bool) -> &'static [Action] {
 }
 
 /// Whether the power menu itself shows under a lockdown policy: any
-/// visible row keeps it, so a nested session (whose only row is Log
-/// Out) shows no menu while `disable-log-out` denies.
+/// visible row keeps it (GNOME 51 `status/system.js` ShutdownItem
+/// `_sync`), so a nested session (whose only row is Log Out) shows no
+/// menu while `disable-log-out` denies, and hardware keeps Suspend.
 pub fn power_menu_visible_for(actions: &[Action], logout_allowed: bool) -> bool {
     actions
         .iter()
-        .any(|action| *action != Action::LogOut || logout_allowed)
+        .any(|action| action_allowed(*action, logout_allowed))
 }
 
 /// Whether `action` may run while `logout_allowed` reflects the live
-/// `disable-log-out` key. Only Log Out is gated; Suspend, Restart, and
-/// Power Off have no lockdown key and always run.
+/// `disable-log-out` key. GNOME 51 gates every session-ending action
+/// on it: gnome-session 51.0 `gsm-manager.c` answers `CanShutdown` and
+/// `CanReboot` `UNAVAILABLE` and refuses `Shutdown`, `Reboot` and
+/// `Logout` ("Logout has been locked down") while it is set, and
+/// gnome-shell's `systemActions.js` re-queries both on the key's
+/// change, hiding Restart… and Power Off… with Log Out…. Suspend
+/// (`CanSuspend`) ignores the key and always runs.
 pub fn action_allowed(action: Action, logout_allowed: bool) -> bool {
-    action != Action::LogOut || logout_allowed
+    action == Action::Suspend || logout_allowed
 }
 
 /// Whether a pending end-session dialog must die under the live policy:
-/// a Log Out countdown open when `disable-log-out` engages. Pending
-/// power actions and an idle dialog never cancel.
+/// a Log Out, Restart or Power Off countdown open when `disable-log-out`
+/// engages (gnome-session refuses to leave the Running phase then).
+/// An idle dialog never cancels.
 pub fn should_cancel_pending(pending: Option<Action>, logout_allowed: bool) -> bool {
     matches!(pending, Some(action) if !action_allowed(action, logout_allowed))
-}
-
-/// GSettings for the lockdown schema when installed; `None` keeps the
-/// shell running without it (same guard as the shell's `settings()`).
-fn lockdown_settings() -> Option<gio::Settings> {
-    let source = gio::SettingsSchemaSource::default()?;
-    source.lookup(crate::lockdown::SCHEMA, true)?;
-    Some(gio::Settings::new(crate::lockdown::SCHEMA))
 }
 
 /// Whether this shell runs inside another desktop.
@@ -295,10 +294,11 @@ impl PowerUi {
                 },
             );
         }
-        // Administrative lockdown (#357 follow-up): a pending Log Out
-        // dialog dies when `disable-log-out` engages, so an already-open
-        // countdown can never terminate the session after the flip.
-        if let Some(lockdown) = lockdown_settings() {
+        // Administrative lockdown (#357 follow-up): a pending Log Out,
+        // Restart or Power Off dialog dies when `disable-log-out`
+        // engages, so an already-open countdown can never end the
+        // session after the flip.
+        if let Some(lockdown) = crate::lockdown::settings() {
             let weak = Rc::downgrade(&ui);
             lockdown.connect_changed(None, move |_, _| {
                 if let Some(me) = weak.upgrade() {
@@ -332,9 +332,9 @@ impl PowerUi {
         perform(action, self.nested, self.conn.borrow().as_ref());
     }
 
-    /// Open the dialog for `action` with a fresh countdown. A Log Out
-    /// request while `disable-log-out` denies never opens (live read
-    /// per open, so no stale menu path can bypass the policy).
+    /// Open the dialog for `action` with a fresh countdown. A Log Out,
+    /// Restart or Power Off request while `disable-log-out` denies never
+    /// opens (live read per open, so no stale menu path can bypass it).
     pub fn ask(self: &Rc<Self>, action: Action) {
         if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
             return;
@@ -379,9 +379,9 @@ impl PowerUi {
         self.fade.hide();
     }
 
-    /// Cancel a pending Log Out dialog while `disable-log-out`
+    /// Cancel a pending session-ending dialog while `disable-log-out`
     /// denies. The live watcher calls this on every policy change;
-    /// harmless when nothing is pending or the action is not Log Out.
+    /// harmless when nothing is pending.
     pub fn apply_lockdown(&self, logout_allowed: bool) {
         if should_cancel_pending(self.pending.get(), logout_allowed) {
             self.cancel();
@@ -392,10 +392,11 @@ impl PowerUi {
         self.stop_timer();
         self.fade.hide();
         if let Some(action) = self.pending.take() {
-            // Re-check at fire time: a Log Out denied since the dialog
-            // opened must not terminate the session.
+            // Re-check at fire time: an action denied since the dialog
+            // opened must not end the session (gnome-session refuses
+            // `end_phase` from Running while locked down).
             if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
-                eprintln!("tuna-shell-gtk: log out refused by administrator policy");
+                eprintln!("tuna-shell-gtk: {action:?} refused by administrator policy");
                 return;
             }
             self.perform(action);
@@ -433,23 +434,24 @@ mod tests {
     }
 
     #[test]
-    fn logout_denied_at_open_fire_and_pending_but_power_actions_run() {
-        // Open/fire gate: Log Out needs the policy; power actions have
-        // no lockdown key and always run.
-        assert!(!action_allowed(Action::LogOut, false));
-        assert!(action_allowed(Action::LogOut, true));
-        for action in [Action::Suspend, Action::Restart, Action::PowerOff] {
-            assert!(action_allowed(action, false), "{action:?} runs under deny");
-            assert!(action_allowed(action, true));
+    fn disable_log_out_denies_every_session_ending_action_but_suspend() {
+        // Open/fire gate (gnome-session 51 CanShutdown/CanReboot and
+        // Logout): Log Out, Restart and Power Off need the policy;
+        // Suspend has no lockdown gate and always runs.
+        for action in [Action::LogOut, Action::Restart, Action::PowerOff] {
+            assert!(!action_allowed(action, false), "{action:?} denied");
+            assert!(action_allowed(action, true), "{action:?} allowed");
         }
-        // Pending-dialog denial: an open Log Out countdown dies when the
-        // policy engages; nothing else cancels.
-        assert!(should_cancel_pending(Some(Action::LogOut), false));
-        assert!(!should_cancel_pending(Some(Action::LogOut), true));
+        assert!(action_allowed(Action::Suspend, false));
+        assert!(action_allowed(Action::Suspend, true));
+        // Pending-dialog denial: an open session-ending countdown dies
+        // when the policy engages; Suspend and an idle dialog never do.
+        for action in [Action::LogOut, Action::Restart, Action::PowerOff] {
+            assert!(should_cancel_pending(Some(action), false), "{action:?}");
+            assert!(!should_cancel_pending(Some(action), true), "{action:?}");
+        }
         assert!(!should_cancel_pending(None, false));
-        for action in [Action::Suspend, Action::Restart, Action::PowerOff] {
-            assert!(!should_cancel_pending(Some(action), false));
-        }
+        assert!(!should_cancel_pending(Some(Action::Suspend), false));
     }
 
     #[test]

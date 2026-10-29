@@ -965,7 +965,7 @@ impl ScreenshotUi {
                             w: tw,
                             h: th,
                         };
-                        self.saved(save(&texture, whole, tw, th));
+                        self.saved(save(&texture, whole, tw, th, saves_to_disk()));
                     }
                     // No selector (the compositor could not picture the
                     // windows): the focused window, as before.
@@ -985,15 +985,21 @@ impl ScreenshotUi {
                     }
                 };
                 self.close();
-                self.saved(save(&texture, crop, f64::from(w), f64::from(h)));
+                self.saved(save(
+                    &texture,
+                    crop,
+                    f64::from(w),
+                    f64::from(h),
+                    saves_to_disk(),
+                ));
             }
         }
     }
 
-    /// Put a saved screenshot on the clipboard and say so.
-    fn saved(&self, result: Option<(std::path::PathBuf, gdk::Texture)>) {
+    /// Put a captured screenshot on the clipboard and say so.
+    fn saved(&self, result: Option<gdk::Texture>) {
         match result {
-            Some((_, cropped)) => {
+            Some(cropped) => {
                 if let Some(display) = gdk::Display::default() {
                     display.clipboard().set_texture(&cropped);
                 }
@@ -1022,14 +1028,17 @@ fn texture_surface(texture: &gdk::Texture) -> Result<gtk::cairo::ImageSurface, g
     Ok(surface)
 }
 
-/// Crop `texture` (shown at `w` x `h`) to `crop`, save it where GNOME
-/// saves screenshots, and return the path and the cropped image.
-fn save(
-    texture: &gdk::Texture,
-    crop: Rect,
-    w: f64,
-    h: f64,
-) -> Option<(std::path::PathBuf, gdk::Texture)> {
+/// Whether captures may land on disk: GNOME 51's `screenshot.js`
+/// `_storeScreenshot` re-reads `disable-save-to-disk` on every capture
+/// and, while it denies, keeps the shot on the clipboard only.
+fn saves_to_disk() -> bool {
+    crate::lockdown::read().entry_visibility().save_to_disk
+}
+
+/// Crop `texture` (shown at `w` x `h`) to `crop` and return the cropped
+/// image, saved where GNOME saves screenshots when `to_disk` (see
+/// [`saves_to_disk`]).
+fn save(texture: &gdk::Texture, crop: Rect, w: f64, h: f64, to_disk: bool) -> Option<gdk::Texture> {
     let sx = f64::from(texture.width()) / w;
     let sy = f64::from(texture.height()) / h;
     let (x, y) = ((crop.x * sx).round() as i32, (crop.y * sy).round() as i32);
@@ -1054,6 +1063,9 @@ fn save(
         stride,
     )
     .upcast();
+    if !to_disk {
+        return Some(cropped);
+    }
     // Where the compositor's screenshots go too: XDG_PICTURES_DIR, the
     // user's Pictures directory, else ~/Pictures.
     let pictures = std::env::var_os("XDG_PICTURES_DIR")
@@ -1064,7 +1076,7 @@ fn save(
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(file_name(&jiff::Zoned::now().datetime()));
     cropped.save_to_png(&path).ok()?;
-    Some((path, cropped))
+    Some(cropped)
 }
 
 #[cfg(test)]

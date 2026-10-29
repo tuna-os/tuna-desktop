@@ -199,6 +199,17 @@
 #   G-POWER-DIALOG Power Off… opens the 60 s end-session dialog, and
 #                  Cancel closes it with nothing done
 #   G-POWER-OFF    confirming the dialog asks logind to power off
+#   G-LOCKDOWN-LOG-OUT disable-log-out flipped live removes Log Out…,
+#                  Restart… and Power Off… from the open power menu,
+#                  keeps Suspend, and restores them (#357)
+#   G-LOCKDOWN-LOCK disable-lock-screen turns the idle lock and the
+#                  compositor's Lock off, hides Lock, and Super+L and
+#                  ScreenSaver.Lock leave the session unlocked; reset
+#                  restores all of it
+#   G-LOCKDOWN-COMMAND-LINE Alt+F2 opens Run a Command and runs a line;
+#                  disable-command-line refuses it live; reset reopens
+#   G-LOCKDOWN-SAVE-TO-DISK disable-save-to-disk keeps the screenshot
+#                  key's shot on the clipboard and writes no file
 #   G-ACCEL        org.gnome.Shell: an allowlisted caller grabs a media key,
 #                  the key fires AcceleratorActivated, and ShowOSD shows
 #   G-KEYBINDINGS  GNOME Shell's keys: Super+S quick settings, Super+V the
@@ -9091,6 +9102,136 @@ end=$(($(date +%s) + 10))
 until grep -q PowerOff "$POWER_LOG" 2>/dev/null || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q PowerOff "$POWER_LOG" || fail G-POWER-OFF "logind never got PowerOff"
 pass G-POWER-OFF "confirming the dialog asks logind to power off"
+
+# Administrative lockdown (#357, P-ST-05): GNOME 51's org.gnome.desktop.lockdown
+# keys flipped live, the shell's real behaviour observed, then restored.
+lockdown_dump() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-$1.json" 20
+}
+# disable-log-out: Log Out…, Restart… and Power Off… leave the open power menu
+# live (gnome-session refuses CanShutdown/CanReboot/Logout); Suspend stays.
+open_power_menu lockdown-menu || fail G-LOCKDOWN-LOG-OUT "could not open the power menu"
+for label in "Suspend" "Restart…" "Power Off…" "Log Out…"; do
+    showing "$ARTIFACTS/a11y-lockdown-menu.json" "$label" ||
+        fail G-LOCKDOWN-LOG-OUT "baseline power menu lacks '$label'"
+done
+gsettings set org.gnome.desktop.lockdown disable-log-out true
+sleep 1.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-logout.json" 20 ||
+    fail G-LOCKDOWN-LOG-OUT "accessibility dump failed"
+scrot "$ARTIFACTS/22l-lockdown-log-out.png" >/dev/null
+for label in "Restart…" "Power Off…" "Log Out…"; do
+    hidden "$ARTIFACTS/a11y-lockdown-logout.json" "$label" ||
+        fail G-LOCKDOWN-LOG-OUT "'$label' still offered with disable-log-out"
+done
+showing "$ARTIFACTS/a11y-lockdown-logout.json" "Suspend" ||
+    fail G-LOCKDOWN-LOG-OUT "disable-log-out hid Suspend, which GNOME keeps"
+gsettings reset org.gnome.desktop.lockdown disable-log-out
+sleep 1.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-logout-restored.json" 20 ||
+    fail G-LOCKDOWN-LOG-OUT "accessibility dump failed"
+for label in "Suspend" "Restart…" "Power Off…" "Log Out…"; do
+    showing "$ARTIFACTS/a11y-lockdown-logout-restored.json" "$label" ||
+        fail G-LOCKDOWN-LOG-OUT "'$label' did not return when disable-log-out was reset"
+done
+open_qs
+pass G-LOCKDOWN-LOG-OUT "disable-log-out removes Log Out…, Restart… and Power Off… from the open menu live, keeps Suspend, and restores them"
+
+# disable-lock-screen: idle never locks, the compositor backstop denies Lock,
+# the Lock button hides, Super+L and ScreenSaver.Lock leave the session unlocked.
+gsettings set org.gnome.desktop.lockdown disable-lock-screen true
+cstate '(.lock_screen_allowed | not) and .idle_timeout_ms > 1e18 and (.locked | not)' "lock screen disabled" ||
+    fail G-LOCKDOWN-LOCK "disable-lock-screen did not reach the idle lock and the compositor backstop"
+open_qs
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-lock.json" 20 ||
+    fail G-LOCKDOWN-LOCK "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-lockdown-lock.json" "Lock" ||
+    fail G-LOCKDOWN-LOCK "the Lock button still shows with disable-lock-screen"
+showing "$ARTIFACTS/a11y-lockdown-lock.json" "Power Off Menu" ||
+    fail G-LOCKDOWN-LOCK "quick settings did not open for the Lock check"
+open_qs
+lockdown_mark=$(log_mark)
+xdotool key super+l
+log_wait "$lockdown_mark" "lock refused by administrator policy" 10 ||
+    fail G-LOCKDOWN-LOCK "Super+L was not refused by the shell"
+if gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver \
+    --method org.gnome.ScreenSaver.Lock >"$ARTIFACTS/lockdown-screensaver-lock.log" 2>&1; then
+    fail G-LOCKDOWN-LOCK "org.gnome.ScreenSaver.Lock succeeded with disable-lock-screen"
+fi
+sleep 2
+jq -e '(.locked | not) and (.lock_screen_allowed | not)' "$CSTATE" >/dev/null ||
+    fail G-LOCKDOWN-LOCK "the session locked with disable-lock-screen: $(jq -c '{locked, lock_screen_allowed}' "$CSTATE")"
+gsettings reset org.gnome.desktop.lockdown disable-lock-screen
+cstate '.lock_screen_allowed and .idle_timeout_ms < 1e18 and (.locked | not)' "lock screen allowed again" ||
+    fail G-LOCKDOWN-LOCK "resetting disable-lock-screen did not restore the idle lock and the backstop"
+open_qs
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-lock-restored.json" 20 ||
+    fail G-LOCKDOWN-LOCK "accessibility dump failed"
+showing "$ARTIFACTS/a11y-lockdown-lock-restored.json" "Lock" ||
+    fail G-LOCKDOWN-LOCK "the Lock button did not return"
+open_qs
+pass G-LOCKDOWN-LOCK "disable-lock-screen turns the idle lock and compositor Lock off, hides Lock, refuses Super+L and ScreenSaver.Lock without locking, and restores"
+
+# disable-command-line: Alt+F2 opens GNOME's Run a Command dialog and runs a
+# line; denied, Alt+F2 shows nothing; reset, it opens again.
+run_marker="/tmp/tuna-run-dialog-$$"
+rm -f "$run_marker"
+xdotool key alt+F2
+sleep 1.5
+lockdown_dump run-open || fail G-LOCKDOWN-COMMAND-LINE "accessibility dump failed"
+scrot "$ARTIFACTS/22m-run-dialog.png" >/dev/null
+showing "$ARTIFACTS/a11y-lockdown-run-open.json" "Run a Command" ||
+    fail G-LOCKDOWN-COMMAND-LINE "Alt+F2 did not open the Run a Command dialog"
+xdotool type --delay 30 "touch $run_marker"
+xdotool key Return
+end=$(($(date +%s) + 10))
+until [ -e "$run_marker" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+[ -e "$run_marker" ] || fail G-LOCKDOWN-COMMAND-LINE "the run dialog did not run its command line"
+rm -f "$run_marker"
+sleep 1
+lockdown_dump run-ran || fail G-LOCKDOWN-COMMAND-LINE "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-lockdown-run-ran.json" "Run a Command" ||
+    fail G-LOCKDOWN-COMMAND-LINE "the dialog stayed open after a successful run"
+gsettings set org.gnome.desktop.lockdown disable-command-line true
+sleep 1.5
+lockdown_mark=$(log_mark)
+xdotool key alt+F2
+log_wait "$lockdown_mark" "run dialog refused by administrator policy" 10 ||
+    fail G-LOCKDOWN-COMMAND-LINE "Alt+F2 was not refused with disable-command-line"
+sleep 1
+lockdown_dump run-denied || fail G-LOCKDOWN-COMMAND-LINE "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-lockdown-run-denied.json" "Run a Command" ||
+    fail G-LOCKDOWN-COMMAND-LINE "Alt+F2 opened the dialog with disable-command-line"
+gsettings reset org.gnome.desktop.lockdown disable-command-line
+sleep 1.5
+xdotool key alt+F2
+sleep 1.5
+lockdown_dump run-restored || fail G-LOCKDOWN-COMMAND-LINE "accessibility dump failed"
+showing "$ARTIFACTS/a11y-lockdown-run-restored.json" "Run a Command" ||
+    fail G-LOCKDOWN-COMMAND-LINE "Alt+F2 did not open the dialog after the reset"
+xdotool key Escape
+sleep 1
+lockdown_dump run-closed || fail G-LOCKDOWN-COMMAND-LINE "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-lockdown-run-closed.json" "Run a Command" ||
+    fail G-LOCKDOWN-COMMAND-LINE "Escape did not close the run dialog"
+pass G-LOCKDOWN-COMMAND-LINE "Alt+F2 opens Run a Command and runs a line; disable-command-line refuses it live; reset restores it"
+
+# disable-save-to-disk: the screenshot key keeps the shot on the clipboard
+# only (screenshot.js _storeScreenshot), never in Pictures/Screenshots.
+shots_before="$(find "$XDG_PICTURES_DIR/Screenshots" -name 'Screenshot From *.png' 2>/dev/null | wc -l)"
+gsettings set org.gnome.desktop.lockdown disable-save-to-disk true
+sleep 1.5
+lockdown_mark=$(log_mark)
+xdotool key shift+Print
+log_wait "$lockdown_mark" "screenshot kept on the clipboard (disable-save-to-disk)" 15 ||
+    fail G-LOCKDOWN-SAVE-TO-DISK "the screenshot key did not capture to the clipboard"
+sleep 1
+[ "$(find "$XDG_PICTURES_DIR/Screenshots" -name 'Screenshot From *.png' 2>/dev/null | wc -l)" = "$shots_before" ] ||
+    fail G-LOCKDOWN-SAVE-TO-DISK "a screenshot file was written with disable-save-to-disk"
+[ ! -e "${XDG_RUNTIME_DIR:?}/tuna-screenshot-clip.png" ] ||
+    fail G-LOCKDOWN-SAVE-TO-DISK "the private capture file was left behind"
+gsettings reset org.gnome.desktop.lockdown disable-save-to-disk
+pass G-LOCKDOWN-SAVE-TO-DISK "disable-save-to-disk keeps the screenshot key's shot on the clipboard and writes no file"
 
 # Monitor confirmed lock transitions over GNOME's public screen-saver API.
 gdbus monitor --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver \

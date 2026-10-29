@@ -3,30 +3,33 @@
 //! Shell side of the lockdown policy: read the eleven keys through
 //! `gio::Settings` (quietly degrading to GNOME defaults when the schema,
 //! a key, or the bus is missing), resolve which shell entry points stay
-//! visible, and apply that to the widgets. The decision engine — key
+//! available, and apply that to the widgets. The decision engine — key
 //! inventory, owners, denial copy — lives in the compositor's
 //! `lockdown` module; this file mirrors only the key names needed to
 //! read GSettings directly, and stays free of `crate::` uses so the
 //! integration test can include it by path (binary modules are not
 //! importable from integration targets).
 //!
-//! Wiring (live; entry points verified at `a445af2e`, wired on w2-357):
+//! Every shell consumer below mirrors a GNOME 51 consumer (gnome-shell
+//! 51.0 and gnome-session 51.0 sources); keys GNOME's desktop never
+//! reads stay unenforced here too.
 //!
-//! | Entry point | Call site | Application |
-//! |---|---|---|
-//! | Lock button | `main.rs` `qs_round("system-lock-screen-symbolic", "Lock")` | hidden when denied, plus a live guard on every `control.lock()` path (button, sleep, screensaver/D-Bus, keybinding) |
-//! | Log Out row | `main.rs` power menu `power::Action::LogOut` item | hidden when denied; nested sessions with no rows show no menu |
-//! | User switch row | none yet | `visible.user_switch` gates the row when it lands |
-//! | Run-command dialog | none yet | `visible.run_command` gates the dialog when it lands |
-//! | Password reveal | `network_agent.rs` secret-entry reveal toggle | [`password_reveal_icon`] omits the toggle when denied |
-//! | Settings buttons | `main.rs`/`wifi.rs`/`accessibility.rs` `gnome-control-center` spawns | [`open_settings_panel`]/[`handlers_allowed`] block the spawn when denied; the top Settings button hides too |
+//! | Entry point | Call site | GNOME 51 source | Application |
+//! |---|---|---|---|
+//! | Lock button and every lock path | `main.rs` quick-settings Lock, sleep, screensaver/D-Bus, keybinding | `systemActions.js` `_updateLockScreen`, `screenShield.js` `lock()` | hidden when denied, plus a live guard on every `control.lock()` path; idle never locks |
+//! | Log Out…, Restart…, Power Off… rows | `main.rs` power menu, `power.rs` | `systemActions.js` `_updateLogout`/`_updateHaveShutdown`/`_updateHaveReboot`, gnome-session `gsm-manager.c` | hidden and refused when `disable-log-out` denies; Suspend stays |
+//! | Run a Command dialog (Alt+F2) | `run_dialog.rs` | `runDialog.js` `open()` | never opens when `disable-command-line` denies |
+//! | Password peek icons | `lock.rs` unlock prompt, `polkit.rs`, `network_agent.rs` | `st-password-entry.c` `disable-show-password` | [`bind_password_entry`] drops the peek icon and re-hides the text live |
+//! | Screenshots and screencasts | `screenshot_ui.rs`, `main.rs` screenshot keys, `screencast.rs` | `screenshot.js` `_storeScreenshot`, `screencastService.js` | `disable-save-to-disk` keeps captures on the clipboard only and refuses screencasts |
+//! | User switch row | none (Tuna ships no Switch User) | `systemActions.js` `_updateSwitchUser` | `visible.user_switch` gates the row when it lands |
 //!
-//! App-owned (`disable-printing`, `disable-print-setup`,
-//! `disable-save-to-disk`) and daemon-owned
-//! (`user-administration-disabled`,
-//! `mount-removable-storage-devices-as-read-only`) keys are read into
-//! the snapshot for admin UX text but constrain no shell widget: the
-//! compositor module documents those owners.
+//! `disable-printing`, `disable-print-setup` (GTK print dialogs in each
+//! application), `disable-application-handlers` (no GNOME 51 desktop
+//! consumer: gnome-shell, gnome-session and gnome-settings-daemon 51.0
+//! never read it), `user-administration-disabled` (Settings' Users
+//! panel) and `mount-removable-storage-devices-as-read-only` (udisks2
+//! mount options) are read into the snapshot but constrain no shell
+//! widget.
 
 use gio::prelude::SettingsExt;
 use gtk4 as gtk;
@@ -36,7 +39,7 @@ use gtk4::prelude::*;
 pub const SCHEMA: &str = "org.gnome.desktop.lockdown";
 /// Run-command dialog gate (Alt+F2).
 pub const KEY_DISABLE_COMMAND_LINE: &str = "disable-command-line";
-/// Applications' Save As dialogs (app-owned).
+/// Shell screenshot/screencast files and applications' Save As dialogs.
 pub const KEY_DISABLE_SAVE_TO_DISK: &str = "disable-save-to-disk";
 /// Applications' Print dialogs (app-owned).
 pub const KEY_DISABLE_PRINTING: &str = "disable-printing";
@@ -46,15 +49,15 @@ pub const KEY_DISABLE_PRINT_SETUP: &str = "disable-print-setup";
 pub const KEY_DISABLE_USER_SWITCHING: &str = "disable-user-switching";
 /// Lock entry points (button, `Lock` command, idle lock).
 pub const KEY_DISABLE_LOCK_SCREEN: &str = "disable-lock-screen";
-/// Shell-opened URL/MIME handlers.
+/// URL/MIME handlers (no GNOME 51 desktop consumer).
 pub const KEY_DISABLE_APPLICATION_HANDLERS: &str = "disable-application-handlers";
-/// Log Out entry points.
+/// Log Out, Restart and Power Off entry points.
 pub const KEY_DISABLE_LOG_OUT: &str = "disable-log-out";
 /// User account administration (daemon-owned).
 pub const KEY_USER_ADMINISTRATION_DISABLED: &str = "user-administration-disabled";
 /// Removable mounts writable (daemon-owned; `true` mounts read-only).
 pub const KEY_MOUNT_REMOVABLE_READ_ONLY: &str = "mount-removable-storage-devices-as-read-only";
-/// Password reveal toggles.
+/// Password peek icons.
 pub const KEY_DISABLE_SHOW_PASSWORD: &str = "disable-show-password";
 
 /// Snapshot of the eleven lockdown keys. GNOME defaults are all `false`
@@ -63,7 +66,7 @@ pub const KEY_DISABLE_SHOW_PASSWORD: &str = "disable-show-password";
 pub struct LockdownPolicy {
     /// `disable-command-line`.
     pub disable_command_line: bool,
-    /// `disable-save-to-disk` (app-owned).
+    /// `disable-save-to-disk`.
     pub disable_save_to_disk: bool,
     /// `disable-printing` (app-owned).
     pub disable_printing: bool,
@@ -73,7 +76,7 @@ pub struct LockdownPolicy {
     pub disable_user_switching: bool,
     /// `disable-lock-screen`.
     pub disable_lock_screen: bool,
-    /// `disable-application-handlers`.
+    /// `disable-application-handlers` (no desktop consumer).
     pub disable_application_handlers: bool,
     /// `disable-log-out`.
     pub disable_log_out: bool,
@@ -85,29 +88,27 @@ pub struct LockdownPolicy {
     pub disable_show_password: bool,
 }
 
-/// Which shell entry points stay visible under a policy.
+/// Which shell entry points stay available under a policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryVisibility {
-    /// Lock button and click path live.
+    /// Lock button and every lock path live.
     pub lock_screen: bool,
-    /// Log Out row shown.
+    /// Session-ending rows (Log Out…, Restart…, Power Off…) shown.
     pub log_out: bool,
     /// User-switch row shown (gates the row when one exists).
     pub user_switch: bool,
-    /// Run-command dialog allowed (gates the dialog when one exists).
+    /// Run a Command dialog opens.
     pub run_command: bool,
-    /// Password reveal toggles shown.
+    /// Password peek icons shown.
     pub password_reveal: bool,
-    /// Shell-opened handlers (settings buttons) run.
-    pub url_handlers: bool,
+    /// Screenshots save files and screencasts record.
+    pub save_to_disk: bool,
 }
 
 /// Shell-constrained action denied by policy, for UX copy.
 ///
 /// Test-only until a shell surface renders denials inline (today's
-/// guards hide widgets or log to stderr): the unit suite pins the
-/// copy, and run-command/user-switch rows will construct their
-/// variants when they land.
+/// guards hide widgets or log to stderr): the unit suite pins the copy.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellAction {
@@ -121,8 +122,6 @@ pub enum ShellAction {
     LockScreen,
     /// Reveal a typed password.
     ShowPassword,
-    /// Open a URL or MIME handler from the shell.
-    OpenHandler,
 }
 
 #[cfg(test)]
@@ -135,13 +134,12 @@ impl ShellAction {
             ShellAction::SwitchUser => "Switching users is disabled by your administrator.",
             ShellAction::LockScreen => "Locking the screen is disabled by your administrator.",
             ShellAction::ShowPassword => "Showing passwords is disabled by your administrator.",
-            ShellAction::OpenHandler => "Opening links is disabled by your administrator.",
         }
     }
 }
 
 impl LockdownPolicy {
-    /// Resolve which shell entry points stay visible.
+    /// Resolve which shell entry points stay available.
     pub fn entry_visibility(&self) -> EntryVisibility {
         EntryVisibility {
             lock_screen: !self.disable_lock_screen,
@@ -149,7 +147,7 @@ impl LockdownPolicy {
             user_switch: !self.disable_user_switching,
             run_command: !self.disable_command_line,
             password_reveal: !self.disable_show_password,
-            url_handlers: !self.disable_application_handlers,
+            save_to_disk: !self.disable_save_to_disk,
         }
     }
 
@@ -162,7 +160,7 @@ impl LockdownPolicy {
 
 /// GSettings for the lockdown schema when installed; `None` keeps the
 /// shell running without it (same guard as the shell's `settings()`).
-fn settings() -> Option<gio::Settings> {
+pub fn settings() -> Option<gio::Settings> {
     let source = gio::SettingsSchemaSource::default()?;
     source.lookup(SCHEMA, true)?;
     Some(gio::Settings::new(SCHEMA))
@@ -201,45 +199,6 @@ pub fn read() -> LockdownPolicy {
     settings().map(|s| read_from(&s)).unwrap_or_default()
 }
 
-/// Whether shell-opened URL/MIME handlers may run (live read of
-/// `disable-application-handlers`). Guards every Settings launch and
-/// the enterprise Wi-Fi setup path, which all re-read per activation.
-pub fn handlers_allowed() -> bool {
-    read().entry_visibility().url_handlers
-}
-
-/// Open a Settings panel unless policy blocks handlers. Returns
-/// whether it launched (`false` covers both denial and spawn
-/// failure; only denial is logged here).
-pub fn open_settings_panel(panel: Option<&str>) -> bool {
-    let policy = read();
-    let launched = spawn_settings_for_policy(panel, &policy, &|panel| {
-        let mut command = tuna_shell_host::apps::application_command("gnome-control-center");
-        if let Some(panel) = panel {
-            command.arg(panel);
-        }
-        command.spawn().is_ok()
-    });
-    if !launched && !policy.entry_visibility().url_handlers {
-        eprintln!("tuna-shell-gtk: opening settings is disabled by your administrator.");
-    }
-    launched
-}
-
-/// Testable core of [`open_settings_panel`]: the spawn runs only when
-/// the policy allows handlers. Callers pass the live [`read`] policy;
-/// tests inject restrictive policies with a recording spawn.
-pub fn spawn_settings_for_policy(
-    panel: Option<&str>,
-    policy: &LockdownPolicy,
-    spawn: &dyn Fn(Option<&str>) -> bool,
-) -> bool {
-    if !policy.entry_visibility().url_handlers {
-        return false;
-    }
-    spawn(panel)
-}
-
 /// Reveal-toggle icon for a secret entry, if the field is a password
 /// field and the policy shows passwords. A denied policy (or a
 /// non-password field) yields no icon, so no toggle path exists.
@@ -250,10 +209,68 @@ pub fn password_reveal_icon(
     (password_field && visibility.password_reveal).then_some("view-reveal-symbolic")
 }
 
-/// Apply handler visibility to the top Settings button: hidden while
-/// `disable-application-handlers` denies, restored when it lifts.
-pub fn apply_settings_visibility(visibility: &EntryVisibility, settings_button: &gtk::Button) {
-    settings_button.set_visible(visibility.url_handlers);
+/// Apply `disable-show-password` to a password entry as GNOME 51's
+/// `StPasswordEntry` does (`st-password-entry.c`
+/// `on_disable_show_password_changed`, with `shellEntry.js` binding the
+/// context menu's "Show Password" item to the peek icon): denied, the
+/// typed text goes back to hidden, the peek icon disappears and GTK's
+/// context-menu "Show Text" (`misc.toggle-visibility` on the inner
+/// `GtkText`, which GTK offers even without the icon) is disabled;
+/// allowed, both return with the text still hidden, so only a fresh
+/// peek reveals it.
+pub fn apply_password_peek(entry: &gtk::PasswordEntry, allowed: bool) {
+    if let Some(text) = entry.delegate().and_downcast::<gtk::Text>() {
+        if !allowed {
+            text.set_visibility(false);
+        }
+        text.action_set_enabled("misc.toggle-visibility", allowed);
+    }
+    entry.set_show_peek_icon(allowed);
+}
+
+/// Bind a password entry's peek icon to the live lockdown schema: the
+/// icon follows `disable-show-password` now and on every change, for as
+/// long as the entry lives. Without the schema the icon shows, as GNOME
+/// shows it by default.
+pub fn bind_password_entry(entry: &gtk::PasswordEntry) {
+    match settings() {
+        Some(settings) => bind_password_entry_to(entry, settings),
+        None => entry.set_show_peek_icon(true),
+    }
+}
+
+/// [`bind_password_entry`] against an explicit settings object (memory
+/// backends in tests). The entry holds the subscription and drops it
+/// with itself. A reveal from any path while the policy denies (a
+/// stale menu, a programmatic toggle) is undone at once from the same
+/// live read.
+pub fn bind_password_entry_to(entry: &gtk::PasswordEntry, settings: gio::Settings) {
+    apply_password_peek(
+        entry,
+        read_from(&settings).entry_visibility().password_reveal,
+    );
+    let weak = entry.downgrade();
+    let handler = settings.connect_changed(Some(KEY_DISABLE_SHOW_PASSWORD), move |s, _| {
+        if let Some(entry) = weak.upgrade() {
+            apply_password_peek(&entry, read_from(s).entry_visibility().password_reveal);
+        }
+    });
+    if let Some(text) = entry.delegate().and_downcast::<gtk::Text>() {
+        let guard = settings.clone();
+        text.connect_notify_local(Some("visibility"), move |text, _| {
+            if text.property::<bool>("visibility")
+                && !read_from(&guard).entry_visibility().password_reveal
+            {
+                text.set_visibility(false);
+            }
+        });
+    }
+    let held = std::cell::RefCell::new(Some((settings, handler)));
+    entry.connect_destroy(move |_| {
+        if let Some((settings, handler)) = held.borrow_mut().take() {
+            settings.disconnect(handler);
+        }
+    });
 }
 
 /// Apply visibility to the lock, log-out, and user-switch widgets.
@@ -290,7 +307,7 @@ mod tests {
                 user_switch: true,
                 run_command: true,
                 password_reveal: true,
-                url_handlers: true,
+                save_to_disk: true,
             }
         );
     }
@@ -309,7 +326,7 @@ mod tests {
                     user_switch: true,
                     run_command: true,
                     password_reveal: true,
-                    url_handlers: true,
+                    save_to_disk: true,
                 },
             ),
             (
@@ -323,7 +340,7 @@ mod tests {
                     user_switch: true,
                     run_command: true,
                     password_reveal: true,
-                    url_handlers: true,
+                    save_to_disk: true,
                 },
             ),
             (
@@ -337,7 +354,7 @@ mod tests {
                     user_switch: false,
                     run_command: true,
                     password_reveal: true,
-                    url_handlers: true,
+                    save_to_disk: true,
                 },
             ),
             (
@@ -351,7 +368,7 @@ mod tests {
                     user_switch: true,
                     run_command: false,
                     password_reveal: true,
-                    url_handlers: true,
+                    save_to_disk: true,
                 },
             ),
             (
@@ -365,12 +382,12 @@ mod tests {
                     user_switch: true,
                     run_command: true,
                     password_reveal: false,
-                    url_handlers: true,
+                    save_to_disk: true,
                 },
             ),
             (
                 LockdownPolicy {
-                    disable_application_handlers: true,
+                    disable_save_to_disk: true,
                     ..LockdownPolicy::default()
                 },
                 EntryVisibility {
@@ -379,7 +396,7 @@ mod tests {
                     user_switch: true,
                     run_command: true,
                     password_reveal: true,
-                    url_handlers: false,
+                    save_to_disk: false,
                 },
             ),
         ];
@@ -389,11 +406,11 @@ mod tests {
     }
 
     #[test]
-    fn app_and_daemon_keys_touch_no_shell_widget() {
+    fn keys_without_a_gnome_shell_consumer_touch_no_shell_widget() {
         let policy = LockdownPolicy {
             disable_printing: true,
             disable_print_setup: true,
-            disable_save_to_disk: true,
+            disable_application_handlers: true,
             user_administration_disabled: true,
             mount_removable_read_only: true,
             ..LockdownPolicy::default()
@@ -428,7 +445,7 @@ mod tests {
                 user_switch: false,
                 run_command: false,
                 password_reveal: false,
-                url_handlers: false,
+                save_to_disk: false,
             }
         );
     }
@@ -441,42 +458,11 @@ mod tests {
             (ShellAction::SwitchUser, "Switching users"),
             (ShellAction::LockScreen, "Locking"),
             (ShellAction::ShowPassword, "passwords"),
-            (ShellAction::OpenHandler, "links"),
         ];
         for (action, fragment) in cases {
             assert!(action.denial().contains(fragment), "{action:?}");
             assert!(action.denial().contains("administrator"), "{action:?}");
         }
-    }
-
-    #[test]
-    fn settings_spawn_blocked_under_deny_and_runs_when_allowed() {
-        use std::cell::Cell;
-        let calls = Cell::new(0);
-        let spawn = |_: Option<&str>| {
-            calls.set(calls.get() + 1);
-            true
-        };
-        let denied = LockdownPolicy {
-            disable_application_handlers: true,
-            ..LockdownPolicy::default()
-        };
-        assert!(!spawn_settings_for_policy(Some("wifi"), &denied, &spawn));
-        assert_eq!(calls.get(), 0, "denied policy must not spawn");
-        assert!(spawn_settings_for_policy(
-            Some("wifi"),
-            &LockdownPolicy::default(),
-            &spawn
-        ));
-        assert_eq!(calls.get(), 1, "allowed policy spawns");
-        // Unrelated keys never block the spawn.
-        let unrelated = LockdownPolicy {
-            disable_lock_screen: true,
-            disable_log_out: true,
-            ..LockdownPolicy::default()
-        };
-        assert!(spawn_settings_for_policy(None, &unrelated, &spawn));
-        assert_eq!(calls.get(), 2);
     }
 
     #[test]

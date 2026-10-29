@@ -220,7 +220,9 @@ impl LockUi {
         let entry = gtk::PasswordEntry::new();
         entry.add_css_class("login-dialog-prompt-entry");
         entry.set_hexpand(true);
-        entry.set_show_peek_icon(true);
+        // GNOME's StPasswordEntry shows its peek icon unless
+        // `disable-show-password` denies, live (#357).
+        crate::lockdown::bind_password_entry(&entry);
         entry.set_property("placeholder-text", "Password");
         entry.update_property(&[gtk::accessible::Property::Label("Password")]);
         // Handle Return before the internal text/IM delegate: a password

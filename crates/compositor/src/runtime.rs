@@ -2312,6 +2312,9 @@ impl Runtime {
                 "pointing_stick": self.input_settings.pointing_stick,
             },
             "locked": self.is_locked(),
+            // Administrative lockdown backstop (#357): the live
+            // `disable-lock-screen` decision `Lock` and idle obey.
+            "lock_screen_allowed": self.control.lock_screen_allowed(),
             "active_workspace": model.active_workspace(),
             "focused": focused,
             "focused_app_id": focused.and_then(app_of),

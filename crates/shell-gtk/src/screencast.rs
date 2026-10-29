@@ -240,6 +240,15 @@ impl Recorder {
         encoder: Option<String>,
         done: impl FnOnce(Result<PathBuf, String>) + 'static,
     ) {
+        // Administrative lockdown (#357): GNOME 51's screencast service
+        // refuses `Screencast`/`ScreencastArea` first thing while
+        // `disable-save-to-disk` denies (`SAVE_TO_DISK_DISABLED`), and the
+        // screenshot UI reports "Screencast Failed to Start".
+        if !crate::lockdown::read().entry_visibility().save_to_disk {
+            (self.notify)("Screencast Failed to Start", "");
+            done(Err("Saving to disk is disabled".into()));
+            return;
+        }
         if self.in_progress() {
             done(Err("a screencast is already running".into()));
             return;

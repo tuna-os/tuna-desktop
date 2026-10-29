@@ -413,17 +413,9 @@ impl WifiMenu {
                 );
             }
             (None, WifiSecurity::Enterprise) => {
-                // Administrative lockdown (#357): shell-opened handlers
-                // stay closed while `disable-application-handlers` denies.
-                if !crate::lockdown::handlers_allowed() {
-                    eprintln!(
-                        "tuna-shell-gtk: enterprise Wi-Fi setup is disabled by your administrator."
-                    );
-                } else {
-                    let _ = tuna_shell_host::apps::application_command("gnome-control-center")
-                        .args(["wifi", "connect-8021x-wifi", &device, &net.ap])
-                        .spawn();
-                }
+                let _ = tuna_shell_host::apps::application_command("gnome-control-center")
+                    .args(["wifi", "connect-8021x-wifi", &device, &net.ap])
+                    .spawn();
             }
         }
     }
