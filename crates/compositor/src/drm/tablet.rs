@@ -17,6 +17,13 @@
 //! run time. Mutter 51 requires libinput 1.31, so on GNOME's own systems
 //! both exist; an older libinput leaves those two settings unapplied and
 //! says so once per tool.
+//!
+//! Stylus and pad buttons, rings and strips that settings give an action
+//! are taken here as Mutter's tablet action mappers take them
+//! (`meta-tool-action-mapper.c`, `meta-pad-action-mapper.c`,
+//! `meta-tablet-action-mapper.c`; policy in `crate::tablet_actions`), and
+//! while the pad OSD is shown pad events are its, not a client's
+//! (`events.c`'s `current_pad_osd`).
 
 use std::collections::BTreeSet;
 use std::ffi::CStr;
@@ -33,13 +40,23 @@ use smithay::reexports::input::event::{pointer::ButtonState, EventTrait};
 use smithay::reexports::input::AsRaw;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletPadDescriptor, TabletPadGroupDescriptor};
+use tuna_shell_control::{PadOsd, PadOsdButton, PadOsdEvent, PadOsdLabels, PadOsdPad, PadOsdTarget};
 
+use super::libwacom::{Libwacom, WacomInfo};
 use crate::tablet::{
-    map_tool_button, stylus_pressure, stylus_settings_path, tablet_settings_path, DeviceMapping,
+    map_tool_button, stylus_pressure, stylus_settings_path, tablet_settings_path, ButtonAction, DeviceMapping,
     EraserButtonMode, Mapping, Monitor, PressureCurve, StylusSettings, TabletEvent, TabletIdentity,
     TabletSettings, ToolAxes, ToolButton, BTN_STYLUS3,
 };
+use crate::tablet_actions::{
+    cycle_monitor, feature_directions, feature_label, group_switch_osd, mode_switch_label, pad_button_label,
+    pad_button_outcome, pad_button_settings_path, pad_feature_settings_path, DirectionTracker, PadButtonOutcome,
+    PadDirection, PadFeature,
+};
 use crate::tablet_settings::{Kind, Snapshot};
+
+/// `meta_display_show_osd`'s icon for tablets and pads.
+const TABLET_OSD_ICON: &str = "input-tablet-symbolic";
 
 /// The tool in proximity of one tablet.
 struct CurrentTool {
@@ -67,11 +84,74 @@ struct TabletDevice {
     tool: Option<CurrentTool>,
     /// Last position, where relative motion continues from.
     pos: Point<f64, Logical>,
+    wacom: Option<WacomInfo>,
 }
 
 struct PadDevice {
     device: li::Device,
     desc: TabletPadDescriptor,
+    /// Stable id the shell's pad OSD names it by.
+    id: u32,
+    vendor: u32,
+    product: u32,
+    devnode: String,
+    wacom: Option<WacomInfo>,
+    /// `PadMappingInfo::group_modes`: each group's mode as the action
+    /// mapper last saw it switch.
+    group_modes: Vec<u32>,
+}
+
+impl PadDevice {
+    /// `clutter_input_device_get_mode_switch_button_group`.
+    fn mode_switch_group(&self, button: u32) -> Option<usize> {
+        self.desc
+            .groups
+            .iter()
+            .position(|group| group.mode_switch_buttons.contains(&button))
+    }
+
+    /// libwacom's name, else the device's (`pretty_name` fallbacks).
+    fn pretty_name(&self) -> &str {
+        self.wacom.as_ref().map_or(self.desc.name.as_str(), |w| w.name.as_str())
+    }
+
+    fn button_settings_path(&self, button: u32) -> String {
+        pad_button_settings_path(self.vendor, self.product, button)
+    }
+
+    /// Every feature path a mode of its group may read.
+    fn feature_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for group in &self.desc.groups {
+            for (feature, numbers) in [(PadFeature::Ring, &group.rings), (PadFeature::Strip, &group.strips)] {
+                for number in numbers {
+                    for mode in 0..group.modes.max(1) {
+                        for direction in feature_directions(feature) {
+                            paths.push(pad_feature_settings_path(
+                                self.vendor,
+                                self.product,
+                                feature,
+                                *number,
+                                direction,
+                                mode,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    /// `get_current_pad_mode`: features are assumed spread evenly over
+    /// the groups.
+    fn feature_mode(&self, number: u32) -> u32 {
+        let groups = self.group_modes.len();
+        if groups == 0 {
+            return 0;
+        }
+        self.group_modes[number as usize % groups]
+    }
 }
 
 /// Every connected tablet and pad on the hardware seat.
@@ -82,6 +162,13 @@ pub struct Tablets {
     settings: Snapshot,
     monitors: Vec<Monitor>,
     events: Vec<TabletEvent>,
+    next_pad: u32,
+    /// The pad action mapper's `last_pad_action_info`.
+    directions: DirectionTracker,
+    /// The pad whose OSD the shell shows (`display->current_pad_osd`).
+    osd: Option<u32>,
+    /// libwacom, opened on the first tablet device (`None` inside: absent).
+    libwacom: Option<Option<Libwacom>>,
 }
 
 fn vendor_product(device: &li::Device) -> (u32, u32) {
@@ -96,6 +183,9 @@ fn pad_descriptor(device: &li::Device) -> TabletPadDescriptor {
         .filter_map(|index| device.tablet_pad_mode_group(index))
         .map(|group| TabletPadGroupDescriptor {
             buttons: (0..buttons).filter(|b| group.has_button(*b)).collect(),
+            mode_switch_buttons: (0..buttons)
+                .filter(|b| group.has_button(*b) && group.button_is_toggle(*b))
+                .collect(),
             rings: (0..rings).filter(|r| group.has_ring(*r)).collect(),
             strips: (0..strips).filter(|s| group.has_strip(*s)).collect(),
             modes: group.number_of_modes(),
@@ -107,6 +197,11 @@ fn pad_descriptor(device: &li::Device) -> TabletPadDescriptor {
         buttons,
         groups,
     }
+}
+
+/// The evdev node libwacom and GNOME Settings name a device by.
+fn devnode(device: &li::Device) -> String {
+    format!("/dev/input/{}", device.sysname())
 }
 
 /// A libinput function newer than the pinned bindings, from the libinput
@@ -231,6 +326,14 @@ impl CurrentTool {
 }
 
 impl Tablets {
+    /// libwacom's entry for a device node, opening libwacom once.
+    fn wacom(&mut self, device: &li::Device) -> Option<WacomInfo> {
+        self.libwacom
+            .get_or_insert_with(Libwacom::open)
+            .as_ref()?
+            .lookup(&devnode(device))
+    }
+
     /// A libinput device arrived: tablets and pads join, and their
     /// settings apply.
     pub fn device_added(&mut self, device: &li::Device) {
@@ -260,10 +363,11 @@ impl Tablets {
                 tool: None,
                 pos: (0.0, 0.0).into(),
                 desc: desc.clone(),
+                wacom: self.wacom(device),
             };
             eprintln!(
-                "tuna-compositor: tablet: added {} ({vendor:04x}:{product:04x}) size={:?}",
-                tablet.identity.name, tablet.identity.size_mm
+                "tuna-compositor: tablet: added {} ({vendor:04x}:{product:04x}) size={:?} libwacom={:?}",
+                tablet.identity.name, tablet.identity.size_mm, tablet.wacom
             );
             Self::apply_tablet(&mut tablet, &self.settings, &self.monitors);
             self.tablets.push(tablet);
@@ -301,9 +405,18 @@ impl Tablets {
             )) {
                 let _ = device.clone().config_left_handed_set(settings.left_handed);
             }
+            let (vendor, product) = vendor_product(device);
+            let wacom = self.wacom(device);
+            self.next_pad += 1;
             self.pads.push(PadDevice {
                 device: device.clone(),
                 desc: desc.clone(),
+                id: self.next_pad,
+                vendor,
+                product,
+                devnode: devnode(device),
+                wacom,
+                group_modes: vec![0; desc.groups.len()],
             });
             self.events.push(TabletEvent::PadAdded { pad: desc, tablet });
         }
@@ -324,12 +437,17 @@ impl Tablets {
         }
         if let Some(index) = self.pads.iter().position(|p| p.device == *device) {
             let pad = self.pads.remove(index);
+            // gnome-shell's PadOsd closes when its pad is removed.
+            if self.osd == Some(pad.id) {
+                self.osd = None;
+                self.events.push(TabletEvent::ClosePadOsd { pad: pad.id });
+            }
             self.events.push(TabletEvent::PadRemoved(pad.desc));
         }
     }
 
     /// The settings paths the connected tablets and the tools in
-    /// proximity read.
+    /// proximity read, and every pad action path.
     pub(crate) fn wanted(&self) -> BTreeSet<(Kind, String)> {
         let mut wanted = BTreeSet::new();
         for tablet in &self.tablets {
@@ -339,10 +457,13 @@ impl Tablets {
             }
         }
         for pad in &self.pads {
-            wanted.insert((
-                Kind::Tablet,
-                tablet_settings_path(pad.device.id_vendor(), pad.device.id_product()),
-            ));
+            wanted.insert((Kind::Tablet, tablet_settings_path(pad.vendor, pad.product)));
+            for button in 0..pad.desc.buttons {
+                wanted.insert((Kind::PadButton, pad.button_settings_path(button)));
+            }
+            for path in pad.feature_paths() {
+                wanted.insert((Kind::PadButton, path));
+            }
         }
         wanted
     }
@@ -462,6 +583,7 @@ impl Tablets {
         };
         let monitors = &self.monitors;
         let time = TabletToolEventTrait::time(&event);
+        let mut cycle = None;
         match event {
             TabletToolEvent::Proximity(event) => {
                 let tool = TabletToolEventTrait::tool(&event);
@@ -587,72 +709,407 @@ impl Tablets {
                         pressed,
                         time,
                     }),
-                    ToolButton::Action(action) => {
-                        // meta_tool_action_mapper_handle_button takes these;
-                        // the switch-monitor and keybinding actions are not
-                        // implemented here, and the press is not delivered.
-                        if pressed {
-                            eprintln!(
-                                "tuna-compositor: tablet: stylus button {:#x} action {action:?} is not implemented; consumed",
-                                event.button()
-                            );
+                    ToolButton::Action(action, accel) => {
+                        // meta_tool_action_mapper_handle_button. Mouse and
+                        // lens tools follow the mouse settings there and
+                        // reach it with Clutter button 0, which events.c
+                        // drops: nothing happens.
+                        if !current.mouse_or_lens {
+                            match action {
+                                ButtonAction::SwitchMonitor if pressed => {
+                                    cycle = Some((
+                                        tablet.vendor,
+                                        tablet.product,
+                                        tablet
+                                            .wacom
+                                            .as_ref()
+                                            .map_or_else(|| tablet.identity.name.clone(), |w| w.name.clone()),
+                                        tablet.wacom.as_ref().is_some_and(|w| w.integrated),
+                                    ));
+                                }
+                                ButtonAction::Keybinding => self.events.push(TabletEvent::EmulateKeybinding {
+                                    accel,
+                                    pressed,
+                                    time,
+                                }),
+                                _ => {}
+                            }
                         }
                     }
                 }
             }
             _ => {}
         }
+        if let Some((vendor, product, name, integrated)) = cycle {
+            self.cycle_output(vendor, product, &name, integrated);
+        }
     }
 
-    /// One libinput pad event.
+    /// `meta_tablet_action_mapper_cycle_tablet_output`: map the device to
+    /// the monitor after the one its `output` names (from the span of all
+    /// monitors to the first; integrated tablets never take the span), and
+    /// say so on screen.
+    fn cycle_output(&mut self, vendor: u32, product: u32, name: &str, integrated: bool) {
+        let path = tablet_settings_path(vendor, product);
+        let settings = self.settings.tablets.get(&path).cloned().unwrap_or_default();
+        // meta_tablet_action_mapper_find_monitor: exactly three values,
+        // not all empty, naming a monitor's EDID.
+        let current = settings
+            .output
+            .as_ref()
+            .filter(|o| o.len() == 3 && o.iter().any(|v| !v.is_empty()))
+            .and_then(|o| {
+                self.monitors
+                    .iter()
+                    .position(|m| m.vendor == o[0] && m.product == o[1] && m.serial == o[2])
+            });
+        let Some(next) = cycle_monitor(current, self.monitors.len(), integrated) else {
+            return;
+        };
+        let output = next.map_or_else(Default::default, |index| {
+            let monitor = &self.monitors[index];
+            [monitor.vendor.clone(), monitor.product.clone(), monitor.serial.clone()]
+        });
+        let connector = next.map(|index| self.monitors[index].connector.clone());
+        eprintln!(
+            "tuna-compositor: tablet: {name} switch-monitor to {}",
+            connector.as_deref().unwrap_or("all monitors")
+        );
+        self.events.push(TabletEvent::SetOutput { path, output });
+        // meta_display_show_tablet_mapping_notification.
+        self.events.push(TabletEvent::ShowOsd {
+            connector,
+            icon: TABLET_OSD_ICON,
+            label: name.to_owned(),
+        });
+    }
+
+    /// The monitor a pad's tablet is mapped to (`lookup_tablet_monitor`).
+    fn pad_connector(&self, index: usize) -> Option<String> {
+        let group = self.pads[index].device.device_group();
+        self.tablets
+            .iter()
+            .find(|t| t.device.device_group() == group)
+            .and_then(|t| t.mapped_to.clone())
+    }
+
+    /// `meta_pad_action_mapper_handle_button`; `true` when taken.
+    fn pad_button_action(&mut self, index: usize, button: u32, pressed: bool, mode: u32, time: u32) -> bool {
+        if let Some(group) = self.pads[index].mode_switch_group(button) {
+            let n_modes = self.pads[index].desc.groups[group].modes;
+            if pressed && n_modes > 0 {
+                let label = group_switch_osd(self.pads[index].pretty_name(), mode, n_modes);
+                let connector = self.pad_connector(index);
+                self.events.push(TabletEvent::ShowOsd {
+                    connector,
+                    icon: TABLET_OSD_ICON,
+                    label,
+                });
+                self.pads[index].group_modes[group] = mode;
+            }
+        }
+        let pad = &self.pads[index];
+        let settings = self
+            .settings
+            .pad_buttons
+            .get(&pad.button_settings_path(button))
+            .cloned()
+            .unwrap_or_default();
+        match pad_button_outcome(&settings) {
+            PadButtonOutcome::Deliver => false,
+            PadButtonOutcome::SwitchMonitor => {
+                if pressed {
+                    let (vendor, product) = (pad.vendor, pad.product);
+                    let name = pad.pretty_name().to_owned();
+                    let integrated = pad.wacom.as_ref().is_some_and(|w| w.integrated);
+                    self.cycle_output(vendor, product, &name, integrated);
+                }
+                true
+            }
+            PadButtonOutcome::Help => {
+                if pressed {
+                    self.events.push(TabletEvent::RequestPadOsd { pad: pad.id, time });
+                }
+                true
+            }
+            PadButtonOutcome::Keybinding(accel) => {
+                self.events.push(TabletEvent::EmulateKeybinding { accel, pressed, time });
+                true
+            }
+        }
+    }
+
+    /// `meta_pad_action_mapper_handle_action`: a ring or strip with a
+    /// keybinding in either direction is taken; moving it types the one
+    /// for the direction it moved. `true` when taken.
+    fn pad_feature_action(
+        &mut self,
+        index: usize,
+        feature: PadFeature,
+        number: u32,
+        mode: u32,
+        value: f64,
+        time: u32,
+    ) -> bool {
+        let pad = &self.pads[index];
+        let accel = |direction| {
+            self.settings
+                .pad_buttons
+                .get(&pad_feature_settings_path(
+                    pad.vendor,
+                    pad.product,
+                    feature,
+                    number,
+                    direction,
+                    mode,
+                ))
+                .map(|s| s.keybinding.clone())
+                .unwrap_or_default()
+        };
+        let [first, second] = feature_directions(feature);
+        let (accel1, accel2) = (accel(first), accel(second));
+        let handled = !accel1.is_empty() || !accel2.is_empty();
+        let id = pad.id;
+        if let Some(direction) = self.directions.direction(id, feature, number, value) {
+            let accel = match direction {
+                PadDirection::Up | PadDirection::Cw => accel1,
+                PadDirection::Down | PadDirection::Ccw => accel2,
+            };
+            if !accel.is_empty() {
+                for pressed in [true, false] {
+                    self.events.push(TabletEvent::EmulateKeybinding {
+                        accel: accel.clone(),
+                        pressed,
+                        time,
+                    });
+                }
+            }
+        }
+        handled
+    }
+
+    /// One libinput pad event (events.c's pad branch): the action mapper
+    /// first (only mode switches while the pad OSD is shown), then the
+    /// OSD or the focused client.
     pub fn pad_event(&mut self, event: TabletPadEvent) {
         let device = EventTrait::device(&event);
-        let Some(pad) = self.pads.iter().find(|p| p.device == device) else {
+        let Some(index) = self.pads.iter().position(|p| p.device == device) else {
             return;
         };
         let time = event.time();
+        let osd_open = self.osd.is_some();
+        let id = self.pads[index].id;
         match event {
             TabletPadEvent::Button(event) => {
                 let button = event.button_number();
-                let group = event.mode_group();
-                let mode = group
-                    .button_is_toggle(button)
-                    .then(|| (group.index() as usize, event.mode()));
-                self.events.push(TabletEvent::PadButton {
-                    pad: pad.desc.clone(),
-                    button,
-                    pressed: event.button_state()
-                        == ButtonState::Pressed,
-                    mode,
-                    time,
-                });
+                let pressed = event.button_state() == ButtonState::Pressed;
+                let mode = event.mode();
+                let switch_group = self.pads[index].mode_switch_group(button);
+                // Clients learn a mode switch whatever happens to the
+                // button next (meta_wayland_compositor_update runs first).
+                if let Some(group) = switch_group {
+                    self.events.push(TabletEvent::PadButton {
+                        pad: self.pads[index].desc.clone(),
+                        button,
+                        pressed,
+                        mode: Some((group, mode)),
+                        time,
+                    });
+                }
+                let taken = (!osd_open || switch_group.is_some())
+                    && self.pad_button_action(index, button, pressed, mode, time);
+                if taken {
+                    return;
+                }
+                if osd_open {
+                    self.events.push(TabletEvent::PadOsdInput {
+                        pad: id,
+                        event: PadOsdEvent::Button { button, pressed },
+                        time,
+                    });
+                } else if switch_group.is_none() {
+                    self.events.push(TabletEvent::PadButton {
+                        pad: self.pads[index].desc.clone(),
+                        button,
+                        pressed,
+                        mode: None,
+                        time,
+                    });
+                }
             }
             TabletPadEvent::Ring(event) => {
-                let angle = event.position();
-                self.events.push(TabletEvent::PadRing {
-                    pad: pad.desc.clone(),
-                    ring: event.number(),
-                    angle: (angle >= 0.0).then_some(angle),
-                    finger: event.source() == RingAxisSource::Finger,
-                    time,
-                });
+                let (ring, mode, angle) = (event.number(), event.mode(), event.position());
+                if osd_open {
+                    self.events.push(TabletEvent::PadOsdInput {
+                        pad: id,
+                        event: PadOsdEvent::Ring { ring, mode },
+                        time,
+                    });
+                } else if !self.pad_feature_action(index, PadFeature::Ring, ring, mode, angle, time) {
+                    self.events.push(TabletEvent::PadRing {
+                        pad: self.pads[index].desc.clone(),
+                        ring,
+                        angle: (angle >= 0.0).then_some(angle),
+                        finger: event.source() == RingAxisSource::Finger,
+                        time,
+                    });
+                }
             }
             TabletPadEvent::Strip(event) => {
-                let position = event.position();
-                self.events.push(TabletEvent::PadStrip {
-                    pad: pad.desc.clone(),
-                    strip: event.number(),
-                    position: (position >= 0.0).then_some(position),
-                    finger: event.source() == StripAxisSource::Finger,
-                    time,
-                });
+                let (strip, mode, position) = (event.number(), event.mode(), event.position());
+                if osd_open {
+                    self.events.push(TabletEvent::PadOsdInput {
+                        pad: id,
+                        event: PadOsdEvent::Strip { strip, mode },
+                        time,
+                    });
+                } else if !self.pad_feature_action(index, PadFeature::Strip, strip, mode, position, time) {
+                    self.events.push(TabletEvent::PadStrip {
+                        pad: self.pads[index].desc.clone(),
+                        strip,
+                        position: (position >= 0.0).then_some(position),
+                        finger: event.source() == StripAxisSource::Finger,
+                        time,
+                    });
+                }
             }
             _ => {}
         }
     }
 
+    /// Every pad the shell may ask an OSD for: id and device node.
+    pub fn pad_targets(&self) -> Vec<(u32, String)> {
+        self.pads.iter().map(|p| (p.id, p.devnode.clone())).collect()
+    }
+
+    /// The pad a shell request names.
+    pub fn resolve_pad(&self, target: &PadOsdTarget) -> Option<u32> {
+        self.pads
+            .iter()
+            .find(|p| match target {
+                PadOsdTarget::Pad(id) => p.id == *id,
+                PadOsdTarget::DeviceNode(node) => p.devnode == *node,
+            })
+            .map(|p| p.id)
+    }
+
+    /// The pad whose OSD is shown.
+    pub fn pad_osd_shown(&self) -> Option<u32> {
+        self.osd
+    }
+
+    /// The shell showed (`Some`) or closed (`None`) the pad OSD.
+    pub fn set_pad_osd_shown(&mut self, pad: Option<u32>) {
+        self.osd = pad;
+    }
+
+    /// `meta_display_request_pad_osd`: what `show-pad-osd` carries, or
+    /// `None` when Mutter shows nothing (an OSD is up, the pad is gone,
+    /// or libwacom has no layout for it). Labels are the action mapper's;
+    /// the caller adds clients' feedback.
+    pub fn pad_osd(&self, pad: u32, edition_mode: bool) -> Option<(TabletPadDescriptor, PadOsd)> {
+        if self.osd.is_some() {
+            return None;
+        }
+        let index = self.pads.iter().position(|p| p.id == pad)?;
+        let device = &self.pads[index];
+        let layout_path = device.wacom.as_ref()?.layout.clone()?;
+        let settings_path = tablet_settings_path(device.vendor, device.product);
+        let left_handed = self
+            .settings
+            .tablets
+            .get(&settings_path)
+            .is_some_and(|s| s.left_handed);
+        let group = device.device.device_group();
+        let group_pads = self
+            .pads
+            .iter()
+            .filter(|p| p.id == pad || p.device.device_group() == group)
+            .map(|p| PadOsdPad {
+                pad: p.id,
+                name: p.desc.name.clone(),
+            })
+            .collect();
+        let (desc, labels) = self.pad_osd_labels(pad)?;
+        Some((
+            desc,
+            PadOsd {
+                pad,
+                name: device.desc.name.clone(),
+                layout_path,
+                settings_path,
+                left_handed,
+                edition_mode,
+                connector: self.pad_connector(index),
+                group_pads,
+                labels,
+            },
+        ))
+    }
+
+    /// The action mapper's labels for a pad in its current modes
+    /// (`meta_pad_action_mapper_get_button_label`, `get_feature_label`).
+    pub fn pad_osd_labels(&self, pad: u32) -> Option<(TabletPadDescriptor, PadOsdLabels)> {
+        let device = self.pads.iter().find(|p| p.id == pad)?;
+        let label = |path: String| self.settings.pad_buttons.get(&path).cloned().unwrap_or_default();
+        let buttons = (0..device.desc.buttons)
+            .map(|button| match device.mode_switch_group(button) {
+                Some(group) => PadOsdButton {
+                    label: Some(mode_switch_label(group as u32, device.desc.groups.len())),
+                    mode_switch_group: Some(group as u32),
+                },
+                None => PadOsdButton {
+                    label: pad_button_label(&label(device.button_settings_path(button))),
+                    mode_switch_group: None,
+                },
+            })
+            .collect();
+        let count = |feature: PadFeature| {
+            device
+                .desc
+                .groups
+                .iter()
+                .flat_map(|g| match feature {
+                    PadFeature::Ring => g.rings.clone(),
+                    PadFeature::Strip => g.strips.clone(),
+                })
+                .max()
+                .map_or(0, |n| n + 1)
+        };
+        let features = |feature: PadFeature| -> (Vec<[Option<String>; 2]>, Vec<u32>) {
+            (0..count(feature))
+                .map(|number| {
+                    let mode = device.feature_mode(number);
+                    let [first, second] = feature_directions(feature).map(|direction| {
+                        feature_label(Some(&label(pad_feature_settings_path(
+                            device.vendor,
+                            device.product,
+                            feature,
+                            number,
+                            direction,
+                            mode,
+                        ))))
+                    });
+                    ([first, second], mode)
+                })
+                .unzip()
+        };
+        let (rings, ring_modes) = features(PadFeature::Ring);
+        let (strips, strip_modes) = features(PadFeature::Strip);
+        Some((
+            device.desc.clone(),
+            PadOsdLabels {
+                buttons,
+                rings,
+                strips,
+                ring_modes,
+                strip_modes,
+            },
+        ))
+    }
+
     /// What the compositor state file reports: each tablet's mapping and
-    /// tool, each pad.
+    /// tool, each pad, and the pad OSD.
     pub fn introspect(&self) -> serde_json::Value {
         serde_json::json!({
             "tablets": self.tablets.iter().map(|t| serde_json::json!({
@@ -660,6 +1117,7 @@ impl Tablets {
                 "id": format!("{:04x}:{:04x}", t.vendor, t.product),
                 "settings_path": t.path,
                 "size_mm": t.identity.size_mm,
+                "libwacom": t.wacom.as_ref().map(|w| &w.name),
                 "mapping": format!("{:?}", t.mapping.mode).to_lowercase(),
                 "output": t.mapped_to,
                 "keep_aspect_ratio": t.mapping.output_ratio,
@@ -678,15 +1136,22 @@ impl Tablets {
                 })),
             })).collect::<Vec<_>>(),
             "pads": self.pads.iter().map(|p| serde_json::json!({
+                "id": p.id,
                 "name": p.desc.name,
+                "devnode": p.devnode,
+                "libwacom": p.wacom.as_ref().map(|w| &w.name),
+                "layout": p.wacom.as_ref().and_then(|w| w.layout.as_ref()),
                 "buttons": p.desc.buttons,
+                "group_modes": p.group_modes,
                 "groups": p.desc.groups.iter().map(|g| serde_json::json!({
                     "buttons": g.buttons,
+                    "mode_switch_buttons": g.mode_switch_buttons,
                     "rings": g.rings,
                     "strips": g.strips,
                     "modes": g.modes,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
+            "pad_osd": self.osd,
         })
     }
 }

@@ -55,6 +55,8 @@ mod osk;
 mod osk_layout;
 mod osk_model;
 mod overview;
+mod pad_osd;
+mod pad_osd_dbus;
 mod panel_focus;
 mod pointer_a11y;
 mod polkit;
@@ -157,6 +159,28 @@ struct Drained {
     /// The compositor's on-screen keyboard updates, in order: focus, the
     /// input-panel request, touch-mode auto-show.
     osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
+    /// Drawing-tablet OSD messages, in arrival order.
+    tablet: Vec<TabletUi>,
+}
+
+/// One compositor request for the tablet OSDs (wire 0.45).
+enum TabletUi {
+    /// `meta_display_show_osd` on this connector (`None` = current).
+    Osd {
+        connector: Option<String>,
+        icon: String,
+        label: String,
+    },
+    ShowPad(Box<tuna_shell_control::PadOsd>),
+    Labels {
+        pad: u32,
+        labels: tuna_shell_control::PadOsdLabels,
+    },
+    Input {
+        pad: u32,
+        event: tuna_shell_control::PadOsdEvent,
+    },
+    Close(u32),
 }
 
 /// One pointer accessibility timeout report: kind, duration when it
@@ -254,6 +278,23 @@ fn drain(
             Handled::AcceleratorDeactivated { action, time, mode } => {
                 out.accelerators.push((action, time, mode, true));
             }
+            Handled::ShowOsd {
+                connector,
+                icon,
+                label,
+            } => out.tablet.push(TabletUi::Osd {
+                connector,
+                icon,
+                label,
+            }),
+            Handled::ShowPadOsd(osd) => out.tablet.push(TabletUi::ShowPad(osd)),
+            Handled::PadOsdLabels { pad, labels } => {
+                out.tablet.push(TabletUi::Labels { pad, labels });
+            }
+            Handled::PadOsdInput { pad, event } => {
+                out.tablet.push(TabletUi::Input { pad, event });
+            }
+            Handled::ClosePadOsd { pad } => out.tablet.push(TabletUi::Close(pad)),
             Handled::CommandResult { id, status } => out.results.push((
                 id,
                 matches!(status, tuna_shell_control::CommandStatus::Applied),
@@ -3430,6 +3471,39 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    // gnome-shell's pad OSD and its org.gnome.Shell.Wacom.PadOsd service.
+    let pad_osd_ui = {
+        let (closed_shell, request_shell) = (shell.clone(), shell.clone());
+        pad_osd::PadOsdUi::new(
+            app.upcast_ref(),
+            pad_osd::Callbacks {
+                closed: Rc::new(move |pad| {
+                    if let Some(control) = closed_shell.borrow_mut().control.as_mut() {
+                        let _ = control.pad_osd_closed(pad);
+                    }
+                }),
+                request: Rc::new(move |pad, edition_mode| {
+                    if let Some(control) = request_shell.borrow_mut().control.as_mut() {
+                        let _ = control.request_pad_osd(
+                            tuna_shell_control::PadOsdTarget::Pad(pad),
+                            edition_mode,
+                        );
+                    }
+                }),
+            },
+        )
+    };
+    let pad_osd_service = {
+        let shell = shell.clone();
+        pad_osd_dbus::start(Rc::new(move |target, edition_mode| {
+            shell
+                .borrow_mut()
+                .control
+                .as_mut()?
+                .request_pad_osd(target, edition_mode)
+                .ok()
+        }))
+    };
     let kbd_a11y_dialog = kbd_a11y::KbdA11yDialog::new(app.upcast_ref());
     let pie_timer = pointer_a11y::PieTimer::new(app.upcast_ref());
     // Compositor state: the control socket is drained whenever it is
@@ -3487,6 +3561,8 @@ fn build(app: &adw::Application) {
                 (chrome.clone(), notify.clone(), switcher_ui.clone());
             let input_sources = input_sources.clone();
             let shell_rc = shell_rc.clone();
+            let (osd_ui, pad_osd_ui, pad_osd_service) =
+                (osd_ui.clone(), pad_osd_ui.clone(), pad_osd_service.clone());
             let resync_after = resync_after.clone();
             Rc::new(move |drained: Drained| {
                 let Drained {
@@ -3500,6 +3576,7 @@ fn build(app: &adw::Application) {
                     aid_switches,
                     dwell_click,
                     pointer_timeouts,
+                    tablet,
                     osk: osk_updates,
                 } = drained;
                 let mut shell = shell.borrow_mut();
@@ -3572,6 +3649,32 @@ fn build(app: &adw::Application) {
                 } else if let Some(secs) = display_change {
                     display_change_dialog.show(secs);
                 }
+                if locked {
+                    pad_osd_ui.close();
+                }
+                for request in tablet {
+                    match request {
+                        TabletUi::Osd {
+                            connector,
+                            icon,
+                            label,
+                        } => osd_ui.show_on(
+                            &osd::OsdRequest {
+                                icon: Some(icon),
+                                label: (!label.is_empty()).then_some(label),
+                                ..Default::default()
+                            },
+                            connector.as_deref(),
+                        ),
+                        // The lock screen holds the keyboard: no modal OSD
+                        // over it, and the compositor learns it closed.
+                        TabletUi::ShowPad(info) if locked => pad_osd_ui.refuse(info.pad),
+                        TabletUi::ShowPad(info) => pad_osd_ui.show(*info),
+                        TabletUi::Labels { pad, labels } => pad_osd_ui.labels(pad, labels),
+                        TabletUi::Input { pad, event } => pad_osd_ui.input(pad, event),
+                        TabletUi::Close(pad) => pad_osd_ui.close_pad(pad),
+                    }
+                }
                 for (action, time, mode, released) in accelerators {
                     if released {
                         gnome_shell.accelerator_deactivated(action, time, mode);
@@ -3612,6 +3715,7 @@ fn build(app: &adw::Application) {
                         locked,
                     );
                     lock_ui.command_result(id, applied);
+                    pad_osd_service.command_result(id, applied);
                 }
                 // The bar goes see-through and Activities shows as checked
                 // while the overview is open, as GNOME draws them.

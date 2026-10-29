@@ -108,15 +108,48 @@ pub enum TabletEvent {
         finger: bool,
         time: u32,
     },
+    /// A tablet action mapper's `keybinding`: emulate one press or
+    /// release of this accelerator on a virtual keyboard
+    /// (`meta_tablet_action_mapper_emulate_keybinding`).
+    EmulateKeybinding {
+        accel: String,
+        pressed: bool,
+        time: u32,
+    },
+    /// `switch-monitor` picked the next output: write the tablet's
+    /// `output` setting at `path` (vendor, product, serial; all empty is
+    /// the span of every monitor).
+    SetOutput { path: String, output: [String; 3] },
+    /// `meta_display_show_osd`: icon and text on a monitor (`None` is the
+    /// current one).
+    ShowOsd {
+        connector: Option<String>,
+        icon: &'static str,
+        label: String,
+    },
+    /// The `help` pad action: show this pad's OSD.
+    RequestPadOsd { pad: u32, time: u32 },
+    /// A pad event while the pad OSD is shown: the shell's, not a client's.
+    PadOsdInput {
+        pad: u32,
+        event: tuna_shell_control::PadOsdEvent,
+        time: u32,
+    },
+    /// The shown pad OSD's pad is gone.
+    ClosePadOsd { pad: u32 },
 }
 
 impl TabletEvent {
-    /// The event time; device hotplug carries none.
+    /// The event time; device hotplug and compositor-side effects carry none.
     pub fn time(&self) -> Option<u32> {
         match self {
-            Self::TabletAdded(_) | Self::TabletRemoved(_) | Self::PadAdded { .. } | Self::PadRemoved(_) => {
-                None
-            }
+            Self::TabletAdded(_)
+            | Self::TabletRemoved(_)
+            | Self::PadAdded { .. }
+            | Self::PadRemoved(_)
+            | Self::SetOutput { .. }
+            | Self::ShowOsd { .. }
+            | Self::ClosePadOsd { .. } => None,
             Self::ProximityIn { time, .. }
             | Self::ProximityOut { time, .. }
             | Self::Motion { time, .. }
@@ -124,7 +157,10 @@ impl TabletEvent {
             | Self::Button { time, .. }
             | Self::PadButton { time, .. }
             | Self::PadRing { time, .. }
-            | Self::PadStrip { time, .. } => Some(*time),
+            | Self::PadStrip { time, .. }
+            | Self::EmulateKeybinding { time, .. }
+            | Self::RequestPadOsd { time, .. }
+            | Self::PadOsdInput { time, .. } => Some(*time),
         }
     }
 }
@@ -282,6 +318,12 @@ pub struct StylusSettings {
     pub button_action: ButtonAction,
     pub secondary_button_action: ButtonAction,
     pub tertiary_button_action: ButtonAction,
+    /// `*-keybinding`: the accelerator a `keybinding` action emulates
+    /// (`meta_input_settings_get_tool_button_action`).
+    pub eraser_button_keybinding: String,
+    pub button_keybinding: String,
+    pub secondary_button_keybinding: String,
+    pub tertiary_button_keybinding: String,
 }
 
 impl Default for StylusSettings {
@@ -297,6 +339,10 @@ impl Default for StylusSettings {
             button_action: ButtonAction::Right,
             secondary_button_action: ButtonAction::Middle,
             tertiary_button_action: ButtonAction::Default,
+            eraser_button_keybinding: String::new(),
+            button_keybinding: String::new(),
+            secondary_button_keybinding: String::new(),
+            tertiary_button_keybinding: String::new(),
         }
     }
 }
@@ -336,7 +382,6 @@ pub struct PressureCurve {
 const N_PRESSURECURVE_POINTS: usize = 256;
 const BEZIER_MAX_LENGTH: i32 = 1 << 18;
 const CBZ_T_Q: i32 = 18;
-const CBZ_T_ONE: i32 = 1 << CBZ_T_Q;
 
 fn cbz_mul(x: i32, y: i32) -> i32 {
     ((x >> 3).wrapping_mul(y >> 3)) >> 12
@@ -486,14 +531,15 @@ impl Default for PressureCurve {
 
 /// What a stylus button press becomes (`meta_seat_impl_notify_button_in_impl`
 /// with `meta_tool_action_mapper_handle_button`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolButton {
     /// Clutter's primary button: the tool's down/up.
     Tip,
     /// `zwp_tablet_tool_v2.button` with this code.
     Button(u32),
-    /// Taken by the compositor's tablet action mapper, never delivered.
-    Action(ButtonAction),
+    /// Taken by the compositor's tablet action mapper, never delivered:
+    /// `switch-monitor`, or `keybinding` with the slot's accelerator.
+    Action(ButtonAction, String),
 }
 
 /// Map a physical stylus button through the tool's settings. `eraser_button`
@@ -505,8 +551,8 @@ pub fn map_tool_button(
     eraser_button: Option<u32>,
     mouse_or_lens: bool,
 ) -> ToolButton {
-    let action = if eraser_button == Some(evdev) {
-        settings.eraser_button_action
+    let (action, keybinding) = if eraser_button == Some(evdev) {
+        (settings.eraser_button_action, &settings.eraser_button_keybinding)
     } else {
         // meta_evdev_tool_button_to_clutter, then the slots
         // set_stylus_button_map fills from the settings keys. Codes with
@@ -520,19 +566,19 @@ pub fn map_tool_button(
         };
         let keyed = if mouse_or_lens {
             match clutter {
-                3 => Some(settings.button_action),
-                2 => Some(settings.secondary_button_action),
+                3 => Some((settings.button_action, &settings.button_keybinding)),
+                2 => Some((settings.secondary_button_action, &settings.secondary_button_keybinding)),
                 _ => None,
             }
         } else {
             match clutter {
-                2 => Some(settings.button_action),
-                3 => Some(settings.secondary_button_action),
-                8 => Some(settings.tertiary_button_action),
+                2 => Some((settings.button_action, &settings.button_keybinding)),
+                3 => Some((settings.secondary_button_action, &settings.secondary_button_keybinding)),
+                8 => Some((settings.tertiary_button_action, &settings.tertiary_button_keybinding)),
                 _ => None,
             }
         };
-        keyed.unwrap_or(ButtonAction::Default)
+        keyed.unwrap_or((ButtonAction::Default, &settings.button_keybinding))
     };
     match action {
         ButtonAction::Default => ToolButton::Tip,
@@ -540,7 +586,8 @@ pub fn map_tool_button(
         ButtonAction::Right => ToolButton::Button(BTN_STYLUS2),
         ButtonAction::Back => ToolButton::Button(BTN_BACK),
         ButtonAction::Forward => ToolButton::Button(BTN_FORWARD),
-        ButtonAction::SwitchMonitor | ButtonAction::Keybinding => ToolButton::Action(action),
+        ButtonAction::SwitchMonitor => ToolButton::Action(action, String::new()),
+        ButtonAction::Keybinding => ToolButton::Action(action, keybinding.clone()),
     }
 }
 
@@ -1057,18 +1104,29 @@ mod tests {
             secondary_button_action: ButtonAction::Forward,
             tertiary_button_action: ButtonAction::SwitchMonitor,
             eraser_button_action: ButtonAction::Keybinding,
+            eraser_button_keybinding: "<Control>z".into(),
+            tertiary_button_keybinding: "unused".into(),
             ..StylusSettings::default()
         };
         assert_eq!(map_tool_button(BTN_STYLUS, &custom, None, false), ToolButton::Button(BTN_BACK));
         assert_eq!(map_tool_button(BTN_STYLUS2, &custom, None, false), ToolButton::Button(BTN_FORWARD));
         assert_eq!(
             map_tool_button(BTN_STYLUS3, &custom, None, false),
-            ToolButton::Action(ButtonAction::SwitchMonitor)
+            ToolButton::Action(ButtonAction::SwitchMonitor, String::new())
         );
-        // An eraser button follows its own key.
+        // An eraser button follows its own keys.
         assert_eq!(
             map_tool_button(BTN_STYLUS3, &custom, Some(BTN_STYLUS3), false),
-            ToolButton::Action(ButtonAction::Keybinding)
+            ToolButton::Action(ButtonAction::Keybinding, "<Control>z".into())
+        );
+        let keyed = StylusSettings {
+            secondary_button_action: ButtonAction::Keybinding,
+            secondary_button_keybinding: "<Alt>Tab".into(),
+            ..StylusSettings::default()
+        };
+        assert_eq!(
+            map_tool_button(BTN_STYLUS2, &keyed, None, false),
+            ToolButton::Action(ButtonAction::Keybinding, "<Alt>Tab".into())
         );
         // Mouse and lens tools: primary key on the right button.
         assert_eq!(map_tool_button(BTN_STYLUS2, &custom, None, true), ToolButton::Button(BTN_BACK));

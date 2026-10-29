@@ -54,5 +54,7 @@ pub const KBD_A11Y_NAMESPACE: &str = "tuna-kbd-a11y";
 pub const POINTER_A11Y_NAMESPACE: &str = "tuna-pointer-a11y";
 /// GTK display-change confirmation surface ("Keep these display settings?").
 pub const DISPLAY_CHANGE_NAMESPACE: &str = "tuna-display-change";
+/// GTK pad on-screen help surface (gnome-shell's PadOsd).
+pub const PAD_OSD_NAMESPACE: &str = "tuna-pad-osd";
 /// GTK on-screen keyboard surface (#349); never takes keyboard focus.
 pub const OSK_NAMESPACE: &str = "tuna-osk";

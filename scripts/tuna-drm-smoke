@@ -27,8 +27,16 @@
 #              and a vanished caller both restore the white point
 #   D-COLOR-RESTART a restart unregisters the device and colord's mapping
 #              restores the calibrated profile to the next session
+#   D-TABLET   an emulated (uinput, ADR 0008) Wacom Cintiq 22HD pen and pad
+#              (P-IN-05): libwacom identity and pen/pad pairing, a GTK 4
+#              GtkGestureStylus client's position, pressure, tilt and tool
+#              (pen, eraser), GNOME's area, keep-aspect, output and
+#              relative mapping, stylus and pad switch-monitor and
+#              keybinding actions, strip keybindings, the pad OSD in the
+#              GTK shell (help button, org.gnome.Shell.Wacom.PadOsd),
+#              hotplug, and nothing reaching the client while locked
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
-# Needs root (sudo) for modprobe and seatd. Exits nonzero on any failure.
+# Needs root (sudo) for modprobe, seatd and uinput. Exits nonzero on any failure.
 set -eu
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -57,8 +65,14 @@ DBUS_PID=""
 COLORD_PID=""
 SYSTEM_BUS_PID=""
 CALIBRATION_PID=""
+EMU_PID=""
+CLIENT_PID=""
 
 cleanup() {
+    if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
+    # The emulator (root) exits when its command pipe closes.
+    exec 8>&- 2>/dev/null || true
+    if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     if [ -n "$COLORD_PID" ]; then sudo kill "$COLORD_PID" 2>/dev/null || true; fi
@@ -142,7 +156,7 @@ done
 echo "tuna-drm-smoke: vkms at $CARD"
 
 echo "tuna-drm-smoke: building"
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
 "$ROOT/scripts/tuna-frame-pacer-build" "$ARTIFACTS/frame-pacer"
 
 # seatd always serves /run/seatd.sock (and removes a leftover one), so a

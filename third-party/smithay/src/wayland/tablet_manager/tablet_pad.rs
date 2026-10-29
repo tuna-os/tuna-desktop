@@ -35,6 +35,8 @@ use super::{tablet::device_node, TabletHandle, TabletManagerState};
 pub struct TabletPadGroupDescriptor {
     /// Pad button indices in this group.
     pub buttons: Vec<u32>,
+    /// The group's mode-switch (toggle) buttons, which take no feedback.
+    pub mode_switch_buttons: Vec<u32>,
     /// Pad-wide ring indices in this group.
     pub rings: Vec<u32>,
     /// Pad-wide strip indices in this group.
@@ -72,6 +74,13 @@ struct TabletPad {
     focus: Option<WlSurface>,
     /// Current mode of each group.
     modes: Vec<u32>,
+    /// Serial of each group's last `mode_switch`; feedback must quote it.
+    mode_switch_serials: Vec<u32>,
+    /// `set_feedback` labels from the focused client, cleared on focus
+    /// change (Mutter's `pad->feedback`, `ring->feedback`, `strip->feedback`).
+    button_feedback: HashMap<u32, String>,
+    ring_feedback: HashMap<u32, String>,
+    strip_feedback: HashMap<u32, String>,
 }
 
 impl TabletPad {
@@ -80,6 +89,10 @@ impl TabletPad {
         self.instances
             .iter()
             .find(|i| i.pad.id().same_client_as(&focus.id()) && i.pad.upgrade().is_ok())
+    }
+
+    fn serial_matches(&self, group: usize, serial: u32) -> bool {
+        self.mode_switch_serials.get(group) == Some(&serial)
     }
 }
 
@@ -96,6 +109,7 @@ impl TabletPadHandle {
             let mut inner = handle.inner.lock().unwrap();
             inner.desc = Some(desc.clone());
             inner.modes = vec![0; desc.groups.len()];
+            inner.mode_switch_serials = vec![0; desc.groups.len()];
         }
         handle
     }
@@ -129,7 +143,7 @@ impl TabletPadHandle {
             rings: HashMap::new(),
             strips: HashMap::new(),
         };
-        for group_desc in &desc.groups {
+        for (group_index, group_desc) in desc.groups.iter().enumerate() {
             let Ok(group) = client.create_resource::<ZwpTabletPadGroupV2, _, D>(
                 dh,
                 version,
@@ -149,7 +163,11 @@ impl TabletPadHandle {
                 if let Ok(ring) = client.create_resource::<ZwpTabletPadRingV2, _, D>(
                     dh,
                     version,
-                    TabletPadRingUserData { _private: () },
+                    TabletPadRingUserData {
+                        handle: self.clone(),
+                        index: *ring_index,
+                        group: group_index,
+                    },
                 ) {
                     group.ring(&ring);
                     instance.rings.insert(*ring_index, ring.downgrade());
@@ -159,7 +177,11 @@ impl TabletPadHandle {
                 if let Ok(strip) = client.create_resource::<ZwpTabletPadStripV2, _, D>(
                     dh,
                     version,
-                    TabletPadStripUserData { _private: () },
+                    TabletPadStripUserData {
+                        handle: self.clone(),
+                        index: *strip_index,
+                        group: group_index,
+                    },
                 ) {
                     group.strip(&strip);
                     instance.strips.insert(*strip_index, strip.downgrade());
@@ -182,6 +204,10 @@ impl TabletPadHandle {
         if inner.focus.as_ref() == surface {
             return;
         }
+        // A new focus starts without the old client's labels.
+        inner.button_feedback.clear();
+        inner.ring_feedback.clear();
+        inner.strip_feedback.clear();
         if let Some(old) = inner.focus.take() {
             if old.is_alive() {
                 for instance in inner
@@ -203,6 +229,10 @@ impl TabletPadHandle {
         };
         inner.focus = Some(surface.clone());
         let modes = inner.modes.clone();
+        let serial_value: u32 = serial.into();
+        for slot in &mut inner.mode_switch_serials {
+            *slot = serial_value;
+        }
         for instance in inner
             .instances
             .iter()
@@ -218,6 +248,22 @@ impl TabletPadHandle {
                 }
             }
         }
+    }
+
+    /// The focused client's `set_feedback` label for a button
+    /// (`meta_wayland_tablet_pad_get_button_label`'s client part).
+    pub fn button_label(&self, button: u32) -> Option<String> {
+        self.inner.lock().unwrap().button_feedback.get(&button).cloned()
+    }
+
+    /// The focused client's label for ring `index`.
+    pub fn ring_label(&self, index: u32) -> Option<String> {
+        self.inner.lock().unwrap().ring_feedback.get(&index).cloned()
+    }
+
+    /// The focused client's label for strip `index`.
+    pub fn strip_label(&self, index: u32) -> Option<String> {
+        self.inner.lock().unwrap().strip_feedback.get(&index).cloned()
     }
 
     /// The surface the pad is focused on.
@@ -248,6 +294,9 @@ impl TabletPadHandle {
             return;
         };
         *current = mode;
+        if let Some(slot) = inner.mode_switch_serials.get_mut(group) {
+            *slot = serial.into();
+        }
         if let Some(group) = inner
             .focused()
             .and_then(|i| i.groups.get(group))
@@ -323,13 +372,17 @@ pub struct TabletPadGroupUserData {
 /// User data of ZwpTabletPadRingV2 object
 #[derive(Debug)]
 pub struct TabletPadRingUserData {
-    _private: (),
+    handle: TabletPadHandle,
+    index: u32,
+    group: usize,
 }
 
 /// User data of ZwpTabletPadStripV2 object
 #[derive(Debug)]
 pub struct TabletPadStripUserData {
-    _private: (),
+    handle: TabletPadHandle,
+    index: u32,
+    group: usize,
 }
 
 impl<D> Dispatch<ZwpTabletPadV2, TabletPadUserData, D> for TabletManagerState
@@ -341,12 +394,35 @@ where
         _state: &mut D,
         _client: &Client,
         _pad: &ZwpTabletPadV2,
-        _request: zwp_tablet_pad_v2::Request,
-        _data: &TabletPadUserData,
+        request: zwp_tablet_pad_v2::Request,
+        data: &TabletPadUserData,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
-        // set_feedback labels Mutter's pad OSD; destroy needs nothing.
+        // tablet_pad_set_feedback: only for the current mode, never for a
+        // mode-switch button. (A button taken by a pad action is labelled
+        // by the action first, so storing its feedback changes nothing.)
+        if let zwp_tablet_pad_v2::Request::SetFeedback {
+            button,
+            description,
+            serial,
+        } = request
+        {
+            let mut inner = data.handle.inner.lock().unwrap();
+            let Some((group, desc)) = inner.desc.as_ref().and_then(|desc| {
+                desc.groups
+                    .iter()
+                    .enumerate()
+                    .find(|(_, g)| g.buttons.contains(&button))
+                    .map(|(i, g)| (i, g.clone()))
+            }) else {
+                return;
+            };
+            if !inner.serial_matches(group, serial) || desc.mode_switch_buttons.contains(&button) {
+                return;
+            }
+            inner.button_feedback.insert(button, description);
+        }
     }
 
     fn destroyed(_state: &mut D, _client: ClientId, pad: &ZwpTabletPadV2, data: &TabletPadUserData) {
@@ -385,11 +461,17 @@ where
         _state: &mut D,
         _client: &Client,
         _ring: &ZwpTabletPadRingV2,
-        _request: zwp_tablet_pad_ring_v2::Request,
-        _data: &TabletPadRingUserData,
+        request: zwp_tablet_pad_ring_v2::Request,
+        data: &TabletPadRingUserData,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
+        if let zwp_tablet_pad_ring_v2::Request::SetFeedback { description, serial } = request {
+            let mut inner = data.handle.inner.lock().unwrap();
+            if inner.serial_matches(data.group, serial) {
+                inner.ring_feedback.insert(data.index, description);
+            }
+        }
     }
 }
 
@@ -402,10 +484,16 @@ where
         _state: &mut D,
         _client: &Client,
         _strip: &ZwpTabletPadStripV2,
-        _request: zwp_tablet_pad_strip_v2::Request,
-        _data: &TabletPadStripUserData,
+        request: zwp_tablet_pad_strip_v2::Request,
+        data: &TabletPadStripUserData,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
+        if let zwp_tablet_pad_strip_v2::Request::SetFeedback { description, serial } = request {
+            let mut inner = data.handle.inner.lock().unwrap();
+            if inner.serial_matches(data.group, serial) {
+                inner.strip_feedback.insert(data.index, description);
+            }
+        }
     }
 }

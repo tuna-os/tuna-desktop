@@ -744,6 +744,10 @@ pub struct Runtime {
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
+    /// Keys the tablet action mappers' virtual keyboard holds (evdev).
+    tablet_virtual_keys: std::collections::BTreeSet<u32>,
+    /// The pad OSD labels the shell last received.
+    pad_osd_labels_sent: Option<tuna_shell_control::PadOsdLabels>,
     /// Window list org.gnome.Shell.Introspect serves (window sharing).
     introspect: crate::introspect::Handle,
     /// A three-finger swipe in progress: its travel so far (#60).
@@ -1032,6 +1036,7 @@ impl Runtime {
                         for event in tablet_events {
                             rt.on_tablet_input(event);
                         }
+                        rt.pad_osd_tick();
                         // The window manager has the final say (a locked
                         // pointer stays put): the drawn cursor follows it.
                         let pos = rt.manager.pointer_pos();
@@ -1433,6 +1438,8 @@ impl Runtime {
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
+            tablet_virtual_keys: Default::default(),
+            pad_osd_labels_sent: None,
             introspect,
             idle_since: Instant::now(),
             unlock_results,
@@ -4619,6 +4626,13 @@ impl Runtime {
         for keep in outcome.display_change {
             self.complete_display_change(keep);
         }
+        // The shell's pad OSD (P-IN-05): shown on request, closed by it.
+        for (pad, edition_mode) in outcome.pad_osd_requests {
+            self.request_pad_osd(pad, edition_mode);
+        }
+        for pad in outcome.pad_osd_closed {
+            self.pad_osd_closed(pad);
+        }
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
                 .queue_message(tuna_shell_control::Message::ShortcutConsent { request });
@@ -5062,21 +5076,59 @@ impl Runtime {
         #[cfg(feature = "drm")]
         if let (Some(snapshot), Backend::Drm(drm)) = (snapshot, &mut self.backend) {
             drm.set_tablet_settings(snapshot);
+            self.pad_osd_tick();
         }
     }
 
-    /// One tablet event (P-IN-05): activity like any input; while locked
-    /// only the lock surface hears tools; a waking blank takes the event.
+    /// One tablet event (P-IN-05): activity like any input; the action
+    /// mappers' effects are the compositor's own; while locked only the
+    /// lock surface hears tools; a waking blank takes the event.
     fn on_tablet_input(&mut self, event: crate::tablet::TabletEvent) {
+        use crate::tablet::TabletEvent;
+        let mut waking_blank = false;
         if let Some(time) = event.time() {
-            let waking_blank = self.blank_alpha() > 0.0;
+            waking_blank = self.blank_alpha() > 0.0;
             self.lock.note_input(u64::from(time));
             self.idle_since = Instant::now();
             self.idle_monitor.activity();
             self.active_at = Instant::now();
-            if waking_blank && !matches!(event, crate::tablet::TabletEvent::ProximityOut { .. }) {
+        }
+        let event = match event {
+            TabletEvent::EmulateKeybinding { accel, pressed, time } => {
+                self.emulate_keybinding(&accel, pressed, time);
                 return;
             }
+            TabletEvent::SetOutput { path, output } => {
+                self.tablet_settings.set_output(path, output);
+                return;
+            }
+            TabletEvent::ShowOsd { connector, icon, label } => {
+                self.control.queue_message(tuna_shell_control::Message::ShowOsd {
+                    connector,
+                    icon: icon.into(),
+                    label,
+                });
+                return;
+            }
+            TabletEvent::RequestPadOsd { pad, .. } => {
+                self.request_pad_osd(pad, false);
+                return;
+            }
+            TabletEvent::PadOsdInput { pad, event, .. } => {
+                self.control
+                    .queue_message(tuna_shell_control::Message::PadOsdInput { pad, event });
+                return;
+            }
+            TabletEvent::ClosePadOsd { pad } => {
+                self.pad_osd_labels_sent = None;
+                self.control
+                    .queue_message(tuna_shell_control::Message::ClosePadOsd { pad });
+                return;
+            }
+            event => event,
+        };
+        if waking_blank && !matches!(event, TabletEvent::ProximityOut { .. }) {
+            return;
         }
         if self.is_locked() {
             let surface = self
@@ -5095,6 +5147,159 @@ impl Runtime {
             return;
         }
         self.manager.tablet_input(&mut self.state, event, None);
+    }
+
+    /// `meta_tablet_action_mapper_emulate_keybinding`: the accelerator's
+    /// modifiers and key on the tablet's virtual keyboard, through the
+    /// same path as a physical key (shortcuts first, then the focus).
+    fn emulate_keybinding(&mut self, accel: &str, pressed: bool, time: u32) {
+        let Some(steps) = crate::tablet_actions::keybinding_steps(accel, pressed) else {
+            eprintln!("tuna-compositor: tablet: \"{accel}\" is not a valid accelerator");
+            return;
+        };
+        eprintln!(
+            "tuna-compositor: tablet: keybinding {accel} {}",
+            if pressed { "press" } else { "release" }
+        );
+        for step in steps {
+            self.notify_keyval(step.keysym, step.pressed, time);
+        }
+    }
+
+    /// `notify_keyval_in_impl`: the key typing `keysym` in the current
+    /// layout, with Shift or Level 3 held around it for a higher level;
+    /// a duplicate press or unmatched release is ignored.
+    fn notify_keyval(&mut self, keysym: u32, pressed: bool, time: u32) {
+        let Some((keycode, level)) = self.manager.keycode_for_keysym(&mut self.state, keysym) else {
+            eprintln!("tuna-compositor: tablet: no keycode found for keyval {keysym:x} in current group");
+            return;
+        };
+        let admitted = if pressed {
+            self.tablet_virtual_keys.insert(keycode)
+        } else {
+            self.tablet_virtual_keys.remove(&keycode)
+        };
+        if !admitted {
+            eprintln!("tuna-compositor: tablet: ignoring repeated virtual key {keycode:#x}");
+            return;
+        }
+        let level_key = crate::tablet_actions::level_modifier(level)
+            .and_then(|modifier| self.manager.keycode_for_keysym(&mut self.state, modifier))
+            .map(|(keycode, _)| keycode);
+        let key = |rt: &mut Self, keycode: u32, pressed: bool| {
+            rt.on_manager_input(ManagerInput::Key {
+                keycode,
+                pressed,
+                time,
+            });
+        };
+        if let (true, Some(modifier)) = (pressed, level_key) {
+            key(self, modifier, true);
+        }
+        key(self, keycode, pressed);
+        if let (false, Some(modifier)) = (pressed, level_key) {
+            key(self, modifier, false);
+        }
+    }
+
+    /// `meta_display_request_pad_osd`: hand the shell the pad's OSD. Like
+    /// Mutter, nothing happens while one is shown or without a layout.
+    fn request_pad_osd(&mut self, pad: u32, edition_mode: bool) {
+        #[cfg(feature = "drm")]
+        {
+            if !self.control.pad_osd_capable() {
+                return;
+            }
+            let Backend::Drm(drm) = &mut self.backend else {
+                return;
+            };
+            let Some((desc, mut osd)) = drm.tablets().pad_osd(pad, edition_mode) else {
+                return;
+            };
+            drm.tablets().set_pad_osd_shown(Some(pad));
+            self.fill_pad_feedback(&desc, &mut osd.labels);
+            self.pad_osd_labels_sent = Some(osd.labels.clone());
+            eprintln!(
+                "tuna-compositor: tablet: pad OSD for {} ({}) edition={edition_mode}",
+                osd.name, osd.layout_path
+            );
+            self.control
+                .queue_message(tuna_shell_control::Message::ShowPadOsd(Box::new(osd)));
+        }
+        #[cfg(not(feature = "drm"))]
+        let _ = (pad, edition_mode);
+    }
+
+    /// The shell closed the pad OSD: pad events go back to clients.
+    fn pad_osd_closed(&mut self, pad: u32) {
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &mut self.backend {
+            if drm.tablets().pad_osd_shown() == Some(pad) {
+                drm.tablets().set_pad_osd_shown(None);
+                self.pad_osd_labels_sent = None;
+                eprintln!("tuna-compositor: tablet: pad OSD closed");
+            }
+        }
+        #[cfg(not(feature = "drm"))]
+        let _ = pad;
+    }
+
+    /// Labels no action gives come from the focused client's
+    /// `set_feedback` (`meta_display_get_pad_button_label`'s second half).
+    fn fill_pad_feedback(
+        &self,
+        desc: &smithay::wayland::tablet_manager::TabletPadDescriptor,
+        labels: &mut tuna_shell_control::PadOsdLabels,
+    ) {
+        use smithay::wayland::tablet_manager::TabletSeatTrait;
+        let Some(handle) = self.state.seat.tablet_seat().get_pad(desc) else {
+            return;
+        };
+        for (button, slot) in labels.buttons.iter_mut().enumerate() {
+            if slot.label.is_none() {
+                slot.label = handle.button_label(button as u32);
+            }
+        }
+        for (ring, pair) in labels.rings.iter_mut().enumerate() {
+            for label in pair.iter_mut().filter(|l| l.is_none()) {
+                *label = handle.ring_label(ring as u32);
+            }
+        }
+        for (strip, pair) in labels.strips.iter_mut().enumerate() {
+            for label in pair.iter_mut().filter(|l| l.is_none()) {
+                *label = handle.strip_label(strip as u32);
+            }
+        }
+    }
+
+    /// After each tablet dispatch and settings read: the shell's pad
+    /// targets, and the shown OSD's labels when a mode or setting changed
+    /// them. A shell that went away takes its OSD with it.
+    fn pad_osd_tick(&mut self) {
+        #[cfg(feature = "drm")]
+        {
+            let Backend::Drm(drm) = &mut self.backend else {
+                return;
+            };
+            self.control.set_pad_targets(drm.tablets().pad_targets());
+            let Some(pad) = drm.tablets().pad_osd_shown() else {
+                return;
+            };
+            if !self.control.pad_osd_capable() {
+                drm.tablets().set_pad_osd_shown(None);
+                self.pad_osd_labels_sent = None;
+                return;
+            }
+            let Some((desc, mut labels)) = drm.tablets().pad_osd_labels(pad) else {
+                return;
+            };
+            self.fill_pad_feedback(&desc, &mut labels);
+            if self.pad_osd_labels_sent.as_ref() != Some(&labels) {
+                self.pad_osd_labels_sent = Some(labels.clone());
+                self.control
+                    .queue_message(tuna_shell_control::Message::PadOsdLabels { pad, labels });
+            }
+        }
     }
 
     /// GNOME's focus policy (P-WM-09): install a completed settings read,

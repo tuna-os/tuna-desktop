@@ -378,6 +378,12 @@ pub struct Session<'a> {
     /// `Lock` commands consult it; a restrictive key denies them with
     /// the administrator's reason instead of engaging the lock.
     lockdown: LockdownPolicy,
+    /// The hub's pads (id, device node) a `RequestPadOsd` may name.
+    pad_targets: std::rc::Rc<Vec<(u32, String)>>,
+    /// Admitted `RequestPadOsd`s (pad id, edition mode), drained by the hub.
+    pad_osd_requests: Vec<(u32, bool)>,
+    /// `PadOsdClosed`s, drained by the hub.
+    pad_osd_closed: Vec<u32>,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -475,6 +481,9 @@ impl<'a> Session<'a> {
             switcher_thumbnails: None,
             switcher_keys: None,
             lockdown: LockdownPolicy::default(),
+            pad_targets: std::rc::Rc::default(),
+            pad_osd_requests: Vec::new(),
+            pad_osd_closed: Vec::new(),
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -598,10 +607,21 @@ impl<'a> Session<'a> {
     }
 
     /// Ask the shell to draw GNOME's window menu.
-    /// Peers older than 0.42 cannot decode `ConfirmDisplayChange` and
-    /// receive nothing.
+    /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
+    /// older than 0.45 the tablet OSD messages, and receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
+            return Ok(());
+        }
+        let tablet = matches!(
+            menu,
+            Message::ShowOsd { .. }
+                | Message::ShowPadOsd(_)
+                | Message::PadOsdLabels { .. }
+                | Message::PadOsdInput { .. }
+                | Message::ClosePadOsd { .. }
+        );
+        if tablet && self.peer_minor < 45 {
             return Ok(());
         }
         self.conn.write_frame(menu)
@@ -1059,6 +1079,43 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::RequestPadOsd { target, edition_mode },
+            } => {
+                // padOsd.js `ShowAsync`: an unknown pad is "Invalid params";
+                // never over the lock screen.
+                let pad = self.pad_targets.iter().find(|(pad, node)| match &target {
+                    tuna_shell_control::PadOsdTarget::Pad(id) => id == pad,
+                    tuna_shell_control::PadOsdTarget::DeviceNode(wanted) => wanted == node,
+                });
+                let status = match pad {
+                    Some((pad, _)) if !self.locked.get() => {
+                        self.pad_osd_requests.push((*pad, edition_mode));
+                        CommandStatus::Applied
+                    }
+                    Some(_) => CommandStatus::Denied {
+                        reason: "locked".into(),
+                    },
+                    None => CommandStatus::Denied {
+                        reason: "Invalid params".into(),
+                    },
+                };
+                let applied = status == CommandStatus::Applied;
+                self.conn.write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::PadOsdClosed { pad },
+            } => {
+                self.pad_osd_closed.push(pad);
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1197,6 +1254,11 @@ impl<'a> Session<'a> {
             | Message::ShortcutConsent { .. }
             | Message::ConfirmDisplayChange { .. }
             | Message::AuthEvent { .. }
+            | Message::ShowOsd { .. }
+            | Message::ShowPadOsd(_)
+            | Message::PadOsdLabels { .. }
+            | Message::PadOsdInput { .. }
+            | Message::ClosePadOsd { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1250,6 +1312,11 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::DwellClickType { .. } => "DwellClickType",
         Message::PointerTimeout { .. } => "PointerTimeout",
         Message::OnScreenKeyboard { .. } => "OnScreenKeyboard",
+        Message::ShowOsd { .. } => "ShowOsd",
+        Message::ShowPadOsd(_) => "ShowPadOsd",
+        Message::PadOsdLabels { .. } => "PadOsdLabels",
+        Message::PadOsdInput { .. } => "PadOsdInput",
+        Message::ClosePadOsd { .. } => "ClosePadOsd",
     }
 }
 
@@ -1424,6 +1491,8 @@ fn apply_command(
         | CommandKind::BeginVerification { .. }
         | CommandKind::AnswerQuery { .. }
         | CommandKind::CancelVerification
+        | CommandKind::RequestPadOsd { .. }
+        | CommandKind::PadOsdClosed { .. }
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1497,6 +1566,10 @@ pub struct PollOutcome {
     pub shortcut_consent: Vec<(u64, bool)>,
     /// Display-change dialog answers (`true` = Keep Changes), in order.
     pub display_change: Vec<bool>,
+    /// Admitted pad OSD requests (pad id, edition mode), in order.
+    pub pad_osd_requests: Vec<(u32, bool)>,
+    /// Pad OSDs the shell closed, in order.
+    pub pad_osd_closed: Vec<u32>,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -1635,6 +1708,8 @@ pub struct ControlHub {
     /// `Lock` commands deny under a restrictive key. Only the lock key
     /// is live here; the shell owns the rest of the surface.
     lockdown: LockdownPolicy,
+    /// Pads (id, device node) the shell's `RequestPadOsd` may name.
+    pad_targets: std::rc::Rc<Vec<(u32, String)>>,
     /// Background policy reads (#357 follow-up): each refresh spawns
     /// one reader thread reporting here (up to
     /// [`LOCKDOWN_MAX_READERS`] concurrent); the tick drains
@@ -1747,6 +1822,7 @@ impl ControlHub {
             overview_sent: false,
             locked: std::rc::Rc::new(std::cell::Cell::new(false)),
             lockdown,
+            pad_targets: std::rc::Rc::default(),
             lockdown_tx,
             lockdown_rx,
             lockdown_inflight,
@@ -2135,6 +2211,18 @@ impl ControlHub {
         });
     }
 
+    /// The pads a `RequestPadOsd` may name: id and device node.
+    pub fn set_pad_targets(&mut self, pads: Vec<(u32, String)>) {
+        if *self.pad_targets != pads {
+            self.pad_targets = std::rc::Rc::new(pads);
+        }
+    }
+
+    /// Whether a connected shell renders the 0.45 tablet OSDs.
+    pub fn pad_osd_capable(&self) -> bool {
+        self.sessions.iter().any(|s| s.peer_minor >= 45)
+    }
+
     /// Set the session-lock flag; the next [`poll`](Self::poll) carries
     /// it to every live session as a (possibly content-stripped)
     /// [`Message::Snapshot`]. Idempotent. Unlock clears through session
@@ -2241,6 +2329,7 @@ impl ControlHub {
                 let before = model.focused();
                 let workspace_before = model.active_workspace();
                 let deltas_ok = session.emit_deltas(model).is_ok();
+                session.pad_targets = self.pad_targets.clone();
                 let cmd_ok = match session.handle_next(model) {
                     Ok(_) => true,
                     Err(ControlError::WouldBlock) => true,
@@ -2271,6 +2360,12 @@ impl ControlHub {
                     outcome
                         .display_change
                         .extend(std::mem::take(&mut session.display_change));
+                    outcome
+                        .pad_osd_requests
+                        .extend(std::mem::take(&mut session.pad_osd_requests));
+                    outcome
+                        .pad_osd_closed
+                        .extend(std::mem::take(&mut session.pad_osd_closed));
                     outcome
                         .input_source_switches
                         .extend(std::mem::take(&mut session.input_source_switches));

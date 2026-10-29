@@ -7679,6 +7679,30 @@ impl WindowManager {
         })
     }
 
+    /// `pick_keycode_for_keyval_in_current_group_in_impl`: the first key
+    /// of the effective layout typing `keysym`, as an evdev code, and the
+    /// level it sits on.
+    pub(crate) fn keycode_for_keysym(&self, state: &mut State, keysym: u32) -> Option<(u32, u32)> {
+        let keyboard = self.keyboard.clone()?;
+        keyboard.with_xkb_state(state, |context| {
+            let xkb = context.xkb().lock().ok()?;
+            let layout = xkb.active_layout().0;
+            // SAFETY: the keymap is only borrowed while the lock is held.
+            let keymap = unsafe { xkb.keymap() };
+            let (min, max) = (keymap.min_keycode().raw(), keymap.max_keycode().raw());
+            (min..max).find_map(|keycode| {
+                let levels = keymap.num_levels_for_key(keycode.into(), layout);
+                (0..levels).find_map(|level| {
+                    keymap
+                        .key_get_syms_by_level(keycode.into(), layout, level)
+                        .iter()
+                        .any(|sym| sym.raw() == keysym)
+                        .then(|| (keycode - XKB_X11_OFFSET, level))
+                })
+            })
+        })
+    }
+
     /// Queue one switcher drive event with a greppable trail for the
     /// CI journey (an empty switcher renders nothing, so pixels alone
     /// cannot prove the drive arrived).

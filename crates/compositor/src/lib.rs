@@ -128,6 +128,7 @@ pub mod spring;
 pub mod state;
 pub mod supervise;
 pub mod tablet;
+pub mod tablet_actions;
 pub(crate) mod tablet_settings;
 mod transient_family;
 pub mod transitions;

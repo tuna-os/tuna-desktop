@@ -1,8 +1,11 @@
-//! Owned GIO reader for GNOME's per-device tablet and stylus settings
-//! (`org.gnome.desktop.peripherals.tablet` at
-//! `/org/gnome/desktop/peripherals/tablets/VVVV:PPPP/` and
-//! `org.gnome.desktop.peripherals.tablet.stylus` per tool), read by the
-//! compositor itself as Mutter's `meta-input-settings.c` does in-process.
+//! Owned GIO reader for GNOME's per-device tablet, stylus and pad-button
+//! settings (`org.gnome.desktop.peripherals.tablet` at
+//! `/org/gnome/desktop/peripherals/tablets/VVVV:PPPP/`,
+//! `org.gnome.desktop.peripherals.tablet.stylus` per tool and
+//! `org.gnome.desktop.peripherals.tablet.pad-button` per pad button, ring
+//! and strip direction), read by the compositor itself as Mutter's
+//! `meta-input-settings.c` and `meta-pad-action-mapper.c` read them
+//! in-process.
 //!
 //! The mechanics are `wm_preferences.rs`'s: native `Settings` and their
 //! `changed` subscriptions live and retire on one owned GLib thread; every
@@ -10,15 +13,18 @@
 //! deadline the frame consumer enforces; a timed-out, panicked or poisoned
 //! worker is quarantined for good. Unlike the fixed focus keys these
 //! schemas are relocatable: the consumer names the paths it needs (one per
-//! connected tablet and per tool seen in proximity) and each read covers
-//! exactly those, watching each path once. A missing schema leaves the
-//! reader unavailable and every device on GNOME 51's defaults.
+//! connected tablet, per tool seen in proximity and per pad action) and
+//! each read covers exactly those, watching each path once. A missing
+//! schema leaves the reader unavailable and every device on GNOME 51's
+//! defaults. The one write, the tablet's `output` (Mutter's
+//! `cycle_tablet_output`), runs on the same thread.
 use crate::night_light::ReadError;
 use crate::night_light_settings::CacheStatus;
 use crate::tablet::{
     ButtonAction, EraserButtonMode, Mapping, StylusSettings, TabletSettings, STYLUS_SCHEMA,
     TABLET_SCHEMA,
 };
+use crate::tablet_actions::{PadButtonAction, PadButtonSettings, PAD_BUTTON_SCHEMA};
 use crate::wake::Wake;
 use gio::{glib, prelude::*};
 use std::cell::RefCell;
@@ -39,23 +45,29 @@ const TABLET_KEYS: [(&str, &str); 5] = [
     ("keep-aspect", "b"),
     ("left-handed", "b"),
 ];
-const STYLUS_KEYS: [(&str, &str); 9] = [
+const STYLUS_KEYS: [(&str, &str); 13] = [
     ("pressure-curve", "ai"),
     ("pressure-range", "ai"),
     ("eraser-pressure-curve", "ai"),
     ("eraser-pressure-range", "ai"),
     ("eraser-button-mode", "s"),
     ("eraser-button-action", "s"),
+    ("eraser-button-keybinding", "s"),
     ("button-action", "s"),
     ("secondary-button-action", "s"),
     ("tertiary-button-action", "s"),
+    ("button-keybinding", "s"),
+    ("secondary-button-keybinding", "s"),
+    ("tertiary-button-keybinding", "s"),
 ];
+const PAD_BUTTON_KEYS: [(&str, &str); 2] = [("action", "s"), ("keybinding", "s")];
 
 /// Which relocatable schema a path holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Kind {
     Tablet,
     Stylus,
+    PadButton,
 }
 
 /// One completed read: every requested path's values.
@@ -63,6 +75,7 @@ pub(crate) enum Kind {
 pub(crate) struct Snapshot {
     pub tablets: BTreeMap<String, TabletSettings>,
     pub styluses: BTreeMap<String, StylusSettings>,
+    pub pad_buttons: BTreeMap<String, PadButtonSettings>,
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +102,8 @@ struct Shared {
 }
 trait NativeReader {
     fn read(&mut self, wanted: &BTreeSet<(Kind, String)>) -> Result<Snapshot, ReadError>;
+    /// `g_settings_set_strv (info->settings, "output", edid)`.
+    fn write_output(&mut self, path: &str, output: &[String]) -> Result<(), ReadError>;
     /// What GNOME Settings does to one tablet and its stylus.
     #[cfg(test)]
     fn change(&self) {
@@ -183,6 +198,34 @@ impl Reader {
         if changed {
             self.shared.request(now);
         }
+    }
+    /// Write a tablet's `output` (switch-monitor). Runs on the worker; the
+    /// change notification then re-reads, so the mapping follows like any
+    /// other settings change. Best effort: a failed write is logged.
+    pub(crate) fn set_output(&self, path: String, output: [String; 3]) {
+        let source = glib::idle_source_new(
+            Some("tuna-tablet-settings-write"),
+            glib::Priority::DEFAULT,
+            move || {
+                let result = LOCAL.with(|local| {
+                    let mut local = local.borrow_mut();
+                    let local = local
+                        .as_mut()
+                        .ok_or_else(|| ReadError("worker unavailable".into()))?;
+                    local
+                        .native
+                        .as_mut()
+                        .ok_or_else(|| ReadError("settings never read".into()))?
+                        .write_output(&path, &output)
+                });
+                if let Err(error) = result {
+                    eprintln!("tuna-compositor: tablet: could not write {path} output: {}", error.0);
+                }
+                glib::ControlFlow::Break
+            },
+        );
+        source.attach(Some(&self.shared.context));
+        self.shared.wake.signal();
     }
     /// The frame consumer never invokes GIO, waits for a worker, or joins
     /// it. `Some` only for a completed, valid read.
@@ -402,6 +445,7 @@ fn schema_matches(schema: &gio::SettingsSchema, keys: &[(&str, &str)]) -> bool {
 struct GioReader {
     tablet: gio::SettingsSchema,
     stylus: gio::SettingsSchema,
+    pad_button: gio::SettingsSchema,
     backend: Option<gio::SettingsBackend>,
     shared: Weak<Shared>,
     /// One live settings object and its watch per path read so far.
@@ -411,17 +455,23 @@ impl GioReader {
     fn new(shared: Weak<Shared>) -> Result<Self, ReadError> {
         let source = gio::SettingsSchemaSource::default()
             .ok_or_else(|| ReadError("schema source unavailable".into()))?;
-        let tablet = source
-            .lookup(TABLET_SCHEMA, true)
-            .ok_or_else(|| ReadError("tablet schema unavailable".into()))?;
-        let stylus = source
-            .lookup(STYLUS_SCHEMA, true)
-            .ok_or_else(|| ReadError("stylus schema unavailable".into()))?;
-        Self::from_schemas(tablet, stylus, None, shared)
+        let lookup = |id: &str| {
+            source
+                .lookup(id, true)
+                .ok_or_else(|| ReadError(format!("{id} schema unavailable")))
+        };
+        Self::from_schemas(
+            lookup(TABLET_SCHEMA)?,
+            lookup(STYLUS_SCHEMA)?,
+            lookup(PAD_BUTTON_SCHEMA)?,
+            None,
+            shared,
+        )
     }
     fn from_schemas(
         tablet: gio::SettingsSchema,
         stylus: gio::SettingsSchema,
+        pad_button: gio::SettingsSchema,
         backend: Option<gio::SettingsBackend>,
         shared: Weak<Shared>,
     ) -> Result<Self, ReadError> {
@@ -431,9 +481,13 @@ impl GioReader {
         if !schema_matches(&stylus, &STYLUS_KEYS) {
             return Err(ReadError("stylus schema key/type mismatch".into()));
         }
+        if !schema_matches(&pad_button, &PAD_BUTTON_KEYS) {
+            return Err(ReadError("pad-button schema key/type mismatch".into()));
+        }
         Ok(Self {
             tablet,
             stylus,
+            pad_button,
             backend,
             shared,
             settings: HashMap::new(),
@@ -448,6 +502,7 @@ impl GioReader {
         let schema = match kind {
             Kind::Tablet => &self.tablet,
             Kind::Stylus => &self.stylus,
+            Kind::PadButton => &self.pad_button,
         };
         let settings = gio::Settings::new_full(schema, self.backend.as_ref(), Some(path));
         let shared = self.shared.clone();
@@ -494,9 +549,20 @@ impl NativeReader for GioReader {
                         .set_value("pressure-curve", &vec![0i32, 75, 25, 100].to_variant())
                         .unwrap();
                     settings.set_string("button-action", "back").unwrap();
+                    settings.set_string("tertiary-button-action", "keybinding").unwrap();
+                    settings.set_string("tertiary-button-keybinding", "<Control>z").unwrap();
+                }
+                Kind::PadButton => {
+                    settings.set_string("action", "keybinding").unwrap();
+                    settings.set_string("keybinding", "<Shift>b").unwrap();
                 }
             }
         }
+    }
+    fn write_output(&mut self, path: &str, output: &[String]) -> Result<(), ReadError> {
+        self.settings(Kind::Tablet, path)
+            .set_strv("output", output)
+            .map_err(|error| ReadError(error.to_string()))
     }
     fn read(&mut self, wanted: &BTreeSet<(Kind, String)>) -> Result<Snapshot, ReadError> {
         // Paths no longer wanted retire with their watches.
@@ -566,6 +632,23 @@ impl NativeReader for GioReader {
                                 "tertiary-button-action",
                                 ButtonAction::from_nick,
                             )?,
+                            eraser_button_keybinding: settings.string("eraser-button-keybinding").into(),
+                            button_keybinding: settings.string("button-keybinding").into(),
+                            secondary_button_keybinding: settings
+                                .string("secondary-button-keybinding")
+                                .into(),
+                            tertiary_button_keybinding: settings
+                                .string("tertiary-button-keybinding")
+                                .into(),
+                        },
+                    );
+                }
+                Kind::PadButton => {
+                    snapshot.pad_buttons.insert(
+                        path.clone(),
+                        PadButtonSettings {
+                            action: nick(&settings, "action", PadButtonAction::from_nick)?,
+                            keybinding: settings.string("keybinding").into(),
                         },
                     );
                 }
@@ -590,37 +673,11 @@ mod tests {
     const TABLET_PATH: &str = "/org/gnome/desktop/peripherals/tablets/056a:0357/";
     const OTHER_PATH: &str = "/org/gnome/desktop/peripherals/tablets/256c:006d/";
     const STYLUS_PATH: &str = "/org/gnome/desktop/peripherals/stylus/default-056a:0357/";
+    const PAD_PATH: &str = "/org/gnome/desktop/peripherals/tablets/056a:0357/buttonA/";
 
-    /// gsettings-desktop-schemas 51's tablet and stylus schemas, as
-    /// installed (relocatable, the enums from gdesktop-enums.h).
-    const SCHEMAS: &str = "<schemalist>\
-        <enum id='org.gnome.desktop.GDesktopTabletMapping'>\
-        <value nick='absolute' value='0'/><value nick='relative' value='1'/></enum>\
-        <enum id='org.gnome.desktop.GDesktopStylusButtonAction'>\
-        <value nick='default' value='0'/><value nick='middle' value='1'/>\
-        <value nick='right' value='2'/><value nick='back' value='3'/>\
-        <value nick='forward' value='4'/><value nick='switch-monitor' value='5'/>\
-        <value nick='keybinding' value='6'/></enum>\
-        <enum id='org.gnome.desktop.GDesktopStylusEraserButtonMode'>\
-        <value nick='default' value='0'/><value nick='button' value='1'/></enum>\
-        <schema id='org.gnome.desktop.peripherals.tablet'>\
-        <key name='output' type='as'><default>['', '', '']</default></key>\
-        <key name='mapping' enum='org.gnome.desktop.GDesktopTabletMapping'><default>'absolute'</default></key>\
-        <key name='area' type='ad'><default>[0.0, 0.0, 0.0, 0.0]</default></key>\
-        <key name='keep-aspect' type='b'><default>false</default></key>\
-        <key name='left-handed' type='b'><default>false</default></key>\
-        </schema>\
-        <schema id='org.gnome.desktop.peripherals.tablet.stylus'>\
-        <key name='pressure-curve' type='ai'><default>[0, 0, 100, 100]</default></key>\
-        <key name='pressure-range' type='ai'><default>[0, 100]</default></key>\
-        <key name='eraser-pressure-curve' type='ai'><default>[0, 0, 100, 100]</default></key>\
-        <key name='eraser-pressure-range' type='ai'><default>[0, 100]</default></key>\
-        <key name='eraser-button-mode' enum='org.gnome.desktop.GDesktopStylusEraserButtonMode'><default>'default'</default></key>\
-        <key name='eraser-button-action' enum='org.gnome.desktop.GDesktopStylusButtonAction'><default>'default'</default></key>\
-        <key name='button-action' enum='org.gnome.desktop.GDesktopStylusButtonAction'><default>'right'</default></key>\
-        <key name='secondary-button-action' enum='org.gnome.desktop.GDesktopStylusButtonAction'><default>'middle'</default></key>\
-        <key name='tertiary-button-action' enum='org.gnome.desktop.GDesktopStylusButtonAction'><default>'default'</default></key>\
-        </schema></schemalist>";
+    /// gsettings-desktop-schemas 51's tablet, stylus and pad-button
+    /// schemas, as installed (relocatable, the enums from gdesktop-enums.h).
+    const SCHEMAS: &str = include_str!("../../../tests/settings/gnome51-peripherals-tablet.gschema.xml");
 
     fn wake_loop() -> (Wake, calloop::EventLoop<'static, usize>) {
         let (wake, source) = Wake::new().unwrap();
@@ -652,9 +709,11 @@ mod tests {
                 let schemas = gio::SettingsSchemaSource::from_directory(&dir, None, false).unwrap();
                 let tablet = schemas.lookup(TABLET_SCHEMA, false).unwrap();
                 let stylus = schemas.lookup(STYLUS_SCHEMA, false).unwrap();
+                let pad_button = schemas.lookup(PAD_BUTTON_SCHEMA, false).unwrap();
                 Ok(Box::new(GioReader::from_schemas(
                     tablet,
                     stylus,
+                    pad_button,
                     Some(gio::memory_settings_backend_new()),
                     shared,
                 )?))
@@ -692,12 +751,17 @@ mod tests {
         // callback may schedule reads, never the periodic re-read.
         let poll_at = Instant::now();
         reader.want(
-            wanted(&[(Kind::Tablet, TABLET_PATH), (Kind::Stylus, STYLUS_PATH)]),
+            wanted(&[
+                (Kind::Tablet, TABLET_PATH),
+                (Kind::Stylus, STYLUS_PATH),
+                (Kind::PadButton, PAD_PATH),
+            ]),
             poll_at,
         );
         let first = completed(&reader, &mut loop_, poll_at);
         assert_eq!(first.tablets[TABLET_PATH], TabletSettings::default());
         assert_eq!(first.styluses[STYLUS_PATH], StylusSettings::default());
+        assert_eq!(first.pad_buttons[PAD_PATH], PadButtonSettings::default());
         assert_eq!(reader.status(), CacheStatus::Fresh);
         let source = glib::idle_source_new(
             Some("tuna-tablet-settings-watch-proof"),
@@ -721,6 +785,27 @@ mod tests {
         let stylus = &changed.styluses[STYLUS_PATH];
         assert_eq!(stylus.pressure_curve, vec![0, 75, 25, 100]);
         assert_eq!(stylus.button_action, ButtonAction::Back);
+        assert_eq!(stylus.tertiary_button_action, ButtonAction::Keybinding);
+        assert_eq!(stylus.tertiary_button_keybinding, "<Control>z");
+        assert_eq!(
+            changed.pad_buttons[PAD_PATH],
+            PadButtonSettings {
+                action: PadButtonAction::Keybinding,
+                keybinding: "<Shift>b".into(),
+            }
+        );
+        // switch-monitor's write lands like any change: the next read has it.
+        reader.set_output(TABLET_PATH.into(), [String::new(), String::new(), String::new()]);
+        let written = loop {
+            let snapshot = completed(&reader, &mut loop_, poll_at);
+            if snapshot.tablets[TABLET_PATH].output.as_ref().is_some_and(|o| o.len() == 3) {
+                break snapshot;
+            }
+        };
+        assert_eq!(
+            written.tablets[TABLET_PATH].output.as_deref(),
+            Some(&[String::new(), String::new(), String::new()][..])
+        );
         // A second tablet's path is its own: still GNOME's defaults.
         reader.want(
             wanted(&[(Kind::Tablet, TABLET_PATH), (Kind::Tablet, OTHER_PATH)]),
@@ -747,10 +832,11 @@ mod tests {
         compile(
             dir.path(),
             &SCHEMAS.replace(
-                "name='keep-aspect' type='b'><default>false",
-                "name='keep-aspect' type='s'><default>'no'",
+                "<key name=\"keep-aspect\" type=\"b\">\n      <default>false</default>",
+                "<key name=\"keep-aspect\" type=\"s\">\n      <default>'no'</default>",
             ),
         );
+        assert!(SCHEMAS.contains("<key name=\"keep-aspect\" type=\"b\">\n      <default>false</default>"));
         let (wake, mut loop_) = wake_loop();
         let reader = gio_reader(&wake, dir.path().to_path_buf());
         reader.want(wanted(&[(Kind::Tablet, TABLET_PATH)]), Instant::now());

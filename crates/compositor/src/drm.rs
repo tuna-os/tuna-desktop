@@ -47,6 +47,7 @@ use crate::windows::ManagerInput;
 
 pub mod color;
 pub mod libinput;
+pub mod libwacom;
 pub mod tablet;
 
 /// Scanout surface type: GBM buffers on the DRM device, each queued
@@ -1504,6 +1505,11 @@ impl DrmBackend {
     /// Tablet events the last libinput dispatch produced, in order.
     pub fn take_tablet_events(&mut self) -> Vec<crate::tablet::TabletEvent> {
         self.tablets.take_events()
+    }
+
+    /// The hardware tablets and pads (pad OSD requests and labels).
+    pub fn tablets(&mut self) -> &mut tablet::Tablets {
+        &mut self.tablets
     }
 
     /// The tablet and stylus settings paths to read.

@@ -328,6 +328,13 @@ impl WindowManager {
                     handle.strip(strip, position, finger, time);
                 }
             }
+            // The runtime's own effects; never routed to clients.
+            TabletEvent::EmulateKeybinding { .. }
+            | TabletEvent::SetOutput { .. }
+            | TabletEvent::ShowOsd { .. }
+            | TabletEvent::RequestPadOsd { .. }
+            | TabletEvent::PadOsdInput { .. }
+            | TabletEvent::ClosePadOsd { .. } => {}
         }
     }
 }
