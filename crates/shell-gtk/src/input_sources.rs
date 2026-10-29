@@ -126,10 +126,6 @@ impl Manager {
         &self.mru
     }
 
-    pub fn current(&self) -> Option<usize> {
-        self.current
-    }
-
     fn index_of(&self, source: &Source) -> Option<usize> {
         self.sources.iter().position(|s| s == source)
     }
@@ -196,10 +192,6 @@ impl Manager {
             self.held.clear();
         }
         self.per_window = on;
-    }
-
-    pub fn per_window(&self) -> bool {
-        self.per_window
     }
 
     /// `notify::focus-window` / overview showing and hiding →
@@ -302,7 +294,16 @@ impl XkbNames {
     }
 
     pub fn add_rules(&mut self, text: &str) {
-        let Ok(doc) = roxmltree::Document::parse(text) else {
+        // xkeyboard-config's registry starts with
+        // `<!DOCTYPE xkbConfigRegistry SYSTEM "xkb.dtd">`; it is a system
+        // file and declares no entities.
+        let Ok(doc) = roxmltree::Document::parse_with_options(
+            text,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..roxmltree::ParsingOptions::default()
+            },
+        ) else {
             return;
         };
         let item = |node: roxmltree::Node| {
@@ -885,7 +886,9 @@ mod tests {
     fn names_come_from_xkeyboard_config_rules() {
         let mut names = XkbNames::default();
         names.add_rules(
-            r#"<xkbConfigRegistry><layoutList>
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE xkbConfigRegistry SYSTEM "xkb.dtd">
+            <xkbConfigRegistry><layoutList>
             <layout><configItem><name>de</name><shortDescription>de</shortDescription>
             <description>German</description></configItem>
             <variantList><variant><configItem><name>nodeadkeys</name>
