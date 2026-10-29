@@ -18,6 +18,7 @@ import uuid
 import base64
 import stat
 import contextlib
+import traceback
 
 RECORDING_DIR = pathlib.Path("/run/tuna-vm-orca-recordings")
 RECORDING_STATE = RECORDING_DIR / "current.json"
@@ -218,39 +219,52 @@ def gpu_pci_caps():
 PAM_HELPER_FLAG = b"--internal-pam-conversation"
 
 
-def auth_process(pid):
-    """Read only fixed helper flags and kernel identity; never return argv."""
+def auth_process(pid, attempts=20):
+    """Read only fixed helper flags and kernel identity; never return argv.
+
+    fork → setpgid → exec and exit pass a process through instants at which
+    two reads disagree: a new group, executable or setuid owner, or the empty
+    command line of an address space being replaced or released. Every PAM
+    unlock does this twice (the compositor's helper spawn, then pam_unix's
+    unix_chkpwd child), so a read straddling one is repeated until the kernel
+    identity is self-consistent. A process that left is absent (None); one
+    that never settles still fails with its fixed code."""
     path = pathlib.Path(f"/proc/{pid}")
-    try:
-        first = (path / "stat").read_text().rsplit(")", 1)[1].split()
-        uid = path.stat().st_uid
-        executable = pathlib.Path(os.readlink(path / "exe")).name
-        inode = (path / "exe").stat()
-        marked = private = False
-        if executable == COMPOSITOR:
-            with (path / "cmdline").open("rb") as stream:
-                raw = stream.read(4097)
-            if len(raw) > 4096 or not raw.endswith(b"\0"):
-                error = RuntimeError("unbounded or partial compositor command metadata")
-                error.delayed_auth_code = "process-metadata-invalid"
+    for attempt in range(attempts):
+        try:
+            first = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            uid = path.stat().st_uid
+            executable = pathlib.Path(os.readlink(path / "exe")).name
+            inode = (path / "exe").stat()
+            marked = private = False
+            if executable == COMPOSITOR:
+                with (path / "cmdline").open("rb") as stream:
+                    raw = stream.read(4097)
+                if len(raw) > 4096 or not raw.endswith(b"\0"):
+                    error = RuntimeError("unbounded or partial compositor command metadata")
+                    error.delayed_auth_code = "process-metadata-invalid"
+                    raise error
+                args = raw[:-1].split(b"\0")
+                marked = PAM_HELPER_FLAG in args
+                private = len(args) == 2 and args[1] == PAM_HELPER_FLAG
+            second = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            after = (path / "exe").stat()
+            if ((first[19], first[1], first[2]) != (second[19], second[1], second[2])
+                    or (inode.st_dev, inode.st_ino) != (after.st_dev, after.st_ino)
+                    or uid != path.stat().st_uid):
+                error = RuntimeError("authentication process identity changed during read")
+                error.delayed_auth_code = "process-identity-changed"
                 raise error
-            args = raw[:-1].split(b"\0")
-            marked = PAM_HELPER_FLAG in args
-            private = len(args) == 2 and args[1] == PAM_HELPER_FLAG
-        second = (path / "stat").read_text().rsplit(")", 1)[1].split()
-        after = (path / "exe").stat()
-        if ((first[19], first[1], first[2]) != (second[19], second[1], second[2])
-                or (inode.st_dev, inode.st_ino) != (after.st_dev, after.st_ino)
-                or uid != path.stat().st_uid):
-            error = RuntimeError("authentication process identity changed during read")
-            error.delayed_auth_code = "process-identity-changed"
-            raise error
-        return {"pid": int(pid), "uid": uid, "ppid": int(first[1]),
-                "pgrp": int(first[2]), "start_ticks": int(first[19]),
-                "executable": executable, "exe_device": inode.st_dev, "exe_inode": inode.st_ino,
-                "_marked": marked, "_private": private, "_state": second[0]}
-    except (FileNotFoundError, ProcessLookupError):
-        return None
+            return {"pid": int(pid), "uid": uid, "ppid": int(first[1]),
+                    "pgrp": int(first[2]), "start_ticks": int(first[19]),
+                    "executable": executable, "exe_device": inode.st_dev, "exe_inode": inode.st_ino,
+                    "_marked": marked, "_private": private, "_state": second[0]}
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except RuntimeError:
+            if attempt + 1 >= attempts:
+                raise
+        time.sleep(0.005)
 
 
 def public_auth_identity(value):
@@ -431,47 +445,98 @@ def owner_login_session():
 
 
 def inventory():
-    state = json.loads(STATE.read_text())
-    processes = []
-    _, helpers = classify_pam_helpers(pam_process_snapshot())
-    helper_identities = {row["pid"]: public_auth_identity(row) for row in helpers}
-    for path in pathlib.Path("/proc").iterdir():
-        if not path.name.isdigit():
-            continue
-        try:
-            uid = path.stat().st_uid
-            executable = pathlib.Path(os.readlink(path / "exe")).name
-            if int(path.name) in helper_identities:
-                observed_helper = auth_process(int(path.name))
-                if (observed_helper is not None and observed_helper["_private"]
-                        and public_auth_identity(observed_helper) == helper_identities[int(path.name)]):
-                    continue
-            if uid != OWNER.pw_uid or executable not in {
-                COMPOSITOR, SHELL_GTK, "gnome-disks",
-                "gnome-system-monitor", "nautilus",
-            }:
+    # Each failure carries its fixed stage; main() returns it with the
+    # exception type and this probe's frame locations, never exception text.
+    stage = "state-read"
+    try:
+        text = STATE.read_text()
+        stage = "state-parse"
+        state = json.loads(text)
+        stage = "pam-snapshot"
+        _, helpers = classify_pam_helpers(pam_process_snapshot())
+        helper_identities = {row["pid"]: public_auth_identity(row) for row in helpers}
+        stage = "process-scan"
+        processes = []
+        for path in pathlib.Path("/proc").iterdir():
+            if not path.name.isdigit():
                 continue
-            stat = (path / "stat").read_text().rsplit(")", 1)[1].split()
-            processes.append({"pid": int(path.name), "uid": uid,
-                              "executable": executable, "start_ticks": int(stat[19])})
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            continue
-    owned = owner_login_session()
-    # Only the original four snapshot keys are mandatory: the published
-    # flavor still ships a Tuna Desktop build that predates the newer
-    # instrumentation, and session detection must not depend on it.
-    # Gates that need a newer key observe an explicit None instead of
-    # collapsing every probe into a missing session (run 37696030597).
-    return {"probe_uid": os.geteuid(), "session_uid": OWNER.pw_uid,
-            "session": owned,
-            # Published pre-key snapshots (run 37696030597) still detect the
-            # session; a missing device list stays None, never an empty list.
-            "state": {k: state[k] for k in ("locked", "windows", "focused", "active_workspace")}
-                     | {k: state.get(k) for k in ("overview_open", "pointer_position",
-                                                  "native_relative_motion_count", "input_devices",
-                                                  "mouse_left_handed", "touchpad_left_handed",
-                                                  "hot_corners", "auth_owner", "power_save_mode")},
-            "processes": sorted(processes, key=lambda item: item["pid"])}
+            try:
+                uid = path.stat().st_uid
+                executable = pathlib.Path(os.readlink(path / "exe")).name
+                if int(path.name) in helper_identities:
+                    observed_helper = auth_process(int(path.name))
+                    # The exact private helper this scan classified, still
+                    # itself or since departed, is never an owned compositor.
+                    if observed_helper is None or (observed_helper["_private"]
+                            and public_auth_identity(observed_helper) == helper_identities[int(path.name)]):
+                        continue
+                if uid != OWNER.pw_uid or executable not in {
+                    COMPOSITOR, SHELL_GTK, "gnome-disks",
+                    "gnome-system-monitor", "nautilus",
+                }:
+                    continue
+                stat = (path / "stat").read_text().rsplit(")", 1)[1].split()
+                processes.append({"pid": int(path.name), "uid": uid,
+                                  "executable": executable, "start_ticks": int(stat[19])})
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+        stage = "login-session"
+        owned = owner_login_session()
+        stage = "snapshot-keys"
+        # Only the original four snapshot keys are mandatory: the published
+        # flavor still ships a Tuna Desktop build that predates the newer
+        # instrumentation, and session detection must not depend on it.
+        # Gates that need a newer key observe an explicit None instead of
+        # collapsing every probe into a missing session (run 37696030597).
+        return {"probe_uid": os.geteuid(), "session_uid": OWNER.pw_uid,
+                "session": owned,
+                # Published pre-key snapshots (run 37696030597) still detect the
+                # session; a missing device list stays None, never an empty list.
+                "state": {k: state[k] for k in ("locked", "windows", "focused", "active_workspace")}
+                         | {k: state.get(k) for k in ("overview_open", "pointer_position",
+                                                      "native_relative_motion_count", "input_devices",
+                                                      "mouse_left_handed", "touchpad_left_handed",
+                                                      "hot_corners", "auth_owner", "power_save_mode")},
+                "processes": sorted(processes, key=lambda item: item["pid"])}
+    except Exception as error:
+        error.inventory_stage = stage
+        raise
+
+
+INVENTORY_STAGES = ("state-read", "state-parse", "pam-snapshot", "process-scan",
+                    "login-session", "snapshot-keys")
+
+
+def inventory_error(error):
+    """Fixed stage, type and code plus this probe's own frame locations;
+    never exception text, argv, paths, subprocess output or locals."""
+    oserrors = {"OSError", "FileNotFoundError", "PermissionError", "ProcessLookupError"}
+    types = oserrors | {"RuntimeError", "ValueError", "TypeError", "KeyError", "IndexError",
+                        "AttributeError", "StopIteration", "JSONDecodeError", "UnicodeDecodeError",
+                        "CalledProcessError", "TimeoutExpired"}
+    kind = type(error).__name__
+    stage = getattr(error, "inventory_stage", None)
+    code = getattr(error, "delayed_auth_code", None)
+    result = {"stage": stage if type(stage) is str and stage in INVENTORY_STAGES else "unstaged",
+              "exception_type": kind if kind in types else "OtherError",
+              "code": code if kind == "RuntimeError" and code in ("process-identity-changed",
+                                                                 "process-metadata-invalid")
+              else "observation-exception"}
+    number = getattr(error, "errno", None)
+    if kind in oserrors and type(number) is int and 0 <= number <= 4095:
+        result["errno"] = number
+    returncode = getattr(error, "returncode", None)
+    if kind == "CalledProcessError" and type(returncode) is int and -255 <= returncode <= 255:
+        result["returncode"] = returncode
+    # Function names and line numbers in this file locate the failing check
+    # at the reported commit; other files' frames and source text are omitted.
+    source = inventory_error.__code__.co_filename
+    result["frames"] = [[frame.name, frame.lineno]
+                        for frame in traceback.extract_tb(error.__traceback__)
+                        if frame.filename == source and type(frame.lineno) is int
+                        and 0 < frame.lineno <= 1000000 and len(frame.name) <= 64
+                        and frame.name.isascii() and frame.name.isidentifier()][-16:]
+    return result
 
 
 def owned_compositor(processes):
@@ -1645,7 +1710,13 @@ def main():
         inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
     elif action == "inventory":
-        result = inventory()
+        try:
+            result = inventory()
+        except Exception as error:
+            # One bounded record (vm_guest_agent.FAILURE_RECORDS); the
+            # traceback text itself never leaves the guest.
+            print(json.dumps({"inventory_error": inventory_error(error)}))
+            raise SystemExit(1) from None
     elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-stop"):
         if len(sys.argv) != 3:
             raise ValueError("strip action requires exactly one nonce")

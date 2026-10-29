@@ -5,6 +5,7 @@ Protocol: https://www.qemu.org/docs/master/interop/qemu-ga-ref.html
 import base64
 import binascii
 import json
+import re
 import socket
 import time
 
@@ -131,11 +132,50 @@ def valid_delayed_auth_error(value):
             and type(present) is bool and not (count == 0 and present))
 
 
+INVENTORY_FRAME_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def valid_inventory_error(value):
+    """Fixed stage/type/code, bounded errno/returncode and the probe's own
+    (function, line) frames; never exception text, argv or paths."""
+    oserrors = {"OSError", "FileNotFoundError", "PermissionError", "ProcessLookupError"}
+    types = oserrors | {"RuntimeError", "ValueError", "TypeError", "KeyError", "IndexError",
+                        "AttributeError", "StopIteration", "JSONDecodeError", "UnicodeDecodeError",
+                        "CalledProcessError", "TimeoutExpired", "OtherError"}
+    stages = {"state-read", "state-parse", "pam-snapshot", "process-scan", "login-session",
+              "snapshot-keys", "unstaged"}
+    base = {"stage", "exception_type", "code", "frames"}
+    if type(value) is not dict or not base <= set(value) or not set(value) <= base | {"errno", "returncode"}:
+        return False
+    if (type(value["stage"]) is not str or value["stage"] not in stages
+            or type(value["exception_type"]) is not str or value["exception_type"] not in types):
+        return False
+    if value["code"] not in ("observation-exception", "process-identity-changed", "process-metadata-invalid"):
+        return False
+    if value["code"] != "observation-exception" and value["exception_type"] != "RuntimeError":
+        return False
+    if "errno" in value and (value["exception_type"] not in oserrors or type(value["errno"]) is not int
+                             or not 0 <= value["errno"] <= 4095):
+        return False
+    if "returncode" in value and (value["exception_type"] != "CalledProcessError"
+                                  or type(value["returncode"]) is not int or not -255 <= value["returncode"] <= 255):
+        return False
+    frames = value["frames"]
+    return type(frames) is list and len(frames) <= 16 and all(
+        type(frame) is list and len(frame) == 2 and type(frame[0]) is str
+        and INVENTORY_FRAME_NAME.fullmatch(frame[0]) is not None
+        and type(frame[1]) is int and 0 < frame[1] <= 1000000 for frame in frames)
+
+
 # Lifecycle actions whose failure prints one bounded, validated record on
 # stdout; any other action's output (and every stderr) stays private.
 FAILURE_RECORDS = {"orca-read": ("orca_read_error", valid_orca_read_error),
                    "strip-stop": ("strip_stop_error", valid_strip_stop_error),
-                   "delayed-auth-state": ("delayed_auth_error", valid_delayed_auth_error)}
+                   "delayed-auth-state": ("delayed_auth_error", valid_delayed_auth_error),
+                   "inventory": ("inventory_error", valid_inventory_error)}
+# Records that must be the whole output and are logged before raising, so a
+# caller's cleanup failure cannot hide them.
+LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory"}
 def speech_failure_diagnostic(encoded):
     if not isinstance(encoded, str) or len(encoded) > 5464:
         return None
@@ -356,7 +396,7 @@ class GuestAgent:
                             output = base64.b64decode(encoded, validate=True)
                             if len(output) <= 4096:
                                 root = json.loads(output)
-                                if action == "delayed-auth-state" and (type(root) is not dict or set(root) != {key}):
+                                if action in LOGGED_FAILURE_RECORDS and (type(root) is not dict or set(root) != {key}):
                                     diagnostic = None
                                 else:
                                     diagnostic = root.get(key)
@@ -365,10 +405,10 @@ class GuestAgent:
                         except (binascii.Error, ValueError, UnicodeDecodeError, AttributeError, TypeError):
                             diagnostic = None
                         if valid(diagnostic):
-                            if action == "delayed-auth-state":
-                                # Preserve the sanitized reason before the lane's
-                                # restore-unlock finally block can itself fail.
-                                print("tuna-vm-lane: delayed-auth-state failure " + json.dumps(diagnostic), flush=True)
+                            if action in LOGGED_FAILURE_RECORDS:
+                                # Preserve the sanitized reason before a caller's
+                                # cleanup (restore-unlock, Orca reset) can itself fail.
+                                print(f"tuna-vm-lane: {action} failure " + json.dumps(diagnostic), flush=True)
                             raise RuntimeError(f"guest lifecycle {action} failed (exit={status.get('exitcode')}): {json.dumps(diagnostic)}")
                     raise RuntimeError(f"guest lifecycle {action} failed (exit={status.get('exitcode')})")
                 return json.loads(base64.b64decode(status.get("out-data", ""), validate=True))

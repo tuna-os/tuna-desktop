@@ -2936,19 +2936,28 @@ class PrivatePamSleepControls(unittest.TestCase):
                 self.assertIsNone(self.match(trace=trace))
 
     def test_same_pid_library_lines_stay_separate_records(self):
-        # Run 40822024326: on wake the compositor's own libinput handler
-        # logged right after its owned-retirement receipt.
+        # Runs 40822024326 and 40468688011: on wake the compositor's own
+        # libinput handler logged right after its owned-retirement receipt;
+        # glued on, the receipt never parsed and the 25 s retirement window
+        # expired on its last inventory poll. The compositor's Orca child
+        # diagnostic is another whole record on the same stderr.
         libinput = ('libinput error: event0  - Power Button: client bug: event processing '
                     'lagging behind by 644ms, your system is too slow')
         mesa = 'MESA-EGL: warning: egl: failed to create dri2 screen'
+        orca = 'TUNA_ORCA_DIAGNOSTIC stage=child-exit pid=9813 attempt=0 code=-1 signal=9'
         serial = '\n'.join([self.trace(), 'tuna-vm-session[600]: ' + libinput,
-                            'tuna-vm-session[600]: ' + mesa])
+                            'tuna-vm-session[600]: ' + mesa, 'tuna-vm-session[600]: ' + orca])
         records = lane.session_records(serial)
-        self.assertIn(libinput, records)
-        self.assertIn(mesa, records)
+        for line in (libinput, mesa, orca):
+            self.assertIn(line, records)
         self.assertEqual(self.match(trace=serial), self.event)
-        fragmented = self.fragmented_trace() + '\n' + 'tuna-vm-session[600]: ' + libinput
-        self.assertEqual(self.match(trace=fragmented), self.event)
+        for line in (libinput, orca):
+            fragmented = self.fragmented_trace() + '\n' + 'tuna-vm-session[600]: ' + line
+            self.assertEqual(self.match(trace=fragmented), self.event)
+        # A sheared piece of a Tuna record is still its continuation.
+        self.assertEqual(lane.session_records('tuna-vm-session[600]: tuna-compositor: \n'
+                                              'tuna-vm-session[600]: libinput: scroll-wheel emulation rejected'),
+                         ['tuna-compositor: libinput: scroll-wheel emulation rejected'])
 
     def match(self, trace=None, original=None, physical=None, current=8):
         return lane.cancelled_sleep_auth_retirement(self.trace() if trace is None else trace,
@@ -3677,11 +3686,15 @@ class DelayedAuthFailureDiagnostics(unittest.TestCase):
         self.assertEqual(scope["delayed_auth_error"](PrivateException("private text"))["exception_type"], "OtherError")
 
     def test_actual_process_reader_failures_have_distinct_fixed_codes(self):
+        # Reads that never settle (metadata always partial, group changing
+        # between every pair of reads) still fail with their fixed code once
+        # the bounded re-reads are spent; one-shot transitions are covered by
+        # InventoryProcessRaces.
         node = next(node for node in ast.parse(self.SOURCE.read_text()).body
                     if isinstance(node, ast.FunctionDef) and node.name == "auth_process")
         for metadata, changed_group, code in [(b"", False, "process-metadata-invalid"),
                 (b"/usr/bin/tuna-compositor\0", True, "process-identity-changed")]:
-            reads = [0]
+            reads, sleeps = [0], []
             class ProcPart:
                 def __init__(self, kind="process"):
                     self.kind = kind
@@ -3691,7 +3704,7 @@ class DelayedAuthFailureDiagnostics(unittest.TestCase):
                     return SimpleNamespace(st_uid=1000, st_dev=1, st_ino=77)
                 def read_text(self):
                     reads[0] += 1
-                    group = 700 if changed_group and reads[0] > 1 else 2
+                    group = 700 if changed_group and reads[0] % 2 == 0 else 2
                     return "700 (controlled) " + " ".join(["S", "600", str(group)] + ["0"] * 16 + ["1700"])
                 def open(self, mode):
                     return io.BytesIO(metadata)
@@ -3699,6 +3712,7 @@ class DelayedAuthFailureDiagnostics(unittest.TestCase):
             scope["pathlib"] = SimpleNamespace(Path=lambda path:
                 ProcPart() if str(path).startswith("/proc/") else Path(path))
             scope["os"] = SimpleNamespace(readlink=lambda _: "/usr/bin/tuna-compositor")
+            scope["time"] = SimpleNamespace(sleep=sleeps.append)
             scope["PAM_HELPER_FLAG"] = b"--internal-pam-conversation"
             exec(compile(ast.Module(body=[node], type_ignores=[]), str(self.SOURCE), "exec"), scope)
             scope["pam_process_snapshot"] = lambda: [scope["auth_process"](700)]
@@ -3706,6 +3720,8 @@ class DelayedAuthFailureDiagnostics(unittest.TestCase):
                 scope["delayed_auth_state"](600, 1500)
             self.assertEqual(scope["delayed_auth_error"](caught.exception),
                              {"stage": "process-snapshot", "exception_type": "RuntimeError", "code": code})
+            self.assertEqual(len(sleeps), 19)
+            self.assertEqual(reads[0], 20 if metadata == b"" else 40)
 
     def test_other_read_errors_keep_only_their_fixed_stage_and_type(self):
         desktop, _ = self.rows()
@@ -3793,6 +3809,278 @@ class DelayedAuthFailureDiagnostics(unittest.TestCase):
                         base64.b64encode(b"[]").decode(), base64.b64encode(b"\xff").decode(), None]:
             self.assertEqual(self.transport_error({}, **{"out-data": encoded}), generic)
         self.assertEqual(self.transport_error({"delayed_auth_error": record}, **{"out-truncated": True}), generic)
+
+
+class InventoryProcessRaces(unittest.TestCase):
+    """Production inventory()/auth_process() over controlled /proc fixtures.
+
+    Runs 40822030597, 40811118152 and 40173107742 started an inventory poll
+    ~60 ms before `lock password submitted`; it exited 1 before the PAM helper
+    retired, while the helper (and pam_unix's unix_chkpwd child) was being
+    spawned. Fixtures only; never a guest, PAM or real /proc."""
+    NAMES = ("auth_process", "public_auth_identity", "classify_pam_helpers", "pam_process_snapshot",
+             "inventory", "inventory_error", "owner_login_session", "INVENTORY_STAGES")
+    STATE = {"locked": True, "windows": [], "focused": None, "active_workspace": 0}
+    DESKTOP_ARGS = b"/usr/bin/tuna-compositor\0"
+    HELPER_ARGS = b"/proc/self/fd/11\0--internal-pam-conversation\0"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        (self.root / "bin").mkdir()
+        self.binaries = {}
+        for name in ("tuna-compositor", "tuna-shell-gtk"):
+            self.binaries[name] = self.root / "bin" / name
+            self.binaries[name].write_bytes(name.encode())
+        self.process(600, 2, 2, 1500, "tuna-compositor", self.DESKTOP_ARGS)
+        self.process(650, 600, 650, 1600, "tuna-shell-gtk")
+        self.process(700, 600, 700, 1700, "tuna-compositor", self.HELPER_ARGS)
+        self.readlinks, self.sleeps = {}, []
+        self.on_readlink = lambda pid, count: None
+        self.on_sleep = lambda: None
+
+    def process(self, pid, parent, group, ticks, binary, args=None):
+        path = self.root / "proc" / str(pid)
+        path.mkdir(parents=True)
+        fields = ["S", str(parent), str(group)] + ["0"] * 16 + [str(ticks)]
+        (path / "stat").write_text(f"{pid} ({binary[:15]}) " + " ".join(fields))
+        if args is not None:
+            (path / "cmdline").write_bytes(args)
+        (path / "exe").symlink_to(self.binaries[binary])
+
+    def guest(self, state=None, call=None):
+        uid = os.getuid()
+        def proc_path(path):
+            path = str(path)
+            if path == "/proc":
+                return self.root / "proc"
+            if path.startswith("/proc/"):
+                return self.root / "proc" / path[len("/proc/"):]
+            return Path(path)
+        def readlink(path):
+            target = os.readlink(path)
+            pid = int(Path(path).parent.name)
+            self.readlinks[pid] = self.readlinks.get(pid, 0) + 1
+            self.on_readlink(pid, self.readlinks[pid])
+            return target
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            self.on_sleep()
+        def sessions(*args, check=True):
+            if args[:2] == ("loginctl", "list-sessions"):
+                return f"1 {uid} tuna-test seat0 tty1"
+            if args[:2] == ("loginctl", "show-session"):
+                return f"Id=1\nVTNr=1\nUser={uid}\nService=greetd\nType=wayland\nClass=user"
+            raise AssertionError(args)
+        state_path = self.root / "tuna-vm-state.json"
+        state_path.write_text(json.dumps(self.STATE) if state is None else state)
+        scope = lifecycle_scope(*self.NAMES)
+        scope.update(json=json, traceback=__import__("traceback"), STATE=state_path,
+                     os=SimpleNamespace(readlink=readlink, geteuid=lambda: 0),
+                     pathlib=SimpleNamespace(Path=proc_path), time=SimpleNamespace(sleep=sleep),
+                     OWNER=SimpleNamespace(pw_uid=uid, pw_name="tuna-test"),
+                     LOGIN_SESSION=DeviceInventoryProjection.GREETD, call=call or sessions,
+                     PAM_HELPER_FLAG=b"--internal-pam-conversation", **guest_identity())
+        return scope
+
+    def pids(self, result):
+        return [(p["pid"], p["executable"]) for p in result["processes"]]
+
+    def test_classified_helper_is_excluded_from_owned_processes(self):
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
+        self.assertEqual(self.sleeps, [])
+
+    def test_helper_exiting_after_its_scan_read_is_absent_not_an_owned_compositor(self):
+        # Snapshot readlinks 700 twice; the scan's own read is the third.
+        def exit_after_scan_read(pid, count):
+            if pid == 700 and count == 3:
+                (self.root / "proc/700/exe").unlink()  # exited; a zombie keeps stat
+        self.on_readlink = exit_after_scan_read
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
+        import shutil
+        self.setUp()
+        self.on_readlink = lambda pid, count: (pid == 700 and count == 3
+                                               and shutil.rmtree(self.root / "proc/700"))
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
+
+    def test_helper_exiting_mid_snapshot_read_is_absent_not_a_failure(self):
+        # exit_mm() releases the command line before the exe link and stat go.
+        def released(pid, count):
+            if pid == 700 and count == 2:
+                (self.root / "proc/700/cmdline").write_bytes(b"")
+        self.on_readlink = released
+        self.on_sleep = lambda: (self.root / "proc/700/exe").unlink()
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
+        self.assertEqual(self.sleeps, [0.005])
+
+    def scripted(self, timeline):
+        """auth_process over one /proc/701 whose state follows `timeline`:
+        (reads, state) pairs served in order, the last persisting; a None
+        state is a reaped process."""
+        reads = [0]
+        def current():
+            reads[0] += 1
+            index = reads[0]
+            for count, value in timeline:
+                if count is None or index <= count:
+                    if value is None:
+                        raise FileNotFoundError("reaped")
+                    return value
+                index -= count
+        class Part:
+            def __init__(self, part=None):
+                self.part = part
+            def __truediv__(self, part):
+                return Part(part)
+            def read_text(self):
+                value = current()
+                return "701 (x) " + " ".join(["S", "600", str(value["pgrp"])] + ["0"] * 16 + ["1700"])
+            def stat(self):
+                value = current()
+                if self.part is None:
+                    return SimpleNamespace(st_uid=value["uid"])
+                return SimpleNamespace(st_dev=1, st_ino=value["inode"])
+            def open(self, mode):
+                return io.BytesIO(current()["cmdline"])
+        scope = self.guest()
+        scope["pathlib"] = SimpleNamespace(Path=lambda path: Part() if str(path).startswith("/proc/") else Path(path))
+        scope["os"] = SimpleNamespace(readlink=lambda path: current()["exe"])
+        scope["OWNER"] = SimpleNamespace(pw_uid=1000)
+        return scope["auth_process"](701), scope
+
+    def test_spawn_transitions_settle_to_one_consistent_identity(self):
+        forked = dict(uid=1000, exe="/usr/bin/tuna-compositor", inode=77, pgrp=2, cmdline=self.DESKTOP_ARGS)
+        grouped = dict(forked, pgrp=701)
+        helper = dict(grouped, cmdline=self.HELPER_ARGS)
+        # Rust's pre_exec setpgid(0, 0) lands between the two stat reads.
+        row, _ = self.scripted([(5, forked), (None, grouped)])
+        self.assertEqual((row["pgrp"], row["_marked"]), (701, False))
+        self.assertEqual(self.sleeps, [0.005])
+        # execve(): the command line reads empty until the new image's is set.
+        self.sleeps.clear()
+        row, _ = self.scripted([(4, grouped), (1, dict(grouped, cmdline=b"")), (None, helper)])
+        self.assertEqual((row["pgrp"], row["_private"]), (701, True))
+        self.assertEqual(self.sleeps, [0.005])
+        # pam_unix's fork of the helper executes setuid unix_chkpwd mid-read.
+        self.sleeps.clear()
+        child = dict(helper, pgrp=700)
+        chkpwd = dict(child, uid=0, exe="/usr/bin/unix_chkpwd", inode=99)
+        row, scope = self.scripted([(6, child), (None, chkpwd)])
+        self.assertEqual((row["uid"], row["executable"], row["exe_inode"]), (0, "unix_chkpwd", 99))
+        desktop = dict(pid=600, uid=1000, ppid=2, pgrp=2, start_ticks=1500, executable="tuna-compositor",
+                       exe_device=1, exe_inode=77, _marked=False, _private=False, _state="S")
+        self.assertEqual(scope["classify_pam_helpers"]([desktop, row]), (desktop, []))
+        # Reaped mid-read: absent.
+        row, _ = self.scripted([(4, helper), (None, None)])
+        self.assertIsNone(row)
+
+    def failure(self, scope, kind):
+        """inventory()'s record with the traceback intact (assertRaises drops it)."""
+        try:
+            scope["inventory"]()
+        except kind as error:
+            return scope["inventory_error"](error)
+        self.fail("inventory unexpectedly succeeded")
+
+    def test_unsettled_helper_still_fails_with_staged_record_and_own_frames(self):
+        (self.root / "proc/700/cmdline").write_bytes(self.HELPER_ARGS[:-1])  # never NUL-terminated
+        record = self.failure(self.guest(), RuntimeError)
+        self.assertEqual(len(self.sleeps), 19)
+        self.assertEqual({key: record[key] for key in ("stage", "exception_type", "code")},
+                         {"stage": "pam-snapshot", "exception_type": "RuntimeError",
+                          "code": "process-metadata-invalid"})
+        self.assertEqual([name for name, _ in record["frames"]],
+                         ["inventory", "pam_process_snapshot", "auth_process"])
+        lines = LIFECYCLE_SOURCE.read_text().splitlines()
+        self.assertEqual(lines[record["frames"][-1][1] - 1].strip(), "raise error")
+        self.assertTrue(lane.guest_agent.valid_inventory_error(record))
+
+    def test_partially_written_state_file_fails_closed_at_parse_stage(self):
+        # The compositor publishes the snapshot by write-temp + rename, so a
+        # reader never sees a partial file; one would be a writer bug, so the
+        # probe fails with a typed stage instead of retrying past it.
+        runtime = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
+        publish = runtime[runtime.index("fn publish_state(&mut self)"):]
+        publish = publish[:publish.index("\n    }\n") + 6]
+        self.assertIn('let tmp = path.with_extension("tmp");', publish)
+        self.assertIn("std::fs::write(&tmp, &doc).is_ok() && std::fs::rename(&tmp, path).is_ok()", publish)
+        record = self.failure(self.guest(state=json.dumps(self.STATE)[:17]), json.JSONDecodeError)
+        self.assertEqual({key: record[key] for key in ("stage", "exception_type", "code")},
+                         {"stage": "state-parse", "exception_type": "JSONDecodeError",
+                          "code": "observation-exception"})
+        self.assertEqual([name for name, _ in record["frames"]], ["inventory"])
+        self.assertTrue(lane.guest_agent.valid_inventory_error(record))
+
+    def run_branch(self, scope):
+        import contextlib
+        main = next(node for node in ast.parse(LIFECYCLE_SOURCE.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "main")
+        branch = next(node for node in ast.walk(main) if isinstance(node, ast.If)
+                      and isinstance(node.test, ast.Compare)
+                      and any(isinstance(value, ast.Constant) and value.value == "inventory"
+                              for value in node.test.comparators))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            exec(compile(ast.Module(body=branch.body, type_ignores=[]), str(LIFECYCLE_SOURCE), "exec"), scope)
+        self.assertEqual(caught.exception.code, 1)
+        return output.getvalue()
+
+    def transport(self, output, **status):
+        import contextlib
+        actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        failure = {"exited": True, "exitcode": 1, "out-data": base64.b64encode(output.encode()).decode(),
+                   "err-data": base64.b64encode(b"private traceback text").decode(), **status}
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log), patch.object(actor, "command", side_effect=[{"pid": 10}, failure]):
+            with self.assertRaises(RuntimeError) as caught:
+                actor.run("inventory")
+        self.assertNotIn("private", str(caught.exception) + log.getvalue())
+        return str(caught.exception), log.getvalue()
+
+    def test_failed_action_returns_bounded_record_the_host_logs_and_raises(self):
+        def failing(*args, check=True):
+            raise subprocess.CalledProcessError(1, list(args), output="private stdout", stderr="private stderr")
+        output = self.run_branch(self.guest(call=failing))
+        root = json.loads(output)
+        self.assertEqual(set(root), {"inventory_error"})
+        record = root["inventory_error"]
+        self.assertEqual({key: record[key] for key in ("stage", "exception_type", "code", "returncode")},
+                         {"stage": "login-session", "exception_type": "CalledProcessError",
+                          "code": "observation-exception", "returncode": 1})
+        # This fake call() is not probe code, so only probe frames remain; argv and output never leave.
+        self.assertEqual([name for name, _ in record["frames"]], ["inventory", "owner_login_session"])
+        for private in ("private", "loginctl", "list-sessions", "/proc"):
+            self.assertNotIn(private, output)
+        message, log = self.transport(output)
+        self.assertEqual(message, "guest lifecycle inventory failed (exit=1): " + json.dumps(record))
+        self.assertEqual(log, "tuna-vm-lane: inventory failure " + json.dumps(record) + "\n")
+
+    def test_host_rejects_unknown_textual_or_unbounded_records(self):
+        record = {"stage": "process-scan", "exception_type": "FileNotFoundError",
+                  "code": "observation-exception", "errno": 2, "frames": [["inventory", 470]]}
+        self.assertTrue(lane.guest_agent.valid_inventory_error(record))
+        generic = "guest lifecycle inventory failed (exit=1)"
+        invalid = [None, [], {}, {**record, "message": "private"}, {**record, "stage": "private"},
+                   {**record, "exception_type": "private"}, {**record, "code": "private"},
+                   {**record, "code": "process-identity-changed"}, {**record, "errno": -1},
+                   {**record, "errno": True}, {**record, "returncode": 1},
+                   {**{k: v for k, v in record.items() if k != "errno"}, "exception_type": "RuntimeError", "errno": 2},
+                   {k: v for k, v in record.items() if k != "frames"}, {**record, "frames": "private"},
+                   {**record, "frames": [["private text", 1]]}, {**record, "frames": [["inventory", 0]]},
+                   {**record, "frames": [["inventory", True]]}, {**record, "frames": [["inventory"]]},
+                   {**record, "frames": [["inventory", 1, 2]]}, {**record, "frames": [["inventory", 1]] * 17},
+                   {**record, "frames": [["x" * 65, 1]]}]
+        for value in invalid:
+            with self.subTest(value=value):
+                self.assertEqual(self.transport(json.dumps({"inventory_error": value}))[0], generic)
+        self.assertEqual(self.transport(json.dumps({"inventory_error": record, "extra": "private"}))[0], generic)
+        self.assertEqual(self.transport(json.dumps({"inventory_error": record}), **{"out-truncated": True})[0], generic)
+        self.assertEqual(self.transport("private " * 600)[0], generic)
 
 
 if __name__ == "__main__":
