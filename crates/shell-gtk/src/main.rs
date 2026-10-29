@@ -2928,6 +2928,9 @@ fn build(app: &adw::Application) {
                     out.mouse_natural_scroll = mouse.boolean("natural-scroll");
                     out.mouse_speed_milli = (mouse.double("speed") * 1000.0).round() as i32;
                     out.mouse_left_handed = mouse.boolean("left-handed");
+                    out.mouse_accel_profile = tuna_shell_control::MouseAccelProfile::from_gsettings(
+                        &mouse.string("accel-profile"),
+                    );
                 }
                 out.touchpad_left_handed = logic::touchpad_left_handed(
                     all[2]

@@ -173,9 +173,11 @@ impl ProtocolVersion {
     /// `0.37` appends NativeOutputInventory without altering OutputInfo.
     /// `0.38` appends typed accelerator grabs
     /// (`SetAcceleratorGrabs`) and `AcceleratorDeactivated`.
+    /// `0.39` appends the mouse acceleration profile to InputSettings.
+    /// Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 38,
+        minor: 39,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -983,6 +985,33 @@ pub struct InputSettings {
     /// GNOME's pointer accessibility aids.
     #[serde(default)]
     pub pointer_aids: PointerAids,
+    /// GNOME mouse acceleration profile; trackballs and pointing sticks have
+    /// separate settings and must not inherit this value.
+    #[serde(default)]
+    pub mouse_accel_profile: MouseAccelProfile,
+}
+
+/// GNOME's mouse acceleration profile.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseAccelProfile {
+    #[default]
+    Default,
+    Flat,
+    Adaptive,
+    /// Custom curves are not supported by the current libinput bindings.
+    Custom,
+}
+
+impl MouseAccelProfile {
+    /// Decode the GSettings enum nick, falling back to the device default.
+    pub fn from_gsettings(value: &str) -> Self {
+        match value {
+            "flat" => Self::Flat,
+            "adaptive" => Self::Adaptive,
+            "custom" => Self::Custom,
+            _ => Self::Default,
+        }
+    }
 }
 
 /// GNOME's `org.gnome.desktop.a11y.mouse`, flattened for the compositor.
@@ -1125,6 +1154,7 @@ impl Default for InputSettings {
             locate_pointer: false,
             locate_pointer_key: default_locate_pointer_key(),
             pointer_aids: PointerAids::default(),
+            mouse_accel_profile: MouseAccelProfile::Default,
         }
     }
 }
@@ -1847,8 +1877,28 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_38() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 38));
+    fn current_version_is_0_39() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 39));
+    }
+
+    #[test]
+    fn mouse_acceleration_nicks_and_wire_roundtrip() {
+        for (nick, profile) in [
+            ("default", MouseAccelProfile::Default),
+            ("flat", MouseAccelProfile::Flat),
+            ("adaptive", MouseAccelProfile::Adaptive),
+            ("custom", MouseAccelProfile::Custom),
+            ("unknown", MouseAccelProfile::Default),
+        ] {
+            assert_eq!(MouseAccelProfile::from_gsettings(nick), profile);
+            roundtrip(&Message::Command {
+                id: 1,
+                kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                    mouse_accel_profile: profile,
+                    ..InputSettings::default()
+                })),
+            });
+        }
     }
 
     #[test]

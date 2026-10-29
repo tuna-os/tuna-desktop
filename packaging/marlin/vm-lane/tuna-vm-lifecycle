@@ -1839,6 +1839,13 @@ print(json.dumps(result))
             raise ValueError("mouse natural scroll must be true or false")
         call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "natural-scroll", value, user=True)
         result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "natural-scroll", user=True) == value}
+    elif action == "mouse-accel":
+        value = sys.argv[2]
+        if value not in ("default", "flat", "adaptive"):
+            raise ValueError("mouse acceleration profile must be default, flat or adaptive")
+        call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "accel-profile", value, user=True)
+        # gsettings prints enum values quoted.
+        result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "accel-profile", user=True) == f"'{value}'"}
     elif action in ("input-count", "input-ready", "input-buttons"):
         result = json.loads(pathlib.Path(RUNTIME, "tuna-vm-input.json").read_text())
         if pathlib.Path(f"/proc/{result['pid']}").stat().st_uid != OWNER.pw_uid:

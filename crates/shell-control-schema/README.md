@@ -12,7 +12,7 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.38).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.39).
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
@@ -21,6 +21,9 @@ before decoding.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
   `NativeOutputInfo`, `InputSettings`, `WindowId`, `WorkspaceId`,
   `dynamic_workspace_count`.
+- Mouse acceleration: `InputSettings::mouse_accel_profile` carries GNOME's
+  mouse profile. The compositor supports default, flat, and adaptive; custom
+  curves are unsupported and fall back to the device default.
 - Tokens and secrets: `ActivationToken`, `TokenMeta`, `Secret`.
 - Switcher and keybindings: `SwitcherAction`, `SwitcherKey`,
   `SwitcherThumbnail`, `WindowAction`, `Accelerator`, and the `MOD_*` and
