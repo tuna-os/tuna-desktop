@@ -78,3 +78,5 @@ wayland-protocols = { workspace = true, features = ["client"] }
 wayland-protocols-wlr = { workspace = true, features = ["client"] }
 wayland-protocols-misc = { version = "=0.3.12", features = ["client"] }
 tempfile = "3"
+# Peer-to-peer links let tests watch real D-Bus signals without a bus.
+zbus = { workspace = true, features = ["p2p"] }

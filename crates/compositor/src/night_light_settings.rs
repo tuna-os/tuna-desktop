@@ -830,7 +830,7 @@ mod tests {
             "equal/early captured time must not make a pre-ownership read fresh"
         );
         assert_eq!(share.preview_temperature(request_time), None);
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         assert!(controller
             .tick_at_system_time(std::time::SystemTime::now(), request_time)
             .is_none());
@@ -946,7 +946,7 @@ mod tests {
         let (share, reader, events, answers, mut loop_) = controlled();
         let shared = reader.shared.clone();
         share.swap_reader_for_test(Some(reader));
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let mut prior = RawSettings::schema_defaults();
         prior.enabled = true;
         prior.temperature_k = 4000;

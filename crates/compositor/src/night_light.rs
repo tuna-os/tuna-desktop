@@ -46,13 +46,22 @@
 //! `6ae712c0454f2586f00821c3486150c1e8feb3e7`):
 //!
 //! - g-s-d computes a smeared temperature and publishes it on
-//!   `org.gnome.SettingsDaemon.Color` (`Temperature`,
-//!   `NightLightActive`, read-write `DisabledUntilTomorrow`);
+//!   `org.gnome.SettingsDaemon.Color` (`NightLightActive`,
+//!   read-write `Temperature` and `DisabledUntilTomorrow`,
+//!   `Sunrise`/`Sunset` in local hours, `NightLightPreview`);
 //!   mutter reads `Temperature` and folds it into each output's
-//!   gamma LUT (GAMMA_LUT, else CTM). We publish the same two
-//!   properties on the same bus name from the compositor and apply
-//!   the gains in GL instead (pinned smithay 0.7 exposes no gamma
-//!   LUT API).
+//!   gamma LUT (GAMMA_LUT, else CTM). We serve the same interface
+//!   on the same bus name from the compositor and apply the gains
+//!   in GL instead (pinned smithay 0.7 exposes no gamma LUT API).
+//!   A `Temperature` write applies until Night Light's own
+//!   temperature next changes, as `gsd_color_state_set_temperature`
+//!   is overwritten by `notify::temperature`.
+//! - Schedules evaluate in the system's local time
+//!   (`g_date_time_new_now_local`), DST included; the zone is
+//!   re-read each second (see [`local_offset_seconds`]).
+//! - Every jump of 10 K or more eases over 5 s in 50 ms steps
+//!   (`GSD_NIGHT_LIGHT_SMOOTH_SMEAR`, `gsd_night_light_smooth_cb`;
+//!   g-s-d enables smoothing by default), previews included.
 //! - Schema defaults (`data/…plugins.color.gschema.xml.in`): enabled
 //!   false, temperature 2700 K, schedule-automatic true, from 20.0,
 //!   to 6.0, last-coordinates (91, 181) as the invalid sentinel.
@@ -87,7 +96,11 @@
 //! (screenshot flashes; the bell and the blank shield are black, so
 //! gains are a no-op on them) and the DRM hardware cursor bypass the
 //! tint; screenshots and screen casts stay untinted, matching GNOME
-//! (gamma applies past the framebuffer).
+//! (gamma applies past the framebuffer); `Temperature` changes are
+//! announced once per rounded Kelvin step rather than per sub-Kelvin
+//! step; a timezone change applies within a second of the next
+//! tick, where g-s-d's cached `GTimeZone` may keep the old zone
+//! [INFERENCE: GLib caches the local zone].
 //!
 //! Sources:
 //!
@@ -163,6 +176,13 @@ pub const SMEAR_HOURS: f64 = 1.0;
 /// (`GSD_TEMPERATURE_MAX_DELTA`): during a smear the applied gains
 /// step at most every few seconds instead of every frame.
 pub const TEMPERATURE_QUANTUM_K: u32 = 10;
+/// Length of the ease applied to every temperature jump
+/// (`GSD_NIGHT_LIGHT_SMOOTH_SMEAR`, 5 s).
+pub const SMOOTH_SECONDS: u32 = 5;
+/// Step of that ease (`g_timeout_add (50, gsd_night_light_smooth_cb)`).
+pub const SMOOTH_STEP: std::time::Duration = std::time::Duration::from_millis(50);
+/// Steps in one ease: the last one lands exactly on the target.
+const SMOOTH_STEPS: u32 = SMOOTH_SECONDS * 1000 / 50;
 /// Schedule and cached-reader fallback cadence. Native change watches also
 /// signal the existing runtime wake. A quarantined reader never retries; only
 /// enabled schedule evaluation retains this clock obligation.
@@ -763,7 +783,13 @@ fn day_of_year_for_days(days: i64) -> u16 {
 /// can actively apply tint at UTC hours. That is a degraded guess,
 /// not fail-closed and not inactive: callers needing inactivity on
 /// unknown zone must check for it themselves.
+///
+/// The zone is re-read (`tzset`) at most once per wall-clock second,
+/// so a runtime timezone change (timedated rewriting `/etc/localtime`,
+/// or `TZ` changing) moves the schedule on the next tick. glibc's
+/// `localtime_r` alone keeps the zone loaded at first use forever.
 pub fn local_offset_seconds(unix_seconds: i64) -> i64 {
+    refresh_system_timezone(unix_seconds);
     let stamp: libc::time_t = unix_seconds as libc::time_t;
     let mut broken = std::mem::MaybeUninit::<libc::tm>::zeroed();
     // SAFETY: `localtime_r` either fills the struct and returns it,
@@ -782,6 +808,20 @@ pub fn local_offset_seconds(unix_seconds: i64) -> i64 {
         + i64::from(tm.tm_min) * 60
         + i64::from(tm.tm_sec);
     wall - unix_seconds
+}
+
+/// Re-run `tzset` when the wall-clock second changed since the last
+/// call: one `stat` of the zone file per second rather than per frame.
+fn refresh_system_timezone(unix_seconds: i64) {
+    static LAST_TZSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+    if LAST_TZSET.swap(unix_seconds, std::sync::atomic::Ordering::Relaxed) != unix_seconds {
+        extern "C" {
+            fn tzset();
+        }
+        // SAFETY: `tzset` takes no arguments; glibc serialises it
+        // against `localtime_r` with its internal timezone lock.
+        unsafe { tzset() };
+    }
 }
 
 /// Signed whole Unix seconds for the actual system clock, including dates
@@ -1017,6 +1057,26 @@ struct Preview {
     until: std::time::Instant,
 }
 
+/// One `org.gnome.SettingsDaemon.Color` property change, raised
+/// exactly where g-s-d's `GsdNightLight` notifies (`notify::active`,
+/// `::temperature`, `::disabled-until-tmw`, `::sunrise`, `::sunset`)
+/// and so where `gsd-color-manager.c` emits one `PropertiesChanged`
+/// per property. A `Temperature` property write raises nothing, as in
+/// g-s-d's `handle_set_property`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColorChange {
+    /// `NightLightActive` flipped.
+    NightLightActive(bool),
+    /// Night Light's own (smoothed) temperature moved, rounded.
+    Temperature(u32),
+    /// `DisabledUntilTomorrow` flipped.
+    DisabledUntilTomorrow(bool),
+    /// `Sunrise` moved by more than a minute.
+    Sunrise(f64),
+    /// `Sunset` moved by more than a minute.
+    Sunset(f64),
+}
+
 /// Live state shared between the compositor loop (which owns the
 /// [`NightLightController`]) and the D-Bus thread (which serves
 /// `org.gnome.SettingsDaemon.Color`): the loop publishes what it
@@ -1028,6 +1088,14 @@ pub struct NightLightShare {
     /// Smeared temperature currently applied, or
     /// [`NEUTRAL_TEMPERATURE_K`] when inactive (`Temperature`).
     temperature: std::sync::atomic::AtomicU32,
+    /// Kelvin written to the `Temperature` property, or 0 for none.
+    /// Like g-s-d's `gsd_color_state_set_temperature` it applies
+    /// until Night Light's own temperature next changes.
+    temperature_override: std::sync::atomic::AtomicU32,
+    /// `Sunrise`/`Sunset` as `f64` bits: local fractional hours, `-1`
+    /// until a location yields one (g-s-d `cached_sunrise/sunset`).
+    sunrise_bits: std::sync::atomic::AtomicU64,
+    sunset_bits: std::sync::atomic::AtomicU64,
     /// Unix seconds when `DisabledUntilTomorrow` was set, if set.
     disabled_until_tmw: std::sync::Mutex<Option<i64>>,
     /// Live slider preview, if one has not expired yet.
@@ -1042,6 +1110,8 @@ pub struct NightLightShare {
     /// nothing; see [`NightLightShare::set_wake`].
     wake: crate::wake::Wake,
     reader: std::sync::Mutex<Option<crate::night_light_settings::Reader>>,
+    /// Subscriber for [`ColorChange`]s (the D-Bus side), if any.
+    changes: std::sync::Mutex<Option<std::sync::mpsc::Sender<ColorChange>>>,
 }
 
 impl Default for NightLightShare {
@@ -1050,12 +1120,16 @@ impl Default for NightLightShare {
         Self {
             active: std::sync::atomic::AtomicBool::new(false),
             temperature: std::sync::atomic::AtomicU32::new(NEUTRAL_TEMPERATURE_K),
+            temperature_override: std::sync::atomic::AtomicU32::new(0),
+            sunrise_bits: std::sync::atomic::AtomicU64::new((-1.0f64).to_bits()),
+            sunset_bits: std::sync::atomic::AtomicU64::new((-1.0f64).to_bits()),
             disabled_until_tmw: std::sync::Mutex::new(None),
             preview: std::sync::Mutex::new(None),
             #[cfg(test)]
             preview_clock_for_test: std::sync::Mutex::new(None),
             wake: crate::wake::Wake::default(),
             reader: std::sync::Mutex::new(None),
+            changes: std::sync::Mutex::new(None),
         }
     }
 }
@@ -1164,17 +1238,103 @@ impl NightLightShare {
 
     /// Publish what the loop applies.
     pub fn publish(&self, active: bool, temperature_k: u32) {
-        self.active
-            .store(active, std::sync::atomic::Ordering::SeqCst);
+        let was = self
+            .active
+            .swap(active, std::sync::atomic::Ordering::SeqCst);
         self.temperature
             .store(temperature_k, std::sync::atomic::Ordering::SeqCst);
+        if was != active {
+            self.emit(ColorChange::NightLightActive(active));
+        }
+    }
+
+    /// Write `Temperature` from the D-Bus side (g-s-d
+    /// `handle_set_property`): reject values outside
+    /// [`MIN_TEMPERATURE_K`]..=[`MAX_TEMPERATURE_K`] unchanged, else
+    /// apply `kelvin` now and keep it until Night Light's own
+    /// temperature next changes.
+    pub fn set_temperature_override(&self, kelvin: u32) -> Result<(), u32> {
+        if !(MIN_TEMPERATURE_K..=MAX_TEMPERATURE_K).contains(&kelvin) {
+            return Err(kelvin);
+        }
+        self.temperature_override
+            .store(kelvin, std::sync::atomic::Ordering::SeqCst);
+        self.temperature
+            .store(kelvin, std::sync::atomic::Ordering::SeqCst);
+        self.wake.signal();
+        Ok(())
+    }
+
+    /// The live `Temperature` write, if Night Light has not moved since.
+    fn temperature_override(&self) -> Option<u32> {
+        match self
+            .temperature_override
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            0 => None,
+            kelvin => Some(kelvin),
+        }
+    }
+
+    /// Night Light's own temperature changed: drop a `Temperature`
+    /// write, as g-s-d's `notify::temperature` overwrites colour state.
+    fn clear_temperature_override(&self) {
+        self.temperature_override
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Read `Sunrise` (local hours, `-1` before any location).
+    pub fn sunrise(&self) -> f64 {
+        f64::from_bits(self.sunrise_bits.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Read `Sunset` (local hours, `-1` before any location).
+    pub fn sunset(&self) -> f64 {
+        f64::from_bits(self.sunset_bits.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Store and announce each of `Sunrise`/`Sunset` only when it moved
+    /// by more than a minute (`GSD_FRAC_DAY_MAX_DELTA`).
+    fn publish_sun(&self, sunrise_hours: f64, sunset_hours: f64) {
+        if (self.sunrise() - sunrise_hours).abs() > 1.0 / 60.0 {
+            self.sunrise_bits
+                .store(sunrise_hours.to_bits(), std::sync::atomic::Ordering::SeqCst);
+            self.emit(ColorChange::Sunrise(sunrise_hours));
+        }
+        if (self.sunset() - sunset_hours).abs() > 1.0 / 60.0 {
+            self.sunset_bits
+                .store(sunset_hours.to_bits(), std::sync::atomic::Ordering::SeqCst);
+            self.emit(ColorChange::Sunset(sunset_hours));
+        }
+    }
+
+    /// Receive every property change g-s-d would announce with
+    /// `PropertiesChanged`, in order. A new subscriber replaces the old.
+    pub fn subscribe_changes(&self) -> std::sync::mpsc::Receiver<ColorChange> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if let Ok(mut changes) = self.changes.lock() {
+            *changes = Some(sender);
+        }
+        receiver
+    }
+
+    fn emit(&self, change: ColorChange) {
+        if let Ok(changes) = self.changes.lock() {
+            if let Some(sender) = changes.as_ref() {
+                let _ = sender.send(change);
+            }
+        }
     }
 
     /// Write `DisabledUntilTomorrow` from the D-Bus side: `Some(now)`
     /// when set, `None` when cleared.
     pub fn set_disabled_until_tmw(&self, set_at: Option<i64>) {
         if let Ok(mut set) = self.disabled_until_tmw.lock() {
+            let changed = set.is_some() != set_at.is_some();
             *set = set_at;
+            if changed {
+                self.emit(ColorChange::DisabledUntilTomorrow(set_at.is_some()));
+            }
             // A temp-disable write must reach an idle loop the same
             // way a preview does; signal only when recorded.
             self.wake.signal();
@@ -1191,6 +1351,7 @@ impl NightLightShare {
             return false;
         }
         *set = None;
+        self.emit(ColorChange::DisabledUntilTomorrow(false));
         self.wake.signal();
         true
     }
@@ -1331,6 +1492,28 @@ pub struct NightLightController {
     applied_temperature: Option<u32>,
     applied_gains: Option<ColorGains>,
     reader_status: Option<crate::night_light_settings::CacheStatus>,
+    /// `(latitude, longitude, local day, offset)` behind the last
+    /// published `Sunrise`/`Sunset`, so the solar math runs once per
+    /// local day or location instead of every frame.
+    sun_key: Option<(u64, u64, i64, i64)>,
+    /// g-s-d `smooth_enabled` (on by default, as in g-s-d).
+    smooth_enabled: bool,
+    /// g-s-d `cached_temperature`: Night Light's own temperature, as
+    /// eased toward the schedule or preview target.
+    cached_temperature: f64,
+    /// `cached_temperature` rounded, as last seen: a change drops a
+    /// `Temperature` property write.
+    night_light_k: u32,
+    /// A running 5 s ease, if any.
+    smooth: Option<Smooth>,
+}
+
+/// A running ease toward `target` (g-s-d `smooth_timer`/`smooth_id`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Smooth {
+    target: f64,
+    started: std::time::Instant,
+    steps_done: u32,
 }
 
 impl NightLightController {
@@ -1343,6 +1526,11 @@ impl NightLightController {
             applied_temperature: None,
             applied_gains: None,
             reader_status: None,
+            sun_key: None,
+            smooth_enabled: true,
+            cached_temperature: f64::from(NEUTRAL_TEMPERATURE_K),
+            night_light_k: NEUTRAL_TEMPERATURE_K,
+            smooth: None,
         }
     }
 
@@ -1440,6 +1628,7 @@ impl NightLightController {
                     .next_deadline(now)
                     .into_iter()
                     .chain(self.share.preview_deadline_at(now))
+                    .chain(self.smooth_deadline().map(|due| due.max(now)))
                     .chain(schedule)
                     .min();
             }
@@ -1455,10 +1644,12 @@ impl NightLightController {
             .and_then(|last| last.checked_add(READ_INTERVAL))
             .filter(|due| *due > now)
             .unwrap_or(now);
-        Some(match preview {
-            Some(p) => p.min(settings),
-            None => settings,
-        })
+        Some(
+            preview
+                .into_iter()
+                .chain(self.smooth_deadline().map(|due| due.max(now)))
+                .fold(settings, std::cmp::Ord::min),
+        )
     }
 
     /// [`NightLightController::next_deadline_at`] at this instant.
@@ -1509,8 +1700,12 @@ impl NightLightController {
             }
         }
         self.config.disabled_until_tmw = self.share.disabled_until_tmw();
-        if let Some(gains) = self.preview_tick(monotonic_now) {
-            return gains;
+        self.publish_sun_window(unix_seconds, utc_offset_secs);
+        if let Some(preview_k) = self.share.preview_temperature(monotonic_now) {
+            // A live preview forces its temperature, bypassing the
+            // schedule and the hysteresis anchor (g-s-d `forced`).
+            self.applied_temperature = Some(preview_k);
+            return self.finish_tick(true, preview_k, monotonic_now);
         }
         let target = self
             .config
@@ -1527,13 +1722,141 @@ impl NightLightController {
             (next, _) => next,
         };
         self.applied_temperature = temperature;
-        let gains = temperature
-            .filter(|kelvin| *kelvin != NEUTRAL_TEMPERATURE_K)
-            .map(temperature_to_gains);
+        self.finish_tick(
+            active,
+            temperature.unwrap_or(NEUTRAL_TEMPERATURE_K),
+            monotonic_now,
+        )
+    }
+
+    /// Smooth toward `desired_k`, honour a `Temperature` write, and
+    /// publish/return what applies this frame.
+    fn finish_tick(
+        &mut self,
+        active: bool,
+        desired_k: u32,
+        monotonic_now: std::time::Instant,
+    ) -> Option<ColorGains> {
+        self.smooth_toward(f64::from(desired_k), monotonic_now);
+        let night_light_k = self.cached_temperature.round() as u32;
+        let moved = night_light_k != self.night_light_k;
+        if moved {
+            self.night_light_k = night_light_k;
+            self.share.clear_temperature_override();
+        }
+        let kelvin = self.share.temperature_override().unwrap_or(night_light_k);
+        let gains = (kelvin != NEUTRAL_TEMPERATURE_K).then(|| temperature_to_gains(kelvin));
         self.applied_gains = gains;
-        self.share
-            .publish(active, temperature.unwrap_or(NEUTRAL_TEMPERATURE_K));
+        self.share.publish(active, kelvin);
+        if moved {
+            self.share.emit(ColorChange::Temperature(night_light_k));
+        }
         gains
+    }
+
+    /// g-s-d's `gsd_night_light_set_temperature` with smoothing on:
+    /// a jump of [`TEMPERATURE_QUANTUM_K`] or more eases over
+    /// [`SMOOTH_SECONDS`], stepping every [`SMOOTH_STEP`] by
+    /// `cached + (target - cached) * elapsed / 5 s` and skipping steps
+    /// within the quantum (`gsd_night_light_smooth_cb`); a smaller
+    /// jump applies at once. A new target restarts the ease from the
+    /// current temperature. Steps sit on the 50 ms grid of the start
+    /// instant, so the result does not depend on the frame rate.
+    fn smooth_toward(&mut self, desired: f64, now: std::time::Instant) {
+        if !self.smooth_enabled {
+            self.cached_temperature = desired;
+            self.smooth = None;
+            return;
+        }
+        let retarget = match self.smooth {
+            Some(smooth) => smooth.target != desired,
+            None => self.cached_temperature != desired,
+        };
+        if retarget {
+            self.smooth = None;
+            if (desired - self.cached_temperature).abs() < f64::from(TEMPERATURE_QUANTUM_K) {
+                self.cached_temperature = desired;
+            } else {
+                self.smooth = Some(Smooth {
+                    target: desired,
+                    started: now,
+                    steps_done: 0,
+                });
+            }
+        }
+        let Some(mut smooth) = self.smooth else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(smooth.started);
+        let due =
+            (elapsed.as_millis() / SMOOTH_STEP.as_millis()).min(u128::from(SMOOTH_STEPS)) as u32;
+        while smooth.steps_done < due {
+            smooth.steps_done += 1;
+            let frac = f64::from(smooth.steps_done) / f64::from(SMOOTH_STEPS);
+            if frac >= 1.0 {
+                self.cached_temperature = smooth.target;
+                self.smooth = None;
+                return;
+            }
+            let step = self.cached_temperature + (smooth.target - self.cached_temperature) * frac;
+            if (step - self.cached_temperature).abs() > f64::from(TEMPERATURE_QUANTUM_K) {
+                self.cached_temperature = step;
+            }
+        }
+        self.smooth = Some(smooth);
+    }
+
+    /// Turn g-s-d smoothing off (`gsd_night_light_set_smooth_enabled`),
+    /// as its own tests do: every temperature then applies at once.
+    pub fn set_smooth_enabled(&mut self, enabled: bool) {
+        if !enabled {
+            self.smooth = None;
+        }
+        self.smooth_enabled = enabled;
+    }
+
+    /// Next 50 ms smoothing step, while an ease runs.
+    fn smooth_deadline(&self) -> Option<std::time::Instant> {
+        let smooth = self.smooth?;
+        smooth
+            .started
+            .checked_add(SMOOTH_STEP * (smooth.steps_done + 1))
+    }
+
+    /// Publish `Sunrise`/`Sunset` for the automatic schedule as local
+    /// fractional hours of the local date (g-s-d
+    /// `update_cached_sunrise_sunset`, which only runs for the
+    /// automatic schedule and keeps the last values otherwise). Polar
+    /// day/night has no sunrise or sunset and keeps the last values.
+    fn publish_sun_window(&mut self, unix_seconds: i64, utc_offset_secs: i64) {
+        let NightLightSchedule::Automatic {
+            latitude_deg,
+            longitude_deg,
+        } = self.config.schedule
+        else {
+            return;
+        };
+        let local_day = (unix_seconds + utc_offset_secs).div_euclid(86_400);
+        let key = (
+            latitude_deg.to_bits(),
+            longitude_deg.to_bits(),
+            local_day,
+            utc_offset_secs,
+        );
+        if self.sun_key == Some(key) {
+            return;
+        }
+        self.sun_key = Some(key);
+        if let Daylight::Normal(window) =
+            sun_window_for_day_of_year(latitude_deg, longitude_deg, day_of_year_for_days(local_day))
+        {
+            let offset_min = utc_offset_secs as f64 / 60.0;
+            let local_hours = |utc_min: f64| ((utc_min + offset_min) / 60.0).rem_euclid(24.0);
+            self.share.publish_sun(
+                local_hours(window.sunrise_utc_min),
+                local_hours(window.sunset_utc_min),
+            );
+        }
     }
 
     /// Actual render consumer: every clock outcome consumes monotonic preview
@@ -1547,24 +1870,19 @@ impl NightLightController {
         if let Some(unix) = system_unix_seconds(wall) {
             return self.tick_with_clock(unix, local_offset_seconds(unix), monotonic_now);
         }
-        if let Some(gains) = self.preview_tick(monotonic_now) {
-            return gains;
+        if let Some(preview_k) = self.share.preview_temperature(monotonic_now) {
+            self.applied_temperature = Some(preview_k);
+            return self.finish_tick(true, preview_k, monotonic_now);
         }
         self.applied_temperature = None;
         self.applied_gains = None;
+        self.cached_temperature = f64::from(NEUTRAL_TEMPERATURE_K);
+        self.smooth = None;
         self.share.publish(false, NEUTRAL_TEMPERATURE_K);
-        None
-    }
-
-    fn preview_tick(&mut self, monotonic_now: std::time::Instant) -> Option<Option<ColorGains>> {
-        if let Some(preview_k) = self.share.preview_temperature(monotonic_now) {
-            self.applied_temperature = Some(preview_k);
-            let gains = Some(preview_k)
-                .filter(|kelvin| *kelvin != NEUTRAL_TEMPERATURE_K)
-                .map(temperature_to_gains);
-            self.applied_gains = gains;
-            self.share.publish(true, preview_k);
-            return Some(gains);
+        if self.night_light_k != NEUTRAL_TEMPERATURE_K {
+            self.night_light_k = NEUTRAL_TEMPERATURE_K;
+            self.share
+                .emit(ColorChange::Temperature(NEUTRAL_TEMPERATURE_K));
         }
         None
     }
@@ -1652,6 +1970,18 @@ pub fn tint_program(
         .user_data()
         .insert_if_missing(|| TintProgram(p.clone()));
     p
+}
+
+/// A controller with g-s-d smoothing off, as g-s-d's own night-light
+/// tests run (`gsd_night_light_set_smooth_enabled (nlight, FALSE)`):
+/// every temperature applies on the tick that computes it.
+#[cfg(test)]
+pub(crate) fn unsmoothed_controller(
+    share: std::sync::Arc<NightLightShare>,
+) -> NightLightController {
+    let mut controller = NightLightController::new(share);
+    controller.set_smooth_enabled(false);
+    controller
 }
 
 #[cfg(test)]
@@ -1960,10 +2290,10 @@ mod tests {
             // The controller's system path agrees too, gains and
             // published state alike.
             let share_sys = Arc::new(NightLightShare::default());
-            let mut sys = NightLightController::new(share_sys.clone());
+            let mut sys = unsmoothed_controller(share_sys.clone());
             sys.config = fixed.clone();
             let share_exp = Arc::new(NightLightShare::default());
-            let mut exp = NightLightController::new(share_exp.clone());
+            let mut exp = unsmoothed_controller(share_exp.clone());
             exp.config = fixed.clone();
             assert_eq!(sys.tick(unix), exp.tick_with_offset(unix, offset));
             assert_eq!(
@@ -2312,7 +2642,7 @@ mod tests {
     fn controller_holds_small_steps_and_republishes_transitions() {
         use std::sync::Arc;
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         // Seed an enabled fixed config directly: refresh tests cover
         // the reader path below.
         controller.config = fixed_at(22.0, 6.0, 2700);
@@ -2347,7 +2677,7 @@ mod tests {
     fn controller_never_programs_identity() {
         use std::sync::Arc;
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         controller.config = fixed_at(22.0, 6.0, NEUTRAL_TEMPERATURE_K);
         let day = midnight(2026, 3, 20);
         // Active at the neutral temperature: published as active,
@@ -2357,7 +2687,7 @@ mod tests {
         assert_eq!(share.temperature(), NEUTRAL_TEMPERATURE_K);
         assert_eq!(controller.effect_bits(), [1.0f32.to_bits(); 3]);
         // A fresh controller starts neutral too.
-        let fresh = NightLightController::new(Arc::new(NightLightShare::default()));
+        let fresh = unsmoothed_controller(Arc::new(NightLightShare::default()));
         assert_eq!(fresh.current_gains(), None);
         assert_eq!(fresh.effect_bits(), [1.0f32.to_bits(); 3]);
     }
@@ -2367,7 +2697,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let now = Instant::now();
         let fixed = fixed_at(22.0, 6.0, 3000);
         // First call always reads.
@@ -2402,7 +2732,7 @@ mod tests {
     fn controller_follows_the_shared_temp_disable() {
         use std::sync::Arc;
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         controller.config = fixed_at(22.0, 6.0, 2700);
         let day = midnight(2026, 3, 20);
         assert!(controller.tick_with_offset(day + 2 * 3600, 0).is_some());
@@ -2421,7 +2751,7 @@ mod tests {
         use std::time::{Duration, Instant};
         // Disabled config: without a preview nothing ever applies.
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let noon = midnight(2026, 3, 20) + 12 * 3600;
         let t0 = Instant::now();
         assert_eq!(controller.tick_with_clock(noon, 0, t0), None);
@@ -2456,7 +2786,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         controller.config = fixed_at(22.0, 6.0, 2700);
         let noon = midnight(2026, 3, 20) + 12 * 3600;
         let t0 = Instant::now();
@@ -2485,7 +2815,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         controller.config = fixed_at(22.0, 6.0, 2700);
         let day = midnight(2026, 3, 20);
         let t0 = Instant::now();
@@ -2516,7 +2846,7 @@ mod tests {
         // Like the schedule path, a neutral preview never programs
         // an identity transform — but it still publishes active.
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let day = midnight(2026, 3, 20);
         let t0 = Instant::now();
         assert_eq!(share.set_preview_at(NEUTRAL_TEMPERATURE_K, t0, 5), Ok(()));
@@ -2644,7 +2974,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let t0 = Instant::now();
         // Disabled, never read, no preview: due now. There is no
         // settings watch, so "no poll while disabled" would miss a
@@ -2674,7 +3004,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let t0 = Instant::now();
         // Disabled with a fresh read: next poll one interval out —
         // bounded even while off.
@@ -2728,7 +3058,7 @@ mod tests {
             Some(0)
         );
         let share = std::sync::Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let t0 = Instant::now();
         share.set_preview_at(2000, t0, 5).unwrap();
         assert_eq!(
@@ -2750,7 +3080,7 @@ mod tests {
     #[test]
     fn disable_expiry_clears_property_without_erasing_a_newer_timestamp() {
         let share = std::sync::Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let day = midnight(2026, 3, 20);
         controller.config = fixed_at(22.0, 6.0, 2700);
         let previous = day + 23 * 3600;
@@ -2776,7 +3106,7 @@ mod tests {
         // preview: only the monotonic clock drives expiry, and the
         // wall clock is never consulted for liveness.
         let share = Arc::new(NightLightShare::default());
-        let mut controller = NightLightController::new(share.clone());
+        let mut controller = unsmoothed_controller(share.clone());
         let noon = midnight(2026, 3, 20) + 12 * 3600;
         let t0 = Instant::now();
         assert_eq!(share.set_preview_at(2000, t0, 5), Ok(()));
@@ -2916,5 +3246,270 @@ mod tests {
         assert!(pixel[0] > pixel[1] && pixel[1] > pixel[2], "{pixel:?}");
         // Release the GL context before the surfaceless display drops.
         drop(renderer);
+    }
+
+    #[test]
+    fn system_zone_drives_schedule_across_dst_and_runtime_changes() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant, UNIX_EPOCH};
+        // `TZ` is process-global: run the body in a single-threaded
+        // child of this test binary so no sibling test sees it.
+        const CHILD: &str = "TUNA_NIGHT_LIGHT_TZ_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "night_light::tests::system_zone_drives_schedule_across_dst_and_runtime_changes",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child failed: {status}");
+            return;
+        }
+        // POSIX rules, so no tzdata is needed: US Eastern with DST.
+        std::env::set_var("TZ", "EST5EDT,M3.2.0,M11.1.0");
+        // 2026-03-08 07:00 UTC: 02:00 EST jumps to 03:00 EDT.
+        let dst = midnight(2026, 3, 8) + 7 * 3600;
+        assert_eq!(local_offset_seconds(dst - 1), -5 * 3600);
+        assert_eq!(local_offset_seconds(dst), -4 * 3600);
+        let share = Arc::new(NightLightShare::default());
+        let mut controller = unsmoothed_controller(share.clone());
+        controller.config = fixed_at(22.0, 3.0, 3000);
+        let wall = |unix: i64| UNIX_EPOCH + Duration::from_secs(unix as u64);
+        let mono = Instant::now();
+        // 01:59:59 EST is inside 22:00–03:00 (before the end smear
+        // from 02:00)...
+        assert_eq!(
+            controller.tick_at_system_time(wall(dst - 1), mono),
+            Some(temperature_to_gains(3000))
+        );
+        // ...and one second later the wall clock reads 03:00 EDT: off.
+        assert_eq!(controller.tick_at_system_time(wall(dst), mono), None);
+        assert!(!share.active());
+        // 01:30 UTC is in the window in UTC framing, but is 20:30 EST
+        // locally, before the 21:00 lead-in: the local zone wins.
+        let evening = midnight(2026, 3, 8) + 90 * 60;
+        assert!(controller.config.is_active_at_offset(evening, 0));
+        assert_eq!(controller.tick_at_system_time(wall(evening), mono), None);
+        // A runtime zone change moves the schedule on the next tick:
+        // 14:00 UTC is 09:00 EST (off) but 23:00 JST (on).
+        let afternoon = midnight(2026, 3, 9) + 14 * 3600;
+        assert_eq!(controller.tick_at_system_time(wall(afternoon), mono), None);
+        std::env::set_var("TZ", "JST-9");
+        assert_eq!(
+            controller.tick_at_system_time(wall(afternoon + 1), mono),
+            Some(temperature_to_gains(3000))
+        );
+        assert_eq!(share.temperature(), 3000);
+    }
+
+    #[test]
+    fn temperature_jumps_ease_over_five_seconds_like_gsd() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let share = Arc::new(NightLightShare::default());
+        let mut controller = NightLightController::new(share.clone());
+        controller.config = NightLightConfig {
+            enabled: true,
+            temperature_k: 2700,
+            disabled_until_tmw: None,
+            schedule: NightLightSchedule::Manual,
+        };
+        let noon = midnight(2026, 3, 20) + 12 * 3600;
+        let t0 = Instant::now();
+        // The first 50 ms step has not fired yet: still neutral, and
+        // the loop is asked to wake for it.
+        assert_eq!(controller.tick_with_clock(noon, 0, t0), None);
+        assert!(share.active());
+        assert_eq!(share.temperature(), NEUTRAL_TEMPERATURE_K);
+        controller.last_read = Some(t0);
+        assert_eq!(controller.next_deadline_at(t0), Some(t0 + SMOOTH_STEP));
+        // gsd_night_light_smooth_cb: cached += (target - cached) * frac.
+        let mut expected = f64::from(NEUTRAL_TEMPERATURE_K);
+        let mut by_step = Vec::new();
+        for step in 1..SMOOTH_STEPS {
+            let next = expected + (2700.0 - expected) * f64::from(step) / f64::from(SMOOTH_STEPS);
+            if (next - expected).abs() > f64::from(TEMPERATURE_QUANTUM_K) {
+                expected = next;
+            }
+            by_step.push(expected.round() as u32);
+        }
+        controller.tick_with_clock(noon, 0, t0 + SMOOTH_STEP);
+        assert_eq!(share.temperature(), by_step[0]);
+        assert_eq!(share.temperature(), 6462);
+        // Frame-rate independent: one late tick lands where 16 ms
+        // ticks do.
+        let mut framed = NightLightController::new(Arc::new(NightLightShare::default()));
+        framed.config = controller.config.clone();
+        let mut at = Duration::ZERO;
+        while at <= Duration::from_millis(2500) {
+            framed.tick_with_clock(noon, 0, t0 + at);
+            at += Duration::from_millis(16);
+        }
+        framed.tick_with_clock(noon, 0, t0 + Duration::from_millis(2500));
+        controller.tick_with_clock(noon, 0, t0 + Duration::from_millis(2500));
+        assert_eq!(share.temperature(), by_step[49]);
+        assert_eq!(framed.share.temperature(), by_step[49]);
+        assert!(share.temperature() > 2700 && share.temperature() < 6462);
+        // At 5 s the ease lands exactly and stops asking for wakes.
+        let gains = controller.tick_with_clock(noon, 0, t0 + Duration::from_secs(5));
+        assert_eq!(gains, Some(temperature_to_gains(2700)));
+        assert_eq!(controller.smooth_deadline(), None);
+        // Switching off eases back the same way; NightLightActive
+        // drops at once while the colour still eases.
+        controller.config.enabled = false;
+        let t1 = t0 + Duration::from_secs(6);
+        assert_eq!(
+            controller.tick_with_clock(noon, 0, t1),
+            Some(temperature_to_gains(2700))
+        );
+        assert!(!share.active());
+        assert_eq!(
+            controller.tick_with_clock(noon, 0, t1 + Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(share.temperature(), NEUTRAL_TEMPERATURE_K);
+    }
+
+    #[test]
+    fn temperature_property_applies_until_night_light_moves() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let share = Arc::new(NightLightShare::default());
+        let mut controller = unsmoothed_controller(share.clone());
+        let noon = midnight(2026, 3, 20) + 12 * 3600;
+        let t0 = Instant::now();
+        assert_eq!(share.set_temperature_override(999), Err(999));
+        assert_eq!(share.set_temperature_override(10_001), Err(10_001));
+        assert_eq!(controller.tick_with_clock(noon, 0, t0), None);
+        // A write applies at once and survives schedule ticks that do
+        // not move Night Light's own temperature...
+        assert_eq!(share.set_temperature_override(4000), Ok(()));
+        assert_eq!(share.temperature(), 4000);
+        for _ in 0..3 {
+            assert_eq!(
+                controller.tick_with_clock(noon, 0, t0),
+                Some(temperature_to_gains(4000))
+            );
+        }
+        assert!(!share.active());
+        // ...and Night Light moving (a preview here) overwrites it,
+        // and it stays gone after the preview expires.
+        share.set_preview_at(2000, t0, 1).unwrap();
+        assert_eq!(
+            controller.tick_with_clock(noon, 0, t0),
+            Some(temperature_to_gains(2000))
+        );
+        assert_eq!(
+            controller.tick_with_clock(noon, 0, t0 + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(share.temperature(), NEUTRAL_TEMPERATURE_K);
+    }
+
+    #[test]
+    fn sunrise_and_sunset_publish_local_hours_for_the_automatic_schedule() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let share = Arc::new(NightLightShare::default());
+        let mut controller = unsmoothed_controller(share.clone());
+        let noon = midnight(2026, 3, 20) + 12 * 3600;
+        // No location yet: g-s-d's -1 sentinel, also for the fixed
+        // schedule.
+        controller.config = fixed_at(20.0, 6.0, 2700);
+        controller.tick_with_clock(noon, 3600, Instant::now());
+        assert_eq!((share.sunrise(), share.sunset()), (-1.0, -1.0));
+        // Equator, Greenwich, equinox, UTC+1: about 07:00 and 19:00
+        // local.
+        controller.config.schedule = NightLightSchedule::Automatic {
+            latitude_deg: 0.0,
+            longitude_deg: 0.0,
+        };
+        controller.tick_with_clock(noon, 3600, Instant::now());
+        assert!((share.sunrise() - 7.0).abs() < 0.25, "{}", share.sunrise());
+        assert!((share.sunset() - 19.1).abs() < 0.25, "{}", share.sunset());
+        // The same instant in UTC-5 reads five hours earlier.
+        controller.tick_with_clock(noon, -5 * 3600, Instant::now());
+        assert!((share.sunrise() - 1.0).abs() < 0.25, "{}", share.sunrise());
+    }
+
+    #[test]
+    fn color_changes_follow_gsd_notifications_only_on_change() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let share = Arc::new(NightLightShare::default());
+        let changes = share.subscribe_changes();
+        let mut controller = NightLightController::new(share.clone());
+        controller.config = NightLightConfig {
+            enabled: true,
+            temperature_k: 2700,
+            disabled_until_tmw: None,
+            schedule: NightLightSchedule::Automatic {
+                latitude_deg: 0.0,
+                longitude_deg: 0.0,
+            },
+        };
+        let midnight_utc = midnight(2026, 3, 20);
+        let t0 = Instant::now();
+        controller.tick_with_clock(midnight_utc, 0, t0);
+        let first: Vec<_> = changes.try_iter().collect();
+        assert!(
+            matches!(first[0], ColorChange::Sunrise(h) if (h - 6.0).abs() < 0.25),
+            "{first:?}"
+        );
+        assert!(
+            matches!(first[1], ColorChange::Sunset(h) if (h - 18.1).abs() < 0.25),
+            "{first:?}"
+        );
+        assert_eq!(first[2..], [ColorChange::NightLightActive(true)]);
+        // The same instant again: nothing moved, nothing announced.
+        controller.tick_with_clock(midnight_utc, 0, t0);
+        assert_eq!(changes.try_iter().count(), 0);
+        // Each smoothing step that moves the temperature is announced,
+        // ending exactly on the target; Sunrise/Sunset stay quiet the
+        // same local day.
+        let mut temps = Vec::new();
+        for step in 1..=SMOOTH_STEPS {
+            controller.tick_with_clock(midnight_utc + 60, 0, t0 + SMOOTH_STEP * step);
+            for change in changes.try_iter() {
+                match change {
+                    ColorChange::Temperature(kelvin) => temps.push(kelvin),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        assert_eq!(temps.first(), Some(&6462));
+        assert_eq!(temps.last(), Some(&2700));
+        assert!(temps.windows(2).all(|pair| pair[0] > pair[1]), "{temps:?}");
+        // A Temperature property write announces nothing; neither do
+        // ticks that keep Night Light's own temperature.
+        share.set_temperature_override(5000).unwrap();
+        controller.tick_with_clock(midnight_utc + 60, 0, t0 + Duration::from_secs(6));
+        assert_eq!(changes.try_iter().count(), 0);
+        // DisabledUntilTomorrow: one signal per flip, then the
+        // schedule deactivates and starts easing back.
+        share.set_disabled_until_tmw(Some(midnight_utc));
+        share.set_disabled_until_tmw(Some(midnight_utc + 1));
+        controller.tick_with_clock(midnight_utc + 60, 0, t0 + Duration::from_secs(7));
+        assert_eq!(
+            changes.try_iter().collect::<Vec<_>>(),
+            [
+                ColorChange::DisabledUntilTomorrow(true),
+                ColorChange::NightLightActive(false),
+            ]
+        );
+        // The loop retiring the disable at sunrise (gsd's recheck) is
+        // announced too, exactly once.
+        let after_sunrise = midnight_utc + 7 * 3600;
+        controller.tick_with_clock(after_sunrise, 0, t0 + Duration::from_secs(7));
+        assert_eq!(share.disabled_until_tmw(), None);
+        assert_eq!(
+            changes.try_iter().collect::<Vec<_>>(),
+            [ColorChange::DisabledUntilTomorrow(false)]
+        );
+        controller.tick_with_clock(after_sunrise, 0, t0 + Duration::from_secs(7));
+        assert_eq!(changes.try_iter().count(), 0);
     }
 }

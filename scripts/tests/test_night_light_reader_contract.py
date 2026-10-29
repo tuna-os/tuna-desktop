@@ -61,8 +61,6 @@ class ReaderContracts(unittest.TestCase):
         self.assertIn(".tick_at_system_time(SystemTime::now(), Instant::now())", RUNTIME)
         self.assertIn("self.share.clear_disabled_until_if(set_at)", MODEL)
         self.assertIn("if *set != Some(expected)", MODEL)
-        self.assertIn("color.disabled_until_tomorrow_changed(interface.signal_emitter())", BUS)
-        self.assertIn("if color_owned && disabled != last_disabled", BUS)
         self.assertIn("actual_gio_memory_watch_updates_typed_cache", READER)
         self.assertIn("actual_controller_failed_cache_keeps_config", READER)
 
