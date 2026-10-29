@@ -76,6 +76,7 @@ pub mod layer;
 pub mod lock;
 pub mod lockdown;
 pub mod magnifier;
+pub mod menu_close;
 pub mod minimize;
 pub mod modal_dim;
 pub mod monitors;
@@ -801,6 +802,11 @@ impl State {
     /// Whether an explicit popup grab is active.
     pub fn popup_grab_active(&self) -> bool {
         !self.popup_grab.is_empty()
+    }
+
+    /// Whether `surface` is a popup holding (part of) the explicit grab.
+    pub(crate) fn popup_grabbed(&self, surface: &wl_surface::WlSurface) -> bool {
+        self.popup_grab.iter().any(|p| p.wl_surface() == surface)
     }
 
     /// Number of physically held keys, without exposing their identities.

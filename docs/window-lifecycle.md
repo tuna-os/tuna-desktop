@@ -15,7 +15,15 @@ close fades instead of collapsing. Disabling animations settles all effects.
 GNOME's slowdown factor changes durations through the shared motion policy.
 The overview, an active workspace gesture, and the session lock suspend the
 effects. X11 menus, tooltips, docks, utility windows and other auxiliary
-roles are excluded. Layer surfaces and xdg popups are not toplevel effects.
+roles are excluded. Layer surfaces and xdg popups are not toplevel effects,
+with one exception: a grabbed popup of the GTK shell's top bar (a panel
+menu) closes as GNOME's `boxpointer.js` `BoxPointer.close`. The shell has
+already closed it logically (focus, accessible tree, `closed` signal); the
+compositor retains the menu's last frame the same way, copies it once when
+the popup goes, and draws it fading out over 150 ms ease-out quad while it
+rises 6 px and shrinks to 96% about its top centre (fade-only under Reduced
+Motion or when another bar menu takes the grab). The ghost takes no input,
+and the same menu opening again drops it (`crates/compositor/src/menu_close.rs`).
 
 ## Client lifetime and cost
 

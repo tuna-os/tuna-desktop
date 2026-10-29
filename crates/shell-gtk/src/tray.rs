@@ -218,7 +218,7 @@ pub fn tray(
                     }
                     menus.borrow_mut().clear();
                     for item in &items {
-                        let popover = gtk::Popover::new();
+                        let popover = crate::transient::MenuPopover::new_popover();
                         popover.add_css_class("tuna-shell-popover");
                         popover.set_has_arrow(false);
                         {

@@ -239,10 +239,14 @@
 #   G-UNLOCK       GNOME's lock screen: a wrong password is refused and
 #                  the right one unlocks through PAM (pam_wrapper)
 #   G-TRANSIENT-OFF with animations off the OSD, banners and panel menus
-#                  show at once; Reduced Motion keeps the fades and drops
-#                  the panel menu's rise (#501)
+#                  show and close at once; Reduced Motion keeps the fades
+#                  and drops the panel menu's rise (#501)
 #   G-TRANSIENT-SETTLE the transient animations ran over GNOME 51's
 #                  durations and settled; panel menus rose and grew (#501)
+#   G-TRANSIENT-CLOSE-CLOCK a panel menu leaves the accessible tree at
+#                  once (Escape, one outside click) while the compositor
+#                  draws BoxPointer's close, sampled on the proof clock;
+#                  reopening replaces the close (#501)
 #   A11Y-GOLDEN    the panel, calendar, quick settings and overview
 #                  accessible trees match tests/a11y/ (#71)
 #   G-SHELL-STABLE the shell never exits or restarts during the journey
@@ -5140,6 +5144,58 @@ cstate '.animation_clock_manual | not' "real clock" ||
     fail G-ANIMATION-CLOCK "removing the clock file did not resume real time"
 pass G-ANIMATION-CLOCK "a proof-driven clock freezes compositor animation time and samples the overview's out-sine opening and out-quad closing at exact 125/250 ms delays"
 
+# BoxPointer.close (#501): GTK closes a panel menu logically at once and
+# the compositor draws its close from the last frame, sampled here on the
+# proof clock: 150 ms ease-out quad, fading while it rises 6px and shrinks
+# to 96%. The accessible tree loses the menu while the close stands still.
+menu_ghost() {
+    printf '(.menu_close.closing | length) == 1 and (.menu_close.closing[0] | %s)' "$1"
+}
+open_calendar
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-menu-close-open.json" 20 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "a11y dump failed"
+showing "$ARTIFACTS/a11y-menu-close-open.json" "Previous month" ||
+    fail G-TRANSIENT-CLOSE-CLOCK "the date menu did not open"
+anim_clock 0
+cstate '.animation_clock_manual and (.menu_close.closing | length) == 0' "frozen clock, no close" ||
+    fail G-TRANSIENT-CLOSE-CLOCK "the clock did not freeze or a close was already running"
+xdotool key Escape
+cstate "$(menu_ghost '.elapsed_ms == 0 and .duration_ms == 150 and .frame.alpha == 1 and .frame.dy == 0 and .frame.scale == 1 and .motion and (.fade_only | not)')" "frozen menu close" 5 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "Escape did not start a frozen 150 ms BoxPointer close"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-menu-close-frozen.json" 20 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "a11y dump failed"
+hidden "$ARTIFACTS/a11y-menu-close-frozen.json" "Previous month" ||
+    fail G-TRANSIENT-CLOSE-CLOCK "the menu stayed in the accessible tree during its close"
+anim_clock 75
+# Ease-out quad: three quarters of the way at half time.
+cstate "$(menu_ghost '.elapsed_ms == 75 and ((.frame.alpha - 0.25) | fabs) < 1e-9 and ((.frame.dy + 4.5) | fabs) < 1e-9 and ((.frame.scale - 0.97) | fabs) < 1e-9')" "menu close at 75 ms" ||
+    fail G-TRANSIENT-CLOSE-CLOCK "the menu was not a quarter opaque, 4.5px up and 97% 75 ms in"
+cp "$CSTATE" "$ARTIFACTS/menu-close-75ms.json"
+anim_clock 150
+cstate '(.menu_close.closing | length) == 0 and .menu_close.history[-1].outcome == "started"' "menu close at 150 ms" ||
+    fail G-TRANSIENT-CLOSE-CLOCK "the menu close had not finished 150 ms in"
+# Opening again replaces a close under way (BoxPointer.open).
+open_calendar
+xdotool key Escape
+cstate "$(menu_ghost '.elapsed_ms == 0')" "second frozen close" 5 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "the second Escape did not start a close"
+open_calendar
+cstate '(.menu_close.closing | length) == 0' "reopen drops the close" 5 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "reopening the menu left its close drawn"
+# An outside click closes on the first click and still animates.
+xdotool mousemove --window "$WID" 40 $((HEIGHT - 40)) click 1
+cstate "$(menu_ghost '.elapsed_ms == 0 and .motion')" "outside-click close" 5 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "an outside click did not close the menu with a BoxPointer close"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-menu-close-click.json" 20 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "a11y dump failed"
+hidden "$ARTIFACTS/a11y-menu-close-click.json" "Previous month" ||
+    fail G-TRANSIENT-CLOSE-CLOCK "one outside click left the menu open"
+anim_clock 300
+cstate '(.menu_close.closing | length) == 0' "outside-click close done" ||
+    fail G-TRANSIENT-CLOSE-CLOCK "the outside-click close never finished"
+real_clock
+pass G-TRANSIENT-CLOSE-CLOCK "panel menus close logically at once (accessible tree, one outside click) while the compositor draws BoxPointer's 150 ms out-quad fade, 6px rise and 96% shrink, sampled at 0/75/150 ms; reopening replaces the close"
+
 # GNOME settings (#63): the idle lock follows idle-delay and
 # lock-enabled as they change.
 gsettings set org.gnome.desktop.session idle-delay 600
@@ -8570,6 +8626,7 @@ pass G-NOTIFICATION-FOCUS-KEY "the rebound key focuses the active banner; Escape
 # With animations off the transient surfaces (#501) appear and go at
 # once: the OSD, a banner and a panel menu each log "instant".
 transient_off_start=$(($(wc -l < "$LOG") + 1))
+menu_close_before="$(jq -c '.menu_close.history[-1]' "$CSTATE")"
 gsettings set org.gnome.desktop.interface enable-animations false
 sleep 1
 xdotool key XF86MonBrightnessUp
@@ -8585,6 +8642,9 @@ for name in osd banner menu; do
         fail G-TRANSIENT-OFF "the $name animation played with animations off"
     fi
 done
+# The compositor draws no menu close either.
+[ "$(jq -c '.menu_close.history[-1]' "$CSTATE")" = "$menu_close_before" ] ||
+    fail G-TRANSIENT-OFF "a panel menu close was drawn with animations off"
 gsettings set org.gnome.desktop.interface enable-animations true
 sleep 1
 # Reduced Motion keeps the fades (GNOME 51): the OSD still fades in,
@@ -8606,9 +8666,11 @@ if grep -q "tuna-shell-gtk: transient menu open motion=true" "$ARTIFACTS/transie
 fi
 grep -q "tuna-shell-gtk: transient menu settled after [0-9]* ms of 150 ms" "$ARTIFACTS/transient-reduced.log" ||
     fail G-TRANSIENT-OFF "Reduced Motion dropped the panel menu's fade"
+cstate '.menu_close.history[-1] | .outcome == "started" and (.motion | not) and (.fade_only | not) and .duration_ms == 150' "reduced menu close" 5 ||
+    fail G-TRANSIENT-OFF "Reduced Motion did not close the panel menu with BoxPointer's fade alone"
 gsettings reset org.gnome.desktop.a11y.interface reduced-motion
 sleep 1
-pass G-TRANSIENT-OFF "with animations off the OSD, banners and panel menus show at once; Reduced Motion keeps the OSD and panel-menu fades and drops the menu's rise"
+pass G-TRANSIENT-OFF "with animations off the OSD, banners and panel menus show and close at once; Reduced Motion keeps the OSD and panel-menu open/close fades and drops the menu's rise"
 
 # GNOME Shell as the polkit agent: polkit (the Authority stub, back on
 # the bus) asks the agent to authenticate; a wrong password says so and

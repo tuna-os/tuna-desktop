@@ -464,12 +464,26 @@ impl ModalFade {
     }
 }
 
+/// `PopupMenuManager._changeMenu` opens a menu fade-only when another menu
+/// is active: here, another panel menu is still mapped, or one unmapped in
+/// the same main-loop turn (GTK closes the old one as it opens the next).
+pub fn open_fade_only(others_mapped: usize, closed_this_turn: bool) -> bool {
+    others_mapped > 0 || closed_this_turn
+}
+
+thread_local! {
+    static MENUS_MAPPED: Cell<usize> = const { Cell::new(0) };
+    static MENU_CLOSED_THIS_TURN: Cell<bool> = const { Cell::new(false) };
+}
+
 mod menu_imp {
     use super::*;
 
     pub struct MenuPopover {
         pub frame: Cell<Frame>,
         pub player: Player,
+        /// Whether the last open played BoxPointer's rise (tests).
+        pub opened_with_motion: Cell<Option<bool>>,
     }
 
     impl Default for MenuPopover {
@@ -477,6 +491,7 @@ mod menu_imp {
             Self {
                 frame: Cell::new(Frame::REST),
                 player: Player::new("menu"),
+                opened_with_motion: Cell::new(None),
             }
         }
     }
@@ -493,7 +508,22 @@ mod menu_imp {
     impl WidgetImpl for MenuPopover {
         fn map(&self) {
             self.parent_map();
-            self.obj().play_open();
+            let fade_only = open_fade_only(
+                MENUS_MAPPED.with(Cell::get),
+                MENU_CLOSED_THIS_TURN.with(Cell::get),
+            );
+            MENUS_MAPPED.with(|n| n.set(n.get() + 1));
+            self.obj().play_open(fade_only);
+        }
+
+        /// The close itself is the compositor's (`menu_close.rs`): GTK
+        /// has already closed the menu logically when this runs.
+        fn unmap(&self) {
+            MENUS_MAPPED.with(|n| n.set(n.get().saturating_sub(1)));
+            if !MENU_CLOSED_THIS_TURN.with(|c| c.replace(true)) {
+                glib::idle_add_local_once(|| MENU_CLOSED_THIS_TURN.with(|c| c.set(false)));
+            }
+            self.parent_unmap();
         }
 
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
@@ -539,12 +569,16 @@ impl MenuPopover {
     }
 
     /// `BoxPointer.open` on every map: fade, rise and grow over
-    /// [`MENU_MS`]; Reduced Motion keeps only the fade.
-    fn play_open(&self) {
-        let motion = motion_allowed();
+    /// [`MENU_MS`]; Reduced Motion, or taking over from another menu,
+    /// keeps only the fade.
+    fn play_open(&self, fade_only: bool) {
+        let motion = motion_allowed() && !fade_only;
+        self.imp().opened_with_motion.set(Some(motion));
         trace(
             "menu",
-            format_args!("open motion={motion} rise={MENU_RISE} scale={MENU_SCALE}"),
+            format_args!(
+                "open motion={motion} rise={MENU_RISE} scale={MENU_SCALE} switch={fade_only}"
+            ),
         );
         let weak = self.downgrade();
         self.imp().player.play(
@@ -758,6 +792,14 @@ mod tests {
     }
 
     #[test]
+    fn a_menu_taking_over_from_another_opens_fade_only() {
+        // PopupMenuManager._changeMenu: fadeOnly when a menu is active.
+        assert!(!open_fade_only(0, false));
+        assert!(open_fade_only(1, false));
+        assert!(open_fade_only(0, true));
+    }
+
+    #[test]
     fn panel_menus_fade_rise_and_grow_open() {
         // BoxPointer.open: opacity 0, translation_y -rise, scale 0.96.
         let start = menu_open(0.0);
@@ -790,5 +832,94 @@ mod tests {
         assert_eq!(fade(0.0, 1.0, 0.5), 0.75);
         assert_eq!(fade(0.4, 0.0, 1.0), 0.0);
         assert_eq!(fade(0.5, 1.0, 0.5), 0.875);
+    }
+}
+
+#[cfg(test)]
+mod gtk_menu_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn pump_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let context = glib::MainContext::default();
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// Real GTK popovers: a panel menu closes logically at once (hidden,
+    /// `closed` emitted, button released) so the compositor alone draws
+    /// the close; a menu opened in the same turn another closes, or while
+    /// another is up, opens fade-only, and a later open rises again.
+    #[test]
+    #[ignore = "requires owned Xvfb/private D-Bus and explicit menu admission"]
+    fn actual_gtk_menus_close_at_once_and_switch_fade_only() {
+        assert_eq!(
+            std::env::var("TUNA_REQUIRE_MENU_MOTION").as_deref(),
+            Ok("1")
+        );
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        gtk::init().expect("actual GTK display required");
+        crate::motion::set(tuna_shell_control::MotionPolicy::default());
+        let window = gtk::Window::new();
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let menus: Vec<(gtk::MenuButton, MenuPopover)> = ["Clock", "System"]
+            .into_iter()
+            .map(|label| {
+                let popover = MenuPopover::new_popover();
+                popover.set_child(Some(&gtk::Label::new(Some(label))));
+                let button = gtk::MenuButton::builder()
+                    .label(label)
+                    .popover(&popover)
+                    .build();
+                bar.append(&button);
+                (button, popover.downcast().unwrap())
+            })
+            .collect();
+        window.set_child(Some(&bar));
+        window.present();
+        assert!(pump_until(Duration::from_secs(5), || window.is_mapped()));
+        let (clock, clock_menu) = &menus[0];
+        let (system, system_menu) = &menus[1];
+        let closed = Rc::new(Cell::new(0));
+        {
+            let closed = closed.clone();
+            clock_menu.connect_closed(move |_| closed.set(closed.get() + 1));
+        }
+        clock.popup();
+        assert!(pump_until(Duration::from_secs(5), || clock_menu.is_mapped()));
+        assert_eq!(clock_menu.imp().opened_with_motion.get(), Some(true));
+        // Switching: the old menu closes logically in this very call.
+        clock.popdown();
+        assert!(!clock_menu.is_visible() && !clock_menu.is_mapped());
+        assert_eq!(closed.get(), 1, "closed is emitted synchronously");
+        assert!(!clock.is_active());
+        system.popup();
+        assert!(pump_until(Duration::from_secs(5), || system_menu.is_mapped()));
+        assert_eq!(
+            system_menu.imp().opened_with_motion.get(),
+            Some(false),
+            "a menu taking over opens fade-only"
+        );
+        system.popdown();
+        // A later, separate open rises again.
+        assert!(pump_until(Duration::from_secs(1), || {
+            !MENU_CLOSED_THIS_TURN.with(Cell::get)
+        }));
+        clock.popup();
+        assert!(pump_until(Duration::from_secs(5), || clock_menu.is_mapped()));
+        assert_eq!(clock_menu.imp().opened_with_motion.get(), Some(true));
+        clock.popdown();
+        assert_eq!(MENUS_MAPPED.with(Cell::get), 0);
+        window.close();
+        println!("MENU-MOTION pass actual GTK menus close at once (closed/visibility/button immediate); takeover opens fade-only; later open rises");
     }
 }

@@ -498,6 +498,16 @@ impl State {
             .find(|record| record.namespace == OVERVIEW_NAMESPACE)
             .map(|record| record.surface.clone())
     }
+
+    /// Whether `surface` is the GTK shell's top bar, whose popovers are
+    /// GNOME's BoxPointer menus (`crate::menu_close`). A namespace names a
+    /// role, not an owner: this only chooses a visual effect.
+    pub fn is_gtk_panel(&self, surface: &WlSurface) -> bool {
+        self.panel_surfaces.iter().any(|record| {
+            &record.surface == surface
+                && record.namespace == tuna_shell_control::GTK_PANEL_NAMESPACE
+        })
+    }
 }
 
 #[cfg(test)]
