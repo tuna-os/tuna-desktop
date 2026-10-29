@@ -1,0 +1,818 @@
+#!/usr/bin/env bash
+# tuna-lock-auth-proof: multi-step and fingerprint authentication on the
+# lock screen in the nested session (#366, ledger P-LK-02).
+#
+# Usage:
+#   scripts/tuna-lock-auth-proof [--display :N] [--artifacts DIR]
+#
+# Binaries: $TUNA_PROOF_BIN_DIR when set, else a cargo build of
+# tuna-compositor and tuna-shell-gtk (${CARGO_TARGET_DIR:-target}/debug).
+#
+# The real compositor and tuna-shell-gtk run nested on Xvfb with
+# TUNA_LOCK_TRACE=1, a private session bus, AT-SPI bus and XDG dirs. The
+# compositor's tuna-lock PAM service is a pam_wrapper stack: pam_matrix
+# (password) then scripts/lib/tuna-pam-otp.c (an info message and a
+# visible "Verification code:" question). fprintd is
+# scripts/lib/tuna-fprintd-mock.py on a private bus handed to the
+# compositor only as DBUS_SYSTEM_BUS_ADDRESS. GNOME 51's behaviour:
+# https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/authPrompt.js
+# https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/authServicesLegacy.js
+# https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/unlockDialog.js
+# https://gitlab.gnome.org/GNOME/gdm/-/blob/51.0/daemon/gdm-session-worker.c
+# https://gitlab.freedesktop.org/libfprint/fprintd/-/blob/master/pam/fingerprint-strings.h
+# Cases (assertions.txt carries the parity-ledger ID, then the case):
+#   G-LOCK-AUTH-MULTISTEP
+#     A-MULTI-STEP  password, then the OTP info and a visible "Verification
+#                   code" step with Back; the code unlocks; the concurrent
+#                   fingerprint claim is stopped and released
+#   G-LOCK-AUTH-WRONG-CODE
+#     B-WRONG-CODE  a wrong code shows GDM's generic failure, stays locked
+#                   and restarts at "Password"
+#     B-BACK        Back at step 2 returns to step 1 without unlocking
+#   G-LOCK-AUTH-CANCEL
+#     C-WRONG-PASSWORD a wrong password stays locked and restarts
+#     C-CANCEL      Escape to the clock stays locked and fprintd is released
+#   G-LOCK-AUTH-FPRINT
+#     D-FINGERPRINT the reader hint shows; a no-match is reported, a match
+#                   unlocks; Claim/VerifyStart/VerifyStop/Release in order
+#   G-LOCK-AUTH-FPRINT-MAXTRIES
+#     E-MAX-TRIES   three no-matches end fingerprint with the max-attempts
+#                   message (swipe reader hint); the password still unlocks
+#   G-LOCK-AUTH-NO-PRINTS
+#     F-NO-PRINTS   without enrolled prints there is no hint and no claim;
+#                   the password unlocks
+#   G-LOCK-AUTH-HYGIENE
+#     Z-HYGIENE     no secret in any log; no panic; the compositor's
+#                   `lock conversation` trace is one JSON object per line
+# Each case keeps screenshots (x11grab of the nested window) and AT-SPI
+# dumps. Writes assertions.txt and receipt.json (source revision, binary
+# hashes, case verdicts, cleanup) to the artifact directory; exits
+# non-zero naming the failed case.
+set -eu
+
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+fi
+unset CDPATH
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+DISPLAY_ARG=""
+ARTIFACTS="$ROOT/lock-auth-artifacts"
+WIDTH=1280
+HEIGHT=800
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --display) DISPLAY_ARG="$2"; shift 2 ;;
+        --artifacts) ARTIFACTS="$2"; shift 2 ;;
+        --help|-h) sed -n '2,50p' "$0"; exit 0 ;;
+        *) echo "tuna-lock-auth-proof: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+mkdir -p "$ARTIFACTS"
+ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
+LOG="$ARTIFACTS/nested.log"
+ASSERTIONS="$ARTIFACTS/assertions.txt"
+CSTATE="$ARTIFACTS/compositor-state.json"
+FP_LOG="$ARTIFACTS/fprintd-calls.jsonl"
+: >"$ASSERTIONS"
+: >"$LOG"
+: >"$FP_LOG"
+rm -f "$ARTIFACTS/receipt.json" "$CSTATE" "$ARTIFACTS/pam-otp-sha256.txt" "$ARTIFACTS"/*.png "$ARTIFACTS"/a11y-*.json
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+PAM_WRAPPER_LIB=/usr/lib/x86_64-linux-gnu/libpam_wrapper.so
+PAM_MATRIX=/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so
+ORIG_HOME="$HOME"
+BIN_DIR="${TUNA_PROOF_BIN_DIR:-${CARGO_TARGET_DIR:-$ROOT/target}/debug}"
+
+# Private runtime (AF_UNIX paths stay short) and XDG/HOME directories.
+RUN_PRIV="$(mktemp -d /tmp/tuna-lap.XXXXXX)"
+chmod 700 "$RUN_PRIV"
+HOME="$ARTIFACTS/home"
+XDG_RUNTIME_DIR="$RUN_PRIV"
+XDG_CONFIG_HOME="$ARTIFACTS/config"
+XDG_DATA_HOME="$ARTIFACTS/data"
+XDG_CACHE_HOME="$ARTIFACTS/cache"
+XDG_STATE_HOME="$ARTIFACTS/state"
+rm -rf "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
+# keyfile: GSettings writes stay in the private config directory.
+GSETTINGS_BACKEND=keyfile
+TUNA_COMPOSITOR_STATE="$CSTATE"
+export HOME XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
+    GSETTINGS_BACKEND TUNA_COMPOSITOR_STATE
+unset WAYLAND_DISPLAY WAYLAND_SOCKET DBUS_SYSTEM_BUS_ADDRESS AT_SPI_BUS_ADDRESS
+
+# Secrets of this run only: never written below $ARTIFACTS.
+PASSWORD="tuna-lap-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+# OTP codes are digits in the wild; this one is alphanumeric so the
+# secret scan below cannot mistake timestamps or pixels for it.
+CODE="otp$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
+WRONG_CODE="${CODE}0"
+WRONG_PASSWORD="nope-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+
+XVFB_PID=""
+ATSPI_PID=""
+SYSBUS_PID=""
+MOCK_PID=""
+COMPOSITOR_PID=""
+CURRENT_CASE="SETUP"
+FAILED_CASE=""
+
+ledger_id() {
+    case "$1" in
+        A-*) echo G-LOCK-AUTH-MULTISTEP ;;
+        B-*) echo G-LOCK-AUTH-WRONG-CODE ;;
+        C-*) echo G-LOCK-AUTH-CANCEL ;;
+        D-*) echo G-LOCK-AUTH-FPRINT ;;
+        E-*) echo G-LOCK-AUTH-FPRINT-MAXTRIES ;;
+        F-*) echo G-LOCK-AUTH-NO-PRINTS ;;
+        Z-*) echo G-LOCK-AUTH-HYGIENE ;;
+        *) echo "G-LOCK-AUTH-$1" ;;
+    esac
+}
+pass() {
+    echo "$(ledger_id "$1") pass [$1] $2" >>"$ASSERTIONS"
+    echo "tuna-lock-auth-proof: $1 pass: $2"
+}
+fail() {
+    FAILED_CASE="$1"
+    echo "$(ledger_id "$1") fail [$1] $2" >>"$ASSERTIONS"
+    echo "tuna-lock-auth-proof: $1 FAIL: $2" >&2
+    tail -40 "$LOG" >&2 2>/dev/null || true
+    exit 1
+}
+
+# Every process this proof started carries XDG_RUNTIME_DIR=$RUN_PRIV.
+owned_pids() {
+    : >"$ARTIFACTS/owned-pids.txt"
+    for environ in /proc/[0-9]*/environ; do
+        pid="${environ#/proc/}"
+        pid="${pid%/environ}"
+        [ "$pid" = "$$" ] && continue
+        if tr '\0' '\n' 2>/dev/null <"$environ" | grep -qxF "XDG_RUNTIME_DIR=$RUN_PRIV"; then
+            echo "$pid" >>"$ARTIFACTS/owned-pids.txt"
+        fi
+    done
+}
+
+stop_pid() {
+    [ -n "$1" ] || return 0
+    kill "$1" 2>/dev/null || return 0
+    for _ in $(seq 1 50); do kill -0 "$1" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
+}
+
+finish() {
+    status=$?
+    set +e
+    trap - EXIT INT TERM
+    if [ "$status" != 0 ] && [ -z "$FAILED_CASE" ]; then
+        FAILED_CASE="$CURRENT_CASE"
+        echo "$(ledger_id "$CURRENT_CASE") fail [$CURRENT_CASE] exited with status $status" >>"$ASSERTIONS"
+    fi
+    [ -s "$CSTATE" ] && cp "$CSTATE" "$ARTIFACTS/final-state.json"
+    # The compositor first, so its shell and conversations retire while
+    # their buses are still there; then the buses and services.
+    stop_pid "$COMPOSITOR_PID"
+    stop_pid "$MOCK_PID"
+    stop_pid "$SYSBUS_PID"
+    stop_pid "$ATSPI_PID"
+    stop_pid "$XVFB_PID"
+    owned_pids
+    swept=""
+    while read -r pid; do
+        kill "$pid" 2>/dev/null && swept="$swept $pid"
+    done <"$ARTIFACTS/owned-pids.txt"
+    [ -n "$swept" ] && sleep 1
+    while read -r pid; do kill -9 "$pid" 2>/dev/null; done <"$ARTIFACTS/owned-pids.txt"
+    sleep 0.3
+    owned_pids
+    cp "$ARTIFACTS/owned-pids.txt" "$ARTIFACTS/leftover-pids.txt"
+    rm -rf "$RUN_PRIV"
+    leftover="$(tr '\n' ' ' <"$ARTIFACTS/leftover-pids.txt")"
+    if [ -n "$leftover" ]; then
+        echo "$(ledger_id CLEANUP) fail [CLEANUP] processes outlived the proof: $leftover" >>"$ASSERTIONS"
+        [ -n "$FAILED_CASE" ] || FAILED_CASE=CLEANUP
+    fi
+    if [ -e "$RUN_PRIV" ]; then
+        echo "$(ledger_id CLEANUP) fail [CLEANUP] $RUN_PRIV remains" >>"$ASSERTIONS"
+        FAILED_CASE="${FAILED_CASE:-CLEANUP}"
+    fi
+    "$PY" - "$ARTIFACTS" "$ROOT" "$BIN_DIR" "${FAILED_CASE}" "$swept" <<'RECEIPT'
+import hashlib, json, pathlib, subprocess, sys
+out, root, bins, failed, swept = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5].split()
+def sha(path):
+    try:
+        return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+def git(*args):
+    try:
+        return subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+cases = []
+for line in (out / 'assertions.txt').read_text().splitlines():
+    ledger_id, verdict, rest = (line.split(' ', 2) + ['', ''])[:3]
+    case, _, detail = rest.partition('] ')
+    cases.append({'ledger_id': ledger_id, 'case': case.lstrip('['), 'verdict': verdict, 'detail': detail})
+status = git('status', '--porcelain', '--untracked-files=no')
+receipt = {
+    'proof': 'tuna-lock-auth-proof', 'issue': 366, 'ledger': 'P-LK-02',
+    'result': 'fail' if failed else 'pass', 'failed_case': failed or None,
+    'source': {'head': git('rev-parse', 'HEAD'), 'dirty': bool(status),
+               'status_sha256': hashlib.sha256((status or '').encode()).hexdigest()},
+    'binaries': {name: sha(bins / name) for name in ('tuna-compositor', 'tuna-shell-gtk')},
+    'pam_otp_so_sha256': ((out / 'pam-otp-sha256.txt').read_text().strip()
+                          if (out / 'pam-otp-sha256.txt').exists() else None),
+    'fixtures': {name: sha(root / name) for name in (
+        'scripts/tuna-lock-auth-proof', 'scripts/lib/tuna-fprintd-mock.py',
+        'scripts/lib/tuna-pam-otp.c', 'scripts/lib/tuna-proof-session-launch')},
+    'bin_dir': str(bins), 'cases': cases,
+    'cleanup': {'swept_pids': swept,
+                'leftover_pids': (out / 'leftover-pids.txt').read_text().split()},
+    'scope': 'nested winit session on Xvfb; PAM via pam_wrapper (pam_matrix + tuna-pam-otp), '
+             'fprintd via a D-Bus mock on a private bus; real compositor, shell, GTK widgets, '
+             'X11 input and AT-SPI',
+    'not_covered': ['greetd-launched sessions (legacy single-password fallback)',
+                    'real fprintd/libfprint hardware and polkit',
+                    'installed PAM stacks (pam_unix, pam_fprintd, OTP modules)',
+                    'smartcard and web login'],
+}
+(out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+RECEIPT
+    if [ -n "$FAILED_CASE" ]; then
+        echo "tuna-lock-auth-proof: FAILED $FAILED_CASE (artifacts in $ARTIFACTS)" >&2
+        exit 1
+    fi
+    echo "tuna-lock-auth-proof: OK, artifacts in $ARTIFACTS"
+    exit 0
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
+
+cstate() {
+    end=$(($(date +%s) + ${2:-20}))
+    while [ "$(date +%s)" -le "$end" ]; do
+        kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
+        [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+# Trace lines: `mark` the log, then wait for an exact line (`twait`) or
+# an extended regex (`twaitre`) after the mark; both print the line number.
+mark() { wc -l <"$LOG" | tr -d ' '; }
+twait_with() {
+    flags="$1" from="$2" text="$3" end=$(($(date +%s) + ${4:-20}))
+    while :; do
+        n="$(tail -n "+$((from + 1))" "$LOG" | grep -n "$flags" -m1 -- "$text" | cut -d: -f1 || true)"
+        if [ -n "$n" ]; then echo $((from + n)); return 0; fi
+        [ "$(date +%s)" -ge "$end" ] && return 1
+        kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
+        sleep 0.2
+    done
+}
+twait() { twait_with -Fx "$1" "tuna-shell-gtk: lock auth $2" "${3:-20}"; }
+twaitre() { twait_with -E "$1" "^tuna-shell-gtk: lock auth $2" "${3:-20}"; }
+# No exact line after the mark.
+tnone() { ! tail -n "+$(($1 + 1))" "$LOG" | grep -qFx -- "tuna-shell-gtk: lock auth $2"; }
+tnone_re() { ! tail -n "+$(($1 + 1))" "$LOG" | grep -qE -- "^tuna-shell-gtk: lock auth $2"; }
+# The request id of the latest `begin` of SERVICE after the mark.
+begin_id() {
+    tail -n "+$(($1 + 1))" "$LOG" | grep -E "^tuna-shell-gtk: lock auth begin service=$2 request=[0-9]+$" |
+        tail -1 | sed 's/.*request=//' | grep . || echo -1
+}
+# cwait MARK JQ [TIMEOUT]: a compositor `lock conversation` event after
+# the mark satisfies the jq predicate.
+cwait() {
+    end=$(($(date +%s) + ${3:-20}))
+    while :; do
+        tail -n "+$(($1 + 1))" "$LOG" | sed -n 's/^tuna-compositor: lock conversation //p' |
+            jq -e -s "any(.[]; $2)" >/dev/null 2>&1 && return 0
+        [ "$(date +%s)" -ge "$end" ] && return 1
+        sleep 0.2
+    done
+}
+
+# The mock fprintd, through its test interface on the private bus.
+fp() {
+    gdbus call --address "$SYS_ADDR" --dest net.reactivated.Fprint \
+        --object-path /net/reactivated/Fprint/Device/0 --method "net.reactivated.Fprint.Test.$1" "${@:2}"
+}
+fp_state() { fp State | sed -e "s/^('//" -e "s/',)\$//"; }
+fp_until() {
+    end=$(($(date +%s) + ${2:-20}))
+    while [ "$(date +%s)" -le "$end" ]; do
+        fp_state | jq -e "$1" >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    fp_state >&2 || true
+    return 1
+}
+fp_mark() { wc -l <"$FP_LOG" | tr -d ' '; }
+# Successful lifecycle calls after the mark, space separated, with the
+# mock's automatic release when the claiming connection left the bus
+# (ClientVanished, as fprintd's _fprint_device_client_vanished).
+fp_calls() {
+    tail -n "+$(($1 + 1))" "$FP_LOG" |
+        jq -rs '[.[] | select((.kind == "call" and .outcome == "ok" and
+            (.member | IN("Claim", "VerifyStart", "VerifyStop", "Release")))
+            or (.kind == "auto" and .member == "ClientVanished")) | .member] | join(" ")'
+}
+# fp_order MARK A B ...: the calls after MARK contain A, B, ... in order;
+# A may list alternatives as X|Y (the earliest one counts).
+fp_order() {
+    rest=" $(fp_calls "$1") . "
+    shift
+    for member in "$@"; do
+        best=""
+        for alt in ${member//|/ }; do
+            case "$rest" in
+                *" $alt "*)
+                    after="${rest#* "$alt" }"
+                    [ "${#after}" -gt "${#best}" ] && best="$after"
+                    ;;
+            esac
+        done
+        [ -n "$best" ] || return 1
+        rest=" $best"
+    done
+}
+press() { fp Press "$1" "$2" >/dev/null; }
+
+# AT-SPI dump of the shell; every dump is taken locked, when exactly one
+# lock window (one monitor) may be on the accessibility tree.
+dump() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-$1.json" 20 \
+        >/dev/null 2>"$ARTIFACTS/a11y-$1.err" || fail "$CURRENT_CASE" "accessibility dump $1 failed"
+    frames="$(jq '[.[] | select(.role == "frame" and .name == "Lock Screen" and .showing)] | length' "$ARTIFACTS/a11y-$1.json")"
+    [ "$frames" = 1 ] || fail "$CURRENT_CASE" "$frames showing Lock Screen windows on the accessibility tree in $1 (stale lock UI)"
+}
+showing() { jq -e --arg n "$2" 'any(.[]; .name == $n and .showing)' "$ARTIFACTS/a11y-$1.json" >/dev/null; }
+hidden() { ! showing "$@"; }
+shot() {
+    geom="$(xdotool getwindowgeometry --shell "$WID")"
+    gx="$(echo "$geom" | sed -n 's/^X=//p')"
+    gy="$(echo "$geom" | sed -n 's/^Y=//p')"
+    ffmpeg -loglevel error -y -f x11grab -draw_mouse 0 -video_size "${WIDTH}x${HEIGHT}" \
+        -i "$DISPLAY+$gx,$gy" -frames:v 1 "$ARTIFACTS/$1.png" ||
+        fail "$CURRENT_CASE" "x11grab of the nested window failed for $1"
+}
+# Click a node of the last dump by name, at its centre (window coordinates
+# are output coordinates: the lock window covers the nested output).
+click_node() {
+    read -r cx cy < <(jq -r --arg n "$2" 'first(.[] | select(.name == $n and .showing and .bounds != null))
+        | .bounds | "\(.[0] + (.[2] / 2 | floor)) \(.[1] + (.[3] / 2 | floor))"' "$ARTIFACTS/a11y-$1.json") ||
+        return 1
+    [ -n "${cx:-}" ] || return 1
+    xdotool mousemove --window "$WID" "$cx" "$cy" click 1
+}
+answer() {
+    xdotool type --delay 40 "$1"
+    xdotool key Return
+}
+lock_session() {
+    xdotool windowfocus --sync "$WID" 2>/dev/null || true
+    xdotool key --clearmodifiers super+l
+    cstate '.locked == true' 15 || fail "$CURRENT_CASE" "Super+L did not lock the session"
+    sleep 1.5
+}
+# Lift the clock curtain with a click, as G-UNLOCK does.
+lift() {
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
+}
+still_locked() {
+    sleep "${1:-1}"
+    jq -e '.locked == true' "$CSTATE" >/dev/null 2>&1
+}
+
+HINT_PRESS="(or place finger on reader)"
+HINT_SWIPE="(or swipe finger across reader)"
+OTP_INFO="A verification code was sent to your device"
+GENERIC_FAILURE="Sorry, password authentication didn’t work. Please try again."
+NO_MATCH="Failed to match fingerprint"
+MAX_TRIES="You reached the maximum fingerprint authentication attempts, please try another method"
+
+# The password service's newest event is an unanswered step-1 Password
+# question (after any reset or restart the prompt went through).
+await_step1() {
+    end=$(($(date +%s) + ${1:-20}))
+    while :; do
+        last="$(grep -E '^tuna-shell-gtk: lock auth (begin|query|answer|result) service=password' "$LOG" | tail -1 || true)"
+        [ "$last" = "tuna-shell-gtk: lock auth query service=password step=1 secret=true question=Password" ] && return 0
+        [ "$(date +%s)" -ge "$end" ] && return 1
+        sleep 0.2
+    done
+}
+# Step 1 then step 2 of the password service, answering the password.
+to_code_step() {
+    await_step1 20 || fail "$CURRENT_CASE" "the prompt is not asking for the Password"
+    m2="$(mark)"
+    answer "$PASSWORD"
+    twait "$m2" "answer service=password step=1" 10 >/dev/null ||
+        fail "$CURRENT_CASE" "the password answer was not sent"
+    twait "$m2" "query service=password step=2 secret=false question=Verification code" 20 >/dev/null ||
+        fail "$CURRENT_CASE" "the visible Verification code step did not follow the password"
+}
+unlock_with_code() {
+    m3="$(mark)"
+    answer "$CODE"
+    twait "$m3" "answer service=password step=2" 10 >/dev/null ||
+        fail "$CURRENT_CASE" "the code answer was not sent"
+    twaitre "$m3" "result service=password request=[0-9]+ applied=true$" 20 >/dev/null ||
+        fail "$CURRENT_CASE" "the password service did not verify"
+    cstate '.locked == false' 20 || fail "$CURRENT_CASE" "the session did not unlock"
+}
+
+# --- environment ------------------------------------------------------
+for tool in Xvfb xdotool ffmpeg jq gdbus dbus-daemon cc; do
+    command -v "$tool" >/dev/null 2>&1 || fail SETUP "$tool is required"
+done
+[ -e "$PAM_WRAPPER_LIB" ] && [ -e "$PAM_MATRIX" ] || fail SETUP "pam_wrapper and pam_matrix are required"
+
+if [ -x /usr/libexec/at-spi-bus-launcher ]; then
+    /usr/libexec/at-spi-bus-launcher --launch-immediately >"$ARTIFACTS/atspi.log" 2>&1 &
+    ATSPI_PID=$!
+    AT_SPI_BUS_ADDRESS="$("$PY" - <<'AT_SPI_ADDRESS'
+import time
+from gi.repository import Gio
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+end = time.monotonic() + 10
+while True:
+    try:
+        reply = bus.call_sync('org.a11y.Bus', '/org/a11y/bus', 'org.a11y.Bus', 'GetAddress',
+                              None, None, Gio.DBusCallFlags.NO_AUTO_START, 2000, None)
+        print(reply.unpack()[0])
+        break
+    except Exception:
+        if time.monotonic() >= end:
+            raise
+        time.sleep(0.1)
+AT_SPI_ADDRESS
+)" || fail SETUP "the private accessibility bus did not start"
+    export AT_SPI_BUS_ADDRESS
+else
+    fail SETUP "at-spi-bus-launcher is required for the accessibility dumps"
+fi
+
+[ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
+if [ -z "$DISPLAY_ARG" ]; then
+    Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+        3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+    XVFB_PID=$!
+    for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 0.5; done
+    [ -s "$ARTIFACTS/xvfb-display" ] || fail SETUP "Xvfb did not allocate a display"
+    DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+    export DISPLAY
+fi
+for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.5; done
+xdotool getdisplaygeometry >/dev/null 2>&1 || fail SETUP "no X display at $DISPLAY"
+
+if [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
+    RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$ORIG_HOME/.cargo}" \
+        cargo build --locked --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk ||
+        fail SETUP "cargo build failed"
+fi
+for bin in tuna-compositor tuna-shell-gtk; do
+    [ -x "$BIN_DIR/$bin" ] || fail SETUP "$BIN_DIR/$bin is missing"
+done
+
+# The private "system" bus: fprintd's only home in this proof.
+cat >"$RUN_PRIV/system-bus.conf" <<BUSCONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>tuna-proof-system</type>
+  <listen>unix:path=$RUN_PRIV/system_bus_socket</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_type="method_call"/>
+    <allow send_type="signal"/>
+    <allow send_type="method_return"/>
+    <allow send_type="error"/>
+    <allow receive_type="method_call"/>
+    <allow receive_type="method_return"/>
+    <allow receive_type="error"/>
+    <allow receive_type="signal"/>
+  </policy>
+</busconfig>
+BUSCONF
+dbus-daemon --config-file="$RUN_PRIV/system-bus.conf" --nofork --print-address=3 \
+    3>"$RUN_PRIV/system-bus-address" >"$ARTIFACTS/system-bus.log" 2>&1 &
+SYSBUS_PID=$!
+for _ in $(seq 1 50); do [ -s "$RUN_PRIV/system-bus-address" ] && break; sleep 0.1; done
+SYS_ADDR="$(head -1 "$RUN_PRIV/system-bus-address")"
+case "$SYS_ADDR" in unix:path=*) ;; *) fail SETUP "the private system bus did not start" ;; esac
+
+"$PY" "$ROOT/scripts/lib/tuna-fprintd-mock.py" --address "$SYS_ADDR" --log "$FP_LOG" \
+    >"$ARTIFACTS/fprintd-mock.out" 2>"$ARTIFACTS/fprintd-mock.err" &
+MOCK_PID=$!
+for _ in $(seq 1 50); do grep -q '^tuna-fprintd-mock: ready ' "$ARTIFACTS/fprintd-mock.out" && break; sleep 0.1; done
+grep -q '^tuna-fprintd-mock: ready ' "$ARTIFACTS/fprintd-mock.out" || fail SETUP "the fprintd mock did not start"
+
+# The tuna-lock PAM stack: password (requisite, so a wrong one ends the
+# conversation like pam_unix before an OTP module), then the code.
+mkdir -p "$RUN_PRIV/pam/services"
+cc -Wall -Wextra -Werror -shared -fPIC -o "$RUN_PRIV/pam/tuna-pam-otp.so" \
+    "$ROOT/scripts/lib/tuna-pam-otp.c" -lpam 2>"$ARTIFACTS/pam-otp-build.log" ||
+    fail SETUP "tuna-pam-otp.c did not build"
+sha256sum "$RUN_PRIV/pam/tuna-pam-otp.so" | cut -d' ' -f1 >"$ARTIFACTS/pam-otp-sha256.txt"
+printf '%s:%s:tuna-lock\n' "$(id -un)" "$PASSWORD" >"$RUN_PRIV/pam/passdb"
+chmod 600 "$RUN_PRIV/pam/passdb"
+printf 'auth requisite %s passdb=%s\nauth required %s code=%s\naccount required %s passdb=%s\n' \
+    "$PAM_MATRIX" "$RUN_PRIV/pam/passdb" "$RUN_PRIV/pam/tuna-pam-otp.so" "$CODE" \
+    "$PAM_MATRIX" "$RUN_PRIV/pam/passdb" >"$RUN_PRIV/pam/services/tuna-lock"
+chmod 600 "$RUN_PRIV/pam/services/tuna-lock"
+
+{
+    echo "source $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-shell-gtk"
+} >"$ARTIFACTS/manifest.txt"
+
+env DBUS_SYSTEM_BUS_ADDRESS="$SYS_ADDR" TUNA_LOCK_TRACE=1 TUNA_PROOF_BIN_DIR="$BIN_DIR" \
+    LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 PAM_WRAPPER_SERVICE_DIR="$RUN_PRIV/pam/services" \
+    RUST_BACKTRACE=1 \
+    "$ROOT/scripts/lib/tuna-proof-session-launch" 0 "$ROOT" "tuna-lock-auth-$$" >>"$LOG" 2>&1 &
+COMPOSITOR_PID=$!
+WID=""
+for _ in $(seq 1 90); do
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail SETUP "the compositor exited during startup"
+    WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
+    [ -n "$WID" ] && break
+    sleep 1
+done
+[ -n "$WID" ] || fail SETUP "no nested window"
+xdotool windowfocus --sync "$WID"
+cstate '.layers | any(.namespace == "tuna-panel")' 180 || fail SETUP "the top bar never mapped"
+cstate '.locked == false' 5 || fail SETUP "the session started locked"
+sleep 2
+shot 00-session
+
+# --- A: password + code, fingerprint running alongside ------------------
+CURRENT_CASE=A-MULTI-STEP
+lock_session
+shot A-0-locked
+m="$(mark)"; f="$(fp_mark)"
+lift
+twaitre "$m" "begin service=password request=[0-9]+$" 20 >/dev/null ||
+    fail A-MULTI-STEP "lifting the curtain did not begin the password service"
+twaitre "$m" "begin service=fingerprint request=[0-9]+$" 20 >/dev/null ||
+    fail A-MULTI-STEP "lifting the curtain did not begin the fingerprint service"
+twait "$m" "query service=password step=1 secret=true question=Password" 20 >/dev/null ||
+    fail A-MULTI-STEP "the first step did not ask for the secret Password"
+fp_until '.claimed and .action == "verify" and (.verify_done | not)' 15 ||
+    fail A-MULTI-STEP "fprintd was not claimed and verifying alongside the password"
+twait "$m" "message type=hint text=$HINT_PRESS" 15 >/dev/null ||
+    fail A-MULTI-STEP "the press-reader hint was not shown"
+sleep 0.5
+dump A-1-password
+shot A-1-password
+showing A-1-password "Password" || fail A-MULTI-STEP "no showing Password entry"
+showing A-1-password "$HINT_PRESS" || fail A-MULTI-STEP "the fingerprint hint is not showing"
+hidden A-1-password "Back" || fail A-MULTI-STEP "Back is offered on the first step"
+m2="$(mark)"
+to_code_step
+twait "$m2" "message type=info text=$OTP_INFO" 10 >/dev/null ||
+    fail A-MULTI-STEP "the PAM info message was not shown"
+sleep 0.5
+dump A-2-code
+shot A-2-code
+showing A-2-code "$OTP_INFO" || fail A-MULTI-STEP "the info message is not on screen"
+showing A-2-code "Verification code" || fail A-MULTI-STEP "no showing Verification code entry"
+showing A-2-code "Back" || fail A-MULTI-STEP "Back is not offered on the second step"
+jq -e 'any(.[]; .name == "Verification code" and .showing and .role != "password text")' \
+    "$ARTIFACTS/a11y-A-2-code.json" >/dev/null || fail A-MULTI-STEP "the code entry is a hidden-text entry"
+still_locked 0.2 || fail A-MULTI-STEP "the password alone unlocked the session"
+unlock_with_code
+unlocked_at="$(date +%s.%N)"
+shot A-3-unlocked
+fp_until '(.claimed | not) and .action == null' 5 ||
+    fail A-MULTI-STEP "fprintd was still claimed 5 s after the password unlocked"
+# A polite VerifyStop + Release, or the compositor dropping its private
+# fprintd connection, which fprintd (and the mock) turn into a release.
+fp_order "$f" Claim VerifyStart VerifyStop Release || fp_order "$f" Claim VerifyStart ClientVanished ||
+    fail A-MULTI-STEP "fprintd was not claimed, verified and then stopped and released: $(fp_calls "$f")"
+released_at="$(tail -n "+$((f + 1))" "$FP_LOG" | jq -rs '[.[] | select((.kind == "call" and .member == "Release" and .outcome == "ok") or (.kind == "auto" and .member == "ClientVanished"))] | last | .wall')"
+# The losing service's conversation is retired unauthenticated (the shell
+# consumes its Denied result silently once another service verified).
+cwait "$m" ".event == \"retired\" and .service == \"fingerprint\" and .request == $(begin_id "$m" fingerprint) and (.authenticated | not)" 10 ||
+    fail A-MULTI-STEP "the losing fingerprint conversation was not retired unauthenticated"
+release_delay="$(awk -v r="$released_at" -v u="$unlocked_at" 'BEGIN { printf "%+.2f", r - u }')"
+pass A-MULTI-STEP "Password (secret), then '$OTP_INFO' and a visible 'Verification code' step with Back; the code unlocked; fprintd Claim/VerifyStart/VerifyStop/Release ($(fp_calls "$f")), release $release_delay s relative to the observed unlock"
+
+# --- B: wrong code, then Back -------------------------------------------
+CURRENT_CASE=B-WRONG-CODE
+lock_session
+m="$(mark)"
+lift
+to_code_step
+m2="$(mark)"
+answer "$WRONG_CODE"
+p="$(twait "$m2" "message type=problem text=$GENERIC_FAILURE" 20)" ||
+    fail B-WRONG-CODE "GDM's generic failure was not shown for a wrong code"
+# The message holds for its reading time before the prompt resets.
+sleep 0.3
+dump B-1-wrong-code
+shot B-1-wrong-code
+showing B-1-wrong-code "$GENERIC_FAILURE" || fail B-WRONG-CODE "the failure message is not on screen"
+twaitre "$m2" "result service=password request=[0-9]+ applied=false$" 10 >/dev/null ||
+    fail B-WRONG-CODE "the wrong code did not end the password conversation Denied"
+twaitre "$p" "begin service=password request=[0-9]+$" 15 >/dev/null ||
+    fail B-WRONG-CODE "the password service did not restart after the failure"
+twait "$p" "query service=password step=1 secret=true question=Password" 15 >/dev/null ||
+    fail B-WRONG-CODE "the prompt did not restart at Password"
+still_locked 1 || fail B-WRONG-CODE "a wrong code unlocked the session"
+dump B-2-restarted
+shot B-2-restarted
+showing B-2-restarted "Password" || fail B-WRONG-CODE "the restarted prompt is not showing Password"
+hidden B-2-restarted "Verification code" || fail B-WRONG-CODE "the code entry is still showing after the restart"
+hidden B-2-restarted "Back" || fail B-WRONG-CODE "Back is offered on the restarted first step"
+pass B-WRONG-CODE "a wrong code shows '$GENERIC_FAILURE', stays locked and restarts at Password"
+
+CURRENT_CASE=B-BACK
+m="$(mark)"
+to_code_step
+sleep 0.5
+dump B-3-code
+showing B-3-code "Back" || fail B-BACK "Back is not offered on the code step"
+m2="$(mark)"
+click_node B-3-code "Back" || fail B-BACK "Back has no on-screen bounds to click"
+twait "$m2" "query service=password step=1 secret=true question=Password" 15 >/dev/null ||
+    fail B-BACK "Back did not return to the Password step"
+still_locked 1 || fail B-BACK "Back unlocked the session"
+tail -n "+$((m + 1))" "$LOG" | grep -qE '^tuna-shell-gtk: lock auth result service=password request=[0-9]+ applied=true$' &&
+    fail B-BACK "a password result applied during Back"
+sleep 0.3
+dump B-4-back
+shot B-4-back
+showing B-4-back "Password" || fail B-BACK "the Password entry is not showing after Back"
+hidden B-4-back "Verification code" || fail B-BACK "the code entry is still showing after Back"
+hidden B-4-back "Back" || fail B-BACK "Back is still offered on the first step"
+pass B-BACK "Back on the code step returns to Password without unlocking"
+
+# --- C: wrong password, then cancel to the clock ------------------------
+CURRENT_CASE=C-WRONG-PASSWORD
+m="$(mark)"
+await_step1 20 || fail C-WRONG-PASSWORD "the prompt is not asking for the Password"
+answer "$WRONG_PASSWORD"
+p="$(twait "$m" "message type=problem text=$GENERIC_FAILURE" 20)" ||
+    fail C-WRONG-PASSWORD "GDM's generic failure was not shown for a wrong password"
+sleep 0.3
+dump C-1-wrong-password
+shot C-1-wrong-password
+showing C-1-wrong-password "$GENERIC_FAILURE" || fail C-WRONG-PASSWORD "the failure message is not on screen"
+twait "$m" "query service=password step=2 secret=false question=Verification code" 1 >/dev/null &&
+    fail C-WRONG-PASSWORD "a wrong password went on to the code step"
+twait "$p" "query service=password step=1 secret=true question=Password" 15 >/dev/null ||
+    fail C-WRONG-PASSWORD "the prompt did not restart at Password"
+still_locked 1 || fail C-WRONG-PASSWORD "a wrong password unlocked the session"
+pass C-WRONG-PASSWORD "a wrong password shows '$GENERIC_FAILURE', stays locked and restarts at Password"
+
+CURRENT_CASE=C-CANCEL
+fp_until '.claimed and .action == "verify" and (.verify_done | not)' 20 ||
+    fail C-CANCEL "fingerprint was not verifying on the restarted prompt"
+f="$(fp_mark)"
+xdotool key Escape
+fp_until '(.claimed | not) and .action == null' 10 ||
+    fail C-CANCEL "Escape to the clock left fprintd claimed"
+fp_order "$f" "Release|ClientVanished" || fail C-CANCEL "no release after Escape: $(fp_calls "$f")"
+still_locked 2 || fail C-CANCEL "Escape unlocked the session"
+fp_state | jq -e '.claimed | not' >/dev/null || fail C-CANCEL "fprintd was claimed again on the clock"
+dump C-2-clock
+shot C-2-clock
+hidden C-2-clock "Password" || fail C-CANCEL "the prompt is still showing on the clock"
+pass C-CANCEL "Escape to the clock stays locked and releases fprintd ($(fp_calls "$f"))"
+
+# --- D: fingerprint no-match, then match --------------------------------
+CURRENT_CASE=D-FINGERPRINT
+m="$(mark)"; f="$(fp_mark)"
+lift
+twait "$m" "message type=hint text=$HINT_PRESS" 20 >/dev/null || fail D-FINGERPRINT "no press-reader hint"
+fp_until '.claimed and .action == "verify" and (.verify_done | not)' 15 || fail D-FINGERPRINT "fprintd is not verifying"
+sleep 0.3
+dump D-1-hint
+shot D-1-hint
+showing D-1-hint "$HINT_PRESS" || fail D-FINGERPRINT "the hint is not on screen"
+m2="$(mark)"
+press verify-no-match true
+twait "$m2" "message type=problem text=$NO_MATCH" 10 >/dev/null || fail D-FINGERPRINT "no-match was not reported"
+still_locked 0.5 || fail D-FINGERPRINT "a no-match unlocked the session"
+dump D-2-no-match
+shot D-2-no-match
+showing D-2-no-match "$NO_MATCH" || fail D-FINGERPRINT "'$NO_MATCH' is not on screen"
+fp_until '.claimed and .action == "verify" and (.verify_done | not)' 15 ||
+    fail D-FINGERPRINT "fingerprint did not retry after a no-match"
+press verify-match true
+twaitre "$m" "result service=fingerprint request=[0-9]+ applied=true$" 15 >/dev/null ||
+    fail D-FINGERPRINT "the fingerprint service did not verify on a match"
+cstate '.locked == false' 20 || fail D-FINGERPRINT "a fingerprint match did not unlock"
+shot D-3-unlocked
+fp_until '(.claimed | not) and .action == null' 5 || fail D-FINGERPRINT "fprintd still claimed after unlock"
+fp_order "$f" Claim VerifyStart VerifyStop Release || fail D-FINGERPRINT "fprintd order: $(fp_calls "$f")"
+cwait "$m" ".event == \"retired\" and .service == \"password\" and .request == $(begin_id "$m" password) and (.authenticated | not)" 10 ||
+    fail D-FINGERPRINT "the losing password conversation was not retired unauthenticated"
+pass D-FINGERPRINT "hint '$HINT_PRESS'; a no-match shows '$NO_MATCH'; a match unlocks; fprintd $(fp_calls "$f")"
+
+# --- E: three no-matches (swipe reader), then the password --------------
+CURRENT_CASE=E-MAX-TRIES
+fp SetScanType swipe >/dev/null
+lock_session
+m="$(mark)"; f="$(fp_mark)"
+lift
+twait "$m" "message type=hint text=$HINT_SWIPE" 20 >/dev/null || fail E-MAX-TRIES "no swipe-reader hint"
+for try in 1 2 3; do
+    fp_until '.claimed and .action == "verify" and (.verify_done | not)' 15 ||
+        fail E-MAX-TRIES "fprintd was not verifying for try $try"
+    mt="$(mark)"; ft="$(fp_mark)"
+    press verify-no-match true
+    if [ "$try" -lt 3 ]; then
+        twait "$mt" "message type=problem text=$NO_MATCH" 10 >/dev/null ||
+            fail E-MAX-TRIES "no-match $try was not reported"
+    fi
+done
+twait "$m" "message type=problem text=$MAX_TRIES" 15 >/dev/null ||
+    fail E-MAX-TRIES "the maximum-attempts message was not shown"
+sleep 0.3
+dump E-1-max-tries
+shot E-1-max-tries
+showing E-1-max-tries "$MAX_TRIES" || fail E-MAX-TRIES "the maximum-attempts message is not on screen"
+twaitre "$m" "result service=fingerprint request=[0-9]+ applied=false$" 10 >/dev/null ||
+    fail E-MAX-TRIES "fingerprint did not end Denied after three no-matches"
+# The third no-match's attempt is stopped and released (GNOME may begin
+# a fresh verification afterwards, so the claim itself is not polled).
+for _ in $(seq 1 50); do fp_order "$ft" VerifyStop Release && break; sleep 0.2; done
+fp_order "$ft" VerifyStop Release || fail E-MAX-TRIES "no VerifyStop/Release after the third no-match: $(fp_calls "$ft")"
+fp_order "$f" Claim VerifyStart VerifyStop Release || fail E-MAX-TRIES "fprintd order: $(fp_calls "$f")"
+still_locked 2.5 || fail E-MAX-TRIES "max tries unlocked the session"
+dump E-2-after
+shot E-2-after
+after_max="the prompt stayed up"
+if hidden E-2-after "Password"; then
+    # GNOME's hard reset after the last allowed failure shows the clock
+    # (authPrompt.js reset -> 'failed' -> unlockDialog.js _fail).
+    after_max="the clock came back and was lifted again"
+    lift
+fi
+to_code_step
+unlock_with_code
+pass E-MAX-TRIES "three no-matches end fingerprint with the max-attempts message ($after_max); '$HINT_SWIPE' for a swipe reader; the password then unlocks"
+
+# --- F: no enrolled prints ----------------------------------------------
+CURRENT_CASE=F-NO-PRINTS
+fp SetScanType press >/dev/null
+fp SetEnrolled false >/dev/null
+lock_session
+m="$(mark)"; f="$(fp_mark)"
+lift
+twait "$m" "query service=password step=1 secret=true question=Password" 20 >/dev/null ||
+    fail F-NO-PRINTS "the prompt did not ask for the Password"
+sleep 2
+dump F-1-password
+shot F-1-password
+hidden F-1-password "$HINT_PRESS" || fail F-NO-PRINTS "a fingerprint hint shows without enrolled prints"
+tnone "$m" "message type=hint text=$HINT_PRESS" || fail F-NO-PRINTS "a fingerprint hint was traced"
+case " $(fp_calls "$f") " in *" Claim "*) fail F-NO-PRINTS "fprintd was claimed without enrolled prints" ;; esac
+fp_detail="the shell did not begin fingerprint"
+if ! tnone_re "$m" "begin service=fingerprint request=[0-9]+$"; then
+    twaitre "$m" "result service=fingerprint request=[0-9]+ applied=false$" 10 >/dev/null ||
+        fail F-NO-PRINTS "the fingerprint service did not end Denied without enrolled prints"
+    tail -n "+$((f + 1))" "$FP_LOG" | jq -es 'any(.[]; .member == "ListEnrolledFingers" and .outcome == "net.reactivated.Fprint.Error.NoEnrolledPrints")' >/dev/null ||
+        fail F-NO-PRINTS "fingerprint ended without asking fprintd for enrolled prints"
+    fp_detail="fingerprint began and ended unavailable after fprintd's NoEnrolledPrints"
+fi
+to_code_step
+unlock_with_code
+pass F-NO-PRINTS "no enrolled prints: no hint, no claim ($fp_detail); password and code unlock"
+
+# --- Z: hygiene ---------------------------------------------------------
+CURRENT_CASE=Z-HYGIENE
+if grep -rlF -e "$PASSWORD" -e "$CODE" "$ARTIFACTS" >"$ARTIFACTS/secret-hits.txt" 2>/dev/null; then
+    fail Z-HYGIENE "a secret reached the artifacts: $(tr '\n' ' ' <"$ARTIFACTS/secret-hits.txt")"
+fi
+grep -qi panicked "$LOG" && fail Z-HYGIENE "panic in the nested log"
+# The compositor's conversation trace: one JSON object per line, known
+# events and services only, and grants for the four unlocks.
+trace_summary="$("$PY" - "$LOG" <<'TRACE'
+import json, sys
+prefix = 'tuna-compositor: lock conversation '
+events = {'begin', 'query', 'info', 'problem', 'scan', 'unavailable', 'answer', 'retired', 'granted'}
+seen = {}
+for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
+    if not line.startswith(prefix):
+        continue
+    doc = json.loads(line[len(prefix):])
+    assert doc.get('event') in events, doc
+    assert doc.get('service') in ('password', 'fingerprint'), doc
+    key = f"{doc['service']}:{doc['event']}"
+    seen[key] = seen.get(key, 0) + 1
+assert seen.get('fingerprint:granted', 0) >= 1 and seen.get('password:granted', 0) >= 3, seen
+print(' '.join(f'{k}={v}' for k, v in sorted(seen.items())))
+TRACE
+)" || fail Z-HYGIENE "the compositor's lock conversation trace broke its contract"
+echo "$trace_summary" >"$ARTIFACTS/compositor-trace-summary.txt"
+pass Z-HYGIENE "no password or code in any artifact; no panic; compositor trace events: $trace_summary"

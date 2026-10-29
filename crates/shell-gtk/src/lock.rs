@@ -1,13 +1,16 @@
 //! GNOME 51's lock screen (`unlockDialog.js`) on ext-session-lock-v1.
 //!
 //! The compositor owns the lock: it decides when the session is locked,
-//! draws the blurred, dimmed wallpaper underneath, and verifies the
-//! password. This module only draws GNOME's unlock dialog: the clock
-//! curtain (clock, date and "Click or press a key") and the unlock
-//! prompt, moved between on GNOME's transition (`lock_curtain.rs`), and
-//! sends what is typed in a redacted `Unlock` command. It releases its
-//! lock surfaces once the compositor's snapshot says the session is
-//! unlocked, never on its own.
+//! draws the blurred, dimmed wallpaper underneath, and runs the
+//! authentication conversations (GDM's part). This module draws GNOME's
+//! unlock dialog: the clock curtain (clock, date and "Click or press a
+//! key") and the unlock prompt, moved between on GNOME's transition
+//! (`lock_curtain.rs`), and drives GNOME's `AuthPrompt` flow over the
+//! control protocol (`lock_auth.rs`): password and fingerprint side by
+//! side, each PAM question in turn, GNOME's messages and Back. Without a
+//! conversation backend (greetd) it falls back to one redacted `Unlock`
+//! command. It releases its lock surfaces once the compositor's snapshot
+//! says the session is unlocked, never on its own.
 //!
 //! Measurements are from GNOME Shell 51's own lock screen at 1280x800
 //! (docs/gnome-parity.md, states 11 and 11b).
@@ -19,36 +22,241 @@ use gtk4 as gtk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_session_lock as session_lock;
+use tuna_shell_control::{AuthEvent, AuthService};
 
+use crate::lock_auth::{AuthMachine, Effect, Host, MessageKind, View};
 use crate::lock_curtain::{self, Curtain, Page};
+use crate::lock_wiggle::Wiggle;
 use crate::logic;
 
-/// GNOME's wrong-password message (authPrompt.js).
-const FAILED: &str = "Sorry, that didn't work. Please try again.";
-
-/// Sends a password; returns the request id.
+/// Sends a password with the single-password `Unlock`; returns the
+/// request id.
 pub type SendUnlock = Rc<dyn Fn(String) -> Option<u64>>;
+
+/// The compositor's verification commands (`ControlClient`) and the
+/// login-screen setting the flow reads. Each command returns its request
+/// id, `None` when it could not be sent.
+#[derive(Clone)]
+pub struct AuthPort {
+    pub unlock: SendUnlock,
+    pub begin: Rc<dyn Fn(AuthService) -> Option<u64>>,
+    pub answer: Rc<dyn Fn(AuthService, u32, String) -> Option<u64>>,
+    pub cancel: Rc<dyn Fn() -> Option<u64>>,
+    /// `org.gnome.login-screen enable-fingerprint-authentication`.
+    pub fingerprint_enabled: Rc<dyn Fn() -> bool>,
+}
+
+impl Host for AuthPort {
+    fn begin(&self, service: AuthService) -> Option<u64> {
+        (self.begin)(service)
+    }
+    fn answer(&self, service: AuthService, sequence: u32, answer: String) -> Option<u64> {
+        (self.answer)(service, sequence, answer)
+    }
+    fn cancel(&self) -> Option<u64> {
+        (self.cancel)()
+    }
+    fn unlock(&self, password: String) -> Option<u64> {
+        (self.unlock)(password)
+    }
+    fn fingerprint_enabled(&self) -> bool {
+        (self.fingerprint_enabled)()
+    }
+    fn wiggle_ms(&self) -> u64 {
+        crate::lock_wiggle::duration_ms()
+    }
+}
+
+/// One trace line in a single write: the proof reads stderr shared with
+/// the compositor, where pieces of separate writes interleave.
+fn trace(line: &str) {
+    if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+        use std::io::Write;
+        let line = format!("tuna-shell-gtk: {line}\n");
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+    }
+}
+
+/// GNOME's two prompt entries (authPrompt.js `_passwordEntry`,
+/// `_textEntry`): one at a time in the entry area, swapped with the text
+/// kept when a question changes between hidden and visible input
+/// (`updateEntry`).
+struct PromptEntry {
+    area: gtk::Overlay,
+    password: gtk::PasswordEntry,
+    text: gtk::Entry,
+    secret: Cell<bool>,
+}
+
+impl PromptEntry {
+    fn current(&self) -> gtk::Widget {
+        if self.secret.get() {
+            self.password.clone().upcast()
+        } else {
+            self.text.clone().upcast()
+        }
+    }
+
+    fn editable(&self) -> gtk::Editable {
+        if self.secret.get() {
+            self.password.clone().upcast()
+        } else {
+            self.text.clone().upcast()
+        }
+    }
+
+    fn has_focus(&self) -> bool {
+        let current = self.current();
+        current
+            .root()
+            .and_then(|root| root.focus())
+            .is_some_and(|focus| focus == current || focus.is_ancestor(&current))
+    }
+
+    /// Swap to the hidden or the visible entry (authPrompt.js
+    /// `updateEntry`). Visible text moves into the hidden entry with its
+    /// cursor and selection; hidden text is never revealed: going visible
+    /// empties both.
+    fn set_secret(&self, secret: bool) {
+        if self.secret.get() == secret {
+            return;
+        }
+        let (old, focused) = (self.editable(), self.has_focus());
+        let carried = secret.then(|| (old.text(), old.position(), old.selection_bounds()));
+        self.secret.set(secret);
+        let new = self.editable();
+        self.area.set_child(Some(&self.current()));
+        match carried {
+            Some((text, position, selection)) => {
+                new.set_text(&text);
+                new.set_position(position);
+                if let Some((start, end)) = selection {
+                    new.select_region(start, end);
+                }
+            }
+            None => new.set_text(""),
+        }
+        // The inactive entry keeps no copy of what was typed.
+        old.set_text("");
+        if focused {
+            self.current().grab_focus();
+        }
+    }
+
+    /// The question as the hint and accessible label of both entries;
+    /// unchanged, nothing is touched (no accessibility churn).
+    fn set_hint(&self, hint: &str) {
+        let current = self.password.property::<Option<String>>("placeholder-text");
+        if current.as_deref() == Some(hint) && self.text.placeholder_text().as_deref() == Some(hint)
+        {
+            return;
+        }
+        self.password.set_property("placeholder-text", hint);
+        self.text.set_placeholder_text(Some(hint));
+        self.password
+            .update_property(&[gtk::accessible::Property::Label(hint)]);
+        self.text
+            .update_property(&[gtk::accessible::Property::Label(hint)]);
+    }
+
+    fn set_sensitive(&self, sensitive: bool) {
+        self.password.set_sensitive(sensitive);
+        self.text.set_sensitive(sensitive);
+    }
+
+    fn clear(&self) {
+        self.password.set_text("");
+        self.text.set_text("");
+    }
+}
 
 /// One monitor's lock window.
 struct Screen {
+    /// Destroyed after the screen (see [`LockUi::release_screens`]): the
+    /// application would otherwise keep it, and with it a stale prompt in
+    /// the accessibility tree.
+    window: gtk::Window,
     curtain: Curtain,
     clock: gtk::Label,
     date: gtk::Label,
-    entry: gtk::PasswordEntry,
+    entry: Rc<PromptEntry>,
+    entry_wiggle: Wiggle,
+    cancel: gtk::Button,
+    next: gtk::Button,
+    caps: gtk::Label,
     message: gtk::Label,
     /// GNOME's on-screen keyboard for this prompt (#349), when enabled.
     _keyboard: Option<Rc<crate::osk::LockKeyboard>>,
+    message_wiggle: Wiggle,
+}
+
+impl Screen {
+    /// Show the shared prompt state on this monitor.
+    fn apply(&self, view: &View) {
+        self.entry.set_secret(view.secret);
+        self.entry.set_hint(&view.hint);
+        if !view.sensitive && self.entry.has_focus() {
+            // `updateSensitivity(false)` gives the focus to the prompt.
+            if let Some(root) = self.entry.current().root() {
+                root.set_focus(gtk::Widget::NONE);
+            }
+        }
+        self.entry.set_sensitive(view.sensitive);
+        self.next.set_can_target(view.sensitive);
+        // authPrompt.js `_updateCancelButton`: Back keeps its room (its
+        // spacer-sized well) but is shown, and reachable, only from a
+        // second step on. Unmapped, it is also hidden from assistive
+        // technologies, which a mapped, transparent button is not (GTK
+        // clears the accessible Hidden state on every map).
+        self.cancel.set_visible(view.back);
+        // `updateEntry`: the caps-lock warning belongs to hidden input.
+        self.caps.set_visible(view.secret && caps_locked());
+        let (text, kind) = view
+            .message
+            .as_ref()
+            .map_or(("", None), |(text, kind)| (text.as_str(), Some(*kind)));
+        if self.message.label() != text {
+            self.message.set_label(text);
+        }
+        set_class(
+            &self.message,
+            "login-dialog-message-warning",
+            kind == Some(MessageKind::Error),
+        );
+        set_class(
+            &self.message,
+            "login-dialog-message-hint",
+            kind == Some(MessageKind::Hint),
+        );
+    }
+}
+
+fn set_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
+    if on {
+        widget.add_css_class(class);
+    } else {
+        widget.remove_css_class(class);
+    }
+}
+
+fn caps_locked() -> bool {
+    gtk::gdk::Display::default()
+        .and_then(|d| d.default_seat())
+        .and_then(|s| s.keyboard())
+        .is_some_and(|k| k.is_caps_locked())
 }
 
 pub struct LockUi {
     app: gtk::Application,
     instance: session_lock::Instance,
-    send: SendUnlock,
+    port: AuthPort,
+    auth: RefCell<AuthMachine>,
+    /// Widgets are being updated from the machine: their own change
+    /// signals are not input.
+    applying: Cell<bool>,
     screens: RefCell<Vec<Screen>>,
     /// A lock was asked of the compositor and not yet released.
     requested: Cell<bool>,
-    /// The password check in flight, by request id.
-    pending: Cell<Option<u64>>,
     connection_generation: Cell<Option<u64>>,
     clock_format: Box<dyn Fn() -> logic::ClockFormat>,
     /// Wakes the clock on the minute while the lock screens are up.
@@ -61,16 +269,20 @@ pub struct LockUi {
 impl LockUi {
     pub fn new(
         app: &gtk::Application,
-        send: SendUnlock,
+        port: AuthPort,
         clock_format: Box<dyn Fn() -> logic::ClockFormat>,
     ) -> Rc<Self> {
+        let multiplier = crate::lock_auth::parse_message_multiplier(
+            std::env::var("GDM_MESSAGE_TIME_MULTIPLIER").ok().as_deref(),
+        );
         let ui = Rc::new(Self {
             app: app.clone(),
             instance: session_lock::Instance::new(),
-            send,
+            port,
+            auth: RefCell::new(AuthMachine::new(multiplier)),
+            applying: Cell::new(false),
             screens: RefCell::new(Vec::new()),
             requested: Cell::new(false),
-            pending: Cell::new(None),
             connection_generation: Cell::new(None),
             clock_format,
             wall_clock: RefCell::new(None),
@@ -81,8 +293,7 @@ impl LockUi {
             ui.instance.connect_failed(move |_| {
                 eprintln!("tuna-shell-gtk: the compositor refused the session lock");
                 if let Some(ui) = weak.upgrade() {
-                    ui.screens.borrow_mut().clear();
-                    ui.wall_clock.take();
+                    ui.release_screens();
                 }
             });
         }
@@ -90,9 +301,8 @@ impl LockUi {
             let weak = Rc::downgrade(&ui);
             ui.instance.connect_unlocked(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.screens.borrow_mut().clear();
-                    ui.wall_clock.take();
-                    ui.pending.set(None);
+                    ui.auth.borrow_mut().forget();
+                    ui.release_screens();
                 }
             });
         }
@@ -102,6 +312,26 @@ impl LockUi {
     /// Give each lock window GNOME's on-screen keyboard for its prompt.
     pub fn set_osk(&self, osk: Rc<crate::osk::Osk>) {
         *self.osk.borrow_mut() = Some(osk);
+    }
+
+    /// Drop every lock window. Their entries are wiped at once, which is
+    /// no input; the windows are destroyed from the main loop afterwards.
+    /// gtk4-session-lock emits `::unlocked` (and `::failed`) before it
+    /// sends `ext_session_lock_v1.unlock_and_destroy`
+    /// (`gtk_session_lock_instance_unlock`), so destroying them here would
+    /// tear the lock surfaces down while the session is still locked.
+    fn release_screens(&self) {
+        let screens = std::mem::take(&mut *self.screens.borrow_mut());
+        let windows: Vec<gtk::Window> = screens.iter().map(|s| s.window.clone()).collect();
+        let was_applying = self.applying.replace(true);
+        drop(screens);
+        self.applying.set(was_applying);
+        self.wall_clock.take();
+        glib::idle_add_local_once(move || {
+            for window in windows {
+                window.destroy();
+            }
+        });
     }
 
     /// Follow the compositor's lock flag: lock when it says locked,
@@ -126,7 +356,7 @@ impl LockUi {
                 else {
                     continue;
                 };
-                let window = self.screen(&self.app.clone());
+                let window = self.screen(Some(&self.app.clone()));
                 self.instance.assign_window_to_monitor(&window, &monitor);
                 window.present();
             }
@@ -146,36 +376,38 @@ impl LockUi {
 
     /// A transport generation change aborts local entry only. It never releases
     /// the lock surface; only the authoritative locked=false state does that.
-    pub fn sync_connection_generation(&self, generation: Option<u64>) {
+    /// The old connection's conversations went with it; verification begins
+    /// again once the new one can carry it ([`LockUi::resume_verification`]).
+    pub fn sync_connection_generation(self: &Rc<Self>, generation: Option<u64>) {
         if !generation_changed(&self.connection_generation, generation) {
             return;
         }
-        self.pending.set(None);
         for screen in self.screens.borrow().iter() {
             screen.curtain.show_page(Page::Prompt);
-            reset_prompt(&screen.entry, &screen.message);
+        }
+        self.drive(|auth, port| auth.reconnected(port));
+    }
+
+    /// The connection carries authentication (a current snapshot): begin
+    /// what a reconnect or an unsendable begin left waiting, if the prompt
+    /// is up.
+    pub fn resume_verification(self: &Rc<Self>) {
+        if self.auth.borrow().wants_resume() && self.prompt_up() {
+            self.drive(|auth, port| auth.resume(port));
         }
     }
 
-    /// A command result arrived: the answer to our password, if it is
-    /// the one in flight.
-    pub fn command_result(&self, id: u64, applied: bool) {
-        if self.pending.get() != Some(id) {
-            return;
-        }
-        self.pending.set(None);
-        if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
-            eprintln!("tuna-shell-gtk: lock command result applied={applied} request_id={id}");
-        }
-        for screen in self.screens.borrow().iter() {
-            screen.entry.set_sensitive(true);
-            if !applied {
-                screen.curtain.show_page(Page::Prompt);
-                screen.entry.set_text("");
-                screen.message.set_label(FAILED);
-                screen.entry.grab_focus();
-            }
-        }
+    /// A command result: the end of a conversation, or of a
+    /// single-password unlock, when it is one of ours.
+    pub fn command_result(self: &Rc<Self>, id: u64, applied: bool) {
+        self.drive(|auth, port| {
+            auth.result(port, id, applied);
+        });
+    }
+
+    /// One step of a conversation (`Handled::AuthEvent`).
+    pub fn auth_event(self: &Rc<Self>, request: u64, service: AuthService, event: &AuthEvent) {
+        self.drive(|auth, port| auth.event(port, request, service, event));
     }
 
     /// Clock and date, as GNOME's UnlockDialogClock shows them (on each
@@ -190,11 +422,128 @@ impl LockUi {
         }
     }
 
+    /// Run one input through the authentication machine, then show the
+    /// result on every monitor.
+    fn drive<R>(self: &Rc<Self>, input: impl FnOnce(&mut AuthMachine, &AuthPort) -> R) -> R {
+        let result = input(&mut self.auth.borrow_mut(), &self.port);
+        self.render();
+        result
+    }
+
+    fn render(self: &Rc<Self>) {
+        let (view, effects) = {
+            let mut auth = self.auth.borrow_mut();
+            (auth.view(), auth.take_effects())
+        };
+        let was_applying = self.applying.replace(true);
+        {
+            let screens = self.screens.borrow();
+            for screen in screens.iter() {
+                screen.apply(&view);
+            }
+            for effect in effects {
+                match effect {
+                    Effect::Timer { token, ms } => {
+                        let weak = Rc::downgrade(self);
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(ms),
+                            move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    ui.drive(|auth, port| auth.timeout(port, token));
+                                }
+                            },
+                        );
+                    }
+                    Effect::ClearEntry => {
+                        for screen in screens.iter() {
+                            screen.entry.clear();
+                        }
+                    }
+                    Effect::Focus => {
+                        for screen in screens.iter() {
+                            if view.sensitive && screen.curtain.active() == Page::Prompt {
+                                screen.entry.current().grab_focus();
+                            }
+                        }
+                    }
+                    Effect::WiggleEntry => {
+                        for screen in screens.iter() {
+                            screen.entry_wiggle.start();
+                        }
+                    }
+                    Effect::WiggleMessage => {
+                        for screen in screens.iter() {
+                            screen.message_wiggle.start();
+                        }
+                    }
+                    // GNOME's assertive notification, once (every monitor
+                    // shows the same message).
+                    Effect::Announce(text) => {
+                        let screen = screens
+                            .iter()
+                            .find(|s| s.curtain.active() == Page::Prompt)
+                            .or_else(|| screens.first());
+                        if let Some(screen) = screen {
+                            screen
+                                .message
+                                .announce(&text, gtk::AccessibleAnnouncementPriority::High);
+                        }
+                    }
+                    Effect::ShowPrompt => {
+                        for screen in screens.iter() {
+                            screen.curtain.show_page(Page::Prompt);
+                        }
+                    }
+                    Effect::Trace(line) => trace(&line),
+                }
+            }
+        }
+        self.applying.set(was_applying);
+    }
+
+    fn prompt_up(&self) -> bool {
+        self.screens
+            .borrow()
+            .iter()
+            .any(|s| s.curtain.active() == Page::Prompt)
+    }
+
+    /// The prompt page comes up on one monitor (unlockDialog.js
+    /// `_showPrompt`), a printable key that lifted it starting the
+    /// answer (`startPreemptiveInput`).
+    fn lift(self: &Rc<Self>, curtain: &Curtain, entry: &PromptEntry, preemptive: Option<char>) {
+        curtain.show_page(Page::Prompt);
+        self.drive(|auth, port| auth.show_prompt(port, preemptive.is_some()));
+        entry.current().grab_focus();
+        if let Some(c) = preemptive {
+            let editable = entry.editable();
+            editable.set_text(&c.to_string());
+            editable.set_position(-1);
+        }
+    }
+
+    /// Back or Escape (authPrompt.js `cancel`): a later step goes back to
+    /// the first; otherwise the clock comes back.
+    fn cancel_prompt(self: &Rc<Self>) {
+        if self.drive(|auth, port| auth.cancel(port)) {
+            for screen in self.screens.borrow().iter() {
+                screen.curtain.show_page(Page::Clock);
+            }
+        }
+    }
+
+    /// Enter or Submit on an entry.
+    fn submit(self: &Rc<Self>, text: String) {
+        self.drive(|auth, port| auth.submit(port, text));
+    }
+
     /// Build one monitor's lock window: GNOME's unlock-screen top bar
     /// over the clock curtain and the prompt.
-    fn screen(self: &Rc<Self>, app: &gtk::Application) -> gtk::Window {
+    fn screen(self: &Rc<Self>, app: Option<&gtk::Application>) -> gtk::Window {
         let window = gtk::Window::new();
-        window.set_application(Some(app));
+        if let Some(app) = app {
+            window.set_application(Some(app));
+        }
         window.add_css_class("tuna-lock");
         window.set_title(Some("Lock Screen"));
 
@@ -221,47 +570,60 @@ impl LockUi {
         let name = gtk::Label::new(Some(&logic::real_name()));
         name.add_css_class("user-widget-label");
         // GNOME keeps the Back button's room but shows it only from a
-        // second PAM step on; a password is one step, so it stays
-        // invisible (authPrompt.js `_updateCancelButton`).
+        // second PAM step on (authPrompt.js `_updateCancelButton`): the
+        // room is a well as wide as the right-hand spacer.
         let cancel = gtk::Button::from_icon_name("go-previous-symbolic");
         cancel.add_css_class("cancel-button");
         cancel.set_valign(gtk::Align::Center);
-        cancel.set_opacity(0.0);
-        cancel.set_can_target(false);
-        cancel.set_can_focus(false);
+        cancel.set_visible(false);
         cancel.update_property(&[gtk::accessible::Property::Label("Back")]);
-        let entry = gtk::PasswordEntry::new();
-        entry.add_css_class("login-dialog-prompt-entry");
-        entry.set_hexpand(true);
+        let cancel_room = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        cancel_room.add_css_class("button-box-spacer");
+        cancel_room.append(&cancel);
+        let password = gtk::PasswordEntry::new();
         // GNOME's StPasswordEntry shows its peek icon unless
         // `disable-show-password` denies, live (#357).
-        crate::lockdown::bind_password_entry(&entry);
-        entry.set_property("placeholder-text", "Password");
-        entry.update_property(&[gtk::accessible::Property::Label("Password")]);
-        // Handle Return before the internal text/IM delegate: a password
-        // field must submit even when that delegate consumes activation.
-        // Use the same signal as the arrow, so pending checks and PAM
-        // verification stay in the single handler below. This controller
-        // only sees keys focused within the entry, not other lock controls.
-        let submit_keys = gtk::EventControllerKey::new();
-        submit_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        {
-            let entry = entry.downgrade();
-            submit_keys.connect_key_pressed(move |_, key, _, _| {
-                if matches!(
-                    key,
-                    gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
-                ) {
-                    if let Some(entry) = entry.upgrade().filter(|entry| entry.is_sensitive()) {
-                        entry.emit_by_name::<()>("activate", &[]);
+        crate::lockdown::bind_password_entry(&password);
+        let text = gtk::Entry::new();
+        let entry_area = gtk::Overlay::new();
+        entry_area.add_css_class("login-dialog-prompt-entry-area");
+        entry_area.set_hexpand(true);
+        entry_area.set_child(Some(&password));
+        let entry = Rc::new(PromptEntry {
+            area: entry_area.clone(),
+            password: password.clone(),
+            text: text.clone(),
+            secret: Cell::new(true),
+        });
+        for widget in [password.upcast_ref::<gtk::Widget>(), text.upcast_ref()] {
+            widget.add_css_class("login-dialog-prompt-entry");
+            widget.set_hexpand(true);
+            // Handle Return before the internal text/IM delegate: an
+            // entry must submit even when that delegate consumes
+            // activation. Use the same signal as the arrow, so answers
+            // stay in the single handler below. This controller only sees
+            // keys focused within the entry, not other lock controls.
+            let submit_keys = gtk::EventControllerKey::new();
+            submit_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            {
+                let widget = widget.downgrade();
+                submit_keys.connect_key_pressed(move |_, key, _, _| {
+                    if matches!(
+                        key,
+                        gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
+                    ) {
+                        if let Some(widget) = widget.upgrade().filter(|w| w.is_sensitive()) {
+                            widget.emit_by_name::<()>("activate", &[]);
+                        }
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
                     }
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
-            });
+                });
+            }
+            widget.add_controller(submit_keys);
         }
-        entry.add_controller(submit_keys);
+        entry.set_hint(crate::lock_auth::DEFAULT_QUESTION);
         // The Submit arrow sits inside the entry's right end.
         let next = gtk::Button::from_icon_name("go-next-symbolic");
         next.add_css_class("next-button");
@@ -272,21 +634,20 @@ impl LockUi {
         {
             let entry = entry.clone();
             next.connect_clicked(move |_| {
-                entry.emit_by_name::<()>("activate", &[]);
+                entry.current().emit_by_name::<()>("activate", &[]);
             });
         }
-        let entry_area = gtk::Overlay::new();
-        entry_area.add_css_class("login-dialog-prompt-entry-area");
-        entry_area.set_hexpand(true);
-        entry_area.set_child(Some(&entry));
         entry_area.add_overlay(&next);
+        // A failed answer wiggles the entry area (`wiggle(this._entryArea)`).
+        let entry_wiggle = Wiggle::new(&entry_area);
+        entry_wiggle.set_hexpand(true);
         // Mirrors the Back button so the entry stays centred.
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.add_css_class("button-box-spacer");
         let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         button_box.add_css_class("login-dialog-button-box");
-        button_box.append(&cancel);
-        button_box.append(&entry_area);
+        button_box.append(&cancel_room);
+        button_box.append(&entry_wiggle);
         button_box.append(&spacer);
         let caps = gtk::Label::new(None);
         caps.add_css_class("caps-lock-warning-label");
@@ -295,6 +656,8 @@ impl LockUi {
         message.set_wrap(true);
         message.set_justify(gtk::Justification::Center);
         message.set_yalign(0.0);
+        // A fingerprint problem wiggles the message.
+        let message_wiggle = Wiggle::new(&message);
         let prompt = gtk::Box::new(gtk::Orientation::Vertical, 0);
         prompt.add_css_class("login-dialog-prompt-layout");
         prompt.set_halign(gtk::Align::Center);
@@ -303,7 +666,7 @@ impl LockUi {
         prompt.append(&name);
         prompt.append(&button_box);
         prompt.append(&caps);
-        prompt.append(&message);
+        prompt.append(&message_wiggle);
 
         // The clock curtain over the prompt, on GNOME's transition.
         let curtain = Curtain::new(&clock_box, &prompt);
@@ -326,31 +689,32 @@ impl LockUi {
         // GNOME's keyboard box sits over the lock screen too: it opens
         // when the prompt takes the focus and types into that prompt
         // alone (`_onKeyFocusChanged`).
-        let keyboard = self
-            .osk
-            .borrow()
-            .as_ref()
-            .map(|osk| osk.lock_keyboard(&entry));
+        let keyboard = self.osk.borrow().as_ref().map(|osk| {
+            let prompt = Rc::downgrade(&entry);
+            osk.lock_keyboard(Rc::new(move || prompt.upgrade().map(|e| e.editable())))
+        });
         if let Some(keyboard) = &keyboard {
             overlay.add_overlay(keyboard.widget());
-            let focus = gtk::EventControllerFocus::new();
-            {
-                let keyboard = Rc::downgrade(keyboard);
-                focus.connect_enter(move |_| {
-                    if let Some(keyboard) = keyboard.upgrade() {
-                        keyboard.prompt_focus(true);
-                    }
-                });
+            for widget in [entry.password.upcast_ref::<gtk::Widget>(), entry.text.upcast_ref()] {
+                let focus = gtk::EventControllerFocus::new();
+                {
+                    let keyboard = Rc::downgrade(keyboard);
+                    focus.connect_enter(move |_| {
+                        if let Some(keyboard) = keyboard.upgrade() {
+                            keyboard.prompt_focus(true);
+                        }
+                    });
+                }
+                {
+                    let keyboard = Rc::downgrade(keyboard);
+                    focus.connect_leave(move |_| {
+                        if let Some(keyboard) = keyboard.upgrade() {
+                            keyboard.prompt_focus(false);
+                        }
+                    });
+                }
+                widget.add_controller(focus);
             }
-            {
-                let keyboard = Rc::downgrade(keyboard);
-                focus.connect_leave(move |_| {
-                    if let Some(keyboard) = keyboard.upgrade() {
-                        keyboard.prompt_focus(false);
-                    }
-                });
-            }
-            entry.add_controller(focus);
         }
         window.set_child(Some(&overlay));
 
@@ -373,31 +737,33 @@ impl LockUi {
         }
 
         // GNOME's unlockDialog.js: any key but Shift or Caps Lock, a click
-        // or a wheel step down lifts the curtain, a printable key starting
-        // the password with it; Escape on the prompt, or a wheel step up,
-        // brings the clock back. A vertical drag (pointer, or touch, which
-        // the session delivers as the primary button) moves the curtain.
+        // or a wheel step down lifts the curtain (and begins verification),
+        // a printable key starting the answer with it; Escape on the
+        // prompt cancels (`cancel`), a wheel step up brings the clock
+        // back. A vertical drag (pointer, or touch, which the session
+        // delivers as the primary button) moves the curtain.
         let show_prompt = {
-            let (curtain, entry) = (curtain.clone(), entry.clone());
-            move || {
-                curtain.show_page(Page::Prompt);
-                entry.grab_focus();
+            let (weak, curtain, entry) = (Rc::downgrade(self), curtain.clone(), entry.clone());
+            move |preemptive: Option<char>| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.lift(&curtain, &entry, preemptive);
+                }
             }
         };
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
-            let (curtain, entry, message, show_prompt) = (
+            let (weak, curtain, entry, show_prompt) = (
+                Rc::downgrade(self),
                 curtain.clone(),
                 entry.clone(),
-                message.clone(),
                 show_prompt.clone(),
             );
             keys.connect_key_pressed(move |_, key, _, _| {
                 if key == gtk::gdk::Key::Escape && curtain.active() == Page::Prompt {
-                    entry.set_text("");
-                    message.set_label("");
-                    curtain.show_page(Page::Clock);
+                    if let Some(ui) = weak.upgrade() {
+                        ui.cancel_prompt();
+                    }
                     return glib::Propagation::Stop;
                 }
                 // A prompt on screen, even on its way off, takes the keys
@@ -409,12 +775,11 @@ impl LockUi {
                     if matches!(
                         key,
                         gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
-                    ) && std::env::var_os("TUNA_LOCK_TRACE").is_some()
-                    {
-                        eprintln!(
-                            "tuna-shell-gtk: lock Return received sensitive={}",
-                            entry.is_sensitive()
-                        );
+                    ) {
+                        trace(&format!(
+                            "lock Return received sensitive={}",
+                            entry.current().is_sensitive()
+                        ));
                     }
                     return glib::Propagation::Proceed;
                 }
@@ -428,11 +793,7 @@ impl LockUi {
                 ) {
                     return glib::Propagation::Proceed;
                 }
-                show_prompt();
-                if let Some(c) = key.to_unicode().filter(|c| !c.is_control()) {
-                    entry.set_text(&c.to_string());
-                    entry.set_position(-1);
-                }
+                show_prompt(key.to_unicode().filter(|c| !c.is_control()));
                 glib::Propagation::Stop
             });
         }
@@ -444,7 +805,7 @@ impl LockUi {
             let (curtain, show_prompt) = (curtain.clone(), show_prompt.clone());
             click.connect_released(move |_, _, _, _| {
                 if curtain.active() != Page::Prompt {
-                    show_prompt();
+                    show_prompt(None);
                 }
             });
         }
@@ -479,6 +840,7 @@ impl LockUi {
             }
             {
                 let (pan, distance, curtain) = (pan.clone(), distance.clone(), curtain.clone());
+                let weak = Rc::downgrade(self);
                 drag.connect_drag_update(move |gesture, _, offset_y| {
                     let time = gesture.current_event_time();
                     let Some(delta) = pan
@@ -491,6 +853,10 @@ impl LockUi {
                     if !curtain.swiping() {
                         gesture.set_state(gtk::EventSequenceState::Claimed);
                         distance.set(curtain.swipe_begin("drag"));
+                        // `_swipeBegin` → `_ensureAuthPrompt`.
+                        if let Some(ui) = weak.upgrade() {
+                            ui.drive(|auth, port| auth.show_prompt(port, false));
+                        }
                     }
                     // Up lifts the curtain (`_getGestureDirFactor`).
                     curtain.swipe_update(-delta, distance.get());
@@ -515,7 +881,7 @@ impl LockUi {
                     if curtain.swipe_end("drag", velocity, distance.get(), false)
                         == Some(Page::Prompt)
                     {
-                        entry.grab_focus();
+                        entry.current().grab_focus();
                     }
                 });
             }
@@ -551,7 +917,7 @@ impl LockUi {
                 }
                 wheel.set(0.0);
                 if steps > 0.0 {
-                    show_prompt();
+                    show_prompt(None);
                 } else {
                     curtain.show_page(Page::Clock);
                 }
@@ -561,8 +927,9 @@ impl LockUi {
         window.add_controller(scroll);
         {
             // GNOME destroys the prompt once the clock is back
-            // (`_maybeDestroyAuthPrompt`): nothing typed outlives it.
-            let (entry, message) = (entry.downgrade(), message.downgrade());
+            // (`_maybeDestroyAuthPrompt`): nothing typed outlives it, and
+            // the conversation ends once no monitor shows the prompt.
+            let (weak, entry) = (Rc::downgrade(self), Rc::downgrade(&entry));
             let lock_keyboard = keyboard.as_ref().map(Rc::downgrade);
             curtain.connect_settled(move |page| {
                 if page != Page::Clock {
@@ -573,38 +940,62 @@ impl LockUi {
                     keyboard.prompt_focus(false);
                 }
                 if let Some(entry) = entry.upgrade() {
-                    entry.set_text("");
+                    entry.clear();
                 }
-                if let Some(message) = message.upgrade() {
-                    message.set_label("");
+                if let Some(ui) = weak.upgrade() {
+                    if !ui.prompt_up() {
+                        ui.drive(|auth, port| auth.stop(port));
+                    }
                 }
-            });
-        }
-        {
-            let (curtain, entry, message) = (curtain.clone(), entry.clone(), message.clone());
-            cancel.connect_clicked(move |_| {
-                entry.set_text("");
-                message.set_label("");
-                curtain.show_page(Page::Clock);
             });
         }
         {
             let weak = Rc::downgrade(self);
-            let message = message.clone();
-            entry.connect_activate(move |entry| {
-                let Some(ui) = weak.upgrade() else { return };
-                submit_password(entry, &message, &ui.pending, &ui.send);
+            cancel.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.cancel_prompt();
+                }
             });
         }
-        // GNOME's caps-lock warning under the entry.
+        for editable in [password.upcast_ref::<gtk::Editable>(), text.upcast_ref()] {
+            {
+                let weak = Rc::downgrade(self);
+                editable.connect_changed(move |editable| {
+                    let Some(ui) = weak.upgrade() else { return };
+                    if ui.applying.get() {
+                        return;
+                    }
+                    let has_text = !editable.text().is_empty();
+                    ui.drive(|auth, _| auth.text_changed(has_text));
+                });
+            }
+        }
+        {
+            let weak = Rc::downgrade(self);
+            password.connect_activate(move |entry| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.submit(entry.text().to_string());
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            text.connect_activate(move |entry| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.submit(entry.text().to_string());
+                }
+            });
+        }
+        // GNOME's caps-lock warning under a hidden entry.
+        caps.set_label("Caps lock is on.");
         if let Some(display) = gtk::gdk::Display::default() {
             if let Some(seat) = display.default_seat() {
                 if let Some(keyboard) = seat.keyboard() {
                     let update = {
-                        let caps = caps.clone();
+                        let (caps, entry) = (caps.clone(), Rc::downgrade(&entry));
                         move |k: &gtk::gdk::Device| {
-                            caps.set_label("Caps lock is on.");
-                            caps.set_visible(k.is_caps_locked());
+                            let secret = entry.upgrade().is_some_and(|e| e.secret.get());
+                            caps.set_visible(secret && k.is_caps_locked());
                         }
                     };
                     update(&keyboard);
@@ -613,22 +1004,30 @@ impl LockUi {
             }
         }
 
-        self.screens.borrow_mut().push(Screen {
+        let screen = Screen {
+            window: window.clone(),
             curtain,
             clock,
             date,
             entry,
+            entry_wiggle,
+            cancel,
+            next,
+            caps,
             message,
             _keyboard: keyboard,
-        });
+            message_wiggle,
+        };
+        screen.apply(&self.auth.borrow().view());
+        self.screens.borrow_mut().push(screen);
         window
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        // Never leave a typed password behind in a dead window.
-        self.entry.set_text("");
+        // Never leave typed text behind in a dead window.
+        self.entry.clear();
     }
 }
 
@@ -636,38 +1035,103 @@ fn generation_changed(current: &Cell<Option<u64>>, next: Option<u64>) -> bool {
     let previous = current.replace(next);
     previous.is_some() && previous != next
 }
-fn reset_prompt(entry: &gtk::PasswordEntry, message: &gtk::Label) {
-    entry.set_text("");
-    entry.set_sensitive(true);
-    entry.grab_focus();
-    message.set_label(FAILED);
-}
-fn submit_password(
-    entry: &gtk::PasswordEntry,
-    message: &gtk::Label,
-    pending: &Cell<Option<u64>>,
-    send: &SendUnlock,
-) {
-    if pending.get().is_some() {
-        return;
-    }
-    if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
-        eprintln!("tuna-shell-gtk: lock password submitted");
-    }
-    let password = entry.text().to_string();
-    message.set_label("");
-    if let Some(root) = entry.root() {
-        root.set_focus(gtk::Widget::NONE);
-    }
-    entry.set_sensitive(false);
-    match send(password) {
-        Some(id) => pending.set(Some(id)),
-        None => reset_prompt(entry, message),
-    }
-}
+
 #[cfg(test)]
 mod auth_transport_ui_tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Calls {
+        next: Cell<u64>,
+        begins: RefCell<Vec<(AuthService, u64)>>,
+        answers: RefCell<Vec<(u32, String)>>,
+        cancels: Cell<u32>,
+        unlocks: Cell<u32>,
+        /// The id the next `Unlock` gets, `None` = unsendable.
+        unlock_next: Cell<Option<u64>>,
+    }
+
+    fn port(calls: &Rc<Calls>) -> AuthPort {
+        let id = |calls: &Calls| {
+            calls.next.set(calls.next.get() + 1);
+            calls.next.get()
+        };
+        AuthPort {
+            unlock: {
+                let calls = calls.clone();
+                Rc::new(move |_password| {
+                    calls.unlocks.set(calls.unlocks.get() + 1);
+                    calls.unlock_next.get()
+                })
+            },
+            begin: {
+                let calls = calls.clone();
+                Rc::new(move |service| {
+                    let request = id(&calls);
+                    calls.begins.borrow_mut().push((service, request));
+                    Some(request)
+                })
+            },
+            answer: {
+                let calls = calls.clone();
+                Rc::new(move |_, sequence, answer| {
+                    calls.answers.borrow_mut().push((sequence, answer));
+                    Some(id(&calls))
+                })
+            },
+            cancel: {
+                let calls = calls.clone();
+                Rc::new(move || {
+                    calls.cancels.set(calls.cancels.get() + 1);
+                    Some(id(&calls))
+                })
+            },
+            fingerprint_enabled: Rc::new(|| true),
+        }
+    }
+
+    fn lock_ui(calls: &Rc<Calls>) -> (Rc<LockUi>, gtk::Window) {
+        let app = gtk::Application::new(None::<&str>, gtk::gio::ApplicationFlags::NON_UNIQUE);
+        let ui = LockUi::new(
+            &app,
+            port(calls),
+            Box::new(|| logic::ClockFormat::TwentyFourHour),
+        );
+        ui.sync_connection_generation(Some(0));
+        let window = ui.screen(None);
+        window.present();
+        (ui, window)
+    }
+
+    /// Lift the curtain as a click does and return (password, fingerprint).
+    fn lift(ui: &Rc<LockUi>, calls: &Calls) -> (u64, u64) {
+        let (curtain, entry) = {
+            let screens = ui.screens.borrow();
+            (screens[0].curtain.clone(), screens[0].entry.clone())
+        };
+        ui.lift(&curtain, &entry, None);
+        let begins = calls.begins.borrow();
+        let n = begins.len();
+        assert!(n >= 2);
+        assert_eq!(begins[n - 2].0, AuthService::Password);
+        assert_eq!(begins[n - 1].0, AuthService::Fingerprint);
+        (begins[n - 2].1, begins[n - 1].1)
+    }
+
+    fn pump_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        let context = glib::MainContext::default();
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    }
+
     #[test]
     #[ignore = "requires admitted Xvfb GTK proof"]
     fn actual_gtk_auth_send_failure_and_generation_reset() {
@@ -676,62 +1140,267 @@ mod auth_transport_ui_tests {
             "dedicated admission required"
         );
         gtk::init().expect("actual GTK display required");
-        let entry = gtk::PasswordEntry::new();
-        let message = gtk::Label::new(None);
-        let pending = Rc::new(Cell::new(None));
-        let next = Rc::new(Cell::new(None));
-        let sends = Rc::new(Cell::new(0));
-        let send: SendUnlock = {
-            let next = next.clone();
-            let sends = sends.clone();
-            Rc::new(move |_password| {
-                sends.set(sends.get() + 1);
-                next.get()
-            })
+        let calls = Rc::new(Calls::default());
+        let (ui, _window) = lock_ui(&calls);
+        // No conversation backend: the password service is unavailable and
+        // the prompt falls back to the single-password Unlock.
+        let fall_back = |ui: &Rc<LockUi>, password: u64, fingerprint: u64| {
+            ui.auth_event(password, AuthService::Password, &AuthEvent::Unavailable);
+            ui.command_result(password, false);
+            ui.auth_event(
+                fingerprint,
+                AuthService::Fingerprint,
+                &AuthEvent::Unavailable,
+            );
+            ui.command_result(fingerprint, false);
+            assert!(ui.auth.borrow().legacy());
         };
-        {
-            let pending = pending.clone();
-            let message = message.clone();
-            let send = send.clone();
-            entry.connect_activate(move |entry| submit_password(entry, &message, &pending, &send));
-        }
+        let (password, fingerprint) = lift(&ui, &calls);
+        fall_back(&ui, password, fingerprint);
+        let entry = ui.screens.borrow()[0].entry.password.clone();
+        let pending = || ui.auth.borrow().legacy_pending();
         entry.set_text("controlled-only");
         entry.emit_by_name::<()>("activate", &[]);
         assert_eq!(entry.text(), "");
         assert!(entry.is_sensitive());
-        assert_eq!(pending.get(), None);
-        next.set(Some(9));
+        assert_eq!(pending(), None);
+        calls.unlock_next.set(Some(9));
         entry.set_text("controlled-only");
         entry.emit_by_name::<()>("activate", &[]);
-        assert_eq!(pending.get(), Some(9));
+        assert_eq!(pending(), Some(9));
         assert!(!entry.is_sensitive());
-        assert_eq!(sends.get(), 2);
+        assert_eq!(calls.unlocks.get(), 2);
         entry.emit_by_name::<()>("activate", &[]);
         assert_eq!(
-            sends.get(),
+            calls.unlocks.get(),
             2,
             "stale captured activation while pending cannot send"
         );
-        let generation = Cell::new(Some(0));
-        let reset = gtk::Button::new();
-        {
-            let pending = pending.clone();
-            let entry = entry.clone();
-            let message = message.clone();
-            reset.connect_clicked(move |_| {
-                if generation_changed(&generation, Some(1)) {
-                    pending.set(None);
-                    reset_prompt(&entry, &message);
-                }
-            });
-        }
-        reset.emit_clicked();
-        assert_eq!(pending.get(), None);
+        let begins = calls.begins.borrow().len();
+        ui.sync_connection_generation(Some(1));
+        assert_eq!(pending(), None);
         assert_eq!(entry.text(), "");
         assert!(entry.is_sensitive());
-        assert_eq!(sends.get(), 2, "reset itself must not submit credentials");
+        assert_eq!(
+            calls.unlocks.get(),
+            2,
+            "reset itself must not submit credentials"
+        );
+        assert_eq!(
+            calls.begins.borrow().len(),
+            begins,
+            "nothing begins before the snapshot"
+        );
+        assert!(calls.answers.borrow().is_empty());
+        ui.resume_verification();
+        let (password, fingerprint) = lift(&ui, &calls);
+        fall_back(&ui, password, fingerprint);
         entry.set_text("explicit-fresh-input");
         entry.emit_by_name::<()>("activate", &[]);
-        assert_eq!(sends.get(), 3);
+        assert_eq!(calls.unlocks.get(), 3);
+    }
+
+    #[test]
+    #[ignore = "requires admitted Xvfb GTK proof"]
+    fn actual_gtk_two_question_conversation_and_back_soft_reset() {
+        assert!(
+            std::env::var_os("TUNA_REQUIRE_AUTH_PROMPT_GTK").is_some(),
+            "dedicated admission required"
+        );
+        gtk::init().expect("actual GTK display required");
+        crate::motion::set(tuna_shell_control::MotionPolicy::from_gnome(
+            false, false, 1.0,
+        ));
+        let calls = Rc::new(Calls::default());
+        let (ui, window) = lock_ui(&calls);
+        let (password, fingerprint) = lift(&ui, &calls);
+        let (entry, cancel, message, next) = {
+            let s = &ui.screens.borrow()[0];
+            (
+                s.entry.clone(),
+                s.cancel.clone(),
+                s.message.clone(),
+                s.next.clone(),
+            )
+        };
+        let shown = |entry: &PromptEntry| entry.area.child().expect("an entry");
+        let placeholder = |w: &gtk::Widget| w.property::<Option<String>>("placeholder-text");
+        let back_targetable = || cancel.is_visible() && cancel.can_target();
+
+        // Step 1: PAM's "Password:" in the hidden entry; Back hidden.
+        ui.auth_event(
+            password,
+            AuthService::Password,
+            &AuthEvent::Query {
+                sequence: 1,
+                question: "Password:".into(),
+                secret: true,
+            },
+        );
+        assert!(shown(&entry).is::<gtk::PasswordEntry>());
+        assert_eq!(placeholder(&shown(&entry)).as_deref(), Some("Password"));
+        assert!(shown(&entry).is_sensitive());
+        assert!(!back_targetable());
+        entry.password.set_text("first-secret");
+        next.emit_clicked();
+        assert_eq!(
+            *calls.answers.borrow(),
+            vec![(1, "first-secret".to_owned())]
+        );
+        assert!(
+            !shown(&entry).is_sensitive(),
+            "insensitive until the next question"
+        );
+
+        // An info message, then step 2: a visible code entry, Back shown.
+        ui.auth_event(
+            password,
+            AuthService::Password,
+            &AuthEvent::Info {
+                text: "Open your authenticator app".into(),
+            },
+        );
+        assert_eq!(message.label(), "Open your authenticator app");
+        assert!(!message.has_css_class("login-dialog-message-warning"));
+        ui.auth_event(
+            password,
+            AuthService::Password,
+            &AuthEvent::Query {
+                sequence: 2,
+                question: "Verification code: ".into(),
+                secret: false,
+            },
+        );
+        assert!(shown(&entry).is::<gtk::Entry>());
+        assert!(!shown(&entry).is::<gtk::PasswordEntry>());
+        assert_eq!(
+            placeholder(&shown(&entry)).as_deref(),
+            Some("Verification code")
+        );
+        assert_eq!(entry.text.text(), "", "the previous answer is gone");
+        assert_eq!(entry.password.text(), "");
+        assert!(shown(&entry).is_sensitive());
+        assert!(back_targetable());
+        entry.text.set_text("123456");
+        entry.text.emit_by_name::<()>("activate", &[]);
+        // The answer waits until the info message has been read (2 s).
+        assert_eq!(calls.answers.borrow().len(), 1);
+        assert!(pump_until(Duration::from_secs(5), || calls
+            .answers
+            .borrow()
+            .len()
+            == 2));
+        assert_eq!(calls.answers.borrow()[1], (2, "123456".to_owned()));
+
+        // A fingerprint problem: error style at once.
+        ui.auth_event(
+            fingerprint,
+            AuthService::Fingerprint,
+            &AuthEvent::Problem {
+                text: "Failed to match fingerprint".into(),
+            },
+        );
+        assert_eq!(message.label(), "Failed to match fingerprint");
+        assert!(message.has_css_class("login-dialog-message-warning"));
+
+        // Back at step 2: soft reset to step 1 once both conversations
+        // retired.
+        cancel.emit_clicked();
+        assert_eq!(calls.cancels.get(), 1);
+        assert!(shown(&entry).is::<gtk::PasswordEntry>());
+        assert_eq!(placeholder(&shown(&entry)).as_deref(), Some("Password"));
+        assert!(!back_targetable());
+        assert_eq!(message.label(), "");
+        assert_eq!(entry.text.text(), "");
+        assert_eq!(ui.screens.borrow()[0].curtain.active(), Page::Prompt);
+        let begins = calls.begins.borrow().len();
+        ui.command_result(password, false);
+        ui.command_result(fingerprint, false);
+        let (password2, fingerprint2) = {
+            let b = calls.begins.borrow();
+            assert_eq!(b.len(), begins + 2, "both begin again after retirement");
+            (b[begins].1, b[begins + 1].1)
+        };
+        // The old conversation's steps no longer reach the prompt.
+        ui.auth_event(
+            password,
+            AuthService::Password,
+            &AuthEvent::Query {
+                sequence: 3,
+                question: "Stale:".into(),
+                secret: false,
+            },
+        );
+        assert!(shown(&entry).is::<gtk::PasswordEntry>());
+        ui.auth_event(
+            fingerprint2,
+            AuthService::Fingerprint,
+            &AuthEvent::FingerprintScan { swipe: false },
+        );
+        assert_eq!(message.label(), "(or place finger on reader)");
+        assert!(message.has_css_class("login-dialog-message-hint"));
+        ui.auth_event(
+            password2,
+            AuthService::Password,
+            &AuthEvent::Query {
+                sequence: 1,
+                question: "Password:".into(),
+                secret: true,
+            },
+        );
+        assert!(shown(&entry).is_sensitive());
+        assert!(!back_targetable());
+        assert_eq!(ui.auth.borrow().prompt_step(), 1);
+        // Typed into the hidden entry, then a visible question: nothing
+        // hidden is revealed in the visible entry.
+        entry.password.set_text("hidden-typed");
+        ui.auth_event(
+            password2,
+            AuthService::Password,
+            &AuthEvent::Query {
+                sequence: 2,
+                question: "Code:".into(),
+                secret: false,
+            },
+        );
+        assert!(shown(&entry).is::<gtk::Entry>());
+        assert!(!shown(&entry).is::<gtk::PasswordEntry>());
+        assert_eq!(entry.text.text(), "", "hidden text is not revealed");
+        assert_eq!(entry.password.text(), "");
+        assert_eq!(placeholder(&shown(&entry)).as_deref(), Some("Code"));
+        assert_eq!(calls.answers.borrow().len(), 2, "nothing sent");
+        // The swap itself (`updateEntry`): visible text is carried into
+        // the hidden entry, hidden text never into the visible one.
+        let lone = PromptEntry {
+            area: gtk::Overlay::new(),
+            password: gtk::PasswordEntry::new(),
+            text: gtk::Entry::new(),
+            secret: Cell::new(true),
+        };
+        lone.area.set_child(Some(&lone.password));
+        lone.password.set_text("s3cret");
+        lone.set_secret(false);
+        assert!(lone.area.child().unwrap().is::<gtk::Entry>());
+        assert_eq!(lone.text.text(), "");
+        assert_eq!(lone.password.text(), "");
+        lone.text.set_text("visible");
+        lone.set_secret(true);
+        assert!(lone.area.child().unwrap().is::<gtk::PasswordEntry>());
+        assert_eq!(lone.password.text(), "visible");
+        assert_eq!(lone.text.text(), "");
+        // Unlocked: the lock window goes, not just its state.
+        entry.text.set_text("typed-after");
+        ui.auth.borrow_mut().forget();
+        ui.release_screens();
+        assert!(ui.screens.borrow().is_empty());
+        assert_eq!(entry.text.text(), "", "wiped at once");
+        // Destroyed from the main loop, after the session lock's own
+        // unlock request (`::unlocked` precedes it).
+        assert!(window.is_visible(), "not inside the unlocked handler");
+        assert!(
+            pump_until(Duration::from_secs(2), || !window.is_visible()),
+            "the lock window is destroyed"
+        );
+        assert_eq!(entry.text.text(), "", "nothing typed survives");
     }
 }

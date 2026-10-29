@@ -63,6 +63,7 @@ use crate::xwayland::XWaylandSupervisor;
 use crate::{ClientState, State};
 
 mod aids;
+mod auth;
 mod color;
 mod display;
 mod osk;
@@ -809,6 +810,8 @@ pub struct Runtime {
     unlock_worker: Option<UnlockWorker>,
     unlock_quarantined: Option<crate::auth_owner::Attempt>,
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The lock screen's password and fingerprint conversations (#366).
+    auth: auth::Conversations,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
     /// org.gnome.SessionManager's inhibitors and session activity.
@@ -1416,6 +1419,7 @@ impl Runtime {
             unlock_worker: None,
             unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            auth: auth::Conversations::default(),
             idle_monitor: crate::idle_monitor::start(),
             session_manager: crate::session_manager::start(),
             magnifier: crate::magnifier::MagnifierState::new(),
@@ -1998,6 +2002,12 @@ impl Runtime {
         self.active_at = Instant::now();
         if self.is_locked() {
             self.cursor.locate.reset_keys();
+            if matches!(
+                input,
+                ManagerInput::Key { .. } | ManagerInput::Button { .. }
+            ) {
+                self.auth.note_user_input();
+            }
         } else {
             // GNOME's locate-pointer: a lone Ctrl tap; the key still
             // reaches the client (#342).
@@ -2690,6 +2700,7 @@ impl Runtime {
         // Owned proof diagnostics only: no credentials, prompts or typed input.
         doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
+                "conversations": self.auth.diagnostics(),
                 "backend_unretired": self.unlock_quarantined.is_some(),
                 "epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
                 "attempt": self.unlock_worker.as_ref().map(|worker| worker.attempt).or(self.unlock_quarantined).map(|attempt| serde_json::json!({
@@ -4441,6 +4452,8 @@ impl Runtime {
             self.manager.focus_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
+            // The lock conversation's shared idle/total deadline.
+            self.auth.next_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -4750,6 +4763,17 @@ impl Runtime {
                 self.control.finish_unlock(origin, false);
             }
         }
+        // The lock screen's conversations (GDM's UserVerifier role): begun,
+        // answered and cancelled here; advanced after the gates below.
+        for (origin, service) in outcome.auth_begin {
+            self.begin_verification(origin, service);
+        }
+        for (connection, service, sequence, answer) in outcome.auth_answers {
+            self.answer_query(connection, service, sequence, answer);
+        }
+        for connection in outcome.auth_cancel {
+            self.cancel_verification(connection);
+        }
         self.idle_monitor.tick();
         // Idle timeout from input timestamps: lock the untouched session.
         // A live idle inhibitor (video, presentation) counts as activity,
@@ -4842,6 +4866,7 @@ impl Runtime {
         if let Some(attempt) = completed {
             self.finish_unlock(attempt);
         }
+        self.poll_conversations();
 
         for event in self.shell.drain_events() {
             eprintln!("tuna-compositor: shell supervision: {event:?}");

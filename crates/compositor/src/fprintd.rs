@@ -5,8 +5,9 @@
 //! password. This module is the only place that speaks to fprintd's
 //! D-Bus API; everything else goes through [`Capability`] (truthful
 //! availability after enrollment) and [`Fprintd::verify`] (one bounded
-//! attempt). Smartcard/PIN, multi-step and web login stay queued for
-//! Wave 3; enrollment UI lives in Settings, not here.
+//! attempt) or [`Fprintd::verify_interactive`] (the lock screen's
+//! cancellable attempt that also reports when the reader is armed and
+//! each retry status). Enrollment UI lives in Settings, not here.
 //!
 //! D-Bus shapes follow the fprintd reference manual
 //! (`net.reactivated.Fprint.Manager` / `.Device` on the system bus):
@@ -105,6 +106,8 @@ pub const REAPER_JOIN_GRACE: Duration = Duration::from_secs(5);
 /// Sleep between backlog-full (`EAGAIN`) connect retries. The absolute
 /// attempt deadline bounds the loop; this only sets the retry cadence.
 const CONNECT_RETRY_SLEEP: Duration = Duration::from_millis(2);
+/// How often [`Fprintd::verify_interactive`] looks at its cancel flag.
+pub const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// Outcome of one fingerprint verification. Only [`Self::Matched`]
 /// unlocks; every other variant keeps the session locked.
@@ -185,6 +188,47 @@ pub fn classify_verify_status(result: &str, done: bool) -> VerifySignal {
     }
 }
 
+/// What the lock screen hears from one interactive verification before
+/// its terminal outcome (`pam_fprintd`'s conversation messages).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyProgress {
+    /// `VerifyStart` succeeded: the reader waits for a finger. `swipe` is
+    /// the device's `scan-type` (GNOME's `FingerprintReaderType`).
+    Armed { swipe: bool },
+    /// A non-terminal retry status, as `pam_fprintd`'s error message.
+    Retry(&'static str),
+}
+
+/// Where an interactive verification reports its [`VerifyProgress`]; called
+/// on fprintd's attempt worker thread.
+pub type ProgressSink = Box<dyn Fn(VerifyProgress) + Send>;
+
+/// `pam_fprintd`'s message for a retry status (fprintd
+/// `pam/fingerprint-strings.h` `verify_result_str_to_msg`), `None` for
+/// statuses it has no message for.
+pub fn retry_message(result: &str, swipe: bool) -> Option<&'static str> {
+    Some(match (result, swipe) {
+        ("verify-retry-scan", false) => "Place your finger on the reader again",
+        ("verify-retry-scan", true) => "Swipe your finger again",
+        ("verify-swipe-too-short", _) => "Swipe was too short, try again",
+        ("verify-finger-not-centered", true) => {
+            "Your finger was not centered, try swiping your finger again"
+        }
+        ("verify-finger-not-centered", false) => {
+            "Your finger was not centered, try touching the sensor again"
+        }
+        ("verify-remove-and-retry", true) => {
+            "Remove your finger, and try swiping your finger again"
+        }
+        ("verify-remove-and-retry", false) => {
+            "Remove your finger, and try touching the sensor again"
+        }
+        ("verify-too-fast", true) => "Swipe was too fast, try again",
+        ("verify-too-fast", false) => "Finger scan was too fast, try again",
+        _ => return None,
+    })
+}
+
 /// The username argument fprintd methods should receive. fprintd
 /// recommends the empty string for the client's own user (it skips the
 /// `setusername` PolicyKit check, which only root passes for anyone
@@ -208,9 +252,20 @@ pub fn effective_claim_name<'a>(user: &'a str, process_user: Option<&str>) -> &'
 /// down, which the parent does at the deadline (past the deadline that
 /// end is [`VerifyOutcome::TimedOut`]). The shutdown — not a receive
 /// timeout — is what bounds the silent wait.
+#[cfg(test)]
 fn drain_verify_signals(
     signals: impl Iterator<Item = zbus::message::Message>,
     deadline: Instant,
+) -> VerifyOutcome {
+    drain_verify_signals_with(signals, deadline, &mut |_| {})
+}
+
+/// [`drain_verify_signals`], reporting each nonterminal status string to
+/// `on_retry` (the lock screen shows `pam_fprintd`'s message for it).
+fn drain_verify_signals_with(
+    signals: impl Iterator<Item = zbus::message::Message>,
+    deadline: Instant,
+    on_retry: &mut dyn FnMut(&str),
 ) -> VerifyOutcome {
     let mut retries = 0usize;
     let mut signals = signals;
@@ -233,6 +288,7 @@ fn drain_verify_signals(
                     if retries > MAX_VERIFY_RETRIES {
                         return VerifyOutcome::Error;
                     }
+                    on_retry(&result);
                 }
             },
             // Malformed signal: tolerate bounded, like a retry.
@@ -395,6 +451,12 @@ impl Drop for ClaimGuard {
             CLAIM.store(ClaimState::QUARANTINED, Ordering::Release);
         }
     }
+}
+
+/// No attempt holds the single-flight claim and the process is not
+/// quarantined: a new attempt would not be refused for contention.
+pub(crate) fn claim_idle() -> bool {
+    CLAIM.load(Ordering::Acquire) == ClaimState::FREE
 }
 
 /// Synthetic worker panic injection, TESTS ONLY: when set, the next
@@ -837,6 +899,8 @@ struct WorkerKit {
     deadline: Instant,
     outcome_tx: mpsc::Sender<VerifyOutcome>,
     completion_tx: mpsc::Sender<()>,
+    /// The interactive caller's progress channel (dropped at retirement).
+    progress: Option<ProgressSink>,
 }
 
 impl WorkerKit {
@@ -855,7 +919,9 @@ impl WorkerKit {
             // unwinding kit shuts down before its connection drops.
             panic!("synthetic worker panic (test injection)");
         }
-        let outcome = kit.attempt.verify_inner(&kit.user, kit.deadline);
+        let outcome = kit
+            .attempt
+            .verify_inner(&kit.user, kit.deadline, kit.progress.as_ref());
         // Started and verified: disarm the spawn-failure guard and take
         // the shutdown socket — explicit retirement owns it from here.
         let worker_shutdown = kit.shutdown_guard.disarm();
@@ -875,6 +941,7 @@ impl WorkerKit {
         // adoption must enforce retirement/callback identity separately.
         drop(kit.attempt);
         drop(kit.user);
+        drop(kit.progress);
         let _ = kit.outcome_tx.send(outcome);
         drop(kit.outcome_tx);
         let _ = kit.completion_tx.send(());
@@ -1130,6 +1197,35 @@ impl Fprintd {
     /// handle until the verified retirement condition, then releases —
     /// or quarantines on any failure.
     pub fn verify(&self, user: &str, timeout: Duration) -> VerifyOutcome {
+        self.verify_with(user, timeout, None, None)
+    }
+
+    /// The lock screen's attempt: [`verify`](Self::verify) that also
+    /// reports [`VerifyProgress`] on `progress`, and ends early with
+    /// [`VerifyOutcome::Cancelled`] once `cancel` is set — through the
+    /// same fd-shutdown-only path as the deadline (the reaper still owns
+    /// release-or-quarantine; fprintd drops the claim of a vanished
+    /// client). `cancel` is polled every [`CANCEL_POLL`].
+    pub fn verify_interactive(
+        &self,
+        user: &str,
+        timeout: Duration,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: ProgressSink,
+    ) -> VerifyOutcome {
+        if cancel.load(Ordering::Acquire) {
+            return VerifyOutcome::Cancelled;
+        }
+        self.verify_with(user, timeout, Some(cancel), Some(progress))
+    }
+
+    fn verify_with(
+        &self,
+        user: &str,
+        timeout: Duration,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        progress: Option<ProgressSink>,
+    ) -> VerifyOutcome {
         // One claim at a time: contention fails closed at once, like
         // the daemon's already-claimed denial — before any bus work, so
         // the denial needs no daemon. The guard moves to the reaper at
@@ -1264,6 +1360,7 @@ impl Fprintd {
             deadline,
             outcome_tx,
             completion_tx,
+            progress,
         };
         // Whole-kit capture: the closure holds the kit intact (see
         // `WorkerKit::run`) — never destructured into locals — so a
@@ -1322,9 +1419,24 @@ impl Fprintd {
             let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
             return VerifyOutcome::TimedOut;
         }
-        match outcome_rx.recv_timeout(remaining) {
+        let wait = |budget: Duration| match cancel {
+            None => outcome_rx.recv_timeout(budget).map_err(Some),
+            // Sliced only for the cancel check: the slices never extend
+            // the absolute deadline the remainder already derives from.
+            Some(cancel) => loop {
+                if cancel.load(Ordering::Acquire) {
+                    break Err(None);
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                match outcome_rx.recv_timeout(left.min(CANCEL_POLL)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => {}
+                    result => break result.map_err(Some),
+                }
+            },
+        };
+        match wait(remaining) {
             Ok(outcome) => outcome,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(Some(mpsc::RecvTimeoutError::Timeout)) => {
                 // Deadline: fd shutdown ONLY, then return — never a
                 // synchronous close or join (either could block behind
                 // a saturated send). The shutdown releases the worker's
@@ -1332,10 +1444,15 @@ impl Fprintd {
                 let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
                 VerifyOutcome::TimedOut
             }
+            // Cancelled: the same shutdown-only retirement as the deadline.
+            Err(None) => {
+                let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
+                VerifyOutcome::Cancelled
+            }
             // The worker died without answering: fail closed after the
             // same shutdown-only path (its handles died with it; the
             // reaper observes the death and quarantines).
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(Some(mpsc::RecvTimeoutError::Disconnected)) => {
                 let _ = parent_shutdown.shutdown(std::net::Shutdown::Both);
                 VerifyOutcome::Error
             }
@@ -1356,7 +1473,12 @@ impl Fprintd {
     /// peer loss with the attempt `deadline` applied to the verdict.
     /// Cleanup is always attempted before the worker retires the
     /// transport.
-    fn verify_inner(&self, user: &str, deadline: Instant) -> VerifyOutcome {
+    fn verify_inner(
+        &self,
+        user: &str,
+        deadline: Instant,
+        progress: Option<&ProgressSink>,
+    ) -> VerifyOutcome {
         let Some(path) = self.default_device() else {
             return VerifyOutcome::NoDevice;
         };
@@ -1374,7 +1496,7 @@ impl Fprintd {
         if device.call::<_, _, ()>("Claim", &(&name,)).is_err() {
             return VerifyOutcome::Error;
         }
-        let outcome = self.verify_claimed(&device, deadline);
+        let outcome = self.verify_claimed(&device, &path, deadline, progress);
         // Always stop and release; errors are best-effort cleanup. Each
         // call carries the setup-remainder-derived method bound, and
         // past the deadline the parent's shutdown fails them fast. The
@@ -1397,7 +1519,9 @@ impl Fprintd {
     fn verify_claimed(
         &self,
         device: &zbus::blocking::Proxy<'_>,
+        path: &zbus::zvariant::OwnedObjectPath,
         deadline: Instant,
+        progress: Option<&ProgressSink>,
     ) -> VerifyOutcome {
         let mut signals = match device.receive_signal("VerifyStatus") {
             Ok(signals) => signals,
@@ -1409,7 +1533,35 @@ impl Fprintd {
         {
             return VerifyOutcome::Error;
         }
-        drain_verify_signals(&mut signals, deadline)
+        let Some(progress) = progress else {
+            return drain_verify_signals_with(&mut signals, deadline, &mut |_| {});
+        };
+        // pam_fprintd's do_verify reads `scan-type` for its wording; an
+        // unreadable property means a press sensor, as there.
+        let swipe = self.scan_type_is_swipe(path);
+        progress(VerifyProgress::Armed { swipe });
+        drain_verify_signals_with(&mut signals, deadline, &mut |result| {
+            if let Some(message) = retry_message(result, swipe) {
+                progress(VerifyProgress::Retry(message));
+            }
+        })
+    }
+
+    /// The device's `scan-type` property is `swipe` (fprintd Device API).
+    fn scan_type_is_swipe(&self, path: &zbus::zvariant::OwnedObjectPath) -> bool {
+        let Ok(properties) = zbus::blocking::Proxy::new(
+            &self.conn,
+            BUS_NAME,
+            path.as_str(),
+            "org.freedesktop.DBus.Properties",
+        ) else {
+            return false;
+        };
+        properties
+            .call::<_, _, zbus::zvariant::OwnedValue>("Get", &(DEVICE_IFACE, "scan-type"))
+            .ok()
+            .and_then(|value| String::try_from(value).ok())
+            .is_some_and(|kind| kind == "swipe")
     }
 }
 
@@ -2743,6 +2895,99 @@ mod tests {
         await_claim_free(Duration::from_secs(30));
     }
 
+    /// (e3) The lock screen's interactive attempt reports the armed reader
+    /// and pam_fprintd's retry message before the terminal match.
+    #[test]
+    fn interactive_attempt_reports_armed_and_retry_then_matches() {
+        let _serial = test_serialize_claim().lock().unwrap();
+        let _watchdog = TestWatchdog::arm(120);
+        let (stub, events) = FprintStub::spawn(
+            vec!["right-index-finger".to_string()],
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let emitter = spawn_emitter(
+            stub.stub_conn.clone(),
+            events.start_rx,
+            vec![
+                ("verify-retry-scan".to_string(), false),
+                ("verify-match".to_string(), true),
+            ],
+            1,
+        );
+        let client = stub.client();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let cancel = AtomicBool::new(false);
+        let outcome = client.verify_interactive(
+            "ada",
+            Duration::from_secs(5),
+            &cancel,
+            Box::new(move |progress| sink.lock().unwrap().push(progress)),
+        );
+        emitter.join().expect("emitter joins");
+        assert_eq!(outcome, VerifyOutcome::Matched);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                VerifyProgress::Armed { swipe: false },
+                VerifyProgress::Retry("Place your finger on the reader again"),
+            ]
+        );
+        let calls = stub.calls();
+        assert_eq!(calls.claims.len(), 1);
+        assert_eq!(calls.stop_calls, 1, "a finished scan stops politely");
+        assert_eq!(calls.release_calls, 1, "a finished scan releases politely");
+        drop(calls);
+        await_claim_free(Duration::from_secs(30));
+    }
+
+    /// (e4) Cancelling an interactive attempt ends it promptly, through the
+    /// deadline's fd-shutdown path: the daemon sees the client vanish and
+    /// the single-flight claim is released for the next attempt.
+    #[test]
+    fn interactive_cancel_ends_the_attempt_and_frees_the_claim() {
+        let _serial = test_serialize_claim().lock().unwrap();
+        let _watchdog = TestWatchdog::arm(120);
+        let (stub, _events) = FprintStub::spawn(
+            vec!["right-index-finger".to_string()],
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let client = stub.client();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            trigger.store(true, TestOrdering::Release);
+        });
+        let start = Instant::now();
+        let outcome =
+            client.verify_interactive("ada", Duration::from_secs(20), &cancel, Box::new(|_| {}));
+        let elapsed = start.elapsed();
+        canceller.join().unwrap();
+        assert_eq!(outcome, VerifyOutcome::Cancelled);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "cancel must end the attempt promptly, took {elapsed:?}"
+        );
+        let caller = stub
+            .calls()
+            .claim_callers
+            .first()
+            .expect("the stub saw the claim")
+            .clone();
+        await_name_gone(&stub, &caller, Duration::from_secs(5));
+        await_claim_free(Duration::from_secs(30));
+        // A set flag refuses before any bus work.
+        let before = stub.calls().claims.len();
+        assert_eq!(
+            client.verify_interactive("ada", Duration::from_secs(5), &cancel, Box::new(|_| {})),
+            VerifyOutcome::Cancelled
+        );
+        assert_eq!(stub.calls().claims.len(), before);
+    }
+
     /// (f) Claim ownership through cleanup until verified release: while
     /// the first attempt sits in delayed Release, a second attempt fails
     /// closed WITHOUT reaching the stub (no second Claim); after the
@@ -3391,6 +3636,7 @@ mod tests {
             deadline: retire_in(Duration::from_secs(5)),
             outcome_tx,
             completion_tx,
+            progress: None,
         };
         // The unstarted-spawn shape: the ACTUAL spawn closure value
         // drops whole, never invoked — no parent handler has run.

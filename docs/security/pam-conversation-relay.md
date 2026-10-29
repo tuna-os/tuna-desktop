@@ -3,7 +3,8 @@
 This API verifies authentication. It cannot unlock a session. Its consumer must
 hold the common auth Slot. It must check the original connection, request,
 serial and lock epoch before it displays a challenge or applies a result.
-The runtime, shell wire and GTK consumers are not connected to this API yet.
+The lock screen's runtime consumer, shell wire (protocol 0.44) and GTK prompt
+are described in [lock-conversations.md](lock-conversations.md).
 
 ## API
 
@@ -85,11 +86,11 @@ not qualify runtime acceptance. The
 controlled PAM stack does not qualify installed services, real logind sleep,
 fingerprint hardware, smartcards, web auth, credential storage or full issue #366.
 
-## Consumer handoff
+## Consumer
 
-The next coordinated patch must bind this ticket to the real common Slot and
-retire or quarantine that Slot from actual backend outcomes. It must cancel on
-origin loss, lock/suspend epoch changes and UI destruction. It must check the
-binding again before every prompt and grant, not merely when it starts a job.
-The future schema needs distinct challenge/answer/cancel semantics with the
-existing NoReplay guarantees. This patch reserves no wire version.
+`crates/compositor/src/runtime/auth.rs` binds each ticket to the common Slot
+(`MethodKind::PamConversation`) and retires or quarantines that Slot from the
+actual backend outcome. It cancels on origin loss, lock/suspend epoch changes
+and shell cancellation, and rechecks the binding before every prompt and the
+grant. Protocol 0.44 carries distinct begin/query/answer/cancel messages over
+the existing NoReplay writer; see [lock-conversations.md](lock-conversations.md).
