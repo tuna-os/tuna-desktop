@@ -6968,13 +6968,20 @@ fn run_loop(
     if let Some(monitor) = &sleep_monitor {
         monitor.set_wake(&runtime.wake);
     }
-    // Graceful shutdown on SIGTERM/SIGINT: ending the loop drops the
+    // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: ending the loop drops the
     // runtime, whose supervisor kills the shell child (ADR 0003 kill
     // on exit). Without this a signal would bypass `Drop` and orphan
-    // the shell on a dead socket. The flag write is the only work done
-    // in the handler; the loop observes it below.
+    // the shell on a dead socket. logind creates session scopes with
+    // SendSIGHUP=yes, so a session stop sends SIGHUP right after SIGTERM;
+    // left at its default it killed the compositor before teardown, so the
+    // owned Orca was never retired (#836). The flag write is the only work
+    // done in the handler; the loop observes it below.
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+    for signal in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ] {
         signal_hook::flag::register(signal, std::sync::Arc::clone(&shutdown))
             .map_err(|e| RuntimeError::Loop(format!("signal handler failed: {e}")))?;
     }
@@ -6984,6 +6991,7 @@ fn run_loop(
         signal_hook::consts::SIGCHLD,
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
     ])
     .map_err(|e| RuntimeError::Loop(format!("signal source failed: {e}")))?;
     event_loop

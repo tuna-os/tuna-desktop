@@ -198,3 +198,73 @@ fn backend_choice_parses_and_auto_resolves_by_host_display() {
     assert_eq!(BackendChoice::Drm.resolve(true), BackendChoice::Drm);
     assert_eq!(BackendChoice::Winit.resolve(false), BackendChoice::Winit);
 }
+
+/// logind session scopes send SIGHUP right after SIGTERM (SendSIGHUP=yes).
+/// The compositor must end through its loop and `Drop` teardown (which
+/// retires the owned screen reader, #836), never by SIGHUP's default
+/// termination. Skips like the launch smoke test without a host display.
+#[test]
+fn sighup_ends_the_session_through_teardown() {
+    use std::os::unix::process::ExitStatusExt;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let socket_name = format!("tuna-hup-{}-{nanos}", std::process::id());
+    let mut child = Command::new(compositor_bin())
+        .args([
+            "--socket",
+            &socket_name,
+            "--width",
+            "800",
+            "--height",
+            "600",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nested compositor");
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let socket_path = runtime_dir.join(&socket_name);
+    let mut bound = false;
+    for _ in 0..RETRY_ROUNDS {
+        if socket_path.exists() {
+            bound = true;
+            break;
+        }
+        if child.try_wait().expect("poll nested compositor").is_some() {
+            break;
+        }
+        std::thread::sleep(RETRY_SLEEP);
+    }
+    if !bound {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("SKIP: no host display/EGL for nested launch");
+        return;
+    }
+    // SAFETY: kill(2) on our own unreaped child.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGHUP);
+    }
+    let mut status = None;
+    for _ in 0..2000 {
+        status = child.try_wait().expect("poll nested compositor");
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(RETRY_SLEEP);
+    }
+    let status = status.unwrap_or_else(|| {
+        let _ = child.kill();
+        child.wait().expect("reap hung nested compositor")
+    });
+    let _ = std::fs::remove_file(&socket_path);
+    assert_eq!(status.signal(), None, "SIGHUP bypassed teardown: {status}");
+    assert!(
+        status.success(),
+        "nested compositor exited {status} on SIGHUP"
+    );
+}
