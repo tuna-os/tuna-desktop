@@ -338,6 +338,19 @@ Proof `G-OCCLUSION-CULL` fullscreens an opaque window over another and
 requires the lower one to be culled and throttled, then drawn at full
 rate again once the upper window's translucent shadow returns.
 
+## Settings writes in proofs
+
+`scripts/tuna-gtk-shell-proof` keeps GSettings in a private keyfile
+(`GSETTINGS_BACKEND=keyfile`). Each writer rewrites the whole file from
+the copy it loaded, so two writers at once can lose a key. The
+compositor writes `numlock-state` through the `gsettings` CLI after
+every Num Lock change. Until its `keyboard.numlock_saving` state field
+is `false` again, any setting the proof writes can be undone. Wait for
+it after a Num Lock change and before the next `gsettings set`. The
+`keyboard.keymap_generation` field goes up each time a keymap is
+applied. Wait for it after changing the input sources or `xkb-options`
+and before typing.
+
 ## Parity ledger check
 
 The `parity-ledger` job runs `scripts/tuna-ledger` against the test list

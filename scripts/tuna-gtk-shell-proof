@@ -5459,11 +5459,19 @@ bells="$(jq '.input_aids.bells' "$CSTATE")"
 xdotool key Caps_Lock Caps_Lock Num_Lock Num_Lock
 cstate ".input_aids.bells == $((bells + 4))" "toggle beeps" ||
     fail G-A11Y-SHORTCUTS "Toggle Keys did not ring once per actual Caps/Num LED change"
+# The compositor saves each Num Lock change (remember-numlock-state)
+# through the gsettings CLI, which rewrites the whole keyfile it loaded:
+# a setting written before that save settles is undone.
+cstate '.keyboard.num_lock == false and .keyboard.numlock_saving == false' "Num Lock save settled" ||
+    fail G-A11Y-SHORTCUTS "the compositor's numlock-state save did not settle"
 # The setting must be live before measuring. No bell for Caps remapped
 # to Control: its keysym/physical location does not change actual LEDs.
 cstate '.input_aids.toggle_beep' "toggle preference live" || fail G-A11Y-SHORTCUTS "Toggle Keys preference did not apply"
+keymap_generation="$(jq '.keyboard.keymap_generation' "$CSTATE")"
 gsettings set org.gnome.desktop.input-sources xkb-options "['ctrl:swapcaps']"
 gsettings set "$A11Y_KBD" stickykeys-enable true
+cstate ".keyboard.keymap_generation > $keymap_generation" "toggle Caps-to-Control map" ||
+    fail G-A11Y-SHORTCUTS "the Caps-to-Control keymap did not load"
 cstate '.input_aids.sticky' "toggle map barrier sticky on" || fail G-A11Y-SHORTCUTS "Sticky Keys on did not apply"
 xdotool key Caps_Lock Caps_Lock
 cstate '.input_aids.locked == ["control"]' "toggle actual remapped role" || fail G-A11Y-SHORTCUTS "the actual Caps-to-Control keymap was not applied"

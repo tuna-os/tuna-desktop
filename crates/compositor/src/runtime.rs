@@ -2301,7 +2301,11 @@ impl Runtime {
         if self.state_path.is_none() {
             return;
         }
-        let keyboard = self.manager.keyboard_summary(&mut self.state);
+        let mut keyboard = self.manager.keyboard_summary(&mut self.state);
+        if let Some(keyboard) = keyboard.as_object_mut() {
+            let saving = self.numlock.saving(self.manager.keyboard_num_lock());
+            keyboard.insert("numlock_saving".into(), saving.into());
+        }
         let Some(path) = self.state_path.as_ref() else {
             return;
         };
