@@ -367,7 +367,11 @@ reject() {
 }
 # close A B TOL: |A - B| <= TOL (integers).
 close() { [ $(($1 - $2)) -le "$3" ] && [ $(($2 - $1)) -le "$3" ]; }
+# Mouse tracking follows pointer motion (GNOME's PointerWatcher), so
+# step off the target first: a pointer already there sends no motion.
 point() {
+    xdotool mousemove --window "$WID" $(($1 + 3)) "$2"
+    cstate ".pointer_position == [$(($1 + 3)), $2]" 10 || fail "$3" "pointer never reached ($(($1 + 3)), $2)"
     xdotool mousemove --window "$WID" "$1" "$2"
     cstate ".pointer_position == [$1, $2]" 10 || fail "$3" "pointer never reached ($1, $2)"
 }
@@ -534,6 +538,7 @@ reject M-KEYS 12-keys-off 20 520 "$GREEN" 16 "magnified (off frame)"
 xdotool key --clearmodifiers super+alt+8
 snapshot '.enabled == true' || fail M-KEYS "a second Super+Alt+8 did not turn the magnifier on"
 cstate '.magnifier.active == true' 10 || fail M-KEYS "the compositor did not magnify after Super+Alt+8"
+point "$GX" "$CY" M-KEYS
 grab 13-keys-on M-KEYS
 # shellcheck disable=SC2086,SC2046
 set -- $("$PY" "$PIX" footprint "$ARTIFACTS/12-keys-off.ppm" "$GX" "$CY" $GREEN 60); w0=$1 h0=$2
@@ -592,6 +597,7 @@ pass M-CROSSHAIRS "red hairs cross at the magnified pointer over the zoomed cont
 # half the unmagnified desktop.
 gsettings set org.gnome.desktop.a11y.magnifier screen-position 'left-half'
 snapshot '.screen_position == "left-half"' || fail M-HALF "screen-position never reached the snapshot"
+point "$CX" "$CY" M-HALF
 cstate "$REGION.viewport == [0, 0, 640, 800]" 10 || fail M-HALF "viewport is not the left half"
 grab 18-half M-HALF
 expect M-HALF 18-half 10 520 "$GREEN" 16 "zoomed green at the left edge"
