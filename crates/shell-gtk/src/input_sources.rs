@@ -674,7 +674,7 @@ impl InputSources {
             slot.borrow_mut().take();
             // The timer holds only the window: finish through its action.
             if let Some(window) = window.upgrade() {
-                let _ = window.activate_action("input-source.finish", None);
+                let _ = WidgetExt::activate_action(&window, "input-source.finish", None);
             }
         });
         *self.popup.no_mods.borrow_mut() = Some(id);
