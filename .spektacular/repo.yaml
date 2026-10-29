@@ -1,15 +1,22 @@
 schema: 2
-description: Independent Rust Wayland desktop session; currently in architecture and planning.
+written_by: dev
+description: 'Tuna Desktop (formerly Roost): Rust Smithay compositor, GTK4/libadwaita shell and greetd greeter targeting GNOME 51 parity on TunaOS. Shipping v1.0.0-beta prereleases from main; v1 tracked by epic #577 and docs/parity-ledger.md.'
 role: product-and-implementation
+tags:
+    - tuna-desktop
+    - wayland
+    - smithay
+    - gtk4
+    - gnome51
 source:
-  provider: file
-  config:
-    location: ..
+    provider: file
+    config:
+        location: ..
 knowledge:
-  provider: file
-  config:
-    location: knowledge
+    provider: file
+    config:
+        location: knowledge
 changelog:
-  provider: file
-  config:
-    directory: changelog
+    provider: file
+    config:
+        directory: changelog
