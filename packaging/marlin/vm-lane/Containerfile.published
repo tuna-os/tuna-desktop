@@ -14,34 +14,40 @@ COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm
 
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
-COPY packaging/marlin/vm-lane/tuna-vm-profile /usr/libexec/tuna-vm-profile
-COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
+COPY packaging/marlin/vm-lane/tuna-vm-published.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.toml
 COPY packaging/marlin/vm-lane/tuna-vm-health /usr/libexec/tuna-vm-health
 COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tuna-vm-health.service
 
-# The greeter's session list (/etc/greetd/environments) is not asserted here:
-# what gtkgreet lists is a qualification check (V-GREETER-LIST) on the booted
-# image, so a wrong entry fails that check instead of the fixture build.
+# The published flavor logs in through stock GDM (tunaOS#3438, from
+# 2026-10-20): no greetd, gtkgreet or /etc/greetd payload ships. The hashes
+# cover the Tuna Desktop binaries and every login-path file the image ships:
+# session entries, both PAM services GDM uses, Tuna's lock PAM service, GDM's
+# configuration and unit, and the greeter theme overlay. Build-time checks pin
+# GDM as the display manager with no automatic or timed login; which sessions
+# GDM offers is a qualification check (V-GREETER-LIST) on the booted image.
 RUN mkdir -p /usr/share/tuna-vm \
     && pacman -Q tuna-desktop > /usr/share/tuna-vm/shipped-package.txt \
     && pacman -Q > /usr/share/tuna-vm/shipped-packages.txt \
     && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor \
          /usr/bin/tuna-shell-host /usr/bin/tuna-shell-gtk \
          /usr/bin/tuna-ibus-bridge /usr/bin/tuna-greeter \
-         /usr/share/wayland-sessions/tuna.desktop \
-         /usr/libexec/tunaos/greetd-session /etc/greetd/config.toml /etc/greetd/gtkgreet.css \
-         /etc/greetd/environments > /usr/share/tuna-vm/shipped-payload.sha256 \
-    && test "$(readlink -f /bin/sh)" = /usr/bin/bash \
-    && grep -q '/usr/libexec/tunaos/greetd-session' /etc/greetd/config.toml \
-    && ! grep -q '\[initial_session\]' /etc/greetd/config.toml \
+         /usr/share/wayland-sessions/*.desktop /etc/pam.d/tuna-lock \
+         /usr/lib/pam.d/gdm-password /usr/lib/pam.d/gdm-launch-environment \
+         /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service \
+         /etc/systemd/user/org.gnome.Shell@gdm.service.d/tunaos-gdm-theme.conf \
+         /usr/share/tunaos/gdm-theme/gnome-shell-*.css > /usr/share/tuna-vm/shipped-payload.sha256 \
+    && test "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service \
+    && ! grep -Eiq '^[[:space:]]*(AutomaticLoginEnable|TimedLoginEnable)[[:space:]]*=[[:space:]]*(true|yes|y|1)[[:space:]]*$' /etc/gdm/custom.conf \
     && pacman -Sy --noconfirm \
     && pacman -S --needed --noconfirm qemu-guest-agent python python-gobject grim wtype wayland-utils gnome-disk-utility gnome-system-monitor \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input \
-    && printf 'L+ /var/home/tuna-test/.profile - tuna-test tuna-test - /usr/libexec/tuna-vm-profile\n' >> /usr/lib/tmpfiles.d/tuna-vm-lane.conf \
+    && printf 'gdm\n' > /usr/share/tuna-vm/display-manager \
+    && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
+         "$(id -u tuna-test)" > /usr/share/tuna-vm/environment.conf \
     && systemctl enable tuna-vm-health.service \
     && systemctl add-wants multi-user.target qemu-guest-agent.service \
     && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \

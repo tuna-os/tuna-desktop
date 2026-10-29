@@ -1,0 +1,11 @@
+# CI-only (published VM lane): the fixture account's home, its GDM user-list
+# entry and its session telemetry environment. The AccountsService record
+# names no Session, so the shipped image alone decides what GDM starts.
+# GDM 51.1 gdm-wayland-session starts the session without a login shell and
+# imports the systemd --user environment, which reads environment.d.
+d /var/home/tuna-test 0700 tuna-test tuna-test -
+d /var/home/tuna-test/.config 0700 tuna-test tuna-test -
+d /var/home/tuna-test/.config/environment.d 0700 tuna-test tuna-test -
+L+ /var/home/tuna-test/.config/environment.d/90-tuna-vm.conf - - - - /usr/share/tuna-vm/environment.conf
+d /var/lib/AccountsService/users 0700 root root -
+f+ /var/lib/AccountsService/users/tuna-test 0600 root root - [User]\nSystemAccount=false\n

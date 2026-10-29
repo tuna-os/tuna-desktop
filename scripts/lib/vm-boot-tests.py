@@ -189,21 +189,38 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
 
 
 class DeviceInventoryProjection(unittest.TestCase):
-    def inventory(self, state):
+    GREETD = {"manager": "greetd", "unit": "greetd.service", "service": "greetd", "vt": "1"}
+    GDM = {"manager": "gdm", "unit": "gdm.service", "service": "gdm-password", "vt": None}
+
+    def inventory(self, state, login=GREETD, session="Id=1\nVTNr=1\nUser=1000\nService=greetd\nType=wayland\nClass=user"):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
         fn = next(n for n in ast.parse(source.read_text()).body
                   if isinstance(n, ast.FunctionDef) and n.name == "inventory")
         def call(*args, check=True):
             if args[1] == "list-sessions":
                 return "1 1000 tuna-test seat0 tty1"
-            return "Id=1\nVTNr=1\nUser=1000\nService=greetd\nType=wayland\nClass=user"
+            return session
         scope = {"json": json, "STATE": SimpleNamespace(read_text=lambda: json.dumps(state)),
                  "pathlib": SimpleNamespace(Path=lambda _: SimpleNamespace(iterdir=lambda: [])),
-                 "OWNER": SimpleNamespace(pw_uid=1000),
+                 "OWNER": SimpleNamespace(pw_uid=1000), "LOGIN_SESSION": login,
                  "os": SimpleNamespace(geteuid=lambda: 0), "call": call,
                  "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), scope)
         return scope["inventory"]()
+
+    def test_gdm_password_session_on_its_new_vt_is_the_owner(self):
+        gdm = "Id=3\nVTNr=2\nUser=1000\nService=gdm-password\nType=wayland\nClass=user"
+        self.assertEqual(self.inventory(self.state(), self.GDM, gdm)["session"]["Service"], "gdm-password")
+
+    def test_login_service_and_vt_must_match_the_fixture(self):
+        for login, session in ((self.GDM, "Id=1\nVTNr=1\nUser=1000\nService=greetd\nClass=user"),
+                               (self.GDM, "Id=3\nVTNr=\nUser=1000\nService=gdm-password\nClass=user"),
+                               (self.GDM, "Id=3\nVTNr=2\nUser=1001\nService=gdm-password\nClass=user"),
+                               (self.GDM, "Id=3\nVTNr=2\nUser=1000\nService=gdm-password\nClass=manager"),
+                               (self.GREETD, "Id=3\nVTNr=2\nUser=1000\nService=gdm-password\nClass=user"),
+                               (self.GREETD, "Id=1\nVTNr=2\nUser=1000\nService=greetd\nClass=user")):
+            with self.subTest(login=login["manager"], session=session), self.assertRaises(RuntimeError):
+                self.inventory(self.state(), login, session)
 
     def state(self):
         return dict.fromkeys(("locked", "windows", "focused", "active_workspace",
@@ -1098,7 +1115,7 @@ class OrcaReadChurn(unittest.TestCase):
             empty_proc = Path(directory, "proc")
             empty_proc.mkdir()
             scope = {"json": json, "STATE": state, "call": call, "os": lane.os,
-                     "OWNER": SimpleNamespace(pw_uid=1000),
+                     "OWNER": SimpleNamespace(pw_uid=1000), "LOGIN_SESSION": DeviceInventoryProjection.GREETD,
                      "pathlib": SimpleNamespace(Path=lambda path: empty_proc),
                      "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
             result = self.load("inventory", scope)()
@@ -3175,6 +3192,7 @@ class ShippedSnapshotInventory(unittest.TestCase):
                      "pathlib": SimpleNamespace(
                          Path=lambda path: proc if str(path) == "/proc" else real_pathlib.Path(path)),
                      "OWNER": SimpleNamespace(pw_uid=uid, pw_name="tuna-test"),
+                     "LOGIN_SESSION": DeviceInventoryProjection.GREETD,
                      "RUNTIME": f"/run/user/{uid}", "STATE": state_path,
                      "call": fake_call, **identity,
                      # Owned PAM helper accounting is proven by PrivatePamSleepControls.
@@ -3374,33 +3392,168 @@ class InterleavedShellStartup(unittest.TestCase):
         self.assertFalse(bool(shell) and lane.EXHAUSTED not in text)
 
 
-class GreeterSessionList(unittest.TestCase):
-    # tunaOS#3110: gtkgreet lists /etc/greetd/environments verbatim, so the
-    # Marlin picker showed the raw `tuna-session` command.
-    def probe(self, sessions, override=False):
-        return {"sessions": sessions, "greeter_command_override": override}
+LIFECYCLE_SOURCE = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
 
-    def test_display_name_preselected_passes(self):
-        ok, detail = lane.greeter_list_ok(self.probe(["Tuna Desktop"]))
+
+def lifecycle_scope(*names, **extra):
+    """Execute the named lifecycle functions/constants without its guest globals."""
+    tree = ast.parse(LIFECYCLE_SOURCE.read_text())
+    nodes = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
+             or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names
+                                                     for t in n.targets))]
+    scope = {"os": os, "pathlib": __import__("pathlib"), **extra}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(LIFECYCLE_SOURCE), "exec"), scope)
+    return scope
+
+
+# Session entries as ghcr.io/tuna-os/marlin@sha256:d9959d1a… (amd64
+# a09b2bb7…, 2026-10-28) ships them: tunaOS's tuna-hide-other-sessions.sh
+# appends NoDisplay=true to GNOME's entry; the package's hidden one-release
+# compatibility session keeps the old name; GDM's own greeter sessions are
+# NoDisplay.
+PUBLISHED_SESSIONS = {
+    "usr/share/wayland-sessions/tuna.desktop":
+        "[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\nTryExec=tuna-session\nType=Application\n",
+    # tuna-rename: keep-begin
+    "usr/share/wayland-sessions/roost.desktop":
+    # tuna-rename: keep-end
+        "[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\nTryExec=tuna-session\nNoDisplay=true\n",
+    "usr/share/wayland-sessions/gnome.desktop":
+        "[Desktop Entry]\nName=GNOME\nName[de]=GNOME\nExec=/usr/bin/gnome-session\n"
+        "TryExec=/usr/bin/gnome-session\nType=Application\n\nNoDisplay=true\n",
+    "usr/share/gdm/greeter/wayland-sessions/gnome-greeter.desktop":
+        "[Desktop Entry]\nName=GNOME Greeter\nExec=gnome-session --session gnome-login\n"
+        "TryExec=gnome-session\nNoDisplay=true\n",
+}
+
+
+class GdmSessionList(unittest.TestCase):
+    """tunaOS#3438 moved marlin:tuna to GDM. GDM 51.1 libgdm/gdm-sessions.c
+    decides the offered list; gnome-shell 51.0 shows no session menu when
+    exactly one session is offered."""
+    NAMES = ("desktop_entry", "gdm_sessions", "GDM_SESSION_DIRS", "GDM_DATA_DIRS", "GDM_PATH")
+
+    def offered(self, files, present=("tuna-session", "gnome-session", "/usr/bin/gnome-session")):
+        scope = lifecycle_scope(*self.NAMES)
+        with tempfile.TemporaryDirectory() as root:
+            for name, text in files.items():
+                path = Path(root, name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            dirs = tuple(root + directory for directory in scope["GDM_SESSION_DIRS"])
+            return scope["gdm_sessions"](dirs, which=lambda program: program if program in present else None)
+
+    def test_published_image_offers_only_tuna_desktop(self):
+        sessions = self.offered(PUBLISHED_SESSIONS)
+        self.assertEqual(sessions, [["tuna", "Tuna Desktop"]])
+        ok, detail = lane.greeter_list_ok({"sessions": sessions, "default_session": "tuna.desktop"})
         self.assertTrue(ok, detail)
 
-    def test_raw_command_fails(self):
-        ok, detail = lane.greeter_list_ok(self.probe(["tuna-session"]))
-        self.assertFalse(ok)
-        self.assertIn("tuna-session", detail)
+    def test_visible_gnome_session_fails_the_list(self):
+        files = dict(PUBLISHED_SESSIONS)
+        files["usr/share/wayland-sessions/gnome.desktop"] = files["usr/share/wayland-sessions/gnome.desktop"].replace(
+            "NoDisplay=true\n", "")
+        sessions = self.offered(files)
+        self.assertEqual(sessions, [["gnome", "GNOME"], ["tuna", "Tuna Desktop"]])
+        self.assertFalse(lane.greeter_list_ok({"sessions": sessions})[0])
 
-    def test_name_not_preselected_fails(self):
-        self.assertFalse(lane.greeter_list_ok(self.probe(["tuna-session", "Tuna Desktop"]))[0])
+    def test_tryexec_hidden_and_nameless_entries_are_not_offered(self):
+        files = dict(PUBLISHED_SESSIONS)
+        files["usr/share/wayland-sessions/tuna.desktop"] += "Hidden=true\n"
+        self.assertEqual(self.offered(files), [])
+        self.assertEqual(self.offered(PUBLISHED_SESSIONS, present=()), [])
+        self.assertEqual(self.offered({"usr/share/wayland-sessions/x.desktop": "[Desktop Entry]\nExec=x\n"}), [])
+        self.assertEqual(self.offered({"usr/share/wayland-sessions/x.desktop": "Name=X\n"}), [])
 
-    def test_empty_list_fails(self):
-        self.assertFalse(lane.greeter_list_ok(self.probe([]))[0])
+    def test_earlier_directory_wins_by_id_and_names_are_offered_once(self):
+        files = dict(PUBLISHED_SESSIONS)
+        files["usr/local/share/wayland-sessions/tuna.desktop"] = "[Desktop Entry]\nName=Tuna Desktop\nNoDisplay=true\n"
+        self.assertEqual(self.offered(files), [])
+        files = dict(PUBLISHED_SESSIONS)
+        files["usr/share/xsessions/tuna-x.desktop"] = "[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\n"
+        self.assertEqual(self.offered(files), [["tuna", "Tuna Desktop"]])
 
-    def test_command_override_fails(self):
-        self.assertFalse(lane.greeter_list_ok(self.probe(["Tuna Desktop"], override=True))[0])
+    def test_missing_or_command_named_session_fails(self):
+        for sessions in ([], None, [["tuna", "tuna-session"]], [["tuna", "Tuna Desktop"], ["tuna", "Tuna Desktop"]]):
+            with self.subTest(sessions=sessions):
+                self.assertFalse(lane.greeter_list_ok({"sessions": sessions})[0])
 
-    def test_missing_override_evidence_fails_closed(self):
-        self.assertFalse(lane.greeter_list_ok({"sessions": ["Tuna Desktop"]})[0])
+    def test_shipped_default_session_is_reported(self):
+        scope = lifecycle_scope("gdm_default_session")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, "custom.conf")
+            path.write_text("# GDM configuration storage\n\n[daemon]\nDefaultSession=tuna.desktop\n\n[security]\n")
+            self.assertEqual(scope["gdm_default_session"](path), "tuna.desktop")
+            path.write_text("[security]\nDefaultSession=gnome.desktop\n")
+            self.assertIsNone(scope["gdm_default_session"](path))
+            self.assertIsNone(scope["gdm_default_session"](Path(root, "absent.conf")))
 
+
+class FixtureLoginSession(unittest.TestCase):
+    def test_fixture_file_selects_the_qualified_login(self):
+        login_session = lifecycle_scope("login_session")["login_session"]
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, "display-manager")
+            self.assertEqual(login_session(path)["service"], "greetd")
+            path.write_text("gdm\n")
+            self.assertEqual(login_session(path), {"manager": "gdm", "unit": "gdm.service",
+                                                   "service": "gdm-password", "vt": None})
+            path.write_text("lightdm\n")
+            with self.assertRaises(RuntimeError):
+                login_session(path)
+
+    def test_published_fixture_names_gdm_without_preselecting_a_session(self):
+        root = Path(__file__).resolve().parents[2]
+        containerfile = (root / "packaging/marlin/vm-lane/Containerfile.published").read_text()
+        tmpfiles = (root / "packaging/marlin/vm-lane/tuna-vm-published.tmpfiles").read_text()
+        self.assertIn("printf 'gdm\\n' > /usr/share/tuna-vm/display-manager", containerfile)
+        self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-published.tmpfiles", containerfile)
+        self.assertNotIn("greetd", containerfile.split("RUN mkdir -p /usr/share/tuna-vm", 1)[1])
+        for path in ("/usr/lib/pam.d/gdm-password", "/etc/gdm/custom.conf", "/etc/pam.d/tuna-lock",
+                     "/usr/share/wayland-sessions/*.desktop", "sha256sum --check"):
+            self.assertIn(path, containerfile)
+        self.assertNotIn("Session=", tmpfiles)
+        self.assertNotIn("AutomaticLogin", containerfile.replace("AutomaticLoginEnable|TimedLoginEnable", ""))
+
+
+class GdmGreeterReadiness(unittest.TestCase):
+    def gdm(self, **changes):
+        greeter = {"manager": "gdm", "manager_active": True, "probe_uid": 0, "greeter_pids": ["812"],
+                   "greeter_uids": [60578], "compositor_pids": [],
+                   "greeter_sessions": [{"Id": "c1", "User": "60578", "Class": "greeter",
+                                         "Service": "gdm-launch-environment", "Active": "yes", "VTNr": "1"}]}
+        return greeter | changes
+
+    def test_active_non_root_gdm_greeter_is_ready(self):
+        self.assertTrue(lane.greeter_ready(self.gdm(), True))
+
+    def test_gdm_greeter_needs_its_active_session_and_no_survivor(self):
+        session = self.gdm()["greeter_sessions"][0]
+        for changes in ({"manager_active": False}, {"manager": "greetd"}, {"greeter_pids": []},
+                        {"greeter_uids": [0]}, {"compositor_pids": ["901"]}, {"greeter_sessions": []},
+                        {"greeter_sessions": [session | {"Active": "no"}]},
+                        {"greeter_sessions": [session | {"Service": "gdm-password"}]},
+                        {"greeter_sessions": [session | {"User": "0"}]}, {"probe_uid": 1000}):
+            with self.subTest(changes=changes):
+                self.assertFalse(lane.greeter_ready(self.gdm(**changes), True))
+
+    def test_current_build_greetd_logout_greeter(self):
+        greetd = {"manager": "greetd", "manager_active": True, "probe_uid": 0, "greeter_pids": ["700"],
+                  "greeter_uids": [958], "compositor_pids": []}
+        self.assertTrue(lane.greeter_ready(greetd, False))
+        self.assertFalse(lane.greeter_ready(greetd | {"compositor_pids": ["900"]}, False))
+        self.assertFalse(lane.greeter_ready(self.gdm(), False))
+
+    def test_login_service_follows_the_lane(self):
+        self.assertEqual(lane.login_service(True), "gdm-password")
+        self.assertEqual(lane.login_service(False), "greetd")
+
+    def test_gdm_session_stream_records_reassemble(self):
+        text = ("[  42.1] /usr/lib/gdm-wayland-session[1203]: tuna-shell-gtk: lock password submitted\n"
+                "[  42.2] /usr/lib/gdm-wayland-session[1203]: tuna-shell-gtk: lock command result applied=\n"
+                "[  42.3] /usr/lib/gdm-wayland-session[1203]: false\n")
+        self.assertEqual(lane.session_records(text), ["tuna-shell-gtk: lock password submitted",
+                                                      "tuna-shell-gtk: lock command result applied=false"])
 
 
 class DelayedAuthFailureDiagnostics(unittest.TestCase):

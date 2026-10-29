@@ -41,6 +41,99 @@ NESTED = f"{PREFIX}-nested-"
 LOCK_PAM = f"/etc/pam.d/{PREFIX}-lock"
 
 
+def login_session(path=pathlib.Path("/usr/share/tuna-vm/display-manager")):
+    """The logind login the fixture qualifies. The current-build fixture runs
+    greetd on VT 1; the published flavor ships GDM (tunaOS#3438), whose PAM
+    service is gdm-password and whose user session takes a new VT (GDM 51.1
+    daemon/gdm-session.c GDM_SESSION_DISPLAY_MODE_NEW_VT)."""
+    manager = path.read_text().strip() if path.exists() else "greetd"
+    if manager == "greetd":
+        return {"manager": "greetd", "unit": "greetd.service", "service": "greetd", "vt": "1"}
+    if manager == "gdm":
+        return {"manager": "gdm", "unit": "gdm.service", "service": "gdm-password", "vt": None}
+    raise RuntimeError("unknown fixture display manager")
+
+
+LOGIN_SESSION = login_session()
+
+
+# GDM 51.1 libgdm/gdm-sessions.c collect_sessions(): the greeter searches the
+# X session directories, then <data dir>/xsessions and <data dir>/wayland-sessions
+# for each XDG data dir, which gdm-launch-environment.c prefixes with
+# /usr/share/gdm/greeter for the greeter; earlier directories win by id.
+GDM_DATA_DIRS = ("/usr/share/gdm/greeter", "/usr/local/share", "/usr/share")
+GDM_SESSION_DIRS = (("/etc/X11/sessions", "/etc/gdm/Sessions", "/usr/share/gdm/BuiltInSessions")
+                    + tuple(f"{root}/xsessions" for root in GDM_DATA_DIRS)
+                    + tuple(f"{root}/wayland-sessions" for root in GDM_DATA_DIRS))
+GDM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/bin"
+
+
+def desktop_entry(text):
+    """[Desktop Entry] keys as GKeyFile reads them (last duplicate wins), or
+    None when the group is absent."""
+    group, found, keys = None, False, {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            group = line[1:-1]
+            found = found or group == "Desktop Entry"
+        elif group == "Desktop Entry" and "=" in line:
+            key, value = line.split("=", 1)
+            keys[key.strip()] = value.strip()
+    return keys if found else None
+
+
+def gdm_sessions(dirs=GDM_SESSION_DIRS, which=None):
+    """[[id, Name]] GDM offers: key_file_is_relevant() drops NoDisplay, Hidden
+    and failing TryExec entries (and removes an earlier same-id entry), a
+    missing Name skips the file, and remove_duplicate_sessions() keeps one
+    session per Name."""
+    import shutil
+    which = which or (lambda program: shutil.which(program, path=GDM_PATH))
+    available = {}
+    for directory in reversed(dirs):
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".desktop"):
+                continue
+            session_id = name[:-len(".desktop")]
+            try:
+                keys = desktop_entry(pathlib.Path(directory, name).read_text())
+            except (OSError, UnicodeDecodeError):
+                continue
+            if keys is None or "Name" not in keys:
+                continue
+            tryexec = keys.get("TryExec", "")
+            if (keys.get("NoDisplay") in ("true", "1") or keys.get("Hidden") in ("true", "1")
+                    or (tryexec and which(tryexec) is None)):
+                available.pop(session_id, None)
+                continue
+            available[session_id] = keys["Name"]
+    offered, seen = [], set()
+    for session_id, title in sorted(available.items()):
+        if title not in seen:
+            seen.add(title)
+            offered.append([session_id, title])
+    return offered
+
+
+def gdm_default_session(path=pathlib.Path("/etc/gdm/custom.conf")):
+    """[daemon] DefaultSession from GDM's configuration, or None."""
+    group, value = None, None
+    for line in path.read_text().splitlines() if path.exists() else []:
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            group = line[1:-1]
+        elif group == "daemon" and "=" in line and line.split("=", 1)[0].strip() == "DefaultSession":
+            value = line.split("=", 1)[1].strip()
+    return value
+
+
 def call(*args, user=False, check=True):
     command = list(args)
     if user:
@@ -301,17 +394,20 @@ def inventory():
             continue
         # Every runuser probe opens a short logind session for this UID, and
         # one may close between list-sessions and show-session. A vanished
-        # session yields no properties; the single greetd session still must.
+        # session yields no properties; the single login session still must.
         description = call("loginctl", "show-session", line[0], "--property=Id",
                            "--property=VTNr", "--property=User", "--property=Type",
                            "--property=Service", "--property=Class", check=False)
         properties = dict(item.split("=", 1) for item in description.splitlines())
-        if (properties.get("Service") == "greetd" and properties.get("VTNr") == "1"
+        vt = properties.get("VTNr", "")
+        if (properties.get("Service") == LOGIN_SESSION["service"]
+                and vt.isdigit() and vt != "0"
+                and LOGIN_SESSION["vt"] in (None, vt)
                 and properties.get("User") == str(OWNER.pw_uid)
                 and not properties.get("Class", "").startswith("manager")):
             owned.append(properties)
     if len(owned) != 1:
-        raise RuntimeError("expected exactly one greetd user session on the configured VT")
+        raise RuntimeError(f"expected exactly one {LOGIN_SESSION['service']} user session on a VT")
     # Only the original four snapshot keys are mandatory: the published
     # flavor still ships a Tuna Desktop build that predates the newer
     # instrumentation, and session detection must not depend on it.
@@ -1395,7 +1491,7 @@ def main():
         raise RuntimeError("probe must be root and session owner must not be root")
     action = sys.argv[1]
     if action == "background-diagnostics":
-        inventory()  # Verify the original actual greetd owner before re-exec.
+        inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
     elif action == "inventory":
         result = inventory()
@@ -1893,25 +1989,35 @@ print(json.dumps(result))
         call("loginctl", "terminate-session", inventory()["session"]["Id"])
         result = {"requested": "terminate session"}
     elif action == "greeter":
-        greeter_pids = call("pgrep", "-x", "gtkgreet", check=False).splitlines()
-        # gtkgreet lists /etc/greetd/environments verbatim, after any -c
-        # command, and preselects the first entry; that list is what the
-        # user reads in the session picker.
-        environments = pathlib.Path("/etc/greetd/environments")
-        result = {"greetd_active": call("systemctl", "is-active", "greetd.service") == "active",
+        result = {"manager": LOGIN_SESSION["manager"],
+                  "manager_active": call("systemctl", "is-active", LOGIN_SESSION["unit"],
+                                         check=False) == "active",
                   "probe_uid": os.geteuid(),
-                  "greeter_pids": greeter_pids,
-                  "greeter_uids": [pathlib.Path(f"/proc/{pid}").stat().st_uid for pid in greeter_pids],
-                  # Only whether a -c command precedes the list; process
-                  # arguments themselves stay out of the artifacts.
-                  "greeter_command_override": any(
-                      arg in ("-c", "--command") or arg.startswith("--command=")
-                      for pid in greeter_pids
-                      for arg in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")[1:]),
-                  "sessions": [line for line in environments.read_text().splitlines() if line]
-                              if environments.exists() else [],
                   "compositor_pids": call("pgrep", "-u", str(OWNER.pw_uid), "-x",
                                           COMPOSITOR_COMM, check=False).splitlines()}
+        if LOGIN_SESSION["manager"] == "gdm":
+            # GDM's greeter is gnome-shell in a logind greeter-class session
+            # of its own (dynamic) non-root user.
+            greeter_sessions = []
+            for line in call("loginctl", "list-sessions", "--no-legend", "--no-pager").splitlines():
+                fields = line.split()
+                if not fields:
+                    continue
+                description = call("loginctl", "show-session", fields[0], "--property=Id",
+                                   "--property=User", "--property=Class", "--property=Service",
+                                   "--property=Active", "--property=VTNr", check=False)
+                properties = dict(item.split("=", 1) for item in description.splitlines() if "=" in item)
+                if properties.get("Class") == "greeter":
+                    greeter_sessions.append(properties)
+            greeter_pids = [pid for uid in sorted({s.get("User", "") for s in greeter_sessions} - {""})
+                            for pid in call("pgrep", "-u", uid, "-x", "gnome-shell", check=False).splitlines()]
+            result |= {"greeter_sessions": greeter_sessions,
+                       "sessions": gdm_sessions(),
+                       "default_session": gdm_default_session()}
+        else:
+            greeter_pids = call("pgrep", "-x", "gtkgreet", check=False).splitlines()
+        result |= {"greeter_pids": greeter_pids,
+                   "greeter_uids": [pathlib.Path(f"/proc/{pid}").stat().st_uid for pid in greeter_pids]}
     elif action == "published":
         payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")
         call("sha256sum", "--check", str(payload))
