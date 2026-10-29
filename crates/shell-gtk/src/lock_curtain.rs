@@ -367,6 +367,9 @@ fn unsigned_zero(value: f64) -> f64 {
     }
 }
 
+/// What runs when an ease ends undisturbed.
+type Settled = Rc<dyn Fn(Page)>;
+
 mod imp {
     use super::*;
 
@@ -378,7 +381,7 @@ mod imp {
         pub swipe: Cell<Option<Swipe>>,
         pub tween: Cell<Option<Tween>>,
         pub ticking: Cell<bool>,
-        pub settled: RefCell<Option<Rc<dyn Fn(Page)>>>,
+        pub settled: RefCell<Option<Settled>>,
     }
 
     #[glib::object_subclass]
