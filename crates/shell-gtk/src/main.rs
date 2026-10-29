@@ -14,6 +14,7 @@
 //! `TUNA_SHELL_BIN=tuna-shell-gtk` while it grows to parity.
 
 mod accessibility;
+mod anim_clock;
 mod audio_state;
 mod background_settings;
 mod brightness;
@@ -35,6 +36,7 @@ mod keybindings;
 mod live_apps;
 mod location;
 mod lock;
+mod lock_curtain;
 mod lockdown;
 mod logic;
 mod magnifier_sync;

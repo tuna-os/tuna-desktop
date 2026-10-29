@@ -837,7 +837,7 @@ jobs:
           if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or 'COUNTDOWN-OSD pass ' not in text:
               raise RuntimeError('actual admitted countdown OSD test did not pass')
           PY
-      - name: Prove real GTK OSD fade-out and panel menu close/switch (#501)
+      - name: Prove real GTK OSD fade-out, panel menu close/switch (#501) and lock curtain (#502)
         run: |
           /usr/bin/python3 - <<'PY'
           import hashlib, json, os, pathlib, signal, subprocess
@@ -849,10 +849,11 @@ jobs:
           if admission['executable_sha256'] != hashlib.sha256(binary.read_bytes()).hexdigest():
               raise RuntimeError('transient proof executable differs from Cargo admission')
           proofs = [
-              ('osd-fade', 'TUNA_REQUIRE_OSD_FADE=1', 'osd::gtk_fade_tests::actual_gtk_show_during_fade_out_lets_the_fade_complete', 'OSD-FADE-OUT pass '),
-              ('menu-motion', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_menus_close_at_once_and_switch_fade_only', 'MENU-MOTION pass '),
+              ('osd-fade', 'TUNA_REQUIRE_OSD_FADE=1', 'osd::gtk_fade_tests::actual_gtk_show_during_fade_out_lets_the_fade_complete', 'OSD-FADE-OUT pass ', 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'),
+              ('menu-motion', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_menus_close_at_once_and_switch_fade_only', 'MENU-MOTION pass ', 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'),
+              ('lock-curtain', 'TUNA_REQUIRE_LOCK_CURTAIN=1', 'lock_curtain::gtk_curtain_tests::actual_gtk_curtain_pages_follow_progress_and_policy', 'LOCK-CURTAIN pass ', 'actual GTK widget allocation, focus and frame clock under private X11; the session-lock surface, real input and frozen-clock frames are proven by G-LOCK-CURTAIN-CLOCK, G-LOCK-CURTAIN-POLICY and G-LOCK-CURTAIN-DRAG'),
           ]
-          for name, admit, test, marker in proofs:
+          for name, admit, test, marker, scope in proofs:
               artifacts = pathlib.Path('gtk-shell-artifacts') / name
               artifacts.mkdir(parents=True, exist_ok=False)
               argv = ['env', '-u', 'WAYLAND_DISPLAY', '-u', 'WAYLAND_SOCKET', 'dbus-run-session', '--', 'xvfb-run', '-a', 'env', 'GDK_BACKEND=x11', admit, str(binary), test, '--exact', '--ignored', '--test-threads=1', '--nocapture']
@@ -871,7 +872,7 @@ jobs:
               text = (artifacts / 'output.txt').read_text()
               print(text)
               unchanged = admission['executable_sha256'] == hashlib.sha256(binary.read_bytes()).hexdigest()
-              (artifacts / 'receipt.json').write_text(json.dumps({'build_admission': admission, 'argv': argv, 'exit_status': exit_status, 'executable_unchanged_after': unchanged, 'output_sha256': hashlib.sha256((artifacts / 'output.txt').read_bytes()).hexdigest(), 'scope': 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'}, indent=2) + '\n')
+              (artifacts / 'receipt.json').write_text(json.dumps({'build_admission': admission, 'argv': argv, 'exit_status': exit_status, 'executable_unchanged_after': unchanged, 'output_sha256': hashlib.sha256((artifacts / 'output.txt').read_bytes()).hexdigest(), 'scope': scope}, indent=2) + '\n')
               if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or marker not in text:
                   raise RuntimeError(f'actual admitted {name} test did not pass')
           PY
@@ -884,6 +885,7 @@ jobs:
       - run: python3 scripts/lib/cursor-pixels-tests.py
       - run: /usr/bin/python3 scripts/lib/wellbeing-pixels-tests.py
       - run: /usr/bin/python3 scripts/lib/gtk-folder-watch-proof-tests.py
+      - run: /usr/bin/python3 scripts/lib/lock-curtain-proof-tests.py
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
