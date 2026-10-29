@@ -50,8 +50,8 @@ GNOME 51 `org.gnome.desktop.a11y.interface reduced-motion` is read live and comb
 | org.gnome.shell favorite-apps | Honored | Used for the dash when Tuna Desktop has no pins of its own |
 | org.gnome.desktop.app-folders (folder-children and each folder's name, apps, categories, excluded-apps, translate) | Honored | App-grid folders, read on each grid open. Proof G-APP-FOLDERS |
 | org.gnome.shell enabled-extensions | Ignored | GNOME Shell extensions are JavaScript. Tuna Desktop has its own extension point |
-| org.gnome.settings-daemon.plugins.color night-light-enabled | Honored (write only) | The Night Light tile writes it, but Tuna Desktop applies no colour temperature yet (#89 gamma control) |
-| org.gnome.settings-daemon.plugins.color night-light-temperature, night-light-schedule-automatic, night-light-schedule-from, night-light-schedule-to | Ignored | Named in the compositor's Night Light key inventory; the schedule model is pure and no reader or gamma control consumes these keys yet (#89, #339) |
+| org.gnome.settings-daemon.plugins.color night-light-enabled | Honored | The Night Light tile writes it; the compositor reads it live and tints every output in GL. Proof G-QS-NIGHT (#339) |
+| org.gnome.settings-daemon.plugins.color night-light-temperature, night-light-schedule-automatic, night-light-schedule-from, night-light-schedule-to, night-light-last-coordinates | Honored | Read live by the compositor: gsd 51's clamp, local-time automatic and from/to schedules (midnight wrap, DST, runtime zone change), one-hour edge smear and 5 s jump smoothing. Geoclue never updates night-light-last-coordinates, so automatic mode uses the stored value or the from/to window. Proof G-QS-NIGHT drives NightLightPreview against night-light-temperature (#339) |
 
 ## Displays
 

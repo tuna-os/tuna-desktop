@@ -360,6 +360,41 @@ impl NightLightColor {
         self.share.disabled_until_tmw().is_some()
     }
 
+    /// Applied colour temperature in Kelvin (6500 when neutral).
+    #[zbus(property)]
+    fn temperature(&self) -> u32 {
+        self.share.temperature()
+    }
+
+    /// g-s-d `handle_set_property`: values outside 1000..=10000 K
+    /// fail with InvalidArgs; others apply until Night Light's own
+    /// temperature next changes.
+    #[zbus(property)]
+    fn set_temperature(&self, value: u32) -> fdo::Result<()> {
+        self.share
+            .set_temperature_override(value)
+            .map_err(|kelvin| {
+                use crate::night_light::{MAX_TEMPERATURE_K, MIN_TEMPERATURE_K};
+                fdo::Error::InvalidArgs(if kelvin < MIN_TEMPERATURE_K {
+                    format!("{kelvin}K is < min {MIN_TEMPERATURE_K}K")
+                } else {
+                    format!("{kelvin}K is > max {MAX_TEMPERATURE_K}K")
+                })
+            })
+    }
+
+    /// Local sunrise in fractional hours; -1 before any location.
+    #[zbus(property)]
+    fn sunrise(&self) -> f64 {
+        self.share.sunrise()
+    }
+
+    /// Local sunset in fractional hours; -1 before any location.
+    #[zbus(property)]
+    fn sunset(&self) -> f64 {
+        self.share.sunset()
+    }
+
     /// Record (or clear) "disabled until tomorrow". Setting stamps
     /// the current time; a wedged clock records no disable rather
     /// than a bogus one.
@@ -1175,6 +1210,30 @@ mod tests {
         color.set_disabled_until_tomorrow(false);
         assert!(!color.disabled_until_tomorrow());
         assert_eq!(share.disabled_until_tmw(), None);
+    }
+
+    #[test]
+    fn color_temperature_and_sun_properties_follow_gsd() {
+        use crate::night_light::NightLightShare;
+        let share = Arc::new(NightLightShare::default());
+        let color = NightLightColor {
+            share: share.clone(),
+        };
+        // g-s-d: 6500 K neutral, -1 sunrise/sunset before a location.
+        assert_eq!(color.temperature(), 6500);
+        assert_eq!((color.sunrise(), color.sunset()), (-1.0, -1.0));
+        // Out-of-range writes fail as InvalidArgs with g-s-d's text.
+        assert_eq!(
+            color.set_temperature(999),
+            Err(fdo::Error::InvalidArgs("999K is < min 1000K".into()))
+        );
+        assert_eq!(
+            color.set_temperature(10_001),
+            Err(fdo::Error::InvalidArgs("10001K is > max 10000K".into()))
+        );
+        assert_eq!(color.temperature(), 6500);
+        assert_eq!(color.set_temperature(4000), Ok(()));
+        assert_eq!(color.temperature(), 4000);
     }
 
     fn snapshot(connector: &str) -> OutputSnapshot {

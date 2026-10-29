@@ -3219,7 +3219,61 @@ qs_press "Night Light" night-on || fail G-QS-NIGHT "could not enable Night Light
 qs_press "Night Light" night-off || fail G-QS-NIGHT "could not disable Night Light"
 [ "$(gsettings get org.gnome.settings-daemon.plugins.color night-light-enabled)" = false ] ||
     fail G-QS-NIGHT "Night Light did not disable its GNOME color key"
-pass G-QS-NIGHT "the real tile enables and disables GNOME's night-light-enabled key"
+# GNOME Settings' slider path: write the key, then NightLightPreview
+# forces it even though Night Light is off. The compositor's own
+# org.gnome.SettingsDaemon.Color must ease the applied Temperature
+# there over gsd's 5 s smoothing, then back to 6500 K after expiry.
+color_call() {
+    gdbus call --session --dest org.gnome.SettingsDaemon.Color \
+        --object-path /org/gnome/SettingsDaemon/Color "$@" 2>/dev/null
+}
+color_prop() {
+    color_call --method org.freedesktop.DBus.Properties.Get org.gnome.SettingsDaemon.Color "$1"
+}
+color_temp() {
+    color_prop Temperature | sed -n 's/^(<uint32 \([0-9]*\)>,)$/\1/p'
+}
+gsettings set org.gnome.settings-daemon.plugins.color night-light-temperature 3000
+# The tile just switched Night Light off: let any ease back finish.
+for _ in $(seq 1 70); do
+    [ "$(color_temp)" = 6500 ] && break
+    sleep 0.1
+done
+[ "$(color_temp)" = 6500 ] || fail G-QS-NIGHT "Temperature is $(color_temp), not 6500 K, with Night Light off"
+if color_call --method org.gnome.SettingsDaemon.Color.NightLightPreview 0 >/dev/null; then
+    fail G-QS-NIGHT "NightLightPreview accepted a zero duration"
+fi
+color_call --method org.gnome.SettingsDaemon.Color.NightLightPreview 10 >/dev/null ||
+    fail G-QS-NIGHT "NightLightPreview(10) failed"
+night_eased="" night_reached=""
+for _ in $(seq 1 100); do
+    night_temp="$(color_temp)"
+    if [ "$night_temp" = 3000 ]; then
+        night_reached=1
+        break
+    fi
+    if [ -n "$night_temp" ] && [ "$night_temp" -gt 3000 ] && [ "$night_temp" -lt 6500 ]; then
+        night_eased=1
+    fi
+    sleep 0.1
+done
+[ -n "$night_reached" ] || fail G-QS-NIGHT "the preview never applied 3000 K (Temperature $(color_temp))"
+[ -n "$night_eased" ] || fail G-QS-NIGHT "the preview jumped to 3000 K without gsd's smoothing"
+color_prop NightLightActive | grep -q true ||
+    fail G-QS-NIGHT "NightLightActive is not true during the preview"
+night_restored=""
+for _ in $(seq 1 200); do
+    if [ "$(color_temp)" = 6500 ]; then
+        night_restored=1
+        break
+    fi
+    sleep 0.1
+done
+[ -n "$night_restored" ] || fail G-QS-NIGHT "the preview never expired back to 6500 K (Temperature $(color_temp))"
+color_prop NightLightActive | grep -q false ||
+    fail G-QS-NIGHT "NightLightActive stayed true after the preview expired"
+gsettings reset org.gnome.settings-daemon.plugins.color night-light-temperature
+pass G-QS-NIGHT "the real tile toggles night-light-enabled; NightLightPreview eases Temperature to the key and back"
 
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-brightness.json" 20 \
     --set Brightness 30 || fail G-QS-BRIGHTNESS "could not set Brightness"
