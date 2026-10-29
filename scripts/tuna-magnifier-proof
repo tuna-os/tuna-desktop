@@ -384,9 +384,14 @@ wait "$CLIENT_PID" 2>/dev/null || true
 CLIENT_PID=""
 cstate '.windows | all(.app_id != "tuna-test-alpha")' "Alpha closed" ||
     fail M-ATSPI-FOCUS "the M-FOCUS window never unmapped"
+# Caret tracking off: GNOME's magnifier follows the caret too, and an
+# entry's caret event can land after its focus event and recentre the
+# view on the caret (seen in CI), so with both on the gate would not
+# prove focus tracking. The caret path is not what this gate checks.
+gsettings set org.gnome.desktop.a11y.magnifier caret-tracking 'none'
 gsettings set org.gnome.desktop.a11y.magnifier mag-factor 4.0
-snapshot '.mag_factor == 4.0 and .mouse_tracking == "none" and .focus_tracking == "centered"' ||
-    fail M-ATSPI-FOCUS "factor 4 never reached the snapshot"
+snapshot '.mag_factor == 4.0 and .mouse_tracking == "none" and .focus_tracking == "centered" and .caret_tracking == "none"' ||
+    fail M-ATSPI-FOCUS "factor 4 and caret-tracking none never reached the snapshot"
 PROBE_LOG="$ARTIFACTS/probe.jsonl"
 PROBE_REQ="$ARTIFACTS/probe-request.json"
 : >"$PROBE_LOG"
