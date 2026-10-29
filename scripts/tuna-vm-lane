@@ -2255,8 +2255,20 @@ def greeter_list_ok(greeter):
     sessions = greeter.get("sessions")
     if sessions != [GREETER_SESSION]:
         return False, f"GDM offers {sessions}, expected only {GREETER_SESSION}"
-    return True, (f"GDM offers only {sessions}, so the greeter shows no session menu; "
-                  f"shipped DefaultSession={greeter.get('default_session')!r}")
+    return True, f"GDM offers only {sessions}, so the greeter shows no session menu"
+
+
+def fallback_session_ok(greeter):
+    """A fresh account has no saved AccountsService session, so GDM 51.1
+    starts its fallback session (daemon/gdm-session.c
+    get_fallback_session_name: [daemon] FallbackSession, default "gnome").
+    The session list cannot show this: a NoDisplay entry is not offered but
+    is still launched as the fallback."""
+    fallback = greeter.get("fallback_session")
+    if fallback != GREETER_SESSION[0]:
+        return False, (f"GDM starts {fallback!r} for an account without a saved session, "
+                       f"not {GREETER_SESSION[0]!r}")
+    return True, f"GDM starts {fallback!r} for an account without a saved session"
 
 
 def dump_shell_stack(agent_path, path):
@@ -2276,21 +2288,22 @@ def dump_shell_stack(agent_path, path):
 
 
 def await_login(agent, deadline):
-    """(started, seen): a gdm-password session of the fixture user running the
-    Tuna Desktop compositor, and whether any such session appeared at all."""
-    seen = False
+    """(started, login): whether a gdm-password session of the fixture user
+    runs the Tuna Desktop compositor, and the last observed login session
+    with the desktop processes it runs (None before any appears)."""
+    login = None
     while time.monotonic() < deadline:
         try:
+            login = agent.run("login-session")
             owner = agent.run("inventory")
-            seen = seen or (owner["session"]["Service"] == login_service(True))
             if (owner["session_uid"] != 0 and owner["session"]["Service"] == login_service(True)
                     and owner["session"]["User"] == str(owner["session_uid"])
                     and any(guest_role(p["executable"]) == "tuna-compositor" for p in owner["processes"])):
-                return True, True
+                return True, login
         except (OSError, RuntimeError, ValueError, KeyError):
             pass
         time.sleep(1)
-    return False, seen
+    return False, login
 
 
 def gdm_login(qmp, agent_path, out, record):
@@ -2327,6 +2340,8 @@ def gdm_login(qmp, agent_path, out, record):
         qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
         ok, detail = greeter_list_ok(greeter)
         record("V-GREETER-LIST", ok, detail)
+        ok, detail = fallback_session_ok(greeter)
+        record("V-GDM-FALLBACK", ok, detail)
         # gnome-shell 51.0 js/gdm/loginDialog.js: _showUserList() gives the
         # user list key focus, which moves to its first item, and activating
         # that item begins password verification. tunaOS's GDM login gate
@@ -2348,14 +2363,19 @@ def gdm_login(qmp, agent_path, out, record):
             qmp.frame(os.path.join(out, f"gdm-attempt-{attempt}.png"))
             qmp.type_text("tuna")
             qmp.keys("ret")
-            started, seen = await_login(agent, time.monotonic() + 60)
+            started, login = await_login(agent, time.monotonic() + 60)
             if started:
                 record("V-GDM-LOGIN", True,
                        f"shipped non-root GDM greeter → user list (selection attempt {attempt}) → password PAM "
                        "login → real non-root gdm-password Tuna Desktop session; payload hashes unchanged")
                 return True
-            if seen:
-                break  # A session started without its compositor; never type into it.
+            if login is not None:
+                # A session started without the Tuna Desktop compositor; never type into it.
+                with open(os.path.join(out, "gdm-login-session.json"), "w") as stream:
+                    json.dump(login, stream, indent=2)
+                raise RuntimeError(f"GDM PAM login started a {login['session'].get('Service')} session "
+                                   f"running {login['desktop']} instead of Tuna Desktop "
+                                   f"(GDM fallback session {greeter.get('fallback_session')!r})")
         raise RuntimeError("graphical GDM PAM login did not produce a Tuna Desktop session")
     finally:
         agent.close()

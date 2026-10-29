@@ -31,10 +31,16 @@ checks the sessions GDM offers (`V-GREETER-LIST`), computed as GDM 51.1
 `libgdm/gdm-sessions.c` does: entries with `NoDisplay`, `Hidden` or a
 missing `TryExec` program are dropped and one entry per name is kept. The
 only offered session must be `tuna` named `Tuna Desktop`; gnome-shell
-51.0's login dialog then shows no session menu. The boot then selects the
-account in GDM's user list, types the fixture password through QMP and
-requires a real non-root logind session with `Service=gdm-password` and the
-actual Tuna Desktop compositor (`V-GDM-LOGIN`). Selection tries Enter on
+51.0's login dialog then shows no session menu. A fresh account has no
+saved session, so GDM starts its fallback session instead: `[daemon]
+FallbackSession`, default `gnome` (GDM 51.1 `daemon/gdm-session.c`). That
+lookup skips only `Hidden` entries, so a `NoDisplay` GNOME entry still
+starts. `V-GDM-FALLBACK` requires the fallback to be `tuna`. The boot then
+selects the account in GDM's user list, types the fixture password through
+QMP and requires a real non-root logind session with `Service=gdm-password`
+and the actual Tuna Desktop compositor (`V-GDM-LOGIN`). If the session runs
+another desktop, the check names it and does not type into that session.
+Selection tries Enter on
 the focused user, then Tab and Enter, then the typed user name, as
 tunaOS's own GDM login gate does. Portal checks require Settings, the
 GNOME backend, and Screenshot and ScreenCast routing. The last boot runs
@@ -48,7 +54,7 @@ accepted.
 | Area | Checks |
 |---|---|
 | Install and boot | `bootc install to-disk` of the digest, `V-DRM`, `V-SHELL`, `V-PANEL`, `V-NOPANIC`, `V-REPEAT` |
-| Greeter | `V-GREETER-LIST`, `V-GDM-LOGIN`, `V-DISPLAY-MANAGER` |
+| Greeter | `V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`, `V-DISPLAY-MANAGER` |
 | Session and portals | `V-CALENDAR`, `V-PORTAL`, `V-PORTAL-GNOME`, `V-PORTAL-SCREENSHOT`, `V-PORTAL-SCREENCAST` |
 | Lock and sleep | `V-LOCK`, `V-AUTH-FAIL-CLOSED`, `V-SLEEP-AUTH-FAIL-CLOSED`, `V-SLEEP-FRESH-AUTH`, `V-LIFECYCLE` |
 

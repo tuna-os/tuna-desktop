@@ -122,16 +122,58 @@ def gdm_sessions(dirs=GDM_SESSION_DIRS, which=None):
     return offered
 
 
-def gdm_default_session(path=pathlib.Path("/etc/gdm/custom.conf")):
-    """[daemon] DefaultSession from GDM's configuration, or None."""
+# GDM 51.1 daemon/gdm-session.c get_system_session_dirs() for Wayland: the
+# daemon's own XDG data dirs (GLib default /usr/local/share:/usr/share)
+# between the greeter directory and DATADIR; the first file found wins.
+GDM_LAUNCH_DIRS = ("/usr/share/gdm/greeter/wayland-sessions", "/usr/local/share/wayland-sessions",
+                   "/usr/share/wayland-sessions", "/usr/share/wayland-sessions")
+
+
+def gdm_daemon_key(key, path=pathlib.Path("/etc/gdm/custom.conf")):
+    """[daemon] key from GDM's configuration, or None."""
     group, value = None, None
     for line in path.read_text().splitlines() if path.exists() else []:
         line = line.strip()
         if line.startswith("[") and line.endswith("]"):
             group = line[1:-1]
-        elif group == "daemon" and "=" in line and line.split("=", 1)[0].strip() == "DefaultSession":
+        elif group == "daemon" and "=" in line and line.split("=", 1)[0].strip() == key:
             value = line.split("=", 1)[1].strip()
     return value
+
+
+def gdm_fallback_session(config=pathlib.Path("/etc/gdm/custom.conf"), dirs=GDM_LAUNCH_DIRS, which=None):
+    """The session GDM 51.1 starts for a user without a saved session:
+    get_fallback_session_name() takes [daemon] FallbackSession (default
+    "gnome") when get_session_command_for_file() accepts it, which rejects
+    only Hidden, a failing TryExec or a missing Exec (NoDisplay still
+    launches); otherwise the first such session id in sorted order."""
+    import shutil
+    which = which or (lambda program: shutil.which(program, path=GDM_PATH))
+
+    def launchable(session_id):
+        for directory in dirs:
+            path = pathlib.Path(directory, f"{session_id}.desktop")
+            if path.exists():
+                try:
+                    keys = desktop_entry(path.read_text())
+                except (OSError, UnicodeDecodeError):
+                    return False
+                return (keys is not None and keys.get("Hidden") not in ("true", "1")
+                        and (not keys.get("TryExec") or which(keys["TryExec"]) is not None)
+                        and bool(keys.get("Exec")))
+        return False
+
+    configured = gdm_daemon_key("FallbackSession", config) or "gnome"
+    if launchable(configured):
+        return configured
+    candidates = set()
+    for directory in dirs:
+        try:
+            candidates.update(name[:-len(".desktop")] for name in os.listdir(directory)
+                              if name.endswith(".desktop"))
+        except OSError:
+            continue
+    return next((session_id for session_id in sorted(candidates) if launchable(session_id)), None)
 
 
 def call(*args, user=False, check=True):
@@ -360,6 +402,33 @@ def auth_retirement_state(record):
                        "original": record}
 
 
+def owner_login_session():
+    """The fixture user's single logind session from the qualified login."""
+    sessions = [line.split() for line in call("loginctl", "list-sessions",
+                                             "--no-legend", "--no-pager").splitlines()]
+    owned = []
+    for line in sessions:
+        if len(line) < 2 or line[1] != str(OWNER.pw_uid):
+            continue
+        # Every runuser probe opens a short logind session for this UID, and
+        # one may close between list-sessions and show-session. A vanished
+        # session yields no properties; the single login session still must.
+        description = call("loginctl", "show-session", line[0], "--property=Id",
+                           "--property=VTNr", "--property=User", "--property=Type",
+                           "--property=Service", "--property=Class", check=False)
+        properties = dict(item.split("=", 1) for item in description.splitlines())
+        vt = properties.get("VTNr", "")
+        if (properties.get("Service") == LOGIN_SESSION["service"]
+                and vt.isdigit() and vt != "0"
+                and LOGIN_SESSION["vt"] in (None, vt)
+                and properties.get("User") == str(OWNER.pw_uid)
+                and not properties.get("Class", "").startswith("manager")):
+            owned.append(properties)
+    if len(owned) != 1:
+        raise RuntimeError(f"expected exactly one {LOGIN_SESSION['service']} user session on a VT")
+    return owned[0]
+
+
 def inventory():
     state = json.loads(STATE.read_text())
     processes = []
@@ -386,35 +455,14 @@ def inventory():
                               "executable": executable, "start_ticks": int(stat[19])})
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
-    sessions = [line.split() for line in call("loginctl", "list-sessions",
-                                             "--no-legend", "--no-pager").splitlines()]
-    owned = []
-    for line in sessions:
-        if len(line) < 2 or line[1] != str(OWNER.pw_uid):
-            continue
-        # Every runuser probe opens a short logind session for this UID, and
-        # one may close between list-sessions and show-session. A vanished
-        # session yields no properties; the single login session still must.
-        description = call("loginctl", "show-session", line[0], "--property=Id",
-                           "--property=VTNr", "--property=User", "--property=Type",
-                           "--property=Service", "--property=Class", check=False)
-        properties = dict(item.split("=", 1) for item in description.splitlines())
-        vt = properties.get("VTNr", "")
-        if (properties.get("Service") == LOGIN_SESSION["service"]
-                and vt.isdigit() and vt != "0"
-                and LOGIN_SESSION["vt"] in (None, vt)
-                and properties.get("User") == str(OWNER.pw_uid)
-                and not properties.get("Class", "").startswith("manager")):
-            owned.append(properties)
-    if len(owned) != 1:
-        raise RuntimeError(f"expected exactly one {LOGIN_SESSION['service']} user session on a VT")
+    owned = owner_login_session()
     # Only the original four snapshot keys are mandatory: the published
     # flavor still ships a Tuna Desktop build that predates the newer
     # instrumentation, and session detection must not depend on it.
     # Gates that need a newer key observe an explicit None instead of
     # collapsing every probe into a missing session (run 37696030597).
     return {"probe_uid": os.geteuid(), "session_uid": OWNER.pw_uid,
-            "session": owned[0],
+            "session": owned,
             # Published pre-key snapshots (run 37696030597) still detect the
             # session; a missing device list stays None, never an empty list.
             "state": {k: state[k] for k in ("locked", "windows", "focused", "active_workspace")}
@@ -1988,6 +2036,13 @@ print(json.dumps(result))
     elif action == "logout":
         call("loginctl", "terminate-session", inventory()["session"]["Id"])
         result = {"requested": "terminate session"}
+    elif action == "login-session":
+        # Before Tuna Desktop writes its state snapshot: which desktop the
+        # login actually started, by fixed process name only.
+        result = {"probe_uid": os.geteuid(), "session_uid": OWNER.pw_uid,
+                  "session": owner_login_session(),
+                  "desktop": [name for name in ("tuna-session", COMPOSITOR_COMM, "gnome-shell", "gnome-session-s")
+                              if call("pgrep", "-u", str(OWNER.pw_uid), "-x", name, check=False)]}
     elif action == "greeter":
         result = {"manager": LOGIN_SESSION["manager"],
                   "manager_active": call("systemctl", "is-active", LOGIN_SESSION["unit"],
@@ -2013,7 +2068,7 @@ print(json.dumps(result))
                             for pid in call("pgrep", "-u", uid, "-x", "gnome-shell", check=False).splitlines()]
             result |= {"greeter_sessions": greeter_sessions,
                        "sessions": gdm_sessions(),
-                       "default_session": gdm_default_session()}
+                       "fallback_session": gdm_fallback_session()}
         else:
             greeter_pids = call("pgrep", "-x", "gtkgreet", check=False).splitlines()
         result |= {"greeter_pids": greeter_pids,

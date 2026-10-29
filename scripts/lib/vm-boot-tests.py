@@ -29,6 +29,15 @@ def guest_identity(prefix="tuna"):
             "LOCK_PAM": f"/etc/pam.d/{prefix}-lock"}
 
 
+def with_owner_login_session(scope):
+    """Add the lifecycle's login-session lookup to an inventory test scope."""
+    source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+    fn = next(n for n in ast.parse(source.read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == "owner_login_session")
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), scope)
+    return scope
+
+
 class AudioAmplificationDiagnostics(unittest.TestCase):
     """Synthetic host-proof regressions; no native audio qualification."""
     SOURCE = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
@@ -205,7 +214,7 @@ class DeviceInventoryProjection(unittest.TestCase):
                  "OWNER": SimpleNamespace(pw_uid=1000), "LOGIN_SESSION": login,
                  "os": SimpleNamespace(geteuid=lambda: 0), "call": call,
                  "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
-        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), scope)
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), with_owner_login_session(scope))
         return scope["inventory"]()
 
     def test_gdm_password_session_on_its_new_vt_is_the_owner(self):
@@ -1118,7 +1127,7 @@ class OrcaReadChurn(unittest.TestCase):
                      "OWNER": SimpleNamespace(pw_uid=1000), "LOGIN_SESSION": DeviceInventoryProjection.GREETD,
                      "pathlib": SimpleNamespace(Path=lambda path: empty_proc),
                      "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
-            result = self.load("inventory", scope)()
+            result = self.load("inventory", with_owner_login_session(scope))()
         self.assertEqual(result["session"]["Id"], "2")
 
     def observe(self, owner_after_failure):
@@ -3197,7 +3206,8 @@ class ShippedSnapshotInventory(unittest.TestCase):
                      "call": fake_call, **identity,
                      # Owned PAM helper accounting is proven by PrivatePamSleepControls.
                      "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
-            exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), scope)
+            exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"),
+                 with_owner_login_session(scope))
             return scope["inventory"]()
 
     def test_shipped_snapshot_without_newer_keys_still_detects_session(self):
@@ -3446,7 +3456,7 @@ class GdmSessionList(unittest.TestCase):
     def test_published_image_offers_only_tuna_desktop(self):
         sessions = self.offered(PUBLISHED_SESSIONS)
         self.assertEqual(sessions, [["tuna", "Tuna Desktop"]])
-        ok, detail = lane.greeter_list_ok({"sessions": sessions, "default_session": "tuna.desktop"})
+        ok, detail = lane.greeter_list_ok({"sessions": sessions})
         self.assertTrue(ok, detail)
 
     def test_visible_gnome_session_fails_the_list(self):
@@ -3478,15 +3488,42 @@ class GdmSessionList(unittest.TestCase):
             with self.subTest(sessions=sessions):
                 self.assertFalse(lane.greeter_list_ok({"sessions": sessions})[0])
 
-    def test_shipped_default_session_is_reported(self):
-        scope = lifecycle_scope("gdm_default_session")
+    def fallback(self, files, config, present=("tuna-session", "gnome-session", "/usr/bin/gnome-session")):
+        scope = lifecycle_scope(*self.NAMES, "gdm_daemon_key", "gdm_fallback_session", "GDM_LAUNCH_DIRS")
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root, "custom.conf")
-            path.write_text("# GDM configuration storage\n\n[daemon]\nDefaultSession=tuna.desktop\n\n[security]\n")
-            self.assertEqual(scope["gdm_default_session"](path), "tuna.desktop")
-            path.write_text("[security]\nDefaultSession=gnome.desktop\n")
-            self.assertIsNone(scope["gdm_default_session"](path))
-            self.assertIsNone(scope["gdm_default_session"](Path(root, "absent.conf")))
+            for name, text in files.items():
+                path = Path(root, name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            conf = Path(root, "custom.conf")
+            conf.write_text(config)
+            dirs = tuple(root + directory for directory in scope["GDM_LAUNCH_DIRS"])
+            return scope["gdm_fallback_session"](conf, dirs, which=lambda program: program if program in present else None)
+
+    def test_published_default_session_key_still_starts_hidden_gnome(self):
+        # Published marlin@sha256:d9959d1a… ships DefaultSession, which GDM
+        # 51.1 never reads; run 40811792200 logged tuna-test in to GNOME.
+        fallback = self.fallback(PUBLISHED_SESSIONS, "# GDM configuration storage\n\n[daemon]\n"
+                                 "DefaultSession=tuna.desktop\n\n[security]\n")
+        self.assertEqual(fallback, "gnome")
+        ok, detail = lane.fallback_session_ok({"fallback_session": fallback})
+        self.assertFalse(ok)
+        self.assertIn("'gnome'", detail)
+
+    def test_fallback_session_key_starts_tuna(self):
+        fallback = self.fallback(PUBLISHED_SESSIONS, "[daemon]\nFallbackSession=tuna\n")
+        self.assertEqual(fallback, "tuna")
+        self.assertTrue(lane.fallback_session_ok({"fallback_session": fallback})[0])
+        self.assertEqual(self.fallback(PUBLISHED_SESSIONS, "[security]\nFallbackSession=tuna\n"), "gnome")
+
+    def test_unlaunchable_fallback_takes_first_launchable_sorted_id(self):
+        files = dict(PUBLISHED_SESSIONS)
+        files["usr/share/wayland-sessions/gnome.desktop"] += "Hidden=true\n"
+        self.assertEqual(self.fallback(files, "[daemon]\n"), "gnome-greeter")
+        self.assertEqual(self.fallback(files, "[daemon]\nFallbackSession=absent\n", present=("tuna-session",)),
+                         "roost")  # tuna-rename: keep
+        self.assertIsNone(self.fallback({}, "[daemon]\n"))
+        self.assertFalse(lane.fallback_session_ok({})[0])
 
 
 class FixtureLoginSession(unittest.TestCase):
