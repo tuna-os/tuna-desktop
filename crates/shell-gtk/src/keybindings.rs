@@ -25,6 +25,9 @@ pub const MEDIA_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
 pub enum Action {
     ToggleOverview,
     LockScreen,
+    /// GNOME's Run a Command dialog (`panel-run-dialog`, Alt+F2;
+    /// main.js binds it in NORMAL|OVERVIEW).
+    RunDialog,
     ToggleApplicationView,
     ToggleMessageTray,
     ToggleQuickSettings,
@@ -412,6 +415,7 @@ fn specs() -> Vec<Spec> {
             modes: NORMAL_OVERVIEW,
         },
         wm("begin-move", Action::BeginMove, vec!["<Alt>F7"]),
+        wm("panel-run-dialog", Action::RunDialog, vec!["<Alt>F2"]),
         wm("begin-resize", Action::BeginResize, vec!["<Alt>F8"]),
         // GNOME binds these in NORMAL|OVERVIEW|LOCK|UNLOCK|LOGIN
         // (windowManager.js `_startA11ySwitcher`); the lock screen
@@ -768,6 +772,7 @@ mod tests {
         assert_eq!(find(Action::ShowScreenshotUi), ["Print"]);
         assert_eq!(find(Action::ShowScreenRecordingUi), ["<Ctrl><Shift><Alt>R"]);
         assert_eq!(find(Action::WindowMenu), ["<Alt>space"]);
+        assert_eq!(find(Action::RunDialog), ["<Alt>F2"]);
         assert_eq!(
             find(Action::FocusPanel { backward: false }),
             ["<Control><Alt>Tab"]

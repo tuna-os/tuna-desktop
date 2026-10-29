@@ -174,7 +174,8 @@ impl Service {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<(bool, String)> {
-        self.authority.authenticate(conn, &header).await?;
+        let (_, caller) = self.authority.authenticate_caller(conn, &header).await?;
+        refuse_without_disk(caller, crate::lockdown::read_save_to_disk_key)?;
         if self.authority.unlocked().is_err() {
             return Ok((false, String::new()));
         }
@@ -192,12 +193,36 @@ impl Service {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<(bool, String)> {
-        self.authority.authenticate(conn, &header).await?;
+        let (_, caller) = self.authority.authenticate_caller(conn, &header).await?;
+        refuse_without_disk(caller, crate::lockdown::read_save_to_disk_key)?;
         if self.authority.unlocked().is_err() {
             return Ok((false, String::new()));
         }
         self.request(filename, true, flash)
     }
+}
+
+/// Administrative lockdown (#357): GNOME 51's `screenshot.js`
+/// `_createScreenshot` answers `Screenshot`, `ScreenshotWindow` and
+/// `ScreenshotArea` with "Saving to disk is disabled" while
+/// `org.gnome.desktop.lockdown disable-save-to-disk` is set. Its own
+/// screenshot UI and keys are in-process there and keep working
+/// clipboard-only; the supervised shell is that in-process role here
+/// (it enforces the clipboard-only rule itself), so only the portal —
+/// GNOME's external D-Bus caller — is refused. An unreadable key reads
+/// GNOME's default (allowed), the lockdown module's refresh rule.
+pub fn refuse_without_disk(
+    caller: crate::capture_security::CaptureCaller,
+    save_to_disk_disabled: impl FnOnce() -> Option<bool>,
+) -> zbus::fdo::Result<()> {
+    if caller == crate::capture_security::CaptureCaller::Portal
+        && save_to_disk_disabled() == Some(true)
+    {
+        return Err(zbus::fdo::Error::AccessDenied(
+            "Saving to disk is disabled".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl Service {
@@ -355,6 +380,23 @@ mod tests {
     fn the_window_selector_leaves_room_for_the_panel() {
         assert_eq!(selector_area(1280, 800), (100, 100, 1080, 500));
         assert_eq!(selector_area(100, 100), (100, 100, 1, 1));
+    }
+
+    #[test]
+    fn save_to_disk_lockdown_refuses_only_the_portal() {
+        use crate::capture_security::CaptureCaller;
+        // Denied: the portal (GNOME's external caller) gets GNOME's error.
+        let err = refuse_without_disk(CaptureCaller::Portal, || Some(true)).unwrap_err();
+        assert!(
+            err.to_string().contains("Saving to disk is disabled"),
+            "{err}"
+        );
+        // Allowed, or unreadable (GNOME default): the portal passes.
+        assert!(refuse_without_disk(CaptureCaller::Portal, || Some(false)).is_ok());
+        assert!(refuse_without_disk(CaptureCaller::Portal, || None).is_ok());
+        // The shell is GNOME Shell's in-process role: never refused here
+        // (it keeps captures on the clipboard itself), never even reads.
+        assert!(refuse_without_disk(CaptureCaller::Shell, || panic!("no read")).is_ok());
     }
 
     #[test]

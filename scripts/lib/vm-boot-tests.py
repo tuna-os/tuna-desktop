@@ -2935,6 +2935,21 @@ class PrivatePamSleepControls(unittest.TestCase):
             with self.subTest(trace=trace):
                 self.assertIsNone(self.match(trace=trace))
 
+    def test_same_pid_library_lines_stay_separate_records(self):
+        # Run 40822024326: on wake the compositor's own libinput handler
+        # logged right after its owned-retirement receipt.
+        libinput = ('libinput error: event0  - Power Button: client bug: event processing '
+                    'lagging behind by 644ms, your system is too slow')
+        mesa = 'MESA-EGL: warning: egl: failed to create dri2 screen'
+        serial = '\n'.join([self.trace(), 'tuna-vm-session[600]: ' + libinput,
+                            'tuna-vm-session[600]: ' + mesa])
+        records = lane.session_records(serial)
+        self.assertIn(libinput, records)
+        self.assertIn(mesa, records)
+        self.assertEqual(self.match(trace=serial), self.event)
+        fragmented = self.fragmented_trace() + '\n' + 'tuna-vm-session[600]: ' + libinput
+        self.assertEqual(self.match(trace=fragmented), self.event)
+
     def match(self, trace=None, original=None, physical=None, current=8):
         return lane.cancelled_sleep_auth_retirement(self.trace() if trace is None else trace,
             self.expected, current, self.original if original is None else original,

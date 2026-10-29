@@ -210,13 +210,25 @@ impl Authority {
         conn: &Connection,
         header: &Header<'_>,
     ) -> fdo::Result<String> {
+        self.authenticate_caller(conn, header)
+            .await
+            .map(|(sender, _)| sender)
+    }
+    /// [`Self::authenticate`], also saying which desktop service passed:
+    /// the supervised shell stands in for GNOME Shell's in-process
+    /// callers, the installed portal for external D-Bus clients.
+    pub async fn authenticate_caller(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+    ) -> fdo::Result<(String, CaptureCaller)> {
         let sender = header.sender().ok_or_else(|| denied("missing sender"))?;
         let dbus = fdo::DBusProxy::new(conn).await?;
         let pid = dbus
             .get_connection_unix_process_id(sender.clone().into())
             .await?;
         if pid != 0 && pid == self.shell_pid.load(Ordering::SeqCst) {
-            return Ok(sender.to_string());
+            return Ok((sender.to_string(), CaptureCaller::Shell));
         }
         let name =
             zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.gnome").unwrap();
@@ -229,8 +241,16 @@ impl Authority {
                 "capture requires the supervised shell or installed portal",
             ));
         }
-        Ok(sender.to_string())
+        Ok((sender.to_string(), CaptureCaller::Portal))
     }
+}
+/// Which desktop service passed capture authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureCaller {
+    /// The supervised Tuna shell (GNOME Shell's in-process role).
+    Shell,
+    /// The installed xdg-desktop-portal-gnome backend.
+    Portal,
 }
 pub fn owns_session(owner: &str, sender: Option<&str>, revoked: bool) -> bool {
     !revoked && sender.is_some_and(|sender| sender == owner)

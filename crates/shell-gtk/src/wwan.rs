@@ -495,8 +495,7 @@ impl WwanMenu {
             "{name}, {detail}"
         ))]);
         button.connect_clicked(|_| {
-            // Administrative lockdown (#357) applies inside the helper.
-            crate::lockdown::open_settings_panel(Some("wwan"));
+            crate::open_settings_panel("wwan");
         });
         button
     }

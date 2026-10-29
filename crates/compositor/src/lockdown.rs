@@ -2,31 +2,32 @@
 //!
 //! Pure policy engine: one snapshot of the eleven lockdown keys plus the
 //! allow/deny decision for every desktop entry point each key constrains.
-//! The compositor owns enforcement for session-scoped requests (lock);
-//! the shell owns its menus and dialogs; applications and system daemons
-//! own the rest. The shell reads all eleven keys live through `gio`
-//! and enforces its surface immediately; the compositor backstops the
-//! lock paths from its own live read of `disable-lock-screen` (see
-//! [`read_lock_screen_key`]), so no control-protocol change is needed.
+//! The compositor owns enforcement for session-scoped requests (lock,
+//! external screenshots); the shell owns its menus and dialogs;
+//! applications and system daemons own the rest. The shell reads all
+//! eleven keys live through `gio` and enforces its surface immediately;
+//! the compositor backstops the lock paths from its own live read of
+//! `disable-lock-screen` (see [`read_lock_screen_key`]) and refuses the
+//! portal's screenshots under `disable-save-to-disk` (see
+//! [`read_save_to_disk_key`]), so no control-protocol change is needed.
 //! Tests inject values through [`LockdownPolicy::from_reader`].
 //!
-//! Key inventory (verified against the installed
-//! `gsettings-desktop-schemas` 46.1 `org.gnome.desktop.lockdown`
-//! schema on this machine; the GNOME 51.0 upstream text is unconfirmed
-//! from here, so key parity with 51.0 stays an open question):
+//! Key inventory and owners, against the GNOME 51 sources
+//! (`gsettings-desktop-schemas` 51.0 `org.gnome.desktop.lockdown`,
+//! gnome-shell 51.0, gnome-session 51.0, gnome-settings-daemon 51.0):
 //!
-//! | Key | Owner | Entry points constrained |
+//! | Key | Owner | Entry points constrained (GNOME 51 consumer) |
 //! |---|---|---|
-//! | `disable-command-line` | shell (future) | run-command dialog (Alt+F2); Tuna ships none yet, so the restriction holds by absence and [`LockdownPolicy::command_line_allowed`] gates the dialog when it lands |
-//! | `disable-log-out` | shell | power menu Log Out row; nested sessions lose their only row and show no menu |
-//! | `disable-user-switching` | shell (future) | user-switch row; Tuna ships none yet, gated by [`LockdownPolicy::user_switching_allowed`] |
-//! | `disable-lock-screen` | compositor + shell | `Lock` control command, idle lock, shell lock button; denied, never weakened (see below) |
-//! | `disable-show-password` | shell | password reveal toggles (network secret dialog) |
-//! | `disable-application-handlers` | shell | shell-opened URLs/handlers (settings buttons today); in-app links stay app-owned |
+//! | `disable-command-line` | shell | Run a Command dialog, Alt+F2 (`runDialog.js` `open()`) |
+//! | `disable-log-out` | shell | power menu Log Out…, Restart… and Power Off… (`systemActions.js`; gnome-session `gsm-manager.c` `CanShutdown`/`CanReboot`/`Logout`); Suspend stays; nested sessions lose their only row and show no menu |
+//! | `disable-user-switching` | shell | Switch User… row and the unlock dialog's other-user button (`systemActions.js`, `unlockDialog.js`); Tuna ships neither, so the restriction holds by absence and [`LockdownPolicy::user_switching_allowed`] gates them when they land |
+//! | `disable-lock-screen` | compositor + shell | `Lock` control command, idle lock, shell lock button, screensaver/logind/sleep lock requests (`screenShield.js` `lock()`, `systemActions.js` `_updateLockScreen`); denied, never weakened (see below) |
+//! | `disable-show-password` | shell | password peek icons: unlock prompt, polkit, network secrets (`st-password-entry.c`) |
+//! | `disable-save-to-disk` | shell + compositor + apps | shell screenshots stay on the clipboard and screencasts refuse (`screenshot.js` `_storeScreenshot`, `screencastService.js`); the portal's `org.gnome.Shell.Screenshot` calls are refused (`_createScreenshot`); applications' Save As dialogs stay app-owned |
+//! | `disable-application-handlers` | none | no GNOME 51 desktop consumer (gnome-shell, gnome-session and gnome-settings-daemon 51.0 never read it) |
 //! | `disable-printing` | app-owned | applications' Print dialogs; the shell exposes no print path of its own |
 //! | `disable-print-setup` | app-owned | applications' Print Setup dialogs |
-//! | `disable-save-to-disk` | app-owned | applications' Save As dialogs; shell-owned savers (screenshots) are out of the key's scope, as in GNOME |
-//! | `user-administration-disabled` | daemon-owned | user account administration (accountsservice/polkit); Tuna ships no Users panel |
+//! | `user-administration-disabled` | daemon/app-owned | user account administration (Settings' Users panel, accountsservice/polkit); Tuna ships no Users panel |
 //! | `mount-removable-storage-devices-as-read-only` | daemon-owned | removable mounts (udisks2); Tuna ships no mount agent |
 //!
 //! Secure-lock invariant: `disable-lock-screen` removes the lock entry
@@ -50,7 +51,7 @@ pub const SCHEMA: &str = "org.gnome.desktop.lockdown";
 pub const LOCKDOWN_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// Run-command dialog gate (Alt+F2).
 pub const KEY_DISABLE_COMMAND_LINE: &str = "disable-command-line";
-/// Applications' Save As dialogs (app-owned).
+/// Shell screenshot/screencast files, portal screenshots, apps' Save As.
 pub const KEY_DISABLE_SAVE_TO_DISK: &str = "disable-save-to-disk";
 /// Applications' Print dialogs (app-owned).
 pub const KEY_DISABLE_PRINTING: &str = "disable-printing";
@@ -60,15 +61,15 @@ pub const KEY_DISABLE_PRINT_SETUP: &str = "disable-print-setup";
 pub const KEY_DISABLE_USER_SWITCHING: &str = "disable-user-switching";
 /// Lock entry points (button, `Lock` command, idle lock).
 pub const KEY_DISABLE_LOCK_SCREEN: &str = "disable-lock-screen";
-/// Shell-opened URL/MIME handlers.
+/// URL/MIME handlers (no GNOME 51 desktop consumer).
 pub const KEY_DISABLE_APPLICATION_HANDLERS: &str = "disable-application-handlers";
-/// Log Out entry points.
+/// Log Out, Restart and Power Off entry points.
 pub const KEY_DISABLE_LOG_OUT: &str = "disable-log-out";
 /// User account administration (daemon-owned).
 pub const KEY_USER_ADMINISTRATION_DISABLED: &str = "user-administration-disabled";
 /// Removable mounts writable (daemon-owned; `true` mounts read-only).
 pub const KEY_MOUNT_REMOVABLE_READ_ONLY: &str = "mount-removable-storage-devices-as-read-only";
-/// Password reveal toggles.
+/// Password peek icons.
 pub const KEY_DISABLE_SHOW_PASSWORD: &str = "disable-show-password";
 
 /// Every lockdown key, in schema order.
@@ -99,13 +100,13 @@ pub enum RestrictedAction {
     LockScreen,
     /// Reveal a typed password.
     ShowPassword,
-    /// Open a URL or MIME handler from the shell.
+    /// Open a URL or MIME handler (no GNOME 51 desktop consumer).
     OpenHandler,
     /// Print (app-owned).
     Print,
     /// Change print setup (app-owned).
     PrintSetup,
-    /// Save to disk (app-owned).
+    /// Save to disk (shell screenshots/screencasts, portal screenshots, apps).
     SaveToDisk,
     /// Administer user accounts (daemon-owned).
     UserAdmin,
@@ -161,7 +162,7 @@ impl RestrictedAction {
 pub struct LockdownPolicy {
     /// `disable-command-line`.
     pub disable_command_line: bool,
-    /// `disable-save-to-disk` (app-owned).
+    /// `disable-save-to-disk`.
     pub disable_save_to_disk: bool,
     /// `disable-printing` (app-owned).
     pub disable_printing: bool,
@@ -171,7 +172,7 @@ pub struct LockdownPolicy {
     pub disable_user_switching: bool,
     /// `disable-lock-screen`.
     pub disable_lock_screen: bool,
-    /// `disable-application-handlers`.
+    /// `disable-application-handlers` (no desktop consumer).
     pub disable_application_handlers: bool,
     /// `disable-log-out`.
     pub disable_log_out: bool,
@@ -298,7 +299,7 @@ impl LockdownPolicy {
     pub fn command_line_allowed(&self) -> bool {
         !self.disable_command_line
     }
-    /// Log Out offered.
+    /// Log Out, Restart and Power Off offered.
     pub fn logout_allowed(&self) -> bool {
         !self.disable_log_out
     }
@@ -316,7 +317,7 @@ impl LockdownPolicy {
     pub fn password_reveal_allowed(&self) -> bool {
         !self.disable_show_password
     }
-    /// Shell-opened URL/MIME handlers run.
+    /// URL/MIME handlers run (no GNOME 51 desktop consumer).
     pub fn application_handlers_allowed(&self) -> bool {
         !self.disable_application_handlers
     }
@@ -328,7 +329,7 @@ impl LockdownPolicy {
     pub fn print_setup_allowed(&self) -> bool {
         !self.disable_print_setup
     }
-    /// Saving to disk allowed (app-owned).
+    /// Saving to disk allowed.
     pub fn save_to_disk_allowed(&self) -> bool {
         !self.disable_save_to_disk
     }
@@ -353,14 +354,21 @@ impl LockdownPolicy {
 /// thread (never the frame path); hub startup calls it directly,
 /// bounded by the same timeout.
 pub fn read_lock_screen_key() -> Option<bool> {
+    read_key(KEY_DISABLE_LOCK_SCREEN)
+}
+
+/// Live value of `disable-save-to-disk` under the same bound and
+/// fail-safe as [`read_lock_screen_key`]; the screenshot service reads
+/// it per external request, off the frame path.
+pub fn read_save_to_disk_key() -> Option<bool> {
+    read_key(KEY_DISABLE_SAVE_TO_DISK)
+}
+
+fn read_key(key: &str) -> Option<bool> {
     if !session_bus_present() {
         return None;
     }
-    read_bool_via_command(
-        "gsettings",
-        &["get", SCHEMA, KEY_DISABLE_LOCK_SCREEN],
-        LOCKDOWN_READ_TIMEOUT,
-    )
+    read_bool_via_command("gsettings", &["get", SCHEMA, key], LOCKDOWN_READ_TIMEOUT)
 }
 
 /// Run `program args` with a timeout, parsing stdout as a `gsettings`

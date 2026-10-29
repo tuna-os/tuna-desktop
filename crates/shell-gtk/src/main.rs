@@ -58,6 +58,7 @@ mod privacy_portal;
 mod providers;
 mod public_search_diagnostic;
 mod renderer;
+mod run_dialog;
 mod screencast;
 mod screensaver;
 mod screenshot_selection;
@@ -862,12 +863,6 @@ fn quick_settings_popover(
         });
     }
     settings_btn.connect_clicked(|_| {
-        // Administrative lockdown (#357): shell-opened handlers stay
-        // closed while `disable-application-handlers` denies.
-        if !lockdown::handlers_allowed() {
-            eprintln!("tuna-shell-gtk: opening settings is disabled by your administrator.");
-            return;
-        }
         let context = tuna_shell_host::apps::application_launch_context();
         let _ = gio::AppInfo::launch_default_for_uri("settings://", Some(&context)).or_else(|_| {
             tuna_shell_host::apps::application_command("gnome-control-center")
@@ -899,9 +894,12 @@ fn quick_settings_popover(
     // Power: GNOME's shutdown menu (status/system.js ShutdownItem), a
     // quick toggle menu opening in place under the top row.
     let power_menu_box = QsMenu::new("system-shutdown-symbolic", "Power Off");
-    // Kept for the lockdown watcher below, which hides the Log Out row
-    // (and its separator) while `disable-log-out` denies.
-    let mut log_out_row: Option<gtk::Button> = None;
+    // Kept for the lockdown watcher below, which hides the rows
+    // `disable-log-out` denies (Restart…, Power Off…, Log Out…, as
+    // gnome-session's CanReboot/CanShutdown/Logout refuse them) and the
+    // separator once nothing follows it (popupMenu.js hides a trailing
+    // separator).
+    let mut power_rows: Vec<(power::Action, gtk::Button)> = Vec::new();
     let mut log_out_separator: Option<gtk::Separator> = None;
     for action in power_ui.actions() {
         let label = match action {
@@ -916,9 +914,7 @@ fn quick_settings_popover(
             log_out_separator = Some(power_menu_box.separator());
         }
         let (item, _) = power_menu_box.item(None, label);
-        if *action == power::Action::LogOut {
-            log_out_row = Some(item.clone());
-        }
+        power_rows.push((*action, item.clone()));
         let (power_ui, popover, action) = (power_ui.clone(), popover.clone(), *action);
         item.connect_clicked(move |_| {
             popover.popdown();
@@ -944,17 +940,16 @@ fn quick_settings_popover(
         let menu = power_menu.clone();
         popover.connect_closed(move |_| menu.set_visible(false));
     }
-    // Administrative lockdown (#357): the lock and settings buttons
-    // and the Log Out row follow the live policy; a nested session
+    // Administrative lockdown (#357): the lock button and the
+    // session-ending rows follow the live policy; a nested session
     // with no rows shows no power menu at all.
     {
         let actions = power_ui.actions().to_vec();
         let apply: Rc<dyn Fn(lockdown::EntryVisibility)> =
             Rc::new(move |visible: lockdown::EntryVisibility| {
                 lock.set_visible(visible.lock_screen);
-                lockdown::apply_settings_visibility(&visible, &settings_btn);
-                if let Some(row) = log_out_row.as_ref() {
-                    row.set_visible(visible.log_out);
+                for (action, row) in &power_rows {
+                    row.set_visible(power::action_allowed(*action, visible.log_out));
                 }
                 if let Some(separator) = log_out_separator.as_ref() {
                     separator.set_visible(visible.log_out);
@@ -989,8 +984,7 @@ fn quick_settings_popover(
     sound_menu_ui.separator();
     let (sound_settings, _) = sound_menu_ui.item(None, "Sound Settings");
     sound_settings.connect_clicked(|_| {
-        // Administrative lockdown (#357) applies inside the helper.
-        lockdown::open_settings_panel(Some("sound"));
+        open_settings_panel("sound");
     });
     let sound_arrow = gtk::ToggleButton::new();
     sound_arrow.set_icon_name("go-next-symbolic");
@@ -1042,8 +1036,7 @@ fn quick_settings_popover(
     wifi_menu_ui.separator();
     let (all_networks, _) = wifi_menu_ui.item(None, "All Networks");
     all_networks.connect_clicked(|_| {
-        // Administrative lockdown (#357) applies inside the helper.
-        lockdown::open_settings_panel(Some("wifi"));
+        open_settings_panel("wifi");
     });
     {
         let wifi_menu = wifi_menu.clone();
@@ -1059,8 +1052,7 @@ fn quick_settings_popover(
     wired_menu_ui.separator();
     let (wired_settings, _) = wired_menu_ui.item(None, "Wired Settings");
     wired_settings.connect_clicked(|_| {
-        // Administrative lockdown (#357) applies inside the helper.
-        lockdown::open_settings_panel(Some("network"));
+        open_settings_panel("network");
     });
     let wired = qs_menu_tile("network-wired-symbolic", "Wired", None, &wired_menu_ui);
     wired_menu.set_tile(wired.clone());
@@ -1076,8 +1068,7 @@ fn quick_settings_popover(
     bt_menu_ui.separator();
     let (bt_settings, _) = bt_menu_ui.item(None, "Bluetooth Settings");
     bt_settings.connect_clicked(|_| {
-        // Administrative lockdown (#357) applies inside the helper.
-        lockdown::open_settings_panel(Some("bluetooth"));
+        open_settings_panel("bluetooth");
     });
     let bluetooth = qs_menu_tile("bluetooth-active-symbolic", "Bluetooth", None, &bt_menu_ui);
     bt_menu.set_tile(bluetooth.clone());
@@ -1127,8 +1118,7 @@ fn quick_settings_popover(
     wwan_menu_ui.separator();
     let (wwan_settings, _) = wwan_menu_ui.item(None, "Mobile Network Settings");
     wwan_settings.connect_clicked(|_| {
-        // Administrative lockdown (#357) applies inside the helper.
-        lockdown::open_settings_panel(Some("wwan"));
+        open_settings_panel("wwan");
     });
     let wwan = qs_menu_tile(
         "network-cellular-signal-excellent-symbolic",
@@ -1160,8 +1150,7 @@ fn quick_settings_popover(
     power_menu_ui.separator();
     let (power_settings, _) = power_menu_ui.item(None, "Power Settings");
     power_settings.connect_clicked(|_| {
-        // Administrative lockdown (#357) applies inside the helper.
-        lockdown::open_settings_panel(Some("power"));
+        open_settings_panel("power");
     });
     let power_mode = qs_menu_tile(
         "power-profile-balanced-symbolic",
@@ -1455,12 +1444,35 @@ fn quick_settings_popover(
     popover
 }
 
+/// Open a GNOME Settings panel, as the quick-settings menus' "… Settings"
+/// rows do in GNOME 51.
+fn open_settings_panel(panel: &str) {
+    if let Err(e) = tuna_shell_host::apps::application_command("gnome-control-center")
+        .arg(panel)
+        .spawn()
+    {
+        eprintln!("tuna-shell-gtk: could not open {panel} settings: {e}");
+    }
+}
+
 /// Save a screenshot of the screen (or the focused window) through
 /// org.gnome.Shell.Screenshot and say so in a notification, as GNOME's
 /// screenshot button and keys do. Waits a moment so a closing menu is
 /// not in the shot.
+///
+/// Administrative lockdown (#357): while `disable-save-to-disk` denies,
+/// the shot goes to the clipboard only, as GNOME 51's
+/// `screenshot.js` `_storeScreenshot` does — captured into a private
+/// runtime file that is read back and removed at once, never into
+/// Pictures.
 fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
     glib::timeout_add_local_once(Duration::from_millis(400), move || {
+        let to_disk = lockdown::read().entry_visibility().save_to_disk;
+        let scratch = (!to_disk).then(|| glib::user_runtime_dir().join("tuna-screenshot-clip.png"));
+        let target = scratch
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         gio::bus_get(
             gio::BusType::Session,
             None::<&gio::Cancellable>,
@@ -1469,9 +1481,12 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
                     return;
                 };
                 let (method, args) = if window {
-                    ("ScreenshotWindow", (true, false, true, "").to_variant())
+                    (
+                        "ScreenshotWindow",
+                        (true, false, true, target.as_str()).to_variant(),
+                    )
                 } else {
-                    ("Screenshot", (false, true, "").to_variant())
+                    ("Screenshot", (false, true, target.as_str()).to_variant())
                 };
                 conn.call(
                     Some("org.gnome.Shell.Screenshot"),
@@ -1489,6 +1504,27 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
                                 .try_child_value(1)
                                 .and_then(|v| v.get::<String>())
                                 .unwrap_or_default();
+                            if let Some(scratch) = scratch {
+                                let texture = gtk::gdk::Texture::from_filename(&scratch).ok();
+                                let _ = std::fs::remove_file(&scratch);
+                                let (Some(texture), Some(display)) =
+                                    (texture, gtk::gdk::Display::default())
+                                else {
+                                    eprintln!("tuna-shell-gtk: screenshot failed");
+                                    return;
+                                };
+                                display.clipboard().set_texture(&texture);
+                                eprintln!(
+                                    "tuna-shell-gtk: screenshot kept on the clipboard (disable-save-to-disk)"
+                                );
+                                notify.post(
+                                    "Screenshot",
+                                    "screenshot-recorded-symbolic",
+                                    "Screenshot captured",
+                                    "You can paste the image from the clipboard.",
+                                );
+                                return;
+                            }
                             let name = std::path::Path::new(&path)
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
@@ -2370,6 +2406,8 @@ fn build(app: &adw::Application) {
 
     // GNOME's workspace switcher popup.
     let workspace_popup = ws_popup::WorkspacePopup::new(app.upcast_ref());
+    // GNOME's Run a Command dialog (Alt+F2, #357 lockdown gate inside).
+    let run_dialog = run_dialog::RunDialog::new(app.upcast_ref());
 
     // GNOME's input-source policy (#346): MRU switching with its popup,
     // per-window sources, saved order. It drives the compositor's keymap
@@ -2404,6 +2442,7 @@ fn build(app: &adw::Application) {
             let screenshot_ui = screenshot_ui.clone();
             let brightness_controller = brightness_controller.clone();
             let workspace_popup_keys = workspace_popup.clone();
+            let run_dialog = run_dialog.clone();
             let (panel_window_keys, activities_keys, panel_held_keys) =
                 (window.clone(), activities.clone(), panel_held.clone());
             Rc::new(move |action, mode| {
@@ -2523,6 +2562,9 @@ fn build(app: &adw::Application) {
                         if let Some(entry) = dash_entry(n) {
                             let _ = tuna_shell_host::apps::launch(&entry);
                         }
+                    }
+                    Action::RunDialog => {
+                        run_dialog.open();
                     }
                     Action::ShowScreenshotUi => screenshot_ui.open(),
                     Action::ShowScreenRecordingUi => screenshot_ui.open_recording(),

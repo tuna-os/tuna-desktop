@@ -187,8 +187,8 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| exec | Ignored | App launch resolves desktop-file/MIME handlers; these legacy command preferences are not read |
-| exec-arg | Ignored | App launch resolves desktop-file/MIME handlers; these legacy command preferences are not read |
+| exec | Honored (GTK shell) | The terminal Ctrl+Return in the Run a Command dialog runs the line inside, as runDialog.js does; app launch still resolves desktop-file/MIME handlers (#357) |
+| exec-arg | Honored (GTK shell) | Placed between `exec` and the line for Ctrl+Return in the Run a Command dialog, as runDialog.js does (#357) |
 ## org.gnome.desktop.input-sources
 
 | Key | Status | Reason |
@@ -251,19 +251,21 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | toolkit-accessibility | Ignored | No Tuna Desktop consumer or verified toolkit translation for this preference |
 ## org.gnome.desktop.lockdown
 
+Consumers re-checked against gnome-shell 51.0, gnome-session 51.0 and gnome-settings-daemon 51.0 (#357); mechanism and proofs in [parity-ledger.md](parity-ledger.md) P-ST-05.
+
 | Key | Status | Reason |
 |---|---|---|
-| disable-application-handlers | Honored | Shell-opened Settings/handlers blocked live while denied (#357) |
-| disable-command-line | Ignored | No run-command dialog ships, so nothing to restrict; visibility gate unit-tested for its landing |
-| disable-lock-screen | Honored | Shell hides and guards all lock paths; compositor denies Lock, idle and Wayland locks (#357) |
-| disable-log-out | Honored | Power menu Log Out row hidden live; nested sessions show no menu (#357) |
-| disable-print-setup | Ignored | App-owned: applications' Print Setup dialogs; the shell exposes no print path |
-| disable-printing | Ignored | App-owned: applications' Print dialogs; the shell exposes no print path |
-| disable-save-to-disk | Ignored | App-owned: applications' Save dialogs; shell-owned savers out of scope as in GNOME |
-| disable-show-password | Honored | Network secret reveal toggle omitted live while denied (#357) |
-| disable-user-switching | Ignored | No user-switch row ships, so nothing to restrict; visibility gate unit-tested for its landing |
-| mount-removable-storage-devices-as-read-only | Ignored | Daemon-owned: removable mounts (udisks2); Tuna ships no mount agent |
-| user-administration-disabled | Ignored | Daemon-owned: user administration (accountsservice/polkit); Tuna ships no Users panel |
+| disable-application-handlers | Ignored | No GNOME 51 desktop consumer: gnome-shell, gnome-session and gnome-settings-daemon 51.0 never read it, so Tuna's shell no longer gates Settings or calendar launches on it (#357); applications that honor it read it themselves |
+| disable-command-line | Honored (GTK shell) | Alt+F2 opens GNOME's Run a Command dialog; `RunDialog.open()` refuses while set, re-read per open (runDialog.js); G-LOCKDOWN-COMMAND-LINE (#357) |
+| disable-lock-screen | Honored | As screenShield.js `lock()`/systemActions.js: Lock button hidden, keybinding, screensaver/D-Bus, sleep and idle locks refused by the shell, compositor backstop denies Lock and idle; never unlocks a locked session; G-LOCKDOWN-LOCK (#357) |
+| disable-log-out | Honored (GTK shell) | Log Out…, Restart… and Power Off… hidden and refused live, as gnome-session 51 answers CanShutdown/CanReboot unavailable and refuses Logout; Suspend stays; G-LOCKDOWN-LOG-OUT (#357) |
+| disable-print-setup | Ignored | No GNOME 51 desktop consumer; applications' Print Setup dialogs read it themselves; the shell exposes no print path |
+| disable-printing | Ignored | No GNOME 51 desktop consumer; applications' Print dialogs read it themselves; the shell exposes no print path |
+| disable-save-to-disk | Honored (shell captures) | As screenshot.js/screencastService.js: shell screenshots stay on the clipboard, screencasts refuse to start, the portal's org.gnome.Shell.Screenshot calls are refused; applications' Save As dialogs stay app-owned; G-LOCKDOWN-SAVE-TO-DISK (#357) |
+| disable-show-password | Honored (GTK shell) | As StPasswordEntry: unlock prompt, polkit and network secret peek icons (and GTK's Show Text) drop live and re-hide revealed text (#357) |
+| disable-user-switching | Ignored | Tuna ships no Switch User row or unlock-dialog user switch (gnome-shell 51.0's only consumers; gnome-session 51.0 defines but never reads the key), so nothing to restrict; the visibility gate is unit-tested for their landing |
+| mount-removable-storage-devices-as-read-only | Ignored | Daemon-owned: removable mounts (udisks2); no GNOME 51 desktop consumer and Tuna ships no mount agent |
+| user-administration-disabled | Ignored | App-owned: GNOME Settings' Users panel; Tuna ships no Users panel |
 ## org.gnome.desktop.media-handling
 
 | Key | Status | Reason |
@@ -571,7 +573,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | move-to-workspace-right | Honored | Live shell accelerator registration and compositor dispatch |
 | move-to-workspace-up | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | panel-main-menu | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
-| panel-run-dialog | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
+| panel-run-dialog | Honored (GTK shell) | Opens GNOME's Run a Command dialog in normal and overview modes (main.js), read and rebound live through the shell's grabs; refused while `disable-command-line` is set (#357) |
 | raise | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | raise-or-lower | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
 | set-spew-mark | Ignored | This accelerator has no Tuna Desktop action/registration; only the listed live bindings are grabbed |
