@@ -9078,17 +9078,17 @@ cstate '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' "125 per
     fail G-DISPLAY-SETTINGS "the layout did not follow scale 1.25 again"
 display_dialog_press "Revert Settings" revert ||
     fail G-DISPLAY-SETTINGS "GNOME Shell's dialog did not offer Revert Settings"
-cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH) and (.display_config.awaiting_confirmation | not)" "reverted" 5 ||
+cstate "(.layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)) and (.display_config.awaiting_confirmation | not)" "reverted" 5 ||
     fail G-DISPLAY-SETTINGS "Revert Settings did not restore scale 1"
 cmp -s "$XDG_CONFIG_HOME/tuna/monitors.xml" "$ARTIFACTS/monitors-kept.xml" ||
     fail G-DISPLAY-SETTINGS "a reverted change was saved"
 # Unanswered, Mutter reverts after its 20 second timeout and the
 # dialog's countdown closes it.
 apply_display 2 1.25 || fail G-DISPLAY-SETTINGS "the third persistent change failed: $(tail -2 "$DISPLAY_LOG")"
-cstate '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024) and .display_config.awaiting_confirmation' "awaiting the timeout" ||
+cstate '(.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)) and .display_config.awaiting_confirmation' "awaiting the timeout" ||
     fail G-DISPLAY-SETTINGS "the third persistent change did not apply"
 changed_at=$(date +%s)
-cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH) and (.display_config.awaiting_confirmation | not)" "timed out" 30 ||
+cstate "(.layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)) and (.display_config.awaiting_confirmation | not)" "timed out" 30 ||
     fail G-DISPLAY-SETTINGS "an unanswered change did not revert"
 elapsed=$(($(date +%s) - changed_at))
 [ "$elapsed" -ge 18 ] || fail G-DISPLAY-SETTINGS "the change reverted after ${elapsed}s, before Mutter's 20 second timeout"
