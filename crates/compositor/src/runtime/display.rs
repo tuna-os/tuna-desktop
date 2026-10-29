@@ -238,6 +238,9 @@ impl Runtime {
                 let size = backend.window_size();
                 let (lw, lh) = logical_size(size.w, size.h, self.scale);
                 self.state.set_output_size(lw, lh);
+                // Anchored layer surfaces (the panel) follow the new
+                // size now, not on their next commit.
+                crate::layer::arrange_after_commit(&self.state);
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
@@ -293,6 +296,12 @@ impl Runtime {
             .filter(|name| !leaders.iter().any(|(leader, ..)| leader == name))
             .collect();
         let primary_before = self.state.primary_output_name();
+        let sizes_before: Vec<(String, (i32, i32))> = self
+            .state
+            .outputs
+            .iter()
+            .map(|entry| (entry.name.clone(), (entry.size.w, entry.size.h)))
+            .collect();
         for name in &gone {
             self.manager.migrate_output_windows(&mut self.state, name);
             self.state.remove_output(name);
@@ -309,9 +318,17 @@ impl Runtime {
         if let Some((primary, ..)) = leaders.first() {
             self.state.set_primary(primary);
         }
-        if !gone.is_empty() || self.state.primary_output_name() != primary_before {
+        let resized = leaders.iter().any(|(name, _, _, logical)| {
+            sizes_before
+                .iter()
+                .any(|(known, size)| known == name && size != logical)
+        });
+        if resized || !gone.is_empty() || self.state.primary_output_name() != primary_before {
             self.manager.reapply_derived_layouts(&mut self.state);
         }
+        // Anchored layer surfaces (the panel) follow a new mode now,
+        // not on their next commit.
+        crate::layer::arrange_after_commit(&self.state);
     }
 
     /// The display configuration for the proof state file: the serial,
