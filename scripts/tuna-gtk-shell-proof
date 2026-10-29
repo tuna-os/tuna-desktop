@@ -7592,7 +7592,10 @@ if command -v ibus-daemon >/dev/null 2>&1 &&
         fail G-IME-CANDIDATES "no #36363a popup surface at the candidate window's top (pixel ${1:-?} ${2:-?} ${3:-?})"
     fi
     surface="$1 $2 $3"
-    row0="$(grep 'ibus candidate 0 你 at' "$LOG" | tail -1 | sed 's/.* at //')"
+    # Take exactly the four integers the shell logs (x y width height):
+    # another process's output can land on the same log line without a
+    # newline, and anything past the numbers must not reach arithmetic.
+    row0="$(grep -oE 'ibus candidate 0 你 at -?[0-9]+ -?[0-9]+ [0-9]+ [0-9]+' "$LOG" | tail -1 | sed 's/.* at //')"
     [ -n "$row0" ] || fail G-IME-CANDIDATES "the first row was never laid out"
     # shellcheck disable=SC2086 # four numbers
     set -- $row0
