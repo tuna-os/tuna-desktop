@@ -277,7 +277,9 @@ impl Runtime {
         let Backend::Drm(drm) = &self.backend else {
             return;
         };
-        let leaders: Vec<(String, smithay::output::Output, (i32, i32), (i32, i32))> = drm
+        // (connector, output, layout position, logical size)
+        type Leader = (String, smithay::output::Output, (i32, i32), (i32, i32));
+        let leaders: Vec<Leader> = drm
             .outputs
             .iter()
             .filter(|o| o.is_leader())

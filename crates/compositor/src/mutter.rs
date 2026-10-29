@@ -1210,6 +1210,7 @@ pub fn session_closed(stream: &SignalEmitter<'static>, session_id: u64) {
 
 /// Serve DisplayConfig and ScreenCast on the session bus from a thread.
 /// Returns the channel the event loop reads cast requests from.
+#[allow(clippy::too_many_arguments)] // one share per service the thread serves
 pub fn start(
     outputs: Outputs,
     windows: Windows,

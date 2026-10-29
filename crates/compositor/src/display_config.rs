@@ -1336,6 +1336,8 @@ mod tests {
         let mut odd = ok();
         odd[0].scale = 1.2;
         assert!(error(verify(&state, 7, None, &odd)).starts_with("Scale 1.2 not valid"));
+        // Two overlapping monitors never share an edge, so the first
+        // one already fails adjacency, as in Mutter.
         assert_eq!(
             error(verify(
                 &state,
@@ -1343,7 +1345,44 @@ mod tests {
                 None,
                 &[panel("1920x1080@60.000"), side(1000)]
             )),
-            "Logical monitors overlap"
+            "Logical monitors not adjacent"
+        );
+        // Overlap needs a third monitor joining the other two.
+        let rects = [
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            Rect {
+                x: 1920,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            Rect {
+                x: 0,
+                y: 500,
+                w: 1920,
+                h: 1080,
+            },
+        ];
+        let logical: Vec<LogicalMonitorConfig> = rects
+            .iter()
+            .enumerate()
+            .map(|(index, r)| LogicalMonitorConfig {
+                x: r.x,
+                y: r.y,
+                scale: 1.0,
+                transform: 0,
+                primary: index == 0,
+                monitors: Vec::new(),
+            })
+            .collect();
+        assert_eq!(
+            verify_list(&logical, &rects),
+            Err(invalid("Logical monitors overlap"))
         );
         assert_eq!(
             error(verify(

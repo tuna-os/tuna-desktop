@@ -367,8 +367,8 @@ MODE_COUNT="${rest#* }"
 wait_crtc "$ORIGINAL_MODE" 10 || fail D-MODES "the CRTC does not run the advertised current mode $ORIGINAL_MODE"
 # Verify refuses a mode the connector lacks, as Mutter does.
 if apply_mode 0 "123x45@60.000"; then fail D-MODES "an unknown mode verified"; fi
-tail -1 "$ARTIFACTS/display-modes.log" | grep -q "InvalidArgs.*Invalid mode '123x45@60.000' specified" ||
-    fail D-MODES "an unknown mode was not refused: $(tail -1 "$ARTIFACTS/display-modes.log")"
+tail -2 "$ARTIFACTS/display-modes.log" | grep -q "InvalidArgs.*Invalid mode '123x45@60.000' specified" ||
+    fail D-MODES "an unknown mode was not refused: $(tail -2 "$ARTIFACTS/display-modes.log")"
 # Temporary: the CRTC switches (atomic test first) and frames flip on.
 frames_before=$(jq -er '.rendered_frames' "$CSTATE")
 apply_mode 1 "$TARGET_MODE" || fail D-MODES "ApplyMonitorsConfig $TARGET_MODE failed: $(tail -2 "$ARTIFACTS/display-modes.log")"

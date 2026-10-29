@@ -8981,17 +8981,17 @@ serial=$(display_serial)
 # Verify (method 0) checks without changing anything; Mutter's errors.
 apply_display 0 1 "640x480@60.000" &&
     fail G-DISPLAY-SETTINGS "an unknown mode verified"
-tail -1 "$DISPLAY_LOG" | grep -q "InvalidArgs.*Invalid mode '640x480@60.000' specified" ||
-    fail G-DISPLAY-SETTINGS "an unknown mode was not refused as Mutter does: $(tail -1 "$DISPLAY_LOG")"
+tail -2 "$DISPLAY_LOG" | grep -q "InvalidArgs.*Invalid mode '640x480@60.000' specified" ||
+    fail G-DISPLAY-SETTINGS "an unknown mode was not refused as Mutter does: $(tail -2 "$DISPLAY_LOG")"
 apply_display 0 1.5 &&
     fail G-DISPLAY-SETTINGS "an unsupported scale verified"
-tail -1 "$DISPLAY_LOG" | grep -q "Scale 1.5 not valid for resolution ${WIDTH}x${HEIGHT}" ||
-    fail G-DISPLAY-SETTINGS "scale 1.5 was not refused as Mutter does: $(tail -1 "$DISPLAY_LOG")"
+tail -2 "$DISPLAY_LOG" | grep -q "Scale 1.5 not valid for resolution ${WIDTH}x${HEIGHT}" ||
+    fail G-DISPLAY-SETTINGS "scale 1.5 was not refused as Mutter does: $(tail -2 "$DISPLAY_LOG")"
 apply_display 1 1 "" "$((serial + 1))" &&
     fail G-DISPLAY-SETTINGS "a stale serial was accepted"
-tail -1 "$DISPLAY_LOG" | grep -q "AccessDenied.*stale information" ||
-    fail G-DISPLAY-SETTINGS "a stale serial was not AccessDenied: $(tail -1 "$DISPLAY_LOG")"
-apply_display 0 1.25 || fail G-DISPLAY-SETTINGS "a valid configuration did not verify: $(tail -1 "$DISPLAY_LOG")"
+tail -2 "$DISPLAY_LOG" | grep -q "AccessDenied.*stale information" ||
+    fail G-DISPLAY-SETTINGS "a stale serial was not AccessDenied: $(tail -2 "$DISPLAY_LOG")"
+apply_display 0 1.25 || fail G-DISPLAY-SETTINGS "a valid configuration did not verify: $(tail -2 "$DISPLAY_LOG")"
 if ! { [ "$(display_serial)" = "$serial" ] && [ ! -e "$XDG_CONFIG_HOME/tuna/monitors.xml" ] &&
     cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)" "verify changes nothing" 5; }; then
     fail G-DISPLAY-SETTINGS "verifying changed the configuration"
