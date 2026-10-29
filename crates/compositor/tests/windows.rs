@@ -5598,3 +5598,51 @@ fn lock_then_unlock_before_keyup_drops_old_release_but_clears_physical_key() {
         [(37, 5001, MODE_NORMAL)]
     );
 }
+
+/// `workspaces-only-on-primary` (mutter 51 `should_be_on_all_workspaces`
+/// and `meta_window_on_all_workspaces_changed`): a window on a secondary
+/// output shows on every workspace; brought back to the primary, or with
+/// the preference turned off, it lands on the active workspace.
+#[test]
+fn secondary_output_windows_are_sticky_and_unstick_onto_the_active_workspace() {
+    let mut f = two_windows();
+    f.comp.state.add_output("primary", None, 1280, 800);
+    f.comp.state.add_output("secondary", None, 1280, 800);
+    f.manager.reconcile(&mut f.comp.state);
+    let beta = f.manager.geometry(f.id_b).unwrap();
+    assert!(f.manager.move_window(f.id_b, 1380 - beta.loc.x, 0));
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(f.manager.model().window(f.id_b).unwrap().on_all_workspaces);
+    assert!(!f.manager.model().window(f.id_a).unwrap().on_all_workspaces);
+    assert!(f.manager.switch_relative(&mut f.comp.state, 1));
+    assert_eq!(
+        f.manager.visible_windows().len(),
+        1,
+        "only the secondary-output window follows to the next workspace"
+    );
+    let active = f.manager.model().active_workspace();
+    assert_ne!(active, 0);
+    // Dragged back onto the primary: on the workspace now in view.
+    assert!(f.manager.move_window(f.id_b, -1200, 0));
+    f.manager.reconcile(&mut f.comp.state);
+    let entry = f.manager.model().window(f.id_b).unwrap();
+    assert!(!entry.on_all_workspaces);
+    assert_eq!(entry.workspace, active);
+    // Back on the secondary, then the preference off: the same landing.
+    assert!(f.manager.move_window(f.id_b, 1200, 0));
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(f.manager.model().window(f.id_b).unwrap().on_all_workspaces);
+    assert!(f.manager.switch_relative(&mut f.comp.state, -1));
+    let home = f.manager.model().active_workspace();
+    f.manager.apply_workspace_policy(
+        &mut f.comp.state,
+        tuna_shell_control::WorkspacePolicy {
+            only_on_primary: false,
+            ..Default::default()
+        },
+    );
+    let entry = f.manager.model().window(f.id_b).unwrap();
+    assert!(!entry.on_all_workspaces);
+    assert_eq!(entry.workspace, home);
+    assert_eq!(f.manager.model().window(f.id_a).unwrap().workspace, home);
+}

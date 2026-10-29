@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- gnome-shell 51.0 data/org.gnome.shell.gschema.xml.in switcher keys. -->
+<schemalist>
+  <schema id="org.gnome.shell.app-switcher" path="/org/gnome/shell/app-switcher/">
+    <key type="b" name="current-workspace-only">
+      <default>false</default>
+      <summary>Limit switcher to current workspace.</summary>
+    </key>
+  </schema>
+  <schema id="org.gnome.shell.window-switcher" path="/org/gnome/shell/window-switcher/">
+    <key type="b" name="current-workspace-only">
+      <default>true</default>
+      <summary>Limit switcher to current workspace.</summary>
+    </key>
+  </schema>
+</schemalist>

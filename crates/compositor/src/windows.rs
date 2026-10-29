@@ -429,6 +429,10 @@ pub struct WindowManager {
     size_changes: crate::size_change::SizeChanges<crate::size_change::Snapshot>,
     window_lifecycle: crate::window_lifecycle::Lifecycle,
     workspace_policy: tuna_shell_control::WorkspacePolicy,
+    /// `org.gnome.mutter center-new-windows` (default on, as in GNOME).
+    center_new_windows: bool,
+    /// The shell's text direction: mutter mirrors automatic placement.
+    right_to_left: bool,
     workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
     floating_workareas: Vec<(String, crate::output_constraints::Rect)>,
     workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
@@ -551,11 +555,18 @@ impl WindowManager {
                     .then_some((id, on_all_workspaces))
             })
             .collect();
+        // Mutter's `meta_window_on_all_workspaces_changed`: a window
+        // leaving the sticky state (unstuck, or moved from a secondary
+        // output onto the primary with `workspaces-only-on-primary`)
+        // lands on the currently active workspace, not the one it had
+        // before it became sticky.
+        let active = self.model.active_workspace();
         for (id, on_all_workspaces) in changes {
             self.model.update(
                 id,
                 crate::state::WindowUpdate {
                     on_all_workspaces: Some(on_all_workspaces),
+                    workspace: (!on_all_workspaces).then_some(active),
                     ..Default::default()
                 },
             );
@@ -575,6 +586,14 @@ impl WindowManager {
         {
             self.focus_topmost(state, self.model.active_workspace());
         }
+    }
+
+    /// Mutter's automatic placement preferences: `center-new-windows`
+    /// and the text direction its first-fit and cascade mirror under.
+    /// Applies to windows placed from now on, as in mutter.
+    pub fn set_window_placement(&mut self, center_new_windows: bool, right_to_left: bool) {
+        self.center_new_windows = center_new_windows;
+        self.right_to_left = right_to_left;
     }
 
     /// Last known pointer position, for position-less events (button
@@ -666,6 +685,8 @@ impl WindowManager {
             size_changes: Default::default(),
             window_lifecycle: Default::default(),
             workspace_policy: Default::default(),
+            center_new_windows: true,
+            right_to_left: false,
             workspace_outputs: Vec::new(),
             floating_workareas: Vec::new(),
             workspace_tracker: Default::default(),
@@ -1588,7 +1609,7 @@ impl WindowManager {
             .and_then(|name| state.outputs.iter().find(|entry| &entry.name == name))
             .or_else(|| state.new_window_output())
             .map(|entry| Rectangle::new(entry.loc.into(), entry.size));
-        let geometry = self.placement_on(state, None, target);
+        let geometry = self.placement_on(state, None, target, self.center_new_windows);
         // With a real output the client chooses its size first (Mutter's
         // empty initial configure); headless tests keep the cascade.
         let unplaced = Self::work_area(state).size.w > 0;
@@ -1650,23 +1671,30 @@ impl WindowManager {
     }
 
     /// Where a new floating window goes. With a real output this follows
-    /// GNOME's automatic placement: the first window on an empty
-    /// workspace is centered in the work area, later ones cascade from
-    /// the most recent by one step, kept inside the work area (never
-    /// under the top bar). Without an output (headless tests) the plain
-    /// cascade from the origin stands.
+    /// mutter's automatic placement (`meta_window_place`): with
+    /// `center-new-windows` (GNOME's default) the first window on an
+    /// empty workspace is centered in the work area and later ones
+    /// cascade from it; without it the window takes the first free fit
+    /// from the work area's corner, else cascades from that corner. The
+    /// result stays inside the work area (never under the top bar).
+    /// Without an output (headless tests) the plain cascade from the
+    /// origin stands.
     /// Automatic placement for a window that brings its own
     /// size (X11 clients ask for one at map); `None` uses the default.
+    /// X11 dialogs and splash screens are always centered, as mutter's
+    /// `window_place_centered` does whatever the preference.
     #[cfg(feature = "xwayland")]
     fn placement_sized(
         &mut self,
         state: &State,
         wanted: Option<Size<i32, Logical>>,
+        always_centered: bool,
     ) -> Rectangle<i32, Logical> {
         let target = state
             .new_window_output()
             .map(|entry| Rectangle::new(entry.loc.into(), entry.size));
-        self.placement_on(state, wanted, target)
+        let centered = always_centered || self.center_new_windows;
+        self.placement_on(state, wanted, target, centered)
     }
 
     fn placement_on(
@@ -1674,6 +1702,7 @@ impl WindowManager {
         state: &State,
         wanted: Option<Size<i32, Logical>>,
         target: Option<Rectangle<i32, Logical>>,
+        centered: bool,
     ) -> Rectangle<i32, Logical> {
         let work = target
             .map(|output| {
@@ -1695,27 +1724,35 @@ impl WindowManager {
             .unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
         let size: Size<i32, Logical> = (w.min(work.size.w), h.min(work.size.h)).into();
         let active = self.model.active_workspace();
-        let others: Vec<Point<i32, Logical>> = self
+        // Mutter skips dialogs when looking for free space; their
+        // transient parents stand for them.
+        let others: Vec<Rectangle<i32, Logical>> = self
             .stacking
             .iter()
             .filter(|id| {
                 self.model
                     .window(**id)
                     .is_some_and(|m| m.workspace == active)
+                    && (centered || self.transient_parent(**id).is_none())
             })
             .filter_map(|id| self.windows.get(id))
             .filter(|w| !w.unplaced && !w.minimized && work.contains(w.geometry.loc))
-            .map(|w| w.geometry.loc)
+            .map(|w| w.geometry)
             .collect();
-        let centered: Point<i32, Logical> = (
-            work.loc.x + (work.size.w - size.w) / 2,
-            work.loc.y + (work.size.h - size.h) / 2,
-        )
-            .into();
-        let mut loc = if others.is_empty() {
-            centered
+        let mut loc = if !centered {
+            first_fit(size, &others, work, self.right_to_left)
+                .unwrap_or_else(|| origin_cascade(size, &others, work, self.right_to_left))
         } else {
-            next_cascade(centered, others, size, work)
+            let center: Point<i32, Logical> = (
+                work.loc.x + (work.size.w - size.w) / 2,
+                work.loc.y + (work.size.h - size.h) / 2,
+            )
+                .into();
+            if others.is_empty() {
+                center
+            } else {
+                next_cascade(center, others.iter().map(|r| r.loc).collect(), size, work)
+            }
         };
         loc.x = loc.x.max(work.loc.x);
         loc.y = loc.y.max(work.loc.y);
@@ -1762,7 +1799,8 @@ impl WindowManager {
                         })
                         .map(|entry| Rectangle::new(entry.loc.into(), entry.size))
                 });
-                let geometry = self.placement_on(state, Some(size), target);
+                let centered = self.center_new_windows;
+                let geometry = self.placement_on(state, Some(size), target, centered);
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.geometry = geometry;
                     window.unplaced = false;
@@ -1809,7 +1847,11 @@ impl WindowManager {
         // GNOME placement at the size the client asked for.
         let asked = surface.geometry().size;
         let wanted = (asked.w > 0 && asked.h > 0).then_some(asked);
-        let geometry = self.placement_sized(state, wanted);
+        let always_centered = matches!(
+            surface.window_type(),
+            Some(WmWindowType::Dialog | WmWindowType::Splash)
+        );
+        let geometry = self.placement_sized(state, wanted, always_centered);
         self.windows.insert(
             id,
             ManagedWindow {
@@ -6689,6 +6731,132 @@ fn next_cascade(
     (x, y).into()
 }
 
+/// Mutter's `find_first_fit` (place.c, used when `center-new-windows`
+/// is off): the window's size tiled from the work area's corner with
+/// the spare space split evenly (`center_tile_rect_in_area`), else the
+/// first free spot below an existing window (top-most, then left-most
+/// first), else beside one (left-most, then top-most first). A spot
+/// fits when it lies inside the work area and overlaps no other window.
+/// Right-to-left mirrors the corner and the side, as mutter does.
+fn first_fit(
+    size: Size<i32, Logical>,
+    others: &[Rectangle<i32, Logical>],
+    work: Rectangle<i32, Logical>,
+    rtl: bool,
+) -> Option<Point<i32, Logical>> {
+    let fits = |loc: Point<i32, Logical>| {
+        let rect = Rectangle::new(loc, size);
+        work.contains_rect(rect) && !others.iter().any(|other| other.overlaps(rect))
+    };
+    let fluff_x = (work.size.w % (size.w + 1)) / 2;
+    let tile_x = if rtl {
+        work.loc.x + work.size.w - size.w - fluff_x
+    } else {
+        work.loc.x + fluff_x
+    };
+    let tile: Point<i32, Logical> = (tile_x, work.loc.y + (work.size.h % (size.h + 1)) / 3).into();
+    if fits(tile) {
+        return Some(tile);
+    }
+    let side = |r: &Rectangle<i32, Logical>| if rtl { -r.loc.x } else { r.loc.x };
+    // Stable sorts: the last key is the primary one, as in mutter's
+    // successive `g_list_sort` calls.
+    let mut below = others.to_vec();
+    below.sort_by_key(side);
+    below.sort_by_key(|r| r.loc.y);
+    if let Some(loc) = below
+        .iter()
+        .map(|r| Point::from((r.loc.x, r.loc.y + r.size.h)))
+        .find(|loc| fits(*loc))
+    {
+        return Some(loc);
+    }
+    let mut beside = others.to_vec();
+    beside.sort_by_key(|r| r.loc.y);
+    beside.sort_by_key(side);
+    beside
+        .iter()
+        .map(|r| {
+            let x = if rtl {
+                r.loc.x - size.w
+            } else {
+                r.loc.x + r.size.w
+            };
+            Point::from((x, r.loc.y))
+        })
+        .find(|loc| fits(*loc))
+}
+
+/// Mutter's `find_next_cascade` without centering (place.c): cascade
+/// from the work area's top corner (top-right right-to-left), windows
+/// taken nearest that corner first; each window within 15px of the
+/// cascade point pushes it one 50px title-bar step down the diagonal,
+/// and a cascade running off the work area starts over 50px further in.
+fn origin_cascade(
+    size: Size<i32, Logical>,
+    others: &[Rectangle<i32, Logical>],
+    work: Rectangle<i32, Logical>,
+    rtl: bool,
+) -> Point<i32, Logical> {
+    const FUZZ: i32 = 15;
+    const TITLEBAR_HEIGHT: i32 = 50;
+    const CASCADE_INTERVAL: i32 = 50;
+    let right = work.loc.x + work.size.w;
+    let bottom = work.loc.y + work.size.h;
+    let mut sorted = others.to_vec();
+    sorted.sort_by_key(|r| {
+        let dx = if rtl {
+            right - (r.loc.x + r.size.w)
+        } else {
+            r.loc.x - work.loc.x
+        };
+        let dy = r.loc.y - work.loc.y;
+        i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy)
+    });
+    let origin_x = if rtl {
+        right - size.w
+    } else {
+        work.loc.x.max(0)
+    };
+    let origin_y = work.loc.y.max(0);
+    let (mut x, mut y) = (origin_x, origin_y);
+    let mut stage = 0;
+    let mut i = 0;
+    while i < sorted.len() {
+        let w = sorted[i];
+        let near_x = if rtl {
+            ((w.loc.x + w.size.w) - (x + size.w)).abs() < FUZZ
+        } else {
+            (w.loc.x - x).abs() < FUZZ
+        };
+        if near_x && (w.loc.y - y).abs() < FUZZ {
+            x = if rtl {
+                w.loc.x + w.size.w - TITLEBAR_HEIGHT - size.w
+            } else {
+                w.loc.x + TITLEBAR_HEIGHT
+            };
+            y = w.loc.y + TITLEBAR_HEIGHT;
+            if x + size.w > right || x < work.loc.x || y + size.h > bottom {
+                stage += 1;
+                x = if rtl {
+                    origin_x - CASCADE_INTERVAL * stage
+                } else {
+                    origin_x + CASCADE_INTERVAL * stage
+                };
+                y = origin_y;
+                if x + size.w < right && x >= work.loc.x {
+                    i = 0;
+                    continue;
+                }
+                x = origin_x;
+                break;
+            }
+        }
+        i += 1;
+    }
+    (x, y).into()
+}
+
 /// Translate a winit backend [`InputEvent`] into [`ManagerInput`].
 /// Returns `None` for device add/remove and other unconsumed kinds.
 /// Button code synthesized for touch contacts: the shell gates tile,
@@ -6877,6 +7045,38 @@ mod tests {
         // Off the work area: a new cascade from the top-left, 50px right.
         let full = vec![c, step(1), step(2), step(3), step(4), step(5), step(6)];
         assert_eq!(next_cascade(c, full, size, work), (50, 32).into());
+    }
+
+    /// `center-new-windows` off: mutter's `find_first_fit` and the
+    /// uncentred `find_next_cascade` (place.c, mutter 51.0).
+    #[test]
+    fn uncentred_placement_takes_mutters_first_fit_then_corner_cascade() {
+        let work = Rectangle::new((0, 32).into(), (1280, 768).into());
+        let size: Size<i32, Logical> = (640, 420).into();
+        let rect = |x: i32, y: i32| Rectangle::<i32, Logical>::new((x, y).into(), size);
+        // Empty: the size tiled from the corner, the spare width split
+        // in half and a third of the spare height above.
+        assert_eq!(first_fit(size, &[], work, false), Some((319, 147).into()));
+        assert_eq!(first_fit(size, &[], work, true), Some((321, 147).into()));
+        // The corner tile taken: beside the window, touching is free.
+        let left = [rect(0, 32)];
+        assert_eq!(first_fit(size, &left, work, false), Some((640, 32).into()));
+        let right = [rect(640, 32)];
+        assert_eq!(first_fit(size, &right, work, true), Some((0, 32).into()));
+        // Below the window when it fits there before beside it.
+        let small: Size<i32, Logical> = (300, 200).into();
+        let top = [Rectangle::new((0, 32).into(), (1280, 300).into())];
+        assert_eq!(first_fit(small, &top, work, false), Some((0, 332).into()));
+        // No free spot: cascade from the work area's corner instead.
+        let middle = [rect(319, 147)];
+        assert_eq!(first_fit(size, &middle, work, false), None);
+        assert_eq!(origin_cascade(size, &middle, work, false), (0, 32).into());
+        let chain = [rect(0, 32), rect(50, 82)];
+        assert_eq!(origin_cascade(size, &chain, work, false), (100, 132).into());
+        assert_eq!(origin_cascade(size, &right, work, true), (590, 82).into());
+        // Off the bottom: a new cascade 50px further in.
+        let full: Vec<_> = (0..7).map(|n| rect(50 * n, 32 + 50 * n)).collect();
+        assert_eq!(origin_cascade(size, &full, work, false), (50, 32).into());
     }
 
     fn key(keycode: u32, pressed: bool) -> ManagerInput {

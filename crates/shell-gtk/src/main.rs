@@ -3090,6 +3090,12 @@ fn build(app: &adw::Application) {
                     {
                         out.attach_modal_dialogs = mutter.boolean("attach-modal-dialogs");
                     }
+                    if mutter
+                        .settings_schema()
+                        .is_some_and(|schema| schema.has_key("center-new-windows"))
+                    {
+                        out.center_new_windows = mutter.boolean("center-new-windows");
+                    }
                 }
                 if let Some(mutter) = all[8].as_ref() {
                     if let Some(schema) = mutter.settings_schema() {

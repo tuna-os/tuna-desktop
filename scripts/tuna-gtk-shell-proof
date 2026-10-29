@@ -277,6 +277,15 @@
 #   G-APP-DRAG  dragging an app's header bar moves the window (#58)
 #   G-TILE-PREVIEW dragging a window to the left edge shows GNOME's tile
 #               preview over the left half; dragging back drops it
+#   G-EDGE-TILING-OFF with org.gnome.mutter edge-tiling off the same
+#               drag shows no preview and drops floating (P-WM-08)
+#   G-SWITCHER-WORKSPACE the window and app switchers follow their live
+#               current-workspace-only keys (P-WM-08)
+#   G-WS-FIXED  num-workspaces with dynamic-workspaces off keeps a fixed
+#               count; shrinking moves windows to the last slot; dynamic
+#               again compacts (P-WM-08)
+#   G-CENTER-NEW-WINDOWS new windows are centred, or take mutter's first
+#               fit with center-new-windows off (P-WM-08)
 #   G-TRAY      an AppIndicator item shows in the panel with its
 #               tooltip, its menu row reaches the item, and the row
 #               leaves the panel when the item exits (P-TR-01)
@@ -723,6 +732,24 @@ for name, defaults in {
     key(name + '-static', 'as', repr(defaults))
 ET.ElementTree(root).write(sys.argv[1], encoding='unicode')
 MEDIA_SCHEMA
+    glib-compile-schemas "$ARTIFACTS/schemas"
+    GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
+    export GSETTINGS_SCHEMA_DIR
+fi
+# GNOME's Multitasking keys (P-WM-08) on hosts without mutter's or
+# gnome-shell's schemas: the GNOME 51 keys with the GNOME session's
+# defaults, so the journey can toggle each one live.
+mt_fixtures=""
+gsettings range org.gnome.mutter center-new-windows >/dev/null 2>&1 ||
+    mt_fixtures="gnome51-mutter.gschema.xml"
+gsettings range org.gnome.shell.window-switcher current-workspace-only >/dev/null 2>&1 ||
+    mt_fixtures="$mt_fixtures gnome51-shell-switchers.gschema.xml"
+if [ -n "$mt_fixtures" ]; then
+    mkdir -p "$ARTIFACTS/schemas"
+    for fixture in $mt_fixtures; do
+        cp "$ROOT/tests/settings/$fixture" "$ARTIFACTS/schemas/"
+    done
+    echo "$mt_fixtures" >"$ARTIFACTS/multitasking-schema-fixtures.txt"
     glib-compile-schemas "$ARTIFACTS/schemas"
     GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
     export GSETTINGS_SCHEMA_DIR
@@ -1501,6 +1528,54 @@ cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[2] == $bw" "u
     fail G-TILE-PREVIEW "the window tiled after leaving the edge"
 pass G-TILE-PREVIEW "dragging to the left edge shows GNOME's tile preview; leaving the edge drops it"
 
+# org.gnome.mutter edge-tiling off (P-WM-08; mutter 51 meta-window-drag.c
+# tiles only under meta_prefs_get_edge_tiling): the same drag held at the
+# left edge shows no preview and drops the window floating at its size.
+gsettings set org.gnome.mutter edge-tiling false
+cstate '.multitasking.edge_tiling == false' "edge tiling off" ||
+    fail G-EDGE-TILING-OFF "the compositor never received edge-tiling=false"
+read -r bx by bw bh <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1]) \(.[2]) \(.[3])"' "$CSTATE")
+EOF2
+xdotool mousemove --window "$WID" $((bx + 131)) $((by + 20))
+xdotool mousedown 1
+xdotool mousemove --window "$WID" $((bx + 120)) $((by + 20))
+sleep 0.5
+for step in 1 2 3 4 5 6 7 8; do
+    xdotool mousemove --window "$WID" $(((bx + 120) * (8 - step) / 8 + 1)) $((by + 20 + step * 5))
+    sleep 0.05
+done
+# The enabled run above showed its preview within this window; sample
+# the same span so a late preview cannot slip through.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    jq -e '.tile_preview == null' "$CSTATE" >/dev/null ||
+        { xdotool mouseup 1; fail G-EDGE-TILING-OFF "a tile preview showed with edge-tiling off"; }
+    sleep 0.2
+done
+scrot "$ARTIFACTS/08-edge-tiling-off.png" >/dev/null
+xdotool mouseup 1
+sleep 0.5
+cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[2] == $bw and .rect[3] == $bh and .rect[0] < $bx" "dropped floating" ||
+    fail G-EDGE-TILING-OFF "the window tiled or resized with edge-tiling off"
+cp "$CSTATE" "$ARTIFACTS/edge-tiling-off.json"
+# Drag it back where it was, for the journey's later header clicks.
+read -r nx ny <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")
+EOF2
+xdotool mousemove --window "$WID" $((nx + 140)) $((ny + 20))
+xdotool mousedown 1
+for step in 1 2 3 4 5 6 7 8; do
+    xdotool mousemove --window "$WID" $((nx + 140 + (bx - nx) * step / 8)) $((ny + 20 + (by - ny) * step / 8))
+    sleep 0.05
+done
+xdotool mouseup 1
+cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[0] >= 0 and .rect[1] >= 32" "beta restored" ||
+    fail G-EDGE-TILING-OFF "could not drag the window back into the work area"
+gsettings reset org.gnome.mutter edge-tiling
+cstate '.multitasking.edge_tiling' "edge tiling restored" ||
+    fail G-EDGE-TILING-OFF "resetting edge-tiling did not reach the compositor"
+pass G-EDGE-TILING-OFF "with edge-tiling off a drag to the left edge shows no preview and drops floating at its size"
+
 # Alt-Tab (P-WM-01): hold Alt, step once, read the switcher, release.
 xdotool keydown Alt_L
 xdotool key Tab
@@ -1693,6 +1768,162 @@ sleep 0.5
 xdotool keyup Shift_L keyup Control_L
 cstate ".focused != $original" "window switcher backward" || fail G-WINDOW-SWITCHER "backward window switching did not move"
 pass G-WINDOW-SWITCHER "bound switch-windows forward/backward show separate window entries and commit on modifier release"
+
+# GNOME's current-workspace-only keys (P-WM-08; gnome-shell 51.0
+# altTab.js): Gamma moves to the next workspace; the window switcher
+# (org.gnome.shell.window-switcher, default on) then lists only this
+# workspace's windows, and all four with the key off, where picking Gamma
+# follows it to its workspace. The app switcher (default off) lists
+# Gamma's app until org.gnome.shell.app-switcher limits it.
+mt_home="$(jq .active_workspace "$CSTATE")"
+mt_gamma="$(jq -r '.windows[] | select(.app_id == "tuna-test-gamma") | .id' "$CSTATE")"
+xdotool key Super_L
+cstate ".overview_open and any(.previews[]; .id == $mt_gamma)" "gamma preview" ||
+    fail G-SWITCHER-WORKSPACE "the overview has no Gamma preview"
+sleep 1
+read -r gx gy <<EOF2
+$(jq -r ".previews[] | select(.id == $mt_gamma) | .rect | \"\(.[0] + .[2] / 2 | floor) \(.[1] + .[3] / 2 | floor)\"" "$CSTATE")
+EOF2
+xdotool mousemove --window "$WID" "$gx" "$gy" click 1
+cstate ".overview_open == false and .focused == $mt_gamma" "gamma focused" ||
+    fail G-SWITCHER-WORKSPACE "could not focus Gamma"
+xdotool key super+shift+Page_Down
+cstate ". as \$s | .active_workspace != $mt_home and any(.windows[]; .id == $mt_gamma and .workspace == \$s.active_workspace)" "gamma moved" ||
+    fail G-SWITCHER-WORKSPACE "Super+Shift+Page_Down did not move Gamma to the next workspace"
+mt_away="$(jq .active_workspace "$CSTATE")"
+xdotool key super+Page_Up
+cstate ".active_workspace == $mt_home and .focused != $mt_gamma" "home again" ||
+    fail G-SWITCHER-WORKSPACE "Super+Page_Up did not return to the home workspace"
+sleep 1
+xdotool keydown Control_L key k
+cstate '.switcher_thumbnails == 3' "this workspace's windows" ||
+    { xdotool keyup Control_L; fail G-SWITCHER-WORKSPACE "the window switcher did not limit itself to this workspace's 3 windows"; }
+sleep 0.7
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-window-switcher-current.json" 20 ||
+    { xdotool keyup Control_L; fail G-SWITCHER-WORKSPACE "a11y dump failed"; }
+xdotool key Escape keyup Control_L
+[ "$(jq '[.[] | select(.showing and .role == "list item" and (.name | test("Gamma")))] | length' "$ARTIFACTS/a11y-window-switcher-current.json")" = 0 ] ||
+    fail G-SWITCHER-WORKSPACE "the window switcher listed Gamma from another workspace"
+cstate ".active_workspace == $mt_home" "cancelled" ||
+    fail G-SWITCHER-WORKSPACE "Escape did not cancel the window switcher"
+gsettings set org.gnome.shell.window-switcher current-workspace-only false
+sleep 1
+xdotool keydown Control_L key k
+cstate '.switcher_thumbnails == 4' "every workspace's windows" ||
+    { xdotool keyup Control_L; fail G-SWITCHER-WORKSPACE "with current-workspace-only off the window switcher did not list all 4 windows"; }
+sleep 0.7
+scrot "$ARTIFACTS/08d-window-switcher-all-workspaces.png" >/dev/null
+xdotool keyup Control_L
+cstate ".focused == $mt_gamma and .active_workspace == $mt_away" "followed gamma" ||
+    fail G-SWITCHER-WORKSPACE "picking Gamma did not activate it on its workspace"
+xdotool key super+Page_Up
+cstate ".active_workspace == $mt_home" "home for apps" ||
+    fail G-SWITCHER-WORKSPACE "could not return home before the app switcher"
+sleep 1
+xdotool keydown Alt_L key Tab
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-app-switcher-all.json" 20 ||
+    { xdotool keyup Alt_L; fail G-SWITCHER-WORKSPACE "a11y dump failed"; }
+xdotool key Escape keyup Alt_L
+[ "$(jq '[.[] | select(.role == "list item" and .showing)] | length' "$ARTIFACTS/a11y-app-switcher-all.json")" = 3 ] ||
+    fail G-SWITCHER-WORKSPACE "the app switcher did not list all 3 apps by default"
+gsettings set org.gnome.shell.app-switcher current-workspace-only true
+sleep 1
+xdotool keydown Alt_L key Tab
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-app-switcher-current.json" 20 ||
+    { xdotool keyup Alt_L; fail G-SWITCHER-WORKSPACE "a11y dump failed"; }
+scrot "$ARTIFACTS/08e-app-switcher-current-workspace.png" >/dev/null
+xdotool key Escape keyup Alt_L
+[ "$(jq '[.[] | select(.role == "list item" and .showing)] | length' "$ARTIFACTS/a11y-app-switcher-current.json")" = 2 ] ||
+    fail G-SWITCHER-WORKSPACE "app-switcher current-workspace-only still listed the app on another workspace"
+jq -e '[.[] | select(.role == "list item" and .showing and (.name | test("Gamma")))] | length == 0' "$ARTIFACTS/a11y-app-switcher-current.json" >/dev/null ||
+    fail G-SWITCHER-WORKSPACE "the limited app switcher listed Gamma"
+gsettings reset org.gnome.shell.app-switcher current-workspace-only
+gsettings reset org.gnome.shell.window-switcher current-workspace-only
+# Bring Gamma home, so the journey continues on one workspace.
+xdotool key super+Page_Down
+cstate ".active_workspace == $mt_away and .focused == $mt_gamma" "gamma again" ||
+    fail G-SWITCHER-WORKSPACE "could not return to Gamma's workspace"
+xdotool key super+shift+Page_Up
+cstate "all(.windows[]; .workspace == $mt_home) and .active_workspace == $mt_home" "gamma home" ||
+    fail G-SWITCHER-WORKSPACE "Super+Shift+Page_Up did not bring Gamma home"
+pass G-SWITCHER-WORKSPACE "window and app switchers follow their current-workspace-only keys live; an off-workspace pick follows its window"
+
+# Fixed workspaces (P-WM-08; mutter 51 workspace manager): with
+# dynamic-workspaces off the count is num-workspaces, empty slots kept;
+# shrinking it moves the windows on removed workspaces to the new last
+# one (meta_workspace_manager_update_num_workspaces), and turning
+# dynamic back on compacts to the occupied ones plus one empty
+# (gnome-shell 51.0 windowManager.js WorkspaceTracker).
+gsettings set org.gnome.desktop.wm.preferences num-workspaces 4
+gsettings set org.gnome.mutter dynamic-workspaces false
+cstate '.multitasking.dynamic_workspaces == false and .multitasking.num_workspaces == 4 and (.workspaces | length) == 4' "four fixed workspaces" ||
+    fail G-WS-FIXED "dynamic-workspaces off did not keep 4 fixed workspaces"
+cstate ".focused == $mt_gamma" "gamma focused for fixed" ||
+    fail G-WS-FIXED "Gamma lost the focus"
+xdotool key super+shift+End
+cstate ". as \$s | any(.windows[]; .id == $mt_gamma and .workspace == \$s.workspaces[3]) and .active_workspace == .workspaces[3]" "gamma on the last fixed workspace" ||
+    fail G-WS-FIXED "Super+Shift+End did not move Gamma to the 4th fixed workspace"
+cp "$CSTATE" "$ARTIFACTS/workspaces-fixed-4.json"
+gsettings set org.gnome.desktop.wm.preferences num-workspaces 2
+cstate ". as \$s | (.workspaces | length) == 2 and any(.windows[]; .id == $mt_gamma and .workspace == \$s.workspaces[1]) and any(.workspaces[]; . == \$s.active_workspace) and ([.windows[] | select(.id != $mt_gamma)] | all(.workspace == \$s.workspaces[0]))" "shrunk to two" ||
+    fail G-WS-FIXED "shrinking num-workspaces did not move Gamma to the new last workspace"
+cp "$CSTATE" "$ARTIFACTS/workspaces-fixed-2.json"
+gsettings set org.gnome.mutter dynamic-workspaces true
+gsettings reset org.gnome.desktop.wm.preferences num-workspaces
+cstate ". as \$s | .multitasking.dynamic_workspaces and (.workspaces | length) == 3 and any(.windows[]; .id == $mt_gamma and .workspace == \$s.workspaces[1])" "dynamic again" ||
+    fail G-WS-FIXED "dynamic-workspaces on did not compact to two occupied workspaces and one empty"
+cp "$CSTATE" "$ARTIFACTS/workspaces-dynamic-again.json"
+[ "$(jq .focused "$CSTATE")" = "$mt_gamma" ] || xdotool key super+Page_Down
+cstate ".focused == $mt_gamma" "gamma focused before home" ||
+    fail G-WS-FIXED "could not focus Gamma on its workspace"
+xdotool key super+shift+Home
+cstate ". as \$s | (.workspaces | length) == 2 and all(.windows[]; .workspace == \$s.workspaces[0]) and .active_workspace == .workspaces[0]" "gamma home from fixed" ||
+    fail G-WS-FIXED "Super+Shift+Home did not bring Gamma back to the first workspace"
+mt_home="$(jq .active_workspace "$CSTATE")"
+gsettings reset org.gnome.mutter dynamic-workspaces
+pass G-WS-FIXED "num-workspaces fixes the count live, shrinking moves windows to the last slot, and dynamic workspaces compact again"
+
+# org.gnome.mutter center-new-windows (P-WM-08; mutter 51 place.c): on
+# an empty workspace a new window is centred in the work area; with the
+# key off mutter's find_first_fit tiles it from the corner instead.
+xdotool key super+Page_Down
+cstate ". as \$s | .active_workspace != $mt_home and ([.windows[] | select(.workspace == \$s.active_workspace)] | length) == 0" "empty workspace" ||
+    fail G-CENTER-NEW-WINDOWS "Super+Page_Down did not reach an empty workspace"
+for mt_center in true false; do
+    gsettings set org.gnome.mutter center-new-windows "$mt_center"
+    cstate ".multitasking.center_new_windows == $mt_center" "center-new-windows=$mt_center" ||
+        fail G-CENTER-NEW-WINDOWS "center-new-windows=$mt_center never reached the compositor"
+    WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
+        Delta "#9141ac" >"$ARTIFACTS/window-Delta-$mt_center.log" 2>&1 &
+    mt_delta_pid=$!
+    cstate ". as \$s | .focused_app_id == \"tuna-test-delta\" and any(.windows[]; .app_id == \"tuna-test-delta\" and .workspace == \$s.active_workspace and .rect[2] > 0) and ([.windows[] | select(.workspace == \$s.active_workspace)] | length) == 1" "delta mapped" ||
+        fail G-CENTER-NEW-WINDOWS "the new window never mapped on the empty workspace"
+    sleep 1
+    read -r dx dy dw dh <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-delta") | .rect | "\(.[0]) \(.[1]) \(.[2]) \(.[3])"' "$CSTATE")
+EOF2
+    work_h=$((HEIGHT - 32))
+    if [ "$mt_center" = true ]; then
+        want_x=$(((WIDTH - dw) / 2)); want_y=$((32 + (work_h - dh) / 2))
+    else
+        want_x=$(((WIDTH % (dw + 1)) / 2)); want_y=$((32 + (work_h % (dh + 1)) / 3))
+    fi
+    cp "$CSTATE" "$ARTIFACTS/center-new-windows-$mt_center.json"
+    scrot "$ARTIFACTS/08f-center-new-windows-$mt_center.png" >/dev/null
+    [ "$dx" = "$want_x" ] && [ "$dy" = "$want_y" ] ||
+        fail G-CENTER-NEW-WINDOWS "center-new-windows=$mt_center placed ${dw}x$dh at $dx,$dy, not mutter's $want_x,$want_y"
+    kill "$mt_delta_pid"
+    wait "$mt_delta_pid" 2>/dev/null || true
+    cstate 'all(.windows[]; .app_id != "tuna-test-delta")' "delta gone" ||
+        fail G-CENTER-NEW-WINDOWS "the test window did not close"
+done
+gsettings reset org.gnome.mutter center-new-windows
+xdotool key super+Page_Up
+cstate ".active_workspace == $mt_home" "home after placement" ||
+    fail G-CENTER-NEW-WINDOWS "could not return to the home workspace"
+pass G-CENTER-NEW-WINDOWS "new windows are centred with center-new-windows and take mutter's first fit without it"
 for key in cycle-group cycle-group-backward cycle-windows cycle-windows-backward switch-windows switch-windows-backward; do
     gsettings reset org.gnome.desktop.wm.keybindings "$key"
 done

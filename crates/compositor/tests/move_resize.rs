@@ -844,3 +844,49 @@ fn stationary_pointer_press_enters_a_newly_mapped_window_before_delivery() {
         "release remains paired with its delivered press"
     );
 }
+
+/// `edge-tiling` off (mutter 51 `meta-window-drag.c` only tiles under
+/// `meta_prefs_get_edge_tiling`): the left edge shows no preview and the
+/// release leaves the window floating where it was dropped; the top edge
+/// does not maximize either.
+#[test]
+fn edge_tiling_off_shows_no_preview_and_drops_floating() {
+    let mut f = fixture();
+    f.manager.apply_workspace_policy(
+        &mut f.comp.state,
+        tuna_shell_control::WorkspacePolicy {
+            edge_tiling: false,
+            ..Default::default()
+        },
+    );
+    let start = geometry(&f);
+    let at = press_inside(&mut f);
+    f.toplevel
+        ._move(f.client.seat.as_ref().unwrap(), f.client.press_serial);
+    sync(&mut f);
+    f.manager
+        .pointer_motion(&mut f.comp.state, Point::from((1.0, at.y + 100.0)), 3);
+    assert_eq!(
+        f.manager.tile_preview(&f.comp.state),
+        None,
+        "no left preview"
+    );
+    f.manager
+        .pointer_motion(&mut f.comp.state, Point::from((640.0, 1.0)), 4);
+    assert_eq!(
+        f.manager.tile_preview(&f.comp.state),
+        None,
+        "no top preview"
+    );
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 5);
+    assert_eq!(
+        f.manager.window_layout(id(&f)),
+        Some(WindowLayout::Floating)
+    );
+    assert_eq!(
+        geometry(&f).size,
+        start.size,
+        "dropped at its floating size"
+    );
+}

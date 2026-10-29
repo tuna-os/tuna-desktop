@@ -2408,6 +2408,16 @@ impl Runtime {
         });
         // Overdraw per output for the last drawn frame (#503).
         doc["workspaces"] = serde_json::json!(model.workspaces());
+        // GNOME's Multitasking preferences as the compositor applies them
+        // (P-WM-08), so nested proofs wait for delivery, not a sleep.
+        let policy = &self.input_settings.workspace_policy;
+        doc["multitasking"] = serde_json::json!({
+            "dynamic_workspaces": policy.dynamic,
+            "num_workspaces": policy.fixed_count,
+            "workspaces_only_on_primary": policy.only_on_primary,
+            "edge_tiling": policy.edge_tiling,
+            "center_new_windows": self.input_settings.center_new_windows,
+        });
         // Bottom-to-top stacking and GNOME's live focus policy (P-WM-09).
         doc["stacking"] = serde_json::json!(self.manager.stacking_order());
         let focus_policy = self.manager.focus_policy();
@@ -3832,6 +3842,8 @@ impl Runtime {
         self.state.protocols.bell.set_policy(settings.bell.clone());
         self.manager
             .apply_workspace_policy(&mut self.state, settings.workspace_policy);
+        self.manager
+            .set_window_placement(settings.center_new_windows, settings.right_to_left);
         // Release delayed/synthetic input under the OLD map. An unrelated
         // preference change must not reinstall the map or lose held state.
         if aids::keymap_changed(&self.input_settings, &settings) {
