@@ -308,8 +308,9 @@ at_most "$show_delay" 2.0 || fail G-OSK-SHOW "the keyboard took ${show_delay}s t
 osk_settled G-OSK-SHOW
 # shellcheck disable=SC2046
 set -- $(osk_rect); KX=$1 KY=$2 KW=$3 KH=$4
-[ "$KW" -eq "$WIDTH" ] && [ $((KY + KH)) -eq "$HEIGHT" ] ||
+if [ "$KW" -ne "$WIDTH" ] || [ $((KY + KH)) -ne "$HEIGHT" ]; then
     fail G-OSK-SHOW "keyboard layer $KX $KY $KW $KH is not across the bottom of the output"
+fi
 cstate '.focused_app_id == "tuna-osk-probe"' 5 || fail G-OSK-SHOW "showing the keyboard took the probe's focus"
 [ "$(focus_of)" = b ] || fail G-OSK-SHOW "the probe's focus is $(focus_of), not entry b"
 # Focus moving between entries goes out and back in: the 50 ms panel
@@ -406,8 +407,9 @@ unlock_t="$(jq -rs --argjson l "$lock_t" 'map(select(.t > $l and .locked == fals
     fail G-OSK-LOCK "the session keyboard mapped while locked: $(cat "$ARTIFACTS/lock-session.txt")"
 leaked="$(jq -rs --argjson a "$lock_t" --argjson b "$unlock_t" '[.[] | select(.text and .t >= $a and .t <= $b)] | length' "$PROBE_LOG")"
 [ "$leaked" -eq 0 ] || fail G-OSK-LOCK "$leaked entry changes reached the session client while locked"
-[ "$(text_of a)" = "$text_a" ] && [ "$(text_of b)" = "$text_b" ] ||
+if [ "$(text_of a)" != "$text_a" ] || [ "$(text_of b)" != "$text_b" ]; then
     fail G-OSK-LOCK "the session entries changed across the lock: '$(text_of a)' '$(text_of b)'"
+fi
 pass G-OSK-LOCK "locked: session keyboard hidden and never mapped; the lock keyboard's 8 taps and Enter unlocked through PAM; the session entries still read '$text_a' '$text_b'"
 
 cp "$CSTATE" "$ARTIFACTS/final-state.json"
