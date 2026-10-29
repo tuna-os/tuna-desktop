@@ -816,6 +816,11 @@ pub fn control_socket_path(socket_name: &str) -> Option<std::path::PathBuf> {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        // Before anything else tears down: the session-owned screen reader
+        // must go while its session and AT-SPI buses still exist (#836).
+        // Every exit path drops the runtime, including SIGTERM from logind's
+        // session stop or the supervisor.
+        self.orca.shutdown();
         if let Some(worker) = &self.unlock_worker {
             worker.cancel.cancel();
         }

@@ -4081,6 +4081,51 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(self.transport(json.dumps({"inventory_error": record, "extra": "private"}))[0], generic)
         self.assertEqual(self.transport(json.dumps({"inventory_error": record}), **{"out-truncated": True})[0], generic)
         self.assertEqual(self.transport("private " * 600)[0], generic)
+class OrcaLogoutRetirement(unittest.TestCase):
+    """#836: the compositor's session-end receipt for its own Orca group."""
+    RECEIPT = ("tuna-compositor: screen reader retired pid=21699 terminated=true "
+               "exited_in_grace=false reaped=true elapsed_ms=2004")
+
+    def test_compositor_format_matches_the_lane_receipt(self):
+        source = (Path(__file__).resolve().parents[2] / "crates/compositor/src/orca.rs").read_text()
+        self.assertIn('"tuna-compositor: screen reader retired pid={pid} terminated={} exited_in_grace={} '
+                      'reaped={reaped} elapsed_ms={}"', source)
+        runtime = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
+        teardown = runtime[runtime.index("impl Drop for Runtime"):]
+        body = teardown[teardown.index("fn drop(&mut self) {") + len("fn drop(&mut self) {"):]
+        # The reader goes first, before any other teardown work.
+        self.assertEqual([line.strip() for line in body.splitlines()
+                          if line.strip() and not line.strip().startswith("//")][0], "self.orca.shutdown();")
+
+    def test_exact_reaped_receipt_for_the_original_reader(self):
+        trace = "\n".join(["[ 535.1] tuna-vm-session[912]: tuna-compositor: modifier super keycode=125 pressed=false",
+                           "[ 537.1] tuna-vm-session[912]: " + self.RECEIPT])
+        self.assertEqual(lane.orca_logout_retirement(trace, 21699),
+                         {"pid": 21699, "terminated": True, "exited_in_grace": False,
+                          "reaped": True, "elapsed_ms": 2004})
+        sheared = ("[ 537.1] tuna-vm-session[912]: tuna-compositor: screen reader retired pid=21699 terminated=\n"
+                   "[ 537.1] tuna-vm-session[1164]: tuna-shell-gtk: unrelated\n"
+                   "[ 537.1] tuna-vm-session[912]: true exited_in_grace=false reaped=true elapsed_ms=2004")
+        self.assertEqual(lane.orca_logout_retirement(sheared, 21699)["elapsed_ms"], 2004)
+
+    def test_missing_unreaped_foreign_duplicate_or_malformed_receipt_refused(self):
+        line = "[ 537.1] tuna-vm-session[912]: "
+        for trace in ["", line + self.RECEIPT.replace("reaped=true", "reaped=false"),
+                      line + self.RECEIPT.replace("pid=21699", "pid=21700"),
+                      line + self.RECEIPT + "\n" + line + self.RECEIPT,
+                      line + self.RECEIPT + " extra",
+                      line + self.RECEIPT.replace("terminated=true", "terminated=yes"),
+                      "[ 537.1] other[912]: " + self.RECEIPT]:
+            with self.subTest(trace=trace):
+                self.assertIsNone(lane.orca_logout_retirement(trace, 21699))
+
+    def test_gate_waits_for_receipt_before_and_keeps_v_orca_logout_unchanged(self):
+        source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
+        reap = source.index('record("V-ORCA-LOGOUT-REAP"')
+        departed = source.index('closed_orca = agent.run("orca-departed"')
+        self.assertLess(reap, departed)
+        self.assertIn('record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],',
+                      source)
 
 
 if __name__ == "__main__":
