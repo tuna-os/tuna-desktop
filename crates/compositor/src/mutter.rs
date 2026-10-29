@@ -184,6 +184,12 @@ pub enum ToLoop {
         present: bool,
         orientation: Option<crate::orientation::SensorOrientation>,
     },
+    /// GNOME Settings Daemon wrote `PowerSaveMode` (#355). The loop
+    /// applies it to the outputs and replies once it is published.
+    PowerSave {
+        mode: i32,
+        reply: std::sync::mpsc::Sender<()>,
+    },
 }
 
 /// GNOME's backend requests this ordinary Wayland connection before owning
@@ -334,6 +340,7 @@ struct DisplayConfig {
     outputs: Outputs,
     to_loop: calloop::channel::Sender<ToLoop>,
     orientation: std::sync::Arc<crate::orientation::OrientationShare>,
+    power_save: std::sync::Arc<crate::power_save::PowerSaveShare>,
 }
 
 /// g-s-d's Night Light properties (#339), served from the compositor
@@ -674,9 +681,29 @@ impl DisplayConfig {
         true
     }
 
+    /// The applied display power-save mode (#355): 0 on, 1 standby,
+    /// 2 suspend, 3 off, -1 unknown.
     #[zbus(property)]
     fn power_save_mode(&self) -> i32 {
-        0
+        self.power_save.mode()
+    }
+
+    /// gnome-settings-daemon blanks with 3 and unblanks with 0. The loop
+    /// owns the outputs; the write completes once it applied the mode, so
+    /// the PropertiesChanged that follows carries the applied value.
+    /// Mutter ignores -1 (`power_save_mode_changed`).
+    #[zbus(property)]
+    fn set_power_save_mode(&self, mode: i32) -> fdo::Result<()> {
+        if mode == crate::power_save::UNSUPPORTED {
+            return Ok(());
+        }
+        let (reply, applied) = std::sync::mpsc::channel();
+        self.to_loop
+            .send(ToLoop::PowerSave { mode, reply })
+            .map_err(|_| fdo::Error::Failed("compositor gone".into()))?;
+        applied
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|_| fdo::Error::Failed("power save mode not applied".into()))
     }
 
     #[zbus(property)]
@@ -1144,6 +1171,7 @@ pub fn start(
     display: smithay::reexports::wayland_server::DisplayHandle,
     orientation: std::sync::Arc<crate::orientation::OrientationShare>,
     night_light: std::sync::Arc<crate::night_light::NightLightShare>,
+    power_save: std::sync::Arc<crate::power_save::PowerSaveShare>,
 ) -> calloop::channel::Channel<ToLoop> {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _ = std::thread::Builder::new()
@@ -1153,6 +1181,7 @@ pub fn start(
                 outputs: outputs.clone(),
                 to_loop: to_loop.clone(),
                 orientation: orientation.clone(),
+                power_save: power_save.clone(),
             };
             // Accelerometer for sensor-driven orientation (#345): polled
             // with the admission scan, reported to the loop on change.
@@ -1291,7 +1320,10 @@ pub fn start(
                         sessions.retain(|(s, _)| s.id != session.id);
                     }
                 }
-                if let Some(sample) = sensor.poll(orientation.is_inhibited()) {
+                // Mutter inhibits orientation tracking while the display
+                // power-save mode is not on (#355).
+                if let Some(sample) = sensor.poll(orientation.is_inhibited() || !power_save.is_on())
+                {
                     let _ = to_loop.send(ToLoop::SensorSample {
                         present: sample.present,
                         orientation: sample.orientation,
@@ -1523,5 +1555,164 @@ mod tests {
         // An area overhanging the logical edge clips to the buffer.
         let (_, area) = area_on_output(&outputs, (1000, 1900, 200, 100)).unwrap();
         assert_eq!(area, (0, 1000, 20, 80));
+    }
+
+    /// The real D-Bus surface gnome-settings-daemon drives (#355): Set
+    /// reaches the loop, Get and PropertiesChanged carry the applied
+    /// mode, and -1 is ignored as Mutter's `power_save_mode_changed` does.
+    #[test]
+    fn power_save_mode_round_trips_over_a_private_bus() {
+        use crate::power_save::{PowerSave, PowerSaveShare, Transition};
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, Command, Stdio};
+        use std::time::Duration;
+
+        struct Bus(Child);
+        impl Drop for Bus {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut daemon = Bus(Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("private test bus starts"));
+        let mut address = String::new();
+        BufReader::new(daemon.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let connect = |builder: zbus::blocking::connection::Builder<'static>| {
+            builder
+                .method_timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+        };
+
+        // The loop side: apply each write and publish what was applied.
+        let (to_loop, from_dbus) = calloop::channel::channel();
+        let share = Arc::new(PowerSaveShare::default());
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let event_loop_thread = std::thread::spawn({
+            let share = share.clone();
+            let transitions = transitions.clone();
+            let stop = stop.clone();
+            move || {
+                let mut event_loop: calloop::EventLoop<PowerSave> =
+                    calloop::EventLoop::try_new().unwrap();
+                event_loop
+                    .handle()
+                    .insert_source(from_dbus, move |event, _, state: &mut PowerSave| {
+                        if let calloop::channel::Event::Msg(ToLoop::PowerSave { mode, reply }) =
+                            event
+                        {
+                            let transition = state.request(mode);
+                            share.publish(state.mode());
+                            transitions.lock().unwrap().push(transition);
+                            reply.send(()).unwrap();
+                        }
+                    })
+                    .unwrap();
+                let mut state = PowerSave::default();
+                while !stop.load(Ordering::SeqCst) {
+                    event_loop
+                        .dispatch(Some(Duration::from_millis(20)), &mut state)
+                        .unwrap();
+                }
+            }
+        });
+
+        let display_config = DisplayConfig {
+            outputs: Default::default(),
+            to_loop,
+            orientation: Default::default(),
+            power_save: share.clone(),
+        };
+        let _server = connect(
+            zbus::blocking::connection::Builder::address(address.trim())
+                .unwrap()
+                .serve_at("/org/gnome/Mutter/DisplayConfig", display_config)
+                .unwrap()
+                .name("org.gnome.Mutter.DisplayConfig")
+                .unwrap(),
+        );
+        let client = connect(zbus::blocking::connection::Builder::address(address.trim()).unwrap());
+        let properties = zbus::blocking::fdo::PropertiesProxy::builder(&client)
+            .destination("org.gnome.Mutter.DisplayConfig")
+            .unwrap()
+            .path("/org/gnome/Mutter/DisplayConfig")
+            .unwrap()
+            .build()
+            .unwrap();
+        let interface =
+            zbus::names::InterfaceName::from_static_str("org.gnome.Mutter.DisplayConfig").unwrap();
+
+        // Mutter's introspection: a read-write int32.
+        let xml: String = client
+            .call_method(
+                Some("org.gnome.Mutter.DisplayConfig"),
+                "/org/gnome/Mutter/DisplayConfig",
+                Some("org.freedesktop.DBus.Introspectable"),
+                "Introspect",
+                &(),
+            )
+            .unwrap()
+            .body()
+            .deserialize()
+            .unwrap();
+        assert!(
+            xml.contains(r#"<property name="PowerSaveMode" type="i" access="readwrite"/>"#),
+            "{xml}"
+        );
+
+        let (changed_tx, changed) = std::sync::mpsc::channel();
+        let signals = properties.receive_properties_changed().unwrap();
+        std::thread::spawn(move || {
+            for signal in signals {
+                let args = signal.args().unwrap();
+                if let Some(value) = args.changed_properties().get("PowerSaveMode") {
+                    let mode = i32::try_from(value).unwrap();
+                    if changed_tx.send(mode).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let get =
+            || i32::try_from(properties.get(interface.clone(), "PowerSaveMode").unwrap()).unwrap();
+        let set = |mode: i32| {
+            properties
+                .set(interface.clone(), "PowerSaveMode", mode.into())
+                .unwrap()
+        };
+        let signal = || changed.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(get(), 0, "Mutter starts on");
+        // gsd's disable_monitors.
+        set(3);
+        assert_eq!(get(), 3);
+        assert_eq!(signal(), 3);
+        // gsd's enable_monitors.
+        set(0);
+        assert_eq!(get(), 0);
+        assert_eq!(signal(), 0);
+        // Unknown never enters: the write changes nothing in the loop.
+        set(-1);
+        assert_eq!(get(), 0);
+        assert_eq!(signal(), 0);
+        assert_eq!(
+            *transitions.lock().unwrap(),
+            vec![
+                Transition::PowerOff {
+                    disable_outputs: true
+                },
+                Transition::PowerOn,
+            ]
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        event_loop_thread.join().unwrap();
     }
 }

@@ -61,10 +61,22 @@ shell owner PID/UID/start identity, requiring empty inventory, false capability,
 unsupported positive operations and successful harmless resets. Neither proves
 real panel luminance or physical logind permissions.
 
+Display power saving is the compositor's: DisplayConfig `PowerSaveMode`
+follows Mutter 51 (`crates/compositor/src/power_save.rs`). gsd's blank (3)
+stops scanout and turns every CRTC off on hardware; its unblank (0) repaints
+and modesets back; -1 is ignored. `G-POWER-SAVE-MODE` drives gsd 51's
+dim → blank → unblank → undim sequence in the nested proof: the dim lowers
+the controlled backlight, the blank stops frames while the pointer moves,
+the unblank repaints and the undim restores the exact user baseline.
+
 Issue #355 remains open for physical hardware, connector association on other
 backlight topologies, persistence across shell restart, cloned-monitor policy,
-ambient sensor integration, actual blank/display power-save, idle/suspend and
-battery/AC policy, external service and shipped-image qualification.
+ambient sensor integration, the hardware CRTC disable, a session
+gnome-settings-daemon power plugin (idle/suspend and battery/AC policy),
+external service and shipped-image qualification. Two adapter behaviors
+differ from GNOME Shell 51 and stay open: `idle-brightness` is followed live
+(GNOME reads it once when the shell starts) and positive operations fail
+without an associated backlight (GNOME accepts them).
 
 Primary contracts and formulas: GNOME Shell 51.0
 [`org.gnome.Shell.Brightness.xml`](https://github.com/GNOME/gnome-shell/blob/51.0/data/dbus-interfaces/org.gnome.Shell.Brightness.xml),
@@ -72,8 +84,14 @@ Primary contracts and formulas: GNOME Shell 51.0
 [`shellDBus.js`](https://github.com/GNOME/gnome-shell/blob/51.0/js/ui/shellDBus.js),
 GNOME Settings 51.0
 [`cc-power-panel.c`](https://github.com/GNOME/gnome-control-center/blob/51.0/panels/power/cc-power-panel.c),
-and GNOME Settings Daemon 51.0
-[`gsd-power-manager.c`](https://github.com/GNOME/gnome-settings-daemon/blob/51.0/plugins/power/gsd-power-manager.c).
+GNOME Settings Daemon 51.0
+[`gsd-power-manager.c`](https://github.com/GNOME/gnome-settings-daemon/blob/51.0/plugins/power/gsd-power-manager.c),
+and Mutter 51.0
+[`org.gnome.Mutter.DisplayConfig.xml`](https://github.com/GNOME/mutter/blob/51.0/data/dbus-interfaces/org.gnome.Mutter.DisplayConfig.xml),
+[`meta-monitor-manager.c`](https://github.com/GNOME/mutter/blob/51.0/src/backends/meta-monitor-manager.c),
+[`meta-monitor-manager-native.c`](https://github.com/GNOME/mutter/blob/51.0/src/backends/native/meta-monitor-manager-native.c)
+and
+[`meta-renderer-native.c`](https://github.com/GNOME/mutter/blob/51.0/src/backends/native/meta-renderer-native.c).
 
 Protocol: control protocol 0.37 appends `NativeOutputInventory` after the
 existing messages without changing `OutputInfo` or earlier indices. A peer
@@ -81,4 +99,4 @@ advertising a minor below 37 receives no native inventory and cannot derive
 exact native backlight capability. The shared `tuna-backlight` crate holds the
 bounded sysfs reads (inventory, scalar, readback, connector identity).
 The default requested-level sysfs readback is distinct from optional
-hardware-reported actual_brightness; no panel luminance or full power-save claim.
+hardware-reported actual_brightness; no panel luminance claim.

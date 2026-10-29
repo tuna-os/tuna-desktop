@@ -691,6 +691,13 @@ pub struct Runtime {
     /// Flags shared with the Mutter D-Bus thread (managed property,
     /// sensor inhibition).
     orientation_share: std::sync::Arc<crate::orientation::OrientationShare>,
+    /// DisplayConfig `PowerSaveMode` applied to the outputs (#355), and
+    /// its copy for the Mutter D-Bus thread.
+    power_save: crate::power_save::PowerSave,
+    power_save_share: std::sync::Arc<crate::power_save::PowerSaveShare>,
+    /// The last dummy page flip while powered off
+    /// ([`FRAME_INTERVAL`](crate::power_save::FRAME_INTERVAL)).
+    power_save_beat: Option<Instant>,
     /// Night Light evaluation: settings, schedule, smear (#339).
     /// The controller also owns the live state shared with the D-Bus
     /// thread (active, temperature, "disabled until tomorrow").
@@ -1104,6 +1111,8 @@ impl Runtime {
             Default::default();
         let night_light_share: std::sync::Arc<crate::night_light::NightLightShare> =
             Default::default();
+        let power_save_share: std::sync::Arc<crate::power_save::PowerSaveShare> =
+            Default::default();
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
@@ -1117,6 +1126,7 @@ impl Runtime {
                     display.handle(),
                     orientation_share.clone(),
                     night_light_share.clone(),
+                    power_save_share.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1299,6 +1309,9 @@ impl Runtime {
             cast_outputs,
             orientation: Default::default(),
             orientation_share,
+            power_save: Default::default(),
+            power_save_share,
+            power_save_beat: None,
             night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
             manual_transforms: Default::default(),
             capture_authority,
@@ -2266,6 +2279,7 @@ impl Runtime {
             "x11_ready": x11_ready,
             "idle_timeout_ms": self.lock.timeout_ms(),
             "idle_blank_alpha": self.blank_alpha(),
+            "power_save_mode": self.power_save.mode(),
             "overview_search": self.overview_search,
             "overview_app_grid": self.overview_app_grid,
             "keyboard": keyboard,
@@ -3697,7 +3711,43 @@ impl Runtime {
                     }
                 }
             }
+            crate::mutter::ToLoop::PowerSave { mode, reply } => {
+                self.set_power_save_mode(mode);
+                let _ = reply.send(());
+            }
         }
+    }
+
+    /// Apply a DisplayConfig `PowerSaveMode` write (#355), as Mutter's
+    /// monitor manager does: off stops scanout (and on hardware turns
+    /// every CRTC off); on repaints every output in full, which modesets
+    /// them back.
+    fn set_power_save_mode(&mut self, mode: i32) {
+        let transition = self.power_save.request(mode);
+        self.power_save_share.publish(self.power_save.mode());
+        match transition {
+            crate::power_save::Transition::Unchanged => return,
+            crate::power_save::Transition::PowerOff { disable_outputs } => {
+                eprintln!("tuna-compositor: display power save mode {mode}");
+                self.power_save_beat = None;
+                #[cfg(feature = "drm")]
+                if let Backend::Drm(drm) = &mut self.backend {
+                    drm.power_off(disable_outputs);
+                }
+                #[cfg(not(feature = "drm"))]
+                let _ = disable_outputs;
+            }
+            crate::power_save::Transition::PowerOn => {
+                eprintln!("tuna-compositor: display power save mode {mode}");
+                #[cfg(feature = "drm")]
+                if let Backend::Drm(drm) = &mut self.backend {
+                    drm.power_on();
+                }
+                self.winit_tracker = None;
+                self.winit_signature = None;
+            }
+        }
+        self.active_at = Instant::now();
     }
 
     /// Private shell feedback remains inside the currently mapped screenshot
@@ -4173,6 +4223,11 @@ impl Runtime {
         if self.hidden_waiting {
             due(self.hidden_beat.map_or(Duration::ZERO, |last| {
                 (last + crate::occlusion::HIDDEN_FRAME_INTERVAL).saturating_duration_since(now)
+            }));
+        }
+        if self.power_save_waiting() {
+            due(self.power_save_beat.map_or(Duration::ZERO, |last| {
+                (last + crate::power_save::FRAME_INTERVAL).saturating_duration_since(now)
             }));
         }
         if let Some(ms) = self.shell_retry_ms {
@@ -4865,6 +4920,15 @@ impl Runtime {
             &self.state,
             &hidden_surfaces(&self.manager, &self.frame_costs, clones_shown),
         );
+        // DisplayConfig PowerSaveMode (#355): the scene advanced above as
+        // Mutter's stage does, but nothing is scanned out; frames complete
+        // on the slow dummy page flip instead.
+        if !self.power_save.is_on() {
+            #[cfg(feature = "drm")]
+            self.performance_trace.cancel();
+            self.power_save_frame_beat();
+            return Ok(());
+        }
         let queued = match &mut self.backend {
             Backend::Winit(backend) => {
                 backend.window().set_cursor_visible(false);
@@ -5450,6 +5514,39 @@ impl Runtime {
         }
         self.hidden_beat = Some(now);
         self.hidden_waiting = false;
+    }
+
+    /// While the display power-save mode is not on (#355), complete frames
+    /// on Mutter's dummy page flip: every surface's frame callbacks, fifo
+    /// barriers and commit timers at most once per
+    /// [`FRAME_INTERVAL`](crate::power_save::FRAME_INTERVAL). Hidden windows
+    /// are served by this beat too.
+    fn power_save_frame_beat(&mut self) {
+        self.hidden_waiting = false;
+        let now = Instant::now();
+        if self.power_save_beat.is_some_and(|last| {
+            now.saturating_duration_since(last) < crate::power_save::FRAME_INTERVAL
+        }) {
+            return;
+        }
+        let Some(output) = self.state.primary_output() else {
+            return;
+        };
+        send_frame_callbacks(&self.state, &self.manager, &[]);
+        let roots = crate::frame_timing::frame_roots(&self.state, &self.manager);
+        let time = self.state.presentation_now();
+        self.state
+            .refresh_cycle(&roots, time, crate::frame_timing::refresh_of(&output));
+        self.power_save_beat = Some(now);
+    }
+
+    /// Whether a surface waits on the next power-save beat.
+    fn power_save_waiting(&self) -> bool {
+        !self.power_save.is_on()
+            && crate::frame_timing::pending_callbacks(&crate::frame_timing::frame_roots(
+                &self.state,
+                &self.manager,
+            ))
     }
 }
 

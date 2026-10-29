@@ -101,6 +101,7 @@ pub mod pam_helper;
 mod performance_trace;
 pub mod pointer_aids;
 pub mod popup;
+pub mod power_save;
 pub mod protocols;
 pub mod runtime;
 mod runtime_signal;
