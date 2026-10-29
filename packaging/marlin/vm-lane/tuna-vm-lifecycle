@@ -1321,7 +1321,8 @@ def strip_client(action, nonce):
         raise RuntimeError("native compositor/shell identity changed since original fixture admission")
     summary = strip_json(STATE, OWNER.pw_uid)
     current["state"].update({key: summary.get(key) for key in
-                           ("session_mode", "strip_offset", "strip_view", "strip_animating", "rendered_frames", "tile_preview")})
+                           ("session_mode", "strip_offset", "strip_view", "strip_animating", "rendered_frames", "tile_preview",
+                            "seat_pressed_key_count")})
     # Native window->PID kernel credentials are not in the current summary.
     # Nonce app IDs/new-map sets are checked by the host; never fabricate that join.
     return {"owner": owner, "fixture": fixture, "inventory": current,

@@ -4397,6 +4397,107 @@ fn strip_super_drag_second_button_preserves_initiator_and_balanced_client_events
     assert!(f.client_c.pointer_buttons.is_empty());
 }
 
+/// Column ids of the active strip, left to right by canonical position.
+fn strip_column_order(f: &ThreeFixture) -> Vec<u64> {
+    let mut columns =
+        [f.id_a, f.id_b, f.id_c].map(|id| (f.manager.geometry(id).unwrap().loc.x, id));
+    columns.sort();
+    columns.into_iter().map(|(_, id)| id).collect()
+}
+
+#[test]
+fn strip_pointer_resize_clamps_width_and_escape_restores_preset() {
+    use tuna_compositor::windows::MIN_WINDOW_SIZE;
+    let mut f = three_windows();
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let before = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    let offset = f.manager.strip_offset();
+    let work_w = f.comp.state.primary_size().w;
+    let pos = start_strip_resize(&mut f, false);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x - 5000.0, pos.y).into(), 22);
+    assert_eq!(
+        f.manager.geometry(f.id_a).unwrap().size.w,
+        MIN_WINDOW_SIZE.0,
+        "shrinking past the minimum stops at the interactive minimum"
+    );
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 1e6, pos.y).into(), 23);
+    let widest = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!(widest.size.w, work_w * 4, "growth stops at the strip bound");
+    assert_eq!(widest.size.h, before[0].size.h);
+    assert_eq!(
+        f.manager.geometry(f.id_b).unwrap().loc.x,
+        widest.loc.x + widest.size.w + 16,
+        "the neighbor follows the clamped edge one gap away"
+    );
+    press(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    assert!(!f.manager.grab_active());
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        before,
+        "cancel restores the preset width and every neighbor"
+    );
+    assert_eq!(f.manager.strip_offset(), offset);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 24);
+    release(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    // The restored column still cycles presets from its preset slot.
+    press(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    press(&mut f.manager, &mut f.comp, R_KEYCODE);
+    assert!(f.manager.geometry(f.id_a).unwrap().size.w > before[0].size.w);
+    release(&mut f.manager, &mut f.comp, R_KEYCODE);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+}
+
+#[test]
+fn strip_pointer_width_and_order_survive_layout_round_trip() {
+    let mut f = three_windows();
+    let floating = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let preset_width = f.manager.geometry(f.id_a).unwrap().size.w;
+    let pos = start_strip_resize(&mut f, false);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 61.0, pos.y).into(), 22);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 23);
+    assert!(!f.manager.grab_active());
+    let resized = f.manager.geometry(f.id_a).unwrap().size.w;
+    assert_eq!(resized, preset_width + 61);
+    let before_drag = strip_column_order(&f);
+    let id_a = f.id_a;
+    let pos = start_strip_drag(&mut f, id_a);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 750.0, pos.y).into(), 24);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 25);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    let dropped = strip_column_order(&f);
+    assert_ne!(dropped, before_drag, "the pointer drop reordered the strip");
+    assert!(f.manager.geometry(f.id_a).unwrap().loc.x > f.manager.geometry(f.id_b).unwrap().loc.x);
+    assert_eq!(f.manager.geometry(f.id_a).unwrap().size.w, resized);
+
+    f.manager.set_scroll(&mut f.comp.state, false);
+    assert_eq!(
+        [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap()),
+        floating,
+        "leaving the strip restores every floating rectangle"
+    );
+    f.manager.set_scroll(&mut f.comp.state, true);
+    assert_eq!(
+        strip_column_order(&f),
+        dropped,
+        "re-entering keeps the dropped column order"
+    );
+    assert_eq!(
+        f.manager.geometry(f.id_a).unwrap().size.w,
+        resized,
+        "re-entering keeps the pointer-set column width"
+    );
+}
+
 #[test]
 fn strip_parent_drag_adopts_newly_mapped_modal_child_and_survives_child_unmap() {
     let mut f = three_windows();
