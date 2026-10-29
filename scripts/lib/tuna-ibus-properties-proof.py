@@ -155,6 +155,23 @@ def owned_application(roots, pid, bus_pid):
     raise RuntimeError(f"GTK accessible application not unique ({len(found)} live)")
 
 
+def child_failure(error, app_bus, pid, bus_pid):
+    """atspi_child's reply for what its read raised.
+
+    PyGObject's GLib.Error is a RuntimeError, so one `except RuntimeError`
+    sees both. libatspi's own disposal of the application under the walk
+    (application_gone; gtk-shell 123371830361 met it in matching right after
+    a property press) is transient only while the bus still binds the
+    application's name to `pid`, as owned_application decides; every other
+    error, the application's or the bus's included, fails.
+    """
+    if (isinstance(error, GLib.Error) and application_gone(error)
+            and app_bus is not None and bus_pid(app_bus) == pid):
+        return {"transient": f"libatspi disposed the live GTK application {app_bus} during the walk"}
+    return {"error": str(error)}
+
+
+
 def atspi_child(pid, op, name, role):
     """One fresh-process AT-SPI query or press against the owned GTK app.
 
@@ -178,6 +195,7 @@ def atspi_child(pid, op, name, role):
                 Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
         except GLib.Error:
             return None
+    app_bus = None
     try:
         desktop = Atspi.get_desktop(0)
         roots = []
@@ -216,9 +234,7 @@ def atspi_child(pid, op, name, role):
     except Transient as error:
         return {"transient": str(error)}
     except RuntimeError as error:
-        return {"error": str(error)}
-    except GLib.Error as error:
-        return {"transient": error.message}
+        return child_failure(error, app_bus, pid, bus_pid)
 
 
 def atspi(pid, op, name, role=None):

@@ -10,7 +10,7 @@ SOURCE = ROOT / "scripts/lib/tuna-ibus-properties-proof.py"
 module = ast.parse(SOURCE.read_text(), filename=str(SOURCE))
 selected = [n for n in module.body if (isinstance(n, ast.FunctionDef)
             and n.name in {"validate_traffic", "live", "walk", "matching",
-                           "application_gone", "owned_application"})
+                           "application_gone", "owned_application", "child_failure"})
             or (isinstance(n, ast.ClassDef) and n.name == "Transient")
             or (isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "INDICATOR" for t in n.targets))]
 
@@ -21,7 +21,8 @@ class Atspi:
 
 
 class GLib:
-    class Error(Exception):
+    # As PyGObject's: GLib.Error is a RuntimeError.
+    class Error(RuntimeError):
         def __init__(self, message="", domain="", code=-1):
             super().__init__(message)
             self.message, self.domain, self.code = message, domain, code
@@ -110,6 +111,43 @@ class Controls(unittest.TestCase):
             owned([(":1.3", other)], 42, {}.get)
         with self.assertRaisesRegex(RuntimeError, r"not unique \(2 live\)"):
             owned([(":1.0", shell), (":1.9", Root(42))], 42, {}.get)
+
+    def test_a_disposal_under_the_walk_is_transient_only_while_the_bus_binds_the_shell(self):
+        # gtk-shell 123371830361: libatspi disposed the shell's application
+        # while matching walked it after a press; the GLib.Error fell into
+        # `except RuntimeError` and failed the proof instead of rereading.
+        self.assertTrue(issubclass(GLib.Error, RuntimeError))
+        failure = namespace["child_failure"]
+        gone = GLib.Error("The application no longer exists", "atspi_error", 0)
+        reply = failure(gone, ":1.0", 42, {":1.0": 42}.get)
+        self.assertEqual(list(reply), ["transient"])
+        # The bus no longer binds the name to the shell, or no application
+        # was resolved yet: a real failure.
+        for app_bus, bus_pid in ((":1.0", {}.get), (":1.0", {":1.0": 7}.get), (None, {":1.0": 42}.get)):
+            with self.subTest(app_bus=app_bus):
+                self.assertEqual(failure(gone, app_bus, 42, bus_pid),
+                                 {"error": "The application no longer exists"})
+        # Errors the application or the bus sent back, and every other
+        # RuntimeError, still fail.
+        for error in (GLib.Error("No such interface", "atspi_error", 1),
+                      GLib.Error("Disconnected", "g-dbus-error-quark", 0),
+                      RuntimeError("GTK accessible application not unique (0 live)"),
+                      RuntimeError("accessible depth limit")):
+            with self.subTest(error=str(error)):
+                self.assertEqual(list(failure(error, ":1.0", 42, {":1.0": 42}.get)), ["error"])
+
+    def test_the_child_classifies_glib_errors_through_child_failure(self):
+        functions = {n.name: n for n in module.body if isinstance(n, ast.FunctionDef)}
+        # A `GLib.Error` handler after a `RuntimeError` one of the same try
+        # is unreachable.
+        for statement in ast.walk(functions["atspi_child"]):
+            if isinstance(statement, ast.Try):
+                caught = [ast.unparse(h.type) for h in statement.handlers if h.type is not None]
+                if "RuntimeError" in caught:
+                    self.assertNotIn("GLib.Error", caught[caught.index("RuntimeError"):])
+        source = SOURCE.read_text()
+        self.assertIn("return child_failure(error, app_bus, pid, bus_pid)",
+                      ast.get_source_segment(source, functions["atspi_child"]))
 
     def test_indicator_selects_the_showing_inner_toggle_of_the_menu_button(self):
         class Node:
