@@ -401,6 +401,23 @@ fn raw_negative_cases() {
                 }
             }
         }
+        if matches!(mode, "oversized-header" | "wrong-uid") {
+            // The helper rejects on its own. Its conversation EOF must mean the
+            // process has finished exiting (descriptor table already released),
+            // never an early close while exit work still runs: Supervisor kills
+            // the group on EOF, which would cut that work short (an instrumented
+            // build writes its coverage profile there).
+            let error = raw_read(&mut output, &mut [0], transport_deadline).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            let open: Vec<_> = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+                .expect("unreaped helper keeps its /proc entry")
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(
+                open.is_empty(),
+                "{mode}: helper closed its conversation before exiting: {open:?}"
+            );
+        }
         drop(input);
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {
