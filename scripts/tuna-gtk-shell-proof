@@ -49,6 +49,8 @@
 #   G-NOTIFY-EXPIRE  the banner waits for an away user, then goes 2 s after input
 #   G-NOTIFY-LIST    the calendar lists it instead of "No Notifications"
 #   G-NOTIFY-CLEAR   Clear empties the list
+#   G-NOTIFY-SEND    GetServerInformation answers; real notify-send shows a banner
+#   G-NOTIFY-BLOCKED the banner hides while the date menu is open
 #   G-NOTIFY-DND     with Do Not Disturb on, no banner, but listed
 #   G-NOTIFY-GROUP   two from one app group, collapsed; pressing expands
 #   G-NOTIFY-POLICY  per-app policy (#348): first notify registers the app,
@@ -72,6 +74,8 @@
 #   G-QS-BLUETOOTH   the Bluetooth tile powers the BlueZ adapter off
 #   G-QS-POWER       the Power Mode tile switches to power saver
 #   G-QS-DARK        the Dark Style tile writes GNOME's color-scheme key
+#   G-QS-EXTERNAL-SYNC  Dark Style / Night Light follow keys written by gsettings
+#   G-QS-DIM-OPAQUE  an open toggle menu dims the grid; the panel stays opaque
 #   G-QS-BRIGHTNESS  the brightness slider sets the backlight via logind
 #   G-QS-VOLUME      the volume slider sets the PipeWire sink volume
 #   G-QS-MIC         recording shows the microphone indicator and slider
@@ -2971,6 +2975,50 @@ pass G-NOTIFY-CLEAR "Clear empties the list"
 
 xdotool key Escape
 sleep 1
+# libnotify asks GetServerInformation before every Notify; the spec
+# makes it mandatory and gnome-shell answers spec 1.2 (#843).
+server_info="$(gdbus call --session --dest org.freedesktop.Notifications \
+    --object-path /org/freedesktop/Notifications \
+    --method org.freedesktop.Notifications.GetServerInformation 2>&1)" ||
+    fail G-NOTIFY-SEND "GetServerInformation failed: $server_info"
+echo "GetServerInformation: $server_info" >>"$ARTIFACTS/notify.log"
+case "$server_info" in
+    *"'1.2')") ;;
+    *) fail G-NOTIFY-SEND "GetServerInformation answered $server_info, not spec 1.2" ;;
+esac
+notify-send -a "Tuna Desktop Proof" "Proof notify-send" "Sent with libnotify" >>"$ARTIFACTS/notify.log" 2>&1 ||
+    fail G-NOTIFY-SEND "notify-send failed: $(tail -1 "$ARTIFACTS/notify.log")"
+sleep 1
+scrot "$ARTIFACTS/13b-notify-send.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notify-send.json" 20 ||
+    fail G-NOTIFY-SEND "accessibility dump failed"
+showing "$ARTIFACTS/a11y-notify-send.json" "Proof notify-send" ||
+    fail G-NOTIFY-SEND "no banner for the notify-send notification"
+pass G-NOTIFY-SEND "notify-send (libnotify) gets server information and shows its banner"
+
+# GNOME 51 panel.js sets messageTray.bannerBlocked while the date menu
+# is open: the notification is only in the menu's list (#845). The open
+# menu must show the title as often as the banner alone did (the list
+# card and the banner card are built alike), not twice.
+title_count() {
+    jq --arg n "Proof notify-send" '[.[] | select(.showing and .name == $n)] | length' "$1"
+}
+banner_alone="$(title_count "$ARTIFACTS/a11y-notify-send.json")"
+open_calendar
+scrot "$ARTIFACTS/13c-banner-blocked.png" >/dev/null
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-banner-blocked.json" 20 ||
+    fail G-NOTIFY-BLOCKED "accessibility dump failed"
+with_menu="$(title_count "$ARTIFACTS/a11y-banner-blocked.json")"
+[ "$with_menu" -ge 1 ] || fail G-NOTIFY-BLOCKED "the date menu does not list the notification"
+[ "$with_menu" = "$banner_alone" ] ||
+    fail G-NOTIFY-BLOCKED "the banner stays drawn over the open date menu ($with_menu showing, $banner_alone from the banner alone)"
+pass G-NOTIFY-BLOCKED "the banner hides while the date menu is open; the notification shows only in its list"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-blocked-cleared.json" 20 --press "Clear" ||
+    fail G-NOTIFY-BLOCKED "could not press Clear"
+sleep 1
+
+xdotool key Escape
+sleep 1
 # Do Not Disturb from the quick-settings tile (the calendar's switch
 # shares the same store).
 xdotool mousemove --window "$WID" $((WIDTH - 50)) 16 click 1
@@ -3189,6 +3237,29 @@ sleep 1.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-wired-menu.json" 20 ||
     fail G-QS-WIRED "accessibility dump failed"
 scrot "$ARTIFACTS/15e-wired-menu.png" >/dev/null
+# GNOME 51 quickSettings.js _setDimmed darkens only the grid behind an
+# open menu; the panel stays opaque (#847: libadwaita's .dimmed made it
+# 55% opaque). The open frame must hold the opaque dimmed surface
+# #202023 in the panel's padding, not a blend with what is behind it.
+"$PY" - "$ARTIFACTS/15e-wired-menu.png" <<'PYEOF' || fail G-QS-DIM-OPAQUE "the dimmed panel is not opaque #202023 (translucent?)"
+import sys
+from PIL import Image
+img = Image.open(sys.argv[1]).convert("RGB")
+w, h = img.size
+px = img.load()
+def near(p):
+    return all(abs(a - b) <= 3 for a, b in zip(p, (0x20, 0x20, 0x23)))
+rows = 0
+for y in range(h):
+    run = best = 0
+    for x in range(w // 2, w):
+        run = run + 1 if near(px[x, y]) else 0
+        best = max(best, run)
+    rows += best >= 12
+print(f"rows with an opaque #202023 run: {rows}")
+sys.exit(0 if rows >= 20 else 1)
+PYEOF
+pass G-QS-DIM-OPAQUE "an open toggle menu dims the grid while the panel stays opaque"
 showing "$ARTIFACTS/a11y-qs-wired-menu.json" "Disconnect Wired" ||
     fail G-QS-WIRED "the menu has no Disconnect row for the active profile"
 showing "$ARTIFACTS/a11y-qs-wired-menu.json" "Wired Settings" ||
@@ -3537,6 +3608,33 @@ qs_press "Night Light" night-on || fail G-QS-NIGHT "could not enable Night Light
 qs_press "Night Light" night-off || fail G-QS-NIGHT "could not disable Night Light"
 [ "$(gsettings get org.gnome.settings-daemon.plugins.color night-light-enabled)" = false ] ||
     fail G-QS-NIGHT "Night Light did not disable its GNOME color key"
+# GNOME 51 darkMode.js / nightLight.js: the tiles follow their keys when
+# something else (Settings, gsettings) writes them (#844).
+qs_tile_checked() {
+    jq -e --arg n "$2" --arg want "$3" 'any(.[]; .name == $n and .role == "toggle button"
+        and .showing and (.checked | tostring) == $want)' "$1" >/dev/null
+}
+gsettings set org.gnome.desktop.interface color-scheme default
+gsettings set org.gnome.settings-daemon.plugins.color night-light-enabled true
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-external-a.json" 20 ||
+    fail G-QS-EXTERNAL-SYNC "accessibility dump failed"
+qs_tile_checked "$ARTIFACTS/a11y-qs-external-a.json" "Dark Style" false ||
+    fail G-QS-EXTERNAL-SYNC "Dark Style stayed on after color-scheme became default"
+qs_tile_checked "$ARTIFACTS/a11y-qs-external-a.json" "Night Light" true ||
+    fail G-QS-EXTERNAL-SYNC "Night Light stayed off after night-light-enabled became true"
+gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+gsettings set org.gnome.settings-daemon.plugins.color night-light-enabled false
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-external-b.json" 20 ||
+    fail G-QS-EXTERNAL-SYNC "accessibility dump failed"
+qs_tile_checked "$ARTIFACTS/a11y-qs-external-b.json" "Dark Style" true ||
+    fail G-QS-EXTERNAL-SYNC "Dark Style stayed off after color-scheme became prefer-dark"
+qs_tile_checked "$ARTIFACTS/a11y-qs-external-b.json" "Night Light" false ||
+    fail G-QS-EXTERNAL-SYNC "Night Light stayed on after night-light-enabled became false"
+[ "$(gsettings get org.gnome.desktop.interface color-scheme)" = "'prefer-dark'" ] ||
+    fail G-QS-EXTERNAL-SYNC "following the key wrote it back"
+pass G-QS-EXTERNAL-SYNC "Dark Style and Night Light follow color-scheme and night-light-enabled written outside the tile"
 # GNOME Settings' slider path: write the key, then NightLightPreview
 # forces it even though Night Light is off. The compositor's own
 # org.gnome.SettingsDaemon.Color must ease the applied Temperature

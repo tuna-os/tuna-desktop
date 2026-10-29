@@ -937,9 +937,9 @@ fn quick_settings_popover(
         let popover = popover.clone();
         power_menu.connect_visible_notify(move |menu| {
             if menu.is_visible() {
-                popover.add_css_class("dimmed");
+                popover.add_css_class("qs-dimmed");
             } else {
-                popover.remove_css_class("dimmed");
+                popover.remove_css_class("qs-dimmed");
             }
         });
     }
@@ -1216,9 +1216,9 @@ fn quick_settings_popover(
         let popover = popover.clone();
         power_menu_ui.revealer.connect_visible_notify(move |menu| {
             if menu.is_visible() {
-                popover.add_css_class("dimmed");
+                popover.add_css_class("qs-dimmed");
             } else {
-                popover.remove_css_class("dimmed");
+                popover.remove_css_class("qs-dimmed");
             }
         });
     }
@@ -1247,9 +1247,9 @@ fn quick_settings_popover(
             let popover = popover.clone();
             menu.connect_visible_notify(move |menu| {
                 if menu.is_visible() {
-                    popover.add_css_class("dimmed");
+                    popover.add_css_class("qs-dimmed");
                 } else {
-                    popover.remove_css_class("dimmed");
+                    popover.remove_css_class("qs-dimmed");
                 }
             });
         }
@@ -1274,9 +1274,9 @@ fn quick_settings_popover(
             .revealer
             .connect_visible_notify(move |menu| {
                 if menu.is_visible() {
-                    popover.add_css_class("dimmed");
+                    popover.add_css_class("qs-dimmed");
                 } else {
-                    popover.remove_css_class("dimmed");
+                    popover.remove_css_class("qs-dimmed");
                 }
             });
     }
@@ -1286,11 +1286,21 @@ fn quick_settings_popover(
     }
     let dnd = dnd_tile.button.clone();
 
+    // GNOME 51 darkMode.js / nightLight.js: the tiles follow their keys
+    // whoever changes them (Settings, gsettings), not only the tile.
     if let Some(iface) = settings(INTERFACE_SCHEMA) {
         dark.button
             .set_active(logic::is_dark(&iface.string("color-scheme")));
+        {
+            let button = dark.button.clone();
+            iface.connect_changed(Some("color-scheme"), move |s, key| {
+                button.set_active(logic::is_dark(&s.string(key)));
+            });
+        }
         dark.button.connect_toggled(move |t| {
-            let _ = iface.set_string("color-scheme", logic::color_scheme_for(t.is_active()));
+            if logic::is_dark(&iface.string("color-scheme")) != t.is_active() {
+                let _ = iface.set_string("color-scheme", logic::color_scheme_for(t.is_active()));
+            }
         });
     }
     match settings(COLOR_SCHEMA) {
@@ -1298,8 +1308,16 @@ fn quick_settings_popover(
             night
                 .button
                 .set_active(color.boolean("night-light-enabled"));
+            {
+                let button = night.button.clone();
+                color.connect_changed(Some("night-light-enabled"), move |s, key| {
+                    button.set_active(s.boolean(key));
+                });
+            }
             night.button.connect_toggled(move |t| {
-                let _ = color.set_boolean("night-light-enabled", t.is_active());
+                if color.boolean("night-light-enabled") != t.is_active() {
+                    let _ = color.set_boolean("night-light-enabled", t.is_active());
+                }
             });
         }
         None => night.present(false),
@@ -1709,6 +1727,10 @@ fn build(app: &adw::Application) {
     // GNOME's calendar events through its calendar server.
     calendar_ui.set_event_source(events::EventSource::new());
     let clock = panel_menu_button(&clock_label, "Date and Time", &cal_popover);
+    {
+        let notify = notify.clone();
+        cal_popover.connect_visible_notify(move |p| notify.set_banner_blocked(p.is_visible()));
+    }
     clock.add_css_class("clock-display");
 
     // System indicators in GNOME's order (panel.js `_indicators`): each
