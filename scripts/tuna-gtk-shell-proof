@@ -107,8 +107,9 @@
 #                  reset to GNOME 51's defaults (#343); the native VM lane
 #                  proves libinput device state
 #   G-INPUT-SOURCE-MRU Super+Space flips between the two most recent
-#                  sources, the held popup steps through the MRU list,
-#                  and mru-sources keeps the order (#346)
+#                  sources (also when Super is up before the popup holds
+#                  the keyboard), the held popup steps through the MRU
+#                  list, and mru-sources keeps the order (#346)
 #   G-INPUT-PER-WINDOW per-window: each window restores its own source on
 #                  focus, new windows start on the first (#346)
 #   G-NUMLOCK      Num Lock changes save numlock-state only while
@@ -4318,6 +4319,26 @@ cstate '.keyboard.layout == "English (US)"' "tap to the previous source" ||
 xdotool key super+space
 cstate '.keyboard.layout == "German"' "tap back" ||
     fail G-INPUT-SOURCE-MRU "a second tap did not flip back"
+# A tap whose popup takes the keyboard only after Super is up, as on a
+# loaded runner (runs 40842699440 and 40846223707 left it open): the
+# shell stays stopped until the compositor has seen the release. GNOME
+# checks the modifiers when its grab lands, on every show, and picks.
+mru_shell="$(pgrep -P "$COMPOSITOR_PID" -x tuna-shell-gtk)" ||
+    fail G-INPUT-SOURCE-MRU "expected exactly one owned shell"
+case "$mru_shell" in ''|*[!0-9]*) fail G-INPUT-SOURCE-MRU "expected exactly one owned shell" ;; esac
+for mru_expected in "English (US)" "German"; do
+    mru_releases="$(grep -c 'modifier super keycode=[0-9]* pressed=false' "$LOG")"
+    kill -STOP "$mru_shell"
+    xdotool key super+space
+    end=$(($(date +%s) + 10))
+    until [ "$(grep -c 'modifier super keycode=[0-9]* pressed=false' "$LOG")" -gt "$mru_releases" ] ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.1; done
+    kill -CONT "$mru_shell"
+    [ "$(grep -c 'modifier super keycode=[0-9]* pressed=false' "$LOG")" -gt "$mru_releases" ] ||
+        fail G-INPUT-SOURCE-MRU "the compositor never saw Super released"
+    cstate ".keyboard.layout == \"$mru_expected\"" "late-grab tap to $mru_expected" ||
+        fail G-INPUT-SOURCE-MRU "a tap released before the switcher held the keyboard did not pick $mru_expected"
+done
 # Held: the popup lists the sources most recent first; a second press
 # steps to the third, releasing Super picks it.
 xdotool keydown Super_L
@@ -4403,10 +4424,17 @@ fi
 xdotool key Num_Lock
 cstate '.keyboard.num_lock == true' "Num Lock on" || fail G-NUMLOCK "Num_Lock did not lock Num Lock"
 numlock_wait true || fail G-NUMLOCK "the compositor did not save numlock-state true"
+# Wait for each reload to land: a keymap applied between a lock key's
+# press and its release keeps the lock (Num Lock unlocks on release), so
+# a Num_Lock typed while the reset is still in flight can be lost.
+keymap_generation="$(jq '.keyboard.keymap_generation' "$CSTATE")"
 gsettings set org.gnome.desktop.input-sources xkb-options "['compose:ralt']"
-cstate '.keyboard.num_lock == true and .keyboard.layout == "English (US)"' "reload keeps Num Lock" ||
+cstate ".keyboard.keymap_generation > $keymap_generation and .keyboard.num_lock == true and .keyboard.layout == \"English (US)\"" "reload keeps Num Lock" ||
     fail G-NUMLOCK "a keymap reload dropped Num Lock or the active source"
+keymap_generation="$(jq '.keyboard.keymap_generation' "$CSTATE")"
 gsettings reset org.gnome.desktop.input-sources xkb-options
+cstate ".keyboard.keymap_generation > $keymap_generation and .keyboard.num_lock == true" "reset reload keeps Num Lock" ||
+    fail G-NUMLOCK "resetting xkb-options did not reload the keymap with Num Lock kept"
 xdotool key Num_Lock
 cstate '.keyboard.num_lock == false' "Num Lock off again" || fail G-NUMLOCK "Num_Lock did not unlock Num Lock"
 numlock_wait false || fail G-NUMLOCK "the compositor did not save numlock-state false"

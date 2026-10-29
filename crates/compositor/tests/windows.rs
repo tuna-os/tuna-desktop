@@ -3856,9 +3856,18 @@ fn keymap_reload_keeps_num_lock_and_the_active_layout() {
     sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
     f.client_a.keyboard_modifiers.clear();
     settings.xkb_options = "compose:ralt".into();
+    let before = f.manager.keyboard_summary(&mut f.comp.state)["keymap_generation"].as_u64();
+    assert!(
+        before.is_some(),
+        "the state file reports the keymap generation"
+    );
     f.manager
         .apply_keyboard_settings(&mut f.comp.state, &settings);
     let summary = f.manager.keyboard_summary(&mut f.comp.state);
+    assert!(
+        summary["keymap_generation"].as_u64() > before,
+        "an applied keymap bumps the reported generation"
+    );
     assert_eq!(
         summary["layout"], "German",
         "the active source survives a reload"

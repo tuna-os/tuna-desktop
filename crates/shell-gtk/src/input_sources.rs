@@ -263,6 +263,13 @@ pub fn initial_selection(len: usize, backward: bool) -> usize {
     }
 }
 
+/// `_onModifierChange` and `show`'s race check: the binding's modifier
+/// `mask` is no longer held in `mods`, so the popup picks. A binding
+/// without a modifier never releases (`NO_MODS_TIMEOUT` finishes it).
+pub fn released(mask: u32, mods: u32) -> bool {
+    mask != 0 && mods & mask == 0
+}
+
 /// `primaryModifier`: the highest bit of a binding's modifier mask.
 pub fn primary_modifier(mask: u32) -> u32 {
     if mask == 0 {
@@ -497,15 +504,24 @@ impl InputSources {
         ui.popup.window.add_controller(keys);
         {
             // `show`'s race check: a modifier released before the popup
-            // held the keyboard is never reported, so look once it does.
+            // held the keyboard is never reported, so look each time it
+            // takes the keyboard. Not `is-active`: GTK drops the focus-out
+            // a hidden window gets, so that stays true after the first
+            // show and a later quick tap would leave the popup open.
+            let focus = gtk::EventControllerLegacy::new();
             let weak = Rc::downgrade(&ui);
-            ui.popup.window.connect_is_active_notify(move |window| {
-                if window.is_active() {
+            focus.connect_event(move |_, event| {
+                let focused = event
+                    .downcast_ref::<gtk::gdk::FocusEvent>()
+                    .is_some_and(|focus| focus.is_in());
+                if focused {
                     if let Some(ui) = weak.upgrade() {
                         ui.check_seat_modifiers();
                     }
                 }
+                glib::Propagation::Proceed
             });
+            ui.popup.window.add_controller(focus);
         }
         ui.install_actions();
         ui
@@ -742,7 +758,7 @@ impl InputSources {
         let mask = self.popup.mask.get();
         if mask.is_empty() {
             self.reset_no_mods();
-        } else if !state.intersects(mask) {
+        } else if released(mask.bits(), state.bits()) {
             self.popup_finish();
         }
     }
@@ -865,6 +881,23 @@ mod tests {
         assert_eq!(m.next_by_position().map(|a| a.index), Some(0));
         assert_eq!(primary_modifier(0), 0);
         assert_eq!(primary_modifier(0b1001), 0b1000);
+    }
+
+    #[test]
+    fn the_release_check_picks_once_the_bindings_modifier_is_up() {
+        const SUPER: u32 = 1 << 26;
+        const NUM_LOCK: u32 = 1 << 4;
+        let mask = primary_modifier(SUPER);
+        // A quick tap whose popup takes the keyboard after Super is up
+        // (run 40842699440): the grab's check picks at once.
+        assert!(released(mask, 0));
+        // Held: the grab still sees Super; its release then picks, and a
+        // lock modifier does not count as holding it.
+        assert!(!released(mask, SUPER));
+        assert!(!released(mask, SUPER | NUM_LOCK));
+        assert!(released(mask, NUM_LOCK));
+        // A binding without a modifier waits for NO_MODS_TIMEOUT.
+        assert!(!released(primary_modifier(0), 0));
     }
 
     #[test]
