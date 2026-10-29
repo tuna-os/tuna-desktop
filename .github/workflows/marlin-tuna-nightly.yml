@@ -17,7 +17,7 @@ on:
       - packaging/marlin/vm-lane/tuna-vm-health
       - packaging/marlin/vm-lane/tuna-vm-constraints.c
       - packaging/marlin/vm-lane/tuna-vm-constraints-build
-      - packaging/marlin/vm-lane/tuna-vm-profile
+      - packaging/marlin/vm-lane/tuna-vm-published.tmpfiles
       - scripts/tuna-vm-lane
 
 permissions:
@@ -87,7 +87,7 @@ jobs:
             bootc install to-disk --via-loopback --generic-image --wipe "${install_args[@]}" /output/disk.raw
           sudo chown "$(id -u):$(id -g)" /mnt/vm/disk.raw
           sudo podman rmi -a -f >/dev/null 2>&1 || true
-      - name: Real shipped greeter PAM login, semantic tour and lifecycle
+      - name: Real shipped GDM PAM login, semantic tour and lifecycle
         run: >-
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out published-vm-artifacts
           --boots 5 --greeter-login --require-kvm --tour
