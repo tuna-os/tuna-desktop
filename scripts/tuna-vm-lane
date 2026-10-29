@@ -611,6 +611,12 @@ def amplification_observation(value):
                            and value["sink_name"].startswith("alsa_output")}
 
 
+# gvc's PA_VOLUME_UI_MAX, pa_sw_volume_from_dB(+11.0) = 99957 of PA_VOLUME_NORM
+# 65536: the ceiling gsd-media-keys 51 raises an amplified sink to
+# (do_sound_action caps at gvc_mixer_control_get_vol_max_amplified).
+GNOME_UI_MAX_PERCENT = 99957 / 65536 * 100
+
+
 def amplification_checks(actual, initial, mode, percent_ok):
     return {"percent": percent_ok, "unmuted": not actual["muted"],
             "amplified": actual["amplified"] == (mode != "off"),
@@ -1549,7 +1555,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                     raise RuntimeError("GNOME overamplification preference did not drive the real PipeWire sink")
                 amplified_observations.append(actual)
         else:
-            for mode, expected in (("off", 100.0), ("on", 104.0), ("high", 152.52), ("off", 100.0)):
+            for mode, expected in (("off", 100.0), ("on", 104.0), ("high", GNOME_UI_MAX_PERCENT), ("off", 100.0)):
                 case = {"mode": mode, "expected_percent": expected, "initial": None,
                         "poll_count": 0, "samples": [], "passed": False}
                 amplified_cases.append(case)
