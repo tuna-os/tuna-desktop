@@ -898,19 +898,39 @@ class Accounting(unittest.TestCase):
                     row = guest.numeric_identity(guest.read_process(path))
                     self.assertEqual(row['status_vmrss_present'], 1 if size == 16384 else None)
 
-    def test_exit_metadata_does_not_classify_live_states(self):
-        for state in ('S', 'R', 'D', 'Z', 'X', 'x'):
-            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+    def test_only_an_exiting_task_without_mm_departs_from_a_live_state(self):
+        # Stock runs 40887247970 and 40890717926: smaps_rollup failed with
+        # ESRCH, then the same task read S or R with PF_EXITING and no Vm*
+        # fields (do_exit() after exit_mm(), before exit_notify()).
+        released = dict(stat_flags=0x40000C, stat_num_threads=2,
+                        status_vmrss_present=0, status_vmsize_present=0)
+        esrch = ProcessLookupError(3, 'private')
+        cases = [(state, {}, esrch, False) for state in ('S', 'R', 'D')]
+        cases += [(state, dict(stat_flags=0), esrch, False) for state in ('Z', 'X', 'x')]
+        cases += [
+            ('S', dict(stat_flags=0x400040), esrch, True),          # not exiting
+            ('S', dict(stat_flags=None), esrch, True),              # flags unknown
+            ('S', dict(status_vmrss_present=1), esrch, True),       # mm still held
+            ('R', dict(status_vmsize_present=1), esrch, True),
+            ('S', dict(status_vmrss_present=None, status_vmsize_present=None), esrch, True),
+            ('S', dict(start_ticks=99), esrch, True),               # PID reused
+            ('S', dict(uid=1001), esrch, True),
+            ('S', {}, PermissionError(13, 'private'), True),        # not ESRCH
+            ('S', {}, ValueError('malformed'), True),
+        ]
+        for state, change, error, unreadable in cases:
+            with self.subTest(state=state, change=change, error=type(error).__name__), \
+                    tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 path = self.process(root, 1, 0, 1000, 10, 55)
                 initial = guest.read_process(path)
-                after = dict(initial, state=state, stat_flags=4, stat_num_threads=1,
-                             status_vmrss_present=0, status_vmsize_present=0)
+                after = dict(initial, state=state, **dict(released, **change))
                 with patch.object(guest, 'read_process', side_effect=[initial, after]), \
-                     patch.object(guest, 'read_smaps_rollup', side_effect=ProcessLookupError(3, 'private')):
+                     patch.object(guest, 'read_smaps_rollup', side_effect=error):
                     result = guest.sample(1000, root)
                 self.assertEqual(result['failure_evidence'][0]['after'], guest.numeric_identity(after))
-                self.assertEqual(bool(result['unreadable']), state in ('S', 'R', 'D'))
+                self.assertEqual(result['unreadable'],
+                                 [{'pid': 1, 'error': type(error).__name__}] if unreadable else [])
                 self.assertEqual(result['process_count'], 0)
 
     def test_failure_evidence_preserves_existing_exit_and_reuse_semantics(self):
@@ -1144,8 +1164,26 @@ class Accounting(unittest.TestCase):
             self.assertEqual(result["process_count"], 0)
 
     def test_journal_prefix_and_truncated_serial_do_not_corrupt_valid_samples(self):
-        result = host.raw_samples('prefix tuna-perf-sample: {"pss_kib":7}\ntuna-perf-sample: {bad\n')
-        self.assertEqual(result, [{"pss_kib":7}])
+        valid = guest.sample_line({"pss_kib": 7})
+        result = host.raw_samples(f'[ 1.0] python3[770]: {valid}\r\ntuna-perf-sample: {{bad\n')
+        self.assertEqual(result, [{"pss_kib": 7}])
+
+    def test_a_record_missing_bytes_is_dropped_even_when_it_still_parses(self):
+        # Run 40914419860: the serial console dropped '":47,...,"c' and left
+        # valid JSON whose process had no cpu_ticks.
+        row = {"processes": [{"pid": 965, "cpu_ticks": 47, "comm": "systemd"},
+                             {"pid": 1188, "cmd": "gsd-datetime"}]}
+        line = guest.sample_line(row)
+        lost = line.replace('":47,"comm":"systemd"},{"pid":1188,"c', '')
+        self.assertIn('"cpu_ticksmd":"gsd-datetime"', lost)
+        json.loads(lost.split('tuna-perf-sample: ', 1)[1].rpartition(' sha256=')[0])
+        self.assertEqual(host.raw_samples(lost), [])
+        # A missing or altered digest, or a pre-digest record, is never accepted.
+        payload, _, digest = line.rpartition(' sha256=')
+        for corrupt in (payload, payload + ' sha256=' + digest[:-1],
+                        payload + ' sha256=' + digest.upper(), line.replace('47', '4')):
+            self.assertEqual(host.raw_samples(corrupt), [])
+        self.assertEqual(host.raw_samples(line), [row])
 
     def test_small_sample_percentiles_keep_the_extreme_tail(self):
         result = host.distribution([1, 9, 2, 3])
@@ -1208,9 +1246,16 @@ class Accounting(unittest.TestCase):
         for identity in (0, True, None, 0x100000000):
             with self.subTest(identity=identity), self.assertRaisesRegex(ValueError, "notification ID"):
                 host.guest_probe(Agent({"boottime_s": 100, "notification_id": identity}), "notify", 0)
-        for action, index in (("exec", None), ("notify", -1), ("notify", 10), ("notify", True)):
+        # One warm-up plus NOTIFICATION_ROUNDS measured rounds; the guest helper
+        # accepts exactly the host workload's indices (#782).
+        bound = host.NOTIFICATIONS_PER_ROUND * (1 + host.NOTIFICATION_ROUNDS)
+        self.assertEqual(bound, 40)
+        for action, index in (("exec", None), ("notify", -1), ("notify", bound), ("notify", True)):
             with self.assertRaises(ValueError):
                 host.guest_probe(agent, action, index)
+        for index in (-1, bound):
+            with self.assertRaisesRegex(ValueError, "outside the fixed workload"):
+                phase.notify(index)
 
 
 

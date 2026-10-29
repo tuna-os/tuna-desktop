@@ -4,6 +4,10 @@ FROM ${BASE_IMAGE}
 ARG DESKTOP
 ARG PAIRED_SESSION=false
 ARG CORRAL_SSH=false
+# Per-thread observer records are ~3x larger and, forwarded to the serial
+# console every second, stalled the GNOME sessions (#782). Opt-in only;
+# scripts/tuna-perf-profile-pairs refuses it for the gated stock profile.
+ARG PERF_THREAD_DIAGNOSTICS=false
 COPY packaging/marlin/perf/tuna-corral-ssh-setup /usr/libexec/tuna-corral-ssh-setup
 COPY packaging/marlin/vm-lane/custom.conf /etc/gdm/custom.conf
 COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
@@ -38,7 +42,14 @@ RUN case "$DESKTOP" in gnome|tuna) ;; *) exit 1 ;; esac && \
     sed -i "s/Session=tuna/Session=${DESKTOP}/" /usr/lib/tmpfiles.d/tuna-vm-lane.conf && \
     test -f "/usr/share/wayland-sessions/${DESKTOP}.desktop" && \
     if [ "$DESKTOP" = tuna ] || [ "$PAIRED_SESSION" = true ]; then sed -i 's|^Exec=.*|Exec=/usr/libexec/tuna-perf-session|' /usr/share/wayland-sessions/tuna.desktop; fi && \
-    systemctl enable tuna-perf.service qemu-guest-agent.service
+    systemctl enable tuna-perf.service qemu-guest-agent.service && \
+    case "$PERF_THREAD_DIAGNOSTICS" in \
+      false) ;; \
+      true) install -d /usr/lib/systemd/system/tuna-perf.service.d && \
+            printf '[Service]\nExecStart=\nExecStart=/usr/bin/python3 /usr/libexec/tuna-perf-guest --user tuna-test --thread-diagnostics\n' \
+              > /usr/lib/systemd/system/tuna-perf.service.d/thread-diagnostics.conf ;; \
+      *) exit 1 ;; \
+    esac
 
 RUN --mount=type=secret,id=benchmark-ssh-key \
     case "$CORRAL_SSH" in \

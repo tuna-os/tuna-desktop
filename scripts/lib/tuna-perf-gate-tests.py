@@ -276,6 +276,125 @@ class Gate(unittest.TestCase):
         self.assertEqual(result["cpu.overview.desktop.mean"]["evidence"], RUN.format(1))
         self.assertEqual(result["overview.response_ms.p50"]["max_ratio"], 1.0)   # 0.5 is past the target
 
+    def test_propose_never_tightens_inside_the_bootstrap_interval(self):
+        # #782: budgets taken from one quiet run's point ratio sat inside the
+        # run-to-run noise. The interval's upper bound replaces a lower point.
+        current = budgets(**{"cpu.overview.desktop.mean": budget(3.0)})
+        row = {"metric": "cpu.overview.desktop.mean", "ratio": 1.8, "ci90": [1.5, 2.4]}
+        result = pb.propose(current, [row])["metrics"]["cpu.overview.desktop.mean"]
+        self.assertEqual(result["max_ratio"], 2.8)   # 2.4 x 1.15 = 2.76 -> 2.80, not 2.10
+        row["ci90"] = [1.7, 1.9]
+        self.assertEqual(pb.propose(current, [row])["metrics"]["cpu.overview.desktop.mean"]["max_ratio"], 2.2)
+
+
+def noisy_tree(root, gnome, tuna, pairs=3):
+    """Pairs whose overview phase follows explicit per-second gnome-shell/compositor loads."""
+    for index in range(pairs):
+        base = Path(root) / ("" if index == 0 else f"repeat-{index + 1}")
+        for desktop, name, series in (("gnome", "gnome-shell", gnome[index]), ("tuna", "tuna-compositor", tuna[index])):
+            write_session(base / desktop, {None: {name: 1}})
+            rows = json.loads((base / desktop / "samples.json").read_text())
+            total = 0
+            for second, row in enumerate(rows):
+                start, end = PHASES["overview"]
+                if start < second <= end:
+                    total += series[(second - start - 1) % len(series)] - 1
+                row["processes"][0]["cpu_ticks"] += total
+            (base / desktop / "samples.json").write_text(json.dumps(rows))
+
+
+class Confidence(unittest.TestCase):
+    metric = "cpu.overview.desktop.mean"
+
+    def rows(self, directory, max_ratio):
+        config = budgets(**{self.metric: budget(max_ratio)})
+        series = pb.pair_series(pb.discover_pairs(directory))
+        intervals = pb.confidence(config, series)
+        return pb.evaluate(config, pb.compare(None, series), 3, intervals)[0], intervals
+
+    def test_series_reproduce_the_reported_phase_distribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            noisy_tree(directory, [[10, 30]] * 3, [[20, 60, 40]] * 3)
+            session = Path(directory) / "tuna"
+            report = pb.phase_cpu(*[json.loads((session / name).read_text())
+                                    for name in ("samples.json", "guest-phases.json")])
+            metrics = pb.session_metrics(session)
+            for role in ("compositor", "desktop", "total"):
+                self.assertEqual(metrics[f"cpu.overview.{role}.mean"], report["overview"][role]["mean"])
+                self.assertEqual(metrics[f"cpu.overview.{role}.p95"], report["overview"][role]["p95"])
+
+    def test_interval_is_seeded_and_flags_a_decision_inside_the_noise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            noisy_tree(directory, [[5, 35], [10, 30], [2, 38]], [[20, 60], [30, 50], [10, 70]])
+            row, intervals = self.rows(directory, 2.0)
+            again, _ = self.rows(directory, 2.0)
+            self.assertEqual(row["ci90"], again["ci90"])         # same artifact, same interval
+            low, high = row["ci90"]
+            self.assertLess(low, 2.0)
+            self.assertGreater(high, 2.0)
+            self.assertFalse(row["decision_stable"])
+            self.assertEqual(row["status"], "pass")              # the point estimate still decides
+            self.assertAlmostEqual(row["ratio"], 2.0)
+            self.assertTrue(self.rows(directory, 10.0)[0]["decision_stable"])
+
+    def test_steady_measurements_give_a_point_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            noisy_tree(directory, [[20]] * 3, [[30]] * 3)
+            row, _ = self.rows(directory, 1.4)
+            self.assertEqual(row["ci90"], [1.5, 1.5])
+            self.assertEqual(row["status"], "fail")
+            self.assertTrue(row["decision_stable"])
+
+
+class Observer(unittest.TestCase):
+    """#782: a perturbing observer's sessions never reach a budget decision."""
+
+    def check(self, mutate):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree(root / "artifacts" / "stock")
+            mutate(root / "artifacts" / "stock" / "repeat-2" / "gnome")
+            path, out = root / "budgets.json", root / "gate.json"
+            path.write_text(json.dumps(budgets(**{"cpu.overview.total.mean": budget(99)})))
+            status = run_gate(["check", "--artifacts", str(root / "artifacts"), "--budgets", str(path),
+                               "--out", str(out)])
+            return status, json.loads(out.read_text())
+
+    def test_clean_sessions_are_admitted(self):
+        status, result = self.check(lambda session: None)
+        self.assertEqual(status, 0)
+        self.assertEqual(result["refused_sessions"], [])
+        self.assertEqual(result["results"][0]["pairs"], 3)
+
+    def test_oversized_observer_records_refuse_the_pair(self):
+        def bloat(session):
+            rows = json.loads((session / "samples.json").read_text())
+            rows[5]["processes"][0]["thread_diagnostics"] = {"threads": [{"tid": 1}] * 4000}
+            (session / "samples.json").write_text(json.dumps(rows))
+        status, result = self.check(bloat)
+        self.assertEqual(status, 1)
+        self.assertEqual(result["results"][0]["status"], "missing")
+        self.assertEqual([(r["repeat"], r["desktop"]) for r in result["refused_sessions"]], [(2, "gnome")])
+        self.assertIn("exceeds", result["refused_sessions"][0]["problems"][0])
+
+    def test_thread_diagnostics_provenance_refuses_the_pair(self):
+        def flag(session):
+            report = json.loads((session / "report.json").read_text())
+            report["meta"] = ["observer_thread_diagnostics=true"]
+            (session / "report.json").write_text(json.dumps(report))
+        status, result = self.check(flag)
+        self.assertEqual(status, 1)
+        self.assertEqual(result["results"][0]["status"], "missing")
+
+    def test_host_cpu_model_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            (session / "report.json").write_text(json.dumps(
+                {"host": {"cpu": "processor\t: 0\nmodel name\t: AMD EPYC 7763 64-Core Processor\n"}}))
+            self.assertEqual(pb.host_cpu(session), "AMD EPYC 7763 64-Core Processor")
+            (session / "report.json").write_text("{}")
+            self.assertIsNone(pb.host_cpu(session))
+
 
 class Ratchet(unittest.TestCase):
     base = budgets(**{"cpu.overview.total.mean": budget(2.0, ceiling=80)})
