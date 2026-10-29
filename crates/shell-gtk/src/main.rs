@@ -432,8 +432,6 @@ fn panel_menu_button(
             window.set_focus_visible(false);
         }
     });
-    // GNOME's BoxPointer fades a panel menu in (150 ms).
-    transient::fade_in_popover(popover);
     button
 }
 
@@ -555,7 +553,7 @@ fn render_pills(shell: &mut Shell) {
 /// GNOME 51's date menu: the notification list beside the calendar
 /// column, back on today each time it opens (dateMenu.js).
 fn calendar_popover(notes: &gtk::Box) -> (gtk::Popover, Rc<calendar::CalendarUi>) {
-    let popover = gtk::Popover::new();
+    let popover = transient::MenuPopover::new_popover();
     popover.add_css_class("tuna-shell-popover");
     popover.add_css_class("tuna-cal");
     popover.set_has_arrow(false);
@@ -830,7 +828,7 @@ fn quick_settings_popover(
     brightness_controller: &Rc<brightness_service::Controller>,
     icons: PanelIcons,
 ) -> gtk::Popover {
-    let popover = gtk::Popover::new();
+    let popover = transient::MenuPopover::new_popover();
     popover.add_css_class("tuna-shell-popover");
     popover.add_css_class("tuna-qs");
     popover.set_has_arrow(false);

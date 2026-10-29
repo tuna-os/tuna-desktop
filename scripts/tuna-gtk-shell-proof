@@ -226,9 +226,10 @@
 #   G-UNLOCK       GNOME's lock screen: a wrong password is refused and
 #                  the right one unlocks through PAM (pam_wrapper)
 #   G-TRANSIENT-OFF with animations off the OSD, banners and panel menus
-#                  show at once; Reduced Motion keeps the fade (#501)
+#                  show at once; Reduced Motion keeps the fades and drops
+#                  the panel menu's rise (#501)
 #   G-TRANSIENT-SETTLE the transient animations ran over GNOME 51's
-#                  durations and settled (#501)
+#                  durations and settled; panel menus rose and grew (#501)
 #   A11Y-GOLDEN    the panel, calendar, quick settings and overview
 #                  accessible trees match tests/a11y/ (#71)
 #   G-SHELL-STABLE the shell never exits or restarts during the journey
@@ -8319,18 +8320,28 @@ for name in osd banner menu; do
 done
 gsettings set org.gnome.desktop.interface enable-animations true
 sleep 1
-# Reduced Motion keeps the fades (GNOME 51): the OSD still fades in.
+# Reduced Motion keeps the fades (GNOME 51): the OSD still fades in,
+# and a panel menu fades in without BoxPointer's rise and growth.
 transient_reduced_start=$(($(wc -l < "$LOG") + 1))
 gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
 sleep 1
 xdotool key XF86MonBrightnessUp
+open_calendar
+xdotool key Escape
 sleep 0.5
 sed -n "${transient_reduced_start},\$p" "$LOG" > "$ARTIFACTS/transient-reduced.log"
 grep -q "tuna-shell-gtk: transient osd settled after [0-9]* ms of 100 ms" "$ARTIFACTS/transient-reduced.log" ||
     fail G-TRANSIENT-OFF "Reduced Motion dropped the OSD's fade"
+grep -q "tuna-shell-gtk: transient menu open motion=false" "$ARTIFACTS/transient-reduced.log" ||
+    fail G-TRANSIENT-OFF "Reduced Motion did not open the panel menu fade-only"
+if grep -q "tuna-shell-gtk: transient menu open motion=true" "$ARTIFACTS/transient-reduced.log"; then
+    fail G-TRANSIENT-OFF "the panel menu still rose under Reduced Motion"
+fi
+grep -q "tuna-shell-gtk: transient menu settled after [0-9]* ms of 150 ms" "$ARTIFACTS/transient-reduced.log" ||
+    fail G-TRANSIENT-OFF "Reduced Motion dropped the panel menu's fade"
 gsettings reset org.gnome.desktop.a11y.interface reduced-motion
 sleep 1
-pass G-TRANSIENT-OFF "with animations off the OSD, banners and panel menus show at once; Reduced Motion keeps the fade"
+pass G-TRANSIENT-OFF "with animations off the OSD, banners and panel menus show at once; Reduced Motion keeps the OSD and panel-menu fades and drops the menu's rise"
 
 # GNOME Shell as the polkit agent: polkit (the Authority stub, back on
 # the bus) asks the agent to authenticate; a wrong password says so and
@@ -8819,7 +8830,10 @@ for spec in osd:100 osd-level:100 banner:200 menu:150 submenu:400 modal:100; do
     grep -q "tuna-shell-gtk: transient $name settled after [0-9]* ms of ${spec#*:} ms" "$LOG" ||
         fail G-TRANSIENT-SETTLE "no $name animation settled over ${spec#*:} ms"
 done
-pass G-TRANSIENT-SETTLE "OSD, banners, panel menus, quick-settings submenus and modals animate over GNOME's durations and settle"
+# Panel menus open as BoxPointer does: rising 6px and growing from 96%.
+grep -q "tuna-shell-gtk: transient menu open motion=true rise=6 scale=0.96" "$LOG" ||
+    fail G-TRANSIENT-SETTLE "no panel menu opened with BoxPointer's 6px rise and 96% growth"
+pass G-TRANSIENT-SETTLE "OSD, banners, panel menus (fade, rise and growth), quick-settings submenus and modals animate over GNOME's durations and settle"
 
 "$ROOT/scripts/tuna-a11y-golden" check "$ARTIFACTS" ||
     fail A11Y-GOLDEN "accessible trees differ from tests/a11y/ (see above)"

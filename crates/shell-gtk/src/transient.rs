@@ -25,6 +25,11 @@ pub const MESSAGE_MS: f64 = 100.0;
 pub const MODAL_MS: f64 = 100.0;
 /// `boxpointer.js` POPUP_ANIMATION_TIME: panel menus.
 pub const MENU_MS: f64 = 150.0;
+/// `-arrow-rise` of `.popup-menu-boxpointer` (`$base_padding`,
+/// `_popovers.scss`): how far a panel menu rises toward the panel.
+pub const MENU_RISE: f64 = 6.0;
+/// `BoxPointer.open` grows a panel menu from 96%.
+const MENU_SCALE: f64 = 0.96;
 /// `quickSettings.js` POPUP_ANIMATION_TIME: a submenu opens in two
 /// halves, height then fade (closing: fade then height).
 pub const SUBMENU_MS: f64 = 400.0;
@@ -162,6 +167,19 @@ pub fn submenu(t: f64, opening: bool) -> Frame {
         dy: 0.0,
         scale: 1.0,
         extent,
+    }
+}
+
+/// A panel menu opening (`BoxPointer.open`, `PopupAnimation.FULL`, the
+/// arrow on top): it fades in while dropping from [`MENU_RISE`] above
+/// and growing from 96% about its top centre, all ease-out quad.
+pub fn menu_open(t: f64) -> Frame {
+    let e = ease_out_quad(t);
+    Frame {
+        opacity: e,
+        dy: lerp(-MENU_RISE, 0.0, e),
+        scale: lerp(MENU_SCALE, 1.0, e),
+        extent: 1.0,
     }
 }
 
@@ -446,26 +464,100 @@ impl ModalFade {
     }
 }
 
-/// Fade a panel menu in as it opens (`BoxPointer.open`). GTK closes a
-/// popover at once, so only the opening plays here; the rise toward the
-/// anchor needs the popup surface itself to move, which is left to the
-/// compositor's popup animation.
-pub fn fade_in_popover(popover: &gtk::Popover) {
-    let player = Player::new("menu");
-    popover.connect_map(move |popover| {
-        popover.set_opacity(0.0);
-        let weak = popover.downgrade();
-        player.play(
-            popover,
+mod menu_imp {
+    use super::*;
+
+    pub struct MenuPopover {
+        pub frame: Cell<Frame>,
+        pub player: Player,
+    }
+
+    impl Default for MenuPopover {
+        fn default() -> Self {
+            Self {
+                frame: Cell::new(Frame::REST),
+                player: Player::new("menu"),
+            }
+        }
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for MenuPopover {
+        const NAME: &'static str = "TunaMenuPopover";
+        type Type = super::MenuPopover;
+        type ParentType = gtk::Popover;
+    }
+
+    impl ObjectImpl for MenuPopover {}
+
+    impl WidgetImpl for MenuPopover {
+        fn map(&self) {
+            self.parent_map();
+            self.obj().play_open();
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            let frame = self.frame.get();
+            if frame.dy == 0.0 && frame.scale == 1.0 {
+                self.parent_snapshot(snapshot);
+                return;
+            }
+            // BoxPointer pivots about (0.5, 0) for a top arrow; the
+            // contents' 6px margin is the rise.
+            let cx = self.obj().width() as f32 / 2.0;
+            let scale = frame.scale.max(0.0) as f32;
+            snapshot.save();
+            snapshot.translate(&gtk::graphene::Point::new(cx, frame.dy as f32));
+            snapshot.scale(scale, scale);
+            snapshot.translate(&gtk::graphene::Point::new(-cx, 0.0));
+            self.parent_snapshot(snapshot);
+            snapshot.restore();
+        }
+    }
+
+    impl PopoverImpl for MenuPopover {}
+}
+
+glib::wrapper! {
+    /// A panel menu: a popover that opens as GNOME's BoxPointer does.
+    pub struct MenuPopover(ObjectSubclass<menu_imp::MenuPopover>)
+        @extends gtk::Popover, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget,
+            gtk::Native, gtk::ShortcutManager;
+}
+
+impl MenuPopover {
+    /// A panel menu popover, to hand to [`gtk::MenuButton`] as usual.
+    pub fn new_popover() -> gtk::Popover {
+        glib::Object::new::<Self>().upcast()
+    }
+
+    fn set_frame(&self, frame: Frame) {
+        self.set_opacity(frame.opacity.clamp(0.0, 1.0));
+        self.imp().frame.set(frame);
+        self.queue_draw();
+    }
+
+    /// `BoxPointer.open` on every map: fade, rise and grow over
+    /// [`MENU_MS`]; Reduced Motion keeps only the fade.
+    fn play_open(&self) {
+        let motion = motion_allowed();
+        trace(
+            "menu",
+            format_args!("open motion={motion} rise={MENU_RISE} scale={MENU_SCALE}"),
+        );
+        let weak = self.downgrade();
+        self.imp().player.play(
+            self,
             MENU_MS,
             move |t| {
-                if let Some(p) = weak.upgrade() {
-                    p.set_opacity(fade(0.0, 1.0, t));
+                if let Some(popover) = weak.upgrade() {
+                    popover.set_frame(menu_open(t).gated(motion));
                 }
             },
             || {},
         );
-    });
+    }
 }
 
 /// A quick-settings submenu that grows open and shrinks closed. `outer`
@@ -663,6 +755,33 @@ mod tests {
         // The slow-down factor stretches durations.
         let slow = crate::motion::derive(Some(true), None, Some("2"));
         assert_eq!(progress(100.0, slow.adjust_ms(MODAL_MS), true), 0.5);
+    }
+
+    #[test]
+    fn panel_menus_fade_rise_and_grow_open() {
+        // BoxPointer.open: opacity 0, translation_y -rise, scale 0.96.
+        let start = menu_open(0.0);
+        assert_eq!(start.opacity, 0.0);
+        assert_eq!(start.dy, -MENU_RISE);
+        assert_eq!(start.scale, 0.96);
+        assert_eq!(start.extent, 1.0);
+        // All three ease out quad together.
+        let mid = menu_open(0.5);
+        assert!(close(mid.opacity, 0.75));
+        assert!(close(mid.dy, -1.5));
+        assert!(close(mid.scale, 0.99));
+        assert_eq!(menu_open(1.0), Frame::REST);
+        assert_eq!(MENU_RISE, 6.0);
+        // Reduced Motion: useMotion is false, so only the fade plays.
+        let faded = menu_open(0.5).gated(false);
+        assert_eq!(faded.opacity, mid.opacity);
+        assert_eq!((faded.dy, faded.scale), (0.0, 1.0));
+        // Animations off and the slow-down factor, as Player reads them.
+        let policy = crate::motion::derive(Some(false), None, None);
+        let t = progress(0.0, policy.adjust_ms(MENU_MS), policy.allows_fades());
+        assert_eq!(menu_open(t), Frame::REST);
+        let slow = crate::motion::derive(Some(true), None, Some("2"));
+        assert_eq!(progress(150.0, slow.adjust_ms(MENU_MS), true), 0.5);
     }
 
     #[test]
