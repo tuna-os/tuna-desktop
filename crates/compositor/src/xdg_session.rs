@@ -7,7 +7,7 @@
 //! passes the id back (`restored`), and asks `restore_toplevel` for each
 //! name before that window's first commit. The compositor then puts the
 //! window back where it was: workspace, position and size, maximized,
-//! tiled or fullscreen, minimized, and on its output. An app that never
+//! tiled or fullscreen, and on its output. An app that never
 //! opens a session is placed as usual. That client opt-in is the whole
 //! of GNOME 51's policy: gnome-session 51 switched its own app relaunch
 //! off (`RestoreSupported` is false: "For GNOME 50, we've disabled the
@@ -44,16 +44,22 @@
 //! Where this differs, on purpose: the file is JSON with Mutter's keys at
 //! `$XDG_DATA_HOME/tuna/window-sessions.json`; a toplevel also remembers
 //! its output by name and, under a maximized, tiled or fullscreen state,
-//! the floating rectangle to return to; its state is also recorded when
-//! the client destroys the session or disconnects (Mutter records only
-//! when the window is unmanaged); the store is bounded (least recently
-//! used sessions go first); `remove_toplevel` forgets a stored name even
-//! when no window holds it this run, as the protocol text asks; the
-//! staging protocol's `already_added`, `invalid_reason` and `rename` are
-//! honoured, which Mutter 51 does not check or implement; Mutter's parser
-//! never reads `is-minimized` back (it tests the wrong variant), here a
-//! minimized window comes back minimized; a floating rectangle no output
-//! shows any more is moved onto one.
+//! the floating rectangle to return to; the store is bounded (least
+//! recently used sessions go first); `remove_toplevel` forgets a stored
+//! name even when no window holds it this run, as the protocol text asks;
+//! the staging protocol's `already_added`, `invalid_reason` and `rename`
+//! are honoured, which Mutter 51 does not check or implement; a floating
+//! rectangle no output shows any more is moved onto one.
+//!
+//! What users see matches Mutter 51: state is recorded only when a window
+//! is unmanaged while its session is live, and at compositor exit. A
+//! destroyed session object detaches its toplevels first
+//! (`xdg_session_destructor` clears each toplevel's session, and
+//! `on_window_unmanaging` records only while it is set), so neither a
+//! session the client destroys nor a client that disconnects records its
+//! open windows again. `is-minimized` is written but, as in Mutter (whose
+//! parser tests the wrong variant and never reads it back), a restored
+//! window is never minimized.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -707,9 +713,6 @@ pub struct WindowSessions {
     save_at: Option<Instant>,
     live: HashMap<String, LiveSession>,
     bindings: HashMap<WlSurface, Binding>,
-    /// Toplevels of sessions the client let go: their state is recorded
-    /// once more on the window manager's next pass.
-    finalizing: Vec<(WlSurface, Binding)>,
     restores: Vec<PendingRestore>,
     next_serial: u64,
 }
@@ -728,7 +731,6 @@ impl WindowSessions {
             save_at: None,
             live: HashMap::new(),
             bindings: HashMap::new(),
-            finalizing: Vec::new(),
             restores: Vec::new(),
             next_serial: 0,
         }
@@ -813,7 +815,6 @@ impl WindowSessions {
     /// Whether `surface` belongs to a session.
     pub(crate) fn is_bound(&self, surface: &WlSurface) -> bool {
         self.bindings.contains_key(surface)
-            || self.finalizing.iter().any(|(other, _)| other == surface)
     }
 
     /// Every toplevel in a session, with what the window manager last
@@ -822,9 +823,9 @@ impl WindowSessions {
     pub(crate) fn record_all(&mut self, snapshot: impl Fn(&WlSurface) -> Option<ToplevelState>) {
         let now = now_micros();
         let bound: Vec<(WlSurface, Binding)> = self
-            .finalizing
-            .drain(..)
-            .chain(self.bindings.iter().map(|(s, b)| (s.clone(), b.clone())))
+            .bindings
+            .iter()
+            .map(|(s, b)| (s.clone(), b.clone()))
             .collect();
         for (surface, binding) in bound {
             if let Some(state) = snapshot(&surface) {
@@ -838,49 +839,19 @@ impl WindowSessions {
         }
     }
 
-    /// Record the toplevels of sessions the client let go, then forget
-    /// them (they are inert now).
-    pub(crate) fn record_finalizing(
-        &mut self,
-        snapshot: impl Fn(&WlSurface) -> Option<ToplevelState>,
-    ) {
-        if self.finalizing.is_empty() {
-            return;
-        }
-        let now = now_micros();
-        let mut recorded = false;
-        for (surface, binding) in std::mem::take(&mut self.finalizing) {
-            if let Some(state) = snapshot(&surface) {
-                recorded |= self
-                    .store
-                    .record(&binding.session, &binding.name, state, now);
-            }
-        }
-        if recorded {
-            self.changed();
-        }
-    }
-
     /// A toplevel's window is going away: record its last state
     /// (Mutter's `on_window_unmanaging`) and let it go.
     pub(crate) fn record_unmapped(&mut self, surface: &WlSurface, state: Option<ToplevelState>) {
-        let binding = match self.bindings.remove(surface) {
-            Some(binding) => {
-                if let Some(live) = self
-                    .live
-                    .get_mut(&binding.session)
-                    .filter(|live| live.serial == binding.serial)
-                {
-                    live.toplevels.remove(&binding.name);
-                }
-                Some(binding)
+        let binding = self.bindings.remove(surface);
+        if let Some(binding) = &binding {
+            if let Some(live) = self
+                .live
+                .get_mut(&binding.session)
+                .filter(|live| live.serial == binding.serial)
+            {
+                live.toplevels.remove(&binding.name);
             }
-            None => self
-                .finalizing
-                .iter()
-                .position(|(other, _)| other == surface)
-                .map(|at| self.finalizing.swap_remove(at).1),
-        };
+        }
         self.restores.retain(|pending| &pending.surface != surface);
         if let (Some(binding), Some(state)) = (binding, state) {
             if self
@@ -1098,17 +1069,11 @@ impl WindowSessions {
     }
 
     /// The client destroyed its session object (or went away): the state
-    /// stays, its toplevels are recorded once more and become inert.
+    /// stays as recorded, and its toplevels become inert without being
+    /// recorded again (Mutter's `xdg_session_destructor`).
     fn session_gone(&mut self, handle: &SessionHandle) {
-        if self.live_session(handle).is_none() {
-            return;
-        }
-        if let Some(live) = self.live.remove(&handle.id) {
-            for surface in live.toplevels.into_values() {
-                if let Some(binding) = self.bindings.remove(&surface) {
-                    self.finalizing.push((surface, binding));
-                }
-            }
+        if self.live_session(handle).is_some() {
+            self.forget_live(&handle.id);
         }
     }
 

@@ -464,7 +464,9 @@ fn a_restarted_compositor_puts_session_windows_back() {
         run.manager.window_layout(side),
         Some(WindowLayout::Tiled(TileSide::Left))
     );
-    assert!(run.manager.is_minimized(side));
+    // Written, but as in Mutter 51 (whose parser never reads it back) a
+    // restored window is not minimized.
+    assert!(!run.manager.is_minimized(side));
     let plain = run.id("plain");
     assert!(peer.position("restored plain").is_none());
     assert_eq!(run.workspace(plain), 0);
@@ -497,7 +499,7 @@ fn restoring_a_toplevel_already_mapped_but_not_committed_still_applies() {
 }
 
 #[test]
-fn windows_record_their_state_when_they_close_or_their_client_leaves() {
+fn windows_record_their_state_when_they_close_not_when_their_session_goes() {
     let dir = tempfile::tempdir().unwrap();
     let store = store_in(&dir);
     let mut run = Session::start(&store);
@@ -551,26 +553,22 @@ fn windows_record_their_state_when_they_close_or_their_client_leaves() {
         .save_if_due(std::time::Instant::now());
     assert!(!store.exists(), "not before the delay");
 
-    // The client goes away with its window still open: its last state is
-    // recorded too.
+    // The client goes away with its window still open: as in Mutter 51,
+    // the session object detaches its toplevels before they go, so the
+    // window's last state is not recorded.
     let second = run.id("two");
     assert!(run.manager.set_maximized(&mut run.comp.state, second, true));
     drop(two_handle);
     drop(peer);
     run.pump(&mut []);
     assert!(run.manager.model().windows().next().is_none());
-    let two = run
+    assert!(run
         .comp
         .state
         .window_sessions()
         .store()
         .toplevel(&id, "two")
-        .cloned()
-        .unwrap();
-    assert_eq!(
-        two.state,
-        tuna_compositor::xdg_session::WindowState::Maximized
-    );
+        .is_none());
     run.comp
         .state
         .window_sessions_mut()
@@ -584,7 +582,7 @@ fn windows_record_their_state_when_they_close_or_their_client_leaves() {
         saved["sessions"][&id]["toplevels"]["one"]["floating-rect"],
         serde_json::json!([300, 200, 500, 400])
     );
-    assert_eq!(saved["sessions"][&id]["toplevels"]["two"]["state"], 2);
+    assert!(saved["sessions"][&id]["toplevels"].get("two").is_none());
 }
 
 #[test]

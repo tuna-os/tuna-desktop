@@ -1423,10 +1423,6 @@ impl WindowManager {
                 self.pointer_motion(state, pos, time);
             }
         }
-        // Toplevels of window sessions the client let go are recorded
-        // while their windows are still managed (a disconnect drops the
-        // session and the windows in one dispatch).
-        self.record_released_sessions(state);
         let live: Vec<ToplevelSurface> = state.toplevels();
         let mut seen = Vec::with_capacity(live.len());
         for surface in &live {
@@ -1641,9 +1637,6 @@ impl WindowManager {
         if let Some(restore) = state.window_sessions.take_restore(surface.wl_surface()) {
             restore.announce();
             self.apply_session_restore(state, id, &restore.state);
-            if let Some(window) = self.windows.get_mut(&id) {
-                window.minimized = restore.state.minimized;
-            }
         }
         self.finish_map(state, id);
         id
@@ -1883,8 +1876,8 @@ impl WindowManager {
     /// Put a window back as its session remembers it (Mutter's
     /// `meta_wayland_xdg_session_state_restore_window`): its workspace
     /// first, then its floating rectangle (moved onto an output when
-    /// none shows it any more), then its state. Minimized is the
-    /// caller's: a window being mapped just starts hidden.
+    /// none shows it any more), then its state. Minimized is not
+    /// restored: Mutter 51's parser never reads it back.
     fn apply_session_restore(&mut self, state: &mut State, id: u64, saved: &ToplevelState) {
         if let Ok(workspace) = u32::try_from(saved.workspace) {
             self.model.update(
@@ -1941,23 +1934,9 @@ impl WindowManager {
             };
             restore.announce();
             self.apply_session_restore(state, id, &restore.state);
-            if restore.state.minimized {
-                self.minimize(state, id);
-            }
             let focused = self.model.focused() == Some(id);
             self.configure(id, focused);
         }
-    }
-
-    /// Record the windows of sessions their clients let go.
-    fn record_released_sessions(&self, state: &mut State) {
-        let outputs = &state.outputs;
-        let index = &self.surface_index;
-        state.window_sessions.record_finalizing(|surface| {
-            index
-                .get(surface)
-                .and_then(|id| self.session_snapshot(outputs, *id))
-        });
     }
 
     /// Record every window in a session and write the store now: the
