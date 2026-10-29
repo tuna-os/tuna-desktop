@@ -180,8 +180,11 @@ mod tests {
         assert!(needs_save(Some(true), None, false));
     }
 
+    /// `remember-numlock-state`, `numlock-state`, and every write.
+    type Keys = (Option<bool>, Option<bool>, Vec<bool>);
+
     #[derive(Clone, Default)]
-    struct Fake(Arc<Mutex<(Option<bool>, Option<bool>, Vec<bool>)>>);
+    struct Fake(Arc<Mutex<Keys>>);
 
     impl Store for Fake {
         fn get(&self, key: &str) -> Option<bool> {

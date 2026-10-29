@@ -483,25 +483,28 @@ impl InputSources {
                 glib::Propagation::Proceed
             });
         }
+        {
+            // A key event carries the state from before it, so a released
+            // modifier shows only in the seat's state once the compositor's
+            // modifiers event lands (`_onModifierChange`).
+            let weak = Rc::downgrade(&ui);
+            keys.connect_key_released(move |_, _, _, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.check_seat_modifiers();
+                }
+            });
+        }
         ui.popup.window.add_controller(keys);
         {
             // `show`'s race check: a modifier released before the popup
             // held the keyboard is never reported, so look once it does.
             let weak = Rc::downgrade(&ui);
             ui.popup.window.connect_is_active_notify(move |window| {
-                if !window.is_active() {
-                    return;
+                if window.is_active() {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.check_seat_modifiers();
+                    }
                 }
-                let weak = weak.clone();
-                glib::timeout_add_local_once(Duration::from_millis(30), move || {
-                    let Some(ui) = weak.upgrade() else { return };
-                    let state = gtk::gdk::Display::default()
-                        .and_then(|d| d.default_seat())
-                        .and_then(|s| s.keyboard())
-                        .map(|k| k.modifier_state())
-                        .unwrap_or_else(gtk::gdk::ModifierType::empty);
-                    ui.modifiers_changed(state);
-                });
             });
         }
         ui.install_actions();
@@ -711,6 +714,27 @@ impl InputSources {
         }
     }
 
+    /// Read the seat keyboard's modifiers a moment later (after the
+    /// compositor's `wl_keyboard.modifiers` for the latest key).
+    fn check_seat_modifiers(&self) {
+        let window = self.popup.window.downgrade();
+        glib::timeout_add_local_once(Duration::from_millis(30), move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let state = gtk::gdk::Display::default()
+                .and_then(|d| d.default_seat())
+                .and_then(|s| s.keyboard())
+                .map(|k| k.modifier_state())
+                .unwrap_or_else(gtk::gdk::ModifierType::empty);
+            let _ = WidgetExt::activate_action(
+                &window,
+                "input-source.modifiers",
+                Some(&state.bits().to_variant()),
+            );
+        });
+    }
+
     fn modifiers_changed(&self, state: gtk::gdk::ModifierType) {
         if !self.popup.open.get() {
             return;
@@ -760,8 +784,17 @@ impl InputSources {
                 ui.popup_finish();
             }
         });
+        let modifiers = gio::SimpleAction::new("modifiers", Some(glib::VariantTy::UINT32));
+        let weak = Rc::downgrade(self);
+        modifiers.connect_activate(move |_, state| {
+            let state = state.and_then(|v| v.get::<u32>()).unwrap_or(0);
+            if let Some(ui) = weak.upgrade() {
+                ui.modifiers_changed(gtk::gdk::ModifierType::from_bits_truncate(state));
+            }
+        });
         let group = gio::SimpleActionGroup::new();
         group.add_action(&finish);
+        group.add_action(&modifiers);
         self.popup
             .window
             .insert_action_group("input-source", Some(&group));
