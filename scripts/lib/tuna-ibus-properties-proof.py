@@ -134,6 +134,13 @@ def owned_application(roots, pid, bus_pid):
     libatspi 2.52 (cache_process_children_changed) then disposes the whole
     application in this process, although it never left the bus (gtk-shell
     123281544604: 'not unique (0 live)' right after the indicator press).
+    The disposal can also land after those reads: libatspi handles queued
+    signals while it waits for a reply, so it can dispose the application
+    during get_child_count, which still returns, and disposal clears the
+    root's `app`. get_process_id then fails with "Process is defunct"
+    (ATSPI_ERROR_IPC) before any D-Bus traffic (gtk-shell 123521641884, right
+    after the indicator press). Its other failure, the bus no longer
+    resolving the name, is no disposal.
     Only such a disposal of a name the bus still binds to `pid` is
     transient; absence, a duplicate or the application's own errors fail.
     """
@@ -146,7 +153,13 @@ def owned_application(roots, pid, bus_pid):
             if application_gone(error):
                 disposed.append(bus_name)
             continue
-        if root.get_process_id() == pid:
+        try:
+            process = root.get_process_id()
+        except GLib.Error:
+            if root.app is None:
+                disposed.append(bus_name)
+            continue
+        if process == pid:
             found.append((bus_name, root))
     if len(found) == 1:
         return found[0]

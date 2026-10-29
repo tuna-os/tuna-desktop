@@ -112,6 +112,36 @@ class Controls(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"not unique \(2 live\)"):
             owned([(":1.0", shell), (":1.9", Root(42))], 42, {}.get)
 
+    def test_a_disposal_after_the_liveness_reads_is_the_same_disposal(self):
+        # gtk-shell 123521641884: get_role and get_child_count succeeded, then
+        # get_process_id failed "Process is defunct" (atspi_error 1): libatspi
+        # had disposed the application, clearing the root's app, in between.
+        defunct = GLib.Error("Process is defunct", "atspi_error", 1)
+        class Root:
+            def __init__(self, pid, app=":1.0", error=None):
+                self.pid, self.app, self.error = pid, app, error
+            def get_role(self): return "application"
+            def get_child_count(self): return 1
+            def get_process_id(self):
+                if self.error:
+                    raise self.error
+                return self.pid
+        owned, transient = namespace["owned_application"], namespace["Transient"]
+        shell, disposed = Root(42), Root(42, None, defunct)
+        # Another application's disposal or departure is not the shell's.
+        for other in (Root(7, None, defunct), Root(7, ":1.3", defunct)):
+            self.assertEqual(owned([(":1.3", other), (":1.0", shell)], 42, {":1.3": 7}.get),
+                             (":1.0", shell))
+        # The shell's own disposal rereads only while the bus binds it to the shell.
+        with self.assertRaises(transient):
+            owned([(":1.0", disposed)], 42, {":1.0": 42}.get)
+        for bus_pid in ({}.get, {":1.0": 7}.get):
+            with self.assertRaisesRegex(RuntimeError, r"not unique \(0 live\)"):
+                owned([(":1.0", disposed)], 42, bus_pid)
+        # The bus no longer resolving a still-held application is no disposal.
+        with self.assertRaisesRegex(RuntimeError, r"not unique \(0 live\)"):
+            owned([(":1.0", Root(42, ":1.0", defunct))], 42, {":1.0": 42}.get)
+
     def test_a_disposal_under_the_walk_is_transient_only_while_the_bus_binds_the_shell(self):
         # gtk-shell 123371830361: libatspi disposed the shell's application
         # while matching walked it after a press; the GLib.Error fell into
