@@ -916,6 +916,13 @@ jobs:
       # maximized and on their workspace, after the nested compositor
       # restarts (G-SESSION-RESTORE*).
       - run: scripts/tuna-session-restore-proof --artifacts gtk-shell-artifacts/session-restore
+      # On-screen keyboard (#349): real clicks into a GTK entry and on the
+      # shell's keys (found in its AT-SPI tree), the client's text read
+      # back, and the lock screen's own keyboard unlocking through PAM.
+      # Independent of the proofs above, so it runs (and gates) even when
+      # one of them already failed the job.
+      - if: ${{ !cancelled() }}
+        run: shellcheck scripts/tuna-osk-proof && scripts/tuna-osk-proof --artifacts gtk-shell-artifacts/osk
       # Keep runnable binaries even when a later live proof assertion fails.
       - if: always()
         run: |
@@ -1329,6 +1336,7 @@ jobs:
           --assertions ledger-in/gtk-shell/scale/assertions.txt
           --assertions ledger-in/gtk-shell/magnifier/assertions.txt
           --assertions ledger-in/gtk-shell/session-restore/assertions.txt
+          --assertions ledger-in/gtk-shell/osk/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
 

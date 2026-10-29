@@ -362,6 +362,7 @@ impl View {
             return;
         }
         self.close_popover();
+        self.model.borrow_mut().keys_rebuilt();
         let grid = gtk::Grid::new();
         grid.set_row_homogeneous(true);
         grid.set_column_homogeneous(true);

@@ -26,7 +26,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| screen-keyboard-enabled | Honored | GTK shell shows GNOME 51's on-screen keyboard (gnome-shell `keyboard.js`, GNOME's osk-layouts) on the focused text field's input-panel request and types through the compositor; the lock screen's keyboard edits only the unlock prompt. Nested proof gates remain open (#349) |
+| screen-keyboard-enabled | Honored | GTK shell shows GNOME 51's on-screen keyboard (gnome-shell `keyboard.js`, GNOME's osk-layouts) on the focused text field's input-panel request and types through the compositor; the lock screen's keyboard edits only the unlock prompt (G-OSK-SHOW, G-OSK-TYPE, G-OSK-SHIFT, G-OSK-LOCK; #349) |
 | screen-magnifier-enabled | Honored | GTK shell mirrors the switch plus every org.gnome.desktop.a11y.magnifier key into the session snapshot; the compositor draws GNOME 51's ZoomRegion on every output frame (zoom, tracking, cross-hairs, color effects, magnified pointer sprite), and captures/casts read back the same passes; Super+Alt+8 toggles it (M-KEYS). Accepted differences: per-monitor regions, touch mapped through the zoom, window-centre fallback for non-AT-SPI apps, shell popover focus untracked (#349) |
 | screen-reader-enabled | Honored (hardware session only) | Hardware GTK shell publishes the preference to the compositor, which owns a genuine nonreplacement Orca child bound to its lifetime; nested runtimes refuse activation and never manage host Orca. Genuine Orca activation/logout VM probes are required; Settings UI activation and complete spoken lock/login/shell navigation remain unqualified (#352) |
 ## org.gnome.desktop.a11y.interface

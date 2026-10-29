@@ -245,6 +245,14 @@ impl Keyboard {
         }
     }
 
+    /// The drawn keys were rebuilt, so a key held down went with them and
+    /// its release never comes. GNOME keeps `_longPressed` on each `Key`:
+    /// the long press that latched shift must not swallow the release of
+    /// the key drawn in its place (the Caps Lock tap that unlatches).
+    pub fn keys_rebuilt(&mut self) {
+        self.long_pressed = false;
+    }
+
     /// An extended (long-press popup) key clicked: commits like a string key.
     pub fn extended(&mut self, text: &str) -> Vec<Effect> {
         self.commit(text)
@@ -471,7 +479,8 @@ impl Presence {
         }
     }
 
-    /// `open(true)`, e.g. for the lock screen prompt.
+    /// `open(true)`: what the timers see once a keyboard is on screen.
+    #[cfg(test)]
     pub fn open_now(&mut self, now: u64) {
         if self.enabled {
             self.open(true, now);
@@ -624,6 +633,20 @@ mod tests {
         assert_eq!(kb.level_name(), "shift");
         let s = shift(&kb);
         kb.release(s);
+        assert_eq!(kb.level_name(), "default");
+        assert!(!kb.latched());
+    }
+
+    #[test]
+    fn caps_lock_tap_unlatches_once_the_keys_are_redrawn() {
+        let mut kb = us(0);
+        let s = shift(&kb);
+        kb.long_press(s);
+        // The latch redraws the keys: the held shift key's release is lost.
+        kb.keys_rebuilt();
+        assert!(kb.latched());
+        let caps = shift(&kb);
+        kb.release(caps);
         assert_eq!(kb.level_name(), "default");
         assert!(!kb.latched());
     }

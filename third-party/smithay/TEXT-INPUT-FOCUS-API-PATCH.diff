@@ -27,3 +27,36 @@ index 71ade865..00408fc7 100644
  
          text_input.set_focus(None);
      }
+diff --git a/src/wayland/text_input/mod.rs b/src/wayland/text_input/mod.rs
+index fe707df9..ecc739bf 100644
+--- a/src/wayland/text_input/mod.rs
++++ b/src/wayland/text_input/mod.rs
+@@ -55,7 +55,9 @@ use wayland_protocols::wp::text_input::zv3::server::{
+     zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
+     zwp_text_input_v3::ZwpTextInputV3,
+ };
+-use wayland_server::{backend::GlobalId, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New};
++use wayland_server::{
++    backend::GlobalId, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
++};
+ 
+ use crate::input::{Seat, SeatHandler};
+ 
+@@ -160,8 +162,15 @@ where
+                     },
+                 );
+                 handle.add_instance(&instance);
+-                if input_method_handle.has_instance() {
+-                    handle.enter();
++                // Roost #349: a text input created while its client holds
++                // the keyboard learns the focus at once, whether or not an
++                // input method runs, as mutter does
++                // (meta_wayland_text_input_create_new_resource).
++                if let Some(focus) = handle
++                    .focus()
++                    .filter(|focus| focus.id().same_client_as(&instance.id()))
++                {
++                    instance.enter(&focus);
+                 }
+             }
+             zwp_text_input_manager_v3::Request::Destroy => {

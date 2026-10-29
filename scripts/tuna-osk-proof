@@ -1,0 +1,416 @@
+#!/bin/sh
+# tuna-osk-proof — GNOME 51's on-screen keyboard (#349) in the nested session.
+#
+# Usage:
+#   scripts/tuna-osk-proof [--display :N] [--artifacts DIR]
+#
+# Drives real pointer input (xdotool through the nested window) at a
+# GTK 4 probe with two entries (scripts/lib/tuna-osk-probe.py, GTK's
+# Wayland text-input module) and at the shell's keyboard, whose keys it
+# finds in the shell's AT-SPI tree, as a screen reader sees them:
+#   G-OSK-SHOW  with screen-keyboard-enabled off a click into an entry
+#              shows nothing; on, a click shows the keyboard no sooner
+#              than GNOME's 300 ms rest time, focus moving between the
+#              entries keeps it (inputMethod's 50 ms focus-out delay), and
+#              focus leaving text hides it no sooner than that delay
+#   G-OSK-TYPE  tapping keys types their characters into the focused
+#              entry, read back from the client; focus stays there
+#   G-OSK-SHIFT shift types one uppercase letter, then lowercase; the
+#              long-press caps latch types uppercase until tapped off
+#   G-OSK-LOCK  locked, the session keyboard is hidden and never maps; the
+#              lock screen's keyboard types the password into the unlock
+#              prompt alone (it unlocks through PAM, pam_wrapper) and no
+#              text reaches the session's entries
+# Writes assertions.txt for the parity ledger.
+set -eu
+
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+fi
+unset CDPATH
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+DISPLAY_ARG=""
+ARTIFACTS="$ROOT/osk-artifacts"
+WIDTH=1280
+HEIGHT=800
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --display) DISPLAY_ARG="$2"; shift 2 ;;
+        --artifacts) ARTIFACTS="$2"; shift 2 ;;
+        --help|-h) sed -n '2,24p' "$0"; exit 0 ;;
+        *) echo "tuna-osk-proof: unknown argument $1" >&2; exit 1 ;;
+    esac
+done
+mkdir -p "$ARTIFACTS"
+ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
+LOG="$ARTIFACTS/nested.log"
+ASSERTIONS="$ARTIFACTS/assertions.txt"
+: >"$ASSERTIONS"
+CSTATE="$ARTIFACTS/compositor-state.json"
+WATCH="$ARTIFACTS/osk-watch.jsonl"
+PROBE_LOG="$ARTIFACTS/probe.jsonl"
+: >"$WATCH"
+: >"$PROBE_LOG"
+HOME_PRIV="$ARTIFACTS/home"
+# Keep AF_UNIX socket paths below SUN_LEN even in long CI checkout paths.
+RUN_PRIV="$(mktemp -d /tmp/tuna-osk.XXXXXX)"
+CONF_PRIV="$ARTIFACTS/config"
+mkdir -p "$HOME_PRIV" "$RUN_PRIV" "$CONF_PRIV"
+chmod 700 "$RUN_PRIV"
+ORIG_HOME="$HOME"
+TUNA_COMPOSITOR_STATE="$CSTATE"
+XDG_RUNTIME_DIR="$RUN_PRIV"
+HOME="$HOME_PRIV"
+# keyfile (not dconf): GSettings writes stay in the private config dir
+# and propagate cross-process through file monitoring, never touching
+# the runner's own dconf database.
+GSETTINGS_BACKEND=keyfile
+XDG_CONFIG_HOME="$CONF_PRIV"
+export TUNA_COMPOSITOR_STATE XDG_RUNTIME_DIR HOME GSETTINGS_BACKEND XDG_CONFIG_HOME
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
+LIB="$ROOT/scripts/lib/tuna-osk-proof.py"
+
+OWNED_XVFB=""
+COMPOSITOR_PID=""
+CLIENT_PID=""
+WATCH_PID=""
+cleanup() {
+    if [ -n "$WATCH_PID" ]; then kill "$WATCH_PID" 2>/dev/null || true; fi
+    if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
+    if [ -n "$COMPOSITOR_PID" ]; then kill "$COMPOSITOR_PID" 2>/dev/null || true; fi
+    if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+    if [ -n "$COMPOSITOR_PID" ]; then wait "$COMPOSITOR_PID" 2>/dev/null || true; fi
+    rm -rf "$RUN_PRIV"
+}
+trap cleanup EXIT INT TERM
+pass() { echo "$1 pass $2" >>"$ASSERTIONS"; echo "tuna-osk-proof: $1 pass: $2"; }
+fail() {
+    echo "$1 fail $2" >>"$ASSERTIONS"
+    echo "tuna-osk-proof: $1 FAIL: $2" >&2
+    cp "$CSTATE" "$ARTIFACTS/fail-state.json" 2>/dev/null || true
+    tail -20 "$LOG" >&2 || true
+    exit 1
+}
+cstate() {
+    # Query, optional label, optional timeout: a numeric second
+    # argument is a timeout, a label means the default 20 seconds.
+    if [ $# -ge 3 ]; then timeout=$3
+    elif [ "${2:-20}" -eq "${2:-20}" ] 2>/dev/null; then timeout=$2
+    else timeout=20; fi
+    end=$(($(date +%s) + timeout))
+    while [ "$(date +%s)" -le "$end" ]; do
+        if [ -n "$COMPOSITOR_PID" ]; then
+            kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
+        fi
+        [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1 && return 0
+        sleep 0.1
+    done
+    cat "$CSTATE" >&2 2>/dev/null || true
+    return 1
+}
+# Seconds between two CLOCK_MONOTONIC stamps, and float comparisons.
+elapsed() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f", b - a }'; }
+at_least() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
+at_most() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'; }
+now() { "$PY" -c 'import time; print(f"{time.monotonic():.6f}")'; }
+OSK_MAPPED='any(.layers[]; .namespace == "tuna-osk")'
+OSK_GONE='all(.layers[]; .namespace != "tuna-osk")'
+osk_rect() {
+    jq -r '[.layers[] | select(.namespace == "tuna-osk") | .rect] | first // empty | "\(.[0]) \(.[1]) \(.[2]) \(.[3])"' "$CSTATE"
+}
+# The keyboard has slid in: its layer holds one size for half a second.
+osk_settled() {
+    for _ in $(seq 1 40); do
+        r1="$(osk_rect)"
+        sleep 0.5
+        r2="$(osk_rect)"
+        if [ -n "$r1" ] && [ "$r1" = "$r2" ]; then
+            # shellcheck disable=SC2086
+            set -- $r2
+            [ "$4" -ge 100 ] && return 0
+        fi
+    done
+    fail "$1" "the keyboard layer never settled (last $r2)"
+}
+# press X Y GATE: a real click at nested (X, Y); sets PRESS_T to the
+# probe's CLOCK_MONOTONIC stamp of the press.
+press() {
+    n="$(wc -l <"$PROBE_LOG")"
+    xdotool mousemove --window "$WID" "$1" "$2" click 1
+    for _ in $(seq 1 50); do
+        PRESS_T="$(tail -n +$((n + 1)) "$PROBE_LOG" | jq -rs 'map(select(.press)) | first | .t // empty')"
+        [ -n "$PRESS_T" ] && return 0
+        sleep 0.1
+    done
+    fail "$3" "the probe never saw the press at ($1, $2)"
+}
+# widget_xy NAME: the probe widget's global centre.
+widget_xy() {
+    jq -rs --arg w "$1" 'map(select(.bounds)) | last | .bounds[$w] | "\(.[0] + .[2] / 2 | floor) \(.[1] + .[3] / 2 | floor)"' "$PROBE_LOG" |
+        awk -v x="$WX" -v y="$WY" '{ printf "%d %d\n", $1 + x, $2 + y }'
+}
+text_of() {
+    jq -rs --arg f "$1" 'map(select(.text)) | last | .text[$f] // ""' "$PROBE_LOG"
+}
+focus_of() {
+    jq -rs 'map(select(has("focus"))) | last | .focus // "none"' "$PROBE_LOG"
+}
+# expect_text FIELD VALUE GATE: the client's entry reaches VALUE.
+expect_text() {
+    for _ in $(seq 1 50); do
+        [ "$(text_of "$1")" = "$2" ] && return 0
+        sleep 0.1
+    done
+    fail "$3" "entry $1 holds '$(text_of "$1")', expected '$2'"
+}
+DUMPS=0
+# key_xy WINDOW OX OY NAME GATE: the showing key NAME of the keyboard in
+# the shell window titled WINDOW, from a fresh AT-SPI dump.
+key_xy() {
+    for _ in $(seq 1 10); do
+        DUMPS=$((DUMPS + 1))
+        dump="$ARTIFACTS/a11y-$DUMPS.json"
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$dump" 20 >/dev/null 2>&1 ||
+            fail "$5" "no AT-SPI tree from the shell"
+        "$PY" "$LIB" key "$dump" "$1" "$2" "$3" "$4" && return 0
+        sleep 0.3
+    done
+    fail "$5" "no showing '$4' key in the '$1' keyboard (last tree $dump)"
+}
+# tap WINDOW OX OY NAME GATE: click the key a screen reader names NAME.
+tap() {
+    # shellcheck disable=SC2046
+    set -- "$@" $(key_xy "$@")
+    xdotool mousemove --window "$WID" "$6" "$7" click 1
+    sleep 0.3
+}
+session_tap() {
+    # shellcheck disable=SC2046
+    set -- "$1" "$2" $(osk_rect)
+    tap "On-Screen Keyboard" "$3" "$4" "$1" "$2"
+}
+
+# The lock screen's password goes through a real PAM stack: pam_wrapper
+# serves the compositor's tuna-lock service from a private password
+# file. The password is lowercase letters, tapped on the lock keyboard.
+PAM_WRAPPER_LIB=/usr/lib/x86_64-linux-gnu/libpam_wrapper.so
+PAM_MATRIX=/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so
+UNLOCK_PASSWORD="oskproof"
+if [ ! -e "$PAM_WRAPPER_LIB" ] || [ ! -e "$PAM_MATRIX" ]; then
+    fail G-OSK-LOCK "pam_wrapper is required (libpam-wrapper)"
+fi
+mkdir -p "$ARTIFACTS/pam/services"
+echo "$(id -un):$UNLOCK_PASSWORD:tuna-lock" >"$ARTIFACTS/pam/passdb"
+printf 'auth required %s passdb=%s\naccount required %s passdb=%s\n' \
+    "$PAM_MATRIX" "$ARTIFACTS/pam/passdb" "$PAM_MATRIX" "$ARTIFACTS/pam/passdb" \
+    >"$ARTIFACTS/pam/services/tuna-lock"
+
+if [ -x /usr/libexec/at-spi-bus-launcher ]; then
+    /usr/libexec/at-spi-bus-launcher --launch-immediately >"$ARTIFACTS/atspi.log" 2>&1 &
+else
+    fail G-OSK-TYPE "the AT-SPI bus launcher is required (at-spi2-core)"
+fi
+[ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
+if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
+    Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
+        3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+    OWNED_XVFB=$!
+    for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+    [ -s "$ARTIFACTS/xvfb-display" ] || fail G-OSK-SHOW "Xvfb did not allocate a display"
+    DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+    export DISPLAY
+    for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 1; done
+fi
+
+# The private HOME below hides the real toolchain config; point the
+# build at the invoking user's cargo/rustup homes explicitly.
+RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$ORIG_HOME/.cargo}" \
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk
+{
+    echo "source $(git -C "$ROOT" rev-parse HEAD) $(git -C "$ROOT" status --short | head -c 200)"
+    sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-shell-gtk"
+} >"$ARTIFACTS/manifest.txt" 2>&1 || fail G-OSK-SHOW "build identity failed"
+gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false
+RUST_BACKTRACE=1 LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
+    PAM_WRAPPER_SERVICE_DIR="$ARTIFACTS/pam/services" \
+    "$BIN_DIR/tuna-compositor" --backend winit --socket "tuna-osk-proof-$$" \
+    --width "$WIDTH" --height "$HEIGHT" --shell-bin "$BIN_DIR/tuna-shell-gtk" >"$LOG" 2>&1 &
+COMPOSITOR_PID=$!
+WID=""
+for _ in $(seq 1 60); do
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail G-OSK-SHOW "compositor exited during startup"
+    WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
+    [ -n "$WID" ] && break
+    sleep 1
+done
+[ -n "$WID" ] || fail G-OSK-SHOW "no nested window"
+xdotool windowfocus --sync "$WID"
+cstate '.layers | any(.namespace == "tuna-panel" and .rect == [0, 0, 1280, 32])' "panel" 180 ||
+    fail G-OSK-SHOW "the top bar never mapped"
+"$PY" "$LIB" watch "$CSTATE" "$WATCH" &
+WATCH_PID=$!
+SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
+[ -n "$SOCKET_NAME" ] || fail G-OSK-SHOW "no nested socket in the log"
+GTK_IM_MODULE=wayland WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-osk-probe.py" \
+    "$PROBE_LOG" >"$ARTIFACTS/probe.log" 2>&1 &
+CLIENT_PID=$!
+cstate '.windows | any(.app_id == "tuna-osk-probe")' "probe window" ||
+    fail G-OSK-SHOW "the probe window never mapped"
+wrect() {
+    jq -r '.windows[] | select(.app_id == "tuna-osk-probe") | .rect | "\(.[0]) \(.[1]) \(.[2]) \(.[3])"' "$CSTATE"
+}
+# The first mapped size races the initial configure; wait for settle.
+sleep 2
+rect1="$(wrect)" && sleep 1 && rect2="$(wrect)"
+if [ -z "$rect1" ] || [ "$rect1" != "$rect2" ]; then
+    fail G-OSK-SHOW "probe geometry never settled ($rect1 vs $rect2)"
+fi
+# shellcheck disable=SC2086
+set -- $rect2
+WX=$1 WY=$2
+for _ in $(seq 1 50); do grep -q '"bounds"' "$PROBE_LOG" && break; sleep 0.2; done
+grep -q '"bounds"' "$PROBE_LOG" || fail G-OSK-SHOW "the probe never reported its widget bounds"
+# shellcheck disable=SC2046
+set -- $(widget_xy a); AX=$1 AY=$2
+# shellcheck disable=SC2046
+set -- $(widget_xy b); BX=$1 BY=$2
+# shellcheck disable=SC2046
+set -- $(widget_xy "done"); DX=$1 DY=$2
+[ "$DY" -lt $((HEIGHT * 2 / 3)) ] ||
+    fail G-OSK-SHOW "probe widgets reach y $DY, under where the keyboard opens"
+
+# ---- G-OSK-SHOW
+# Off: a click into an entry gives it input-method focus and nothing else.
+press "$AX" "$AY" G-OSK-SHOW
+off_t="$PRESS_T"
+cstate '.focused_app_id == "tuna-osk-probe" and .text_input != null' "entry focus" 10 ||
+    fail G-OSK-SHOW "the click never gave entry a text-input focus"
+[ "$(focus_of)" = a ] || fail G-OSK-SHOW "the probe's focus is $(focus_of), not entry a"
+sleep 1.5
+"$PY" "$LIB" never "$WATCH" "$off_t" "$(now)" >"$ARTIFACTS/show-off.txt" ||
+    fail G-OSK-SHOW "the keyboard showed with screen-keyboard-enabled off: $(cat "$ARTIFACTS/show-off.txt")"
+gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
+# GSettings' keyfile backend reaches the shell through file monitoring.
+sleep 3
+cstate "$OSK_GONE" 1 || fail G-OSK-SHOW "enabling alone opened the keyboard"
+# On: the click into entry b is the input-panel request (GTK re-enables
+# text-input); the keyboard opens after KEYBOARD_REST_TIME (300 ms).
+press "$BX" "$BY" G-OSK-SHOW
+show_press="$PRESS_T"
+cstate "$OSK_MAPPED" 10 || fail G-OSK-SHOW "a click into entry b never showed the keyboard"
+show_t="$("$PY" "$LIB" first "$WATCH" "$show_press" 1)" ||
+    fail G-OSK-SHOW "no mapped keyboard in the watch log after the press"
+show_delay="$(elapsed "$show_press" "$show_t")"
+at_least "$show_delay" 0.299 || fail G-OSK-SHOW "the keyboard showed ${show_delay}s after the press, before GNOME's 300 ms rest time"
+at_most "$show_delay" 2.0 || fail G-OSK-SHOW "the keyboard took ${show_delay}s to show"
+osk_settled G-OSK-SHOW
+# shellcheck disable=SC2046
+set -- $(osk_rect); KX=$1 KY=$2 KW=$3 KH=$4
+[ "$KW" -eq "$WIDTH" ] && [ $((KY + KH)) -eq "$HEIGHT" ] ||
+    fail G-OSK-SHOW "keyboard layer $KX $KY $KW $KH is not across the bottom of the output"
+cstate '.focused_app_id == "tuna-osk-probe"' 5 || fail G-OSK-SHOW "showing the keyboard took the probe's focus"
+[ "$(focus_of)" = b ] || fail G-OSK-SHOW "the probe's focus is $(focus_of), not entry b"
+# Focus moving between entries goes out and back in: the 50 ms panel
+# hide delay keeps the keyboard up throughout.
+press "$AX" "$AY" G-OSK-SHOW
+move_press="$PRESS_T"
+sleep 1
+move_end="$(now)"
+[ "$(focus_of)" = a ] || fail G-OSK-SHOW "the probe's focus is $(focus_of), not entry a"
+"$PY" "$LIB" steady "$WATCH" "$move_press" "$move_end" >"$ARTIFACTS/show-move.txt" ||
+    fail G-OSK-SHOW "moving focus between entries hid the keyboard: $(cat "$ARTIFACTS/show-move.txt")"
+# Focus leaving text: hidden after the 50 ms focus-out delay.
+press "$DX" "$DY" G-OSK-SHOW
+hide_press="$PRESS_T"
+cstate "$OSK_GONE" 10 || fail G-OSK-SHOW "focus on the button never hid the keyboard"
+[ "$(focus_of)" = "done" ] || fail G-OSK-SHOW "the probe's focus is $(focus_of), not the button"
+hide_t="$("$PY" "$LIB" first "$WATCH" "$hide_press" 0)" ||
+    fail G-OSK-SHOW "no unmapped keyboard in the watch log after the press"
+hide_delay="$(elapsed "$hide_press" "$hide_t")"
+at_least "$hide_delay" 0.050 || fail G-OSK-SHOW "the keyboard hid ${hide_delay}s after focus left, before GNOME's 50 ms delay"
+at_most "$hide_delay" 2.0 || fail G-OSK-SHOW "the keyboard took ${hide_delay}s to hide"
+pass G-OSK-SHOW "off: no keyboard; on: shown ${show_delay}s after the click (rest 300 ms), kept across entries, hidden ${hide_delay}s after focus left (delay 50 ms)"
+
+# ---- G-OSK-TYPE: tap t, u, n, a into entry a.
+press "$AX" "$AY" G-OSK-TYPE
+cstate "$OSK_MAPPED" 10 || fail G-OSK-TYPE "a click into entry a never showed the keyboard"
+osk_settled G-OSK-TYPE
+typed=""
+for letter in t u n a; do
+    session_tap "$letter" G-OSK-TYPE
+    typed="$typed$letter"
+    expect_text a "$typed" G-OSK-TYPE
+done
+[ "$(text_of b)" = "" ] || fail G-OSK-TYPE "entry b got '$(text_of b)'"
+cstate '.focused_app_id == "tuna-osk-probe" and .text_input != null' 5 ||
+    fail G-OSK-TYPE "tapping keys moved the keyboard focus off the entry"
+[ "$(focus_of)" = a ] || fail G-OSK-TYPE "the probe's focus is $(focus_of), not entry a"
+pass G-OSK-TYPE "tapped t u n a: the client's entry a reads '$(text_of a)' and keeps the focus"
+
+# ---- G-OSK-SHIFT: Shift T u, long-press latch N A, unlatch s.
+press "$BX" "$BY" G-OSK-SHIFT
+"$PY" "$LIB" steady "$WATCH" "$PRESS_T" "$(now)" >/dev/null ||
+    fail G-OSK-SHIFT "the keyboard hid moving to entry b"
+[ "$(focus_of)" = b ] || fail G-OSK-SHIFT "the probe's focus is $(focus_of), not entry b"
+session_tap Shift G-OSK-SHIFT
+session_tap T G-OSK-SHIFT
+expect_text b "T" G-OSK-SHIFT
+# One key, then back to the lowercase level.
+session_tap u G-OSK-SHIFT
+expect_text b "Tu" G-OSK-SHIFT
+# shellcheck disable=SC2046
+set -- $(osk_rect)
+# shellcheck disable=SC2046
+set -- $(key_xy "On-Screen Keyboard" "$1" "$2" Shift G-OSK-SHIFT)
+xdotool mousemove --window "$WID" "$1" "$2" mousedown 1
+sleep 1.5
+xdotool mouseup 1
+sleep 0.5
+# shellcheck disable=SC2046
+set -- $(osk_rect)
+key_xy "On-Screen Keyboard" "$1" "$2" "Caps Lock" G-OSK-SHIFT >/dev/null
+session_tap N G-OSK-SHIFT
+expect_text b "TuN" G-OSK-SHIFT
+session_tap A G-OSK-SHIFT
+expect_text b "TuNA" G-OSK-SHIFT
+session_tap "Caps Lock" G-OSK-SHIFT
+session_tap s G-OSK-SHIFT
+expect_text b "TuNAs" G-OSK-SHIFT
+[ "$(text_of a)" = tuna ] || fail G-OSK-SHIFT "entry a changed to '$(text_of a)'"
+pass G-OSK-SHIFT "Shift T then u typed 'Tu'; the long-press latch typed 'NA' until tapped off; entry b reads '$(text_of b)'"
+
+# ---- G-OSK-LOCK
+cstate "$OSK_MAPPED" 5 || fail G-OSK-LOCK "the session keyboard was not up before locking"
+text_a="$(text_of a)"
+text_b="$(text_of b)"
+xdotool key --clearmodifiers super+l
+cstate '.locked == true' 15 || fail G-OSK-LOCK "Super+L did not lock the session"
+cstate "$OSK_GONE" 5 || fail G-OSK-LOCK "the session keyboard stayed mapped over the lock screen"
+lock_t="$(jq -rs 'map(select(.locked == true)) | first | .t' "$WATCH")"
+hidden_t="$(jq -rs --argjson l "$lock_t" 'map(select(.t >= $l and .osk == null)) | first | .t' "$WATCH")"
+sleep 1
+# A click lifts the curtain; the unlock prompt takes the focus and opens
+# the lock screen's own keyboard.
+xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
+sleep 1.5
+for letter in o s k p r o o f; do
+    tap "Lock Screen" 0 0 "$letter" G-OSK-LOCK
+done
+cstate '.locked == true' 2 || fail G-OSK-LOCK "the session unlocked before Enter"
+tap "Lock Screen" 0 0 Enter G-OSK-LOCK
+cstate '(.locked | not)' 15 || fail G-OSK-LOCK "the password tapped on the lock keyboard did not unlock the session"
+unlock_t="$(jq -rs --argjson l "$lock_t" 'map(select(.t > $l and .locked == false)) | first | .t' "$WATCH")"
+"$PY" "$LIB" never "$WATCH" "$hidden_t" "$unlock_t" >"$ARTIFACTS/lock-session.txt" ||
+    fail G-OSK-LOCK "the session keyboard mapped while locked: $(cat "$ARTIFACTS/lock-session.txt")"
+leaked="$(jq -rs --argjson a "$lock_t" --argjson b "$unlock_t" '[.[] | select(.text and .t >= $a and .t <= $b)] | length' "$PROBE_LOG")"
+[ "$leaked" -eq 0 ] || fail G-OSK-LOCK "$leaked entry changes reached the session client while locked"
+[ "$(text_of a)" = "$text_a" ] && [ "$(text_of b)" = "$text_b" ] ||
+    fail G-OSK-LOCK "the session entries changed across the lock: '$(text_of a)' '$(text_of b)'"
+pass G-OSK-LOCK "locked: session keyboard hidden and never mapped; the lock keyboard's 8 taps and Enter unlocked through PAM; the session entries still read '$text_a' '$text_b'"
+
+cp "$CSTATE" "$ARTIFACTS/final-state.json"
+grep -qi panicked "$LOG" && fail G-OSK-NOPANIC "panic in nested log"
+echo "G-OSK-NOPANIC pass no panic in nested log" >>"$ASSERTIONS"
+echo "tuna-osk-proof: OK, artifacts in $ARTIFACTS"
