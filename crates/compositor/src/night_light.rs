@@ -3500,5 +3500,16 @@ mod tests {
                 ColorChange::NightLightActive(false),
             ]
         );
+        // The loop retiring the disable at sunrise (gsd's recheck) is
+        // announced too, exactly once.
+        let after_sunrise = midnight_utc + 7 * 3600;
+        controller.tick_with_clock(after_sunrise, 0, t0 + Duration::from_secs(7));
+        assert_eq!(share.disabled_until_tmw(), None);
+        assert_eq!(
+            changes.try_iter().collect::<Vec<_>>(),
+            [ColorChange::DisabledUntilTomorrow(false)]
+        );
+        controller.tick_with_clock(after_sunrise, 0, t0 + Duration::from_secs(7));
+        assert_eq!(changes.try_iter().count(), 0);
     }
 }
