@@ -102,3 +102,15 @@ frames dropped without finish, per-draw fences for shared contexts, and an
 upload from a later shared context that must not change a finished frame.
 The isolated diff is retained in PER-FRAME-READ-FENCE-PATCH.diff; the
 pinned version stays 0.7.0.
+
+Issue #349 additionally changes src/wayland/seat/keyboard.rs for GNOME's
+on-screen keyboard. Upstream sends zwp_text_input_v3 enter and leave only
+while an input method instance exists, so without IBus a text field never
+learns it has focus and never enables its text input. Mutter announces
+text-input focus unconditionally (meta-wayland-text-input.c), and GNOME's
+on-screen keyboard follows that input-method focus; keyboard focus enter
+and leave now always send text-input enter and leave. Input-method
+deactivation stays gated on an instance, and text-input requests without
+an input method are still discarded by Smithay (Roost tracks them itself
+before Smithay dispatches them). The isolated diff is retained in
+TEXT-INPUT-FOCUS-API-PATCH.diff; the pinned version stays 0.7.0.

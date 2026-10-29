@@ -352,6 +352,8 @@ pub struct Session<'a> {
     screenshot_pointer: Option<(i32, i32)>,
     /// The hover-click chooser's latest pick, drained by the hub.
     dwell_click: Option<tuna_shell_control::DwellClick>,
+    /// On-screen keyboard input the shell typed, drained by the hub (#349).
+    osk_inputs: Vec<tuna_shell_control::OskInput>,
     /// Input-source switches the shell asked for (`true` backward).
     input_source_switches: Vec<bool>,
     /// The switcher's thumbnail frames, when the shell sent new ones.
@@ -451,6 +453,7 @@ impl<'a> Session<'a> {
             screen_reader: None,
             screenshot_pointer: None,
             dwell_click: None,
+            osk_inputs: Vec::new(),
             input_source_switches: Vec::new(),
             switcher_thumbnails: None,
             switcher_keys: None,
@@ -612,6 +615,19 @@ impl<'a> Session<'a> {
         }
         self.conn
             .write_frame(&Message::AcceleratorDeactivated { action, time, mode })
+    }
+
+    /// Send what GNOME's on-screen keyboard follows (#349). Peers older
+    /// than 0.43 cannot decode it and receive nothing.
+    pub fn send_on_screen_keyboard(&mut self, osk: OskBroadcast) -> Result<(), ControlError> {
+        if self.peer_minor < 43 {
+            return Ok(());
+        }
+        self.conn.write_frame(&Message::OnScreenKeyboard {
+            focus: osk.focus,
+            show: osk.show,
+            touch_auto: osk.touch_auto,
+        })
     }
 
     /// Send where the overview's window previews sit.
@@ -780,6 +796,34 @@ impl<'a> Session<'a> {
                     status: CommandStatus::Applied,
                 })?;
                 Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::OskInput { input },
+            } => {
+                if self.peer_minor < 43 {
+                    self.conn.write_frame(&Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        message: "on-screen keyboard input requires negotiated minor 43".into(),
+                    })?;
+                    return Ok(Handled::ErrorSent {
+                        kind: ErrorKind::UnknownCommand,
+                    });
+                }
+                // The lock screen's keyboard edits only its own prompt:
+                // nothing typed through the compositor while locked.
+                let applied = !self.locked.get();
+                let status = if applied {
+                    self.osk_inputs.push(input);
+                    CommandStatus::Applied
+                } else {
+                    CommandStatus::Denied {
+                        reason: "session locked".into(),
+                    }
+                };
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
             }
             Message::Command {
                 id,
@@ -1063,6 +1107,7 @@ impl<'a> Session<'a> {
             | Message::ScreenReader { .. }
             | Message::KeyboardAidToggled { .. }
             | Message::DwellClickType { .. }
+            | Message::OnScreenKeyboard { .. }
             | Message::PointerTimeout { .. }
             | Message::ShortcutConsent { .. }
             | Message::ConfirmDisplayChange { .. }
@@ -1117,6 +1162,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
         Message::PointerTimeout { .. } => "PointerTimeout",
+        Message::OnScreenKeyboard { .. } => "OnScreenKeyboard",
     }
 }
 
@@ -1295,6 +1341,7 @@ fn apply_command(
         | CommandKind::SetSwitcherKeys { .. }
         | CommandKind::MoveScreenshotPointer { .. }
         | CommandKind::SetScreenReader { .. }
+        | CommandKind::OskInput { .. }
         | CommandKind::SetDwellClickType { .. }
         | CommandKind::SetInputSettings(_) => (CommandStatus::Applied, None),
         CommandKind::Lock => {
@@ -1354,6 +1401,20 @@ pub struct PollOutcome {
     pub switcher_thumbnails: Option<Vec<tuna_shell_control::SwitcherThumbnail>>,
     /// The shell's switcher keys, if it sent new ones.
     pub switcher_keys: Option<Vec<tuna_shell_control::SwitcherKey>>,
+    /// On-screen keyboard input to type, in order (#349).
+    pub osk_inputs: Vec<tuna_shell_control::OskInput>,
+}
+
+/// What GNOME's on-screen keyboard follows, as broadcast to the shell
+/// (`Message::OnScreenKeyboard`, #349).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OskBroadcast {
+    /// The field holding input-method focus (none while locked).
+    pub focus: Option<tuna_shell_control::TextFieldFocus>,
+    /// An input-panel ON request not yet delivered.
+    pub show: bool,
+    /// Touch-mode auto-show.
+    pub touch_auto: bool,
 }
 
 /// Peers accepted but not yet handshaken are capped so a same-user
@@ -1492,6 +1553,10 @@ pub struct ControlHub {
     accelerator_queue: Vec<(u32, u32, u32, bool)>,
     /// Window-menu requests waiting for the next poll.
     menu_queue: Vec<Message>,
+    /// What the on-screen keyboard follows, as last set by the runtime,
+    /// and the value every live session holds (#349).
+    osk: OskBroadcast,
+    osk_sent: Option<OskBroadcast>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
     /// (multi-monitor): the runtime refreshes this every tick from the
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
@@ -1586,6 +1651,10 @@ impl ControlHub {
             switcher_queue: Vec::new(),
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
+            osk: OskBroadcast::default(),
+            // No focus and no auto-show is what a shell assumes before
+            // any message: only a change is owed.
+            osk_sent: Some(OskBroadcast::default()),
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             pointer_output: None,
@@ -1732,6 +1801,7 @@ impl ControlHub {
             || self.previews != self.previews_sent
             || self.outputs != self.outputs_sent
             || !self.switcher_queue.is_empty()
+            || self.osk_sent != Some(self.osk)
             || !self.accelerator_queue.is_empty()
             || !self.menu_queue.is_empty()
             || self.sessions.iter().any(|s| s.owes_deltas(model));
@@ -1781,6 +1851,20 @@ impl ControlHub {
     /// sessions always set an empty inventory.
     pub fn set_native_outputs(&mut self, outputs: Vec<tuna_shell_control::NativeOutputInfo>) {
         self.native_outputs = outputs;
+    }
+
+    /// Refresh what the on-screen keyboard follows (#349); the next
+    /// [`poll`](Self::poll) broadcasts a change. `show` queues one
+    /// input-panel ON request, dropped if focus is gone by then.
+    pub fn set_on_screen_keyboard(
+        &mut self,
+        focus: Option<tuna_shell_control::TextFieldFocus>,
+        show: bool,
+        touch_auto: bool,
+    ) {
+        self.osk.focus = focus;
+        self.osk.touch_auto = touch_auto;
+        self.osk.show = (self.osk.show || show) && focus.is_some();
     }
 
     /// Set the session environment (#59); the next [`poll`](Self::poll)
@@ -2098,6 +2182,9 @@ impl ControlHub {
                     if let Some(click) = session.dwell_click.take() {
                         outcome.dwell_click = Some(click);
                     }
+                    outcome
+                        .osk_inputs
+                        .extend(std::mem::take(&mut session.osk_inputs));
                     reply_ok
                 } else {
                     false
@@ -2188,6 +2275,19 @@ impl ControlHub {
             }
             if all_sent {
                 self.native_outputs_sent = self.native_outputs.clone();
+            }
+        }
+        if self.osk_sent != Some(self.osk) {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session.send_on_screen_keyboard(self.osk).is_err() {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                // The input-panel request is an edge: sent once.
+                self.osk.show = false;
+                self.osk_sent = Some(self.osk);
             }
         }
         if self.outputs != self.outputs_sent {
@@ -2292,6 +2392,13 @@ impl ControlHub {
                 if !self.environment.is_empty() {
                     let _ = session.send_environment(&self.environment);
                     let _ = session.send_overview_previews(&self.previews.0, self.previews.1);
+                }
+                let osk = OskBroadcast {
+                    show: false,
+                    ..self.osk
+                };
+                if osk != OskBroadcast::default() {
+                    let _ = session.send_on_screen_keyboard(osk);
                 }
                 if self.pointer_output.is_some() {
                     let _ = session.send_window_menu(&Message::PointerOutput {

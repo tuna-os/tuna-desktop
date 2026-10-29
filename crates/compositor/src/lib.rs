@@ -92,6 +92,7 @@ pub mod numlock;
 mod occlusion;
 pub mod orca;
 pub mod orientation;
+pub mod osk;
 mod output_constraints;
 pub mod overlay;
 pub mod overview;
@@ -720,6 +721,8 @@ impl SeatHandler for State {
         if let Some(surface) = focused {
             self.reactivate_inhibitor(surface);
         }
+        // Text inputs must be enabled anew after `enter` (#349).
+        self.protocols.text_inputs.focus_changed();
     }
 
     /// A client set the cursor (wl_pointer.set_cursor or a

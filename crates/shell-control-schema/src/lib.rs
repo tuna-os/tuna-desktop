@@ -31,7 +31,7 @@ pub mod layer_namespaces;
 pub use layer_namespaces::{
     BANNER_NAMESPACE, DISPLAY_CHANGE_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE,
     FOLDER_DIALOG_NAMESPACE, GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE,
-    KBD_A11Y_NAMESPACE, NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OVERVIEW_NAMESPACE,
+    KBD_A11Y_NAMESPACE, NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OSK_NAMESPACE, OVERVIEW_NAMESPACE,
     PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
     SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
     SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
@@ -185,9 +185,14 @@ impl ProtocolVersion {
     /// positional postcard peers must ship together.
     /// `0.42` appends GNOME's display-change confirmation: compositor-to-shell
     /// `ConfirmDisplayChange` and shell-to-compositor `CompleteDisplayChange`.
+    /// `0.43` appends GNOME's on-screen keyboard (#349): the
+    /// shell-to-compositor `OskInput` command (typing into the focused
+    /// client) and the compositor-to-shell `OnScreenKeyboard` message
+    /// (input-method focus, the input-panel request and touch-mode
+    /// auto-show); positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 42,
+        minor: 43,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -437,6 +442,41 @@ pub enum CommandKind {
     /// Since 0.42: the display-change dialog's answer (GNOME's
     /// `complete_display_change`): Keep Changes = true, Revert Settings = false.
     CompleteDisplayChange { keep: bool },
+    /// Since 0.43: GNOME's on-screen keyboard typing into the client with
+    /// keyboard focus (`KeyboardController`, #349). Denied while the
+    /// session is locked: the lock screen's keyboard edits only its own
+    /// prompt and never reaches the compositor.
+    OskInput { input: OskInput },
+}
+
+/// One on-screen keyboard action (gnome-shell 51 `KeyboardController`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OskInput {
+    /// `commit(str, modifiers)`: a key's string. With input-method focus
+    /// and no latched modifiers the compositor commits it to the focused
+    /// text input; otherwise it presses and releases each character's
+    /// keysym from the active layout, holding the latched modifier
+    /// keysyms around them (X11 clients, terminals, shortcuts). At most
+    /// [`MAX_OSK_TEXT`] bytes and [`MAX_OSK_MODIFIERS`] modifiers.
+    Commit { text: String, modifiers: Vec<u32> },
+    /// `keyvalPress` / `keyvalRelease`: one keysym (Return, BackSpace)
+    /// pressed or released through the active layout.
+    Keyval { keysym: u32, pressed: bool },
+}
+
+/// Bytes one [`OskInput::Commit`] may carry (an emoji ZWJ sequence fits).
+pub const MAX_OSK_TEXT: usize = 256;
+
+/// Modifier keysyms one [`OskInput::Commit`] may hold.
+pub const MAX_OSK_MODIFIERS: usize = 8;
+
+/// The text field holding input-method focus (mutter's
+/// `ClutterInputFocus`), with its text-input-v3 content type: raw
+/// `zwp_text_input_v3` purpose and hint values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextFieldFocus {
+    pub purpose: u32,
+    pub hints: u32,
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -837,6 +877,19 @@ pub enum Message {
     /// this countdown; a newer one replaces an open dialog and restarts it.
     /// Sent only to peers advertising minor >=41.
     ConfirmDisplayChange { timeout_secs: u32 },
+    /// Since 0.43: what GNOME's on-screen keyboard follows (#349).
+    /// `focus` is the enabled text input of the client holding keyboard
+    /// focus (none while locked); `show` marks an update carrying the
+    /// input-panel ON request (a focused text input enabled again, GTK's
+    /// click into its field, as mutter treats text-input-v3 version 1);
+    /// `touch_auto` is `KeyboardManager`'s auto-enable: seat touch-mode
+    /// with a touchscreen as the last pointing device. Sent on change and
+    /// after each handshake snapshot, only to peers advertising minor >= 43.
+    OnScreenKeyboard {
+        focus: Option<TextFieldFocus>,
+        show: bool,
+        touch_auto: bool,
+    },
 }
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
@@ -1820,6 +1873,17 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             ));
         }
         Message::Command {
+            kind:
+                CommandKind::OskInput {
+                    input: OskInput::Commit { text, modifiers },
+                },
+            ..
+        } if text.len() > MAX_OSK_TEXT || modifiers.len() > MAX_OSK_MODIFIERS => {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
+        Message::Command {
             kind: CommandKind::SetAccelerators { accelerators },
             ..
         } if accelerators.len() > MAX_ACCELERATORS => {
@@ -1848,6 +1912,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::KeyboardAidToggled { .. }
         | Message::DwellClickType { .. }
         | Message::PointerTimeout { .. }
+        | Message::OnScreenKeyboard { .. }
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }
         | Message::CommandResult { .. }
@@ -2094,8 +2159,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_41() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 42));
+    fn current_version_is_0_43() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 43));
     }
 
     #[test]
@@ -3134,5 +3199,101 @@ mod accelerator_release_wire_tests {
         ] {
             assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
         }
+    }
+}
+
+#[cfg(test)]
+mod on_screen_keyboard_wire_tests {
+    use super::*;
+
+    #[test]
+    fn osk_messages_roundtrip_and_sit_last() {
+        for message in [
+            Message::Command {
+                id: 3,
+                kind: CommandKind::OskInput {
+                    input: OskInput::Commit {
+                        text: "é".into(),
+                        modifiers: vec![0xffe3],
+                    },
+                },
+            },
+            Message::Command {
+                id: 4,
+                kind: CommandKind::OskInput {
+                    input: OskInput::Keyval {
+                        keysym: 0xff0d,
+                        pressed: true,
+                    },
+                },
+            },
+            Message::OnScreenKeyboard {
+                focus: Some(TextFieldFocus {
+                    purpose: 8,
+                    hints: 0x200,
+                }),
+                show: true,
+                touch_auto: false,
+            },
+            Message::OnScreenKeyboard {
+                focus: None,
+                show: false,
+                touch_auto: true,
+            },
+        ] {
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+        let index = |message: &Message| encode_frame(message)[4];
+        assert_eq!(
+            index(&Message::OnScreenKeyboard {
+                focus: None,
+                show: false,
+                touch_auto: false,
+            }),
+            index(&Message::ConfirmDisplayChange { timeout_secs: 0 }) + 1
+        );
+        let command = |kind: CommandKind| {
+            let mut buffer = [0_u8; 64];
+            postcard::to_slice(&kind, &mut buffer).unwrap()[0]
+        };
+        assert_eq!(
+            command(CommandKind::OskInput {
+                input: OskInput::Keyval {
+                    keysym: 0,
+                    pressed: false,
+                },
+            }),
+            command(CommandKind::CompleteDisplayChange { keep: false }) + 1
+        );
+    }
+
+    #[test]
+    fn osk_commit_decode_rejects_oversized_text_and_modifiers() {
+        for input in [
+            OskInput::Commit {
+                text: "x".repeat(MAX_OSK_TEXT + 1),
+                modifiers: Vec::new(),
+            },
+            OskInput::Commit {
+                text: "x".into(),
+                modifiers: vec![0xffe1; MAX_OSK_MODIFIERS + 1],
+            },
+        ] {
+            assert!(decode_frame(&encode_frame(&Message::Command {
+                id: 5,
+                kind: CommandKind::OskInput { input },
+            }))
+            .is_err());
+        }
+        let at_cap = Message::Command {
+            id: 6,
+            kind: CommandKind::OskInput {
+                input: OskInput::Commit {
+                    text: "x".repeat(MAX_OSK_TEXT),
+                    modifiers: vec![0xffe1; MAX_OSK_MODIFIERS],
+                },
+            },
+        };
+        assert_eq!(decode_frame(&encode_frame(&at_cap)).unwrap(), at_cap);
     }
 }
