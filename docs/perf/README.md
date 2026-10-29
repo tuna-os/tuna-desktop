@@ -44,6 +44,11 @@ The [2026-10-08 CPU investigation](2026-10-08-cpu-investigation.md)
 attributes the measured CPU to processes and workload phases, records the
 overview-card and plane-damage fixes, and ranks the remaining work for #503.
 
+The [2026-10-29 gate variance report](2026-10-29-gate-variance.md) (#782)
+quantifies run-to-run variance per metric, records why the nightly lane
+measured nothing from 2026-10-22, and traces Tuna's per-frame rasterizer
+flushes to Smithay's per-draw texture fences.
+
 ## Regression gate (#315)
 
 Tuna Desktop's target is to match or beat GNOME 51 on every metric below, and never to regress. `scripts/tuna-perf-gate` compares each paired run with the budgets in [`budgets.json`](budgets.json). The decision is recorded in [ADR 0009](../adr/0009-performance-regression-budgets.md).

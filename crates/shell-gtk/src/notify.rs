@@ -316,6 +316,9 @@ pub struct NotifyUi {
     /// The groups the user expanded, by source key.
     expanded: RefCell<HashSet<String>>,
     group_widgets: RefCell<HashMap<String, Rc<crate::group_animation::Group>>>,
+    /// The history list's widgets lag the store: they are built only while
+    /// the list is on screen, and when it next maps.
+    history_stale: Cell<bool>,
     shown: RefCell<Shown>,
     local_actions: RefCell<ActionDispatch>,
     /// The next banner expiry (a one-shot timeout).
@@ -542,6 +545,7 @@ impl NotifyUi {
             first_seen: RefCell::new(HashMap::new()),
             expanded: RefCell::new(HashSet::new()),
             group_widgets: RefCell::new(HashMap::new()),
+            history_stale: Cell::new(false),
             shown: RefCell::new(Shown {
                 banners: vec![u64::MAX],
                 ..Default::default()
@@ -571,6 +575,16 @@ impl NotifyUi {
                     center.clear_history();
                 }
                 me.refresh();
+            });
+        }
+        {
+            // Opening the calendar maps the list: build what changed while
+            // it was hidden before its first frame.
+            let weak = Rc::downgrade(&ui);
+            ui.list.connect_map(move |_| {
+                if let Some(me) = weak.upgrade() {
+                    me.sync_history();
+                }
             });
         }
         ui.update();
@@ -965,14 +979,67 @@ impl NotifyUi {
             self.enter_banners();
         }
 
-        // History list.
+        // History list. Like GNOME's message list it is only built for the
+        // open calendar: rebuilding every card of every group on each
+        // arrival and expiry while the list was off screen was most of the
+        // shell's notification CPU (#782). It catches up when it maps.
+        if self.list.is_mapped() {
+            self.build_history(&center, &groups, &before.history, &now.expanded);
+        } else {
+            self.history_stale.set(true);
+        }
+        let any = !now.history.is_empty();
+        self.list.set_visible(any);
+        if self.empty.is_visible() == any {
+            // The placeholder changes: from here on Clear follows it.
+            self.clear_bound.set(true);
+        }
+        self.empty.set_visible(!any);
+        self.clear.set_visible(!self.clear_bound.get() || any);
+        self.clear.set_sensitive(any);
+        drop(center);
+        *self.shown.borrow_mut() = now;
+        // Showing the list above maps it while the store was held.
+        if self.list.is_mapped() {
+            self.sync_history();
+        }
+    }
+
+    /// Build the history list deferred while it was hidden. Its cards
+    /// arrived off screen, so none zooms in.
+    fn sync_history(self: &Rc<Self>) {
+        if !self.history_stale.get() {
+            return;
+        }
+        // Held by a refresh that is mapping the list: it syncs after.
+        let Ok(center) = self.center.try_lock() else {
+            return;
+        };
+        let groups = group_ids(center.history().iter().rev().map(|n| (n.id, group_key(n))));
+        let (listed, expanded) = {
+            let shown = self.shown.borrow();
+            (shown.history.clone(), shown.expanded.clone())
+        };
+        self.build_history(&center, &groups, &listed, &expanded);
+    }
+
+    /// Replace the history list's cards and groups. `listed` are the ids
+    /// already on the list: only the others zoom in.
+    fn build_history(
+        self: &Rc<Self>,
+        center: &NotificationCenter,
+        groups: &[(String, Vec<u64>)],
+        listed: &[u64],
+        expanded: &[String],
+    ) {
+        self.history_stale.set(false);
         self.group_widgets.borrow_mut().clear();
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
         let by_id: HashMap<u64, &Notification> =
             center.history().iter().map(|n| (n.id, n)).collect();
-        for (key, ids) in &groups {
+        for (key, ids) in groups {
             let members: Vec<&Notification> =
                 ids.iter().filter_map(|id| by_id.get(id).copied()).collect();
             match members.as_slice() {
@@ -1004,35 +1071,21 @@ impl NotifyUi {
                             move || me.remove(&[id]),
                         );
                     });
-                    self.add_item(&item, !before.history.contains(&n.id));
+                    self.add_item(&item, !listed.contains(&n.id));
                 }
                 _ => {
                     let group = crate::group_animation::Group::new(
                         &self.collapsed_group(key, &members),
                         &self.expanded_group(key, &members),
-                        now.expanded.contains(key),
+                        expanded.contains(key),
                     );
                     let item = crate::transient::MotionBin::new(&group.widget);
                     // A group is new when none of its cards were listed.
-                    self.add_item(
-                        &item,
-                        members.iter().all(|n| !before.history.contains(&n.id)),
-                    );
+                    self.add_item(&item, members.iter().all(|n| !listed.contains(&n.id)));
                     self.group_widgets.borrow_mut().insert(key.clone(), group);
                 }
             }
         }
-        let any = !now.history.is_empty();
-        self.list.set_visible(any);
-        if self.empty.is_visible() == any {
-            // The placeholder changes: from here on Clear follows it.
-            self.clear_bound.set(true);
-        }
-        self.empty.set_visible(!any);
-        self.clear.set_visible(!self.clear_bound.get() || any);
-        self.clear.set_sensitive(any);
-        drop(center);
-        *self.shown.borrow_mut() = now;
     }
 
     /// Append a list item, zooming it in when it is new and the list is
@@ -1589,7 +1642,12 @@ mod gtk_action_lifecycle_tests {
                     ui.update(); // Real expiry and retirement path, no sleep/retry.
                     assert!(!center.lock().unwrap().banners().iter().any(|n| n.id == id));
                 }
-                "history-close" => button(&ui.list, "close").emit_clicked(),
+                "history-close" => {
+                    // This window never maps the list: build it as opening
+                    // the calendar would.
+                    ui.sync_history();
+                    button(&ui.list, "close").emit_clicked()
+                }
                 "center-remove" => {
                     center.lock().unwrap().remove(id);
                     ui.refresh();
