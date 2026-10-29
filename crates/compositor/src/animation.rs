@@ -52,23 +52,35 @@ fn interpolate(from: Rect, to: Rect, p: f64) -> Rect {
     )
 }
 
-/// niri's default window-movement and window-resize springs (800/1/0.0001).
+/// niri's default window-movement and window-resize springs (800/1/0.0001),
+/// on a strip window's position and size: columns move and widen, and
+/// windows inside a shared column move and change height.
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnSpring {
     pub to: Rect,
     x: Spring,
+    y: Spring,
     width: Spring,
+    height: Spring,
     elapsed: f64,
 }
 impl ColumnSpring {
+    fn springs(&self) -> [&Spring; 4] {
+        [&self.x, &self.y, &self.width, &self.height]
+    }
     pub(crate) fn running(&self) -> bool {
-        !self.x.done_at(self.elapsed) || !self.width.done_at(self.elapsed)
+        self.springs()
+            .iter()
+            .any(|spring| !spring.done_at(self.elapsed))
     }
     pub fn new(from: Rect, to: Rect) -> Self {
+        let spring = |a: i32, b: i32| Spring::view_movement(f64::from(a), f64::from(b), 0.0);
         Self {
             to,
-            x: Spring::view_movement(f64::from(from.loc.x), f64::from(to.loc.x), 0.0),
-            width: Spring::view_movement(f64::from(from.size.w), f64::from(to.size.w), 0.0),
+            x: spring(from.loc.x, to.loc.x),
+            y: spring(from.loc.y, to.loc.y),
+            width: spring(from.size.w, to.size.w),
+            height: spring(from.size.h, to.size.h),
             elapsed: 0.0,
         }
     }
@@ -76,22 +88,24 @@ impl ColumnSpring {
         if to == self.to {
             return;
         }
-        self.x = Spring::view_movement(
-            self.x.value_at(self.elapsed),
-            f64::from(to.loc.x),
-            self.x.velocity_at(self.elapsed),
-        );
-        self.width = Spring::view_movement(
-            self.width.value_at(self.elapsed),
-            f64::from(to.size.w),
-            self.width.velocity_at(self.elapsed),
-        );
+        let elapsed = self.elapsed;
+        let restart = |spring: &Spring, target: i32| {
+            Spring::view_movement(
+                spring.value_at(elapsed),
+                f64::from(target),
+                spring.velocity_at(elapsed),
+            )
+        };
+        self.x = restart(&self.x, to.loc.x);
+        self.y = restart(&self.y, to.loc.y);
+        self.width = restart(&self.width, to.size.w);
+        self.height = restart(&self.height, to.size.h);
         self.to = to;
         self.elapsed = 0.0;
     }
     pub fn step(&mut self, dt: f64, enabled: bool) -> bool {
         self.elapsed += dt.max(0.0);
-        if !enabled || (self.x.done_at(self.elapsed) && self.width.done_at(self.elapsed)) {
+        if !enabled || !self.running() {
             *self = Self::new(self.to, self.to);
             false
         } else {
@@ -99,11 +113,12 @@ impl ColumnSpring {
         }
     }
     pub fn value(&self) -> Rect {
+        let at = |spring: &Spring| spring.value_at(self.elapsed).round();
         Rect::new(
-            (self.x.value_at(self.elapsed).round() as i32, self.to.loc.y).into(),
+            (at(&self.x) as i32, at(&self.y) as i32).into(),
             (
-                self.width.value_at(self.elapsed).round().max(1.0) as i32,
-                self.to.size.h,
+                at(&self.width).max(1.0) as i32,
+                at(&self.height).max(1.0) as i32,
             )
                 .into(),
         )
@@ -185,5 +200,20 @@ mod tests {
         let mut animation = ColumnSpring::new(rect(0, 600), rect(632, 900));
         assert!(!animation.step(0.5, true));
         assert_eq!(animation.value(), animation.to);
+    }
+
+    #[test]
+    fn windows_inside_a_column_spring_their_position_and_height() {
+        let top = Rect::new((16, 48).into(), (616, 736).into());
+        let below = Rect::new((16, 424).into(), (616, 360).into());
+        let mut animation = ColumnSpring::new(top, below);
+        assert!(animation.running());
+        assert!(animation.step(0.1, true));
+        let shown = animation.value();
+        assert!(shown.loc.y > 48 && shown.loc.y < 424, "{shown:?}");
+        assert!(shown.size.h < 736 && shown.size.h > 360, "{shown:?}");
+        assert_eq!((shown.loc.x, shown.size.w), (16, 616));
+        assert!(!animation.step(0.5, true));
+        assert_eq!(animation.value(), below);
     }
 }

@@ -299,6 +299,72 @@ class Tests(unittest.TestCase):
         self.assertIn('"seat_pressed_key_count"', (Path(proof.__file__).resolve().parents[2]
                       / 'packaging/marlin/vm-lane/tuna-vm-lifecycle').read_text())
 
+    def test_strip_insert_mirrors_the_compositor_drop_rule(self):
+        column = lambda x, w=616: [[[x, 48, w, 736]]]
+        # Same cases as the compositor's tests/windows.rs drop tests.
+        self.assertEqual(proof.strip_insert(column(648) + column(1280), 853, 58), ('tile', 0, 0))
+        self.assertEqual(proof.strip_insert(column(648) + column(1280), 1076, 413), ('column', 1))
+        self.assertEqual(proof.strip_insert(column(648) + column(1280), 926, 113), ('tile', 0, 0))
+        shared = [[16, 48, 405, 360], [16, 424, 405, 360]]
+        self.assertEqual(proof.strip_insert([shared, *column(437)], 100, 410), ('tile', 0, 1))
+        self.assertEqual(proof.strip_insert([shared, *column(437)], 899, 400), ('column', 2))
+        # The stationary edge drop past the fully revealed last column.
+        self.assertEqual(proof.strip_insert(column(-616) + column(16) + column(648), 1279, 68), ('column', 3))
+        # A lifted slot keeps its place: both of its sides name it.
+        self.assertEqual(proof.strip_insert(column(16) + column(1280), 700, 400), ('column', 1))
+        self.assertEqual(proof.strip_insert(column(16) + column(1280), 1200, 400), ('column', 1))
+        self.assertEqual(proof.strip_insert([], 600, 400), ('column', 0))
+
+    def test_actual_drag_targets_choose_the_intended_gaps(self):
+        # Geometry of the installed proof after its grip step widened (+53)
+        # or narrowed (-53) Alpha, for the title reorder, VT cancellation
+        # and Super+drag targets the proof computes.
+        for alpha_w in (669, 563):
+            with self.subTest(alpha_w=alpha_w):
+                beta_x = 16 + alpha_w + 16
+                state = {'windows': [
+                    {'id': 1, 'workspace': 0, 'rect': [16, 48, alpha_w, 736]},
+                    {'id': 2, 'workspace': 0, 'rect': [beta_x, 48, 616, 736]},
+                    {'id': 3, 'workspace': 0, 'rect': [beta_x + 632, 48, 616, 736]},
+                    {'id': 9, 'workspace': 1, 'rect': [16, 48, 616, 736]}]}
+                value = {'inventory': {'state': state}}
+                found = {'alpha': state['windows'][0], 'beta': state['windows'][1]}
+                columns = proof.remaining_columns(value, found, 'alpha')
+                self.assertEqual([tiles[0][0] for tiles in columns], [beta_x, beta_x + 632])
+                target = (min(1260, beta_x + 3 * 616 // 4), 48 + 736 // 2)
+                after = proof.drop_slot(value, found, 'alpha', 'beta') + 1
+                self.assertEqual(proof.strip_insert(columns, *target), ('column', after))
+                # The superseded centre-based target, at title height, would
+                # now join Beta's column instead.
+                old = (min(1260, beta_x + 616 // 2 + 30), 48 + 20)
+                self.assertEqual(proof.strip_insert(columns, *old)[0], 'tile')
+                # Reordered: [Beta, Alpha, Gamma] with Alpha focused and whole.
+                offset = max(0, 632 + alpha_w + 32 - 1280)
+                beta_x = 16 - offset
+                alpha_x = beta_x + 632
+                state['windows'][0]['rect'] = [alpha_x, 48, alpha_w, 736]
+                state['windows'][1]['rect'] = [beta_x, 48, 616, 736]
+                state['windows'][2]['rect'] = [alpha_x + alpha_w + 16, 48, 616, 736]
+                columns = proof.remaining_columns(value, found, 'alpha')
+                target = (max(20, beta_x + 616 // 4), 48 + 736 // 2)
+                before = proof.drop_slot(value, found, 'alpha', 'beta')
+                self.assertEqual(before, 0)
+                self.assertEqual(proof.strip_insert(columns, *target), ('column', before))
+
+    def test_column_chords_and_in_column_height_follow_the_super_drag(self):
+        source = Path(proof.__file__).read_text()
+        start = source.index("capture('08-super-drag-reorder', returned)")
+        consume = source.index("chord('meta_l', 'bracket_right')", start)
+        consumed = source.index("capture('09-column-consume', consumed)", consume)
+        grip = source.index("grip = ready('scroll'", consumed)
+        motion = source.index("move(x, y - 12)", consumed)
+        height = source.index("capture('10-column-height', heights, 'beta')", motion)
+        expel = source.index("chord('meta_l', 'bracket_right')", height)
+        expelled = source.index("capture('11-column-expel', returned, 'beta')", expel)
+        edge = source.index('if edge:\n            before_edge = returned', expelled)
+        self.assertLess(grip, motion)
+        self.assertLess(expelled, edge)
+
 
 class EndpointEvidence(unittest.TestCase):
     def test_storage_failure_preserves_exact_primary_endpoint_exception(self):
