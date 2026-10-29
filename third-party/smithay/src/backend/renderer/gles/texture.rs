@@ -30,6 +30,7 @@ impl GlesTexture {
         GlesTexture(Arc::new(GlesTextureInternal {
             texture: tex,
             sync: RwLock::default(),
+            read_sync: ReadSync::default(),
             format: internal_format,
             has_alpha: !opaque,
             is_external: false,
@@ -62,9 +63,122 @@ impl GlesTexture {
     }
 }
 
+/// A GL fence ordering later writes to textures after the reads it covers.
+///
+/// A [`GlesFrame`] reading textures through an unshared context creates one fence when it finishes
+/// and hands it to every texture it read, so the fence is reference counted. The last holder
+/// queues its deletion on the renderer that created it.
+#[derive(Debug)]
+pub(super) struct ReadFence {
+    sync: ffi::types::GLsync,
+    destruction_callback_sender: Sender<CleanupResource>,
+}
+
+impl ReadFence {
+    /// Inserts a fence after every command issued so far in the current context.
+    pub(super) fn new(gl: &Gles2, destruction_callback_sender: Sender<CleanupResource>) -> Arc<Self> {
+        Arc::new(ReadFence {
+            sync: unsafe { gl.FenceSync(ffi::SYNC_GPU_COMMANDS_COMPLETE, 0) },
+            destruction_callback_sender,
+        })
+    }
+
+    /// Makes the current context wait for this fence, so that a fence created next in this
+    /// context covers the reads this one covers, whichever context issued them.
+    fn wait(&self, gl: &Gles2) {
+        unsafe { gl.WaitSync(self.sync, 0, ffi::TIMEOUT_IGNORED) };
+    }
+}
+
+impl Drop for ReadFence {
+    fn drop(&mut self) {
+        let _ = self
+            .destruction_callback_sender
+            .send(CleanupResource::Sync(self.sync as *const _));
+    }
+}
+
+/// The read fence of a texture, covering every read issued so far.
+///
+/// A draw through a shared context fences its read while it holds the texture's read lock, so a
+/// writer taking the write lock afterwards waits for it. A frame drawing through an unshared
+/// context fences all its reads once, when it finishes: no other context can reach those
+/// textures in the meantime. It is not behind the [`TextureSync`] lock because, after a leaked
+/// frame, the next frame's target may hold the write lock of a texture that frame fences.
+#[derive(Debug, Default)]
+pub(super) struct ReadSync(Mutex<Option<Arc<ReadFence>>>);
+
+impl ReadSync {
+    /// Fences the reads issued so far in the current context, covering earlier ones too.
+    pub(super) fn update(&self, gl: &Gles2, destruction_callback_sender: Sender<CleanupResource>) {
+        let mut read_sync = self.0.lock().unwrap();
+        if let Some(old) = read_sync.take() {
+            old.wait(gl);
+        }
+        *read_sync = Some(ReadFence::new(gl, destruction_callback_sender));
+    }
+
+    /// Makes the current context wait for the current fence, returning it.
+    ///
+    /// Pass the result to [`ReadSync::replace`] with a fence created next in this context.
+    pub(super) fn wait_to_replace(&self, gl: &Gles2) -> Option<Arc<ReadFence>> {
+        let read_sync = self.0.lock().unwrap();
+        if let Some(old) = &*read_sync {
+            old.wait(gl);
+        }
+        read_sync.clone()
+    }
+
+    /// Replaces the fence `waited` by `fence`, created after [`ReadSync::wait_to_replace`]
+    /// returned `waited` in the same context.
+    ///
+    /// If another context fenced its reads in between, `fence` does not cover them: this
+    /// waits for that fence too and fences again.
+    pub(super) fn replace(
+        &self,
+        gl: &Gles2,
+        waited: Option<Arc<ReadFence>>,
+        fence: &Arc<ReadFence>,
+        destruction_callback_sender: &Sender<CleanupResource>,
+    ) {
+        let mut read_sync = self.0.lock().unwrap();
+        let unchanged = match (&*read_sync, &waited) {
+            (None, None) => true,
+            (Some(current), Some(waited)) => Arc::ptr_eq(current, waited),
+            _ => false,
+        };
+        if unchanged {
+            *read_sync = Some(fence.clone());
+        } else {
+            if let Some(current) = &*read_sync {
+                current.wait(gl);
+            }
+            fence.wait(gl);
+            *read_sync = Some(ReadFence::new(gl, destruction_callback_sender.clone()));
+        }
+    }
+
+    /// Orders the current context after every read; for writers holding the write lock.
+    pub(super) fn wait_for_reads(&self, gl: &Gles2) {
+        let mut read_sync = self.0.lock().unwrap();
+        if let Some(fence) = &*read_sync {
+            match unsafe { gl.ClientWaitSync(fence.sync, 0, 0) } {
+                ffi::ALREADY_SIGNALED | ffi::CONDITION_SATISFIED => {
+                    let _ = read_sync.take();
+                }
+                _ => fence.wait(gl),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn current(&self) -> Option<Arc<ReadFence>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct TextureSync {
-    read_sync: Mutex<Option<ffi::types::GLsync>>,
     write_sync: Mutex<Option<ffi::types::GLsync>>,
 }
 
@@ -89,20 +203,9 @@ impl TextureSync {
         }
     }
 
-    pub(super) fn update_read(&self, gl: &Gles2) {
-        let mut read_sync = self.read_sync.lock().unwrap();
-        if let Some(old) = read_sync.take() {
-            unsafe {
-                gl.WaitSync(old, 0, ffi::TIMEOUT_IGNORED);
-                gl.DeleteSync(old);
-            };
-        }
-        *read_sync = Some(unsafe { gl.FenceSync(ffi::SYNC_GPU_COMMANDS_COMPLETE, 0) });
-    }
-
-    pub(super) fn wait_for_all(&mut self, gl: &Gles2) {
+    pub(super) fn wait_for_all(&mut self, gl: &Gles2, read_sync: &ReadSync) {
+        read_sync.wait_for_reads(gl);
         unsafe {
-            wait_for_syncpoint(self.read_sync.get_mut().unwrap(), gl);
             wait_for_syncpoint(self.write_sync.get_mut().unwrap(), gl);
         }
     }
@@ -124,6 +227,7 @@ impl TextureSync {
 pub(super) struct GlesTextureInternal {
     pub(super) texture: ffi::types::GLuint,
     pub(super) sync: RwLock<TextureSync>,
+    pub(super) read_sync: ReadSync,
     pub(super) format: Option<ffi::types::GLenum>,
     pub(super) has_alpha: bool,
     pub(super) is_external: bool,
@@ -141,11 +245,6 @@ impl Drop for GlesTextureInternal {
             .destruction_callback_sender
             .send(CleanupResource::Texture(self.texture));
         let mut sync = self.sync.write().unwrap();
-        if let Some(sync) = sync.read_sync.get_mut().unwrap().take() {
-            let _ = self
-                .destruction_callback_sender
-                .send(CleanupResource::Sync(sync as *const _));
-        }
         if let Some(sync) = sync.write_sync.get_mut().unwrap().take() {
             let _ = self
                 .destruction_callback_sender

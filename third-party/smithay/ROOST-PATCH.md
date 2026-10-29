@@ -76,3 +76,29 @@ additive XkbContext::set_modifier_locked locks or unlocks one named modifier
 change through with_xkb_state's usual modifier and LED notification. The
 existing set_xkb_config is unchanged. The isolated diff is retained in
 KEYMAP-STATE-API-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #503 and #782 additionally change src/backend/renderer/gles/mod.rs
+and texture.rs so that a GLES frame creates one texture read fence instead of
+one per texture draw. Upstream TextureSync::update_read ran glFenceSync after
+every draw. llvmpipe flushes and rasterizes its scene at each fence, so a frame
+was rasterized once per drawn element: one GTK4 commit woke the rasterizer
+threads about 4.5 times. A frame drawing through an unshared EGL context now
+records the textures it reads and, in finish_internal (which Drop also runs
+for frames never finished), creates one fence before the frame's flush and
+gives it to all of them. An unshared context orders its own commands, and no
+other context can reach its textures until the frame ends. Before the fence is
+created, the context waits for each texture's previous fence, so the new fence
+also covers reads from a context that shared the texture before. A draw
+through a shared context (EGLContext::is_shared) still fences while it holds
+the texture's read lock, as upstream does, because another thread may take
+the write lock as soon as the draw returns; it also fences reads deferred
+before the context became shared. Writers still wait for the read fence when
+they take the write lock. The read fence, now reference counted, moves out of
+the TextureSync RwLock into a ReadSync slot: after a leaked frame, the next
+frame's target may hold the write lock of a texture that frame fences.
+GL tests in per_frame_read_fence_tests (surfaceless Mesa EGL) cover several
+cases: one fence for every texture of a frame, a new fence for each frame,
+frames dropped without finish, per-draw fences for shared contexts, and an
+upload from a later shared context that must not change a finished frame.
+The isolated diff is retained in PER-FRAME-READ-FENCE-PATCH.diff; the
+pinned version stays 0.7.0.
