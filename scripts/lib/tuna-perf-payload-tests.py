@@ -278,13 +278,13 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaises(payload.Refusal):
             payload.installed(self.root, report, "tuna-desktop 0.1.0-1\n", inventory)
 
-    def test_all_six_runtime_versions_include_gtk_and_reject_mismatch(self):
+    def test_all_five_runtime_versions_include_gtk_and_reject_mismatch(self):
         report = self.inspect()
         for name in payload.BINS:
             binary = name.rsplit("/", 1)[1]
             (self.root / (binary + ".version")).write_text(binary + " 0.1.0\n")
             (self.root / (binary + ".status")).write_text("0\n")
-        self.assertEqual(len(payload.runtime(self.root, report)), 6)
+        self.assertEqual(len(payload.runtime(self.root, report)), 5)
         (self.root / "tuna-shell-gtk.status").write_text("127\n")
         with self.assertRaises(payload.Refusal):
             payload.runtime(self.root, report)
@@ -300,7 +300,7 @@ class PayloadTests(unittest.TestCase):
             binary = name.rsplit("/", 1)[1]
             (self.root / (binary + ".version")).write_text(binary + " 1.0.0-beta.1\n")
             (self.root / (binary + ".status")).write_text("0\n")
-        self.assertEqual(len(payload.runtime(self.root, report)), 6)
+        self.assertEqual(len(payload.runtime(self.root, report)), 5)
         for version in ("1.0.0-beta.2", "1.0.0", "1.0.0beta.1-1"):
             (self.root / "tuna-shell-gtk.version").write_text("tuna-shell-gtk " + version + "\n")
             with self.assertRaises(payload.Refusal):
