@@ -8776,11 +8776,19 @@ sleep 1
 # Exercise the normal three-finger handler with nested synthetic phases.
 # Physical touchpad/libinput qualification remains a separate hardware gate.
 swipe_sequence=100
+# The input file is a single slot the compositor polls each tick: wait
+# until it has read a phase before writing the next one, so a slow tick
+# can never drop a begin (a lost begin leaves the whole swipe ignored).
+swipe_consumed() {
+    cstate ".proof_swipe_sequence == $1" "swipe phase $1 consumed" 5 ||
+        fail G-SWIPE-INPUT "the compositor never read synthetic swipe phase $1"
+}
 swipe_phase() {
     swipe_sequence=$((swipe_sequence + 1))
     printf '{"phase":"%s","dx":%s,"dy":%s,"sequence":%s}\n' \
         "$1" "$2" "$3" "$swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
     mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+    swipe_consumed "$swipe_sequence"
     sleep 0.2
 }
 gesture_home="$(jq -r '.active_workspace' "$CSTATE")"
@@ -8807,6 +8815,7 @@ swipe_at() {
     printf '{"phase":"%s","dx":%s,"dy":0,"time":%s,"sequence":%s}\n' \
         "$1" "$2" "$3" "$swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
     mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+    swipe_consumed "$swipe_sequence"
     sleep 0.2
 }
 held_at() {
@@ -8913,6 +8922,7 @@ swipe_timed() {
     printf '{"phase":"%s","dy":%s,"time":%s,"sequence":%s}\n' \
         "$1" "$2" "$3" "$swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
     mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+    swipe_consumed "$swipe_sequence"
     sleep 0.2
 }
 swipe_timed begin 0 5000
@@ -8954,9 +8964,11 @@ sleep 1
 # compositor's normal gesture handler; the held frame lets CI sample it.
 printf '{"phase":"begin","sequence":1}\n' >"$TUNA_PROOF_SWIPE_INPUT.tmp"
 mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+swipe_consumed 1
 sleep 0.2
 printf '{"phase":"update","dy":-150,"sequence":2}\n' >"$TUNA_PROOF_SWIPE_INPUT.tmp"
 mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+swipe_consumed 2
 cstate '.overview_progress == 0.5 and (.thumbnails | length) == 3 and any(.workspace_cards[]; (.active | not) and .alpha > 0 and .alpha < 1)' "half swipe" ||
     fail G-SWIPE-PROGRESS "neighbour cards or thumbnails are missing mid-gesture"
 sleep 0.2
@@ -8965,6 +8977,7 @@ cp "$CSTATE" "$ARTIFACTS/mid-swipe-state.json"
 pass G-SWIPE-PROGRESS "neighbour workspaces and thumbnails slide and fade during a held three-finger swipe"
 printf '{"phase":"end","sequence":3}\n' >"$TUNA_PROOF_SWIPE_INPUT.tmp"
 mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+swipe_consumed 3
 cstate '.overview_open and (.thumbnails | length) == 3' "strip" ||
     fail G-WS-THUMBS "the overview shows no three-thumbnail strip"
 sleep 1.5

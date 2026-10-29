@@ -814,6 +814,9 @@ pub struct Runtime {
     state_last: String,
     /// Opt-in synthetic touchpad phases for the nested proof harness.
     proof_swipe_last: String,
+    /// The `sequence` of the last phase consumed, published in the state
+    /// file so the harness never replaces a phase the loop has not read.
+    proof_swipe_sequence: Option<u64>,
     #[cfg(feature = "drm")]
     performance_trace: crate::performance_trace::Trace,
 }
@@ -1369,6 +1372,7 @@ impl Runtime {
                 .filter(|p| p.is_absolute()),
             state_last: String::new(),
             proof_swipe_last: String::new(),
+            proof_swipe_sequence: None,
             #[cfg(feature = "drm")]
             performance_trace: crate::performance_trace::Trace::from_env(),
         };
@@ -2533,6 +2537,7 @@ impl Runtime {
         // state file every frame.
         let manual = self.animation_clock.is_manual();
         doc["animation_clock_manual"] = serde_json::json!(manual);
+        doc["proof_swipe_sequence"] = serde_json::json!(self.proof_swipe_sequence);
         doc["animation_clock_ms"] =
             serde_json::json!(manual.then(|| self.animation_clock.now().as_millis() as u64));
         doc["overview_motion"] = self.overview_motion.diagnostics();
@@ -2856,6 +2861,7 @@ impl Runtime {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
             return;
         };
+        self.proof_swipe_sequence = value["sequence"].as_u64();
         // Proofs may stamp phases to shape the release velocity.
         let time = value["time"]
             .as_u64()
