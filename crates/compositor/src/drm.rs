@@ -1502,7 +1502,7 @@ impl DrmBackend {
     fn tablet_tool(&mut self, event: smithay::reexports::input::event::TabletToolEvent) {
         let monitors = self.tablet_monitors();
         self.tablets.set_monitors(monitors);
-        self.tablets.tool_event(event, self.pointer);
+        self.tablets.tool_event(event);
     }
 
     /// Tablet events the last libinput dispatch produced, in order.

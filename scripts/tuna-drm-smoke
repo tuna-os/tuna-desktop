@@ -895,14 +895,15 @@ emu key KEY_ESC
 state '.tablets.pad_osd == null' || fail D-TABLET "Escape did not close the edition OSD"
 pass D-TABLET "pad OSD shown by the help button and PadOsd.Show (edition), pad buttons captured, closed by a key; unknown device refused"
 
-# Relative mapping: the pen moves the cursor from where it is.
+# Relative mapping: the pen moves on from its last position (the centre,
+# where the output check left it), as Mutter's stylus state does.
 tset mapping relative
 state '.tablets.tablets[0].mapping == "relative"' || fail D-TABLET "relative mapping did not apply"
 mark
-emu tool pen
 emu pen 0.9 0.9 0
-emu pen 0.95 0.9 0
-client "r['event'] == 'motion' and r['x'] < W * 0.85" ||
+emu pen 0.905 0.9 0
+# GtkGestureStylus reports hovering moves as "proximity".
+client "r['event'] == 'proximity' and W * 0.5 < r['x'] < W * 0.6" ||
     fail D-TABLET "relative mode followed the tablet's absolute position: $(tail -2 "$CLIENT_LOG")"
 emu tool out
 tset mapping absolute

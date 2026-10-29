@@ -581,7 +581,7 @@ impl Tablets {
     }
 
     /// One libinput tablet tool event.
-    pub fn tool_event(&mut self, event: TabletToolEvent, pointer: Point<f64, Logical>) {
+    pub fn tool_event(&mut self, event: TabletToolEvent) {
         let device = EventTrait::device(&event);
         let Some(tablet) = self.tablets.iter_mut().find(|t| t.device == device) else {
             return;
@@ -629,10 +629,9 @@ impl Tablets {
                     "tuna-compositor: tablet: {} tool {:?} serial={:x} in proximity",
                     tablet.identity.name, desc.tool_type, desc.hardware_serial
                 );
-                if tablet.tool.is_none() && (mouse_or_lens || tablet.mapping.mode == Mapping::Relative) {
-                    // Relative motion starts where the pointer is.
-                    tablet.pos = pointer;
-                }
+                // Relative motion continues from the tablet's last stylus
+                // position, not the pointer (meta_seat_impl_lookup_stylus_state
+                // via get_onscreen_coords_for_source_device).
                 let relative = mouse_or_lens || tablet.mapping.mode == Mapping::Relative;
                 // Mutter moves nothing on proximity (process_device_event
                 // only notifies it): libinput's delta on entering is the jump
