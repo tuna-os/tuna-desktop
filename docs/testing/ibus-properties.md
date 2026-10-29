@@ -10,7 +10,9 @@ This change consumes properties from the IBus panel. It does not close issue #59
 - [IBus 1.5.32 list serialization](https://github.com/ibus/ibus/blob/1.5.32/src/ibusproplist.c).
 - [IBus sender for the panel and messages from peers](https://github.com/ibus/ibus/blob/1.5.32/bus/dbusimpl.c): the filter for output sets an absent direct sender to `org.freedesktop.DBus`. The filter for input replaces a peer sender with its unique name. The daemon reserves both names.
 - [IBus global engine and fake context](https://github.com/ibus/ibus/blob/1.5.32/bus/ibusimpl.c): focus loss can transfer the global engine to its fake context. Panel acquisition sends the focused context and cached engine properties.
-- [IBus engine removal from a context](https://github.com/ibus/ibus/blob/1.5.32/bus/inputcontext.c): the context disconnects handlers when it removes an engine. Focus starts registration of properties again.
+- [IBus engine removal from a context](https://github.com/ibus/ibus/blob/1.5.32/bus/inputcontext.c): the context disconnects handlers when it removes an engine. Focus starts registration of properties again. Before an engine switch, `new_engine_cb` registers an empty list on the focused context (disable, then `unset_engine`) directly to the panel.
+- [IBus signal dispatch](https://github.com/ibus/ibus/blob/1.5.32/bus/dbusimpl.c): `bus_dbus_impl_dispatch_message_by_rule` queues broadcast signals such as GlobalEngineChanged for an idle callback, one message per iteration. The new engine's RegisterProperties can reach the panel before that signal.
+- [GTK 4.17.1 window children fix](https://gitlab.gnome.org/GNOME/gtk/-/commit/f7f158b675a5f383e9ce4bf834bb77453029854d) and [at-spi2-core 2.52 event cache](https://gitlab.gnome.org/GNOME/at-spi2-core/-/blob/AT_SPI2_CORE_2_52_0/atspi/atspi-event-listener.c): older GTK reports a hidden window as a ChildrenChanged that removes the application root itself. libatspi then disposes that application in the reading process.
 - [GLib peer credentials](https://docs.gtk.org/gio/method.DBusConnection.get_peer_credentials.html): this method returns no credentials for bus clients. This implementation uses the actual Unix socket's credentials instead.
 
 ## Behavior and trust
@@ -41,7 +43,7 @@ This menu does not yet list configured XKB/IBus input sources or select a partic
 
 ## Recovery follow-up
 
-The consumer retires tokens from prior actions on every engine or FocusIn edge, even if the identifier is the same. The consumer watches both daemon and panel owners. Async responses need the same pinned transport, owner epoch, request, and lock state. Engine and context queries target the resolved daemon owner.
+The consumer retires tokens from prior actions on every engine or FocusIn edge, even if the identifier is the same. An engine edge keeps the current list: the daemon cleared it before the switch, so any list present when GlobalEngineChanged arrives came from the new engine. The consumer watches both daemon and panel owners. Async responses need the same pinned transport, owner epoch, request, and lock state. Engine and context queries target the resolved daemon owner.
 
 On unlock, the consumer reads current daemon and panel owners before it releases its own panel name. It then requests the name with ALLOW_REPLACEMENT and DO_NOT_QUEUE. It never uses REPLACE_EXISTING for recovery. The daemon sends fresh FocusIn and cached engine properties when it creates the new panel proxy. The consumer does not replay an old UI list.
 
@@ -52,3 +54,5 @@ The candidate popup uses a weak callback to clear and hide when trust or panel o
 The original menu gate still has a 40-second bound. The separate G-IME-PROPERTIES-LIFECYCLE gate has an 80-second bound for context reentry and two cycles of lock and unlock. The helper sees no password. The parent uses its existing private PAM fixture and native lock UI. The first cycle checks refresh without another panel. The other checks refusal while a second peer owns the panel name, then recovery after that peer releases it.
 
 The observer needs fresh consumer traces, exact daemon traffic, checked state, and the same engine instance. An old action from accessibility may return handled, rejected, or defunct; its effects must remain absent. CI must execute all these runtime controls.
+
+Each AT-SPI read runs in a fresh libatspi process. A read counts only when the one registered application with the shell PID stays live through the walk. On GTK before 4.17.1, libatspi can dispose that application in the reading process when the shell hides a window. Such a read is transient only when the bus still binds the application's name to the shell PID; the helper then reads again within the same deadline. Absence, a duplicate application, or an error from the application fails the gate. A press repeats only when libatspi refused it before DoAction. A timeout or DoAction error fails, because the action may have been sent.

@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "scripts/lib/tuna-ibus-properties-proof.py"
 module = ast.parse(SOURCE.read_text(), filename=str(SOURCE))
 selected = [n for n in module.body if (isinstance(n, ast.FunctionDef)
-            and n.name in {"validate_traffic", "live", "walk", "matching"})
+            and n.name in {"validate_traffic", "live", "walk", "matching",
+                           "application_gone", "owned_application"})
+            or (isinstance(n, ast.ClassDef) and n.name == "Transient")
             or (isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "INDICATOR" for t in n.targets))]
 
 
@@ -20,7 +22,9 @@ class Atspi:
 
 class GLib:
     class Error(Exception):
-        pass
+        def __init__(self, message="", domain="", code=-1):
+            super().__init__(message)
+            self.message, self.domain, self.code = message, domain, code
 
 
 namespace = {"Atspi": Atspi, "GLib": GLib}
@@ -68,6 +72,44 @@ class Controls(unittest.TestCase):
         self.assertEqual(list(namespace["walk"](root)), [root, live])
         self.assertFalse(namespace["live"](Defunct()))
         self.assertTrue(namespace["live"](live))
+
+    def test_only_libatspis_own_disposal_of_the_bus_bound_shell_is_transient(self):
+        # GTK < 4.17.1 names its own application root as the child removed
+        # when one of its windows hides; libatspi 2.52 then disposes that
+        # application in the reading process although it never left the bus
+        # (gtk-shell 123281544604: 'not unique (0 live)' after the press).
+        gone = GLib.Error("The application no longer exists", "atspi_error", 0)
+        class Root:
+            def __init__(self, pid, error=None): self.pid, self.error = pid, error
+            def get_role(self):
+                if self.error:
+                    raise self.error
+                return "application"
+            def get_child_count(self): return 1
+            def get_process_id(self): return self.pid
+        owned, transient = namespace["owned_application"], namespace["Transient"]
+        shell, other, disposed = Root(42), Root(7), Root(42, gone)
+        self.assertTrue(namespace["application_gone"](gone))
+        self.assertEqual(owned([(":1.0", shell), (":1.3", other)], 42, {}.get), (":1.0", shell))
+        self.assertEqual(owned([(":1.3", Root(7, gone)), (":1.0", shell)], 42, {":1.3": 7}.get),
+                         (":1.0", shell))
+        with self.assertRaises(transient):
+            owned([(":1.0", disposed), (":1.3", other)], 42, {":1.0": 42}.get)
+        # The bus no longer binds the name to the shell: it really left.
+        for bus_pid in ({}.get, {":1.0": 7}.get):
+            with self.assertRaisesRegex(RuntimeError, r"not unique \(0 live\)"):
+                owned([(":1.0", disposed)], 42, bus_pid)
+        # Errors the application or the bus sent back are no local disposal.
+        for error in (GLib.Error("No such interface", "atspi_error", 1),
+                      GLib.Error("Disconnected", "g-dbus-error-quark", 0)):
+            self.assertFalse(namespace["application_gone"](error))
+            with self.assertRaisesRegex(RuntimeError, r"not unique \(0 live\)"):
+                owned([(":1.0", Root(42, error))], 42, {":1.0": 42}.get)
+        # Absence and duplicates still fail.
+        with self.assertRaisesRegex(RuntimeError, r"not unique \(0 live\)"):
+            owned([(":1.3", other)], 42, {}.get)
+        with self.assertRaisesRegex(RuntimeError, r"not unique \(2 live\)"):
+            owned([(":1.0", shell), (":1.9", Root(42))], 42, {}.get)
 
     def test_indicator_selects_the_showing_inner_toggle_of_the_menu_button(self):
         class Node:
@@ -178,12 +220,30 @@ class Controls(unittest.TestCase):
         self.assertTrue(atspi_uses(functions["atspi_child"]))
         source = SOURCE.read_text()
         self.assertIn('[sys.executable, __file__, "--atspi", str(pid), op, name, role or ""]', source)
-        self.assertIn('return atspi(pid, "query", name, role)', source)
-        self.assertIn('atspi(pid, "press", name, role)', source)
-        # Assertions the child must still enforce.
-        for message in ("GTK accessible application not unique", "ambiguous property action",
-                        "accessible action rejected"):
-            self.assertIn(message, ast.get_source_segment(source, functions["atspi_child"]))
+        read = ast.get_source_segment(source, functions["run"])
+        self.assertIn('return atspi(pid, op, name, role)', read)
+        self.assertIn('reads.append(read("query", name, role))', read)
+        self.assertIn('wait(lambda: bool(read("press", name, role)))', read)
+        # Assertions the child must still enforce, before and after its walk.
+        child = ast.get_source_segment(source, functions["atspi_child"])
+        for message in ("ambiguous property action", "accessible action rejected"):
+            self.assertIn(message, child)
+        self.assertEqual(child.count("owned_application("), 2)
+        self.assertIn("GTK accessible application not unique",
+                      ast.get_source_segment(source, functions["owned_application"]))
+
+    def test_a_press_is_repeated_only_when_no_action_was_sent(self):
+        # press() retries a Transient press; only libatspi's own refusal
+        # before DoAction may be one. A timeout or a DoAction error fails.
+        functions = {n.name: n for n in module.body if isinstance(n, ast.FunctionDef)}
+        source = SOURCE.read_text()
+        child = ast.get_source_segment(source, functions["atspi_child"])
+        action = child[child.index("action.do_action(0)"):]
+        self.assertLess(action.index("if application_gone(error):"), action.index("raise Transient("))
+        self.assertIn('return {"error": f"accessible action failed: {error.message}"}', action)
+        parent = ast.get_source_segment(source, functions["atspi"])
+        self.assertLess(parent.index('if op == "press":'), parent.index('raise RuntimeError(f"AT-SPI press'))
+        self.assertLess(parent.index('raise RuntimeError(f"AT-SPI press'), parent.index("raise Transient("))
 
 
 if __name__ == "__main__":
