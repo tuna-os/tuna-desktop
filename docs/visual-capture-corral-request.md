@@ -143,8 +143,8 @@ behavior differs from nested (marked below).
 
 - States: animations-off, reduced-motion and slow-down variants of the
   overview, workspace slide, size-change, switcher-fade and grid-morph
-  clips; modal-dim, minimize (once implemented), folder-zoom and
-  banner/popover/OSD transitions.
+  clips; modal-dim, minimize (once implemented), folder-zoom, launch-zoom,
+  app-grid page-switch and banner/popover/OSD transitions.
   Why nested is insufficient: nested clips film full-speed defaults on
   fixtures; paired GNOME 51 intermediate frames and native-GPU timing
   need the installed image.
@@ -156,7 +156,7 @@ behavior differs from nested (marked below).
 
 - `missing-product` rows need product work first, not capture time:
   P-WM-08, P-SY-08, P-DS-01 (transform), P-DS-03, P-DS-04, P-IN-03,
-  P-IN-05, P-A11Y-03, P-A11Y-04, P-ST-02, P-AN-03, P-AN-08.
+  P-IN-05, P-A11Y-03, P-A11Y-04, P-ST-02, P-AN-03.
 - `nonvisual` rows (P-SY-06, P-SY-09, P-A11Y-01 trees, P-A11Y-02,
   P-IN-04, P-IN-06, P-ST-11) are evidenced by consumer output and CI
   logs, not by frames.

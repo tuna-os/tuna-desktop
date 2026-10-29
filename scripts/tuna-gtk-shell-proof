@@ -30,15 +30,18 @@
 #                   them; dragging one out of the folder dialog removes it
 #   G-APP-GRID-PAGES enough apps page the grid: indicators and arrows show,
 #                   and Next Page turns to the second page
-#   G-GRID-PAGE-ANIM a page switch eases over GNOME's 300 ms and the
-#                   arrows fade over 200 ms; with animations off, both jump
+#   G-GRID-PAGE-ANIM a page switch eases over GNOME's 300 ms (each frame's
+#                   frame-clock sample on its out-cubic, the page dots
+#                   following) and the arrows fade over 200 ms; with
+#                   animations off, both jump
 #   G-SEARCH-PROVIDER  typing lists a D-Bus search provider's result (#57)
 #   G-SEARCH-VIEW      while search shows results the workspace view hides
 #   G-SEARCH-ACTIVATE  clicking it calls ActivateResult, closes overview
 #   G-FOLDER-ZOOM  the folder dialog zooms out of its icon and back in
 #                  over 200 ms while the icon fades; with animations off
 #                  it jumps, and Reduced Motion keeps only the fades
-#   G-LAUNCH-ZOOM  launching from the grid zooms the icon out over 250 ms
+#   G-LAUNCH-ZOOM  launching from the grid zooms the icon and label out
+#                  over 250 ms
 #   G-GRID-FADE    Show Apps fades the grid in over 400 ms after 100 ms
 #   G-APP-FOLDERS  GNOME's app-folders settings group the app grid: the
 #                  folder replaces its apps and opens to show them
@@ -1893,6 +1896,17 @@ pass G-APP-GRID-PAGES "thirty more apps page the grid; indicators and arrows sho
 
 # GNOME's page switch (iconGrid.js goToPage): 300 ms ease-out-cubic,
 # instead of a spring; the Previous Page arrow fades in over 200 ms.
+# Every animated frame (elapsed time on the GDK frame clock) must sit on
+# GNOME's curve and the page dots must follow the drawn position
+# (pageIndicators.js), checked by grid-anim-samples.py against GNOME's
+# own constants.
+grid_samples() {
+    samples_mark="$1"
+    samples_name="$2"
+    shift 2
+    "$PY" "$ROOT/scripts/lib/grid-anim-samples.py" --log "$LOG" --offset "$samples_mark" "$@" \
+        >"$ARTIFACTS/grid-anim-samples-$samples_name.txt" 2>&1
+}
 if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-switch start ms=300 motion=full" ||
         fail G-GRID-PAGE-ANIM "the page switch did not start a 300 ms eased slide"
@@ -1900,6 +1914,8 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     [ "${page_ms:-0}" -ge 290 ] || fail G-GRID-PAGE-ANIM "the page switch settled after ${page_ms:-?} ms, not 300"
     log_has "$page_mark" "grid-anim page-arrow start ms=200" ||
         fail G-GRID-PAGE-ANIM "the page arrows did not fade over 200 ms"
+    grid_samples "$page_mark" next --from 0 --to 1 ||
+        fail G-GRID-PAGE-ANIM "page-switch frames or page dots strayed from GNOME's 300 ms out-cubic (grid-anim-samples-next.txt)"
     # With animations off the switch and the arrows jump.
     motion_policy Off
     page_mark="$(log_mark)"
@@ -1909,6 +1925,8 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
         fail G-GRID-PAGE-ANIM "with animations off the page switch still animated"
     log_has "$page_mark" "grid-anim page-switch start" &&
         fail G-GRID-PAGE-ANIM "with animations off a page slide started"
+    grid_samples "$page_mark" off --instant --to 0 ||
+        fail G-GRID-PAGE-ANIM "with animations off the pages or dots passed through between pages (grid-anim-samples-off.txt)"
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page1-off.json" 20 ||
         fail G-GRID-PAGE-ANIM "accessibility dump failed"
     showing "$ARTIFACTS/a11y-grid-page1-off.json" "Previous Page" &&
@@ -1918,8 +1936,10 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-next-again.json" 20 \
         --press "Next Page" || fail G-GRID-PAGE-ANIM "could not return to page two"
     log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch back never settled"
+    grid_samples "$page_mark" next-again --from 0 --to 1 ||
+        fail G-GRID-PAGE-ANIM "the second switch's frames or dots strayed from GNOME's curve (grid-anim-samples-next-again.txt)"
     sleep 0.5
-    pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms and the arrows fade over 200 ms; with animations off both jump"
+    pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms (every frame-clock sample on GNOME's curve, page dots following the drawn position) and the arrows fade over 200 ms; with animations off both jump"
 fi
 
 # Select the rendered icon through actual accessibility bounds, including
@@ -2579,6 +2599,10 @@ log_wait "$launch_mark" "grid-anim launch-zoom settle" ||
     fail G-LAUNCH-ZOOM "the launch zoom never settled"
 log_has "$launch_mark" "grid-anim launch-zoom start ms=250 motion=full" ||
     fail G-LAUNCH-ZOOM "the launch zoom did not run 250 ms"
+# zoomOutActor clones BaseIcon's child, the icon with its label: the
+# clone is the tile's drawn icon-and-label box, not an empty frame.
+log_has "$launch_mark" "grid-anim launch-zoom clone size=[0-9]*x[0-9]* drawn=[1-9][0-9]*x[1-9][0-9]* label=1" ||
+    fail G-LAUNCH-ZOOM "the launch clone was not the tile's drawn icon and label"
 launch_ms="$(settle_ms "$launch_mark" launch-zoom)"
 [ "${launch_ms:-0}" -ge 240 ] || fail G-LAUNCH-ZOOM "the launch zoom settled after ${launch_ms:-?} ms, not 250"
 log_has "$launch_mark" "grid-anim folder-zoom-out" &&

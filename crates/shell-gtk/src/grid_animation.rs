@@ -1,7 +1,12 @@
-//! GNOME 51's app grid animations (appDisplay.js, iconGrid.js): the
-//! folder dialog's zoom from its icon, icon scale-in and scale-and-fade,
-//! the launch zoom, the page switch, the page arrows' fade and the
-//! staggered reflow while dragging.
+//! GNOME 51's app grid animations (appDisplay.js, iconGrid.js,
+//! pageIndicators.js, swipeTracker.js): the folder dialog's zoom from its
+//! icon, the icons' scale-and-fade while dragged, the launch zoom, the
+//! page switch and the swipe that ends in one, the page dots following
+//! the pages, the page arrows' fade and the staggered reflow while
+//! dragging.
+//!
+//! GNOME 51 defines AppIcon.scaleIn() (appDisplay.js) but nothing calls
+//! it: an app new to the grid appears in place, so it does here too.
 //!
 //! Each animation is a tick callback that runs only while it moves and
 //! touches nothing but a transform and an opacity: no relayout per frame.
@@ -44,7 +49,6 @@ pub enum Curve {
     InQuad,
     OutQuad,
     OutCubic,
-    OutQuint,
     OutExpo,
 }
 
@@ -55,7 +59,6 @@ impl Curve {
             Curve::InQuad => p * p,
             Curve::OutQuad => 1.0 - (1.0 - p).powi(2),
             Curve::OutCubic => 1.0 - (1.0 - p).powi(3),
-            Curve::OutQuint => 1.0 - (1.0 - p).powi(5),
             Curve::OutExpo => {
                 if p >= 1.0 {
                     1.0
@@ -131,8 +134,6 @@ pub const FOLDER_SHADE: Timing = Timing::new(200.0, Curve::OutQuad, Part::Fade);
 /// opening and returns over the last half of the closing.
 pub const FOLDER_ICON_HIDE: Timing = Timing::new(100.0, Curve::OutQuad, Part::Fade);
 pub const FOLDER_ICON_SHOW: Timing = Timing::new(100.0, Curve::InQuad, Part::Fade).delayed(100.0);
-/// `APP_ICON_SCALE_IN_TIME` after `APP_ICON_SCALE_IN_DELAY`.
-pub const ICON_SCALE_IN: Timing = Timing::new(500.0, Curve::OutQuint, Part::Motion).delayed(700.0);
 /// scaleAndFade/undoScaleAndFade: Clutter's implicit 250 ms
 /// ease-out-cubic, to half size and transparent.
 pub const ICON_SCALE: Timing = Timing::new(250.0, Curve::OutCubic, Part::Motion);
@@ -145,7 +146,8 @@ pub const LAUNCH_SCALE: f64 = 3.0;
 /// fading in on the switch from the window picker, and out on the way back.
 pub const GRID_FADE_IN: Timing = Timing::new(400.0, Curve::OutQuad, Part::Fade).delayed(100.0);
 pub const GRID_FADE_OUT: Timing = Timing::new(400.0, Curve::OutQuad, Part::Fade);
-/// `PAGE_SWITCH_TIME`.
+/// `PAGE_SWITCH_TIME`: goToPage eases out-cubic over 300 ms from wherever
+/// the pages are drawn, even part of the way there.
 pub const PAGE_SWITCH: Timing = Timing::new(300.0, Curve::OutCubic, Part::Motion);
 /// `PAGE_INDICATOR_FADE_TIME`, Clutter's implicit ease-out-cubic.
 pub const PAGE_ARROW_FADE: Timing = Timing::new(200.0, Curve::OutCubic, Part::Fade);
@@ -158,13 +160,13 @@ pub fn lerp(from: f64, to: f64, t: f64) -> f64 {
     from + (to - from) * t
 }
 
-/// The launch clone's box at `t`: (center x, center y, scale) of an icon
-/// centred at `center`, `size` square, grown `LAUNCH_SCALE` times while
-/// staying inside `bounds` (x, y, width, height), as zoomOutActorAtPos
-/// keeps it on the monitor.
+/// The launch clone's box at `t`: (center x, center y, scale) of a clone
+/// centred at `center`, `size` (width, height), grown `LAUNCH_SCALE`
+/// times while staying inside `bounds` (x, y, width, height), as
+/// zoomOutActorAtPos keeps it on the monitor.
 pub fn launch_box(
     center: (f64, f64),
-    size: f64,
+    size: (f64, f64),
     bounds: (f64, f64, f64, f64),
     t: f64,
 ) -> (f64, f64, f64) {
@@ -176,16 +178,22 @@ pub fn launch_box(
     )
 }
 
-/// Where the fully grown launch clone is centred.
-pub fn launch_center(center: (f64, f64), size: f64, bounds: (f64, f64, f64, f64)) -> (f64, f64) {
-    let grown = size * LAUNCH_SCALE;
-    let contain = |c: f64, lo: f64, span: f64| {
+/// Where the fully grown launch clone is centred: zoomOutActorAtPos's
+/// `Math.clamp(scaledX, monitor.x, monitor.x + monitor.width -
+/// scaledWidth)`, and the same down.
+pub fn launch_center(
+    center: (f64, f64),
+    size: (f64, f64),
+    bounds: (f64, f64, f64, f64),
+) -> (f64, f64) {
+    let contain = |c: f64, extent: f64, lo: f64, span: f64| {
+        let grown = extent * LAUNCH_SCALE;
         let start = c - grown / 2.0;
         start.clamp(lo, (lo + span - grown).max(lo)) + grown / 2.0
     };
     (
-        contain(center.0, bounds.0, bounds.2),
-        contain(center.1, bounds.1, bounds.3),
+        contain(center.0, size.0, bounds.0, bounds.2),
+        contain(center.1, size.1, bounds.1, bounds.3),
     )
 }
 
@@ -205,10 +213,190 @@ pub fn folder_zoom(
     )
 }
 
-/// How long a switch of `distance` pages takes: GNOME's 300 ms for a
-/// whole page, less for a swipe already part of the way there.
-pub fn page_switch_ms(distance: f64) -> f64 {
-    PAGE_SWITCH.duration_ms * distance.abs().clamp(0.0, 1.0).max(0.25)
+/// pageIndicators.js `INDICATOR_INACTIVE_SCALE`, `_SCALE_PRESSED`,
+/// `INDICATOR_INACTIVE_OPACITY` and `_OPACITY_HOVER` (of 255).
+pub const DOT_INACTIVE_SCALE: f64 = 2.0 / 3.0;
+pub const DOT_INACTIVE_SCALE_PRESSED: f64 = 0.5;
+pub const DOT_INACTIVE_OPACITY: f64 = 128.0 / 255.0;
+pub const DOT_INACTIVE_OPACITY_HOVER: f64 = 1.0;
+
+/// pageIndicators.js _updateIndicator: page dot `index`'s (scale,
+/// opacity) with the pages drawn at `position`. A dot is whole where its
+/// page is drawn and inactive a page away, in between in between, so
+/// the dots follow the page switch's own curve and a swipe's fingers.
+pub fn page_dot_look(position: f64, index: usize, hover: bool, pressed: bool) -> (f64, f64) {
+    let progress = (1.0 - (position - index as f64).abs()).max(0.0);
+    let inactive_scale = if pressed {
+        DOT_INACTIVE_SCALE_PRESSED
+    } else {
+        DOT_INACTIVE_SCALE
+    };
+    let inactive_opacity = if hover {
+        DOT_INACTIVE_OPACITY_HOVER
+    } else {
+        DOT_INACTIVE_OPACITY
+    };
+    (
+        lerp(inactive_scale, 1.0, progress),
+        lerp(inactive_opacity, 1.0, progress),
+    )
+}
+
+/// swipeTracker.js `EVENT_HISTORY_THRESHOLD_MS`.
+const SWIPE_HISTORY_MS: u32 = 150;
+/// `MIN_ANIMATION_DURATION`, `MAX_ANIMATION_DURATION`.
+const SWIPE_MIN_MS: f64 = 100.0;
+const SWIPE_MAX_MS: f64 = 400.0;
+/// `VELOCITY_THRESHOLD_TOUCH`, `VELOCITY_THRESHOLD_TOUCHPAD` (px/ms).
+const SWIPE_VELOCITY_THRESHOLD_TOUCH: f64 = 0.3;
+const SWIPE_VELOCITY_THRESHOLD_TOUCHPAD: f64 = 0.6;
+/// `DECELERATION_TOUCH`, `DECELERATION_TOUCHPAD`.
+const SWIPE_DECELERATION_TOUCH: f64 = 0.998;
+const SWIPE_DECELERATION_TOUCHPAD: f64 = 0.997;
+/// `VELOCITY_CURVE_THRESHOLD`, `DECELERATION_PARABOLA_MULTIPLIER`.
+const SWIPE_VELOCITY_CURVE_THRESHOLD: f64 = 2.0;
+const SWIPE_PARABOLA_MULTIPLIER: f64 = 0.35;
+/// `DURATION_MULTIPLIER`, `ANIMATION_BASE_VELOCITY`, `EPSILON`.
+const SWIPE_DURATION_MULTIPLIER: f64 = 3.0;
+const SWIPE_BASE_VELOCITY: f64 = 0.002;
+const SWIPE_EPSILON: f64 = 0.005;
+
+/// swipeTracker.js EventHistory: the swipe's moves of the last 150 ms,
+/// (event time in ms, pixels toward later pages), for its velocity.
+#[derive(Debug, Default)]
+pub struct SwipeHistory {
+    data: Vec<(u32, f64)>,
+}
+
+impl SwipeHistory {
+    pub fn reset(&mut self) {
+        self.data.clear();
+    }
+
+    /// Forget moves older than 150 ms before `time`.
+    pub fn trim(&mut self, time: u32) {
+        let threshold = time.saturating_sub(SWIPE_HISTORY_MS);
+        if let Some(index) = self.data.iter().position(|&(t, _)| t >= threshold) {
+            self.data.drain(..index);
+        }
+    }
+
+    pub fn append(&mut self, time: u32, delta: f64) {
+        self.trim(time);
+        self.data.push((time, delta));
+    }
+
+    /// Pixels per millisecond over the kept moves.
+    pub fn velocity(&self) -> f64 {
+        let (Some(&(first, _)), Some(&(last, _))) = (self.data.first(), self.data.last()) else {
+            return 0.0;
+        };
+        if self.data.len() < 2 || first == last {
+            return 0.0;
+        }
+        let total: f64 = self.data[1..].iter().map(|&(_, delta)| delta).sum();
+        total / f64::from(last.wrapping_sub(first))
+    }
+}
+
+/// _findClosestPoint over the pages 0..=`last`: the nearer page, the
+/// earlier one on a tie (indexOf of the minimum).
+fn closest_page(position: f64, last: f64) -> f64 {
+    let below = position.floor().clamp(0.0, last);
+    let above = (below + 1.0).min(last);
+    if (position - below).abs() <= (above - position).abs() {
+        below
+    } else {
+        above
+    }
+}
+
+/// _getBounds without long swipes: how far a swipe that began at
+/// `initial` may go, a page past the pages around it.
+pub fn swipe_bounds(initial: f64, last: f64) -> (f64, f64) {
+    let closest = closest_page(initial, last);
+    let (previous, next) = if (closest - initial).abs() < SWIPE_EPSILON {
+        (closest, closest)
+    } else {
+        (initial.floor().max(0.0), initial.ceil().min(last))
+    };
+    ((previous - 1.0).max(0.0), (next + 1.0).min(last))
+}
+
+/// GNOME's cancel progress for a swipe that began at `initial`
+/// (AppDisplay._swipeBegin's `Math.round`).
+pub fn swipe_cancel_page(initial: f64) -> f64 {
+    (initial + 0.5).floor()
+}
+
+/// _getEndProgress: the page a swipe at `progress` (begun at `initial`)
+/// settles on when released at `velocity` px/ms: the nearest page when
+/// slow, else where its deceleration would carry it, never back past
+/// the page it began on.
+fn swipe_end_page(progress: f64, initial: f64, velocity: f64, touchpad: bool, last: f64) -> f64 {
+    let threshold = if touchpad {
+        SWIPE_VELOCITY_THRESHOLD_TOUCHPAD
+    } else {
+        SWIPE_VELOCITY_THRESHOLD_TOUCH
+    };
+    if velocity.abs() < threshold {
+        return closest_page(progress, last);
+    }
+    let deceleration = if touchpad {
+        SWIPE_DECELERATION_TOUCHPAD
+    } else {
+        SWIPE_DECELERATION_TOUCH
+    };
+    let slope = deceleration / (1.0 - deceleration) / 1000.0;
+    let speed = velocity.abs();
+    let travel = if speed > SWIPE_VELOCITY_CURVE_THRESHOLD {
+        let c = slope / 2.0 / SWIPE_PARABOLA_MULTIPLIER;
+        let x = speed - SWIPE_VELOCITY_CURVE_THRESHOLD + c;
+        slope * SWIPE_VELOCITY_CURVE_THRESHOLD + SWIPE_PARABOLA_MULTIPLIER * x * x
+            - SWIPE_PARABOLA_MULTIPLIER * c * c
+    } else {
+        speed * slope
+    };
+    let (lower, upper) = swipe_bounds(initial, last);
+    let projected = (travel * velocity.signum() + progress).clamp(lower, upper);
+    // _findPointForProjection.
+    let start = closest_page(initial, last);
+    let (previous, next) = (projected.floor(), projected.ceil());
+    if velocity > 0.0 && previous == start {
+        next
+    } else if velocity < 0.0 && next == start {
+        previous
+    } else {
+        closest_page(projected, last)
+    }
+}
+
+/// _endGesture: the page a released swipe settles on and how long its
+/// out-cubic ease takes (0: at once), from the swipe's `progress` and
+/// `initial` position in pages, its `velocity` in px/ms, and the page
+/// width `distance` in px.
+pub fn swipe_end(
+    progress: f64,
+    initial: f64,
+    velocity: f64,
+    distance: f64,
+    touchpad: bool,
+    last: f64,
+) -> (f64, f64) {
+    let end = swipe_end_page(progress, initial, velocity, touchpad, last);
+    let mut velocity = velocity / distance.max(1.0);
+    if (end - progress) * velocity <= 0.0 {
+        velocity = SWIPE_BASE_VELOCITY;
+    }
+    let pages = (progress - end).abs().ceil().max(1.0);
+    let max_ms = SWIPE_MAX_MS * (1.0 + pages).log2();
+    let duration = ((progress - end) / velocity * SWIPE_DURATION_MULTIPLIER).abs();
+    let duration = if duration > 0.0 {
+        duration.clamp(SWIPE_MIN_MS, max_ms)
+    } else {
+        0.0
+    };
+    (end, duration)
 }
 
 /// The slot a tile moves by in a reflow, in cells: (columns, rows).
@@ -220,8 +408,17 @@ pub fn reflow_shift(from: usize, to: usize, columns: usize) -> (f64, f64) {
     )
 }
 
-fn trace(name: &str, what: std::fmt::Arguments) {
-    if std::env::var_os("TUNA_GRID_TRACE").is_some() {
+/// Whether the grid's animations are traced (`TUNA_GRID_TRACE`, read
+/// once).
+static TRACING: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("TUNA_GRID_TRACE").is_some());
+
+pub fn tracing() -> bool {
+    *TRACING
+}
+
+pub fn trace(name: &str, what: std::fmt::Arguments) {
+    if tracing() {
         eprintln!("tuna-shell-gtk: grid-anim {name} {what}");
     }
 }
@@ -387,11 +584,12 @@ pub fn monitor_bounds() -> (f64, f64, f64, f64) {
         .unwrap_or((0.0, 0.0, 1280.0, 800.0))
 }
 
-fn first_image(widget: &gtk::Widget) -> Option<gtk::Image> {
+/// The first `T` in `widget`'s tree, `widget` included, depth first.
+fn first_of<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> Option<T> {
     let mut pending = vec![widget.clone()];
     while let Some(widget) = pending.pop() {
-        if let Ok(image) = widget.clone().downcast::<gtk::Image>() {
-            return Some(image);
+        if let Ok(found) = widget.clone().downcast::<T>() {
+            return Some(found);
         }
         let mut child = widget.last_child();
         while let Some(next) = child {
@@ -402,16 +600,29 @@ fn first_image(widget: &gtk::Widget) -> Option<gtk::Image> {
     None
 }
 
-/// GNOME's launch animation (iconGrid.js zoomOutActor): a copy of the
-/// launched tile's icon grows to three times its size and fades out over
-/// 250 ms, kept on the monitor, while the overview closes. It is drawn
-/// on its own click-through overlay surface, only as big as the grown
-/// icon, and destroyed when done.
+/// What a launch clones (iconGrid.js animateZoomOut zooms BaseIcon's
+/// child): a grid or folder tile's icon with its label, the box under
+/// the tile's [`Zoom`]; a tile without one (the dash's, whose icons have
+/// no label) its icon.
+fn launch_source(tile: &gtk::Widget) -> Option<gtk::Widget> {
+    if let Some(zoom) = tile.first_child().and_downcast::<Zoom>() {
+        return zoom.first_child();
+    }
+    first_of::<gtk::Image>(tile).map(|image| image.upcast())
+}
+
+/// GNOME's launch animation (iconGrid.js zoomOutActor): a clone of the
+/// launched tile's icon (and label, in the grid) grows to three times its
+/// size about its centre and fades out over 250 ms, kept on the monitor,
+/// while the overview closes. As Clutter.Clone paints its source, the
+/// clone is the source's last drawn frame, scaled. It is drawn on its
+/// own click-through overlay surface, only as big as the zoom covers,
+/// and destroyed when done.
 pub fn launch_zoom(tile: &impl IsA<gtk::Widget>) {
     use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
     let policy = motion();
     let total = LAUNCH_ZOOM.end_ms(policy).max(LAUNCH_FADE.end_ms(policy));
-    let Some(source) = first_image(tile.upcast_ref()) else {
+    let Some(source) = launch_source(tile.upcast_ref()) else {
         return;
     };
     let (Some((x, y, w, h)), Some(app)) = (
@@ -430,33 +641,40 @@ pub fn launch_zoom(tile: &impl IsA<gtk::Widget>) {
         );
         return;
     }
-    let size = f64::from(source.pixel_size().max(16));
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    // The source's render node as it was last drawn: it stays whole
+    // after the overview hides the source.
+    let frame = gtk::WidgetPaintable::new(Some(&source)).current_image();
+    if tracing() {
+        trace(
+            "launch-zoom",
+            format_args!(
+                "clone size={w:.0}x{h:.0} drawn={}x{} label={}",
+                frame.intrinsic_width(),
+                frame.intrinsic_height(),
+                u8::from(first_of::<gtk::Label>(&source).is_some())
+            ),
+        );
+    }
+    let size = (w, h);
     let center = (x + w / 2.0, y + h / 2.0);
     let monitor = monitor_bounds();
-    let grown = size * LAUNCH_SCALE;
+    let (grown_w, grown_h) = (w * LAUNCH_SCALE, h * LAUNCH_SCALE);
     let end = launch_center(center, size, monitor);
-    // The surface covers where the icon starts and where it ends.
-    let left = (center.0 - size / 2.0).min(end.0 - grown / 2.0).floor();
-    let top = (center.1 - size / 2.0).min(end.1 - grown / 2.0).floor();
-    let right = (center.0 + size / 2.0).max(end.0 + grown / 2.0).ceil();
-    let bottom = (center.1 + size / 2.0).max(end.1 + grown / 2.0).ceil();
-    let image = match source.storage_type() {
-        gtk::ImageType::IconName => {
-            gtk::Image::from_icon_name(&source.icon_name().unwrap_or_default())
-        }
-        gtk::ImageType::Gicon => match source.gicon() {
-            Some(icon) => gtk::Image::from_gicon(&icon),
-            None => return,
-        },
-        gtk::ImageType::Paintable => gtk::Image::from_paintable(source.paintable().as_ref()),
-        _ => return,
-    };
-    // Drawn at its grown size and scaled down: sharp at the end.
-    image.set_pixel_size(grown as i32);
-    image.set_size_request(grown as i32, grown as i32);
-    image.set_halign(gtk::Align::Start);
-    image.set_valign(gtk::Align::Start);
-    let zoom = Zoom::new(&image);
+    // The surface covers where the clone starts and where it ends.
+    let left = (center.0 - w / 2.0).min(end.0 - grown_w / 2.0).floor();
+    let top = (center.1 - h / 2.0).min(end.1 - grown_h / 2.0).floor();
+    let right = (center.0 + w / 2.0).max(end.0 + grown_w / 2.0).ceil();
+    let bottom = (center.1 + h / 2.0).max(end.1 + grown_h / 2.0).ceil();
+    let picture = gtk::Picture::for_paintable(&frame);
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Fill);
+    picture.set_size_request(w.round() as i32, h.round() as i32);
+    picture.set_halign(gtk::Align::Start);
+    picture.set_valign(gtk::Align::Start);
+    let zoom = Zoom::new(&picture);
     zoom.set_pivot(0.0, 0.0);
     let window = gtk::Window::new();
     window.set_application(Some(&app));
@@ -486,12 +704,11 @@ pub fn launch_zoom(tile: &impl IsA<gtk::Widget>) {
             let Some(zoom) = zoom.upgrade() else { return };
             let (cx, cy, scale) =
                 launch_box(center, size, monitor, LAUNCH_ZOOM.at(elapsed, policy));
-            // The grown image at the surface's top-left, scaled down
-            // to `scale` icons and centred on the clone's centre.
-            let k = scale / LAUNCH_SCALE;
+            // The clone's top-left, `scale` times its size about the
+            // clone's centre.
             zoom.set(
-                (cx - left - grown * k / 2.0, cy - top - grown * k / 2.0),
-                (k, k),
+                (cx - left - w * scale / 2.0, cy - top - h * scale / 2.0),
+                (scale, scale),
                 1.0 - LAUNCH_FADE.at(elapsed, policy),
             );
         }
@@ -660,7 +877,6 @@ mod tests {
             Curve::InQuad,
             Curve::OutQuad,
             Curve::OutCubic,
-            Curve::OutQuint,
             Curve::OutExpo,
         ] {
             assert_eq!(curve.at(0.0), 0.0, "{curve:?}");
@@ -670,7 +886,6 @@ mod tests {
         assert!(close(Curve::InQuad.at(0.5), 0.25));
         assert!(close(Curve::OutQuad.at(0.5), 0.75));
         assert!(close(Curve::OutCubic.at(0.5), 0.875));
-        assert!(close(Curve::OutQuint.at(0.5), 0.96875));
         assert!(close(Curve::OutExpo.at(0.5), 1.0 - 1.0 / 32.0));
     }
 
@@ -682,9 +897,6 @@ mod tests {
         assert_eq!(FOLDER_ICON_HIDE.end_ms(FULL), 100.0);
         assert_eq!(FOLDER_ICON_SHOW.end_ms(FULL), 200.0);
         assert_eq!(FOLDER_ICON_SHOW.curve, Curve::InQuad);
-        assert_eq!(ICON_SCALE_IN.duration_ms, 500.0);
-        assert_eq!(ICON_SCALE_IN.delay_ms, 700.0);
-        assert_eq!(ICON_SCALE_IN.curve, Curve::OutQuint);
         assert_eq!(LAUNCH_ZOOM.duration_ms, 250.0);
         assert_eq!(LAUNCH_ZOOM.curve, Curve::OutQuad);
         assert_eq!(PAGE_SWITCH.duration_ms, 300.0);
@@ -721,19 +933,17 @@ mod tests {
         let slow = Motion::from_gnome(true, false, 2.0);
         assert_eq!(PAGE_SWITCH.end_ms(slow), 600.0);
         assert!(close(PAGE_SWITCH.at(300.0, slow), 0.875));
-        assert_eq!(ICON_SCALE_IN.end_ms(slow), 2400.0);
-        assert_eq!(ICON_SCALE_IN.at(1400.0, slow), 0.0);
+        assert_eq!(GRID_FADE_IN.end_ms(slow), 1000.0);
+        assert_eq!(GRID_FADE_IN.at(200.0, slow), 0.0);
+        assert!(close(GRID_FADE_IN.at(600.0, slow), Curve::OutQuad.at(0.5)));
     }
 
     #[test]
     fn delays_hold_the_start_value() {
-        assert_eq!(ICON_SCALE_IN.at(0.0, FULL), 0.0);
-        assert_eq!(ICON_SCALE_IN.at(700.0, FULL), 0.0);
-        assert!(close(
-            ICON_SCALE_IN.at(950.0, FULL),
-            Curve::OutQuint.at(0.5)
-        ));
-        assert_eq!(ICON_SCALE_IN.at(1200.0, FULL), 1.0);
+        assert_eq!(GRID_FADE_IN.at(0.0, FULL), 0.0);
+        assert_eq!(GRID_FADE_IN.at(100.0, FULL), 0.0);
+        assert!(close(GRID_FADE_IN.at(300.0, FULL), Curve::OutQuad.at(0.5)));
+        assert_eq!(GRID_FADE_IN.at(500.0, FULL), 1.0);
         assert_eq!(FOLDER_ICON_SHOW.at(50.0, FULL), 0.0);
         assert!(close(FOLDER_ICON_SHOW.at(150.0, FULL), 0.25));
     }
@@ -753,22 +963,113 @@ mod tests {
     #[test]
     fn launch_zoom_triples_and_stays_on_the_monitor() {
         let monitor = (0.0, 0.0, 1280.0, 800.0);
+        let icon = (64.0, 64.0);
         assert_eq!(
-            launch_box((640.0, 400.0), 64.0, monitor, 0.0),
+            launch_box((640.0, 400.0), icon, monitor, 0.0),
             (640.0, 400.0, 1.0)
         );
         assert_eq!(
-            launch_box((640.0, 400.0), 64.0, monitor, 1.0),
+            launch_box((640.0, 400.0), icon, monitor, 1.0),
             (640.0, 400.0, 3.0)
         );
         // Near the left edge the grown clone slides right to stay whole.
-        assert_eq!(launch_center((40.0, 400.0), 64.0, monitor), (96.0, 400.0));
+        assert_eq!(launch_center((40.0, 400.0), icon, monitor), (96.0, 400.0));
         assert_eq!(
-            launch_center((1270.0, 790.0), 64.0, monitor),
+            launch_center((1270.0, 790.0), icon, monitor),
             (1184.0, 704.0)
         );
-        let (x, _, s) = launch_box((40.0, 400.0), 64.0, monitor, 0.5);
+        let (x, _, s) = launch_box((40.0, 400.0), icon, monitor, 0.5);
         assert_eq!((x, s), (68.0, 2.0));
+        // A grid tile's clone (icon and label) is taller than wide: each
+        // axis stays on the monitor by its own grown extent.
+        assert_eq!(
+            launch_center((60.0, 760.0), (100.0, 120.0), monitor),
+            (150.0, 620.0)
+        );
+    }
+
+    #[test]
+    fn page_dots_follow_the_drawn_position() {
+        let inactive = (DOT_INACTIVE_SCALE, DOT_INACTIVE_OPACITY);
+        assert_eq!(page_dot_look(0.0, 0, false, false), (1.0, 1.0));
+        assert_eq!(page_dot_look(0.0, 1, false, false), inactive);
+        assert_eq!(page_dot_look(0.0, 2, false, false), inactive);
+        assert!(close(DOT_INACTIVE_OPACITY, 128.0 / 255.0));
+        // Halfway through a 300 ms switch from page 0 to page 1, the
+        // pages are drawn at 0.875 and both dots are part way.
+        let position = lerp(0.0, 1.0, PAGE_SWITCH.at(150.0, FULL));
+        let (scale, opacity) = page_dot_look(position, 1, false, false);
+        assert!(close(scale, 2.0 / 3.0 + 0.875 / 3.0));
+        assert!(close(opacity, (128.0 + 127.0 * 0.875) / 255.0));
+        let (scale, _) = page_dot_look(position, 0, false, false);
+        assert!(close(scale, 2.0 / 3.0 + 0.125 / 3.0));
+        // Hovered, an inactive dot is opaque; pressed, it shrinks to half.
+        assert_eq!(page_dot_look(0.0, 1, true, false), (2.0 / 3.0, 1.0));
+        assert_eq!(page_dot_look(0.0, 1, false, true), (0.5, 128.0 / 255.0));
+        assert_eq!(page_dot_look(1.0, 1, true, true), (1.0, 1.0));
+    }
+
+    #[test]
+    fn swipe_history_keeps_150_ms_of_moves() {
+        let mut history = SwipeHistory::default();
+        history.append(1000, 0.0);
+        history.append(1010, 5.0);
+        history.append(1020, 5.0);
+        assert_eq!(history.velocity(), 0.5);
+        history.trim(1165);
+        assert_eq!(history.velocity(), 0.0);
+        history.append(1170, 6.0);
+        assert_eq!(history.velocity(), 6.0 / 150.0);
+        history.reset();
+        assert_eq!(history.velocity(), 0.0);
+    }
+
+    #[test]
+    fn a_swipe_goes_at_most_a_page_past_where_it_began() {
+        assert_eq!(swipe_bounds(0.0, 3.0), (0.0, 1.0));
+        assert_eq!(swipe_bounds(2.0, 3.0), (1.0, 3.0));
+        assert_eq!(swipe_bounds(3.0, 3.0), (2.0, 3.0));
+        assert_eq!(swipe_bounds(2.003, 3.0), (1.0, 3.0));
+        // Begun mid-switch, it may reach a page past either neighbour.
+        assert_eq!(swipe_bounds(1.5, 3.0), (0.0, 3.0));
+        assert_eq!(swipe_cancel_page(1.5), 2.0);
+        assert_eq!(swipe_cancel_page(1.49), 1.0);
+    }
+
+    #[test]
+    fn released_swipes_settle_as_gnome_swipe_tracker() {
+        let end = |progress, initial, velocity, touchpad| {
+            swipe_end(progress, initial, velocity, 1000.0, touchpad, 3.0)
+        };
+        // Slow: the nearest page (the earlier on a tie), at the slowest
+        // base velocity, so the longest single-page ease.
+        assert_eq!(end(0.4, 0.0, 0.1, false), (0.0, 400.0));
+        assert_eq!(end(0.6, 0.0, 0.1, false), (1.0, 400.0));
+        assert_eq!(end(0.5, 0.0, 0.0, false), (0.0, 400.0));
+        // A gentle touch flick still turns the page.
+        assert_eq!(end(0.1, 0.0, 0.5, false), (1.0, 400.0));
+        // The same speed on a touchpad is under its threshold: back at
+        // the base velocity, 0.1 page / 0.002 * 3 = 150 ms.
+        let (page, ms) = end(0.1, 0.0, 0.5, true);
+        assert_eq!(page, 0.0);
+        assert!((ms - 150.0).abs() < 1e-6, "{ms}");
+        // A fast flick: the rest of the way at three times its speed.
+        let (page, ms) = end(0.5, 0.0, 4.0, false);
+        assert_eq!(page, 1.0);
+        assert!((ms - 375.0).abs() < 1e-6, "{ms}");
+        let (page, ms) = end(1.4, 1.0, 10.0, false);
+        assert_eq!(page, 2.0);
+        assert!((ms - 180.0).abs() < 1e-6, "{ms}");
+        // Flicked back past where it began: the page before.
+        assert_eq!(end(0.7, 1.0, -1.0, false), (0.0, 400.0));
+        // Already there: nothing to ease.
+        assert_eq!(end(1.0, 1.0, 0.0, false), (1.0, 0.0));
+        // Two pages away the longest ease grows with log2(1 + pages).
+        let (page, ms) = end(0.9, 1.5, 2.0, false);
+        assert_eq!(page, 2.0);
+        assert!((ms - 400.0 * 3f64.log2()).abs() < 1e-6, "{ms}");
+        let (_, ms) = end(0.9, 1.5, 0.1, false);
+        assert!(ms >= 100.0);
     }
 
     fn page_position(from: f64, to: f64, elapsed_ms: f64, motion: Motion) -> f64 {
@@ -789,9 +1090,10 @@ mod tests {
             page_position(0.0, 1.0, 0.0, Motion::from_gnome(false, false, 1.0)),
             1.0
         );
-        assert_eq!(page_switch_ms(1.0), 300.0);
-        assert_eq!(page_switch_ms(-0.5), 150.0);
-        assert_eq!(page_switch_ms(0.01), 75.0);
+        // goToPage takes the whole 300 ms even from part of the way
+        // there (iconGrid.js: `duration: animate ? PAGE_SWITCH_TIME : 0`).
+        assert!(close(page_position(0.6, 0.0, 150.0, FULL), 0.6 * 0.125));
+        assert_eq!(PAGE_SWITCH.end_ms(FULL), 300.0);
     }
 
     #[test]

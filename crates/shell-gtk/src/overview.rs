@@ -206,8 +206,6 @@ pub struct OverviewUi {
     want_apps: std::cell::Cell<bool>,
     /// GNOME's app folder dialog.
     folder_dialog: Rc<crate::folder_dialog::FolderDialog>,
-    /// The grid's items as last built: one new since scales in.
-    grid_keys: RefCell<std::collections::HashSet<String>>,
     /// Whether the grid is shown (it may still be fading out).
     apps_shown: Cell<bool>,
     /// The grid's fade in and out (animateSwitch).
@@ -350,7 +348,6 @@ impl OverviewUi {
                 app,
                 Rc::new(crate::folders::rename),
             ),
-            grid_keys: RefCell::new(std::collections::HashSet::new()),
             apps_shown: Cell::new(false),
             grid_fade: Rc::new(crate::grid_animation::Slot::default()),
         }));
@@ -676,13 +673,16 @@ impl OverviewUi {
             me.dash_icons.push((ids, image));
             let entry = entry.clone();
             let actions = me.actions.clone();
-            button.connect_clicked(move |_| match window {
+            // AppIcon.activate: a stopped app's launch zooms its icon out
+            // (animateLaunch); a running one is only activated.
+            button.connect_clicked(move |button| match window {
                 Some(id) => {
                     actions.activate_window(id);
                     actions.close_overview();
                 }
                 None => {
                     if tuna_shell_host::apps::launch(&entry).is_ok() {
+                        crate::grid_animation::launch_zoom(button);
                         actions.close_overview();
                     }
                 }
@@ -1027,18 +1027,6 @@ impl OverviewUi {
                         });
                     }
                     add(&key, button.upcast_ref());
-                }
-            }
-        }
-        let keys: std::collections::HashSet<String> =
-            reflow.widgets.borrow().keys().cloned().collect();
-        let previous = me.grid_keys.replace(keys);
-        if !previous.is_empty() {
-            for (id, widget) in reflow.widgets.borrow().iter() {
-                if !previous.contains(id) {
-                    if let Some(widget) = widget.upgrade() {
-                        scale_in(&widget);
-                    }
                 }
             }
         }
@@ -1770,8 +1758,10 @@ fn paged_grid(
     if n <= 1 {
         return column.upcast();
     }
-    // The page indicators (pageIndicators.js): 10px dots, the inactive
-    // ones at 2/3 size and half opacity.
+    // The page indicators (pageIndicators.js): 10px dots whose scale and
+    // opacity follow where the pages are drawn (setCurrentPosition): the
+    // inactive ones at 2/3 size and half opacity, opaque while hovered,
+    // half size while pressed.
     let indicators = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     indicators.add_css_class("page-indicators");
     indicators.set_halign(gtk::Align::Center);
@@ -1779,15 +1769,48 @@ fn paged_grid(
         .map(|i| {
             let dot = gtk::Box::new(gtk::Orientation::Vertical, 0);
             dot.add_css_class("page-indicator-icon");
-            let button = gtk::Button::builder().child(&dot).build();
+            let look = crate::grid_animation::Zoom::new(&dot);
+            let button = gtk::Button::builder().child(&look).build();
             button.add_css_class("page-indicator");
             button.update_property(&[gtk::accessible::Property::Label(&format!("Page {}", i + 1))]);
+            sync_page_dot(&button, i, carousel.position());
+            let pager = carousel.downgrade();
+            button.connect_state_flags_changed(move |button, _| {
+                if let Some(pager) = pager.upgrade() {
+                    sync_page_dot(button, i, pager.position());
+                }
+            });
             let carousel = carousel.clone();
             button.connect_clicked(move |_| carousel.scroll_to(i as u32, true));
             indicators.append(&button);
             button
         })
         .collect();
+    {
+        // Carousel owns this callback: weak dots, as for `sync` below.
+        let dots: Vec<_> = dots.iter().map(|dot| dot.downgrade()).collect();
+        carousel.connect_position_changed(move |position| {
+            let tracing = crate::grid_animation::tracing();
+            let mut samples = Vec::new();
+            for (i, dot) in dots.iter().enumerate() {
+                let Some(dot) = dot.upgrade() else { continue };
+                let (scale, opacity, hover, pressed) = sync_page_dot(&dot, i, position);
+                if tracing {
+                    samples.push(format!(
+                        "{i}:{scale:.6}:{opacity:.6}:{}:{}",
+                        u8::from(hover),
+                        u8::from(pressed)
+                    ));
+                }
+            }
+            if tracing {
+                crate::grid_animation::trace(
+                    "page-dots",
+                    format_args!("position={position:.6} dots={}", samples.join(",")),
+                );
+            }
+        });
+    }
     column.append(&indicators);
     // The side arrows (page-navigation-arrow).
     let arrow = |icon: &str, label: &str, align: gtk::Align, step: i32| {
@@ -1876,17 +1899,8 @@ fn paged_grid(
     let sync = {
         // Carousel owns this callback. Indicator click callbacks and the
         // pager reference Carousel, so strong captures would retain the grid.
-        let dots: Vec<_> = dots.iter().map(|dot| dot.downgrade()).collect();
         let pager = Rc::downgrade(&pager);
         move |page: u32| {
-            for (i, dot) in dots.iter().enumerate() {
-                let Some(dot) = dot.upgrade() else { continue };
-                if i as u32 == page {
-                    dot.add_css_class("active");
-                } else {
-                    dot.remove_css_class("active");
-                }
-            }
             if let Some(pager) = pager.upgrade() {
                 pager.sync(page);
             }
@@ -2354,28 +2368,17 @@ fn scale_and_fade(tile: &gtk::Widget, slot: &Rc<crate::grid_animation::Slot>, aw
     );
 }
 
-/// GNOME's AppIcon scaleIn: a tile new to the grid grows from nothing,
-/// after 700 ms, over 500 ms ease-out-quint.
-fn scale_in(tile: &gtk::Widget) {
-    use crate::grid_animation as anim;
-    let Some(zoom) = tile.first_child().and_downcast::<anim::Zoom>() else {
-        return;
-    };
-    let policy = anim::motion();
-    let slot = Rc::new(anim::Slot::default());
-    let keep = slot.clone();
-    let weak = zoom.downgrade();
-    slot.start(
-        &zoom,
-        "scale-in",
-        anim::ICON_SCALE_IN.end_ms(policy),
-        move |elapsed| {
-            if let Some(zoom) = weak.upgrade() {
-                zoom.set_look(anim::ICON_SCALE_IN.at(elapsed, policy), 1.0);
-            }
-        },
-        move || drop(keep),
-    );
+/// pageIndicators.js _updateIndicator on page dot `index` with the
+/// pages drawn at `position`: its (scale, opacity, hover, pressed).
+fn sync_page_dot(button: &gtk::Button, index: usize, position: f64) -> (f64, f64, bool, bool) {
+    let flags = button.state_flags();
+    let hover = flags.contains(gtk::StateFlags::PRELIGHT);
+    let pressed = flags.contains(gtk::StateFlags::ACTIVE);
+    let (scale, opacity) = crate::grid_animation::page_dot_look(position, index, hover, pressed);
+    if let Some(look) = button.child().and_downcast::<crate::grid_animation::Zoom>() {
+        look.set_look(scale, opacity);
+    }
+    (scale, opacity, hover, pressed)
 }
 
 /// Accept a dropped string on `widget`: `act` edits the folders and
