@@ -1,10 +1,11 @@
-schema: 3
+schema: 4
 written_by: dev
 skills_version: dev
 name: rust-wayland-desktop
 command: spektacular
 agent: codex
 spec_trigger_threshold: moderate
+epic_split_threshold: moderate
 auto_commit: "off"
 debug:
     enabled: false
@@ -24,6 +25,17 @@ changelog:
     provider: file
     config:
         directory: changelog
+epic:
+    provider: file
+    strict_dependencies: false
+    config:
+        directory: epics
 repos:
     - name: rust-wayland-desktop
       location: .
+    - name: tunaos
+      location: /home/ubuntu/dev/rust-wayland-desktop/.spektacular/repos/tunaos/.spektacular
+    - name: tunaos-packages
+      location: /home/ubuntu/dev/tunaos-packages/.spektacular
+    - name: corral
+      location: /home/ubuntu/dev/corral/.spektacular
