@@ -8949,7 +8949,7 @@ apply_display() {
     gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
         --object-path /org/gnome/Mutter/DisplayConfig \
         --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
-        -- "$serial" "$1" "[(0, 0, $2, uint32 0, true, [('tuna-0', '${3:-${WIDTH}x${HEIGHT}@60.000}', {'color-mode': <uint32 0>, 'underscanning': <false>})])]" \
+        "$serial" "$1" "[(0, 0, $2, uint32 0, true, [('tuna-0', '${3:-${WIDTH}x${HEIGHT}@60.000}', {'color-mode': <uint32 0>, 'underscanning': <false>})])]" \
         "@a{sv} {}" >>"$DISPLAY_LOG" 2>&1
 }
 # GNOME Shell's "Keep these display settings?" dialog: wait until it
@@ -8970,11 +8970,12 @@ display_dialog_press() {
 # and the scales Mutter 51 computes for 1280x800.
 display_state >"$ARTIFACTS/display-state.txt" 2>&1 ||
     fail G-DISPLAY-SETTINGS "GetCurrentState failed: $(tail -2 "$ARTIFACTS/display-state.txt")"
-grep -qF "('${WIDTH}x${HEIGHT}@60.000', ${WIDTH}, ${HEIGHT}, 60.0, 1.0, [1.0, 1.25, 1.3333333730697632, 1.6666666269302368]" "$ARTIFACTS/display-state.txt" &&
+if ! { grep -qF "('${WIDTH}x${HEIGHT}@60.000', ${WIDTH}, ${HEIGHT}, 60.0, 1.0, [1.0, 1.25, 1.3333333730697632, 1.6666666269302368]" "$ARTIFACTS/display-state.txt" &&
     grep -qF "'is-current': <true>" "$ARTIFACTS/display-state.txt" &&
     grep -qF "'is-preferred': <true>" "$ARTIFACTS/display-state.txt" &&
-    grep -qF "{'layout-mode': <uint32 1>}" "$ARTIFACTS/display-state.txt" ||
+    grep -qF "{'layout-mode': <uint32 1>}" "$ARTIFACTS/display-state.txt"; }; then
     fail G-DISPLAY-SETTINGS "GetCurrentState is not Mutter's: $(cat "$ARTIFACTS/display-state.txt")"
+fi
 serial=$(display_serial)
 [ -n "$serial" ] || fail G-DISPLAY-SETTINGS "no configuration serial"
 # Verify (method 0) checks without changing anything; Mutter's errors.
@@ -8991,9 +8992,10 @@ apply_display 1 1 "" "$((serial + 1))" &&
 tail -1 "$DISPLAY_LOG" | grep -q "AccessDenied.*stale information" ||
     fail G-DISPLAY-SETTINGS "a stale serial was not AccessDenied: $(tail -1 "$DISPLAY_LOG")"
 apply_display 0 1.25 || fail G-DISPLAY-SETTINGS "a valid configuration did not verify: $(tail -1 "$DISPLAY_LOG")"
-[ "$(display_serial)" = "$serial" ] && [ ! -e "$XDG_CONFIG_HOME/tuna/monitors.xml" ] &&
-    cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)" "verify changes nothing" 5 ||
+if ! { [ "$(display_serial)" = "$serial" ] && [ ! -e "$XDG_CONFIG_HOME/tuna/monitors.xml" ] &&
+    cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)" "verify changes nothing" 5; }; then
     fail G-DISPLAY-SETTINGS "verifying changed the configuration"
+fi
 # The observer must subscribe before the actual display configuration changes.
 python3 "$ROOT/scripts/lib/tuna-introspect-size-client.py" \
     "$ARTIFACTS/introspect-size.json" "$WIDTH" "$HEIGHT" \
@@ -9060,9 +9062,10 @@ cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $WIDTH)" "100
     fail G-DISPLAY-SETTINGS "the layout did not return to scale 1"
 cstate ".transitions.monitor_change.started == $screen_started and (.transitions.monitor_change.active | not)" "instant monitor change" 5 ||
     fail G-MONITOR-TRANSITION "the monitor change faded with animations off"
-cstate '(.display_config.awaiting_confirmation | not)' "temporary" 5 &&
-    cmp -s "$XDG_CONFIG_HOME/tuna/monitors.xml" "$ARTIFACTS/monitors-kept.xml" ||
+if ! { cstate '(.display_config.awaiting_confirmation | not)' "temporary" 5 &&
+    cmp -s "$XDG_CONFIG_HOME/tuna/monitors.xml" "$ARTIFACTS/monitors-kept.xml"; }; then
     fail G-DISPLAY-SETTINGS "a temporary change asked for confirmation or was saved"
+fi
 gsettings set org.gnome.desktop.interface enable-animations true
 cstate '.animations_enabled' "monitor motion restored" ||
     fail G-MONITOR-TRANSITION "enable-animations true did not reach the compositor"

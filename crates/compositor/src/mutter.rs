@@ -1632,15 +1632,18 @@ mod tests {
             Err(fdo::Error::InvalidArgs("Monitors config incomplete".into()))
         );
         // Mirroring needs a mode both monitors have.
-        let mut mirrored = logical("eDP-1", 1.0);
-        mirrored
-            .monitors
-            .push(("HDMI-A-1".into(), "1920x1080@60.000".into(), HashMap::new()));
-        let config = check(&state, &[mirrored.clone()]).unwrap();
+        let mirrored = |first: &str| {
+            let mut config = logical("eDP-1", 1.0);
+            config.monitors[0].1 = first.into();
+            config
+                .monitors
+                .push(("HDMI-A-1".into(), "1920x1080@60.000".into(), HashMap::new()));
+            config
+        };
+        let config = check(&state, &[mirrored("1920x1080@60.000")]).unwrap();
         assert_eq!(config.logical[0].monitors.len(), 2);
-        mirrored.monitors[0].1 = "1280x720@60.000".into();
         assert_eq!(
-            check(&state, &[mirrored]),
+            check(&state, &[mirrored("1280x720@60.000")]),
             Err(fdo::Error::InvalidArgs(
                 "Monitors modes in logical monitor not equal".into()
             ))
@@ -1716,11 +1719,11 @@ mod tests {
             ids,
             ["1920x1080@60.000", "1920x1080@59.940", "1280x720@60.000"]
         );
-        let flags = |m: &Mode| {
+        fn flags(m: &Mode) -> Vec<&str> {
             let mut keys: Vec<&str> = m.properties.keys().map(String::as_str).collect();
             keys.sort_unstable();
             keys
-        };
+        }
         assert_eq!(flags(&panel.modes[0]), ["is-preferred"]);
         assert_eq!(flags(&panel.modes[1]), ["is-current"]);
         assert!(flags(&panel.modes[2]).is_empty());

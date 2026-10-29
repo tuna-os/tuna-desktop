@@ -313,7 +313,7 @@ display_call() {
 apply_mode() {
     serial="$(display_call GetCurrentState | sed -n 's/^(uint32 \([0-9]*\),.*/\1/p')"
     [ -n "$serial" ] || return 1
-    display_call ApplyMonitorsConfig -- "$serial" "$1" \
+    display_call ApplyMonitorsConfig "$serial" "$1" \
         "[(0, 0, 1.0, uint32 0, true, [('$CONNECTOR', '$2', {'color-mode': <uint32 0>, 'underscanning': <false>})])]" \
         "@a{sv} {}" >>"$ARTIFACTS/display-modes.log" 2>&1
 }
